@@ -40,6 +40,8 @@ let healthFailure: Error | null = null
 // Repositories github-interface answers 404/NOT_FOUND for, as if the agent
 // account could not read them.
 let deniedRepos = new Set<string>()
+// Repositories whose candidates carry one grey workflow run to rerun.
+let greyRunRepos = new Set<string>()
 // A wholesale batch failure, unattributable to any one repository.
 let batchEnvelopeFailure: Error | null = null
 
@@ -147,7 +149,17 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
       return json({ action: 'grey_ci_candidates', actor: AGENT, graphql_cost: 1,
         records: requests.map((request) => deniedRepos.has(request.repository)
           ? { ...request, head_sha: null, author: null, runs: [], error: `Could not resolve to a Repository with the name '${request.repository}'.` }
-          : { ...request, head_sha: HEAD, author: ME, runs: [], error: null }) })
+          : { ...request, head_sha: HEAD, author: ME, error: null,
+            runs: greyRunRepos.has(request.repository)
+              ? [{ run_id: 100, run_attempt: 1, workflow_id: 7, status: 'completed', conclusion: 'cancelled',
+                event: 'pull_request', created_at: '2026-07-15T12:00:00Z' }]
+              : [] }) })
+    }
+    if (args[0] === '--rerun-grey-ci-if-ready') {
+      // The preflight read the pull request, then its workflow run was gone.
+      return json({ action: 'rerun_grey_ci_if_ready', repository, pull_number: number, head_sha: HEAD,
+        run_id: Number(flagValue(args, '--run-id')), run_attempt: Number(flagValue(args, '--run-attempt')),
+        outcome: 'read_failed', error: 'GitHub 404: Not Found' })
     }
     if (args[0] === '--merge-candidates') {
       if (batchEnvelopeFailure) throw batchEnvelopeFailure
@@ -235,6 +247,7 @@ beforeEach(async () => {
   unresolvedConversations = 0
   healthFailure = null
   deniedRepos = new Set()
+  greyRunRepos = new Set()
   batchEnvelopeFailure = null
   vi.spyOn(console, 'log').mockImplementation(() => undefined)
   vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -443,6 +456,44 @@ describe('Repository hold', () => {
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({
       behavior: 'merge-prs', target: `${WEB}#2`,
     })])
+  })
+
+  it('rerun-grey-ci keeps a deleted-run 404 as a per-target failure, never a hold', async () => {
+    const { runtime } = await start()
+    pulls = [pull(API, 1)]
+    enable(database!, 'rerun-grey-ci')
+    greyRunRepos.add(API)
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(actedOn('rerun-grey-ci')).toEqual([`${API}#1`])
+    expect(holdsOf(runtime)).toEqual([])
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({
+      behavior: 'rerun-grey-ci', target: `${API}#1:workflow:7:pull_request:${HEAD}`,
+    })])
+  })
+
+  it('a quarantined launch never releases the repository hold', async () => {
+    const { db, runtime } = await start()
+    pulls = [pull(API, 1)]
+    enable(database!, 'review-new-prs')
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(actedOn('review-new-prs')).toEqual([`${API}#1`])
+
+    // Access is lost after the launch; the hold is recorded.
+    db.setMeta('behavior_repo_hold:acme/api', JSON.stringify({ repo: API, error: 'GitHub 404: Not Found',
+      heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 3_600_000 }))
+    // The agent log feed fails while the claim is still open.
+    mocks.runFile.mockImplementation(async (command: string, all: string[], options?: { cwd?: string }) => {
+      if (command === 'agent-interface' && all[0] === '--logs') throw new Error('shared log temporarily unavailable')
+      return cli(command, all, options)
+    })
+    await (await import('../server/agent')).resetAgentLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(db.listBehaviorLaunchClaims('review-new-prs')[0]?.launchQuarantine).toBe('unreadable')
+    expect(holdsOf(runtime)).toEqual([expect.objectContaining({ repo: API })])
   })
 
   it('refuses a replay for a held repository, and admits it once the hold expires', async () => {

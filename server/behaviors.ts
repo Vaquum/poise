@@ -483,6 +483,12 @@ function clearBehaviorFailure(key: BehaviorKey, target?: string): void {
   }
 }
 
+// Clearing without proof — quarantine, retirement — retires only the
+// failure row. A repository hold is released solely by proven access.
+function clearBehaviorFailureKeepHold(key: BehaviorKey, target: string): void {
+  setMeta(failureKey(key, target), '')
+}
+
 // ── Repository access holds ──────────────────────────────────────────
 // When the agent account cannot read a repository at all (GitHub 404 or
 // NOT_FOUND for it), every PR behavior would fail on it every sweep,
@@ -636,9 +642,8 @@ function retireClosedTargetFailures(open: ReadonlySet<string>, behaviors: readon
     for (const target of behaviorFailureTargets(behavior)) {
       const ref = target.match(/^[^#]+#\d+/)?.[0]
       if (ref && !unreadRepositories?.has(ref.split('#')[0]) && !open.has(ref)) {
-        // A closed PR proves nothing about repository access: retire only the
-        // failure row, never a repository hold with it.
-        setMeta(failureKey(behavior, target), '')
+        // A closed PR proves nothing about repository access.
+        clearBehaviorFailureKeepHold(behavior, target)
       }
     }
   }
@@ -1184,7 +1189,8 @@ function quarantineClaim(
       linkBehaviorLaunchCallOwned(claim.key, claim.target, claim.claimId, callId)
     }
     recordQuarantineIncident(claim, error, callId)
-    clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+    // Uncertainty, not success: a quarantine must not release a hold.
+    clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
     return true
   })()
   if (changed) captureBehaviorOutcome({ nativeId: claim.launchCorrelationId,
@@ -1293,7 +1299,8 @@ function quarantineFailedClaim(
     `).run(Number(mayRun), Number(mayRun), kind, error, claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
     if (changed.changes) {
       recordQuarantineIncident(claim, error, claim.launchCallId)
-      clearBehaviorFailure(claim.key as BehaviorKey, claim.target)
+      // Uncertainty, not success: a quarantine must not release a hold.
+      clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
     }
     return changed.changes !== 0
   })()
@@ -4360,7 +4367,10 @@ async function tickRerunGreyCi(): Promise<void> {
               url: `https://github.com/${pr.repo}/actions/runs/${runId}` }))
           } else if (!releaseSeenOwned(claimKey, claimTarget, claimId)) throw new Error('grey CI intent ownership changed before no-write receipt')
           if (result.outcome === 'read_failed') {
-            recordBehaviorFailure(behavior, 'operation', result.error, failureTarget)
+            // The rerun preflight reads the pull request before its workflow
+            // runs and jobs: a 404 here can name a deleted run on a readable
+            // repository, so it never holds the repository.
+            recordBehaviorFailure(behavior, 'operation', result.error, failureTarget, { hold: false })
           } else clearBehaviorFailure(behavior, failureTarget)
         } catch (error) {
           // A missing receipt may follow an accepted write. Retain the durable

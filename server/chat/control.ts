@@ -18,7 +18,7 @@ import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
 import { findEvent } from './storage'
 import { ChatError, type ChatRuntime } from './runtime'
-import { GREY_CI_INTENT_KEY, getEnabledMap, getBehaviorsRuntimeHealth, isEnabled, pullRequestPolicy, pullRequestRefusal } from '../behaviors'
+import { GREY_CI_INTENT_KEY, getEnabledMap, getBehaviorsRuntimeHealth, isEnabled, pullRequestPolicy, pullRequestRefusal, withBehaviorOrganization } from '../behaviors'
 import * as store from './control-store'
 import { isSwitchboardSession } from './switchboard-store'
 import { SWITCHBOARD_LOOKUPS, SWITCHBOARD_OPERATIONS, SWITCHBOARD_PERSON, SWITCHBOARD_READS, type SwitchboardControl } from './switchboard'
@@ -374,8 +374,15 @@ export function mergePrsOwnsBehind(target: store.WorkTarget, ci: CiObservation, 
   if (!isEnabled('merge-prs')) return false
   if (!ci.author || ci.draft === undefined || status !== 'open') return false
   const policy = pullRequestPolicy('merge-prs')
-  if (pullRequestRefusal(policy, target.repo, target.number,
-    { repo: target.repo, number: target.number, status, draft: ci.draft, author: ci.author, updated_at: '' })) return false
+  const facts = { repo: target.repo, number: target.number, status, draft: ci.draft, author: ci.author, updated_at: '' }
+  // Repository holds live under the owning account's metadata: resolve the
+  // refusal there, or a held repository reads as automation-owned and its
+  // bound chat is never woken for its behind branch.
+  const org = organizationForRepository(target.repo)
+  const refusal = org
+    ? withBehaviorOrganization(org.login, () => pullRequestRefusal(policy, target.repo, target.number, facts))
+    : pullRequestRefusal(policy, target.repo, target.number, facts)
+  if (refusal) return false
   const prefix = `${target.repo}#${target.number}`
   // Failure targets keep the datastore's repo case; the bound target is lowercase.
   return !getBehaviorsRuntimeHealth().failures.some(failure => failure.behavior === 'merge-prs' && !!failure.target

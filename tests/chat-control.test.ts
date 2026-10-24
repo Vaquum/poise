@@ -814,6 +814,34 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     }
   })
 
+  it('wakes for behind when a managed account holds the repository', async () => {
+    const { mergePrsOwnsBehind } = await import('../server/chat/control')
+    const target = store.workTarget('https://github.com/beta/app/pull/64')
+    const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }
+    database.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES ('beta', ?, 1, 'ready', 'ready', ?)`).run(join(root, 'beta.sqlite'), 'fixture-agent')
+    // An unmanaged default account alongside: unscoped metadata reads fall
+    // back to it and miss the managed account's hold.
+    database.setMeta('org', 'acme')
+    database.setMeta('behavior_merge_prs_enabled', '1')
+    database.setMeta('me', 'fixture-agent')
+    try {
+      expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(true)
+      database.setMeta('org:beta:behavior_repo_hold:beta/app', JSON.stringify({ repo: 'beta/app',
+        error: 'GitHub 404: Not Found', heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 3_600_000 }))
+      try {
+        expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(false)
+      } finally {
+        database.setMeta('org:beta:behavior_repo_hold:beta/app', '')
+      }
+    } finally {
+      database.db.prepare('DELETE FROM organizations WHERE login = ?').run('beta')
+      database.setMeta('org', '')
+      database.setMeta('behavior_merge_prs_enabled', '0')
+      database.setMeta('me', '')
+    }
+  })
+
   it('queues one degraded notice per CI outage and keeps the settled baseline', async () => {
     const parent = await manager()
     const target = 'https://github.com/acme/app/pull/65'
