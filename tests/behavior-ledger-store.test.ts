@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
-import { LedgerError, type LedgerAdmission, type LedgerCaller, type LedgerPolicy, type LedgerRecord } from '../server/behavior-ledger-contract'
+import { LedgerError, type LedgerAdmission, type LedgerCaller, type LedgerOutcome, type LedgerPolicy, type LedgerRecord } from '../server/behavior-ledger-contract'
 
 const roots: string[] = []
 const stores: BehaviorLedgerStore[] = []
@@ -36,10 +36,10 @@ function records(db: BehaviorLedgerStore): LedgerRecord[] {
   expect(page.status).toBe(200)
   return page.body.records!
 }
-function complete(db: BehaviorLedgerStore, nativeId: string, outcome: 'clean' | 'not_ready' = 'clean'): void {
+function complete(db: BehaviorLedgerStore, nativeId: string, outcome: LedgerOutcome = 'clean'): void {
   db.capture({ type: 'result', nativeId, state: 'completed', activity: 'settled', outcome, completedAt: stamp() })
 }
-function direct(db: BehaviorLedgerStore, nativeId: string, outcome: 'not_ready' = 'not_ready'): void {
+function direct(db: BehaviorLedgerStore, nativeId: string, outcome: LedgerOutcome = 'not_ready'): void {
   db.capture(admission(nativeId, { admissionKey: nativeId, behavior: 'merge-prs', source: 'poise:merge-prs', plannedSlots: [], slot: undefined }))
   complete(db, nativeId, outcome)
 }
@@ -285,6 +285,26 @@ describe('behavior firing ledger store', () => {
     expect(db.read({ operation: 'get', id: panel }).status).toBe(200)
     expect(db.health().instances).toBeLessThanOrEqual(4)
     expect(records(db).filter((record) => record.behavior === 'merge-prs' && record.kind === 'firing')).toHaveLength(1)
+  })
+
+  it('retains a confirmed enqueue write ahead of waiting observations under pressure', () => {
+    const db = store({ maxInstances: 4 })
+    direct(db, 'enqueue-1', 'enqueued')
+    direct(db, 'observe-1', 'waiting')
+    direct(db, 'observe-2', 'waiting')
+    const firings = records(db).filter((record) => record.behavior === 'merge-prs' && record.kind === 'firing')
+    expect(firings.map((record) => record.outcome).sort()).toEqual(['enqueued', 'waiting'])
+    expect(db.health().instances).toBeLessThanOrEqual(4)
+  })
+
+  it('accepts a queue entry reference on an enqueue result', () => {
+    const db = store()
+    db.capture(admission('enqueue-1', { admissionKey: 'enqueue-1', behavior: 'merge-prs', source: 'poise:merge-prs', plannedSlots: [], slot: undefined }))
+    db.capture({ type: 'result', nativeId: 'enqueue-1', state: 'completed', activity: 'settled', outcome: 'enqueued',
+      refs: [{ kind: 'queue', identity: 'MQE_1', availability: 'available' }], completedAt: stamp() })
+    const root = records(db).find((record) => record.kind === 'firing')!
+    const attempts = db.read({ operation: 'list', parent: root.id }).body.records!
+    expect(attempts.at(-1)?.refs).toContainEqual({ kind: 'queue', identity: 'MQE_1', availability: 'available' })
   })
 
   it('caps old attempts without coalescing identities or deleting the latest slot attempt', () => {
