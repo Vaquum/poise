@@ -83,7 +83,7 @@ describe('replay publication refusal', () => {
     const { database, behaviors } = await admitReady()
     failedPrClaim(database, 'review-new-prs', `${pr.repo}#${pr.number}:tertiary`, 'e'.repeat(32))
 
-    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toBeUndefined()
+    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toMatchObject({ author: pr.author })
   })
 
   it('admits a pr_approve replay after the head approval was dismissed', async () => {
@@ -94,7 +94,7 @@ describe('replay publication refusal', () => {
     })
     const { behaviors } = await admitReady()
 
-    await expect(behaviors.admitReplay('pr_approve', pr.repo, pr.number)).resolves.toBeUndefined()
+    await expect(behaviors.admitReplay('pr_approve', pr.repo, pr.number)).resolves.toMatchObject({ author: pr.author })
   })
 
   it('admits a pr_approve replay while an unclaimed change request stands on the head', async () => {
@@ -106,7 +106,7 @@ describe('replay publication refusal', () => {
 
     // An approval replay duplicates only an approval: a lost review verdict
     // belongs to the review behavior, not to this replay.
-    await expect(behaviors.admitReplay('pr_approve', pr.repo, pr.number)).resolves.toBeUndefined()
+    await expect(behaviors.admitReplay('pr_approve', pr.repo, pr.number)).resolves.toMatchObject({ author: pr.author })
   })
 
   it('admits a pr_review replay while only an approval stands on the head', async () => {
@@ -120,7 +120,7 @@ describe('replay publication refusal', () => {
     })]
     const { behaviors } = await admitReady()
 
-    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toBeUndefined()
+    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toMatchObject({ author: pr.author })
   })
 
   it('admits a failed slot beside a claimed sibling review after its incident retired', async () => {
@@ -145,7 +145,7 @@ describe('replay publication refusal', () => {
     const [settled] = database.reconcileBehaviorDeadLetters(new Set([`${pr.repo}#${pr.number}`]))
     expect(settled.disposition).toBe('resolved')
 
-    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toBeUndefined()
+    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toMatchObject({ author: pr.author })
   })
 
   it('admits a pr_approve replay while only a change request stands on the head', async () => {
@@ -161,7 +161,7 @@ describe('replay publication refusal', () => {
     })]
     const { behaviors } = await admitReady()
 
-    await expect(behaviors.admitReplay('pr_approve', pr.repo, pr.number)).resolves.toBeUndefined()
+    await expect(behaviors.admitReplay('pr_approve', pr.repo, pr.number)).resolves.toMatchObject({ author: pr.author })
   })
 
   it('refuses while the scheduler still owns the pull request', async () => {
@@ -218,7 +218,7 @@ describe('replay publication refusal', () => {
     fixture.agentLogs = [{ corrupt: true, repo: 'other/repo', pr_id: '9' }]
     const { behaviors } = await admitReady()
 
-    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toBeUndefined()
+    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toMatchObject({ author: pr.author })
   })
 
   it('admits exactly one of two concurrent replays of the same target', async () => {
@@ -248,7 +248,7 @@ describe('replay publication refusal', () => {
     await expect(Promise.all([
       behaviors.admitReplay('pr_review', pr.repo, pr.number),
       behaviors.admitReplay('pr_approve', pr.repo, pr.number),
-    ])).resolves.toEqual([undefined, undefined])
+    ])).resolves.toEqual([{ author: pr.author, actor: 'review-bot', reviewEnvironment: undefined }, { author: pr.author, actor: 'review-bot', reviewEnvironment: {} }])
   })
 
   it('releases its reservation when refused, leaving nothing behind', async () => {
@@ -286,7 +286,7 @@ describe('replay publication refusal', () => {
       VALUES (?, ?, 'pr_review', '2026-07-15T12:00:00Z', '2026-07-15T12:10:00Z')
     `).run(pr.repo, pr.number)
 
-    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toBeUndefined()
+    await expect(behaviors.admitReplay('pr_review', pr.repo, pr.number)).resolves.toMatchObject({ author: pr.author })
   })
 
   it('makes the scheduler skip a reserved target and launch once the reservation expires', async () => {

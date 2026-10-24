@@ -578,7 +578,7 @@ export async function triggerPrReview(
 // admitReplay): it reads the target fresh and throws when the scheduler would
 // not act on it. Passed in rather than imported, so this bridge to Caller does
 // not depend on the behavior runtime.
-export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, reviewEnvironment?: NodeJS.ProcessEnv } | void>
+export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, reviewEnvironment?: NodeJS.ProcessEnv } | void>
 
 // Replay an existing agent-interface job — used by the Swarm view's
 // Replay column. The frontend sends the row's `behavior` + `repo` +
@@ -611,7 +611,8 @@ export async function replayAgentJob(input: {
 
   const admission = await admit(behavior, repo, Number(prId))
   if (!admission) throw new Error('Replay admission returned no PR author')
-  const actor = prReviewer(admission.author)
+  const actor = admission.actor
+  if (prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
   const { model, recovery, catalog } = await reviewChoice(place)
   const claude = needsClaude(catalog, model)

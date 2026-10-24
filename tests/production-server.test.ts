@@ -235,6 +235,7 @@ describe('production server', () => {
 
   it('returns 503 when Claude-backed behavior work is enabled without authentication', async () => {
     const { setMeta } = await import('../server/db')
+    setMeta('me', 'octocat')
     setMeta('behavior_review_new_prs_enabled', '1')
     auth.setStatus('reauth_required')
     try {
@@ -250,6 +251,7 @@ describe('production server', () => {
       })
     } finally {
       setMeta('behavior_review_new_prs_enabled', '0')
+      setMeta('me', '')
       auth.setStatus('authenticated')
     }
   })

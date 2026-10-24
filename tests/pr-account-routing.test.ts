@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { mocks, fixture, loadModules, restartModules, arrangeCli, pr, HEAD_SHA, NEXT_HEAD_SHA, recordCompletedInitialReview, agentLog } from './behaviors-runtime-fixture'
 
 const value = (args: string[], flag: string) => args[args.indexOf(flag) + 1]
@@ -191,5 +191,79 @@ describe('PR account routing', () => {
     await behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
     expect(behaviors.getBehaviorsRuntimeHealth().failures.some((f) => f.error?.includes('Manual or unclaimed'))).toBe(true)
+  })
+
+  it.each(['pr_review', 'pr_approve'] as const)('refuses %s replay when accounts change during publication checks', async (behavior) => {
+    const { db, behaviors } = await initial()
+    db.setMeta('behavior_review_new_prs_enabled', '0')
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await original(command, args, options)
+      if (command === 'github-interface' && args[0] === '--review-activity-since') db.setMeta('me', 'replacement-user')
+      return result
+    })
+    await expect(behaviors.admitReplay(behavior, pr.repo, pr.number)).rejects.toThrow('GitHub accounts changed')
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    db.setMeta('me', 'poise-user')
+    // Refusal releases the reservation so the original account can retry.
+    mocks.runFile.mockImplementation(original)
+    await expect(behaviors.admitReplay(behavior, pr.repo, pr.number)).resolves.toMatchObject({ actor: 'poise-user' })
+  })
+
+  it.each(['disable', 'skip'] as const)('stops approval when %s is saved during its final receipt lookup', async (change) => {
+    const { db, behaviors } = await initial()
+    db.setMeta('behavior_review_new_prs_enabled', '0')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+    db.db.prepare('UPDATE behavior_seen SET launch_actor = ? WHERE launch_repo = ?').run('poise-user', pr.repo)
+    fixture.agentLogs = [agentLog({ id: 'c'.repeat(32), actor: 'poise-user', status: 'completed', action: 'requested_changes', outcome: 'changes_requested', head_sha: HEAD_SHA, review_id: 91, correlation_id: 'old-call', completed_at: new Date().toISOString() })]
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA, reviewerReviewIdsSince: [91] })
+    const agent = await import('../server/agent')
+    const original = mocks.runFile.getMockImplementation()!
+    let changed = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await original(command, args, options)
+      if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+        agent.resetAgentLogCache()
+        const read = agent.fetchAgentLogSnapshot
+        vi.spyOn(agent, 'fetchAgentLogSnapshot').mockImplementationOnce(async (options) => {
+          const snapshot = await read(options)
+          db.setMeta(change === 'disable' ? 'behavior_approve_prs_enabled' : 'behavior_approve_prs_skip_repos', change === 'disable' ? '0' : JSON.stringify([pr.repo]))
+          changed = true
+          return snapshot
+        })
+      }
+      return result
+    })
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(changed).toBe(true)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it.each(['disable', 'skip'] as const)('stops resolution when %s is saved during its final receipt lookup', async (change) => {
+    const { db, behaviors } = await initial()
+    db.setMeta('behavior_review_new_prs_enabled', '0')
+    db.setMeta('behavior_resolve_unblocking_enabled', '1')
+    arrangeCli(false, false, { reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA, unresolvedConversationCount: 1, reviewerReviewIdsSince: [] })
+    const agent = await import('../server/agent')
+    const read = agent.fetchAgentLogSnapshot
+    const original = mocks.runFile.getMockImplementation()!
+    let changed = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await original(command, args, options)
+      if (command === 'github-interface' && args[0] === '--review-activity-since') {
+        // The first receipt read admits the candidate; the second prepares the mutation.
+        vi.spyOn(agent, 'fetchAgentLogSnapshot').mockImplementationOnce(read).mockImplementationOnce(async (options) => {
+          const snapshot = await read(options)
+          db.setMeta(change === 'disable' ? 'behavior_resolve_unblocking_enabled' : 'behavior_resolve_unblocking_skip_repos', change === 'disable' ? '0' : JSON.stringify([pr.repo]))
+          changed = true
+          return snapshot
+        })
+      }
+      return result
+    })
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(changed).toBe(true)
+    expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--resolve-nonblocking-conversations-if-ready')).toBe(false)
   })
 })

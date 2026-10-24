@@ -193,3 +193,13 @@ describe('behavior diagnostic groups', () => {
     expect(behaviorDiagnosticGroups(diagnostics)[0]!.entries).toHaveLength(2)
   })
 })
+
+
+it('names and separates the two acting accounts when both lack repository access', () => {
+  const diagnostics = snapshot()
+  diagnostics.holds = ['human', 'review-bot'].map((actor) => ({ actor, repo: 'org/repo',
+    error: 'GitHub 404: Not Found', heldAt: '', nextRecheckAt: '' }))
+  expect(behaviorDiagnosticGroups(diagnostics).map((group) => group.message)).toEqual([
+    'human has no access to org/repo', 'review-bot has no access to org/repo',
+  ])
+})
