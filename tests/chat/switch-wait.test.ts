@@ -596,7 +596,46 @@ describe('the switch bound', () => {
       timer.fire()
       expect(restart).toHaveBeenCalledTimes(1)
       expect(logs.filter((line) => line.includes('still waiting on'))).toHaveLength(0)
+      // The restart's own drain close runs as an operation first.
+      await until(() => w.runtime.working() === 0)
       expect(service.health().switchWaitingOn).toBeNull()
+    } finally {
+      service.reset()
+    }
+  })
+
+  it('holds the switch for an operation still running on a switch-waited session', async () => {
+    const w = await world()
+    w.runtime.prompt(w.s.id, input('Original task'))
+    await until(() => w.turns(w.s.id).length === 1 && w.runtime.working() === 0)
+    const timer = new FakeTimer()
+    let now = 5_000_000
+    const restart = vi.fn(() => true)
+    const logs: string[] = []
+    const service = new Service(w.runtime, {
+      drainTimeoutSeconds: 60, timer, log: (line: string) => logs.push(line), releasesDir: await releases(),
+      release: { name: 'r1', base: 'b1' }, restart, canRestart: () => true, switchTurnBoundMinutes: () => 15, now: () => now,
+    })
+    try {
+      service.switchRelease('r2')
+      expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+      // An accepted revert still running on the queued session: the switch
+      // waits on it instead of restarting over it.
+      const live = (w.runtime as unknown as { live: Map<string, { pendingOps: number }> }).live.get(w.s.id)
+      if (!live) throw new Error('the session is not live')
+      live.pendingOps += 1
+      expect(w.runtime.working()).toBe(1)
+      expect(service.health().switchWaitingOn).toBe('1 runtime operation')
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      now += 15 * 60_000
+      timer.fire()
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      expect(logs.filter((line) => line.includes('still waiting on'))).toHaveLength(1)
+      live.pendingOps -= 1
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
     } finally {
       service.reset()
     }

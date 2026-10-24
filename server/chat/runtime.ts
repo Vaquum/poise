@@ -1493,11 +1493,15 @@ export class ChatRuntime extends EventEmitter {
       if (session.turn?.relayHeld && session.relay?.healthy) continue
       // A prompt waiting behind a Poise update holds nothing a restart would
       // cut: it is durable, and the next server starts it. Whatever the
-      // session keeps from before it queued — a live process, unsettled
-      // operations, even a turn past its recorded outcome — must never hold
-      // the very switch it waits for. A turn still recorded open holds the
+      // session keeps from before it queued — a live process, even a turn
+      // past its recorded outcome — must never hold the very switch it
+      // waits for. An operation still running on it, like an accepted
+      // revert, does hold the switch. A turn still recorded open holds the
       // switch through the open-turn gate instead, and the bound cancels it.
-      if (session.record.status === 'queued' && session.record.queuedBehind === SWITCH_WAIT_REASON) continue
+      if (session.record.status === 'queued' && session.record.queuedBehind === SWITCH_WAIT_REASON) {
+        count += session.pendingOps
+        continue
+      }
       const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
       count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) ? 1 : 0
     }
