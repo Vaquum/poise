@@ -28,6 +28,7 @@ github-datastore view pr --status open --format json
 github-datastore view issue --author LOGIN --format csv
 github-datastore view user --username LOGIN --item-type pr --limit 20
 github-datastore view pr-reviews --repo OWNER/REPO --number 123 --page-size 200 --review-after 0 --comment-after 0
+github-datastore view pr-dependents --repo OWNER/REPO --number 123
 ```
 
 `pr-reviews --page-size N` (1–200) bounds reviews and comment identities separately.
@@ -44,6 +45,18 @@ available. All reads are local and preserve shared-account authors without
 claiming to know which chat posted them. The paged read requires the indexes
 created by the normal datastore initialization/sync migration; an unmigrated
 database fails the read instead of scanning full histories without those indexes.
+
+`pr-dependents` returns one pull request's closed issues and their open
+dependents: `found`, the PR `title`, `closed` with each issue's state,
+`closes_via` (`closing-references`, or `body-keywords` when the stored read
+predates dependency tracking), and `dependents` with `via` naming
+`blocked-by`, `depends-on`, or both. A dependent is an open issue in the same
+repository that GitHub lists as blocked by a closed issue, or that lists it
+under a `Depends on:` header in its body, inline or as list items. At most 100
+closed issues and 50 dependents are returned; `truncated` means a cap or a
+malformed stored connection hid entries. Blocked-by edges ride the existing issue query, so a
+dependent last synced before they were tracked reads as unblocked until its
+next sync; `Depends on:` works from long-synced bodies.
 
 `github-datastore` and `python3 -m github_datastore` work from any directory on this host.
 Every command takes `--db PATH`; without it the database is

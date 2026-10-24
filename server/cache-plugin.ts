@@ -44,7 +44,7 @@ import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-
 import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceRuntime, stopStorageMaintenanceRuntime, storageStatus } from './storage-maintenance'
 import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
-import { retryFailedPrReviews } from './behaviors'
+import { retryFailedPrReviews, setBehaviorCheckSlots } from './behaviors'
 import { enforceApiRequest, httpStatus, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
@@ -223,6 +223,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       },
       extensions: runtimeExtensions,
     })
+    setBehaviorCheckSlots(chatRuntime.checkSlots)
     // Before recovery, so it sees the turns a restart cut.
     chatSwitchboard = new Switchboard(chatRuntime)
     chatControl = new ChatControl(chatRuntime, { switchboard: chatSwitchboard })

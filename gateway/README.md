@@ -85,6 +85,8 @@ A handle stays bound to the GitHub account id that first signed in with it, so a
 
 One JSON object per line on standard output, with an `event` name. Every container lifecycle step is logged (`workspace.volume.created`, `workspace.container.started`, `workspace.upgrade.finished` and so on), as are sign-ins, refusals, device pairing and admin actions. Query strings are never logged, because they can carry sign-in tickets.
 
+Proxy failures triage by status and event: `503` with `workspace.unreachable` means the gateway could not reach the workspace at all and is starting it; `502` with `proxy.failed` means the exchange broke before the answer started; `proxy.truncated` means the workspace failed mid-answer, after the client had its status — the client keeps a partial answer, so only the event shows the failure. Client cancellations log nothing. Upgrade health shows in `workspace.drain.waiting` (busy work and time left), `workspace.drain.unconfirmed` (the drain was never admitted) and `workspace.upgrade.aborted` (the update is deferred to the next pass), `workspace.update.waiting` and `workspace.update.stuck` for in-place switches, and `readyAfterMs` on `workspace.upgrade.finished`, the measured stop-to-ready time against the two-minute idle-to-ready bound.
+
 ## Container
 
 The gateway drives the Docker Engine through its mounted socket and joins each workspace network: all of them when it starts, before it answers, because a recreated container is on none of them, and any one it is not on before it calls that workspace. The socket is root-equivalent on the host whatever user the process runs as, so the image does not switch to an unprivileged user. Build it with `docker build gateway/`.

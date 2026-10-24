@@ -28,6 +28,7 @@ vi.mock('../server/behavior-ledger', () => ({
 vi.mock('../server/process', () => ({
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
+  runningCallerLaunches: () => 0,
   claudeSubscriptionEnvironment: () => ({
     ANTHROPIC_API_KEY: undefined,
     ANTHROPIC_AUTH_TOKEN: undefined,
@@ -121,6 +122,9 @@ interface ReviewActivityFixture {
   reviewerReviewsSince?: number
   // With ids, as github-interface reports them since Caller #39.
   reviewerReviewIdsSince?: number[]
+  // Full items when a test needs per-review state or head; each defaults
+  // to a COMMENTED review on the current head.
+  reviewerReviewsSinceItems?: Array<{ id: number, state?: string, commit?: string }>
   reviewerPendingReviews?: number
   resolveSuperseded?: boolean
   resolveUnresolvedCount?: number
@@ -209,6 +213,9 @@ function arrangeCli(
     const activityRecord = (repository: string, pullNumber: number, reviewer: string) => {
       const requested = (reviewActivity.requestedReviewers || [])
         .some((login) => login.toLowerCase() === reviewer.toLowerCase())
+      const sinceItems: Array<{ id: number, state?: string, commit?: string }> | undefined =
+        reviewActivity.reviewerReviewsSinceItems
+        ?? reviewActivity.reviewerReviewIdsSince?.map((id) => ({ id }))
       return {
         action: 'review_activity_since',
         repository,
@@ -238,9 +245,17 @@ function arrangeCli(
         reviewer_latest_commit: reviewActivity.reviewerLatestCommit ?? null,
         reviewer_change_requests_since: 0,
         reviewer_approvals_since: 0,
-        reviewer_reviews_since: reviewActivity.reviewerReviewIdsSince?.length ?? reviewActivity.reviewerReviewsSince ?? 0,
-        ...(reviewActivity.reviewerReviewIdsSince
-          ? { reviewer_reviews_since_items: reviewActivity.reviewerReviewIdsSince.map((id) => ({ id, node_id: `PRR_${id}`, state: 'COMMENTED', commit: HEAD_SHA, submitted_at: new Date().toISOString() })) }
+        reviewer_reviews_since: sinceItems?.length ?? reviewActivity.reviewerReviewsSince ?? 0,
+        ...(sinceItems
+          ? {
+              reviewer_reviews_since_items: sinceItems.map((item) => ({
+                id: item.id,
+                node_id: `PRR_${item.id}`,
+                state: item.state ?? 'COMMENTED',
+                commit: item.commit ?? reviewActivity.headSha ?? HEAD_SHA,
+                submitted_at: new Date().toISOString(),
+              })),
+            }
           : {}),
         reviewer_pending_reviews: reviewActivity.reviewerPendingReviews ?? 0,
         latest_activity_at: reviewActivity.latestActivityAt ?? null,

@@ -11,8 +11,9 @@ import { diagnostic } from '../logging'
 import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from '../release-background'
 import { POISE_ROOT } from './local-workspace'
 import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
+import { WORKER_SNIPPET_DEFAULT } from './worker-default'
 import { ensureSnippetSwitch, readSwitch } from '../snippet-library'
-import { MANAGER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
 import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-receipts'
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
@@ -333,6 +334,55 @@ export async function readWorkReviews(target: store.WorkTarget, cursor: ReviewsC
   }
 }
 
+/** One merged PR's closed issues and their open dependents as the local
+ *  datastore has them; null when the datastore cannot be asked. Local rows
+ *  only — the sync owns freshness, and this read adds zero GitHub traffic. */
+export interface MergeWakeClosedIssue { repo: string, number: number, title: string, url: string, state: string | null }
+export interface MergeWakeDependent { repo: string, number: number, title: string, url: string, via: Array<'blocked-by' | 'depends-on'> }
+export interface MergeWakeObservation {
+  found: boolean, title: string | null, closed: MergeWakeClosedIssue[],
+  closesVia: 'closing-references' | 'body-keywords' | null, dependents: MergeWakeDependent[], truncated: boolean,
+}
+export async function readWorkMergeWake(target: store.WorkTarget): Promise<MergeWakeObservation | null> {
+  const org = organizationForRepository(target.repo)
+  if (!org) return null
+  try {
+    const { stdout } = await runFile('github-datastore',
+      organizationArgs(org, ['view', 'pr-dependents', '--repo', target.repo, '--number', String(target.number), '--format', 'json']),
+      { timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })
+    const value: unknown = JSON.parse(stdout)
+    if (!value || typeof value !== 'object') return null
+    const row = value as Record<string, unknown>
+    if (typeof row.found !== 'boolean' || (row.title !== null && typeof row.title !== 'string')
+      || !Array.isArray(row.closed) || row.closed.length > 100 || !Array.isArray(row.dependents) || row.dependents.length > 50
+      || typeof row.truncated !== 'boolean'
+      || (row.closes_via !== null && row.closes_via !== 'closing-references' && row.closes_via !== 'body-keywords')) return null
+    const closed: MergeWakeClosedIssue[] = []
+    for (const entry of row.closed) {
+      if (!entry || typeof entry !== 'object') return null
+      const issue = entry as Record<string, unknown>
+      if (typeof issue.repo !== 'string' || !issue.repo || typeof issue.number !== 'number' || !Number.isSafeInteger(issue.number) || issue.number <= 0
+        || typeof issue.title !== 'string' || !issue.title || typeof issue.url !== 'string' || !issue.url
+        || (issue.state !== null && typeof issue.state !== 'string')) return null
+      closed.push({ repo: issue.repo, number: issue.number, title: issue.title, url: issue.url, state: issue.state })
+    }
+    const dependents: MergeWakeDependent[] = []
+    for (const entry of row.dependents) {
+      if (!entry || typeof entry !== 'object') return null
+      const issue = entry as Record<string, unknown>
+      if (typeof issue.repo !== 'string' || !issue.repo || typeof issue.number !== 'number' || !Number.isSafeInteger(issue.number) || issue.number <= 0
+        || typeof issue.title !== 'string' || !issue.title || typeof issue.url !== 'string' || !issue.url
+        || !Array.isArray(issue.via) || issue.via.length < 1 || issue.via.length > 2 || new Set(issue.via).size !== issue.via.length
+        || !issue.via.every(via => via === 'blocked-by' || via === 'depends-on')) return null
+      dependents.push({ repo: issue.repo, number: issue.number, title: issue.title, url: issue.url, via: issue.via as MergeWakeDependent['via'] })
+    }
+    return { found: row.found, title: row.title, closed, closesVia: row.closes_via as MergeWakeObservation['closesVia'],
+      dependents, truncated: row.truncated }
+  } catch {
+    return null
+  }
+}
+
 /** GitHub login identifies an account, not a chat. Without per-chat origin
  *  evidence, even same-account feedback remains actionable. Resolved threads,
  *  approvals and unsubmitted reviews need no author action. */
@@ -574,7 +624,7 @@ export class ChatControl {
         ...(timer.reason ? { reason: timer.reason } : {}), ...(error ? { error } : {}) } })
   }
 
-  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, now?: () => number, switchboard?: SwitchboardControl } = {}) {
+  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, mergeWake?: typeof readWorkMergeWake, now?: () => number, switchboard?: SwitchboardControl } = {}) {
     runtime.on('event', this.onEvent)
     runtime.on('deleted', this.onDeleted)
   }
@@ -644,24 +694,26 @@ export class ChatControl {
       'You have 120 control actions and 20 new chats per hour; stopping work never counts. Your authority is cooperative, not a security boundary.',
       'You can set timers on any chat, including yourself (timer, timers, cancelTimer, rearmTimer). Each wake-up is a model turn: at most 5 timers per chat, each at most every 5 minutes. Timer text is delivered as your message, never as the person\'s. A chat the person holds takes no timer turns until the person resumes it.',
     )
-    if (record.role !== 'manager') return guidance.join('\n')
-    return `${guidance.join('\n')}\n${await this.managerCharter()}`
+    if (record.role !== 'manager' && record.role !== 'worker') return guidance.join('\n')
+    return `${guidance.join('\n')}\n${await this.charter(record.role)}`
   }
 
-  /** The Manager's standing instructions: the current /manager text, read fresh
-   *  for every turn, so an edit applies from the next turn. */
-  private async managerCharter(): Promise<string> {
-    await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT)
+  /** A Manager's or worker's standing instructions: the current charter text,
+   *  read fresh for every turn, so an edit applies from the next turn. */
+  private async charter(role: 'manager' | 'worker'): Promise<string> {
+    const name = role === 'manager' ? MANAGER_SWITCH : WORKER_SWITCH
+    const label = role === 'manager' ? 'Manager' : 'Worker'
+    await ensureSnippetSwitch(name, role === 'manager' ? MANAGER_SNIPPET_DEFAULT : WORKER_SNIPPET_DEFAULT)
     let charter: ChatSwitch | null
     try {
-      charter = readSwitch(MANAGER_SWITCH)
+      charter = readSwitch(name)
     } catch (error) {
-      throw new Error(`The /manager snippet could not be read: ${error instanceof Error ? error.message : String(error)}. Snippets shows the problem.`)
+      throw new Error(`The /${name} snippet could not be read: ${error instanceof Error ? error.message : String(error)}. Snippets shows the problem.`)
     }
-    if (!charter) throw new Error('The /manager snippet could not be read: it is missing. Snippets shows the problem.')
-    if (Buffer.byteLength(charter.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new Error('The /manager snippet is larger than 64 KiB. Shorten it in Snippets.')
-    if (!charter.content.trim()) return '[Manager charter] The /manager snippet is empty. Ask the person to write it in Snippets.'
-    return `[Manager charter — the /manager snippet, revision ${charter.revision}, which the person edits in Snippets. It supersedes all earlier revisions. It is the person's standing instruction and authorizes turns the person did not start; a direct request from the person in this chat takes precedence, and it takes precedence over Memories where they conflict. Chats cannot change it.]\n${charter.content}`
+    if (!charter) throw new Error(`The /${name} snippet could not be read: it is missing. Snippets shows the problem.`)
+    if (Buffer.byteLength(charter.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new Error(`The /${name} snippet is larger than 64 KiB. Shorten it in Snippets.`)
+    if (!charter.content.trim()) return `[${label} charter] The /${name} snippet is empty. Ask the person to write it in Snippets.`
+    return `[${label} charter — the /${name} snippet, revision ${charter.revision}, which the person edits in Snippets. It supersedes all earlier revisions. It is the person's standing instruction and authorizes turns the person did not start; a direct request from the person in this chat takes precedence, and it takes precedence over Memories where they conflict. Chats cannot change it.]\n${charter.content}`
   }
 
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -706,7 +758,7 @@ export class ChatControl {
   /** Before any receipt: a refusal is a 403, never a recorded outcome. The
    *  Switchboard observes and reports; only it reports. */
   private authorize(id: string, operation: string, command: Record<string, unknown>): void {
-    if (operation === 'create' && command.role !== undefined) throw new HttpError(403, 'A Manager is created by the person in the New session dialog.')
+    if (operation === 'create' && command.role !== undefined) throw new HttpError(403, 'A Manager or Worker is created by the person in the New session dialog.')
     if (['timer', 'timers', 'cancelTimer', 'rearmTimer'].includes(operation) && this.runtime.get(id)?.role !== 'manager') {
       throw new HttpError(403, 'timers are available to the workspace Manager and the person')
     }
@@ -1068,7 +1120,13 @@ export class ChatControl {
       } catch (error) { this.itemFailed('binding', binding.target, error) }
       if (target.kind !== 'pull') continue
       const prStatus = await this.workTargetStatus(target, now)
-      if (prStatus === 'closed' || prStatus === 'merged') continue
+      if (prStatus === 'merged') {
+        try {
+          await this.observeMergeWake(binding, target, now)
+        } catch (error) { this.itemFailed('ci', binding.target, error) }
+        continue
+      }
+      if (prStatus === 'closed') continue
       try {
         await this.observeCi(binding, target, prStatus, now)
         await this.observeReviews(binding, target, now)
@@ -1468,6 +1526,56 @@ export class ChatControl {
     })]
     for (const comment of commentBaselines) store.saveObservation(instance, `${seenKey}:comment:${comment.id}`, comment.revision, now)
     if (reviews.page) store.saveObservation(instance, `reviews-cursor:${target.url}`, JSON.stringify([reviews.page]), now)
+  }
+
+  /** A merged worker-bound PR wakes its creating chat once with the closed
+   *  issues and their open dependents, from the merge the target-status read
+   *  already saw: zero new GitHub requests. Unknown or missing evidence
+   *  keeps the unsettled baseline like pending CI; with no creating chat,
+   *  nothing changes. */
+  private async observeMergeWake(binding: store.Binding, target: store.WorkTarget, now: number): Promise<void> {
+    const instance = this.runtime.instance
+    const key = `merge-wake:${target.url}`
+    const previous = store.observation(instance, key)
+    if (previous && now - previous.checked_at < CI_INTERVAL) return
+    if (previous?.fingerprint) return
+    let wake: MergeWakeObservation | null
+    try {
+      wake = await (this.options.mergeWake ?? readWorkMergeWake)(target)
+    } catch (error) {
+      this.runtime.emit('log', `[chat control] merge-wake read for ${target.url} failed: ${String(error)}`)
+      wake = null
+    }
+    // An ownership transfer mid-read must not announce the merge to the old
+    // owner's Manager; the new owner starts from the unsettled baseline.
+    if (!store.bindingIsCurrent(instance, binding)) return
+    const manager = store.children(instance).find(child => child.child === binding.session)?.manager
+    if (!manager || !this.runtime.ownsSession(manager) || !wake || !wake.found) {
+      store.saveObservation(instance, key, previous?.fingerprint ?? '', now)
+      return
+    }
+    const worker = this.runtime.get(binding.session)
+    const data = { kind: 'worker_pr_merged', target: target.url, worker: binding.session,
+      ...(worker?.title ? { workerTitle: worker.title } : {}), ...(wake.title ? { title: wake.title } : {}),
+      closedIssues: wake.closed, closesVia: wake.closesVia, dependentIssues: wake.dependents,
+      truncated: wake.truncated,
+      detail: wake.truncated
+        ? 'The closed and dependent lists may be incomplete; inspect the complete current work state through Poise APIs or Caller before acting.'
+        : 'Start dependent work at once; inspect the complete current work state through Poise APIs or Caller before acting.' }
+    const body = JSON.stringify(data)
+    const fingerprint = createHash('sha256').update(body).digest('hex')
+    db.transaction(() => {
+      if (!store.bindingIsCurrent(instance, binding)) return
+      store.message(instance, manager, store.WORK_MONITOR_SENDER,
+        boundedNotice(body, { kind: data.kind, target: binding.target, worker: binding.session,
+          closedCount: wake.closed.length, dependentsCount: wake.dependents.length, truncated: wake.truncated,
+          detail: 'Inspect the complete current work state through Poise APIs or Caller before acting.' }),
+        key)
+      store.saveObservation(instance, key, fingerprint, now)
+      diagnostic({ level: 'info', operation: 'chat.work.merge_wake', target: binding.target,
+        repository: target.repo, message: 'Worker PR merged; its Manager was woken',
+        context: { sessionId: manager, worker: binding.session, closed: wake.closed.length, dependents: wake.dependents.length } })
+    })()
   }
 
   private observe(binding: store.Binding, key: string, data: Record<string, unknown>, now: number, initiallyActionable: boolean, pending = false, actionable?: unknown, shouldWake = true): void {

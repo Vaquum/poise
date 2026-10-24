@@ -243,6 +243,20 @@ included. Every new revision still writes a `chat.manager.charter.changed`
 diagnostic. Under a service drain, editing `/manager` still works; under a
 local release drain it returns 503 like other snippet saves.
 
+**Worker chats.** A worker is a `role: 'worker'` chat, chosen in the New
+session dialog like the Manager; Worker and Manager are mutually exclusive
+and neither is selected by default. A worker runs on its own standing
+instructions, the built-in `/worker` snippet, which rides on every worker
+turn the same way `/manager` rides on Manager turns — whoever sent the
+message — and is absent from default chats. While a worker exists, Poise
+creates it from the default text in `server/chat/worker-default.ts` when no
+snippet is named `worker`; an existing snippet of that name is adopted as it
+is, and an existing `/worker` is never replaced. It holds up to 64 KiB, is
+edited in Snippets like any snippet, and cannot be deleted. In any non-worker
+chat, `/worker` is not supported. Every new revision writes a
+`chat.worker.charter.changed` diagnostic. A worker keeps its type through a
+fork; a handoff starts an ordinary chat.
+
 ## The Switchboard
 
 The [Switchboard](Switchboard.md) is a chat Poise runs as an observer for the
@@ -335,6 +349,19 @@ wakes, and CI polling stops for a closed or merged PR. The state is read only
 when a behavior notice is about to be queued, or alongside the five-minute CI
 poll, and cached for five minutes. An unreadable or unsynced target wakes as
 before: unknown is never treated as closed.
+
+When a PR bound to a worker merges, the monitor wakes the creating chat once
+with the merged PR, the issues it closed, and the open issues that depend on
+them, so dependent work starts at once. A dependent is an open issue in the
+same repository that GitHub lists as blocked by a closed issue, or that lists
+it under `Depends on:` in its body. The closed issues come from GitHub's
+closing references on the PR, or from its body's closing keywords when the
+stored read predates dependency tracking. The wake reuses the merge the
+target-state read already saw and adds no GitHub requests: the sync carries
+the two dependency fields on its existing item queries. With no creating
+chat, nothing changes. Unknown or missing evidence keeps the unsettled
+baseline and retries; the wake fires exactly once per merged PR, marked
+truncated when a cap or a malformed stored read hid entries.
 
 Work changes also enter the existing structured diagnostic log with the target,
 repository and responsible chat. The native `api` operation reaches Poise's

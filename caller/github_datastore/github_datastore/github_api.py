@@ -241,6 +241,13 @@ ITEM_GRAPH_BATCH_SIZE = 20
 
 ISSUE_GRAPH_FIELDS = f"""
       {ISSUE_ITEM_FIELDS}
+      blockedBy(first: 100) {{
+        pageInfo {{ hasNextPage }}
+        nodes {{
+          number
+          repository {{ nameWithOwner }}
+        }}
+      }}
       comments(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
@@ -268,6 +275,14 @@ PR_GRAPH_FIELDS = f"""
       isDraft
       additions
       deletions
+      closingIssuesReferences(first: 100) {{
+        pageInfo {{ hasNextPage }}
+        nodes {{
+          number
+          title
+          repository {{ nameWithOwner }}
+        }}
+      }}
       comments(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
         nodes {{

@@ -420,6 +420,45 @@ describe('Poise-local session storage', () => {
     }
   }, 30_000)
 
+  it('keeps one slot free for a turn the person sent', async () => {
+    const instance = randomUUID()
+    const capped = new Runtime({ instance, instanceLabel: 'test', callerTurns: null,
+      catalog: async () => CATALOG, resolveCheckout, localWorkspaceRoot: join(outer, '.poise-chat'),
+      idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => 2, adapters: { grok: fakeAdapter }, probeAgent: async () => ({ ok: true }) })
+    const controlStore = await import('../../server/chat/control-store')
+    const delegated = (sessionId: string, shown: string) => {
+      controlStore.message(instance, sessionId, 'Manager', shown)
+      const row = controlStore.inbox(instance, sessionId).at(-1)!
+      return { seq: row.seq, source: { kind: 'chat', sessionId: 'manager', title: 'Manager' } as const, shown, at: Date.now() }
+    }
+    try {
+      const a = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title: 'A' })
+      await until(() => capped.get(a.id)?.status === 'idle')
+      capped.prompt(a.id, { text: 'hold this turn', attachments: [], mentions: [] }, delegated(a.id, 'delegated work'))
+      await until(() => capped.get(a.id)?.status === 'running')
+      const b = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title: 'B' })
+      await until(() => capped.get(b.id)?.status === 'idle')
+      capped.prompt(b.id, { text: 'work too', attachments: [], mentions: [] }, delegated(b.id, 'more delegated work'))
+      await until(() => capped.get(b.id)?.status === 'queued')
+      expect(capped.get(b.id)?.queuedBehind).toBe('waiting for a free agent slot')
+      // The person's turn takes the reserved slot instead of queueing behind it.
+      const c = await capped.create({ agent: 'grok', model: 'grok-4.6-high', title: 'C' })
+      await until(() => capped.get(c.id)?.status === 'idle')
+      capped.prompt(c.id, { text: 'interactive work', attachments: [], mentions: [] })
+      await until(() => capped.get(c.id)?.status === 'running')
+      expect(capped.get(b.id)?.status).toBe('queued')
+      expect(capped.checkSlots.stats()).toMatchObject({ running: 2, personRunning: 1, backgroundRunning: 1, queued: 1 })
+      await capped.cancel(a.id)
+      await until(() => capped.get(b.id)?.status === 'running')
+      await capped.cancel(b.id)
+      await capped.cancel(c.id)
+      await until(() => capped.get(b.id)?.status === 'idle')
+      await until(() => capped.get(c.id)?.status === 'idle')
+    } finally {
+      await capped.stop()
+    }
+  }, 60_000)
+
   it('lets Stop cancel a Poise-local turn waiting for a free agent slot', async () => {
     const prompted: string[] = []
     let next = ''

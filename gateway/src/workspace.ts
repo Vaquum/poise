@@ -257,6 +257,15 @@ export async function workspaceRequest(ctx: Context, req: IncomingMessage, res: 
       log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure) })
       res.destroy()
     }
+  }, (error, bytesSent) => {
+    // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
+    try {
+      // The client keeps its partial answer; the failure is recorded, never answered twice.
+      log.warn('proxy.truncated', { handle: owner.handle, error: error.message, errno: error.code ?? null,
+        ...evidence(), disconnect: 'upstream failed after the client could no longer be answered', phase: 'response', bytesSent })
+    } catch (failure) {
+      log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure) })
+    }
   })
 }
 
@@ -317,6 +326,14 @@ export async function workspaceUpgrade(ctx: Context, req: IncomingMessage, socke
     } catch (failure) {
       log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure) })
       socket.destroy()
+    }
+  }, (error) => {
+    // Runs inside a socket event: a throw here would escape every handler and stop the gateway.
+    try {
+      log.warn('proxy.truncated', { handle: owner.handle, error: error.message, errno: error.code ?? null,
+        ...evidence(), disconnect: 'upstream failed after the switch, when the client could no longer be answered', phase: 'websocket' })
+    } catch (failure) {
+      log.error('proxy.failure.unanswered', { handle: owner.handle, error: errorMessage(failure) })
     }
   })
 }
