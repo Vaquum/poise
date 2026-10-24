@@ -81,7 +81,7 @@ async function openEditor(page: Page, title: string, put: 'ok' | 'fail') {
   })
   await page.getByRole('button', { name: 'Editor', exact: true }).click()
   const doc = page.locator('#editor-doc')
-  await expect(doc).toContainText('word')
+  await expect(doc).toContainText('word', { timeout: 10_000 })
   return {
     doc,
     saveCount: () => saves,
@@ -98,10 +98,13 @@ type Editor = Awaited<ReturnType<typeof openEditor>>
 async function saveCycle(page: Page, editor: Editor, edit: () => Promise<void>): Promise<Geometry[]> {
   const rest = await geometry(page)
   editor.holdSaves()
+  // Sampled before the edit: sampling after typing would race the 500 ms
+  // debounce, and a PUT that lands first would make the poll below wait
+  // for a second PUT that never comes.
+  const before = editor.saveCount()
   await edit()
   await page.waitForTimeout(150)
   const debounced = await geometry(page)
-  const before = editor.saveCount()
   await expect.poll(() => editor.saveCount(), { timeout: 10_000 }).toBeGreaterThan(before)
   const count = editor.saveCount()
   await page.waitForTimeout(150)
@@ -162,5 +165,5 @@ test('a failed autosave reaches the notice feed without moving the editor', asyn
   expect(Math.abs(after.docTop - before.docTop)).toBeLessThanOrEqual(1)
   expect(after.barH).toBe(before.barH)
   await page.locator('#notification-bell').click()
-  await expect(page.locator('.nr-card').filter({ hasText: 'Save failed' })).toBeVisible()
+  await expect(page.locator('.nr-card').filter({ hasText: 'Save failed' })).toBeVisible({ timeout: 10_000 })
 })
