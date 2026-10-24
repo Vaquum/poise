@@ -310,7 +310,9 @@ Bound chats receive local behavior ledger changes for their exact repository,
 target number and issue/PR kind. Local target reads use the repository/number
 index. The observation pass yields to I/O between targets, including cached
 and completed targets, so it does not hold request handling behind a whole
-pass. Passes remain single-flight and coalesce intervening ticks.
+pass. Passes remain single-flight and coalesce intervening ticks. Active passes
+count as background work across suspension; new passes wait during drain or a
+release switch. Shutdown fences late read results before releasing that count.
 PR owners also receive observed-head CI
 failures and recovery, merge conflicts, behind-main branches that merge-prs
 will not update itself, review feedback with unresolved threads, and

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -15,6 +15,7 @@ import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
 import type { ChatControl, CiObservation, MergeWakeObservation, ReviewsCursor, ReviewsObservation, WorkTargetStatus } from '../server/chat/control'
+import { releaseBackgroundBusy } from '../server/release-background'
 
 vi.mock('../server/claude-auth', () => ({ claudeAuth: { snapshot: () => ({ status: 'authenticated' }), requireReady: async () => {} } }))
 const executeFile = promisify(execFile)
@@ -294,6 +295,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     for (const target of targets.slice(0, 3)) store.bindWork(runtime.instance, parent.id, target)
     const passes = vi.spyOn(store, 'bindings')
     const writes = vi.spyOn(store, 'saveObservation')
+    const statements = vi.spyOn(database.db, 'prepare')
     const ownsSession = runtime.ownsSession.bind(runtime)
     let intervened = false
     const ownership = vi.spyOn(runtime, 'ownsSession').mockImplementation(id => {
@@ -315,12 +317,13 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       await control.stop()
       expect(passes).toHaveBeenCalledTimes(2)
       expect(observed()).toEqual([targets[0], targets[2], ...targets].map(target => `behavior:${target}`))
+      expect(statements.mock.calls.filter(([sql]) => sql.includes('substr(launch_error, 1, 1000)') && sql.includes('FROM behavior_seen'))).toHaveLength(6)
       expect(store.bindings(runtime.instance).find(binding => binding.target === targets[1])?.session).toBe(replacement.id)
       expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
       expect(store.inbox(runtime.instance, replacement.id)).toHaveLength(0)
     } finally {
       await control.stop()
-      ownership.mockRestore(); passes.mockRestore(); writes.mockRestore()
+      ownership.mockRestore(); passes.mockRestore(); writes.mockRestore(); statements.mockRestore()
       vi.useRealTimers()
     }
   })
@@ -337,7 +340,10 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     else reviews.mockImplementationOnce(() => hold(null))
     await control.tick()
     await until(() => complete !== undefined)
+    await control.tick(); await control.tick()
+    expect(releaseBackgroundBusy()).toBeGreaterThan(0)
     await control.stop()
+    expect(releaseBackgroundBusy()).toBe(0)
     const observations = vi.spyOn(store, 'saveObservation')
     const messages = vi.spyOn(store, 'message')
     try {
@@ -346,7 +352,49 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       await nextTurn()
       expect(observations).not.toHaveBeenCalled()
       expect(messages).not.toHaveBeenCalled()
+      expect(releaseBackgroundBusy()).toBe(0)
     } finally { observations.mockRestore(); messages.mockRestore() }
+  })
+
+  it.each(['drain', 'switch'] as const)('counts yielded and suspended monitor work through service %s', async (mode) => {
+    const { ServiceControl } = await import('../server/service/control')
+    const parent = await manager()
+    const releasesDir = join(root, `releases-${randomUUID()}`)
+    const release = '1'.repeat(40)
+    await mkdir(join(releasesDir, release), { recursive: true })
+    await writeFile(join(releasesDir, release, 'installed'), '')
+    await writeFile(join(releasesDir, release, 'base'), 'fixture-base')
+    const scheduled = new Map<unknown, { run: () => void; delay: number }>()
+    const timer = {
+      setTimeout(run: () => void, delay: number) { const handle = {}; scheduled.set(handle, { run, delay }); return handle },
+      clearTimeout(handle: unknown) { scheduled.delete(handle) },
+    }
+    const restart = vi.fn(() => false)
+    const service = new ServiceControl(runtime, { drainTimeoutSeconds: 60, timer, log: () => {},
+      releasesDir, release: { name: '0'.repeat(40), base: 'fixture-base' }, canRestart: () => true, restart, now: () => clock })
+    let complete: ((status: WorkTargetStatus) => void) | undefined
+    targetStatus.mockImplementationOnce(() => new Promise(resolve => { complete = resolve }))
+    store.bindWork(runtime.instance, parent.id, 'https://github.com/monitor/barrier/pull/1')
+    const passes = vi.spyOn(store, 'bindings')
+    try {
+      await control.tick()
+      expect(service.health()).toMatchObject({ idle: false, backgroundWork: 1 })
+      await until(() => complete !== undefined)
+      await control.tick(); await control.tick()
+      expect(service.health()).toMatchObject({ idle: false, backgroundWork: 1 })
+      const poll = () => {
+        const entry = [...scheduled].find(([, job]) => job.delay === 500)
+        if (!entry) throw new Error('expected a release-switch poll')
+        scheduled.delete(entry[0]); entry[1].run()
+      }
+      if (mode === 'drain') expect(service.drain()).toMatchObject({ idle: false, backgroundWork: 1 })
+      else { service.switchRelease(release); poll(); expect(restart).not.toHaveBeenCalled() }
+      complete!('open')
+      await until(() => releaseBackgroundBusy() === 0)
+      expect(service.health()).toMatchObject({ idle: true, backgroundWork: 0 })
+      expect(passes).toHaveBeenCalledTimes(1)
+      if (mode === 'switch') { poll(); expect(restart).toHaveBeenCalledOnce() }
+    } finally { service.reset(); passes.mockRestore(); complete?.('open') }
   })
 
   it('lets a running manager create three parallel workers and receive their outcomes without sharing its lease', async () => {

@@ -1079,10 +1079,16 @@ export class ChatControl {
 
   private ciRunning = false
   private ciQueued = false
+  private ciRelease: (() => void) | null = null
+  private ciAdmitted(): boolean {
+    return !this.stopped && !this.runtime.draining && !releaseBackgroundPaused() && !releaseSwitchPending()
+  }
   private kickCiPass(): void {
+    if (!this.ciAdmitted()) return
     if (this.ciRunning) { this.ciQueued = true; return }
     this.ciRunning = true
-    void this.runCiLoop().finally(() => { this.ciRunning = false })
+    const release = this.ciRelease = trackReleaseBackground()
+    void this.runCiLoop().finally(() => { this.ciRunning = false; this.ciRelease = null; release() })
   }
 
   /** Coalesce ticks into one follow-up pass; each pass yields between targets. */
@@ -1090,7 +1096,7 @@ export class ChatControl {
     do {
       this.ciQueued = false
       await this.runCiPass().catch((error: unknown) => { if (!this.stopped) this.itemFailed('ci', 'pass', error) })
-    } while (this.ciQueued && !this.stopped)
+    } while (this.ciQueued && this.ciAdmitted())
   }
 
   /** Observe claimed targets in the background, caching remote reads for five minutes. */
@@ -1100,6 +1106,7 @@ export class ChatControl {
       // Cached reads resolve in microtasks; give requests an I/O turn between targets.
       await setImmediate()
       if (this.stopped) return
+      if (!store.bindingIsCurrent(instance, binding)) continue
       const now = (this.options.now ?? Date.now)()
       if (!this.runtime.ownsSession(binding.session)) { store.forgetSession(instance, binding.session, now); continue }
       const target = store.workTarget(binding.target)
@@ -1655,6 +1662,8 @@ export class ChatControl {
   async stop(runtimeStopped?: Promise<void>): Promise<void> {
     // Remote reads may outlive shutdown; their continuations check stopped before store access.
     this.stopped = true
+    this.ciRelease?.()
+    this.ciRelease = null
     if (this.timer) clearInterval(this.timer)
     await this.running
     await runtimeStopped
