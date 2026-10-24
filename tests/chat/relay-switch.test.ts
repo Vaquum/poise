@@ -482,7 +482,7 @@ describe('release switch adoption', () => {
 
   it('reconciles a session stranded by an earlier switch', async () => {
     const instance = 'poise-switch-stranded:db'
-    const first = makeRuntime(instance, { hosts: [], adapters: [], auto: false, replayTurns: [] })
+    const first = makeRuntime(instance, { hosts: [], adapters: [], auto: false, replayTurns: [], exitAware: false })
     const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
     await waitFor(() => lastStatus(first.events, session.id) === 'idle')
     first.runtime.prompt(session.id, { text: 'Get stranded', attachments: [], mentions: [] })
@@ -499,6 +499,9 @@ describe('release switch adoption', () => {
     const stored = storage.getSession(session.id)!
     storage.saveSession({ ...stored, status: 'interrupted', interruptedTurnId: open.turnId,
       orphanNotice: 'a worker recorded for this session is still running but could not be verified; stop it by hand' })
+    // Crash: the first server dies with its sockets — a dead link settles
+    // nothing — while its agent runs on, stranded.
+    peer.detach()
     const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [] })
     await second.runtime.recover()
     await waitFor(() => !worker.pgidAlive(pgid), 10_000)
