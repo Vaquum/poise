@@ -185,9 +185,9 @@ deleting never duplicate it, and deleting frees it for the next chat.
 One Manager session can exist per Poise instance (`ChatRuntime.instance`,
 `poise-<label>:<POISE_DB>`), enforced by a unique SQLite index on
 `chat_sessions(instance)` where the role column is `'manager'`. The person
-creates it in the New session dialog, which offers a Type choice of Chat or
-Manager; only REST `POST /api/chat/sessions` with a browser `Origin` creates
-one (in service mode, through the gateway's assertion). WebSocket `session.new`
+creates it in the New session dialog, which offers a Type choice of Chat,
+Worker or Manager; only REST `POST /api/chat/sessions` with a browser `Origin`
+creates one (in service mode, through the gateway's assertion). WebSocket `session.new`
 and control `create` refuse a role. The `Origin` rule is cooperative: it refuses
 the documented non-browser paths, but a loopback process can still send
 `curl -H 'Origin: http://127.0.0.1:<port>' …` and create a Manager. The Manager
@@ -201,6 +201,10 @@ singleton at once. When its model leaves the catalogue, the next startup keeps
 the Manager instead of deleting it, marks `retiredModel`, and refuses every
 turn until the person picks another model with `set_model`; retirement is
 detected at startup only. A closed Manager still holds the key.
+
+A worker (`role: 'worker'`) is created the same way, with no singleton limit;
+unlike the Manager it keeps the requested title and is auto-titled like any
+chat. It keeps its role through a fork; a handoff starts an ordinary chat.
 
 Other chats are named from the first message when the first turn starts. When
 the message references a GitHub issue or PR, the chat takes that item's title
@@ -245,13 +249,21 @@ branch tip never moved, and its tree is clean; otherwise the workspace is
 kept, and the delete confirmation says which applies. Lock files are never
 deleted, and no server sweeps workspaces by its own session table: development
 and production share the chat root but keep separate session tables. A setting
-caps concurrently running Poise-local turns (default 4); a turn held by the
-cap shows `queued` with its own reason, "waiting for a free agent slot".
-Raising the cap starts waiting turns at once, in queue order, up to the new
-cap; lowering it stops nothing, and new turns wait. The
+caps concurrently running heavy work (default 4): Poise-local turns and the
+agent runs background behaviors launch draw from the one pool, so builds and
+test suites cannot pile past the cap no matter which surface started them. A
+turn held by the cap shows `queued` with its own reason, "waiting for a free
+agent slot"; a behavior launch past it waits for its retry clock instead, and
+names the busy budget in its failure. Raising the cap starts waiting turns at
+once, in queue order, up to the new cap; lowering it stops nothing, and new
+turns wait. While the cap holds at least two, delegated, supervised and timer
+turns together with behavior runs leave one slot free, so a turn you send
+starts without queueing behind background work. The
 Switchboard's chat runs one turn at a time outside that cap, so it keeps
 reporting while every slot is busy, and the Manager's turns run outside it
-too, so supervision still runs when every slot is busy.
+too, so supervision still runs when every slot is busy. The health endpoint
+reports the pool (running and queued work, oldest queue age) next to the
+main-thread stall figures, so queueing and its cause stay visible together.
 
 The checkout lease is shared by Poise development, Poise production and the
 compatible Caller writing behavior. Turns in different checkouts can run

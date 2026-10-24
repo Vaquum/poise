@@ -86,12 +86,15 @@ the Chat connection's two-second library check. An open Snippets editor retains
 its text and uses the existing version conflict check before overwriting a
 change made elsewhere.
 
-One skill is built in: `/manager`, the Manager's standing instructions (see
+Two skills are built in: `/manager`, the Manager's standing instructions,
+and `/worker`, a worker's standing instructions (see
 [Chat orchestration](Chat-orchestration.md)). While a Manager exists, Poise
-creates it from its default text when no snippet is named `manager` — an
-existing snippet of that name is kept as it is — and never replaces it
-afterwards, through restarts or updates. It is edited freely in Snippets,
-which marks it **built in**, but it cannot be deleted and its trigger is
-fixed. In any chat but the Manager, `/manager` is not supported: Poise says
-so, keeps the draft and sends nothing to a model. Its `;manager` trigger
-expands through Espanso and Poise Link like any snippet.
+creates `/manager` from its default text when no snippet is named `manager`;
+while a worker exists, it creates `/worker` from its default text when no
+snippet is named `worker` — an existing snippet of that name is kept as it
+is — and never replaces either afterwards, through restarts or updates. Each
+is edited freely in Snippets, which marks it **built in**, but it cannot be
+deleted and its trigger is fixed. In any chat but the Manager, `/manager` is
+not supported, and in any non-worker chat `/worker` is not supported: Poise
+says so, keeps the draft and sends nothing to a model. The `;manager` and
+`;worker` triggers expand through Espanso and Poise Link like any snippet.

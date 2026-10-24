@@ -585,7 +585,7 @@ export interface RenderContext {
   }
   /** Live chats for actor labels: a listed source is a select button, a
    *  missing one renders with a deleted marker. */
-  chats?: Array<{ id: string, title: string, role?: 'manager' }>
+  chats?: Array<{ id: string, title: string, role?: 'manager' | 'worker' }>
 }
 
 const ICONS: Record<ToolKind, string> = {

@@ -14,7 +14,7 @@ import { patchContent } from '../dom-patch'
 // on each save and espanso hot-reloads, so a `;trigger` goes live at once.
 
 import { chatClient } from '../chat-client'
-import { MANAGER_SWITCH, parseChatSwitches, type ChatSwitches } from '../chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH, parseChatSwitches, type ChatSwitches } from '../chat-switches'
 
 interface Snippet { trigger: string; replace: string }
 interface SnippetState { snippets: Snippet[]; version: string; skills?: ChatSwitches }
@@ -90,10 +90,17 @@ function previewLine(body: string): string {
   return body.split('\n').map((l) => l.trim()).find((l) => l) || ''
 }
 
+function builtinTitle(name: string): string {
+  if (name === MANAGER_SWITCH) return "Built in: the Manager's standing instructions"
+  if (name === WORKER_SWITCH) return "Built in: a worker's standing instructions"
+  return ''
+}
+
 function skillBadge(trigger: string): string {
   const name = skills.switches.find(skill => skill.snippetTrigger === trigger)?.name
   if (!name) return ''
-  const builtin = name === MANAGER_SWITCH ? '<span class="snip-builtin" title="Built in: the Manager\'s standing instructions">built in</span>' : ''
+  const title = builtinTitle(name)
+  const builtin = title ? `<span class="snip-builtin" title="${title}">built in</span>` : ''
   return `<span class="snip-skill-name" aria-label="Chat skill /${escapeHtml(name)}">/${escapeHtml(name)}</span>${builtin}`
 }
 function libraryChanged(catalogue: ChatSwitches): void {
@@ -148,13 +155,20 @@ function setStatus(text: string, cls: 'info' | 'ok' | 'error' = 'info') {
 function buildEditRow(snip: Snippet | null, isDraft: boolean): HTMLTableRowElement {
   const tr = document.createElement('tr')
   tr.className = 'snip-expand-row'
-  const builtin = !isDraft && !!snip && skills.switches.some(skill => skill.snippetTrigger === snip.trigger && skill.name === MANAGER_SWITCH)
+  const builtinName = !isDraft && snip ? skills.switches.find(skill => skill.snippetTrigger === snip.trigger
+    && (skill.name === MANAGER_SWITCH || skill.name === WORKER_SWITCH))?.name ?? null : null
+  const builtinNote = builtinName === MANAGER_SWITCH
+    ? 'Built in: the Manager\'s standing instructions, sent to its model on every Manager turn. Edit it freely; it cannot be deleted. Keep secrets out of it.'
+    : builtinName === WORKER_SWITCH
+      ? 'Built in: a worker\'s standing instructions, sent to its model on every worker turn. Edit it freely; it cannot be deleted. Keep secrets out of it.'
+      : null
+  const builtin = builtinName !== null
   tr.innerHTML = `
     <td colspan="3">
       <div class="snip-edit">
         <input type="text" class="st-input snip-trigger-input" aria-label="Snippet trigger" placeholder=";hello" autocomplete="off" spellcheck="false"${builtin ? ' readonly' : ''} />
         <textarea class="st-input snip-body-input" aria-label="Snippet instructions" placeholder="Text to expand, or instructions to include in Chat…" spellcheck="false"></textarea>
-        ${builtin ? '<p class="st-help snip-builtin-note">Built in: the Manager\'s standing instructions, sent to its model on every Manager turn. Edit it freely; it cannot be deleted. Keep secrets out of it.</p>' : ''}
+        ${builtinNote ? `<p class="st-help snip-builtin-note">${builtinNote}</p>` : ''}
         <div class="st-row">
           <button type="button" class="st-save snip-save">Save</button>
           ${builtin ? '' : `<button type="button" class="st-clear snip-delete">${isDraft ? 'Discard' : 'Delete'}</button>`}

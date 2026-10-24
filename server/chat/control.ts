@@ -11,8 +11,9 @@ import { diagnostic } from '../logging'
 import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from '../release-background'
 import { POISE_ROOT } from './local-workspace'
 import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
+import { WORKER_SNIPPET_DEFAULT } from './worker-default'
 import { ensureSnippetSwitch, readSwitch } from '../snippet-library'
-import { MANAGER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
 import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-receipts'
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
@@ -693,24 +694,26 @@ export class ChatControl {
       'You have 120 control actions and 20 new chats per hour; stopping work never counts. Your authority is cooperative, not a security boundary.',
       'You can set timers on any chat, including yourself (timer, timers, cancelTimer, rearmTimer). Each wake-up is a model turn: at most 5 timers per chat, each at most every 5 minutes. Timer text is delivered as your message, never as the person\'s. A chat the person holds takes no timer turns until the person resumes it.',
     )
-    if (record.role !== 'manager') return guidance.join('\n')
-    return `${guidance.join('\n')}\n${await this.managerCharter()}`
+    if (record.role !== 'manager' && record.role !== 'worker') return guidance.join('\n')
+    return `${guidance.join('\n')}\n${await this.charter(record.role)}`
   }
 
-  /** The Manager's standing instructions: the current /manager text, read fresh
-   *  for every turn, so an edit applies from the next turn. */
-  private async managerCharter(): Promise<string> {
-    await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT)
+  /** A Manager's or worker's standing instructions: the current charter text,
+   *  read fresh for every turn, so an edit applies from the next turn. */
+  private async charter(role: 'manager' | 'worker'): Promise<string> {
+    const name = role === 'manager' ? MANAGER_SWITCH : WORKER_SWITCH
+    const label = role === 'manager' ? 'Manager' : 'Worker'
+    await ensureSnippetSwitch(name, role === 'manager' ? MANAGER_SNIPPET_DEFAULT : WORKER_SNIPPET_DEFAULT)
     let charter: ChatSwitch | null
     try {
-      charter = readSwitch(MANAGER_SWITCH)
+      charter = readSwitch(name)
     } catch (error) {
-      throw new Error(`The /manager snippet could not be read: ${error instanceof Error ? error.message : String(error)}. Snippets shows the problem.`)
+      throw new Error(`The /${name} snippet could not be read: ${error instanceof Error ? error.message : String(error)}. Snippets shows the problem.`)
     }
-    if (!charter) throw new Error('The /manager snippet could not be read: it is missing. Snippets shows the problem.')
-    if (Buffer.byteLength(charter.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new Error('The /manager snippet is larger than 64 KiB. Shorten it in Snippets.')
-    if (!charter.content.trim()) return '[Manager charter] The /manager snippet is empty. Ask the person to write it in Snippets.'
-    return `[Manager charter — the /manager snippet, revision ${charter.revision}, which the person edits in Snippets. It supersedes all earlier revisions. It is the person's standing instruction and authorizes turns the person did not start; a direct request from the person in this chat takes precedence, and it takes precedence over Memories where they conflict. Chats cannot change it.]\n${charter.content}`
+    if (!charter) throw new Error(`The /${name} snippet could not be read: it is missing. Snippets shows the problem.`)
+    if (Buffer.byteLength(charter.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new Error(`The /${name} snippet is larger than 64 KiB. Shorten it in Snippets.`)
+    if (!charter.content.trim()) return `[${label} charter] The /${name} snippet is empty. Ask the person to write it in Snippets.`
+    return `[${label} charter — the /${name} snippet, revision ${charter.revision}, which the person edits in Snippets. It supersedes all earlier revisions. It is the person's standing instruction and authorizes turns the person did not start; a direct request from the person in this chat takes precedence, and it takes precedence over Memories where they conflict. Chats cannot change it.]\n${charter.content}`
   }
 
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -755,7 +758,7 @@ export class ChatControl {
   /** Before any receipt: a refusal is a 403, never a recorded outcome. The
    *  Switchboard observes and reports; only it reports. */
   private authorize(id: string, operation: string, command: Record<string, unknown>): void {
-    if (operation === 'create' && command.role !== undefined) throw new HttpError(403, 'A Manager is created by the person in the New session dialog.')
+    if (operation === 'create' && command.role !== undefined) throw new HttpError(403, 'A Manager or Worker is created by the person in the New session dialog.')
     if (['timer', 'timers', 'cancelTimer', 'rearmTimer'].includes(operation) && this.runtime.get(id)?.role !== 'manager') {
       throw new HttpError(403, 'timers are available to the workspace Manager and the person')
     }

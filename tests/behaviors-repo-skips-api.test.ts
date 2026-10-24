@@ -29,10 +29,12 @@ vi.mock('../server/content-jobs', async (original) => ({
 }))
 vi.mock('../server/chat/runtime', async (original) => {
   const { EventEmitter } = await import('node:events')
+  const { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP } = await import('../server/check-semaphore')
   return {
     ...(await original<typeof import('../server/chat/runtime')>()),
     ChatRuntime: class extends EventEmitter {
       draining = null
+      checkSlots = new CheckSemaphore(() => DEFAULT_CHECK_SLOT_CAP)
       async recover() {}
       async stop() {}
       endDrain() {}

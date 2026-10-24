@@ -1,7 +1,7 @@
 import { createJevWorkspace } from './jev-workspace'
 import { cancelMotion, layout, motionValue, retire, spring } from '../motion'
 import { patchContent } from '../dom-patch'
-import { MANAGER_SWITCH, parseSwitchCreation, RESERVED_SWITCHES, type ChatSwitches } from '../chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH, parseSwitchCreation, RESERVED_SWITCHES, type ChatSwitches } from '../chat-switches'
 // Chat — one view for a full coding-agent conversation with any installed
 // agent, running as itself under a Poise-native interface. Sessions live on
 // the Poise server (server/chat/); this view is the window: a sidebar of
@@ -707,6 +707,7 @@ function sidebarHtml(): string {
       + creatorHtml(s)
       + `<div class="chat-session-meta">`
       + (s.role === 'manager' ? `<span class="chat-pill chat-pill-manager">Manager</span>` : '')
+      + (s.role === 'worker' ? `<span class="chat-pill chat-pill-worker">Worker</span>` : '')
       + `<span class="chat-pill">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)} · ${escapeHtml(s.model)}</span>`
       + `<span class="chat-session-dot" data-state="${dot.state}" title="${escapeHtml(dot.label)}" aria-hidden="true"></span>`
       + `<span class="chat-session-state" title="${escapeHtml(dot.label)}">${escapeHtml(dot.label)}</span>`
@@ -1135,6 +1136,11 @@ async function queueDraft(draft: ComposerDraft): Promise<void> {
   if (chain.switches?.includes(MANAGER_SWITCH) && source?.record.role !== 'manager') {
     restoreDraftTo(origin, draft)
     if (activeId === origin) setNotice('/manager is not supported in regular chats.', 'info')
+    queueRender(); return
+  }
+  if (chain.switches?.includes(WORKER_SWITCH) && source?.record.role !== 'worker') {
+    restoreDraftTo(origin, draft)
+    if (activeId === origin) setNotice('/worker is not supported in non-worker chats.', 'info')
     queueRender(); return
   }
   const requestedModel = draft.model || chain.model || source?.record.model || freshModelIdentity
@@ -1655,7 +1661,12 @@ async function sendPrompt(draft: ComposerDraft): Promise<void> {
   if (!await waitForSwitchSave(draft, origin)) return
   if (activeId !== origin) { restoreDraftTo(origin, draft); return }
   if (parseChatCommandChain(draft.text).create) { await createSavedSwitch(draft, origin); return }
-  if (parseChatCommandChain(draft.text).context === 'reset') { await resetPrompt(draft, origin); return }
+  // Charter switches are refused before /reset runs: a rejected request must
+  // never clear the conversation first.
+  const refused = parseChatCommandChain(draft.text)
+  if (refused.switches?.includes(MANAGER_SWITCH) && entry()?.record.role !== 'manager') { restoreDraftTo(origin, draft); setNotice('/manager is not supported in regular chats.', 'info'); return }
+  if (refused.switches?.includes(WORKER_SWITCH) && entry()?.record.role !== 'worker') { restoreDraftTo(origin, draft); setNotice('/worker is not supported in non-worker chats.', 'info'); return }
+  if (refused.context === 'reset') { await resetPrompt(draft, origin); return }
   const pendingModel = modelUpdates.get(origin)
   if (pendingModel) {
     try { await pendingModel }
@@ -1663,7 +1674,6 @@ async function sendPrompt(draft: ComposerDraft): Promise<void> {
     if (activeId !== origin) { restoreDraftTo(origin, draft); return }
   }
   const chain = parseChatCommandChain(draft.text)
-  if (chain.switches?.includes(MANAGER_SWITCH) && entry()?.record.role !== 'manager') { restoreDraftTo(origin, draft); setNotice('/manager is not supported in regular chats.', 'info'); return }
   if (chain.missingModel) { restoreDraftTo(origin, draft); setNotice('Choose a model from /model first.'); return }
   if (chain.review && !entry()) { restoreDraftTo(origin, draft); setNotice('There is no reply to review yet.'); return }
   if (chain.context === 'compact' && !entry() && !chain.review && !chain.text && !chain.switches?.length && !draft.attachments.length) {
@@ -1736,6 +1746,7 @@ async function steer(draft: ComposerDraft): Promise<void> {
   const chain = parseChatCommandChain(commandDraftText(draft))
   if (chain.create) { await createSavedSwitch(draft, e.record.id); return }
   if (chain.switches?.includes(MANAGER_SWITCH) && e.record.role !== 'manager') { restoreDraftTo(e.record.id, draft); setNotice('/manager is not supported in regular chats.', 'info'); return }
+  if (chain.switches?.includes(WORKER_SWITCH) && e.record.role !== 'worker') { restoreDraftTo(e.record.id, draft); setNotice('/worker is not supported in non-worker chats.', 'info'); return }
   if (chain.context === 'reset' && !chain.queue) { await resetPrompt(draft, e.record.id); return }
   if (chain.queue || chain.context || chain.review || chain.model) { queueDraft(draft); return }
   try {
