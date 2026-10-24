@@ -29,6 +29,7 @@ github-datastore view issue --author LOGIN --format csv
 github-datastore view user --username LOGIN --item-type pr --limit 20
 github-datastore view pr-reviews --repo OWNER/REPO --number 123 --page-size 200 --review-after 0 --comment-after 0
 github-datastore view pr-dependents --repo OWNER/REPO --number 123
+github-datastore view pr-closing --limit 50
 ```
 
 `pr-reviews --page-size N` (1–200) bounds reviews and comment identities separately.
@@ -57,6 +58,20 @@ closed issues and 50 dependents are returned; `truncated` means a cap or a
 malformed stored connection hid entries. Blocked-by edges ride the existing issue query, so a
 dependent last synced before they were tracked reads as unblocked until its
 next sync; `Depends on:` works from long-synced bodies.
+
+`pr-closing` lists open pull requests with the issues each closes: `prs`
+with each PR's `repo`, `number`, `url`, `closing` refs, `closes_via`
+(`closing-references`, or `body-keywords` when the stored read predates
+dependency tracking) and `closing_truncated`, and `truncated` when a cap or
+a malformed stored connection hid entries. A pull request with
+`closing_truncated` carries an incomplete closing list; matching on it
+would misbind, so consumers must skip it. At most 500 pull requests and 100
+closing refs per pull request are returned; `--repo` scopes the list to one
+repository and `--limit` lowers the pull request cap. `more` means further
+pull requests follow: pass the last returned cursor back until it clears,
+the number as `--after-number` with the same `--repo`, or the pair as
+`--after-repo`/`--after-number` for an unscoped list. All reads are local
+rows; the sync owns freshness.
 
 `github-datastore` and `python3 -m github_datastore` work from any directory on this host.
 Every command takes `--db PATH`; without it the database is

@@ -685,5 +685,170 @@ class RequestedReviewersTest(unittest.TestCase):
             self.assertIn("requested_reviewers", user_columns)
 
 
+class PrClosingTest(unittest.TestCase):
+    def test_pr_closing_lists_open_prs_with_their_closing_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            items = [
+                closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open"),
+                closing_pr_fixture(13, 113, "Fixes vaquum/other#3", closing=None, state="open"),
+                closing_pr_fixture(14, 114, "no closing keyword", closing=None, state="open"),
+                closing_pr_fixture(15, 115, "Closes #7", closing=(7,), state="merged"),
+            ]
+            with conn:
+                upsert_repo(conn, items[0]["repo"])
+            for item in items:
+                store_expanded(conn, item)
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path))
+            self.assertFalse(listed["truncated"])
+            self.assertEqual(
+                [(entry["number"], entry["closes_via"]) for entry in listed["prs"]],
+                [(12, "closing-references"), (13, "body-keywords"), (14, "body-keywords")],
+            )
+            self.assertEqual(listed["prs"][0]["closing"], [{"repo": "vaquum/test", "number": 7}])
+            self.assertEqual(listed["prs"][0]["url"], "https://github.com/Vaquum/Test/pull/12")
+            self.assertEqual(listed["prs"][1]["closing"], [{"repo": "vaquum/other", "number": 3}])
+            self.assertEqual(listed["prs"][2]["closing"], [])
+
+    def test_pr_closing_filters_by_repo_case_insensitively(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            first = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            second = closing_pr_fixture(13, 113, "Closes #7", closing=(7,), state="open")
+            second["repo"] = dict(second["repo"], id=11, node_id="R_11", name="Other", full_name="Vaquum/Other")
+            with conn:
+                upsert_repo(conn, first["repo"])
+                upsert_repo(conn, second["repo"])
+            store_expanded(conn, first)
+            store_expanded(conn, second)
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path, repo="vaquum/test"))
+            self.assertEqual([entry["number"] for entry in listed["prs"]], [12])
+
+    def test_pr_closing_marks_a_truncated_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            first = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            with conn:
+                upsert_repo(conn, first["repo"])
+            store_expanded(conn, first)
+            store_expanded(conn, closing_pr_fixture(13, 113, "Closes #8", closing=(8,), state="open"))
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path, limit=1))
+            self.assertTrue(listed["truncated"])
+            self.assertEqual([entry["number"] for entry in listed["prs"]], [12])
+
+    def test_pr_closing_rejects_csv_or_a_bad_limit(self) -> None:
+        with self.assertRaises(ValueError):
+            views.pr_closing(output="csv")
+        with self.assertRaises(ValueError):
+            views.pr_closing(limit=0)
+
+    def test_pr_closing_marks_a_capped_closing_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            body = "\n".join(f"Closes #{number}" for number in range(1, 102))
+            pr = closing_pr_fixture(12, 112, body, closing=None, state="open")
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            store_expanded(conn, closing_pr_fixture(13, 113, "Closes #7", closing=(7,), state="open"))
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path))
+            self.assertTrue(listed["truncated"])
+            self.assertFalse(listed["more"])
+            self.assertEqual(len(listed["prs"][0]["closing"]), 100)
+            self.assertTrue(listed["prs"][0]["closing_truncated"])
+            self.assertFalse(listed["prs"][1]["closing_truncated"])
+
+    def test_pr_closing_pages_one_repo_by_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            first = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            with conn:
+                upsert_repo(conn, first["repo"])
+            store_expanded(conn, first)
+            store_expanded(conn, closing_pr_fixture(13, 113, "Closes #8", closing=(8,), state="open"))
+            store_expanded(conn, closing_pr_fixture(14, 114, "Closes #9", closing=(9,), state="open"))
+            conn.close()
+
+            head = json.loads(views.pr_closing(db_path=db_path, repo="vaquum/test", limit=2))
+            self.assertTrue(head["more"])
+            self.assertEqual([entry["number"] for entry in head["prs"]], [12, 13])
+            tail = json.loads(views.pr_closing(db_path=db_path, repo="vaquum/test", limit=2, after_number=13))
+            self.assertFalse(tail["more"])
+            self.assertEqual([entry["number"] for entry in tail["prs"]], [14])
+            with self.assertRaises(ValueError):
+                views.pr_closing(db_path=db_path, limit=2, after_number=13)
+            with self.assertRaises(ValueError):
+                views.pr_closing(db_path=db_path, repo="vaquum/test", after_number=0)
+
+    def test_pr_closing_pages_an_unscoped_list_by_repo_and_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            first = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            second = closing_pr_fixture(3, 113, "Closes #7", closing=(7,), state="open")
+            second["repo"] = dict(second["repo"], id=11, node_id="R_11", name="Other", full_name="Vaquum/Other")
+            with conn:
+                upsert_repo(conn, first["repo"])
+                upsert_repo(conn, second["repo"])
+            store_expanded(conn, first)
+            store_expanded(conn, second)
+            store_expanded(conn, closing_pr_fixture(14, 114, "Closes #9", closing=(9,), state="open"))
+            conn.close()
+
+            head = json.loads(views.pr_closing(db_path=db_path, limit=1))
+            self.assertTrue(head["more"])
+            self.assertEqual([(entry["repo"], entry["number"]) for entry in head["prs"]], [("Vaquum/Other", 3)])
+            middle = json.loads(views.pr_closing(db_path=db_path, limit=1, after_repo="Vaquum/Other", after_number=3))
+            self.assertTrue(middle["more"])
+            self.assertEqual([(entry["repo"], entry["number"]) for entry in middle["prs"]], [("Vaquum/Test", 12)])
+            tail = json.loads(views.pr_closing(db_path=db_path, limit=1, after_repo="Vaquum/Test", after_number=12))
+            self.assertFalse(tail["more"])
+            self.assertEqual([(entry["repo"], entry["number"]) for entry in tail["prs"]], [("Vaquum/Test", 14)])
+            with self.assertRaises(ValueError):
+                views.pr_closing(db_path=db_path, after_repo="Vaquum/Other")
+            with self.assertRaises(ValueError):
+                views.pr_closing(db_path=db_path, repo="vaquum/test", after_repo="Vaquum/Other", after_number=3)
+
+    def test_pr_closing_serves_through_the_view_command(self) -> None:
+        from contextlib import redirect_stdout
+
+        from github_datastore import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            pr = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            conn.close()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cli.main(["--db", str(db_path), "view", "pr-closing", "--limit", "50"])
+            listed = json.loads(output.getvalue())
+            self.assertFalse(listed["truncated"])
+            self.assertEqual([entry["number"] for entry in listed["prs"]], [12])
+
+
 if __name__ == "__main__":
     unittest.main()
