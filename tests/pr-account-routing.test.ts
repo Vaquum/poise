@@ -104,6 +104,18 @@ describe('PR account routing', () => {
     expect(headReads.every(([, args]) => value(args, '--token-user') === 'poise-user')).toBe(true)
   })
 
+  it('pins the selected account before provider preparation', async () => {
+    const { db, behaviors } = await initial()
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await original(command, args, options)
+      if (command === 'github-interface' && args[0] === '--requested-changes-addressed') db.setMeta('me', 'replacement-user')
+      return result
+    })
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
   it('holds repository access per actor while the other account continues', async () => {
     const { behaviors } = await initial()
     fixture.listedPrs.push({ ...pr, number: 18, url: pr.url.replace('/17', '/18') })

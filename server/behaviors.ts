@@ -2301,6 +2301,7 @@ async function prepareReviewTarget(
   key: string,
   slot: ReviewerSlot,
 ): Promise<PreparedReviewTarget | null> {
+  const reviewer = configuredReviewer(pr.author)
   const target = reviewSlotTarget(key, slot)
   const checkTarget = `${target}:check`
   if (!isEnabled('review-new-prs') || behaviorAborted()) return null
@@ -2316,7 +2317,7 @@ async function prepareReviewTarget(
   }
   let prepared: PreparedReviewTarget | null = null
   try {
-    return await withNoticeDiagnosticIdentity({ correlationId: operationId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author) }, async () => {
+    return await withNoticeDiagnosticIdentity({ correlationId: operationId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: reviewer }, async () => {
       // Recovery probe only: release a dead no-action launch so the claim
       // phase can reclaim this target. Its own writes are claim-guarded.
       await releaseFailedBehaviorIfNoAction('review-new-prs', pr.repo, pr.number, target)
@@ -2327,7 +2328,6 @@ async function prepareReviewTarget(
       if (!resolved || !isEnabled('review-new-prs') || behaviorAborted()) return null
       const { model, recovery, catalog } = resolved
       const claude = needsClaude(catalog, model)
-      const reviewer = configuredReviewer(pr.author)
       const actor = reviewer
       if (claude) await waitForBehavior(claudeAuth.requireReady())
       const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], operationId)
