@@ -1343,4 +1343,92 @@ describe('turn stall detection and waking', () => {
     await runtime.stop({ handover: false })
     // The 100k-entry fixture is heavy by design; past the file's usual 40 s.
   }, 60_000)
+
+  it('flags linked worktrees with quoting and newline paths exactly', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-worktree-quoted:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const app = join(session.checkout, 'app')
+    const cloned = spawnSync('git', ['clone', '-q', origin, app], { encoding: 'utf8' })
+    if (cloned.status !== 0) throw new Error(`git clone: ${cloned.stderr}`)
+    const quoted = join(root, 'wt-"quoted-stall')
+    const newline = join(root, 'wt-new\nline-stall')
+    git(['worktree', 'add', quoted, '-b', 'feat-q'], app)
+    git(['worktree', 'add', newline, '-b', 'feat-n'], app)
+    await writeFile(join(quoted, 'dirty.txt'), 'uncommitted\n')
+    await writeFile(join(newline, 'dirty.txt'), 'uncommitted\n')
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // Both flag under their exact paths: a mangled path would inspect
+    // nothing and count truncated instead.
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled?.repos).toHaveLength(2)
+    expect(stalled).toMatchObject({ repos: expect.arrayContaining([
+      expect.objectContaining({ path: quoted, branch: 'feat-q', dirtyFiles: 1 }),
+      expect.objectContaining({ path: newline, branch: 'feat-n', dirtyFiles: 1 }),
+    ]) })
+    expect(stalled?.truncatedRepos).toBeUndefined()
+
+    // Clean, both clear: no persistent stall from a path the parser mangled.
+    await rm(join(quoted, 'dirty.txt'))
+    await rm(join(newline, 'dirty.txt'))
+    runtime.prompt(session.id, { text: 'do more work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toBeUndefined()
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('still wakes when twenty deep unscannable paths would overflow the notice', async () => {
+    if (process.getuid?.() === 0) return // unreadable-dir simulation needs permission checks
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-unreadable-long:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    // Twenty ~1KB-deep gap paths: serialized in full twice, the notice
+    // would pass the 32 KiB inbox bound and the wake would throw.
+    const deep: string[] = []
+    for (let n = 0; n < 20; n++) {
+      const top = join(session.checkout, `t${String(n).padStart(2, '0')}`)
+      let dir = top
+      for (const leaf of ['x'.repeat(250), 'x'.repeat(250), 'x'.repeat(250), `${'x'.repeat(246)}-e${String(n).padStart(2, '0')}`]) {
+        dir = join(dir, leaf)
+        await mkdir(dir, { recursive: true })
+      }
+      spawnSync('chmod', ['000', dir])
+      deep.push(dir)
+    }
+    try {
+      store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+      runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+      const stalled = runtime.get(session.id)?.stall
+      expect(stalled).toBeDefined()
+      expect(stalled?.repos).toEqual([])
+      expect(stalled?.truncatedRepos).toBe(1)
+      const paths = stalled?.unreadablePaths ?? []
+      expect(paths).toHaveLength(20)
+      for (const path of paths) {
+        expect(path.startsWith('…')).toBe(true)
+        expect(Buffer.byteLength(path)).toBeLessThanOrEqual(200)
+      }
+      expect(new Set(paths).size).toBe(20)
+      const inbox = store.inbox(runtime.instance, session.id)
+      expect(inbox).toHaveLength(1)
+      expect(Buffer.byteLength(inbox[0].body)).toBeLessThanOrEqual(32 * 1024)
+      const blockers = (JSON.parse(inbox[0].body).blockers as string[]).join('\n')
+      expect(blockers).toContain('…')
+      expect(blockers).not.toContain('more task repo')
+    } finally {
+      for (const dir of deep) spawnSync('chmod', ['755', dir])
+    }
+    await runtime.stop({ handover: false })
+  }, 40_000)
 })
