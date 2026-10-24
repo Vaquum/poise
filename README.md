@@ -201,6 +201,8 @@ fail, available results remain visible with an explicit error. Current paints pe
 each read arrives; repository discovery and agent activity do not delay them.
 Current keeps an issue draft open while its write is pending and closes it
 after confirmation. A failed write retains the draft for an explicit retry.
+A later refresh failure does not reopen the draft or report the confirmed
+write as failed.
 Archive paints its page before the full-history total is available, showing
 an available-row count until that read finishes.
 

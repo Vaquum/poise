@@ -940,11 +940,13 @@ interface IssueComposerPrefill {
 }
 
 function openIssueComposer(prefill?: IssueComposerPrefill) {
+  const reportError = (message: string) => viewFeedback('current-create:issue', 'Current action needs attention', message, 'action_needed')
   const laneNode = laneEl('issue')
   const existing = laneNode.querySelector('.composer')
   if (existing) {
-    if (!prefill) {
-      // Plain "+ Add an issue" click while one is already open — just focus.
+    if (!prefill || existing.querySelector<HTMLButtonElement>('.composer-add')?.disabled) {
+      // A pending write keeps its composer, including during drag promotion.
+      if (prefill) reportError('Still opening the issue — wait for it to finish.')
       ;(existing.querySelector('input') as HTMLInputElement | null)?.focus()
       return
     }
@@ -984,7 +986,6 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   const repoSel = composer.querySelector<HTMLSelectElement>('.issue-repo')!
   const addB = composer.querySelector<HTMLButtonElement>('.composer-add')!
   const cancelB = composer.querySelector<HTMLButtonElement>('.composer-cancel')!
-  const reportError = (message: string) => viewFeedback('current-create:issue', 'Current action needs attention', message, 'action_needed')
 
   // The list was a one-shot snapshot taken when the composer opened. If
   // /api/repos had not answered yet it silently degraded to the repos inside
@@ -1028,6 +1029,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
     submitting = true
     addB.disabled = true
     reportError('')
+    let created: LiveItem | undefined
     try {
       const ghRes = await fetch('/api/gh', {
         method: 'POST',
@@ -1054,7 +1056,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
         const r = result?.record
         if (r && r.kind === 'issue' && r.number) {
           pendingLiveItems = pendingLiveItems.filter((p) => !(p.repo === r.repo && p.number === r.number))
-          pendingLiveItems.unshift({
+          created = {
             repo: String(r.repo),
             number: Number(r.number),
             title: String(r.title),
@@ -1064,7 +1066,8 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
             created_at: String(r.created_at),
             merged_at: r.merged_at ? String(r.merged_at) : null,
             updated_at: String(r.updated_at),
-          })
+          }
+          pendingLiveItems.unshift(created)
         }
       } catch { /* fall through — fetchLive on its own may still surface it */ }
       // Drag-promote: the source manual card is deleted only after the
@@ -1075,23 +1078,29 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
         try { await deleteManualCard(prefill.sourceCardId) }
         catch (err) { console.error('[promote] delete source card failed:', err) }
       }
-      submitting = false
-      close()
-      await fetchLive()
-      renderLiveOnly()
-      // Created, but the active filter excludes it — otherwise the composer
-      // just closes and nothing appears, which reads as a failed write.
-      const created = pendingLiveItems.find((p) => p.repo === repo)
-      if (created && !withinActiveWindow(created)) {
-        showLoadError('Issue created — the current filter is hiding it.')
-        window.setTimeout(() => viewFeedback('current-created', 'Current item created', ''), 6000)
-      }
     } catch (err) {
       addB.disabled = false
       addB.textContent = 'Open issue'
       showError((err as Error).message)
+      return
     } finally {
       submitting = false
+    }
+    // The guard is released; close removes live controls before the next await.
+    reportError('')
+    close()
+    if (created && withinActiveWindow(created)) {
+      const confirmed = created
+      if (!liveItems.some(item => item.repo === confirmed.repo && item.number === confirmed.number)) liveItems.unshift(confirmed)
+    }
+    // Show the confirmed record even while its follow-up read is pending.
+    renderLiveOnly()
+    try { await fetchLive() }
+    catch (err) { showLoadError(`Issue created — could not refresh: ${(err as Error).message}`); return }
+    renderLiveOnly()
+    if (created && !withinActiveWindow(created)) {
+      showLoadError('Issue created — the current filter is hiding it.')
+      window.setTimeout(() => viewFeedback('current-created', 'Current item created', ''), 6000)
     }
   }
 
