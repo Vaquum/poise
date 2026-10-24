@@ -23,12 +23,19 @@
 }
 
 {$POISE_DOMAIN} {
-	reverse_proxy gateway:8080
+	reverse_proxy gateway:8080 {
+		# A gateway replacement briefly refuses dials; retry so the client sees a delay, not a 502.
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }
 
 *.{$POISE_DOMAIN} {
 	tls {
 		on_demand
 	}
-	reverse_proxy gateway:8080
+	reverse_proxy gateway:8080 {
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }

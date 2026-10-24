@@ -77,6 +77,7 @@ export interface HarnessOptions {
   requireNetwork?: boolean
   serviceTimeoutMs?: number
   idleToReadyMs?: number
+  shutdownGraceMs?: number
 }
 
 export function workspaceHost(handle: string): string {
@@ -190,6 +191,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const disk = new DiskWatch({ config, docker: dockerClient, log, now, space: async () => ({ free: 200 * 1024 ** 3, total: 290 * 1024 ** 3 }) })
   const gateway: Gateway = createGateway({
     config, store, keys, github: new GitHubClient(config), docker: dockerClient, orchestrator, disk, log, now, upstream,
+    shutdownGraceMs: options.shutdownGraceMs ?? 1000,
   })
   await new Promise<void>((resolve) => gateway.server.listen(0, '127.0.0.1', resolve))
   const { port } = gateway.server.address() as AddressInfo

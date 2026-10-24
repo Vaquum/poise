@@ -490,9 +490,32 @@ check_upgrade() {
 # gateway joins the workspace networks again itself as it starts, before it
 # answers, so alice's running workspace answers at once rather than after a
 # start, and the upgrade after this drains it through the new container.
+# Traffic runs through Caddy while the container is replaced: Caddy retries
+# dials and the old gateway exits 0, so every answer is 200, never a 502.
 check_gateway_recreated() {
+  local before after traffic=$work/gateway-traffic.log loop code
+  before=$(docker inspect --format '{{.Id}}' poise-gateway)
+  : >"$traffic"
+  (
+    while :; do
+      code=$(curl --silent --max-time 60 --cookie "$alice" --output /dev/null --write-out '%{http_code}' "${navigate[@]}" "http://alice.$domain/" 2>/dev/null) || code="curl:$?"
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$code" >>"$traffic"
+      sleep 0.2
+    done
+  ) &
+  loop=$!
+  compose stop gateway
+  code=$(docker inspect --format '{{.State.ExitCode}}' poise-gateway)
+  if [ "$code" != 0 ]; then kill $loop 2>/dev/null || true; fail "the replaced gateway exited $code, not 0"; fi
   compose up --detach --force-recreate gateway
-  "$deploy/install.sh"
+  "$deploy/install.sh" >"$work/gateway-recreate-install.log"
+  kill $loop 2>/dev/null || true
+  wait $loop 2>/dev/null || true
+  after=$(docker inspect --format '{{.Id}}' poise-gateway)
+  [ "$before" != "$after" ] || fail "the gateway container did not change"
+  grep --quiet ' 200$' "$traffic" || fail "no traffic reached the workspace during replacement: $(cat "$traffic")"
+  if grep --quiet -v ' 200$' "$traffic"; then fail "traffic during replacement saw non-200: $(grep -v ' 200$' "$traffic" | head -n 5)"; fi
+  pass "traffic during gateway replacement saw zero 502s and zero connection failures ($(wc -l <"$traffic") requests)"
   docker logs poise-gateway 2>&1 | awk '
     /"event":"workspace.network.connected"/ && /"handle":"alice"/ { joined = NR }
     /"event":"gateway.listening"/ { listening = NR }
@@ -570,6 +593,36 @@ check_proxy_mode() {
   done
   expect 401 "external proxy policy exception excludes POST" "$nobody" "http://127.0.0.1:8081/privacy" --request POST --header "Host: $domain"
   expect 401 "external proxy policy exception excludes workspace hosts" "$nobody" "http://127.0.0.1:8081/privacy" --header "Host: alice.$domain"
+  # The production topology: traffic through the server's own proxy while the published gateway is
+  # replaced. The proxy retries dials, so every answer is 200, never a 502 for a refused connection.
+  local traffic=$work/proxy-traffic.log loop code before after
+  before=$(docker inspect --format '{{.Id}}' poise-gateway)
+  : >"$traffic"
+  (
+    while :; do
+      code=$(curl --silent --max-time 60 --cookie "$alice" --output /dev/null --write-out '%{http_code}' "${navigate[@]}" "http://alice.$domain/" 2>/dev/null) || code="curl:$?"
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$code" >>"$traffic"
+      sleep 0.2
+    done
+  ) &
+  loop=$!
+  compose stop gateway
+  code=$(docker inspect --format '{{.State.ExitCode}}' poise-gateway)
+  if [ "$code" != 0 ]; then kill $loop 2>/dev/null || true; fail "the replaced gateway exited $code, not 0"; fi
+  compose up --detach --force-recreate gateway
+  for _ in $(seq 1 60); do
+    if [ "$(curl --silent --max-time 5 "http://$listen/_gateway/tls-ask?domain=alice.$domain" 2>/dev/null)" = ok ]; then break; fi
+    sleep 2
+  done
+  [ "$(curl --silent --max-time 10 "http://$listen/_gateway/tls-ask?domain=alice.$domain")" = ok ] \
+    || { kill $loop 2>/dev/null || true; fail "the recreated gateway does not answer at $listen"; }
+  kill $loop 2>/dev/null || true
+  wait $loop 2>/dev/null || true
+  after=$(docker inspect --format '{{.Id}}' poise-gateway)
+  [ "$before" != "$after" ] || fail "the gateway container did not change"
+  grep --quiet ' 200$' "$traffic" || fail "no traffic reached the workspace during replacement: $(cat "$traffic")"
+  if grep --quiet -v ' 200$' "$traffic"; then fail "traffic through the server's own proxy saw non-200: $(grep -v ' 200$' "$traffic" | head -n 5)"; fi
+  pass "traffic through the server's own proxy saw zero 502s and zero connection failures ($(wc -l <"$traffic") requests)"
   docker rm --force poise-e2e-proxy >/dev/null
 
   sed -i '/^POISE_PROXY_LISTEN=/d' "$deploy/.env"

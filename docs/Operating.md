@@ -220,6 +220,8 @@ Your proxy must:
 - pass WebSockets through, put no time limit on a response, and accept
   request bodies of up to 32 MiB: event streams, Chat's WebSocket and
   terminals stay open for as long as people use them;
+- retry a connection failure (no listener while the gateway is replaced) for
+  30 seconds before it answers 502, so a replacement reads as a brief delay;
 - set `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` from what
   it saw itself, never from what the client sent; Caddy does unless told to
   trust another proxy;
@@ -248,14 +250,20 @@ With Caddy, for a gateway on `127.0.0.1:8080`:
 }
 
 poise.example.com {
-	reverse_proxy 127.0.0.1:8080
+	reverse_proxy 127.0.0.1:8080 {
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }
 
 *.poise.example.com {
 	tls {
 		on_demand
 	}
-	reverse_proxy 127.0.0.1:8080
+	reverse_proxy 127.0.0.1:8080 {
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }
 ```
 
@@ -608,7 +616,9 @@ workspace to drain it; `deploy/upgrade.sh` and `deploy/install.sh` check that
 it did, and stop with a message if not. If the gateway cannot join a
 workspace's network, that workspace's upgrade fails with the reason
 (`workspace.upgrade.failed`) and is tried again five minutes later, rather
-than recreating the workspace undrained.
+than recreating the workspace undrained. The old gateway lets in-flight
+requests finish for up to ten seconds while the front retries dials for
+thirty, so a replacement reads as a brief delay, not 502s.
 
 To roll back, check out the earlier commit and apply it without pulling;
 return to the branch the same way:
