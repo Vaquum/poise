@@ -104,7 +104,7 @@ describe('PR account routing', () => {
     expect(headReads.every(([, args]) => value(args, '--token-user') === 'poise-user')).toBe(true)
   })
 
-  it('pins the selected account before provider preparation', async () => {
+  it('abandons admission when accounts change after activity evidence', async () => {
     const { db, behaviors } = await initial()
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, options) => {

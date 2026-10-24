@@ -1971,7 +1971,8 @@ async function automatedReviewEnvironment(repo: string, number: number, reviewer
     throw new Error('Cannot establish ownership of automated reviews: Caller evidence is unreadable')
   }
   const ids = snapshot.entries.filter((row) => row.repo === repo && row.pr_id === String(number)
-    && row.actor?.toLowerCase() === reviewer.toLowerCase() && row.source?.startsWith('poise:')
+    && row.actor?.toLowerCase() === reviewer.toLowerCase()
+    && ['poise:review-new-prs', 'poise:approve-prs', 'poise:manual-review', 'poise:replay'].includes(row.source || '')
     && ['pr_review', 'pr_approve'].includes(row.behavior || '')
     && ['completed', 'superseded'].includes(row.status) && unambiguousAgentCall(snapshot, row)
     && Number.isSafeInteger(row.review_id) && (row.review_id || 0) > 0).map((row) => row.review_id!)
@@ -3574,6 +3575,7 @@ interface ApproveLaunch {
   seenTarget: string
   firedReason: string
   admittedReviewer: string | undefined
+  dismissedRecovery?: boolean
 }
 
 // The approve-prs change gate (#488): --requested-changes-addressed costs
@@ -3883,7 +3885,7 @@ async function tickApprovePrs(): Promise<void> {
               launches.push({ pr, expectedHead: activity.headSha,
                 seenTarget: `${pr.repo}#${pr.number}@head=${activity.headSha}`,
                 firedReason: `${request.clean ? 'clean' : 'dismissed'} review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`,
-                admittedReviewer: request.admittedReviewer })
+                admittedReviewer: request.admittedReviewer, dismissedRecovery: !request.clean })
             }
           } catch (err) {
             if (behaviorAborted()) return
@@ -3896,7 +3898,7 @@ async function tickApprovePrs(): Promise<void> {
       // provider layer expects, while the sweep stays bounded.
       await forEachPool(launches, APPROVE_FIRE_CONCURRENCY, async (launch) => {
         if (!isEnabled('approve-prs') || behaviorAborted()) return
-        const { pr, expectedHead, seenTarget, firedReason, admittedReviewer } = launch
+        const { pr, expectedHead, seenTarget, firedReason, admittedReviewer, dismissedRecovery } = launch
         const prTarget = `${pr.repo}#${pr.number}`
         // Pool starts are ordered; resume after the last attempted launch,
         // even when its claim or preparation consumes the sweep deadline.
@@ -3917,7 +3919,7 @@ async function tickApprovePrs(): Promise<void> {
           let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
           let replacesFailedCallId: string | undefined
           if (!claimId) {
-            if (admittedReviewer && firedReason.startsWith('dismissed')) {
+            if (dismissedRecovery) {
               const held = getFailedBehaviorLaunch('approve-prs', seenTarget)
               if (!held?.launchCallId || await dismissedApprovalHeld(
                 pr, expectedHead, (await reviewChoice('pr_approve')).model,
