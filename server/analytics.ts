@@ -301,11 +301,7 @@ async function readOrganization(org: Organization, me: string, window: Analytics
       const view = kind === 'pr' ? 'prs' : 'issues'
       const ref = kind === 'pr' ? 'pr_ref' : 'issue_ref'
       const params: string[] = []
-      const filters: string[] = []
-      // Narrow items before checking involvement. Building the union of
-      // every association first scans old discussion evidence on each read.
       if (window.since) {
-        filters.push('updated_at >= ?')
         params.push(new Date(window.since).toISOString().slice(0, 19))
       }
       const scopes = scopeByKind[kind].map(scope => {
@@ -316,34 +312,43 @@ async function readOrganization(org: Organization, me: string, window: Analytics
         }
         if (scope[1] === '--author') {
           params.push(scope[2])
-          return 'author = ?'
+          return 'v.author = ?'
         }
         return '1'
       })
-      filters.push(`(${scopes.join(' OR ')})`)
+      // Stream every range candidate, including nonmatches, so filtering cannot
+      // hide a long scan from the cooperative yield below.
+      const source = window.since
+        ? `(SELECT DISTINCT repo_id FROM items) AS repositories
+          CROSS JOIN items AS recent ON recent.repo_id = repositories.repo_id AND recent.updated_at >= ?
+          LEFT JOIN ${view} v ON v.${ref} = recent.item_id AND (${scopes.join(' OR ')})`
+        : `${view} v WHERE (${scopes.join(' OR ')})`
       // A pending review is not submitted, and an author's own review is a
       // reply. A review counts unless it is known to be the author's: a
       // deleted account leaves either login NULL.
       // Discussion counts and size JSON are only used for PRs merged in
       // this window; openings and first reviews need none of that payload.
-      const details = kind === 'pr' ? `pr_ref, 0 AS comments_count,
-        (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = pr_ref AND r.submitted_at IS NOT NULL
-          AND r.state <> 'PENDING' AND (r.author_login IS NULL OR author IS NULL OR lower(r.author_login) <> lower(author))) AS first_review_at`
+      const details = kind === 'pr' ? `v.pr_ref, 0 AS comments_count,
+        (SELECT min(r.submitted_at) FROM reviews r WHERE r.item_id = v.pr_ref AND r.submitted_at IS NOT NULL
+          AND r.state <> 'PENDING' AND (r.author_login IS NULL OR v.author IS NULL OR lower(r.author_login) <> lower(v.author))) AS first_review_at`
         : '0 AS comments_count'
-      const query = db.prepare<string[], DatastoreRecord>(`
-        SELECT repo, number, status, author, updated_at, created_at, closed_at, title, url, ${details}
-        FROM ${view} v WHERE ${filters.join(' AND ')}
+      const query = db.prepare<string[], DatastoreRecord | { number: null }>(`
+        SELECT v.repo, v.number, v.status, v.author, v.updated_at, v.created_at, v.closed_at, v.title, v.url, ${details}
+        FROM ${source}
       `)
       const rows: DatastoreRecord[] = []
       let sliceStart = performance.now()
+      let scanned = 0
       for (const row of query.iterate(...params)) {
-        if (!repoBelongsTo(row.repo, org.login)) throw new Error(`datastore contains records outside ${org.login}`)
-        if (kind === 'pr' && row.status === 'merged' && inWindow(row.closed_at, window)) {
-          Object.assign(row, mergedDetails.get(row.pr_ref!))
-          row.review_summary = mergedReviews.get(row.pr_ref!)!
+        if (row.number !== null) {
+          if (!repoBelongsTo(row.repo, org.login)) throw new Error(`datastore contains records outside ${org.login}`)
+          if (kind === 'pr' && row.status === 'merged' && inWindow(row.closed_at, window)) {
+            Object.assign(row, mergedDetails.get(row.pr_ref!))
+            row.review_summary = mergedReviews.get(row.pr_ref!)!
+          }
+          rows.push(row)
         }
-        rows.push(row)
-        if (rows.length % 64 === 0 || performance.now() - sliceStart >= 8) {
+        if (++scanned % 64 === 0 || performance.now() - sliceStart >= 8) {
           await setImmediate()
           sliceStart = performance.now()
         }
