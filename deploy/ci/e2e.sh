@@ -596,6 +596,9 @@ check_proxy_mode() {
   # The production topology: traffic through the server's own proxy while the published gateway is
   # replaced. The proxy retries dials, so every answer is 200, never a 502 for a refused connection.
   local traffic=$work/proxy-traffic.log loop code before after
+  # install.sh's file set: the run's own two files omit compose.proxy.yaml, which publishes
+  # the gateway on $listen, so recreating with them would drop the published port.
+  local proxy_files=compose.yaml:ci/compose.yaml:compose.proxy.yaml
   before=$(docker inspect --format '{{.Id}}' poise-gateway)
   : >"$traffic"
   (
@@ -606,10 +609,10 @@ check_proxy_mode() {
     done
   ) &
   loop=$!
-  compose stop gateway
+  COMPOSE_FILE="$proxy_files" compose stop gateway
   code=$(docker inspect --format '{{.State.ExitCode}}' poise-gateway)
   if [ "$code" != 0 ]; then kill $loop 2>/dev/null || true; fail "the replaced gateway exited $code, not 0"; fi
-  compose up --detach --force-recreate gateway
+  COMPOSE_FILE="$proxy_files" compose up --detach --force-recreate gateway
   for _ in $(seq 1 60); do
     if [ "$(curl --silent --max-time 5 "http://$listen/_gateway/tls-ask?domain=alice.$domain" 2>/dev/null)" = ok ]; then break; fi
     sleep 2
