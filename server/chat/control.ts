@@ -417,11 +417,11 @@ export async function readWorkMergeWake(target: store.WorkTarget): Promise<Merge
  *  the sync owns freshness, and this read adds zero GitHub traffic. */
 export interface OpenPrClosingRefs { repo: string, number: number, url: string, closing: Array<{ repo: string, number: number }>, closesVia: 'closing-references' | 'body-keywords', closingTruncated: boolean }
 export interface OpenPrClosingList { prs: OpenPrClosingRefs[], truncated: boolean, more: boolean }
-export async function readOpenPrClosingRefs(org: Organization, repo: string, after?: number): Promise<OpenPrClosingList | null> {
+export async function readOpenPrClosingRefs(org: Organization, after?: { repo: string, number: number }): Promise<OpenPrClosingList | null> {
   try {
     const { stdout } = await runFile('github-datastore',
-      organizationArgs(org, ['view', 'pr-closing', '--format', 'json', '--repo', repo,
-        ...(after === undefined ? [] : ['--after-number', String(after)])]),
+      organizationArgs(org, ['view', 'pr-closing', '--format', 'json',
+        ...(after === undefined ? [] : ['--after-repo', after.repo, '--after-number', String(after.number)])]),
       { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024 })
     const value: unknown = JSON.parse(stdout)
     if (!value || typeof value !== 'object') return null
@@ -1187,7 +1187,9 @@ export class ChatControl {
   /** Bind each open PR that closes a bound issue to that issue's chat, so a
    *  chat that opens its PR without calling `bind` still receives its CI,
    *  conflict, behind and review notices. At most once a minute, from local
-   *  datastore rows, one paged listing per bound repository. Never takes a
+   *  datastore rows, one paged listing per organization behind a bound
+   *  target — whole-organization, so a PR in a repository with no bindings
+   *  of its own is still found when it closes a bound issue. Never takes a
    *  claimed target, never rebinds a released one, never binds to a closed
    *  or deleted chat, never matches a PR whose closing list is incomplete,
    *  and never guesses between two chats: an ambiguous PR stays unbound
@@ -1196,34 +1198,31 @@ export class ChatControl {
     if (now - this.lastDiscovery < DISCOVERY_INTERVAL) return
     const instance = this.runtime.instance
     if (!current.some(binding => store.workTarget(binding.target).kind === 'issues')) return
-    const repos = new Map<string, Organization>()
+    const orgs = new Map<string, Organization>()
     for (const binding of current) {
-      const repo = store.workTarget(binding.target).repo
-      if (!repos.has(repo)) {
-        const org = organizationForRepository(repo)
-        if (org) repos.set(repo, org)
-      }
+      const org = organizationForRepository(store.workTarget(binding.target).repo)
+      if (org) orgs.set(org.login.toLowerCase(), org)
     }
-    if (repos.size === 0) return
+    if (orgs.size === 0) return
     // The window opens only when listings were actually read, so an empty
     // sweep never starves the pass that first has something to discover.
     this.lastDiscovery = now
     const read = this.options.closingRefs ?? readOpenPrClosingRefs
     const ambiguous = new Set<string>()
-    for (const [repo, org] of repos) {
-      let after: number | undefined
+    for (const org of orgs.values()) {
+      let after: { repo: string, number: number } | undefined
       for (;;) {
-        // The listing is local reads per repository; give requests an I/O
+        // The listing is local reads per organization; give requests an I/O
         // turn between pages.
         await setImmediate()
         if (this.stopped) return
         let listed: OpenPrClosingList | null
         try {
-          listed = await read(org, repo, after)
-        } catch (error) { this.itemFailed('discovery', repo, error); break }
+          listed = await read(org, after)
+        } catch (error) { this.itemFailed('discovery', org.login, error); break }
         if (this.stopped) return
-        if (!listed) { this.itemFailed('discovery', repo, new Error('the open-PR listing could not be read')); break }
-        if (listed.truncated) this.itemFailed('discovery', repo, new Error('the open-PR listing was truncated; some PRs were not considered'))
+        if (!listed) { this.itemFailed('discovery', org.login, new Error('the open-PR listing could not be read')); break }
+        if (listed.truncated) this.itemFailed('discovery', org.login, new Error('the open-PR listing was truncated; some PRs were not considered'))
         // Re-snapshot after the read: an issue released and reclaimed while
         // the listing was in flight resolves to its current owner, and the
         // match-to-claim below holds no awaits.
@@ -1258,11 +1257,12 @@ export class ChatControl {
           const [session] = live
           if (session && store.bindWorkAuto(instance, session, url)) bound.add(url)
         }
-        const last = listed.prs.at(-1)?.number
-        // Numbers order within the repository, so the cursor always moves;
-        // a page that makes no progress ends the sweep instead of spinning.
-        if (!listed.more || last === undefined || (after !== undefined && last <= after)) break
-        after = last
+        const last = listed.prs.at(-1)
+        // The (repository, number) cursor always moves; a page that makes
+        // no progress ends the sweep instead of spinning.
+        if (!listed.more || last === undefined
+          || (after !== undefined && (last.repo < after.repo || (last.repo === after.repo && last.number <= after.number)))) break
+        after = { repo: last.repo, number: last.number }
       }
     }
     for (const url of ambiguous) {

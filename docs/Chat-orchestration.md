@@ -371,8 +371,9 @@ bound PR every five minutes, independent of browsers and supervision intervals.
 On the usual unpaginated path that is three GitHub reads per observation, at
 most 36 per hour per bound PR; pagination/retries can add reads. Unbound work
 adds zero GitHub traffic. Binding discovery reads the local datastore only,
-one paged open-PR listing per bound repository, and adds no GitHub request
-either. While any check is pending, notifications wait and retain
+one paged open-PR listing per organization behind a bound target — the whole
+organization, so a PR in a repository with no bindings of its own is still
+found when it closes a bound issue — and adds no GitHub request either. While any check is pending, notifications wait and retain
 the last settled state, including when other checks have failed. Unchanged
 settled states deduplicate. A failed CI read keeps the settled baseline and
 queues at most one degraded notice per outage. Reviews use bounded local

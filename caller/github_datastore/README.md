@@ -68,9 +68,10 @@ a malformed stored connection hid entries. A pull request with
 would misbind, so consumers must skip it. At most 500 pull requests and 100
 closing refs per pull request are returned; `--repo` scopes the list to one
 repository and `--limit` lowers the pull request cap. `more` means further
-pull requests follow: pass the last returned number back as
-`--after-number` with the same `--repo` until it clears. All reads are
-local rows; the sync owns freshness.
+pull requests follow: pass the last returned cursor back until it clears,
+the number as `--after-number` with the same `--repo`, or the pair as
+`--after-repo`/`--after-number` for an unscoped list. All reads are local
+rows; the sync owns freshness.
 
 `github-datastore` and `python3 -m github_datastore` work from any directory on this host.
 Every command takes `--db PATH`; without it the database is

@@ -486,6 +486,7 @@ def pr_closing(
     repo: str | None = None,
     limit: int | None = None,
     after_number: int | None = None,
+    after_repo: str | None = None,
 ) -> str:
     """Open pull requests and the issues each closes, as the datastore has
     them: local rows only, the sync owns freshness. Each entry carries
@@ -495,14 +496,17 @@ def pr_closing(
     list is incomplete; matching on it would misbind, so consumers must skip
     it. `truncated` means a cap or a malformed stored connection hid entries;
     absence from the list then proves nothing. `more` means further pull
-    requests follow: pass the last returned number back as `after_number`
-    with the same `repo` until it clears. `after_number` needs `repo`, since
-    numbers order only within one repository."""
+    requests follow: pass the last returned cursor back until it clears, the
+    number as `after_number` with the same `repo`, or the pair as
+    `after_repo`/`after_number` for an unscoped list. A bare `after_number`
+    needs `repo`, since numbers order only within one repository."""
     if output != "json":
         raise ValueError("pr-closing renders json only")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
-    if after_number is not None and (repo is None or after_number <= 0):
+    if after_repo is not None and (repo is not None or after_number is None):
+        raise ValueError("after_repo pages an unscoped list and needs after_number")
+    if after_number is not None and (after_number <= 0 or (repo is None and after_repo is None)):
         raise ValueError("after_number needs a repo and a positive number")
     cap = min(limit, PR_CLOSING_SCAN_LIMIT) if limit is not None else PR_CLOSING_SCAN_LIMIT
     sql = """SELECT repo_full_name, number, body, expanded_json FROM items
@@ -511,7 +515,10 @@ def pr_closing(
     if repo is not None:
         sql += " AND repo_full_name = ? COLLATE NOCASE"
         params.append(repo)
-    if after_number is not None:
+    if after_repo is not None and after_number is not None:
+        sql += " AND (repo_full_name > ? OR (repo_full_name = ? AND number > ?))"
+        params.extend([after_repo, after_repo, after_number])
+    elif after_number is not None:
         sql += " AND number > ?"
         params.append(after_number)
     sql += " ORDER BY repo_full_name ASC, number ASC LIMIT ?"

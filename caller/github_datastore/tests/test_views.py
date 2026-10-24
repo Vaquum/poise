@@ -798,6 +798,36 @@ class PrClosingTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 views.pr_closing(db_path=db_path, repo="vaquum/test", after_number=0)
 
+    def test_pr_closing_pages_an_unscoped_list_by_repo_and_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            first = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            second = closing_pr_fixture(3, 113, "Closes #7", closing=(7,), state="open")
+            second["repo"] = dict(second["repo"], id=11, node_id="R_11", name="Other", full_name="Vaquum/Other")
+            with conn:
+                upsert_repo(conn, first["repo"])
+                upsert_repo(conn, second["repo"])
+            store_expanded(conn, first)
+            store_expanded(conn, second)
+            store_expanded(conn, closing_pr_fixture(14, 114, "Closes #9", closing=(9,), state="open"))
+            conn.close()
+
+            head = json.loads(views.pr_closing(db_path=db_path, limit=1))
+            self.assertTrue(head["more"])
+            self.assertEqual([(entry["repo"], entry["number"]) for entry in head["prs"]], [("Vaquum/Other", 3)])
+            middle = json.loads(views.pr_closing(db_path=db_path, limit=1, after_repo="Vaquum/Other", after_number=3))
+            self.assertTrue(middle["more"])
+            self.assertEqual([(entry["repo"], entry["number"]) for entry in middle["prs"]], [("Vaquum/Test", 12)])
+            tail = json.loads(views.pr_closing(db_path=db_path, limit=1, after_repo="Vaquum/Test", after_number=12))
+            self.assertFalse(tail["more"])
+            self.assertEqual([(entry["repo"], entry["number"]) for entry in tail["prs"]], [("Vaquum/Test", 14)])
+            with self.assertRaises(ValueError):
+                views.pr_closing(db_path=db_path, after_repo="Vaquum/Other")
+            with self.assertRaises(ValueError):
+                views.pr_closing(db_path=db_path, repo="vaquum/test", after_repo="Vaquum/Other", after_number=3)
+
     def test_pr_closing_serves_through_the_view_command(self) -> None:
         from contextlib import redirect_stdout
 

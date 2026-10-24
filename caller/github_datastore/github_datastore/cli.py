@@ -99,6 +99,7 @@ def main(argv: list[str] | None = None) -> None:
     view_parser.add_argument("--comment-after", type=int, default=0)
     view_parser.add_argument("--page-size", type=int)
     view_parser.add_argument("--after-number", type=int)
+    view_parser.add_argument("--after-repo")
 
     args = parser.parse_args(argv)
     db_path = Path(args.db)
@@ -182,7 +183,7 @@ def run_view(db_path: Path, args: argparse.Namespace) -> str:
         return views.pr_dependents(db_path=db_path, output=args.format, repo=args.repo, number=args.number)
     if args.name == "pr-closing":
         return views.pr_closing(db_path=db_path, output=args.format, repo=args.repo, limit=args.limit,
-                                after_number=args.after_number)
+                                after_number=args.after_number, after_repo=args.after_repo)
     raise AssertionError(args.name)
 
 
