@@ -64,6 +64,9 @@ describe('launch ownership and resolution', () => {
     })]
     vi.setSystemTime(new Date('2026-07-15T11:45:00.000Z'))
     await runtime.runEnabledBehaviorsOnce()
+    expect(db.listBehaviorLaunchClaims('review-new-prs')).toHaveLength(0)
+    // Concurrent approval may have observed the claim before review reconciliation settled it.
+    await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(mocks.spawnDetached.mock.calls[1][1]).toContain('--pr-approve')
   })
