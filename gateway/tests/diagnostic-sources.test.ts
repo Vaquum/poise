@@ -77,6 +77,30 @@ describe('operator diagnostic budgets', () => {
 })
 
 
+it('projects proxy truncation and upgrade/health failures as shared infrastructure evidence', () => {
+  const events: Array<ReturnType<typeof normalize>> = []
+  const logger = createLogger(() => undefined, (level, operation, fields) => events.push(normalize(gatewayDiagnostic(level, operation, fields))))
+  logger.warn('proxy.truncated', { handle: 'alice', error: 'read ECONNRESET', errno: 'ECONNRESET', method: 'GET',
+    route: '/api/chat', upstream: 'poise-ws-alice:5555', container: 'poise-ws-alice', durationMs: 12, requestId: 'request-1',
+    disconnect: 'upstream failed after the client could no longer be answered', phase: 'response', bytesSent: 7 })
+  logger.warn('workspace.upgrade.aborted', { handle: 'alice', reason: 'the drain timed out without confirmed admission and idleness',
+    activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0 })
+  logger.warn('workspace.health.refused', { handle: 'alice', error: 'the workspace answered GET /api/service/health with HTTP 503' })
+  logger.warn('workspace.drain.timeout', { handle: 'alice', timeoutSeconds: 5400, activeChatTurns: 2, runningCallerCalls: 1, backgroundWork: 0 })
+  logger.warn('workspace.container.stopped', { handle: 'alice', reason: 'upgrade' })
+  expect(events[0]).toMatchObject({ workspace: 'alice', visibility: 'infrastructure', requestId: 'request-1',
+    context: { method: 'GET', route: '/api/chat', errno: 'ECONNRESET', phase: 'response', bytesSent: 7 } })
+  expect(events[0]?.message).toContain('read ECONNRESET')
+  expect(events[1]).toMatchObject({ workspace: 'alice', visibility: 'infrastructure',
+    context: { activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0 } })
+  expect(events[2]).toMatchObject({ workspace: 'alice', visibility: 'infrastructure' })
+  expect(events[2]?.message).toContain('HTTP 503')
+  expect(events[3]).toMatchObject({ workspace: 'alice', visibility: 'infrastructure',
+    context: { timeoutSeconds: 5400, activeChatTurns: 2, runningCallerCalls: 1, backgroundWork: 0 } })
+  // Lifecycle steps stay operator-side: only the allow-listed operations cross the boundary.
+  expect(events[4]).toMatchObject({ workspace: null, visibility: 'operator' })
+})
+
 it('preserves a full gateway cause beyond stdout formatting limits with truthful truncation', () => {
   const lines: string[] = []; const events: Array<ReturnType<typeof normalize>> = []
   const logger = createLogger((line) => lines.push(line), (level, operation, fields) => events.push(normalize(gatewayDiagnostic(level, operation, fields))))

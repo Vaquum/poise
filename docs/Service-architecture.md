@@ -221,6 +221,11 @@ client sent.
   the workspace's five-second keep-alive closes them. This is an idle pool
   limit; active responses, long polls and event streams remain open. Failed
   requests are not replayed, including mutations with an unknown outcome.
+- A workspace that fails after its answer started — a response cut mid-body,
+  or an established WebSocket reset — leaves the client with a partial answer
+  the status cannot show: the gateway closes the stream and records
+  `proxy.truncated` with the phase and the bytes relayed instead of answering
+  twice. A client that goes first is never recorded as an upstream failure.
 - A request on a bodiless method (`GET`, `HEAD`, `OPTIONS`, `DELETE`, `TRACE`)
   that carries a body is refused with 400, and every forwarded body is framed,
   so nothing can ride along as a second request.
@@ -405,6 +410,11 @@ instead of retaining an unanswerable request and checkout lease.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
   unreachable past the switch grace gets a new container, drained first.
+- **Waiting.** A switch fires at a quiet moment, so a busy workspace keeps its
+  container while the gateway asks again; each pass logs `workspace.update.waiting`
+  with what it waits on. An idle workspace still on the old release past the switch
+  grace is stuck, not waiting: the gateway warns once (`workspace.update.stuck`) and
+  keeps asking, since recreating could cut work it cannot see.
 - **Meanwhile.** While the workspace restarts, the gateway answers for it
   with `x-poise-updating: 1`: "Updating to the latest version" for a page, 503
   `workspace_updating` for anything else. Poise dims the open page with the
@@ -507,7 +517,7 @@ otherwise offer it):
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
   runningCallerCalls, backgroundWork, idle, draining, release, switching,
-  eventLoop, desiredRelease, installedRelease, pendingSince }`. `idle` is true only
+  eventLoop, desiredRelease, installedRelease, pendingSince, switchWaitingOn }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
   - `eventLoop` is the current minute window of event-loop delay
@@ -540,6 +550,10 @@ assertion may only resume, and anything else is refused with 403):
     `null` when none is pending. It is the `next` record's mtime, which
     re-asking the queued release leaves alone, so asking again on later
     passes never moves it.
+  - `switchWaitingOn` names what the pending switch still waits for, one
+    phrase per failing quiet-gate clause (unheld chat turns, runtime
+    operations, background operations, browser launches); `null` when none
+    is pending or nothing blocks it.
   - `activeChatTurns` counts the Chat turns recorded open: reserved before
     their first write, closed once their outcome is recorded.
   - `runningCallerCalls` counts the Caller processes Poise launched for agent
@@ -552,17 +566,28 @@ assertion may only resume, and anything else is refused with 403):
     background work (behavior ticks, provider CLI updates, the model check),
     and launches from the browser admitted and still in their handler.
 - `POST /api/service/drain` stops admitting new Chat turns and behavior
-  launches, then returns the same fields. A drain lapses unless it is renewed:
-  while the gateway polls health it re-POSTs `/api/service/drain` at least
-  every 5 minutes. One `POISE_DRAIN_TIMEOUT` budget (default 5400, 90 minutes)
-  covers the whole workspace operation: every drain, recheck and re-drain.
-  Once `idle` is true the gateway recreates the container; past the budget it
-  recreates a workspace that confirmed busy work or refused answers, and aborts
-  a workspace whose answers only timed out, releasing its drain for the next
-  pass. While it waits it logs `workspace.drain.waiting` at each renew with
-  the counters and the time left, and `workspace.drain.lifted` when a drain it
-  saw on is gone while the workspace still isn't idle. A pass skipped behind a
-  running one names its handle and phase.
+  launches, then returns the same fields with the drain on. The gateway treats
+  the drain as admitted only when the answer is `ok` and shows `draining`; an
+  answer that does not (`workspace.drain.unconfirmed`) never recreates the
+  workspace, since without admission new work stays unblocked. A drain lapses
+  unless it is renewed: while the gateway polls health it re-POSTs
+  `/api/service/drain` at least every 5 minutes. One `POISE_DRAIN_TIMEOUT`
+  budget (default 5400, 90 minutes) covers the whole workspace operation: every
+  drain, recheck and re-drain. Once an admitted drain reports `idle` the gateway
+  recreates the container; past the budget it recreates a workspace that confirmed
+  busy work behind an admitted drain or that it can no longer reach, and aborts one
+  whose drain was never admitted or whose answers only timed out or were refused,
+  releasing its drain for the next pass (`workspace.upgrade.aborted`). While it
+  waits it logs `workspace.drain.waiting` at each renew with the counters and the
+  time left, `workspace.drain.lifted` when a drain it saw on is gone while the
+  workspace still isn't idle, and `workspace.drain.timeout` with the last known
+  counters. After starting the replacement the gateway waits for its health before
+  declaring the upgrade finished, within the two-minute idle-to-ready bound
+  (`readyAfterMs` on `workspace.upgrade.finished` measures stop to ready). Past it
+  the miss is recorded as `workspace.upgrade.ready.missed`: a replacement that answers
+  late still reports its measured `readyAfterMs`, and one that never answers is left
+  for the next visit to bring up through demand-driven readiness. A pass skipped
+  behind a running one names its handle and phase.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
     `/api/debate`, `/api/models/refresh`). Refused work answers

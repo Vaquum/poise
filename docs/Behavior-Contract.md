@@ -309,20 +309,48 @@ those opened since the baseline are reviewed, and the backlog it recorded is
 not. `approve-prs`, `resolve-unblocking`, `merge-prs` and `rerun-grey-ci` have no baseline; an unskipped
 repository's pull requests are evaluated on the next tick like any other.
 
+## Dead-letter reconciliation
+
+Every behavior tick reconciles the dead-letter inventory against the launch
+ledger and the open targets it just listed. Each open row is resolved (a
+later completion settled its target), superseded (its pull request or issue
+closed), or explicitly held, with the disposition, the evidence and the
+check time recorded on the row. Resolved and superseded rows retire; held
+rows stay open. Nothing is deleted. Quarantined rows are never resolved or
+superseded, and a repository that could not be listed holds its rows instead
+of proving anything about them. Unseen rows reconcile before rechecks of
+held rows, least-recently rechecked first.
+
 ## Replays
 
-A replay from Swarm passes the same check the scheduler applies, or it is
-refused with HTTP 409 and an error naming the check that failed. Poise reads
-the target fresh, behind the datastore freshness gate and from the same
-datastore the scheduler reads, and decides before it prepares a model, a
-checkout or a head. The scheduler and the replay call the same function for
-each kind of target, so the two cannot drift apart.
+A replay from Swarm passes the same eligibility check the scheduler applies,
+or it is refused with HTTP 409 and an error naming the check that failed.
+Poise reads the target fresh, behind the datastore freshness gate and from
+the same datastore the scheduler reads, and decides before it prepares a
+model, a checkout or a head. The scheduler and the replay call the same
+function for each kind of target for eligibility, so the two cannot drift
+apart.
 
 - `pr_review` and `pr_approve`: the pull request is open, not a draft,
   authored by your GitHub account, and not in the Skip repositories list of
   `review-new-prs` or `approve-prs` respectively.
 - `issue_review`: the repository is opted in to `review-new-issues`, the issue
   is open, and its author is a trusted author.
+
+A pull-request replay is additionally refused while any worker owns the pull
+request, and when live GitHub already shows the review as published on the
+current head. Each behavior replays only its own publication kind: an
+approval for `pr_approve`; a commented or change-requested review for
+`pr_review`, unless a failed review slot on that head is still outstanding.
+Panel siblings share the agent account, so a review another Caller row claims
+as its own receipt is not a duplicate. Dismissed reviews never count. A
+replay reserves its target for ten minutes before its checks and holds it
+through spawn, so a concurrent replay is refused while preparation and
+spawn are ahead. Launch claims fence live reservations atomically, so a
+scheduler tick in that window skips instead of starting a duplicate
+worker; a refused replay releases its reservation. An
+`issue_review` replay stays a deliberate fresh run that comments again: it
+takes no publication check.
 
 A repository outside every ready account is refused the same way. When the
 facts cannot be read, the replay answers 502 and launches nothing.
@@ -352,7 +380,9 @@ Resolution, merge, and grey-CI metrics count direct mutation attempts recorded
 in the local run ledger since tracking was introduced; earlier history is
 unavailable. Eligibility checks and resolution polls that change no conversations
 are excluded. Safe no-write merge/rerun receipts count as successful executions;
-errors count as failures. Unknown durations show a dash. The ledger uses indexed
+errors count as failures. A direct run whose owner died without finishing
+closes as interrupted with its completion unknown: it stays out of the
+success rate and its duration stays unknown. Unknown durations show a dash. The ledger uses indexed
 time windows and cached database aggregates; unchanged refreshes do not scan its
 history. Narrow windows scroll the table without compressing its controls.
 

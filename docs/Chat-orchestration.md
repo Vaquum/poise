@@ -336,6 +336,19 @@ when a behavior notice is about to be queued, or alongside the five-minute CI
 poll, and cached for five minutes. An unreadable or unsynced target wakes as
 before: unknown is never treated as closed.
 
+When a PR bound to a worker merges, the monitor wakes the creating chat once
+with the merged PR, the issues it closed, and the open issues that depend on
+them, so dependent work starts at once. A dependent is an open issue in the
+same repository that GitHub lists as blocked by a closed issue, or that lists
+it under `Depends on:` in its body. The closed issues come from GitHub's
+closing references on the PR, or from its body's closing keywords when the
+stored read predates dependency tracking. The wake reuses the merge the
+target-state read already saw and adds no GitHub requests: the sync carries
+the two dependency fields on its existing item queries. With no creating
+chat, nothing changes. Unknown or missing evidence keeps the unsettled
+baseline and retries; the wake fires exactly once per merged PR, marked
+truncated when a cap or a malformed stored read hid entries.
+
 A bound turn that ends normally with work left behind never settles
 silently: unpushed commits, uncommitted changes and still-running background
 jobs flag the chat as stalled in the session list and its header, and queue

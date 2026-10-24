@@ -3,7 +3,8 @@ import { LEDGER_RESPONSE_BYTES, type LedgerRead } from './behavior-ledger-contra
 
 const PREFIX = '/api/behavior-ledger'
 const ID = /^[a-f0-9]{64}$/
-const USAGE = 'Usage: behavior-ledger list [--limit N] [--cursor CURSOR] [--parent ID] | get ID | changes CURSOR [--limit N] | health; each accepts --base-url ORIGIN'
+const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,100}$/
+const USAGE = 'Usage: behavior-ledger list [--limit N] [--cursor CURSOR] [--parent ID] [--repository OWNER/REPO --number N] | get ID | changes CURSOR [--limit N] | health; each accepts --base-url ORIGIN'
 
 class UsageError extends Error {}
 
@@ -22,7 +23,7 @@ export function parseBehaviorLedgerArguments(args: string[], env: NodeJS.Process
   if (!['list', 'get', 'changes', 'health'].includes(operation ?? '')) throw new UsageError(USAGE)
   const flags = new Map<string, string>()
   const positional: string[] = []
-  const permitted = operation === 'list' ? ['--base-url', '--limit', '--cursor', '--parent']
+  const permitted = operation === 'list' ? ['--base-url', '--limit', '--cursor', '--parent', '--repository', '--number']
     : operation === 'changes' ? ['--base-url', '--limit'] : ['--base-url']
   for (let index = 0; index < rest.length; index++) {
     const arg = rest[index]
@@ -39,6 +40,15 @@ export function parseBehaviorLedgerArguments(args: string[], env: NodeJS.Process
   if (limit !== undefined && (!/^[1-9]\d{0,2}$/.test(limit) || Number(limit) > 100)) throw new UsageError('limit must be an integer from 1 to 100')
   const cursor = operation === 'changes' ? positional[0] : flags.get('--cursor')
   if (cursor !== undefined && (!cursor || cursor.length > 2048)) throw new UsageError('cursor must contain 1 to 2048 characters')
+  const repository = flags.get('--repository')
+  const targetNumber = flags.get('--number')
+  if ((repository === undefined) !== (targetNumber === undefined)) throw new UsageError(USAGE)
+  if (repository !== undefined && (!REPO.test(repository) || repository.length > 140)) {
+    throw new UsageError('repository must be OWNER/REPO with at most 140 characters')
+  }
+  if (targetNumber !== undefined && (!/^[1-9]\d{0,9}$/.test(targetNumber) || !Number.isSafeInteger(Number(targetNumber)))) {
+    throw new UsageError('number must be a positive integer')
+  }
   const base = loopbackOrigin(flags.get('--base-url') ?? `http://127.0.0.1:${env.POISE_PORT ?? '5555'}`)
   const request: LedgerRead = operation === 'get' ? { operation, id: positional[0] }
     : operation === 'changes' ? { operation, cursor: positional[0] }
@@ -47,6 +57,8 @@ export function parseBehaviorLedgerArguments(args: string[], env: NodeJS.Process
   if (limit !== undefined) base.searchParams.set('limit', limit)
   if (cursor !== undefined) base.searchParams.set('cursor', cursor)
   if (parent !== undefined) base.searchParams.set('parent', parent)
+  if (repository !== undefined) base.searchParams.set('repository', repository)
+  if (targetNumber !== undefined) base.searchParams.set('number', targetNumber)
   return base
 }
 

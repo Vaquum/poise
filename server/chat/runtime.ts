@@ -1519,11 +1519,18 @@ export class ChatRuntime extends EventEmitter {
     let count = this.inflightOps + (this.recovering ? 1 : 0)
     for (const session of this.live.values()) {
       if (session.turn?.relayHeld && session.relay?.healthy) continue
-      const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
       // A prompt waiting behind a Poise update holds nothing a restart would
-      // cut: it is durable, and the next server starts it. Counting it would
-      // hold the very switch it waits for.
-      if (own === 0 && session.record.status === 'queued' && session.record.queuedBehind === SWITCH_WAIT_REASON) continue
+      // cut: it is durable, and the next server starts it. Whatever the
+      // session keeps from before it queued — a live process, even a turn
+      // past its recorded outcome — must never hold the very switch it
+      // waits for. An operation still running on it, like an accepted
+      // revert, does hold the switch. A turn still recorded open holds the
+      // switch through the open-turn gate instead, and the bound cancels it.
+      if (session.record.status === 'queued' && session.record.queuedBehind === SWITCH_WAIT_REASON) {
+        count += session.pendingOps
+        continue
+      }
+      const own = (session.turn ? 1 : 0) + session.services + session.pendingOps
       count += own > 0 ? own : ACTIVE_STATUSES.includes(session.record.status) ? 1 : 0
     }
     return count
@@ -3947,7 +3954,7 @@ export class ChatRuntime extends EventEmitter {
       const metadata = await lstat(join(record.checkout, '.git'))
       if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
         // A failed bootstrap may have written HEAD without its first commit.
-        recreated = !(await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: record.checkout }).then(() => true, () => false))
+        recreated = !(await runFile('git', ['rev-parse', '--verify', 'HEAD'], { cwd: record.checkout, expected: { codes: [128], stderr: /Needed a single revision/ } }).then(() => true, () => false))
       }
     }
     catch (error) {
@@ -4372,7 +4379,7 @@ export class ChatRuntime extends EventEmitter {
     // Admission, including its branch check, is part of the service lifetime.
     session.services += 1
     try {
-      const head = await runFile('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: session.record.checkout, timeoutMs: 10_000 }).then((r) => r.stdout.trim()).catch(() => '')
+      const head = await runFile('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: session.record.checkout, timeoutMs: 10_000, expected: { codes: [1] } }).then((r) => r.stdout.trim()).catch(() => '')
       if (head !== session.record.branch.name) throw new Error(`the checkout is on ${head || 'a detached HEAD'}, not ${session.record.branch.name}; file services are closed`)
       if (session.turn !== turn || turn.stopping || turn.abort.signal.aborted || session.draining || !session.lease?.held) throw new Error('the turn is settling; file services are closed')
       return await operation()

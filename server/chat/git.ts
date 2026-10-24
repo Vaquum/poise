@@ -15,7 +15,7 @@
 
 import { lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
-import { runFile } from '../process'
+import { runFile, type ExpectedFailure } from '../process'
 import type { CheckoutLease } from './checkout-lock'
 import { spawnWorker } from './worker'
 
@@ -42,9 +42,9 @@ export interface CheckoutInspection {
   headSha: string
 }
 
-async function git(checkout: string, args: string[], options: { timeoutMs?: number } = {}): Promise<string> {
+async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure } = {}): Promise<string> {
   try {
-    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS })
+    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}) })
     return stdout
   } catch (error: any) {
     const detail = String(error?.stderr || error?.message || error).trim()
@@ -69,7 +69,7 @@ export async function inspectCheckout(checkout: string): Promise<CheckoutInspect
   const dirtyFiles = lines.slice(1).length
   const branches = (await git(checkout, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']))
     .split('\n').map((line) => line.trim()).filter(Boolean)
-  const headSha = (await git(checkout, ['rev-parse', 'HEAD']).catch(() => '')).trim()
+  const headSha = (await git(checkout, ['rev-parse', 'HEAD'], { expected: { codes: [128], stderr: /unknown revision|Needed a single revision/ } }).catch(() => '')).trim()
   return {
     currentBranch,
     detached,
@@ -82,7 +82,7 @@ export async function inspectCheckout(checkout: string): Promise<CheckoutInspect
 }
 
 export async function defaultBranch(checkout: string, branches?: string[]): Promise<string> {
-  const remoteHead = (await git(checkout, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).catch(() => '')).trim()
+  const remoteHead = (await git(checkout, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { expected: { codes: [128], stderr: /is not a symbolic ref/ } }).catch(() => '')).trim()
   if (remoteHead) return remoteHead.replace(/^origin\//, '')
   const known = branches ?? (await git(checkout, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'])).split('\n').map((line) => line.trim())
   for (const candidate of ['main', 'master']) if (known.includes(candidate)) return candidate
@@ -91,7 +91,7 @@ export async function defaultBranch(checkout: string, branches?: string[]): Prom
 
 export async function branchExists(checkout: string, name: string): Promise<boolean> {
   try {
-    await git(checkout, ['rev-parse', '--verify', '--quiet', `refs/heads/${assertBranchName(name)}`])
+    await git(checkout, ['rev-parse', '--verify', '--quiet', `refs/heads/${assertBranchName(name)}`], { expected: { codes: [1] } })
     return true
   } catch {
     return false

@@ -31,6 +31,8 @@ export interface WorkspaceStub {
   reachable: boolean
   /** The status /api/service/health and /api/service/drain answer with. */
   healthStatus: number
+  /** False makes a drain POST answer without applying the drain, as a refusal before admission. */
+  drainApplies: boolean
   health: StubHealth
   /** Bytes of filler added to every health and drain answer, as a hostile workspace could. */
   healthPadding: number
@@ -62,6 +64,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
   const stub: Omit<WorkspaceStub, 'port' | 'close'> = {
     reachable: true,
     healthStatus: 200,
+    drainApplies: true,
     health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, draining: false, release: null, switching: null },
     switches: [],
     failedReleases: [],
@@ -94,6 +97,13 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
       req.socket.destroy()
       return
     }
+    if (url === '/truncate') {
+      // A 200 that dies mid-body: the client keeps a partial answer it cannot detect from the status.
+      res.writeHead(200, { 'content-type': 'text/plain', 'content-length': 100 })
+      res.write('partial')
+      setTimeout(() => res.destroy(), 20)
+      return
+    }
     if (url === '/api/link/events') {
       // Poise Link's event stream: answered at once and held open until the device goes.
       stub.requests.push({ method: req.method ?? '', url, headers: req.headers, body: '' })
@@ -111,8 +121,9 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
       const seen = { method: req.method ?? '', url, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') }
       if (url.startsWith('/api/service/')) {
         stub.serviceRequests.push(seen)
-        // A drain takes effect when received, even when its answer is slow past the gateway timeout.
-        if (url === '/api/service/drain' && req.method === 'POST') stub.health.draining = true
+        // A drain takes effect when received, even when its answer is slow past the gateway timeout —
+        // unless the stub refuses admission, in which case the answer reports no drain.
+        if (url === '/api/service/drain' && req.method === 'POST' && stub.drainApplies) stub.health.draining = true
         if (url === '/api/service/resume' && req.method === 'POST') stub.health.draining = false
         const answer = (status: number, body: unknown): void => {
           if (stub.answerDelayMs > 0) setTimeout(() => json(res, status, body), stub.answerDelayMs)
@@ -155,6 +166,15 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
   })
   server.on('upgrade', (req, socket, head) => {
     stub.requestLines.push(`${req.method} ${req.url}`)
+    if (req.url === '/ws/drop') {
+      // An established switch reset without a close frame, as a killed workspace would. The reset
+      // fires on the client's first message, so the hello is always flushed before the connection dies.
+      sockets.handleUpgrade(req, socket, head, (client) => {
+        client.send(JSON.stringify({ type: 'hello' }))
+        client.on('message', () => (socket as unknown as { resetAndDestroy(): void }).resetAndDestroy())
+      })
+      return
+    }
     if (req.url === '/ws/status/099') return rawAnswer(socket, 'HTTP/1.1 099 Odd\r\n\r\n')
     if (req.url === '/ws/declined-large') {
       // A refusal with a megabyte of body: the gateway must not hold it all to relay it.
