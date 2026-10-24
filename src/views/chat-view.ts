@@ -1008,10 +1008,19 @@ async function deleteSession(id: string): Promise<void> {
 async function deleteSessions(ids: string[]): Promise<void> {
   const targets = ids.filter((id) => sessions.has(id))
   if (!targets.length) return
+  const activeBefore = activeId
+  // Titles up front: a target deleted concurrently is already gone when its
+  // turn comes, and then no entry is left to name it from.
+  const titles = new Map<string, string>()
+  for (const id of targets) titles.set(id, sessionTitle(sessions.get(id)!.record))
   const failures: { title: string, message: string }[] = []
   let deleted = 0
   for (const id of targets) {
-    const e = sessions.get(id)!
+    const e = sessions.get(id)
+    if (!e) {
+      failures.push({ title: titles.get(id)!, message: 'already deleted' })
+      continue
+    }
     try {
       await destroySession(id, e)
       deleted += 1
@@ -1021,7 +1030,9 @@ async function deleteSessions(ids: string[]): Promise<void> {
   }
   // Successes already left the selection in destroySession; failures stay
   // selected so the list still shows what the notice names.
-  if (activeId && !sessions.has(activeId)) resetAfterActiveDeleted()
+  // Only the open chat's own deletion moves the pane: a JEV builder holds an
+  // activeId outside the sessions map and must stay open.
+  if (activeBefore && targets.includes(activeBefore) && !sessions.has(activeBefore)) resetAfterActiveDeleted()
   if (!failures.length) {
     setNotice(`Deleted ${deleted} ${deleted === 1 ? 'chat' : 'chats'}.`, 'info')
   } else {

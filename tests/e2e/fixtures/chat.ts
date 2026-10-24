@@ -99,6 +99,8 @@ interface ServerState {
   timers?: Record<string, TimersData>
   /** Failing DELETE /api/chat/sessions/<id> answers, by session. */
   deleteErrors?: Record<string, { status: number, json: unknown }>
+  /** Holds a DELETE /api/chat/sessions/<id> answer until released. */
+  deleteDelay?: (id: string) => Promise<void> | void
 }
 
 async function installRoutes(page: Page, state: ServerState): Promise<void> {
@@ -241,6 +243,7 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
       if (method === 'DELETE') {
         const failure = state.deleteErrors?.[id]
         if (failure) { await route.fulfill(failure); return }
+        await state.deleteDelay?.(id)
         state.sessions = state.sessions.filter((x) => x.id !== id)
         await route.fulfill({ json: { ok: true, workspaceRemoved: false } })
         return
