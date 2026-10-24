@@ -4216,6 +4216,17 @@ export class ChatRuntime extends EventEmitter {
         return
       }
       const previous = record.stall
+      let jobs = previous?.backgroundJobs ?? []
+      const baseline = turn.jobBaseline
+      const worker = storage.getWorker(record.id)
+      const gatePid = session.relay?.gatePid ?? worker?.gatePid
+      const gatePgid = session.relay?.gatePgid ?? worker?.gatePgid
+      // The group is listed before git is read: a job alive here is tracked
+      // even if it exits right after, and anything it dirtied lands in the
+      // later git read instead of falling through both. The reverse order
+      // would miss a job that dirties between the reads and exits before
+      // the group snapshot.
+      const members = baseline && gatePid && gatePgid && baseline.pgid === gatePgid ? await groupMembers(gatePgid) : null
       const { repos, truncatedRepos } = await this.stallRepos(session, previous)
       // A background job is a group member the turn started: present now
       // but absent from the prompt-start baseline, however deep the
@@ -4224,12 +4235,6 @@ export class ChatRuntime extends EventEmitter {
       // does not prove the agent saw the result, and the shared event key
       // keeps the two paths from ever queuing it twice. Without a
       // baseline nothing new is tracked; the poll still reaps.
-      let jobs = previous?.backgroundJobs ?? []
-      const baseline = turn.jobBaseline
-      const worker = storage.getWorker(record.id)
-      const gatePid = session.relay?.gatePid ?? worker?.gatePid
-      const gatePgid = session.relay?.gatePgid ?? worker?.gatePgid
-      const members = baseline && gatePid && gatePgid && baseline.pgid === gatePgid ? await groupMembers(gatePgid) : null
       if (members !== null && gatePgid && baseline) {
         const seen = new Map(jobs.map((job) => [job.pid, job]))
         const now = new Date().toISOString()
