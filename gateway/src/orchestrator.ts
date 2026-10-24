@@ -767,11 +767,12 @@ export class Orchestrator {
         this.upgradingPhase = 'upgrade'
         drainAttempted = drainAttempted || result.attempted
         confirmedBusy = confirmedBusy || result.confirmedBusy
-        admitted = admitted || result.admitted
+        // A round that observed drain state supersedes the admission an earlier round saw; a round
+        // with no usable answer leaves it alone. An idle round always observed an applied drain.
+        if (result.observed) admitted = result.admitted
         if (!result.idle) sawDown = sawDown || result.sawDown
         lastCounts = result.lastCounts ?? lastCounts
         if (result.idle) {
-          admitted = true
           drainedIdle = true
         } else if ((confirmedBusy && admitted) || sawDown) {
           drainedIdle = false
@@ -857,12 +858,13 @@ export class Orchestrator {
    * A network the gateway cannot join fails the upgrade instead: waiting would drain nothing, and the
    * timeout would then recreate the workspace with its work cut off. A drain POST counts as dispatched
    * once the gateway is on the network to send it, recorded where the caller sees it even when a later
-   * poll throws, since a failed answer may still have been applied. Only an admitted drain — one whose
-   * answer showed it on — can finish idle: without admission new work stays unblocked, so an idle answer
-   * alone never recreates the workspace.
+   * poll throws, since a failed answer may still have been applied. Only an applied drain — one whose
+   * latest answer showed it on — can finish idle: without admission new work stays unblocked, so an
+   * idle answer alone never recreates the workspace. Admission is the drain as last observed; an
+   * answer showing it off un-admits, and a round with no usable answer leaves it alone.
    */
   private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }): Promise<{
-    idle: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; sawDown: boolean;
+    idle: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; observed: boolean; sawDown: boolean;
     lastCounts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null
   }> {
     const { config, log, now } = this.deps
@@ -870,10 +872,11 @@ export class Orchestrator {
     let requestedAt = now()
     let confirmedBusy = false
     let admitted = false
+    let observed = false
     let sawDown = false
     let sawDraining = false
     const lastCounts: { counts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null } = { counts: null }
-    const done = (idle: boolean) => ({ idle, attempted: dispatched.value, confirmedBusy, admitted, sawDown, lastCounts: lastCounts.counts })
+    const done = (idle: boolean) => ({ idle, attempted: dispatched.value, confirmedBusy, admitted, observed, sawDown, lastCounts: lastCounts.counts })
     const waiting = (health: ServiceHealth): void => {
       log.info('workspace.drain.waiting', {
         handle,
@@ -892,15 +895,17 @@ export class Orchestrator {
     const note = (health: ServiceHealth): void => {
       // Anything that answers is not down: a transient failure stops authorizing a cut the moment
       // answers resume. Only an ok answer is evidence beyond that: a non-ok answer proves nothing
-      // about admission, work or idleness, so it latches no flag a forced stop could rest on.
+      // about admission, work or idleness, so it moves no flag a forced stop could rest on.
       sawDown = false
       if (!health.ok) return
+      observed = true
+      // Admission is the drain as last observed, not as once seen: an answer showing it off
+      // un-admits, so a lost admission can never combine with later busy work into a forced stop.
       // A drain the gateway saw on is gone while the workspace still isn't idle: the owner or admin
       // resumed, the drain lapsed, or Poise restarted. An answer that never showed a drain is not a lift.
-      if (health.draining) {
-        sawDraining = true
-        admitted = true
-      } else if (sawDraining && !health.idle) log.warn('workspace.drain.lifted', { handle })
+      if (health.draining) sawDraining = true
+      else if (sawDraining && !health.idle) log.warn('workspace.drain.lifted', { handle })
+      admitted = health.draining
       if (!health.idle) confirmedBusy = true
       lastCounts.counts = counts(health)
     }
@@ -911,9 +916,11 @@ export class Orchestrator {
       log.warn('workspace.drain.unconfirmed', { handle, ok: health.ok, draining: health.draining, ...counts(health) })
     }
     const failed = (error: unknown): void => {
-      // A timeout or an unusable answer leaves the workspace's state unknown; reaching nothing means
-      // it is down. Only a down workspace is recreated without ever confirming busy work.
-      if (!(error instanceof ServiceTimeoutError) && !(error instanceof WorkspaceAnswerError)) sawDown = true
+      // An answer, even an unusable one, proves the workspace is not down; only reaching nothing
+      // sets that. A timeout proves neither — a filtered port times out without connecting — so it
+      // leaves the flag alone.
+      if (error instanceof WorkspaceAnswerError) sawDown = false
+      else if (!(error instanceof ServiceTimeoutError)) sawDown = true
     }
     // Fail before anything is sent when the gateway is off the network, so only a POST that left
     // the gateway counts towards releasing the drain on failure.
@@ -957,9 +964,9 @@ export class Orchestrator {
         } else {
           const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
           note(health)
-          // Idle behind an admitted drain finishes; idle without one waits for the renewal to admit.
-          // A drain admitted and then lifted while idle is still safe to finish: nothing runs to cut.
-          if (health.ok && health.idle && (health.draining || admitted)) {
+          // Idle behind an applied drain finishes; idle without one waits for a renewal to admit.
+          // A lifted drain re-applies on renewal, so waiting costs one renew cycle, never safety.
+          if (health.ok && health.idle && health.draining) {
             this.lifecycle('workspace.drain.idle', handle)
             return done(true)
           }
