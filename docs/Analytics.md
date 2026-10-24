@@ -125,7 +125,7 @@ Without a matching fresh preparation, previous values are removed immediately
 and the standard three-dot loading indicator appears. The server reads the local datastore views directly,
 without starting a CLI process for each scope.
 Each account read keeps one database snapshot and yields to other server
-work after 64 records or once eight milliseconds of processing have elapsed. Discussion
+work after 64 scanned candidates or once eight milliseconds of processing have elapsed. Discussion
 counts and stored JSON for sizes and merger identity are read only for pull
 requests merged inside the requested window. Openings, closings and first
 reviews do not parse unrelated discussion payloads; year history therefore
@@ -134,9 +134,10 @@ Involvement membership comes directly from the indexed associations, without
 aggregating the evidence descriptions that the full user view supplies.
 The date filter seeks each repository's existing update-time index before
 reading item payloads and checking indexed membership. This changes only the
-Analytics query and needs no datastore migration. Range matches stream directly
-to item lookups, so a dense dated window does not collect all matching IDs before
-its first possible yield. Merged
+Analytics query and needs no datastore migration. Range candidates stream to the
+yield loop even when their item type or involvement does not match; only matching
+records enter the report. A dense dated window therefore collects no complete ID
+list before its first possible yield. Merged
 PR sizes and merger identity come from one parse of each stored payload.
 The selected day and its baseline load first. The year request starts after
 the cards render, so its larger scan cannot delay their initial appearance.
