@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
 import { CheckoutLease, LEASE_MS, canonicalCheckout, checkoutLockPath } from '../../server/chat/checkout-lock'
-import { pgidAlive, pidAlive, spawnWorker, workerIdentityMatches } from '../../server/chat/worker'
+import { pgidAlive, pidAlive, processStartTime, spawnWorker, workerIdentityMatches } from '../../server/chat/worker'
 
 const CONTENDER = resolve('tests/fixtures/chat/lock-contender.py')
 let root = ''
@@ -179,6 +179,99 @@ describe('checkout lease', () => {
     await new Promise((r) => worker.once('exit', r))
     expect(b.tryAcquire()).toMatchObject({ acquired: true, recovered: true })
     b.release()
+  })
+
+  it('takes over a dead host whose pid was reused, but respects the live holder', () => {
+    const now = { value: Date.now() }
+    const a = lease('a', { now: () => now.value, hostPid: 999_999_5, hostStart: 'first-generation' })
+    expect(a.tryAcquire().acquired).toBe(true)
+    now.value += LEASE_MS + 1
+    // The pid is alive and still the holder's process: blocked.
+    const live = lease('live', { now: () => now.value, pidAlive: () => true, processStart: () => 'first-generation' })
+    expect(live.tryAcquire()).toMatchObject({ acquired: false, reason: 'live_host' })
+    // The pid is alive but belongs to another process now: take over.
+    const reused = lease('reused', { now: () => now.value, pidAlive: () => true, processStart: () => 'second-generation' })
+    expect(reused.tryAcquire()).toMatchObject({ acquired: true, recovered: true })
+    reused.release()
+  })
+
+  it('detects a reused host pid against real processes', async () => {
+    const worker = spawn('sleep', ['30'], { detached: true })
+    try {
+      const now = { value: Date.now() }
+      // A stale row naming sleep's pid with a dead generation's start time.
+      const stale = lease('stale', { now: () => now.value, hostPid: worker.pid!, hostStart: 'a-dead-generation' })
+      expect(stale.tryAcquire().acquired).toBe(true)
+      now.value += LEASE_MS + 1
+      const next = lease('next', { now: () => now.value })
+      expect(next.tryAcquire()).toMatchObject({ acquired: true, recovered: true })
+      next.release()
+      // The same pid with sleep's real start time is a live holder.
+      const live = lease('live-real', { hostPid: worker.pid!, hostStart: processStartTime(worker.pid!) })
+      expect(live.tryAcquire().acquired).toBe(true)
+      expect(lease('d').tryAcquire()).toMatchObject({ acquired: false, reason: 'live_host' })
+      live.release()
+    } finally {
+      worker.kill('SIGKILL')
+      await new Promise((r) => worker.once('exit', r))
+    }
+  })
+
+  it('adopts past a reused host pid and records the new host generation', async () => {
+    const holder = spawn('sleep', ['30'], { detached: true })
+    const gate = spawn('sleep', ['30'], { detached: true })
+    try {
+      // A previous turn's row: a dead host generation with a live worker.
+      const before = lease('adopt-me', { hostPid: holder.pid!, hostStart: 'a-dead-generation' })
+      expect(before.tryAcquire().acquired).toBe(true)
+      expect(before.registerWorker({ pid: gate.pid!, pgid: gate.pid!, ident: 'adopt-ident' })).toBe(true)
+      const after = lease('adopt-me')
+      expect(after.adoptLiveWorker({ workerPid: gate.pid!, workerPgid: gate.pid!, workerIdent: 'adopt-ident', ownerId: 'adopt-me' })).toBe(true)
+      const row = after.read()!
+      expect(row.host_pid).toBe(process.pid)
+      expect(row.host_start).toBe(processStartTime(process.pid))
+      after.release()
+    } finally {
+      holder.kill('SIGKILL')
+      gate.kill('SIGKILL')
+      await new Promise((r) => holder.once('exit', r))
+      await new Promise((r) => gate.once('exit', r))
+    }
+  })
+
+  it('migrates lock files written before host_start and fails closed on their rows', async () => {
+    const legacyCheckout = join(root, 'legacy-checkout')
+    await mkdir(legacyCheckout)
+    const canonical = canonicalCheckout(legacyCheckout)
+    const db = new Database(checkoutLockPath(canonical))
+    try {
+      db.exec(`CREATE TABLE lease (
+        id INTEGER PRIMARY KEY CHECK (id = 1), token TEXT NOT NULL, checkout TEXT NOT NULL,
+        owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL, owner_label TEXT NOT NULL,
+        instance TEXT NOT NULL, host_pid INTEGER NOT NULL,
+        worker_pid INTEGER, worker_pgid INTEGER, worker_ident TEXT, branch TEXT,
+        acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, lease_until INTEGER NOT NULL)`)
+      const stamp = new Date().toISOString()
+      db.prepare('INSERT INTO lease (id, token, checkout, owner_kind, owner_id, owner_label, instance, host_pid, acquired_at, heartbeat_at, lease_until) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run('legacy-token', canonical, 'poise:chat', 'legacy', 'legacy holder', 'poise-test:db', process.pid, stamp, stamp, Date.now() + LEASE_MS)
+    } finally {
+      db.close()
+    }
+    const owner = { ownerKind: 'poise:chat', ownerId: 'new', ownerLabel: 'new', instance: 'poise-test:db' }
+    // The column was added; the row without a recorded start fails closed.
+    expect(new CheckoutLease(legacyCheckout, owner).tryAcquire()).toMatchObject({ acquired: false, reason: 'live_host' })
+    const migrated = new Database(checkoutLockPath(canonical))
+    try {
+      const names = (migrated.prepare('PRAGMA table_info(lease)').all() as Array<{ name: string }>).map((column) => column.name)
+      expect(names).toContain('host_start')
+    } finally {
+      migrated.close()
+    }
+    // Once the pid is dead the legacy row is recoverable, and the new row records its generation.
+    const dead = new CheckoutLease(legacyCheckout, owner, { pidAlive: () => false, now: () => Date.now() + LEASE_MS + 1 })
+    expect(dead.tryAcquire()).toMatchObject({ acquired: true, recovered: true })
+    expect(dead.read()!.host_start).toBe(processStartTime(process.pid))
+    dead.release()
   })
 })
 

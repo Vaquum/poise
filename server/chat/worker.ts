@@ -9,8 +9,9 @@
 // leaves a registered group the lease keeps blocking until it is dead, and
 // the gate itself tears the group down when its control descriptor closes.
 
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { CLAUDE_SUBSCRIPTION_CLI, runFile, scrubbedChildEnvironment } from '../process'
 
@@ -130,6 +131,42 @@ export function pgidAlive(pgid: number | null | undefined): boolean {
   try { process.kill(-pgid, 0); return true } catch (error: any) {
     return error?.code !== 'ESRCH'
   }
+}
+
+/** Start time of `pid` as an opaque same-machine token, or null when it
+ *  cannot be read. Linux parses /proc (tick resolution); anything else asks
+ *  ps (one-second resolution). Compared only for equality with the value
+ *  recorded when a lease was acquired, so a reused pid reads as a different
+ *  process. */
+export function processStartTime(pid: number | null | undefined): string | null {
+  if (!pid || !Number.isSafeInteger(pid) || pid <= 0) return null
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      // comm (field 2) may itself hold spaces and parens, so count from its
+      // closing paren: what follows are fields 3 on, and starttime is 22.
+      const afterComm = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)
+      const starttime = afterComm[22 - 3]
+      return starttime && /^\d+$/.test(starttime) ? starttime : null
+    } catch {
+      return null
+    }
+  }
+  try {
+    const started = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 }).trim()
+    return started || null
+  } catch {
+    return null
+  }
+}
+
+let ownStart: string | null | undefined
+
+/** This process's start time, read once: it never changes, and off Linux
+ *  each read spawns ps. */
+export function ownProcessStartTime(): string | null {
+  if (ownStart === undefined) ownStart = processStartTime(process.pid)
+  return ownStart
 }
 
 /** Whether `pid` is still the gate we recorded: its command line must be

@@ -12,10 +12,13 @@
 //
 // Ownership is a random token, never an id: the same session id from a
 // restarted server is a different holder. A live host blocks takeover no
-// matter what its row says. A dead host's row stays busy while the worker
-// group it registered is alive — a surviving child never shares the checkout
-// with a new writer — and only its own instance may clean that up, after
-// verifying the worker is still the gate it recorded.
+// matter what its row says — and "live" means its pid is alive and still
+// the process that acquired the lease (same start time), so a pid the OS
+// reused after a restart never holds a dead lease. A dead host's row stays
+// busy while the worker group it registered is alive — a surviving child
+// never shares the checkout with a new writer — and only its own instance
+// may clean that up, after verifying the worker is still the gate it
+// recorded.
 
 import Database from 'better-sqlite3'
 import { createHash, randomBytes } from 'node:crypto'
@@ -23,7 +26,7 @@ import { chmodSync, mkdirSync } from 'node:fs'
 import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { pgidAlive, pidAlive } from './worker'
+import { ownProcessStartTime, pgidAlive, pidAlive, processStartTime } from './worker'
 
 export const LEASE_MS = 90_000
 export const HEARTBEAT_MS = 20_000
@@ -55,6 +58,7 @@ export interface LeaseRow {
   owner_label: string
   instance: string
   host_pid: number
+  host_start: string | null
   worker_pid: number | null
   worker_pgid: number | null
   worker_ident: string | null
@@ -86,6 +90,7 @@ CREATE TABLE IF NOT EXISTS lease (
   owner_label    TEXT    NOT NULL,
   instance       TEXT    NOT NULL,
   host_pid       INTEGER NOT NULL,
+  host_start     TEXT,
   worker_pid     INTEGER,
   worker_pgid    INTEGER,
   worker_ident   TEXT,
@@ -102,6 +107,17 @@ function openLock(path: string): LockDb {
   const db = new Database(path, { timeout: BUSY_TIMEOUT_MS })
   try { chmodSync(path, 0o600) } catch { /* not ours to tighten */ }
   db.exec(SCHEMA)
+  // Lock files written before host_start keep working: the column is added
+  // once, and rows without it fail closed to the pid check. Two processes
+  // migrating at once race on the ALTER; the loser sees duplicate-column.
+  const columns = db.prepare('PRAGMA table_info(lease)').all() as Array<{ name: string }>
+  if (!columns.some((column) => column.name === 'host_start')) {
+    try {
+      db.exec('ALTER TABLE lease ADD COLUMN host_start TEXT')
+    } catch (error) {
+      if (!(error instanceof Error) || !/duplicate column name/i.test(error.message)) throw error
+    }
+  }
   return db
 }
 
@@ -122,7 +138,10 @@ export interface CheckoutLeaseOptions {
   /** Liveness probes, replaceable in tests. */
   pidAlive?: (pid: number) => boolean
   pgidAlive?: (pgid: number) => boolean
+  /** Process start time for PID-reuse detection; null means unreadable. */
+  processStart?: (pid: number) => string | null
   hostPid?: number
+  hostStart?: string | null
   now?: () => number
 }
 
@@ -139,10 +158,17 @@ export class CheckoutLease {
   constructor(checkout: string, readonly owner: LeaseOwner, options: CheckoutLeaseOptions = {}) {
     this.canonical = canonicalCheckout(checkout)
     this.path = checkoutLockPath(this.canonical)
+    const hostPid = options.hostPid ?? process.pid
+    const processStart = options.processStart ?? processStartTime
     this.probes = {
       pidAlive: options.pidAlive ?? pidAlive,
       pgidAlive: options.pgidAlive ?? pgidAlive,
-      hostPid: options.hostPid ?? process.pid,
+      processStart,
+      hostPid,
+      // The recorded (pid, start) pair always describes one real process:
+      // our own memoized start for our own pid, the claimed pid's start
+      // otherwise (null when it is dead or unreadable, which fails closed).
+      hostStart: options.hostStart ?? (hostPid === process.pid ? ownProcessStartTime() : processStart(hostPid)),
       now: options.now ?? Date.now,
     }
   }
@@ -169,6 +195,7 @@ export class CheckoutLease {
         owner_label: this.owner.ownerLabel,
         instance: this.owner.instance,
         host_pid: this.probes.hostPid,
+        host_start: this.probes.hostStart,
         branch: this.owner.branch ?? null,
         acquired_at: nowIso,
         heartbeat_at: nowIso,
@@ -176,9 +203,9 @@ export class CheckoutLease {
       }
       const insert = () => {
         db.prepare(`
-          INSERT OR REPLACE INTO lease (id, token, checkout, owner_kind, owner_id, owner_label, instance, host_pid,
+          INSERT OR REPLACE INTO lease (id, token, checkout, owner_kind, owner_id, owner_label, instance, host_pid, host_start,
             worker_pid, worker_pgid, worker_ident, branch, acquired_at, heartbeat_at, lease_until)
-          VALUES (1, @token, @checkout, @owner_kind, @owner_id, @owner_label, @instance, @host_pid,
+          VALUES (1, @token, @checkout, @owner_kind, @owner_id, @owner_label, @instance, @host_pid, @host_start,
             NULL, NULL, NULL, @branch, @acquired_at, @heartbeat_at, @lease_until)
         `).run(mine)
         this.token = mine.token
@@ -192,7 +219,7 @@ export class CheckoutLease {
           .run(nowIso, now + LEASE_MS, this.token)
         return { acquired: true, token: this.token, recovered: false }
       }
-      if (this.probes.pidAlive(row.host_pid)) {
+      if (this.hostAlive(row)) {
         return { acquired: false, holder: row, orphan: false, reason: 'live_host' }
       }
       if (row.lease_until >= now) {
@@ -209,6 +236,19 @@ export class CheckoutLease {
       insert()
       return { acquired: true, token: mine.token, recovered: true }
     })
+  }
+
+  /** The row's host is alive only when its pid is alive and still the
+   *  process that acquired the lease: a reused pid with a different start
+   *  time is a dead host. A missing or unreadable start time (rows written
+   *  before host_start, foreign writers, unreadable tables) fails closed
+   *  to the pid check. */
+  private hostAlive(row: LeaseRow): boolean {
+    if (!this.probes.pidAlive(row.host_pid)) return false
+    if (row.host_start == null) return true
+    const start = this.probes.processStart(row.host_pid)
+    if (start == null) return true
+    return start === row.host_start
   }
 
   /** Take over a row whose host is dead but whose worker is verified alive
@@ -228,13 +268,13 @@ export class CheckoutLease {
       if (row.worker_pid !== expected.workerPid || row.worker_pgid !== expected.workerPgid || row.worker_ident !== expected.workerIdent) return false
       if (row.host_pid === this.probes.hostPid) {
         // Our own row (a retried adoption): renew it under a fresh token.
-      } else if (this.probes.pidAlive(row.host_pid)) {
+      } else if (this.hostAlive(row)) {
         return false
       }
       if (!this.probes.pgidAlive(expected.workerPgid) && !this.probes.pidAlive(expected.workerPid)) return false
       const token = newToken()
-      const changed = db.prepare('UPDATE lease SET token = ?, host_pid = ?, heartbeat_at = ?, lease_until = ? WHERE id = 1 AND token = ?')
-        .run(token, this.probes.hostPid, nowIso, now + LEASE_MS, row.token).changes === 1
+      const changed = db.prepare('UPDATE lease SET token = ?, host_pid = ?, host_start = ?, heartbeat_at = ?, lease_until = ? WHERE id = 1 AND token = ?')
+        .run(token, this.probes.hostPid, this.probes.hostStart, nowIso, now + LEASE_MS, row.token).changes === 1
       if (changed) this.token = token
       return changed
     })
