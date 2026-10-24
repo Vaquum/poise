@@ -123,7 +123,8 @@ describe('retained incident actionability', () => {
   const error = `error: pull-request head changed: expected ${'a'.repeat(40)}, got ${'b'.repeat(40)}`
   const incident: BehaviorDeadLetter = { id: 'audit', behavior: 'review-new-prs', target: 'acme/repo#18',
     repo: 'acme/repo', pr: 18, actor: 'review-bot', source: 'poise:review-new-prs',
-    callId: 'd'.repeat(32), correlationId: 'launch', error, createdAt: '2026-10-13T14:09:00Z', attemptCount: 3 }
+    callId: 'd'.repeat(32), correlationId: 'launch', error, createdAt: '2026-10-13T14:09:00Z',
+    resolution: null, resolutionEvidence: null, resolvedAt: null, attemptCount: 3 }
   const call: LogEntry = { id: incident.callId!, repo: incident.repo, pr_id: '18', actor: incident.actor,
     source: incident.source, correlation_id: incident.correlationId, behavior: 'pr_review', model: 'test',
     prompt: '', session_id: null, started_at: '2026-10-13T14:08:00Z', time_elapsed: '4s', status: 'failed',

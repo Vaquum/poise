@@ -33,6 +33,38 @@ export function discardDirectBehaviorRun(id: string): void {
   activeDirectRuns.delete(id)
 }
 
+// A direct run finishes inside its own tick, bounded by the 65 s PR
+// operation lease. Past an hour it cannot still be alive: its owner died
+// without reaching its finally. Only rows this process does not own are
+// touched, so a live run is never closed; a concurrent finish wins over
+// the reap, since it no longer matches `running`.
+export const DIRECT_RUN_ABANDONED_AFTER_MS = 60 * 60_000
+
+export function reapAbandonedDirectBehaviorRuns(nowMs = Date.now()): string[] {
+  const cutoff = (nowMs - DIRECT_RUN_ABANDONED_AFTER_MS) / 1000
+  const stale = db.prepare(`
+    SELECT id, started_at FROM behavior_runs
+    WHERE status = 'running' AND unixepoch(started_at, 'subsec') < ?
+  `).all(cutoff) as Array<{ id: string, started_at: string }>
+  const close = db.prepare(`
+    UPDATE behavior_runs SET status = 'interrupted', note = ?
+    WHERE id = ? AND status = 'running'
+  `)
+  const reaped: string[] = []
+  db.transaction(() => {
+    for (const row of stale) {
+      if (activeDirectRuns.has(row.id)) continue
+      // The actual completion is unknown, so completed_at stays null and
+      // the duration with it: an October run reaped today must not look
+      // like a four-day run. `interrupted` belongs to neither the success
+      // nor the failure set, so the success rate skips it too.
+      close.run(`abandoned: started ${row.started_at}, older than the 1 h bound, no live owner in this process`, row.id)
+      reaped.push(row.id)
+    }
+  })()
+  return reaped
+}
+
 const AGENT_BEHAVIORS = {
   'review-new-prs': 'pr_review', 'approve-prs': 'pr_approve', 'review-new-issues': 'issue_review',
 } as const

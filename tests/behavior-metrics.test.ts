@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { computeBehaviorMetrics, discardDirectBehaviorRun, finishDirectBehaviorRun, readBehaviorMetrics, startDirectBehaviorRun } from '../server/behavior-metrics'
+import { computeBehaviorMetrics, discardDirectBehaviorRun, finishDirectBehaviorRun, readBehaviorMetrics, reapAbandonedDirectBehaviorRuns, startDirectBehaviorRun } from '../server/behavior-metrics'
 import { db } from '../server/db'
 import type { LogEntry } from '../server/agent'
 
@@ -61,6 +61,44 @@ describe('behavior run metrics', () => {
       .run('previous-process', 'merge-prs', '2026-10-17T10:00:00Z')
     expect(readBehaviorMetrics([], window, null).behaviors['merge-prs'])
       .toEqual({ totalRuns: 1, durationMinutes: null, successRate: null })
+  })
+
+  it('reaps abandoned direct runs as interrupted with the evidence recorded, never deleted', () => {
+    const insert = db.prepare('INSERT INTO behavior_runs(id, behavior, started_at) VALUES (?, ?, ?)')
+    insert.run('oct-18-a', 'resolve-unblocking', '2026-10-18T20:24:33Z')
+    insert.run('oct-18-b', 'resolve-unblocking', '2026-10-18T22:47:10Z')
+    insert.run('fresh', 'resolve-unblocking', '2026-10-22T12:00:00Z')
+    const owned = startDirectBehaviorRun('merge-prs')
+    db.prepare('UPDATE behavior_runs SET started_at = ? WHERE id = ?')
+      .run('2026-10-18T20:24:33Z', owned)
+
+    expect(reapAbandonedDirectBehaviorRuns(Date.parse('2026-10-22T12:00:01Z')).sort())
+      .toEqual(['oct-18-a', 'oct-18-b'])
+    expect(db.prepare('SELECT count(*) FROM behavior_runs').pluck().get()).toBe(4)
+    const state = (id: string) => db.prepare(
+      'SELECT status, completed_at, note FROM behavior_runs WHERE id = ?').get(id)
+    expect(state('oct-18-a')).toEqual({
+      status: 'interrupted', completed_at: null, note: expect.stringContaining('2026-10-18T20:24:33Z'),
+    })
+    expect(state('oct-18-b')).toEqual({
+      status: 'interrupted', completed_at: null, note: expect.stringContaining('2026-10-18T22:47:10Z'),
+    })
+    expect(state('fresh')).toEqual({ status: 'running', completed_at: null, note: null })
+    expect(state(owned)).toEqual({ status: 'running', completed_at: null, note: null })
+    // A second pass is quiet: reaping is idempotent.
+    expect(reapAbandonedDirectBehaviorRuns(Date.parse('2026-10-22T12:00:01Z'))).toEqual([])
+    finishDirectBehaviorRun(owned, true)
+  })
+
+  it('excludes interrupted runs from the success rate with unknown duration in both calculators', () => {
+    const runs = [run('completed'), run('interrupted', undefined, null)]
+    expect(computeBehaviorMetrics(runs, window))
+      .toEqual({ totalRuns: 2, durationMinutes: null, successRate: 100 })
+    const insert = db.prepare('INSERT INTO behavior_runs(id, behavior, started_at, completed_at, status) VALUES (?, ?, ?, ?, ?)')
+    insert.run('done', 'merge-prs', '2026-10-17T10:00:00Z', '2026-10-17T10:02:00Z', 'completed')
+    insert.run('cut', 'merge-prs', '2026-10-17T10:00:00Z', null, 'interrupted')
+    expect(readBehaviorMetrics([], window, null).behaviors['merge-prs'])
+      .toEqual(computeBehaviorMetrics(runs, window))
   })
 
   it('aggregates indexed windows with the same boundaries, durations and outcomes as agent runs', () => {
