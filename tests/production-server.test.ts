@@ -461,6 +461,18 @@ describe('production server', () => {
     await fetch(url, { method: 'POST', headers, body: JSON.stringify({ agentAccount: 'bit-mis' }) })
   })
 
+  it('serves the shared check-slot budget on the health endpoint', async () => {
+    const url = `${baseUrl}/api/settings`
+    const headers = { 'Content-Type': 'application/json' }
+    const readCap = async () => (((await (await fetch(`${baseUrl}/api/health`)).json()) as { scheduler: { checkSlots: { cap: number } } }).scheduler.checkSlots.cap)
+    const before = ((await (await fetch(url)).json()) as { chat: { maxConcurrentLocalTurns: number } }).chat.maxConcurrentLocalTurns
+    expect(await readCap()).toBe(before)
+    await fetch(url, { method: 'POST', headers, body: JSON.stringify({ chat: { maxConcurrentLocalTurns: 2 } }) })
+    expect(await readCap()).toBe(2)
+    await fetch(url, { method: 'POST', headers, body: JSON.stringify({ chat: { maxConcurrentLocalTurns: before } }) })
+    expect(await readCap()).toBe(before)
+  })
+
   it('tells the chat runtime when saved settings include the chat cap', async () => {
     const url = `${baseUrl}/api/settings`
     const headers = { 'Content-Type': 'application/json' }

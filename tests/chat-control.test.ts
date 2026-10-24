@@ -13,7 +13,7 @@ import type { Capabilities, ChatEnvelope, ChatEvent, PromptInput, ServerFrame, S
 import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
 import type { ChatRuntime } from '../server/chat/runtime'
-import type { ChatControl, CiObservation, ReviewsCursor, ReviewsObservation, WorkTargetStatus } from '../server/chat/control'
+import type { ChatControl, CiObservation, MergeWakeObservation, ReviewsCursor, ReviewsObservation, WorkTargetStatus } from '../server/chat/control'
 
 vi.mock('../server/claude-auth', () => ({ claudeAuth: { snapshot: () => ({ status: 'authenticated' }), requireReady: async () => {} } }))
 const executeFile = promisify(execFile)
@@ -39,6 +39,7 @@ const ci = vi.fn<() => Promise<CiObservation>>()
 const targetStatus = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }) => Promise<WorkTargetStatus>>()
 const reviews = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }, cursor?: ReviewsCursor) => Promise<ReviewsObservation | null>>()
 const ownsBehind = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }, ci: CiObservation, status: WorkTargetStatus) => boolean>()
+const mergeWake = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }) => Promise<MergeWakeObservation | null>>()
 
 function adapterWith(capabilities: Capabilities) {
   return function adapter(host: AdapterHost): Adapter {
@@ -118,6 +119,10 @@ async function observeReviews(target: string): Promise<void> {
   await control.tick()
   await until(() => store.observation(runtime.instance, `reviews:${target}`)?.checked_at === clock)
 }
+async function observeMergeWake(target: string): Promise<void> {
+  await control.tick()
+  await until(() => store.observation(runtime.instance, `merge-wake:${target}`)?.checked_at === clock)
+}
 async function config(id: string) {
   const context = await control.context(id)
   const path = /"([^"\n]+\.json)"/.exec(context)?.[1]
@@ -154,7 +159,7 @@ async function restart() {
   const stopped = runtime.stop()
   await control.stop(stopped)
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake })
   control.attach(server)
   await runtime.recover()
   control.start()
@@ -177,10 +182,11 @@ beforeEach(async () => {
   targetStatus.mockReset().mockResolvedValue('open')
   reviews.mockReset().mockResolvedValue(null)
   ownsBehind.mockReset().mockReturnValue(false)
+  mergeWake.mockReset().mockResolvedValue(null)
   instance = `control:${randomUUID()}`
   workspaceRoot = join(root, randomUUID())
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake })
   server = createServer((req, res) => {
     if (req.url === '/api/chat/control') { void control.handle(req, res); return }
     res.setHeader('Content-Type', 'application/json')
@@ -454,7 +460,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       { name: 'Queued', state: 'queued', conclusion: null }, { name: 'Running', state: 'in_progress', conclusion: null },
       { name: 'Failure', state: 'completed', conclusion: 'failure', url: 'https://github.com/acme/app/actions/runs/1' },
       { name: 'Legacy', state: 'error' },
-    ], mergeable: false, mergeable_state: 'dirty', author: 'other', draft: false, base: 'main' }), stderr: '' })
+    ], mergeable: false, mergeable_state: 'dirty', author: 'other', draft: false, base: 'main', state: 'open', merged: false }), stderr: '' })
     const target = store.workTarget('https://github.com/acme/app/pull/9')
     const observed = await readWorkCi(target)
     expect(observed.failing.map(c => c.name)).toEqual(['Failure', 'Legacy'])
@@ -465,10 +471,20 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(observed.author).toBe('other')
     expect(observed.draft).toBe(false)
     expect(observed.base).toBe('main')
+    expect(observed.state).toBe('open')
+    expect(observed.merged).toBe(false)
     run.mockResolvedValue({ stdout: JSON.stringify({ repository: 'acme/other', pull_number: 9, head_sha: 'b'.repeat(40), failing: [] }), stderr: '' })
     await expect(readWorkCi(target)).rejects.toThrow('invalid CI evidence')
     run.mockResolvedValue({ stdout: JSON.stringify({ repository: 'acme/app', pull_number: 9, head_sha: 'b'.repeat(40), failing: [], mergeable: 'yes' }), stderr: '' })
     await expect(readWorkCi(target)).rejects.toThrow('invalid merge evidence')
+    run.mockResolvedValue({ stdout: JSON.stringify({ repository: 'acme/app', pull_number: 9, head_sha: 'b'.repeat(40), failing: [], state: 'unknown' }), stderr: '' })
+    await expect(readWorkCi(target)).rejects.toThrow('invalid pull state')
+    run.mockResolvedValue({ stdout: JSON.stringify({ repository: 'acme/app', pull_number: 9, head_sha: 'b'.repeat(40), failing: [], merged: 'no' }), stderr: '' })
+    await expect(readWorkCi(target)).rejects.toThrow('invalid pull state')
+    run.mockResolvedValue({ stdout: JSON.stringify({ repository: 'acme/app', pull_number: 9, head_sha: 'b'.repeat(40), failing: [] }), stderr: '' })
+    const legacy = await readWorkCi(target)
+    expect(legacy.state).toBeUndefined()
+    expect(legacy.merged).toBeUndefined()
     run.mockRestore()
   })
 
@@ -482,7 +498,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
     const old = await config(second.id)
     await control.stop()
-    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind }); control.attach(server); control.start()
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake }); control.attach(server); control.start()
     const response = await fetch(`${origin}/api/chat/control`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Poise-Chat': second.id, Authorization: `Bearer ${old.token}` }, body: '{"operation":"list"}' })
     expect(response.status).toBe(403)
   })
@@ -496,6 +512,8 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_error)
       VALUES(?, ?, ?, ?, ?, ?)`).run('rerun-grey-ci', 'acme/app#44:workflow', new Date().toISOString(), 'acme/app', 44, 'Rerun failed')
     await control.tick()
+    // The pass runs behind the tick: one behavior row plus the degraded row.
+    await until(() => store.inbox(runtime.instance, parent.id).length === 2)
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('Review failed')
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('Rerun failed')
     expect(store.inbox(runtime.instance, parent.id).map(m => m.body).join('\n')).toContain('ci_unavailable')
@@ -593,6 +611,71 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(prompts.has(parent.id)).toBe(false)
   })
 
+  it('wakes the Manager once when a worker-bound PR merges, with the closed issue and its dependents', async () => {
+    const parent = await manager()
+    const created = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Implement the fix' })
+    const worker = (created.session as { id: string }).id
+    await command(worker, { operation: 'bind', target: 'https://github.com/acme/app/pull/120' })
+    targetStatus.mockResolvedValue('merged')
+    mergeWake.mockResolvedValue({ found: true, title: 'Fix the audit gate', closesVia: 'closing-references', truncated: false,
+      closed: [{ repo: 'acme/app', number: 7, title: 'The fix', url: 'https://github.com/acme/app/issues/7', state: 'closed' }],
+      dependents: [
+        { repo: 'acme/app', number: 9, title: 'Blocked work', url: 'https://github.com/acme/app/issues/9', via: ['blocked-by'] },
+        { repo: 'acme/app', number: 10, title: 'Listed work', url: 'https://github.com/acme/app/issues/10', via: ['depends-on'] },
+        { repo: 'acme/app', number: 11, title: 'Both work', url: 'https://github.com/acme/app/issues/11', via: ['blocked-by', 'depends-on'] },
+      ] })
+    await control.tick()
+    await until(() => prompts.has(parent.id))
+    expect(prompts.get(parent.id)).toHaveLength(1)
+    expect(prompts.get(parent.id)![0].text).toContain('worker_pr_merged')
+    const inbox = store.inbox(runtime.instance, parent.id)
+    expect(inbox).toHaveLength(1)
+    expect(inbox[0].sender).toBe('Poise work monitor')
+    const notice = JSON.parse(inbox[0].body) as Record<string, unknown>
+    expect(notice).toMatchObject({ kind: 'worker_pr_merged', target: 'https://github.com/acme/app/pull/120',
+      worker, workerTitle: 'Worker', title: 'Fix the audit gate', closesVia: 'closing-references', truncated: false })
+    expect(notice.closedIssues).toHaveLength(1)
+    expect((notice.closedIssues as Array<Record<string, unknown>>)[0]).toMatchObject({ number: 7, state: 'closed' })
+    expect((notice.dependentIssues as Array<Record<string, unknown>>).map(dependent => dependent.number)).toEqual([9, 10, 11])
+    expect(ci).not.toHaveBeenCalled()
+    finishes.get(parent.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(parent.id)?.status === 'idle')
+    clock += 5 * 60_000
+    await control.tick()
+    await until(() => store.observation(runtime.instance, 'behavior:https://github.com/acme/app/pull/120')?.checked_at === clock)
+    expect(mergeWake).toHaveBeenCalledTimes(1)
+    expect(prompts.get(parent.id)).toHaveLength(1)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+  }, 30_000)
+
+  it('wakes no one when a PR merges outside any worker', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/121' })
+    targetStatus.mockResolvedValue('merged')
+    mergeWake.mockResolvedValue({ found: true, title: 'Lone fix', closesVia: 'closing-references', truncated: false, closed: [], dependents: [] })
+    await observeMergeWake('https://github.com/acme/app/pull/121')
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+    expect(store.observation(runtime.instance, 'merge-wake:https://github.com/acme/app/pull/121')?.fingerprint).toBe('')
+  })
+
+  it('keeps the unsettled merge-wake baseline until the datastore sees the merge evidence', async () => {
+    const parent = await manager()
+    const created = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Implement the fix' })
+    const worker = (created.session as { id: string }).id
+    await command(worker, { operation: 'bind', target: 'https://github.com/acme/app/pull/122' })
+    targetStatus.mockResolvedValue('merged')
+    mergeWake.mockResolvedValue(null)
+    await observeMergeWake('https://github.com/acme/app/pull/122')
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(store.observation(runtime.instance, 'merge-wake:https://github.com/acme/app/pull/122')?.fingerprint).toBe('')
+    mergeWake.mockResolvedValue({ found: true, title: 'Late fix', closesVia: 'closing-references', truncated: false, closed: [], dependents: [] })
+    clock += 5 * 60_000
+    await control.tick()
+    await until(() => prompts.has(parent.id))
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+  }, 30_000)
+
   it('wakes once for a human comment on a closed PR', async () => {
     const parent = await manager()
     await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/102' })
@@ -610,6 +693,122 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(prompts.get(parent.id)).toHaveLength(1)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
   }, 30_000)
+
+  it('starts no turn for behavior, CI or review notices on a merged PR the datastore still shows open', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/130'
+    await command(parent.id, { operation: 'bind', target })
+    // The datastore lags the merge; the live pull read already sees it.
+    targetStatus.mockResolvedValue('open')
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }],
+      state: 'closed', merged: true })
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [{ id: 'R_9', author: 'reviewer', state: 'CHANGES_REQUESTED' }],
+      threads: [{ thread: 'T_9', resolved: false, outdated: false, comments: [{ id: 'C_9', author: 'reviewer' }] }] })
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id,launch_outcome,launch_action)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('approve-prs', 'acme/app#130:check', new Date().toISOString(), 'acme/app', 130, 'pr_review', 'a1'.repeat(16), 'changes_requested', 'requested_changes')
+    await control.tick()
+    await until(() => store.observation(runtime.instance, `behavior:${target}`)?.checked_at === clock)
+    await until(() => store.observation(runtime.instance, `ci:${target}`)?.checked_at === clock)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+    expect(store.observation(runtime.instance, `ci-state:${target}`)?.fingerprint).toBe('merged')
+    // A throttled tick reuses the persisted live state, a fresh tick re-reads it.
+    await control.tick()
+    await until(() => store.observation(runtime.instance, `behavior:${target}`)?.checked_at === clock)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    clock += 5 * 60_000
+    await control.tick()
+    await until(() => store.observation(runtime.instance, `behavior:${target}`)?.checked_at === clock)
+    await until(() => store.observation(runtime.instance, `ci:${target}`)?.checked_at === clock)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+  })
+
+  it('wakes the Manager when a live-merged PR lands its datastore evidence, never the worker', async () => {
+    const parent = await manager()
+    const created = await command(parent.id, { operation: 'create', title: 'Worker', task: 'Implement the fix' })
+    const worker = (created.session as { id: string }).id
+    await control.tick()
+    await until(() => prompts.has(worker))
+    const target = 'https://github.com/acme/app/pull/134'
+    await command(worker, { operation: 'bind', target })
+    targetStatus.mockResolvedValue('open')
+    mergeWake.mockResolvedValue(null)
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [], state: 'closed', merged: true })
+    const monitorRows = () => store.inbox(runtime.instance, worker).filter(row => row.sender === store.WORK_MONITOR_SENDER)
+    await control.tick()
+    await until(() => store.observation(runtime.instance, `behavior:${target}`)?.checked_at === clock)
+    expect(monitorRows()).toHaveLength(0)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    mergeWake.mockResolvedValue({ found: true, title: 'Merged fix', closesVia: 'closing-references', truncated: false, closed: [], dependents: [] })
+    clock += 5 * 60_000
+    await control.tick()
+    await until(() => store.observation(runtime.instance, `merge-wake:${target}`)?.checked_at === clock)
+    await control.tick()
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    await until(() => prompts.has(parent.id))
+    expect(JSON.parse(store.inbox(runtime.instance, parent.id)[0].body)).toMatchObject({ kind: 'worker_pr_merged' })
+    expect(monitorRows()).toHaveLength(0)
+    expect(prompts.get(worker)).toHaveLength(1)
+  }, 30_000)
+
+  it('stays silent when CI recovers green on a merged PR', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/131'
+    targetStatus.mockResolvedValue('open')
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }],
+      state: 'open', merged: false })
+    await command(parent.id, { operation: 'bind', target })
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [], state: 'closed', merged: true })
+    clock += 5 * 60_000
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
+    expect(JSON.parse(store.inbox(runtime.instance, parent.id)[0].body)).toMatchObject({ kind: 'ci' })
+  })
+
+  it('delivers no new notices after a restart when PR state is unchanged', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/132'
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }],
+      state: 'open', merged: false })
+    reviews.mockResolvedValue({ found: true, truncated: false, reviews: [{ id: 'R_2', author: 'reviewer', state: 'CHANGES_REQUESTED' }],
+      threads: [] })
+    database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id,launch_outcome,launch_action)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`).run('approve-prs', 'acme/app#132:check', new Date().toISOString(), 'acme/app', 132, 'pr_review', 'a2'.repeat(16), 'changes_requested', 'requested_changes')
+    await command(parent.id, { operation: 'bind', target })
+    await control.tick()
+    await until(() => store.inbox(runtime.instance, parent.id).length === 3)
+    await control.tick()
+    await until(() => prompts.has(parent.id))
+    const turns = prompts.get(parent.id)!.length
+    await restart()
+    clock += 5 * 60_000
+    await control.tick()
+    await until(() => store.observation(runtime.instance, `behavior:${target}`)?.checked_at === clock)
+    await until(() => store.observation(runtime.instance, `ci:${target}`)?.checked_at === clock)
+    await until(() => store.observation(runtime.instance, `reviews:${target}`)?.checked_at === clock)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(3)
+    expect(prompts.get(parent.id)).toHaveLength(turns)
+  }, 30_000)
+
+  it('stays silent across a CI outage after restart for a merged PR', async () => {
+    const parent = await manager()
+    const target = 'https://github.com/acme/app/pull/133'
+    targetStatus.mockResolvedValue('open')
+    ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }],
+      state: 'closed', merged: true })
+    await command(parent.id, { operation: 'bind', target })
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    await restart()
+    ci.mockRejectedValue(new Error('GitHub access unavailable'))
+    clock += 5 * 60_000
+    await observeCi(target)
+    expect(store.inbox(runtime.instance, parent.id)).toHaveLength(0)
+    expect(prompts.has(parent.id)).toBe(false)
+  })
 
   it('wakes a session once when a check fails on its pull request', async () => {
     const parent = await manager()

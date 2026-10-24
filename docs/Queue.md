@@ -50,18 +50,18 @@ SQLite transactions and stable request IDs. A lost acknowledgement can be
 retried with the same identity, including after a task completed or was removed.
 
 A successful completed turn advances the queue. Pending permissions/questions
-are still part of the current turn. Stop, a failed turn, or a crash with a
-turn in flight pauses the tail rather than silently treating interruption as
-success. The interrupted item remains visibly not completed and is not
-automatically retried; remaining waiting items proceed after the next
-successful task you send, and a fresh task is always admitted past unarmed or
-failed queue items. A restart or release switch starts the waiting items of
-an idle chat whose last turn completed, instead of leaving them stranded.
-After a stopped or failed turn, while delivery is paused, or before the first
-task ever runs, the tail still waits for the next successful task, as do
-queues with a running, failed or interrupted turn. Restart recovery continues
-an already-armed but not-yet-started task, never an uncertain in-flight
-one. Queues are not copied into independent forks.
+are still part of the current turn. Stop or a failed turn pauses the tail
+rather than silently treating interruption as success. The interrupted
+item remains visibly not completed and is not automatically retried; remaining
+waiting items proceed after the next successful task you send, and a fresh
+task is always admitted past unarmed or failed queue items. A crash with a
+turn in flight interrupts the turn without retrying it, and the waiting
+follow-ups continue after the restart unless the chat was stopped. A restart
+or release switch also starts the waiting items of an idle chat whose last
+turn completed; after a stopped or failed turn, while delivery is paused, or
+before the first task ever runs, the tail still waits for the next successful
+task. Restart recovery continues an already-armed but not-yet-started task,
+never an uncertain in-flight one. Queues are not copied into independent forks.
 
 ## Verification
 

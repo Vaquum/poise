@@ -335,6 +335,26 @@ already aborted by lease loss requires verified native-worker termination before
 releasing its checkout.
 A recorded failed Muse decision ends the turn with a visible error
 instead of retaining an unanswerable request and checkout lease.
+Relay and gate identity never names the install directory: verification
+matches the `scripts/chat-relay.mjs` or `scripts/chat-worker-gate.mjs`
+script carrying its recorded random ident, so a new release adopts relays
+and workers still running from the previous release. A handoff that never
+reaches LIVE within a minute fails instead of hanging: the turn is
+interrupted and its processes are terminated through the same verified
+path as Stop. An adopted turn's pre-restart relay and agent retire when
+the turn settles, so no old-release relay outlives its adoption and the
+next prompt starts a fresh relay that resumes the same native session. A
+Stop asked before the restart is finished, never adopted: shutdown
+terminates a stopped turn instead of handing it over, and recovery
+terminates it instead of replaying it. Waiting follow-ups stranded by an
+interruption continue on their own once recovery clears the way; the
+interrupted in-flight turn itself is never retried, and a person's Stop
+still holds its chat until the person sends again. An agent that is
+demonstrably alive but unverifiable keeps its turn open and counted,
+with its rows kept for the next restart to retry, instead of being
+interrupted while it runs unseen. A session whose scratch checkout sits
+on an agent-cut branch with uncommitted work checkpoints that work as
+its own instead of refusing with dirty_unowned.
 
 - **Releases.** The image carries one release, Poise (`/opt/poise`) and
   Caller's relocatable virtualenv (`/opt/caller/venv`), and labels it

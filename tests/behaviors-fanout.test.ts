@@ -1,6 +1,14 @@
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
+import { CheckSemaphore } from '../server/check-semaphore'
 import { mocks, pr, HEAD_SHA, loadModules, arrangeCli, datastoreHealthOutput, fixture, deferred } from './behaviors-runtime-fixture'
+
+// This file pins CLI batching, cursors and prepare pooling, not the shared
+// launch budget: an open budget lets every eligible PR launch, and
+// behaviors-check-slots pins the default budget instead.
+function openLaunchBudget(runtime: { setBehaviorCheckSlots(slots: CheckSemaphore): void }): void {
+  runtime.setBehaviorCheckSlots(new CheckSemaphore(() => 64))
+}
 
 function openPrs(count: number, repo = pr.repo, start = 17): typeof fixture.listedPrs {
   return Array.from({ length: count }, (_, index) => ({
@@ -48,6 +56,7 @@ describe('behavior tick spawn budget', () => {
     ]))
     db.setMeta('behavior_approve_prs_enabled', '1')
     db.setMeta('behavior_resolve_unblocking_enabled', '1')
+    openLaunchBudget(runtime)
 
     await runtime.runEnabledBehaviorsOnce()
 
@@ -86,6 +95,7 @@ describe('approve-prs cursor rotation', () => {
     db.setMeta('me', 'poise-user')
     db.setMeta('behavior_approve_prs_enabled', '1')
     db.setMeta('behavior_approve_prs_cursor', `${pr.repo}#19`)
+    openLaunchBudget(runtime)
 
     await runtime.runEnabledBehaviorsOnce()
 
@@ -126,6 +136,7 @@ describe('review-new-prs prepare pool', () => {
     db.setMeta('behavior_review_new_prs_enabled', '1')
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
+    openLaunchBudget(runtime)
 
     await runtime.runEnabledBehaviorsOnce()
 

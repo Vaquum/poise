@@ -7,6 +7,8 @@ const LIBRARY_LIMITS = { count: 65_536, contentBytes: 1024 * 1024, totalBytes: 1
 export const RESERVED_SWITCHES = new Set(['create', 'model', 'review', 'queue', 'compact', 'reset', 'mode', 'fork', 'poise', 'context', 'clear', 'help', 'always-approve', 'deep-research', 'content', 'consensus'])
 /** The built-in snippet: the Manager's charter, used as /manager. */
 export const MANAGER_SWITCH = 'manager'
+/** The built-in snippet: a worker's charter, used as /worker. */
+export const WORKER_SWITCH = 'worker'
 export function switchName(value: string): string {
   const name = value.replace(/^\//, '').toLowerCase()
   if (!/^[a-z][a-z0-9_-]{0,63}$/.test(name)) throw new Error('Use a switch name starting with a letter, followed by letters, numbers, hyphens or underscores (up to 64 characters).')

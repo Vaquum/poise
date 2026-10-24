@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { CheckSemaphore } from '../server/check-semaphore'
 import { CATALOG_STDOUT, PRE_ISSUE_REVIEW_CATALOG } from './model-catalog-fixture'
 
 const mocks = vi.hoisted(() => ({
@@ -21,6 +22,7 @@ vi.mock('../server/behavior-ledger', () => ({
 vi.mock('../server/process', () => ({
   runFile: mocks.runFile,
   spawnDetached: mocks.spawnDetached,
+  runningCallerLaunches: () => 0,
   claudeSubscriptionEnvironment: () => ({ CLAUDE_CLI: '/poise/claude-subscription' }),
 }))
 vi.mock('../server/claude-auth', () => ({
@@ -264,6 +266,8 @@ describe('Review New Issues', () => {
       return original(command, scoped)
     })
     expect(behaviors.getIssueRepositories()).toEqual([{ repo: REPO, since }, { repo: betaRepo, since }])
+    // This test pins multi-account scoping, not the shared launch budget.
+    behaviors.setBehaviorCheckSlots(new CheckSemaphore(() => 64))
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches()).toHaveLength(4)
     expect(launches().map((args) => flag(args, '--issue-review')).sort()).toEqual([
@@ -361,6 +365,20 @@ describe('Review New Issues', () => {
     await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches().map((args) => args[1])).toEqual([`${REPO}#452`, `${REPO}#452`, `${REPO}#452`, `${REPO}#453`])
+  })
+
+  it('stops the scan when the shared budget is full and launches once it drains', async () => {
+    const { behaviors } = await start()
+    issues = [issue(452), issue(453)]
+    const slots = behaviors.getBehaviorCheckSlots()
+    const held = [slots.tryAcquire('background'), slots.tryAcquire('background'), slots.tryAcquire('background')]
+    expect(held.every(Boolean)).toBe(true)
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(0)
+    expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
+    for (const release of held) release!()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches().map((args) => args[1])).toEqual([`${REPO}#452`, `${REPO}#453`])
   })
 
   it('completes a commented review and never reviews that issue again', async () => {

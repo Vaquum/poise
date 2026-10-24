@@ -1,7 +1,8 @@
 // Durable queue and delivery receipts. The browser never pumps this queue.
 // Claiming and reserving a turn are one SQLite transaction; a crashed or
 // failed attempt is visible, never silently re-executed. Idle enqueue does
-// not arm anything: only a completed turn can advance the queue.
+// not arm anything: only a completed turn advances the queue, except
+// recovery re-arming follow-ups a restart stranded.
 import { db } from '../db'
 import type { MessageQueue, QueuedMessage } from './protocol'
 
@@ -119,15 +120,15 @@ export function settleQueuedTurn(sessionId: string, turnId: string, completed: b
 export function pauseQueue(sessionId: string): void {
   if (readQueue(sessionId).ready) bump(sessionId, false)
 }
-/** Restart recovery arms an idle chat's untouched queue so its waiting items
- *  start instead of sitting silently. A queue with a running or failed item
- *  stays paused: only never-started items arm, and an interrupted attempt is
- *  never re-executed. Returns true when this call armed the queue. */
-export function armWaitingQueue(sessionId: string): boolean {
+/** Arm a queue that holds waiting follow-ups so the scheduler dispatches
+ *  them. Only recovery calls this: a restart stranded follow-ups whose
+ *  preceding turn was interrupted instead of completed, and nothing else
+ *  ever re-arms them. The interrupted in-flight item itself stays failed
+ *  and is never retried. True when the queue is armed afterwards. */
+export function armQueue(sessionId: string): boolean {
   const queue = readQueue(sessionId)
-  if (queue.ready || queue.items.some(item => item.state === 'running' || item.state === 'failed')) return false
   if (!queue.items.some(item => item.state === 'waiting')) return false
-  bump(sessionId, true)
+  if (!queue.ready) bump(sessionId, true)
   return true
 }
 export function deleteMessageQueue(sessionId: string): void {

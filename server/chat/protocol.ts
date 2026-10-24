@@ -170,8 +170,8 @@ export interface SessionRecord {
   forkedFrom?: string
   /** The chat that created this one through the control create operation, frozen at creation. Never copied by fork. */
   createdBy?: ChatActor
-  /** The one workspace Manager. Set at creation; never changes; read from the chat_sessions.role column. */
-  role?: 'manager'
+  /** The one workspace Manager, or a worker. Set at creation; never changes; read from the chat_sessions.role column. */
+  role?: 'manager' | 'worker'
   /** The Manager's catalogue model was retired; every turn is refused until set_model picks one. */
   retiredModel?: string
   /** Which Poise server owns the session: `poise-dev:<db>` or `poise-prod:<db>`. */
@@ -180,6 +180,10 @@ export interface SessionRecord {
   interruptedTurnId?: string
   /** Set when the session's worker could not be verified for cleanup. */
   orphanNotice?: string
+  /** A Stop was asked for this turn and it has not settled since. Shutdown
+   *  terminates it instead of handing it over, and recovery terminates it
+   *  instead of adopting it; a new turn clears the marker. */
+  stopRequestedTurnId?: string
   /** Optional context handed over at creation (card, document, another session). */
   context?: SessionContext
   /** The subject this session belongs to; at most one session per subject. */
@@ -307,7 +311,7 @@ export interface PlanEntry {
  *  action happens: `title` is the acting chat's title at that moment, at
  *  most 200 characters, and `role` is copied from its `SessionRecord.role`,
  *  so only the workspace Manager ever renders as the Manager. */
-export interface ChatActor { kind: 'chat', sessionId: string, title: string, role?: 'manager' }
+export interface ChatActor { kind: 'chat', sessionId: string, title: string, role?: 'manager' | 'worker' }
 /** Poise itself acting on a chat: supervision, the work monitor, or a relay. */
 export interface PoiseActor { kind: 'poise', name: string }
 /** The person, acting from the browser: a Stop, a hold, or a timer they set. */
@@ -452,8 +456,8 @@ export interface NewSessionRequest {
   deferStart?: boolean
   autoMerge?: boolean
   safeMode?: boolean
-  /** Only POST /api/chat/sessions with a browser Origin passes it; never with repo, branch, checkout or context. */
-  role?: 'manager'
+  /** Only POST /api/chat/sessions with a browser Origin passes it; a Manager never arrives with repo, branch, checkout or context. */
+  role?: 'manager' | 'worker'
   /** Create (or adopt) the subject's session instead of a fresh one. */
   subject?: ChatSubject
   /** Skip reading the earlier conversation when creating for a subject. */

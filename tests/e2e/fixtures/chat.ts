@@ -210,7 +210,8 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
         repo: '', checkout: '/poise/.poise-chat/workspace', workspaceKind: 'poise-local', title: req2.title || '', status: req2.deferStart ? 'idle' : 'starting', createdAt: new Date().toISOString(),
         branch: { name: 'chat/generated', origin: 'new', provisional: true },
         ...(req2.subject ? { subject: req2.subject } : {}),
-        ...(req2.role === 'manager' ? { role: 'manager' as const, title: 'Manager' } : {}) })
+        ...(req2.role === 'manager' ? { role: 'manager' as const, title: 'Manager' } : {}),
+        ...(req2.role === 'worker' ? { role: 'worker' as const } : {}) })
       state.sessions.unshift(created)
       state.history[created.id] = []
       await route.fulfill({ status: 201, json: { session: created, ...(req2.subject ? { existing: false } : {}) } })

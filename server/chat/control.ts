@@ -11,8 +11,9 @@ import { diagnostic } from '../logging'
 import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from '../release-background'
 import { POISE_ROOT } from './local-workspace'
 import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
+import { WORKER_SNIPPET_DEFAULT } from './worker-default'
 import { ensureSnippetSwitch, readSwitch } from '../snippet-library'
-import { MANAGER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
 import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-receipts'
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
@@ -66,6 +67,8 @@ export interface CiObservation {
   head: string, pending?: boolean, failing: Array<{ name: string, state: string, conclusion?: string | null, url?: string | null }>,
   /** Merge state from the same get_pull response: null while GitHub is still computing it. Absent from older Caller output. */
   mergeable?: boolean | null, mergeableState?: string | null, author?: string, draft?: boolean, base?: string,
+  /** Pull state from the same get_pull response. Absent from older Caller output. */
+  state?: string, merged?: boolean,
 }
 /** One existing Caller primitive; no job-log reads or new GitHub client. */
 export async function readWorkCi(target: store.WorkTarget): Promise<CiObservation> {
@@ -81,11 +84,15 @@ export async function readWorkCi(target: store.WorkTarget): Promise<CiObservatio
   const author = 'author' in value ? value.author : undefined
   const draft = 'draft' in value ? value.draft : undefined
   const base = 'base' in value ? value.base : undefined
+  const state = 'state' in value ? value.state : undefined
+  const merged = 'merged' in value ? value.merged : undefined
   if ((mergeable !== undefined && mergeable !== null && typeof mergeable !== 'boolean')
     || (mergeableState !== undefined && mergeableState !== null && typeof mergeableState !== 'string')
     || (author !== undefined && typeof author !== 'string')
     || (draft !== undefined && typeof draft !== 'boolean')
     || (base !== undefined && typeof base !== 'string')) throw new Error('Caller returned invalid merge evidence for the bound PR')
+  if ((state !== undefined && state !== 'open' && state !== 'closed')
+    || (merged !== undefined && typeof merged !== 'boolean')) throw new Error('Caller returned invalid pull state for the bound PR')
   const failing: CiObservation['failing'] = []
   let pending = false
   for (const item of value.failing) {
@@ -103,7 +110,8 @@ export async function readWorkCi(target: store.WorkTarget): Promise<CiObservatio
   }
   return { head: value.head_sha.toLowerCase(), pending, failing: failing.sort((a, b) => a.name.localeCompare(b.name)),
     ...(mergeable === undefined ? {} : { mergeable }), ...(mergeableState === undefined ? {} : { mergeableState }),
-    ...(author === undefined ? {} : { author }), ...(draft === undefined ? {} : { draft }), ...(base === undefined ? {} : { base }) }
+    ...(author === undefined ? {} : { author }), ...(draft === undefined ? {} : { draft }), ...(base === undefined ? {} : { base }),
+    ...(state === undefined ? {} : { state }), ...(merged === undefined ? {} : { merged }) }
 }
 
 function text(value: unknown, name: string): string {
@@ -231,6 +239,25 @@ function ciWatched(ci: CiObservation): unknown {
   return ci.failing.length > 0 ? { head: ci.head, failing: ci.failing } : { failing: ci.failing }
 }
 
+/** Live pull state from the CI read's own get_pull: null when older Caller
+ *  output omits pull state. */
+function livePullState(ci: CiObservation): 'open' | 'closed' | 'merged' | null {
+  if (ci.merged === true) return 'merged'
+  if (ci.state === 'closed') return 'closed'
+  if (ci.state === 'open') return 'open'
+  return null
+}
+
+/** Merged or closed from either source suppresses every facet; open from
+ *  either clears unknown. The datastore lags merges, so a live terminal
+ *  state wins over a stale open. */
+function combinedPullState(datastore: WorkTargetStatus, live: 'open' | 'closed' | 'merged' | null): WorkTargetStatus {
+  if (datastore === 'merged' || live === 'merged') return 'merged'
+  if (datastore === 'closed' || live === 'closed') return 'closed'
+  if (datastore === 'open' || live === 'open') return 'open'
+  return 'unknown'
+}
+
 /** A bound target's state as the datastore has it; unknown when the
  *  datastore has no such target or cannot be asked, so the monitor wakes
  *  as before instead of dropping a notice it cannot place. */
@@ -328,6 +355,55 @@ export async function readWorkReviews(target: store.WorkTarget, cursor: ReviewsC
     }
     return { found: value.found, truncated: 'truncated' in value && value.truncated === true, reviews, threads,
       ...(page ? { page, comments, hasUnresolved: 'has_unresolved' in value && value.has_unresolved === true } : {}) }
+  } catch {
+    return null
+  }
+}
+
+/** One merged PR's closed issues and their open dependents as the local
+ *  datastore has them; null when the datastore cannot be asked. Local rows
+ *  only — the sync owns freshness, and this read adds zero GitHub traffic. */
+export interface MergeWakeClosedIssue { repo: string, number: number, title: string, url: string, state: string | null }
+export interface MergeWakeDependent { repo: string, number: number, title: string, url: string, via: Array<'blocked-by' | 'depends-on'> }
+export interface MergeWakeObservation {
+  found: boolean, title: string | null, closed: MergeWakeClosedIssue[],
+  closesVia: 'closing-references' | 'body-keywords' | null, dependents: MergeWakeDependent[], truncated: boolean,
+}
+export async function readWorkMergeWake(target: store.WorkTarget): Promise<MergeWakeObservation | null> {
+  const org = organizationForRepository(target.repo)
+  if (!org) return null
+  try {
+    const { stdout } = await runFile('github-datastore',
+      organizationArgs(org, ['view', 'pr-dependents', '--repo', target.repo, '--number', String(target.number), '--format', 'json']),
+      { timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })
+    const value: unknown = JSON.parse(stdout)
+    if (!value || typeof value !== 'object') return null
+    const row = value as Record<string, unknown>
+    if (typeof row.found !== 'boolean' || (row.title !== null && typeof row.title !== 'string')
+      || !Array.isArray(row.closed) || row.closed.length > 100 || !Array.isArray(row.dependents) || row.dependents.length > 50
+      || typeof row.truncated !== 'boolean'
+      || (row.closes_via !== null && row.closes_via !== 'closing-references' && row.closes_via !== 'body-keywords')) return null
+    const closed: MergeWakeClosedIssue[] = []
+    for (const entry of row.closed) {
+      if (!entry || typeof entry !== 'object') return null
+      const issue = entry as Record<string, unknown>
+      if (typeof issue.repo !== 'string' || !issue.repo || typeof issue.number !== 'number' || !Number.isSafeInteger(issue.number) || issue.number <= 0
+        || typeof issue.title !== 'string' || !issue.title || typeof issue.url !== 'string' || !issue.url
+        || (issue.state !== null && typeof issue.state !== 'string')) return null
+      closed.push({ repo: issue.repo, number: issue.number, title: issue.title, url: issue.url, state: issue.state })
+    }
+    const dependents: MergeWakeDependent[] = []
+    for (const entry of row.dependents) {
+      if (!entry || typeof entry !== 'object') return null
+      const issue = entry as Record<string, unknown>
+      if (typeof issue.repo !== 'string' || !issue.repo || typeof issue.number !== 'number' || !Number.isSafeInteger(issue.number) || issue.number <= 0
+        || typeof issue.title !== 'string' || !issue.title || typeof issue.url !== 'string' || !issue.url
+        || !Array.isArray(issue.via) || issue.via.length < 1 || issue.via.length > 2 || new Set(issue.via).size !== issue.via.length
+        || !issue.via.every(via => via === 'blocked-by' || via === 'depends-on')) return null
+      dependents.push({ repo: issue.repo, number: issue.number, title: issue.title, url: issue.url, via: issue.via as MergeWakeDependent['via'] })
+    }
+    return { found: row.found, title: row.title, closed, closesVia: row.closes_via as MergeWakeObservation['closesVia'],
+      dependents, truncated: row.truncated }
   } catch {
     return null
   }
@@ -581,7 +657,7 @@ export class ChatControl {
         ...(timer.reason ? { reason: timer.reason } : {}), ...(error ? { error } : {}) } })
   }
 
-  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, now?: () => number, switchboard?: SwitchboardControl } = {}) {
+  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, mergeWake?: typeof readWorkMergeWake, now?: () => number, switchboard?: SwitchboardControl } = {}) {
     runtime.on('event', this.onEvent)
     runtime.on('deleted', this.onDeleted)
   }
@@ -651,24 +727,26 @@ export class ChatControl {
       'You have 120 control actions and 20 new chats per hour; stopping work never counts. Your authority is cooperative, not a security boundary.',
       'You can set timers on any chat, including yourself (timer, timers, cancelTimer, rearmTimer). Each wake-up is a model turn: at most 5 timers per chat, each at most every 5 minutes. Timer text is delivered as your message, never as the person\'s. A chat the person holds takes no timer turns until the person resumes it.',
     )
-    if (record.role !== 'manager') return guidance.join('\n')
-    return `${guidance.join('\n')}\n${await this.managerCharter()}`
+    if (record.role !== 'manager' && record.role !== 'worker') return guidance.join('\n')
+    return `${guidance.join('\n')}\n${await this.charter(record.role)}`
   }
 
-  /** The Manager's standing instructions: the current /manager text, read fresh
-   *  for every turn, so an edit applies from the next turn. */
-  private async managerCharter(): Promise<string> {
-    await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT)
+  /** A Manager's or worker's standing instructions: the current charter text,
+   *  read fresh for every turn, so an edit applies from the next turn. */
+  private async charter(role: 'manager' | 'worker'): Promise<string> {
+    const name = role === 'manager' ? MANAGER_SWITCH : WORKER_SWITCH
+    const label = role === 'manager' ? 'Manager' : 'Worker'
+    await ensureSnippetSwitch(name, role === 'manager' ? MANAGER_SNIPPET_DEFAULT : WORKER_SNIPPET_DEFAULT)
     let charter: ChatSwitch | null
     try {
-      charter = readSwitch(MANAGER_SWITCH)
+      charter = readSwitch(name)
     } catch (error) {
-      throw new Error(`The /manager snippet could not be read: ${error instanceof Error ? error.message : String(error)}. Snippets shows the problem.`)
+      throw new Error(`The /${name} snippet could not be read: ${error instanceof Error ? error.message : String(error)}. Snippets shows the problem.`)
     }
-    if (!charter) throw new Error('The /manager snippet could not be read: it is missing. Snippets shows the problem.')
-    if (Buffer.byteLength(charter.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new Error('The /manager snippet is larger than 64 KiB. Shorten it in Snippets.')
-    if (!charter.content.trim()) return '[Manager charter] The /manager snippet is empty. Ask the person to write it in Snippets.'
-    return `[Manager charter — the /manager snippet, revision ${charter.revision}, which the person edits in Snippets. It supersedes all earlier revisions. It is the person's standing instruction and authorizes turns the person did not start; a direct request from the person in this chat takes precedence, and it takes precedence over Memories where they conflict. Chats cannot change it.]\n${charter.content}`
+    if (!charter) throw new Error(`The /${name} snippet could not be read: it is missing. Snippets shows the problem.`)
+    if (Buffer.byteLength(charter.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new Error(`The /${name} snippet is larger than 64 KiB. Shorten it in Snippets.`)
+    if (!charter.content.trim()) return `[${label} charter] The /${name} snippet is empty. Ask the person to write it in Snippets.`
+    return `[${label} charter — the /${name} snippet, revision ${charter.revision}, which the person edits in Snippets. It supersedes all earlier revisions. It is the person's standing instruction and authorizes turns the person did not start; a direct request from the person in this chat takes precedence, and it takes precedence over Memories where they conflict. Chats cannot change it.]\n${charter.content}`
   }
 
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -713,7 +791,7 @@ export class ChatControl {
   /** Before any receipt: a refusal is a 403, never a recorded outcome. The
    *  Switchboard observes and reports; only it reports. */
   private authorize(id: string, operation: string, command: Record<string, unknown>): void {
-    if (operation === 'create' && command.role !== undefined) throw new HttpError(403, 'A Manager is created by the person in the New session dialog.')
+    if (operation === 'create' && command.role !== undefined) throw new HttpError(403, 'A Manager or Worker is created by the person in the New session dialog.')
     if (['timer', 'timers', 'cancelTimer', 'rearmTimer'].includes(operation) && this.runtime.get(id)?.role !== 'manager') {
       throw new HttpError(403, 'timers are available to the workspace Manager and the person')
     }
@@ -1056,31 +1134,51 @@ export class ChatControl {
       const now = (this.options.now ?? Date.now)()
       if (!this.runtime.ownsSession(binding.session)) { store.forgetSession(instance, binding.session, now); continue }
       const target = store.workTarget(binding.target)
+      if (target.kind !== 'pull') {
+        try {
+          await this.observeBehavior(binding, target, now, async () => {
+            const status = await this.workTargetStatus(target, now)
+            return status === 'closed' || status === 'merged'
+          })
+        } catch (error) { this.itemFailed('binding', binding.target, error) }
+        continue
+      }
       try {
-        const local = this.workOperations(target)
-        let actionable = actionableOperations(local.operations)
-        let initiallyActionable = actionable.length > 0
-        // A closed or merged target drops late automation bookkeeping; only
-        // human activity still wakes. The datastore is read only when there
-        // is something to drop, so bookkeeping-only ticks stay local.
-        if (initiallyActionable) {
-          const status = await this.workTargetStatus(target, now)
-          if (status === 'closed' || status === 'merged') {
-            actionable = humanOnly(actionable)
-            initiallyActionable = actionable.length > 0
-          }
+        // The live pull read comes first, so a merged or closed PR the
+        // datastore still shows open suppresses every facet below.
+        const datastoreStatus = await this.workTargetStatus(target, now)
+        const { ci, live } = await this.readLivePullState(binding, target, datastoreStatus, now)
+        const prStatus = combinedPullState(datastoreStatus, live)
+        await this.observeBehavior(binding, target, now, async () => prStatus === 'closed' || prStatus === 'merged')
+        if (prStatus === 'merged') {
+          try {
+            await this.observeMergeWake(binding, target, now)
+          } catch (error) { this.itemFailed('ci', binding.target, error) }
+          continue
         }
-        this.observe(binding, `behavior:${target.url}`, { kind: 'behavior', target: target.url, ...local,
-          ...(target.kind === 'pull' ? { done: WORK_DONE } : {}) }, now, initiallyActionable, false, actionable)
+        if (prStatus === 'closed') continue
+        try {
+          if (ci) this.observeCiResult(binding, target, ci, prStatus, now)
+          await this.observeReviews(binding, target, now)
+        } catch (error) { this.itemFailed('ci', binding.target, error) }
       } catch (error) { this.itemFailed('binding', binding.target, error) }
-      if (target.kind !== 'pull') continue
-      const prStatus = await this.workTargetStatus(target, now)
-      if (prStatus === 'closed' || prStatus === 'merged') continue
-      try {
-        await this.observeCi(binding, target, prStatus, now)
-        await this.observeReviews(binding, target, now)
-      } catch (error) { this.itemFailed('ci', binding.target, error) }
     }
+  }
+
+  /** Behavior notices for a bound target; a closed or merged target drops
+   *  late automation bookkeeping and only human activity still wakes. The
+   *  terminal check runs only when there is something to drop, so
+   *  bookkeeping-only ticks stay local. */
+  private async observeBehavior(binding: store.Binding, target: store.WorkTarget, now: number, resolveTerminal: () => Promise<boolean>): Promise<void> {
+    const local = this.workOperations(target)
+    let actionable = actionableOperations(local.operations)
+    let initiallyActionable = actionable.length > 0
+    if (initiallyActionable && await resolveTerminal()) {
+      actionable = humanOnly(actionable)
+      initiallyActionable = actionable.length > 0
+    }
+    this.observe(binding, `behavior:${target.url}`, { kind: 'behavior', target: target.url, ...local,
+      ...(target.kind === 'pull' ? { done: WORK_DONE } : {}) }, now, initiallyActionable, false, actionable)
   }
 
   // ── Timers ───────────────────────────────────────────────────────────
@@ -1341,26 +1439,39 @@ export class ChatControl {
     this.startError = error instanceof Error ? error.message : String(error)
   }
 
-  /** The bound PR's CI and merge state, from the one existing per-PR read.
-   *  A failed read keeps the settled baseline and queues at most one
-   *  degraded notice per outage: the same red state seen through an
-   *  outage wakes once, not once per sync. */
-  private async observeCi(binding: store.Binding, target: store.WorkTarget, status: WorkTargetStatus, now: number): Promise<void> {
+  /** The live pull read, first in every pass over a bound PR: a due read
+   *  persists ci-state and advances the CI clock; a throttled tick reuses
+   *  the persisted state; a failed read keeps it. Terminal datastore state
+   *  reads nothing, as before. A failed read keeps the settled baseline
+   *  and queues at most one degraded notice per outage — never for a PR
+   *  already known merged or closed. */
+  private async readLivePullState(binding: store.Binding, target: store.WorkTarget,
+    datastoreStatus: WorkTargetStatus, now: number): Promise<{ ci: CiObservation | null, live: 'open' | 'closed' | 'merged' | null }> {
     const instance = this.runtime.instance
     const previous = store.observation(instance, `ci:${target.url}`)
-    if (previous && now - previous.checked_at < CI_INTERVAL) return
+    if (datastoreStatus === 'closed' || datastoreStatus === 'merged' || (previous && now - previous.checked_at < CI_INTERVAL)) {
+      return { ci: null, live: this.persistedLivePullState(target) }
+    }
     try {
       const ci = await (this.options.ci ?? readWorkCi)(target)
-      const data = { kind: 'ci', target: target.url, head: ci.head, failing: ci.failing,
-        blockers: ci.failing.map(check => `Fix check "${check.name}" (${check.conclusion ?? check.state}) on ${ci.head.slice(0, 7)}${check.url ? ` ${check.url}` : ''} and push`),
-        done: WORK_DONE }
-      this.observe(binding, `ci:${target.url}`, data, now, ci.failing.length > 0, ci.pending === true, ciWatched(ci))
-      this.observeMerge(binding, target, ci, status, now)
-      store.deleteObservation(instance, `ci-degraded:${target.url}`)
-    } catch (error) {
-      if (!store.bindingIsCurrent(instance, binding)) return
+      // An ownership transfer mid-read clears this target's observations; the
+      // new owner starts from no baseline, so a stale write here must not
+      // restore the old fingerprint and silence its first notice.
+      if (!store.bindingIsCurrent(instance, binding)) return { ci: null, live: this.persistedLivePullState(target) }
+      const fresh = livePullState(ci)
+      if (fresh) store.saveObservation(instance, `ci-state:${target.url}`, fresh, now)
+      // The clock advances on every read; the facet observe overwrites the
+      // fingerprint when the PR is open, while a live-terminal read keeps
+      // the settled baseline like pending CI.
       store.saveObservation(instance, `ci:${target.url}`, previous?.fingerprint ?? '', now)
-      if (store.observation(instance, `ci-degraded:${target.url}`)) return
+      return { ci, live: fresh ?? this.persistedLivePullState(target) }
+    } catch (error) {
+      if (!store.bindingIsCurrent(instance, binding)) return { ci: null, live: this.persistedLivePullState(target) }
+      store.saveObservation(instance, `ci:${target.url}`, previous?.fingerprint ?? '', now)
+      const live = this.persistedLivePullState(target)
+      const outageStatus = combinedPullState(datastoreStatus, live)
+      if (outageStatus === 'closed' || outageStatus === 'merged') return { ci: null, live }
+      if (store.observation(instance, `ci-degraded:${target.url}`)) return { ci: null, live }
       store.saveObservation(instance, `ci-degraded:${target.url}`, 'degraded', now)
       const body = JSON.stringify({ kind: 'ci_unavailable', target: target.url,
         error: error instanceof Error ? error.message : String(error),
@@ -1371,7 +1482,18 @@ export class ChatControl {
         `ci-degraded:${target.url}:${binding.session}:${binding.created_at}:${now}`)
       diagnostic({ level: 'warning', operation: 'chat.work.unavailable', target: binding.target,
         repository: target.repo, message: 'Bound chat CI read failed', context: { sessionId: binding.session } })
+      return { ci: null, live }
     }
+  }
+
+  /** The CI and merge facets of one live read, for an open PR only. */
+  private observeCiResult(binding: store.Binding, target: store.WorkTarget, ci: CiObservation, status: WorkTargetStatus, now: number): void {
+    const data = { kind: 'ci', target: target.url, head: ci.head, failing: ci.failing,
+      blockers: ci.failing.map(check => `Fix check "${check.name}" (${check.conclusion ?? check.state}) on ${ci.head.slice(0, 7)}${check.url ? ` ${check.url}` : ''} and push`),
+      done: WORK_DONE }
+    this.observe(binding, `ci:${target.url}`, data, now, ci.failing.length > 0, ci.pending === true, ciWatched(ci))
+    this.observeMerge(binding, target, ci, status, now)
+    store.deleteObservation(this.runtime.instance, `ci-degraded:${target.url}`)
   }
 
   /** Conflicts and behind-main from the CI read's own merge state: zero
@@ -1476,6 +1598,56 @@ export class ChatControl {
     if (reviews.page) store.saveObservation(instance, `reviews-cursor:${target.url}`, JSON.stringify([reviews.page]), now)
   }
 
+  /** A merged worker-bound PR wakes its creating chat once with the closed
+   *  issues and their open dependents, from the merge the target-status read
+   *  already saw: zero new GitHub requests. Unknown or missing evidence
+   *  keeps the unsettled baseline like pending CI; with no creating chat,
+   *  nothing changes. */
+  private async observeMergeWake(binding: store.Binding, target: store.WorkTarget, now: number): Promise<void> {
+    const instance = this.runtime.instance
+    const key = `merge-wake:${target.url}`
+    const previous = store.observation(instance, key)
+    if (previous && now - previous.checked_at < CI_INTERVAL) return
+    if (previous?.fingerprint) return
+    let wake: MergeWakeObservation | null
+    try {
+      wake = await (this.options.mergeWake ?? readWorkMergeWake)(target)
+    } catch (error) {
+      this.runtime.emit('log', `[chat control] merge-wake read for ${target.url} failed: ${String(error)}`)
+      wake = null
+    }
+    // An ownership transfer mid-read must not announce the merge to the old
+    // owner's Manager; the new owner starts from the unsettled baseline.
+    if (!store.bindingIsCurrent(instance, binding)) return
+    const manager = store.children(instance).find(child => child.child === binding.session)?.manager
+    if (!manager || !this.runtime.ownsSession(manager) || !wake || !wake.found) {
+      store.saveObservation(instance, key, previous?.fingerprint ?? '', now)
+      return
+    }
+    const worker = this.runtime.get(binding.session)
+    const data = { kind: 'worker_pr_merged', target: target.url, worker: binding.session,
+      ...(worker?.title ? { workerTitle: worker.title } : {}), ...(wake.title ? { title: wake.title } : {}),
+      closedIssues: wake.closed, closesVia: wake.closesVia, dependentIssues: wake.dependents,
+      truncated: wake.truncated,
+      detail: wake.truncated
+        ? 'The closed and dependent lists may be incomplete; inspect the complete current work state through Poise APIs or Caller before acting.'
+        : 'Start dependent work at once; inspect the complete current work state through Poise APIs or Caller before acting.' }
+    const body = JSON.stringify(data)
+    const fingerprint = createHash('sha256').update(body).digest('hex')
+    db.transaction(() => {
+      if (!store.bindingIsCurrent(instance, binding)) return
+      store.message(instance, manager, store.WORK_MONITOR_SENDER,
+        boundedNotice(body, { kind: data.kind, target: binding.target, worker: binding.session,
+          closedCount: wake.closed.length, dependentsCount: wake.dependents.length, truncated: wake.truncated,
+          detail: 'Inspect the complete current work state through Poise APIs or Caller before acting.' }),
+        key)
+      store.saveObservation(instance, key, fingerprint, now)
+      diagnostic({ level: 'info', operation: 'chat.work.merge_wake', target: binding.target,
+        repository: target.repo, message: 'Worker PR merged; its Manager was woken',
+        context: { sessionId: manager, worker: binding.session, closed: wake.closed.length, dependents: wake.dependents.length } })
+    })()
+  }
+
   private observe(binding: store.Binding, key: string, data: Record<string, unknown>, now: number, initiallyActionable: boolean, pending = false, actionable?: unknown, shouldWake = true): void {
     const instance = this.runtime.instance
     const body = JSON.stringify(data)
@@ -1540,6 +1712,13 @@ export class ChatControl {
     for (const [url, entry] of this.targetStatusCache) if (entry.expiry <= now) this.targetStatusCache.delete(url)
     this.targetStatusCache.set(target.url, { status, expiry: now + CI_INTERVAL })
     return status
+  }
+
+  /** The live pull state the last CI read persisted, across throttled ticks,
+   *  outages and restarts. Anything but a known state reads as no evidence. */
+  private persistedLivePullState(target: store.WorkTarget): 'open' | 'closed' | 'merged' | null {
+    const fingerprint = store.observation(this.runtime.instance, `ci-state:${target.url}`)?.fingerprint
+    return fingerprint === 'open' || fingerprint === 'closed' || fingerprint === 'merged' ? fingerprint : null
   }
 
   async stop(runtimeStopped?: Promise<void>): Promise<void> {

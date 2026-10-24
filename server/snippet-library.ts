@@ -8,7 +8,7 @@ import { HttpError } from './http'
 import { diagnostic } from './logging'
 import { MATCH_FILE, MAX_SNIPPETS_BYTES, readSnippetSnapshotSync, mutateSnippetLibrary, validateSnippets, SnippetConflictError, type Snippet, type SnippetState } from './snippets'
 import { judgeEntry, parseMatchFile, type MatchFile } from './link/espanso'
-import { MANAGER_SWITCH, parseChatSwitches, RESERVED_SWITCHES, switchName, SWITCH_LIMITS, type ChatSwitch, type ChatSwitches } from '../src/chat-switches'
+import { MANAGER_SWITCH, WORKER_SWITCH, parseChatSwitches, RESERVED_SWITCHES, switchName, SWITCH_LIMITS, type ChatSwitch, type ChatSwitches } from '../src/chat-switches'
 
 const PREFIX = '# poise-chat-library-v1 '
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -137,8 +137,10 @@ function project(prepared: Plan): ChatSwitches {
   const signature = hash(JSON.stringify(live.map(({ snippet, name, digest }) => [snippet.trigger, name, digest])))
   if (signature !== index.signature) {
     if (live.length || index.entries.length) index.revision++
-    const manager = live.find(({ name }) => name === MANAGER_SWITCH)
-    const managerBefore = manager ? previous.get(manager.snippet.trigger) : undefined
+    const charters = [MANAGER_SWITCH, WORKER_SWITCH].map(name => {
+      const found = live.find(({ name: item }) => item === name)
+      return { name, found, before: found ? previous.get(found.snippet.trigger) : undefined }
+    })
     for (const { snippet, name, digest } of live) {
       const old = previous.get(snippet.trigger)
       if (!old || old.removed || old.digest !== digest || old.name !== name) previous.set(snippet.trigger, {
@@ -151,12 +153,14 @@ function project(prepared: Plan): ChatSwitches {
     }
     index.signature = signature; index.entries = [...previous.values()]
     setMeta(INDEX_KEY, JSON.stringify(index))
-    if (manager && previous.get(manager.snippet.trigger)!.revision !== managerBefore?.revision) {
-      const created = !managerBefore || managerBefore.removed === true
+    for (const { name, found, before } of charters) {
+      if (!found || previous.get(found.snippet.trigger)!.revision === before?.revision) continue
+      const created = !before || before.removed === true
+      const operation = name === MANAGER_SWITCH ? 'chat.manager.charter.changed' : 'chat.worker.charter.changed'
       // Warning, not info: the diagnostics pipeline drops info and below, so
       // only warning and above leave the audit record this revision needs.
-      diagnostic({ level: 'warning', operation: 'chat.manager.charter.changed', message: 'The /manager snippet changed',
-        context: { revision: previous.get(manager.snippet.trigger)!.revision, bytes: Buffer.byteLength(manager.snippet.replace, 'utf8'), ...(created ? { created: true } : {}) } })
+      diagnostic({ level: 'warning', operation, message: `The /${name} snippet changed`,
+        context: { revision: previous.get(found.snippet.trigger)!.revision, bytes: Buffer.byteLength(found.snippet.replace, 'utf8'), ...(created ? { created: true } : {}) } })
     }
   }
   return { revision: index.revision, switches: live.map(({ snippet, name }) => {
@@ -183,20 +187,26 @@ function boundMetadata(snapshot: { raw: string | null, state: SnippetState }): M
   return metadata
 }
 
-function liveManager(snippets: Snippet[], metadata: Metadata): { trigger: string, content: string } | null {
+function liveBuiltin(snippets: Snippet[], metadata: Metadata, name: string): { trigger: string, content: string } | null {
   const bindings = new Map(metadata.names)
-  const found = snippets.find(snippet => bindings.get(snippet.trigger) === MANAGER_SWITCH)
+  const found = snippets.find(snippet => bindings.get(snippet.trigger) === name)
   return found ? { trigger: found.trigger, content: found.replace } : null
 }
 
-/** The built-in /manager is edited freely but never deleted or re-triggered,
- *  and only by a request that speaks for the person. A write that leaves it
- *  unchanged is not affected. */
-function guardManagerBuiltIn(before: { trigger: string, content: string } | null, after: { trigger: string, content: string } | null, person: boolean): void {
-  if (before && !after) throw new HttpError(400, '/manager is built in. You can edit its text, but not delete it or change its trigger.')
+/** A built-in charter (/manager, /worker) is edited freely but never deleted
+ *  or re-triggered, and only by a request that speaks for the person. A write
+ *  that leaves it unchanged is not affected. */
+function guardBuiltin(before: { trigger: string, content: string } | null, after: { trigger: string, content: string } | null, person: boolean, name: string): void {
+  if (before && !after) throw new HttpError(400, `/${name} is built in. You can edit its text, but not delete it or change its trigger.`)
   const changed = after && (!before || after.trigger !== before.trigger || after.content !== before.content)
-  if (changed && !person) throw new HttpError(403, 'The /manager snippet is edited in the browser.')
-  if (changed && Buffer.byteLength(after.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new HttpError(413, 'The /manager snippet holds up to 64 KiB. Nothing was saved.')
+  if (changed && !person) throw new HttpError(403, `The /${name} snippet is edited in the browser.`)
+  if (changed && Buffer.byteLength(after.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new HttpError(413, `The /${name} snippet holds up to 64 KiB. Nothing was saved.`)
+}
+
+function guardBuiltins(beforeSnippets: Snippet[], beforeMetadata: Metadata, afterSnippets: Snippet[], afterMetadata: Metadata, person: boolean): void {
+  for (const name of [MANAGER_SWITCH, WORKER_SWITCH]) {
+    guardBuiltin(liveBuiltin(beforeSnippets, beforeMetadata, name), liveBuiltin(afterSnippets, afterMetadata, name), person, name)
+  }
 }
 
 async function importLegacy(): Promise<void> {
@@ -226,9 +236,9 @@ export async function saveSkillSnippets(input: unknown, version: unknown, person
   await mutateSnippetLibrary(snapshot => {
     if (snapshot.state.version !== version) throw new SnippetConflictError(snapshot.state.version)
     const snippets = validateSnippets(input), metadata = metadataFrom(snapshot.raw)
-    const before = liveManager(snapshot.state.snippets, boundMetadata(snapshot))
+    const before = boundMetadata(snapshot)
     bind(snippets, metadata)
-    guardManagerBuiltIn(before, liveManager(snippets, metadata), person)
+    guardBuiltins(snapshot.state.snippets, before, snippets, metadata, person)
     return { snippets, header: header(metadata) }
   })
   return publish()
@@ -277,9 +287,9 @@ export async function importEspansoSnippets(raw: unknown, person = true): Promis
     })
     if (!additions.length) return null
     const snippets = validateSnippets([...snapshot.state.snippets, ...additions]), metadata = metadataFrom(snapshot.raw)
-    const before = liveManager(snapshot.state.snippets, boundMetadata(snapshot))
+    const before = boundMetadata(snapshot)
     bind(snippets, metadata)
-    guardManagerBuiltIn(before, liveManager(snippets, metadata), person)
+    guardBuiltins(snapshot.state.snippets, before, snippets, metadata, person)
     return { snippets, header: header(metadata) }
   })
   return { ...(added.length ? publish() : snapshotLibrary.immediate()), added, skipped }
@@ -290,9 +300,9 @@ export async function addSkillSnippet(input: unknown, person = true): Promise<{ 
   await importLegacy()
   await mutateSnippetLibrary(snapshot => {
     const snippets = validateSnippets([...snapshot.state.snippets, snippet]), metadata = metadataFrom(snapshot.raw)
-    const before = liveManager(snapshot.state.snippets, boundMetadata(snapshot))
+    const before = boundMetadata(snapshot)
     bind(snippets, metadata)
-    guardManagerBuiltIn(before, liveManager(snippets, metadata), person)
+    guardBuiltins(snapshot.state.snippets, before, snippets, metadata, person)
     return { snippets, header: header(metadata) }
   })
   const state = publish()

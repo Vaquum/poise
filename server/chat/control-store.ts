@@ -103,10 +103,11 @@ export const WORK_MONITOR_SENDER = 'Poise work monitor'
 /** Event-key prefixes the work monitor's notices carry, one per watched facet. */
 const NOTICE_PREFIXES = ['ci:', 'behavior:', 'merge:', 'reviews:', 'ci-degraded:']
 /** One observation key per watched facet of a bound target, plus the
- *  degraded-read marker and the reviews seen-set sidecar, which carries
- *  no notices. A new owner starts from no baseline on all of them, so
- *  current blockers wake it even when the old owner saw them. */
-const OBSERVATION_PREFIXES = [...NOTICE_PREFIXES, 'reviews-seen:', 'reviews-cursor:']
+ *  degraded-read marker, the live pull-state sidecar and the reviews
+ *  seen-set sidecar, which carry no notices. A new owner starts from no
+ *  baseline on all of them, so current blockers wake it even when the old
+ *  owner saw them. */
+const OBSERVATION_PREFIXES = [...NOTICE_PREFIXES, 'ci-state:', 'reviews-seen:', 'reviews-cursor:']
 function resetTargetObservations(instance: string, url: string): void {
   db.prepare(`DELETE FROM chat_control_observations WHERE instance = ? AND target IN (${OBSERVATION_PREFIXES.map(() => '?').join(', ')})`)
     .run(instance, ...OBSERVATION_PREFIXES.map(prefix => `${prefix}${url}`))
@@ -167,11 +168,11 @@ export function children(instance: string): Array<{ child: string, manager: stri
 
 export interface InternalMessage {
   seq: number, recipient: string, sender: string, event_key: string, body: string, created_at: number,
-  state: 'pending' | 'admitted', turn_id: string | null, sender_title: string | null, sender_role: 'manager' | null,
+  state: 'pending' | 'admitted', turn_id: string | null, sender_title: string | null, sender_role: 'manager' | 'worker' | null,
   timer_id: string | null, timer_missed: number
 }
 const INBOX_COLUMNS = 'seq, recipient, sender, event_key, body, created_at, state, turn_id, sender_title, sender_role, timer_id, timer_missed'
-export function message(instance: string, recipient: string, sender: string, body: string, eventKey: string = randomUUID(), from?: { title: string, role?: 'manager' }): void {
+export function message(instance: string, recipient: string, sender: string, body: string, eventKey: string = randomUUID(), from?: { title: string, role?: 'manager' | 'worker' }): void {
   if (!body.trim() || Buffer.byteLength(body) > 32 * 1024) throw new HttpError(400, 'an internal message needs 1–32768 UTF-8 bytes')
   db.prepare(`INSERT INTO chat_control_inbox(instance, recipient, sender, event_key, body, created_at, sender_title, sender_role)
     VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance, recipient, event_key) DO NOTHING`).run(instance, recipient, sender, eventKey, body, Date.now(), from?.title ?? null, from?.role ?? null)
