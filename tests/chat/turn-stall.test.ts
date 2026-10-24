@@ -9,15 +9,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { AgentId, ChatEnvelope, ChatEvent, PromptInput } from '../../server/chat/protocol'
-import type { Adapter, AdapterHost, AdapterStartOptions } from '../../server/chat/adapters/types'
+import type { Adapter, AdapterHost, AdapterStartOptions, TurnResult } from '../../server/chat/adapters/types'
 import type { CallerTurns } from '../../server/chat/caller-turns'
 import { CATALOG } from '../model-catalog-fixture'
 
+// Process starts stall past the global 10 s under suite load: the fixture
+// hook gets 25 s, and each case sets its own 40 s.
+vi.setConfig({ hookTimeout: 25_000 })
 let root = ''
 let repo = ''
 let origin = ''
 let runtimeModule: typeof import('../../server/chat/runtime')
 let controlModule: typeof import('../../server/chat/control')
+let storage: typeof import('../../server/chat/storage')
 let store: typeof import('../../server/chat/control-store')
 let worker: typeof import('../../server/chat/worker')
 
@@ -37,6 +41,9 @@ interface FakeControls {
   startWorker?: { command: string, args: string[] }
   /** When set, the first prompt throws, ending the turn as an error. */
   failFirst?: string
+  /** When set, prompts wait for finishTurn instead of resolving. */
+  manual?: boolean
+  finishTurn?: ((result: { stopReason: 'end_turn' | 'cancelled' }) => void) | null
 }
 
 class FakeAdapter implements Adapter {
@@ -51,8 +58,10 @@ class FakeAdapter implements Adapter {
     this.nativeSessionId = options.resume || `native-${this.controls.adapters.length}`
     return { nativeSessionId: this.nativeSessionId, capabilities: this.capabilities, modelId: options.modelId, effort: options.effort, efforts: ['high', 'xhigh'] }
   }
+  seen: PromptInput[] = []
   async prompt(turnId: string, input: PromptInput) {
     this.controls.prompts.push(input)
+    this.seen.push(input)
     this.host.emit({ type: 'text.delta', turnId, messageId: `${turnId}:m1`, delta: `echo: ${input.text.slice(0, 40)}` })
     if (this.controls.commitFirst && this.controls.prompts.length === 1) {
       const { file, content, dirty } = this.controls.commitFirst
@@ -62,10 +71,18 @@ class FakeAdapter implements Adapter {
       git(['commit', '-q', '-m', 'work the turn leaves unpushed'], this.host.checkout)
     }
     if (this.controls.failFirst && this.controls.prompts.length === 1) throw new Error(this.controls.failFirst)
+    if (this.controls.manual) {
+      return new Promise<TurnResult>((resolve) => {
+        this.controls.finishTurn = (result) => resolve({ ...result, usage: { totalTokens: 3 } })
+      })
+    }
     return { stopReason: 'end_turn' as const, usage: { totalTokens: 3 } }
   }
   async steer() {}
-  async cancel() {}
+  async cancel() {
+    this.controls.finishTurn?.({ stopReason: 'cancelled' })
+    this.controls.finishTurn = null
+  }
   async setModel(modelId: string, effort: string) { return { modelId, effort } }
   async setMode() {}
   async fork() { return `${this.nativeSessionId}-fork` }
@@ -130,6 +147,7 @@ beforeAll(async () => {
   vi.resetModules()
   runtimeModule = await import('../../server/chat/runtime')
   controlModule = await import('../../server/chat/control')
+  storage = await import('../../server/chat/storage')
   store = await import('../../server/chat/control-store')
   worker = await import('../../server/chat/worker')
 })
@@ -155,12 +173,19 @@ afterEach(async () => {
   }
 })
 
-async function waitFor(check: () => boolean, ms = 8_000): Promise<void> {
+async function waitFor(check: () => boolean | Promise<boolean>, ms = 20_000): Promise<void> {
   const deadline = Date.now() + ms
-  while (!check()) {
+  while (!(await check())) {
     if (Date.now() > deadline) throw new Error('condition not met in time')
     await new Promise((r) => setTimeout(r, 20))
   }
+}
+
+function finishManual(owned: FakeControls): void {
+  const finish = owned.finishTurn
+  if (!finish) throw new Error('no prompt waiting for finishTurn')
+  owned.finishTurn = null
+  finish({ stopReason: 'end_turn' })
 }
 
 const ofType = (events: ChatEnvelope[], id: string, type: ChatEvent['type']) => events.filter((e) => e.sessionId === id && e.event.type === type).map((e) => e.event as any)
@@ -214,14 +239,23 @@ describe('turn stall detection and waking', () => {
     await runtime.stop({ handover: false })
   }, 40_000)
 
-  it('tracks a background job past the turn end and wakes the chat when it finishes', async () => {
-    const owned: FakeControls = { hosts: [], adapters: [], prompts: [],
-      startWorker: { command: 'sh', args: ['-c', 'sleep 30 & wait'] } }
+  it('tracks a background job the turn starts and wakes the chat when it finishes', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [], manual: true,
+      startWorker: { command: 'sh', args: ['-c', 'while [ ! -e go ]; do sleep 0.05; done; sleep 30 & wait'] } }
     const { runtime, events } = makeRuntime('poise-turn-stall-bg:db', owned)
     const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-bg' } })
     store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
     await waitFor(() => lastStatus(events, session.id) === 'idle')
     runtime.prompt(session.id, { text: 'run the suite', attachments: [], mentions: [] })
+    // The baseline is taken before the prompt reaches the adapter, so a
+    // job the turn starts afterwards is new by construction.
+    await waitFor(() => owned.prompts.length === 1)
+    await writeFile(join(session.checkout, 'go'), 'run\n')
+    const row = storage.getWorker(session.id)
+    if (!row) throw new Error('no worker row for the session')
+    await waitFor(async () => (await worker.groupMembers(row.gatePgid))?.some((m) => m.command.includes('sleep 30')) ?? false)
+    spawnSync('rm', ['go'], { cwd: session.checkout })
+    finishManual(owned)
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
     await waitFor(() => lastStatus(events, session.id) === 'idle')
 
@@ -236,10 +270,15 @@ describe('turn stall detection and waking', () => {
     await waitFor(() => !worker.pidAlive(jobs[0].pid))
     const control = await makeControl(runtime)
     await control.tick()
-    await waitFor(() => owned.prompts.length === 3)
+    await waitFor(() => owned.prompts.length === 2)
     expect(owned.prompts[1].text).toContain('still running')
+    finishManual(owned)
+    await waitFor(() => owned.prompts.length === 3)
     expect(owned.prompts[2].text).toContain('finished')
     expect(owned.prompts[2].text).toContain('sleep 30')
+    finishManual(owned)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
     expect(runtime.get(session.id)?.stall).toBeUndefined()
 
     // Each notice fires once: no completion replay, no nag loop.
@@ -305,6 +344,126 @@ describe('turn stall detection and waking', () => {
     await waitFor(() => owned.prompts.length === 2)
     expect(owned.prompts[1].text).toContain('task')
     expect(owned.prompts[1].text).toContain('unpushed')
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('drops the handoff source pending stall notices and re-detects on the target', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [],
+      commitFirst: { file: 'work.txt', content: 'done\n', dirty: 'draft.txt' } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-handoff:db', owned)
+    const source = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-handoff' } })
+    store.bindWork(runtime.instance, source.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, source.id) === 'idle')
+    runtime.prompt(source.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, source.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, source.id) === 'idle')
+    expect(runtime.get(source.id)?.stall).toBeDefined()
+    expect(store.inbox(runtime.instance, source.id)).toHaveLength(1)
+
+    const target = await runtime.handoff(source.id, { agent: 'grok', model: 'grok-4.6-xhigh' })
+    expect(store.bindings(runtime.instance).find((b) => b.target.endsWith('/issues/577'))?.session).toBe(target.id)
+    expect(store.inbox(runtime.instance, source.id)).toHaveLength(0)
+
+    // The leftover persists on the shared branch, so the target's first
+    // turn end flags a fresh episode and wakes the target, never the source.
+    await waitFor(() => ofType(events, target.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, target.id) === 'idle')
+    expect(runtime.get(target.id)?.stall?.repos).toHaveLength(1)
+    expect(store.inbox(runtime.instance, target.id)).toHaveLength(1)
+    const control = await makeControl(runtime)
+    await control.tick()
+    await waitFor(() => runtime.get(source.id)?.stall === undefined)
+    const seenSource = owned.adapters[0].seen.length
+    await control.tick()
+    await new Promise((r) => setTimeout(r, 1_500))
+    await control.tick()
+    expect(owned.adapters[0].seen.length).toBe(seenSource)
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('forks without the source stall state', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [],
+      commitFirst: { file: 'work.txt', content: 'done\n', dirty: 'draft.txt' } }
+    const { runtime, events } = makeRuntime('poise-turn-stall-fork:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-fork' } })
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toBeDefined()
+
+    const fork = await runtime.fork(session.id)
+    expect(fork.id).not.toBe(session.id)
+    expect(fork.stall).toBeUndefined()
+    await waitFor(() => lastStatus(events, fork.id) === 'idle')
+    expect(runtime.get(fork.id)?.stall).toBeUndefined()
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('keeps the previous repos when nested discovery fails transiently', async () => {
+    if (process.getuid?.() === 0) return // unreadable-dir simulation needs permission checks
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-discovery:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const task = join(session.checkout, 'task')
+    const cloned = spawnSync('git', ['clone', '-q', origin, task], { encoding: 'utf8' })
+    if (cloned.status !== 0) throw new Error(`git clone: ${cloned.stderr}`)
+    git(['checkout', '-qb', 'work'], task)
+    await writeFile(join(task, 'fix.txt'), 'fix\n')
+    git(['add', 'fix.txt'], task)
+    git(['commit', '-qm', 'unpushed fix'], task)
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const episode = runtime.get(session.id)?.stall?.episode
+    expect(episode).toBeDefined()
+
+    // The clone is briefly unreadable: the turn end keeps the previous
+    // repos instead of reading the IO error as finished work.
+    spawnSync('chmod', ['000', task])
+    try {
+      runtime.prompt(session.id, { text: 'again', attachments: [], mentions: [] })
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+      expect(runtime.get(session.id)?.stall).toMatchObject({ episode, repos: [{ path: 'task' }] })
+      expect(store.inbox(runtime.instance, session.id)).toHaveLength(1)
+    } finally {
+      spawnSync('chmod', ['755', task])
+    }
+    runtime.prompt(session.id, { text: 'once more', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toMatchObject({ episode, repos: [{ path: 'task', branch: 'work' }] })
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('caps the kept repos and still wakes', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-cap:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    for (let n = 0; n < 21; n++) {
+      const dir = join(session.checkout, `repo${String(n).padStart(2, '0')}`)
+      await mkdir(dir)
+      const inited = spawnSync('git', ['init', '-q', '-b', 'main', dir], { encoding: 'utf8' })
+      if (inited.status !== 0) throw new Error(`git init: ${inited.stderr}`)
+      await writeFile(join(dir, 'draft.txt'), 'uncommitted\n')
+    }
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled?.repos).toHaveLength(20)
+    expect(stalled?.truncatedRepos).toBe(1)
+    const control = await makeControl(runtime)
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 2)
+    expect(owned.prompts[1].text).toContain('more task repo')
     await runtime.stop({ handover: false })
   }, 40_000)
 

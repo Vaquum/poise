@@ -132,8 +132,9 @@ export function unbindWork(instance: string, session: string, target: string): v
 }
 /** Move every work binding from one chat to another: a handoff's ownership
  *  transfer. The new owner starts from no observation baseline; the old
- *  owner's still-pending work-monitor notices for those targets are
- *  dropped, so they never wake it stale after the transfer. */
+ *  owner's still-pending work-monitor notices for those targets, and its
+ *  session-keyed stall notices, are dropped, so they never wake it stale
+ *  after the transfer. */
 export const moveBindings = db.transaction((instance: string, from: string, to: string): Binding[] => {
   const moved = db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND session = ?')
     .all(instance, from) as Binding[]
@@ -149,6 +150,13 @@ export const moveBindings = db.transaction((instance: string, from: string, to: 
         AND event_key LIKE ? ESCAPE '\\'`).run(instance, from, WORK_MONITOR_SENDER, `${prefix}${escaped}:%`)
     }
   }
+  // Session-keyed stall notices name the old worker's group and episode,
+  // not the work: the source stays open but unbound, so its pending ones
+  // drop instead of waking it after the transfer.
+  const session = from.replace(/[\\%_]/g, ch => `\\${ch}`)
+  db.prepare(`DELETE FROM chat_control_inbox WHERE instance = ? AND recipient = ? AND sender = ? AND state = 'pending'
+    AND (event_key LIKE ? ESCAPE '\\' OR event_key LIKE ? ESCAPE '\\')`)
+    .run(instance, from, WORK_MONITOR_SENDER, `stall:${session}:%`, `stall-done:${session}:%`)
   return moved.map(binding => ({ ...binding, session: to }))
 })
 /** Release every work binding a chat holds. Closing settles work rather

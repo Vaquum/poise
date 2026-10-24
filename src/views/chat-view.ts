@@ -230,6 +230,7 @@ function stallSummary(stall: StallState): string {
     if (repo.dirtyFiles) parts.push(`${repo.dirtyFiles} uncommitted change${repo.dirtyFiles === 1 ? '' : 's'} ${where}`)
   }
   for (const job of stall.backgroundJobs) parts.push(`background job "${job.command}" (pid ${job.pid}) still running`)
+  if (stall.truncatedRepos) parts.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work`)
   if (!parts.length) return 'Stalled — the last turn left work behind.'
   return `Stalled — the last turn left ${parts.join(', ')}.`
 }

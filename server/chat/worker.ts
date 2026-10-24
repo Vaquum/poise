@@ -162,20 +162,31 @@ export async function groupMembers(pgid: number): Promise<GroupMember[] | null> 
   return members
 }
 
-/** Whether `pid` is still the gate we recorded: its command line must be
- *  the gate script carrying `--lease-worker <ident>` as its own argument.
- *  Anything else (pid reuse, unreadable table) is "no". */
-export async function workerIdentityMatches(pid: number, ident: string): Promise<boolean> {
-  if (!pidAlive(pid) || !/^[A-Za-z0-9-]{8,64}$/.test(ident)) return false
+export type WorkerGateStatus = 'verified' | 'gone' | 'unknown'
+
+/** Whether the recorded gate still owns `pid`: `verified` when its command
+ *  line is the gate script carrying `--lease-worker <ident>` as its own
+ *  argument, `gone` when the pid is dead or another process (pid reuse),
+ *  `unknown` when the process table itself cannot be read. Callers that
+ *  act on death must retry on `unknown`, never treat it as `gone`. */
+export async function workerGateStatus(pid: number, ident: string): Promise<WorkerGateStatus> {
+  if (!pidAlive(pid) || !/^[A-Za-z0-9-]{8,64}$/.test(ident)) return 'gone'
+  let stdout: string
   try {
-    const { stdout } = await runFile('ps', ['-o', 'command=', '-p', String(pid)], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 })
-    const line = stdout.trim()
-    const gateIndex = line.indexOf(WORKER_GATE)
-    const identIndex = line.indexOf(` --lease-worker ${ident} -- `)
-    return gateIndex >= 0 && identIndex > gateIndex
+    ({ stdout } = await runFile('ps', ['-o', 'command=', '-p', String(pid)], { timeoutMs: 5_000, maxOutputBytes: 64 * 1024 }))
   } catch {
-    return false
+    return 'unknown'
   }
+  const line = stdout.trim()
+  const gateIndex = line.indexOf(WORKER_GATE)
+  const identIndex = line.indexOf(` --lease-worker ${ident} -- `)
+  return gateIndex >= 0 && identIndex > gateIndex ? 'verified' : 'gone'
+}
+
+/** Whether `pid` is still the gate we recorded. Anything but a verified
+ *  command line — pid reuse, an unreadable table — is "no". */
+export async function workerIdentityMatches(pid: number, ident: string): Promise<boolean> {
+  return (await workerGateStatus(pid, ident)) === 'verified'
 }
 
 function delay(ms: number): Promise<void> {

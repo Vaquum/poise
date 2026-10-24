@@ -113,17 +113,30 @@ export async function unpushedCommits(checkout: string, branch: string): Promise
 }
 
 /** Leftover work in a worker-owned task repo: the current branch, the
- *  uncommitted file count, and commits on any local branch no remote
- *  contains. Read-only: safe without the checkout lease. */
+ *  uncommitted file count, and commits on any local branch — or a
+ *  detached HEAD — that no remote contains. Read-only: safe without the
+ *  checkout lease. */
 export async function inspectTaskRepo(checkout: string): Promise<{ branch: string, dirtyFiles: number, unpushedCommits: number }> {
   const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'])
   const lines = status.split('\n').filter((line) => line.length > 0)
   const header = lines[0] || ''
   const detached = header.includes('(no branch)') || header.includes('HEAD (no branch)')
-  const branch = detached ? '' : header.replace(/^## /, '').split('...')[0].split(' ')[0]
+  const branch = detached ? ''
+    : header.startsWith('## No commits yet on ') ? header.replace('## No commits yet on ', '').split('...')[0]
+    : header.replace(/^## /, '').split('...')[0].split(' ')[0]
   const dirtyFiles = lines.slice(1).length
-  const unpushed = Number((await git(checkout, ['rev-list', '--count', '--branches', '--not', '--remotes'])).trim()) || 0
-  return { branch, dirtyFiles, unpushedCommits: unpushed }
+  return { branch, dirtyFiles, unpushedCommits: await unpushedTaskCommits(checkout) }
+}
+
+/** Commits no remote contains: every local branch plus an unborn-proof
+ *  HEAD, so a detached HEAD's commits count but a commit-less repo reads
+ *  zero instead of failing. */
+async function unpushedTaskCommits(checkout: string): Promise<number> {
+  try {
+    return Number((await git(checkout, ['rev-list', '--count', '--branches', 'HEAD', '--not', '--remotes'])).trim()) || 0
+  } catch {
+    return Number((await git(checkout, ['rev-list', '--count', '--branches', '--not', '--remotes'])).trim()) || 0
+  }
 }
 
 // ── Guarded (mutating) commands ───────────────────────────────────────────

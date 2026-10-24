@@ -227,9 +227,9 @@ export interface WorkspaceState {
   checkedAt: string
 }
 
-/** A background process a turn started that outlived the turn: a member of
- *  the turn's worker group that is neither the gate nor its direct child
- *  (the agent). `command` is a redacted display label, not forensics. */
+/** A background process a turn started that outlived the turn: a member
+ *  of the turn's worker group that was not there when the turn's native
+ *  prompt began. `command` is a redacted display label, not forensics. */
 export interface StalledJob {
   pid: number
   pgid: number
@@ -257,8 +257,10 @@ export interface StallState {
   episode: string
   at: string
   updatedAt: string
-  /** Task repos with leftover work, by path. */
+  /** Task repos with leftover work, by path, at most 20 kept. */
   repos: StallRepo[]
+  /** Further task repos with leftover work beyond the kept 20. */
+  truncatedRepos?: number
   /** Still-running background jobs, oldest first, at most 20 tracked. */
   backgroundJobs: StalledJob[]
 }
