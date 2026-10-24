@@ -638,7 +638,7 @@ export class ChatRuntime extends EventEmitter {
       // waking. The git facets stay; the next turn end re-verifies them.
       if (record.stall?.backgroundJobs.length) {
         record.stall = { ...record.stall, backgroundJobs: [] }
-        if (!record.stall.repos.length) delete record.stall
+        if (!record.stall.repos.length && !record.stall.truncatedRepos) delete record.stall
         storage.saveSession(record)
       }
       // A change session whose outcome was never recorded ended with the
@@ -4366,7 +4366,8 @@ export class ChatRuntime extends EventEmitter {
       // IO error must never read as finished work.
       if (!found.complete) {
         this.emit('log', `[chat ${record.id.slice(0, 8)}] stall discovery incomplete; keeping the previous repos`)
-        return cap(previous?.repos ?? [])
+        const capped = cap(previous?.repos ?? [])
+        return { repos: capped.repos, truncatedRepos: capped.truncatedRepos + (previous?.truncatedRepos ?? 0) }
       }
       const repos: StallRepo[] = []
       let unreadable = 0

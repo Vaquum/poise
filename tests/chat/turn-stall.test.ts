@@ -592,6 +592,70 @@ describe('turn stall detection and waking', () => {
     await runtime.stop({ handover: false })
   }, 40_000)
 
+  it('keeps truncated overflow across a restart that drops job tracking', async () => {
+    const instance = 'poise-turn-stall-restart:db'
+    const first = makeRuntime(instance, { hosts: [], adapters: [], prompts: [] })
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'chat/stall-restart' } })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    store.bindWork(first.runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    // The shape a truncated stall has when the process dies: jobs that
+    // cannot survive the restart, no kept repos, unfinished overflow.
+    const record = first.runtime.get(session.id)
+    if (!record) throw new Error('no session record')
+    const now = new Date().toISOString()
+    record.stall = { episode: 'e1', at: now, updatedAt: now, repos: [],
+      backgroundJobs: [{ pid: 42424242, pgid: 42424242, command: 'sleep 30', startedAt: now }],
+      truncatedRepos: 1 }
+    storage.saveSession(record)
+    await first.runtime.stop({ handover: false })
+
+    const second = makeRuntime(instance, { hosts: [], adapters: [], prompts: [] })
+    await second.runtime.recover()
+    const kept = second.runtime.get(session.id)?.stall
+    expect(kept?.backgroundJobs).toHaveLength(0)
+    expect(kept?.repos).toHaveLength(0)
+    expect(kept?.truncatedRepos).toBe(1)
+    expect(store.inbox(instance, session.id)).toHaveLength(0)
+    await second.runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('keeps truncated overflow when nested discovery fails', async () => {
+    if (process.getuid?.() === 0) return // unreadable-dir simulation needs permission checks
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-discovery-truncated:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    const seed = runtime.get(session.id)
+    if (!seed) throw new Error('no session record')
+    const now = new Date().toISOString()
+    seed.stall = { episode: 'e1', at: now, updatedAt: now, repos: [], backgroundJobs: [], truncatedRepos: 1 }
+    storage.saveSession(seed)
+
+    // Discovery fails on the unreadable dir: the fallback keeps the
+    // previous overflow count instead of resetting it to zero.
+    const blocked = join(session.checkout, 'blocked')
+    await mkdir(blocked)
+    spawnSync('chmod', ['000', blocked])
+    try {
+      runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+      const kept = runtime.get(session.id)?.stall
+      expect(kept?.repos).toHaveLength(0)
+      expect(kept?.truncatedRepos).toBe(1)
+    } finally {
+      spawnSync('chmod', ['755', blocked])
+    }
+
+    // With discovery healthy and nothing dirty, the stall clears.
+    runtime.prompt(session.id, { text: 'do more work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toBeUndefined()
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
   it('leaves a failed turn with unpushed work to the error surface', async () => {
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [],
       commitFirst: { file: 'work.txt', content: 'done\n', dirty: 'draft.txt' }, failFirst: 'boom' }
