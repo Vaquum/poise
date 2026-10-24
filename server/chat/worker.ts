@@ -162,26 +162,29 @@ export interface GroupMember {
   command: string
 }
 
-/** Every process in `pgid`'s group: pid, parent pid and full command line.
- *  `ps -eo` with `=`-suppressed headers is the same on macOS and Linux (the
- *  worker gate lists groups the same way). Null when the table cannot be
- *  read — callers skip group decisions, never invent them. */
+/** Every live process in `pgid`'s group: pid, parent pid and full command
+ *  line. `ps -eo` with `=`-suppressed headers is the same on macOS and
+ *  Linux (the worker gate lists groups the same way), as is the `stat`
+ *  column. Zombies are skipped: an exited child lingers in the table until
+ *  its parent reaps it, but it is finished — listing it would withhold its
+ *  completion wake. Null when the table cannot be read — callers skip
+ *  group decisions, never invent them. */
 export async function groupMembers(pgid: number): Promise<GroupMember[] | null> {
   if (!pgid || !Number.isSafeInteger(pgid) || pgid <= 1) return null
   let stdout: string
   try {
-    ({ stdout } = await runFile('ps', ['-eo', 'pid=,pgid=,ppid=,command='], { timeoutMs: 5_000, maxOutputBytes: 4 * 1024 * 1024 }))
+    ({ stdout } = await runFile('ps', ['-eo', 'pid=,pgid=,ppid=,stat=,command='], { timeoutMs: 5_000, maxOutputBytes: 4 * 1024 * 1024 }))
   } catch {
     return null
   }
   const members: GroupMember[] = []
   for (const line of stdout.split('\n')) {
     const fields = line.trim().split(/\s+/)
-    if (fields.length < 4) continue
+    if (fields.length < 5) continue
     const [pid, listed, ppid] = fields.slice(0, 3).map(Number)
     if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(listed) || !Number.isSafeInteger(ppid)) continue
-    if (listed !== pgid) continue
-    members.push({ pid, ppid, command: fields.slice(3).join(' ') })
+    if (listed !== pgid || fields[3].startsWith('Z')) continue
+    members.push({ pid, ppid, command: fields.slice(4).join(' ') })
   }
   return members
 }
