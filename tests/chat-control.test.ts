@@ -1244,6 +1244,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('leaves behind branches to merge-prs only when it is enabled, eligible and healthy', async () => {
+    database.setMeta('agentAccount', 'review-bot')
     const { mergePrsOwnsBehind } = await import('../server/chat/control')
     const target = store.workTarget('https://github.com/acme/app/pull/64')
     const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }
@@ -1254,6 +1255,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       database.setMeta('me', 'fixture-agent')
       try {
         expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(true)
+        expect(mergePrsOwnsBehind(target, { ...ciState, author: 'review-bot' }, 'open')).toBe(true)
         expect(mergePrsOwnsBehind(target, { ...ciState, author: 'other' }, 'open')).toBe(false)
         expect(mergePrsOwnsBehind(target, { ...ciState, draft: true }, 'open')).toBe(false)
         expect(mergePrsOwnsBehind(target, { ...ciState, author: undefined }, 'open')).toBe(false)
@@ -1273,6 +1275,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('wakes for behind when a managed account holds the repository', async () => {
+    database.setMeta('agentAccount', 'review-bot')
     const { mergePrsOwnsBehind } = await import('../server/chat/control')
     const target = store.workTarget('https://github.com/beta/app/pull/64')
     const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }

@@ -97,6 +97,7 @@ function humanAvatarFallback(username: string): string {
 
 function ownerCell(username: string | null): string {
   if (!username) return '<span class="last-dash">—</span>'
+  if (username.includes(' / ')) return username.split(' / ').map(ownerCell).join(' ')
   const isBot = /\[bot\]$/i.test(username)
   const classes = ['last-avatar']
   if (isBot) classes.push('is-bot')

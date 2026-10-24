@@ -20,4 +20,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "repository": f"{owner}/{repo}",
         "pull_number": pull_number,
         "head_sha": head_sha,
+        "author": (pull.get("user") or {}).get("login"),
     }

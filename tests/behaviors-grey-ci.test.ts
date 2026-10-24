@@ -63,7 +63,7 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
     return json({ action: 'grey_ci_candidates', actor: args[args.indexOf('--token-user') + 1], graphql_cost: 1, records: requests.map((request) => {
       const runs: unknown = malformedNumbers.has(request.number) ? 'oops'
         : greyNumbers === null || greyNumbers.has(request.number) ? greyRuns : []
-      return ({ ...request, head_sha: HEAD, author: ghostNumbers.has(request.number) ? null : 'octocat', runs,
+      return ({ ...request, head_sha: HEAD, author: ghostNumbers.has(request.number) ? null : pulls.find((pr) => pr.repo === request.repository && pr.number === request.number)?.author ?? 'octocat', runs,
         error: unreadableNumbers.has(request.number) ? 'GitHub could not read this target' : null })
     }) })
   }
@@ -317,4 +317,18 @@ describe('Rerun Grey CI', () => {
     expect(JSON.parse(batches[1]![1][2])[0].number).toBe(51)
     expect(JSON.parse(batches[2]![1][2])).toHaveLength(1)
   })
+})
+
+
+it('recovers mixed-author CI using the opposite account and actual author', async () => {
+  pulls = [pull(), pull('acme/other', 8, { author: 'review-bot' })]
+  db.setMeta('behavior_rerun_grey_ci_enabled', '1')
+  await runtime.runEnabledBehaviorsOnce()
+  const calls = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--rerun-grey-ci-if-ready')
+  expect(calls).toHaveLength(2)
+  for (const [, args] of calls) {
+    const agentAuthor = args[1] === '#8'
+    expect(args[args.indexOf('--author') + 1]).toBe(agentAuthor ? 'review-bot' : 'octocat')
+    expect(args[args.indexOf('--token-user') + 1]).toBe(agentAuthor ? 'octocat' : 'review-bot')
+  }
 })

@@ -1,5 +1,6 @@
 from typing import Any
 
+from github_interface.atoms.review_identity import require_owned_reviews
 from github_interface.atoms.pulls import (
     get_combined_status,
     get_pull,
@@ -146,6 +147,7 @@ async def _read_gate(
     pull = await get_pull(client, owner, repo, pull_number)
     _assert_head(pull, expected_head_sha, "during readiness check")
     reviews = await list_reviews(client, owner, repo, pull_number)
+    require_owned_reviews(reviews, username)
     status = await get_combined_status(client, owner, repo, expected_head_sha)
     rollup = await get_pull_check_rollup(client, owner, repo, pull_number)
     _assert_head(

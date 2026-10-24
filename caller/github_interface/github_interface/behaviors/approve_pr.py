@@ -1,6 +1,8 @@
+import os
 from typing import Any
 
-from github_interface.atoms.pulls import approve_pr, get_pull, list_review_threads
+from github_interface.atoms.review_identity import require_other_author, require_owned_reviews
+from github_interface.atoms.pulls import approve_pr, get_pull, list_review_threads, list_reviews
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head, pull_number, repository, token_user
 
@@ -13,6 +15,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     required_head = expected_head(payload)
     actor = token_user(payload)
     pull = await get_pull(client, owner, repo, number)
+    require_other_author(pull, actor)
     if pull.get("state") != "open" or pull.get("draft") is True:
         raise RuntimeError("pull request is not open and ready for review")
     threads = await list_review_threads(client, owner, repo, number)
@@ -28,6 +31,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             f"{len(unresolved_other)} unresolved review conversation(s) from other reviewers remain"
         )
 
+    if "GITHUB_INTERFACE_AUTOMATED_REVIEWS" in os.environ:
+        require_owned_reviews(await list_reviews(client, owner, repo, number), actor)
     review = await approve_pr(client, owner, repo, number, required_head)
     review_head = str(review.get("commit_id") or "").lower()
     review_actor = str((review.get("user") or {}).get("login") or "")

@@ -95,7 +95,7 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
   // notice subject.
   for (const hold of diagnostics.holds) {
     const cause = failureCause(hold.error)
-    const message = `agent account has no access to ${hold.repo}`
+    const message = `${hold.actor || 'agent account'} has no access to ${hold.repo}`
     const detail = `${hold.org ? `${hold.org}: ` : ''}PR behaviors held for ${hold.repo} — ${cause}`
     for (const behavior of HELD_PR_BEHAVIORS) {
       add({ severity: 'warning', code: 'github_access' }, hold.repo, message, detail,

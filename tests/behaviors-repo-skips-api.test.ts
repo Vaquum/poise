@@ -329,7 +329,7 @@ describe('Replay API', () => {
   const cases: Array<[string, () => void, 'pr_review' | 'pr_approve' | 'issue_review', string]> = [
     ['a draft', () => { pulls[0]!.draft = 1 }, 'pr_review', `Replay refused: ${REPO}#1 is a draft.`],
     ['a merged pull request', () => { pulls[0]!.status = 'merged' }, 'pr_approve', `Replay refused: ${REPO}#1 is not an open pull request.`],
-    ['someone else\'s pull request', () => { pulls[0]!.author = 'mallory' }, 'pr_review', `Replay refused: ${REPO}#1 is authored by mallory, not by your GitHub account octocat.`],
+    ['someone else\'s pull request', () => { pulls[0]!.author = 'mallory' }, 'pr_review', `Replay refused: ${REPO}#1 is authored by mallory, outside your configured GitHub account pair.`],
     ['a skipped repository', () => database!.setMeta('behavior_approve_prs_skip_repos', JSON.stringify([REPO])), 'pr_approve', `Replay refused: ${REPO} is in the Skip repositories list of Approve Pull Requests.`],
     ['an issue in a repository that is not opted in', () => undefined, 'issue_review', `Replay refused: ${REPO} is not opted in to Review New Issues.`],
   ]

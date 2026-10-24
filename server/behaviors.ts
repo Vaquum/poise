@@ -85,6 +85,7 @@ import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type Check
 import { withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, requireAgentAccount } from './settings'
+import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { behaviorHeld } from './alerts/producers'
 
@@ -415,21 +416,21 @@ function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehavi
 }
 
 function recordBehaviorFailure(key: BehaviorKey, kind: 'worker', cause: unknown, target: string, options?: DiagnosticOptions & { callId?: string }): void
-function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string, hold?: boolean }): void
-function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string, hold?: boolean } = {}): void {
+function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string, hold?: boolean, actingAccount?: string }): void
+function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string, hold?: boolean, actingAccount?: string } = {}): void {
   if (!isEnabled(key)) return
   const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
   if (kind === 'operation' && target !== undefined && options.hold !== false && error !== undefined
     && isSkippableBehavior(key)) {
     const repo = repoOfFailureTarget(target)
     if (repo && isRepoAccessDenied(error)) {
-      // The agent account cannot read this repository at all: one held state
+      // The acting account cannot read this repository at all: one held state
       // for the repository replaces this sweep's per-target failure, and the
       // PR behaviors skip the repository until the hourly recheck succeeds.
       // Callers that fan one error out to a whole batch pass hold: false:
       // their error is unattributable to any one repository.
       setMeta(failureKey(key, target), '')
-      recordRepoAccessHold(repo, error)
+      recordRepoAccessHold(repo, error, options.actingAccount ?? diagnosticIdentity(cause)?.account ?? agentAccount())
       return
     }
   }
@@ -478,13 +479,13 @@ function refreshFailureDiagnostic(behavior: BehaviorKey, target: string, call: L
   }
 }
 
-function clearBehaviorFailure(key: BehaviorKey, target?: string): void {
+function clearBehaviorFailure(key: BehaviorKey, target?: string, actor?: string): void {
   setMeta(failureKey(key, target), '')
-  // A cleared PR check proved the agent account can reach the repository, so
+  // A cleared PR check proved the acting account can reach the repository, so
   // an access hold for it is over. Only PR behaviors record holds.
   if (target !== undefined && isSkippableBehavior(key)) {
     const repo = repoOfFailureTarget(target)
-    if (repo) clearRepoAccessHold(repo)
+    if (repo) clearRepoAccessHold(repo, actor ?? diagnosticIdentity()?.account ?? agentAccount())
   }
 }
 
@@ -495,7 +496,7 @@ function clearBehaviorFailureKeepHold(key: BehaviorKey, target: string): void {
 }
 
 // ── Repository access holds ──────────────────────────────────────────
-// When the agent account cannot read a repository at all (GitHub 404 or
+// When an acting account cannot read a repository at all (GitHub 404 or
 // NOT_FOUND for it), every PR behavior would fail on it every sweep,
 // spending calls and burying real failures. Instead the first such failure
 // records one held state per repository, the PR behaviors skip the
@@ -507,13 +508,14 @@ const REPO_ACCESS_HOLD_RECHECK_MS = 60 * 60_000
 
 interface RepoAccessHold {
   repo: string
+  actor?: string
   error: string
   heldAtMs: number
   nextRecheckAtMs: number
 }
 
-function repoHoldKey(repo: string): string {
-  return `${REPO_ACCESS_HOLD_PREFIX}${repo.toLowerCase()}`
+function repoHoldKey(repo: string, actor = agentAccount()): string {
+  return `${REPO_ACCESS_HOLD_PREFIX}${actor.toLowerCase()}:${repo.toLowerCase()}`
 }
 
 // The repository a per-PR failure target names, or null for behavior-wide,
@@ -524,8 +526,11 @@ function repoOfFailureTarget(target: string): string | null {
   return match ? match[1]! : null
 }
 
-function readRepoAccessHold(repo: string): RepoAccessHold | null {
-  const raw = getMeta(repoHoldKey(repo))
+function readRepoAccessHold(repo: string, actor = agentAccount()): RepoAccessHold | null {
+  const key = repoHoldKey(repo, actor)
+  const legacyKey = `${REPO_ACCESS_HOLD_PREFIX}${repo.toLowerCase()}`
+  const legacy = actor.toLowerCase() === agentAccount().toLowerCase() ? getMeta(legacyKey) : null
+  const raw = getMeta(key) || legacy
   if (!raw) return null
   try {
     const value = JSON.parse(raw) as Partial<RepoAccessHold>
@@ -535,12 +540,14 @@ function readRepoAccessHold(repo: string): RepoAccessHold | null {
       || Number(value.heldAtMs) > 8.64e15
       || !Number.isFinite(value.nextRecheckAtMs) || Number(value.nextRecheckAtMs) < 0
       || Number(value.nextRecheckAtMs) > 8.64e15) return null
-    const hold = { repo: value.repo, error: value.error.slice(0, 300),
+    if (value.actor && value.actor.toLowerCase() !== actor.toLowerCase()) return null
+    if (legacy && !getMeta(key)) { setMeta(key, raw); setMeta(legacyKey, '') }
+    const hold = { repo: value.repo, actor, error: value.error.slice(0, 300),
       heldAtMs: Number(value.heldAtMs), nextRecheckAtMs: Number(value.nextRecheckAtMs) }
     // An expired hold is no hold: the next sweep rechecks, and the recheck
     // renews or clears. Purge the row so stale holds never display.
     if (Date.now() >= hold.nextRecheckAtMs) {
-      setMeta(repoHoldKey(repo), '')
+      setMeta(repoHoldKey(repo, actor), '')
       return null
     }
     return hold
@@ -552,16 +559,16 @@ function readRepoAccessHold(repo: string): RepoAccessHold | null {
 // Records the hold unless one is already active. A failure observed while
 // the hold stands (a race in the recording sweep, a path that ran anyway)
 // must not extend it, or the hourly recheck would never come due.
-function recordRepoAccessHold(repo: string, error: string): void {
-  if (readRepoAccessHold(repo)) return
+function recordRepoAccessHold(repo: string, error: string, actor = agentAccount()): void {
+  if (readRepoAccessHold(repo, actor)) return
   const now = Date.now()
-  setMeta(repoHoldKey(repo), JSON.stringify({
-    repo, error: error.slice(0, 300), heldAtMs: now, nextRecheckAtMs: now + REPO_ACCESS_HOLD_RECHECK_MS,
+  setMeta(repoHoldKey(repo, actor), JSON.stringify({
+    repo, actor, error: error.slice(0, 300), heldAtMs: now, nextRecheckAtMs: now + REPO_ACCESS_HOLD_RECHECK_MS,
   } satisfies RepoAccessHold))
 }
 
-function clearRepoAccessHold(repo: string): void {
-  setMeta(repoHoldKey(repo), '')
+function clearRepoAccessHold(repo: string, actor = agentAccount()): void {
+  setMeta(repoHoldKey(repo, actor), '')
 }
 
 function listRepoAccessHolds(): RepoAccessHold[] {
@@ -571,8 +578,11 @@ function listRepoAccessHolds(): RepoAccessHold[] {
   ).all(prefix.length, prefix) as Array<{ key: string }>
   const holds: RepoAccessHold[] = []
   for (const row of rows) {
-    const hold = readRepoAccessHold(row.key.slice(prefix.length))
-    if (hold) holds.push(hold)
+    const identity = row.key.slice(prefix.length)
+    const separator = identity.indexOf(':')
+    const hold = separator < 0 ? readRepoAccessHold(identity)
+      : readRepoAccessHold(identity.slice(separator + 1), identity.slice(0, separator))
+    if (hold && !holds.some((entry) => entry.repo === hold.repo && entry.actor === hold.actor)) holds.push(hold)
   }
   return holds.sort((a, b) => a.repo.localeCompare(b.repo))
 }
@@ -960,6 +970,7 @@ export interface PullRequestFacts {
 export interface PullRequestPolicy {
   behavior: SkippableBehavior
   me: string
+  agentAccount?: string
   skipped: ReadonlySet<string>
 }
 
@@ -967,16 +978,19 @@ export function pullRequestPolicy(behavior: SkippableBehavior): PullRequestPolic
   return {
     behavior,
     me: getMeta('me') || '',
+    agentAccount: agentAccount(),
     skipped: new Set(getRepositorySkips(behavior).map((repo) => repo.toLowerCase())),
   }
 }
 
 // Open, not a draft and yours: what every PR behavior and the baseline require.
-function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | null): string | null {
+function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | null, agent = agentAccount()): string | null {
   if (pr?.status !== 'open') return `${ref} is not an open pull request`
   if (pr.draft) return `${ref} is a draft`
   if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → GitHub`
-  if (pr.author !== me) return `${ref} is authored by ${pr.author}, not by your GitHub account ${me}`
+  if (!agent) return `${ref} needs an agent account in Settings → GitHub`
+  if (agent.toLowerCase() === me.toLowerCase()) return `${ref} needs different GitHub user and agent accounts`
+  if (![me.toLowerCase(), agent.toLowerCase()].includes(pr.author.toLowerCase())) return `${ref} is authored by ${pr.author}, outside your configured GitHub account pair`
   return null
 }
 
@@ -984,16 +998,16 @@ function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | n
 // by the scheduler and by a replay from Swarm alike. It names what failed;
 // `pr` is null when the datastore does not have the pull request.
 export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, number: number, pr: PullRequestFacts | null): string | null {
-  return ownPullRequestRefusal(policy.me, `${repo}#${number}`, pr)
+  return ownPullRequestRefusal(policy.me, `${repo}#${number}`, pr, policy.agentAccount)
     ?? (policy.skipped.has(repo.toLowerCase()) ? `${repo} is in the Skip repositories list of ${SKIPPABLE_LABELS[policy.behavior]}` : null)
-    ?? repoHoldRefusal(repo)
+    ?? (pr ? repoHoldRefusal(repo, prReviewer(pr.author)) : null)
 }
 
 // A repository the agent account cannot read holds every PR behavior until
 // access comes back, rechecked hourly. An expired hold reads as no hold.
-function repoHoldRefusal(repo: string): string | null {
-  const hold = readRepoAccessHold(repo)
-  return hold ? `agent account has no access to ${hold.repo}; PR behaviors are held for this repository` : null
+function repoHoldRefusal(repo: string, actor = agentAccount()): string | null {
+  const hold = readRepoAccessHold(repo, actor)
+  return hold ? `${actor.toLowerCase() === agentAccount().toLowerCase() ? 'agent account' : actor} has no access to ${hold.repo}; PR behaviors are held for this repository` : null
 }
 
 // Last-fired info is intentionally NOT persisted here — agent-interface
@@ -1565,7 +1579,8 @@ async function reconcileBehaviorLaunchClaims(
       && SHA_PATTERN.test(String(call.head_sha || '').toLowerCase())
       && Number.isFinite(Date.parse(completedAt))) {
       if (retireBehaviorDeadLetter(letter.id)) {
-        clearBehaviorFailure(behavior, letter.target)
+        if (call.actor) clearBehaviorFailure(behavior, letter.target, call.actor)
+        else clearBehaviorFailureKeepHold(behavior, letter.target)
         recoveredDeadLetter = true
       }
     }
@@ -1711,7 +1726,7 @@ async function reconcileBehaviorLaunchClaims(
         captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
           state: 'superseded', activity: status === 'superseded' ? 'settled' : 'unknown', stateSource: 'native',
           outcome: 'superseded', head: call.head_sha, completedAt: call.completed_at })
-        clearBehaviorFailure(behavior, claim.target)
+        clearBehaviorFailure(behavior, claim.target, claim.launchActor)
       }
       console.log(
         `[behaviors] ${behavior} superseded for ${claim.launchRepo}#${claim.launchPr}; current head will be reconsidered`,
@@ -1811,7 +1826,7 @@ async function reconcileBehaviorLaunchClaims(
           outcome: outcome as 'clean' | 'changes_requested' | 'approved', head: headSha, completedAt })
         if (claim.launchQuarantine === 'unreadable') retireQuarantineIncident(claim)
         dropActiveClaim(claim.claimId)
-        clearBehaviorFailure(behavior, claim.target)
+        clearBehaviorFailure(behavior, claim.target, claim.launchActor)
       } else {
         dropActiveClaim(claim.claimId)
         const current = listBehaviorLaunchClaims(behavior).find(
@@ -1931,8 +1946,48 @@ export function datastoreFreshnessEntries(now = Date.now()): DatastoreFreshnessE
   return entries
 }
 
-function configuredReviewer(): string {
-  return requireAgentAccount()
+function configuredReviewer(author?: string): string {
+  return author === undefined ? requireAgentAccount() : prReviewer(author)
+}
+
+function reviewBatches(prs: DatastorePr[], size: number): { reviewer: string, batch: DatastorePr[] }[] {
+  const groups = new Map<string, DatastorePr[]>()
+  for (const pr of prs) {
+    const reviewer = configuredReviewer(pr.author)
+    const group = groups.get(reviewer) ?? []
+    group.push(pr)
+    groups.set(reviewer, group)
+  }
+  return [...groups].flatMap(([reviewer, group]) => {
+    const batches = []
+    for (let i = 0; i < group.length; i += size) batches.push({ reviewer, batch: group.slice(i, i + size) })
+    return batches
+  })
+}
+
+async function automatedReviewEnvironment(repo: string, number: number, reviewer: string, accounts = prAccounts()): Promise<NodeJS.ProcessEnv> {
+  if (reviewer.toLowerCase() !== accounts.me.toLowerCase()) return {}
+  const snapshot = await readBehaviorLogSnapshot()
+  if (snapshot.quarantined.some((row) => quarantinedLogMayMatch(row, { repo, prId: String(number) }))) {
+    throw new Error('Cannot establish ownership of automated reviews: Caller evidence is unreadable')
+  }
+  const ids = snapshot.entries.filter((row) => row.repo === repo && row.pr_id === String(number)
+    && row.actor?.toLowerCase() === reviewer.toLowerCase()
+    && ['poise:review-new-prs', 'poise:approve-prs', 'poise:manual-review', 'poise:replay'].includes(row.source || '')
+    && ['pr_review', 'pr_approve'].includes(row.behavior || '')
+    && ['completed', 'superseded'].includes(row.status) && unambiguousAgentCall(snapshot, row)
+    && Number.isSafeInteger(row.review_id) && (row.review_id || 0) > 0).map((row) => row.review_id!)
+  return { GITHUB_INTERFACE_AUTOMATED_REVIEWS: JSON.stringify(ids) }
+}
+
+async function requireOwnedHumanReviews(pr: DatastorePr, reviewer: string, activity: ReviewActivityResult): Promise<void> {
+  const env = await automatedReviewEnvironment(pr.repo, pr.number, reviewer)
+  if (!env.GITHUB_INTERFACE_AUTOMATED_REVIEWS) return
+  const owned = new Set<number>(JSON.parse(env.GITHUB_INTERFACE_AUTOMATED_REVIEWS))
+  if (activity.reviewerReviewIdsSince === null || activity.reviewerPendingReviews > 0
+    || activity.reviewerReviewIdsSince.some((id) => !owned.has(id))) {
+    throw new Error(`Manual or unclaimed reviews by ${reviewer} remain; automatic approval and resolution are held`)
+  }
 }
 
 function parseJson(value: string, operation: string): unknown {
@@ -2048,7 +2103,8 @@ function datastorePr(row: unknown, index: number): DatastorePr {
 }
 
 async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
-  if (!author) return []
+  prAccounts()
+  author = JSON.stringify([author.toLowerCase(), agentAccount().toLowerCase()])
   const shared = sharedPrListing.getStore()
   if (shared && (shared.promise === null || shared.author === author)) {
     shared.author = author
@@ -2062,7 +2118,7 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   return readOpenPrsByAuthor(author)
 }
 
-async function readOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
+async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
   await requireFreshDatastore()
   const { stdout } = await runFile(
     DATASTORE,
@@ -2082,7 +2138,7 @@ async function readOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   })
   reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
   retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
-  return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(author, `${pr.repo}#${pr.number}`, pr))
+  return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(getMeta('me') || '', `${pr.repo}#${pr.number}`, pr))
 }
 
 // The open pull requests a PR behavior may act on in this scan: yours, and
@@ -2095,8 +2151,9 @@ async function listEligiblePrs(behavior: SkippableBehavior, author: string): Pro
 
 // Read just before a launch: a skip saved, or your account changed, while the
 // launch was being prepared stops it.
-function stillEligible(behavior: SkippableBehavior, pr: DatastorePr): boolean {
+function stillEligible(behavior: SkippableBehavior, pr: DatastorePr, actor?: string): boolean {
   return !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
+    && (actor === undefined || configuredReviewer(pr.author).toLowerCase() === actor.toLowerCase())
 }
 
 // A scan cut short by its deadline resumes beyond the blocked batch or
@@ -2140,8 +2197,8 @@ async function readPullRequest(repo: string, number: number): Promise<DatastoreP
   return rows[0] ?? null
 }
 
-async function localCheckoutPath(owner: string, repo: string, number: number, head: string): Promise<string> {
-  return resolveReviewCheckout(owner, repo, number, configuredReviewer(), head, behaviorSignal())
+async function localCheckoutPath(owner: string, repo: string, number: number, head: string, actor: string): Promise<string> {
+  return resolveReviewCheckout(owner, repo, number, actor, head, behaviorSignal())
 }
 
 async function currentHeadSha(
@@ -2215,6 +2272,7 @@ async function slotModel(slot: ReviewerSlot): Promise<{ model: string, recovery:
 }
 
 interface PreparedReviewTarget {
+  accounts: ReturnType<typeof prAccounts>
   pr: DatastorePr
   num: string
   key: string
@@ -2246,12 +2304,14 @@ async function prepareReviewTarget(
   key: string,
   slot: ReviewerSlot,
 ): Promise<PreparedReviewTarget | null> {
+  const accounts = prAccounts()
+  const reviewer = configuredReviewer(pr.author)
   const target = reviewSlotTarget(key, slot)
   const checkTarget = `${target}:check`
   if (!isEnabled('review-new-prs') || behaviorAborted()) return null
   if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) return null
-  if (await packetBlocked('review-new-prs', pr.repo, pr.number)) {
-    if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+  if (await packetBlocked('review-new-prs', pr.repo, pr.number, reviewer)) {
+    if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, reviewer)
     return null
   }
   const operationId = await claimEligiblePrOperation('review-new-prs', target)
@@ -2261,7 +2321,7 @@ async function prepareReviewTarget(
   }
   let prepared: PreparedReviewTarget | null = null
   try {
-    return await withNoticeDiagnosticIdentity({ correlationId: operationId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
+    return await withNoticeDiagnosticIdentity({ correlationId: operationId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: reviewer }, async () => {
       // Recovery probe only: release a dead no-action launch so the claim
       // phase can reclaim this target. Its own writes are claim-guarded.
       await releaseFailedBehaviorIfNoAction('review-new-prs', pr.repo, pr.number, target)
@@ -2272,7 +2332,6 @@ async function prepareReviewTarget(
       if (!resolved || !isEnabled('review-new-prs') || behaviorAborted()) return null
       const { model, recovery, catalog } = resolved
       const claude = needsClaude(catalog, model)
-      const reviewer = configuredReviewer()
       const actor = reviewer
       if (claude) await waitForBehavior(claudeAuth.requireReady())
       const modelCliEnv = await prepareBehaviorModelClis(catalog, [model, recovery], operationId)
@@ -2287,14 +2346,14 @@ async function prepareReviewTarget(
         throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
       }
       const expectedHead = await currentHeadSha(pr.repo, pr.number, actor)
-      if (!isEnabled('review-new-prs') || behaviorAborted() || !stillEligible('review-new-prs', pr)) return null
+      if (!isEnabled('review-new-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('review-new-prs', pr, actor)) return null
       let changes: ChangesAddressedResult | null = null
       if (reviewer) {
         changes = await checkChangesAddressed(pr.repo, pr.number, reviewer)
         if (!isEnabled('review-new-prs') || behaviorAborted()) return null
       }
       prepared = {
-        pr, num, key, slot, target, checkTarget, operationId,
+        accounts, pr, num, key, slot, target, checkTarget, operationId,
         owner, repo, reviewer, actor, model, recovery, catalog,
         modelCliEnv, expectedHead, changes, source: 'poise:review-new-prs',
       }
@@ -2330,7 +2389,7 @@ async function spawnReviewLaunch(prepared: PreparedReviewTarget, claimId: string
     setting,
     ...noteArgs('review-new-prs'),
   ]
-  await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
+  await withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: prepared.actor }, async () => {
     if (!renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
       captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
         outcome: 'preflight_failed', completedAt: new Date().toISOString() })
@@ -2433,7 +2492,6 @@ const SNAPSHOT_RECOVERY_META = 'behavior_review_new_prs_snapshot_recovery_v2'
 
 async function recoverSnapshotReviews(
   prs: DatastorePr[],
-  reviewer: string,
 ): Promise<void> {
   if (currentOrganization()?.managed || getMeta(SNAPSHOT_RECOVERY_META) === '1') return
   const previousRecoveryComplete = getMeta(FAILED_SNAPSHOT_RECOVERY_META) === '1'
@@ -2448,6 +2506,7 @@ async function recoverSnapshotReviews(
       const separator = candidate.target.lastIndexOf('#')
       const repo = candidate.target.slice(0, separator)
       const prId = candidate.target.slice(separator + 1)
+      const reviewer = configuredReviewer(prs.find((pr) => pr.repo === repo && String(pr.number) === prId)!.author)
       const matching = logs.filter((entry) =>
         entry.behavior === 'pr_review'
         && entry.repo === repo
@@ -2519,7 +2578,6 @@ async function tickReviewNewPrs(): Promise<void> {
   await withBehaviorProcessLock('review-new-prs', async () => {
     await reconcileBehaviorLaunchClaims('review-new-prs')
   })
-  const reviewer = configuredReviewer()
 
   // keyver=3 restores one initial review per PR. Convert a complete v2 ledger
   // in place so a PR opened during downtime is not absorbed by a deploy-time
@@ -2536,7 +2594,7 @@ async function tickReviewNewPrs(): Promise<void> {
     const slots = availableReviewSlots(await launchReviewPanel(getReviewers('review-new-prs')))
     if (slots.length === 0) return
     const prs = await listEligiblePrs('review-new-prs', author)
-    await recoverSnapshotReviews(prs, reviewer)
+    await recoverSnapshotReviews(prs)
     let failure: unknown
     const candidates = orderByCursor(prs, 'behavior_review_new_prs_prepare_cursor').flatMap((pr) => {
       const key = `${pr.repo}#${pr.number}`
@@ -2566,6 +2624,7 @@ async function tickReviewNewPrs(): Promise<void> {
     await forEachPool(candidates, REVIEW_PREPARE_CONCURRENCY, async ([pr, key, slot]) => {
       const target = reviewSlotTarget(key, slot)
       const checkTarget = `${target}:check`
+      const reviewer = configuredReviewer(pr.author)
       setMeta('behavior_review_new_prs_prepare_cursor', key)
       try {
         const bundle = await prepareReviewTarget(pr, key, slot)
@@ -2574,7 +2633,7 @@ async function tickReviewNewPrs(): Promise<void> {
         if (behaviorAborted()) return
         console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
-        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
+        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
       }
     })
     // An expired operation deadline must not discard prepared reviews: a slow
@@ -2621,7 +2680,7 @@ async function tickReviewNewPrs(): Promise<void> {
             if (behaviorAborted()) { releasePhase2Leases(); return }
             if (!isEnabled('review-new-prs')) { releaseLeases(null); continue }
             if (!behaviorRetryDue('review-new-prs', target) || !behaviorRetryDue('review-new-prs', checkTarget)) { releaseLeases(null); continue }
-            if (!stillEligible('review-new-prs', pr)) { releaseLeases(null); continue }
+            if (!prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) { releaseLeases(null); continue }
             const primaryFresh = !hasSeen('review-new-prs', key) || !!getFailedBehaviorLaunch('review-new-prs', key)
             const panelKey = `${META_PREFIX}review_new_prs_panel:${key}`
             let admitted = parseJsonMeta(panelKey)
@@ -2660,11 +2719,11 @@ async function tickReviewNewPrs(): Promise<void> {
             // so its claim is retained. The address check ran during
             // preparation, so a request landing in the seconds since is
             // caught on the next tick.
-            if (bundle.changes?.hasChangeRequest) {
+            if (bundle.changes?.hasChangeRequest && bundle.actor.toLowerCase() !== (getMeta('me') || '').toLowerCase()) {
               completeOwnedClaim('review-new-prs', target, claimId)
               ownedClaimId = null
               releasePrOperationOwned(operationId)
-              if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+              if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, bundle.actor)
               console.log(`[behaviors] review-new-prs skipped for ${pr.repo}#${pr.number} — outstanding CHANGES_REQUESTED, approve-prs owns it`)
               continue
             }
@@ -2690,7 +2749,7 @@ async function tickReviewNewPrs(): Promise<void> {
             }
             console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
             if (err instanceof BehaviorLogFeedError) failure ??= err
-            else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
+            else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
             releaseLeases(ownedClaimId)
           }
         }
@@ -2728,8 +2787,8 @@ async function tickReviewNewPrs(): Promise<void> {
         if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
-        const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead)
-        if (behaviorAborted() || !isEnabled('review-new-prs') || !stillEligible('review-new-prs', pr)) {
+        const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor)
+        if (behaviorAborted() || !isEnabled('review-new-prs') || !prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) {
           releaseOwnedClaim('review-new-prs', target, claimId)
           releasePrOperationOwned(bundle.operationId)
           captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
@@ -2741,7 +2800,7 @@ async function tickReviewNewPrs(): Promise<void> {
         }
         checkoutReady = true
         await spawnReviewLaunch(bundle, claimId, setting, pwd)
-        if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget)
+        if (!behaviorAborted()) clearBehaviorFailure('review-new-prs', checkTarget, bundle.actor)
         console.log(`[behaviors] review-new-prs fired for ${pr.repo}#${pr.number} (p=${setting}, ${slot})`)
       } catch (err) {
         // A superseded spawn releases its claim like any other launch
@@ -2757,7 +2816,7 @@ async function tickReviewNewPrs(): Promise<void> {
         }
         console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
-        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget)
+        else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
       }
     })))
     if (failure) throw failure
@@ -2957,12 +3016,12 @@ function packetBlockKey(behavior: string, repo: string, number: number): string 
 }
 
 async function packetBlocked(
-  behavior: ActiveClaim['behavior'], repo: string, number: number, head?: string,
+  behavior: ActiveClaim['behavior'], repo: string, number: number, reviewer: string, head?: string,
 ): Promise<boolean> {
   const key = packetBlockKey(behavior, repo, number)
   const blockedHead = getMeta(key)
   if (!blockedHead) return false
-  const current = head ?? await currentHeadSha(repo, number, configuredReviewer())
+  const current = head ?? await currentHeadSha(repo, number, reviewer)
   if (current === blockedHead) return true
   // A changed head is new input. The old launch remains in the audit trail;
   // initial-review recovery still verifies its exact no-action provenance.
@@ -3004,7 +3063,8 @@ export async function retryFailedPrReviews(callIds: unknown): Promise<{ ok: true
     throw new HttpError(409, 'Retry calls must belong to one automated PR review on one head')
   }
   return withBehaviorOrganization(first.repo!.split('/')[0], async () => {
-    if (!isEnabled(behavior) || first.actor?.toLowerCase() !== configuredReviewer().toLowerCase()) {
+    const pr = await readPullRequest(first.repo!, Number(first.pr_id))
+    if (!pr || !isEnabled(behavior) || first.actor?.toLowerCase() !== configuredReviewer(pr.author).toLowerCase()) {
       throw new HttpError(409, 'Retry does not match the enabled reviewer')
     }
     const failed = failedBehaviorLaunches(behavior).filter((claim) => callIds.includes(claim.launchCallId))
@@ -3042,8 +3102,8 @@ export async function retryFailedPrReviews(callIds: unknown): Promise<{ ok: true
           setMeta(`${META_PREFIX}operator_retry:${claim.launchCallId}`, JSON.stringify({ at: new Date().toISOString(),
             target: claim.target, expectedHead: first.expected_head, correlationId: claim.launchCorrelationId }))
           retireBehaviorDeadLettersForTarget(behavior, claim.target)
-          clearBehaviorFailure(behavior, claim.target)
-          clearBehaviorFailure(behavior, `${claim.target}:check`)
+          clearBehaviorFailure(behavior, claim.target, claim.launchActor)
+          clearBehaviorFailure(behavior, `${claim.target}:check`, claim.launchActor)
         }
         setMeta(packetBlockKey(behavior, first.repo!, Number(first.pr_id)), '')
       })()
@@ -3126,7 +3186,7 @@ async function releaseFailedBehaviorIfNoAction(
           head: replay.head_sha, completedAt: replay.completed_at,
           refs: [{ kind: 'caller', identity: replay.id, availability: 'available' }] })
         retireBehaviorDeadLettersForTarget(behavior, target)
-        clearBehaviorFailure(behavior, target)
+        clearBehaviorFailure(behavior, target, failed.launchActor)
         return false
       }
     }
@@ -3215,6 +3275,9 @@ function parseChangesAddressedResult(
   number: number,
   reviewer: string,
 ): ChangesAddressedResult {
+  if (typeof data.pr_author !== 'string' || configuredReviewer(data.pr_author).toLowerCase() !== reviewer.toLowerCase()) {
+    throw new Error('Live PR author is missing or differs from the admitted account routing')
+  }
   const hasChangeRequest = data.has_change_request
   const status = data.status
   const headSha = String(data.head_sha || '').toLowerCase()
@@ -3311,6 +3374,9 @@ async function readChangesAddressedBatch(
       throw new Error('github-interface --requested-changes-addressed returned misaligned batch evidence')
     }
     if (record.error === null) {
+      if (typeof record.pr_author !== 'string' || record.pr_author.toLowerCase() !== pr.author.toLowerCase()) {
+        return { pr, result: null, error: 'Live PR author is missing or differs from the admitted author' }
+      }
       return { pr, result: parseChangesAddressedResult(record, pr.repo, pr.number, reviewer), error: null }
     }
     if (typeof record.error !== 'string' || !record.error) {
@@ -3326,7 +3392,8 @@ async function readReviewActivityBatch(
 ): Promise<BatchRead<ReviewActivityResult>[]> {
   const { stdout } = await runFile(GH_INTERFACE, [
     '--review-activity-since', '--requests-json',
-    JSON.stringify(requests.map(({ pr, since }) => ({ repository: pr.repo, number: pr.number, since }))),
+    JSON.stringify(requests.map(({ pr, since }) => ({ repository: pr.repo, number: pr.number,
+      since: reviewer.toLowerCase() === (getMeta('me') || '').toLowerCase() ? '1970-01-01T00:00:00Z' : since }))),
     '--username', reviewer, '--token-user', reviewer,
   ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() })
   const packet = objectValue(
@@ -3387,14 +3454,15 @@ async function fireApprove(
   admittedReviewer?: string,
   replacesFailedCallId?: string,
 ): Promise<boolean> {
-  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: agentAccount() || null }, async () => {
+  return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'approve-prs', repository: pr.repo, target: `${pr.repo}#${pr.number}`, account: configuredReviewer(pr.author) }, async () => {
   if (!isEnabled('approve-prs')) return false
+  const accounts = prAccounts()
   const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
   if (!m) throw new Error('not a github PR url: ' + pr.url)
   const [, owner, repo, num] = m
   const { model, recovery, catalog } = await waitForBehavior(reviewChoice('pr_approve'))
   const claude = needsClaude(catalog, model)
-  const actor = configuredReviewer()
+  const actor = configuredReviewer(pr.author)
   if (admittedReviewer && (actor.toLowerCase() !== admittedReviewer.toLowerCase()
     || await dismissedApprovalHeld(pr, expectedHead, model))) return false
   if (claude) await waitForBehavior(claudeAuth.requireReady())
@@ -3429,10 +3497,12 @@ async function fireApprove(
     return false
   }
   attachCheckSlotToClaim(claimId, checkSlot)
-  const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead)
-  if (!isEnabled('approve-prs') || behaviorAborted() || !stillEligible('approve-prs', pr)) return false
-  if ((await reviewChoice('pr_approve')).model !== model) return false
-  if (admittedReviewer && configuredReviewer().toLowerCase() !== admittedReviewer.toLowerCase()) return false
+  const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
+  const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor, accounts)
+  const selectedModel = (await reviewChoice('pr_approve')).model
+  if (!isEnabled('approve-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('approve-prs', pr, actor)) return false
+  if (selectedModel !== model) return false
+  if (admittedReviewer && configuredReviewer(pr.author).toLowerCase() !== admittedReviewer.toLowerCase()) return false
   if (replacesFailedCallId && !renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
     throw new Error(`approval PR operation ownership was lost for ${pr.repo}#${pr.number}`)
   }
@@ -3474,7 +3544,7 @@ async function fireApprove(
   }
   try { await spawnDetached(AGENT_INTERFACE, args, {
     cwd: agentInterfaceCwd(),
-    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
+    env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv, ...reviewEnvironment },
     onExit: settleClaimAfterExit('approve-prs', claimTarget, claimId),
   }) } catch (error) {
     captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
@@ -3510,6 +3580,7 @@ interface ApproveLaunch {
   seenTarget: string
   firedReason: string
   admittedReviewer: string | undefined
+  dismissedRecovery?: boolean
 }
 
 // The approve-prs change gate (#488): --requested-changes-addressed costs
@@ -3530,7 +3601,7 @@ interface ApproveCheckSnapshot {
 function approveCheckSnapshot(repo: string, number: number, reviewer: string): ApproveCheckSnapshot {
   return {
     reviewer,
-    basis: latestApprovalBasisLaunch(repo, number)?.callId ?? null,
+    basis: latestApprovalBasisLaunch(repo, number, reviewer)?.callId ?? null,
     dismissed: latestCompletedChangeRequestLaunch(repo, number, reviewer)?.callId ?? null,
     packet: getMeta(packetBlockKey('approve-prs', repo, number)) || null,
   }
@@ -3582,10 +3653,8 @@ function clearApproveSkip(pr: DatastorePr): void {
 async function tickApprovePrs(): Promise<void> {
   if (!isEnabled('approve-prs')) return
   const author = getMeta('me') || ''
-  // The reviewer is whoever left the change-requests we're checking
-  // against: the agent account (Settings → GitHub).
+  // Each PR uses the configured account opposite its author.
   if (!author) return
-  const reviewer = configuredReviewer()
   try {
     const prs = await listEligiblePrs('approve-prs', author)
     // Backed-off PRs don't spend batch capacity, and the cursor rotates
@@ -3615,7 +3684,7 @@ async function tickApprovePrs(): Promise<void> {
     // being parked under inputs the check never saw.
     const snapshots = new Map(candidates.map((pr) => [
       `${pr.repo}#${pr.number}`,
-      approveCheckSnapshot(pr.repo, pr.number, reviewer),
+      approveCheckSnapshot(pr.repo, pr.number, configuredReviewer(pr.author)),
     ] as const))
     // A held failure retries on its own clock even when nothing changed,
     // and an in-flight launch settles into the snapshot's local inputs:
@@ -3635,21 +3704,20 @@ async function tickApprovePrs(): Promise<void> {
       }
     }
     let failure: unknown
-    const clearCheck = (checkTarget: string) => {
-      if (!behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
+    const clearCheck = (checkTarget: string, reviewer: string) => {
+      if (!behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget, reviewer)
     }
     // A terminal no-op parks the PR: a launch, a deferral (busy PR,
     // active launch, held claim) or an error never does, so the next
     // tick checks it again.
     const parkCheck = (pr: DatastorePr, reason: string) => {
       if (behaviorAborted()) return
-      clearBehaviorFailure('approve-prs', `${pr.repo}#${pr.number}:check`)
+      clearBehaviorFailure('approve-prs', `${pr.repo}#${pr.number}:check`, configuredReviewer(pr.author))
       recordApproveCheck(pr, snapshots.get(`${pr.repo}#${pr.number}`)!)
       logApproveSkip(pr, `parked: ${reason}`)
     }
-    for (let offset = 0; offset < stage1.length; offset += PR_READ_BATCH_SIZE) {
+    for (const { reviewer, batch } of reviewBatches(stage1, PR_READ_BATCH_SIZE)) {
       if (!isEnabled('approve-prs') || behaviorAborted()) return
-      const batch = stage1.slice(offset, offset + PR_READ_BATCH_SIZE)
       const last = batch[batch.length - 1]!
       setMeta('behavior_approve_prs_cursor', `${last.repo}#${last.number}`)
       let records: BatchRead<ChangesAddressedResult>[]
@@ -3670,16 +3738,16 @@ async function tickApprovePrs(): Promise<void> {
         setMeta('behavior_approve_prs_cursor', `${pr.repo}#${pr.number}`)
         if (error !== null) {
           console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, error)
-          recordBehaviorFailure('approve-prs', 'operation', error, checkTarget)
+          recordBehaviorFailure('approve-prs', 'operation', error, checkTarget, { actingAccount: reviewer })
           continue
         }
         try {
           const check = result!
-          if (await packetBlocked('approve-prs', pr.repo, pr.number, check.headSha)) {
+          if (await packetBlocked('approve-prs', pr.repo, pr.number, reviewer, check.headSha)) {
             parkCheck(pr, `review packet too large for head ${check.headSha.slice(0, 8)}`)
             continue
           }
-          const cleanReview = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number)
+          const cleanReview = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number, reviewer)
           let dismissedReview: CompletedApprovalBasisLaunch | null = null
           if (!check.hasChangeRequest && !cleanReview) {
             dismissedReview = check.reviewerLatestState === 'DISMISSED'
@@ -3704,11 +3772,16 @@ async function tickApprovePrs(): Promise<void> {
           // author response counters reset to 0. Caller matches resolution
           // evidence to that request's findings, including reaffirmations.
           if (check.hasChangeRequest) {
+            if (reviewer.toLowerCase() === (getMeta('me') || '').toLowerCase()
+              && !latestCompletedChangeRequestLaunch(pr.repo, pr.number, reviewer)) {
+              parkCheck(pr, 'change request has no automated review receipt')
+              continue
+            }
             if (check.responseCount < 1 || check.latestRequestAt === null) {
               parkCheck(pr, 'waiting for author response to change request')
               continue
             }
-            checks.push({ pr, check, since: check.latestRequestAt, clean: false, review: null, admittedReviewer: undefined })
+            checks.push({ pr, check, since: check.latestRequestAt, clean: false, review: null, admittedReviewer: reviewer })
           } else {
             const review = cleanReview ?? dismissedReview
             if (!review) {
@@ -3716,12 +3789,12 @@ async function tickApprovePrs(): Promise<void> {
               continue
             }
             checks.push({ pr, check, since: review.completedAt, clean: cleanReview !== null, review,
-              admittedReviewer: cleanReview ? undefined : reviewer })
+              admittedReviewer: reviewer })
           }
         } catch (err) {
           if (behaviorAborted()) return
           console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
-          recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
+          recordBehaviorFailure('approve-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
         }
       }
       // Each chunk runs the whole pipeline — activity read, claim and fire —
@@ -3749,11 +3822,12 @@ async function tickApprovePrs(): Promise<void> {
           const checkTarget = `${pr.repo}#${pr.number}:check`
           if (error !== null) {
             console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, error)
-            recordBehaviorFailure('approve-prs', 'operation', error, checkTarget)
+            recordBehaviorFailure('approve-prs', 'operation', error, checkTarget, { actingAccount: reviewer })
             continue
           }
           try {
             const activity = result!
+            await requireOwnedHumanReviews(pr, reviewer, activity)
             const check = request.check
             if (check.hasChangeRequest) {
               // An outdated thread is evidence to inspect, not a current-head veto.
@@ -3775,7 +3849,7 @@ async function tickApprovePrs(): Promise<void> {
               launches.push({ pr, expectedHead: check.headSha,
                 seenTarget: `${pr.repo}#${pr.number}@req=${check.latestRequestAt}/r=${check.responseCount}/head=${check.headSha}`,
                 firedReason: `req=${check.latestRequestAt}, r=${check.responseCount}: ${check.commitsAfterRequest}c+${check.authorInlineRepliesAfterRequest}inline+${check.authorPrCommentsAfterRequest}pr-comment+${check.resolvedRequestThreads}resolved, head=${check.headSha.slice(0, 8)}`,
-                admittedReviewer: undefined })
+                admittedReviewer: reviewer })
             } else {
               const review = request.review!
               if (!request.clean && (activity.reviewerLatestState !== 'DISMISSED'
@@ -3815,12 +3889,12 @@ async function tickApprovePrs(): Promise<void> {
               launches.push({ pr, expectedHead: activity.headSha,
                 seenTarget: `${pr.repo}#${pr.number}@head=${activity.headSha}`,
                 firedReason: `${request.clean ? 'clean' : 'dismissed'} review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`,
-                admittedReviewer: request.admittedReviewer })
+                admittedReviewer: request.admittedReviewer, dismissedRecovery: !request.clean })
             }
           } catch (err) {
             if (behaviorAborted()) return
             console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
-            recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
+            recordBehaviorFailure('approve-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
           }
         }
       }
@@ -3828,7 +3902,7 @@ async function tickApprovePrs(): Promise<void> {
       // provider layer expects, while the sweep stays bounded.
       await forEachPool(launches, APPROVE_FIRE_CONCURRENCY, async (launch) => {
         if (!isEnabled('approve-prs') || behaviorAborted()) return
-        const { pr, expectedHead, seenTarget, firedReason, admittedReviewer } = launch
+        const { pr, expectedHead, seenTarget, firedReason, admittedReviewer, dismissedRecovery } = launch
         const prTarget = `${pr.repo}#${pr.number}`
         // Pool starts are ordered; resume after the last attempted launch,
         // even when its claim or preparation consumes the sweep deadline.
@@ -3849,7 +3923,7 @@ async function tickApprovePrs(): Promise<void> {
           let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
           let replacesFailedCallId: string | undefined
           if (!claimId) {
-            if (admittedReviewer) {
+            if (dismissedRecovery) {
               const held = getFailedBehaviorLaunch('approve-prs', seenTarget)
               if (!held?.launchCallId || await dismissedApprovalHeld(
                 pr, expectedHead, (await reviewChoice('pr_approve')).model,
@@ -3886,9 +3960,9 @@ async function tickApprovePrs(): Promise<void> {
           if (behaviorAborted()) return
           console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
           if (err instanceof BehaviorLogFeedError) failure ??= err
-          else recordBehaviorFailure('approve-prs', 'operation', err, checkTarget)
+          else recordBehaviorFailure('approve-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
         } finally {
-          if (checked) clearCheck(checkTarget)
+          if (checked) clearCheck(checkTarget, reviewer)
           if (!launched && operationId) releasePrOperationOwned(operationId)
         }
       })
@@ -3957,14 +4031,17 @@ export function getResolveUnblockingLastFired(): { at: string, target: string } 
 // The expected head comes from the pre-check's observed activity, not a
 // separate lookup: the primitive revalidates it against a fresh read at
 // execution time and reports superseded when the head already moved.
-async function resolveNonblockingIfReady(repo: string, number: number, expectedHead: string): Promise<ResolveResult> {
+async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, reviewer: string): Promise<ResolveResult | null> {
+  const { repo, number } = pr
+  const accounts = prAccounts()
   const [owner, name] = repo.split('/', 2)
   if (!owner || !name || !Number.isSafeInteger(number) || number < 1) {
     throw new Error(`invalid GitHub PR identity: ${repo}#${number}`)
   }
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
-  const reviewer = configuredReviewer()
+  const reviewEnvironment = await automatedReviewEnvironment(repo, number, reviewer, accounts)
+  if (!isEnabled('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
   const nativeId = randomUUID()
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
     source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,
@@ -3982,7 +4059,8 @@ async function resolveNonblockingIfReady(repo: string, number: number, expectedH
       '--token-user',
       reviewer,
     ],
-    { cwd, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal() },
+    { cwd, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024, signal: behaviorSignal(),
+      env: reviewEnvironment },
   )
   const data = objectValue(
     parseJson(stdout, 'github-interface --resolve-nonblocking-conversations-if-ready'),
@@ -4063,14 +4141,12 @@ async function tickResolveUnblocking(): Promise<void> {
     const prs = await listEligiblePrs('resolve-unblocking', author)
     const ordered = orderByCursor(prs, 'behavior_resolve_unblocking_cursor').filter((pr) =>
       behaviorRetryDue('resolve-unblocking', `${pr.repo}#${pr.number}:check`))
-    const reviewer = configuredReviewer()
     // A read cannot resolve anything. One batched pre-check per chunk finds
     // the PRs with unresolved conversations, so only those occupy the
     // mutation lock — and each chunk resolves before the next is read, so a
     // sweep cut short still resolves what it prepared.
-    for (let offset = 0; offset < ordered.length; offset += PR_READ_BATCH_SIZE) {
+    for (const { reviewer, batch } of reviewBatches(ordered, PR_READ_BATCH_SIZE)) {
       if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
-      const batch = ordered.slice(offset, offset + PR_READ_BATCH_SIZE)
       const last = batch[batch.length - 1]!
       setMeta('behavior_resolve_unblocking_cursor', `${last.repo}#${last.number}`)
       let records: BatchRead<ReviewActivityResult>[]
@@ -4093,12 +4169,12 @@ async function tickResolveUnblocking(): Promise<void> {
         setMeta('behavior_resolve_unblocking_cursor', key)
         if (error !== null) {
           console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, error)
-          recordBehaviorFailure('resolve-unblocking', 'operation', error, checkTarget)
+          recordBehaviorFailure('resolve-unblocking', 'operation', error, checkTarget, { actingAccount: reviewer })
           continue
         }
         const activity = result!
         if (activity.state !== 'OPEN' || activity.draft || activity.unresolvedConversationCount === 0) {
-          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           continue
         }
         // The resolve CLI re-verifies this gate itself and costs 3 core
@@ -4107,9 +4183,11 @@ async function tickResolveUnblocking(): Promise<void> {
         if (activity.reviewerLatestState !== 'APPROVED'
           || activity.reviewerLatestCommit !== activity.headSha
           || activity.activeChangeRequestAuthors.length > 0) {
-          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           continue
         }
+        try { await requireOwnedHumanReviews(pr, reviewer, activity) }
+        catch (error) { recordBehaviorFailure('resolve-unblocking', 'operation', error, checkTarget, { actingAccount: reviewer }); continue }
         actionable.push({ pr, headSha: activity.headSha })
       }
       for (const { pr, headSha } of actionable) {
@@ -4128,9 +4206,10 @@ async function tickResolveUnblocking(): Promise<void> {
           // This CLI performs the mutation itself. The synchronous checks
           // immediately before invocation prevent a disabled behavior, or one
           // whose repository was just skipped, from starting another resolve.
-          if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr)) continue
+          if (!isEnabled('resolve-unblocking') || !stillEligible('resolve-unblocking', pr, reviewer)) continue
           runId = startDirectBehaviorRun('resolve-unblocking')
-          const result = await resolveNonblockingIfReady(pr.repo, pr.number, headSha)
+          const result = await resolveNonblockingIfReady(pr, headSha, reviewer)
+          if (!result) { discardDirectBehaviorRun(runId); runId = null; continue }
           if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true)
           else discardDirectBehaviorRun(runId)
           runId = null
@@ -4157,10 +4236,10 @@ async function tickResolveUnblocking(): Promise<void> {
           checked = false
           if (behaviorAborted()) return
           console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
-          recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget)
+          recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget, { actingAccount: reviewer })
         } finally {
           if (runId) finishDirectBehaviorRun(runId, false)
-          if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           if (operationId) releasePrOperationOwned(operationId)
         }
       }
@@ -4196,6 +4275,7 @@ export function getMergePrsLastFired(): { at: string, target: string } | null {
 export const MERGE_CANDIDATE_BATCH_SIZE = 50
 
 interface MergeCandidate {
+  actor: string
   pr: DatastorePr
   ready: boolean
   behind: boolean
@@ -4230,7 +4310,7 @@ async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<M
       || (record.behind && (record.ready || record.head_sha === null || !record.author || record.error !== null))) {
       throw new Error('github-interface --merge-candidates returned malformed candidate evidence')
     }
-    return { pr, ready: record.ready, behind: record.behind, head: record.head_sha as string | null,
+    return { pr, actor, ready: record.ready, behind: record.behind, head: record.head_sha as string | null,
       author: record.author as string | null, approvedAt: record.approved_at as string | null,
       error: record.error as string | null }
   })
@@ -4252,15 +4332,19 @@ async function tickMergePrs(): Promise<void> {
   const cursor = getMeta('behavior_merge_prs_cursor')
   const start = (prs.findIndex((pr) => `${pr.repo}#${pr.number}` === cursor) + 1) % Math.max(prs.length, 1)
   const ordered = [...prs.slice(start), ...prs.slice(0, start)]
-  const actor = configuredReviewer()
   const behind: MergeCandidate[] = []
-  for (let offset = 0; offset < ordered.length; offset += MERGE_CANDIDATE_BATCH_SIZE) {
+  for (const { reviewer: actor, batch } of reviewBatches(ordered, MERGE_CANDIDATE_BATCH_SIZE)) {
     if (!isEnabled('merge-prs') || behaviorAborted()) return
-    const batch = ordered.slice(offset, offset + MERGE_CANDIDATE_BATCH_SIZE)
     // A timed-out batch must not repeatedly hide the later batches.
     const last = batch[batch.length - 1]!
     setMeta('behavior_merge_prs_cursor', `${last.repo}#${last.number}`)
-    const candidates = await readMergeCandidates(batch, actor)
+    let candidates: MergeCandidate[]
+    try { candidates = await readMergeCandidates(batch, actor) }
+    catch (error) {
+      if (behaviorAborted()) throw error
+      for (const pr of batch) recordBehaviorFailure('merge-prs', 'operation', error, `${pr.repo}#${pr.number}`, { hold: false })
+      continue
+    }
     for (const candidate of candidates) {
       if (!isEnabled('merge-prs') || behaviorAborted()) return
       const pr = candidate.pr
@@ -4268,16 +4352,20 @@ async function tickMergePrs(): Promise<void> {
       setMeta('behavior_merge_prs_cursor', target)
       if (!stillEligible('merge-prs', pr) || !behaviorRetryDue('merge-prs', target)) continue
       if (candidate.error !== null) {
-        recordBehaviorFailure('merge-prs', 'operation', candidate.error, target)
+        recordBehaviorFailure('merge-prs', 'operation', candidate.error, target, { actingAccount: actor })
         continue
       }
-      if (!candidate.ready || candidate.author?.toLowerCase() !== author.toLowerCase()) {
-        if (candidate.behind && candidate.author?.toLowerCase() === author.toLowerCase()) {
+      if (candidate.author?.toLowerCase() !== pr.author.toLowerCase()) {
+        recordBehaviorFailure('merge-prs', 'operation', 'Live PR author is missing or differs from the admitted author', target, { actingAccount: actor })
+        continue
+      }
+      if (!candidate.ready) {
+        if (candidate.behind) {
           // A failed update keeps its failure record so retries back off like merges.
           behind.push(candidate)
           continue
         }
-        clearBehaviorFailure('merge-prs', target)
+        clearBehaviorFailure('merge-prs', target, actor)
         continue
       }
       const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
@@ -4289,14 +4377,14 @@ async function tickMergePrs(): Promise<void> {
         const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
         await mkdir(cwd, { recursive: true })
         if (!isEnabled('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', pr)
-          || configuredReviewer() !== actor) continue
+          || configuredReviewer(pr.author) !== actor) continue
         runId = startDirectBehaviorRun('merge-prs')
         captureBehaviorAdmission({ admissionKey: runId, nativeId: runId, behavior: 'merge-prs',
           source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
           actor, repository: pr.repo, number: pr.number, head: expectedHead, startedAt: new Date().toISOString() })
         const { stdout } = await runFile(GH_INTERFACE, [
           '--merge-if-ready', `#${pr.number}`, '--expected-head', expectedHead,
-          '--author', author, '--token-user', actor,
+          '--author', pr.author, '--token-user', actor,
         ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() })
         const result = objectValue(parseJson(stdout, 'github-interface --merge-if-ready'), 'merge-if-ready')
         if (result.action !== 'merge_if_ready' || result.repository !== pr.repo
@@ -4317,11 +4405,11 @@ async function tickMergePrs(): Promise<void> {
           setMeta(MERGE_LAST_FIRED_KEY, JSON.stringify({ at: new Date().toISOString(), target }))
           console.log(`[behaviors] merge-prs merged ${target}`)
         }
-        clearBehaviorFailure('merge-prs', target)
+        clearBehaviorFailure('merge-prs', target, actor)
       } catch (error) {
         if (runId) captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
         if (behaviorAborted()) return
-        recordBehaviorFailure('merge-prs', 'operation', error, target)
+        recordBehaviorFailure('merge-prs', 'operation', error, target, { actingAccount: actor })
         console.error(`[behaviors] merge-prs failed for ${target}:`, error)
       } finally {
         if (runId) finishDirectBehaviorRun(runId, false)
@@ -4335,6 +4423,7 @@ async function tickMergePrs(): Promise<void> {
   behind.sort(compareBehindCandidates)
   const update = behind[0]!
   const updatePr = update.pr
+  const actor = update.actor
   const updateTarget = `${updatePr.repo}#${updatePr.number}`
   if (!stillEligible('merge-prs', updatePr) || !behaviorRetryDue('merge-prs', updateTarget)) return
   const updateOperationId = claimPrOperationOwned(updateTarget, PR_OPERATION_EVALUATION_LEASE_MS)
@@ -4346,14 +4435,14 @@ async function tickMergePrs(): Promise<void> {
     const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
     await mkdir(cwd, { recursive: true })
     if (!isEnabled('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', updatePr)
-      || configuredReviewer() !== actor) return
+      || configuredReviewer(updatePr.author) !== actor) return
     updateRunId = startDirectBehaviorRun('merge-prs')
     captureBehaviorAdmission({ admissionKey: updateRunId, nativeId: updateRunId, behavior: 'merge-prs',
       source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
       actor, repository: updatePr.repo, number: updatePr.number, head: expectedHead, startedAt: new Date().toISOString() })
     const { stdout } = await runFile(GH_INTERFACE, [
       '--update-branch-if-behind', `#${updatePr.number}`, '--expected-head', expectedHead,
-      '--author', author, '--token-user', actor,
+      '--author', updatePr.author, '--token-user', actor,
     ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() })
     const result = objectValue(parseJson(stdout, 'github-interface --update-branch-if-behind'), 'update-branch-if-behind')
     if (result.action !== 'update_branch_if_behind' || result.repository !== updatePr.repo
@@ -4369,11 +4458,11 @@ async function tickMergePrs(): Promise<void> {
     if (result.outcome === 'updated') {
       console.log(`[behaviors] merge-prs updated ${updateTarget}`)
     }
-    clearBehaviorFailure('merge-prs', updateTarget)
+    clearBehaviorFailure('merge-prs', updateTarget, actor)
   } catch (error) {
     if (updateRunId) captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
     if (behaviorAborted()) return
-    recordBehaviorFailure('merge-prs', 'operation', error, updateTarget)
+    recordBehaviorFailure('merge-prs', 'operation', error, updateTarget, { actingAccount: actor })
     console.error(`[behaviors] merge-prs failed for ${updateTarget}:`, error)
   } finally {
     if (updateRunId) finishDirectBehaviorRun(updateRunId, false)
@@ -4431,10 +4520,8 @@ async function tickRerunGreyCi(): Promise<void> {
   const cursor = getMeta('behavior_rerun_grey_ci_cursor')
   const start = (prs.findIndex((pr) => `${pr.repo}#${pr.number}` === cursor) + 1) % Math.max(prs.length, 1)
   const ordered = [...prs.slice(start), ...prs.slice(0, start)]
-  const actor = configuredReviewer()
-  for (let offset = 0; offset < ordered.length; offset += MERGE_CANDIDATE_BATCH_SIZE) {
+  for (const { reviewer: actor, batch } of reviewBatches(ordered, MERGE_CANDIDATE_BATCH_SIZE)) {
     if (!isEnabled(behavior) || behaviorAborted()) return
-    const batch = ordered.slice(offset, offset + MERGE_CANDIDATE_BATCH_SIZE)
     const last = batch[batch.length - 1]!
     setMeta('behavior_rerun_grey_ci_cursor', `${last.repo}#${last.number}`)
     let packet: Record<string, unknown>
@@ -4468,18 +4555,21 @@ async function tickRerunGreyCi(): Promise<void> {
         row = objectValue(packet.records[index], 'grey CI candidate')
         if (row.repository !== pr.repo || row.number !== pr.number || !Array.isArray(row.runs)
           || !(row.error === null || typeof row.error === 'string')) throw new Error('malformed grey CI target evidence')
-        if (row.error !== null) { recordBehaviorFailure(behavior, 'operation', row.error, target); continue }
+        if (row.error !== null) { recordBehaviorFailure(behavior, 'operation', row.error, target, { actingAccount: actor }); continue }
         if (typeof row.head_sha !== 'string' || !SHA_PATTERN.test(row.head_sha)
           || !(row.author === null || typeof row.author === 'string')) throw new Error('missing grey CI head or author evidence')
       } catch (error) {
         // One PR's unreadable evidence must not stop the readable ones.
         if (behaviorAborted()) throw error
         if (!isEnabled(behavior)) return
-        recordBehaviorFailure(behavior, 'operation', error, target)
+        recordBehaviorFailure(behavior, 'operation', error, target, { actingAccount: actor })
         continue
       }
-      if (row.author === null || (row.author as string).toLowerCase() !== author.toLowerCase()) continue
-      clearBehaviorFailure(behavior, target)
+      if (row.author === null || (row.author as string).toLowerCase() !== pr.author.toLowerCase()) {
+        recordBehaviorFailure(behavior, 'operation', 'Live PR author is missing or differs from the admitted author', target, { actingAccount: actor })
+        continue
+      }
+      clearBehaviorFailure(behavior, target, actor)
       // Rehydrate every unconfirmed intent on this head, even when its CI is
       // now green or running and discovery no longer returns a grey candidate.
       const pending = db.prepare(`SELECT launch_source AS source, launch_error AS error FROM behavior_seen
@@ -4509,7 +4599,7 @@ async function tickRerunGreyCi(): Promise<void> {
           // One workflow's unsafe evidence must not stop the readable ones.
           if (behaviorAborted()) throw error
           if (!isEnabled(behavior)) return
-          recordBehaviorFailure(behavior, 'operation', error, target)
+          recordBehaviorFailure(behavior, 'operation', error, target, { actingAccount: actor })
           continue
         }
         const claimKey = GREY_CI_INTENT_KEY
@@ -4526,7 +4616,7 @@ async function tickRerunGreyCi(): Promise<void> {
           const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
           await mkdir(cwd, { recursive: true })
           if (!isEnabled(behavior) || behaviorAborted() || !stillEligible(behavior, pr)
-            || configuredReviewer() !== actor) continue
+            || configuredReviewer(pr.author) !== actor) continue
           const claimed = db.transaction(() => {
             if (!claimSeenOwnedAs(claimKey, claimTarget, claimId, PR_OPERATION_EVALUATION_LEASE_MS)) return false
             db.prepare(`UPDATE behavior_seen SET launch_requested_at = ?, launch_repo = ?, launch_pr = ?,
@@ -4542,7 +4632,7 @@ async function tickRerunGreyCi(): Promise<void> {
             workflow: { id: workflowId, runId, attempt, event }, startedAt: new Date().toISOString() })
           const { stdout: receipt } = await runFile(GH_INTERFACE, ['--rerun-grey-ci-if-ready', `#${pr.number}`,
             '--run-id', String(runId), '--run-attempt', String(attempt), '--expected-head', row.head_sha,
-            '--author', author, '--token-user', actor],
+            '--author', pr.author, '--token-user', actor],
           { cwd, timeoutMs: 30_000, maxOutputBytes: 1024 * 1024, signal: behaviorSignal() })
           const result = objectValue(parseJson(receipt, 'grey CI rerun'), 'grey CI rerun')
           if (result.action !== 'rerun_grey_ci_if_ready' || result.repository !== pr.repo || result.pull_number !== pr.number
@@ -4565,7 +4655,7 @@ async function tickRerunGreyCi(): Promise<void> {
             // runs and jobs: a 404 here can name a deleted run on a readable
             // repository, so it never holds the repository.
             recordBehaviorFailure(behavior, 'operation', result.error, failureTarget, { hold: false })
-          } else clearBehaviorFailure(behavior, failureTarget)
+          } else clearBehaviorFailure(behavior, failureTarget, actor)
         } catch (error) {
           // A missing receipt may follow an accepted write. Retain the durable
           // claim across restarts; never automatically replay that ambiguity.
@@ -5576,23 +5666,34 @@ export class ReplayRefusedError extends HttpError {
   }
 }
 
-export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<void> {
+export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv } | void> {
   const owner = repo.split('/')[0].toLowerCase()
   const org = readyOrganizations().find((candidate) => candidate.login.toLowerCase() === owner)
   if (!org) throw new ReplayRefusedError(`${repo} does not belong to a ready GitHub account`)
+  let author: string | undefined
+  let actor: string | undefined
+  let accounts: ReturnType<typeof prAccounts> | undefined
+  let reviewEnvironment: NodeJS.ProcessEnv | undefined
   const refusal = await behaviorOrganization.run(org, async () => {
     try {
       await requireFreshDatastore()
+      const pr = behavior === 'issue_review' ? null : await readPullRequest(repo, number)
+      author = pr?.author
       const targetRefusal = behavior === 'issue_review'
         ? issueReviewRefusal(issueReviewPolicy(), repo, number, await readIssue(repo, number))
-        : pullRequestRefusal(pullRequestPolicy(REPLAY_SKIPS[behavior]), repo, number, await readPullRequest(repo, number))
+        : pullRequestRefusal(pullRequestPolicy(REPLAY_SKIPS[behavior]), repo, number, pr)
       if (targetRefusal || behavior === 'issue_review') return targetRefusal
-      return await replayPublicationRefusal(behavior, repo, number)
+      accounts = prAccounts()
+      actor = configuredReviewer(author)
+      reviewEnvironment = behavior === 'pr_approve' ? await automatedReviewEnvironment(repo, number, actor, accounts) : undefined
+      if (!prAccountsMatch(accounts) || configuredReviewer(author) !== actor) return 'GitHub accounts changed; retry the replay'
+      return await replayPublicationRefusal(behavior, repo, number, actor, author!, accounts)
     } catch (error) {
       throw new HttpError(502, `Replay could not check ${repo}#${number}: ${behaviorErrorMessage(error)}`)
     }
   })
   if (refusal) throw new ReplayRefusedError(refusal)
+  if (author && actor && accounts) return { author, actor, accounts, reviewEnvironment }
 }
 
 // A replay carries no call identity — behavior, repository and number only —
@@ -5620,6 +5721,9 @@ async function replayPublicationRefusal(
   behavior: 'pr_review' | 'pr_approve',
   repo: string,
   number: number,
+  reviewer: string,
+  author: string,
+  accounts: ReturnType<typeof prAccounts>,
 ): Promise<string | null> {
   const reservedAt = Date.now()
   if (!reserveBehaviorReplay(repo, number, behavior, reservedAt)) {
@@ -5628,7 +5732,8 @@ async function replayPublicationRefusal(
   const stamp = new Date(reservedAt).toISOString()
   let refusal: string | null
   try {
-    refusal = await replayTargetRefusal(behavior, repo, number)
+    refusal = await replayTargetRefusal(behavior, repo, number, reviewer)
+    if (!refusal && (!prAccountsMatch(accounts) || configuredReviewer(author) !== reviewer)) refusal = 'GitHub accounts changed; retry the replay'
   } catch (error) {
     releaseBehaviorReplay(repo, number, behavior, stamp)
     throw error
@@ -5641,6 +5746,7 @@ async function replayTargetRefusal(
   behavior: 'pr_review' | 'pr_approve',
   repo: string,
   number: number,
+  reviewer: string,
 ): Promise<string | null> {
   if (hasActiveAgentLaunchForPr(repo, number)) {
     return `another behavior worker is still active on ${repo}#${number}`
@@ -5655,7 +5761,6 @@ async function replayTargetRefusal(
     && RUNNING_AGENT_STATUSES.has(row.status.toLowerCase()))) {
     return `another PR worker is still active on ${repo}#${number}`
   }
-  const reviewer = configuredReviewer()
   const activity = await checkReviewActivity(repo, number, reviewer, '1970-01-01T00:00:00Z')
   if (activity.reviewerReviewsSinceItems === null && activity.reviewerReviewsSince !== 0) {
     return `live GitHub evidence cannot prove no review by ${reviewer} is published on ${repo}#${number}`
@@ -5983,6 +6088,7 @@ export interface BehaviorsRuntimeHealth {
   holds: Array<{
     org?: string
     repo: string
+    actor?: string
     error: string
     heldAt: string
     nextRecheckAt: string
@@ -6028,7 +6134,10 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
       }
       if (failure?.kind === 'worker' && failure.diagnostic?.severity === 'info' && target) {
         const ref = /^([^#]+)#(\d+)/.exec(target)
-        if (ref && db.prepare(`
+        const failedActor = failure.callId
+          ? (db.prepare('SELECT launch_actor FROM behavior_seen WHERE launch_call_id = ?').get(failure.callId) as { launch_actor: string } | undefined)?.launch_actor
+          : undefined
+        if (ref && failedActor && db.prepare(`
           SELECT 1 FROM behavior_seen recovered
           WHERE recovered.key = ? AND recovered.launch_repo = ? AND recovered.launch_pr = ?
             AND lower(recovered.launch_actor) = lower(?) AND recovered.launch_source = ?
@@ -6038,7 +6147,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
             AND NOT EXISTS (SELECT 1 FROM behavior_seen held WHERE held.key = ?
               AND held.target = ? AND held.launch_quarantine IS NOT NULL)
           LIMIT 1
-        `).get(behavior, ref[1], Number(ref[2]), agentAccount(), `poise:${behavior}`,
+        `).get(behavior, ref[1], Number(ref[2]), failedActor, `poise:${behavior}`,
           new Date(failure.lastFailureAtMs).toISOString(), behavior, target, behavior, target)) recovered = true
       }
       return failure ? [{
@@ -6077,10 +6186,14 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   const author = getMeta('me') || ''
   // Review New Issues is scoped by repository and author list, not by `me`.
   const needsMe = BEHAVIOR_KEYS.some((key) => key !== 'review-new-issues' && isEnabled(key))
-  const identityValid = reviewer !== null
+  let pairError: string | null = null
+  if (needsMe) {
+    try { prAccounts() } catch (error) { pairError = behaviorErrorMessage(error) }
+  }
+  const identityValid = reviewer !== null && pairError === null
   const identityError = reviewer === null
     ? reviewerError
-    : (needsMe && author === ''
+    : pairError ?? (needsMe && author === ''
       ? 'No GitHub username set in Settings — enabled behaviours cannot act until it is'
       : null)
   const identity = {
@@ -6111,6 +6224,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     failures,
     holds: listRepoAccessHolds().map((hold) => ({
       repo: hold.repo,
+      actor: hold.actor,
       error: hold.error,
       heldAt: new Date(hold.heldAtMs).toISOString(),
       nextRecheckAt: new Date(hold.nextRecheckAtMs).toISOString(),
