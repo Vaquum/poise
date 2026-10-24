@@ -63,7 +63,7 @@ export function listHandling(limit = HANDLED_READ_LIMIT, now = Date.now(), since
   const cutoff = new Date(now - HANDLING_RETENTION_MS).toISOString()
   const rows = db.prepare(`
     SELECT id, kind, source, title, started_at, finished_at, outcome, error, actor, at
-    FROM handling_log WHERE at >= ? AND (? IS NULL OR at >= ?) ORDER BY id DESC LIMIT ?
+    FROM handling_log WHERE at >= ? AND (? IS NULL OR at >= ?) ORDER BY at DESC, id DESC LIMIT ?
   `).all(cutoff, since ?? null, since ?? null, limit) as Array<{ id: number, kind: HandlingKind, source: string, title: string, started_at: string,
     finished_at: string, outcome: string, error: string | null, actor: HandlingActor, at: string }>
   return rows.map((row) => ({ id: row.id, kind: row.kind, source: row.source, title: row.title,

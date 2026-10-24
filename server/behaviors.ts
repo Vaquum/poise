@@ -4084,7 +4084,9 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
   const reviewEnvironment = await automatedReviewEnvironment(repo, number, reviewer, accounts)
-  if (!isEnabled('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
+  // Final admission before the mutation: a pause landing during the awaits
+  // above must still hold this resolve.
+  if (!isRunnable('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
   const nativeId = randomUUID()
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
     source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,

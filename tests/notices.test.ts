@@ -139,12 +139,24 @@ describe('the notices', () => {
     expect(handling.listHandling(200, at(14))).toEqual([])
     notices.dismissNotice(alert.id, at(14))
     notices.dismissNotice(alert.id, at(16))
-    // The same alert dismissed twice: one row per action, same ref kept once.
+    // The same alert dismissed twice: one row per dismissal, newest first.
     expect(handling.listHandling(200, at(17)).map((row) => [row.outcome, row.at])).toEqual([
+      ['dismissed', new Date(at(16)).toISOString()],
       ['dismissed', new Date(at(14)).toISOString()],
     ])
     store.resolveAlert(`pr-ready:acme/api#1`, at(18))
-    expect(handling.listHandling(200, at(19)).map((row) => row.outcome)).toEqual(['resolved', 'dismissed'])
+    expect(handling.listHandling(200, at(19)).map((row) => row.outcome)).toEqual(['resolved', 'dismissed', 'dismissed'])
+  })
+
+  it('lists backfilled completions by handling time, not insertion order', () => {
+    handling.recordHandling({ kind: 'notice', source: 'pr_ready', title: 'Recent dismissal',
+      startedAt: new Date(at(0)).toISOString(), finishedAt: new Date(at(10)).toISOString(),
+      outcome: 'dismissed', actor: 'person', ref: 'alert:9:dismissed' }, new Date(at(10)).toISOString())
+    // A Caller completion backfilled afterwards with its original time.
+    handling.recordHandling({ kind: 'caller-update', source: 'pr_review', title: 'Old run',
+      startedAt: new Date(at(0)).toISOString(), finishedAt: new Date(at(1)).toISOString(),
+      outcome: 'completed', actor: 'caller', ref: 'caller:abc123' }, new Date(at(1)).toISOString())
+    expect(handling.listHandling().map((row) => row.title)).toEqual(['Recent dismissal', 'Old run'])
   })
 
   it('puts other notices away for good, until their condition clears and returns', () => {
@@ -266,6 +278,11 @@ describe('an alert target', () => {
 })
 
 describe('the check for pull requests ready to merge', () => {
+  // The checks raise only for accounts followed right now.
+  beforeEach(() => {
+    database.setMeta('org', 'acme')
+    database.db.prepare("INSERT OR IGNORE INTO organizations (login, managed, status, stage) VALUES ('other', 1, 'ready', 'ready')").run()
+  })
   type Read = Awaited<ReturnType<typeof import('../server/gh').readOwnPullRequests>>
   const noHeld = (): OwnPullRequest['held'] => ({ reasons: [], checks: { failing: [], failingCount: 0, runningCount: 0, partial: false }, threadsChecked: true })
   const pr = (number: number, status: OwnPullRequest['status'], repo = 'acme/api', held = noHeld()): OwnPullRequest => ({ repo, number, title: `Change ${number}`, status, held })
@@ -285,6 +302,17 @@ describe('the check for pull requests ready to merge', () => {
       target: { pullRequest: 'https://github.com/acme/api/pull/1' },
     })])
     expect(database.db.prepare("SELECT url FROM alerts WHERE kind = 'pr_ready'").all()).toEqual([{ url: '/' }])
+  })
+
+  it('raises nothing for an account unfollowed after the pass read its lists', async () => {
+    await notices.checkReadyPullRequests(async () => {
+      const value = all([pr(1, 'green')])
+      // The unfollow lands mid-pass: the row goes and the removal resolves
+      // what stood, before this pass raises from its stale read.
+      database.db.prepare("DELETE FROM meta WHERE key = 'org'").run()
+      return value
+    }, () => at(0))
+    expect(open()).toEqual([])
   })
 
   it('resolves it when the pull request stops being ready, and notices it anew when it is ready again', async () => {
@@ -363,6 +391,11 @@ describe('the check for pull requests ready to merge', () => {
 })
 
 describe('the check for requested reviews', () => {
+  // The checks raise only for accounts followed right now.
+  beforeEach(() => {
+    database.setMeta('org', 'acme')
+    database.db.prepare("INSERT OR IGNORE INTO organizations (login, managed, status, stage) VALUES ('other', 1, 'ready', 'ready')").run()
+  })
   type Involved = import('../server/gh').InvolvedPullRequest
   type Read = Awaited<ReturnType<typeof import('../server/gh').readInvolvedPullRequests>>
   const pr = (number: number, reviewRequested: boolean | null, repo = 'acme/api'): Involved => ({ repo, number, title: `Change ${number}`, reviewRequested })
@@ -434,6 +467,11 @@ describe('the check for requested reviews', () => {
 })
 
 describe('the check for conflicting pull requests of yours', () => {
+  // The checks raise only for accounts followed right now.
+  beforeEach(() => {
+    database.setMeta('org', 'acme')
+    database.db.prepare("INSERT OR IGNORE INTO organizations (login, managed, status, stage) VALUES ('other', 1, 'ready', 'ready')").run()
+  })
   type Read = Awaited<ReturnType<typeof import('../server/gh').readOwnPullRequests>>
   const held = (reasons: OwnPullRequest['held']['reasons']): OwnPullRequest['held'] => ({ reasons, checks: { failing: [], failingCount: 0, runningCount: 0, partial: false }, threadsChecked: true })
   const pr = (number: number, status: OwnPullRequest['status'], reasons: OwnPullRequest['held']['reasons'] = []): OwnPullRequest => ({ repo: 'acme/api', number, title: `Change ${number}`, status, held: held(reasons) })

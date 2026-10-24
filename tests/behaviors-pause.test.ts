@@ -1,10 +1,24 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { mocks, HEAD_SHA, arrangeCli, deferred, loadModules, restartModules } from './behaviors-runtime-fixture'
 
 // A behavior paused until a time launches nothing new, while everything
 // already launched runs on, the ledger keeps new work, and the saved
 // on/off, claims, seen state and backoff are untouched.
 const RESOLVE = '--resolve-nonblocking-conversations-if-ready'
+
+// A hook into directory creation, so a test can pause while a resolve is
+// inside its final preparation. Delegates by default.
+const fsMocks = vi.hoisted(() => ({ onMkdir: null as null | ((path: string) => Promise<void>) }))
+vi.mock('node:fs/promises', async (original) => {
+  const actual = await original<typeof import('node:fs/promises')>()
+  return {
+    ...actual,
+    mkdir: async (path: unknown, options: unknown) => {
+      if (typeof path === 'string' && fsMocks.onMkdir) await fsMocks.onMkdir(path)
+      return (actual.mkdir as (path: unknown, options: unknown) => Promise<unknown>)(path, options)
+    },
+  }
+})
 
 function resolveCalls(): unknown[][] {
   return mocks.runFile.mock.calls.filter(([, args]: any[]) => args[0] === RESOLVE)
@@ -66,6 +80,40 @@ describe('a behavior paused until a time', () => {
     await behaviors.setPaused('resolve-unblocking', null, 'person')
     await behaviors.runEnabledBehaviorsOnce()
     expect(resolveCalls()).toHaveLength(1)
+  })
+
+  it('holds a resolve whose pause arrives inside its final preparation', async () => {
+    const { behaviors } = await enableResolveUnblocking()
+    await behaviors.runEnabledBehaviorsOnce()
+    const before = resolveCalls().length
+    expect(before).toBe(1)
+    // The pause lands after the sweep's final admission check but before
+    // the resolve's own guard: inside resolveNonblockingIfReady, whose
+    // first await creates the run directory.
+    const reached = deferred<void>()
+    const release = deferred<void>()
+    let armed = true
+    fsMocks.onMkdir = async (path: string) => {
+      if (!armed || !path.includes('poise-gh-interface')) return
+      armed = false
+      reached.resolve()
+      await release.promise
+    }
+    try {
+      const sweep = behaviors.runEnabledBehaviorsOnce()
+      await reached.promise
+      const pausing = behaviors.setPaused('resolve-unblocking', new Date(Date.now() + 60_000).toISOString(), 'person')
+      release.resolve()
+      await sweep
+      await pausing
+    } finally {
+      fsMocks.onMkdir = null
+    }
+    expect(resolveCalls()).toHaveLength(before)
+
+    await behaviors.setPaused('resolve-unblocking', null, 'person')
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(resolveCalls()).toHaveLength(before + 1)
   })
 
   it('launches nothing while paused and keeps claims, seen state and backoff', async () => {

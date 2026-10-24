@@ -210,6 +210,35 @@ describe('approving a pull request as you', () => {
     expect(result).toEqual({ status: 409, body: { outcome: 'refused', repo: 'acme/api', number: 7, error: 'pull request is not open and ready for review' } })
   })
 
+  it('approves again when a change request followed the earlier approval', async () => {
+    const approved = { id: 9, state: 'APPROVED', commit_id: H, submitted_at: '2026-08-01T00:00:00Z' }
+    const changes = { id: 10, state: 'CHANGES_REQUESTED', commit_id: H, submitted_at: '2026-08-02T00:00:00Z' }
+    interfaceMock({ '--pull-action-state': stateResponse({ my_reviews: [approved, changes] }), '--approve-pr': approve() })
+    const result = await call('POST', '/api/pull-requests/approve', body())
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({ outcome: 'approved', approvedHead: H })
+    expect(interfaceCalls('--approve-pr')).toHaveLength(1)
+  })
+
+  it('reports already approved when the approval followed the change request', async () => {
+    const changes = { id: 10, state: 'CHANGES_REQUESTED', commit_id: H, submitted_at: '2026-08-02T00:00:00Z' }
+    const approved = { id: 11, state: 'APPROVED', commit_id: H, submitted_at: '2026-08-03T00:00:00Z' }
+    interfaceMock({ '--pull-action-state': stateResponse({ my_reviews: [changes, approved] }) })
+    const result = await call('POST', '/api/pull-requests/approve', body())
+    expect(result.status).toBe(200)
+    expect(result.body).toMatchObject({ outcome: 'already_approved', reviewId: 11 })
+    expect(interfaceCalls('--approve-pr')).toEqual([])
+  })
+
+  it('refuses counted unresolved conversations with their explanation', async () => {
+    interfaceMock({
+      '--pull-action-state': stateResponse(),
+      '--approve-pr': cliError('Traceback (most recent call last):\nRuntimeError: 2 unresolved review conversation(s) from other reviewers remain\n'),
+    })
+    const result = await call('POST', '/api/pull-requests/approve', body())
+    expect(result).toEqual({ status: 409, body: { outcome: 'refused', repo: 'acme/api', number: 7, error: '2 unresolved review conversation(s) from other reviewers remain' } })
+  })
+
   it('answers a GitHub refusal in GitHub words', async () => {
     interfaceMock({
       '--pull-action-state': stateResponse(),
@@ -249,6 +278,26 @@ describe('merging a pull request as you', () => {
     const result = await call('POST', '/api/pull-requests/merge', body())
     expect(result.status).toBe(200)
     expect(result.body).toMatchObject({ outcome: 'in_queue', queueEntryId: 'entry-1' })
+    expect(interfaceCalls('--merge-pr')).toEqual([])
+  })
+
+  it('names both heads when H2 merged after H was expected', async () => {
+    interfaceMock({ '--pull-action-state': stateResponse({ state: 'closed', merged: true, merged_by: 'hubot', merge_sha: MERGE, head_sha: H2 }) })
+    const result = await call('POST', '/api/pull-requests/merge', body())
+    expect(result).toEqual({ status: 200, body: {
+      outcome: 'already_merged', repo: 'acme/api', number: 7, actor: 'octocat',
+      headSha: H2, expectedHead: H, mergedBy: 'hubot', mergeSha: MERGE,
+    } })
+    expect(interfaceCalls('--merge-pr')).toEqual([])
+  })
+
+  it('names both heads when H2 queued after H was expected', async () => {
+    interfaceMock({ '--pull-action-state': stateResponse({ head_sha: H2, queue_entry_id: 'entry-9' }) })
+    const result = await call('POST', '/api/pull-requests/merge', body())
+    expect(result).toEqual({ status: 200, body: {
+      outcome: 'in_queue', repo: 'acme/api', number: 7, actor: 'octocat',
+      headSha: H2, expectedHead: H, queueEntryId: 'entry-9',
+    } })
     expect(interfaceCalls('--merge-pr')).toEqual([])
   })
 
@@ -342,6 +391,26 @@ describe('action receipts', () => {
     const retry = await call('POST', '/api/pull-requests/approve', body())
     expect(retry.status).toBe(503)
     expect(retry.body.outcome).toBe('unknown')
+    expect(interfaceCalls('--approve-pr')).toHaveLength(1)
+  })
+
+  it('re-reads GitHub after an unknown outcome instead of replaying it', async () => {
+    const review = { id: 11, state: 'APPROVED', commit_id: H, submitted_at: '2026-09-01T00:00:00Z' }
+    let reads = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command !== 'github-interface') throw new Error('Unexpected test command')
+      if (args[0] === '--pull-action-state') {
+        reads += 1
+        return { stdout: JSON.stringify(stateResponse(reads < 3 ? {} : { my_reviews: [review] })), stderr: '' }
+      }
+      throw cliError('Command timed out after 60000ms: github-interface')
+    })
+    const lost = await call('POST', '/api/pull-requests/approve', body())
+    expect(lost.status).toBe(503)
+    expect(lost.body.outcome).toBe('unknown')
+    const retry = await call('POST', '/api/pull-requests/approve', body())
+    expect(retry.status).toBe(200)
+    expect(retry.body).toMatchObject({ outcome: 'already_approved', reviewId: 11 })
     expect(interfaceCalls('--approve-pr')).toHaveLength(1)
   })
 

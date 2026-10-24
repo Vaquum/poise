@@ -374,6 +374,11 @@ export async function runPublicationReviewSweepOnce(now = Date.now()): Promise<{
     return now - checkedMs(value) >= (value.snapshot.active ? SWEEP_ACTIVE_MS : SWEEP_TERMINAL_MS)
   })
   if (!next) return { read: null }
+  // Rechecked after the disk reads above: the release drain may have
+  // started while they were awaited, and no new read begins after it.
+  // The recheck and the tracking below are synchronous, so the drain
+  // either sees this read or this read sees the drain.
+  if (releaseBackgroundPaused()) return { read: null }
   // Forced past the Editor's terminal exclusion: a closed publication that
   // reopened, or gained late feedback, is read again. The release drain
   // waits for the read; pausing stops admission, never this read.

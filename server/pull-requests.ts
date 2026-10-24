@@ -90,11 +90,14 @@ function classifyFailure(error: unknown): Failure {
   const last = (lines[lines.length - 1] ?? '').replace(/^[A-Za-z_][\w.]*Error: /, '')
   const attached = last.match(/^GitHub attached approval to ([0-9a-f]{40}|missing), expected [0-9a-f]{40}$/)
   if (attached) return { kind: 'attached', approvedHead: attached[1] === 'missing' ? null : attached[1].toLowerCase() }
-  if (REFUSED_PREFIXES.some((prefix) => last.startsWith(prefix))) return { kind: 'refused', message: last.slice(0, 2000) }
+  // A refusal may count what it found first: "2 unresolved review
+  // conversation(s) ...". The count is stripped before matching.
+  const stripped = last.replace(/^\d+ /, '')
+  if (REFUSED_PREFIXES.some((prefix) => stripped.startsWith(prefix))) return { kind: 'refused', message: last.slice(0, 2000) }
   return { kind: 'unknown' }
 }
 
-interface Approval { id: unknown, commitSha: string | null, submittedAt: unknown }
+interface MyReview { id: unknown, state: string | null, commitSha: string | null, submittedAt: unknown }
 
 interface ActionState {
   state: string | null
@@ -103,7 +106,7 @@ interface ActionState {
   headSha: string | null
   mergeSha: string | null
   queueEntryId: string | null
-  myApprovals: Approval[]
+  myReviews: MyReview[]
 }
 
 function asSha(value: unknown): string | null {
@@ -113,10 +116,11 @@ function asSha(value: unknown): string | null {
 async function readActionState(repo: string, number: number, actor: string): Promise<ActionState> {
   const raw = await callInterface(['--pull-action-state', `#${number}`, '--repository', repo, '--token-user', actor]) as Record<string, unknown>
   if (!raw || typeof raw !== 'object' || !Array.isArray(raw.my_reviews)) throw new Error('pull-action-state returned no state')
-  const myApprovals: Approval[] = []
+  const myReviews: MyReview[] = []
   for (const review of raw.my_reviews as Array<Record<string, unknown>>) {
-    if (!review || typeof review !== 'object' || review.state !== 'APPROVED') continue
-    myApprovals.push({ id: review.id ?? null, commitSha: asSha(review.commit_id), submittedAt: review.submitted_at ?? null })
+    if (!review || typeof review !== 'object') continue
+    myReviews.push({ id: review.id ?? null, state: typeof review.state === 'string' ? review.state : null,
+      commitSha: asSha(review.commit_id), submittedAt: review.submitted_at ?? null })
   }
   return {
     state: typeof raw.state === 'string' ? raw.state : null,
@@ -125,13 +129,30 @@ async function readActionState(repo: string, number: number, actor: string): Pro
     headSha: asSha(raw.head_sha),
     mergeSha: asSha(raw.merge_sha),
     queueEntryId: typeof raw.queue_entry_id === 'string' ? raw.queue_entry_id : null,
-    myApprovals,
+    myReviews,
   }
+}
+
+// The approval still standing at the expected head, if any. Reviews arrive
+// oldest first: a changes-requested or dismissed review supersedes an
+// earlier approval, and a later approval supersedes it back. An approval
+// followed by a change request is not reported as already approved.
+function currentApproval(reviews: MyReview[], head: string | null): MyReview | null {
+  let approval: MyReview | null = null
+  for (const review of reviews) {
+    if (review.state === 'APPROVED' && review.commitSha === head) approval = review
+    else if (review.state === 'CHANGES_REQUESTED' || review.state === 'DISMISSED') approval = null
+  }
+  return approval
 }
 
 function githubState(state: ActionState | null): Record<string, unknown> | null {
   if (!state) return null
-  const latest = [...state.myApprovals].reverse().find((approval) => approval.commitSha !== null) ?? null
+  let latest: MyReview | null = null
+  for (const review of state.myReviews) {
+    if (review.state === 'APPROVED') latest = review.commitSha !== null ? review : latest
+    else if (review.state === 'CHANGES_REQUESTED' || review.state === 'DISMISSED') latest = null
+  }
   return {
     state: state.state,
     merged: state.merged,
@@ -187,7 +208,11 @@ async function runAction(kind: 'approve' | 'merge', action: ValidAction, actor: 
   }
   if (reserved.receipt.outcome !== null) {
     try {
-      return JSON.parse(reserved.receipt.outcome) as ActionResult
+      const stored = JSON.parse(reserved.receipt.outcome) as ActionResult
+      // Only a determined outcome replays. An unknown one re-reads GitHub
+      // below, so a delayed approval or merge is seen once it lands; the
+      // reservation is not fresh, so nothing acts twice.
+      if ((stored.body as { outcome?: unknown } | null)?.outcome !== 'unknown') return stored
     } catch {
       // A corrupted receipt never acts again; it reconciles like a pending one.
     }
@@ -222,7 +247,7 @@ function finalize(id: string, result: ActionResult): ActionResult {
 }
 
 function reconcileApproval(action: ValidAction, actor: string, state: ActionState): ActionResult | null {
-  const approval = state.myApprovals.find((review) => review.commitSha === action.expectedHead) ?? null
+  const approval = currentApproval(state.myReviews, action.expectedHead)
   if (!approval) return null
   return {
     status: 200,
@@ -235,12 +260,14 @@ function reconcileApproval(action: ValidAction, actor: string, state: ActionStat
 }
 
 function reconcileMerge(action: ValidAction, actor: string, state: ActionState): ActionResult | null {
+  // The head named is the one GitHub reports, not the expected one: when H
+  // was replaced by H2 and H2 merged or queued, both heads are stated.
   if (state.merged) {
     return {
       status: 200,
       body: {
         outcome: 'already_merged', repo: action.repo, number: action.number, actor,
-        headSha: action.expectedHead, mergedBy: state.mergedBy, mergeSha: state.mergeSha,
+        headSha: state.headSha, expectedHead: action.expectedHead, mergedBy: state.mergedBy, mergeSha: state.mergeSha,
       },
     }
   }
@@ -249,7 +276,7 @@ function reconcileMerge(action: ValidAction, actor: string, state: ActionState):
       status: 200,
       body: {
         outcome: 'in_queue', repo: action.repo, number: action.number, actor,
-        headSha: action.expectedHead, queueEntryId: state.queueEntryId,
+        headSha: state.headSha, expectedHead: action.expectedHead, queueEntryId: state.queueEntryId,
       },
     }
   }
@@ -271,7 +298,7 @@ async function act(kind: 'approve' | 'merge', action: ValidAction, actor: string
 async function actFailed(kind: 'approve' | 'merge', action: ValidAction, actor: string, failure: Failure): Promise<ActionResult> {
   if (failure.kind === 'attached' && kind === 'approve') {
     const state = await tryState(action, actor)
-    const found = 'state' in state ? state.state.myApprovals.find((review) => review.commitSha === failure.approvedHead) ?? null : null
+    const found = 'state' in state ? currentApproval(state.state.myReviews, failure.approvedHead) : null
     return finalize(action.actionId, {
       status: 200,
       body: {

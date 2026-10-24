@@ -15,6 +15,7 @@ import { GITHUB_AUTOMATION_SIGN_IN_TITLE } from '../accounts/types'
 import { getBehaviorIncident, listBehaviorIncidents } from '../db'
 import { readInvolvedPullRequests, readOwnPullRequests, type InvolvedPullRequest, type OwnPullRequest } from '../gh'
 import { HttpError } from '../http'
+import { getOrganizations } from '../organizations'
 import { getNotificationSettings } from '../settings'
 import {
   alertKind, alertRow, alertSeq, dismissAlert, forgetSilence, openAlerts, raiseAlert, resolveAlert, silenceAlert, silenced, silencedKeys,
@@ -115,7 +116,9 @@ function storedSeq(id: string): number {
 
 /** The person put a notice away: for good, or for a ready pull request until
  *  its next reminder. The dismissal is handled even while the condition
- *  continues; a later clearing records another row. */
+ *  continues; a later clearing records another row. Each dismissal carries
+ *  its own time in its ref, so dismissing a later reminder of the same
+ *  alert records its own row instead of colliding with the first. */
 export function dismissNotice(id: string, now = Date.now()): void {
   const seq = storedSeq(id)
   const row = alertRow(seq)
@@ -123,7 +126,7 @@ export function dismissNotice(id: string, now = Date.now()): void {
   if (row) {
     const at = new Date(now).toISOString()
     recordHandling({ kind: 'notice', source: row.kind, title: row.title, startedAt: row.createdAt,
-      finishedAt: at, outcome: 'dismissed', actor: 'person', ref: `alert:${seq}:dismissed` }, at)
+      finishedAt: at, outcome: 'dismissed', actor: 'person', ref: `alert:${seq}:dismissed:${at}` }, at)
   }
 }
 
@@ -140,7 +143,7 @@ export function silenceNotice(id: string, now = Date.now(), actor: HandlingActor
   if (row) {
     const at = new Date(now).toISOString()
     recordHandling({ kind: 'notice', source: row.kind, title: row.title, startedAt: row.createdAt,
-      finishedAt: at, outcome: 'silenced', actor, ref: `alert:${seq}:silenced` }, at)
+      finishedAt: at, outcome: 'silenced', actor, ref: `alert:${seq}:silenced:${at}` }, at)
   }
 }
 
@@ -150,6 +153,13 @@ const readyKey = (pr: Pick<OwnPullRequest, 'repo' | 'number'>) => `${READY_PREFI
 function clip(text: string, max: number): string {
   const line = text.replace(/\s+/g, ' ').trim()
   return line.length <= max ? line : `${line.slice(0, max - 1).trimEnd()}…`
+}
+
+/** The accounts followed right now, read at raise time: a pass that read
+ *  its lists before an account was unfollowed must not raise that
+ *  account's alerts from its stale read after the removal resolved them. */
+function followedNow(): Set<string> {
+  return new Set(getOrganizations().map((org) => org.login.toLowerCase()))
 }
 
 /** Raises an alert for each of the person's own pull requests that has become
@@ -164,8 +174,12 @@ export async function checkReadyPullRequests(
   const { pullRequests, read: listed, tracked } = await read()
   // Turned off while GitHub was being asked: nothing more is noticed, on the desktop either.
   if (!getNotificationSettings().enabled) return
+  const followed = followedNow()
   const open = new Set<string>()
   for (const pr of pullRequests) {
+    // Unfollowed after this pass read its lists: never raised from the
+    // stale read. The removal already resolved what stood.
+    if (!followed.has(pr.repo.split('/')[0].toLowerCase())) continue
     const dedupeKey = readyKey(pr)
     open.add(dedupeKey)
     if (pr.status === undefined) continue
@@ -223,8 +237,10 @@ export async function checkReviewRequests(
 ): Promise<void> {
   const { pullRequests, read: listed, tracked } = await read()
   if (!getNotificationSettings().enabled) return
+  const followed = followedNow()
   const open = new Set<string>()
   for (const pr of pullRequests) {
+    if (!followed.has(pr.repo.split('/')[0].toLowerCase())) continue
     const dedupeKey = reviewKey(pr)
     open.add(dedupeKey)
     if (pr.reviewRequested === null) continue
@@ -257,8 +273,10 @@ export async function checkConflictPullRequests(
 ): Promise<void> {
   const { pullRequests, read: listed, tracked } = await read()
   if (!getNotificationSettings().enabled) return
+  const followed = followedNow()
   const open = new Set<string>()
   for (const pr of pullRequests) {
+    if (!followed.has(pr.repo.split('/')[0].toLowerCase())) continue
     const dedupeKey = conflictKey(pr)
     open.add(dedupeKey)
     if (pr.status === undefined) continue

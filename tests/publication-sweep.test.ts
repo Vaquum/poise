@@ -10,6 +10,19 @@ const mocks = vi.hoisted(() => ({ query: vi.fn(), signIn: vi.fn(), file: vi.fn()
 vi.mock('../server/publishing-github', async (original) => ({
   ...(await original<typeof import('../server/publishing-github')>()), queryGitHub: mocks.query, signIn: mocks.signIn, fileAt: mocks.file, repositoryById: mocks.repository,
 }))
+// A hook into the document listing, so a test can pause the release while
+// the sweep is still reading which publications exist. Passes through.
+const editorMocks = vi.hoisted(() => ({ beforeList: null as null | (() => Promise<void>) }))
+vi.mock('../server/editor', async (original) => {
+  const actual = await original<typeof import('../server/editor')>()
+  return {
+    ...actual,
+    listDocs: async (...args: Parameters<typeof actual.listDocs>) => {
+      if (editorMocks.beforeList) await editorMocks.beforeList()
+      return actual.listDocs(...args)
+    },
+  }
+})
 
 const SHA = 'a'.repeat(40)
 const SOURCE = '---\ntitle: "A question"\n---\n\nOpening paragraph.\n\nSecond line.\nThird line.\n'
@@ -177,6 +190,25 @@ describe('the publication review sweep', () => {
     resolveQuery({ repository: { databaseId: 42, nameWithOwner: 'acme/site', pullRequest: structuredClone(pulls.get(7)) }, rateLimit: { remaining: 4500, cost: 1, resetAt: '2026-10-18T11:00:00Z' } })
     expect((await run).read).not.toBeNull()
     expect(release.releaseBackgroundBusy()).toBe(0)
+  })
+
+  it('starts no read when the release pause lands while it lists publications', async () => {
+    let releaseList!: () => void
+    const listed = new Promise<void>((resolve) => { releaseList = resolve })
+    let entered = false
+    editorMocks.beforeList = async () => { entered = true; await listed }
+    try {
+      const run = api.runPublicationReviewSweepOnce()
+      await vi.waitFor(() => expect(entered).toBe(true))
+      release.pauseReleaseBackground()
+      releaseList()
+      expect(await run).toEqual({ read: null })
+      expect(pullQueries()).toBe(0)
+      expect(release.releaseBackgroundBusy()).toBe(0)
+    } finally {
+      editorMocks.beforeList = null
+      release.resumeReleaseBackground()
+    }
   })
 
   it('refuses anything but GET on the list', async () => {
