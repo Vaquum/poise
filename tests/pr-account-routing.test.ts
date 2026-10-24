@@ -370,4 +370,33 @@ describe('PR account routing', () => {
     expect(swapped).toBe(true)
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
+
+  it('derives receipt ownership from the admitted roles when accounts swap and return during preparation', async () => {
+    const { db, behaviors } = await initial()
+    db.setMeta('behavior_review_new_prs_enabled', '0')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+    db.db.prepare('UPDATE behavior_seen SET launch_actor = ? WHERE launch_repo = ?').run('poise-user', pr.repo)
+    fixture.agentLogs = [agentLog({ id: 'c'.repeat(32), actor: 'poise-user', status: 'completed', action: 'requested_changes', outcome: 'changes_requested', head_sha: HEAD_SHA, review_id: 91, correlation_id: 'old-call', completed_at: new Date().toISOString() })]
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA, reviewerReviewIdsSince: [91] })
+    const models = await import('../server/models')
+    const original = mocks.runFile.getMockImplementation()!
+    let swapped = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await original(command, args, options)
+      if (command === 'github-interface' && args[0] === '--local-checkout-path') {
+        db.setMeta('me', 'review-bot'); db.setMeta('agentAccount', 'poise-user')
+        swapped = true
+        models.invalidateCatalog()
+      }
+      if (swapped && command === 'agent-interface' && args[0] === '--models') {
+        db.setMeta('me', 'poise-user'); db.setMeta('agentAccount', 'review-bot')
+      }
+      return result
+    })
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(swapped).toBe(true)
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][2].env.GITHUB_INTERFACE_AUTOMATED_REVIEWS).toBe('[91]')
+  })
 })

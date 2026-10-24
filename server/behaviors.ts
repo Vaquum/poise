@@ -1965,8 +1965,8 @@ function reviewBatches(prs: DatastorePr[], size: number): { reviewer: string, ba
   })
 }
 
-async function automatedReviewEnvironment(repo: string, number: number, reviewer: string): Promise<NodeJS.ProcessEnv> {
-  if (reviewer.toLowerCase() !== (getMeta('me') || '').toLowerCase()) return {}
+async function automatedReviewEnvironment(repo: string, number: number, reviewer: string, accounts = prAccounts()): Promise<NodeJS.ProcessEnv> {
+  if (reviewer.toLowerCase() !== accounts.me.toLowerCase()) return {}
   const snapshot = await readBehaviorLogSnapshot()
   if (snapshot.quarantined.some((row) => quarantinedLogMayMatch(row, { repo, prId: String(number) }))) {
     throw new Error('Cannot establish ownership of automated reviews: Caller evidence is unreadable')
@@ -3498,7 +3498,7 @@ async function fireApprove(
   }
   attachCheckSlotToClaim(claimId, checkSlot)
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
-  const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor)
+  const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor, accounts)
   const selectedModel = (await reviewChoice('pr_approve')).model
   if (!isEnabled('approve-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('approve-prs', pr, actor)) return false
   if (selectedModel !== model) return false
@@ -4040,7 +4040,7 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
   }
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
-  const reviewEnvironment = await automatedReviewEnvironment(repo, number, reviewer)
+  const reviewEnvironment = await automatedReviewEnvironment(repo, number, reviewer, accounts)
   if (!isEnabled('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
   const nativeId = randomUUID()
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
@@ -5685,7 +5685,7 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
       if (targetRefusal || behavior === 'issue_review') return targetRefusal
       accounts = prAccounts()
       actor = configuredReviewer(author)
-      reviewEnvironment = behavior === 'pr_approve' ? await automatedReviewEnvironment(repo, number, actor) : undefined
+      reviewEnvironment = behavior === 'pr_approve' ? await automatedReviewEnvironment(repo, number, actor, accounts) : undefined
       if (!prAccountsMatch(accounts) || configuredReviewer(author) !== actor) return 'GitHub accounts changed; retry the replay'
       return await replayPublicationRefusal(behavior, repo, number, actor, author!, accounts)
     } catch (error) {
