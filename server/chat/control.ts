@@ -1445,6 +1445,10 @@ export class ChatControl {
     }
     try {
       const ci = await (this.options.ci ?? readWorkCi)(target)
+      // An ownership transfer mid-read clears this target's observations; the
+      // new owner starts from no baseline, so a stale write here must not
+      // restore the old fingerprint and silence its first notice.
+      if (!store.bindingIsCurrent(instance, binding)) return { ci: null, live: this.persistedLivePullState(target) }
       const fresh = livePullState(ci)
       if (fresh) store.saveObservation(instance, `ci-state:${target.url}`, fresh, now)
       // The clock advances on every read; the facet observe overwrites the
