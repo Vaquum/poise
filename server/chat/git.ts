@@ -142,33 +142,35 @@ export function githubRepoFromRemoteUrl(url: string): string | null {
   return /^[^/\s]+\/[^/\s]+$/.test(repo) ? repo : null
 }
 
-/** A local branch linked to a GitHub remote: an upstream is configured, so
- *  the branch was pushed there (or fetched from there) at some point. */
+/** A branch on a GitHub remote that a local branch tracks: an upstream is
+ *  configured, so the remote branch was pushed there (or fetched from
+ *  there) at some point. The branch is the remote's name for it, which may
+ *  differ from the local one. */
 export interface PushedBranch { branch: string, repo: string }
 
-/** Local branches with a GitHub upstream, each with its remote's
- *  `owner/name`. Branches without an upstream, with a local-only or
- *  removed upstream remote, or with a non-GitHub remote contribute
- *  nothing: evidence must positively attribute a branch to a repository.
- *  Read-only: safe without the checkout lease. Confined like
- *  inspectTaskRepo: a broken nested `.git` fails here instead of reading
- *  the parent checkpoint repo. */
+/** Remote branches with a GitHub remote, each with its remote's
+ *  `owner/name` and the remote's branch name. Branches without an
+ *  upstream, with a local-only or removed upstream remote, or with a
+ *  non-GitHub remote contribute nothing: evidence must positively
+ *  attribute a branch to a repository. Every git failure propagates —
+ *  swallowing one would read as no pushed branches and let discovery bind
+ *  on incomplete evidence. Read-only: safe without the checkout lease.
+ *  Confined like inspectTaskRepo: a broken nested `.git` fails here
+ *  instead of reading the parent checkpoint repo. */
 export async function pushedBranches(checkout: string): Promise<PushedBranch[]> {
   const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
-  const refs = await git(checkout, ['for-each-ref', '--format=%(refname:short)%00%(upstream:remotename)', 'refs/heads'], { env })
+  const refs = await git(checkout, ['for-each-ref', '--format=%(refname:short)%00%(upstream:short)%00%(upstream:remotename)', 'refs/heads'], { env })
   const remotes = new Map<string, string>()
   let remotesLoaded = false
   const remoteRepo = async (name: string): Promise<string | null> => {
     if (!remotesLoaded) {
       remotesLoaded = true
-      const config = await git(checkout, ['config', '--get-regexp', '^remote\\..*\\.url$'],
-        { env, expected: { codes: [1] } }).catch(() => '')
-      for (const line of config.split('\n')) {
-        if (!line) continue
-        const parsed = /^remote\.(.+)\.url\s+(.*)$/.exec(line)
-        if (!parsed) throw new GitError('git config returned a malformed remote')
-        const repo = githubRepoFromRemoteUrl(parsed[2])
-        if (repo) remotes.set(parsed[1], repo)
+      // `git remote` lists nothing and exits zero when no remote exists, so
+      // a missing remote is a fact, never a swallowed failure.
+      const names = (await git(checkout, ['remote'], { env })).split('\n').filter(line => line !== '')
+      for (const remote of names) {
+        const repo = githubRepoFromRemoteUrl(await git(checkout, ['config', '--get', `remote.${remote}.url`], { env }))
+        if (repo) remotes.set(remote, repo)
       }
     }
     return remotes.get(name) ?? null
@@ -177,9 +179,12 @@ export async function pushedBranches(checkout: string): Promise<PushedBranch[]> 
   for (const line of refs.split('\n')) {
     if (!line) continue
     const fields = line.split('\0')
-    if (fields.length !== 2 || !fields[0]) throw new GitError('git for-each-ref returned a malformed branch')
-    const [branch, remote] = fields as [string, string]
+    if (fields.length !== 3 || !fields[0]) throw new GitError('git for-each-ref returned a malformed branch')
+    const [, upstream, remote] = fields as [string, string, string]
     if (!remote || remote === '.') continue
+    if (!upstream.startsWith(`${remote}/`)) throw new GitError('git for-each-ref returned a malformed upstream')
+    const branch = upstream.slice(remote.length + 1)
+    if (!branch) throw new GitError('git for-each-ref returned a malformed upstream')
     const repo = await remoteRepo(remote)
     if (repo) found.push({ branch, repo })
   }

@@ -27,7 +27,7 @@ import * as store from './control-store'
 import { isSwitchboardSession } from './switchboard-store'
 import { SWITCHBOARD_LOOKUPS, SWITCHBOARD_OPERATIONS, SWITCHBOARD_PERSON, SWITCHBOARD_READS, type SwitchboardControl } from './switchboard'
 import { BEHAVIOR_KEYS } from '../../src/behavior-types'
-import { organizationArgs, organizationForRepository, type Organization } from '../organizations'
+import { organizationArgs, organizationForRepository, readyOrganizations, type Organization } from '../organizations'
 
 const PATH = '/api/chat/control'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -1299,10 +1299,17 @@ export class ChatControl {
       }
     }
     if (branches) {
+      let unmanaged = false
       for (const repo of branches.repos) {
         const org = organizationForRepository(repo)
         if (org) orgs.set(org.login.toLowerCase(), org)
+        else unmanaged = true
       }
+      // A fork's owner is not a managed organization, but its base is: when
+      // any evidence points outside the managed orgs, list them all so a
+      // fork head still matches. Extra listings only ever match their own
+      // evidence, so they bind nothing spurious.
+      if (unmanaged) for (const org of readyOrganizations()) orgs.set(org.login.toLowerCase(), org)
     }
     if (orgs.size === 0) return
     // The window opens only when listings were actually read, so an empty
@@ -1353,11 +1360,13 @@ export class ChatControl {
             }
           }
           const pushed = new Set<string>()
-          if (branches && pr.headRef !== null) {
-            const headRepos = new Set([pr.repo.toLowerCase(), ...(pr.headRepo ? [pr.headRepo.toLowerCase()] : [])])
-            for (const repo of headRepos) {
-              for (const session of branches.owners.get(JSON.stringify([repo, pr.headRef])) ?? []) pushed.add(session)
-            }
+          // The head repository alone names where the branch lives: matching
+          // the base repository too would let an unrelated same-named base
+          // branch claim a fork PR. A half-known head is incomplete evidence
+          // and matches nothing, like an incomplete closing list.
+          if (branches && pr.headRef !== null && pr.headRepo !== null) {
+            const key = JSON.stringify([pr.headRepo.toLowerCase(), pr.headRef])
+            for (const session of branches.owners.get(key) ?? []) pushed.add(session)
           }
           const live = (sessions: Set<string>): string[] => [...sessions].filter(session =>
             this.runtime.ownsSession(session) && this.runtime.get(session)?.status !== 'closed'

@@ -491,14 +491,26 @@ describe('automatic PR binding through workspace branches', () => {
     const parent = await manager()
     const { worker, checkout } = await workerWithCheckout(parent.id)
     await pushBranch(checkout, 'fix/7-fork', 'fork/app')
-    // The fork owner is not a managed organization: the base repository's
-    // listing, reached here through an unrelated bound issue, carries the head.
-    await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/issues/9' })
+    // No bindings at all: the fork owner is unmanaged, so discovery lists
+    // every managed organization to reach the base repository's listing.
     closingRefs.mockResolvedValue(branchListing('fix/7-fork', 'fork/app'))
     clock += 61_000
     await control.tick()
     await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(worker)
+  })
+
+  it('binds a fork PR to its pusher, never a same-named base branch', async () => {
+    const parent = await manager()
+    const base = await workerWithCheckout(parent.id)
+    const fork = await workerWithCheckout(parent.id)
+    await pushBranch(base.checkout, 'fix/7-same', 'acme/app')
+    await pushBranch(fork.checkout, 'fix/7-same', 'fork/app')
+    closingRefs.mockResolvedValue(branchListing('fix/7-same', 'fork/app'))
+    clock += 61_000
+    await control.tick()
+    await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
+    expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(fork.worker)
   })
 
   it('leaves a PR pushed from two chats\' workspaces unbound', async () => {
@@ -539,12 +551,15 @@ describe('automatic PR binding through workspace branches', () => {
     expect(store.bindings(runtime.instance).some(b => b.target === PR)).toBe(false)
   })
 
-  it('skips branch matching when the head ref is unknown', async () => {
+  it.each([[null, null], ['fix/7-pushed', null]] as Array<[string | null, string | null]>)(
+    'skips branch matching when the head is unknown (headRef=%s headRepo=%s)', async (headRef, headRepo) => {
     const parent = await manager()
     const { checkout } = await workerWithCheckout(parent.id)
     await pushBranch(checkout, 'fix/7-pushed', 'acme/app')
     await unrelatedBinding()
-    closingRefs.mockResolvedValue(branchListing(null, null))
+    // Old rows know neither half; a half-known head is incomplete evidence
+    // either way and matches nothing.
+    closingRefs.mockResolvedValue(branchListing(headRef, headRepo))
     clock += 61_000
     await control.tick()
     await until(() => store.observation(runtime.instance, 'behavior:https://github.com/acme/app/issues/9')?.checked_at === clock)
@@ -620,6 +635,22 @@ describe('pushed branch evidence', () => {
     await git(['remote', 'add', 'origin', 'https://github.com/Acme/App.git'], dir)
     await git(['update-ref', 'refs/remotes/origin/pushed', 'HEAD'], dir)
     await git(['branch', '--set-upstream-to=origin/pushed', 'pushed'], dir)
-    expect(await pushedBranches(dir)).toEqual([{ branch: 'pushed', repo: 'acme/app' }])
+    // A local branch tracking a differently-named remote branch reports the
+    // remote's name: that is the branch a PR head would carry.
+    await git(['checkout', '-q', '-b', 'work', 'main'], dir)
+    await git(['update-ref', 'refs/remotes/origin/fix/7-remote', 'HEAD'], dir)
+    await git(['branch', '--set-upstream-to=origin/fix/7-remote', 'work'], dir)
+    expect(await pushedBranches(dir)).toEqual([
+      { branch: 'fix/7-remote', repo: 'acme/app' },
+      { branch: 'pushed', repo: 'acme/app' },
+    ])
+    // A git failure is loud: reading as no pushed branches would let
+    // discovery bind on incomplete evidence.
+    await chmod(join(dir, '.git', 'config'), 0o000)
+    try {
+      await expect(pushedBranches(dir)).rejects.toThrow()
+    } finally {
+      await chmod(join(dir, '.git', 'config'), 0o644)
+    }
   })
 })
