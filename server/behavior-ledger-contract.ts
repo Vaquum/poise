@@ -124,7 +124,7 @@ export const DEFAULT_LEDGER_POLICY: Readonly<LedgerPolicy> = {
   retentionMs: 30 * 86_400_000, maxInstances: 10_000, maxChanges: 30_000,
   maxBytes: 32 * 1024 * 1024, maxPagesBytes: 64 * 1024 * 1024, maxAttempts: 32,
 }
-export type LedgerRead = { operation: 'list'; limit?: number; cursor?: string; parent?: string }
+export type LedgerRead = { operation: 'list'; limit?: number; cursor?: string; parent?: string; repository?: string; number?: number }
   | { operation: 'get'; id: string }
   | { operation: 'changes'; cursor: string; limit?: number }
   | { operation: 'health' }
