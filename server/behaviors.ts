@@ -1208,15 +1208,19 @@ function quarantineBlocksLogCorrection(behavior: string, target: string): boolea
 
 // Approval keys change with commits and author responses. A durable hold
 // belongs to the PR, even if an earlier runtime closed its owned claim.
-function invalidPrResultHeld(repo: string, pr: number): boolean {
-  return !!db.prepare(`
-    SELECT 1 FROM behavior_seen
+function invalidPrResultHoldDetail(repo: string, pr: number): {
+  callId: string | null, head: string, error: string | null,
+} | null {
+  const row = db.prepare(`
+    SELECT launch_call_id AS callId, launch_expected_head AS head, launch_error AS error
+    FROM behavior_seen
     WHERE key IN ('review-new-prs', 'approve-prs') AND (
       (launch_repo = ? AND launch_pr = ? AND launch_quarantine = 'invalid_result')
       OR (target = ? AND launch_requested_at IS NULL AND launch_quarantine IS NOT NULL)
     )
     LIMIT 1
-  `).get(repo, pr, `${repo}#${pr}`)
+  `).get(repo, pr, `${repo}#${pr}`) as { callId: string | null, head: string, error: string | null } | undefined
+  return row ?? null
 }
 
 // Invalid terminal results keep ownership and coverage without using a
@@ -3420,6 +3424,24 @@ function recordApproveCheck(pr: DatastorePr, snapshot: ApproveCheckSnapshot): vo
   setMeta(approveCheckGateKey(pr), JSON.stringify({ ...snapshot, updated_at: pr.updated_at, at: Date.now() }))
 }
 
+// A dismissed approval that never gets re-selected is invisible without a
+// skip reason (#559). Log once per reason so a permanently parked PR does
+// not emit a line every minute.
+function approveSkipKey(pr: DatastorePr): string {
+  return `${META_PREFIX}approve_prs_skip:${pr.repo}#${pr.number}`
+}
+
+function logApproveSkip(pr: DatastorePr, reason: string): void {
+  const key = approveSkipKey(pr)
+  if (getMeta(key) === reason) return
+  setMeta(key, reason)
+  console.log(`[behaviors] approve-prs skipped ${pr.repo}#${pr.number}: ${reason}`)
+}
+
+function clearApproveSkip(pr: DatastorePr): void {
+  setMeta(approveSkipKey(pr), '')
+}
+
 async function tickApprovePrs(): Promise<void> {
   if (!isEnabled('approve-prs')) return
   const author = getMeta('me') || ''
@@ -3431,10 +3453,25 @@ async function tickApprovePrs(): Promise<void> {
     const prs = await listEligiblePrs('approve-prs', author)
     // Backed-off PRs don't spend batch capacity, and the cursor rotates
     // coverage so a sweep cut short by its deadline resumes beyond the
-    // blocked batch.
-    const candidates = orderByCursor(prs, 'behavior_approve_prs_cursor').filter((pr) =>
-      !invalidPrResultHeld(pr.repo, pr.number)
-      && behaviorRetryDue('approve-prs', `${pr.repo}#${pr.number}:check`))
+    // blocked batch. Every filter logs its reason once (#559), so a
+    // dismissed approval that never gets re-selected is visible.
+    const candidates: DatastorePr[] = []
+    for (const pr of orderByCursor(prs, 'behavior_approve_prs_cursor')) {
+      const hold = invalidPrResultHoldDetail(pr.repo, pr.number)
+      if (hold) {
+        const call = hold.callId ? ` launch ${hold.callId.slice(0, 8)}` : ''
+        const head = hold.head ? ` (head ${String(hold.head).slice(0, 8)})` : ''
+        logApproveSkip(pr, `held by invalid_result${call}${head}`)
+        continue
+      }
+      const checkTarget = `${pr.repo}#${pr.number}:check`
+      const failure = readBehaviorFailure('approve-prs', checkTarget)
+      if (failure && Date.now() < failure.nextRetryAtMs) {
+        logApproveSkip(pr, `check backoff until ${new Date(failure.nextRetryAtMs).toISOString()}: ${failure.error ?? 'check failed'}`)
+        continue
+      }
+      candidates.push(pr)
+    }
     // The change gate parks terminal no-ops while the datastore row and
     // the local inputs are unchanged. Snapshots are taken up front so a
     // review completing mid-sweep invalidates the watermark instead of
@@ -3448,12 +3485,18 @@ async function tickApprovePrs(): Promise<void> {
     // only skip once nothing for the PR is still in flight, so a
     // completing review can never be gated out by a snapshot taken a
     // moment early.
-    const stage1 = candidates.filter((pr) => {
+    const stage1: DatastorePr[] = []
+    for (const pr of candidates) {
       const key: `${string}#${number}` = `${pr.repo}#${pr.number}`
-      return readBehaviorFailure('approve-prs', `${key}:check`) !== null
+      if (readBehaviorFailure('approve-prs', `${key}:check`) !== null
         || hasActiveAgentLaunchForPr(pr.repo, pr.number)
-        || !approveCheckFresh(pr, snapshots.get(key)!)
-    })
+        || !approveCheckFresh(pr, snapshots.get(key)!)) {
+        clearApproveSkip(pr)
+        stage1.push(pr)
+      } else {
+        logApproveSkip(pr, `no change since last check (datastore updated_at ${pr.updated_at})`)
+      }
+    }
     let failure: unknown
     const clearCheck = (checkTarget: string) => {
       if (!behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
@@ -3461,10 +3504,11 @@ async function tickApprovePrs(): Promise<void> {
     // A terminal no-op parks the PR: a launch, a deferral (busy PR,
     // active launch, held claim) or an error never does, so the next
     // tick checks it again.
-    const parkCheck = (pr: DatastorePr) => {
+    const parkCheck = (pr: DatastorePr, reason: string) => {
       if (behaviorAborted()) return
       clearBehaviorFailure('approve-prs', `${pr.repo}#${pr.number}:check`)
       recordApproveCheck(pr, snapshots.get(`${pr.repo}#${pr.number}`)!)
+      logApproveSkip(pr, `parked: ${reason}`)
     }
     for (let offset = 0; offset < stage1.length; offset += PR_READ_BATCH_SIZE) {
       if (!isEnabled('approve-prs') || behaviorAborted()) return
@@ -3495,7 +3539,7 @@ async function tickApprovePrs(): Promise<void> {
         try {
           const check = result!
           if (await packetBlocked('approve-prs', pr.repo, pr.number, check.headSha)) {
-            parkCheck(pr)
+            parkCheck(pr, `review packet too large for head ${check.headSha.slice(0, 8)}`)
             continue
           }
           const cleanReview = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number)
@@ -3504,7 +3548,7 @@ async function tickApprovePrs(): Promise<void> {
             dismissedReview = check.reviewerLatestState === 'DISMISSED'
               ? latestCompletedChangeRequestLaunch(pr.repo, pr.number, reviewer) : null
             if (!dismissedReview) {
-              parkCheck(pr)
+              parkCheck(pr, 'dismissed approval without a recorded approval or change-request basis')
               continue
             }
           }
@@ -3524,14 +3568,14 @@ async function tickApprovePrs(): Promise<void> {
           // evidence to that request's findings, including reaffirmations.
           if (check.hasChangeRequest) {
             if (check.responseCount < 1 || check.latestRequestAt === null) {
-              parkCheck(pr)
+              parkCheck(pr, 'waiting for author response to change request')
               continue
             }
             checks.push({ pr, check, since: check.latestRequestAt, clean: false, review: null, admittedReviewer: undefined })
           } else {
             const review = cleanReview ?? dismissedReview
             if (!review) {
-              parkCheck(pr)
+              parkCheck(pr, 'no review basis')
               continue
             }
             checks.push({ pr, check, since: review.completedAt, clean: cleanReview !== null, review,
@@ -3583,7 +3627,12 @@ async function tickApprovePrs(): Promise<void> {
                 || activity.unresolvedLiveConversationAuthors.some(
                   (author) => author.toLowerCase() !== reviewer.toLowerCase(),
                 )) {
-                parkCheck(pr)
+                const reason = activity.state !== 'OPEN' ? `PR is ${activity.state.toLowerCase()}`
+                  : activity.draft ? 'PR is draft'
+                    : activity.headSha !== check.headSha
+                      ? `head race (activity ${activity.headSha.slice(0, 8)} vs check ${check.headSha.slice(0, 8)})`
+                      : 'live conversations owned by another author'
+                parkCheck(pr, reason)
                 continue
               }
               launches.push({ pr, expectedHead: check.headSha,
@@ -3594,7 +3643,7 @@ async function tickApprovePrs(): Promise<void> {
               const review = request.review!
               if (!request.clean && (activity.reviewerLatestState !== 'DISMISSED'
                 || activity.headSha !== check.headSha || activity.headSha === review.headSha)) {
-                parkCheck(pr)
+                parkCheck(pr, `dismissal race (reviewer ${activity.reviewerLatestState ?? 'none'}, activity ${activity.headSha.slice(0, 8)} vs check ${check.headSha.slice(0, 8)})`)
                 continue
               }
               const reapprovalOwnsEveryUnresolvedConversation =
@@ -3613,7 +3662,14 @@ async function tickApprovePrs(): Promise<void> {
                   && !reapprovalOwnsEveryUnresolvedConversation)
                 || (activity.reviewerLatestState === 'APPROVED'
                   && activity.reviewerLatestCommit === activity.headSha)) {
-                parkCheck(pr)
+                const reason = activity.state !== 'OPEN' ? `PR is ${activity.state.toLowerCase()}`
+                  : activity.draft ? 'PR is draft'
+                    : activity.activeChangeRequestAuthors.length > 0
+                      ? `active change requests by ${activity.activeChangeRequestAuthors.join(', ')}`
+                      : activity.unresolvedLiveConversationCount > 0
+                        ? 'live conversations owned by another author'
+                        : `already approved on head ${activity.headSha.slice(0, 8)}`
+                parkCheck(pr, reason)
                 continue
               }
               if (activity.headSha !== review.headSha && activity.latestActivityAt === null) {
@@ -3687,6 +3743,7 @@ async function tickApprovePrs(): Promise<void> {
             throw err
           }
           console.log(`[behaviors] approve-prs fired for ${pr.repo}#${pr.number} (${firedReason})`)
+          clearApproveSkip(pr)
         } catch (err) {
           checked = false
           if (behaviorAborted()) return
