@@ -255,6 +255,7 @@ CLOSES_REF = re.compile(
 DEPENDENTS_SCAN_LIMIT = 1000
 DEPENDENTS_MATCH_LIMIT = 50
 CLOSED_MATCH_LIMIT = 100
+PR_CLOSING_SCAN_LIMIT = 500
 
 
 def _extract_refs(text: str, default_repo: str) -> list[tuple[str, int]]:
@@ -474,6 +475,65 @@ def pr_dependents(
                            "dependents": dependents, "truncated": truncated}, ensure_ascii=False)
     except sqlite3.Error as exc:
         raise RuntimeError(f"view query failed: pr-dependents: {exc}") from exc
+    finally:
+        conn.close()
+
+
+def pr_closing(
+    *,
+    db_path: str | Path = DEFAULT_DB,
+    output: Output = "json",
+    repo: str | None = None,
+    limit: int | None = None,
+) -> str:
+    """Open pull requests and the issues each closes, as the datastore has
+    them: local rows only, the sync owns freshness. Each entry carries
+    GitHub's closing references when the stored read tracked them, else the
+    body's closing keywords, the same provenance pr-dependents reports per
+    pull request. `truncated` means a cap or a malformed stored connection
+    hid entries; absence from the list then proves nothing."""
+    if output != "json":
+        raise ValueError("pr-closing renders json only")
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
+    cap = min(limit, PR_CLOSING_SCAN_LIMIT) if limit is not None else PR_CLOSING_SCAN_LIMIT
+    sql = """SELECT repo_full_name, number, body, expanded_json FROM items
+             WHERE item_type = 'pr' AND state = 'open'"""
+    params: list[Any] = []
+    if repo is not None:
+        sql += " AND repo_full_name = ? COLLATE NOCASE"
+        params.append(repo)
+    sql += " ORDER BY repo_full_name ASC, number ASC LIMIT ?"
+    params.append(cap + 1)
+    conn = _read_connect(db_path)
+    try:
+        conn.execute("BEGIN")
+        rows = conn.execute(sql, params).fetchall()
+        truncated = len(rows) > cap
+        prs: list[dict[str, Any]] = []
+        for row in rows[:cap]:
+            try:
+                expanded = json.loads(row["expanded_json"])
+            except ValueError:
+                expanded = None
+            pull = expanded.get("pull") if isinstance(expanded, dict) else None
+            graphql = pull.get("graphql") if isinstance(pull, dict) else None
+            closing, closes_via, refs_truncated = _closing_refs(graphql, row["body"], row["repo_full_name"])
+            if refs_truncated:
+                truncated = True
+            if len(closing) > CLOSED_MATCH_LIMIT:
+                truncated = True
+                closing = closing[:CLOSED_MATCH_LIMIT]
+            prs.append({
+                "repo": row["repo_full_name"],
+                "number": row["number"],
+                "url": f"https://github.com/{row['repo_full_name']}/pull/{row['number']}",
+                "closing": [{"repo": ref_repo, "number": ref_number} for ref_repo, ref_number, _ in closing],
+                "closes_via": closes_via,
+            })
+        return json.dumps({"prs": prs, "truncated": truncated}, ensure_ascii=False)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"view query failed: pr-closing: {exc}") from exc
     finally:
         conn.close()
 

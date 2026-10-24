@@ -11,6 +11,10 @@ db.exec(`
     instance TEXT NOT NULL, target TEXT NOT NULL, session TEXT NOT NULL,
     created_at INTEGER NOT NULL, PRIMARY KEY(instance, target)
   );
+  CREATE TABLE IF NOT EXISTS chat_work_binding_releases (
+    instance TEXT NOT NULL, target TEXT NOT NULL, session TEXT NOT NULL,
+    released_at INTEGER NOT NULL, PRIMARY KEY(instance, target, session)
+  );
   CREATE TABLE IF NOT EXISTS chat_control_inbox (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, instance TEXT NOT NULL,
     recipient TEXT NOT NULL, sender TEXT NOT NULL, event_key TEXT NOT NULL,
@@ -122,15 +126,41 @@ export const bindWork = db.transaction((instance: string, session: string, targe
   if (existing) return existing
   const result = { target: canonical, session, created_at: Date.now() }
   resetTargetObservations(instance, canonical)
+  db.prepare('DELETE FROM chat_work_binding_releases WHERE instance = ? AND target = ? AND session = ?').run(instance, canonical, session)
   db.prepare('INSERT INTO chat_work_bindings VALUES(?, ?, ?, ?)').run(instance, canonical, session, result.created_at)
   return result
 })
-export function unbindWork(instance: string, session: string, target: string): void {
+/** Claim a target for a chat without ever taking another chat's binding:
+ *  null when another chat holds it or the chat released it before. One
+ *  transaction, so a sweep and an explicit bind cannot interleave. */
+export const bindWorkAuto = db.transaction((instance: string, session: string, target: string): Binding | null => {
+  const canonical = workTarget(target).url
+  const existing = db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND target = ?').get(instance, canonical) as Binding | undefined
+  if (existing) return existing.session === session ? existing : null
+  if (bindingReleased(instance, session, canonical)) return null
+  const result = { target: canonical, session, created_at: Date.now() }
+  resetTargetObservations(instance, canonical)
+  db.prepare('INSERT INTO chat_work_bindings VALUES(?, ?, ?, ?)').run(instance, canonical, session, result.created_at)
+  return result
+})
+/** Whether the chat explicitly released the target: an automatic claim
+ *  never undoes that release. */
+export function bindingReleased(instance: string, session: string, target: string): boolean {
+  const canonical = workTarget(target).url
+  return !!db.prepare('SELECT 1 FROM chat_work_binding_releases WHERE instance = ? AND target = ? AND session = ?')
+    .get(instance, canonical, session)
+}
+export const unbindWork = db.transaction((instance: string, session: string, target: string): void => {
   const canonical = workTarget(target).url
   const owner = bindings(instance).find(b => b.target === canonical)
   if (owner && owner.session !== session) throw new HttpError(409, `only chat ${owner.session} can release this work`)
   db.prepare('DELETE FROM chat_work_bindings WHERE instance = ? AND target = ? AND session = ?').run(instance, canonical, session)
-}
+  if (owner?.session === session) {
+    db.prepare(`INSERT INTO chat_work_binding_releases VALUES(?, ?, ?, ?)
+      ON CONFLICT(instance, target, session) DO UPDATE SET released_at = excluded.released_at`)
+      .run(instance, canonical, session, Date.now())
+  }
+})
 /** Move every work binding from one chat to another: a handoff's ownership
  *  transfer. The new owner starts from no observation baseline; the old
  *  owner's still-pending work-monitor notices for those targets are
