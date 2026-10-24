@@ -81,6 +81,7 @@ import { createCodexAdapter } from './adapters/codex'
 import { createGrokAdapter } from './adapters/grok'
 import { createMuseAdapter } from './adapters/muse'
 import type { Adapter, AdapterHost, AgentProcess, PermissionRequest, QuestionAnswers, QuestionRequest, TurnResult } from './adapters/types'
+import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP } from '../check-semaphore'
 import { skippedNotice, type ResolvedServer, type Skipped } from '../extensions/types'
 import { SELF_UPDATE_REPOSITORY, SelfUpdateBridgeError, SelfUpdateUnavailableError, UUID_PATTERN, type SelfUpdateBridge } from '../self-update-bridge'
 import * as finishOutbox from '../self-update-outbox'
@@ -109,7 +110,7 @@ const isSwitchboardChat = (record: SessionRecord): boolean => record.context?.ki
 
 export const DEFAULT_IDLE_TIMEOUT_MINUTES = 120
 export const DEFAULT_BRANCH_PREFIX = 'chat/'
-export const DEFAULT_MAX_CONCURRENT_LOCAL_TURNS = 4
+export const DEFAULT_MAX_CONCURRENT_LOCAL_TURNS = DEFAULT_CHECK_SLOT_CAP
 const STOP_SETTLE_MS = 2_000
 const CLOSE_GRACE_MS = 5_000
 const SERVICE_SETTLE_MS = 5_000
@@ -185,8 +186,8 @@ interface RunningTurn {
   commandEffort?: string
   contextAction?: 'compact' | 'reset'
   review?: { target: ReviewTarget, throughSeq: number }
-  /** True while the turn holds one of the bounded Poise-local agent slots. */
-  localSlot?: boolean
+  /** Releases one of the shared check slots; set while the turn holds it. */
+  localSlot?: () => void
   /** Steers sent to this turn by correlation id, with the text to queue if
    *  the adapter reports them unrun when the turn settles. */
   pendingSteers?: Map<string, { text: string, attachments: Attachment[], mentions: Mention[], actor?: ChatActor | PoiseActor }>
@@ -334,9 +335,9 @@ export class ChatRuntime extends EventEmitter {
   private readonly idleTimeoutMinutes: () => number
   private readonly branchPrefix: () => string
   private readonly maxConcurrentLocalTurns: () => number
-  /** Poise-local agent slots in use, and turns waiting for one in FIFO order. */
-  private localTurnSlots = 0
-  private readonly localTurnWaiters: Array<{ resolve: () => void, reject: (error: Error) => void }> = []
+  /** The shared heavy-work budget: turns hold a slot while they may build or
+   *  test, and background behaviors draw from the same pool. */
+  readonly checkSlots: CheckSemaphore
   private readonly requireClaudeReady: () => Promise<void>
   private readonly probeAgent: (agent: AgentId) => Promise<{ ok: boolean, reason?: string }>
   private readonly leaseProbes: CheckoutLeaseOptions
@@ -371,6 +372,7 @@ export class ChatRuntime extends EventEmitter {
     this.idleTimeoutMinutes = options.idleTimeoutMinutes ?? (() => DEFAULT_IDLE_TIMEOUT_MINUTES)
     this.branchPrefix = options.branchPrefix ?? (() => DEFAULT_BRANCH_PREFIX)
     this.maxConcurrentLocalTurns = options.maxConcurrentLocalTurns ?? (() => DEFAULT_MAX_CONCURRENT_LOCAL_TURNS)
+    this.checkSlots = new CheckSemaphore(this.maxConcurrentLocalTurns)
     this.requireClaudeReady = options.requireClaudeReady ?? (() => claudeAuth.requireReady())
     this.probeAgent = options.probeAgent ?? defaultProbeAgent
     this.leaseProbes = options.leaseProbes ?? {}
@@ -3169,10 +3171,11 @@ export class ChatRuntime extends EventEmitter {
       this.emit_(record.id, { type: 'turn.started', turnId: turn.id, prompt: turn.shown ?? nativeInput, callId: turn.callId ?? undefined, agent: record.agent, model: record.model, ...(turn.queueItem ? { queueItemId: turn.queueItem.id } : {}), ...(turn.source ? { source: turn.source } : {}) })
       started = true
       this.setStatus(session, 'queued')
-      // Poise-local turns share a bounded pool of agent slots; a turn past
-      // the cap waits here with its own reason instead of starting an agent.
-      // The Switchboard's one observer turn and the Manager's turns stay
-      // outside it, so supervision still runs when every slot is busy.
+      // Poise-local turns share a bounded pool of check slots with the
+      // agent runs background behaviors launch; a turn past the cap waits
+      // here with its own reason instead of starting an agent. The
+      // Switchboard's one observer turn and the Manager's turns stay outside
+      // it, so supervision still runs when every slot is busy.
       if (record.workspaceKind === 'poise-local' && !isSwitchboardChat(record) && record.role !== 'manager') await this.acquireLocalTurnSlot(session, turn)
       // Created after the title settled: the label names what is queued behind.
       if (!lease) {
@@ -3851,57 +3854,32 @@ export class ChatRuntime extends EventEmitter {
     }
   }
 
-  /** Take one of the bounded Poise-local agent slots, FIFO. A turn that
-   *  waits shows `queued` with the cap's own reason; cancelling the turn
-   *  wakes it. Lowering the cap converges as running turns release;
-   *  raising it starts waiters through localTurnCapChanged. */
+  /** Take one of the shared check slots, FIFO per lane. A turn that waits
+   *  shows `queued` with the cap's own reason; cancelling the turn wakes it.
+   *  A turn the person sent takes the person lane, which background work
+   *  cannot fill; delegated, supervised and timer turns share the background
+   *  lane with behavior runs. Lowering the cap converges as running turns
+   *  release; raising it starts waiters through localTurnCapChanged. */
   private async acquireLocalTurnSlot(session: LiveSession, turn: RunningTurn): Promise<void> {
-    const cap = Math.max(1, this.maxConcurrentLocalTurns())
-    // A raised cap frees earlier waiters first; the arrival never jumps them.
-    this.grantLocalTurnSlots()
-    if (this.localTurnSlots < cap) {
-      this.localTurnSlots += 1
-      turn.localSlot = true
-      return
-    }
-    // A turn stopped before it reaches the queue must never park: its abort
-    // already fired, so the waiter's listener below would never wake it again.
-    turn.abort.signal.throwIfAborted()
-    session.record.queuedBehind = SLOT_WAIT_REASON
-    this.setStatus(session, 'queued')
-    await new Promise<void>((resolve, reject) => {
-      const waiter = { resolve, reject }
-      this.localTurnWaiters.push(waiter)
-      turn.abort.signal.addEventListener('abort', () => {
-        const at = this.localTurnWaiters.indexOf(waiter)
-        if (at >= 0) {
-          this.localTurnWaiters.splice(at, 1)
-          reject(new Error(turn.failure || 'cancelled before it started'))
-        }
-      }, { once: true })
+    const person = !turn.source || (turn.source.kind === 'poise' && turn.source.name === SWITCHBOARD_PERSON)
+    turn.localSlot = await this.checkSlots.acquire(person ? 'person' : 'background', {
+      signal: turn.abort.signal,
+      onQueued: () => {
+        session.record.queuedBehind = SLOT_WAIT_REASON
+        this.setStatus(session, 'queued')
+      },
+      abortError: () => new Error(turn.failure || 'cancelled before it started'),
     })
-    turn.localSlot = true
   }
 
   private releaseLocalTurnSlot(turn: RunningTurn): void {
-    if (!turn.localSlot) return
-    turn.localSlot = false
-    this.localTurnSlots -= 1
-    this.grantLocalTurnSlots()
+    turn.localSlot?.()
+    turn.localSlot = undefined
   }
 
   /** The cap setting changed: start every slot waiter that now fits, in order. */
   localTurnCapChanged(): void {
-    this.grantLocalTurnSlots()
-  }
-
-  /** Hand free slots to parked waiters in FIFO order, up to the live cap. */
-  private grantLocalTurnSlots(): void {
-    const cap = Math.max(1, this.maxConcurrentLocalTurns())
-    while (this.localTurnWaiters.length > 0 && this.localTurnSlots < cap) {
-      this.localTurnSlots += 1
-      this.localTurnWaiters.shift()!.resolve()
-    }
+    this.checkSlots.grant()
   }
 
   /** A closed session whose scratch workspace storage maintenance removed

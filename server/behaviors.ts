@@ -80,7 +80,8 @@ import { behaviorErrorMessage, behaviorIncidentDiagnostics } from './behavior-di
 import { classifyBehaviorDiagnostic, diagnosticClassification, isRepoAccessDenied, isTimeoutCause, rateLimitRetryAtMs, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { resolveReviewCheckout } from './review-checkout'
-import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
+import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDetached } from './process'
+import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type CheckSlotStats } from './check-semaphore'
 import { withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, requireAgentAccount } from './settings'
@@ -1013,9 +1014,23 @@ interface ActiveClaim {
   behavior: 'review-new-prs' | 'approve-prs' | 'review-new-issues'
   target: string
   launched: boolean
+  releaseCheckSlot?: () => void
 }
 
 const activeClaims = new Map<string, ActiveClaim>()
+
+// The shared heavy-work budget. The server wires the Chat runtime's pool
+// here at startup; until then (and in tests) launches draw from a default
+// pool with the same cap.
+let behaviorCheckSlots = new CheckSemaphore(() => DEFAULT_CHECK_SLOT_CAP)
+
+export function setBehaviorCheckSlots(slots: CheckSemaphore): void {
+  behaviorCheckSlots = slots
+}
+
+export function getBehaviorCheckSlots(): CheckSemaphore {
+  return behaviorCheckSlots
+}
 
 function trackClaim(
   behavior: ActiveClaim['behavior'],
@@ -1030,13 +1045,33 @@ function markClaimLaunched(claimId: string): void {
   if (claim) claim.launched = true
 }
 
-function releaseOwnedClaim(behavior: ActiveClaim['behavior'], target: string, claimId: string): boolean {
+// A claim's check slot lives exactly as long as its active entry: worker
+// exit, durable settlement and shutdown all drop the entry, and every path
+// funnels through here.
+function dropActiveClaim(claimId: string): void {
+  const claim = activeClaims.get(claimId)
+  if (!claim) return
   activeClaims.delete(claimId)
+  claim.releaseCheckSlot?.()
+}
+
+function attachCheckSlotToClaim(claimId: string, release: () => void): void {
+  const claim = activeClaims.get(claimId)
+  if (!claim) {
+    release()
+    throw new Error(`check slot acquired for unknown claim ${claimId}`)
+  }
+  claim.releaseCheckSlot?.()
+  claim.releaseCheckSlot = release
+}
+
+function releaseOwnedClaim(behavior: ActiveClaim['behavior'], target: string, claimId: string): boolean {
+  dropActiveClaim(claimId)
   return releaseSeenOwned(behavior, target, claimId)
 }
 
 function completeOwnedClaim(behavior: ActiveClaim['behavior'], target: string, claimId: string): boolean {
-  activeClaims.delete(claimId)
+  dropActiveClaim(claimId)
   return completeSeenOwned(behavior, target, claimId)
 }
 
@@ -1153,7 +1188,7 @@ function retainClaimSafely(claim: BehaviorLaunchClaim, error: string): void {
 function completeClaimSafely(claim: BehaviorLaunchClaim, error: string | null = null): boolean {
   setBehaviorLaunchErrorOwned(claim.key, claim.target, claim.claimId, error)
   const completed = completeSeenOwned(claim.key, claim.target, claim.claimId)
-  if (completed) activeClaims.delete(claim.claimId)
+  if (completed) dropActiveClaim(claim.claimId)
   return completed
 }
 
@@ -1775,10 +1810,10 @@ async function reconcileBehaviorLaunchClaims(
           state: 'completed', activity: 'settled', stateSource: 'native',
           outcome: outcome as 'clean' | 'changes_requested' | 'approved', head: headSha, completedAt })
         if (claim.launchQuarantine === 'unreadable') retireQuarantineIncident(claim)
-        activeClaims.delete(claim.claimId)
+        dropActiveClaim(claim.claimId)
         clearBehaviorFailure(behavior, claim.target)
       } else {
-        activeClaims.delete(claim.claimId)
+        dropActiveClaim(claim.claimId)
         const current = listBehaviorLaunchClaims(behavior).find(
           (candidate) => candidate.target === claim.target
             && candidate.claimId === claim.claimId,
@@ -2146,7 +2181,7 @@ function settleClaimAfterExit(
 ): (result: { code: number | null, signal: NodeJS.Signals | null, error?: Error }) => void {
   return ({ code, signal, error }) => {
     if (!error && signal === null && code === 0) {
-      activeClaims.delete(claimId)
+      dropActiveClaim(claimId)
       setBehaviorLaunchErrorOwned(
         behavior,
         target,
@@ -2158,7 +2193,7 @@ function settleClaimAfterExit(
       return
     }
     const outcome = error?.message || signal || `exit ${code ?? 'unknown'}`
-    activeClaims.delete(claimId)
+    dropActiveClaim(claimId)
     setBehaviorLaunchErrorOwned(
       behavior,
       target,
@@ -2606,6 +2641,10 @@ async function tickReviewNewPrs(): Promise<void> {
             const launchModels = new Map((await launchReviewPanel(getReviewers('review-new-prs')))
               .reviewers.map((entry) => [entry.slot, entry.model]))
             if (launchModels.get(slot) !== bundle.model) { releaseLeases(null); continue }
+            // A full shared budget stops here, before the probe and the
+            // claim: the candidate retries on the next tick instead of
+            // consuming a recovery probe for a launch that cannot run.
+            if (!behaviorCheckSlots.available('background')) { releaseLeases(null); continue }
             // At most one probe per backoff window: a sibling that already
             // claimed it makes this target wait for the verdict.
             if (!claimReviewerTripProbe(bundle.model)) { releaseLeases(null); continue }
@@ -2668,6 +2707,24 @@ async function tickReviewNewPrs(): Promise<void> {
       const { pr, slot, target, checkTarget } = bundle
       let checkoutReady = false
       try {
+        // Shed load before provisioning a checkout: a launch past the
+        // shared budget waits for the retry clock, not for a slot.
+        const checkSlot = behaviorCheckSlots.tryAcquire('background')
+        if (!checkSlot) {
+          releaseOwnedClaim('review-new-prs', target, claimId)
+          releasePrOperationOwned(bundle.operationId)
+          if (!behaviorAborted()) {
+            const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
+            console.log(`[behaviors] review-new-prs deferred for ${pr.repo}#${pr.number}: ${busy.message}`)
+            // The phase-2 launch intent already admitted this claim: close
+            // the ledger attempt so a later retry inherits no unknown activity.
+            captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
+              outcome: 'no_op', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+            recordBehaviorFailure('review-new-prs', 'operation', busy, checkTarget)
+          }
+          return
+        }
+        attachCheckSlotToClaim(claimId, checkSlot)
         if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
@@ -3362,6 +3419,16 @@ async function fireApprove(
       `approval head changed before launch: expected ${expectedHead}, got ${currentHead}`,
     )
   }
+  // Shed load before provisioning a checkout: a launch past the shared
+  // budget waits for the retry clock, not for a slot.
+  const checkSlot = behaviorCheckSlots.tryAcquire('background')
+  if (!checkSlot) {
+    const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
+    console.log(`[behaviors] approve-prs deferred for ${pr.repo}#${pr.number}: ${busy.message}`)
+    recordBehaviorFailure('approve-prs', 'operation', busy, `${pr.repo}#${pr.number}:check`)
+    return false
+  }
+  attachCheckSlotToClaim(claimId, checkSlot)
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead)
   if (!isEnabled('approve-prs') || behaviorAborted() || !stillEligible('approve-prs', pr)) return false
   if ((await reviewChoice('pr_approve')).model !== model) return false
@@ -5012,6 +5079,16 @@ async function fireIssueReview(
   if ((await waitForBehavior(issueSlotModel(slot)))?.model !== model) return false
   if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return false
   if (issueReviewRefusal(issueReviewPolicy(), issue.repo, issue.number, issue)) return false
+  // Shed load before claiming a recovery probe: a launch past the shared
+  // budget waits for the retry clock without consuming the probe.
+  const checkSlot = behaviorCheckSlots.tryAcquire('background')
+  if (!checkSlot) {
+    const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
+    console.log(`[behaviors] review-new-issues deferred for ${issue.repo}#${issue.number}: ${busy.message}`)
+    recordBehaviorFailure(ISSUES_KEY, 'operation', busy, `${target}:check`)
+    return false
+  }
+  attachCheckSlotToClaim(claimId, checkSlot)
   // At most one probe per backoff window: a sibling that already claimed it
   // makes this issue wait for the verdict.
   if (!claimReviewerTripProbe(model)) return false
@@ -5226,7 +5303,9 @@ async function tickReviewNewIssues(): Promise<void> {
     if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return
     const covers = plan.launch.get(issueRef(`${issue.repo}#${issue.number}`))
     if (!covers) continue
-    if (runningIssueReviewCount() >= MAX_ISSUE_REVIEW_RUNS) break
+    // A full shared budget also stops the scan: later candidates wait for
+    // the next tick instead of each recording a busy failure.
+    if (runningIssueReviewCount() >= MAX_ISSUE_REVIEW_RUNS || !behaviorCheckSlots.available('background')) break
     const checkTarget = `${target}:check`
     if (!behaviorRetryDue(ISSUES_KEY, checkTarget)) continue
     try {
@@ -5428,7 +5507,7 @@ async function reconcileIssueReviewClaims(): Promise<void> {
       }
       const prover = call.recovery_model || call.model
       if (prover) clearReviewerAccountTrip(prover)
-      activeClaims.delete(claim.claimId)
+      dropActiveClaim(claim.claimId)
       if (completeIssueReviewLaunchOwned({
         key: claim.key,
         target: claim.target,
@@ -5917,6 +5996,10 @@ export interface BehaviorsRuntimeHealth {
   deadLetters: ReturnType<typeof listBehaviorIncidents>
   /** Main-thread stall in the current minute window; spikes mark CLI fan-out. */
   eventLoop: EventLoopDelayStats
+  /** Shared heavy-work budget: turns and behavior runs draw from one pool;
+   *  `callerLaunches` counts live agent-interface children, including manual
+   *  runs outside the budget. */
+  checkSlots: CheckSlotStats & { callerLaunches: number }
 }
 
 function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
@@ -6036,6 +6119,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     identity,
     deadLetters: listBehaviorIncidents(),
     eventLoop: eventLoopDelayStats(),
+    checkSlots: { ...behaviorCheckSlots.stats(), callerLaunches: runningCallerLaunches() },
   }
 }
 
@@ -6131,7 +6215,7 @@ export async function stopBehaviorsRuntime(): Promise<void> {
   // identity so a later runtime reconciles exact log status before retrying;
   // release pre-launch work aborted during shutdown immediately.
   for (const [claimId, claim] of activeClaims) {
-    if (claim.launched) activeClaims.delete(claimId)
+    if (claim.launched) dropActiveClaim(claimId)
     else releaseOwnedClaim(claim.behavior, claim.target, claimId)
   }
   runtimeStartedAtMs = null
