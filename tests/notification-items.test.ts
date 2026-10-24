@@ -45,6 +45,17 @@ describe('the list', () => {
     expect(headTone(countItems(items))).toBe('red')
   })
 
+  it('needs you for a requested review and for a conflict on your pull request', () => {
+    const items = notificationItems([
+      notice('review', { kind: 'review_requested', title: 'acme/api#4 requests your review', target: { pullRequest: 'https://github.com/acme/api/pull/4' } }),
+      notice('conflict', { kind: 'pr_conflict', title: 'acme/api#5 has a merge conflict', target: { pullRequest: 'https://github.com/acme/api/pull/5' } }),
+    ], null, NOW)
+    expect(items).toMatchObject([
+      { id: 'review', group: 'needs', tone: 'amber', source: 'GitHub' },
+      { id: 'conflict', group: 'needs', tone: 'amber', source: 'GitHub' },
+    ])
+  })
+
   it('groups notices by who acts, in the order the server gave them', () => {
     const items = notificationItems([
       notice('waiting'),

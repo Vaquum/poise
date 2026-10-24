@@ -100,6 +100,9 @@ export interface DatastoreRecord {
   item_type?: 'pr' | 'issue'
   reasons?: string
   evidence_count?: number
+  // The pull request's current requested reviewers as of the last sync, a
+  // JSON array of logins: null for a row from before reviewers were read.
+  requested_reviewers?: string | string[] | null
 }
 
 // What Poise's views consume. Kept identical to the old /github shape so
@@ -127,6 +130,22 @@ interface GhRecord {
   labels: string[]
   owner_login: string | null
   owner_avatar: string | null
+  /** Whether your GitHub account is currently asked to review this pull
+   *  request: null when unknown, and for issues. */
+  reviewRequested: boolean | null
+}
+
+/** Parses the projection's reviewer list: null when the row predates it. */
+function parseRequestedReviewers(value: unknown): string[] | null {
+  if (value === null || value === undefined) return null
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string')
+  if (typeof value !== 'string') return null
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === 'string') : null
+  } catch {
+    return null
+  }
 }
 
 export async function runCli(org: Organization, args: string[]): Promise<DatastoreRecord[]> {
@@ -144,7 +163,8 @@ export async function runCli(org: Organization, args: string[]): Promise<Datasto
   return records
 }
 
-function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue'): GhRecord {
+function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue', me: string): GhRecord {
+  const reviewers = kind === 'pr' ? parseRequestedReviewers(r.requested_reviewers) : null
   return {
     kind,
     repo: r.repo,
@@ -164,6 +184,7 @@ function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue'): GhRecord {
     labels: [],
     owner_login: r.owner_login ?? null,
     owner_avatar: r.owner_avatar ?? null,
+    reviewRequested: reviewers === null || !me ? null : reviewers.some((login) => login.toLowerCase() === me.toLowerCase()),
   }
 }
 
@@ -445,6 +466,8 @@ export interface OwnPullRequest {
   title: string
   /** Current's colour; null when it has neither, undefined when GitHub could not say. */
   status: PrStatus
+  /** Why the pull request is held, from the same check that coloured it. */
+  held: HeldInfo
 }
 
 /** The person's own open pull requests with Current's colour for each. `read`
@@ -464,9 +487,37 @@ export async function readOwnPullRequests(): Promise<{ pullRequests: OwnPullRequ
     const chunk = own.slice(i, i + GREEN_CONCURRENCY)
     pullRequests.push(...await Promise.all(chunk.map(async (pr) => {
       const [owner, name] = pr.repo.split('/', 2)
-      return { repo: pr.repo, number: pr.number, title: pr.title, status: (await checkPrStatus(owner, name, pr.number, agent)).status }
+      const check = await checkPrStatus(owner, name, pr.number, agent)
+      return { repo: pr.repo, number: pr.number, title: pr.title, status: check.status, held: check.held }
     })))
   }
+  const failed = new Set(read.errors.map((error) => error.org.toLowerCase()))
+  return { pullRequests, read: orgs.map((org) => org.login).filter((login) => !failed.has(login.toLowerCase())), tracked }
+}
+
+/** An involved open pull request: the person's footprint plus what the agent
+ *  account authored, whoever wrote each one. */
+export interface InvolvedPullRequest {
+  repo: string
+  number: number
+  title: string
+  /** Whether the person's GitHub account is currently asked to review it:
+   *  null when the last sync did not say. */
+  reviewRequested: boolean | null
+}
+
+/** Every involved open pull request with its review request state, from the
+ *  datastore sync alone: no GitHub reads. `read` and `tracked` carry the
+ *  same completeness contract as the own pull requests. */
+export async function readInvolvedPullRequests(): Promise<{ pullRequests: InvolvedPullRequest[], read: string[], tracked: string[] }> {
+  const me = getMeta('me') || ''
+  if (!me) return { pullRequests: [], read: [], tracked: [] }
+  const tracked = getOrganizations().map((org) => org.login)
+  const orgs = readyOrganizations()
+  const read = await fetchKind('pr', { record_state: 'open', count_only: true }, me, orgs)
+  const pullRequests = read.records
+    .filter((pr) => pr.state === 'open' && pr.repo.includes('/'))
+    .map((pr) => ({ repo: pr.repo, number: pr.number, title: pr.title, reviewRequested: pr.reviewRequested ?? null }))
   const failed = new Set(read.errors.map((error) => error.org.toLowerCase()))
   return { pullRequests, read: orgs.map((org) => org.login).filter((login) => !failed.has(login.toLowerCase())), tracked }
 }
@@ -577,7 +628,7 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: 
       const key = `${r.repo}#${r.number}`
       if (seen.has(key)) continue
       seen.add(key)
-      out.push(toLegacy(r, itemType))
+      out.push(toLegacy(r, itemType, me))
     }
   }
   out.sort((a, b) => b.updated_at.localeCompare(a.updated_at))
@@ -738,6 +789,7 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
         labels: [],
         owner_login: null,
         owner_avatar: null,
+        reviewRequested: null,
       }
       return { status: 200, body: { record } }
     } catch (err: any) {

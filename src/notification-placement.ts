@@ -12,6 +12,8 @@ export const NOTIFICATION_PLACEMENT = {
   ledger_queue_stalled: { actor: 'poise', logging: 'sustained-queue-age', lifecycle: 'stall-budget-two-checks-until-drained' },
   ledger_capture_loss: { actor: 'poise', logging: 'dropped-increase', lifecycle: 'increase-per-generation-until-dismissed' },
   pr_ready: { actor: 'user', logging: 'none', lifecycle: 'ready-two-minute-check-fifteen-minute-reminder' },
+  review_requested: { actor: 'user', logging: 'none', lifecycle: 'requested-until-authoritative-removal' },
+  pr_conflict: { actor: 'user', logging: 'none', lifecycle: 'conflict-until-resolved-or-closed' },
   action_failed: { actor: 'poise', logging: 'known-source-only', lifecycle: 'tab-dedupe-until-action-recovery' },
   action_needed: { actor: 'user', logging: 'none', lifecycle: 'tab-dedupe-until-action-recovery' },
   action_finished: { actor: 'user', logging: 'none', lifecycle: 'tab-local-until-dismissed-or-cleared' },

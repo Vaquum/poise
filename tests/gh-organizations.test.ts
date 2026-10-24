@@ -15,11 +15,15 @@ vi.mock('../server/organizations', () => ({
   readyOrganizations: () => mocks.orgs.filter((org) => org.status === 'ready'),
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
-const { handleGhBody, invalidateRepoListCache, listOrganizationsRepos, listOrgRepos, readOwnPullRequests } = await import('../server/gh')
+const { handleGhBody, invalidateRepoListCache, listOrganizationsRepos, listOrgRepos, readInvolvedPullRequests, readOwnPullRequests } = await import('../server/gh')
 
-function record(org: string, number: number, day: number) {
+function record(org: string, number: number, day: number, reviewers?: string[] | null) {
   const date = `2026-09-${String(day).padStart(2, '0')}T00:00:00Z`
-  return { repo: `${org}/same`, number, status: 'open', author: 'octocat', title: `${org} ${number}`, url: `https://github.com/${org}/same/pull/${number}`, created_at: date, updated_at: date, closed_at: null, comments_count: 0 }
+  return {
+    repo: `${org}/same`, number, status: 'open', author: 'octocat', title: `${org} ${number}`, url: `https://github.com/${org}/same/pull/${number}`,
+    created_at: date, updated_at: date, closed_at: null, comments_count: 0,
+    ...(reviewers === undefined ? {} : { requested_reviewers: reviewers === null ? null : JSON.stringify(reviewers) }),
+  }
 }
 
 // A held entry for a --mergeable answer without evidence: no reasons beyond
@@ -159,9 +163,9 @@ describe('the accounts GitHub is read as', () => {
       : { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [pull(7, 'octocat'), pull(8, 'review-bot'), pull(9, 'octocat'), pull(10, 'someone-else')] : []), stderr: '' })
     expect(await readOwnPullRequests()).toEqual({
       pullRequests: [
-        { repo: 'alpha/same', number: 7, title: 'alpha 7', status: 'green' },
-        { repo: 'alpha/same', number: 8, title: 'alpha 8', status: undefined },
-        { repo: 'alpha/same', number: 9, title: 'alpha 9', status: null },
+        { repo: 'alpha/same', number: 7, title: 'alpha 7', status: 'green', held: { reasons: [], checks: { failing: [], failingCount: 0, runningCount: 0, partial: true }, threadsChecked: true } },
+        { repo: 'alpha/same', number: 8, title: 'alpha 8', status: undefined, held: { reasons: ['unknown'], checks: { failing: [], failingCount: 0, runningCount: 0, partial: true }, threadsChecked: true } },
+        { repo: 'alpha/same', number: 9, title: 'alpha 9', status: null, held: { reasons: ['blocked'], checks: { failing: [], failingCount: 0, runningCount: 0, partial: true }, threadsChecked: true } },
       ],
       read: ['alpha', 'beta'],
       tracked: ['alpha', 'beta'],
@@ -251,7 +255,7 @@ describe('concurrent pull request status reads', () => {
 
     expect(current.body).toEqual({ records: [{ repo: 'alpha/same', number: 21, status: 'green' }], held: [heldStatic(21, [])], errors: [] })
     expect(otherCurrent).toEqual(current)
-    expect(notices.pullRequests).toEqual([{ repo: 'alpha/same', number: 21, title: 'alpha 21', status: 'green' }])
+    expect(notices.pullRequests).toEqual([{ repo: 'alpha/same', number: 21, title: 'alpha 21', status: 'green', held: { reasons: [], checks: { failing: [], failingCount: 0, runningCount: 0, partial: true }, threadsChecked: true } }])
     expect(statusCalls()).toHaveLength(1)
     await handleGhBody({ operation: 'green_pr', org: 'alpha' })
     expect(statusCalls()).toHaveLength(1)
@@ -293,7 +297,7 @@ describe('concurrent pull request status reads', () => {
       readOwnPullRequests(),
     ])
     expect(current.body).toEqual({ records: [], held: [heldUnknown(number)], errors: [] })
-    expect(notices.pullRequests).toEqual([{ repo: 'alpha/same', number, title: `alpha ${number}`, status: undefined }])
+    expect(notices.pullRequests).toEqual([{ repo: 'alpha/same', number, title: `alpha ${number}`, status: undefined, held: { reasons: ['unknown'], checks: { failing: [], failingCount: 0, runningCount: 0, partial: false }, threadsChecked: false } }])
     expect(statusCalls()).toHaveLength(1)
 
     failed = false
@@ -308,5 +312,49 @@ describe('concurrent pull request status reads', () => {
     expect(retried.body).toEqual({ records: [{ repo: 'alpha/same', number, status: 'green' }], held: [heldStatic(number, [])], errors: [] })
     expect(retriedNotices.pullRequests[0].status).toBe('green')
     expect(statusCalls()).toHaveLength(2)
+  })
+})
+
+describe('requested reviews', () => {
+  it('marks the pull requests that ask your account to review them', async () => {
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({
+      stdout: JSON.stringify(args[1] === '/alpha.sqlite'
+        ? [record('alpha', 1, 5, ['OctoCat']), record('alpha', 2, 4, ['hubot']), record('alpha', 3, 3, []), record('alpha', 4, 2, null), record('alpha', 5, 1)]
+        : []),
+      stderr: '',
+    }))
+    const result = await handleGhBody({ operation: 'list', record_type: 'pull_request', org: 'alpha' })
+    expect((result.body as any).records.map((r: any) => [r.number, r.reviewRequested])).toEqual([
+      [1, true], [2, false], [3, false], [4, null], [5, null],
+    ])
+  })
+
+  it('leaves issues and rows without your account unknown', async () => {
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({
+      stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 1, 5, ['octocat'])] : []),
+      stderr: '',
+    }))
+    const issues = await handleGhBody({ operation: 'list', record_type: 'issue', org: 'alpha' })
+    expect((issues.body as any).records.map((r: any) => r.reviewRequested)).toEqual([null])
+    mocks.meta = {}
+    const anonymous = await handleGhBody({ operation: 'list', record_type: 'pull_request', org: 'alpha' })
+    expect((anonymous.body as any).records.map((r: any) => r.reviewRequested)).toEqual([null])
+  })
+
+  it('reads every involved open pull request with its review state and nothing else', async () => {
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'github-interface') throw new Error('must not ask GitHub')
+      return { stdout: JSON.stringify(args[1] === '/alpha.sqlite' ? [record('alpha', 1, 5, ['octocat']), record('alpha', 2, 4, [])] : []), stderr: '' }
+    })
+    expect(await readInvolvedPullRequests()).toEqual({
+      pullRequests: [
+        { repo: 'alpha/same', number: 1, title: 'alpha 1', reviewRequested: true },
+        { repo: 'alpha/same', number: 2, title: 'alpha 2', reviewRequested: false },
+      ],
+      read: ['alpha', 'beta'],
+      tracked: ['alpha', 'beta'],
+    })
+    mocks.meta = {}
+    expect(await readInvolvedPullRequests()).toEqual({ pullRequests: [], read: [], tracked: [] })
   })
 })

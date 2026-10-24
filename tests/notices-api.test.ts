@@ -186,15 +186,19 @@ describe('the notices API', () => {
     expect((await call('GET', '/api/notices')).body.notices.map((notice: any) => notice.kind)).toEqual(['pr_ready'])
   })
 
-  it('silences a pull request ready to merge, and refuses to silence anything else', async () => {
+  it('silences a pull request ready to merge or asking for review, and refuses to silence anything else', async () => {
     const chat = store!.raiseAlert(waiting)!
     const pr = store!.raiseAlert(ready)!
+    const review = store!.raiseAlert({ kind: 'review_requested', dedupeKey: 'review-requested:acme/api#4', title: 'acme/api#4 requests your review', body: 'Change 4', path: '/', target: { pullRequest: 'https://github.com/acme/api/pull/4' } })!
     const refused = await call('POST', `/api/notices/${encodeURIComponent(chat.id)}/silence`)
     expect(refused.status).toBe(400)
-    expect(refused.body.error).toMatch(/Only a pull request ready to merge can be silenced/)
+    expect(refused.body.error).toMatch(/Only a pull request ready to merge or asking for your review can be silenced/)
     const silenced = await call('POST', `/api/notices/${encodeURIComponent(pr.id)}/silence`)
     expect(silenced.status).toBe(200)
-    expect(silenced.body.notices.map((notice: any) => notice.kind)).toEqual(['chat_waiting'])
+    expect(silenced.body.notices.map((notice: any) => notice.kind).sort()).toEqual(['chat_waiting', 'review_requested'])
+    const quiet = await call('POST', `/api/notices/${encodeURIComponent(review.id)}/silence`)
+    expect(quiet.status).toBe(200)
+    expect(quiet.body.notices.map((notice: any) => notice.kind)).toEqual(['chat_waiting'])
   })
 
   it('answers 404 for a notice it did not issue or that has cleared, and 400 for an unreadable id', async () => {
