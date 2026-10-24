@@ -322,7 +322,13 @@ Release bindings after verified completion; deleting a chat releases its
 bindings and disables its own supervision.
 
 Bound chats receive local behavior ledger changes for their exact repository,
-target number and issue/PR kind. PR owners also receive observed-head CI
+target number and issue/PR kind. Local target reads use the repository/number
+index. The observation pass yields to I/O between targets, including cached
+and completed targets, so it does not hold request handling behind a whole
+pass. Passes remain single-flight and coalesce intervening ticks. Active passes
+count as background work across suspension; new passes wait during drain or a
+release switch. Shutdown fences late read results before releasing that count.
+PR owners also receive observed-head CI
 failures and recovery, merge conflicts, behind-main branches that merge-prs
 will not update itself, review feedback with unresolved threads, and
 dismissed approvals that leave author-actionable threads. Resolving a
@@ -365,8 +371,9 @@ the local GitHub datastore, and the live pull state on the CI read's own
 `get_pull` response, persisted across throttled ticks, outages and restarts —
 so a merge the datastore has not synced yet still suppresses every facet.
 Either source reporting merged or closed suppresses; open from either clears
-unknown. The datastore state is read only when a behavior notice is about to
-be queued, or alongside the five-minute CI poll, and cached for five minutes.
+unknown. PR datastore state is consulted on each local pass through a
+five-minute cache; issue state is consulted when a behavior notice is
+actionable, through the same cache.
 An unreadable target wakes as before: unknown is never treated as closed.
 
 When a PR bound to a worker merges, the monitor wakes the creating chat once

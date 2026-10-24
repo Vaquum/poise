@@ -465,7 +465,10 @@ computer.
   explicit issue/PR ownership, durable timers and their holds persist in the
   workspace's SQLite store.
   Dispatch pauses while draining; running monitor reads join the existing
-  background-work barrier. A release switch waiting for quiet holds timer fire
+  background-work barrier. New observation passes, including queued follow-ups,
+  wait during drain or a pending release switch. Shutdown fences late read
+  results before releasing their barrier; it does not wait on remote reads.
+  A release switch waiting for quiet holds timer fire
   and admission back so timer turns never keep it waiting. See [Chat orchestration](Chat-orchestration.md).
 - The Switchboard pane's actions (`POST /api/chat/switchboard/…`) act for the
   owner, so they also require an `Origin`, checked as below. A loopback
