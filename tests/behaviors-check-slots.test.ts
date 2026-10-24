@@ -31,7 +31,7 @@ function saturateBackground(runtime: { getBehaviorCheckSlots(): { tryAcquire(lan
 }
 
 describe('shared check slots for behavior launches', () => {
-  it('sheds a review launch with a visible reason when the shared budget is full', async () => {
+  it('skips review candidates silently when the shared budget is full', async () => {
     const { behaviors: runtime } = await arrangeReviewRun()
     const held = saturateBackground(runtime)
     try {
@@ -40,14 +40,39 @@ describe('shared check slots for behavior launches', () => {
       expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({
         status: 'ok',
         checkSlots: { cap: 4, running: 3, personRunning: 0, backgroundRunning: 3, queued: 0, callerLaunches: 0 },
-        failures: [{
-          behavior: 'review-new-prs',
-          target: `${pr.repo}#${pr.number}:check`,
-          error: 'all 4 shared check slots are busy; will retry',
-        }],
+        failures: [],
       })
+      expect(mocks.captureOutcome).not.toHaveBeenCalledWith(expect.objectContaining({ outcome: 'no_op' }))
     } finally {
       for (const release of held) release()
+    }
+  })
+
+  it('sheds contended review launches with a recorded reason and a closed attempt', async () => {
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.setMeta('behavior_review_new_prs_reviewers', '3')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+    runtime.startBehaviorsRuntime()
+    const slots = runtime.getBehaviorCheckSlots()
+    const held = [slots.tryAcquire('background'), slots.tryAcquire('background')]
+    if (held.some((release) => !release)) throw new Error('could not hold two background slots')
+    try {
+      await runtime.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      const failures = runtime.getBehaviorsRuntimeHealth().failures
+      expect(failures).toHaveLength(2)
+      for (const failure of failures) {
+        expect(failure).toMatchObject({ behavior: 'review-new-prs', error: 'all 4 shared check slots are busy; will retry' })
+      }
+      const closed = mocks.captureOutcome.mock.calls.filter((call) => (call[0] as { outcome?: string }).outcome === 'no_op')
+      expect(closed).toHaveLength(2)
+    } finally {
+      for (const release of held) release!()
     }
   })
 

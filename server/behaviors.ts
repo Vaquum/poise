@@ -2629,6 +2629,10 @@ async function tickReviewNewPrs(): Promise<void> {
             const launchModels = new Map((await launchReviewPanel(getReviewers('review-new-prs')))
               .reviewers.map((entry) => [entry.slot, entry.model]))
             if (launchModels.get(slot) !== bundle.model) { releaseLeases(null); continue }
+            // A full shared budget stops here, before the probe and the
+            // claim: the candidate retries on the next tick instead of
+            // consuming a recovery probe for a launch that cannot run.
+            if (!behaviorCheckSlots.available('background')) { releaseLeases(null); continue }
             // At most one probe per backoff window: a sibling that already
             // claimed it makes this target wait for the verdict.
             if (!claimReviewerTripProbe(bundle.model)) { releaseLeases(null); continue }
@@ -2700,6 +2704,10 @@ async function tickReviewNewPrs(): Promise<void> {
           if (!behaviorAborted()) {
             const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
             console.log(`[behaviors] review-new-prs deferred for ${pr.repo}#${pr.number}: ${busy.message}`)
+            // The phase-2 launch intent already admitted this claim: close
+            // the ledger attempt so a later retry inherits no unknown activity.
+            captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
+              outcome: 'no_op', head: bundle.expectedHead, completedAt: new Date().toISOString() })
             recordBehaviorFailure('review-new-prs', 'operation', busy, checkTarget)
           }
           return
@@ -5045,11 +5053,8 @@ async function fireIssueReview(
   if ((await waitForBehavior(issueSlotModel(slot)))?.model !== model) return false
   if (!isEnabled(ISSUES_KEY) || behaviorAborted()) return false
   if (issueReviewRefusal(issueReviewPolicy(), issue.repo, issue.number, issue)) return false
-  // At most one probe per backoff window: a sibling that already claimed it
-  // makes this issue wait for the verdict.
-  if (!claimReviewerTripProbe(model)) return false
-  // Shed load before the launch intent: a launch past the shared budget
-  // waits for the retry clock, not for a slot.
+  // Shed load before claiming a recovery probe: a launch past the shared
+  // budget waits for the retry clock without consuming the probe.
   const checkSlot = behaviorCheckSlots.tryAcquire('background')
   if (!checkSlot) {
     const busy = checkSlotsBusyError(behaviorCheckSlots.stats().cap)
@@ -5058,6 +5063,9 @@ async function fireIssueReview(
     return false
   }
   attachCheckSlotToClaim(claimId, checkSlot)
+  // At most one probe per backoff window: a sibling that already claimed it
+  // makes this issue wait for the verdict.
+  if (!claimReviewerTripProbe(model)) return false
   const startedAt = new Date().toISOString()
   if (!markBehaviorLaunchIntentOwned({
     key: ISSUES_KEY,
