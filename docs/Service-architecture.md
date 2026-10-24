@@ -919,6 +919,25 @@ at its top.
 - **Tray menu:** status, Open Poise, Sync now, Notifications on/off,
   Start at login on/off, Sign out, Quit.
 
+## Pull-request actions
+
+The person's Approve and Merge buttons (workspace, the person's browser
+only): `POST /api/pull-requests/approve` and `POST /api/pull-requests/merge`.
+Both take `{ repo, number, expectedHeadSha, actionId }`, act with the person's
+GitHub account, and pin the action to the expected head. Anything without the
+person's authority answers 403 and acts on nothing.
+
+Each `actionId` is a receipt: the server reserves it with a fingerprint of the
+action before anything is sent. Repeating a call returns the stored outcome
+without acting again; the same ID for a different action is refused with 409.
+A lost response or a crash reconciles against GitHub instead of acting twice:
+a recorded result becomes the outcome, anything else answers unknown with the
+GitHub state, and a retry with the same ID reconciles again. Outcomes name
+what happened: `approved` and `already_approved` carry the approval's head and
+the current head; `merged` carries the merge SHA and method; `enqueued` and
+`in_queue` carry the queue entry; `already_merged` names who merged;
+`superseded` carries both heads; `refused` carries GitHub's own words.
+
 ## Deployment
 
 `deploy/` holds:

@@ -24,6 +24,7 @@ import { parseBounds, parseWindow, readAnalytics, readAnalyticsHistory } from '.
 import { checkGithubQuota, readGithubQuota, startGithubQuotaRuntime, stopGithubQuotaRuntime } from './github-quota'
 import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
+import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
@@ -649,6 +650,24 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             return json(res, status, respBody)
           } catch (err: any) {
             return json(res, httpStatus(err, 502), { error: 'github-datastore call failed: ' + (err.message || String(err)) })
+          }
+        }
+
+        // ── /api/pull-requests/approve and /merge — the person's buttons ──
+        // Body: { repo, number, expectedHeadSha, actionId }. Acts with the
+        // person's GitHub account; the actionId receipt makes retries safe.
+        // Person-only: without the person's authority this answers 403 and
+        // acts on nothing. See server/pull-requests.ts.
+        if ((url === '/api/pull-requests/approve' || url === '/api/pull-requests/merge') && req.method === 'POST') {
+          try {
+            const body = await readJson<any>(req)
+            const person = speaksForPerson(req, !!service, authority)
+            const { status, body: respBody } = url === '/api/pull-requests/approve'
+              ? await handlePullRequestApprove(body, person)
+              : await handlePullRequestMerge(body, person)
+            return json(res, status, respBody)
+          } catch (err: any) {
+            return json(res, httpStatus(err, 502), { error: 'pull request action failed: ' + (err.message || String(err)) })
           }
         }
 
