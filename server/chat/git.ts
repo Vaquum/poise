@@ -42,9 +42,9 @@ export interface CheckoutInspection {
   headSha: string
 }
 
-async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure } = {}): Promise<string> {
+async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure, env?: NodeJS.ProcessEnv } = {}): Promise<string> {
   try {
-    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}) })
+    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}), ...(options.env ? { env: options.env } : {}) })
     return stdout
   } catch (error: any) {
     const detail = String(error?.stderr || error?.message || error).trim()
@@ -117,7 +117,10 @@ export async function unpushedCommits(checkout: string, branch: string): Promise
  *  detached HEAD — that no remote contains. Read-only: safe without the
  *  checkout lease. */
 export async function inspectTaskRepo(checkout: string): Promise<{ branch: string, dirtyFiles: number, unpushedCommits: number }> {
-  const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'])
+  // Confined to this repo: without a ceiling a broken nested `.git` reads
+  // the parent checkpoint repo instead of failing, misattributing its state.
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
+  const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'], { env })
   const lines = status.split('\n').filter((line) => line.length > 0)
   const header = lines[0] || ''
   const detached = header.includes('(no branch)') || header.includes('HEAD (no branch)')
@@ -130,12 +133,14 @@ export async function inspectTaskRepo(checkout: string): Promise<{ branch: strin
 
 /** Commits no remote contains: every local branch plus an unborn-proof
  *  HEAD, so a detached HEAD's commits count but a commit-less repo reads
- *  zero instead of failing. */
+ *  zero instead of failing. Confined like its caller: a broken nested
+ *  `.git` must fail here, not read the parent checkpoint repo. */
 async function unpushedTaskCommits(checkout: string): Promise<number> {
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
   try {
-    return Number((await git(checkout, ['rev-list', '--count', '--branches', 'HEAD', '--not', '--remotes'])).trim()) || 0
+    return Number((await git(checkout, ['rev-list', '--count', '--branches', 'HEAD', '--not', '--remotes'], { env })).trim()) || 0
   } catch {
-    return Number((await git(checkout, ['rev-list', '--count', '--branches', '--not', '--remotes'])).trim()) || 0
+    return Number((await git(checkout, ['rev-list', '--count', '--branches', '--not', '--remotes'], { env })).trim()) || 0
   }
 }
 

@@ -4337,6 +4337,7 @@ export class ChatRuntime extends EventEmitter {
         return cap(previous?.repos ?? [])
       }
       const repos: StallRepo[] = []
+      let unreadable = 0
       for (const dir of found.dirs) {
         const path = relative(record.checkout, dir) || '.'
         try {
@@ -4345,10 +4346,15 @@ export class ChatRuntime extends EventEmitter {
         } catch (error) {
           this.emit('log', `[chat ${record.id.slice(0, 8)}] stall check skipped ${path}: ${error instanceof Error ? error.message : String(error)}`)
           const keep = kept.get(path)
+          // An unreadable repo without a saved entry — typically a truncated
+          // overflow repo — still counts: it may hold unfinished work, so it
+          // keeps the stall truncated instead of clearing it.
           if (keep) repos.push(keep)
+          else unreadable += 1
         }
       }
-      return cap(repos)
+      const capped = cap(repos)
+      return { repos: capped.repos, truncatedRepos: capped.truncatedRepos + unreadable }
     }
     try {
       const state = await inspectCheckout(record.checkout)

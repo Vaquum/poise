@@ -3,7 +3,7 @@
 // flag the chat as stalled, and the monitor cycle wakes it once per episode.
 
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -544,6 +544,51 @@ describe('turn stall detection and waking', () => {
     await control.tick()
     await waitFor(() => owned.prompts.length === 2)
     expect(owned.prompts[1].text).toContain('more task repo')
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('keeps the stall when the last unfinished overflow repo cannot be read', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-overflow-unreadable:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    for (let n = 0; n < 21; n++) {
+      const dir = join(session.checkout, `repo${String(n).padStart(2, '0')}`)
+      await mkdir(dir)
+      const inited = spawnSync('git', ['init', '-q', '-b', 'main', dir], { encoding: 'utf8' })
+      if (inited.status !== 0) throw new Error(`git init: ${inited.stderr}`)
+      await writeFile(join(dir, 'draft.txt'), 'uncommitted\n')
+    }
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/577')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall?.repos).toHaveLength(20)
+    expect(runtime.get(session.id)?.stall?.truncatedRepos).toBe(1)
+
+    // The 20 kept repos go clean while the overflow repo becomes unreadable:
+    // with no saved entry for it, the stall must stay truncated, not clear.
+    for (let n = 0; n < 20; n++) await rm(join(session.checkout, `repo${String(n).padStart(2, '0')}`, 'draft.txt'))
+    const overflowHead = join(session.checkout, 'repo20', '.git', 'HEAD')
+    const savedHead = await readFile(overflowHead, 'utf8')
+    await writeFile(overflowHead, 'garbage: not a ref\n')
+    try {
+      runtime.prompt(session.id, { text: 'do more work', attachments: [], mentions: [] })
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+      const kept = runtime.get(session.id)?.stall
+      expect(kept?.repos).toHaveLength(0)
+      expect(kept?.truncatedRepos).toBe(1)
+    } finally {
+      await writeFile(overflowHead, savedHead)
+    }
+
+    // Readable and clean, the overflow repo lets the stall clear.
+    await rm(join(session.checkout, 'repo20', 'draft.txt'))
+    runtime.prompt(session.id, { text: 'do final work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toBeUndefined()
     await runtime.stop({ handover: false })
   }, 40_000)
 
