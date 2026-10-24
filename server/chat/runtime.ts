@@ -40,8 +40,8 @@ import { prepareEditorContext, removeEditorContext } from './editor-context'
 import { tryParseStructuredReply } from '../../src/edit-proposals'
 import type { AutoMergeAck, SafeModeAck } from './protocol'
 import { homedir } from 'node:os'
-import { lstat, mkdir, readdir, rm, rmdir, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, relative } from 'node:path'
+import { lstat, mkdir, readdir, realpath, rm, rmdir, writeFile } from 'node:fs/promises'
+import { basename, dirname, join, relative, sep } from 'node:path'
 import { loadCatalog, catalogModel, type Catalog, type CatalogModel } from '../models'
 import { db, getMeta, setMeta } from '../db'
 import { claudeAuth } from '../claude-auth'
@@ -63,7 +63,7 @@ import { legacyIdFor, quoteImportedHistory, readLegacyConversation } from './leg
 import { forkStagedDocument, isBridgeProblem, refreshDocument, stageDocument, stagedDocumentPrompt, unstageDocument, writeBackDocument, type StagedDocument } from './editor-bridge'
 import {
   GitError, PathError, assertBranchName, branchExists, branchTip, checkoutPrHead, checkpoint, createBranch, deleteBranch,
-  inspectCheckout, inspectTaskRepo, moveBranch, resolveInsideCheckout, revertDiff, switchBranch, unpushedCommits, type RecordedDiff,
+  inspectCheckout, inspectTaskRepo, linkedWorktrees, moveBranch, resolveInsideCheckout, revertDiff, switchBranch, unpushedCommits, type RecordedDiff,
 } from './git'
 import {
   AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, SWITCH_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type EditDecision, type NewSessionRequest,
@@ -123,6 +123,14 @@ const MAX_STALL_JOBS = 20
  *  with the capped job listing this keeps every stall notice under the
  *  inbox bound. */
 const MAX_STALL_REPOS = 20
+/** Directory entries one stall-discovery scan reads before it stops
+ *  incomplete: far past any real workspace, while a runaway tree cannot
+ *  hold the turn end unboundedly. */
+const MAX_DISCOVERY_ENTRIES = 100_000
+/** Wall-clock bound on one stall-discovery scan, for trees whose entries
+ *  arrive slowly. A single hung filesystem call still blocks past it;
+ *  the bound covers the scan's total, not one call. */
+const DISCOVERY_DEADLINE_MS = 10_000
 /** Stored command labels are redacted display text, truncated past this. */
 const STALL_COMMAND_CHARS = 200
 
@@ -4291,7 +4299,7 @@ export class ChatRuntime extends EventEmitter {
       // would miss a job that dirties between the reads and exits before
       // the group snapshot.
       const members = baseline && gatePid && gatePgid && baseline.pgid === gatePgid ? await groupMembers(gatePgid) : null
-      const { repos, truncatedRepos } = await this.stallRepos(session, previous)
+      const { repos, truncatedRepos, unreadablePaths, unreadableTruncated } = await this.stallRepos(session, previous)
       // A handoff may have moved the bindings during the awaited reads; the
       // source stays silent. This check runs synchronously with the queues
       // below, so no handoff can interleave between them.
@@ -4365,7 +4373,7 @@ export class ChatRuntime extends EventEmitter {
         record.stallJobBaseline = { pgid: gatePgid, pids: [...baseline.members.keys()] }
         this.saveRecord(session)
       }
-      if (!repos.length && !truncatedRepos && !jobs.length) {
+      if (!repos.length && !truncatedRepos && !unreadablePaths.length && !unreadableTruncated && !jobs.length) {
         if (previous) {
           delete record.stall
           this.saveRecord(session)
@@ -4376,7 +4384,9 @@ export class ChatRuntime extends EventEmitter {
       }
       const at = new Date().toISOString()
       record.stall = { episode: previous?.episode ?? randomUUID(), at: previous?.at ?? at, updatedAt: at,
-        repos, ...(truncatedRepos ? { truncatedRepos } : {}), backgroundJobs: jobs }
+        repos, ...(truncatedRepos ? { truncatedRepos } : {}),
+        ...(unreadablePaths.length ? { unreadablePaths } : {}), ...(unreadableTruncated ? { unreadableTruncated } : {}),
+        backgroundJobs: jobs }
       this.saveRecord(session)
       this.emit_(record.id, { type: 'session.updated', session: record })
       // One wake per episode: the event key dedupes repeats, so a worker
@@ -4427,114 +4437,194 @@ export class ChatRuntime extends EventEmitter {
    *  never worker output, so it is not read. A repo that cannot be read
    *  keeps its previous entry; one that is gone drops. At most
    *  MAX_STALL_REPOS are kept; the rest count as truncated. */
-  private async stallRepos(session: LiveSession, previous: StallState | undefined): Promise<{ repos: StallRepo[], truncatedRepos: number }> {
+  private async stallRepos(session: LiveSession, previous: StallState | undefined): Promise<{ repos: StallRepo[], truncatedRepos: number, unreadablePaths: string[], unreadableTruncated: number }> {
     const record = session.record
     const kept = new Map((previous?.repos ?? []).map((repo) => [repo.path, repo]))
     const cap = (repos: StallRepo[]): { repos: StallRepo[], truncatedRepos: number } => {
       const sorted = repos.sort((a, b) => a.path.localeCompare(b.path))
       return { repos: sorted.slice(0, MAX_STALL_REPOS), truncatedRepos: Math.max(0, sorted.length - MAX_STALL_REPOS) }
     }
+    const clean = { repos: [] as StallRepo[], truncatedRepos: 0, unreadablePaths: [] as string[], unreadableTruncated: 0 }
     if (record.workspaceKind === 'poise-local') {
       const found = await this.nestedTaskRepos(record.checkout)
       // An incomplete discovery keeps the whole previous set: a transient
-      // IO error must never read as finished work.
+      // IO error must never read as finished work. The unscanned paths
+      // are named, so the wake can say where the scan could not go.
       if (!found.complete) {
-        this.emit('log', `[chat ${record.id.slice(0, 8)}] stall discovery incomplete; keeping the previous repos`)
+        const gaps = [...found.unreadable, ...(found.unreadableTruncated ? [`+${found.unreadableTruncated} more`] : [])].join(', ')
+        this.emit('log', `[chat ${record.id.slice(0, 8)}] stall discovery incomplete (${gaps}); keeping the previous repos`)
         const capped = cap(previous?.repos ?? [])
         // An incomplete scan asserts nothing about its remainder: when no
         // kept or truncated entry survives, the unknown remainder still
         // counts, so a first failure flags instead of clearing.
-        return { repos: capped.repos, truncatedRepos: (capped.truncatedRepos + (previous?.truncatedRepos ?? 0)) || 1 }
+        return { repos: capped.repos, truncatedRepos: (capped.truncatedRepos + (previous?.truncatedRepos ?? 0)) || 1,
+          unreadablePaths: found.unreadable, unreadableTruncated: found.unreadableTruncated }
       }
       const repos: StallRepo[] = []
       let unreadable = 0
+      const noteUnreadable = (path: string, error: unknown): void => {
+        this.emit('log', `[chat ${record.id.slice(0, 8)}] stall check skipped ${path}: ${error instanceof Error ? error.message : String(error)}`)
+        const keep = kept.get(path)
+        // An unreadable repo without a saved entry — typically a truncated
+        // overflow repo — still counts: it may hold unfinished work, so it
+        // keeps the stall truncated instead of clearing it.
+        if (keep) repos.push(keep)
+        else unreadable += 1
+      }
+      const extras: string[] = []
       for (const dir of found.dirs) {
         const path = relative(record.checkout, dir) || '.'
         try {
+          // A linked worktree outside the workspace is invisible to the
+          // walk; its main repo's worktree list names it.
+          for (const worktree of await this.linkedWorktreesUnder(dir)) extras.push(worktree)
           const state = await inspectTaskRepo(dir)
           if (state.dirtyFiles || state.unpushedCommits) repos.push({ path, ...state })
         } catch (error) {
-          this.emit('log', `[chat ${record.id.slice(0, 8)}] stall check skipped ${path}: ${error instanceof Error ? error.message : String(error)}`)
-          const keep = kept.get(path)
-          // An unreadable repo without a saved entry — typically a truncated
-          // overflow repo — still counts: it may hold unfinished work, so it
-          // keeps the stall truncated instead of clearing it.
-          if (keep) repos.push(keep)
-          else unreadable += 1
+          noteUnreadable(path, error)
+        }
+      }
+      // A worktree checkout the walk already found — an in-workspace
+      // worktree carries a `.git` file like any nested clone — is
+      // inspected once, under the walk's path.
+      const seen = new Set<string>()
+      for (const dir of found.dirs) seen.add(await worktreeKey(dir))
+      const checkoutReal = await realpath(record.checkout).catch(() => record.checkout)
+      for (const worktree of extras) {
+        const key = await worktreeKey(worktree)
+        if (seen.has(key)) continue
+        seen.add(key)
+        const path = key === checkoutReal || key.startsWith(checkoutReal + sep) ? relative(checkoutReal, key) : worktree
+        try {
+          const state = await inspectTaskRepo(worktree)
+          if (state.dirtyFiles || state.unpushedCommits) repos.push({ path, ...state })
+        } catch (error) {
+          noteUnreadable(path, error)
         }
       }
       const capped = cap(repos)
-      return { repos: capped.repos, truncatedRepos: capped.truncatedRepos + unreadable }
+      return { repos: capped.repos, truncatedRepos: capped.truncatedRepos + unreadable,
+        unreadablePaths: clean.unreadablePaths, unreadableTruncated: clean.unreadableTruncated }
     }
     try {
       const state = await inspectCheckout(record.checkout)
       const dirtyFiles = state.currentBranch === record.branch.name ? state.dirtyFiles : 0
       const unpushed = await unpushedCommits(record.checkout, record.branch.name)
-      if (!dirtyFiles && !unpushed) return { repos: [], truncatedRepos: 0 }
-      return cap([{ path: '.', branch: record.branch.name, dirtyFiles, unpushedCommits: unpushed }])
+      if (!dirtyFiles && !unpushed) return clean
+      return { ...cap([{ path: '.', branch: record.branch.name, dirtyFiles, unpushedCommits: unpushed }]),
+        unreadablePaths: clean.unreadablePaths, unreadableTruncated: clean.unreadableTruncated }
     } catch (error) {
       this.emit('log', `[chat ${record.id.slice(0, 8)}] stall git check skipped: ${error instanceof Error ? error.message : String(error)}`)
       const keep = kept.get('.')
       // An unreadable checkout without a saved entry may hold unfinished
       // work, so it counts: like the local path's unreadable repos, it
       // keeps the stall truncated instead of clearing it.
-      if (keep) return cap([keep])
-      return { repos: [], truncatedRepos: 1 }
+      if (keep) return { ...cap([keep]), unreadablePaths: clean.unreadablePaths, unreadableTruncated: clean.unreadableTruncated }
+      return { repos: [], truncatedRepos: 1, unreadablePaths: clean.unreadablePaths, unreadableTruncated: clean.unreadableTruncated }
     }
   }
 
-  /** `.git` roots one or two levels under a worker's own
-   *  `workers/<id>/workspace`, sorted. Anything outside a worker
+  /** `.git` roots under a worker's own `workers/<id>/workspace`, at any
+   *  depth, sorted — hidden directories included, `.git` and
+   *  `node_modules` never entered, symlinked directories never followed.
+   *  The walk descends into found clones too, so nested clones, linked
+   *  worktrees and submodules are all found. Anything outside a worker
    *  workspace — the legacy shared workspace, a custom checkout — is not
    *  this session's alone, so it contributes no git facets. `complete` is
    *  false when any listing failed for another reason than a vanished
-   *  path, so callers keep their previous state instead of inventing a
-   *  clean one. */
-  private async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean }> {
+   *  path, or when the entry budget or the deadline stopped the scan, so
+   *  callers keep their previous state instead of inventing a clean one.
+   *  `unreadable` names where the scan could not go — capped like repos,
+   *  the rest counted — so the wake can say so. */
+  private async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean, unreadable: string[], unreadableTruncated: number }> {
     const root = this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT
-    if (!workerWorkspaceRef(root, checkout)) return { dirs: [], complete: true }
-    /** Absent paths are real; any other IO failure poisons the scan. */
-    const stat = async (path: string) => {
-      try {
-        return await lstat(path)
-      } catch (error: any) {
-        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null
-        throw new Error('incomplete')
-      }
+    if (!workerWorkspaceRef(root, checkout)) return { dirs: [], complete: true, unreadable: [], unreadableTruncated: 0 }
+    const found: string[] = []
+    const gaps: string[] = []
+    let gapOverflow = 0
+    const noteGap = (dir: string): void => {
+      if (gaps.length < MAX_STALL_REPOS) gaps.push(relative(checkout, dir) || '.')
+      else gapOverflow += 1
     }
-    const list = async (path: string): Promise<string[]> => {
-      try {
-        return await readdir(path)
-      } catch (error: any) {
-        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return []
-        throw new Error('incomplete')
+    const startedAt = Date.now()
+    let entries = 0
+    let probes = 0
+    let stopped = false
+    /** The scan stops at the first bound it hits, naming the directory
+     *  it stopped in; a stopped scan is incomplete, never silently clean. */
+    const stop = (dir: string): boolean => {
+      if (!stopped && (Date.now() - startedAt > DISCOVERY_DEADLINE_MS || entries > MAX_DISCOVERY_ENTRIES)) {
+        noteGap(dir)
+        stopped = true
       }
+      return stopped
     }
-    try {
-      const found: string[] = []
-      const isDir = async (dir: string): Promise<boolean> => {
-        const info = await stat(dir)
-        return !!info && info.isDirectory() && !info.isSymbolicLink()
+    const stack = [checkout]
+    while (!stopped) {
+      const dir = stack.pop()
+      if (dir === undefined) break
+      if (stop(dir)) break
+      let names: string[]
+      try {
+        names = await readdir(dir)
+      } catch (error: any) {
+        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') continue
+        noteGap(dir)
+        continue
       }
-      const isRepo = async (dir: string): Promise<boolean> => {
-        const info = await stat(join(dir, '.git'))
-        return !!info && (info.isDirectory() || info.isFile())
-      }
-      for (const name of await list(checkout)) {
-        if (name.startsWith('.') || name === 'node_modules') continue
-        const dir = join(checkout, name)
-        if (!(await isDir(dir))) continue
-        if (await isRepo(dir)) { found.push(dir); continue }
-        for (const grand of await list(dir)) {
-          if (grand.startsWith('.') || grand === 'node_modules') continue
-          const sub = join(dir, grand)
-          if ((await isDir(sub)) && (await isRepo(sub))) found.push(sub)
+      entries += names.length
+      if (stop(dir)) break
+      for (const name of names) {
+        if (name === '.git' || name === 'node_modules') continue
+        if ((probes++ & 1023) === 0 && stop(dir)) break
+        const child = join(dir, name)
+        let info
+        try {
+          info = await lstat(child)
+        } catch (error: any) {
+          if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') continue
+          noteGap(child)
+          continue
         }
+        if (!info.isDirectory() || info.isSymbolicLink()) continue
+        try {
+          const gitInfo = await lstat(join(child, '.git'))
+          if (gitInfo.isDirectory() || gitInfo.isFile()) found.push(child)
+        } catch (error: any) {
+          if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') { noteGap(child); continue }
+        }
+        stack.push(child)
       }
-      return { dirs: found.sort(), complete: true }
-    } catch {
-      return { dirs: [], complete: false }
     }
+    gaps.sort()
+    return { dirs: found.sort(), complete: gaps.length === 0, unreadable: gaps, unreadableTruncated: gapOverflow }
+  }
+
+  /** Live linked worktrees registered on a discovered repo — the only way
+   *  to see a worktree outside the workspace. Repos without a worktrees
+   *  registry skip the git call, as do linked checkouts and submodules,
+   *  whose `.git` is a file. Throws when the registry cannot be read, so
+   *  the caller counts the repo unreadable instead of missing its
+   *  worktrees silently. */
+  private async linkedWorktreesUnder(dir: string): Promise<string[]> {
+    const gitPath = join(dir, '.git')
+    let gitInfo
+    try {
+      gitInfo = await lstat(gitPath)
+    } catch (error: any) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return []
+      throw error
+    }
+    if (!gitInfo.isDirectory()) return []
+    let registry
+    try {
+      registry = await lstat(join(gitPath, 'worktrees'))
+    } catch (error: any) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return []
+      throw error
+    }
+    if (!registry.isDirectory()) return []
+    return linkedWorktrees(dir)
   }
 
   /** Reap tracked background jobs that finished since the last look: the
@@ -5201,6 +5291,12 @@ function repoWhere(repo: StallRepo): string {
   return repo.path === '.' ? `on ${branch}` : `in ${repo.path} on ${branch}`
 }
 
+/** Identity for worktree dedupe: the canonical path, or the printed one
+ *  when the checkout vanished mid-scan. */
+async function worktreeKey(dir: string): Promise<string> {
+  return realpath(dir).catch(() => dir)
+}
+
 /** The stall wake body: what the turn left behind and what clears it. */
 function stallNotice(sessionId: string, stall: StallState): Record<string, unknown> {
   const blockers: string[] = []
@@ -5209,7 +5305,15 @@ function stallNotice(sessionId: string, stall: StallState): Record<string, unkno
     if (repo.dirtyFiles) blockers.push(`Commit or set aside ${repo.dirtyFiles} uncommitted change${repo.dirtyFiles === 1 ? '' : 's'} ${where}`)
     if (repo.unpushedCommits) blockers.push(`Push ${repo.unpushedCommits} unpushed commit${repo.unpushedCommits === 1 ? '' : 's'} ${where}`)
   }
-  if (stall.truncatedRepos) blockers.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work; inspect the workspace`)
+  // Unscanned paths are named, not counted as task repos: an incomplete
+  // scan asserts nothing about its remainder, so the generic overflow
+  // line would claim repos it cannot see.
+  if (stall.unreadablePaths?.length) {
+    const shown = stall.unreadablePaths.map((path) => `\`${path}\``).join(', ')
+    const more = stall.unreadableTruncated ? ` (+${stall.unreadableTruncated} more)` : ''
+    const many = stall.unreadablePaths.length + (stall.unreadableTruncated ?? 0) > 1
+    blockers.push(`Could not scan ${shown}${more}: fix permissions or move ${many ? 'them' : 'it'} out of the workspace; anything below ${many ? 'them' : 'it'} may hold unfinished work`)
+  } else if (stall.truncatedRepos) blockers.push(`${stall.truncatedRepos} more task repo${stall.truncatedRepos === 1 ? '' : 's'} with leftover work; inspect the workspace`)
   const shownJobs = stall.backgroundJobs.slice(0, MAX_STALL_JOBS)
   for (const job of shownJobs) {
     blockers.push(`Background job "${job.command}" (pid ${job.pid}) is still running; finish what you can now and end your turn — Poise wakes you when it finishes`)
@@ -5217,6 +5321,8 @@ function stallNotice(sessionId: string, stall: StallState): Record<string, unkno
   const hiddenJobs = stall.backgroundJobs.length - shownJobs.length
   if (hiddenJobs) blockers.push(`${hiddenJobs} more background job${hiddenJobs === 1 ? '' : 's'} still running; Poise wakes you as each finishes`)
   return { kind: 'stall', session: sessionId, repos: stall.repos, ...(stall.truncatedRepos ? { truncatedRepos: stall.truncatedRepos } : {}),
+    ...(stall.unreadablePaths?.length ? { unreadablePaths: stall.unreadablePaths } : {}),
+    ...(stall.unreadableTruncated ? { unreadableTruncated: stall.unreadableTruncated } : {}),
     backgroundJobs: shownJobs.map((job) => ({ pid: job.pid, command: job.command, startedAt: job.startedAt })),
     ...(hiddenJobs ? { truncatedJobs: hiddenJobs } : {}),
     blockers, done: STALL_DONE }

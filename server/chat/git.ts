@@ -131,6 +131,29 @@ export async function inspectTaskRepo(checkout: string): Promise<{ branch: strin
   return { branch, dirtyFiles, unpushedCommits: await unpushedTaskCommits(checkout) }
 }
 
+/** Live linked worktrees registered on a task repo: checkout paths from
+ *  `git worktree list --porcelain`, without prunable entries whose
+ *  checkouts are gone. The main worktree is included; callers dedupe it
+ *  against discovery. Confined like inspectTaskRepo. Read-only. */
+export async function linkedWorktrees(checkout: string): Promise<string[]> {
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
+  const out = await git(checkout, ['worktree', 'list', '--porcelain'], { env })
+  const paths: string[] = []
+  let current: string | null = null
+  let prunable = false
+  const flush = () => {
+    if (current !== null && !prunable && current.length > 0) paths.push(current)
+    current = null
+    prunable = false
+  }
+  for (const line of out.split('\n')) {
+    if (line.startsWith('worktree ')) { flush(); current = line.slice('worktree '.length).trim() }
+    else if (line.startsWith('prunable')) prunable = true
+  }
+  flush()
+  return paths.map((path) => isAbsolute(path) ? path : resolve(checkout, path))
+}
+
 /** Commits no remote contains: every local branch plus an unborn-proof
  *  HEAD, so a detached HEAD's commits count but a commit-less repo reads
  *  zero instead of failing. Confined like its caller: a broken nested
