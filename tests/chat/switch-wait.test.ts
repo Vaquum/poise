@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { randomUUID } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -502,6 +502,40 @@ describe('the switch bound', () => {
     expect(w.c.calls.map(call => call.input.text)).toEqual([
       'Poise restarted for an update while your turn was running. Continue where you left off.', 'Waited follow-up',
     ])
+  })
+
+  it('recovers waiting prompts past a reused host pid', async () => {
+    const w = await world()
+    w.runtime.setSwitchPending('r2')
+    w.runtime.recordSwitchInterrupted([{ sessionId: w.s.id, turnId: randomUUID() }])
+    expect(w.runtime.prompt(w.s.id, input('Waited follow-up'))).toHaveProperty('waitId')
+    await w.runtime.stop()
+    const { CheckoutLease } = await import('../../server/chat/checkout-lock')
+    // The previous turn's row: its host pid is alive again as an unrelated
+    // process, and its lease is stale. Recovery must take it over instead
+    // of deferring to the "live" squatter.
+    const squatter = spawn('sleep', ['30'], { detached: true })
+    try {
+      const stale = new CheckoutLease(w.repo, { ownerKind: 'poise:chat', ownerId: w.s.id,
+        ownerLabel: 'stale owner', instance: w.instance },
+        { hostPid: squatter.pid!, hostStart: 'a-dead-generation', now: () => Date.now() - 120_000 })
+      expect(stale.tryAcquire().acquired).toBe(true)
+      const next = w.make()
+      try {
+        next.setSwitchPending('r3')
+        await next.recover()
+        await next.releaseSwitchWait()
+        await until(() => w.c.calls.length === 2)
+        expect(w.c.calls.map(call => call.input.text)).toEqual([
+          'Poise stopped your turn for an update that did not restart. Continue where you left off.', 'Waited follow-up',
+        ])
+      } finally {
+        await next.stop()
+      }
+    } finally {
+      squatter.kill('SIGKILL')
+      await new Promise((r) => squatter.once('exit', r))
+    }
   })
 
   it('resumes interrupted work before an existing normal follow-up after a busy turn', async () => {
