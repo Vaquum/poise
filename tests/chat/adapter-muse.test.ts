@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createMuseAdapter, uuidv7 } from '../../server/chat/adapters/muse'
 import { AdapterError, assertRequiredCapabilities } from '../../server/chat/adapters/types'
@@ -251,6 +251,50 @@ describe('Muse adapter', () => {
     await host.waitFor((event) => event.type === 'text.delta')
     controller.abort()
     await expect(turn).resolves.toMatchObject({ stopReason: 'cancelled' })
+  })
+
+  it('ends a worker turn a blocking reminder resumes twice, and interrupts the native turn', async () => {
+    const { host, adapter } = setup()
+    await adapter.start({ ...MODEL, worker: true })
+    const result = await adapter.prompt('turn-1', prompt('reminder-loop'), new AbortController().signal)
+    // The model ended its work; the turn ends as end_turn with the reason,
+    // never as a stop — and far short of the fake's five unguarded cycles.
+    expect(result.stopReason).toBe('end_turn')
+    expect(result.terminate).toBe(true)
+    expect(result.note).toMatch(/goal-reminder/)
+    // Bounded: at most the polls of the two allowed foreground rounds, never
+    // the fake's five unguarded cycles. (Whether the second poll's start or
+    // the interrupt lands first depends on pipe chunking.)
+    expect(host.ofType('tool.started').length).toBeLessThan(5)
+    expect(host.logs.join('\n')).toMatch(/goal-reminder/)
+    // The native turn really ended: once its interrupt lands, the next
+    // prompt starts at once instead of queueing behind it.
+    await until(() => existsSync(join(host.checkout, 'reminder-interrupted')))
+    const second = await adapter.prompt('turn-2', prompt('echo-input after guard'), new AbortController().signal)
+    expect(second.stopReason).toBe('end_turn')
+    expect(host.logs.join('\n')).not.toMatch(/queued the turn behind another one/)
+  })
+
+  it('reports steers a guard interrupt reclaims so the runtime requeues them', async () => {
+    const { host, adapter } = setup(['--hold-reminder-loop'])
+    await adapter.start({ ...MODEL, worker: true })
+    const turn = adapter.prompt('turn-1', prompt('reminder-loop'), new AbortController().signal)
+    await host.waitFor((event) => event.type === 'tool.started')
+    await adapter.steer('also check the reviews', { correlationId: 'corr-1' })
+    const result = await turn
+    expect(result.stopReason).toBe('end_turn')
+    expect(result.terminate).toBe(true)
+    expect(result.unrunSteers).toEqual(['corr-1'])
+  })
+
+  it('lets blocking reminders resume a turn outside a worker chat', async () => {
+    const { host, adapter } = setup()
+    await adapter.start(MODEL)
+    const result = await adapter.prompt('turn-1', prompt('reminder-loop'), new AbortController().signal)
+    expect(result.stopReason).toBe('end_turn')
+    expect(result.note).toBeUndefined()
+    // All five cycles ran: reminders are normal in conversation.
+    expect(host.ofType('tool.started')).toHaveLength(5)
   })
 
   it('steers the running turn and keeps the Poise turn open until the steered native turn ran', async () => {

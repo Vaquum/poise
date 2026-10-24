@@ -62,7 +62,7 @@ import { isTerminal, nextPollDelay, POLL_ACTIVE_MS, POLL_IDLE_MS, selectChangeFo
 import { takeDraftSnapshot, buildDraftSnapshot, saveDraftSnapshot, type DraftSnapshot } from '../self-update-drafts'
 import { installSelfUpdateWatch, registerDraftProvider, registerReloadGuard } from '../self-update-watch'
 import { BUILD_SHA } from '../build-identity'
-import { deleteConfirmCopy, queuedStatusText } from '../chat-text'
+import { deleteBulkConfirmCopy, deleteConfirmCopy, queuedStatusText } from '../chat-text'
 import { RELOADED_RELEASE_KEY } from '../self-update-reload'
 import type { SelfChange, SelfUpdateStatus } from '../self-update-types'
 import { POISE_REPOSITORY } from '../poise-repository'
@@ -622,6 +622,8 @@ async function readSessions(): Promise<void> {
         sessions.delete(id)
         order = order.filter((x) => x !== id)
         pins.delete(id)
+        selectedIds.delete(id)
+        if (selectAnchor === id) selectAnchor = null
         if (activeId === id) activeId = null
       }
     }
@@ -638,7 +640,11 @@ async function readSessions(): Promise<void> {
   queueRender()
 }
 
-let armedDelete: { id: string, until: number } | null = null
+let armedDelete: { id: string, until: number, bulk: string[] | null } | null = null
+// Multi-selection for bulk delete: the checked chats plus the shift+click
+// anchor. A plain click resets both to the opened chat.
+let selectedIds = new Set<string>()
+let selectAnchor: string | null = null
 let clickTimer: ReturnType<typeof setTimeout> | null = null
 let lastSidebarHtml = ''
 
@@ -683,10 +689,12 @@ function sidebarHtml(): string {
     const e = sessions.get(id)!
     const s = e.record
     const armed = armedDelete?.id === id && armedDelete.until > Date.now()
-    const confirm = armed ? deleteConfirmCopy(s, records) : null
+    const bulkArmed = armed && armedDelete!.bulk && armedDelete!.bulk.length > 1 ? armedDelete!.bulk : null
+    const confirm = armed ? (bulkArmed ? deleteBulkConfirmCopy(bulkArmed.length) : deleteConfirmCopy(s, records)) : null
     const dot = sessionDot(s, now, zone)
     const pinned = pins.has(id) && s.role !== 'manager'
-    return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}${pinned ? ' pinned' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0" draggable="${s.role !== 'manager'}">`
+    const selected = selectedIds.has(id)
+    return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}${pinned ? ' pinned' : ''}${selected ? ' selected' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0" draggable="${s.role !== 'manager'}">`
       + `<div class="chat-session-title" title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</div>`
       + (s.subject ? `<div class="chat-session-subject">From Current · ${escapeHtml(s.subject.label)}</div>` : '')
       + creatorHtml(s)
@@ -737,6 +745,30 @@ function moveSession(id: string, delta: -1 | 1): void {
   placePinned(id, to)
 }
 
+/** Shift+click: everything between the anchor and `id` in list order. The
+ *  anchor falls back to the open chat, so a first shift+click still spans. */
+function selectRange(id: string): void {
+  const visible = order.filter(listed)
+  if (!visible.includes(id)) return
+  if (!selectAnchor || !visible.includes(selectAnchor)) selectAnchor = activeId && visible.includes(activeId) ? activeId : id
+  const from = visible.indexOf(selectAnchor)
+  const to = visible.indexOf(id)
+  selectedIds = new Set(visible.slice(Math.min(from, to), Math.max(from, to) + 1))
+}
+
+/** Cmd/Ctrl+click: one chat in or out; the anchor follows the click. */
+function toggleSelected(id: string): void {
+  if (!sessions.has(id)) return
+  if (selectedIds.has(id)) selectedIds.delete(id)
+  else selectedIds.add(id)
+  selectAnchor = id
+}
+
+function clearSelection(): void {
+  selectedIds = new Set()
+  selectAnchor = null
+}
+
 let dragId: string | null = null
 let dropTarget: { el: HTMLElement, before: boolean } | null = null
 let dropEnd = false
@@ -765,21 +797,45 @@ function attachSidebar(): void {
       const id = del.dataset.id!
       const armed = armedDelete?.id === id && armedDelete.until > Date.now()
       if (!armed) {
-        armedDelete = { id, until: Date.now() + DELETE_ARM_MS }
+        // Deleting from inside a multi-selection arms the whole selection.
+        const bulk = selectedIds.size > 1 && selectedIds.has(id)
+          ? order.filter((x) => listed(x) && selectedIds.has(x))
+          : null
+        armedDelete = { id, until: Date.now() + DELETE_ARM_MS, bulk }
         renderSidebar()
         window.setTimeout(() => {
           if (armedDelete?.id === id && armedDelete.until <= Date.now()) { armedDelete = null; renderSidebar() }
         }, DELETE_ARM_MS + 50)
         return
       }
+      const bulk = armedDelete!.bulk
       armedDelete = null
-      void deleteSession(id)
+      if (bulk && bulk.length > 1) void deleteSessions(bulk)
+      else void deleteSession(id)
       return
     }
     const item = target.closest<HTMLElement>('.chat-session-item')
     if (!item || item.querySelector('.chat-session-rename')) return
     const id = item.dataset.id!
-    // A double-click renames; the single click waits so it never opens first.
+    if (e.shiftKey) {
+      e.preventDefault()
+      if (clickTimer) { clearTimeout(clickTimer); clickTimer = null }
+      selectRange(id)
+      renderSidebar()
+      return
+    }
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault()
+      if (clickTimer) { clearTimeout(clickTimer); clickTimer = null }
+      toggleSelected(id)
+      renderSidebar()
+      return
+    }
+    // A plain click clears the selection; the chat itself still opens after
+    // the double-click window so a rename never opens first.
+    selectedIds = new Set([id])
+    selectAnchor = id
+    renderSidebar()
     if (clickTimer) clearTimeout(clickTimer)
     clickTimer = setTimeout(() => {
       clickTimer = null
@@ -903,26 +959,38 @@ function startRename(item: HTMLElement): void {
   input.addEventListener('blur', () => { void finish(true) })
 }
 
+/** One chat gone on the server (which stops a running one first) and out of
+ *  the local list. Single and bulk delete share this path. */
+async function destroySession(id: string, e: SessionEntry): Promise<boolean> {
+  const removed = !e.pending ? (await chatClient.deleteSession(id)).workspaceRemoved : false
+  chatClient.unsubscribe(id)
+  sessions.delete(id)
+  order = order.filter((x) => x !== id)
+  pins.delete(id)
+  selectedIds.delete(id)
+  if (selectAnchor === id) selectAnchor = null
+  return removed
+}
+
+/** The open chat is gone: blank the pane and move to the next listed one. */
+function resetAfterActiveDeleted(): void {
+  // Nothing is on screen now; selecting the next session must treat it
+  // as a switch (fresh transcript, its own draft), not a no-op.
+  activeId = null
+  composerStateFor(null)
+  transcript.clear()
+  composer.setDraft(freshDraft)
+  const next = order.find(listed)
+  if (next) void selectSession(next)
+  else { composer.setDraft(freshDraft); setNotice(null) }
+}
+
 async function deleteSession(id: string): Promise<void> {
   const e = sessions.get(id)
   if (!e) return
   try {
-    const removed = !e.pending ? (await chatClient.deleteSession(id)).workspaceRemoved : false
-    chatClient.unsubscribe(id)
-    sessions.delete(id)
-    order = order.filter((x) => x !== id)
-    pins.delete(id)
-    if (activeId === id) {
-      // Nothing is on screen now; selecting the next session must treat it
-      // as a switch (fresh transcript, its own draft), not a no-op.
-      activeId = null
-      composerStateFor(null)
-      transcript.clear()
-      composer.setDraft(freshDraft)
-      const next = order.find(listed)
-      if (next) void selectSession(next)
-      else { composer.setDraft(freshDraft); setNotice(null) }
-    }
+    const removed = await destroySession(id, e)
+    if (activeId === id) resetAfterActiveDeleted()
     // The server reports what the delete actually did; only a Poise-local
     // session can take a workspace with it.
     if (removed) setNotice('Session deleted; its workspace was removed.', 'info')
@@ -932,6 +1000,46 @@ async function deleteSession(id: string): Promise<void> {
     setNotice(`Delete failed — ${(err as Error).message}`)
     queueRender()
   }
+}
+
+/** Delete a multi-selection after its single confirmation. A failure deletes
+ *  nothing further for that chat but never stops the rest; the notice then
+ *  reports the count plus each failure with its reason. */
+async function deleteSessions(ids: string[]): Promise<void> {
+  const targets = ids.filter((id) => sessions.has(id))
+  if (!targets.length) return
+  // Titles up front: a target deleted concurrently is already gone when its
+  // turn comes, and then no entry is left to name it from.
+  const titles = new Map<string, string>()
+  for (const id of targets) titles.set(id, sessionTitle(sessions.get(id)!.record))
+  const failures: { title: string, message: string }[] = []
+  let deleted = 0
+  for (const id of targets) {
+    const e = sessions.get(id)
+    if (!e) {
+      failures.push({ title: titles.get(id)!, message: 'already deleted' })
+      continue
+    }
+    try {
+      await destroySession(id, e)
+      deleted += 1
+    } catch (err) {
+      failures.push({ title: sessionTitle(e.record), message: (err as Error).message })
+    }
+  }
+  // Successes already left the selection in destroySession; failures stay
+  // selected so the list still shows what the notice names.
+  // Only the open chat's own deletion moves the pane, read fresh like the
+  // single delete does: the user may have opened a survivor mid-flight, and
+  // a JEV builder holds an activeId outside the sessions map that must stay.
+  if (activeId && targets.includes(activeId) && !sessions.has(activeId)) resetAfterActiveDeleted()
+  if (!failures.length) {
+    setNotice(`Deleted ${deleted} ${deleted === 1 ? 'chat' : 'chats'}.`, 'info')
+  } else {
+    const failed = failures.map((f) => `"${f.title}" — ${f.message}`).join('; ')
+    setNotice(`Deleted ${deleted} of ${targets.length} chats; failed: ${failed}`)
+  }
+  queueRender()
 }
 
 // ── Selecting and loading a session ────────────────────────────────────────
@@ -2286,6 +2394,12 @@ function attachKeys(): void {
     const tag = active?.tagName
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || active?.isContentEditable) return
     if (e.metaKey || e.ctrlKey || e.altKey) return
+    if (!e.isComposing && e.key === 'Escape' && selectedIds.size > 0) {
+      e.preventDefault()
+      clearSelection()
+      renderSidebar()
+      return
+    }
     const en = entry()
     if (!en) return
     const pending = focusedPending(en.model)
