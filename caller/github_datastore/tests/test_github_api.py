@@ -854,6 +854,12 @@ class PullReviewThreadTest(unittest.TestCase):
         self.assertIn("blockedBy", ISSUE_BASE_QUERY)
         self.assertIn("closingIssuesReferences", PR_BASE_QUERY)
 
+    def test_pr_query_carries_head_ref_without_new_requests(self) -> None:
+        # The head branch and its repository ride the existing pull request
+        # query; the sync issues the same GraphQL calls with or without them.
+        self.assertIn("headRefName", PR_BASE_QUERY)
+        self.assertIn("headRepository", PR_BASE_QUERY)
+
     def test_first_page_comments_carry_their_thread_without_paging(self) -> None:
         pull = pull_with_threads([
             thread("T_open", False, False, [thread_comment(1, "C_1", "reviewer")]),

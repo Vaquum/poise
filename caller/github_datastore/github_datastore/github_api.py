@@ -275,6 +275,8 @@ PR_GRAPH_FIELDS = f"""
       isDraft
       additions
       deletions
+      headRefName
+      headRepository {{ nameWithOwner }}
       closingIssuesReferences(first: 100) {{
         pageInfo {{ hasNextPage }}
         nodes {{
