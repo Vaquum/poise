@@ -4,7 +4,7 @@
 // worker; it never replaces one. Changing this text changes only what a
 // missing /worker is created with.
 export const WORKER_SNIPPET_DEFAULT = `1. Work only on the task you were given. Report your result and the PR link in this chat.
-2. Open the PR early.
+2. Open the PR early. Run lint, typecheck and the tests for what you changed; CI runs the full suite.
 3. Done means: CI green; up to date with main; no conflicts; every review finding fixed or justified, with a reply on its thread, and every handled thread resolved. If a finding repeats one you already justified, reply with the evidence instead of changing code.
 4. Once you have pushed and your checks pass, end your turn. Poise wakes you on CI failures, conflicts, behind-main and review changes.
 5. If something outside your PR blocks you, say so here with the evidence and end your turn.
