@@ -688,6 +688,74 @@ describe('approval eligibility and review activity', () => {
     expect(db.hasSeen('approve-prs', `${pr.repo}#17@head=${NEXT_HEAD_SHA}`)).toBe(true)
   })
 
+  it('re-approves on the next tick after a push dismisses the approval with no threads', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    arrangeCli(false, false, {
+      headSha: NEXT_HEAD_SHA,
+      reviewerLatestState: 'DISMISSED',
+      reviewerLatestCommit: HEAD_SHA,
+      latestActivityAt: new Date().toISOString(),
+    }, { reviewer_latest_state: 'DISMISSED' })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    const target = `${pr.repo}#${pr.number}@head=${HEAD_SHA}`
+    const claimId = db.claimSeenOwned('approve-prs', target)
+    if (!claimId) throw new Error('could not arrange approval basis')
+    db.markBehaviorLaunchIntentOwned({
+      key: 'approve-prs', target, claimId,
+      launchBehavior: 'pr_approve', repo: pr.repo, pr: pr.number,
+      requestedAt: new Date(Date.now() - 60_000).toISOString(), expectedHead: HEAD_SHA,
+      actor: 'review-bot', source: 'poise:approve-prs', correlationId: claimId,
+    })
+    db.linkBehaviorLaunchCallOwned('approve-prs', target, claimId, 'a'.repeat(32))
+    const completed = db.completeBehaviorLaunchOwned({
+      key: 'approve-prs', target, claimId,
+      action: 'approved', outcome: 'approved',
+      completedAt: new Date(Date.now() - 30_000).toISOString(), headSha: HEAD_SHA,
+    })
+    if (!completed) throw new Error('could not complete approval basis')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--pr-approve', '#17', '--expected-head', NEXT_HEAD_SHA,
+    ]))
+    expect(db.hasSeen('approve-prs', `${pr.repo}#17@head=${NEXT_HEAD_SHA}`)).toBe(true)
+  })
+
+  it('logs why a dismissed approval without a basis is skipped', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    arrangeCli(false, false, {
+      headSha: NEXT_HEAD_SHA,
+      reviewerLatestState: 'DISMISSED',
+      reviewerLatestCommit: HEAD_SHA,
+      latestActivityAt: new Date().toISOString(),
+    }, { reviewer_latest_state: 'DISMISSED' })
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    const lines = () => log.mock.calls.map(([first]) => String(first))
+    expect(lines().some((line) =>
+      line.includes(`approve-prs skipped ${pr.repo}#${pr.number}`)
+      && line.includes('without a recorded approval or change-request basis'),
+    )).toBe(true)
+    await runtime.runEnabledBehaviorsOnce()
+    expect(lines().some((line) => line.includes('no change since last check'))).toBe(true)
+    const calls = log.mock.calls.length
+    await runtime.runEnabledBehaviorsOnce()
+    expect(log.mock.calls.length).toBe(calls)
+  })
+
   it('does not re-approve a dismissed approval while another author owns a live conversation', async () => {
     arrangeCli(false, false, {
       headSha: NEXT_HEAD_SHA,
