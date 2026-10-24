@@ -1089,10 +1089,6 @@ function quarantineBlocksLogCorrection(behavior: string, target: string): boolea
 
 // Approval keys change with commits and author responses. A durable hold
 // belongs to the PR, even if an earlier runtime closed its owned claim.
-function invalidPrResultHeld(repo: string, pr: number): boolean {
-  return invalidPrResultHoldDetail(repo, pr) !== null
-}
-
 function invalidPrResultHoldDetail(repo: string, pr: number): {
   callId: string | null, head: string, error: string | null,
 } | null {
