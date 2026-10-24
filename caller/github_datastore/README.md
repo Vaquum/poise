@@ -62,10 +62,13 @@ next sync; `Depends on:` works from long-synced bodies.
 `pr-closing` lists open pull requests with the issues each closes: `prs`
 with each PR's `repo`, `number`, `url`, `closing` refs, `closes_via`
 (`closing-references`, or `body-keywords` when the stored read predates
-dependency tracking) and `closing_truncated`, and `truncated` when a cap or
-a malformed stored connection hid entries. A pull request with
-`closing_truncated` carries an incomplete closing list; matching on it
-would misbind, so consumers must skip it. At most 500 pull requests and 100
+dependency tracking), `closing_truncated`, and the head branch and its
+repository as `head_ref`/`head_repo` (both null when the stored read
+predates head tracking), and `truncated` when a cap or a malformed stored
+connection hid entries. A pull request with `closing_truncated` carries an
+incomplete closing list; matching on it through that list would misbind,
+so consumers must skip it, though its head branch still matches. At most
+500 pull requests and 100
 closing refs per pull request are returned; `--repo` scopes the list to one
 repository and `--limit` lowers the pull request cap. `more` means further
 pull requests follow: pass the last returned cursor back until it clears,

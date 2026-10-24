@@ -20,6 +20,7 @@ import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-re
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
 import { findEvent } from './storage'
+import { pushedBranches } from './git'
 import { ChatError, type ChatRuntime } from './runtime'
 import { GREY_CI_INTENT_KEY, getEnabledMap, getBehaviorsRuntimeHealth, isEnabled, pullRequestPolicy, pullRequestRefusal, withBehaviorOrganization } from '../behaviors'
 import * as store from './control-store'
@@ -415,7 +416,7 @@ export async function readWorkMergeWake(target: store.WorkTarget): Promise<Merge
 /** Open pull requests and the issues each closes, as the local datastore
  *  has them; null when the datastore cannot be asked. Local rows only —
  *  the sync owns freshness, and this read adds zero GitHub traffic. */
-export interface OpenPrClosingRefs { repo: string, number: number, url: string, closing: Array<{ repo: string, number: number }>, closesVia: 'closing-references' | 'body-keywords', closingTruncated: boolean }
+export interface OpenPrClosingRefs { repo: string, number: number, url: string, closing: Array<{ repo: string, number: number }>, closesVia: 'closing-references' | 'body-keywords', closingTruncated: boolean, headRef: string | null, headRepo: string | null }
 export interface OpenPrClosingList { prs: OpenPrClosingRefs[], truncated: boolean, more: boolean }
 export async function readOpenPrClosingRefs(org: Organization, after?: { repo: string, number: number }): Promise<OpenPrClosingList | null> {
   try {
@@ -443,7 +444,15 @@ export async function readOpenPrClosingRefs(org: Organization, after?: { repo: s
           || !Number.isSafeInteger(target.number) || target.number <= 0) return null
         closing.push({ repo: target.repo, number: target.number })
       }
-      prs.push({ repo: pr.repo, number: pr.number, url: pr.url, closing, closesVia: pr.closes_via, closingTruncated: pr.closing_truncated })
+      // Absent head fields are rows synced before head tracking: branch
+      // matching skips them. Present-but-malformed ones fail the listing,
+      // like every other malformed field.
+      const headRef = 'head_ref' in pr ? pr.head_ref : null
+      const headRepo = 'head_repo' in pr ? pr.head_repo : null
+      if ((headRef !== null && (typeof headRef !== 'string' || !headRef))
+        || (headRepo !== null && (typeof headRepo !== 'string' || !headRepo))) return null
+      prs.push({ repo: pr.repo, number: pr.number, url: pr.url, closing, closesVia: pr.closes_via, closingTruncated: pr.closing_truncated,
+        headRef, headRepo })
     }
     return { prs, truncated: row.truncated, more: row.more }
   } catch {
@@ -1187,31 +1196,41 @@ export class ChatControl {
   private lastDiscovery = 0
   private readonly reportedAmbiguous = new Set<string>()
 
-  /** Bind each open PR that closes a bound issue to that issue's chat, so a
-   *  chat that opens its PR without calling `bind` still receives its CI,
-   *  conflict, behind and review notices. At most once a minute, from local
-   *  datastore rows, one paged listing per organization behind a bound
-   *  target — whole-organization, so a PR in a repository with no bindings
-   *  of its own is still found when it closes a bound issue. Never takes a
-   *  claimed target, never rebinds a released one, never binds to a closed
-   *  or deleted chat, never matches a PR whose closing list is incomplete,
-   *  and never guesses between two chats: an ambiguous PR stays unbound
-   *  with one warning. */
+  /** Bind each open PR that closes a bound issue to that issue's chat, and
+   *  each open PR whose head branch was pushed from a chat's workspace to
+   *  that chat, so a chat that opens its PR without calling `bind` still
+   *  receives its CI, conflict, behind and review notices. At most once a
+   *  minute, from local datastore rows, one paged listing per organization
+   *  behind a bound target or a workspace branch — whole-organization, so
+   *  a PR in a repository with no bindings of its own is still found.
+   *  Never takes a claimed target, never rebinds a released one, never
+   *  binds to a closed or deleted chat, never matches a PR whose closing
+   *  list is incomplete through that list, and never guesses between two
+   *  chats: an ambiguous PR stays unbound with one warning. */
   private async discoverWorkBindings(now: number, current: store.Binding[]): Promise<void> {
     if (now - this.lastDiscovery < DISCOVERY_INTERVAL) return
     const instance = this.runtime.instance
-    if (!current.some(binding => store.workTarget(binding.target).kind === 'issues')) return
+    const branches = await this.scanWorkspaceBranches()
+    if (this.stopped) return
     const orgs = new Map<string, Organization>()
-    for (const binding of current) {
-      const org = organizationForRepository(store.workTarget(binding.target).repo)
-      if (org) orgs.set(org.login.toLowerCase(), org)
+    if (current.some(binding => store.workTarget(binding.target).kind === 'issues')) {
+      for (const binding of current) {
+        const org = organizationForRepository(store.workTarget(binding.target).repo)
+        if (org) orgs.set(org.login.toLowerCase(), org)
+      }
+    }
+    if (branches) {
+      for (const repo of branches.repos) {
+        const org = organizationForRepository(repo)
+        if (org) orgs.set(org.login.toLowerCase(), org)
+      }
     }
     if (orgs.size === 0) return
     // The window opens only when listings were actually read, so an empty
     // sweep never starves the pass that first has something to discover.
     this.lastDiscovery = now
     const read = this.options.closingRefs ?? readOpenPrClosingRefs
-    const ambiguous = new Set<string>()
+    const ambiguous = new Map<string, 'closing' | 'branch' | 'both'>()
     for (const org of orgs.values()) {
       let after: { repo: string, number: number } | undefined
       for (;;) {
@@ -1237,9 +1256,6 @@ export class ChatControl {
           if (target.kind === 'issues') issueOwners.set(target.url, binding.session)
         }
         for (const pr of listed.prs) {
-          // An incomplete closing list would misbind where the full list is
-          // ambiguous: only complete evidence claims.
-          if (pr.closingTruncated) continue
           let url: string
           try {
             const pull = store.workTarget(pr.url)
@@ -1247,17 +1263,35 @@ export class ChatControl {
             url = pull.url
           } catch { continue }
           if (bound.has(url)) continue
-          const candidates = new Set<string>()
-          for (const ref of pr.closing) {
-            const owner = issueOwners.get(`https://github.com/${ref.repo.toLowerCase()}/issues/${ref.number}`)
-            if (owner !== undefined) candidates.add(owner)
+          const closing = new Set<string>()
+          // An incomplete closing list would misbind where the full list is
+          // ambiguous: only complete evidence claims through this list. The
+          // head branch below is independent evidence and still matches.
+          if (!pr.closingTruncated) {
+            for (const ref of pr.closing) {
+              const owner = issueOwners.get(`https://github.com/${ref.repo.toLowerCase()}/issues/${ref.number}`)
+              if (owner !== undefined) closing.add(owner)
+            }
           }
-          const live = [...candidates].filter(session =>
+          const pushed = new Set<string>()
+          if (branches && pr.headRef !== null) {
+            const headRepos = new Set([pr.repo.toLowerCase(), ...(pr.headRepo ? [pr.headRepo.toLowerCase()] : [])])
+            for (const repo of headRepos) {
+              for (const session of branches.owners.get(JSON.stringify([repo, pr.headRef])) ?? []) pushed.add(session)
+            }
+          }
+          const live = (sessions: Set<string>): string[] => [...sessions].filter(session =>
             this.runtime.ownsSession(session) && this.runtime.get(session)?.status !== 'closed'
             && !store.bindingReleased(instance, session, url))
-          if (live.length === 0) continue
-          if (live.length > 1) { ambiguous.add(url); continue }
-          const [session] = live
+          const liveClosing = live(closing)
+          const livePushed = live(pushed)
+          const union = [...new Set([...liveClosing, ...livePushed])]
+          if (union.length === 0) continue
+          if (union.length > 1) {
+            ambiguous.set(url, liveClosing.length > 0 && livePushed.length > 0 ? 'both' : livePushed.length > 0 ? 'branch' : 'closing')
+            continue
+          }
+          const [session] = union
           if (session && store.bindWorkAuto(instance, session, url)) bound.add(url)
         }
         const last = listed.prs.at(-1)
@@ -1268,14 +1302,65 @@ export class ChatControl {
         after = { repo: last.repo, number: last.number }
       }
     }
-    for (const url of ambiguous) {
+    for (const [url, cause] of ambiguous) {
       if (this.reportedAmbiguous.has(url)) continue
       this.reportedAmbiguous.add(url)
       diagnostic({ level: 'warning', operation: 'chat.work.discovery', target: url,
-        message: 'An open PR closes issues owned by several chats and stays unbound; one of them must bind it explicitly',
+        message: cause === 'branch'
+          ? 'An open PR\'s head branch was pushed from several chats\' workspaces and stays unbound; one of them must bind it explicitly'
+          : cause === 'both'
+            ? 'An open PR matches several chats through closing references and workspace branches and stays unbound; one of them must bind it explicitly'
+            : 'An open PR closes issues owned by several chats and stays unbound; one of them must bind it explicitly',
         context: { target: url } })
     }
     for (const url of [...this.reportedAmbiguous]) if (!ambiguous.has(url)) this.reportedAmbiguous.delete(url)
+  }
+
+  /** Branches each live chat pushed from its workspace: the session's own
+   *  branch for a repository-bound session (its checkout may be shared, so
+   *  only its own branch attributes to it), and every branch with a GitHub
+   *  upstream in each nested task clone for a worker workspace. The same
+   *  task-repo set stall tracking watches. Null when any session's
+   *  evidence cannot be read: branch matching pauses for the sweep rather
+   *  than bind on a partial set that hides an ambiguity. Closing
+   *  references are unaffected. */
+  private async scanWorkspaceBranches(): Promise<{ owners: Map<string, Set<string>>, repos: Set<string> } | null> {
+    const owners = new Map<string, Set<string>>()
+    const repos = new Set<string>()
+    const add = (repo: string, branch: string, session: string): void => {
+      const key = JSON.stringify([repo.toLowerCase(), branch])
+      const known = owners.get(key)
+      if (known) known.add(session)
+      else owners.set(key, new Set([session]))
+      repos.add(repo.toLowerCase())
+    }
+    // Sessions that share one checkout (a handoff's source and target)
+    // scan it once; each keeps its own session-branch evidence.
+    const scanned = new Map<string, Array<{ repo: string, branch: string }>>()
+    try {
+      for (const session of this.runtime.list()) {
+        // Local reads resolve fast; still give requests an I/O turn between chats.
+        await setImmediate()
+        if (this.stopped) return null
+        if (session.status === 'closed') continue
+        if (session.repo) add(session.repo, session.branch.name, session.id)
+        let evidence = scanned.get(session.checkout)
+        if (evidence === undefined) {
+          evidence = []
+          scanned.set(session.checkout, evidence)
+          const found = await this.runtime.nestedTaskRepos(session.checkout)
+          if (!found.complete) throw new Error(`workspace discovery incomplete for chat ${session.id}`)
+          for (const dir of found.dirs) {
+            for (const pushed of await pushedBranches(dir)) evidence.push(pushed)
+          }
+        }
+        for (const pushed of evidence) add(pushed.repo, pushed.branch, session.id)
+      }
+    } catch (error) {
+      this.itemFailed('discovery', 'workspace-branches', error)
+      return null
+    }
+    return { owners, repos }
   }
 
   /** Observe claimed targets in the background, caching remote reads for five minutes. */

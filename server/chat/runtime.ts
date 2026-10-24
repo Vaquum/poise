@@ -4489,8 +4489,9 @@ export class ChatRuntime extends EventEmitter {
    *  this session's alone, so it contributes no git facets. `complete` is
    *  false when any listing failed for another reason than a vanished
    *  path, so callers keep their previous state instead of inventing a
-   *  clean one. */
-  private async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean }> {
+   *  clean one. Stall tracking and work-binding discovery share this set:
+   *  both reason about the same task repos. */
+  async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean }> {
     const root = this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT
     if (!workerWorkspaceRef(root, checkout)) return { dirs: [], complete: true }
     /** Absent paths are real; any other IO failure poisons the scan. */
