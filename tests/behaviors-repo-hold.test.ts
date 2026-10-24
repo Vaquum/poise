@@ -92,7 +92,7 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
     const repository = githubRepository(args, options)
     const number = Number(String(args[1] || '').replace(/^#/, ''))
     const changesEvidence = (repo: string, num: number) => ({
-      action: 'requested_changes_addressed', repository: repo, pull_number: num, username: flagValue(args, '--username'),
+      action: 'requested_changes_addressed', pr_author: 'poise-user', repository: repo, pull_number: num, username: flagValue(args, '--username'),
       status: changeRequested, has_change_request: changeRequested,
       reviewer_latest_state: changeRequested ? 'CHANGES_REQUESTED' : null,
       reviewer_latest_commit: changeRequested ? HEAD : null,
@@ -395,8 +395,8 @@ describe('Repository hold', () => {
 
     // Access is restored after the hourly recheck comes due.
     deniedRepos.clear()
-    const stored = JSON.parse(db.getMeta('behavior_repo_hold:acme/web')!)
-    db.setMeta('behavior_repo_hold:acme/web', JSON.stringify({ ...stored, nextRecheckAtMs: Date.now() - 1 }))
+    const stored = JSON.parse(db.getMeta('behavior_repo_hold:review-bot:acme/web')!)
+    db.setMeta('behavior_repo_hold:review-bot:acme/web', JSON.stringify({ ...stored, nextRecheckAtMs: Date.now() - 1 }))
     mocks.runFile.mockClear()
     await runtime.runEnabledBehaviorsOnce()
 
@@ -414,8 +414,8 @@ describe('Repository hold', () => {
     await runtime.runEnabledBehaviorsOnce()
     expect(holdsOf(runtime)).toHaveLength(1)
 
-    const stored = JSON.parse(db.getMeta('behavior_repo_hold:acme/web')!)
-    db.setMeta('behavior_repo_hold:acme/web', JSON.stringify({ ...stored, nextRecheckAtMs: Date.now() - 1 }))
+    const stored = JSON.parse(db.getMeta('behavior_repo_hold:review-bot:acme/web')!)
+    db.setMeta('behavior_repo_hold:review-bot:acme/web', JSON.stringify({ ...stored, nextRecheckAtMs: Date.now() - 1 }))
     deniedRepos.clear()
     mocks.runFile.mockImplementation(async (command: string, all: string[], options?: { cwd?: string }) => {
       if (command === 'github-interface' && (all as string[])[0] === '--merge-candidates') {
@@ -483,7 +483,7 @@ describe('Repository hold', () => {
     expect(actedOn('review-new-prs')).toEqual([`${API}#1`])
 
     // Access is lost after the launch; the hold is recorded.
-    db.setMeta('behavior_repo_hold:acme/api', JSON.stringify({ repo: API, error: 'GitHub 404: Not Found',
+    db.setMeta('behavior_repo_hold:review-bot:acme/api', JSON.stringify({ repo: API, error: 'GitHub 404: Not Found',
       heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 3_600_000 }))
     // The agent log feed fails while the claim is still open.
     mocks.runFile.mockImplementation(async (command: string, all: string[], options?: { cwd?: string }) => {
@@ -499,14 +499,14 @@ describe('Repository hold', () => {
 
   it('refuses a replay for a held repository, and admits it once the hold expires', async () => {
     const { db, runtime } = await start()
-    db.setMeta('behavior_repo_hold:acme/web', JSON.stringify({ repo: WEB, error: 'GitHub 404: Not Found',
+    db.setMeta('behavior_repo_hold:review-bot:acme/web', JSON.stringify({ repo: WEB, error: 'GitHub 404: Not Found',
       heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 3_600_000 }))
     await expect(runtime.admitReplay('pr_review', WEB, 2)).rejects.toThrow(
       `Replay refused: agent account has no access to ${WEB}; PR behaviors are held for this repository.`)
-    await expect(runtime.admitReplay('pr_review', API, 1)).resolves.toBeUndefined()
+    await expect(runtime.admitReplay('pr_review', API, 1)).resolves.toMatchObject({ author: 'poise-user' })
 
-    db.setMeta('behavior_repo_hold:acme/web', JSON.stringify({ repo: WEB, error: 'GitHub 404: Not Found',
+    db.setMeta('behavior_repo_hold:review-bot:acme/web', JSON.stringify({ repo: WEB, error: 'GitHub 404: Not Found',
       heldAtMs: Date.now() - 7_200_000, nextRecheckAtMs: Date.now() - 1 }))
-    await expect(runtime.admitReplay('pr_review', WEB, 2)).resolves.toBeUndefined()
+    await expect(runtime.admitReplay('pr_review', WEB, 2)).resolves.toMatchObject({ author: 'poise-user' })
   })
 })

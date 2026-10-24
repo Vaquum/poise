@@ -430,7 +430,7 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
       // Callers that fan one error out to a whole batch pass hold: false:
       // their error is unattributable to any one repository.
       setMeta(failureKey(key, target), '')
-      recordRepoAccessHold(repo, error, options.actingAccount ?? diagnosticIdentity()?.account ?? agentAccount())
+      recordRepoAccessHold(repo, error, options.actingAccount ?? diagnosticIdentity(cause)?.account ?? agentAccount())
       return
     }
   }
@@ -515,7 +515,7 @@ interface RepoAccessHold {
 }
 
 function repoHoldKey(repo: string, actor = agentAccount()): string {
-  return `${REPO_ACCESS_HOLD_PREFIX}${actor.toLowerCase() === agentAccount().toLowerCase() ? '' : actor.toLowerCase() + ':'}${repo.toLowerCase()}`
+  return `${REPO_ACCESS_HOLD_PREFIX}${actor.toLowerCase()}:${repo.toLowerCase()}`
 }
 
 // The repository a per-PR failure target names, or null for behavior-wide,
@@ -527,7 +527,10 @@ function repoOfFailureTarget(target: string): string | null {
 }
 
 function readRepoAccessHold(repo: string, actor = agentAccount()): RepoAccessHold | null {
-  const raw = getMeta(repoHoldKey(repo, actor))
+  const key = repoHoldKey(repo, actor)
+  const legacyKey = `${REPO_ACCESS_HOLD_PREFIX}${repo.toLowerCase()}`
+  const legacy = actor.toLowerCase() === agentAccount().toLowerCase() ? getMeta(legacyKey) : null
+  const raw = getMeta(key) || legacy
   if (!raw) return null
   try {
     const value = JSON.parse(raw) as Partial<RepoAccessHold>
@@ -537,7 +540,9 @@ function readRepoAccessHold(repo: string, actor = agentAccount()): RepoAccessHol
       || Number(value.heldAtMs) > 8.64e15
       || !Number.isFinite(value.nextRecheckAtMs) || Number(value.nextRecheckAtMs) < 0
       || Number(value.nextRecheckAtMs) > 8.64e15) return null
-    const hold = { repo: value.repo, actor: value.actor ?? agentAccount(), error: value.error.slice(0, 300),
+    if (value.actor && value.actor.toLowerCase() !== actor.toLowerCase()) return null
+    if (legacy && !getMeta(key)) { setMeta(key, raw); setMeta(legacyKey, '') }
+    const hold = { repo: value.repo, actor, error: value.error.slice(0, 300),
       heldAtMs: Number(value.heldAtMs), nextRecheckAtMs: Number(value.nextRecheckAtMs) }
     // An expired hold is no hold: the next sweep rechecks, and the recheck
     // renews or clears. Purge the row so stale holds never display.
@@ -577,7 +582,7 @@ function listRepoAccessHolds(): RepoAccessHold[] {
     const separator = identity.indexOf(':')
     const hold = separator < 0 ? readRepoAccessHold(identity)
       : readRepoAccessHold(identity.slice(separator + 1), identity.slice(0, separator))
-    if (hold) holds.push(hold)
+    if (hold && !holds.some((entry) => entry.repo === hold.repo && entry.actor === hold.actor)) holds.push(hold)
   }
   return holds.sort((a, b) => a.repo.localeCompare(b.repo))
 }
@@ -1002,7 +1007,7 @@ export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, numb
 // access comes back, rechecked hourly. An expired hold reads as no hold.
 function repoHoldRefusal(repo: string, actor = agentAccount()): string | null {
   const hold = readRepoAccessHold(repo, actor)
-  return hold ? `agent account has no access to ${hold.repo}; PR behaviors are held for this repository` : null
+  return hold ? `${actor.toLowerCase() === agentAccount().toLowerCase() ? 'agent account' : actor} has no access to ${hold.repo}; PR behaviors are held for this repository` : null
 }
 
 // Last-fired info is intentionally NOT persisted here — agent-interface
@@ -3693,15 +3698,15 @@ async function tickApprovePrs(): Promise<void> {
       }
     }
     let failure: unknown
-    const clearCheck = (checkTarget: string) => {
-      if (!behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget)
+    const clearCheck = (checkTarget: string, reviewer: string) => {
+      if (!behaviorAborted()) clearBehaviorFailure('approve-prs', checkTarget, reviewer)
     }
     // A terminal no-op parks the PR: a launch, a deferral (busy PR,
     // active launch, held claim) or an error never does, so the next
     // tick checks it again.
     const parkCheck = (pr: DatastorePr, reason: string) => {
       if (behaviorAborted()) return
-      clearBehaviorFailure('approve-prs', `${pr.repo}#${pr.number}:check`)
+      clearBehaviorFailure('approve-prs', `${pr.repo}#${pr.number}:check`, configuredReviewer(pr.author))
       recordApproveCheck(pr, snapshots.get(`${pr.repo}#${pr.number}`)!)
       logApproveSkip(pr, `parked: ${reason}`)
     }
@@ -3951,7 +3956,7 @@ async function tickApprovePrs(): Promise<void> {
           if (err instanceof BehaviorLogFeedError) failure ??= err
           else recordBehaviorFailure('approve-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
         } finally {
-          if (checked) clearCheck(checkTarget)
+          if (checked) clearCheck(checkTarget, reviewer)
           if (!launched && operationId) releasePrOperationOwned(operationId)
         }
       })
@@ -4159,7 +4164,7 @@ async function tickResolveUnblocking(): Promise<void> {
         }
         const activity = result!
         if (activity.state !== 'OPEN' || activity.draft || activity.unresolvedConversationCount === 0) {
-          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           continue
         }
         // The resolve CLI re-verifies this gate itself and costs 3 core
@@ -4168,7 +4173,7 @@ async function tickResolveUnblocking(): Promise<void> {
         if (activity.reviewerLatestState !== 'APPROVED'
           || activity.reviewerLatestCommit !== activity.headSha
           || activity.activeChangeRequestAuthors.length > 0) {
-          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           continue
         }
         try { await requireOwnedHumanReviews(pr, reviewer, activity) }
@@ -4223,7 +4228,7 @@ async function tickResolveUnblocking(): Promise<void> {
           recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget, { actingAccount: reviewer })
         } finally {
           if (runId) finishDirectBehaviorRun(runId, false)
-          if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget)
+          if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           if (operationId) releasePrOperationOwned(operationId)
         }
       }
@@ -4349,7 +4354,7 @@ async function tickMergePrs(): Promise<void> {
           behind.push(candidate)
           continue
         }
-        clearBehaviorFailure('merge-prs', target)
+        clearBehaviorFailure('merge-prs', target, actor)
         continue
       }
       const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
@@ -4389,7 +4394,7 @@ async function tickMergePrs(): Promise<void> {
           setMeta(MERGE_LAST_FIRED_KEY, JSON.stringify({ at: new Date().toISOString(), target }))
           console.log(`[behaviors] merge-prs merged ${target}`)
         }
-        clearBehaviorFailure('merge-prs', target)
+        clearBehaviorFailure('merge-prs', target, actor)
       } catch (error) {
         if (runId) captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
         if (behaviorAborted()) return
@@ -4553,7 +4558,7 @@ async function tickRerunGreyCi(): Promise<void> {
         recordBehaviorFailure(behavior, 'operation', 'Live PR author is missing or differs from the admitted author', target, { actingAccount: actor })
         continue
       }
-      clearBehaviorFailure(behavior, target)
+      clearBehaviorFailure(behavior, target, actor)
       // Rehydrate every unconfirmed intent on this head, even when its CI is
       // now green or running and discovery no longer returns a grey candidate.
       const pending = db.prepare(`SELECT launch_source AS source, launch_error AS error FROM behavior_seen
@@ -6110,7 +6115,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
         const ref = /^([^#]+)#(\d+)/.exec(target)
         const failedActor = failure.callId
           ? (db.prepare('SELECT launch_actor FROM behavior_seen WHERE launch_call_id = ?').get(failure.callId) as { launch_actor: string } | undefined)?.launch_actor
-          : agentAccount()
+          : undefined
         if (ref && failedActor && db.prepare(`
           SELECT 1 FROM behavior_seen recovered
           WHERE recovered.key = ? AND recovered.launch_repo = ? AND recovered.launch_pr = ?

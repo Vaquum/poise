@@ -104,6 +104,24 @@ describe('PR account routing', () => {
     expect(headReads.every(([, args]) => value(args, '--token-user') === 'poise-user')).toBe(true)
   })
 
+  it('holds repository access per actor while the other account continues', async () => {
+    const { behaviors } = await initial()
+    fixture.listedPrs.push({ ...pr, number: 18, url: pr.url.replace('/17', '/18') })
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-interface' && args[0] === '--head-sha' && value(args, '--token-user') === 'poise-user') throw new Error('GitHub 404: Not Found')
+      return original(command, args, options)
+    })
+    await behaviors.runEnabledBehaviorsOnce()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(value(mocks.spawnDetached.mock.calls[0][1], '--actor')).toBe('review-bot')
+    expect(behaviors.getBehaviorsRuntimeHealth().holds).toHaveLength(1)
+    const reads = mocks.runFile.mock.calls.length
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.runFile.mock.calls.slice(reads).some(([, args]) => args[0] === '--head-sha' && value(args, '--token-user') === 'poise-user')).toBe(false)
+  })
+
   it('does not use an approval basis from another actor', async () => {
     const { db } = await initial()
     recordCompletedInitialReview(db)
