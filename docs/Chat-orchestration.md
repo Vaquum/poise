@@ -293,7 +293,11 @@ Release bindings after verified completion; deleting a chat releases its
 bindings and disables its own supervision.
 
 Bound chats receive local behavior ledger changes for their exact repository,
-target number and issue/PR kind. PR owners also receive observed-head CI
+target number and issue/PR kind. Local target reads use the repository/number
+index. The observation pass yields to I/O between targets, including cached
+and completed targets, so it does not hold request handling behind a whole
+pass. Passes remain single-flight and coalesce intervening ticks.
+PR owners also receive observed-head CI
 failures and recovery, merge conflicts, behind-main branches that merge-prs
 will not update itself, review feedback with unresolved threads, and
 dismissed approvals that leave author-actionable threads. Resolving a

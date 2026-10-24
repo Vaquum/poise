@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { setImmediate as nextTurn } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { WebSocket } from 'ws'
@@ -201,6 +202,82 @@ afterEach(async () => {
 afterAll(async () => { database.closeDatabase(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }) })
 
 describe('native Poise control through HTTP, SQLite and the real Chat runtime', () => {
+  it.each(['issues', 'pull'] as const)('serves HTTP during a cached %s work-monitor pass', async (kind) => {
+    const parent = await manager()
+    const targets = Array.from({ length: 58 }, (_, i) => `https://github.com/monitor/app/${kind}/${i + 1}`)
+    for (const target of targets) store.bindWork(runtime.instance, parent.id, target)
+    targetStatus.mockResolvedValue('merged')
+    const completed = () => Number(database.db.prepare(`SELECT count(*) FROM chat_control_observations
+      WHERE instance = ? AND target LIKE 'behavior:%' AND checked_at = ?`).pluck().get(runtime.instance, clock))
+    await control.tick()
+    await until(() => completed() === targets.length)
+    targetStatus.mockClear()
+    clock++
+
+    let completedAtRequest = -1
+    let probe: Promise<void> | undefined
+    const onRequest = (req: import('node:http').IncomingMessage) => {
+      if (req.url === '/fixture-monitor-progress') completedAtRequest = completed()
+    }
+    server.on('request', onRequest)
+    const ownsSession = runtime.ownsSession.bind(runtime)
+    const ownership = vi.spyOn(runtime, 'ownsSession').mockImplementation(id => {
+      if (id === parent.id && !probe) probe = fetch(`${origin}/fixture-monitor-progress`).then(async response => {
+        expect(response.ok).toBe(true)
+        await response.arrayBuffer()
+      })
+      return ownsSession(id)
+    })
+    const statements = vi.spyOn(database.db, 'prepare')
+    try {
+      await control.tick()
+      await until(() => probe !== undefined)
+      await probe
+      expect(completedAtRequest).toBeGreaterThan(0)
+      expect(completedAtRequest).toBeLessThan(targets.length)
+      await until(() => completed() === targets.length)
+      expect(targetStatus).not.toHaveBeenCalled()
+      expect(ci).not.toHaveBeenCalled()
+      const query = statements.mock.calls.find(([sql]) => sql.includes('substr(launch_error, 1, 1000)') && sql.includes('FROM behavior_seen'))?.[0]
+      expect(query).toBeDefined()
+      statements.mockRestore()
+      const plan = database.db.prepare(`EXPLAIN QUERY PLAN ${query!}`).all('monitor/app', 1, kind, kind) as Array<{ detail: string }>
+      expect(plan.some(row => row.detail.includes('USING INDEX idx_behavior_seen_target'))).toBe(true)
+    } finally {
+      ownership.mockRestore()
+      statements.mockRestore()
+      server.off('request', onRequest)
+      await probe
+    }
+  })
+
+  it('stops a work-monitor pass at its next I/O turn without observing later bindings', async () => {
+    const parent = await manager()
+    for (let number = 1; number <= 58; number++) store.bindWork(runtime.instance, parent.id, `https://github.com/monitor/stop/issues/${number}`)
+    let stopping: Promise<void> | undefined
+    let scheduled = false
+    const ownsSession = runtime.ownsSession.bind(runtime)
+    const ownership = vi.spyOn(runtime, 'ownsSession').mockImplementation(id => {
+      if (id === parent.id && !scheduled) {
+        scheduled = true
+        setImmediate(() => { stopping = control.stop() })
+      }
+      return ownsSession(id)
+    })
+    try {
+      await control.tick()
+      await until(() => stopping !== undefined)
+      await stopping
+      await nextTurn()
+      const observed = database.db.prepare(`SELECT count(*) FROM chat_control_observations
+        WHERE instance = ? AND target LIKE 'behavior:%'`).pluck().get(runtime.instance)
+      expect(observed).toBe(1)
+      await nextTurn()
+      expect(database.db.prepare(`SELECT count(*) FROM chat_control_observations
+        WHERE instance = ? AND target LIKE 'behavior:%'`).pluck().get(runtime.instance)).toBe(observed)
+    } finally { ownership.mockRestore() }
+  })
+
   it('lets a running manager create three parallel workers and receive their outcomes without sharing its lease', async () => {
     const parent = await manager()
     runtime.prompt(parent.id, { text: 'Manage three tasks', attachments: [], mentions: [] })

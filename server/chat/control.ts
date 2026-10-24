@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { setImmediate } from 'node:timers/promises'
 import { db } from '../db'
 import { HttpError, httpStatus, readJson } from '../http'
 import { runFile } from '../process'
@@ -1045,6 +1046,8 @@ export class ChatControl {
   private async runCiPass(): Promise<void> {
     const instance = this.runtime.instance
     for (const binding of store.bindings(instance)) {
+      // Cached reads resolve in microtasks; give requests an I/O turn between targets.
+      await setImmediate()
       if (this.stopped) return
       const now = (this.options.now ?? Date.now)()
       if (!this.runtime.ownsSession(binding.session)) { store.forgetSession(instance, binding.session, now); continue }
