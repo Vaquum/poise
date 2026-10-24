@@ -1,10 +1,10 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, rm, writeFile } from 'node:fs/promises'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
-import { db } from '../db'
+import { db, getMeta, setMeta } from '../db'
 import { HttpError, httpStatus, readJson } from '../http'
 import { runFile } from '../process'
 import { requireAgentAccount } from '../settings'
@@ -540,8 +540,25 @@ function queueHoldsDelivery(queue: MessageQueue | undefined): boolean {
     || (queue.ready && queue.items.some(item => item.state === 'waiting')))
 }
 
+/** The control credential secret, persisted per instance: a chat's token
+ *  survives a Poise restart, so a worker mid-turn keeps its connection. A
+ *  malformed stored secret is replaced with a warning — the one restart
+ *  that invalidates existing connections. */
+function controlSecret(instance: string): Buffer {
+  const stored = getMeta(`chat_control_secret:${instance}`)
+  if (stored && /^[0-9a-f]{64}$/.test(stored)) return Buffer.from(stored, 'hex')
+  if (stored) {
+    diagnostic({ level: 'warning', operation: 'chat.control.secret',
+      message: 'The stored chat-control secret was malformed and was replaced; existing connections were invalidated',
+      context: {} })
+  }
+  const fresh = randomBytes(32)
+  setMeta(`chat_control_secret:${instance}`, fresh.toString('hex'))
+  return fresh
+}
+
 export class ChatControl {
-  private readonly secret = randomBytes(32)
+  private readonly secret: Buffer
   private origin = ''
   private root: Promise<string> | null = null
   private timer: ReturnType<typeof setInterval> | null = null
@@ -643,6 +660,18 @@ export class ChatControl {
       const view = store.timerById(this.runtime.instance, timer.id)
       if (view) this.emitTimerChanged(timer.target, view, 'cancelled', { kind: 'poise', name: 'Poise' })
     }
+    // Its connection file goes with it; a missing file is a no-op.
+    void this.dropConnection(id)
+  }
+
+  /** Remove one chat's connection file. Best-effort: a missing file or a
+   *  missing directory is fine, anything else is a server-log line. */
+  private async dropConnection(id: string): Promise<void> {
+    try {
+      await rm(join(await this.ensureRoot(), `${id}.json`), { force: true })
+    } catch (error) {
+      this.runtime.emit('log', `[chat control] connection file for ${id} not removed: ${String(error)}`)
+    }
   }
 
   /** Account a finished timer turn: successes reset the failures, failures
@@ -708,9 +737,10 @@ export class ChatControl {
         ...(timer.reason ? { reason: timer.reason } : {}), ...(error ? { error } : {}) } })
   }
 
-  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, mergeWake?: typeof readWorkMergeWake, closingRefs?: typeof readOpenPrClosingRefs, now?: () => number, switchboard?: SwitchboardControl } = {}) {
+  constructor(private readonly runtime: ChatRuntime, private readonly options: { ci?: typeof readWorkCi, targetStatus?: typeof readWorkTargetStatus, reviews?: typeof readWorkReviews, ownsBehind?: typeof mergePrsOwnsBehind, mergeWake?: typeof readWorkMergeWake, closingRefs?: typeof readOpenPrClosingRefs, now?: () => number, switchboard?: SwitchboardControl, connectionDir?: string } = {}) {
     runtime.on('event', this.onEvent)
     runtime.on('deleted', this.onDeleted)
+    this.secret = controlSecret(runtime.instance)
   }
 
   /** Called after runtime crash reconciliation, so old turns cannot be resumed by a timer. */
@@ -718,6 +748,7 @@ export class ChatControl {
     if (this.stopped || this.ready) return
     this.ready = true
     this.timer = setInterval(() => { void this.tick().catch(error => this.runtime.emit('log', `[chat control] ${String(error)}`)) }, 1000).unref()
+    void this.refreshConnections().catch(error => this.runtime.emit('log', `[chat control] connection refresh failed: ${String(error)}`))
   }
 
   attach(server: Server): void {
@@ -725,9 +756,58 @@ export class ChatControl {
       const address = server.address()
       if (!address || typeof address === 'string') throw new Error('Chat control needs a TCP listener')
       this.origin = `http://${address.address === '::1' ? '[::1]' : '127.0.0.1'}:${address.port}`
+      void this.refreshConnections().catch(error => this.runtime.emit('log', `[chat control] connection refresh failed: ${String(error)}`))
     }
     if (server.listening) listening()
     else server.once('listening', listening)
+  }
+
+  /** The stable per-instance connection directory: connection files keep
+   *  their paths across restarts, so a mid-turn worker survives one. A
+   *  private directory owned by this user, like Chat storage itself. */
+  private ensureRoot(): Promise<string> {
+    return this.root ??= (async () => {
+      const slug = this.runtime.instance.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'poise'
+      const dir = this.options.connectionDir ?? join(tmpdir(), 'poise-chat-control', slug)
+      await mkdir(dir, { mode: 0o700, recursive: true })
+      const info = await lstat(dir)
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Chat control storage is not a plain directory: ${dir}`)
+      if (process.getuid && info.uid !== process.getuid()) throw new Error(`Chat control storage belongs to another user: ${dir}`)
+      return dir
+    })()
+  }
+
+  /** Rewrite every live chat's connection file: a restart recreates files
+   *  that went missing and refreshes the origin when the listener moved.
+   *  Best-effort per chat; failures are one warning, never a throw. */
+  private async refreshConnections(): Promise<void> {
+    if (!this.origin || this.stopped) return
+    let dir: string
+    try {
+      dir = await this.ensureRoot()
+    } catch (error) {
+      diagnostic({ level: 'warning', operation: 'chat.control.refresh',
+        message: `Poise could not open its chat-control connection directory: ${error instanceof Error ? error.message : String(error)}`,
+        context: {} })
+      return
+    }
+    const failed: string[] = []
+    for (const record of this.runtime.list()) {
+      if (this.stopped) return
+      try {
+        const live = this.runtime.get(record.id)
+        if (!live || live.status === 'closed') continue
+        await writeFile(join(dir, `${record.id}.json`),
+          JSON.stringify({ origin: this.origin, sessionId: record.id, token: this.token(record.id) }), { mode: 0o600 })
+      } catch {
+        failed.push(record.id)
+      }
+    }
+    if (failed.length) {
+      diagnostic({ level: 'warning', operation: 'chat.control.refresh',
+        message: `Poise could not recreate ${failed.length} chat-control connection file(s); those chats retry from their next turn prompt`,
+        context: { count: failed.length } })
+    }
   }
 
   private token(sessionId: string): string { return createHmac('sha256', this.secret).update(sessionId).digest('hex') }
@@ -746,8 +826,7 @@ export class ChatControl {
   async context(id: string): Promise<string> {
     if (!this.origin || this.stopped) throw new Error('Poise chat control has no active local listener')
     const record = this.session(id)
-    this.root ??= mkdtemp(join(tmpdir(), 'poise-chat-control-'))
-    const config = join(await this.root, `${id}.json`)
+    const config = join(await this.ensureRoot(), `${id}.json`)
     await writeFile(config, JSON.stringify({ origin: this.origin, sessionId: id, token: this.token(id) }), { mode: 0o600 })
     const command = [
       '[Poise native control]',
@@ -1978,6 +2057,7 @@ export class ChatControl {
 
   async stop(runtimeStopped?: Promise<void>): Promise<void> {
     // Remote reads may outlive shutdown; their continuations check stopped before store access.
+    // Connection files stay: a restart keeps mid-turn workers connected.
     this.stopped = true
     this.ciRelease?.()
     this.ciRelease = null
@@ -1985,7 +2065,6 @@ export class ChatControl {
     await this.running
     await runtimeStopped
     this.runtime.off('event', this.onEvent); this.runtime.off('deleted', this.onDeleted)
-    if (this.root) await rm(await this.root, { recursive: true, force: true })
   }
 }
 

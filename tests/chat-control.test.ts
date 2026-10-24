@@ -164,7 +164,7 @@ async function restart() {
   const stopped = runtime.stop()
   await control.stop(stopped)
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') })
   control.attach(server)
   await runtime.recover()
   control.start()
@@ -191,7 +191,7 @@ beforeEach(async () => {
   instance = `control:${randomUUID()}`
   workspaceRoot = join(root, randomUUID())
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') })
   server = createServer((req, res) => {
     if (req.url === '/api/chat/control') { void control.handle(req, res); return }
     res.setHeader('Content-Type', 'application/json')
@@ -292,7 +292,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     const parent = await manager(), replacement = await manager()
     await control.stop()
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
-    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake })
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') })
     control.attach(server); control.start()
     const targets = [1, 2, 3, 4].map(n => `https://github.com/monitor/interleave/issues/${n}`)
     for (const target of targets.slice(0, 3)) store.bindWork(runtime.instance, parent.id, target)
@@ -684,7 +684,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     run.mockRestore()
   })
 
-  it('delivers current failure evidence to a new owner and rejects credentials after control restart', async () => {
+  it('delivers current failure evidence to a new owner and keeps credentials across control restart', async () => {
     const first = await manager(), second = await manager()
     const target = 'https://github.com/acme/app/pull/45'
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
@@ -693,11 +693,63 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     await command(second.id, { operation: 'bind', target }); await control.tick()
     await until(() => store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure')))
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
+    // #620 redefined this contract on purpose: a restart used to invalidate
+    // every connection, stranding mid-turn workers whose prompt named the
+    // deleted file. The persisted secret and stable paths keep them working.
     const old = await config(second.id)
     await control.stop()
-    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake }); control.attach(server); control.start()
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') }); control.attach(server); control.start()
     const response = await fetch(`${origin}/api/chat/control`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Poise-Chat': second.id, Authorization: `Bearer ${old.token}` }, body: '{"operation":"list"}' })
-    expect(response.status).toBe(403)
+    expect(response.status).toBe(200)
+    const reread = JSON.parse(await readFile(old.path, 'utf8')) as { token: string, sessionId: string, origin: string }
+    expect(reread).toEqual({ token: old.token, sessionId: second.id, origin: old.origin })
+  })
+
+  it('recreates a missing connection file at restart so bind keeps working', async () => {
+    const chat = await manager()
+    const before = await config(chat.id)
+    // The worker's prompt names this path, but the file is gone — a cleaned
+    // temp directory, a crashed stop — when the chat starts.
+    await rm(before.path)
+    await control.stop()
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') }); control.attach(server); control.start()
+    const deadline = Date.now() + 20_000
+    let recreated = false
+    while (!recreated && Date.now() < deadline) {
+      try {
+        const reread = JSON.parse(await readFile(before.path, 'utf8')) as { token: string }
+        recreated = reread.token === before.token
+      } catch { await new Promise(done => setTimeout(done, 15)) }
+    }
+    expect(recreated).toBe(true)
+    // Through the real native command, at the prompt's original path.
+    const script = resolve('scripts/poise-chat-control.mjs')
+    const run = await executeFile(process.execPath, [script, before.path,
+      JSON.stringify({ operation: 'bind', target: 'https://github.com/acme/app/issues/44', requestId: randomUUID() })])
+    expect((JSON.parse(run.stdout) as { ok: boolean }).ok).toBe(true)
+    expect(store.bindings(runtime.instance).find(b => b.target === 'https://github.com/acme/app/issues/44')?.session).toBe(chat.id)
+  })
+
+  it('tells a chat without a connection file how to recover', async () => {
+    const script = resolve('scripts/poise-chat-control.mjs')
+    const missing = join(root, 'connections', `${randomUUID()}.json`)
+    await expect(executeFile(process.execPath, [script, missing, '{"operation":"help"}'])).rejects.toThrow(/connection file not found/)
+    await expect(executeFile(process.execPath, [script, missing, '{"operation":"help"}'])).rejects.toThrow(/next turn prompt/)
+  })
+
+  it('removes the connection file with a deleted chat', async () => {
+    const chat = await manager()
+    const connection = await config(chat.id)
+    await runtime.delete(chat.id)
+    const deadline = Date.now() + 20_000
+    let gone = false
+    while (!gone && Date.now() < deadline) {
+      try {
+        await readFile(connection.path, 'utf8')
+        await new Promise(done => setTimeout(done, 15))
+      } catch { gone = true }
+    }
+    expect(gone).toBe(true)
   })
 
   it('routes local behavior changes to the matching work owner and fails visibly when CI cannot be read', async () => {

@@ -8,11 +8,16 @@ No model or provider credential is added. Safe mode still governs native tools.
 
 The command discovers itself with `{"operation":"help"}`. Its connection file
 identifies the calling chat; a request cannot impersonate another chat by
-putting a different sender in its JSON. The private, process-scoped credential
-is accepted only on loopback, without browser Origin/fetch headers. Deleting
-the chat or restarting Poise invalidates it. The next native prompt receives
-the current connection. This is the existing trusted workspace, not isolation
-between agents running as the same operating-system user.
+putting a different sender in its JSON. The private per-chat credential
+is accepted only on loopback, without browser Origin/fetch headers.
+Connection files live in a stable per-instance directory and keep working
+across Poise restarts, so a mid-turn worker stays connected; Poise recreates
+any missing ones at startup and refreshes the origin when its listener
+moves. Every native prompt carries the current connection, and a command
+whose file is still missing says how to recover. Deleting the chat removes
+its file and invalidates its credential. This is the existing trusted
+workspace, not isolation between agents running as the same
+operating-system user.
 
 ## Operations
 

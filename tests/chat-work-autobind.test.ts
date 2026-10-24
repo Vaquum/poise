@@ -160,7 +160,7 @@ beforeEach(async () => {
   instance = `autobind:${randomUUID()}`
   workspaceRoot = join(root, randomUUID())
   runtime = makeRuntime()
-  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, closingRefs })
+  control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, closingRefs, connectionDir: join(root, 'connections') })
   server = createServer((req, res) => {
     if (req.url === '/api/chat/control') { void control.handle(req, res); return }
     res.setHeader('Content-Type', 'application/json')
