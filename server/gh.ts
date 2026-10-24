@@ -287,16 +287,16 @@ export async function localCheckoutPath(owner: string, repo: string): Promise<st
 // the review-new-prs dedupe key so a force-push (or any new commit)
 // is recognised as a fresh target for re-review rather than treated
 // as the already-reviewed PR. Single GitHub call, no pagination.
-export async function getHeadSha(
+async function readPrHead(
   repo: string,
   number: number,
-  options: { signal?: AbortSignal } = {},
-): Promise<string> {
+  options: { signal?: AbortSignal, actor?: string } = {},
+): Promise<Record<string, unknown>> {
   if (!repo.includes('/')) throw new Error('repo must be owner/name')
   const [owner, name] = repo.split('/', 2)
   const cwd = join(GH_INTERFACE_CWD_ROOT, owner, name)
   await mkdir(cwd, { recursive: true })
-  const actor = requireAgentAccount()
+  const actor = options.actor ?? requireAgentAccount()
   const { stdout } = await runFile(GH_INTERFACE, [
     '--head-sha',
     `#${number}`,
@@ -320,7 +320,19 @@ export async function getHeadSha(
     || !/^[0-9a-f]{40}$/.test(headSha)) {
     throw new Error('github-interface --head-sha returned malformed state')
   }
-  return headSha
+  return data
+}
+
+export async function getHeadSha(repo: string, number: number, options: { signal?: AbortSignal, actor?: string } = {}): Promise<string> {
+  return String((await readPrHead(repo, number, options)).head_sha).toLowerCase()
+}
+
+export async function getPrAuthor(repo: string, number: number, actor: string): Promise<string> {
+  const data = await readPrHead(repo, number, { actor })
+  if (typeof data.author !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?(?:\[bot\])?$/.test(data.author)) {
+    throw new Error('github-interface --head-sha returned no valid PR author')
+  }
+  return data.author
 }
 
 // The --mergeable evidence the held reasons read. Absent fields predate the

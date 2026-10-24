@@ -53,7 +53,7 @@ import { discardUnclaimedWorkspace, ensureLocalWorkspace, ensureWorkerWorkspace,
 import { restorePrunedArtifacts } from '../storage-maintenance'
 import { catalogueAgents } from './catalog-agents'
 import { runFile, scrubbedChildEnvironment } from '../process'
-import { CheckoutLease, canonicalCheckout, describeHolder, type AcquireResult, type CheckoutLeaseOptions } from './checkout-lock'
+import { CheckoutLease, canonicalCheckout, describeHolder, leaseHostAlive, type AcquireResult, type CheckoutLeaseOptions } from './checkout-lock'
 import { ATTACHMENT_DIR, attachmentPath, ensureExcluded, inlineText, safeAttachmentName, sha256Of } from './attachments'
 import { readCheckoutBytes, readCheckoutTextFile, writeCheckoutTextFile } from './client-fs'
 import { captureCheckoutSnapshot, emitCheckoutChanges, type CheckoutSnapshot } from './change-mirror'
@@ -636,7 +636,7 @@ export class ChatRuntime extends EventEmitter {
       const row = new CheckoutLease(worker.checkout, { ownerKind: 'poise:chat', ownerId: worker.sessionId, ownerLabel: '', instance: this.instance }, this.leaseProbes).read()
       // Another server's adoption rotates the token but retains this owner.
       return !!row && row.owner_id === worker.sessionId && row.instance === this.instance
-        && row.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(row.host_pid)
+        && row.host_pid !== this.hostPid && leaseHostAlive(row, this.leaseProbes)
     } catch (error) {
       this.emit('log', `[chat ${worker.sessionId.slice(0, 8)}] recovery ownership could not be verified; preserving its worker: ${error instanceof Error ? error.message : String(error)}`)
       return true
@@ -799,7 +799,7 @@ export class ChatRuntime extends EventEmitter {
         try {
           const holder = lease.read()
           transferred = !!holder && holder.owner_id === record.id && holder.instance === this.instance
-            && holder.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(holder.host_pid)
+            && holder.host_pid !== this.hostPid && leaseHostAlive(holder, this.leaseProbes)
         } catch (error) {
           this.emit('log', `[chat ${record.id.slice(0, 8)}] relay ownership could not be verified; preserving its worker: ${error instanceof Error ? error.message : String(error)}`)
           transferred = true
@@ -1378,7 +1378,7 @@ export class ChatRuntime extends EventEmitter {
       const row = new CheckoutLease(record.checkout, { ownerKind: 'poise:chat', ownerId: sessionId,
         ownerLabel: '', instance: this.instance }, this.leaseProbes).read()
       return !!row && row.owner_kind === 'poise:chat' && row.owner_id === sessionId
-        && row.host_pid !== this.hostPid && (this.leaseProbes.pidAlive ?? pidAlive)(row.host_pid)
+        && row.host_pid !== this.hostPid && leaseHostAlive(row, this.leaseProbes)
     } catch (error) {
       this.emit('log', `[chat] recovery ownership for ${sessionId.slice(0, 8)} is unreadable: ${error instanceof Error ? error.message : String(error)}`)
       return true

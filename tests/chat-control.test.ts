@@ -1032,9 +1032,15 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.bindings(runtime.instance)).toHaveLength(0)
   })
 
-  it('advances past a full page of messages blocked by a deferred task queue', async () => {
+  it('advances past a full page of messages blocked by a running queued task', async () => {
     const blocked = await manager(), recipient = await manager()
     await runtime.enqueue(blocked.id, randomUUID(), { text: 'Deferred user task', attachments: [], mentions: [] })
+    // Only a running or armed queue holds ordinary delivery (#590): start the item.
+    runtime.prompt(blocked.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(blocked.id))
+    finishes.get(blocked.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(blocked.id) ?? []).length === 2)
+    prompts.delete(blocked.id)
     for (let i = 0; i < 100; i++) store.message(runtime.instance, blocked.id, 'fixture', `Pending context ${i}`)
     store.message(runtime.instance, recipient.id, 'fixture', 'Deliver this context')
     await control.tick()
@@ -1043,6 +1049,59 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(prompts.has(blocked.id)).toBe(false)
     expect(store.inbox(runtime.instance, recipient.id)[0].state).toBe('admitted')
     expect(store.inbox(runtime.instance, blocked.id).every(m => m.state === 'pending')).toBe(true)
+  })
+
+  it('admits an ordinary message past an unarmed waiting queue item and then runs the tail', async () => {
+    const recipient = await manager()
+    await runtime.enqueue(recipient.id, randomUUID(), { text: 'Deferred while idle', attachments: [], mentions: [] })
+    expect(runtime.get(recipient.id)?.queue?.ready).toBe(false)
+    store.message(runtime.instance, recipient.id, 'fixture', 'Run this now')
+    await control.tick()
+    await until(() => prompts.has(recipient.id))
+    expect(store.inbox(runtime.instance, recipient.id)[0].state).toBe('admitted')
+    expect(runtime.get(recipient.id)?.queue?.items.map(item => item.state)).toEqual(['waiting'])
+    finishes.get(recipient.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(recipient.id) ?? []).length === 2)
+    expect(prompts.get(recipient.id)![1].text).toContain('Deferred while idle')
+  })
+
+  it('keeps a stop on an idle chat pausing its queue across a restart', async () => {
+    const m = await workspaceManager(), p = await manager()
+    runtime.prompt(p.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(p.id))
+    finishes.get(p.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(p.id)?.status === 'idle')
+    await runtime.enqueue(p.id, randomUUID(), { text: 'Deferred while idle', attachments: [], mentions: [] })
+    await command(m.id, { operation: 'stop', sessionId: p.id })
+    prompts.delete(p.id)
+    await restart()
+    await new Promise(done => setTimeout(done, 150))
+    expect(prompts.has(p.id)).toBe(false)
+    expect(runtime.get(p.id)?.queue?.items.map(item => item.state)).toEqual(['waiting'])
+    runtime.prompt(p.id, { text: 'Next task', attachments: [], mentions: [] })
+    await until(() => (prompts.get(p.id) ?? []).length === 1)
+    finishes.get(p.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(p.id) ?? []).length === 2)
+    expect(prompts.get(p.id)![1].text).toContain('Deferred while idle')
+  })
+
+  it('admits an ordinary message past a failed queue item', async () => {
+    const recipient = await manager()
+    await runtime.enqueue(recipient.id, randomUUID(), { text: 'Doomed task', attachments: [], mentions: [] })
+    runtime.prompt(recipient.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(recipient.id))
+    finishes.get(recipient.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(recipient.id) ?? []).length === 2)
+    finishes.get(recipient.id)!({ stopReason: 'error', error: 'boom' })
+    await until(() => runtime.get(recipient.id)?.status === 'idle')
+    expect(runtime.get(recipient.id)?.queue?.items.map(item => item.state)).toEqual(['failed'])
+    // The failed turn paused delivery; resume it to isolate the queue question.
+    store.resumeDelivery(runtime.instance, recipient.id)
+    store.message(runtime.instance, recipient.id, 'fixture', 'Run past the failure')
+    await control.tick()
+    await until(() => (prompts.get(recipient.id) ?? []).length === 3)
+    expect(prompts.get(recipient.id)![2].text).toContain('Run past the failure')
+    expect(store.inbox(runtime.instance, recipient.id).find(m => m.body === 'Run past the failure')?.state).toBe('admitted')
   })
 
   it('starts no native work when the atomic inbox admission write fails', async () => {
@@ -1185,6 +1244,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('leaves behind branches to merge-prs only when it is enabled, eligible and healthy', async () => {
+    database.setMeta('agentAccount', 'review-bot')
     const { mergePrsOwnsBehind } = await import('../server/chat/control')
     const target = store.workTarget('https://github.com/acme/app/pull/64')
     const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }
@@ -1195,6 +1255,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
       database.setMeta('me', 'fixture-agent')
       try {
         expect(mergePrsOwnsBehind(target, ciState, 'open')).toBe(true)
+        expect(mergePrsOwnsBehind(target, { ...ciState, author: 'review-bot' }, 'open')).toBe(true)
         expect(mergePrsOwnsBehind(target, { ...ciState, author: 'other' }, 'open')).toBe(false)
         expect(mergePrsOwnsBehind(target, { ...ciState, draft: true }, 'open')).toBe(false)
         expect(mergePrsOwnsBehind(target, { ...ciState, author: undefined }, 'open')).toBe(false)
@@ -1214,6 +1275,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('wakes for behind when a managed account holds the repository', async () => {
+    database.setMeta('agentAccount', 'review-bot')
     const { mergePrsOwnsBehind } = await import('../server/chat/control')
     const target = store.workTarget('https://github.com/beta/app/pull/64')
     const ciState = { head: 'a'.repeat(40), failing: [], mergeable: true as const, mergeableState: 'behind', author: 'fixture-agent', draft: false, base: 'main' }
@@ -1610,13 +1672,18 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   it('returns to an unblocked recipient while a later recipient keeps receiving new messages', async () => {
     const pair = [await manager(), await manager()].sort((a, b) => a.id < b.id ? -1 : 1)
     const [blocked, fast] = pair
-    const taskId = randomUUID()
-    await runtime.enqueue(blocked.id, taskId, { text: 'Deferred task', attachments: [], mentions: [] })
+    await runtime.enqueue(blocked.id, randomUUID(), { text: 'Deferred task', attachments: [], mentions: [] })
+    // Only a running or armed queue holds ordinary delivery (#590): start the item.
+    runtime.prompt(blocked.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(blocked.id))
+    finishes.get(blocked.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(blocked.id) ?? []).length === 2)
     store.message(runtime.instance, blocked.id, 'fixture', 'Older blocked context')
     store.message(runtime.instance, fast.id, 'fixture', 'Fast context 0')
     await control.tick()
     await until(() => prompts.has(fast.id))
-    runtime.removeQueue(blocked.id, taskId)
+    finishes.get(blocked.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(blocked.id)?.status === 'idle')
     finishes.get(fast.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(fast.id)?.status === 'idle')
     store.message(runtime.instance, fast.id, 'fixture', 'Fast context 1')

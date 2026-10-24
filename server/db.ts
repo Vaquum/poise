@@ -1478,6 +1478,7 @@ export interface CompletedApprovalBasisLaunch {
 export function latestApprovalBasisLaunch(
   repo: string,
   pr: number,
+  actor?: string,
 ): CompletedApprovalBasisLaunch | null {
   const row = db.prepare(`
     SELECT launch_call_id, launch_completed_at, launch_head_sha
@@ -1485,6 +1486,7 @@ export function latestApprovalBasisLaunch(
     WHERE claim_id = ''
       AND launch_repo = ?
       AND launch_pr = ?
+      AND (? IS NULL OR lower(launch_actor) = lower(?))
       AND launch_error IS NULL
       AND (
         (key = 'review-new-prs'
@@ -1502,7 +1504,7 @@ export function latestApprovalBasisLaunch(
       AND launch_head_sha IS NOT NULL
     ORDER BY launch_completed_at DESC
     LIMIT 1
-  `).get(repo, pr) as {
+  `).get(repo, pr, actor ?? null, actor ?? null) as {
     launch_call_id: string
     launch_completed_at: string
     launch_head_sha: string

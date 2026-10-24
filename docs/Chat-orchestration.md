@@ -63,10 +63,11 @@ the Manager, Poise or another chat — since its previous notice for that worker
 most 20, then `more`. Those ride along and start no turn of their own. An active creating
 chat can read its inbox directly. Admission records the new turn ID; it is not proof
 that the agent completed the task. Failed/stopped/interrupted work pauses
-automatic dispatch until explicit chat activity. Existing queued tasks take
-priority. Stop preserves pending messages and bindings.
+automatic dispatch until explicit chat activity. A running or armed task queue
+takes priority over new messages; unarmed waiting items and failed ones never
+hold ordinary delivery. Stop preserves pending messages and bindings.
 Dispatch preserves each recipient's message order while rotating across
-recipients, including those blocked behind a deferred queue.
+recipients, including those blocked behind a running turn or an armed queue.
 
 A creating chat can explicitly steer its own worker or answer its pending
 question with known task data. Native answer validation still applies. The
@@ -89,8 +90,8 @@ timer, setter and collapsed firings, and timer changes land as notes. A
 timer survives restarts: missed occurrences collapse into the next delivery
 with their count, and the schedule keeps its phase. Delivery orders admissible
 inbox candidates by sequence: a timer waiting for the person's grace period or
-an update cannot block an ordinary message; an ordinary message blocked by a
-failed or paused task queue cannot block an otherwise ready timer. A timer
+an update cannot block an ordinary message, and failed or unarmed queue items
+hold back neither. A timer
 still reopens a closed chat before admission; a completed reopen releases its
 in-flight guard even when that firing was cancelled. Each scheduler page rotates
 over 100 recipients and keeps both candidates for every selected recipient.

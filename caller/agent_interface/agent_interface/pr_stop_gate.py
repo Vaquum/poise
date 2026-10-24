@@ -120,12 +120,22 @@ def handle(event: dict[str, Any]) -> dict[str, Any] | None:
     readiness_errors: list[RuntimeError | OSError] = []
     for current, candidate in currents:
         try:
+            selected = reviewer
+            main = os.getenv("CALLER_GITHUB_READER", "").strip()
+            if main:
+                if main.lower() == reviewer.lower():
+                    raise RuntimeError("PR reviewer and main GitHub account must be different")
+                author = str(current.get("author") or "")
+                if not author:
+                    raise RuntimeError("Cannot select PR reviewer: current-pr returned no author")
+                if author.lower() == reviewer.lower():
+                    selected = main
             readiness = _interface(
                 [
                     "--pr-readiness",
                     f"#{current['pull_number']}",
                     "--username",
-                    reviewer,
+                    selected,
                     "--expected-head",
                     str(current["head_sha"]),
                     *reader,

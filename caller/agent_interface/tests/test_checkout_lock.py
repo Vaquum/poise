@@ -136,6 +136,7 @@ class TestIdentityAndSchema(LockCase):
         self.assertEqual(columns, [
             ("id", "integer", 0), ("token", "text", 1), ("checkout", "text", 1), ("owner_kind", "text", 1),
             ("owner_id", "text", 1), ("owner_label", "text", 1), ("instance", "text", 1), ("host_pid", "integer", 1),
+            ("host_start", "text", 0),
             ("worker_pid", "integer", 0), ("worker_pgid", "integer", 0), ("worker_ident", "text", 0), ("branch", "text", 0),
             ("acquired_at", "text", 1), ("heartbeat_at", "text", 1), ("lease_until", "integer", 1),
         ])
@@ -193,6 +194,16 @@ class TestContention(LockCase):
         self.set_row(lease_until=0)
         second = self.lease("other").acquire(0)
         self.assertEqual((self.rows()[0]["token"], self.rows()[0]["owner_id"]), (second.token, "other"))
+        second.release()
+
+    def test_recovery_clears_the_previous_holders_host_start(self):
+        first = self.lease().acquire(1)
+        self.set_row(host_pid=dead_pid(), host_start="a-dead-generation", lease_until=0)
+        second = self.lease("other").acquire(0)
+        (row,) = self.rows()
+        # The stale start must not stay attached to this live process,
+        # which Poise would read as a dead host. Null fails closed.
+        self.assertEqual((row["token"], row["host_pid"], row["host_start"]), (second.token, os.getpid(), None))
         second.release()
 
     def test_token_aba_the_old_holder_can_neither_renew_nor_release(self):

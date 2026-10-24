@@ -1,4 +1,5 @@
 import http, { STATUS_CODES, type IncomingMessage, type ServerResponse } from 'node:http'
+import type { Socket } from 'node:net'
 import type { Duplex } from 'node:stream'
 import * as admin from './admin.js'
 import * as auth from './auth.js'
@@ -52,6 +53,13 @@ export interface Gateway {
   server: http.Server
   close(): Promise<void>
 }
+
+/**
+ * How long close() lets in-flight requests finish before it destroys what is left. Upgraded sockets
+ * (Chat's WebSocket, terminals) are not covered by closeAllConnections(), so without the bound close()
+ * never resolves while one is open and Docker SIGKILLs the container after its stop timeout.
+ */
+export const SHUTDOWN_GRACE_MS = 10_000
 
 function wantsHtml(req: IncomingMessage): boolean {
   return header(req, 'accept').includes('text/html')
@@ -165,15 +173,41 @@ export function createGateway(deps: GatewayDeps): Gateway {
   })
   // Outlive Caddy's two-minute upstream keep-alive, so the gateway never closes a connection Caddy is about to reuse.
   server.keepAliveTimeout = 130_000
+  // Every TCP connection, including upgraded ones closeAllConnections() does not cover.
+  const openSockets = new Set<Socket>()
+  server.on('connection', (socket: Socket) => {
+    openSockets.add(socket)
+    socket.on('close', () => openSockets.delete(socket))
+  })
   return {
     context: ctx,
     server,
     close: async () => {
-      ctx.agent.destroy()
       const stopped = new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
-      server.closeAllConnections()
-      await Promise.all([stopped, ctx.closeLoggingReads()])
-      ctx.closeGoogleConnections()
+      // Idle keep-alive drops at once; in-flight answers finish within the grace.
+      server.closeIdleConnections()
+      const force = setTimeout(() => {
+        try {
+          server.closeAllConnections()
+        } catch {
+          // Already closed.
+        }
+        for (const socket of openSockets) {
+          try {
+            socket.destroy()
+          } catch {
+            // Already closed.
+          }
+        }
+      }, deps.shutdownGraceMs ?? SHUTDOWN_GRACE_MS)
+      try {
+        await Promise.all([stopped, ctx.closeLoggingReads()])
+      } finally {
+        clearTimeout(force)
+        // Only after the server stopped: destroying the pool first would reset in-flight proxied answers.
+        ctx.agent.destroy()
+        ctx.closeGoogleConnections()
+      }
     },
   }
 }

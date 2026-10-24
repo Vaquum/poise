@@ -819,6 +819,13 @@ diagnostic; it cannot establish datastore or identity failure. Last-known runtim
 degradation remains visible; an initial unread runtime is unknown. The classification
 and evidence rules are in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
 
+PR automation uses the opposite configured account from the PR author, including
+follow-up approval, replay and downstream PR operations. Existing enable switches
+cover both directions. Settings and gh's active account are unchanged. Manual
+reviews under the main account cannot become automation evidence: only recorded
+Poise receipts authorize automated follow-up approval and conversation resolution.
+See [PR accounts](Behavior-Contract.md#pr-accounts) for admission and recovery rules.
+
 **Repository opt-out.** Review new PRs, Approve PRs and Resolve unblocking
 each have a "Skip repositories" list:
 - The list is chosen from all repositories of the person's ready accounts.
@@ -833,7 +840,7 @@ scheduler applies, or it is refused with HTTP 409 and the failed check named:
 - **Issue review:** the repository is opted in, the issue is open, and its
   author is a trusted author.
 - **PR review and approval:** the pull request is open, is not a draft, is
-  authored by the person's own GitHub account, and is not in a skipped
+  authored by either the person's GitHub account or their configured agent account, and is not in a skipped
   repository.
 
 The facts are read fresh from the datastore the scheduler reads; when they

@@ -14,18 +14,27 @@
 }
 
 http://{$POISE_DOMAIN}, http://*.{$POISE_DOMAIN} {
-	reverse_proxy {$POISE_PROXY_LISTEN}
+	reverse_proxy {$POISE_PROXY_LISTEN} {
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }
 
 https://{$POISE_DOMAIN}:8443 {
-	reverse_proxy {$POISE_PROXY_LISTEN}
+	reverse_proxy {$POISE_PROXY_LISTEN} {
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }
 
 https://*.{$POISE_DOMAIN}:8443 {
 	tls {
 		on_demand
 	}
-	reverse_proxy {$POISE_PROXY_LISTEN}
+	reverse_proxy {$POISE_PROXY_LISTEN} {
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
 }
 
 # A separate listener models an operator's additional login boundary.
@@ -36,7 +45,10 @@ http://:8081 {
 		expression `{orig_uri}.matches('^/(privacy|terms)?([?].*)?$')`
 	}
 	handle @public {
-		reverse_proxy {$POISE_PROXY_LISTEN}
+		reverse_proxy {$POISE_PROXY_LISTEN} {
+			lb_try_duration 30s
+			lb_try_interval 100ms
+		}
 	}
 	handle {
 		respond "External proxy authentication required" 401
