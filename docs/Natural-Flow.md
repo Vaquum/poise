@@ -29,12 +29,14 @@ old or new bounds intersect the viewport receive layout/entry motion. Clipped
 departures use the captured geometry without reading styles after each removal.
 Spatial offsets are non-inherited CSS properties: an actor moves its subtree
 without recalculating every descendant's styles on each animation frame.
-Swarm prepares large histories in detached batches and inserts at most 200 new
-rows per reconciliation, yielding between additions while retaining existing controls.
-Its loading count includes rows still being prepared. It reuses cell markup
-when grouping, disclosure, action buttons and displayed times remain unchanged. Each prepared
-row is consumed on insertion; later refreshes still recompute current values
-and skip unchanged row markup.
+Swarm retains full history for search, grouping and counts, but mounts at most
+200 run rows per Previous/Next page, including expanded identical runs. Detail
+rows belong only to mounted runs. Page changes replace rows directly; refresh
+retains keyed controls and follows a focused run across page boundaries. Search
+and organization changes reset the page. Deep links select their target's page.
+Leaving clears row DOM; late reads update only data. Cached return restores the
+page and disclosure state without entry motion. No offscreen rows are prepared.
+Refreshes recompute current values and skip unchanged row markup.
 Structural lists reveal new actors once and retire
 departed visuals inertly. Changed text and elapsed time remain immediate.
 Batch departures use geometry captured before the layout mutation; retiring
@@ -112,8 +114,8 @@ safeguards for drafts, native dialogs, submits, selection, authentication,
 service operations and asynchronous loading. The settlement helper waits for
 both runtime channels and native animations.
 
-`tests/e2e/swarm-performance.spec.ts` retains 1,300 distinct calls while checking
-viewport-bounded motion, navigation during a held refresh, cached return and
-filtering. Chromium performance counters guard against per-row synchronous
-layout and style recalculation; other motion semantics remain covered by the
-runtime and interaction suites.
+The Swarm browser tests retain 6,280 distinct calls while checking bounded page
+DOM, full-history filtering, deep links, disclosure/action state, refresh focus,
+and empty hidden DOM. Chromium performance counters retain the long-task and
+navigation budgets, including cold page transitions; other motion semantics
+remain covered by the runtime and interaction suites.
