@@ -191,6 +191,17 @@ function finishManual(owned: FakeControls): void {
 const ofType = (events: ChatEnvelope[], id: string, type: ChatEvent['type']) => events.filter((e) => e.sessionId === id && e.event.type === type).map((e) => e.event as any)
 const lastStatus = (events: ChatEnvelope[], id: string) => ofType(events, id, 'status.changed').at(-1)?.status
 
+/** A worker's task clone at any depth: one unpushed commit on `work`. */
+async function seedNestedClone(task: string): Promise<void> {
+  await mkdir(join(task, '..'), { recursive: true })
+  const cloned = spawnSync('git', ['clone', '-q', origin, task], { encoding: 'utf8' })
+  if (cloned.status !== 0) throw new Error(`git clone: ${cloned.stderr}`)
+  git(['checkout', '-qb', 'work'], task)
+  await writeFile(join(task, 'fix.txt'), 'fix\n')
+  git(['add', 'fix.txt'], task)
+  git(['commit', '-qm', 'unpushed fix'], task)
+}
+
 describe('turn stall detection and waking', () => {
   it('flags a bound turn that ends with unpushed work as stalled and wakes it once', async () => {
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [],
@@ -1110,4 +1121,226 @@ describe('turn stall detection and waking', () => {
     expect(store.inbox(runtime.instance, session.id)).toHaveLength(0)
     await runtime.stop({ handover: false })
   }, 40_000)
+
+  it('flags unpushed work in a clone nested four levels deep', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-deep:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    await seedNestedClone(join(session.checkout, 'groups/acme/app/repo'))
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled).toMatchObject({ repos: [{ path: 'groups/acme/app/repo', branch: 'work', dirtyFiles: 0, unpushedCommits: 1 }], backgroundJobs: [] })
+    expect(store.inbox(runtime.instance, session.id)).toHaveLength(1)
+
+    const control = await makeControl(runtime)
+    await control.tick()
+    await waitFor(() => owned.prompts.length === 2)
+    expect(owned.prompts[1].text).toContain('groups/acme/app/repo')
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('flags unpushed work in a clone under a hidden directory', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-hidden:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    await seedNestedClone(join(session.checkout, '.work/repo'))
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled).toMatchObject({ repos: [{ path: '.work/repo', branch: 'work', unpushedCommits: 1 }], backgroundJobs: [] })
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('flags a dirty linked worktree ignored inside its clone', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-worktree-in:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const app = join(session.checkout, 'app')
+    const cloned = spawnSync('git', ['clone', '-q', origin, app], { encoding: 'utf8' })
+    if (cloned.status !== 0) throw new Error(`git clone: ${cloned.stderr}`)
+    git(['worktree', 'add', '.worktrees/feat', '-b', 'feat'], app)
+    await writeFile(join(app, '.gitignore'), '.worktrees/\n')
+    git(['add', '.gitignore'], app)
+    git(['commit', '-qm', 'ignore worktrees'], app)
+    git(['push', '-q', 'origin', 'main'], app)
+    await writeFile(join(app, '.worktrees/feat/dirty.txt'), 'uncommitted\n')
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    // The parent reads clean and pushed; only the worktree flags, by path.
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled?.repos).toHaveLength(1)
+    expect(stalled).toMatchObject({ repos: [{ path: 'app/.worktrees/feat', branch: 'feat', dirtyFiles: 1, unpushedCommits: 0 }] })
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('flags a dirty linked worktree outside the workspace by its path', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-worktree-out:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const app = join(session.checkout, 'app')
+    const cloned = spawnSync('git', ['clone', '-q', origin, app], { encoding: 'utf8' })
+    if (cloned.status !== 0) throw new Error(`git clone: ${cloned.stderr}`)
+    const outside = join(root, 'wt-outside-stall')
+    git(['worktree', 'add', outside, '-b', 'feat-out'], app)
+    await writeFile(join(outside, 'dirty.txt'), 'uncommitted\n')
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled?.repos).toHaveLength(1)
+    expect(stalled).toMatchObject({ repos: [{ path: outside, branch: 'feat-out', dirtyFiles: 1 }] })
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('flags unpushed work in a clone under an ignored directory of another clone', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-nested-ignored:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const app = join(session.checkout, 'app')
+    const cloned = spawnSync('git', ['clone', '-q', origin, app], { encoding: 'utf8' })
+    if (cloned.status !== 0) throw new Error(`git clone: ${cloned.stderr}`)
+    await seedNestedClone(join(app, 'vendor/dep'))
+    await writeFile(join(app, '.gitignore'), 'vendor/\n')
+    git(['add', '.gitignore'], app)
+    git(['commit', '-qm', 'ignore vendor'], app)
+    git(['push', '-q', 'origin', 'main'], app)
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled?.repos).toHaveLength(1)
+    expect(stalled).toMatchObject({ repos: [{ path: 'app/vendor/dep', branch: 'work', unpushedCommits: 1 }] })
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('flags unpushed work in a submodule of a nested clone', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-submodule:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const app = join(session.checkout, 'super')
+    const cloned = spawnSync('git', ['clone', '-q', origin, app], { encoding: 'utf8' })
+    if (cloned.status !== 0) throw new Error(`git clone: ${cloned.stderr}`)
+    git(['-c', 'protocol.file.allow=always', 'submodule', 'add', origin, 'sub'], app)
+    git(['commit', '-qm', 'add submodule'], app)
+    git(['push', '-q', 'origin', 'main'], app)
+    // The classic forgotten push: the parent records and pushes the new
+    // gitlink while the submodule's own commit never leaves it.
+    const sub = join(app, 'sub')
+    git(['checkout', '-qb', 'work'], sub)
+    await writeFile(join(sub, 'fix.txt'), 'fix\n')
+    git(['add', 'fix.txt'], sub)
+    git(['commit', '-qm', 'unpushed sub fix'], sub)
+    git(['add', 'sub'], app)
+    git(['commit', '-qm', 'bump sub'], app)
+    git(['push', '-q', 'origin', 'main'], app)
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled?.repos).toHaveLength(1)
+    expect(stalled).toMatchObject({ repos: [{ path: 'super/sub', branch: 'work', dirtyFiles: 0, unpushedCommits: 1 }] })
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('names an unscannable directory instead of claiming a task repo', async () => {
+    if (process.getuid?.() === 0) return // unreadable-dir simulation needs permission checks
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-unreadable:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    const blocked = join(session.checkout, 'pgdata')
+    await mkdir(blocked)
+    spawnSync('chmod', ['000', blocked])
+    try {
+      runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+      const stalled = runtime.get(session.id)?.stall
+      expect(stalled).toBeDefined()
+      expect(stalled?.repos).toEqual([])
+      expect(stalled?.unreadablePaths).toEqual(['pgdata'])
+      const inbox = store.inbox(runtime.instance, session.id)
+      expect(inbox).toHaveLength(1)
+      const blockers = (JSON.parse(inbox[0].body).blockers as string[]).join('\n')
+      expect(blockers).toContain('pgdata')
+      expect(blockers).not.toContain('more task repo')
+    } finally {
+      spawnSync('chmod', ['755', blocked])
+    }
+
+    // Readable again with nothing dirty, the marker clears.
+    runtime.prompt(session.id, { text: 'do more work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toBeUndefined()
+
+    // Removed instead, the marker clears too.
+    const gone = join(session.checkout, 'pgdata2')
+    await mkdir(gone)
+    spawnSync('chmod', ['000', gone])
+    runtime.prompt(session.id, { text: 'do third work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 3)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall?.unreadablePaths).toEqual(['pgdata2'])
+    spawnSync('chmod', ['755', gone])
+    await rm(gone, { recursive: true, force: true })
+    runtime.prompt(session.id, { text: 'do final work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 4)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    expect(runtime.get(session.id)?.stall).toBeUndefined()
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('flags truncated with the stop path when discovery passes its entry budget', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-budget:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const bulk = join(session.checkout, 'bulk')
+    await mkdir(bulk)
+    for (let base = 0; base < 100_005; base += 500) {
+      await Promise.all(Array.from({ length: 500 }, (_, n) => mkdir(join(bulk, `d${String(base + n).padStart(6, '0')}`))))
+    }
+    store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
+    runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+
+    const stalled = runtime.get(session.id)?.stall
+    expect(stalled).toBeDefined()
+    expect(stalled?.repos).toEqual([])
+    expect(stalled?.truncatedRepos).toBe(1)
+    expect(stalled?.unreadablePaths).toEqual(['bulk'])
+    await runtime.stop({ handover: false })
+    // The 100k-entry fixture is heavy by design; past the file's usual 40 s.
+  }, 60_000)
 })
