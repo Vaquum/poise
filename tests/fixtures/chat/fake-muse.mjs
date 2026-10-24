@@ -288,6 +288,35 @@ function scripted() {
       return
     }
 
+    if (prompt.startsWith('reminder-loop')) {
+      // A Muse 1.4.x blocking-reminder loop: the model ends its foreground
+      // work, a blocking reminder holds the turn open, the model polls the
+      // same PR state and ends again. Only turn/interrupt ends it early;
+      // uninterrupted it runs all five cycles and completes on its own.
+      const output = JSON.stringify({ chunk_id: 'exec-1-1', command: 'gh pr view 600 --json state,reviews', exit_code: 0, terminal_status: 'completed', output: 'CHANGES_REQUESTED\n', truncated: false })
+      for (let cycle = 0; cycle < 5 && !turn.interrupted; cycle++) {
+        await streamMessage(uuid('msg'), ['No change: verdict still CHANGES_REQUESTED. Ending the turn to await re-review.'])
+        if (turn.interrupted) break
+        view('turn/foregroundCompleted', { turnId: turn.id, blockingAgents: ['goal-reminder'] })
+        const childId = uuid('reminder')
+        item('item/started', { itemId: childId, kind: 'reminderChild', blocking: true, fallbackText: 'Goal reminder', childSessionId: uuid('child'), reminderAgentId: 'goal-reminder', generationId: cycle + 1, taskId: uuid('task') })
+        item('item/completed', { itemId: childId, kind: 'reminderChild', revision: 2, status: 'completed' })
+        if (turn.interrupted) break
+        const pollId = uuid('poll')
+        const pollArgs = JSON.stringify({ command: 'gh pr view 600 --json state,reviews', description: 'Check PR state' })
+        item('item/started', { itemId: pollId, kind: 'toolCall', tool: 'bash', callId: pollId, args: pollArgs })
+        await sleep(5)
+        if (turn.interrupted) break
+        item('item/completed', { itemId: pollId, kind: 'toolCall', revision: 2, status: 'completed', tool: 'bash', callId: pollId, args: pollArgs, visibleOutput: output })
+        // `--hold-reminder-loop` pauses after the first cycle until a steer
+        // (or the interrupt) arrives, so a test can steer deterministically.
+        if (process.argv.includes('--hold-reminder-loop') && cycle === 0 && !turn.interrupted) await waitFor(() => turn.steered.length > 0)
+      }
+      if (turn.interrupted) writeFileSync('reminder-interrupted', 'yes')
+      await completeTurn(turn.interrupted ? 'cancelled' : 'completed')
+      return
+    }
+
     if (prompt.startsWith('unknown-request')) {
       const reply = await peer.request('session/nonexistent', { sessionId })
       await streamMessage(uuid('msg'), [`unknown:${reply.error ? reply.error.code : 'ok'}`])

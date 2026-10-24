@@ -103,6 +103,10 @@ export interface AdapterStartOptions {
   /** The Extensions switched on for this chat's workspace, secrets resolved.
    *  Sent through the agent's protocol, never on its command line. */
   mcpServers?: readonly ResolvedServer[]
+  /** A worker chat: Poise owns continuation through its wakes, so an
+   *  adapter bounds agent-side continuation (Muse blocking reminders)
+   *  instead of letting it hold a finished turn open. */
+  worker?: boolean
 }
 
 export interface AdapterStartResult {
@@ -135,6 +139,9 @@ export interface TurnResult {
    *  before the turn settled: the runtime queues their original text as the
    *  next prompt instead of failing the turn. */
   unrunSteers?: string[]
+  /** Why the adapter ended the turn although the agent had not finished
+   *  it: the runtime records it in the transcript and the diagnostics. */
+  note?: string
 }
 
 /** Reconnecting to a turn that outlived its Poise: the relay peer carries
@@ -160,6 +167,7 @@ export interface ReplayInit {
     safeMode: boolean
     efforts?: string[]
     commands?: CommandOption[]
+    worker?: boolean
   }
   recalledDiffs: Map<string, { oldText: string, newText: string, oldExists: boolean, newExists: boolean }>
 }
