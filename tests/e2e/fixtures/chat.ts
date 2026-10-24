@@ -97,6 +97,8 @@ interface ServerState {
   models?: unknown
   /** Answer for GET /api/chat/sessions/<id>/timers, by session. */
   timers?: Record<string, TimersData>
+  /** Failing DELETE /api/chat/sessions/<id> answers, by session. */
+  deleteErrors?: Record<string, { status: number, json: unknown }>
 }
 
 async function installRoutes(page: Page, state: ServerState): Promise<void> {
@@ -236,7 +238,13 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
         return
       }
       if (method === 'PATCH') { s.title = (body as { title: string }).title; await route.fulfill({ json: { session: s } }); return }
-      if (method === 'DELETE') { state.sessions = state.sessions.filter((x) => x.id !== id); await route.fulfill({ json: { ok: true, workspaceRemoved: false } }); return }
+      if (method === 'DELETE') {
+        const failure = state.deleteErrors?.[id]
+        if (failure) { await route.fulfill(failure); return }
+        state.sessions = state.sessions.filter((x) => x.id !== id)
+        await route.fulfill({ json: { ok: true, workspaceRemoved: false } })
+        return
+      }
       const after = Number(url.searchParams.get('after') || 0)
       await route.fulfill({ json: { session: s, events: (state.history[id] || []).filter((e) => e.seq > after) } })
       return
