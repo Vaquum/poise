@@ -820,6 +820,33 @@ describe('durable timers that wake chats', () => {
     expect(timerNotes(m.id).at(-1)).toMatchObject({ change: 'cancelled' })
   }, 120_000)
 
+  it('reports a self-timer chat delete as done and emits no event for it', async () => {
+    const p = await manager('Worker')
+    const timer = store.createTimer(instance, { sessionId: p.id, label: 'Self', message: 'Ping', delayMinutes: 10 },
+      { kind: 'chat', sessionId: p.id, title: p.title }, clock)
+    const notes: ChatEvent[] = []
+    const onEvent = (envelope: { event: ChatEvent }) => { notes.push(envelope.event) }
+    runtime.on('event', onEvent)
+    try {
+      await expect(runtime.delete(p.id)).resolves.toMatchObject({ workspaceRemoved: false })
+    } finally { runtime.off('event', onEvent) }
+    expect(runtime.get(p.id)).toBeNull()
+    expect(runtime.list().some(session => session.id === p.id)).toBe(false)
+    expect(store.timerById(instance, timer.id)).toMatchObject({ state: 'done', reason: 'target_deleted' })
+    expect(notes.filter(event => event.type === 'timer.changed')).toHaveLength(0)
+  }, 120_000)
+
+  it('reports a chat delete as done when post-delete cleanup fails', async () => {
+    const m = await workspaceManager(), p = await manager('Worker')
+    await heartbeat(m, p)
+    runtime.on('deleted', () => { throw new Error('cleanup boom') })
+    await expect(runtime.delete(p.id)).resolves.toMatchObject({ workspaceRemoved: false })
+    expect(runtime.get(p.id)).toBeNull()
+    const failures = reported('chat.session.delete').filter(e => e.target === p.id)
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toMatchObject({ message: expect.stringContaining('cleanup') })
+  }, 120_000)
+
   it.each(['once', 'every'] as const)('retains an open %s timer turn beyond the admitted-row window', async (kind) => {
     const m = await workspaceManager(), p = await manager('Worker')
     const created = (await command(m.id, { operation: 'timer', sessionId: p.id, label: 'Long turn', message: 'Ping',
