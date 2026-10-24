@@ -762,6 +762,7 @@ export class Orchestrator {
     let attempted = false
     let confirmedBusy = false
     let sawNonTimeout = false
+    let sawDraining = false
     const waiting = (health: ServiceHealth): void => {
       log.info('workspace.drain.waiting', {
         handle,
@@ -773,7 +774,10 @@ export class Orchestrator {
       })
     }
     const note = (health: ServiceHealth): void => {
-      if (!health.draining) log.warn('workspace.drain.lifted', { handle })
+      // A drain the gateway saw on is gone while the workspace still isn't idle: the owner or admin
+      // resumed, the drain lapsed, or Poise restarted. An answer that never showed a drain is not a lift.
+      if (health.draining) sawDraining = true
+      else if (sawDraining && !health.idle) log.warn('workspace.drain.lifted', { handle })
       if (!health.idle) confirmedBusy = true
     }
     attempted = true

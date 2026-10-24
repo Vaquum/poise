@@ -560,9 +560,9 @@ assertion may only resume, and anything else is refused with 403):
   recreates a workspace that confirmed busy work or refused answers, and aborts
   a workspace whose answers only timed out, releasing its drain for the next
   pass. While it waits it logs `workspace.drain.waiting` at each renew with
-  the counters and the time left, and `workspace.drain.lifted` when health
-  shows the drain gone. A pass skipped behind a running one names its handle
-  and phase.
+  the counters and the time left, and `workspace.drain.lifted` when a drain it
+  saw on is gone while the workspace still isn't idle. A pass skipped behind a
+  running one names its handle and phase.
   - New Chat turns include queued messages, and launches include the
     browser's (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`,
     `/api/debate`, `/api/models/refresh`). Refused work answers

@@ -451,6 +451,12 @@ describe('image upgrades', () => {
     const calls = h.workspace.serviceRequests.map((request) => `${request.method} ${request.url}`)
     expect(calls.filter((call) => call === 'POST /api/service/drain').length).toBeGreaterThanOrEqual(3)
     expect(calls.filter((call) => call === 'GET /api/service/health').length).toBeGreaterThanOrEqual(3)
+    expect(h.logs.find((entry) => entry.event === 'workspace.drain.waiting')).toMatchObject({
+      handle: 'alice',
+      activeChatTurns: 1,
+      runningCallerCalls: 0,
+      backgroundWork: 0,
+    })
     expect(h.docker.containers.get('poise-ws-alice')?.imageId).toBe(CURRENT_IMAGE_ID)
   })
 
@@ -462,6 +468,20 @@ describe('image upgrades', () => {
     expect(Date.now() - began).toBeGreaterThanOrEqual(1000)
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
     expect(h.logs.find((entry) => entry.event === 'workspace.drain.timeout')).toMatchObject({ handle: 'alice', timeoutSeconds: 1 })
+  })
+
+  it('notices a drain lifted while it waits instead of silently draining again', async () => {
+    await start({ drainRenewMs: 200 })
+    h.workspace.health.runningCallerCalls = 1
+    const upgrade = h.orchestrator.upgradePass()
+    await waitFor(() => h.workspace.serviceRequests.length > 0, 'the drain request')
+    // The owner lifts the drain mid-wait while Caller work still runs.
+    h.workspace.health.draining = false
+    await waitFor(() => events(h.logs, 'workspace.drain.lifted').length > 0, 'the lifted drain to be noticed')
+    h.workspace.health.runningCallerCalls = 0
+    await upgrade
+    expect(h.workspace.health.draining).toBe(true)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
   })
 
   it('aborts a drain that only times out and releases it, instead of recreating the workspace', async () => {
