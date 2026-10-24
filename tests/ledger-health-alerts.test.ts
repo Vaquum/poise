@@ -4,6 +4,26 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BehaviorLedgerSnapshot } from '../server/behavior-ledger'
 
+// Read at call time: a test flips it mid-run without re-importing.
+const failRaise = { value: false }
+
+async function freshImports(): Promise<void> {
+  // doMock (not the hoisted mock) so each test's store binds its own fresh
+  // database instead of a closed one from an earlier test.
+  vi.resetModules()
+  vi.doMock('../server/alerts/store', async (importOriginal) => {
+    const mod = await importOriginal<typeof import('../server/alerts/store')>()
+    const raiseAlert = ((...args: Parameters<typeof mod.raiseAlert>) => {
+      if (failRaise.value) throw new Error('alert store down')
+      return mod.raiseAlert(...args)
+    }) as typeof mod.raiseAlert
+    return { ...mod, raiseAlert }
+  })
+  database = await import('../server/db')
+  alerts = await import('../server/alerts/store')
+  producers = await import('../server/alerts/producers')
+}
+
 let root: string
 let database: typeof import('../server/db')
 let alerts: typeof import('../server/alerts/store')
@@ -28,11 +48,9 @@ function open(kind?: 'ledger_queue_stalled' | 'ledger_capture_loss'): Array<{ ki
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-ledger-health-alerts-'))
+  failRaise.value = false
   vi.stubEnv('POISE_DB', join(root, 'cache.db'))
-  vi.resetModules()
-  database = await import('../server/db')
-  alerts = await import('../server/alerts/store')
-  producers = await import('../server/alerts/producers')
+  await freshImports()
   vi.useFakeTimers()
   vi.setSystemTime(T0)
 })
@@ -159,7 +177,7 @@ describe('unstarted ledger', () => {
 })
 
 describe('notification settings', () => {
-  it('gates raising but not resolution or the loss baseline', () => {
+  it('gates raising but not resolution, and holds the loss baseline while off', () => {
     database.setMeta('notification_settings', JSON.stringify({ enabled: false }))
     producers.ledgerHealthObserved(snapshot({ queueAgeMs: 11_000 }), T0)
     producers.ledgerHealthObserved(snapshot({ queueAgeMs: 71_000 }), T0 + 60_000)
@@ -171,15 +189,40 @@ describe('notification settings', () => {
     producers.ledgerHealthObserved(snapshot(), T0 + 180_000)
     expect(open('ledger_queue_stalled')).toEqual([])
 
-    // The baseline advances while off, so re-enabling does not alert stale.
+    // The baseline holds while off, so re-enabling surfaces everything lost
+    // since the earlier baseline of 0 from this test's stall checks.
     producers.ledgerHealthObserved(snapshot({}, { dropped: 5 }), T0 + 240_000)
     producers.ledgerHealthObserved(snapshot({}, { dropped: 7 }), T0 + 300_000)
     expect(open('ledger_capture_loss')).toEqual([])
     database.setMeta('notification_settings', JSON.stringify({ enabled: true }))
     producers.ledgerHealthObserved(snapshot({}, { dropped: 7 }), T0 + 360_000)
-    expect(open('ledger_capture_loss')).toEqual([])
+    const surfaced = open('ledger_capture_loss')
+    expect(surfaced).toHaveLength(1)
+    expect(surfaced[0].body).toContain('7 captures were lost')
     producers.ledgerHealthObserved(snapshot({}, { dropped: 9 }), T0 + 420_000)
-    expect(open('ledger_capture_loss')).toHaveLength(1)
+    const updated = open('ledger_capture_loss')
+    expect(updated).toHaveLength(1)
+    expect(updated[0].body).toContain('2 captures were lost')
+  })
+})
+
+describe('failed alert writes', () => {
+  it('retries the delta on the next check instead of consuming it', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      producers.ledgerHealthObserved(snapshot({}, { dropped: 5 }), T0)
+      failRaise.value = true
+      producers.ledgerHealthObserved(snapshot({}, { dropped: 7 }), T0 + 60_000)
+      expect(open('ledger_capture_loss')).toEqual([])
+      failRaise.value = false
+      producers.ledgerHealthObserved(snapshot({}, { dropped: 7 }), T0 + 120_000)
+      const alert = open('ledger_capture_loss')
+      expect(alert).toHaveLength(1)
+      expect(alert[0].body).toContain('2 captures were lost')
+    } finally {
+      failRaise.value = false
+      error.mockRestore()
+    }
   })
 })
 

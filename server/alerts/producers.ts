@@ -243,11 +243,17 @@ const baselineKey = (generation: string) => `ledger-loss-baseline:${generation}`
 let stalledChecks = 0
 let ledgerTimer: ReturnType<typeof setInterval> | undefined
 
-function ledgerStanding(what: string, input: Parameters<typeof raiseAlert>[0]): void {
-  record(what, () => {
+/** Raises (or refreshes) a standing ledger alert. True once the condition
+ *  is surfaced: a failed raise must not consume what it was meant to report. */
+function ledgerStanding(what: string, input: Parameters<typeof raiseAlert>[0]): boolean {
+  try {
     raiseAlert(input)
-    updateAlertDetails(input.dedupeKey, input.title, input.body)
-  })
+  } catch (error) {
+    console.error(`[alerts] could not record ${what}:`, error)
+    return false
+  }
+  record(`${what} details`, () => updateAlertDetails(input.dedupeKey, input.title, input.body))
+  return true
 }
 
 function ledgerCleared(what: string, dedupeKey: string, nowMs?: number): void {
@@ -257,14 +263,16 @@ function ledgerCleared(what: string, dedupeKey: string, nowMs?: number): void {
 /** The ledger's drain state as this check saw it: a stalled queue, a dead
  *  worker, and lost-capture deltas alert through the durable alert path
  *  (Poise Link, and the page's notices while it is open). Raising honors
- *  the Notifications setting; resolution and the loss baseline do not, so a
- *  condition that cleared while notifications were off cannot alert stale.
+ *  the Notifications setting; resolution does not, so a condition that
+ *  cleared while notifications were off cannot alert stale.
  *
  *  Loss is baselined per store generation in meta: an unchanged historical
  *  `dropped` never re-alerts on a poll or a restart, a later increase
  *  alerts (and refreshes the standing alert's details) even while the
  *  ledger is already degraded, and counters are never subtracted across
- *  different stores. */
+ *  different stores. The baseline advances only once a delta is surfaced,
+ *  so neither a failed alert write nor notifications being off can consume
+ *  an increase unreported. */
 export function ledgerHealthObserved(snapshot: BehaviorLedgerSnapshot | null, nowMs = Date.now()): void {
   const enabled = getNotificationSettings().enabled
   if (snapshot?.failed) {
@@ -318,17 +326,20 @@ export function ledgerHealthObserved(snapshot: BehaviorLedgerSnapshot | null, no
   if (dropped === baseline) return
   const delta = dropped - baseline
   const lost = delta === 1 ? '1 capture was lost' : `${delta} captures were lost`
-  if (enabled) {
-    ledgerStanding('the ledger loss alert', {
-      kind: 'ledger_capture_loss',
-      dedupeKey: lossKey(generation),
-      title: 'Behavior ledger lost captures',
-      body: `${lost}; ${dropped} total in this store. The gaps stay in history.`,
-      path: FRONT_PAGE,
-      target: BEHAVIORS_VIEW,
-    })
+  // The baseline advances only once the delta is surfaced. An alert write
+  // that throws leaves the baseline behind so the next check retries, and
+  // while notifications are off the delta accumulates instead of being
+  // consumed, so re-enabling surfaces what was lost.
+  if (enabled && ledgerStanding('the ledger loss alert', {
+    kind: 'ledger_capture_loss',
+    dedupeKey: lossKey(generation),
+    title: 'Behavior ledger lost captures',
+    body: `${lost}; ${dropped} total in this store. The gaps stay in history.`,
+    path: FRONT_PAGE,
+    target: BEHAVIORS_VIEW,
+  })) {
+    record('the ledger loss baseline', () => setMeta(baselineKey(generation), String(dropped)))
   }
-  record('the ledger loss baseline', () => setMeta(baselineKey(generation), String(dropped)))
 }
 
 /** One ledger health check, from the timer below. */

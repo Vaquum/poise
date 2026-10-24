@@ -122,8 +122,9 @@ captures raises a red `ledger_capture_loss` error. Loss is baselined per store
 generation, so history alone never re-alerts on a poll or a restart, and a new
 store resolves the previous store's loss alert. A standing loss alert refreshes
 its totals without issuing another arrival. Like quota alerts, these raise only
-while notifications are enabled; resolution and the loss baseline continue
-while off. They open the Behaviors view.
+while notifications are enabled. Resolution continues while off, and unraised
+loss accumulates instead of being consumed, so re-enabling surfaces what was
+lost. They open the Behaviors view.
 
 ## Pull requests ready to merge
 
