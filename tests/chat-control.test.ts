@@ -672,6 +672,26 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(prompts.get(recipient.id)![1].text).toContain('Deferred while idle')
   })
 
+  it('keeps a stop on an idle chat pausing its queue across a restart', async () => {
+    const m = await workspaceManager(), p = await manager()
+    runtime.prompt(p.id, { text: 'First task', attachments: [], mentions: [] })
+    await until(() => prompts.has(p.id))
+    finishes.get(p.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(p.id)?.status === 'idle')
+    await runtime.enqueue(p.id, randomUUID(), { text: 'Deferred while idle', attachments: [], mentions: [] })
+    await command(m.id, { operation: 'stop', sessionId: p.id })
+    prompts.delete(p.id)
+    await restart()
+    await new Promise(done => setTimeout(done, 150))
+    expect(prompts.has(p.id)).toBe(false)
+    expect(runtime.get(p.id)?.queue?.items.map(item => item.state)).toEqual(['waiting'])
+    runtime.prompt(p.id, { text: 'Next task', attachments: [], mentions: [] })
+    await until(() => (prompts.get(p.id) ?? []).length === 1)
+    finishes.get(p.id)!({ stopReason: 'end_turn' })
+    await until(() => (prompts.get(p.id) ?? []).length === 2)
+    expect(prompts.get(p.id)![1].text).toContain('Deferred while idle')
+  })
+
   it('admits an ordinary message past a failed queue item', async () => {
     const recipient = await manager()
     await runtime.enqueue(recipient.id, randomUUID(), { text: 'Doomed task', attachments: [], mentions: [] })

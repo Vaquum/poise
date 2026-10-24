@@ -55,10 +55,12 @@ turn in flight pauses the tail rather than silently treating interruption as
 success. The interrupted item remains visibly not completed and is not
 automatically retried; remaining waiting items proceed after the next
 successful task you send, and a fresh task is always admitted past unarmed or
-failed queue items. A restart or release switch starts an idle chat's waiting
-items in order instead of leaving them stranded; only queues with a running,
-failed or interrupted turn stay paused. Restart recovery continues an
-already-armed but not-yet-started task, never an uncertain in-flight
+failed queue items. A restart or release switch starts the waiting items of
+an idle chat whose last turn completed, instead of leaving them stranded.
+After a stopped or failed turn, while delivery is paused, or before the first
+task ever runs, the tail still waits for the next successful task, as do
+queues with a running, failed or interrupted turn. Restart recovery continues
+an already-armed but not-yet-started task, never an uncertain in-flight
 one. Queues are not copied into independent forks.
 
 ## Verification

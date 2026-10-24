@@ -215,6 +215,9 @@ export function pending(instance: string, afterRecipient = '', now = Date.now())
 export function pauseDelivery(instance: string, session: string): void {
   db.prepare('INSERT OR IGNORE INTO chat_control_paused VALUES(?, ?)').run(instance, session)
 }
+export function deliveryPaused(instance: string, session: string): boolean {
+  return !!db.prepare('SELECT 1 FROM chat_control_paused WHERE instance = ? AND session = ?').get(instance, session)
+}
 export function resumeDelivery(instance: string, session: string): void {
   db.prepare('DELETE FROM chat_control_paused WHERE instance = ? AND session = ?').run(instance, session)
 }
