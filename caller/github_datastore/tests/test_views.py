@@ -754,6 +754,50 @@ class PrClosingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             views.pr_closing(limit=0)
 
+    def test_pr_closing_marks_a_capped_closing_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            body = "\n".join(f"Closes #{number}" for number in range(1, 102))
+            pr = closing_pr_fixture(12, 112, body, closing=None, state="open")
+            with conn:
+                upsert_repo(conn, pr["repo"])
+            store_expanded(conn, pr)
+            store_expanded(conn, closing_pr_fixture(13, 113, "Closes #7", closing=(7,), state="open"))
+            conn.close()
+
+            listed = json.loads(views.pr_closing(db_path=db_path))
+            self.assertTrue(listed["truncated"])
+            self.assertFalse(listed["more"])
+            self.assertEqual(len(listed["prs"][0]["closing"]), 100)
+            self.assertTrue(listed["prs"][0]["closing_truncated"])
+            self.assertFalse(listed["prs"][1]["closing_truncated"])
+
+    def test_pr_closing_pages_one_repo_by_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            first = closing_pr_fixture(12, 112, "Closes #7", closing=(7,), state="open")
+            with conn:
+                upsert_repo(conn, first["repo"])
+            store_expanded(conn, first)
+            store_expanded(conn, closing_pr_fixture(13, 113, "Closes #8", closing=(8,), state="open"))
+            store_expanded(conn, closing_pr_fixture(14, 114, "Closes #9", closing=(9,), state="open"))
+            conn.close()
+
+            head = json.loads(views.pr_closing(db_path=db_path, repo="vaquum/test", limit=2))
+            self.assertTrue(head["more"])
+            self.assertEqual([entry["number"] for entry in head["prs"]], [12, 13])
+            tail = json.loads(views.pr_closing(db_path=db_path, repo="vaquum/test", limit=2, after_number=13))
+            self.assertFalse(tail["more"])
+            self.assertEqual([entry["number"] for entry in tail["prs"]], [14])
+            with self.assertRaises(ValueError):
+                views.pr_closing(db_path=db_path, limit=2, after_number=13)
+            with self.assertRaises(ValueError):
+                views.pr_closing(db_path=db_path, repo="vaquum/test", after_number=0)
+
     def test_pr_closing_serves_through_the_view_command(self) -> None:
         from contextlib import redirect_stdout
 

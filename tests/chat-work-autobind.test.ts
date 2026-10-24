@@ -32,7 +32,7 @@ const targetStatus = vi.fn<(target: { url: string, repo: string, kind: 'issues' 
 const reviews = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }, cursor?: ReviewsCursor) => Promise<ReviewsObservation | null>>()
 const ownsBehind = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }, ci: CiObservation, status: WorkTargetStatus) => boolean>()
 const mergeWake = vi.fn<(target: { url: string, repo: string, kind: 'issues' | 'pull', number: number }) => Promise<MergeWakeObservation | null>>()
-const closingRefs = vi.fn<(org: Organization) => Promise<OpenPrClosingList | null>>()
+const closingRefs = vi.fn<(org: Organization, repo: string, after?: number) => Promise<OpenPrClosingList | null>>()
 
 function adapter(host: AdapterHost): Adapter {
   let alive = false
@@ -115,7 +115,7 @@ beforeEach(async () => {
   reviews.mockReset().mockResolvedValue(null)
   ownsBehind.mockReset().mockReturnValue(false)
   mergeWake.mockReset().mockResolvedValue(null)
-  closingRefs.mockReset().mockResolvedValue({ prs: [], truncated: false })
+  closingRefs.mockReset().mockResolvedValue({ prs: [], truncated: false, more: false })
   instance = `autobind:${randomUUID()}`
   workspaceRoot = join(root, randomUUID())
   runtime = makeRuntime()
@@ -146,7 +146,7 @@ const ISSUE = 'https://github.com/acme/app/issues/7'
 const PR = 'https://github.com/acme/app/pull/12'
 function listingFor(issueNumber: number, prNumber = 12): OpenPrClosingList {
   return { prs: [{ repo: 'acme/app', number: prNumber, url: `https://github.com/acme/app/pull/${prNumber}`,
-    closing: [{ repo: 'acme/app', number: issueNumber }], closesVia: 'closing-references' }], truncated: false }
+    closing: [{ repo: 'acme/app', number: issueNumber }], closesVia: 'closing-references', closingTruncated: false }], truncated: false, more: false }
 }
 
 describe('automatic PR binding through closing references', () => {
@@ -256,7 +256,8 @@ describe('automatic PR binding through closing references', () => {
     await command(first.id, { operation: 'bind', target: ISSUE })
     await command(second.id, { operation: 'bind', target: 'https://github.com/acme/app/issues/8' })
     closingRefs.mockResolvedValue({ prs: [{ repo: 'acme/app', number: 12, url: PR,
-      closing: [{ repo: 'acme/app', number: 7 }, { repo: 'acme/app', number: 8 }], closesVia: 'closing-references' }], truncated: false })
+      closing: [{ repo: 'acme/app', number: 7 }, { repo: 'acme/app', number: 8 }], closesVia: 'closing-references', closingTruncated: false }],
+      truncated: false, more: false })
     const listed = closingRefs.mock.calls.length
     clock += 61_000
     await control.tick()
@@ -282,7 +283,7 @@ describe('automatic PR binding through closing references', () => {
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(parent.id)
   })
 
-  it('reads one local listing per organization per minute and nothing else', async () => {
+  it('reads one local listing per repository per minute and nothing else', async () => {
     const parent = await manager()
     await command(parent.id, { operation: 'bind', target: ISSUE })
     const listed = closingRefs.mock.calls.length
@@ -292,6 +293,7 @@ describe('automatic PR binding through closing references', () => {
     await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`)?.checked_at === clock)
     const calls = closingRefs.mock.calls.length
     expect(closingRefs.mock.calls[calls - 1]?.[0]).toMatchObject({ login: 'acme' })
+    expect(closingRefs.mock.calls[calls - 1]?.slice(1)).toEqual(['acme/app', undefined])
     expect(ci).not.toHaveBeenCalled()
     expect(targetStatus).not.toHaveBeenCalled()
     expect(reviews).not.toHaveBeenCalled()
@@ -334,5 +336,59 @@ describe('automatic PR binding through closing references', () => {
     await control.tick()
     await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(second.id)
+  })
+
+  it('resolves ownership after the listing read, never from a stale snapshot', async () => {
+    const first = await manager(), second = await manager()
+    await command(first.id, { operation: 'bind', target: ISSUE })
+    closingRefs.mockImplementation(async () => {
+      store.unbindWork(runtime.instance, first.id, ISSUE)
+      store.bindWork(runtime.instance, second.id, ISSUE)
+      return listingFor(7)
+    })
+    clock += 61_000
+    await control.tick()
+    await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
+    expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(second.id)
+  })
+
+  it('skips a PR whose closing list is truncated while binding a complete one', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: ISSUE })
+    const other = 'https://github.com/acme/app/pull/13'
+    closingRefs.mockResolvedValue({ prs: [
+      { repo: 'acme/app', number: 12, url: PR, closing: [{ repo: 'acme/app', number: 7 }],
+        closesVia: 'body-keywords', closingTruncated: true },
+      { repo: 'acme/app', number: 13, url: other, closing: [{ repo: 'acme/app', number: 7 }],
+        closesVia: 'closing-references', closingTruncated: false },
+    ], truncated: true, more: false })
+    clock += 61_000
+    await control.tick()
+    await until(() => store.bindings(runtime.instance).some(b => b.target === other))
+    expect(store.bindings(runtime.instance).find(b => b.target === other)?.session).toBe(parent.id)
+    expect(store.bindings(runtime.instance).some(b => b.target === PR)).toBe(false)
+  })
+
+  it('pages past the first listing to reach later PRs', async () => {
+    const parent = await manager()
+    await command(parent.id, { operation: 'bind', target: ISSUE })
+    const other = 'https://github.com/acme/app/pull/13'
+    closingRefs.mockImplementation(async (_org: Organization, repo: string, after?: number) => {
+      expect(repo).toBe('acme/app')
+      if (after === undefined) {
+        return { prs: [{ repo, number: 12, url: PR, closing: [], closesVia: 'closing-references', closingTruncated: false }],
+          truncated: true, more: true }
+      }
+      if (after === 12) {
+        return { prs: [{ repo, number: 13, url: other, closing: [{ repo, number: 7 }], closesVia: 'closing-references', closingTruncated: false }],
+          truncated: false, more: false }
+      }
+      return { prs: [], truncated: false, more: false }
+    })
+    clock += 61_000
+    await control.tick()
+    await until(() => store.bindings(runtime.instance).some(b => b.target === other))
+    expect(store.bindings(runtime.instance).find(b => b.target === other)?.session).toBe(parent.id)
+    expect(closingRefs.mock.calls.some(([, repo, after]) => repo === 'acme/app' && after === 12)).toBe(true)
   })
 })

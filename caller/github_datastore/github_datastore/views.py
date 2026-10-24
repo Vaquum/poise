@@ -485,17 +485,25 @@ def pr_closing(
     output: Output = "json",
     repo: str | None = None,
     limit: int | None = None,
+    after_number: int | None = None,
 ) -> str:
     """Open pull requests and the issues each closes, as the datastore has
     them: local rows only, the sync owns freshness. Each entry carries
     GitHub's closing references when the stored read tracked them, else the
     body's closing keywords, the same provenance pr-dependents reports per
-    pull request. `truncated` means a cap or a malformed stored connection
-    hid entries; absence from the list then proves nothing."""
+    pull request. `closing_truncated` marks a pull request whose own closing
+    list is incomplete; matching on it would misbind, so consumers must skip
+    it. `truncated` means a cap or a malformed stored connection hid entries;
+    absence from the list then proves nothing. `more` means further pull
+    requests follow: pass the last returned number back as `after_number`
+    with the same `repo` until it clears. `after_number` needs `repo`, since
+    numbers order only within one repository."""
     if output != "json":
         raise ValueError("pr-closing renders json only")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    if after_number is not None and (repo is None or after_number <= 0):
+        raise ValueError("after_number needs a repo and a positive number")
     cap = min(limit, PR_CLOSING_SCAN_LIMIT) if limit is not None else PR_CLOSING_SCAN_LIMIT
     sql = """SELECT repo_full_name, number, body, expanded_json FROM items
              WHERE item_type = 'pr' AND state = 'open'"""
@@ -503,13 +511,17 @@ def pr_closing(
     if repo is not None:
         sql += " AND repo_full_name = ? COLLATE NOCASE"
         params.append(repo)
+    if after_number is not None:
+        sql += " AND number > ?"
+        params.append(after_number)
     sql += " ORDER BY repo_full_name ASC, number ASC LIMIT ?"
     params.append(cap + 1)
     conn = _read_connect(db_path)
     try:
         conn.execute("BEGIN")
         rows = conn.execute(sql, params).fetchall()
-        truncated = len(rows) > cap
+        more = len(rows) > cap
+        truncated = more
         prs: list[dict[str, Any]] = []
         for row in rows[:cap]:
             try:
@@ -519,9 +531,8 @@ def pr_closing(
             pull = expanded.get("pull") if isinstance(expanded, dict) else None
             graphql = pull.get("graphql") if isinstance(pull, dict) else None
             closing, closes_via, refs_truncated = _closing_refs(graphql, row["body"], row["repo_full_name"])
-            if refs_truncated:
-                truncated = True
-            if len(closing) > CLOSED_MATCH_LIMIT:
+            closing_truncated = refs_truncated or len(closing) > CLOSED_MATCH_LIMIT
+            if closing_truncated:
                 truncated = True
                 closing = closing[:CLOSED_MATCH_LIMIT]
             prs.append({
@@ -530,8 +541,9 @@ def pr_closing(
                 "url": f"https://github.com/{row['repo_full_name']}/pull/{row['number']}",
                 "closing": [{"repo": ref_repo, "number": ref_number} for ref_repo, ref_number, _ in closing],
                 "closes_via": closes_via,
+                "closing_truncated": closing_truncated,
             })
-        return json.dumps({"prs": prs, "truncated": truncated}, ensure_ascii=False)
+        return json.dumps({"prs": prs, "truncated": truncated, "more": more}, ensure_ascii=False)
     except sqlite3.Error as exc:
         raise RuntimeError(f"view query failed: pr-closing: {exc}") from exc
     finally:

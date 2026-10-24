@@ -60,13 +60,17 @@ dependent last synced before they were tracked reads as unblocked until its
 next sync; `Depends on:` works from long-synced bodies.
 
 `pr-closing` lists open pull requests with the issues each closes: `prs`
-with each PR's `repo`, `number`, `url`, `closing` refs and `closes_via`
+with each PR's `repo`, `number`, `url`, `closing` refs, `closes_via`
 (`closing-references`, or `body-keywords` when the stored read predates
-dependency tracking), and `truncated` when a cap or a malformed stored
-connection hid entries. At most 500 pull requests and 100 closing refs per
-pull request are returned; `--repo` scopes the list to one repository and
-`--limit` lowers the pull request cap. All reads are local rows; the sync
-owns freshness.
+dependency tracking) and `closing_truncated`, and `truncated` when a cap or
+a malformed stored connection hid entries. A pull request with
+`closing_truncated` carries an incomplete closing list; matching on it
+would misbind, so consumers must skip it. At most 500 pull requests and 100
+closing refs per pull request are returned; `--repo` scopes the list to one
+repository and `--limit` lowers the pull request cap. `more` means further
+pull requests follow: pass the last returned number back as
+`--after-number` with the same `--repo` until it clears. All reads are
+local rows; the sync owns freshness.
 
 `github-datastore` and `python3 -m github_datastore` work from any directory on this host.
 Every command takes `--db PATH`; without it the database is

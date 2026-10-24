@@ -344,11 +344,12 @@ An open PR that closes a bound issue is bound to that issue's chat
 automatically, within a minute of the datastore sync seeing it, so the chat
 that opened it receives its CI, conflict, behind and review notices without
 calling bind. Automatic binding never takes a claimed target, never rebinds
-a target its chat released, never binds to a closed or deleted chat, and
-leaves a PR closing several chats' issues unbound with one warning naming
-it; one of those chats must bind it explicitly. A PR that closes no bound
-issue — a chat that never bound its issue, or a PR without a closing
-reference — still needs an explicit bind in the turn that opens it.
+a target its chat released, never binds to a closed or deleted chat, never
+matches a PR whose closing list is incomplete, and leaves a PR closing
+several chats' issues unbound with one warning naming it; one of those
+chats must bind it explicitly. A PR that closes no bound issue — a chat
+that never bound its issue, or a PR without a closing reference — still
+needs an explicit bind in the turn that opens it.
 
 Bound chats receive local behavior ledger changes for their exact repository,
 target number and issue/PR kind. Local target reads use the repository/number
@@ -370,8 +371,8 @@ bound PR every five minutes, independent of browsers and supervision intervals.
 On the usual unpaginated path that is three GitHub reads per observation, at
 most 36 per hour per bound PR; pagination/retries can add reads. Unbound work
 adds zero GitHub traffic. Binding discovery reads the local datastore only,
-one open-PR listing per organization behind a bound target, and adds no
-GitHub request either. While any check is pending, notifications wait and retain
+one paged open-PR listing per bound repository, and adds no GitHub request
+either. While any check is pending, notifications wait and retain
 the last settled state, including when other checks have failed. Unchanged
 settled states deduplicate. A failed CI read keeps the settled baseline and
 queues at most one degraded notice per outage. Reviews use bounded local

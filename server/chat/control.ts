@@ -415,24 +415,26 @@ export async function readWorkMergeWake(target: store.WorkTarget): Promise<Merge
 /** Open pull requests and the issues each closes, as the local datastore
  *  has them; null when the datastore cannot be asked. Local rows only —
  *  the sync owns freshness, and this read adds zero GitHub traffic. */
-export interface OpenPrClosingRefs { repo: string, number: number, url: string, closing: Array<{ repo: string, number: number }>, closesVia: 'closing-references' | 'body-keywords' }
-export interface OpenPrClosingList { prs: OpenPrClosingRefs[], truncated: boolean }
-export async function readOpenPrClosingRefs(org: Organization): Promise<OpenPrClosingList | null> {
+export interface OpenPrClosingRefs { repo: string, number: number, url: string, closing: Array<{ repo: string, number: number }>, closesVia: 'closing-references' | 'body-keywords', closingTruncated: boolean }
+export interface OpenPrClosingList { prs: OpenPrClosingRefs[], truncated: boolean, more: boolean }
+export async function readOpenPrClosingRefs(org: Organization, repo: string, after?: number): Promise<OpenPrClosingList | null> {
   try {
     const { stdout } = await runFile('github-datastore',
-      organizationArgs(org, ['view', 'pr-closing', '--format', 'json']),
+      organizationArgs(org, ['view', 'pr-closing', '--format', 'json', '--repo', repo,
+        ...(after === undefined ? [] : ['--after-number', String(after)])]),
       { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024 })
     const value: unknown = JSON.parse(stdout)
     if (!value || typeof value !== 'object') return null
     const row = value as Record<string, unknown>
-    if (!Array.isArray(row.prs) || row.prs.length > 501 || typeof row.truncated !== 'boolean') return null
+    if (!Array.isArray(row.prs) || row.prs.length > 501 || typeof row.truncated !== 'boolean' || typeof row.more !== 'boolean') return null
     const prs: OpenPrClosingRefs[] = []
     for (const entry of row.prs) {
       if (!entry || typeof entry !== 'object') return null
       const pr = entry as Record<string, unknown>
       if (typeof pr.repo !== 'string' || !pr.repo || typeof pr.number !== 'number' || !Number.isSafeInteger(pr.number) || pr.number <= 0
         || typeof pr.url !== 'string' || !pr.url || !Array.isArray(pr.closing) || pr.closing.length > 100
-        || (pr.closes_via !== 'closing-references' && pr.closes_via !== 'body-keywords')) return null
+        || (pr.closes_via !== 'closing-references' && pr.closes_via !== 'body-keywords')
+        || typeof pr.closing_truncated !== 'boolean') return null
       const closing: OpenPrClosingRefs['closing'] = []
       for (const ref of pr.closing) {
         if (!ref || typeof ref !== 'object') return null
@@ -441,9 +443,9 @@ export async function readOpenPrClosingRefs(org: Organization): Promise<OpenPrCl
           || !Number.isSafeInteger(target.number) || target.number <= 0) return null
         closing.push({ repo: target.repo, number: target.number })
       }
-      prs.push({ repo: pr.repo, number: pr.number, url: pr.url, closing, closesVia: pr.closes_via })
+      prs.push({ repo: pr.repo, number: pr.number, url: pr.url, closing, closesVia: pr.closes_via, closingTruncated: pr.closing_truncated })
     }
-    return { prs, truncated: row.truncated }
+    return { prs, truncated: row.truncated, more: row.more }
   } catch {
     return null
   }
@@ -1185,63 +1187,82 @@ export class ChatControl {
   /** Bind each open PR that closes a bound issue to that issue's chat, so a
    *  chat that opens its PR without calling `bind` still receives its CI,
    *  conflict, behind and review notices. At most once a minute, from local
-   *  datastore rows, one read per organization behind a bound target. Never
-   *  takes a claimed target, never rebinds a released one, never binds to
-   *  a closed or deleted chat, and never guesses between two chats: an
-   *  ambiguous PR stays unbound with one warning. */
+   *  datastore rows, one paged listing per bound repository. Never takes a
+   *  claimed target, never rebinds a released one, never binds to a closed
+   *  or deleted chat, never matches a PR whose closing list is incomplete,
+   *  and never guesses between two chats: an ambiguous PR stays unbound
+   *  with one warning. */
   private async discoverWorkBindings(now: number, current: store.Binding[]): Promise<void> {
     if (now - this.lastDiscovery < DISCOVERY_INTERVAL) return
     const instance = this.runtime.instance
-    const bound = new Set(current.map(binding => binding.target))
-    const issueOwners = new Map<string, string>()
+    if (!current.some(binding => store.workTarget(binding.target).kind === 'issues')) return
+    const repos = new Map<string, Organization>()
     for (const binding of current) {
-      const target = store.workTarget(binding.target)
-      if (target.kind === 'issues') issueOwners.set(target.url, binding.session)
+      const repo = store.workTarget(binding.target).repo
+      if (!repos.has(repo)) {
+        const org = organizationForRepository(repo)
+        if (org) repos.set(repo, org)
+      }
     }
-    if (issueOwners.size === 0) return
-    const orgs = new Map<string, Organization>()
-    for (const binding of current) {
-      const org = organizationForRepository(store.workTarget(binding.target).repo)
-      if (org) orgs.set(org.login.toLowerCase(), org)
-    }
-    if (orgs.size === 0) return
+    if (repos.size === 0) return
     // The window opens only when listings were actually read, so an empty
     // sweep never starves the pass that first has something to discover.
     this.lastDiscovery = now
     const read = this.options.closingRefs ?? readOpenPrClosingRefs
     const ambiguous = new Set<string>()
-    for (const org of orgs.values()) {
-      // The listing is one local read per organization; give requests an
-      // I/O turn between organizations.
-      await setImmediate()
-      if (this.stopped) return
-      let listed: OpenPrClosingList | null
-      try {
-        listed = await read(org)
-      } catch (error) { this.itemFailed('discovery', org.login, error); continue }
-      if (this.stopped) return
-      if (!listed) { this.itemFailed('discovery', org.login, new Error('the open-PR listing could not be read')); continue }
-      if (listed.truncated) this.itemFailed('discovery', org.login, new Error('the open-PR listing was truncated; some PRs were not considered'))
-      for (const pr of listed.prs) {
-        let url: string
+    for (const [repo, org] of repos) {
+      let after: number | undefined
+      for (;;) {
+        // The listing is local reads per repository; give requests an I/O
+        // turn between pages.
+        await setImmediate()
+        if (this.stopped) return
+        let listed: OpenPrClosingList | null
         try {
-          const pull = store.workTarget(pr.url)
-          if (pull.kind !== 'pull') continue
-          url = pull.url
-        } catch { continue }
-        if (bound.has(url)) continue
-        const candidates = new Set<string>()
-        for (const ref of pr.closing) {
-          const owner = issueOwners.get(`https://github.com/${ref.repo.toLowerCase()}/issues/${ref.number}`)
-          if (owner !== undefined) candidates.add(owner)
+          listed = await read(org, repo, after)
+        } catch (error) { this.itemFailed('discovery', repo, error); break }
+        if (this.stopped) return
+        if (!listed) { this.itemFailed('discovery', repo, new Error('the open-PR listing could not be read')); break }
+        if (listed.truncated) this.itemFailed('discovery', repo, new Error('the open-PR listing was truncated; some PRs were not considered'))
+        // Re-snapshot after the read: an issue released and reclaimed while
+        // the listing was in flight resolves to its current owner, and the
+        // match-to-claim below holds no awaits.
+        const fresh = store.bindings(instance)
+        const bound = new Set(fresh.map(binding => binding.target))
+        const issueOwners = new Map<string, string>()
+        for (const binding of fresh) {
+          const target = store.workTarget(binding.target)
+          if (target.kind === 'issues') issueOwners.set(target.url, binding.session)
         }
-        const live = [...candidates].filter(session =>
-          this.runtime.ownsSession(session) && this.runtime.get(session)?.status !== 'closed'
-          && !store.bindingReleased(instance, session, url))
-        if (live.length === 0) continue
-        if (live.length > 1) { ambiguous.add(url); continue }
-        const [session] = live
-        if (session && store.bindWorkAuto(instance, session, url)) bound.add(url)
+        for (const pr of listed.prs) {
+          // An incomplete closing list would misbind where the full list is
+          // ambiguous: only complete evidence claims.
+          if (pr.closingTruncated) continue
+          let url: string
+          try {
+            const pull = store.workTarget(pr.url)
+            if (pull.kind !== 'pull') continue
+            url = pull.url
+          } catch { continue }
+          if (bound.has(url)) continue
+          const candidates = new Set<string>()
+          for (const ref of pr.closing) {
+            const owner = issueOwners.get(`https://github.com/${ref.repo.toLowerCase()}/issues/${ref.number}`)
+            if (owner !== undefined) candidates.add(owner)
+          }
+          const live = [...candidates].filter(session =>
+            this.runtime.ownsSession(session) && this.runtime.get(session)?.status !== 'closed'
+            && !store.bindingReleased(instance, session, url))
+          if (live.length === 0) continue
+          if (live.length > 1) { ambiguous.add(url); continue }
+          const [session] = live
+          if (session && store.bindWorkAuto(instance, session, url)) bound.add(url)
+        }
+        const last = listed.prs.at(-1)?.number
+        // Numbers order within the repository, so the cursor always moves;
+        // a page that makes no progress ends the sweep instead of spinning.
+        if (!listed.more || last === undefined || (after !== undefined && last <= after)) break
+        after = last
       }
     }
     for (const url of ambiguous) {
