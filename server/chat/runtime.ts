@@ -112,10 +112,11 @@ const isSwitchboardChat = (record: SessionRecord): boolean => record.context?.ki
 export const DEFAULT_IDLE_TIMEOUT_MINUTES = 120
 export const DEFAULT_BRANCH_PREFIX = 'chat/'
 export const DEFAULT_MAX_CONCURRENT_LOCAL_TURNS = DEFAULT_CHECK_SLOT_CAP
-/** Consecutive repeated no-op tool completions that end a worker turn:
- *  the same command with the same result, no edits and no diffs. A result
- *  that changes (CI pending → success) or any edit resets the streak, so
- *  ordinary waits survive while an identical poll loop is cut. */
+/** Consecutive unchanged tool completions that end a worker turn: each
+ *  command returning what it returned last time, no edits and no diffs. A
+ *  new command, a changed result (CI pending → success) or any edit resets
+ *  the streak, so ordinary waits — and outputs alternating between states
+ *  — survive while an identical poll loop is cut. */
 const WORKER_NOOP_REPEAT_LIMIT = 20
 const STOP_SETTLE_MS = 2_000
 const CLOSE_GRACE_MS = 5_000
@@ -167,9 +168,9 @@ interface RunningTurn {
   /** Set when a guard ends the turn: it settles as end_turn with the
    *  reason recorded, never as a stop by anyone. */
   guardEnd?: string
-  /** No-op loop tracking for worker turns: open tools by id, fingerprints
-   *  completed before, and the current consecutive-repeat streak. */
-  noOp?: { open: Map<string, { kind: ToolKind, title: string }>, seen: Set<string>, repeats: number }
+  /** No-op loop tracking for worker turns: open tools by id, the last
+   *  result hash per command, and the current consecutive-unchanged streak. */
+  noOp?: { open: Map<string, { kind: ToolKind, title: string, input?: unknown }>, lastOutput: Map<string, string>, repeats: number }
   /** Set when the turn must end as an error (mirror failure, lost lease, forced stop). */
   failure?: string
   /** The one implementing turn of a `/poise` change: its settlement is the
@@ -964,7 +965,7 @@ export class ChatRuntime extends EventEmitter {
     // An adopted turn's pre-restart relay and agent retire at this idle
     // boundary: no old-release relay outlives its adoption, and the next
     // prompt starts a fresh relay from this release, resuming natively.
-    if (turn.adoptedRelay === true || turn.stopping || result.terminate === true || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
+    if (turn.adoptedRelay === true || turn.stopping || result.terminate === true || turn.guardEnd !== undefined || (session.adapter && !session.adapter.alive) || (session.relay && !session.relay.healthy)) {
       try { await this.stopProcess(session) } catch { freed = false }
     }
     session.draining = true
@@ -3488,7 +3489,9 @@ export class ChatRuntime extends EventEmitter {
       // worker group: the agent's acknowledgement ends the turn, but only a
       // verified-dead group proves its shells, test runners and sleeps went
       // with it. The next prompt resumes the native session in a fresh group.
-      if (turn.stopping || terminate || (agentInvoked && session.adapter && (!agentSettled || !session.adapter.alive)) || (session.relay && !session.relay.healthy)) {
+      // A guard end recycles its worker group like a stop: the turn ended
+      // without the runtime verifying the native turn is gone.
+      if (turn.stopping || terminate || turn.guardEnd !== undefined || (agentInvoked && session.adapter && (!agentSettled || !session.adapter.alive)) || (session.relay && !session.relay.healthy)) {
         try { await this.stopProcess(session) } catch { freed = false }
       }
       session.draining = true
@@ -4532,34 +4535,43 @@ export class ChatRuntime extends EventEmitter {
     this.emit('log', `[chat ${session.record.id.slice(0, 8)}] ${note}`)
   }
 
-  /** A completed tool's identity for the no-op guard: kind, title, status
-   *  and a hash of the result text. Byte-identical by design: a result that
-   *  changes (CI pending → success) is new work, while a volatile output
-   *  (ticking durations) fails open — the guard does not fire on it. */
-  private toolFingerprint(kind: ToolKind, title: string, event: Extract<ChatEvent, { type: 'tool.finished' }>): string {
+  /** Command identity for the no-op guard: kind, title and input. Titles
+   *  can be truncated (Claude caps Bash titles at 200 characters), so the
+   *  input carries what the title drops. */
+  private noOpCommand(kind: ToolKind, title: string, input: unknown): string {
+    const args = input === undefined ? '' : createHash('sha256').update(JSON.stringify(input) ?? '').digest('hex')
+    return [kind, title, args].join(' ')
+  }
+
+  /** A completed tool's result hash: status and result text. Byte-identical
+   *  by design: a result that changes (CI pending → success) is new work,
+   *  while a volatile output (ticking durations) fails open — the guard
+   *  does not fire on it. */
+  private noOpOutput(event: Extract<ChatEvent, { type: 'tool.finished' }>): string {
     const parts: string[] = []
     for (const block of event.content ?? []) {
       if (block.type === 'terminal') parts.push(`terminal:${block.exitCode ?? ''}:${block.text}`)
       else if (block.type === 'text') parts.push(`text:${block.text}`)
       else parts.push(`diff:${block.path}:${block.oldText}:${block.newText}`)
     }
-    return `${kind}\0${title}\0${event.status}\0${createHash('sha256').update(parts.join('\n')).digest('hex')}`
+    return `${event.status} ${createHash('sha256').update(parts.join(' ')).digest('hex')}`
   }
 
   /** End a worker turn stuck polling the same no-op checks: consecutive
-   *  completions whose fingerprint was seen before, with no edits and no
-   *  diffs. The turn settles as end_turn with the reason recorded — the
-   *  model has nothing left but waiting, and Poise wakes it on change. */
+   *  completions where each command returns what it returned last time,
+   *  with no edits and no diffs. The turn settles as end_turn with the
+   *  reason recorded — the model has nothing left but waiting, and Poise
+   *  wakes it on change. */
   private noOpGuard(sessionId: string, event: ChatEvent): void {
     if (event.type !== 'tool.started' && event.type !== 'tool.finished' && event.type !== 'diff') return
     const session = this.live.get(sessionId)
     if (!session || session.record.role !== 'worker') return
     const turn = session.turn
     if (!turn || turn.id !== event.turnId || turn.stopping || turn.abort.signal.aborted || turn.guardEnd) return
-    const state = turn.noOp ??= { open: new Map(), seen: new Set(), repeats: 0 }
+    const state = turn.noOp ??= { open: new Map(), lastOutput: new Map(), repeats: 0 }
     if (event.type === 'diff') { state.repeats = 0; return }
     if (event.type === 'tool.started') {
-      state.open.set(event.id, { kind: event.kind, title: event.title })
+      state.open.set(event.id, { kind: event.kind, title: event.title, ...(event.input === undefined ? {} : { input: event.input }) })
       if (event.kind === 'edit') state.repeats = 0
       return
     }
@@ -4567,9 +4579,13 @@ export class ChatRuntime extends EventEmitter {
     state.open.delete(event.id)
     const kind = open?.kind ?? 'other'
     if (kind === 'edit') { state.repeats = 0; return }
-    const fingerprint = this.toolFingerprint(kind, open?.title ?? '', event)
-    if (!state.seen.has(fingerprint)) {
-      state.seen.add(fingerprint)
+    // Unchanged is per command: the same check returning what it returned
+    // last time. A new command or a changed result is activity, so an
+    // alternation between two outputs never trips.
+    const command = this.noOpCommand(kind, open?.title ?? '', open?.input)
+    const output = this.noOpOutput(event)
+    if (state.lastOutput.get(command) !== output) {
+      state.lastOutput.set(command, output)
       state.repeats = 0
       return
     }
@@ -4580,6 +4596,19 @@ export class ChatRuntime extends EventEmitter {
     this.recordTurnNote(session, turn, reason, { repeats: state.repeats })
     turn.abort.abort()
     void session.adapter?.cancel().catch(() => undefined)
+    void this.guardWatchdog(session, turn)
+  }
+
+  /** If a guard-ended turn does not settle — a lost interrupt leaves the
+   *  prompt pending — its worker group is terminated like any stopped
+   *  turn, so a hung cancel cannot hold the check slot. Never touches a
+   *  replacement turn. */
+  private async guardWatchdog(session: LiveSession, turn: RunningTurn): Promise<void> {
+    if (await this.waitForTurnEnd(session, turn, STOP_SETTLE_MS)) return
+    if (session.turn !== turn) return
+    await this.stopProcess(session).catch(() => undefined)
+    if (await this.waitForTurnEnd(session, turn, CLOSE_GRACE_MS * 2)) return
+    this.emit('log', `[chat ${session.record.id.slice(0, 8)}] guard-ended turn ${turn.id.slice(0, 8)} did not settle after its worker group was terminated`)
   }
 
   /** Append to the mirror, then broadcast. Throws when the mirror cannot be

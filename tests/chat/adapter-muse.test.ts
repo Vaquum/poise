@@ -260,6 +260,7 @@ describe('Muse adapter', () => {
     // The model ended its work; the turn ends as end_turn with the reason,
     // never as a stop — and far short of the fake's five unguarded cycles.
     expect(result.stopReason).toBe('end_turn')
+    expect(result.terminate).toBe(true)
     expect(result.note).toMatch(/goal-reminder/)
     // Bounded: at most the polls of the two allowed foreground rounds, never
     // the fake's five unguarded cycles. (Whether the second poll's start or
@@ -272,6 +273,18 @@ describe('Muse adapter', () => {
     const second = await adapter.prompt('turn-2', prompt('echo-input after guard'), new AbortController().signal)
     expect(second.stopReason).toBe('end_turn')
     expect(host.logs.join('\n')).not.toMatch(/queued the turn behind another one/)
+  })
+
+  it('reports steers a guard interrupt reclaims so the runtime requeues them', async () => {
+    const { host, adapter } = setup(['--hold-reminder-loop'])
+    await adapter.start({ ...MODEL, worker: true })
+    const turn = adapter.prompt('turn-1', prompt('reminder-loop'), new AbortController().signal)
+    await host.waitFor((event) => event.type === 'tool.started')
+    await adapter.steer('also check the reviews', { correlationId: 'corr-1' })
+    const result = await turn
+    expect(result.stopReason).toBe('end_turn')
+    expect(result.terminate).toBe(true)
+    expect(result.unrunSteers).toEqual(['corr-1'])
   })
 
   it('lets blocking reminders resume a turn outside a worker chat', async () => {

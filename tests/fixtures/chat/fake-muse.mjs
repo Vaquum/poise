@@ -308,6 +308,9 @@ function scripted() {
         await sleep(5)
         if (turn.interrupted) break
         item('item/completed', { itemId: pollId, kind: 'toolCall', revision: 2, status: 'completed', tool: 'bash', callId: pollId, args: pollArgs, visibleOutput: output })
+        // `--hold-reminder-loop` pauses after the first cycle until a steer
+        // (or the interrupt) arrives, so a test can steer deterministically.
+        if (process.argv.includes('--hold-reminder-loop') && cycle === 0 && !turn.interrupted) await waitFor(() => turn.steered.length > 0)
       }
       if (turn.interrupted) writeFileSync('reminder-interrupted', 'yes')
       await completeTurn(turn.interrupted ? 'cancelled' : 'completed')

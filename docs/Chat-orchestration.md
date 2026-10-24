@@ -203,9 +203,11 @@ diagnostic — never as anyone's stop, so the queue advances and no hold is set:
   finished native turn once — the useful case is `verify-reminder` catching an
   unverified "done". The second resumption ends the Poise turn and interrupts
   the native turn, so the next wake starts instead of queueing behind it.
-- A turn that repeats the same no-op checks 20 times in a row — the same
-  command with an unchanged result, no edits and no diffs — is ended. A
-  changed result or any edit resets the streak, so ordinary waits survive.
+- A turn that repeats the same no-op checks 20 times in a row — each
+  command returning what it returned last time, no edits and no diffs — is
+  ended, and its worker group is recycled like a stopped turn. A new command,
+  a changed result or any edit resets the streak, so ordinary waits — and
+  outputs alternating between states — survive.
 
 ## Workspace Manager
 

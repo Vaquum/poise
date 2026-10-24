@@ -925,10 +925,16 @@ export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: 
         ? `${LABEL}: foreground completed on ${view.turnId}, held open by ${held} (${seen.count}/${WORKER_FOREGROUND_COMPLETION_LIMIT})`
         : `${LABEL}: foreground completed on ${view.turnId}, held open by ${held}`)
       if (!workerSession || seen.count < WORKER_FOREGROUND_COMPLETION_LIMIT) return
+      // Steers the interrupt reclaims never run: report them so the
+      // runtime requeues their text instead of losing accepted messages.
+      const unrun = [...turn.steers.values()].filter((id): id is string => !!id)
       // The interrupt first: its send is deferred, and a finished turn
       // would skip it as done.
       void interrupt(turn)
-      finish(turn, { stopReason: 'end_turn',
+      // Terminate: the Poise turn ends without waiting for native
+      // completion, so the runtime verifies the worker group dead before
+      // the checkout lease is released.
+      finish(turn, { stopReason: 'end_turn', terminate: true, ...(unrun.length ? { unrunSteers: unrun } : {}),
         note: `Muse blocking reminders (${held}) resumed the finished turn; Poise ended it after ${seen.count - 1} allowed continuation. The turn resumes on its next wake.` })
     })
 
