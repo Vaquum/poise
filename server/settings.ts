@@ -37,6 +37,7 @@ export interface Settings {
   models: ModelSettings
   chat: ChatSettings
   notifications: NotificationSettings
+  manager: ManagerSettings
 }
 
 // Chat v1 (server/chat): the prefix of branches new sessions cut from the
@@ -123,6 +124,87 @@ function validateNotificationSettings(value: unknown): NotificationSettings {
   return { enabled }
 }
 
+// The Manager controls (General pane): how the workspace Manager works.
+// Rhythm is its concurrent slots, Stability and Autonomy are five-position
+// scales, scope is the repositories it may bind (null: every followed one),
+// and paused holds new work. Version counts the changes and serves as the
+// policy version the turns carry.
+export const MANAGER_STABILITY = ['Stability', 'Lean to stability', 'Balanced', 'Lean to expansion', 'Full expansion'] as const
+export type ManagerStability = typeof MANAGER_STABILITY[number]
+export const MANAGER_AUTONOMY = ['Ask first', 'Ask on judgement calls', 'Balanced', 'Ask on the irreversible', 'Standing instructions'] as const
+export type ManagerAutonomy = typeof MANAGER_AUTONOMY[number]
+
+export interface ManagerSettings {
+  rhythm: number
+  stability: ManagerStability
+  autonomy: ManagerAutonomy
+  scope: string[] | null
+  paused: boolean
+  version: number
+}
+
+export const DEFAULT_MANAGER_SETTINGS: ManagerSettings = { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 0 }
+const MANAGER_REPO = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/
+
+export function getManagerSettings(): ManagerSettings {
+  const raw = getMeta('manager_settings')
+  if (!raw) return { ...DEFAULT_MANAGER_SETTINGS }
+  try {
+    const parsed = JSON.parse(raw) as Partial<ManagerSettings>
+    return {
+      rhythm: Number.isSafeInteger(parsed.rhythm) && Number(parsed.rhythm) >= 1 && Number(parsed.rhythm) <= 10 ? Number(parsed.rhythm) : DEFAULT_MANAGER_SETTINGS.rhythm,
+      stability: typeof parsed.stability === 'string' && (MANAGER_STABILITY as readonly string[]).includes(parsed.stability) ? parsed.stability : DEFAULT_MANAGER_SETTINGS.stability,
+      autonomy: typeof parsed.autonomy === 'string' && (MANAGER_AUTONOMY as readonly string[]).includes(parsed.autonomy) ? parsed.autonomy : DEFAULT_MANAGER_SETTINGS.autonomy,
+      scope: parsed.scope === null || parsed.scope === undefined ? null
+        : Array.isArray(parsed.scope) && parsed.scope.every((repo) => typeof repo === 'string' && MANAGER_REPO.test(repo)) ? [...parsed.scope] : null,
+      paused: typeof parsed.paused === 'boolean' ? parsed.paused : DEFAULT_MANAGER_SETTINGS.paused,
+      version: Number.isSafeInteger(parsed.version) && Number(parsed.version) >= 0 ? Number(parsed.version) : 0,
+    }
+  } catch {
+    return { ...DEFAULT_MANAGER_SETTINGS }
+  }
+}
+
+function validateManagerSettings(value: unknown): ManagerSettings {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('manager settings must be an object')
+  const current = getManagerSettings()
+  const input = value as Record<string, unknown>
+  const next = { ...current, version: current.version }
+  if ('rhythm' in input) {
+    const rhythm = Number(input.rhythm)
+    if (!Number.isSafeInteger(rhythm) || rhythm < 1 || rhythm > 10) throw new Error('rhythm must be a whole number of Manager slots between 1 and 10')
+    next.rhythm = rhythm
+  }
+  if ('stability' in input) {
+    const stability = input.stability
+    if (typeof stability !== 'string' || !(MANAGER_STABILITY as readonly string[]).includes(stability)) {
+      throw new Error(`stability must be one of: ${MANAGER_STABILITY.join(', ')}`)
+    }
+    next.stability = stability as (typeof MANAGER_STABILITY)[number]
+  }
+  if ('autonomy' in input) {
+    const autonomy = input.autonomy
+    if (typeof autonomy !== 'string' || !(MANAGER_AUTONOMY as readonly string[]).includes(autonomy)) {
+      throw new Error(`autonomy must be one of: ${MANAGER_AUTONOMY.join(', ')}`)
+    }
+    next.autonomy = autonomy as (typeof MANAGER_AUTONOMY)[number]
+  }
+  if ('scope' in input) {
+    if (input.scope !== null && (!Array.isArray(input.scope) || !input.scope.every((repo) => typeof repo === 'string' && MANAGER_REPO.test(repo)))) {
+      throw new Error('scope must be null or a list of repositories like owner/name')
+    }
+    next.scope = input.scope === null ? null : [...(input.scope as string[])]
+  }
+  if ('paused' in input) {
+    if (typeof input.paused !== 'boolean') throw new Error('paused must be true or false')
+    next.paused = input.paused
+  }
+  const { version: _before, ...before } = current
+  const { version: _after, ...after } = next
+  if (JSON.stringify(before) !== JSON.stringify(after)) next.version = current.version + 1
+  return next
+}
+
 const TEXT_KEYS = ['org', 'me', 'agentAccount', 'timezone'] as const
 const ACCOUNT_KEYS: ReadonlySet<string> = new Set(['org', 'me', 'agentAccount'])
 
@@ -164,6 +246,7 @@ export function getSettings(): Settings {
     models: getModelSettings(),
     chat: getChatSettings(),
     notifications: getNotificationSettings(),
+    manager: getManagerSettings(),
   }
 }
 
@@ -204,6 +287,8 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
   if ('chat' in partial && partial.chat !== undefined) chat = validateChatSettings(partial.chat)
   let notifications: NotificationSettings | undefined
   if ('notifications' in partial && partial.notifications !== undefined) notifications = validateNotificationSettings(partial.notifications)
+  let manager: ManagerSettings | undefined
+  if ('manager' in partial && partial.manager !== undefined) manager = validateManagerSettings(partial.manager)
   const orgChanged = typeof next.org === 'string' && next.org !== (getMeta('org') || '')
   for (const k of TEXT_KEYS) {
     const v = next[k]
@@ -212,6 +297,7 @@ export function setSettings(partial: Partial<Settings>, catalog?: Catalog): Sett
   if (models) setMeta('models', JSON.stringify(models))
   if (chat) setMeta('chat_settings', JSON.stringify(chat))
   if (notifications) setMeta('notification_settings', JSON.stringify(notifications))
+  if (manager) setMeta('manager_settings', JSON.stringify(manager))
   if (orgChanged) invalidateRepoListCache()
   return getSettings()
 }

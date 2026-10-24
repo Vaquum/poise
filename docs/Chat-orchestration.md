@@ -221,16 +221,31 @@ is, and an existing `/manager` is never replaced. It holds up to 64 KiB. In
 any other chat, `/manager` is not supported.
 
 Every Manager turn carries the current text at the end of its control
-context, as the authorization for turns the person did not start. When the
-person's direct request, the charter and Memories conflict, that is also
-their precedence: the person's request first, then the charter, then
+context, as the authorization for turns the person did not start. Above the
+charter rides the effective policy: the Manager controls with their wording
+and the policy version (below). When the person's direct request, the
+controls, the charter and Memories conflict, that is also their precedence:
+the person's request first, then the controls, then the charter, then
 Memories. On a turn the person started, the native prompt runs Auto-merge
 mode text when set, `[User request]` when set, the control context, the
-charter block, `[Request]` with the request, then `[Memories]`; on a turn a
-chat, Poise or a timer started, the same without `[User request]`. An edit
-applies from the next turn; it does not clear the Manager's native history,
-so the block states the current revision supersedes earlier ones, and
-`/reset` gives a clean context.
+policy block, the charter block, `[Request]` with the request, then
+`[Memories]`; on a turn a chat, Poise or a timer started, the same without
+`[User request]`. An edit applies from the next turn; it does not clear the
+Manager's native history, so the block states the current revision
+supersedes earlier ones, and `/reset` gives a clean context.
+
+**Manager controls.** Settings (General pane) holds how the Manager works:
+Rhythm (its concurrent slots, 1 to 10), Stability and Autonomy (five
+positions each, with the wording the turn carries), scope (the repositories
+it may bind, or every followed one when null), and paused. Every change bumps
+a version counter, and every Manager turn — and every turn of a worker the
+Manager created — carries the settings, the wording and the version as its
+effective policy, above the charter. The controls and the chat turn limit
+(`chat.maxConcurrentLocalTurns`) are person-only: saves containing them are
+refused without the person's authority, before anything is stored, while
+saves of other fields keep working for every caller. The shipped `/manager`
+default defers to the controls; an existing charter is never replaced, so a
+person who wrote their own keeps it word for word.
 
 The charter rides on every Manager turn, up to 64 KiB of input each time,
 and its `;manager` trigger also expands wherever Espanso runs, including

@@ -552,6 +552,14 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         if (url.startsWith('/api/settings') && req.method === 'POST') {
           try {
             const body = await readJson<any>(req)
+            // Person-only, checked before any state changes: the Manager
+            // controls and the local turn limit. Saves of other fields keep
+            // working for every caller.
+            const touchesManagerControls = body !== null && typeof body === 'object' && !Array.isArray(body)
+              && ('manager' in body || (typeof body.chat === 'object' && body.chat !== null && 'maxConcurrentLocalTurns' in body.chat))
+            if (touchesManagerControls && !speaksForPerson(req, !!service, authority)) {
+              return json(res, 403, { error: 'The Manager controls and the local turn limit are the person\'s: change them in the browser.', code: 'invalid' })
+            }
             const catalog = body && typeof body === 'object' && 'models' in body ? await loadCatalog() : undefined
             if (typeof body?.org === 'string' && body.org.trim() !== getSettings().org) {
               return json(res, 400, { error: 'Add GitHub accounts through account setup.' })

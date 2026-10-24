@@ -11,6 +11,7 @@ import { diagnostic } from '../logging'
 import { releaseBackgroundPaused, releaseSwitchPending, trackReleaseBackground } from '../release-background'
 import { POISE_ROOT } from './local-workspace'
 import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
+import { managerPolicyBlock } from './manager-policy'
 import { WORKER_SNIPPET_DEFAULT } from './worker-default'
 import { ensureSnippetSwitch, readSwitch } from '../snippet-library'
 import { MANAGER_SWITCH, WORKER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '../../src/chat-switches'
@@ -721,7 +722,15 @@ export class ChatControl {
       'You can set timers on any chat, including yourself (timer, timers, cancelTimer, rearmTimer). Each wake-up is a model turn: at most 5 timers per chat, each at most every 5 minutes. Timer text is delivered as your message, never as the person\'s. A chat the person holds takes no timer turns until the person resumes it.',
     )
     if (record.role !== 'manager' && record.role !== 'worker') return guidance.join('\n')
+    if (record.role === 'manager' || this.createdByManager(id)) guidance.push(managerPolicyBlock())
     return `${guidance.join('\n')}\n${await this.charter(record.role)}`
+  }
+
+  /** Whether the chat is a worker the workspace Manager created: its turns
+   *  run under the Manager's effective policy. */
+  private createdByManager(id: string): boolean {
+    const entry = store.children(this.runtime.instance).find((child) => child.child === id)
+    return !!entry && this.runtime.get(entry.manager)?.role === 'manager'
   }
 
   /** A Manager's or worker's standing instructions: the current charter text,
