@@ -2,11 +2,14 @@ import { spawnSync } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { CheckoutLease } from '../../server/chat/checkout-lock'
 import { CLIENT_FILE_MAX_BYTES, readCheckoutTextFile, writeCheckoutTextFile } from '../../server/chat/client-fs'
 import { branchExists, branchTip, checkpoint, createBranch, deleteBranch, inspectCheckout, resolveInsideCheckout, revertDiff, switchBranch } from '../../server/chat/git'
 
+// The branch cases run dozens of git processes each, and under suite load
+// their starts can stall past the global 10 s: each case and hook gets 25 s.
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 let root = ''
 let checkout = ''
 let outside = ''
@@ -182,4 +185,9 @@ describe('revert', () => {
     const released = new CheckoutLease(checkout, { ownerKind: 'poise:chat', ownerId: 'x', ownerLabel: 'x', instance: 'test' })
     await expect(revertDiff(released, checkout, { path: 'src/a.txt', oldText: 'a', newText: 'alpha\n', oldExists: true, newExists: true })).rejects.toMatchObject({ code: 'conflict' })
   })
+})
+
+it('gives every case 25 s instead of the global 10 s', ({ task }) => {
+  const cases = (tasks: RunnerTask[]): RunnerTestCase[] => tasks.flatMap(t => t.type === 'test' ? [t] : cases(t.tasks))
+  expect(cases(task.file.tasks).filter(t => t.timeout !== 25_000).map(t => t.fullTestName)).toEqual([])
 })

@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
@@ -108,8 +108,14 @@ async function withinReadiness<T>(pending: Promise<T>, label: string, budget: Re
   }
   finally { clearTimeout(timer); budget.signal.removeEventListener('abort', abort) }
 }
+// Every case drives the real Chat runtime through real git and SQLite
+// lifecycles, and under suite load one of their steps can stall past eight
+// seconds: each unbudgeted readiness wait gets 20 s, and each case and hook
+// at least 25 s, instead of vitest's global 10 s. Budgeted waits share their
+// case's larger ceiling.
+vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 async function until(check: () => boolean, label: string, budget?: ReadinessBudget) {
-  const deadline = budget?.deadline ?? Date.now() + 8000
+  const deadline = budget?.deadline ?? Date.now() + 20_000
   const healthy = (): void => {
     if (!budget) return
     budget.signal.throwIfAborted()
@@ -983,4 +989,9 @@ describe('notifications', () => {
     producers.chatTurnFinished({ sessionId: randomUUID(), agent: 'Muse', title: 'Manager' }, turn('other', 'end_turn'))
     expect(keys()).toEqual([`chat-turn-finished:failed-${instance}`, `chat-turn-finished:other-${instance}`])
   })
+})
+
+it('gives every case at least 25 s instead of the global 10 s', ({ task }) => {
+  const cases = (tasks: RunnerTask[]): RunnerTestCase[] => tasks.flatMap(t => t.type === 'test' ? [t] : cases(t.tasks))
+  expect(cases(task.file.tasks).filter(t => t.timeout < 25_000).map(t => t.fullTestName)).toEqual([])
 })
