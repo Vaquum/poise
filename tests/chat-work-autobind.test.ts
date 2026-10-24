@@ -66,7 +66,7 @@ async function observeReviews(target: string): Promise<void> {
 }
 async function config(id: string) {
   const context = await control.context(id)
-  const path = /"([^"\\n]+\.json)"/.exec(context)?.[1]
+  const path = /"([^"\n]+\.json)"/.exec(context)?.[1]
   if (!path) throw new Error('native control connection missing')
   return { path, ...JSON.parse(await readFile(path, 'utf8')) as { token: string, sessionId: string, origin: string } }
 }
@@ -94,6 +94,8 @@ function makeRuntime() {
 function seedAcme() {
   database.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
     VALUES ('acme', ?, 1, 'ready', 'ready', ?)`).run(join(root, 'acme.sqlite'), 'fixture-agent')
+  // A managed org reads ready only when its indexed user is the current me.
+  database.setMeta('me', 'fixture-agent')
 }
 
 beforeAll(async () => {
@@ -136,6 +138,7 @@ afterEach(async () => {
   await runtime?.stop()
   await new Promise<void>(done => server.close(() => done()))
   database.db.prepare('DELETE FROM organizations WHERE login = ?').run('acme')
+  database.setMeta('me', '')
 })
 afterAll(async () => { database.closeDatabase(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }) })
 
@@ -158,9 +161,13 @@ describe('automatic PR binding through closing references', () => {
     await command(worker, { operation: 'bind', target: ISSUE })
     closingRefs.mockResolvedValue(listingFor(7))
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
+    // Past any window a 1s interval tick burned while setup was slow.
+    clock += 61_000
     await control.tick()
     await until(() => prompts.has(worker))
     expect(prompts.get(worker)).toHaveLength(1)
+    // Delivery starts the task turn before the background pass discovers.
+    await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(worker)
     expect(store.bindings(runtime.instance).find(b => b.target === ISSUE)?.session).toBe(worker)
     finishes.get(worker)!({ stopReason: 'end_turn' })
@@ -174,6 +181,7 @@ describe('automatic PR binding through closing references', () => {
     await command(parent.id, { operation: 'bind', target: ISSUE })
     closingRefs.mockResolvedValue(listingFor(7))
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [], mergeable: false, mergeableState: 'dirty', author: 'other', draft: false, base: 'main' })
+    clock += 61_000
     await observeMerge(PR)
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(parent.id)
     expect(store.inbox(runtime.instance, parent.id).some(m => JSON.parse(m.body).kind === 'merge')).toBe(true)
@@ -194,8 +202,10 @@ describe('automatic PR binding through closing references', () => {
     await command(second.id, { operation: 'bind', target: PR })
     await command(first.id, { operation: 'bind', target: ISSUE })
     closingRefs.mockResolvedValue(listingFor(7))
+    const listed = closingRefs.mock.calls.length
+    clock += 61_000
     await control.tick()
-    await until(() => closingRefs.mock.calls.length > 0)
+    await until(() => closingRefs.mock.calls.length > listed)
     await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`)?.checked_at === clock)
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(second.id)
   })
@@ -204,13 +214,15 @@ describe('automatic PR binding through closing references', () => {
     const parent = await manager()
     await command(parent.id, { operation: 'bind', target: ISSUE })
     closingRefs.mockResolvedValue(listingFor(7))
+    clock += 61_000
     await control.tick()
     await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
     await command(parent.id, { operation: 'unbind', target: PR })
     expect(store.bindingReleased(runtime.instance, parent.id, PR)).toBe(true)
+    const listed = closingRefs.mock.calls.length
     clock += 61_000
     await control.tick()
-    await until(() => closingRefs.mock.calls.length > 1)
+    await until(() => closingRefs.mock.calls.length > listed)
     await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`)?.checked_at === clock)
     expect(store.bindings(runtime.instance).some(b => b.target === PR)).toBe(false)
     await command(parent.id, { operation: 'bind', target: PR })
@@ -222,17 +234,20 @@ describe('automatic PR binding through closing references', () => {
     await manager()
     store.bindWork(runtime.instance, randomUUID(), ISSUE)
     closingRefs.mockResolvedValue(listingFor(7))
+    const listed = closingRefs.mock.calls.length
+    clock += 61_000
     await control.tick()
-    await until(() => closingRefs.mock.calls.length > 0)
+    await until(() => closingRefs.mock.calls.length > listed)
     expect(store.bindings(runtime.instance).some(b => b.target === PR)).toBe(false)
     const worker = await manager()
     await command(worker.id, { operation: 'bind', target: 'https://github.com/acme/app/issues/8' })
     await runtime.close(worker.id)
     store.bindWork(runtime.instance, worker.id, 'https://github.com/acme/app/issues/8')
     closingRefs.mockResolvedValue(listingFor(8))
+    const relisted = closingRefs.mock.calls.length
     clock += 61_000
     await control.tick()
-    await until(() => closingRefs.mock.calls.length > 1)
+    await until(() => closingRefs.mock.calls.length > relisted)
     expect(store.bindings(runtime.instance).some(b => b.target === PR)).toBe(false)
   })
 
@@ -242,8 +257,10 @@ describe('automatic PR binding through closing references', () => {
     await command(second.id, { operation: 'bind', target: 'https://github.com/acme/app/issues/8' })
     closingRefs.mockResolvedValue({ prs: [{ repo: 'acme/app', number: 12, url: PR,
       closing: [{ repo: 'acme/app', number: 7 }, { repo: 'acme/app', number: 8 }], closesVia: 'closing-references' }], truncated: false })
+    const listed = closingRefs.mock.calls.length
+    clock += 61_000
     await control.tick()
-    await until(() => closingRefs.mock.calls.length > 0)
+    await until(() => closingRefs.mock.calls.length > listed)
     await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`)?.checked_at === clock)
     expect(store.bindings(runtime.instance).some(b => b.target === PR)).toBe(false)
   })
@@ -251,9 +268,12 @@ describe('automatic PR binding through closing references', () => {
   it('discovers a PR that appears after a failed or empty listing', async () => {
     const parent = await manager()
     await command(parent.id, { operation: 'bind', target: ISSUE })
-    closingRefs.mockResolvedValueOnce(null)
+    closingRefs.mockResolvedValue(null)
+    const listed = closingRefs.mock.calls.length
+    clock += 61_000
     await control.tick()
-    await until(() => closingRefs.mock.calls.length === 1)
+    await until(() => closingRefs.mock.calls.length > listed)
+    await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`)?.checked_at === clock)
     expect(store.bindings(runtime.instance).some(b => b.target === PR)).toBe(false)
     closingRefs.mockResolvedValue(listingFor(7))
     clock += 61_000
@@ -265,17 +285,21 @@ describe('automatic PR binding through closing references', () => {
   it('reads one local listing per organization per minute and nothing else', async () => {
     const parent = await manager()
     await command(parent.id, { operation: 'bind', target: ISSUE })
+    const listed = closingRefs.mock.calls.length
+    clock += 61_000
     await control.tick()
-    await until(() => closingRefs.mock.calls.length > 0)
+    await until(() => closingRefs.mock.calls.length > listed)
     await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`)?.checked_at === clock)
-    expect(closingRefs.mock.calls).toHaveLength(1)
-    expect(closingRefs.mock.calls[0]?.[0]).toMatchObject({ login: 'acme' })
+    const calls = closingRefs.mock.calls.length
+    expect(closingRefs.mock.calls[calls - 1]?.[0]).toMatchObject({ login: 'acme' })
     expect(ci).not.toHaveBeenCalled()
     expect(targetStatus).not.toHaveBeenCalled()
     expect(reviews).not.toHaveBeenCalled()
+    // A new pass inside the same window observes again but lists nothing.
+    clock += 1_000
     await control.tick()
-    await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`) !== undefined)
-    expect(closingRefs.mock.calls).toHaveLength(1)
+    await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`)?.checked_at === clock)
+    expect(closingRefs.mock.calls.length).toBe(calls)
   })
 
   it('keeps created_at and baselines on repeated discovery', async () => {
@@ -283,13 +307,15 @@ describe('automatic PR binding through closing references', () => {
     await command(parent.id, { operation: 'bind', target: ISSUE })
     closingRefs.mockResolvedValue(listingFor(7))
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
+    clock += 61_000
     await control.tick()
     await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
     await until(() => store.inbox(runtime.instance, parent.id).length === 1)
     const created = store.bindings(runtime.instance).find(b => b.target === PR)?.created_at
+    const listed = closingRefs.mock.calls.length
     clock += 61_000
     await control.tick()
-    await until(() => closingRefs.mock.calls.length > 1)
+    await until(() => closingRefs.mock.calls.length > listed)
     clock += 5 * 60_000
     await control.tick()
     await until(() => store.observation(runtime.instance, `ci:${PR}`)?.checked_at === clock)
@@ -304,6 +330,7 @@ describe('automatic PR binding through closing references', () => {
     if (!model) throw new Error('fixture lacks grok')
     const second = await runtime.handoff(first.id, { agent: 'grok', model: model.identity })
     closingRefs.mockResolvedValue(listingFor(7))
+    clock += 61_000
     await control.tick()
     await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(second.id)

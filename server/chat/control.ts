@@ -1191,7 +1191,6 @@ export class ChatControl {
    *  ambiguous PR stays unbound with one warning. */
   private async discoverWorkBindings(now: number): Promise<void> {
     if (now - this.lastDiscovery < DISCOVERY_INTERVAL) return
-    this.lastDiscovery = now
     const instance = this.runtime.instance
     const current = store.bindings(instance)
     const bound = new Set(current.map(binding => binding.target))
@@ -1206,6 +1205,10 @@ export class ChatControl {
       const org = organizationForRepository(store.workTarget(binding.target).repo)
       if (org) orgs.set(org.login.toLowerCase(), org)
     }
+    if (orgs.size === 0) return
+    // The window opens only when listings were actually read, so an empty
+    // sweep never starves the pass that first has something to discover.
+    this.lastDiscovery = now
     const read = this.options.closingRefs ?? readOpenPrClosingRefs
     const ambiguous = new Set<string>()
     for (const org of orgs.values()) {
