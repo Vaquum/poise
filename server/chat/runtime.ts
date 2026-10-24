@@ -131,6 +131,10 @@ const MAX_DISCOVERY_ENTRIES = 100_000
  *  arrive slowly. A single hung filesystem call still blocks past it;
  *  the bound covers the scan's total, not one call. */
 const DISCOVERY_DEADLINE_MS = 10_000
+/** Bytes kept per recorded unscannable path: twenty deep paths are named
+ *  in full when short, and keep their distinguishing tails when long, so
+ *  the wake notice always fits the inbox bound. */
+const MAX_UNREADABLE_PATH_BYTES = 200
 /** Stored command labels are redacted display text, truncated past this. */
 const STALL_COMMAND_CHARS = 200
 
@@ -4543,7 +4547,7 @@ export class ChatRuntime extends EventEmitter {
     const gaps: string[] = []
     let gapOverflow = 0
     const noteGap = (dir: string): void => {
-      if (gaps.length < MAX_STALL_REPOS) gaps.push(relative(checkout, dir) || '.')
+      if (gaps.length < MAX_STALL_REPOS) gaps.push(tailClip(relative(checkout, dir) || '.', MAX_UNREADABLE_PATH_BYTES))
       else gapOverflow += 1
     }
     const startedAt = Date.now()
@@ -5282,6 +5286,22 @@ function implementingTurnOutcome(sessionId: string): { started: boolean, finishe
 
 function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+/** Keep the distinguishing tail of an overlong path within a byte budget:
+ *  sibling gaps usually share their tops, so the head is what can go.
+ *  Code points stay whole, so the result never exceeds the budget. */
+function tailClip(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text) <= maxBytes) return text
+  let bytes = Buffer.byteLength('…')
+  const kept: string[] = []
+  for (const point of [...text].reverse()) {
+    const size = Buffer.byteLength(point)
+    if (bytes + size > maxBytes) break
+    bytes += size
+    kept.push(point)
+  }
+  return `…${kept.reverse().join('')}`
 }
 
 /** Where a stalled repo's leftover sits: `on chat/x` for the checkout

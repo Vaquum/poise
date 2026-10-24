@@ -134,10 +134,19 @@ export async function inspectTaskRepo(checkout: string): Promise<{ branch: strin
 /** Live linked worktrees registered on a task repo: checkout paths from
  *  `git worktree list --porcelain`, without prunable entries whose
  *  checkouts are gone. The main worktree is included; callers dedupe it
- *  against discovery. Confined like inspectTaskRepo. Read-only. */
+ *  against discovery. NUL-separated output keeps quote, newline and
+ *  unicode paths unambiguous; a git too old for `-z` falls back to
+ *  line-separated output. Confined like inspectTaskRepo. Read-only. */
 export async function linkedWorktrees(checkout: string): Promise<string[]> {
   const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
-  const out = await git(checkout, ['worktree', 'list', '--porcelain'], { env })
+  let out: string
+  let separator = '\0'
+  try {
+    out = await git(checkout, ['worktree', 'list', '--porcelain', '-z'], { env })
+  } catch {
+    out = await git(checkout, ['worktree', 'list', '--porcelain'], { env })
+    separator = '\n'
+  }
   const paths: string[] = []
   let current: string | null = null
   let prunable = false
@@ -146,8 +155,8 @@ export async function linkedWorktrees(checkout: string): Promise<string[]> {
     current = null
     prunable = false
   }
-  for (const line of out.split('\n')) {
-    if (line.startsWith('worktree ')) { flush(); current = line.slice('worktree '.length).trim() }
+  for (const line of out.split(separator)) {
+    if (line.startsWith('worktree ')) { flush(); current = line.slice('worktree '.length) }
     else if (line.startsWith('prunable')) prunable = true
   }
   flush()
