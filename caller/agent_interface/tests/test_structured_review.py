@@ -483,6 +483,41 @@ class TestSincePositions(TestCase):
         submitted = json.loads(calls[-1][0][4])
         self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(5, "LEFT")])
 
+    def test_reaffirmed_left_finding_keeps_its_original_thread_coordinates(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 5, "side": "LEFT", "body": "still blocks"}]}
+        for outdated in (False, True):
+            with self.subTest(outdated=outdated):
+                node = json.loads(self._packet("c" * 40, self.REMOVAL))
+                node["review_threads"] = [{"path": "src/gone.py", "line": 5, "side": "LEFT",
+                                          "is_resolved": False, "is_outdated": outdated,
+                                          "bodies": ["still blocks"]}]
+                _, calls, _ = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
+                self.assertEqual(calls[-1][0][1], "--request-changes")
+                self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_resolved_thread_cannot_validate_a_finding_outside_the_since_diff(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 5, "side": "LEFT", "body": "still blocks"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 5, "side": "LEFT",
+                                  "is_resolved": True, "is_outdated": True, "bodies": ["still blocks"]}]
+        with self.assertRaises(atoms.AgentPreflightError):
+            self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
+
+    def test_repeated_removed_text_maps_using_current_head_position(self):
+        since = "\n".join(["diff --git a/src/gone.py b/src/gone.py",
+                           "--- a/src/gone.py", "+++ b/src/gone.py",
+                           "@@ -10,3 +30,2 @@", " context", "-return None", " context2"])
+        full = "\n".join(["diff --git a/src/gone.py b/src/gone.py",
+                          "--- a/src/gone.py", "+++ b/src/gone.py",
+                          "@@ -4,3 +10,3 @@", " context", "-return None", "+first", " context2",
+                          "@@ -40,3 +30,3 @@", " context", "-return None", "+second", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "second removal"}]}
+        _, calls, _ = self._run(self._packet("c" * 40, since), verdict, self._full(full))
+        self.assertEqual(json.loads(calls[-1][0][4])[0]["line"], 41)
+
     def test_left_finding_absent_from_the_pr_diff_fails_closed(self):
         other = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
                            "@@ -4,3 +4,3 @@", " context", "-other", "+replacement", " context2"])
@@ -534,19 +569,23 @@ class TestSincePositions(TestCase):
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
                                 "body": "still removed upstream"}]}
-        result, calls, _ = self._run(self._packet("c" * 40, kept, paths=("src/kept.py",)), verdict,
+        node = json.loads(self._packet("c" * 40, kept, paths=("src/kept.py",)))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False,
+                                  "bodies": ["still removed upstream"]}]
+        result, calls, _ = self._run(json.dumps(node), verdict,
                                      self._full(self.REMOVAL + "\n" + kept,
                                               paths=("src/gone.py", "src/kept.py")))
         self.assertIn('"review_id": 91', result)
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
-    def test_left_finding_on_repeated_text_anchors_by_context(self):
+    def test_left_finding_on_repeated_text_anchors_at_the_current_head(self):
         full = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
                           "@@ -1,5 +1,3 @@", " def a():", "-    return None", " def b():",
                           "-    return None", " tail"])
         since = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
-                           "@@ -8,3 +8,2 @@", " def b():", "-    return None", " tail"])
+                           "@@ -8,3 +2,2 @@", " def b():", "-    return None", " tail"])
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/dup.py", "line": 9, "side": "LEFT", "body": "needed"}]}
         result, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/dup.py",)), verdict,
@@ -557,9 +596,9 @@ class TestSincePositions(TestCase):
 
     def test_left_finding_on_indistinguishable_repeats_fails_closed(self):
         full = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
-                          "@@ -1,5 +1,3 @@", " ctx", "-x", " ctx", "-x", " ctx"])
+                          "@@ -1,4 +1,2 @@", " ctx", "-x", "-x", " tail"])
         since = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
-                           "@@ -1,3 +1,2 @@", " ctx", "-x", " ctx"])
+                           "@@ -1,3 +1,2 @@", " ctx", "-x", " tail"])
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/dup.py", "line": 2, "side": "LEFT", "body": "which one"}]}
         with self.assertRaises(atoms.AgentPreflightError) as failure:

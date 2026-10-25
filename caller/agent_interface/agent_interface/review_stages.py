@@ -200,15 +200,18 @@ def diff_line_sets(diff: str, retained: list[str]) -> dict[str, dict[str, set[in
     return sets
 
 
-def diff_left_contents(diff: str, retained: list[str]) -> dict[str, dict[int, str]]:
-    """Per-file LEFT-side hunk line contents, for remapping since-diff
-    positions (previous-head coordinates) onto the pull request diff."""
-    contents: dict[str, dict[int, str]] = {}
+def diff_left_anchors(diff: str, retained: list[str]) -> dict[str, dict[int, tuple[int, str]]]:
+    """LEFT lines keyed to their current-head position and content.
+
+    Both the since diff and the full PR diff end at the same current head,
+    so that position distinguishes repeated text in different hunks.
+    """
+    contents: dict[str, dict[int, tuple[int, str]]] = {}
     for section in _sections(diff):
         lines = contents.setdefault(_primary(section, retained), {})
-        for kind, old, _new, content in _hunk_lines(section):
+        for kind, old, new, content in _hunk_lines(section):
             if kind in ("context", "removed"):
-                lines[old] = content
+                lines[old] = (new, content)
     return contents
 
 

@@ -224,34 +224,17 @@ def _stage_texts(text: str, packet: str) -> list[str]:
     return [text.replace(packet, stage, 1) for stage in stages]
 
 
-def _neighbors(index: dict[int, str], number: int) -> tuple[list[str], list[str]]:
-    """Up to two neighboring contents on each side of a diff line."""
-    keys = sorted(index)
-    at = keys.index(number)
-    below = [index[keys[j]] for j in range(max(0, at - 2), at)]
-    above = [index[keys[j]] for j in range(at + 1, min(len(keys), at + 3))]
-    return below, above
-
-
-def _anchor(since_lines: dict[int, str], full_lines: dict[int, str],
-            since_number: int, candidates: list[int]) -> int:
-    """The PR-base line matching a since-diff removal, disambiguated by
-    neighboring context when the removed text repeats."""
-    if len(candidates) == 1:
-        return candidates[0]
-    want_below, want_above = _neighbors(since_lines, since_number)
-    scored = []
-    for candidate in candidates:
-        below, above = _neighbors(full_lines, candidate)
-        score = sum(1 for pair in zip(reversed(want_below), reversed(below)) if pair[0] == pair[1])
-        score += sum(1 for pair in zip(want_above, above) if pair[0] == pair[1])
-        scored.append((score, candidate))
-    best = max(score for score, _ in scored)
-    winners = [candidate for score, candidate in scored if score == best]
-    if len(winners) > 1:
-        raise InvalidVerdict(
-            "removed line matches several pull request lines; refusing an unverified anchor")
-    return winners[0]
+def _reaffirms_finding(comment: dict, threads: list[dict]) -> bool:
+    body = " ".join(comment["body"].lower().split())
+    for thread in threads:
+        if thread.get("is_resolved") or thread.get("path") != comment["path"]:
+            continue
+        if not any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
+            continue
+        if thread.get("is_outdated") or (
+                thread.get("line") == comment["line"] and thread.get("side") == comment["side"]):
+            return True
+    return False
 
 
 def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str,
@@ -260,10 +243,9 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
 
     The model reviewed the diff since the last head: RIGHT numbers already
     name current-head lines, but LEFT numbers name previous-head lines, so
-    each LEFT comment is remapped to base coordinates by matching its removed
-    content, disambiguated by neighboring context when the text repeats. A
-    LEFT comment the since diff never showed may reaffirm a prior finding in
-    base coordinates and is kept when the pull request diff carries it. A
+    each new LEFT comment is remapped to base coordinates by matching its
+    content and current-head position. Known unresolved findings retain their
+    original thread coordinates, including outdated findings. A
     missing anchor never proves the defect is gone: if any finding cannot be
     anchored, the review fails closed before submitting an incomplete change
     request or filing incomplete findings for a capped approval."""
@@ -283,37 +265,38 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
         sets = review_stages.diff_line_sets(full["diff"], retained)
         since_files = [entry["filename"] for entry in node.get("files", [])]
         since_diff = node.get("diff")
-        since_left = review_stages.diff_left_contents(
+        since_left = review_stages.diff_left_anchors(
             since_diff if isinstance(since_diff, str) else "", since_files)
-        full_left = review_stages.diff_left_contents(full["diff"], retained)
+        full_left = review_stages.diff_left_anchors(full["diff"], retained)
     except (ValueError, KeyError, TypeError) as error:
         raise InvalidVerdict(f"cannot validate since-diff positions: {error}") from error
-    by_content: dict[tuple[str, str], list[int]] = {}
+    by_anchor: dict[tuple[str, int, str], list[int]] = {}
     for path, lines in full_left.items():
-        for number, content in lines.items():
-            by_content.setdefault((path, content), []).append(number)
+        for number, (position, content) in lines.items():
+            by_anchor.setdefault((path, position, content), []).append(number)
     kept, dropped = [], []
     for comment in verdict["comments"]:
+        if _reaffirms_finding(comment, node.get("review_threads", [])):
+            kept.append(comment)
+            continue
         if comment["side"] == "RIGHT":
             if comment["line"] in sets.get(comment["path"], {}).get("right", set()):
                 kept.append(comment)
             else:
                 dropped.append({key: comment[key] for key in ("path", "line", "side")})
             continue
-        content = since_left.get(comment["path"], {}).get(comment["line"])
-        if content is None:
-            if comment["line"] in full_left.get(comment["path"], {}):
-                kept.append(comment)
-                continue
+        anchor = since_left.get(comment["path"], {}).get(comment["line"])
+        if anchor is None:
             raise InvalidVerdict(
                 f"comment on {comment['path']}:{comment['line']} (LEFT) is outside the reviewed since diff")
-        candidates = by_content.get((comment["path"], content), [])
+        candidates = by_anchor.get((comment["path"], *anchor), [])
         if not candidates:
             dropped.append({key: comment[key] for key in ("path", "line", "side")})
+        elif len(candidates) == 1:
+            kept.append({**comment, "line": candidates[0]})
         else:
-            line = _anchor(since_left[comment["path"]], full_left[comment["path"]],
-                           comment["line"], candidates)
-            kept.append({**comment, "line": line})
+            raise InvalidVerdict(
+                "removed line matches several pull request lines; refusing an unverified anchor")
     if dropped:
         raise InvalidVerdict(
             "follow-up findings cannot be anchored to the full PR diff; no review submitted")

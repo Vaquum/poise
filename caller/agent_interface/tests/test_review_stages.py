@@ -198,15 +198,15 @@ class TestSplit(TestCase):
         self.assertEqual(sets["src/gone.py"]["left"], {1, 2})
         self.assertEqual(sets["src/gone.py"]["right"], set())
 
-    def test_diff_left_contents_maps_left_lines_to_content(self):
+    def test_diff_left_anchors_maps_left_lines_to_current_position_and_content(self):
         diff = "\n".join([
             "diff --git a/src/a.py b/src/a.py",
             "--- a/src/a.py", "+++ b/src/a.py",
             "@@ -10,4 +10,4 @@",
             " ctx1", "-old1", "+new1", " ctx2",
         ])
-        contents = review_stages.diff_left_contents(diff, ["src/a.py"])
-        self.assertEqual(contents["src/a.py"], {10: "ctx1", 11: "old1", 12: "ctx2"})
+        contents = review_stages.diff_left_anchors(diff, ["src/a.py"])
+        self.assertEqual(contents["src/a.py"], {10: (10, "ctx1"), 11: (11, "old1"), 12: (12, "ctx2")})
 
     def test_malformed_hunk_header_fails_loud(self):
         diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ bogus @@\n-x\n"
