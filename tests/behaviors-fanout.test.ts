@@ -178,6 +178,29 @@ describe('prepare pool startup', () => {
       vi.useRealTimers()
     }
   })
+
+  it('reports a fast worker failure without an unhandled rejection', async () => {
+    const { behaviors: runtime } = await loadModules()
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      // A synchronous throw before any await, as the prepare and approval
+      // tasks can fail ahead of their local try blocks.
+      const failure = new Error('worker failed fast')
+      await expect(runtime.forEachPool(['a', 'b', 'c'], 3, async (item) => {
+        if (item === 'a') throw failure
+      })).rejects.toBe(failure)
+      // Let any unhandled rejection fire before asserting there was none.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
 })
 
 describe('review checkout in the launch phase', () => {

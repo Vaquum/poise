@@ -2310,7 +2310,12 @@ export async function forEachPool<T>(items: readonly T[], limit: number, task: (
   const workers: Array<Promise<void>> = []
   const count = Math.min(limit, items.length)
   for (let started = 0; started < count; started++) {
-    workers.push(worker())
+    const running = worker()
+    // Own the rejection before the stagger below yields: a worker that fails
+    // fast must not read as unhandled while Promise.all is not yet attached.
+    // This only marks it handled; Promise.all still fails with it.
+    void running.catch(() => undefined)
+    workers.push(running)
     if (started + 1 < count) await loopTurn()
   }
   await Promise.all(workers)
@@ -5202,7 +5207,11 @@ async function readSubIssues(entries: readonly EligibleIssue[]): Promise<Map<str
   const readers: Array<Promise<void>> = []
   const readerCount = Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length)
   for (let started = 0; started < readerCount; started++) {
-    readers.push(reader())
+    const running = reader()
+    // Same ownership as forEachPool workers: own the rejection before the
+    // stagger below yields; Promise.all still fails with it.
+    void running.catch(() => undefined)
+    readers.push(running)
     if (started + 1 < readerCount) await loopTurn()
   }
   await Promise.all(readers)
