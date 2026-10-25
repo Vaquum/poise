@@ -367,14 +367,24 @@ describe('budgeted fixture readiness', () => {
   })
 
   it('rejects readiness delivered after the shared deadline and bounds a held tick', async () => {
+    vi.useFakeTimers()
     const budget = probe(Date.now() + 20)
     let ready = false
     let release!: () => void
     const tick = new Promise<void>(done => { release = done })
     budget.tick = () => tick
-    try { await expect(until(() => ready, 'late delivery', budget)).rejects.toThrow('switchboard fixture deadline: late delivery') }
-    finally { ready = true; release(); await tick }
-    await expect(until(() => ready, 'late readiness', budget)).rejects.toThrow('switchboard fixture deadline: late readiness')
+    try {
+      const expired = expect(until(() => ready, 'late delivery', budget)).rejects.toThrow('switchboard fixture deadline: late delivery')
+      await vi.advanceTimersByTimeAsync(20)
+      await expired
+      ready = true
+      release()
+      await tick
+      await expect(until(() => ready, 'late readiness', budget)).rejects.toThrow('switchboard fixture deadline: late readiness')
+    } finally {
+      release()
+      vi.useRealTimers()
+    }
   })
 
   it('stops an aborted wait before its held delivery can resume against another case', async () => {

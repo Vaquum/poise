@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, utimes, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -555,12 +555,210 @@ describe('storage breakdown', () => {
     await mkdir(pip, { recursive: true })
     await writeFile(join(pip, 'wheel'), 'y'.repeat(2048))
     const breakdown = await maintenance.storageBreakdown(home, chatRoot, stateRoot)
-    const byKey = new Map(breakdown.categories.map((category) => [category.key, category.bytes]))
-    expect(byKey.get('chat-workers')).toBeGreaterThanOrEqual(4096)
-    expect(byKey.get('pip')).toBeGreaterThanOrEqual(2048)
-    expect(byKey.get('review-checkouts')).toBe(0)
+    const byKey = new Map(breakdown.categories.map((category) => [category.key, category]))
+    expect(byKey.get('chat-workers')!.status).toBe('ok')
+    expect(byKey.get('chat-workers')!.bytes).toBeGreaterThanOrEqual(4096)
+    expect(byKey.get('pip')!.status).toBe('ok')
+    expect(byKey.get('pip')!.bytes).toBeGreaterThanOrEqual(2048)
+    expect(byKey.get('review-checkouts')).toMatchObject({ status: 'ok', bytes: 0 })
+    expect(breakdown.complete).toBe(true)
     expect(breakdown.disk.totalBytes).toBeGreaterThan(0)
     expect(breakdown.disk.usedPercent).toBeGreaterThanOrEqual(0)
+  })
+})
+
+describe('bounded storage reads', () => {
+  it('measures missing directories as zero and completes', async () => {
+    const breakdown = await maintenance.storageBreakdown(home, chatRoot, stateRoot)
+    expect(breakdown.categories).toHaveLength(8)
+    for (const category of breakdown.categories) {
+      expect(category).toMatchObject({ status: 'ok', bytes: 0 })
+    }
+    expect(breakdown.complete).toBe(true)
+  })
+
+  it('measures a single file path as its own size', async () => {
+    const file = join(home, 'lone.bin')
+    await writeFile(file, 'x'.repeat(1024))
+    await expect(maintenance.measureDir(file)).resolves.toMatchObject({ status: 'ok', bytes: expect.any(Number) })
+    expect((await maintenance.measureDir(file)).bytes).toBeGreaterThanOrEqual(1024)
+  })
+
+  it.skipIf(process.getuid?.() === 0)('reports an unreadable category as unavailable, not zero', async () => {
+    const pip = join(home, 'pip')
+    await mkdir(pip, { recursive: true })
+    await writeFile(join(pip, 'wheel'), 'y'.repeat(2048))
+    await chmod(pip, 0o000)
+    try {
+      const breakdown = await maintenance.storageBreakdown(home, chatRoot, stateRoot)
+      const byKey = new Map(breakdown.categories.map((category) => [category.key, category]))
+      expect(byKey.get('pip')!.status).toBe('unavailable')
+      expect(byKey.get('pip')!.bytes).toBeNull()
+      expect(byKey.get('pip')!.error).toMatch(/permission|EACCES|EPERM/i)
+      expect(byKey.get('review-checkouts')).toMatchObject({ status: 'ok', bytes: 0 })
+      expect(breakdown.complete).toBe(false)
+    } finally {
+      await chmod(pip, 0o755)
+    }
+  })
+
+  it.skipIf(process.getuid?.() === 0)('reports a partially unreadable category as partial with measured bytes', async () => {
+    const pip = join(home, 'pip')
+    await mkdir(join(pip, 'dark'), { recursive: true })
+    await writeFile(join(pip, 'wheel'), 'y'.repeat(2048))
+    await writeFile(join(pip, 'dark', 'hidden'), 'z'.repeat(2048))
+    await chmod(join(pip, 'dark'), 0o000)
+    try {
+      const measured = await maintenance.measureDir(pip)
+      expect(measured.status).toBe('partial')
+      expect(measured.bytes).toBeGreaterThanOrEqual(2048)
+      expect(measured.error).toMatch(/permission|EACCES|EPERM/i)
+    } finally {
+      await chmod(join(pip, 'dark'), 0o755)
+    }
+  })
+
+  it('stops a large category at the entry budget while other categories complete', async () => {
+    const pip = join(home, 'pip')
+    await mkdir(pip, { recursive: true })
+    for (let i = 0; i < 200; i++) await writeFile(join(pip, `wheel-${i}`), 'y'.repeat(64))
+    const measured = await maintenance.measureDir(pip, { maxEntries: 50 })
+    expect(measured.status).toBe('partial')
+    expect(measured.entries).toBeLessThanOrEqual(51)
+    expect(measured.bytes).toBeGreaterThan(0)
+    const breakdown = await maintenance.storageBreakdown(home, chatRoot, stateRoot, { maxEntries: 50 })
+    const byKey = new Map(breakdown.categories.map((category) => [category.key, category]))
+    expect(byKey.get('pip')!.status).toBe('partial')
+    expect(byKey.get('review-checkouts')).toMatchObject({ status: 'ok', bytes: 0 })
+    expect(breakdown.complete).toBe(false)
+  })
+
+  it('stops at the time deadline instead of walking on', async () => {
+    const pip = join(home, 'pip')
+    await mkdir(pip, { recursive: true })
+    for (let i = 0; i < 200; i++) await writeFile(join(pip, `wheel-${i}`), 'y'.repeat(64))
+    let ticks = 0
+    const measured = await maintenance.measureDir(pip, { timeoutMs: 1_000, now: () => (ticks++ < 10 ? 1_000 : 1_000 + 1_001) })
+    expect(measured.status).toBe('partial')
+    expect(measured.entries).toBeLessThan(200)
+    expect(measured.error).toMatch(/timed out/)
+    const expired = await maintenance.storageBreakdown(home, chatRoot, stateRoot, { timeoutMs: 0, now: () => 1_000 })
+    expect(expired.complete).toBe(false)
+    expect(expired.categories.every((category) => category.status !== 'ok' || category.bytes === 0)).toBe(true)
+  })
+})
+
+describe('storage status cache', () => {
+  function scriptedBreakdown(results: Array<{ categories?: Array<{ key: string, bytes: number | null }> } | Error>): { calls: () => number, breakdown: () => Promise<import('../server/storage-maintenance').StorageBreakdown> } {
+    let calls = 0
+    const breakdown = async (): Promise<import('../server/storage-maintenance').StorageBreakdown> => {
+      const next = results[Math.min(calls, results.length - 1)]
+      calls += 1
+      if (next instanceof Error) throw next
+      return {
+        at: new Date(1_000 + calls).toISOString(),
+        categories: (next.categories ?? [{ key: 'pip', bytes: 10 }]).map((category) => ({
+          key: category.key, label: category.key, path: `/tmp/${category.key}`,
+          bytes: category.bytes, status: category.bytes === null ? 'unavailable' as const : 'ok' as const,
+        })),
+        disk: { path: '/tmp', totalBytes: 100, freeBytes: 50, usedPercent: 50 },
+        complete: true,
+      }
+    }
+    return { calls: () => calls, breakdown }
+  }
+
+  it('reuses one scan across repeated and concurrent reads', async () => {
+    const scripted = scriptedBreakdown([{}])
+    const now = 10_000
+    const first = await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    const second = await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    expect(second).toBe(first)
+    const [a, b] = await Promise.all([
+      maintenance.storageStatus({ now: now + maintenance.STORAGE_STATUS_TTL_MS + 1, breakdown: scripted.breakdown }),
+      maintenance.storageStatus({ now: now + maintenance.STORAGE_STATUS_TTL_MS + 1, breakdown: scripted.breakdown }),
+    ])
+    expect(a).toBe(b)
+    expect(scripted.calls()).toBe(2)
+  })
+
+  it('rescans after the TTL and serves the fresh observation', async () => {
+    const scripted = scriptedBreakdown([{}, {}])
+    const now = 20_000
+    const first = await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    const second = await maintenance.storageStatus({ now: now + maintenance.STORAGE_STATUS_TTL_MS + 1, breakdown: scripted.breakdown })
+    expect(scripted.calls()).toBe(2)
+    expect(second).not.toBe(first)
+    expect(second.stale).toBe(false)
+  })
+
+  it('serves the last observation as stale when a refresh fails, without keeping the failure', async () => {
+    const scripted = scriptedBreakdown([{}, new Error('disk walk blew up'), {}])
+    const now = 30_000
+    const first = await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    const stale = await maintenance.storageStatus({ now: now + maintenance.STORAGE_STATUS_TTL_MS + 1, breakdown: scripted.breakdown })
+    expect(stale.stale).toBe(true)
+    expect(stale.error).toMatch(/disk walk blew up/)
+    expect(stale.categories).toEqual(first.categories)
+    const recovered = await maintenance.storageStatus({ now: now + maintenance.STORAGE_STATUS_TTL_MS + 1, breakdown: scripted.breakdown })
+    expect(recovered.stale).toBe(false)
+    expect(scripted.calls()).toBe(3)
+  })
+
+  it('fails the first read loudly when nothing was ever measured', async () => {
+    const scripted = scriptedBreakdown([new Error('no walk today')])
+    await expect(maintenance.storageStatus({ now: 40_000, breakdown: scripted.breakdown })).rejects.toThrow('no walk today')
+  })
+
+  it('measures afresh on demand even with a live cache entry', async () => {
+    const scripted = scriptedBreakdown([{}, {}])
+    const now = 50_000
+    await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    const fresh = await maintenance.storageStatus({ now, fresh: true, breakdown: scripted.breakdown })
+    expect(scripted.calls()).toBe(2)
+    expect(fresh.stale).toBe(false)
+  })
+
+  it('drops the cached summary when maintenance changes what it measures', async () => {
+    const scripted = scriptedBreakdown([{}, {}])
+    const now = 60_000
+    await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    await maintenance.runStorageMaintenance({ now, dryRun: true, chatRoot, stateRoot, home, trim: async () => null, claims: () => [] })
+    await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    expect(scripted.calls()).toBe(1)
+    await maintenance.runStorageMaintenance({ now, chatRoot, stateRoot, home, trim: async () => null, claims: () => [] })
+    await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    expect(scripted.calls()).toBe(2)
+  })
+
+  it('does not let a scan overtaken by maintenance repopulate the cache', async () => {
+    const scripted = scriptedBreakdown([{}, {}])
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const now = 70_000
+    const pending = maintenance.storageStatus({ now, breakdown: () => gate.then(scripted.breakdown) })
+    await maintenance.runStorageMaintenance({ now, chatRoot, stateRoot, home, trim: async () => null, claims: () => [] })
+    release()
+    const first = await pending
+    expect(first.stale).toBe(false)
+    const second = await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    expect(second).not.toBe(first)
+    expect(scripted.calls()).toBe(2)
+  })
+
+  it('does not join a pre-maintenance scan for reads issued after maintenance', async () => {
+    const scripted = scriptedBreakdown([{}, {}])
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const now = 80_000
+    const before = maintenance.storageStatus({ now, breakdown: () => gate.then(scripted.breakdown) })
+    await maintenance.runStorageMaintenance({ now, chatRoot, stateRoot, home, trim: async () => null, claims: () => [] })
+    const after = maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    release()
+    const [first, second] = await Promise.all([before, after])
+    expect(second).not.toBe(first)
+    expect(second.stale).toBe(false)
+    expect(scripted.calls()).toBe(2)
   })
 })
 

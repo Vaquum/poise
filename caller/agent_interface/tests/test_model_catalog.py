@@ -1,4 +1,7 @@
+import contextlib
+import io
 import json
+import sys
 import tempfile
 from importlib.resources import files
 from pathlib import Path
@@ -248,6 +251,51 @@ class TestCatalogRefresh(TestCase):
         self.assertIn("not signed in", report["families"]["antigravity"]["error"])
         self.assertEqual(report["families"]["antigravity"]["models"], ["gemini-3.8-flash-high", "gemini-3.8-flash-medium"])
 
+    def test_selected_families_skip_the_rest_without_moving_their_rows(self) -> None:
+        report = catalog_refresh.refresh(self.probes(), self.target, families=["claude", "codex"])
+        self.assertFalse(report["changed"])
+        self.assertFalse(self.target.exists())
+        self.assertEqual(report["families"]["claude"]["status"], "ok")
+        self.assertEqual(report["families"]["codex"]["status"], "ok")
+        for family in ("grok", "antigravity", "muse"):
+            entry = report["families"][family]
+            self.assertEqual(entry["status"], "skipped")
+            self.assertEqual(entry["reason"], "never_configured")
+            self.assertEqual(entry["models"], [m.identity for m in CATALOG.models.values() if m.provider == family])
+        self.assertEqual(report["added"], [])
+        self.assertEqual(report["removed"], [])
+
+    def test_skipped_families_keep_pinned_debate_participants_on_a_selected_move(self) -> None:
+        bumped = [
+            Model("opus-5.1-max", "claude", "claude-opus-5-1", "max"),
+            Model("opus-5.1-xhigh", "claude", "claude-opus-5-1", "xhigh"),
+            Model("opus-5.1-high", "claude", "claude-opus-5-1", "high"),
+            Model("fable-5.1-max", "claude", "claude-fable-5-1", "max"),
+            Model("fable-5.1-xhigh", "claude", "claude-fable-5-1", "xhigh"),
+            Model("fable-5.1-high", "claude", "claude-fable-5-1", "high"),
+        ]
+        report = catalog_refresh.refresh(self.probes(claude=lambda: bumped), self.target, families=["claude"])
+        self.assertTrue(report["changed"])
+        written = load_catalog(self.target)
+        self.assertEqual(written.behaviors["pr_review"], "opus-5.1-high")
+        self.assertIn("grok-4.6-xhigh", written.debate_participants)
+        self.assertIn("gemini-3.8-flash-high", written.debate_participants)
+        self.assertIn("muse-spark-1.3-contributor-max", written.debate_participants)
+        self.assertNotIn("grok-4.6-xhigh", report["removed"])
+
+    def test_explicit_empty_selection_probes_nothing(self) -> None:
+        called: list[str] = []
+        probes = {family: (lambda family=family: called.append(family)) for family in catalog_refresh.FAMILIES}
+        report = catalog_refresh.refresh(probes, self.target, families=[])
+        self.assertEqual(called, [])
+        self.assertFalse(report["changed"])
+        self.assertFalse(self.target.exists())
+        self.assertEqual({entry["status"] for entry in report["families"].values()}, {"skipped"})
+
+    def test_unknown_selected_family_fails(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown model family nope"):
+            catalog_refresh.refresh(self.probes(), self.target, families=["claude", "nope"])
+
     def test_a_missing_codex_line_keeps_the_family_as_it_is(self) -> None:
         home = Path(self.work.name)
         (home / ".codex").mkdir()
@@ -382,3 +430,39 @@ class TestMuseContributorDiscovery(TestCase):
         self.assertFalse(report["changed"])
         self.assertEqual(report["families"]["muse"]["status"], "unavailable")
         self.assertIn("quality levels", report["families"]["muse"]["error"])
+
+
+class TestRefreshModelsCommand(TestCase):
+    def run_main(self, argv: list[str]):
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), \
+                patch.object(catalog_refresh, "refresh", return_value={"families": {}}) as refresh, \
+                contextlib.redirect_stdout(out):
+            agent_interface.main()
+        return refresh, json.loads(out.getvalue())
+
+    def test_bare_refresh_probes_every_family(self) -> None:
+        refresh, printed = self.run_main(["agent-interface", "--refresh-models"])
+        refresh.assert_called_once_with()
+        self.assertEqual(printed, {"families": {}})
+
+    def test_families_selects_probed_families(self) -> None:
+        refresh, _ = self.run_main(["agent-interface", "--refresh-models", "--families", "claude,codex"])
+        refresh.assert_called_once_with(families=["claude", "codex"])
+
+    def test_empty_families_probes_nothing(self) -> None:
+        refresh, _ = self.run_main(["agent-interface", "--refresh-models", "--families", ""])
+        refresh.assert_called_once_with(families=[])
+
+    def test_unknown_family_and_stray_arguments_usage_error(self) -> None:
+        for argv in (
+            ["agent-interface", "--refresh-models", "--families", "claude,nope"],
+            ["agent-interface", "--refresh-models", "--families"],
+            ["agent-interface", "--refresh-models", "claude"],
+        ):
+            with self.subTest(argv=argv), \
+                    patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as stop:
+                    agent_interface.main()
+                self.assertEqual(stop.exception.code, 2)
