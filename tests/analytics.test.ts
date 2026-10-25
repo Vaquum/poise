@@ -32,6 +32,8 @@ vi.mock('../server/organizations', () => ({
   readyOrganizations: () => mocks.orgs.filter((org) => org.status === 'ready'),
   organizationArgs: (org: { datastorePath: string }, args: string[]) => ['--db', org.datastorePath, ...args],
 }))
+const { involvementScopes } = await import('../server/gh')
+const { readAnalyticsDatastores } = await import('../server/analytics-datastore')
 const { computeAnalytics, computeHistory, parseBounds, parseWindow, prepareMergedDetails, readAnalytics, readAnalyticsHistory } = await import('../server/analytics')
 
 const HOUR = 60 * 60 * 1000
@@ -375,6 +377,17 @@ describe('reading what Current shows', () => {
     seed(pr(3, '2026-10-05T00:00:00Z', '2026-10-06T00:00:00Z', { author: 'stranger', additions: 500 }), 'pr')
   }
 
+  function datastoreInput(window: Parameters<typeof readAnalytics>[0], login = 'alpha') {
+    const me = mocks.meta.me || ''
+    return { organizations: mocks.orgs.filter(org => org.login === login), me, window,
+      scopes: { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) } }
+  }
+
+  async function inlineReport(window: Parameters<typeof readAnalytics>[0]) {
+    return computeAnalytics({ window, ...await readAnalyticsDatastores(datastoreInput(window)),
+      agent: mocks.meta.agentAccount, behaviors: [] })
+  }
+
   it.each([
     { me: 'octocat', agentAccount: '', issues: 2, merged: 1 },
     { me: 'octocat', agentAccount: 'robot', issues: 2, merged: 2 },
@@ -392,7 +405,7 @@ describe('reading what Current shows', () => {
         const prepare = vi.spyOn(Database.prototype, 'prepare')
         let queries: string[]
         try {
-          const report = await readAnalytics(window, 'alpha')
+          const report = await inlineReport(window)
           expect(report.issues.opened).toBe(window === WEEK ? issues : 0)
           expect(report.pullRequests.merged).toBe(window === WEEK ? merged : 0)
           queries = prepare.mock.calls.map(([sql]) => sql).filter(sql => /(?:FROM|(?:CROSS|LEFT) JOIN) (prs|issues) v\b/.test(sql))
@@ -413,7 +426,7 @@ describe('reading what Current shows', () => {
     const prepare = vi.spyOn(Database.prototype, 'prepare')
     let queries: string[]
     try {
-      await readAnalytics(WEEK, 'alpha')
+      await readAnalyticsDatastores(datastoreInput(WEEK))
       queries = prepare.mock.calls.map(([sql]) => sql).filter(sql => /(?:FROM|(?:CROSS|LEFT) JOIN) (prs|issues) v\b/.test(sql))
     } finally { prepare.mockRestore() }
     expect(queries).toHaveLength(2)
@@ -610,6 +623,48 @@ describe('reading what Current shows', () => {
     expect((await readAnalytics(WEEK)).issues.opened).toBe(1)
   })
 
+  it('reads the real datastores without preparing their queries on the server thread', async () => {
+    data()
+    const prepare = vi.spyOn(Database.prototype, 'prepare')
+    try {
+      expect((await readAnalytics(WEEK, 'alpha')).pullRequests.merged).toBe(2)
+      expect(prepare).not.toHaveBeenCalled()
+    } finally { prepare.mockRestore() }
+  })
+
+  it('maps read pages within a fixed cap and holds one WAL snapshot across both item reads', async () => {
+    const writer = new Database(mocks.orgs[0].datastorePath)
+    const pragma = Database.prototype.pragma
+    const mappings: unknown[] = []
+    const observation = vi.spyOn(Database.prototype, 'pragma').mockImplementation(function (this: Database.Database, source, options) {
+      const result = pragma.call(this, source, options)
+      if (this.readonly && source.startsWith('mmap_size =')) {
+        mappings.push(pragma.call(this, 'mmap_size', { simple: true }))
+      }
+      return result
+    })
+    try {
+      writer.pragma('journal_mode = WAL')
+      writer.transaction(() => {
+        for (let number = 1; number <= 128; number++) seed(pr(number, '2026-10-06T00:00:00Z', null), 'pr', true, writer)
+      })()
+      const input = datastoreInput(WEEK)
+      const pending = readAnalyticsDatastores(input)
+      // The first PR slice has opened the snapshot; its issue read is later.
+      seed(issue(129, '2026-10-06T00:00:00Z'), 'issue', true, writer)
+      expect(writer.pragma('wal_checkpoint(PASSIVE)')).toMatchObject([{ busy: 0 }])
+      writer.pragma('busy_timeout = 0')
+      expect(writer.pragma('wal_checkpoint(TRUNCATE)')).toMatchObject([{ busy: 1 }])
+      expect((await pending).issues).toHaveLength(0)
+      expect(writer.pragma('wal_checkpoint(TRUNCATE)')).toMatchObject([{ busy: 0 }])
+      expect((await readAnalyticsDatastores(input)).issues).toHaveLength(1)
+      expect(mappings).toEqual([1073741824, 1073741824])
+    } finally {
+      observation.mockRestore()
+      writer.close()
+    }
+  })
+
   it('does not parse discussion payloads for open PRs or merges outside the window', async () => {
     const open = seed(pr(1, '2026-10-05T00:00:00Z', null), 'pr', true)
     const old = seed(pr(2, '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z', { updated_at: '2026-10-06T00:00:00Z' }), 'pr', true)
@@ -633,7 +688,6 @@ describe('reading what Current shows', () => {
     expect(completed).toBe(false)
     // A separate account/day read can complete while the history is pending.
     expect((await readAnalytics(WEEK, 'beta')).pullRequests.merged).toBe(0)
-    expect(completed).toBe(false)
     const history = await pending
     const expected = computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' })
     expect(history.periods[0].pullRequests).toEqual(expected.pullRequests)
@@ -657,8 +711,9 @@ describe('reading what Current shows', () => {
       }
       const expected = computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' })
       const oldMs = performance.now() - oldStart
+      // Compare datastore work on both sides, excluding worker startup.
       const start = performance.now()
-      expect(await readAnalytics(WEEK, 'alpha')).toEqual(expected)
+      expect(await inlineReport(WEEK)).toEqual(expected)
       const readMs = performance.now() - start
       console.info(`Analytics 192 MiB discussions: eager ${oldMs.toFixed(1)} ms; windowed ${readMs.toFixed(1)} ms`)
       expect(readMs).toBeLessThan(oldMs)

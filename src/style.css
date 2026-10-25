@@ -1100,6 +1100,7 @@ tr:hover .review-btn { opacity: 1; }
 /* All panels share one order and two content-safe height families. */
 #view-analytics main { position: relative; min-height: var(--sp-6); }
 .analytics-board { position: relative; min-width: 0; }
+.analytics-board[aria-busy="true"] > .analytics-panel { visibility: hidden; }
 .analytics-loader { position: absolute; top: 0; inset-inline: 0; z-index: 3; pointer-events: none; }
 .analytics-panel { position: absolute; top: 0; left: 0; box-sizing: border-box; min-width: 0; border: var(--b-base); border-radius: var(--r-sm); background: var(--surface); }
 .analytics-panel[data-size="tall"] { min-height: 22rem; }

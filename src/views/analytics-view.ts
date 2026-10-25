@@ -16,6 +16,10 @@ let initialized = false
 let cardLayout: ReturnType<typeof analyticsLayout>
 let metricMarkup = ''
 let quotaMarkup = ''
+let foregroundPending = false
+let initialQuotaPending = false
+let historyPending = false
+let quotaRead: AbortController | null = null
 const dragGrip = '<span class="analytics-drag-grip" aria-hidden="true"></span>'
 function renderCards(): void {
   const broken = new Set([...viewEl.querySelectorAll<HTMLImageElement>('.github-quota-avatar img.broken')].map(img => img.getAttribute('src')))
@@ -26,6 +30,15 @@ function renderCards(): void {
     quotaMarkup = quota.innerHTML
   }
   cardLayout.patch(metricMarkup + quotaMarkup)
+  const pending = foregroundPending || initialQuotaPending
+  const board = viewEl.querySelector<HTMLElement>('.analytics-board')!
+  if (pending) board.setAttribute('aria-busy', 'true')
+  else board.removeAttribute('aria-busy')
+  viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = !pending
+  if (!pending && historyPending) {
+    historyPending = false
+    void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
+  }
 }
 function dragHandle(label: string): string {
   return `<button type="button" class="analytics-drag-handle" aria-label="Move ${escapeHtml(label)}" aria-pressed="false" aria-describedby="analytics-drag-help">${dragGrip}<span>${escapeHtml(label)}</span></button>`
@@ -131,10 +144,14 @@ function quotaCharts(bucket: GithubQuotaBucket, now: number): string {
 }
 
 async function readQuota(): Promise<void> {
+  if (quotaRead) return
+  const controller = new AbortController()
+  quotaRead = controller
+  const timeout = setTimeout(() => controller.abort(new Error('GitHub quota read timed out')), 5_000)
   const generation = ++quotaGeneration
   const content = viewEl.querySelector<HTMLElement>('.analytics-board')!
   try {
-    const response = await fetch('/api/github-quota')
+    const response = await fetch('/api/github-quota', { signal: controller.signal })
     const data: GithubQuotaReport & { error?: string } = await response.json()
     if (!response.ok || !Array.isArray(data.accounts)) throw new Error(data.error || 'GitHub API quota could not be read.')
     if (generation !== quotaGeneration) return
@@ -170,11 +187,17 @@ async function readQuota(): Promise<void> {
           </div>`
         }).join('')}
       </article>`).join('') : ''
-    renderCards()
   } catch (error: unknown) {
     if (generation !== quotaGeneration) return
-    quotaMarkup = ''; renderCards()
+    quotaMarkup = ''
     noticeFeed.reportReadErrors('analytics-quota', [readFailure('GitHub quota is unavailable', error)])
+  } finally {
+    clearTimeout(timeout)
+    if (quotaRead === controller) quotaRead = null
+    if (generation === quotaGeneration) {
+      initialQuotaPending = false
+      renderCards()
+    }
   }
 }
 
@@ -422,6 +445,8 @@ async function readAnalytics(background = false): Promise<void> {
   lastReadAt = Date.now()
   const groups = viewEl.querySelector<HTMLElement>('.analytics-groups')!
   if (!background) {
+    foregroundPending = true
+    historyPending = true
     shown = null
     historyGeneration++
     historyRead?.abort()
@@ -466,12 +491,9 @@ async function readAnalytics(background = false): Promise<void> {
     controller.abort()
     if (analyticsRead === controller) analyticsRead = null
     if (generation === readGeneration && !background) {
-      viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = true
-      groups.removeAttribute('aria-busy')
+      foregroundPending = false
       groups.style.minHeight = ''
-      // Admit the year only after the selected-day cards have rendered.
-      // Its synchronous SQLite slices must not compete with the first paint.
-      void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
+      renderCards()
     }
   }
 }
@@ -563,6 +585,7 @@ export function initAnalyticsView(): void {
   // that reads again for the day already chosen.
   if (!active) {
     active = true
+    initialQuotaPending = true
     dayOffset = 0
     dayAnchor = new Date()
     reserveQuotaRead()
@@ -575,10 +598,9 @@ export function initAnalyticsView(): void {
     const reopening = shown?.report === snapshot.report && shown.baseline === snapshot.baseline
     const keepHistory = history.data && historyScope === analyticsSnapshotScope(dayOffset, dayAnchor) && Date.now() - historyReadAt <= getRefreshRateMs()
     if (!keepHistory) { history = { data: null, error: '' }; cursors.clear() }
+    historyPending = !keepHistory || !!history.data?.errors.length
     showSnapshot(snapshot)
     noticeFeed.reportReadErrors('analytics-day', [...accountFailures(snapshot.report), ...accountFailures(snapshot.baseline)])
-    viewEl.querySelector<HTMLElement>('.analytics-loader')!.hidden = true
-    if (!keepHistory || history.data?.errors.length) void readHistory(analyticsHistoryBounds(dayOffset, dayAnchor))
     if (reopening && (snapshot.report.errors.length || snapshot.baseline.errors.length)) void readAnalytics(true)
   }
   else void readAnalytics()
@@ -588,11 +610,16 @@ export function initAnalyticsView(): void {
 export function stopAnalyticsRefresh(): void {
   if (!active) return
   active = false
+  foregroundPending = false
+  initialQuotaPending = false
+  historyPending = false
   cardLayout.cancel()
   readGeneration++
   analyticsRead?.abort()
   analyticsRead = null
   quotaGeneration++
+  quotaRead?.abort()
+  quotaRead = null
   historyGeneration++
   historyRead?.abort()
   historyRead = null

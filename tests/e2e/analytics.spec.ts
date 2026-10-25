@@ -365,7 +365,7 @@ test('keyboard traversal keeps the moved header visible and Tab rolls back witho
   }
 })
 
-test('keeps the canonical unsaved order when quota arrives before daily reports', async ({ page }) => {
+test('publishes quota and daily cards together in canonical order when quota arrives first', async ({ page }) => {
   await workspace(page)
   let release!: () => void
   const waiting = new Promise<void>(resolve => { release = resolve })
@@ -379,13 +379,44 @@ test('keeps the canonical unsaved order when quota arrives before daily reports'
     await openAnalytics(page)
     await expect(page.locator('.analytics-panel[data-group="quota"]')).toHaveCount(2)
     await expect(page.locator('.analytics-panel[data-group="productivity"]')).toHaveCount(0)
+    await expect(page.locator('.github-quota-usage').first()).toBeHidden()
+    await expect(page.locator('.analytics-loader')).toBeVisible()
   } finally { release() }
   const cards = page.locator('.analytics-board > [data-id]')
   await expect(cards).toHaveCount(18)
   await expect(cards.first()).toHaveAttribute('data-group', 'productivity')
   await expect(cards.nth(15)).toHaveAttribute('data-group', 'per-merged-pr')
   await expect(cards.nth(16)).toHaveAttribute('data-group', 'quota')
+  await expect(page.locator('.github-quota-usage').first()).toBeVisible()
+  await expect(value(page, 'Pull requests merged')).toBeVisible()
+  await expect(page.locator('.analytics-loader')).toBeHidden()
   expect(await page.evaluate(() => localStorage.getItem('poise-analytics-card-order'))).toBeNull()
+})
+
+test('shares a pending initial quota read across visible-tab refreshes', async ({ page }) => {
+  await workspace(page)
+  let reads = 0, release!: () => void
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/github-quota', async route => {
+    reads++
+    await waiting
+    await route.fulfill({ json: quotaReport() })
+  })
+  await page.goto('/')
+  try {
+    await openAnalytics(page)
+    await expect.poll(() => reads).toBe(1)
+    await expect(value(page, 'Pull requests merged')).toHaveText('4')
+    await page.evaluate(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    await expect(value(page, 'Pull requests merged')).toBeHidden()
+    expect(reads).toBe(1)
+  } finally { release() }
+  await expect(value(page, 'Pull requests merged')).toBeVisible()
+  await expect(page.locator('.github-quota-usage').first()).toBeVisible()
+  expect(reads).toBe(1)
 })
 
 test('reopening reserves the saved quota slot with loading content until fresh usage arrives', async ({ page }) => {
@@ -424,11 +455,13 @@ test('reopening reserves the saved quota slot with loading content until fresh u
     await expect.poll(() => board.locator('[data-group="quota"]').evaluateAll(cards => cards.map(card => card.getBoundingClientRect().height))).toEqual(heights)
     await expect.poll(() => board.locator(':scope > [data-id]').evaluateAll(cards => cards.map(card => card.getAttribute('data-id')))).toEqual(order)
     await expect(value(page, 'Pull requests merged')).toHaveText('4')
+    await expect(value(page, 'Pull requests merged')).toBeHidden()
     quota.accounts[0].buckets[0].used = 1234
     quota.accounts[0].buckets[0].remaining = 3766
   } finally { hold = false; release() }
   await expect(board.locator('.github-quota-usage').first()).toContainText('1,234 / 5,000 used')
   await expect(board.locator('.github-quota-loading')).toHaveCount(0)
+  await expect(value(page, 'Pull requests merged')).toBeVisible()
   expect(reads).toBe(2)
 })
 
