@@ -66,7 +66,9 @@ Every child Poise starts also observes two tool defaults
 an explicit undefined removes the variable. Explicit ripgrep flags override
 the config file; `--no-config` and provider-embedded search bypass it.
 Caller passes both on to provider CLIs through its inherited environment,
-and the runtime smoke contract checks the shipped config parses.
+the Claude subscription wrapper carries both on to the native CLI and its
+tool children, and the runtime smoke contract checks the shipped config
+parses.
 
 Measured on a Linux container with 12 vCPUs (Node 22.23.4, TypeScript
 5.9.3, ESLint 10.6.0, ripgrep 13.0.0, esbuild 0.28.1). CPU seconds are user
