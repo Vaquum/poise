@@ -548,6 +548,20 @@ describe('who may act', () => {
 })
 
 describe('what the Switchboard posts and reads', () => {
+  it('attributes state items from stored sessions without per-session queue and timer summaries', async () => {
+    await chat('Alpha')
+    await chat('Beta')
+    await chat('Gamma')
+    const prepare = vi.spyOn(database.db, 'prepare')
+    try {
+      const state = switchboard.state()
+      expect(state.chats).toBe(3)
+      const summaries = prepare.mock.calls.map(([sql]) => String(sql)).filter(sql =>
+        sql.includes('chat_message_queue') || sql.includes('chat_control_timers'))
+      expect(summaries).toHaveLength(0)
+    } finally { prepare.mockRestore() }
+  })
+
   it('validates items, keeps the first post of a source event and kind, and caps open decisions', async () => {
     const person = await chat('Manager')
     const seq = await say(person.id)
