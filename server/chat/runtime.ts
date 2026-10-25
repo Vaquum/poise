@@ -75,7 +75,7 @@ import { actorOf, nativeName } from './actors'
 import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
 import { WORK_MONITOR_SENDER, bindings, holdChat, holds, internalTurn, message as controlMessage, moveBindings, releaseBindings, timerSummaries } from './control-store'
-import { groupMembers, pgidAlive, pidAlive, signalGroup, workerGateStatus, workerIdentityMatches, type GroupMember, type WorkerGateStatus } from './worker'
+import { groupMembers, pgidAlive, pidAlive, signalGroup, workerGateStatus, workerGroupMatches, workerIdentityMatches, type GroupMember, type WorkerGateStatus } from './worker'
 import { ADOPTION_LIVE_TIMEOUT_MS, attachRelay, livePromise, relayDirFor, relayIdentityMatches, spawnRelay, type RelayConnection } from './relay'
 import { createReplayHost, recalledDiffs } from './replay'
 import { createClaudeAdapter } from './adapters/claude'
@@ -740,12 +740,24 @@ export class ChatRuntime extends EventEmitter {
     }
   }
 
-  /** SIGTERM a verified recorded group, SIGKILL after the grace period.
-   *  True when the group is gone; on survival the session says so and
-   *  both rows stay for the next recovery. */
-  private async terminateRecordedWorker(worker: Pick<storage.WorkerRow, 'gatePgid'>, record: SessionRecord | null): Promise<boolean> {
+  /** SIGTERM a recorded group that still belongs to this session's
+   *  worker, SIGKILL after the grace period. Each signal re-verifies
+   *  ownership first: a stale registration naming another session's
+   *  live group is never signalled. True when the group is gone; on
+   *  survival or refusal the session says so and both rows stay for
+   *  the next recovery. */
+  private async terminateRecordedWorker(worker: Pick<storage.WorkerRow, 'gatePid' | 'gatePgid' | 'ident'>, record: SessionRecord | null): Promise<boolean> {
+    const refuse = () => {
+      if (record) {
+        record.orphanNotice = `the recorded worker group ${worker.gatePgid} of this session could not be verified as its own; stop it by hand`
+        storage.saveSession(record)
+      }
+      return false
+    }
+    if (!(await workerGroupMatches(worker.gatePid, worker.gatePgid, worker.ident))) return refuse()
     signalGroup(worker.gatePgid, 'SIGTERM')
     if (!(await waitDead(worker.gatePgid, CLOSE_GRACE_MS))) {
+      if (!(await workerGroupMatches(worker.gatePid, worker.gatePgid, worker.ident))) return refuse()
       signalGroup(worker.gatePgid, 'SIGKILL')
       if (!(await waitDead(worker.gatePgid, CLOSE_GRACE_MS))) {
         if (record) {
