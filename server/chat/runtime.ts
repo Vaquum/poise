@@ -3491,6 +3491,10 @@ export class ChatRuntime extends EventEmitter {
         // is about the conversation and gets none.
         let editor = false
         if (!turn.review && turn.contextAction !== 'compact' && record.subject?.surface.startsWith('editor-')) {
+          // Set before the call: if preparation aborts after the file lands,
+          // final cleanup must still remove it. Removal is best-effort when
+          // the file was never created.
+          editorContext = true
           next = await prepareEditorContext(record.checkout, record, turn.id, next, turn.abort.signal)
           editor = true
         }
@@ -4402,10 +4406,14 @@ export class ChatRuntime extends EventEmitter {
       let retained = ''
       if (!state.currentBranch && owner.id === record.id && result.sha) {
         const name = `poise/checkpoint/${record.id.slice(0, 8)}-${result.sha.slice(0, 12)}`
-        await moveBranch(lease, record.checkout, name, result.sha, signal ? { signal } : {})
+        // Load-bearing like the post-commit read: the branch must land even
+        // when the caller aborted, or the commit dangles once a later
+        // switch moves away from the now-clean checkout.
+        await moveBranch(lease, record.checkout, name, result.sha)
         retained = ` (kept on branch ${name})`
       }
       this.emit_(record.id, { type: 'status.changed', status: session.record.status, detail: `checkpointed ${owner.title}'s changes on ${state.currentBranch || 'a detached HEAD'}${retained}` })
+      signal?.throwIfAborted()
     }
   }
 

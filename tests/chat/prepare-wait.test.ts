@@ -4,7 +4,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -90,6 +90,26 @@ vi.mock('../../server/chat/git', async (importOriginal) => {
     inspectCheckout: async (checkout: string, options?: { signal?: AbortSignal }) => {
       if (!stubs.stuckCheckout) return actual.inspectCheckout(checkout, options)
       throw new actual.GuardedWorkerStuckError('git')
+    },
+  }
+})
+
+const editorStubs = vi.hoisted(() => ({
+  gate: null as null | { created: () => void, proceed: Promise<void> },
+}))
+
+vi.mock('../../server/chat/editor-context', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../server/chat/editor-context')>()
+  return {
+    ...actual,
+    prepareEditorContext: async (...args: Parameters<typeof actual.prepareEditorContext>) => {
+      const out = await actual.prepareEditorContext(...args)
+      const gate = editorStubs.gate
+      if (gate) {
+        gate.created()
+        await gate.proceed
+      }
+      return out
     },
   }
 })
@@ -500,5 +520,38 @@ describe('queued preparation waits', () => {
     expect(controls.prompts).toHaveLength(0)
     await until(() => runtime.get(record.id)?.status === 'error')
     expect(new CheckoutLease(record.checkout, { ownerKind: 'test', ownerId: 't', ownerLabel: 't', instance: 'test' }).read()).not.toBeNull()
+  })
+
+  it('removes the editor context file when the turn aborts after it lands', async () => {
+    const controls = controllableAdapter()
+    const runtime = makeRuntime(controls)
+    const record = await runtime.create({ agent: 'grok', model: 'grok-4.6-high', title: 'editor abort',
+      subject: { surface: 'editor-document', key: 'draft', label: 'draft' } })
+    await until(() => runtime.get(record.id)?.status === 'idle')
+    const contextDir = join(record.checkout, '.poise-chat', 'context', record.id)
+    const listed = (): Promise<string[]> => readdir(contextDir).catch(() => [])
+    expect(await listed()).toHaveLength(0)
+    let created!: () => void
+    const wasCreated = new Promise<void>((resolve) => { created = resolve })
+    let release: () => void = () => undefined
+    const proceed = new Promise<void>((resolve) => { release = resolve })
+    editorStubs.gate = { created, proceed }
+    try {
+      runtime.prompt(record.id, promptInput('edit please'))
+      await wasCreated
+      // preparing() awaits the input callback, so the gate must release for
+      // the abort below to settle the turn; cancel() delivers the abort
+      // synchronously and then waits for the end.
+      const cancelling = runtime.cancel(record.id)
+      release()
+      const { settled } = await cancelling
+      expect(settled).toBe(true)
+      await until(() => finished(runtime, record.id).length === 1)
+      expect(finished(runtime, record.id)[0]).toMatchObject({ stopReason: 'cancelled' })
+      expect(await listed()).toHaveLength(0)
+    } finally {
+      release()
+      editorStubs.gate = null
+    }
   })
 })

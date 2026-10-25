@@ -3,6 +3,7 @@
 // verified dead, clearing the lease registration — or keeps it with a
 // stuck error when termination cannot be verified.
 
+import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
@@ -36,7 +37,7 @@ vi.mock('../../server/chat/worker', async (importOriginal) => {
 })
 
 const abortStubs = vi.hoisted(() => ({
-  abortAtPostCommitRevParse: null as { controller: AbortController, revParses: number } | null,
+  abortAtPostCommitRevParse: null as { controller: AbortController, revParses: number, abortAt: number } | null,
 }))
 
 vi.mock('../../server/process', async (importOriginal) => {
@@ -48,8 +49,8 @@ vi.mock('../../server/process', async (importOriginal) => {
       if (gate && command === 'git' && args[0] === 'rev-parse' && args[1] === 'HEAD') {
         gate.revParses += 1
         // checkpoint() reads the head once to inspect, then once to resolve
-        // the commit it just made: abort at the second read.
-        if (gate.revParses === 2) gate.controller.abort()
+        // the commit it just made; each test arms which read aborts.
+        if (gate.revParses === gate.abortAt) gate.controller.abort()
       }
       return actual.runFile(command, args, options)
     },
@@ -140,7 +141,7 @@ describe('guarded command abort', () => {
     const l = lease()
     await writeFile(join(checkout, 'dirty.txt'), 'uncommitted\n')
     const controller = new AbortController()
-    abortStubs.abortAtPostCommitRevParse = { controller, revParses: 0 }
+    abortStubs.abortAtPostCommitRevParse = { controller, revParses: 0, abortAt: 2 }
     try {
       const result = await checkpoint(l, checkout, 'main', { signal: controller.signal })
       expect(result).toMatchObject({ committed: true })
@@ -152,5 +153,46 @@ describe('guarded command abort', () => {
     // The checkpoint commit stays reachable; the fixture returns to pristine.
     git(['reset', '--quiet', 'HEAD~1'])
     await rm(join(checkout, 'dirty.txt'))
+  })
+})
+
+describe('detached checkpoint retention', () => {
+  it('keeps the retention branch when the abort lands after the post-commit read', async () => {
+    const { ChatRuntime } = await import('../../server/chat/runtime')
+    const id = randomUUID()
+    const wsRoot = join(root, 'ws')
+    const wsCheckout = join(wsRoot, 'workers', id, 'workspace')
+    await mkdir(wsCheckout, { recursive: true })
+    const wgit = (args: string[]): string => execFileSync('git', args, { cwd: wsCheckout, encoding: 'utf8',
+      env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid' } }) as string
+    wgit(['init', '-q', '-b', 'main'])
+    wgit(['config', 'user.email', 't@example.invalid'])
+    wgit(['config', 'user.name', 't'])
+    await writeFile(join(wsCheckout, 'README.md'), '# repo\n')
+    wgit(['add', '-A'])
+    wgit(['commit', '-q', '-m', 'init'])
+    wgit(['checkout', '-q', '--detach'])
+    await writeFile(join(wsCheckout, 'dirty.txt'), 'uncommitted\n')
+    const l = new CheckoutLease(wsCheckout, { ownerKind: 'poise:chat', ownerId: 'test', ownerLabel: 'test', instance: 'test' })
+    if (!l.tryAcquire().acquired) throw new Error('could not acquire test lease')
+    leases.push(l)
+    const controller = new AbortController()
+    // Head reads before the resolve: makeCheckoutSwitchable inspects, then
+    // checkpoint() inspects, then resolves the commit it just made.
+    abortStubs.abortAtPostCommitRevParse = { controller, revParses: 0, abortAt: 3 }
+    const session = { record: { id, checkout: wsCheckout, workspaceKind: 'poise-local', branch: { name: 'main' }, title: 't' } }
+    const fakeThis = { live: new Map(), instance: 'test', options: { localWorkspaceRoot: wsRoot }, emit_: () => undefined }
+    try {
+      const call = (ChatRuntime.prototype as any).makeCheckoutSwitchable.call(fakeThis, session, l, controller.signal)
+      await expect(call).rejects.toMatchObject({ name: 'AbortError' })
+      expect(controller.signal.aborted).toBe(true)
+    } finally {
+      abortStubs.abortAtPostCommitRevParse = null
+    }
+    const branches = (execFileSync('git', ['branch', '--format=%(refname:short)'], { cwd: wsCheckout, encoding: 'utf8' }) as string)
+      .split('\n').map((b) => b.trim()).filter((b) => b.startsWith('poise/checkpoint/'))
+    expect(branches).toHaveLength(1)
+    const shown = execFileSync('git', ['show', `${branches[0]}:dirty.txt`], { cwd: wsCheckout, encoding: 'utf8' }) as string
+    expect(shown).toContain('uncommitted')
   })
 })
