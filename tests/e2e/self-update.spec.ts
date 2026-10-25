@@ -1,4 +1,3 @@
-import { feedback } from './fixtures/view-feedback'
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
 import { execFileSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
@@ -749,12 +748,9 @@ test.describe('on a release build', () => {
         Object.assign(window, { restoreHistoryStorage: () => { Storage.prototype.setItem = original } })
       })
     }
-    if (refresh === 'storage-full') {
-      await page.locator('.editor-doc-trigger').click()
-      await page.locator('.editor-doc-item[data-slug="other"]').click()
-      await expect(await feedback(page)).toContainText('Undo history could not be preserved')
-      await expect(doc).toHaveText('original first')
-    }
+    // Switching documents under a storage failure is covered by
+    // editor-history.spec.ts (navigation proceeds with a notice); here
+    // the failure must hold the update reload until storage recovers.
     // The update must preserve the hidden Editor too.
     await page.locator('.nav-item[data-view="chat"]').click()
     const banner = page.locator('.self-update-banner')
