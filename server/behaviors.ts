@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { mkdir } from 'node:fs/promises'
+import { MessageChannel } from 'node:worker_threads'
 import { ISSUE_REVIEW_BEHAVIOR, fetchAgentLogSnapshot, quarantinedLogMayMatch, type LogEntry } from './agent'
 import { claudeAuth } from './claude-auth'
 import { REVIEW_POLICY, needsClaude, reviewChoice, reviewPanel, type ReviewPanel, type ReviewPlace } from './review-model'
@@ -1204,7 +1205,8 @@ const PR_OPERATION_EVALUATION_LEASE_MS = 65_000
 // One behavior tick's per-PR work stays inside the CLI budget: evidence
 // batches of ten fit the 30 s CLI budget under load, and preparation and
 // approval launches run in small pools instead of fanning out over every
-// candidate at once.
+// candidate at once. Initial worker entries yield to the event loop;
+// later task continuations can still converge after shared async work.
 export const PR_READ_BATCH_SIZE = 10
 export const REVIEW_PREPARE_CONCURRENCY = 5
 export const APPROVE_FIRE_CONCURRENCY = 3
@@ -2310,18 +2312,45 @@ function orderByCursor(prs: DatastorePr[], cursorKey: string): DatastorePr[] {
   return [...prs.slice(start), ...prs.slice(0, start)]
 }
 
+// One macrotask on the real loop: a MessageChannel turn, not a timer, so
+// the wait still crosses the loop wherever the clock is faked.
+function loopTurn(): Promise<void> {
+  return new Promise((resolve) => {
+    const { port1, port2 } = new MessageChannel()
+    port1.once('message', () => {
+      port1.close()
+      port2.close()
+      resolve()
+    })
+    port2.postMessage(null)
+  })
+}
+
 // A fixed pool: queued items check the sweep deadline when they start, not
 // only when they are enqueued, so an ended sweep begins no new CLI work.
-async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
+// Initial worker entries yield to the loop so their synchronous prefixes
+// do not all run in one drain. This does not space later continuations.
+export async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
   let next = 0
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+  const worker = async (): Promise<void> => {
     for (;;) {
       if (behaviorAborted()) return
       const index = next++
       if (index >= items.length) return
       await task(items[index]!)
     }
-  })
+  }
+  const workers: Array<Promise<void>> = []
+  const count = Math.min(limit, items.length)
+  for (let started = 0; started < count; started++) {
+    const running = worker()
+    // Own the rejection before the stagger below yields: a worker that fails
+    // fast must not read as unhandled while Promise.all is not yet attached.
+    // This only marks it handled; Promise.all still fails with it.
+    void running.catch(() => undefined)
+    workers.push(running)
+    if (started + 1 < count) await loopTurn()
+  }
   await Promise.all(workers)
 }
 
@@ -5219,7 +5248,19 @@ async function readSubIssues(entries: readonly EligibleIssue[]): Promise<Map<str
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length) }, reader))
+  // Space initial reader entries like forEachPool workers; subsequent
+  // reads can still converge after their asynchronous work completes.
+  const readers: Array<Promise<void>> = []
+  const readerCount = Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length)
+  for (let started = 0; started < readerCount; started++) {
+    const running = reader()
+    // Same ownership as forEachPool workers: own the rejection before the
+    // stagger below yields; Promise.all still fails with it.
+    void running.catch(() => undefined)
+    readers.push(running)
+    if (started + 1 < readerCount) await loopTurn()
+  }
+  await Promise.all(readers)
   return subIssues
 }
 
