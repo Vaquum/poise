@@ -6,6 +6,27 @@ import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, arrangeCli, recordComp
 // again. Rounds are completed change-request rounds read from the durable
 // launch ledger, so the count survives restarts.
 
+function recordCompletedApprovalRound(
+  db: Parameters<typeof recordCompletedInitialReview>[0],
+  options: { target: string, headSha: string, callId: string },
+): void {
+  const claimId = db.claimSeenOwned('approve-prs', options.target)
+  if (!claimId) throw new Error('could not arrange approval claim')
+  const marked = db.markBehaviorLaunchIntentOwned({
+    key: 'approve-prs', target: options.target, claimId, launchBehavior: 'pr_approve',
+    repo: pr.repo, pr: pr.number, requestedAt: new Date().toISOString(),
+    expectedHead: options.headSha, actor: 'review-bot',
+    source: 'poise:approve-prs', correlationId: claimId,
+  })
+  const linked = db.linkBehaviorLaunchCallOwned('approve-prs', options.target, claimId, options.callId)
+  const completed = db.completeBehaviorLaunchOwned({
+    key: 'approve-prs', target: options.target, claimId,
+    action: 'requested_changes', outcome: 'changes_requested',
+    completedAt: new Date().toISOString(), headSha: options.headSha,
+  })
+  if (!marked || !linked || !completed) throw new Error('could not arrange completed approval round')
+}
+
 describe('review-round cap', () => {
   it('is off unless set', async () => {
     const { behaviors: runtime } = await loadModules()
@@ -45,7 +66,7 @@ describe('review-round cap', () => {
     expect(runtime.reviewRoundNumber(pr.repo, pr.number)).toBe(1)
   })
 
-  it('counts one round per head the reviewers sent back', async () => {
+  it('counts the initial panel once and every follow-up after it', async () => {
     const { database: db } = await loadModules()
     recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: HEAD_SHA })
     expect(db.countReviewRounds(pr.repo, pr.number)).toBe(1)
@@ -53,22 +74,27 @@ describe('review-round cap', () => {
     recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: HEAD_SHA, target: `${pr.repo}#${pr.number}:secondary`, callId: 'd'.repeat(32) })
     expect(db.countReviewRounds(pr.repo, pr.number)).toBe(1)
     // A follow-up round on a new head adds a round.
-    const target = `${pr.repo}#${pr.number}@req=2026-07-10T10:00:00Z/r=1/head=${NEXT_HEAD_SHA}`
-    const claimId = db.claimSeenOwned('approve-prs', target)
-    if (!claimId) throw new Error('could not arrange approval claim')
-    const marked = db.markBehaviorLaunchIntentOwned({
-      key: 'approve-prs', target, claimId, launchBehavior: 'pr_approve', repo: pr.repo, pr: pr.number,
-      requestedAt: new Date().toISOString(), expectedHead: NEXT_HEAD_SHA, actor: 'review-bot',
-      source: 'poise:approve-prs', correlationId: claimId,
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T10:00:00Z/r=1/head=${NEXT_HEAD_SHA}`,
+      headSha: NEXT_HEAD_SHA, callId: 'e'.repeat(32),
     })
-    const callId = 'e'.repeat(32)
-    const linked = db.linkBehaviorLaunchCallOwned('approve-prs', target, claimId, callId)
-    const completed = db.completeBehaviorLaunchOwned({
-      key: 'approve-prs', target, claimId, action: 'requested_changes', outcome: 'changes_requested',
-      completedAt: new Date().toISOString(), headSha: NEXT_HEAD_SHA,
-    })
-    if (!marked || !linked || !completed) throw new Error('could not arrange completed approval round')
     expect(db.countReviewRounds(pr.repo, pr.number)).toBe(2)
+  })
+
+  it('counts follow-ups on an unchanged head', async () => {
+    const { database: db } = await loadModules()
+    recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: HEAD_SHA })
+    // Author replies re-arm the trigger without a new commit, so two
+    // completed follow-ups can share one head — and both are rounds.
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T10:00:00Z/r=1/head=${HEAD_SHA}`,
+      headSha: HEAD_SHA, callId: 'e'.repeat(32),
+    })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T11:00:00Z/r=2/head=${HEAD_SHA}`,
+      headSha: HEAD_SHA, callId: 'f'.repeat(32),
+    })
+    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(3)
   })
 
   it('ignores clean, failed and quarantined runs', async () => {

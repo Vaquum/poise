@@ -159,10 +159,11 @@ must be present in live evidence before it becomes durable approval evidence.
 
 Approve Pull Requests carries a review-round cap: off unless set, otherwise an
 integer from 2 to 10. A round is a completed change-request round on the pull
-request — one per head the automated reviewers sent back, so a parallel
-initial panel on one head is one round, and failed, held, quarantined,
-superseded and manual runs add none. The count is read from the durable launch
-ledger at preparation time, so it survives restarts. From the capped round on
+request: the initial review counts once however wide its panel, and every
+approve-prs follow-up counts, including follow-ups on an unchanged head that
+author replies re-armed. Failed, held, quarantined, superseded and manual runs
+add none. The count is read from the durable launch ledger at preparation
+time, so it survives restarts. From the capped round on
 (round ≥ cap, never = cap alone, so a push after a capped approval cannot
 reopen the loop), the run files that round's findings as one follow-up issue
 in the pull request's repository and approves instead of requesting changes
