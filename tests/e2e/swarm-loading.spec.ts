@@ -439,7 +439,9 @@ test('an exhausted search reopens when arrivals and a hidden match land together
   logs.splice(300, 0, completed)
   running = []
   await settledRefresh(page)
-  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 301+')
+  // The hidden match is not merged yet — only the reopened cursor's `+`
+  // proves the walk reopened; the match arrives with the next fetch below.
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 300+')
   await expect(pagerNext(page)).toBeEnabled()
   await pagerNext(page).click()
   await expect(page.locator('#swarm-page')).toHaveText('201–301 / 301')
