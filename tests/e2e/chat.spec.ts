@@ -1232,7 +1232,7 @@ test('shows all five catalogue providers and keeps efforts specific to each mode
 })
 
 
-test('starts a fresh console with Opus 5 High on first send, exactly once', async ({ page }) => {
+test('starts a fresh console with the saved Chat default on first send, exactly once', async ({ page }) => {
   const state = makeState([])
   let release = () => {}
   state.createDelay = () => new Promise<void>(resolve => { release = resolve })
@@ -1241,7 +1241,7 @@ test('starts a fresh console with Opus 5 High on first send, exactly once', asyn
   await page.goto('/')
   await expect(input(page)).toBeEnabled()
   await expect(page.getByText('Pick a session on the left, or start a new one.')).toHaveCount(0)
-  await expect(page.locator('.chat-default-model')).toHaveText('Opus 5 · High')
+  await expect(page.locator('.chat-default-model')).toHaveText('Opus 5 · Max')
   await input(page).fill('First line')
   await input(page).press('Shift+Enter')
   await input(page).pressSequentially('Second line')
@@ -1253,13 +1253,51 @@ test('starts a fresh console with Opus 5 High on first send, exactly once', asyn
   await page.locator('.chat-v-composer').dispatchEvent('submit')
   expect(sock.framesOf('prompt')).toHaveLength(0)
   expect(state.calls.filter(c => c.method === 'POST' && c.path === '/api/chat/sessions')).toHaveLength(1)
-  expect(state.calls.find(c => c.method === 'POST')?.body).toMatchObject({ agent: 'claude', model: 'opus-5-high', effort: 'high' })
+  expect(state.calls.find(c => c.method === 'POST')?.body).toMatchObject({ agent: 'claude', model: 'opus-5-max', effort: 'max' })
   expect(state.calls.find(c => c.method === 'POST')?.body).not.toHaveProperty('repo')
   release()
   await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
   expect(sock.framesOf('prompt')[0].command).toMatchObject({ sessionId: 'new-1', text: 'First line\nSecond line', attachments: [], mentions: [] })
   await expect(page.locator('.chat-msg-user')).toHaveCount(1)
   await expect(page.getByRole('dialog', { name: 'New session' })).toBeHidden()
+})
+
+test('a non-Claude saved default drives the fresh console and the New session dialog', async ({ page }) => {
+  const state = makeState([])
+  state.agents = structuredClone(AGENTS)
+  state.agents.defaults = { model: 'gpt-6-astra-ultra', fallback: 'opus-5-max' }
+  await installRoutes(page, state)
+  const sock = await installSocket(page, state)
+  await page.goto('/')
+  await expect(page.locator('.chat-default-model')).toHaveText('GPT 6 Astra · Ultra')
+  await page.getByRole('button', { name: 'New session' }).click()
+  const dialog = page.getByRole('dialog', { name: 'New session' })
+  await expect(dialog.getByLabel('Model')).toHaveValue('gpt-6-astra-ultra')
+  await expect(dialog.getByLabel('Effort')).toHaveValue('ultra')
+  await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await input(page).fill('Use the saved default')
+  await input(page).press('Enter')
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  const creates = state.calls.filter(c => c.method === 'POST' && c.path === '/api/chat/sessions')
+  expect(creates).toHaveLength(1)
+  expect(creates[0].body).toMatchObject({ agent: 'codex', model: 'gpt-6-astra-ultra', effort: 'ultra' })
+})
+
+test('keeps a fresh message when its saved default has retired from the catalogue', async ({ page }) => {
+  const state = makeState([])
+  state.agents = structuredClone(AGENTS)
+  state.agents.defaults = { model: 'retired-model-max', fallback: 'gpt-6-astra-ultra' }
+  await installRoutes(page, state)
+  const sock = await installSocket(page, state)
+  await page.goto('/')
+  await expect(page.locator('.chat-default-model')).toHaveText('Retired Model · Max')
+  await input(page).fill('Nowhere to send')
+  await input(page).press('Enter')
+  await expect(page.locator('.chat-notice')).toContainText('not in the current catalogue')
+  await expect(input(page)).toHaveValue('Nowhere to send')
+  await expect(input(page)).toBeEnabled()
+  expect(state.calls.filter(c => c.method === 'POST')).toHaveLength(0)
+  expect(sock.framesOf('prompt')).toHaveLength(0)
 })
 
 test('keeps a failed fresh message editable without switching model or opening a dialog', async ({ page }) => {
@@ -1495,7 +1533,7 @@ test('chooses any available catalogue model and effort from the console without 
   const picker = consolePicker(page)
   await expect(picker.locator('.chat-model-provider')).toHaveText(['Claude Code', 'Codex', 'Grok Build', 'Antigravity (Google)', 'Muse'])
   await expect(picker.getByRole('option')).toHaveCount(10)
-  await expect(picker.locator('[data-identity="opus-5-high"]')).toHaveAttribute('aria-selected', 'true')
+  await expect(picker.locator('[data-identity="opus-5-max"]')).toHaveAttribute('aria-selected', 'true')
   await expect(picker.locator('[data-identity="gemini-3.8-flash-high"]')).toBeDisabled()
   await expect(picker).toContainText('No interactive permission/question channel')
   await picker.locator('[data-identity="muse-spark-1.3-contributor-xhigh"]').click()
@@ -1526,11 +1564,11 @@ test('navigates console models with the keyboard and dismisses without changing 
   await button.focus()
   await button.press('ArrowDown')
   const picker = consolePicker(page)
-  await expect(picker.locator('[data-identity="opus-5-high"]')).toBeFocused()
+  await expect(picker.locator('[data-identity="opus-5-max"]')).toBeFocused()
   await page.keyboard.press('ArrowDown')
-  await expect(picker.locator('[data-identity="gpt-6-astra-ultra"]')).toBeFocused()
+  await expect(picker.locator('[data-identity="opus-5-xhigh"]')).toBeFocused()
   await page.keyboard.press('Enter')
-  await expect(button).toHaveText('GPT 6 Astra · Ultra')
+  await expect(button).toHaveText('Opus 5 · Extra high')
   await expect(button).toBeFocused()
   await button.click()
   await expect(picker.getByRole('option')).toHaveCount(10)
@@ -3419,21 +3457,22 @@ test('settings: opening autofocus never steals a field the person already chose'
   await expect(prefix).toHaveValue('agent/')
 })
 
-for (const queued of [false, true]) test(`CLI refresh: a fresh ${queued ? 'queued task' : 'message'} uses discovered Opus 5.5 High`, async ({ page }) => {
+for (const queued of [false, true]) test(`CLI refresh: a fresh ${queued ? 'queued task' : 'message'} uses the re-resolved default`, async ({ page }) => {
   const state = makeState([])
   state.agents = structuredClone(AGENTS)
   const claude = state.agents.agents[0] as { models: Array<{ identity: string, selector: string, effort: string }> }
   claude.models = claude.models.map(model => ({ ...model, identity: model.identity.replace('opus-5-', 'opus-5.5-'), selector: 'claude-opus-5-5' }))
+  state.agents.defaults = { model: 'opus-5.5-max', fallback: 'gpt-6-astra-ultra' }
   await installRoutes(page, state); const sock = await installSocket(page, state)
   await page.goto('/')
-  await expect(page.locator('.chat-default-model')).toHaveText('Opus 5.5 · High')
+  await expect(page.locator('.chat-default-model')).toHaveText('Opus 5.5 · Max')
   await input(page).fill(queued ? '/queue Later task' : 'Start with the current model')
   await input(page).press('Enter')
   await expect.poll(() => state.calls.filter(c => c.method === 'POST' && c.path === '/api/chat/sessions').length).toBe(1)
-  expect(state.calls.find(c => c.method === 'POST' && c.path === '/api/chat/sessions')!.body).toMatchObject({ model: 'opus-5.5-high', effort: 'high' })
+  expect(state.calls.find(c => c.method === 'POST' && c.path === '/api/chat/sessions')!.body).toMatchObject({ model: 'opus-5.5-max', effort: 'max' })
   await expect.poll(() => sock.framesOf(queued ? 'queue.add' : 'prompt').length).toBe(1)
   if (queued) {
-    expect(sock.framesOf('queue.add')[0].command).toMatchObject({ model: 'opus-5.5-high', effort: 'high' })
+    expect(sock.framesOf('queue.add')[0].command).toMatchObject({ model: 'opus-5.5-max', effort: 'max' })
     expect(sock.framesOf('prompt')).toHaveLength(0)
   }
 })
@@ -3532,9 +3571,10 @@ test('CLI refresh: a completed Settings check updates the fresh console without 
   await page.route('**/api/models/refresh', async route => {
     const claude = state.agents!.agents[0] as { models: Array<{ identity: string, selector: string, effort: string }> }
     claude.models = claude.models.map(model => ({ ...model, identity: model.identity.replace('opus-5-', 'opus-5.5-'), selector: 'claude-opus-5-5' }))
+    state.agents!.defaults = { model: 'opus-5.5-max', fallback: 'gpt-6-astra-ultra' }
     await route.fulfill({ json: { changed: true, completed_at: '2026-10-21T16:38:00.000Z', families: { claude: { status: 'ok' } }, cli_updates: { claude: { status: 'updated', before: '2.1.274', after: '2.1.280' } } } })
   })
-  await page.goto('/'); await expect(page.locator('.chat-default-model')).toHaveText('Opus 5 · High')
+  await page.goto('/'); await expect(page.locator('.chat-default-model')).toHaveText('Opus 5 · Max')
   await openModelSettings(page)
   await page.getByRole('button', { name: 'Check now', exact: true }).click()
   await expect(page.locator('.st-status')).toContainText('Catalog updated.')
@@ -3543,7 +3583,7 @@ test('CLI refresh: a completed Settings check updates the fresh console without 
   await expect(page.locator('.st-catalog-status')).toHaveText(/ · Checked (21 Oct (2026 )?)?16:38$/)
   await expect(page.locator('.st-catalog-status')).not.toContainText('Invalid Date')
   await page.keyboard.press('Escape')
-  await expect(page.locator('.chat-default-model')).toHaveText('Opus 5.5 · High')
+  await expect(page.locator('.chat-default-model')).toHaveText('Opus 5.5 · Max')
   expect(sock.framesOf('prompt')).toHaveLength(0)
   expect(state.calls.filter(call => call.method === 'POST' && call.path === '/api/chat/sessions')).toHaveLength(0)
 })
@@ -3595,7 +3635,7 @@ test('CLI refresh: a fast catalogue cannot accept text into the wrong conversati
   } finally { release() }
 })
 
-for (const explicit of [false, true]) test(`CLI refresh: ${explicit ? 'explicit model choice is preserved' : 'legacy pinned default follows the discovered successor'} after an update`, async ({ page }) => {
+for (const explicit of [false, true]) test(`CLI refresh: ${explicit ? 'explicit model choice is preserved' : 'legacy pinned default follows the saved default'} after an update`, async ({ page }) => {
   const state = makeState([]); state.agents = structuredClone(AGENTS)
   const claude = state.agents.agents[0] as { models: Array<{ identity: string, selector: string, effort: string }> }
   claude.models.push(...claude.models.map(model => ({ ...model, identity: model.identity.replace('opus-5-', 'opus-5.5-'), selector: 'claude-opus-5-5' })))
@@ -3605,7 +3645,7 @@ for (const explicit of [false, true]) test(`CLI refresh: ${explicit ? 'explicit 
       fresh: { draft: { text: 'Keep this unsent draft', attachments: [], mentions: [], mode: null }, modelIdentity: 'opus-5-high', ...(explicit ? { modelSelection: 'explicit' } : {}) }, sessions: {} }))
   }, explicit)
   await page.goto('/')
-  await expect(page.locator('.chat-default-model')).toHaveText(explicit ? 'Opus 5 · High' : 'Opus 5.5 · High')
+  await expect(page.locator('.chat-default-model')).toHaveText(explicit ? 'Opus 5 · High' : 'Opus 5 · Max')
   await expect(input(page)).toHaveValue('Keep this unsent draft')
   expect(sock.framesOf('prompt')).toHaveLength(0)
 })

@@ -28,11 +28,12 @@ export function familyForIdentity(families: ModelFamily[], identity: string): Mo
   return families.find(family => family.models.some(model => model.identity === identity))
 }
 
-/** Keep the Opus/High policy, not a version string that discovery can retire. */
-export function quickSessionModel(agents: AgentInfo[]): AgentModel | undefined {
-  const models = agents.find(agent => agent.id === 'claude')?.models.filter(model => /^claude-opus-\d+(?:-\d+)*$/.test(model.selector)) || []
-  const latest = [...models].sort((a, b) => b.selector.localeCompare(a.selector, 'en', { numeric: true }))[0]?.selector
-  return models.find(model => model.selector === latest && model.effort === 'high')
+/** The fresh console's automatic model: the saved Chat default, resolved
+ *  against the current catalogue. A retired default resolves to nothing; the
+ *  send path reports that visibly instead of substituting another model. */
+export function quickSessionModel(agents: AgentInfo[], defaultIdentity?: string | null): AgentModel | undefined {
+  if (!defaultIdentity) return undefined
+  return agents.flatMap(agent => agent.models).find(model => model.identity === defaultIdentity)
 }
 
 /** Display only: submission always uses an actual catalogue row, never a label. */
@@ -44,10 +45,11 @@ export function consoleModelLabel(identity: string, effort = identity.split('-')
   return `${name} · ${level}`
 }
 
-/** Resolve the draft's choice again at Send/Attach, without silent fallback. */
-export function quickSessionRequest(agents: AgentInfo[], identity?: string | null): import('../server/chat/protocol').NewSessionRequest {
-  identity ||= quickSessionModel(agents)?.identity
-  if (!identity) throw new Error('Opus High is not in the current catalogue. Choose a model in the console.')
+/** Resolve the draft's choice again at Send/Attach, without silent fallback.
+ *  An untouched console sends the saved Chat default, like New session. */
+export function quickSessionRequest(agents: AgentInfo[], identity?: string | null, defaultIdentity?: string | null): import('../server/chat/protocol').NewSessionRequest {
+  identity ||= defaultIdentity || undefined
+  if (!identity) throw new Error('No model is configured for new chats. Choose a model in the console.')
   const selected = identity
   const agent = agents.find(candidate => candidate.models.some(model => model.identity === selected))
   const model = agent?.models.find(candidate => candidate.identity === identity)

@@ -75,7 +75,7 @@ The Settings view shows elapsed time in neutral text while checking, clearing
 any previous failure message and error color. A failed check is red; a successful
 check restores the neutral catalog status. It then shows versions and the
 completed result. Refreshing the catalogue updates an untouched fresh console
-to the latest discovered Opus with High effort. Explicit model selections and
+to the re-resolved Chat default. Explicit model selections and
 existing conversations are not silently moved to another model.
 
 ## Verification
@@ -87,8 +87,9 @@ turns, catalogue invalidation, new-model defaults and browser timeout recovery.
 
 Upgrade compatibility: older pages stored the fixed `opus-5-high` fresh-console
 default without recording whether it was explicitly chosen. That legacy value
-now restores as automatic Opus High, with draft text preserved. New snapshots
-record automatic versus explicit selection, so future reloads preserve a
-person's intentional model choice. Sessions whose model left the catalog are
-deleted on startup, so a retired identity can never be resumed, forked, or
-copied into a `/poise` change; every other session keeps its selected model.
+now restores as automatic, showing the saved Chat default, with draft text
+preserved. New snapshots record automatic versus explicit selection, so future
+reloads preserve a person's intentional model choice. Sessions whose model left
+the catalog are deleted on startup, so a retired identity can never be resumed,
+forked, or copied into a `/poise` change; every other session keeps its
+selected model.
