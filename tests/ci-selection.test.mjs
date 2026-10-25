@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { parse } from 'yaml'
 import { callerAffected, reusableRun, selectTests, verify } from '../.github/ci.mjs'
 
@@ -8,6 +12,40 @@ const browsers = ['smoke', 'service-mode', 'independent-startup', 'swarm-loading
 const select = (paths, event = 'pull_request') => selectTests(event, paths, browsers)
 
 describe('PR test admission', () => {
+  it('retains the merge base that Vitest needs in a shallow PR checkout', () => {
+    const root = mkdtempSync(join(tmpdir(), 'poise-ci-history-'))
+    const source = join(root, 'source')
+    const checkout = join(root, 'checkout')
+    const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+    try {
+      mkdirSync(source)
+      git(source, 'init', '-b', 'main')
+      git(source, 'config', 'user.name', 'CI test')
+      git(source, 'config', 'user.email', 'ci@example.invalid')
+      writeFileSync(join(source, 'module.ts'), 'export const value = 1\n')
+      git(source, 'add', '.')
+      git(source, 'commit', '-m', 'base')
+      const base = git(source, 'rev-parse', 'HEAD')
+      git(source, 'checkout', '-b', 'feature')
+      writeFileSync(join(source, 'module.ts'), 'export const value = 2\n')
+      git(source, 'commit', '-am', 'feature')
+      git(source, 'checkout', 'main')
+      git(source, 'merge', '--no-ff', 'feature', '-m', 'PR merge')
+      git(source, 'update-ref', 'refs/pull/1/merge', 'HEAD')
+      mkdirSync(checkout)
+      git(checkout, 'init')
+      git(checkout, 'remote', 'add', 'origin', pathToFileURL(source).href)
+      for (const depth of [1, 2]) {
+        git(checkout, 'fetch', `--depth=${depth}`, 'origin', 'refs/pull/1/merge')
+        git(checkout, 'checkout', '--detach', 'FETCH_HEAD')
+        git(checkout, 'fetch', '--depth=1', 'origin', base)
+        const diff = spawnSync('git', ['diff', '--name-only', `${base}...HEAD`], { cwd: checkout, encoding: 'utf8' })
+        expect(diff.status).toBe(depth === 1 ? 128 : 0)
+        if (depth === 2) expect(diff.stdout.trim()).toBe('module.ts')
+      }
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
   it('retains exhaustive merge-queue and unproven main validation', () => {
     expect(select(['docs/Testing.md'], 'merge_group').mode).toBe('full')
     expect(select(['src/views/swarm-view.ts'], 'push').mode).toBe('full')
@@ -117,6 +155,7 @@ describe('required aggregate', () => {
     expect(ci.jobs.verify.if).toContain('always()')
     expect(ci.jobs.verify.needs).toEqual(['plan', 'static', 'build', 'unit', 'browser'])
     expect(ci.jobs.browser.container.image).toBe('${{ needs.plan.outputs.browser_image }}')
+    expect(ci.jobs.unit.steps[0].with['fetch-depth']).toBe(2)
     expect(JSON.stringify(ci.jobs.browser.steps)).not.toContain('playwright install')
     expect(readFileSync('.github/ci.mjs', 'utf8')).toContain("'--workers=1'")
     expect(ci.permissions.actions).toBe('read')

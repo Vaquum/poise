@@ -112,6 +112,9 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.unit_shards) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Vitest --changed uses BASE...HEAD; retain the PR merge's parents.
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
