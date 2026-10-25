@@ -210,10 +210,14 @@ export function updatingPage(input: { workspaceHost: string }): string {
 </div>`, { refreshSeconds: 2 })
 }
 
-/** Poise Link's installer (link/install.sh), as published with the newest release. */
-export const LINK_INSTALLER_URL = 'https://github.com/autonomio/poise/releases/latest/download/install.sh'
-/** Where the Windows installers and every other Poise Link build are. */
-export const LINK_RELEASES_URL = 'https://github.com/autonomio/poise/releases/latest'
+/** Poise Link's installer (link/install.sh), as published with the newest release of `repo`. */
+export function linkInstallerUrl(repo: string): string {
+  return `https://github.com/${repo}/releases/latest/download/install.sh`
+}
+/** Where the Windows installers and every other Poise Link build of `repo` are. */
+export function linkReleasesUrl(repo: string): string {
+  return `https://github.com/${repo}/releases/latest`
+}
 
 export function when(ms: number | null): string {
   return ms === null ? 'never' : new Date(ms).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'

@@ -135,6 +135,53 @@ describe('production runtime reconciliation', () => {
     expect(result.action).toBe('reconciled-runtime')
     expect(test.options.install).toHaveBeenCalledOnce()
   })
+
+  it('reinstalls when the installed sync jobs authenticate as a former account, and stays put when they match', async () => {
+    // The real check reads process.env through the reconciler: pin the
+    // database to the test home whatever the developer exports.
+    vi.stubEnv('POISE_DB', '')
+    try {
+      for (const saved of ['new-user', 'old-user']) {
+        const home = await mkdtemp(join(tmpdir(), 'poise-reconciler-identity-'))
+        try {
+          const launchAgents = join(home, 'Library', 'LaunchAgents')
+          await mkdir(launchAgents, { recursive: true })
+          const executable = '/production/caller/.venv/bin/github-datastore'
+          for (const kind of ['sync', 'reconcile', 'health']) {
+            await writeFile(
+              join(launchAgents, `com.vaquum.github-datastore.${kind}.plist`),
+              `<string>exec &apos;${executable}&apos;; GH_TOKEN="$(gh auth token --user &apos;old-user&apos;)"</string>`,
+            )
+          }
+          await mkdir(join(home, '.poise'), { recursive: true })
+          await writeFile(join(home, '.poise', 'cache.db'), '')
+          const test = harness()
+          test.options.home = home
+          const gitRun = test.run
+          test.options.run = vi.fn(async (command, args, options) => (
+            command === '/usr/bin/sqlite3'
+              ? { stdout: JSON.stringify([{ key: 'me', value: saved }]), stderr: '' }
+              : gitRun(command, args, options)
+          ))
+          // The real currency check, not the mock: it reads the run through.
+          test.options.datastoreCurrent = undefined
+          const result = await reconcileRuntime(test.options)
+          if (saved === 'new-user') {
+            expect(result.action).toBe('reconciled-runtime')
+            expect(test.options.install).toHaveBeenCalledOnce()
+          } else {
+            expect(result).toEqual({ action: 'current', poiseCommit: A })
+            expect(test.options.install).not.toHaveBeenCalled()
+            expect(test.options.repairHookConfiguration).toHaveBeenCalledOnce()
+          }
+        } finally {
+          await rm(home, { recursive: true, force: true })
+        }
+      }
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
 })
 
 describe('datastore service currency', () => {
@@ -159,6 +206,53 @@ describe('datastore service currency', () => {
       expect(await datastoreServicesCurrent({ home, binRoot })).toBe(false)
       await rm(join(home, 'Library', 'LaunchAgents', `${labels[2]}.plist`))
       expect(await datastoreServicesCurrent({ home, binRoot })).toBe(false)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  // As install-production.mjs embeds it, xml-escaped: the sync job
+  // authenticates as the saved account through that account's gh token.
+  async function installed(home, executable, user) {
+    const launchAgents = join(home, 'Library', 'LaunchAgents')
+    await mkdir(launchAgents, { recursive: true })
+    for (const label of labels) {
+      await writeFile(
+        join(launchAgents, `${label}.plist`),
+        `<string>exec &apos;${executable}&apos; --db x sync; GH_TOKEN="$(gh auth token --user &apos;${user}&apos;)"</string>`,
+      )
+    }
+    await mkdir(join(home, '.poise'), { recursive: true })
+    await writeFile(join(home, '.poise', 'cache.db'), '')
+  }
+
+  function savedMe(me) {
+    return vi.fn(async (command) => {
+      if (command !== '/usr/bin/sqlite3') throw new Error(`Unexpected command: ${command}`)
+      return { stdout: JSON.stringify([{ key: 'me', value: me }]), stderr: '' }
+    })
+  }
+
+  it('is stale when the installed jobs authenticate as a former account', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'poise-datastore-identity-'))
+    try {
+      const binRoot = '/production/caller/.venv/bin'
+      await installed(home, join(binRoot, 'github-datastore'), 'old-user')
+      expect(await datastoreServicesCurrent({ home, binRoot, run: savedMe('new-user'), environment: {} })).toBe(false)
+      expect(await datastoreServicesCurrent({ home, binRoot, run: savedMe('old-user'), environment: {} })).toBe(true)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('is stale when the saved account is cleared, and unjudged before the first start', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'poise-datastore-identity-'))
+    try {
+      const binRoot = '/production/caller/.venv/bin'
+      await installed(home, join(binRoot, 'github-datastore'), 'old-user')
+      expect(await datastoreServicesCurrent({ home, binRoot, run: savedMe(''), environment: {} })).toBe(false)
+      await rm(join(home, '.poise', 'cache.db'))
+      expect(await datastoreServicesCurrent({ home, binRoot, run: savedMe('old-user'), environment: {} })).toBe(true)
     } finally {
       await rm(home, { recursive: true, force: true })
     }

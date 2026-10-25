@@ -351,6 +351,13 @@ rejects an incomplete pair or a Google secret stored as a variable before
 contacting the server. It rewrites both values into the protected `deploy/.env`
 on each deployment, so configure them in Actions rather than editing that file.
 
+**Serving the fork's own releases.** Set `POISE_RELEASE_REPO` to the fork,
+as an Actions variable like the settings above. The gateway then serves the
+fork's Poise Link installer links to every workspace's Settings, and each
+workspace attributes its release to the fork once its container is recreated.
+Tag `link-v*` in the fork to publish its own Poise Link builds; until then
+the links point at releases that do not exist yet.
+
 **Keeping up with autonomio/poise.** For the fork to update itself, it needs
 both of these:
 

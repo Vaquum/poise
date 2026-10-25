@@ -137,6 +137,7 @@ describe('lazy start', () => {
         'POISE_WORKSPACE_OWNER=Alice',
         `POISE_PUBLIC_ORIGIN=https://${ALICE}`,
         `POISE_GATEWAY_PUBLIC_KEY=${h.keys.publicKeyBase64}`,
+        'POISE_RELEASE_REPO=autonomio/poise',
         'POISE_HOST=0.0.0.0',
         'POISE_PORT=5555',
         'HOME=/home/poise',
@@ -171,12 +172,21 @@ describe('lazy start', () => {
       'POISE_WORKSPACE_OWNER=Alice',
       `POISE_PUBLIC_ORIGIN=https://${ALICE}`,
       `POISE_GATEWAY_PUBLIC_KEY=${h.keys.publicKeyBase64}`,
+      'POISE_RELEASE_REPO=autonomio/poise',
       'POISE_HOST=0.0.0.0',
       'POISE_PORT=5555',
       'HOME=/home/poise',
       'POISE_DRAIN_TIMEOUT=5400',
       'POISE_SKIP_CLI_BOOTSTRAP=1',
     ])
+  })
+
+  it('hands workspaces the fork POISE_RELEASE_REPO names', async () => {
+    const cookie = await start({ env: { POISE_RELEASE_REPO: 'fork/poise' } })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    const create = h.docker.calls.find((call) => call.path.startsWith('/containers/create'))
+    expect((create?.body as { Env: string[] }).Env).toContain('POISE_RELEASE_REPO=fork/poise')
   })
 
   it('leaves out the OCI runtime unless one is configured', async () => {
