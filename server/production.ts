@@ -6,7 +6,10 @@ import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
 import { assertCallerRelease } from './caller-release'
-import { onUpdateRestart } from './service/restart'
+import { refuseInspectorActivation, registerProductionShutdownSignals } from './production-signals'
+// In-process launchers (scripts/start-production.mjs, scripts/self-update/launch.mjs)
+// import these from the bundle, so they are re-exported here.
+export { refuseInspectorActivation, registerProductionShutdownSignals }
 import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runtime-config'
 import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
@@ -14,6 +17,15 @@ import { TERMINAL_WS_PATH, type TerminalPreset } from './terminal/protocol'
 import type { TerminalCommand } from './terminal/pty'
 import { startLaunchdWatchdog } from './launchd-watchdog'
 import type { ClaudeAuthRuntime } from './cache-plugin'
+
+// The production server refuses the inspector before anything slower runs
+// (dotenv, logging, the runtime), so a SIGUSR1 arriving during startup finds
+// the refusal already installed. Importers (tests, tooling) are unaffected:
+// only the server process itself takes this posture.
+const isProductionEntrypoint = process.argv[1]
+  ? resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+  : false
+if (isProductionEntrypoint) refuseInspectorActivation()
 
 // Security validation must run before dotenv reads the file and before modules
 // that derive database/runtime paths from process.env are evaluated. A
@@ -495,16 +507,10 @@ export async function startProductionServer(options: ProductionServerOptions = {
   return server
 }
 
-const isEntrypoint = process.argv[1]
-  ? resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
-  : false
-if (isEntrypoint) {
+if (isProductionEntrypoint) {
   startProductionServer().then((server) => {
-    const shutdown = createProductionShutdown(server)
     // A release switch shuts down the same way, then exits for the supervisor to start the new release.
-    onUpdateRestart((exitCode) => shutdown(exitCode))
-    process.once('SIGINT', () => shutdown())
-    process.once('SIGTERM', () => shutdown())
+    registerProductionShutdownSignals(createProductionShutdown(server))
   }).catch(async (error: unknown) => {
     await settleRuntimeStop()
     closeDatabaseOnce()
