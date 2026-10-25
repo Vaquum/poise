@@ -75,7 +75,7 @@ plus system as reported by `time`:
 | Workload | Condition | Elapsed (s) | CPU (s) |
 | --- | --- | ---: | ---: |
 | Lint, all files | Uncached | 41.56 | 33.88 |
-| Lint, all files | Warm content cache | 13.75 | 7.49 |
+| Lint, all files | Warm content cache | 12.11 | 5.89 |
 | All three typechecks | Uncached | 82.47 | 64.99 |
 | All three typechecks | Warm build info | 25.86 | 22.44 |
 | Complete build (clean, typecheck, client, server) | Cold caches | 110.18 | 65.07 |

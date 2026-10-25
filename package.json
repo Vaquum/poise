@@ -31,7 +31,7 @@
     "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
     "typecheck:tests": "tsc -p tsconfig.tests.json --noEmit",
     "typecheck:uncached": "tsc -p tsconfig.json --noEmit --incremental false && tsc -p tsconfig.server.json --noEmit --incremental false && tsc -p tsconfig.tests.json --noEmit --incremental false",
-    "lint": "eslint --cache --cache-location node_modules/.cache/poise/.eslintcache src server tests scripts vite.config.ts playwright.config.ts vitest.config.ts",
+    "lint": "eslint --cache --cache-strategy content --cache-location node_modules/.cache/poise/.eslintcache src server tests scripts vite.config.ts playwright.config.ts vitest.config.ts",
     "lint:uncached": "eslint src server tests scripts vite.config.ts playwright.config.ts vitest.config.ts",
     "test": "vitest run",
     "test:watch": "vitest",

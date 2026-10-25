@@ -28,6 +28,7 @@ describe('Tool CPU caches', () => {
   it('caches lint by content and keeps an uncached invocation', () => {
     const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
     expect(pkg.scripts.lint).toContain('--cache')
+    expect(pkg.scripts.lint).toContain('--cache-strategy content')
     expect(pkg.scripts.lint).toContain('--cache-location node_modules/.cache/')
     expect(pkg.scripts['lint:uncached']).toBeDefined()
     expect(pkg.scripts['lint:uncached']).not.toContain('--cache')
