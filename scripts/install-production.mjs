@@ -15,7 +15,6 @@ import { fileURLToPath } from 'node:url'
 import { config as loadDotenv } from 'dotenv'
 import { callerPython, setupCaller } from './caller-setup.mjs'
 import { installStopGate, stopGateManifest } from './stop-gate-runtime.mjs'
-import { retireCatalogJob } from './model-catalog-job.mjs'
 import { servicePath } from './production-path.mjs'
 import { requireProductionDotenv } from './production-env.mjs'
 import { legacyDatastoreServices, resolveLegacyDatastore, resolveLegacySyncUser } from './legacy-datastore.mjs'
@@ -354,8 +353,10 @@ async function main() {
   ])
   // No calendar job for the model catalog: the production server runs the
   // daily check itself at 07:00 in the timezone saved in Settings, so a
-  // timezone change takes effect without reinstalling. The legacy job is
-  // retired at the end, once the service is back up.
+  // timezone change takes effect without reinstalling. The running server
+  // retires the legacy job at startup (server/launchd-watchdog.ts) — the
+  // only retirer, so its stand-down decision can never race a concurrent
+  // unload. That also covers managed installs, which never run this script.
   // The empty plan on a clean install must not write, unload, or start any
   // pre-existing datastore launchd job owned outside this Poise installation.
   if (datastoreDb) {
@@ -444,10 +445,6 @@ async function main() {
     await bootstrap(updaterPlist)
     await start(updaterLabel)
   }
-  // Last: retiring the legacy catalog job throws when the old job survives,
-  // and must not abort the install before the service it just restarted is
-  // back up. Everything above is already running if this fails.
-  await retireCatalogJob({ launchAgents, domain, run })
   console.log(`Installed ${serviceLabel} at ${commit} with its Caller (${Object.entries(manifest.packages).map(([name, version]) => `${name} ${version}`).join(', ')})`)
   if (!datastoreDb) console.log('Add your first GitHub organization in Settings to initialize its datastore.')
   if (!health.healthy) {
