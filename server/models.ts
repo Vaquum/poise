@@ -271,8 +271,14 @@ export function resolveSlots(catalog: Catalog, stored: ModelSlotChoices | undefi
   const usable = (identity: string | undefined) => !!identity && !!catalogModel(catalog, identity)
   let primary = stored?.primary
   if (!usable(primary)) {
-    if (primary) notes.push(`${primary} is no longer in the catalog; using ${seedPrimary}.`)
-    primary = seedPrimary
+    // Like the later seats, the replacement must not repeat a saved pick:
+    // the retired primary's seed may already sit in Secondary or Tertiary.
+    const kept = [stored?.secondary, stored?.tertiary]
+    const primarySeeds = seedReviewers(catalog, seedPrimary)
+    const replacement = [seedPrimary, primarySeeds.secondary, primarySeeds.tertiary]
+      .find((candidate) => usable(candidate) && !kept.includes(candidate)) ?? seedPrimary
+    if (primary) notes.push(`${primary} is no longer in the catalog; using ${replacement}.`)
+    primary = replacement
   }
   const seeds = seedReviewers(catalog, primary!)
   const resolved: Record<ModelSlot, string> = { primary: primary!, secondary: '', tertiary: '' }

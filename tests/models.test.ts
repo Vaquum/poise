@@ -83,6 +83,16 @@ describe('resolving the slots against the live catalog', () => {
     expect(resolved.notes).toEqual(['gemini-3.1-pro-high is no longer in the catalog; using grok-4.6-xhigh.'])
   })
 
+  it('replaces a retired primary past the saved later slots instead of repeating one', () => {
+    // The review default already sits in Secondary; the replacement must skip it.
+    expect(models.resolveSlots(catalog, { primary: 'opus-4.8-max', secondary: 'opus-5-xhigh', tertiary: 'gemini-3.8-flash-high' })).toEqual({
+      primary: 'gpt-6-astra-ultra',
+      secondary: 'opus-5-xhigh',
+      tertiary: 'gemini-3.8-flash-high',
+      notes: ['opus-4.8-max is no longer in the catalog; using gpt-6-astra-ultra.'],
+    })
+  })
+
   it('seeds a missing seat past the stored picks instead of repeating one', () => {
     // The tertiary seed for this primary is the stored secondary itself.
     expect(models.resolveSlots(catalog, { primary: 'opus-5-xhigh', secondary: 'grok-4.6-xhigh' })).toEqual({
