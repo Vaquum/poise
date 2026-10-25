@@ -2,8 +2,9 @@
 # your own Poise from a fork"). Opt in with the repository variable
 # POISE_UPSTREAM_SYNC=true. Every five minutes, GitHub's shortest schedule, it
 # merges autonomio/poise's main into this repository's main, as the Sync fork
-# button does, and deploys what that brought in, so a merged change reaches
-# the server within minutes. A run with nothing to merge does nothing more.
+# button does, and what that brought in deploys once its CI passes on it, so
+# a merged change reaches the server about ten to twenty-five minutes later.
+# A run with nothing to merge does nothing more.
 #
 # GitHub lets the workflow's own token change no workflow file. When
 # autonomio/poise changes one, the merge fails until the fork is synced by
