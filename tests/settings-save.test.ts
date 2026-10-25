@@ -5,6 +5,7 @@ import {
   deepEqual,
   generalPayload,
   mergeSaveBaseline,
+  rereadValue,
   validateGeneralDraft,
   validateModelChoices,
   type GeneralDraft,
@@ -154,6 +155,17 @@ describe('the refused save', () => {
       .toEqual({ chat: { default: 'a', fallback: 'b' }, editor: { default: 'c', fallback: 'd' } })
     expect(mergeSaveBaseline('UTC', 'Europe/Berlin')).toBe('Europe/Berlin')
     expect(mergeSaveBaseline(undefined, { idleTimeoutMinutes: 0 })).toEqual({ idleTimeoutMinutes: 0 })
+  })
+
+  it('reads again from the refresh when it landed, else from the 409 snapshot', () => {
+    const cached = { org: 'acme', me: 'octocat', timezone: 'Europe/Berlin', chat: { branchPrefix: 'agent/', idleTimeoutMinutes: 0, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 } }
+    expect(rereadValue('timezone', null, 'Europe/Helsinki', cached, true)).toBe('Europe/Berlin')
+    expect(rereadValue('timezone', null, 'Europe/Helsinki', cached, false)).toBe('Europe/Helsinki')
+    expect(rereadValue('chat', 'idleTimeoutMinutes', 120, cached, true)).toBe(0)
+    expect(rereadValue('chat', null, { idleTimeoutMinutes: 120 }, cached, true)).toEqual(cached.chat)
+    expect(rereadValue('me', null, 'other', cached, true)).toBe('octocat')
+    expect(rereadValue('agentAccount', null, 'bot', cached, true)).toBe('')
+    expect(rereadValue('manager', null, { rhythm: 1 }, cached, true)).toEqual({ rhythm: 1 })
   })
 
   it('compares values structurally', () => {

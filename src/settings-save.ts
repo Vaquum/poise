@@ -2,6 +2,7 @@
 // smallest partial update that carries them, and what to say when another
 // tab got there first. DOM-free so the unit suite covers it; src/settings.ts
 // wires it to the panel and the baselines a save carries.
+import type { AppSettings } from './config'
 
 // What the server applies when nothing is stored; shown so an empty field
 // never reads as "no prefix" or "never times out".
@@ -168,6 +169,24 @@ function formatChoice(value: unknown): string {
     return parts.join(', ')
   }
   return formatScalar(value)
+}
+
+// Read again shows the freshest known server value for a reverted leaf: the
+// conflict refresh when it landed (it ran after the 409), else the 409's own
+// snapshot. Showing the older snapshot while the cache holds newer would base
+// the next draft on an unseen value.
+export function rereadValue(field: string, leaf: string | null, snapshot: unknown, cached: AppSettings, fresh: boolean): unknown {
+  if (!fresh) return snapshot
+  if (leaf === null) {
+    if (field === 'me') return cached.me
+    if (field === 'agentAccount') return cached.agentAccount ?? ''
+    if (field === 'timezone') return cached.timezone
+    if (field === 'chat' && cached.chat) return { ...cached.chat }
+    return snapshot
+  }
+  const chat = cached.chat as Record<string, unknown> | undefined
+  if (field === 'chat' && chat && leaf in chat) return chat[leaf]
+  return snapshot
 }
 
 export function conflictMessage(leaves: ConflictLeaf[]): string {

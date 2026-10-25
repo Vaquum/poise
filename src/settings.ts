@@ -15,7 +15,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 // panel never invents a label for one.
 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
-import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, mergeSaveBaseline, validateGeneralDraft, validateModelChoices, type ConflictLeaf, type GeneralDraft, type GeneralField, type GeneralTopField, type ModelChoice } from './settings-save'
+import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, mergeSaveBaseline, rereadValue, validateGeneralDraft, validateModelChoices, type ConflictLeaf, type GeneralDraft, type GeneralField, type GeneralTopField, type ModelChoice } from './settings-save'
 import { productionSummary, type ProductionUpdate } from './production-status'
 import { clockDay, logTime, shortTime } from './clock'
 import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, MUSE_API_KEY_LOGIN, type ConnectedAccount } from '../server/accounts/types'
@@ -86,9 +86,10 @@ const dirtyFields = new Set<HTMLInputElement | HTMLSelectElement>()
 // first draft is made. A save carries them as `expect`, so another tab's edit
 // to the same field is refused with 409 instead of silently overwritten.
 const saveBaselines = new Map<string, unknown>()
-// A refused save's read-again offer: the section it was saving and the leaves
-// that moved elsewhere.
-let pendingConflict: { section: 'general' | 'models', leaves: ConflictLeaf[] } | null = null
+// A refused save's read-again offer: the section it was saving, the leaves
+// that moved elsewhere, and whether each conflict refresh landed — Read again
+// prefers the refresh over the 409's snapshot when it did.
+let pendingConflict: { section: 'general' | 'models', leaves: ConflictLeaf[], generalRefreshed: boolean, modelsRefreshed: boolean } | null = null
 let rereadBtn: HTMLButtonElement | null = null
 let modelRefreshActive = false
 let modelsGeneration = 0
@@ -1107,11 +1108,12 @@ async function handleConflict(section: 'general' | 'models', current: Record<str
   // Baselines move to what the server holds, so Save again retries with intent.
   for (const [field, value] of Object.entries(current)) saveBaselines.set(field, value)
   await loadSettings({ fresh: true })
+  const generalRefreshed = settingsLoadOk()
   syncFieldsFromCache()
-  if (section === 'models') await loadModels()
+  const modelsRefreshed = section === 'models' ? await loadModels() : false
   renderOrganizations()
   renderAccounts()
-  pendingConflict = { section, leaves }
+  pendingConflict = { section, leaves, generalRefreshed, modelsRefreshed }
   if (rereadBtn) rereadBtn.hidden = false
   setHelp(conflictMessage(leaves), 'error')
 }
@@ -1125,25 +1127,36 @@ function applyReread(): void {
   const conflict = pendingConflict
   dismissReread()
   if (!conflict) return
-  for (const entry of conflict.leaves) revertConflictLeaf(entry)
-  // The re-render reads the catalog: refresh it from the 409's saved choices
-  // first, since the conflict reload may have failed.
+  const cached = getCachedSettings()
   for (const entry of conflict.leaves) {
-    if (entry.field !== 'models') continue
-    if (entry.leaf === null && isRecord(entry.current)) {
-      for (const [key, choice] of Object.entries(entry.current)) updateStoredChoice(key, choice)
-    } else if (entry.leaf !== null) {
-      updateStoredChoice(entry.leaf, entry.current)
+    const value = entry.field === 'models' ? entry.current : rereadValue(entry.field, entry.leaf, entry.current, cached, conflict.generalRefreshed)
+    revertConflictLeaf({ ...entry, current: value })
+  }
+  // The re-render reads the catalog: without a landed reload it still holds
+  // pre-conflict choices, so the 409's saved choices are applied first.
+  if (!conflict.modelsRefreshed) {
+    for (const entry of conflict.leaves) {
+      if (entry.field !== 'models') continue
+      if (entry.leaf === null && isRecord(entry.current)) {
+        for (const [key, choice] of Object.entries(entry.current)) updateStoredChoice(key, choice)
+      } else if (entry.leaf !== null) {
+        updateStoredChoice(entry.leaf, entry.current)
+      }
     }
   }
   if (conflict.leaves.some((entry) => entry.field === 'models') && lastModels) renderPlaces(lastModels)
-  for (const [input, top] of [[meInput, 'me'], [agentInput, 'agentAccount'], [tzSelect, 'timezone']] as const) {
-    if (input && !dirtyFields.has(input)) saveBaselines.delete(top)
+  // Baselines clear only past a landed refresh: without one the cache still
+  // holds pre-conflict values, and the kept 409 baselines stay the newest
+  // known server state for the next draft.
+  if (conflict.generalRefreshed) {
+    for (const [input, top] of [[meInput, 'me'], [agentInput, 'agentAccount'], [tzSelect, 'timezone']] as const) {
+      if (input && !dirtyFields.has(input)) saveBaselines.delete(top)
+    }
+    if ([branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput, updateTurnBoundInput].every((input) => !input || !dirtyFields.has(input))) {
+      saveBaselines.delete('chat')
+    }
   }
-  if ([branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput, updateTurnBoundInput].every((input) => !input || !dirtyFields.has(input))) {
-    saveBaselines.delete('chat')
-  }
-  if (dirtyModels.size === 0) saveBaselines.delete('models')
+  if (conflict.modelsRefreshed && dirtyModels.size === 0) saveBaselines.delete('models')
   setHelp('Read the latest saved values.', 'info')
 }
 
