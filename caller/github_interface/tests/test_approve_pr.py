@@ -65,7 +65,7 @@ def client(
     threads: list[dict[str, Any]] | None = None,
     response: dict[str, Any] | None = None,
 ) -> FakeClient:
-    return FakeClient(pull or {"state": "open", "draft": False, "user": {"login": "person"}}, threads or [], response or review())
+    return FakeClient(pull or {"state": "open", "draft": False, "user": {"login": "person"}, "head": {"sha": HEAD}}, threads or [], response or review())
 
 
 class TestApprovePr(IsolatedAsyncioTestCase):

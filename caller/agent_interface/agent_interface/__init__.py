@@ -1168,7 +1168,15 @@ def run_governed_behavior(
                                                                        capped=capped, review_round=review_round, review_cap=review_cap)
             except ReviewSuperseded as cancelled:
                 response = str(cancelled)
-                result = {"action": None, "outcome": "superseded", "head_sha": cancelled.head_sha}
+                cancelled_receipt = review_receipt.get()
+                if cancelled_receipt is None:
+                    result = {"action": None, "outcome": "superseded", "head_sha": cancelled.head_sha}
+                else:
+                    # The provider submitted before the cancellation landed:
+                    # verify the posted review instead of retracting it.
+                    progress.stage("verifying", "Verifying GitHub outcome after cancellation")
+                    result = behavior_outcome(mod, behavior, pr, pwd, actor, expected_head, before,
+                                              receipt=cancelled_receipt, call_id=id_)
             else:
                 progress.stage("verifying", "Verifying GitHub outcome")
                 result = recovered_result or behavior_outcome(
@@ -1415,7 +1423,16 @@ def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: di
     review = own[0]
     state = review.get("state")
     if receipt is not None and RECEIPT_STATES.get(receipt["action"]) != state:
-        raise RuntimeError("submitted review does not match its receipt")
+        if state == "DISMISSED" and receipt["action"] in ("requested_changes", "reviewed_clean"):
+            # The verdict posted, then someone dismissed it before
+            # verification: the round completed, so its original kind stands.
+            state = RECEIPT_STATES[receipt["action"]]
+        elif state == "DISMISSED" and receipt["action"] == "approved_pr":
+            # A dismissed approval confers no approval authority and is not
+            # a change request either: fail loudly instead of reconciling it.
+            raise RuntimeError("submitted approval was dismissed before verification")
+        else:
+            raise RuntimeError("submitted review does not match its receipt")
     if str(review.get("commit") or "").lower() != expected_head:
         raise RuntimeError("terminal review is not attached to the expected head")
     _parse_time(str(review.get("submitted_at") or ""), "submitted_at")
@@ -1445,22 +1462,41 @@ def behavior_outcome(
 ) -> dict[str, str | None]:
     if facts is None:
         facts = review_facts(mod, pr, pwd, actor, expected_head, 0)
+    if behavior not in {"pr_review", "pr_approve"}:
+        raise RuntimeError(f"unsupported governed behavior: {behavior}")
     actual_head = str(facts["head_sha"]).lower()
-    if (
-        facts["state"] != "OPEN"
-        or facts["draft"] is True
-        or actual_head != expected_head
-    ):
+    stale = facts["state"] != "OPEN" or facts["draft"] is True or actual_head != expected_head
+    own = own_reviews(before, facts, receipt, call_id)
+    if own is not None:
+        if len(own) == 1:
+            if (receipt is not None and receipt.get("action") == "approved_pr"
+                    and own[0].get("state") == "DISMISSED" and stale):
+                # GitHub dismissed the posted approval as stale after the
+                # target moved: no approval authority, but the current head
+                # needs a fresh evaluation, not a hold. Poise releases this
+                # typed failure like a supersede.
+                raise review_budget.ReviewLimitError(
+                    "submitted approval was dismissed as stale after the target moved",
+                    "approval_dismissed_stale")
+            # A posted review wins over a target that went stale after the
+            # submission: the round completed on the expected head.
+            return _own_outcome(behavior, own, expected_head, receipt)
+        if stale and not own and receipt is None:
+            # Nothing posted and the target moved on: a clean supersede.
+            return {
+                "action": None,
+                "outcome": "superseded",
+                "head_sha": actual_head,
+            }
+        return _own_outcome(behavior, own, expected_head, receipt)
+    # Without per-review ids a moved head cannot be attributed to a posted
+    # review, so the legacy counter path keeps its supersede-first rule.
+    if stale:
         return {
             "action": None,
             "outcome": "superseded",
             "head_sha": actual_head,
         }
-    if behavior not in {"pr_review", "pr_approve"}:
-        raise RuntimeError(f"unsupported governed behavior: {behavior}")
-    own = own_reviews(before, facts, receipt, call_id)
-    if own is not None:
-        return _own_outcome(behavior, own, expected_head, receipt)
     change_requests = _count(facts, "reviewer_change_requests_since") - _count(
         before,
         "reviewer_change_requests_since",

@@ -41,7 +41,7 @@ class TestHeadObservation(TestCase):
         for body, changed in cases:
             with self.subTest(body=body), patch.object(review_watch.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(body))) as run:
                 self.assertEqual(watch.changed_head(10), changed)
-                self.assertEqual(run.call_args.args[0], ["github-interface", "--head-sha", PR, "--token-user", "bit-mis"])
+                self.assertEqual(run.call_args.args[0], ["github-interface", "--head-sha", "#12", "--repository", "o/r", "--token-user", "bit-mis"])
                 self.assertEqual(run.call_args.kwargs["timeout"], 10)
 
     def test_transient_or_malformed_checks_do_not_cancel(self):

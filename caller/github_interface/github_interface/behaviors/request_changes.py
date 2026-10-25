@@ -34,6 +34,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     require_other_author(pull, actor)
     if pull.get("state") != "open" or pull.get("draft") is True:
         raise RuntimeError("pull request is not open and ready for review")
+    actual_head = str((pull.get("head") or {}).get("sha") or "").lower()
+    if actual_head != required_head:
+        raise RuntimeError(
+            f"pull-request head changed: expected {required_head}, got {actual_head or 'missing'}"
+        )
     rest_comments = await list_inline_comments(client, owner, repo, pull_number)
     threads = await list_review_threads(client, owner, repo, pull_number)
     accepted, skipped = accepted_inline_comments(comments, rest_comments, threads)

@@ -14,7 +14,7 @@ class FakeClient:
         self.posts: list[tuple[str, dict[str, Any]]] = []
 
     async def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
-        return {"state": "open", "draft": False, "user": {"login": "person"}}
+        return {"state": "open", "draft": False, "user": {"login": "person"}, "head": {"sha": HEAD}}
 
     async def paginate(self, path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         return self._rest_comments

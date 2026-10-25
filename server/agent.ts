@@ -639,7 +639,7 @@ export async function triggerPrReview(
 // admitReplay): it reads the target fresh and throws when the scheduler would
 // not act on it. Passed in rather than imported, so this bridge to Caller does
 // not depend on the behavior runtime.
-export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv } | void>
+export type ReplayAdmission = (behavior: 'pr_review' | 'pr_approve' | 'issue_review', repo: string, number: number) => Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCapReached?: { reviewRound: number, reviewCap: number } } | void>
 
 // Replay an existing agent-interface job — used by the Swarm view's
 // Replay column. The frontend sends the row's `behavior` + `repo` +
@@ -691,6 +691,13 @@ export async function replayAgentJob(input: {
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
     repository: repo, number: Number(prId), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+  // An approval replay runs under the same effective cap as a scheduled
+  // approve-prs launch: at or past the capped round it files (or reuses)
+  // the follow-up issue and approves instead of requesting changes again.
+  const capFlags = behavior === 'pr_approve' && admission.reviewCapReached
+    ? ['--review-cap-reached', '--review-round', String(admission.reviewCapReached.reviewRound),
+      '--review-cap', String(admission.reviewCapReached.reviewCap)]
+    : []
   try { await spawnDetached(CLI, [
     flag,
     `#${prId}`,
@@ -708,6 +715,7 @@ export async function replayAgentJob(input: {
     correlationId,
     '--pwd',
     pwd,
+    ...capFlags,
   ], {
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv, ...admission.reviewEnvironment },

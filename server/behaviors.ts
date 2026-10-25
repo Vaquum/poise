@@ -1831,6 +1831,17 @@ async function reconcileBehaviorLaunchClaims(
       || String(call.outcome || '') === 'superseded'
       || call.error === SUPERSEDED_AGENT_ERROR
     if (superseded) {
+      if (call.review_id != null || call.receipts != null) {
+        // A run that posted must never be silently released: a superseded
+        // result always carries the observed current head, which proves
+        // nothing, but a review id or issue receipts prove a publication
+        // happened. Quarantine it so the round is flagged, not erased.
+        const posted = call.review_id != null ? `review ${call.review_id}` : 'issue comments'
+        quarantineClaim(claim, 'invalid_result',
+          `superseded run posted ${posted}; retained to prevent round loss`, call.id,
+          quarantineEvidence(snapshot, claim, call).mayRun)
+        continue
+      }
       if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
         captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
           state: 'superseded', activity: status === 'superseded' ? 'settled' : 'unknown', stateSource: 'native',
@@ -1839,6 +1850,21 @@ async function reconcileBehaviorLaunchClaims(
       }
       console.log(
         `[behaviors] ${behavior} superseded for ${claim.launchRepo}#${claim.launchPr}; current head will be reconsidered`,
+      )
+      continue
+    }
+    if (FAILED_AGENT_STATUSES.has(status) && call.error_code === 'approval_dismissed_stale') {
+      // The run posted an approval that GitHub dismissed as stale after the
+      // target moved: no approval authority, but the current head needs a
+      // fresh evaluation, not a hold. Release like a supersede.
+      if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'superseded', activity: 'settled', stateSource: 'native',
+          outcome: 'superseded', head: call.head_sha, completedAt: call.completed_at })
+        clearBehaviorFailure(behavior, claim.target, claim.launchActor)
+      }
+      console.log(
+        `[behaviors] ${behavior} approval dismissed as stale for ${claim.launchRepo}#${claim.launchPr}; current head will be reconsidered`,
       )
       continue
     }
@@ -5888,7 +5914,7 @@ export class ReplayRefusedError extends HttpError {
   }
 }
 
-export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv } | void> {
+export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCapReached?: { reviewRound: number, reviewCap: number } } | void> {
   const owner = repo.split('/')[0].toLowerCase()
   const org = readyOrganizations().find((candidate) => candidate.login.toLowerCase() === owner)
   if (!org) throw new ReplayRefusedError(`${repo} does not belong to a ready GitHub account`)
@@ -5915,7 +5941,16 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
     }
   })
   if (refusal) throw new ReplayRefusedError(refusal)
-  if (author && actor && accounts) return { author, actor, accounts, reviewEnvironment }
+  if (author && actor && accounts) {
+    // The replayed approval round is pinned here, like a scheduled launch
+    // pins its round at preparation time.
+    const reviewCap = behavior === 'pr_approve' ? getReviewCap() : null
+    const reviewRound = reviewCap === null ? null : reviewRoundNumber(repo, number)
+    const reviewCapReached = reviewCap !== null && reviewRound !== null && reviewRound >= reviewCap
+      ? { reviewRound, reviewCap }
+      : undefined
+    return { author, actor, accounts, reviewEnvironment, reviewCapReached }
+  }
 }
 
 // A replay carries no call identity — behavior, repository and number only —
