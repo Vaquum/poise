@@ -5,7 +5,7 @@ import { expect, test, type Page } from '@playwright/test'
 
 const COMMIT = '46815bfcaae2aace9e2534296639b872e34f8db1'
 
-async function workspace(page: Page, release: { commit: string | null, since: string | null }): Promise<void> {
+async function workspace(page: Page, release: { commit: string | null, since: string | null, repo: string | null }): Promise<void> {
   await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'current') })
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com)\//, (route) => route.abort())
   await page.route('**/api/**', async (route) => {
@@ -21,7 +21,7 @@ async function workspace(page: Page, release: { commit: string | null, since: st
 }
 
 test('the menu opens on the commit Poise runs and since when', async ({ page }) => {
-  await workspace(page, { commit: COMMIT, since: '2026-10-09T18:40:00Z' })
+  await workspace(page, { commit: COMMIT, since: '2026-10-09T18:40:00Z', repo: 'autonomio/poise' })
   await page.goto('/')
   await page.getByRole('button', { name: 'Menu' }).click()
   const line = page.locator('#menu-popover .menu-release')
@@ -37,7 +37,7 @@ test('the menu opens on the commit Poise runs and since when', async ({ page }) 
 })
 
 test('a build without a commit opens the menu on Settings', async ({ page }) => {
-  const release: { commit: string | null, since: string | null } = { commit: null, since: null }
+  const release: { commit: string | null, since: string | null, repo: string | null } = { commit: null, since: null, repo: 'autonomio/poise' }
   await workspace(page, release)
   await page.goto('/')
   const answered = page.waitForResponse('**/api/release')

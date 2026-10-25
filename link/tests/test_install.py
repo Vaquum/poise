@@ -808,6 +808,19 @@ class LinuxTest(InstallerTest):
         self.assert_refused(result, 'this computer is aarch64')
         self.assertEqual(linux.system_changes(), [])
 
+    def test_a_fork_release_repo_reaches_the_docs_link(self):
+        linux = Installer(self, 'Linux', machine='aarch64')
+        result = linux.run(POISE_RELEASE_REPO='fork/poise', **self.desktop('x11'))
+        self.assert_refused(result, 'https://github.com/fork/poise/blob/main/docs/Poise-Link.md')
+        self.assertEqual(linux.system_changes(), [])
+
+    def test_a_fork_release_repo_reaches_the_download_base(self):
+        linux = Installer(self, 'Linux')
+        linux.standin('curl', 'exit 1')
+        result = linux.run(POISE_RELEASE_REPO='fork/poise', POISE_LINK_DOWNLOAD_BASE='', **self.desktop('x11'))
+        self.assert_refused(result, 'could not download https://github.com/fork/poise/releases/latest/download/SHA256SUMS')
+        self.assertEqual(linux.system_changes(), [])
+
     def test_an_espanso_package_that_fails_its_pinned_checksum_changes_nothing(self):
         linux = Installer(self, 'Linux')
         linux.write_script(espanso_sums={'ESPANSO_X11_SHA256': 'a' * 64})
@@ -853,6 +866,22 @@ class AnySystemTest(InstallerTest):
         result = other.run()
         self.assert_refused(result, 'covers macOS and Linux')
         self.assertEqual(other.system_changes(), [])
+
+    def test_a_fork_release_repo_reaches_the_releases_link(self):
+        other = Installer(self, 'FreeBSD')
+        self.assert_refused(other.run(), 'https://github.com/autonomio/poise/releases/latest')
+        fork = Installer(self, 'FreeBSD')
+        result = fork.run(POISE_RELEASE_REPO='fork/poise')
+        self.assert_refused(result, 'https://github.com/fork/poise/releases/latest')
+        self.assertNotIn('autonomio/poise', result.stderr)
+        self.assertEqual(fork.system_changes(), [])
+
+    def test_refuses_a_release_repo_that_is_not_owner_name(self):
+        for value in ('not a repo', 'a/b/c', '/leading', 'trailing/', 'double//slash', 'back\\slash'):
+            mac = Installer(self, 'Darwin')
+            result = mac.run(POISE_RELEASE_REPO=value)
+            self.assert_refused(result, 'POISE_RELEASE_REPO must be a GitHub repository like owner/name')
+            self.assertEqual(mac.system_changes(), [], value)
 
     def test_refuses_a_wait_that_is_not_a_number(self):
         mac = Installer(self, 'Darwin')
