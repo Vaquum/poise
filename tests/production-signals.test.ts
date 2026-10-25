@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeAll, expect, it } from 'vitest'
+import { afterAll, beforeAll, expect, it } from 'vitest'
 import { build } from 'esbuild'
 
 // The production server shares its container user with worker agents, issue
@@ -11,13 +11,11 @@ import { build } from 'esbuild'
 // trigger must name itself in the log. Each case runs in a child process, so
 // real signals are delivered exactly as the container would deliver them.
 
-const directories: string[] = []
-afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }) })
-
+let compiled = ''
 let helper = ''
+afterAll(() => { if (compiled) rmSync(compiled, { recursive: true, force: true }) })
 beforeAll(async () => {
-  const compiled = mkdtempSync(join(tmpdir(), 'poise-production-signals-'))
-  directories.push(compiled)
+  compiled = mkdtempSync(join(tmpdir(), 'poise-production-signals-'))
   helper = join(compiled, 'helper.mjs')
   await build({
     stdin: {
