@@ -325,6 +325,86 @@ test('saves the model choices under a name and switches back to them in one step
   await expect(page.getByLabel('Chat default model')).toHaveValue('gpt-6-astra-max')
 })
 
+test('a failed first device read stays visible until a later read succeeds', async ({ page }) => {
+  const state = await setup(page, 'service')
+  state.devices = [device('laptop')]
+  let fail = true
+  await page.route('**/_poise/api/devices', async (route) => {
+    if (fail) return route.fulfill({ status: 503, json: { message: 'The device store is unavailable.' } })
+    return route.fallback()
+  })
+  await page.clock.install({ time: new Date('2026-10-21T12:00:00Z') })
+  await page.goto('/?settings=link')
+  const devices = page.locator('.pl-devices')
+  await expect(devices).toContainText('Could not read the paired computers: The device store is unavailable.')
+  await expect(page.locator('.pl-device')).toHaveCount(0)
+  fail = false
+  await page.clock.fastForward(10_000)
+  await expect(page.locator('.pl-device-state')).toHaveText('Connected')
+  await expect(devices).not.toContainText('Could not read')
+})
+
+test('a failed device read keeps retained rows as last-known and recovers on the next read', async ({ page }) => {
+  const state = await setup(page, 'service')
+  state.devices = [device('laptop')]
+  let fail = false
+  await page.route('**/_poise/api/devices', async (route) => {
+    if (fail) return route.fulfill({ status: 503, json: { message: 'The device store is unavailable.' } })
+    return route.fallback()
+  })
+  await page.clock.install({ time: new Date('2026-10-21T12:00:00Z') })
+  await page.goto('/?settings=link')
+  const card = page.locator('.pl-device')
+  await expect(card.locator('.pl-device-state')).toHaveText('Connected')
+  fail = true
+  await page.clock.fastForward(10_000)
+  const devices = page.locator('.pl-devices')
+  await expect(devices.locator('.pl-devices-stale')).toContainText('Could not read the paired computers: The device store is unavailable.')
+  await expect(devices.locator('.pl-devices-stale')).toContainText('Last known list, read 12:00.')
+  await expect(card.locator('.pl-device-state')).toHaveText('Connection unknown')
+  await expect(card.locator('.pl-device-state')).toHaveClass(/pl-device-state-stale/)
+  await expect(card.locator('.pl-device-state')).toHaveAttribute('data-help', 'Poise could not read the paired computers, so this may be out of date.')
+  await expect(card.locator('.pl-device-times')).toHaveText('Paired 9 Oct 07:00 · as of 12:00')
+  fail = false
+  await page.clock.fastForward(10_000)
+  await expect(card.locator('.pl-device-state')).toHaveText('Connected')
+  await expect(devices.locator('.pl-devices-stale')).toHaveCount(0)
+  await expect(card.locator('.pl-device-times')).toHaveText('Paired 9 Oct 07:00')
+})
+
+test('overlapping device reads keep the newer observation', async ({ page }) => {
+  const state = await setup(page, 'service')
+  state.devices = [device('laptop')]
+  let holdNext = false, release!: () => void, held!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  const started = new Promise<void>((resolve) => { held = resolve })
+  await page.route('**/_poise/api/devices', async (route) => {
+    if (holdNext) {
+      holdNext = false
+      held()
+      await gate
+      return route.fulfill({ json: { devices: [device('laptop')] } })
+    }
+    return route.fallback()
+  })
+  await page.clock.install({ time: new Date('2026-10-21T12:00:00Z') })
+  await page.goto('/?settings=link')
+  const card = page.locator('.pl-device')
+  await expect(card.locator('.pl-device-state')).toHaveText('Connected')
+  holdNext = true
+  await page.clock.fastForward(10_000)
+  await started
+  state.devices = [stopped('laptop')]
+  await page.clock.fastForward(10_000)
+  await expect(card.locator('.pl-device-state')).toHaveText('Not connected')
+  const response = page.waitForResponse((entry) => entry.url().includes('/_poise/api/devices'))
+  release()
+  await response
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())))
+  await expect(card.locator('.pl-device-state')).toHaveText('Not connected')
+  await expect(card.locator('.pl-device-times')).toHaveText('Paired 9 Oct 07:00 · last seen 9 Oct 07:53')
+})
+
 test('adds no gateway sections on a personal computer', async ({ page }) => {
   const state = await setup(page, 'local')
   await page.goto('/')

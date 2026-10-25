@@ -150,8 +150,11 @@ paired computer as **Connected** while its Poise Link holds that event stream
 open. Otherwise it shows **Not connected**, with when it was last seen: Poise
 Link is not running on that computer, or it cannot reach Poise. Snippets and
 alerts reach it once it connects again. The list follows computers connecting
-and going away while it is on screen. Connection status stays in Settings;
-the Snippets view has no Poise Link connection banner.
+and going away while it is on screen. When a read of the list fails, the
+retained rows stay on screen but their badges say **Connection unknown**,
+with when the list was last read, until a read succeeds again. Connection
+status stays in Settings; the Snippets view has no Poise Link connection
+banner.
 
 If the device is revoked in Poise (Settings → Accounts → Poise Link), Poise Link notices on
 its next request, says so once in a notification, forgets the token and shows

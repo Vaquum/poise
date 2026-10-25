@@ -56,18 +56,24 @@ function seen(device: PairedDevice): string {
 }
 
 const NOT_CONNECTED_HELP = 'Poise Link is not running on that computer, or it cannot reach Poise. Snippets and alerts reach it once it connects again.'
+const STALE_HELP = 'Poise could not read the paired computers, so this may be out of date.'
 
-function devicesHtml(devices: PairedDevice[]): string {
-  if (!devices.length) return '<div class="st-help st-help-info">No computer is paired yet.</div>'
-  return devices.map((device) => {
-    const state = badge(device)
+/** A failed read over retained rows: the error, and when the rows were last read. */
+interface StaleList { error: string, at: number }
+
+function devicesHtml(devices: PairedDevice[], stale: StaleList | null): string {
+  const banner = stale ? `<div class="st-help st-help-error pl-devices-stale">Could not read the paired computers: ${escapeHtml(stale.error)} Last known list, read ${escapeHtml(moment(stale.at))}.</div>` : ''
+  if (!devices.length) return `${banner}<div class="st-help st-help-info">No computer is paired yet.</div>`
+  return banner + devices.map((device) => {
+    const state = stale && device.state === 'active' ? { text: 'Connection unknown', tone: 'stale' } : badge(device)
+    const help = stale && device.state === 'active' ? STALE_HELP : device.state === 'active' && !device.connected ? NOT_CONNECTED_HELP : null
     return `
     <div class="pl-device" data-device="${escapeHtml(device.id)}">
       <div class="pl-device-head">
         <span class="pl-device-name">${escapeHtml(deviceName(device))}</span>
-        <span class="pl-device-state pl-device-state-${state.tone}"${device.state === 'active' && !device.connected ? ` data-help="${NOT_CONNECTED_HELP}" tabindex="0"` : ''}>${state.text}</span>
+        <span class="pl-device-state pl-device-state-${state.tone}"${help ? ` data-help="${help}" tabindex="0"` : ''}>${state.text}</span>
       </div>
-      <div class="st-help st-help-info pl-device-times">Paired ${escapeHtml(moment(device.createdAt))}${escapeHtml(seen(device))}</div>
+      <div class="st-help st-help-info pl-device-times">Paired ${escapeHtml(moment(device.createdAt))}${escapeHtml(seen(device))}${stale ? ` · as of ${escapeHtml(moment(stale.at))}` : ''}</div>
       ${device.state === 'active'
         ? `<button type="button" class="st-clear pl-revoke" data-revoke="${escapeHtml(device.id)}">Revoke</button>`
         : device.state === 'expired' ? '<div class="st-help st-help-info">Pair it again in Poise Link.</div>' : ''}
@@ -116,6 +122,8 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
   const statusEl = element.querySelector<HTMLElement>('.pl-status')!
   const devicesEl = element.querySelector<HTMLElement>('.pl-devices')!
   let devices: PairedDevice[] | null = null
+  let readError: string | null = null
+  let observedAt: number | null = null
   let generation = 0
   let deciding = false
   let disposed = false
@@ -129,7 +137,9 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
   }
 
   const render = () => {
-    if (devices) patchInformation(devicesEl, devicesHtml(devices))
+    // Retained rows stay useful, but a failed read is not current
+    // connectivity: the badges say unknown, with when they were read.
+    if (devices) patchInformation(devicesEl, devicesHtml(devices, readError !== null && observedAt !== null ? { error: readError, at: observedAt } : null))
   }
 
   const refresh = async (): Promise<void> => {
@@ -138,10 +148,14 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
       const next = await fetchDevices()
       if (current !== generation || disposed) return
       devices = next
+      readError = null
+      observedAt = Date.now()
       render()
     } catch (error) {
       if (current !== generation || disposed) return
-      if (!devices) devicesEl.innerHTML = `<div class="st-help st-help-error">${escapeHtml(`Could not read the paired computers: ${(error as Error).message}`)}</div>`
+      readError = (error as Error).message
+      if (!devices) devicesEl.innerHTML = `<div class="st-help st-help-error">${escapeHtml(`Could not read the paired computers: ${readError}`)}</div>`
+      else render()
     }
   }
 
@@ -231,6 +245,8 @@ export function poiseLinkSection(account: GatewayAccount, options: PoiseLinkOpti
     try {
       devices = await revokeDevice(button.dataset.revoke)
       generation++
+      readError = null
+      observedAt = Date.now()
       render()
     } catch (error) {
       button.disabled = false

@@ -94,6 +94,69 @@ test('requires review before explicitly publishing the Poise version over Google
   expect(actions.find(action => action.path.endsWith('/google/publish'))?.body).toEqual({ accountId: 'one', localVersion: VERSION, reviewedRemoteSha: REMOTE, fileId: 'file-one', connectionVersion: 'connection-one' })
   await expect(page.locator('#editor-doc')).toContainText('The local paragraph.')
 })
+test('a held Google accounts read cannot undo a disconnect', async ({ page }) => {
+  await workspace(page)
+  let holdNext = false, release!: () => void, held!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const started = new Promise<void>(resolve => { held = resolve })
+  await page.route('**/api/google/accounts', async route => {
+    if (holdNext) { holdNext = false; held(); await gate }
+    return route.fulfill({ json: accounts })
+  })
+  await page.route('**/api/google/disconnect', route => route.fulfill({ json: { ...accounts, accounts: [{ ...accounts.accounts[0], connected: false }, accounts.accounts[1]] } }))
+  const openAccounts = async () => {
+    await page.getByRole('button', { name: 'Menu', exact: true }).click()
+    await page.locator('#menu-popover').getByRole('button', { name: 'Accounts', exact: true }).click()
+  }
+  await openAccounts()
+  const google = page.locator('.st-google-accounts')
+  await expect(google.locator('[data-google-account="one"]')).toContainText('Connected')
+  holdNext = true
+  await page.keyboard.press('Escape')
+  await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
+  await openAccounts()
+  await started
+  await google.getByRole('button', { name: 'Disconnect', exact: true }).first().click()
+  await expect(google.locator('[data-google-account="one"]')).toContainText('Disconnected')
+  await expect(page.locator('.google-account-status')).toHaveText('Google account disconnected.')
+  const response = page.waitForResponse(response => response.url().includes('/api/google/accounts'))
+  release(); await response
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())))
+  await expect(google.locator('[data-google-account="one"]')).toContainText('Disconnected')
+  await expect(page.locator('.google-account-status')).toHaveText('Google account disconnected.')
+})
+test('overlapping Google accounts reads keep the newer observation', async ({ page }) => {
+  await workspace(page)
+  const newer = { ...accounts, accounts: [{ ...accounts.accounts[0], connected: false }, accounts.accounts[1]] }
+  let armed = false, holdNext = false, release!: () => void, held!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const started = new Promise<void>(resolve => { held = resolve })
+  await page.route('**/api/google/accounts', async route => {
+    if (holdNext) { holdNext = false; held(); await gate; return route.fulfill({ json: accounts }) }
+    return route.fulfill({ json: armed ? newer : accounts })
+  })
+  const openAccounts = async () => {
+    await page.getByRole('button', { name: 'Menu', exact: true }).click()
+    await page.locator('#menu-popover').getByRole('button', { name: 'Accounts', exact: true }).click()
+  }
+  const reopenAccounts = async () => {
+    await page.keyboard.press('Escape')
+    await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
+    await openAccounts()
+  }
+  await openAccounts()
+  const google = page.locator('.st-google-accounts')
+  await expect(google.locator('[data-google-account="one"]')).toContainText('Connected')
+  armed = true; holdNext = true
+  await reopenAccounts()
+  await started
+  await reopenAccounts()
+  await expect(google.locator('[data-google-account="one"]')).toContainText('Disconnected')
+  const response = page.waitForResponse(response => response.url().includes('/api/google/accounts'))
+  release(); await response
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())))
+  await expect(google.locator('[data-google-account="one"]')).toContainText('Disconnected')
+})
 test('lists multiple Google connections and disconnects only the chosen account', async ({ page }) => {
   await workspace(page)
   await page.route('**/api/google/accounts', route => route.fulfill({ json: accounts }))
