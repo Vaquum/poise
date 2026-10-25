@@ -205,6 +205,7 @@ const checks = [
       '--chat',
       '--cursor',
       '--debate',
+      '--families',
       '--limit',
       '--logs',
       '--model',

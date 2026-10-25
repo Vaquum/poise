@@ -11,12 +11,16 @@ vi.mock('../server/process', async (original) => ({
 }))
 import { refreshModelCatalog } from '../server/models-refresh'
 import { runFile, scrubbedChildEnvironment, claudeSubscriptionEnvironment } from '../server/process'
+import { setMeta } from '../server/db'
 import { DailyModelRefresh } from '../server/service/model-refresh'
 
 let root: string, poise: string, bin: string, reportPath: string, caller: string
 const families = Object.fromEntries(['claude', 'codex', 'grok', 'antigravity', 'muse'].map(name => [name, { status: 'ok' }]))
 
 beforeEach(async () => {
+  // Every provider participates: these release tests cover the installed
+  // Caller boundary, and provider-participation.test.ts covers eligibility.
+  setMeta('account_logins', JSON.stringify(Object.fromEntries(['claude', 'codex', 'grok', 'antigravity', 'muse'].map(name => [name, '2026-10-20T06:00:00.000Z']))))
   root = await realpath(await mkdtemp(join(tmpdir(), 'poise model release ')))
   poise = join(root, 'release', 'poise')
   bin = join(root, 'release', 'venv', 'bin')
@@ -106,7 +110,8 @@ it('direct script runs preserve the development default without an override', as
   await writeFile(join(fallback, 'agent-interface'), caller, { mode: 0o700 })
   vi.stubEnv('CALLER_BIN_ROOT', undefined)
   const { stdout } = await runFile(process.execPath, [join(poise, 'scripts', 'refresh-models.mjs'), '--json'], {
-    cwd: poise, env: { ...scrubbedChildEnvironment('agent-interface', claudeSubscriptionEnvironment()), POISE_MODEL_CATALOG_REPORT: reportPath },
+    cwd: poise, env: { ...scrubbedChildEnvironment('agent-interface', claudeSubscriptionEnvironment()), POISE_MODEL_CATALOG_REPORT: reportPath,
+      POISE_PROVIDER_EVIDENCE: JSON.stringify({ logins: Object.fromEntries(['claude', 'codex', 'grok', 'antigravity', 'muse'].map(name => [name, '2026-10-20T06:00:00.000Z'])), live: { claude: null, codex: null } }) },
   })
   await assertCaller(JSON.parse(stdout), fallback)
 })
