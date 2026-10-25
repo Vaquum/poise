@@ -61,8 +61,14 @@ async function setupModels(page: Page, state: SettingsStub): Promise<void> {
 }
 
 async function openSection(page: Page, section: string): Promise<void> {
-  await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator(`[data-settings="${section}"]`).click()
+  // With the panel open the burger closes it instead of showing the menu;
+  // Back to menu is the way between destinations.
+  if (await page.locator('#settings-panel.open').count()) {
+    await page.getByRole('button', { name: 'Back to menu' }).click()
+  } else {
+    await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  }
+  await page.locator(`#menu-popover [data-settings="${section}"]`).click()
 }
 
 test.beforeEach(async ({ page }) => {
