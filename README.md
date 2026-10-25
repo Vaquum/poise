@@ -553,12 +553,27 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 | `POISE_VOICE_GUIDE_PATH` | Optional editor-chat voice guide | unset |
 | `AGENT_INTERFACE_VOICE_GUIDE` | Optional voice guide `/content` writes in; without one it writes without | unset |
 | `REVIEW_AGENT_USERNAME` | Optional seed for the agent account (Settings → GitHub) on the first install and start without one saved; ignored after that | unset |
+| `POISE_RELEASE_REPO` | Repository the release links and menu attribution point at, as `owner/name`; a fork's own releases | `autonomio/poise` |
 | `CONFAB_URL` | Optional Confab service | `http://localhost:8000` |
 | `CONFAB_API_KEY` | Optional Confab bearer credential | unset |
 
 The browser keeps view, filter, typography, refresh, and theme preferences in
 `localStorage`. SQLite uses WAL mode and stores local settings, manual cards,
 and automation deduplication state. Editor documents remain plain Markdown.
+
+### Fixed values
+
+What is configurable and what is deliberately fixed:
+
+| Value | Disposition |
+| --- | --- |
+| Release/download/attribution repository | Configurable: `POISE_RELEASE_REPO` as `owner/name`, default `autonomio/poise`. It drives the Poise Link installer links the gateway serves, the installer's release links, and the menu's release attribution. A fork sets it once per deployment; see [Run your own Poise from a fork](docs/Operating.md#run-your-own-poise-from-a-fork) |
+| Release host `github.com` | Product invariant: releases are distributed from github.com. The deployment's own GitHub for sign-in and API calls is separately configurable in the gateway (`POISE_GITHUB_URL`, `POISE_GITHUB_API_URL`) |
+| `com.vaquum.*` launchd labels, the Poise Link bundle identifier and launch agent | Product invariant: renaming one orphans the installed jobs, agents and login items and breaks upgrades. They select no GitHub identity |
+| `github.com` API, clone and browser URLs in Poise and Caller | Product invariant: Poise and Caller work against github.com through `gh` and `git`; there is no GitHub Enterprise mode outside the gateway sign-in above |
+| Self-update trust root (`package.json` repository) | Product invariant: the controller releases the repository its trusted copy names and refuses to let a change touch that field, so a candidate release can never redirect what judges it. It never follows `POISE_RELEASE_REPO` |
+| Release branch `main` | Product invariant: Poise releases from `main`, which the production updater fast-forwards and the self-update controller tracks |
+| Daily model refresh at 07:00 | Schedule invariant; the time zone it runs in is the Settings user choice |
 
 ## Quality gates
 

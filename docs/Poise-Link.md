@@ -105,7 +105,8 @@ These settings change what the installer does, given as
 
 | Variable | Effect |
 | --- | --- |
-| `POISE_LINK_DOWNLOAD_BASE` | Where Poise Link's files and `SHA256SUMS` are; by default the newest release |
+| `POISE_RELEASE_REPO` | The repository the release, its page and the docs link to, as `owner/name`; by default `autonomio/poise`, a fork's own releases |
+| `POISE_LINK_DOWNLOAD_BASE` | Where Poise Link's files and `SHA256SUMS` are; by default the newest release of `POISE_RELEASE_REPO` |
 | `POISE_LINK_APP_DIR` | macOS: the folder the apps go to, and the only folder Espanso is looked for in |
 | `POISE_LINK_ESPANSO_WAIT` | Seconds to wait for Espanso's setup: 900 by default, `0` does not wait |
 | `POISE_LINK_SESSION` | Linux: `x11` or `wayland`, when the terminal is not part of your desktop session |
