@@ -631,6 +631,35 @@ describe('Review New Issues sub-issues', () => {
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 
+  it('yields to the loop between later reader pickups instead of draining in microtasks', async () => {
+    const { behaviors: runtime } = await start()
+    issues = Array.from({ length: 6 }, (_, index) => issue(500 + index))
+    const original = mocks.runFile.getMockImplementation()!
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const fourEntered = new Promise<void>((resolve) => { entered = resolve })
+    const reads: string[] = []
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command !== 'github-interface' || args[0] !== '--sub-issues') return original(command, args, options)
+      reads.push(args[1])
+      if (reads.length === 4) entered()
+      if (reads.length <= 4) await gate
+      return await original(command, args, options)
+    })
+    const done = runtime.runEnabledBehaviorsOnce()
+    await fourEntered
+    expect(reads).toHaveLength(4)
+    release()
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    try {
+      expect(reads).toHaveLength(4)
+    } finally {
+      await done
+    }
+    expect(reads.sort()).toEqual(issues.map(row => `#${row.number}`).sort())
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
   it('reports the first reader rejection instead of the earlier array entry after startup', async () => {
     const { behaviors: runtime } = await start()
     issues = [issue(500), issue(501), issue(502), issue(503)]

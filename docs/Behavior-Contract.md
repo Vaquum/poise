@@ -117,8 +117,8 @@ reviewer wrote, on the issue and its sub-issues, and recorded each one as it
 was posted. An issue has no head, so no head is pinned or reported. A failure
 is relaunched once, and only when the run recorded no comment and never began
 posting. See [Review New Issues](Issue-review.md).
-Initial sub-issue reader startup yields to real callbacks rather than draining
-all initial readers at once; at most four reads run concurrently. Reader
+Sub-issue reader entries and later pickups yield to real callbacks rather
+than draining in microtasks; at most four reads run concurrently. Reader
 failures are observed before yielding and retain the first original rejection
 when several fail during startup. Normal per-issue read failures still use
 their existing independent retry handling.
@@ -238,13 +238,13 @@ check on the usual backoff; a failed batch holds each of its targets the
 same way. Each record settles on its own timeout inside the batch, so one
 hung read cannot take its completed siblings with it. Review preparation
 and approval launches run in small pools instead of one process per pull
-request at once. Initial pool worker startup yields to real callbacks rather
-than draining all initial entries at once. Multiple startup failures retain
+request at once. Pool worker entries and later pickups yield to real callbacks
+rather than draining in one microtask sequence. Multiple startup failures retain
 the first observed original rejection. Later workers can enter later under
 load while the original sweep deadline still applies, lowering early
 concurrency; the existing cursor preserves deferred targets. Shared asynchronous
-preparation and later completion waves can still bring CLI starts together;
-this is not a global limit on forks per turn or a throughput guarantee.
+preparation can still release continuations together; this is not a global
+limit on forks per turn or a throughput guarantee.
 Review launch (phase 3) remains unspaced and bounded by check slots. The review checkout
 provisions in the launch phase after the claim, outside the sweep
 deadline; a checkout failure there releases the claim and records a
