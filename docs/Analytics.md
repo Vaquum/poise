@@ -124,6 +124,16 @@ prefetched. Settings/account changes cannot reuse another scope's snapshot.
 Without a matching fresh preparation, previous values are removed immediately
 and the standard three-dot loading indicator appears. The server reads the local datastore views directly,
 without starting a CLI process for each scope.
+On entry the board remains in its loading state until both the selected-day
+snapshot and the initial live-quota read settle, then exposes all available
+cards together. Quota cannot appear as a completed view while the main metrics
+are still pending, and prepared metrics wait for that initial quota read too.
+Read failures retain their existing notices and do not leave the board loading.
+Subsequent quota and metric refreshes retain independent schedules.
+Analytics' short-lived read-only connections allow up to 1 GiB of mapped
+database address space per account, avoiding repeated page copies through the
+service sandbox. This is not a heap allocation or a stored database change;
+each connection retains its transaction snapshot, including with WAL writers.
 Each account read keeps one database snapshot and yields to other server
 work after 64 scanned candidates or once eight milliseconds of processing have elapsed. Discussion
 counts and stored JSON for sizes and merger identity are read only for pull

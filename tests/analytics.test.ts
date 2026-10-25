@@ -610,6 +610,34 @@ describe('reading what Current shows', () => {
     expect((await readAnalytics(WEEK)).issues.opened).toBe(1)
   })
 
+  it('maps read pages within a fixed cap and holds one WAL snapshot across both item reads', async () => {
+    const writer = new Database(mocks.orgs[0].datastorePath)
+    const pragma = Database.prototype.pragma
+    const mappings: unknown[] = []
+    const observation = vi.spyOn(Database.prototype, 'pragma').mockImplementation(function (this: Database.Database, source, options) {
+      const result = pragma.call(this, source, options)
+      if (this.readonly && source.startsWith('mmap_size =')) {
+        mappings.push(pragma.call(this, 'mmap_size', { simple: true }))
+      }
+      return result
+    })
+    try {
+      writer.pragma('journal_mode = WAL')
+      writer.transaction(() => {
+        for (let number = 1; number <= 128; number++) seed(pr(number, '2026-10-06T00:00:00Z', null), 'pr', true, writer)
+      })()
+      const pending = readAnalytics(WEEK, 'alpha')
+      // The first PR slice has opened the snapshot; its issue read is later.
+      seed(issue(129, '2026-10-06T00:00:00Z'), 'issue', true, writer)
+      expect((await pending).issues.opened).toBe(0)
+      expect((await readAnalytics(WEEK, 'alpha')).issues.opened).toBe(1)
+      expect(mappings).toEqual([1073741824, 1073741824])
+    } finally {
+      observation.mockRestore()
+      writer.close()
+    }
+  })
+
   it('does not parse discussion payloads for open PRs or merges outside the window', async () => {
     const open = seed(pr(1, '2026-10-05T00:00:00Z', null), 'pr', true)
     const old = seed(pr(2, '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z', { updated_at: '2026-10-06T00:00:00Z' }), 'pr', true)

@@ -282,6 +282,9 @@ async function readOrganization(org: Organization, me: string, window: Analytics
   const path = org.datastorePath ?? join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'github-datastore', 'github_datastore.sqlite')
   const db = new Database(path, { readonly: true, fileMustExist: true, timeout: 1_000 })
   try {
+    // Bound mapped address space, avoiding repeated page copies through the
+    // service sandbox. SQLite retains its snapshot and WAL visibility rules.
+    db.pragma('mmap_size = 1073741824')
     // Keep one snapshot while yielding between bounded slices of work. A
     // synchronous .all() across a year prevents even quota/health reads.
     const scopeByKind = { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) }
