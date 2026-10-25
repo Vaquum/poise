@@ -231,10 +231,11 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
     The model reviewed the diff since the last head: RIGHT numbers already
     name current-head lines, but LEFT numbers name previous-head lines, so
     each LEFT comment is remapped to base coordinates by matching its removed
-    content. Any finding the pull request diff no longer carries fails the
-    review closed: GitHub would reject the whole submission for one stale
-    position, and a missing anchor never proves the defect is gone. A comment
-    on a line the since diff never showed is a model error and fails loudly."""
+    content. A missing anchor never proves the defect is gone: if any finding
+    cannot be anchored, the review fails closed before submitting an incomplete
+    change request or filing incomplete findings for a capped approval. A
+    comment on a line the since diff never showed is a model error and fails
+    loudly."""
     if not packet or not verdict["comments"]:
         return
     try:
