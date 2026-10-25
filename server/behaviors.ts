@@ -1290,8 +1290,8 @@ const PR_OPERATION_EVALUATION_LEASE_MS = 65_000
 // One behavior tick's per-PR work stays inside the CLI budget: evidence
 // batches of ten fit the 30 s CLI budget under load, and preparation and
 // approval launches run in small pools instead of fanning out over every
-// candidate at once. Initial worker entries yield to the event loop;
-// later task continuations can still converge after shared async work.
+// candidate at once. Worker entries and later pickups yield to the event
+// loop; shared async preparation can still release continuations together.
 export const PR_READ_BATCH_SIZE = 10
 export const REVIEW_PREPARE_CONCURRENCY = 5
 export const APPROVE_FIRE_CONCURRENCY = 3
@@ -2393,8 +2393,9 @@ function loopTurn(): Promise<void> {
 
 // A fixed pool: queued items check the sweep deadline when they start, not
 // only when they are enqueued, so an ended sweep begins no new CLI work.
-// Initial worker entries yield to the loop so their synchronous prefixes
-// do not all run in one drain. This does not space later continuations.
+// Worker entries and later pickups yield to the loop so their synchronous
+// prefixes do not all run in one drain. Shared async preparation can still
+// release several continuations together; this is not a global fork bound.
 // Exported for the fixture-backed startup and failure guards only.
 export async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
   let next = 0
@@ -2404,6 +2405,7 @@ export async function forEachPool<T>(items: readonly T[], limit: number, task: (
       const index = next++
       if (index >= items.length) return
       await task(items[index]!)
+      if (next < items.length && !behaviorAborted()) await loopTurn()
     }
   }
   const workers: Array<Promise<void>> = []
@@ -5320,10 +5322,11 @@ async function readSubIssues(entries: readonly EligibleIssue[]): Promise<Map<str
         }
         subIssueReadErrors.set(ref, message)
       }
+      if (next < entries.length && !behaviorAborted()) await loopTurn()
     }
   }
-  // Space initial reader entries like forEachPool workers; subsequent
-  // reads can still converge after their asynchronous work completes.
+  // Space reader entries and later pickups like forEachPool workers; shared
+  // async work can still release continuations together.
   const readers: Array<Promise<void>> = []
   let firstFailure: { error: unknown } | undefined
   const readerCount = Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length)

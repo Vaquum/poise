@@ -177,6 +177,30 @@ describe('prepare pool startup', () => {
     }
   })
 
+  it('yields to the loop between later pickups instead of draining in microtasks', async () => {
+    const { behaviors: runtime } = await loadModules()
+    const gate = deferred<void>()
+    const entered = [deferred<void>(), deferred<void>()]
+    const pickups: string[] = []
+    const done = runtime.forEachPool(['a', 'b', 'c'], 2, async (item) => {
+      if (item === 'a') entered[0].resolve()
+      if (item === 'b') entered[1].resolve()
+      if (item === 'c') pickups.push(item)
+      else await gate.promise
+    })
+    await Promise.all(entered.map(({ promise }) => promise))
+    gate.resolve()
+    // Drain microtasks only: a microtask-only pickup would have run by now,
+    // while a real loop turn stays pending.
+    for (let i = 0; i < 20; i++) await Promise.resolve()
+    try {
+      expect(pickups).toEqual([])
+    } finally {
+      await done
+    }
+    expect(pickups).toEqual(['c'])
+  })
+
   it('completes while the clock is faked', async () => {
     vi.useFakeTimers()
     try {

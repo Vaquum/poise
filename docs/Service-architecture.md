@@ -584,7 +584,9 @@ assertion may only resume, and anything else is refused with 403):
     work (behavior runs, manual reviews and replays, card chats, `/content`)
     that it has not seen exit, plus `/consensus` debates still running, or,
     when more, the calls Caller records as running with their process alive,
-    which include those an earlier release started.
+    which include those an earlier release started. That records read waits at
+    most 100 ms; on contention health reports unknown (idle false) at once
+    instead of blocking the loop.
   - `backgroundWork` counts everything else a restart would cut: the Chat
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),
