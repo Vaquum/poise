@@ -3,7 +3,8 @@ import http from 'node:http'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import { LINK_INSTALLER_URL, LINK_RELEASES_URL } from '../src/pages.js'
+import { DEFAULT_RELEASE_REPO } from '../src/config.js'
+import { linkInstallerUrl, linkReleasesUrl } from '../src/pages.js'
 import { APEX, startHarness, verifyAssertion, workspaceHost, type Harness, type Reply } from './harness.js'
 
 const ALICE = workspaceHost('alice')
@@ -399,10 +400,21 @@ describe('device pairing', () => {
       isAdmin: false,
       workspaceHost: ALICE,
       apexOrigin: `https://${APEX}`,
-      link: { installer: LINK_INSTALLER_URL, releases: LINK_RELEASES_URL },
+      link: { installer: linkInstallerUrl(DEFAULT_RELEASE_REPO), releases: linkReleasesUrl(DEFAULT_RELEASE_REPO) },
     })
     const installer = readFileSync(new URL('../../link/install.sh', import.meta.url), 'utf8')
-    expect(installer).toContain(`curl -fsSL ${LINK_INSTALLER_URL} | sh`)
+    expect(installer).toContain(`curl -fsSL ${linkInstallerUrl(DEFAULT_RELEASE_REPO)} | sh`)
+  })
+
+  it('tells Settings about the fork releases POISE_RELEASE_REPO names', async () => {
+    await h.close()
+    h = await startHarness({ env: { POISE_RELEASE_REPO: 'fork/poise' } })
+    alice = await h.openWorkspace('Alice')
+    const account = await api(h, ALICE, alice.workspaceCookie, 'account')
+    expect(account.status).toBe(200)
+    expect(account.json()).toMatchObject({
+      link: { installer: linkInstallerUrl('fork/poise'), releases: linkReleasesUrl('fork/poise') },
+    })
   })
 
   it('stores only hashes of device codes and tokens', async () => {

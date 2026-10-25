@@ -5,7 +5,7 @@ import {
 import type { Context, Principal } from './context.js'
 import { header, HttpError, readBody, sendJson } from './http.js'
 import { decideCode, listDevices, revokeDevice } from './link.js'
-import { LINK_INSTALLER_URL, LINK_RELEASES_URL } from './pages.js'
+import { linkInstallerUrl, linkReleasesUrl } from './pages.js'
 import type { User } from './store.js'
 import { gatewayLogging } from './logging-api.js'
 
@@ -137,7 +137,7 @@ const ROUTES: Record<string, Route> = {
         isAdmin: principal.isAdmin,
         workspaceHost: new URL(ctx.workspaceOrigin(principal.user.handle)).host,
         apexOrigin: ctx.apexOrigin,
-        link: { installer: LINK_INSTALLER_URL, releases: LINK_RELEASES_URL },
+        link: { installer: linkInstallerUrl(ctx.deps.config.releaseRepo), releases: linkReleasesUrl(ctx.deps.config.releaseRepo) },
       },
     }),
   },

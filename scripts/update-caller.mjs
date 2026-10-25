@@ -5,6 +5,7 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { productionUpdatePath, readProductionUpdate, writeProductionUpdate } from './production-update.mjs'
+import { readSavedSettings } from './saved-settings.mjs'
 import { configureStopGate, stopGateIsCurrent, stopGateManifest } from './stop-gate-runtime.mjs'
 
 const scriptPath = fileURLToPath(import.meta.url)
@@ -59,8 +60,11 @@ async function productionInstall(run) {
   })
 }
 
-// The legacy datastore jobs must run this checkout's github-datastore.
-export async function datastoreServicesCurrent({ home, binRoot }) {
+// The legacy datastore jobs must run this checkout's github-datastore, and —
+// once a run function is given — authenticate as your saved GitHub account.
+// A changed account makes them stale, so the reinstall below rewrites them;
+// a cleared one fails that reinstall naming the setting.
+export async function datastoreServicesCurrent({ home, binRoot, run, environment = process.env }) {
   const executable = join(binRoot, 'github-datastore')
   const launchAgents = join(home, 'Library', 'LaunchAgents')
   const labels = [
@@ -68,15 +72,23 @@ export async function datastoreServicesCurrent({ home, binRoot }) {
     'com.vaquum.github-datastore.reconcile',
     'com.vaquum.github-datastore.health',
   ]
+  let services
   try {
-    const services = await Promise.all(labels.map((label) => readFile(
+    services = await Promise.all(labels.map((label) => readFile(
       join(launchAgents, `${label}.plist`),
       'utf8',
     )))
-    return services.every((service) => service.includes(executable))
+    if (!services.every((service) => service.includes(executable))) return false
   } catch {
     return false
   }
+  if (!run) return true
+  const { present, settings } = await readSavedSettings({ home, run, environment })
+  if (!present) return true
+  const me = settings.me?.trim() || ''
+  if (!me) return false
+  // As install-production.mjs embeds it, xml-escaped: GH_TOKEN="$(gh auth token --user &apos;me&apos;)".
+  return services[0].includes(`gh auth token --user &apos;${me}&apos;`)
 }
 
 function requireCommit(value, label) {
@@ -167,7 +179,8 @@ async function reconcile(options) {
   const readHealth = options.readHealth || callerReady
   const manifestFor = options.stopGateManifest || stopGateManifest
   const hookCurrent = options.hookCurrent || stopGateIsCurrent
-  const datastoreCurrent = options.datastoreCurrent || datastoreServicesCurrent
+  const datastoreCurrent = options.datastoreCurrent
+    || ((args) => datastoreServicesCurrent({ ...args, run, environment: process.env }))
   const repairHookConfiguration = options.repairHookConfiguration || configureStopGate
   const install = options.install || (() => productionInstall(run))
   const log = options.log || console.log

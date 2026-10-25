@@ -10,8 +10,11 @@
 # again to update Poise Link. docs/Poise-Link.md describes every step.
 #
 # Optional settings:
+#   POISE_RELEASE_REPO        the GitHub repository the release, its page and
+#                             the docs link to, as owner/name (default:
+#                             autonomio/poise); a fork's own releases
 #   POISE_LINK_DOWNLOAD_BASE  where Poise Link's installers and SHA256SUMS are
-#                             (default: the latest release)
+#                             (default: the latest release of POISE_RELEASE_REPO)
 #   POISE_LINK_APP_DIR        macOS: the folder the apps go to, and the only
 #                             folder Espanso is looked for in (default:
 #                             /Applications, or ~/Applications when
@@ -26,9 +29,12 @@
 
 set -eu
 
-RELEASE_BASE=https://github.com/autonomio/poise/releases/latest/download
-RELEASES=https://github.com/autonomio/poise/releases/latest
-DOCS=https://github.com/autonomio/poise/blob/main/docs/Poise-Link.md
+# The release, its page and the docs, from POISE_RELEASE_REPO. Assigned in
+# main, where fail() is defined: a partly downloaded script does nothing.
+RELEASE_REPO=
+RELEASE_BASE=
+RELEASES=
+DOCS=
 MAC_IMAGE=Poise-Link-macos-universal.dmg
 DEBIAN_PACKAGE=Poise-Link-linux-amd64.deb
 # The launch agent Poise Link 0.1.2 and later run as on macOS while start at login is on.
@@ -474,6 +480,15 @@ main() {
 		fail "run this as yourself, not as root or with sudo. On Linux it asks for sudo when it installs the packages."
 	has curl || has wget || fail "this installer needs curl or wget to download"
 	has sha256sum || has shasum || fail "this installer needs sha256sum or shasum to check the downloads"
+	RELEASE_REPO=${POISE_RELEASE_REPO:-autonomio/poise}
+	case $RELEASE_REPO in
+	*/*/* | /* | */ | *[!A-Za-z0-9_./-]*) fail "POISE_RELEASE_REPO must be a GitHub repository like owner/name" ;;
+	*/*) ;;
+	*) fail "POISE_RELEASE_REPO must be a GitHub repository like owner/name" ;;
+	esac
+	RELEASE_BASE=https://github.com/$RELEASE_REPO/releases/latest/download
+	RELEASES=https://github.com/$RELEASE_REPO/releases/latest
+	DOCS=https://github.com/$RELEASE_REPO/blob/main/docs/Poise-Link.md
 	BASE=${POISE_LINK_DOWNLOAD_BASE:-$RELEASE_BASE}
 	ESPANSO_WAIT=${POISE_LINK_ESPANSO_WAIT:-900}
 	case $ESPANSO_WAIT in

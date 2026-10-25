@@ -234,6 +234,7 @@ export class Orchestrator {
         `POISE_WORKSPACE_OWNER=${login}`,
         `POISE_PUBLIC_ORIGIN=${scheme}://${handle}.${config.domain}`,
         `POISE_GATEWAY_PUBLIC_KEY=${keys.publicKeyBase64}`,
+        `POISE_RELEASE_REPO=${config.releaseRepo}`,
         'POISE_HOST=0.0.0.0',
         `POISE_PORT=${WORKSPACE_PORT}`,
         'HOME=/home/poise',
