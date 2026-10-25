@@ -475,7 +475,9 @@ async function loadStorage(fresh = false): Promise<void> {
     renderStorage(data)
   } catch (error) {
     if (generation !== storageGeneration || !panelEl) return
-    storageError(error instanceof DOMException && error.name === 'AbortError'
+    // AbortSignal.timeout aborts with TimeoutError; a manual abort would be AbortError.
+    const timedOut = error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')
+    storageError(timedOut
       ? `The storage read timed out after ${STORAGE_FETCH_TIMEOUT_MS / 1000} seconds.`
       : error instanceof Error ? error.message : String(error))
   }
