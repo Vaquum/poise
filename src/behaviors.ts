@@ -19,6 +19,9 @@ export interface BehaviorMeta {
   // The Behaviors view renders an em dash in the Setting cell when
   // this is false.
   hasSetting: boolean
+  // Whether this behavior caps review rounds: from the capped round on,
+  // the run files its findings as one follow-up issue and approves.
+  hasReviewCap: boolean
   // Whether this behavior chooses how many reviewers act on each pull
   // request (the PR review place's default, secondary and tertiary, in
   // parallel). Only the initial review does; the others show a dash.
@@ -41,12 +44,12 @@ export interface BehaviorMeta {
 // Pull-request review, approval, conversation resolution and optional merging,
 // then the issue review that stands apart from them. Rows use this order.
 export const BEHAVIORS: BehaviorMeta[] = [
-  { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewers: true,  hasMemory: true,  hasTriggers: false, hasSkips: true,  reviews: { place: 'PR review', item: 'pull request' } },
-  { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewers: false, hasMemory: true,  hasTriggers: false, hasSkips: true },
-  { key: 'resolve-unblocking', label: 'Resolve Unblocking Conversations', hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
-  { key: 'rerun-grey-ci',      label: 'Rerun Grey CI',                hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
-  { key: 'merge-prs',          label: 'Merge Pull Requests',           hasSetting: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
-  { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  hasSkips: false, reviews: { place: 'Issue review', item: 'issue' } },
+  { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewCap: false, hasReviewers: true,  hasMemory: true,  hasTriggers: false, hasSkips: true,  reviews: { place: 'PR review', item: 'pull request' } },
+  { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewCap: true,  hasReviewers: false, hasMemory: true,  hasTriggers: false, hasSkips: true },
+  { key: 'resolve-unblocking', label: 'Resolve Unblocking Conversations', hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'rerun-grey-ci',      label: 'Rerun Grey CI',                hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'merge-prs',          label: 'Merge Pull Requests',           hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewCap: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  hasSkips: false, reviews: { place: 'Issue review', item: 'issue' } },
 ]
 
 export type BehaviorSetting = 'p0' | 'p1' | 'p2' | 'p3' | 'p4'
