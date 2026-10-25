@@ -146,7 +146,7 @@ export async function resolveReviewCheckout(
   const remote = `https://github.com/${owner}/${repo}.git`
   // Marks the head used, so its checkouts stay for a day after this review;
   // see pruneReviewCheckouts.
-  await withProcessLock({ path: join(root, 'review-checkouts', MARK_LOCK) }, async () => {
+  await withProcessLock({ path: join(root, 'review-checkouts', MARK_LOCK), signal }, async () => {
     await mkdir(base, { recursive: true })
     const used = new Date()
     await utimes(headDirectory, used, used)
@@ -160,7 +160,7 @@ export async function resolveReviewCheckout(
     if (origin.stdout.trim().toLowerCase() !== remote.toLowerCase()
       || commit.stdout.trim() !== head || status.stdout.trim()) throw new Error('Managed review checkout differs from the expected repository/head or has local changes')
   }
-  return withProcessLock({ path: `${path}.lock`, timeoutMs: 10_000 }, async () => {
+  return withProcessLock({ path: `${path}.lock`, timeoutMs: 10_000, signal }, async () => {
     signal?.throwIfAborted()
     let exists = false
     try {
