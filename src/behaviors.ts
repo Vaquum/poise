@@ -141,6 +141,19 @@ export function getReviewers(key: BehaviorKey): ReviewerCount {
   return reviewersByKey[key] || 1
 }
 
+// The review-round cap for Approve Pull Requests: null is off, otherwise the
+// round from which a run files its findings as one follow-up issue and
+// approves. Only the server's approve-prs row carries it.
+const reviewCapByKey: Partial<Record<BehaviorKey, number | null>> = {}
+
+export function getReviewCap(key: BehaviorKey): number | null {
+  return reviewCapByKey[key] ?? null
+}
+
+export function isReviewCap(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 2 && value <= 10
+}
+
 
 export function getLastTriggered(key: BehaviorKey): LastTriggered | null {
   return lastByKey[key] || null
@@ -273,6 +286,7 @@ export function setReviewers(key: BehaviorKey, reviewers: ReviewerCount): Promis
 // applies all of them or none.
 export interface SettingFields {
   setting?: BehaviorSetting
+  reviewCap?: number | null
   repos?: string[]
   authors?: string[]
   skipRepos?: string[]
@@ -285,8 +299,9 @@ const settingFieldsWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
 
 export function setSettingFields(key: BehaviorKey, fields: SettingFields): Promise<void> {
   const run = async () => {
-    const previous = { setting: settingByKey[key], repos: reposByKey[key], authors: authorsByKey[key], skipRepos: skipReposByKey[key] }
+    const previous = { setting: settingByKey[key], reviewCap: reviewCapByKey[key], repos: reposByKey[key], authors: authorsByKey[key], skipRepos: skipReposByKey[key] }
     if (fields.setting) settingByKey[key] = fields.setting
+    if ('reviewCap' in fields) reviewCapByKey[key] = fields.reviewCap ?? null
     if (fields.repos) reposByKey[key] = [...fields.repos]
     if (fields.authors) authorsByKey[key] = [...fields.authors]
     if (fields.skipRepos) skipReposByKey[key] = [...fields.skipRepos]
@@ -294,11 +309,15 @@ export function setSettingFields(key: BehaviorKey, fields: SettingFields): Promi
     try {
       const data = await postBehavior(key, fields)
       if (fields.setting && data.setting) settingByKey[key] = data.setting
+      if ('reviewCap' in fields && (data.reviewCap === null || isReviewCap(data.reviewCap))) {
+        reviewCapByKey[key] = data.reviewCap
+      }
       reposByKey[key] = stringList(data.repos) ?? reposByKey[key]
       authorsByKey[key] = stringList(data.authors) ?? authorsByKey[key]
       skipReposByKey[key] = stringList(data.skipRepos) ?? skipReposByKey[key]
     } catch (err) {
       settingByKey[key] = previous.setting
+      reviewCapByKey[key] = previous.reviewCap
       reposByKey[key] = previous.repos
       authorsByKey[key] = previous.authors
       skipReposByKey[key] = previous.skipRepos
@@ -388,6 +407,7 @@ export async function refreshState(): Promise<void> {
       if (!readIsCurrentFor(k, seen.started, seen.busy)) continue
       enabledByKey[k] = !!data[k]?.enabled
       if (data[k]?.setting) settingByKey[k] = data[k].setting
+      if (data[k]?.reviewCap === null || isReviewCap(data[k]?.reviewCap)) reviewCapByKey[k] = data[k].reviewCap
       if (isReviewerCount(data[k]?.reviewers)) reviewersByKey[k] = data[k].reviewers
       const repos = stringList(data[k]?.repos)
       if (repos) reposByKey[k] = repos
