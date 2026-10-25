@@ -217,6 +217,42 @@ describe('review outcome evidence and registration', () => {
     }))
   })
 
+  it('quarantines a superseded review that posted instead of releasing it', async () => {
+    const launched = await launchReviewBeforeCrash()
+    fixture.agentLogs = [agentLog({
+      id: 'd'.repeat(32),
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'superseded',
+      outcome: 'superseded',
+      head_sha: NEXT_HEAD_SHA,
+      completed_at: new Date().toISOString(),
+      review_id: 91,
+      expected_head: launched.expectedHead,
+      actor: launched.actor,
+      source: launched.source,
+      correlation_id: launched.correlationId,
+    })]
+    await resetLogCache()
+
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(db.hasSeen('review-new-prs', launched.target)).toBe(true)
+    expect(db.listBehaviorLaunchClaims('review-new-prs')).toHaveLength(1)
+    expect(db.listBehaviorLaunchClaims('review-new-prs')[0]).toMatchObject({
+      launchQuarantine: 'invalid_result',
+      launchCallId: 'd'.repeat(32),
+    })
+    expect(db.listBehaviorDeadLetters()).toHaveLength(1)
+    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(0)
+    expect(mocks.captureOutcome).not.toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: launched.correlationId, state: 'superseded',
+    }))
+  })
+
   it('waits through bounded registration grace before retrying a missing call', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))

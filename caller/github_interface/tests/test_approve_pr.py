@@ -65,7 +65,7 @@ def client(
     threads: list[dict[str, Any]] | None = None,
     response: dict[str, Any] | None = None,
 ) -> FakeClient:
-    return FakeClient(pull or {"state": "open", "draft": False, "user": {"login": "person"}}, threads or [], response or review())
+    return FakeClient(pull or {"state": "open", "draft": False, "user": {"login": "person"}, "head": {"sha": HEAD}}, threads or [], response or review())
 
 
 class TestApprovePr(IsolatedAsyncioTestCase):
@@ -107,6 +107,13 @@ class TestApprovePr(IsolatedAsyncioTestCase):
 
         result = await approve_pr.run(fake, payload())
         self.assertEqual(result["outcome"], "approved")
+
+    async def test_moved_head_refuses_before_post(self) -> None:
+        fake = client(pull={"state": "open", "draft": False, "user": {"login": "person"}, "head": {"sha": "d" * 40}})
+
+        with self.assertRaisesRegex(RuntimeError, "pull-request head changed"):
+            await approve_pr.run(fake, payload())
+        self.assertEqual(fake.posts, [])
 
     async def test_closed_pull_fails_before_mutation(self) -> None:
         fake = client(pull={"state": "closed", "draft": False})

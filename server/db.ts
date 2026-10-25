@@ -1022,7 +1022,8 @@ export interface CompletedBehaviorAction {
 }
 
 // Only launches whose agent reported the typed result count: a launch that
-// failed, was superseded or never finished did nothing on GitHub.
+// failed, never finished, or was superseded without posting did nothing on
+// GitHub. A superseded run that posted is quarantined, never counted.
 export function listCompletedBehaviorActions(): CompletedBehaviorAction[] {
   return (db.prepare(`
     SELECT launch_repo AS repo, launch_pr AS pr, launch_action AS action, launch_completed_at AS completedAt
@@ -1038,8 +1039,10 @@ export function listCompletedBehaviorActions(): CompletedBehaviorAction[] {
 // review counts once however wide its panel, and every approve-prs follow-up
 // counts — including follow-ups on an unchanged head, which author replies
 // re-arm without a new commit. Only launches that reconciled cleanly count:
-// failed, held, quarantined and superseded runs never completed, and neither
-// do manual reviews. The review-round cap reads this at launch time.
+// failed, held and quarantined runs never completed, and neither do manual
+// reviews nor superseded runs that posted nothing. A superseded run that
+// posted is quarantined for a person instead of being silently released. The
+// review-round cap reads this at launch time.
 export function countReviewRounds(repo: string, pr: number): number {
   const row = db.prepare(`
     SELECT
