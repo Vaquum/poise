@@ -135,7 +135,9 @@ it('names a release switch in the shutdown log', async () => {
 }, 15_000)
 
 it('re-exports the signal helpers from the production entry for in-process launchers', async () => {
+  const cpuHandlers = process.listeners('SIGUSR2')
   const production = await import('../server/production')
   expect(typeof production.refuseInspectorActivation).toBe('function')
   expect(typeof production.registerProductionShutdownSignals).toBe('function')
+  expect(process.listeners('SIGUSR2')).toEqual(cpuHandlers)
 }, 15_000)

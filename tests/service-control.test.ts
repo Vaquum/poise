@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { ChatRuntime } from '../server/chat/runtime'
 import type { SessionRecord } from '../server/chat/protocol'
 import type { RequestAuthority } from '../server/http'
+import { createCpuCapture } from '../server/production-cpu-profile'
 
 let root = ''
 let control: typeof import('../server/service/control')
@@ -319,6 +320,29 @@ describe('switching to another release', () => {
       service.reset()
       background.resumeReleaseBackground()
     }
+  })
+
+  it('does not let an optional CPU capture hold a pending quiet release switch', async () => {
+    const dir = await releases({ r2: 'b1' })
+    const capture = createCpuCapture({ directory: join(dir, 'diagnostics'), conflict: () => null,
+      sessionFactory: () => ({ connect() {}, disconnect() {},
+        // Hold setup indefinitely. A diagnostic must not enter the release
+        // barrier even when an inspector callback has not completed.
+        post() {},
+      }), log: vi.fn() })
+    const { runtime, timer, restart, service } = switching(dir, { restart: () => { capture.abandon(); return true } })
+    try {
+      runtime.workingNow = 1
+      service.switchRelease('r2')
+      capture.request()
+      timer.fire()
+      expect(restart).not.toHaveBeenCalled()
+      runtime.workingNow = 0
+      timer.fire()
+      expect(restart).toHaveBeenCalledTimes(1)
+      expect(service.health()).toMatchObject({ backgroundWork: 0, draining: true })
+      expect(existsSync(join(dir, 'diagnostics', 'cpu-profile.json'))).toBe(false)
+    } finally { capture.abandon(); service.reset(); background.resumeReleaseBackground() }
   })
 
   it('lands while relay-held turns are running, and waits for the rest', async () => {

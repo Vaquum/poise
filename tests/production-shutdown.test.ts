@@ -12,6 +12,13 @@ const mocks = vi.hoisted(() => ({
   // shutdown ordering is what this file checks, so it is a no-op here.
   attachChatSockets: vi.fn<() => void>(),
   stopDailyModelRefresh: vi.fn<() => void>(),
+  abandonCapture: vi.fn<() => void>(),
+  installCapture: vi.fn<() => void>(),
+}))
+
+vi.mock('../server/production-cpu-profile', () => ({
+  abandonProductionCpuCapture: mocks.abandonCapture,
+  installProductionCpuCapture: mocks.installCapture,
 }))
 
 vi.mock('../server/cache-plugin', () => ({
@@ -30,6 +37,8 @@ beforeEach(() => {
   mocks.stopPoiseRuntime.mockReset()
   mocks.closeDatabase.mockReset()
   mocks.createPoiseMiddleware.mockClear()
+  mocks.abandonCapture.mockClear()
+  mocks.installCapture.mockClear()
 })
 
 afterEach(() => {
@@ -43,13 +52,16 @@ describe('production shutdown', () => {
       releaseRuntime = resolve
     }))
     const production = await import('../server/production')
+    expect(mocks.installCapture).not.toHaveBeenCalled()
     const server = production.createProductionServer()
 
     const first = production.shutdownProductionServer(server)
     const second = production.shutdownProductionServer(server)
     expect(second).toBe(first)
+    expect(mocks.abandonCapture).toHaveBeenCalledTimes(1)
     await vi.waitFor(() => expect(mocks.stopPoiseRuntime).toHaveBeenCalledTimes(1))
     expect(mocks.closeDatabase).not.toHaveBeenCalled()
+    expect(mocks.abandonCapture.mock.invocationCallOrder[0]).toBeLessThan(mocks.stopPoiseRuntime.mock.invocationCallOrder[0])
 
     releaseRuntime()
     await first
