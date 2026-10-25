@@ -661,12 +661,21 @@ function renderShell() {
     void (async () => {
       // Load before rendering: painting first would clamp the requested
       // next page back to the loaded rows and never fetch older history.
+      const previous = pageIndex
       pageIndex = Math.max(0, pageIndex + (button.dataset.page === 'next' ? 1 : -1))
       const mine = pollSequence
       const org = getSelectedOrganization()
       const search = searchQuery
       const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery
-      await loadMoreForView(current)
+      try {
+        await loadMoreForView(current)
+      } catch (err) {
+        if (!current()) return
+        pageIndex = previous
+        lastLoadError = (err as Error).message
+        renderStaleBanner()
+        return
+      }
       if (!current()) return
       clearRows()
       render(false)
@@ -1121,6 +1130,7 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
   // and resolve-unblocking — which produce pr_approve and other behaviours —
   // matched nothing and the click did nothing.
   const match = await ensureTarget((e) => e.repo === repo && String(e.pr_id) === String(pr_id))
+  if (viewEl.hidden) return
   if (!match) {
     notFocusable(`No run found for ${repo}#${pr_id}.`)
     return
@@ -1195,11 +1205,15 @@ export async function focusCall(callId: string): Promise<void> {
   await pollOnce()
   if (mine !== callFocusSequence || viewEl.hidden) return
   let match = await ensureTarget((entry) => entry.id === callId)
+  // An aborted lookup (navigated away or superseded) is not a missing call:
+  // returning here keeps the global organization filter untouched.
+  if (mine !== callFocusSequence || viewEl.hidden) return
   if (!match && getSelectedOrganization()) {
     setSelectedOrganization('')
     await pollOnce()
     if (mine !== callFocusSequence || viewEl.hidden) return
     match = await ensureTarget((entry) => entry.id === callId)
+    if (mine !== callFocusSequence || viewEl.hidden) return
   }
   if (!match) {
     notFocusable(`No run found for call ${callId}.`)
@@ -1327,6 +1341,13 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
     if (!known.has(id)) arrivals = true
     known.set(id, entry)
   }
+  // New unreadable calls shift page boundaries exactly like readable ones;
+  // ignoring them would keep a stale cursor that skips the intervening range.
+  if (!arrivals) {
+    const knownBad = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}:${row.error}`))
+    arrivals = [...(history.quarantined || []), ...(running.quarantined || [])]
+      .some((row) => !knownBad.has(`${row.id || ''}:${row.index}:${row.error}`))
+  }
   entries = [...known.values()].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
   const seenQuarantined = new Set<string>()
   const mergedQuarantined: QuarantinedLog[] = []
@@ -1376,20 +1397,27 @@ async function settleStaleRunning(freshIds: Set<string>, current: () => boolean)
   if (!stale.length) return
   const settled = await Promise.all(stale.map(async (entry) => {
     try {
-      return await readLogFeed(organizationUrl(`/api/agent-logs?id=${encodeURIComponent(entry.id)}`, org))
-    } catch {
-      return null
+      return { data: await readLogFeed(organizationUrl(`/api/agent-logs?id=${encodeURIComponent(entry.id)}`, org)), error: null as string | null }
+    } catch (err) {
+      return { data: null, error: (err as Error).message }
     }
   }))
   if (!current()) return
   let changed = false
+  const failures: string[] = []
   const byId = new Map(entries.map((entry) => [entry.id, entry]))
   for (let index = 0; index < stale.length; index++) {
-    const data = settled[index]
-    if (!data) continue
+    const { data } = settled[index]!
+    if (!data) {
+      failures.push(stale[index]!.id.slice(0, 8))
+      continue
+    }
     const row = (data.logs || [])[0]
-    if (row && matchesSearch(row)) {
-      byId.set(row.id, row)
+    if (row) {
+      // A terminal row outside this search no longer belongs to its cache;
+      // retaining the old running entry would show it as running forever.
+      if (matchesSearch(row)) byId.set(row.id, row)
+      else byId.delete(row.id)
       changed = true
       continue
     }
@@ -1400,7 +1428,12 @@ async function settleStaleRunning(freshIds: Set<string>, current: () => boolean)
       changed = true
     }
   }
-  if (!changed) return
+  // Failed lookups keep their old running rows for the next refresh, but say
+  // so: silent retries would display obsolete statuses as fresh indefinitely.
+  if (failures.length) {
+    lastLoadError = `Settle failed for ${failures.length} running call${failures.length === 1 ? '' : 's'} (${failures.join(', ')}): ${settled.find((item) => item.error)?.error || 'lookup failed'}`
+  }
+  if (!changed && !failures.length) return
   entries = [...byId.values()].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
   render()
   renderStaleBanner()
@@ -1432,6 +1465,22 @@ function pollOnce(): Promise<void> {
             entries = [...extra, ...entries].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
             render()
           }
+        }
+        // Unreadable active calls outside the first history page still warn
+        // on first paint; waiting for a later refresh would omit them.
+        const freshBad = running.quarantined || []
+        if (freshBad.length) {
+          const seen = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}:${row.error}`))
+          let added = false
+          for (const row of freshBad) {
+            const key = `${row.id || ''}:${row.index}:${row.error}`
+            if (!seen.has(key)) {
+              seen.add(key)
+              quarantined.push(row)
+              added = true
+            }
+          }
+          if (added) renderStaleBanner()
         }
       } else {
         if (!current()) return
