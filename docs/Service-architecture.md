@@ -1056,6 +1056,24 @@ build tools and `tini`.
 
 ## Diagnostic collection boundary
 
+The direct workspace production entrypoint additionally owns a permanent
+`SIGUSR2` handler for one optional 15-second CPU capture per process. It uses
+an in-process inspector Session without a debugger listener, HTTP interface,
+heap capture or expression execution. Its fixed protocol commands are
+`Profiler.enable/start/stop/disable` and `Runtime.discardConsoleEntries`; the
+last command releases console references before disconnect. `SIGUSR1` remains
+refused. Imported production modules, local launchers and development servers
+do not install the capture handler. Native signal-report/heap options make
+capture unavailable; operators must check availability before signalling,
+since a JS handler cannot prevent Node's independent native signal actions.
+
+This optional capture does not enter the release background barrier. Shutdown
+abandons it without waiting for the remaining capture period or changing exit
+codes. Its one private, non-replacing home-volume artifact is separate from
+retained diagnostic delivery and creates no new gateway or health contract.
+The exact process/release preflight, file limits and interpretation rules are
+in [Operating: bounded CPU capture](Operating.md#bounded-cpu-capture).
+
 Poise retains version 1 private diagnostic records in a dedicated home-volume
 SQLite store; the gateway retains the central copy in its own data volume.
 Neither store depends on alert lifecycle. Workspaces never mount the central

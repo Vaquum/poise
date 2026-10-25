@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
 import { assertCallerRelease } from './caller-release'
 import { refuseInspectorActivation, registerProductionShutdownSignals } from './production-signals'
+import { abandonProductionCpuCapture, installProductionCpuCapture } from './production-cpu-profile'
 // In-process launchers (scripts/start-production.mjs, scripts/self-update/launch.mjs)
 // import these from the bundle, so they are re-exported here.
 export { refuseInspectorActivation, registerProductionShutdownSignals }
@@ -26,6 +27,7 @@ const isProductionEntrypoint = process.argv[1]
   ? resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
   : false
 if (isProductionEntrypoint) refuseInspectorActivation()
+if (isProductionEntrypoint && process.env.POISE_MODE === 'service') installProductionCpuCapture()
 
 // Security validation must run before dotenv reads the file and before modules
 // that derive database/runtime paths from process.env are evaluated. A
@@ -355,6 +357,7 @@ async function closeHttpServer(server: Server): Promise<void> {
 export function shutdownProductionServer(server: Server): Promise<void> {
   const existing = serverShutdowns.get(server)
   if (existing) return existing
+  abandonProductionCpuCapture()
 
   const shutdown = (async () => {
     const results = await Promise.allSettled([stopRuntimeOnce(), closeHttpServer(server)])

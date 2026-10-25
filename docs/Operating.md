@@ -15,6 +15,82 @@ For an external Caddy proxy, install the optional
 [bounded diagnostic reader](../deploy/ingress/README.md) on its operator-owned
 Docker host to connect the external ingress source with expiring health.
 
+## Bounded CPU capture
+
+The direct service-mode production server accepts at most one operator-requested
+15-second CPU capture during its lifetime. It opens no debugger listener and
+does not enable SIGUSR1 inspection. There is no HTTP trigger or environment
+override for duration, output or commands. This is an optional diagnostic,
+not a responsiveness fix or an unlimited-load acceptance test.
+
+Before sending any signal, complete this preflight in the workspace's PID
+namespace:
+
+1. Identify the **Node application PID**, its `/proc/<pid>/stat` start ticks,
+   executable, supervisor parent and running command. Never signal PID 1,
+   `tini`, a launcher/supervisor, a process group or an older release. Never use
+   `docker kill --signal=USR2`: that targets the container's init and can stop
+   the workspace and its agents.
+2. Read normal authenticated service health. Bind its compiled `version` and
+   active `release` to the running bundle containing this handler; require no
+   pending release switch. A checkout HEAD, installed/desired release, image
+   label or successful Deploy job alone does not establish the running code.
+3. Find that process's startup `CPU capture availability` record. Require
+   `available:true` and matching PID, start ticks, build SHA and release.
+   Independently check the effective Node arguments and inherited
+   `NODE_OPTIONS` for native diagnostic signal flags without exporting the
+   environment. Capture refuses signal-report/heap options, including
+   ambiguous or overridden spellings, and `process.report.reportOnSignal`.
+   The supported server does not mutate that report setting after startup;
+   if the effective configuration cannot be established, stop. A JS refusal
+   **cannot prevent** an already-enabled native report or heap handler from
+   writing sensitive data when SIGUSR2 arrives.
+4. Require the caught-signal bit `SigCgt & 0x800` in `/proc/<pid>/status` and
+   no existing `~/.poise/diagnostics/cpu-profile.json`. Preserve any prior
+   artifact before a separately authorized later process/attempt. Recheck
+   PID/start identity and active release immediately before delivering
+   **SIGUSR2 only to that application PID**. An old server without this
+   handler can terminate on SIGUSR2.
+
+Choose a naturally busy Chat or Caller phase with contemporaneous loop-delay
+evidence; do not create production agent load for a capture. Separately retain
+native host CPU/I/O pressure, cgroup limits/counters, actual workload phases
+and client vantage for the same window. The artifact reads only fixed
+namespace-local `cpu.stat` and `cpu.pressure` paths; unavailable sources are
+explicit, and these are not necessarily host-wide measurements. A failed,
+interrupted, oversized or uninformative attempt does not re-arm the process
+or authorize a retry. Duplicate signals produce only one refusal log and the
+handler remains installed after completion, failure and shutdown.
+
+The fixed output is `~/.poise/diagnostics/cpu-profile.json`: an envelope with
+`metadata` and `profile`. Directory mode is 0700 and file mode 0600. These
+exclude other UIDs, not agent processes sharing the server's UID. Do not post
+profile frames, environment/argument dumps or the artifact in GitHub. Extract
+the `profile` member privately as JSON to a `.cpuprofile` file for a CPU-profile
+viewer; an oversize envelope has `profile:null` and cannot be opened as one.
+
+Publication uses exclusive staging, file sync, an atomic non-replacing link
+and directory sync. Existing output is preserved. The persisted UTF-8 cap is
+64 MiB, including metadata; this is not a peak serialization-memory cap.
+Oversize captures publish valid metadata only. Disk/write/sync failures name
+the failure and clean owned staging files; a full disk cannot guarantee a
+fallback artifact. A directory-sync failure after the atomic commit retains
+the complete artifact but does not promise durability. Cancellation before
+commit prevents publication; an already committed artifact is retained.
+
+Capture-only metadata records UTC/monotonic phase timestamps, actual duration,
+start/stop wait and serialization costs, V8 profile times in microseconds,
+sample count/mean interval and gaps over 100 ms. **Gaps are unattributed**:
+weighting one by an adjacent frame does not prove CPU self-time or distinguish
+scheduler pressure from a synchronous wait. Dedicated loop statistics report
+their sample count and coverage; zero samples means insufficient coverage.
+CPU/resource deltas include worker threads; ELU measures the main isolate.
+`persistenceStarted` precedes output I/O; the bounded completion log
+records publication completion time. Start/stop/setup/persistence overhead is
+separate from workload evidence. A quiet or incomplete capture cannot explain
+an earlier stall. Shutdown promptly abandons diagnostics, preserves normal
+exit codes and never holds the quiet release gate for the remaining 15 seconds.
+
 This guide runs Poise as a service on one Linux server, for yourself and a
 few colleagues. Each person signs in with GitHub at one address and gets
 their own workspace: their own Poise, agent CLIs, GitHub accounts and data,
