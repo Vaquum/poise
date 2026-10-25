@@ -105,7 +105,9 @@ jobs:
     if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'affected'
     name: Unit & integration (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # One worker per shard keeps process/lease fixtures from competing with
+    # another file. Keep test deadlines; allow the serial file execution.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

@@ -15,6 +15,9 @@ consume the same run's build artifact without rebuilding it. Each owns its
 runner, server, databases and fixtures, and retains one browser worker because
 some real-API fixtures share server state within a shard. The queue admits at
 most two candidate builds at once; each candidate retains its internal shards.
+Each CI unit shard also uses one worker: the real process/lease fixtures must
+not compete with another test file. Per-test deadlines stay unchanged; the
+job budget allows the serial file execution. Local Vitest defaults stay at two.
 
 Pull requests use `.github/ci.mjs` to select work against the PR base SHA:
 

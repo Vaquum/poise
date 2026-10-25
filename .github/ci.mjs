@@ -122,7 +122,7 @@ function runTests(kind) {
   const shard = Number(process.env.CI_TEST_SHARD)
   if (!Number.isInteger(shard) || shard < 1 || shard > (kind === 'unit' ? 2 : 4)) throw new Error('Invalid test shard')
   const args = kind === 'unit'
-    ? ['test', '--', `--shard=${shard}/${mode === 'full' ? 2 : 1}`, '--reporter=default', '--reporter=json', '--outputFile=test-results/vitest.json']
+    ? ['test', '--', `--shard=${shard}/${mode === 'full' ? 2 : 1}`, '--maxWorkers=1', '--reporter=default', '--reporter=json', '--outputFile=test-results/vitest.json']
     : ['run', 'test:e2e', '--', `--shard=${shard}/${mode === 'full' ? 4 : 1}`, '--workers=1']
   if (mode === 'affected') {
     if (kind === 'unit') {
