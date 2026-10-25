@@ -117,7 +117,21 @@ def run(
         raise ValueError("a capped approval round needs its round and cap numbers")
     spec = atoms.CATALOG.review_model("pr_approve", model)
     tools = allowed(pr, actor, expected_head, capped) if spec.provider == "claude" else []
-    packet_text = atoms.packet(pwd, pr, actor, expected_head, p)
+    # A follow-up round reviews the diff since the last reviewed head, not
+    # the whole PR again. The same head (or no prior review) reviews everything.
+    since = atoms.last_reviewed_head(pwd, pr, actor)
+    if since is not None and since == expected_head.strip().lower():
+        since = None
+    lost_since = None
+    try:
+        packet_text = atoms.packet(pwd, pr, actor, expected_head, p, since_head=since)
+    except atoms.AgentPreflightError as error:
+        if since is None or error.code != "review_since_head_unknown":
+            raise
+        # A garbage-collected head (after a force-push) must not brick the
+        # round: review the full diff once, and say so in the prompt.
+        lost_since = since
+        packet_text = atoms.packet(pwd, pr, actor, expected_head, p, since_head=None)
     if capped and spec.provider == "claude":
         policy: str = capped_policy(review_round or 0, review_cap or 0)
         rules = capped_rules(repo_name(pr, pwd), pr, expected_head, review_round or 0, review_cap or 0, actor)
@@ -135,6 +149,9 @@ def run(
         note,
         p,
     )
+    if lost_since is not None:
+        text += (f"\n\nThe last reviewed head ({lost_since}) is no longer fetchable; "
+                 "this round reviews the full diff instead.")
     return atoms.run_agent(
         pwd, SYSTEM, text, tools, "pr_approve", timeout_s,
         model=spec.identity, pr=pr, actor_name=actor, head=expected_head,

@@ -10,6 +10,8 @@ import sys
 from threading import Event, Lock, Thread
 from time import time, monotonic
 
+from .review_budget import usage as _budget_usage
+
 HEARTBEAT_SECONDS = 5
 HISTORY_LIMIT = 20
 REASONING_LIMIT = 64 * 1024
@@ -63,7 +65,7 @@ def terminal(status: str) -> str | None:
     with current.lock:
         now = stamp()
         snapshot = {**current.state, "phase": status, "phase_started_at": now,
-                    "heartbeat_at": now, "deadline_at": None,
+                    "heartbeat_at": now, "deadline_at": None, "budget": _budget_usage(),
                     "events": [*current.state["events"], {"at": now, "message": f"Run {status}"}][-HISTORY_LIMIT:]}
         current.finished = True
         return json.dumps(snapshot, separators=(",", ":"))
