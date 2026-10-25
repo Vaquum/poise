@@ -9,17 +9,51 @@ Poise uses Node 22 (minimum 22.13), matching the workspace image and gateway.
 build gate. `npm run test:e2e` prepares isolated fixtures, builds the application
 and runs Chromium. `npm run verify` runs both.
 
-CI starts lint/types/audit, the production build and two unit/integration shards
-independently. Four browser shards start when the build artifact is available;
-each runs that artifact without rebuilding it. Every shard owns its runner,
-server, databases and fixture directories. Browser shards use one worker each:
-real-API fixtures share server state within a shard and some suites are serial.
-The four runners provide browser parallelism without changing those contracts.
+The native merge queue runs the complete lint/types/audit and production-build
+jobs, two unit/integration shards and four Chromium shards. Browser shards
+consume the same run's build artifact without rebuilding it. Each owns its
+runner, server, databases and fixtures, and retains one browser worker because
+some real-API fixtures share server state within a shard. The queue admits at
+most two candidate builds at once; each candidate retains its internal shards.
 
-`Verify (Node 22)` is the stable required check. It runs even after failure or
-skip and fails unless every dependency succeeds. The self-update controller
-requires this exact aggregate from the trusted CI workflow on the candidate head.
-Caller retains its independent Python 3.13 check.
+Pull requests use `.github/ci.mjs` to select work against the PR base SHA:
+
+- Documentation-only changes omit application jobs.
+- Recognized frontend areas run the affected Vitest import graph and their
+  browser suites, plus `smoke`, `service-mode` and `independent-startup`.
+  Changed browser specs are included directly. These runs use one unit and one
+  browser shard. An empty Vitest graph runs all unit tests instead of passing
+  without tests.
+- Shared code, configuration, fixtures, deleted source/tests and unknown paths
+  run all gates. The frontend-to-browser mapping is deliberately conservative;
+  adding an unmapped surface keeps full coverage.
+- Caller omits Python work for frontend/browser/documentation-only PR changes;
+  shared and unknown paths still run it. Every merge-queue candidate runs all
+  Caller tests.
+
+Affected tests provide iteration feedback; the merge queue remains the
+exhaustive pre-merge gate, including source-text and dynamic dependencies that
+Vitest's static import graph cannot discover. During local iteration, use
+`npm test -- --changed origin/main` and the relevant browser spec; the complete
+local gates remain available above.
+
+Browser jobs use the official `mcr.microsoft.com/playwright:v<VERSION>-noble`
+image, with VERSION read from the locked `@playwright/test` package. Its browsers
+and system libraries are already installed. A version/executable mismatch fails
+before tests. Browser isolation and every existing assertion are unchanged.
+
+A push to main first looks for the latest merge-queue run of the same workflow
+for the **exact same commit**, repository and queue branch. A completed success
+is reused, with its URL recorded in the Actions summary. Missing, failed,
+cancelled or unfinished evidence runs the complete main gates; API errors fail
+visibly. A new fork therefore still validates its first main push normally.
+
+`Verify (Node 22)` and `Caller (Python 3.13)` retain their names and main-push
+workflow events. The aggregate accepts omitted application jobs only when the
+successful planner explicitly selected documentation-only work or trusted
+exact-commit reuse; unexpected skips/failures still fail. The application update
+controller and deployment gate continue to consume these checks without any
+application or deployment-policy changes.
 
 Behavior runtime tests live in responsibility-named `tests/behaviors-*.test.ts`
 files. Their common fixture registers the original mocks and per-test lifecycle;
