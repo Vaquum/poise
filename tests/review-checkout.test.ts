@@ -96,6 +96,35 @@ describe('review checkout provisioning through Caller', () => {
     await expect(resolveReviewCheckout(owner, '..', 146, actor, head)).rejects.toThrow('Invalid review')
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
+
+  it.each(['retention', 'provisioning'] as const)('cancels admission promptly while the %s lock is held', async (stage) => {
+    await resolveCheckout()
+    const lockPath = stage === 'retention' ? join(root, 'review-checkouts', '.lock')
+      : join(root, 'review-checkouts', head, owner, `${repo}.lock`)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let entered!: () => void
+    const holding = new Promise<void>((resolve) => { entered = resolve })
+    const holder = withProcessLock({ path: lockPath }, async () => { entered(); await gate })
+    const controller = new AbortController()
+    let attempt: Promise<string> | undefined
+    try {
+      await holding
+      mocks.runFile.mockClear()
+      attempt = resolveCheckout(controller.signal)
+      const outcome = attempt.then(() => 'unexpected admission', (error: Error) => error.message)
+      await vi.waitFor(() => expect(mocks.runFile).toHaveBeenCalled())
+      controller.abort(new Error('review cancelled'))
+      expect(await Promise.race([outcome, new Promise<string>((resolve) => setTimeout(() => resolve('still waiting'), 300))]))
+        .toBe('review cancelled')
+      expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--checkout-repo')).toBe(false)
+    } finally {
+      release()
+      await holder
+      await attempt?.catch(() => undefined)
+    }
+    expect(await resolveCheckout()).toBe(join(root, 'review-checkouts', head, owner, repo))
+  })
 })
 describe('review checkout retention', () => {
   const day = REVIEW_CHECKOUT_RETENTION_MS

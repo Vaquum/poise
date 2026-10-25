@@ -84,6 +84,9 @@ it('fails fast on permanent errors and isolates unrelated lock paths', async () 
     await expect(withProcessLock({ path: join(root, 'blocker', 'lock.sqlite3'), timeoutMs: 5000 }, async () => 'unreachable'))
       .rejects.toThrow('process lock is unavailable')
     expect(performance.now() - began).toBeLessThan(5_000)
+    await rm(join(root, 'blocker'))
+    await expect(withProcessLock({ path: join(root, 'blocker', 'lock.sqlite3') }, async () => 'repaired'))
+      .resolves.toBe('repaired')
     const first = join(root, 'a.sqlite3')
     const second = join(root, 'b.sqlite3')
     let release!: () => void
@@ -108,7 +111,7 @@ it('records monotonic lock wait independently of the wall-clock deadline', async
   holder.exec('BEGIN IMMEDIATE')
   const captured = vi.spyOn(logging, 'diagnosticFailure').mockReturnValue('fixture')
   const monotonic = vi.spyOn(performance, 'now').mockReturnValue(10_999.65).mockReturnValueOnce(10_000.25)
-  const wall = vi.spyOn(Date, 'now').mockReturnValue(11_000).mockReturnValueOnce(10_000)
+  const wall = vi.spyOn(Date, 'now').mockReturnValue(11_000).mockReturnValueOnce(10_000).mockReturnValueOnce(10_000)
   const operation = vi.fn(async () => 'unreachable')
   try {
     const attempt = withProcessLock({ path, timeoutMs: 1000 }, operation)

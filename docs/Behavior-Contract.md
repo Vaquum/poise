@@ -217,6 +217,13 @@ approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
 
+Process-lock contenders within one server queue by normalized path, so only
+the local owner polls SQLite for cross-process ownership. Queueing and SQLite
+acquisition share one timeout; cancelled and expired waiters never run their
+callbacks. Different paths progress independently, and callback or acquisition
+failure releases local admission as well as the SQLite reservation. Review
+checkout retention and provisioning waits use the review's cancellation signal.
+
 Every behavior tick starts at most one open-PR listing per ready account,
 shared by the pull-request behaviors; each behavior then reads its per-PR
 evidence in batches of ten over one process per batch, and a per-account
