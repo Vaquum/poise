@@ -12,7 +12,7 @@ import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
 import { TERMINAL_WS_PATH, type TerminalPreset } from './terminal/protocol'
 import type { TerminalCommand } from './terminal/pty'
-import { startLaunchdWatchdog } from './launchd-watchdog'
+import { catalogRetirementEnabled, retireCatalogJob, startLaunchdWatchdog } from './launchd-watchdog'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
 // Security validation must run before dotenv reads the file and before modules
@@ -492,6 +492,16 @@ export async function startProductionServer(options: ProductionServerOptions = {
   // Production only: the installer names the launchd jobs to keep alive.
   const stopWatchdog = startLaunchdWatchdog()
   if (stopWatchdog) server.once('close', stopWatchdog)
+  // The daily model check runs in this server now; an installed server
+  // retires the legacy calendar job it replaces. Managed installs never
+  // re-run the installer, so this is what retires theirs.
+  if (catalogRetirementEnabled()) {
+    retireCatalogJob().then(({ unloaded }) => {
+      if (unloaded) console.log('[launchd-watchdog] retired the legacy model-catalog launchd job; the daily model check now runs in this server')
+    }, (error: unknown) => {
+      console.error(`[launchd-watchdog] ${error instanceof Error ? error.message : String(error)}`)
+    })
+  }
   return server
 }
 

@@ -27,39 +27,96 @@ function legacyPlist() {
   ].join('\n')
 }
 
+const domain = 'gui/501'
+const target = `${domain}/${CATALOG_LABEL}`
+const plistMissing = async () => {
+  await expect(readFile(catalogPlistPath(launchAgents), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+}
+
 describe('retiring the legacy model-catalog launchd job', () => {
   it('unloads the job and removes its plist, leaving other jobs alone', async () => {
     const calls = []
     await writeFile(catalogPlistPath(launchAgents), legacyPlist())
     const neighbor = join(launchAgents, 'com.vaquum.poise.health.plist')
     await writeFile(neighbor, 'health')
-    await retireCatalogJob({
+    const retired = await retireCatalogJob({
       launchAgents,
-      domain: 'gui/501',
+      domain,
       run: async (command, args, options) => { calls.push([command, ...args]) },
     })
-    expect(calls).toEqual([['/bin/launchctl', 'bootout', `gui/501/${CATALOG_LABEL}`]])
-    await expect(readFile(catalogPlistPath(launchAgents), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(retired).toEqual({ unloaded: true })
+    expect(calls).toEqual([['/bin/launchctl', 'bootout', target]])
+    await plistMissing()
     await expect(readFile(neighbor, 'utf8')).resolves.toBe('health')
   })
 
   it('still removes the plist when there is nothing to unload', async () => {
+    const calls = []
     await writeFile(catalogPlistPath(launchAgents), legacyPlist())
-    await retireCatalogJob({
+    const retired = await retireCatalogJob({
       launchAgents,
-      domain: 'gui/501',
-      run: async () => { throw new Error('Could not find service') },
+      domain,
+      run: async (command, args, options) => {
+        calls.push([command, ...args])
+        throw new Error(`Could not find service "${CATALOG_LABEL}" in domain for user ${domain}`)
+      },
     })
-    await expect(readFile(catalogPlistPath(launchAgents), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(retired).toEqual({ unloaded: false })
+    expect(calls).toEqual([['/bin/launchctl', 'bootout', target], ['/bin/launchctl', 'print', target]])
+    await plistMissing()
   })
 
   it('is a no-op on a first install', async () => {
-    const calls = []
-    await retireCatalogJob({
+    const retired = await retireCatalogJob({
       launchAgents,
-      domain: 'gui/501',
-      run: async (command, args, options) => { calls.push([command, ...args]); throw new Error('Could not find service') },
+      domain,
+      run: async () => { throw Object.assign(new Error(`/bin/launchctl failed (exit 113)`), { code: 113 }) },
     })
-    expect(calls).toEqual([['/bin/launchctl', 'bootout', `gui/501/${CATALOG_LABEL}`]])
+    expect(retired).toEqual({ unloaded: false })
+    await plistMissing()
+  })
+
+  it('reads every runner\'s not-loaded answer as absent', async () => {
+    // The updater's runner reports the bare exit instead.
+    const retired = await retireCatalogJob({
+      launchAgents,
+      domain,
+      run: async () => { throw new Error('/bin/launchctl exited 113') },
+    })
+    expect(retired).toEqual({ unloaded: false })
+  })
+
+  it('fails the install when the old job is still loaded', async () => {
+    await writeFile(catalogPlistPath(launchAgents), legacyPlist())
+    const calls = []
+    const failure = await retireCatalogJob({
+      launchAgents,
+      domain,
+      run: async (command, args, options) => {
+        calls.push(args[0])
+        if (args[0] === 'bootout') throw new Error('/bin/launchctl failed (exit 1): Operation not permitted')
+        return `${target} = {\n\tstate = running\n\truns = 12\n}`
+      },
+    }).then(() => null, (error) => error)
+    expect(failure?.message).toContain(`Could not unload the legacy ${CATALOG_LABEL} launchd job`)
+    expect(failure?.message).toContain('two model-check schedulers')
+    expect(calls).toEqual(['bootout', 'print'])
+    // The plist stays: removing it while the job is loaded would hide the
+    // second scheduler, not stop it.
+    await expect(readFile(catalogPlistPath(launchAgents), 'utf8')).resolves.toContain('StartCalendarInterval')
+  })
+
+  it('fails when launchd itself cannot be read', async () => {
+    await writeFile(catalogPlistPath(launchAgents), legacyPlist())
+    const failure = await retireCatalogJob({
+      launchAgents,
+      domain,
+      run: async (command, args, options) => {
+        if (args[0] === 'bootout') throw new Error('/bin/launchctl failed (exit 1)')
+        throw new Error('/bin/launchctl failed (exit 1): Database error')
+      },
+    }).then(() => null, (error) => error)
+    expect(failure?.message).toContain('Database error')
+    await expect(readFile(catalogPlistPath(launchAgents), 'utf8')).resolves.toContain('StartCalendarInterval')
   })
 })

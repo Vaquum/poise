@@ -20,6 +20,9 @@
 // can never start a real production job.
 
 import { execFile } from 'node:child_process'
+import { rm } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 export interface LaunchdJob {
   running: boolean
@@ -159,6 +162,59 @@ export function createLaunchdWatchdog(options: LaunchdWatchdogOptions): () => Pr
       }
     }
   }
+}
+
+// The legacy personal-install model-catalog calendar job. The daily check
+// runs inside the production server now, so an installed server retires this
+// job on startup: managed installs never re-run the installer (nor does its
+// updater run new code — it is frozen at the pre-manage checkout), so the
+// server is the only new code that runs there.
+export const CATALOG_LABEL = 'com.vaquum.poise.model-catalog'
+
+/** Only an installed production server names launchd jobs: the unmanaged
+ *  installer sets the variable and managed plists inherit it, while a dev
+ *  server or a test server never does — so those can never unload a real
+ *  job. Service mode is excluded too: it refuses this variable outright. */
+export function catalogRetirementEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return process.platform === 'darwin' && !!env.POISE_LAUNCHD_WATCHDOG
+}
+
+export interface CatalogRetirementOptions {
+  domain?: string
+  launchAgentsDir?: string
+  run?: (args: string[]) => Promise<string>
+  remove?: (path: string) => Promise<void>
+}
+
+/** Unload the legacy job and remove its plist, so the old calendar schedule
+ *  and the server's own in-process check cannot both fire. Resolves whether
+ *  a loaded job was unloaded — silently false when there is nothing to
+ *  retire — and rejects loudly when the old job cannot be confirmed gone. */
+export async function retireCatalogJob(options: CatalogRetirementOptions = {}): Promise<{ unloaded: boolean }> {
+  const domain = options.domain || `gui/${process.getuid?.() ?? 0}`
+  const run = options.run || launchctl
+  const remove = options.remove || ((path: string) => rm(path, { force: true }))
+  let unloaded = true
+  try {
+    await run(['bootout', `${domain}/${CATALOG_LABEL}`])
+  } catch (bootoutError) {
+    // A failed unload is only benign when the job is really gone: verify
+    // with print rather than assume it was absent.
+    let loaded = true
+    try {
+      await run(['print', `${domain}/${CATALOG_LABEL}`])
+    } catch (printError) {
+      if (!isNotLoaded(printError)) throw printError
+      loaded = false
+    }
+    if (loaded) {
+      throw new Error(`could not unload the legacy ${CATALOG_LABEL} job; refusing to run a second model-check scheduler alongside it`,
+        { cause: bootoutError })
+    }
+    unloaded = false
+  }
+  await remove(join(options.launchAgentsDir || join(homedir(), 'Library', 'LaunchAgents'), `${CATALOG_LABEL}.plist`))
+  return { unloaded }
 }
 
 export function startLaunchdWatchdog(env: NodeJS.ProcessEnv = process.env): (() => void) | null {

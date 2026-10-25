@@ -1,6 +1,10 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
-  assess, createLaunchdWatchdog, graceMs, isNotLoaded, parseLaunchctlPrint, startLaunchdWatchdog, watchdogLabels,
+  assess, CATALOG_LABEL, catalogRetirementEnabled, createLaunchdWatchdog, graceMs, isNotLoaded, parseLaunchctlPrint,
+  retireCatalogJob, startLaunchdWatchdog, watchdogLabels,
 } from '../server/launchd-watchdog'
 
 // What execFile rejects with: `launchctl print` exits 113 for a job that is not
@@ -239,5 +243,84 @@ describe('enabling the watchdog', () => {
   it('stays off unless the installer named the jobs', () => {
     expect(startLaunchdWatchdog({})).toBeNull()
     expect(startLaunchdWatchdog({ POISE_LAUNCHD_WATCHDOG: '' })).toBeNull()
+  })
+})
+
+describe('retiring the legacy model-catalog job', () => {
+  const domain = 'gui/501'
+  const target = `${domain}/${CATALOG_LABEL}`
+
+  it('stays off unless the installer named launchd jobs', () => {
+    expect(catalogRetirementEnabled({})).toBe(false)
+    expect(catalogRetirementEnabled({ POISE_LAUNCHD_WATCHDOG: '' })).toBe(false)
+    expect(catalogRetirementEnabled({ POISE_LAUNCHD_WATCHDOG: 'com.vaquum.poise.health' })).toBe(process.platform === 'darwin')
+  })
+
+  it('unloads the job and removes its plist from an isolated home', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'poise-catalog-retire-'))
+    try {
+      const launchAgentsDir = join(root, 'Library', 'LaunchAgents')
+      const calls: string[][] = []
+      const removed: string[] = []
+      const retired = await retireCatalogJob({
+        domain,
+        launchAgentsDir,
+        run: async (args) => { calls.push(args); return '' },
+        remove: async (path) => { removed.push(path) },
+      })
+      expect(retired).toEqual({ unloaded: true })
+      expect(calls).toEqual([['bootout', target]])
+      expect(removed).toEqual([join(launchAgentsDir, `${CATALOG_LABEL}.plist`)])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('removes a real plist with the default remover and nothing loaded', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'poise-catalog-retire-'))
+    try {
+      const launchAgentsDir = join(root, 'Library', 'LaunchAgents')
+      await mkdir(launchAgentsDir, { recursive: true })
+      await writeFile(join(launchAgentsDir, `${CATALOG_LABEL}.plist`), 'legacy')
+      const retired = await retireCatalogJob({
+        domain,
+        launchAgentsDir,
+        run: async () => { throw notLoaded() },
+      })
+      expect(retired).toEqual({ unloaded: false })
+      await expect(readFile(join(launchAgentsDir, `${CATALOG_LABEL}.plist`), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fails loudly when the old job is still loaded', async () => {
+    const removed: string[] = []
+    const failure = await retireCatalogJob({
+      domain,
+      run: async (args) => {
+        if (args[0] === 'bootout') throw Object.assign(new Error('Operation not permitted'), { code: 1 })
+        return printed({ state: 'running', runs: 12 })
+      },
+      remove: async (path) => { removed.push(path) },
+    }).then(() => null, (error: unknown) => error as Error)
+    expect(failure?.message).toContain(`could not unload the legacy ${CATALOG_LABEL} job`)
+    expect(failure?.message).toContain('a second model-check scheduler')
+    expect(removed).toEqual([])
+  })
+
+  it('fails when launchd itself cannot be read', async () => {
+    const removed: string[] = []
+    const failure = await retireCatalogJob({
+      domain,
+      run: async (args) => {
+        if (args[0] === 'bootout') throw notLoaded()
+        throw timedOut()
+      },
+      remove: async (path) => { removed.push(path) },
+    }).then(() => null, (error: unknown) => error as Error)
+    expect(failure).toBeInstanceOf(Error)
+    expect(failure?.message).toContain('launchctl print')
+    expect(removed).toEqual([])
   })
 })
