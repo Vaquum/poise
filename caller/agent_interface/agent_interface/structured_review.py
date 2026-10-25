@@ -23,6 +23,7 @@ from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
 from .review_watch import ReviewWatch
 from . import progress, review_budget, review_receipt
+from . import review_cap as followup
 
 
 MAX_INSPECTION_ROUNDS = 12
@@ -161,8 +162,35 @@ def events(stdout: str) -> list[dict]:
     return found
 
 
+def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
+                          review_round: int, review_cap: int,
+                          comments: list, pwd: str) -> str:
+    try:
+        node = json.loads(packet)
+    except ValueError:
+        node = None
+    repo = node.get("repository") if isinstance(node, dict) else None
+    number = node.get("pull_number") if isinstance(node, dict) else None
+    if not isinstance(repo, str) or "/" not in repo or not isinstance(number, int) or number < 1:
+        raise review_budget.ReviewLimitError(
+            "a capped approval round needs a readable PR packet", "review_contract_violation")
+    existing = followup.find_capped_issue(packet, str(number), head)
+    if existing is not None:
+        return followup.issue_reference(existing)
+    issue = followup.file_followup_issue(
+        pwd,
+        pr_ref(pr),
+        actor(actor_name),
+        followup.render_title(repo, str(number), review_round),
+        followup.render_body(repo, str(number), head, review_round, review_cap, comments),
+    )
+    return followup.issue_reference(issue)
+
+
 def run(pwd: str, system: str, text: str, model: Model, behavior: str,
-        pr: str, actor_name: str, head: str, timeout_s: int, *, repository=None) -> str:
+        pr: str, actor_name: str, head: str, timeout_s: int, *, repository=None,
+        packet: str = "", capped: bool = False,
+        review_round: int | None = None, review_cap: int | None = None) -> str:
     # Target and credentials are controller-owned, never model output.
     fixed = ["--expected-head", expected_head(head), "--token-user", actor(actor_name)]
     ref = pr_ref(pr)
@@ -253,6 +281,20 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {cause}", code,
                                   diagnostic) from error
 
+    capped_note = ""
+    if capped and behavior == "pr_approve" and verdict["action"] == "request_changes":
+        # The model reviewed as usual; the harness converts the change request
+        # deterministically: file the findings as one follow-up issue first,
+        # then approve. A clean verdict approves as usual, with no issue.
+        if review_round is None or review_cap is None:
+            raise review_budget.ReviewLimitError(
+                "a capped approval round needs its round and cap numbers", "review_contract_violation")
+        reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
+                                          verdict["comments"], pwd)
+        verdict = {"action": "approve", "comments": []}
+        capped_note = (f"\nReview cap reached (round {review_round} of {review_cap}); "
+                       f"findings filed as {reference}.")
+
     flag = {"request_changes": "--request-changes", "reviewed_clean": "--reviewed-clean",
             "approve": "--approve-pr"}[verdict["action"]]
     args = [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), flag, ref]
@@ -291,7 +333,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             "review submission returned no receipt; publication uncertain, reconcile before retry")
     # The outer governed behavior reads authoritative review facts afterward,
     # including head supersession when GitHub correctly rejects a stale verdict.
-    return raw.strip() + "\n" + (done.stdout or done.stderr).strip()
+    return raw.strip() + "\n" + (done.stdout or done.stderr).strip() + capped_note
 
 
 # ── Codex ─────────────────────────────────────────────────────────────
