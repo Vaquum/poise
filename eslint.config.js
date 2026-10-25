@@ -1,6 +1,10 @@
 import globals from 'globals'
 import tseslint from 'typescript-eslint'
 
+// `npm run lint` caches by file content. That stays valid only while these
+// rules need no compiler type information: the cache key cannot see
+// cross-module or type dependencies, so adding such a rule must revisit the
+// cache (tests/tool-cache-config.test.ts names the markers).
 export default tseslint.config(
   {
     ignores: [

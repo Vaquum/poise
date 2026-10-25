@@ -6,7 +6,8 @@
     "types": ["node"],
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "tsBuildInfoFile": "node_modules/.cache/poise/tsconfig.server.tsbuildinfo"
   },
   "include": ["server/**/*.ts", "vite.config.ts"]
 }

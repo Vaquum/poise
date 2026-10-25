@@ -46,6 +46,67 @@ from the following eligibility sweep. The two behaviors run concurrently, so
 approval may observe the still-owned review before reconciliation settles it.
 The test keeps its no-overlap and exactly-one-approval assertions.
 
+## Agent tool CPU defaults
+
+Repeated agent tooling runs through native caches and bounded parallelism.
+The three typechecks run incrementally, each with its own build-info file
+under `node_modules/.cache/poise/`, outside `dist`, so `npm run clean`
+keeps them. `npm run lint` caches by file content at
+`node_modules/.cache/poise/.eslintcache`. The caches are disposable and
+checkout-local; CI runs cold with no shared cache between jobs.
+`npm run lint:uncached` and `npm run typecheck:uncached` keep the uncached
+invocations. The lint cache stays valid only while the rules need no
+compiler type information; `tests/tool-cache-config.test.ts` names the
+markers that must revisit the cache.
+
+Every child Poise starts also observes two tool defaults
+(`server/process.ts`): `GOMAXPROCS=2`, which only Go runtimes read, and
+`RIPGREP_CONFIG_PATH` pointing at `scripts/agent-tools.ripgreprc`
+(`--threads=2`). An inherited or explicitly passed value always wins, and
+an explicit undefined removes the variable. Explicit ripgrep flags override
+the config file; `--no-config` and provider-embedded search bypass it.
+Caller passes both on to provider CLIs through its inherited environment,
+and the runtime smoke contract checks the shipped config parses.
+
+Measured on a Linux container with 12 vCPUs (Node 22.23.4, TypeScript
+5.9.3, ESLint 10.6.0, ripgrep 13.0.0, esbuild 0.28.1). CPU seconds are user
+plus system as reported by `time`:
+
+| Workload | Condition | Elapsed (s) | CPU (s) |
+| --- | --- | ---: | ---: |
+| Lint, all files | Uncached | 41.56 | 33.88 |
+| Lint, all files | Warm content cache | 13.75 | 7.49 |
+| All three typechecks | Uncached | 82.47 | 64.99 |
+| All three typechecks | Warm build info | 25.86 | 22.44 |
+| Complete build (clean, typecheck, client, server) | Cold caches | 110.18 | 65.07 |
+| Complete build (clean, typecheck, client, server) | Warm caches | 43.43 | 34.08 |
+
+A mixed batch of 80 whole-repo searches plus 32 six-entry esbuild bundles
+over 12 search and 12 build lanes, alternating conditions, with sampled
+peak RSS of the `rg` and `esbuild` processes:
+
+| Run | Elapsed (s) | User (s) | System (s) | Peak RSS (KiB) |
+| --- | ---: | ---: | ---: | ---: |
+| Default | 15.23 | 24.31 | 96.10 | 426924 |
+| Candidate | 12.99 | 40.74 | 29.81 | 151076 |
+| Default | 8.39 | 13.28 | 61.33 | 334352 |
+| Candidate | 16.17 | 49.39 | 26.35 | 155388 |
+| Default | 11.87 | 20.25 | 74.32 | 325500 |
+| Candidate | 13.01 | 36.99 | 25.37 | 163960 |
+
+A single whole-repo search measured 0.24 to 0.26 seconds elapsed with
+default threads and 0.35 to 0.57 seconds with two threads; a single
+six-entry esbuild bundle measured 0.06 seconds elapsed with and without
+`GOMAXPROCS=2`.
+
+Cached and uncached typecheck and lint report identical diagnostics,
+stable across repeats, with clean recovery after the error is removed;
+every diagnostic exit stays nonzero (the incremental typecheck exits 1
+where the uncached one exits 2). Eighty searches per condition produced
+identical match sets and exit statuses, and 32 bundles per condition
+produced identical bytes apart from the harness's per-run fixture path in
+a source comment.
+
 ## Profile a run
 
 CI uploads `unit-timings-1` and `unit-timings-2` (Vitest JSON with per-test

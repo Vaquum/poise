@@ -12,6 +12,15 @@ export const CLAUDE_SUBSCRIPTION_CLI = fileURLToPath(new URL(
   '../scripts/claude-subscription.mjs',
   import.meta.url,
 ))
+// Resolved like the subscription wrapper so it names the shipped file both
+// from the source tree (server/process.ts) and the production bundle
+// (dist/server.js): the runtime image copies scripts/ beside dist/.
+export const AGENT_RIPGREP_CONFIG = fileURLToPath(new URL(
+  '../scripts/agent-tools.ripgreprc',
+  import.meta.url,
+))
+// Bounds Go runtimes only; every other child ignores it.
+export const AGENT_GOMAXPROCS = '2'
 
 export function assertProcessArgSize(value: string, label = 'argument'): void {
   if (Buffer.byteLength(value, 'utf8') > MAX_PROCESS_ARG_BYTES) {
@@ -106,6 +115,10 @@ const SAFE_BASE_ENV = new Set([
   // Known non-secret integration paths used by agent-interface.
   'AGENT_INTERFACE_ROOT',
   'AGENT_INTERFACE_DATA_DIR',
+  // Non-secret tool configuration a user may set: an inherited value always
+  // wins over the agent tool defaults applied below.
+  'GOMAXPROCS',
+  'RIPGREP_CONFIG_PATH',
 ])
 
 const NETWORK_ENV = [
@@ -329,7 +342,24 @@ function childEnvironment(
     if (value === undefined) delete env[key]
     else env[key] = value
   }
+  applyAgentToolDefaults(env, overrides)
   return env
+}
+
+// Agent tool-performance defaults: external ripgrep searches run two threads
+// and Go tools observe GOMAXPROCS=2. Both only affect the tools that read
+// them, and an inherited or explicitly passed value always wins; an explicit
+// undefined removes the variable instead of restoring the default.
+function applyAgentToolDefaults(env: NodeJS.ProcessEnv, overrides: NodeJS.ProcessEnv): void {
+  const removed = new Set(
+    Object.keys(overrides)
+      .filter((key) => overrides[key] === undefined)
+      .map((key) => key.toUpperCase()),
+  )
+  for (const [key, value] of [['GOMAXPROCS', AGENT_GOMAXPROCS], ['RIPGREP_CONFIG_PATH', AGENT_RIPGREP_CONFIG]] as const) {
+    if (removed.has(key)) continue
+    if (!Object.keys(env).some((present) => present.toUpperCase() === key)) env[key] = value
+  }
 }
 
 function abortError(signal: AbortSignal, killSignal: NodeJS.Signals): Error {
