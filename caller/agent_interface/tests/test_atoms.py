@@ -49,6 +49,35 @@ class TestAtoms(TestCase):
                 atoms.packet("/tmp", "#1", "bit-mis", "a" * 40)
         self.assertIsNone(caught.exception.code)
 
+    def test_last_reviewed_head_reports_the_reviewers_latest_commit(self) -> None:
+        reply = {"action": "review_activity_since", "reviewer_latest_commit": "c" * 40}
+        with patch.object(atoms.subprocess, "run",
+                          return_value=SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")) as run:
+            self.assertEqual(atoms.last_reviewed_head("/tmp", "#1", "bit-mis"), "c" * 40)
+        self.assertEqual(run.call_args.args[0],
+                         ["github-interface", "--review-activity-since", "#1", "--username", "bit-mis",
+                          "--since", "1970-01-01T00:00:00Z", "--token-user", "bit-mis"])
+
+    def test_last_reviewed_head_is_none_without_a_prior_review(self) -> None:
+        for commit in (None, ""):
+            reply = {"action": "review_activity_since", "reviewer_latest_commit": commit}
+            with patch.object(atoms.subprocess, "run",
+                              return_value=SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")):
+                self.assertIsNone(atoms.last_reviewed_head("/tmp", "#1", "bit-mis"))
+
+    def test_last_reviewed_head_rejects_garbage_loudly(self) -> None:
+        reply = {"action": "review_activity_since", "reviewer_latest_commit": "not-a-sha"}
+        with patch.object(atoms.subprocess, "run",
+                          return_value=SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")), \
+                self.assertRaises(atoms.AgentPreflightError) as failure:
+            atoms.last_reviewed_head("/tmp", "#1", "bit-mis")
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+
+    def test_last_reviewed_head_failure_is_not_a_prior_review(self) -> None:
+        with patch.object(atoms.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="boom")), \
+                self.assertRaises(atoms.AgentPreflightError):
+            atoms.last_reviewed_head("/tmp", "#1", "bit-mis")
+
     def test_packet_limit_has_stable_code_but_network_error_remains_retryable(self) -> None:
         for error, code in [
             ("error: review_packet_too_large: retained diff exceeds limit", "review_packet_too_large"),

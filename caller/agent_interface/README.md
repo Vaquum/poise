@@ -269,6 +269,19 @@ as usual and the harness converts a change-request verdict deterministically;
 Claude receives the capped tool contract (file the issue, then approve) and
 must submit nothing when filing fails.
 
+### Staged and follow-up reviews
+
+A structured review whose packet exceeds one provider call's reliable size
+runs in file-group stages (at most 8 files or 200,000 diff bytes each), all
+under the same head watch and budget. Every stage's findings combine into the
+single verdict the harness submits; a packet that fits in one group runs
+exactly as before. A follow-up (`--pr-approve`) round reviews the diff since
+the reviewer's last submitted review instead of the whole PR again, with new
+findings on current-head lines; an unfetchable last head falls back to the
+full diff once and says so in the prompt. Every run reports its budget usage
+(`used_seconds` of `total_seconds`) in its terminal progress snapshot and in
+the completion result, so a near-miss is visible before it fails.
+
 # Issue review
 
 `--issue-review OWNER/REPO#N --model MODEL [--recovery-model MODEL] --actor USER

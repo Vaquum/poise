@@ -4,6 +4,7 @@ from . import progress, review_budget
 from .process_diagnostic import command_failure, diagnostic_envelope, diagnostic_from_stderr, diagnostic_message
 from .provider_progress import claude_error, claude_result
 
+import json
 import os
 import re
 import subprocess
@@ -136,15 +137,54 @@ def correlation_id(value: str) -> str:
     return correlation
 
 
+def last_reviewed_head(pwd: str, pr: str, actor_name: str) -> str | None:
+    """The head the reviewer's latest submitted review covered, if any."""
+    limit = review_budget.timeout(120)
+    progress.stage("locating_last_review", "Locating the last reviewed head", timeout=limit)
+    args = [
+        os.getenv("GITHUB_INTERFACE_CLI", "github-interface"),
+        "--review-activity-since",
+        pr_ref(pr),
+        "--username",
+        actor(actor_name),
+        "--since",
+        "1970-01-01T00:00:00Z",
+        "--token-user",
+        actor(actor_name),
+    ]
+    try:
+        done = subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=limit)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        diagnostic = command_failure(error, "review_history", pwd, limit)
+        raise AgentPreflightError(str(error), diagnostic=diagnostic) from error
+    if done.returncode:
+        error = (done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}"
+        diagnostic = diagnostic_from_stderr(done.stderr, "review_history")
+        raise AgentPreflightError(diagnostic_message(diagnostic) if diagnostic else error, None, diagnostic)
+    try:
+        reply = json.loads(done.stdout)
+    except ValueError as error:
+        raise AgentPreflightError(f"review activity is not JSON: {error}") from error
+    commit = reply.get("reviewer_latest_commit") if isinstance(reply, dict) else None
+    if commit in (None, ""):
+        return None
+    try:
+        return expected_head(commit)
+    except ValueError as error:
+        raise AgentPreflightError(f"review activity returned an invalid last reviewed head: {commit!r}",
+                                  "review_contract_violation") from error
+
+
 def packet(
     pwd: str,
     pr: str,
     actor_name: str,
     head: str,
     p: str | None = None,
+    since_head: str | None = None,
 ) -> str:
     cache = review_budget.packet_cache()
-    key = (pwd, pr, actor_name, head, p)
+    key = (pwd, pr, actor_name, head, p, since_head)
     if cache is not None and key in cache:
         return cache[key]
     limit = review_budget.timeout(600)
@@ -160,6 +200,8 @@ def packet(
     ]
     if p:
         args.extend(["--p", _priority(p)])
+    if since_head:
+        args.extend(["--since-head", since_head])
     try:
         done = subprocess.run(args, cwd=pwd, text=True, capture_output=True, timeout=limit)
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -172,7 +214,9 @@ def packet(
         raise AgentPreflightError(str(error), diagnostic=diagnostic) from error
     if done.returncode:
         error = (done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}"
-        code = "review_packet_too_large" if error.startswith("error: review_packet_too_large:") else None
+        code = ("review_packet_too_large" if error.startswith("error: review_packet_too_large:")
+                else "review_since_head_unknown" if error.startswith("error: review_since_head_unknown:")
+                else None)
         diagnostic = diagnostic_from_stderr(done.stderr, "packet_acquisition")
         raise AgentPreflightError(diagnostic_message(diagnostic) if diagnostic else error, code, diagnostic)
     if cache is not None:

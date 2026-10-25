@@ -94,6 +94,7 @@ class TestReviewModel(TestCase):
             for identity in ("gpt-6-astra-ultra", "grok-4.6-xhigh", "gemini-3.8-flash-high", "muse-spark-1.3-contributor-max"):
                 repository = SimpleNamespace(prompt=lambda: "repo guidance", root=Path("/tmp/review"))
                 with patch.object(atoms, "packet", return_value="immutable packet"), patch.object(atoms, "run_agent") as run, \
+                        patch.object(atoms, "last_reviewed_head", return_value=None), \
                         patch.object(review_repository, "prepare", return_value=nullcontext(repository)):
                     mod.run("/tmp", "12", "bit-mis", "a" * 40, note="memory", p="p1", model=identity)
                     text = run.call_args.args[2]
@@ -324,6 +325,78 @@ class TestStagedReview(TestCase):
             self._run(packet, [{"action": "reviewed_clean", "comments": []}],
                       text_packet=staged_packet(["src/other.py"]))
         self.assertEqual(failure.exception.code, "review_contract_violation")
+
+    def test_stages_keep_repository_inspection_with_one_combined_submission(self):
+        request = {"operation": "read", "path": "src/old.py", "query": "", "start_line": 1}
+        calls = []
+
+        def ask(root, model, system, text, schema, watch, timeout):
+            calls.append(text)
+            self.assertIn("requests", schema["required"])
+            if "file group 1 of 2" in text and "Previous review step" not in text:
+                return json.dumps({"action": "inspect", "comments": [], "requests": [request]})
+            path = "src/f00.py" if "file group 1 of 2" in text else "src/f08.py"
+            finding = {"path": path, "line": 1, "side": "RIGHT", "body": "defect"}
+            return json.dumps({"action": "request_changes", "comments": [finding], "requests": []})
+
+        repo = review_repository.Repository(Path("/tmp/review"), {"head_sha": "a" * 40})
+        inspected = {"action": "review_context", "head_sha": "a" * 40, "results": []}
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40})
+        with patch.dict(structured_review.ASK, {"codex": ask}), \
+                patch.object(repo, "inspect", return_value=inspected) as inspect, \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit:
+            structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"), "pr_review",
+                                  "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60,
+                                  repository=repo, packet=packet)
+        inspect.assert_called_once_with([request])
+        submit.assert_called_once()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("file group 2 of 2", calls[2])
+        self.assertEqual(len(json.loads(submit.call_args.args[0][4])), 2)
+
+
+class TestApproveSinceHead(TestCase):
+    def _run(self, since, packets):
+        with patch.object(atoms, "last_reviewed_head", return_value=since) as history, \
+                patch.object(atoms, "packet", side_effect=packets) as packet, \
+                patch.object(atoms, "run_agent", return_value="verdict") as run:
+            self.assertEqual(pr_approve.run("/tmp", "12", "bit-mis", "a" * 40, model="gpt-6-astra-ultra"), "verdict")
+        return history, packet, run
+
+    def test_follow_up_reviews_the_diff_since_the_last_reviewed_head(self):
+        _, packet, run = self._run("c" * 40, ["since packet"])
+        packet.assert_called_once_with("/tmp", "12", "bit-mis", "a" * 40, None, since_head="c" * 40)
+        self.assertIn("since packet", run.call_args.args[2])
+
+    def test_same_head_reviews_the_full_packet(self):
+        _, packet, _ = self._run("a" * 40, ["full packet"])
+        packet.assert_called_once_with("/tmp", "12", "bit-mis", "a" * 40, None, since_head=None)
+
+    def test_first_review_has_no_since_head(self):
+        _, packet, _ = self._run(None, ["full packet"])
+        packet.assert_called_once_with("/tmp", "12", "bit-mis", "a" * 40, None, since_head=None)
+
+    def test_unfetchable_since_head_falls_back_to_the_full_diff(self):
+        unknown = atoms.AgentPreflightError("error: review_since_head_unknown: gone", "review_since_head_unknown")
+        _, packet, run = self._run("c" * 40, [unknown, "full packet"])
+        self.assertEqual(packet.call_count, 2)
+        self.assertEqual(packet.call_args_list[0].kwargs, {"since_head": "c" * 40})
+        self.assertEqual(packet.call_args_list[1].kwargs, {"since_head": None})
+        self.assertIn("full packet", run.call_args.args[2])
+        self.assertIn("c" * 40, run.call_args.args[2])
+
+    def test_other_packet_failures_do_not_fall_back(self):
+        with patch.object(atoms, "last_reviewed_head", return_value="c" * 40), \
+                patch.object(atoms, "packet",
+                             side_effect=atoms.AgentPreflightError("too large", "review_packet_too_large")) as packet, \
+                patch.object(atoms, "run_agent") as run:
+            with self.assertRaises(atoms.AgentPreflightError):
+                pr_approve.run("/tmp", "12", "bit-mis", "a" * 40, model="gpt-6-astra-ultra")
+        packet.assert_called_once()
+        run.assert_not_called()
 
 
 class TestOtherProviderVerdicts(TestCase):

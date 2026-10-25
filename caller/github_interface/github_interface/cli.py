@@ -11,7 +11,7 @@ from .interface import checkout_review, review_context, approve_pr, assign_issue
 TOP_HELP = """usage: github-interface BEHAVIOR ...
 
 behaviors:
-  --pr-review PR [--p p2] --expected-head SHA --token-user USER
+  --pr-review PR [--p p2] [--since-head SHA] --expected-head SHA --token-user USER
   --approve-pr PR --expected-head SHA --token-user USER
   --head-sha PR --token-user USER
   --list-failing-ci PR [--repository OWNER/REPO]
@@ -182,6 +182,8 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--pr-review":
         parser = argparse.ArgumentParser(prog="github-interface --pr-review PR")
         parser.add_argument("--p", default="p2", metavar="p2")
+        parser.add_argument("--since-head", default=None, metavar="SHA",
+                            help="diff since this previously reviewed head instead of the merge base")
         _add_expected_head(parser)
         return parser
 

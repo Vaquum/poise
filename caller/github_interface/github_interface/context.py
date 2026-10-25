@@ -57,6 +57,16 @@ def expected_head(payload: dict[str, Any]) -> str:
     return value
 
 
+def since_head(payload: dict[str, Any]) -> str | None:
+    raw = payload.get("since_head")
+    if raw is None or str(raw).strip() == "":
+        return None
+    value = str(raw).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise ValueError("since-head must be a 40-character commit SHA")
+    return value
+
+
 def token_user(payload: dict[str, Any]) -> str:
     value = str(payload.get("token_user") or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?", value):

@@ -213,3 +213,69 @@ class TestBoundedCoverage(IsolatedAsyncioTestCase):
         packet = await self._packet(['a.py', 'b.py'], 1000, rd.MAX_DIFF_BYTES)
         self.assertEqual(len(packet['diff']), 2000)
         self.assertNotIn('omitted_files', packet)
+
+
+class TestSinceHeadDiff(IsolatedAsyncioTestCase):
+    async def _packet(self, since=None, fetch_error=None):
+        base, head, old = 'a' * 40, 'b' * 40, 'c' * 40
+        raw = f':100644 100644 {old} {head} M\0code.py\0'.encode()
+        calls = []
+
+        def git_result(cwd, env, *args, limit):
+            calls.append(args)
+            if args[:1] == ('fetch',) and fetch_error is not None:
+                raise fetch_error
+            if '--raw' in args:
+                return raw
+            if '--find-renames' in args:
+                return b'diff --git a/code.py b/code.py\n'
+            return b''
+
+        client = AsyncMock()
+        client.token = 'test-token'
+        client.get.return_value = {'merge_base_commit': {'sha': base}}
+        with patch.object(rd, '_git', side_effect=git_result), \
+                patch.object(rd, '_blob_sizes', AsyncMock(return_value={old: 100, head: 100})):
+            packet = await rd.review_diff(client, 'o', 'r', {'base': {'sha': base}, 'head': {'sha': head}},
+                                          since=since)
+        return packet, calls, client
+
+    async def test_since_head_diffs_since_to_head_without_compare_call(self):
+        since = 'c' * 40
+        packet, calls, client = await self._packet(since=since)
+        client.get.assert_not_awaited()
+        fetch = next(args for args in calls if args[:1] == ('fetch',))
+        self.assertEqual(fetch[-2:], (since, 'b' * 40))
+        raw = next(args for args in calls if '--raw' in args)
+        self.assertEqual(raw[5:7], (since, 'b' * 40))
+        self.assertEqual(packet['merge_base_sha'], since)
+        self.assertEqual([entry['filename'] for entry in packet['files']], ['code.py'])
+        self.assertIn('Follow-up review', packet['review_scope'])
+        self.assertIn('RIGHT-side', packet['review_scope'])
+
+    async def test_unfetchable_since_head_is_a_distinct_error(self):
+        from github_interface.atoms.process_diagnostic import GitProcessError
+        fetch_error = GitProcessError({"operation": "fetch", "outcome": "exit", "stderr": "missing object",
+                                       "exit_code": 128, "signal": None, "errno": None})
+        with self.assertRaisesRegex(RuntimeError, 'review_since_head_unknown'):
+            await self._packet(since='c' * 40, fetch_error=fetch_error)
+
+    async def test_pr_review_behavior_passes_since_head_to_the_diff(self):
+        from unittest.mock import ANY
+        head, base, since = 'a' * 40, 'b' * 40, 'c' * 40
+        pull = {'head': {'sha': head}, 'base': {'sha': base}}
+        client = AsyncMock()
+        with patch.object(pr_review, 'get_pull', AsyncMock(side_effect=[pull, pull])), \
+                patch.object(pr_review, 'review_diff', AsyncMock(return_value={})) as diff, \
+                patch.object(pr_review, 'list_inline_comments', AsyncMock(return_value=[])), \
+                patch.object(pr_review, 'issue_comments', AsyncMock(return_value=[])), \
+                patch.object(pr_review, 'list_review_threads', AsyncMock(return_value=[])), \
+                patch.object(pr_review, 'linked_issues', AsyncMock(return_value=[])):
+            await pr_review.run(client, {'repository': 'o/r', 'pr': 1, 'expected_head': head,
+                                         'since_head': since})
+        diff.assert_awaited_once_with(client, 'o', 'r', pull, ANY, since=since)
+
+    async def test_pr_review_behavior_rejects_a_malformed_since_head(self):
+        with self.assertRaisesRegex(ValueError, 'since-head'):
+            await pr_review.run(AsyncMock(), {'repository': 'o/r', 'pr': 1, 'expected_head': 'a' * 40,
+                                              'since_head': 'zzz'})
