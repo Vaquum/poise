@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
-  assess, CATALOG_LABEL, catalogRetirementEnabled, createLaunchdWatchdog, ensureSingleModelScheduler, graceMs, isNotLoaded,
-  parseLaunchctlPrint, retireCatalogJob, startLaunchdWatchdog, watchdogLabels,
+  assess, CATALOG_LABEL, catalogRetirementEnabled, CatalogStillLoadedError, createLaunchdWatchdog, ensureSingleModelScheduler,
+  graceMs, isNotLoaded, parseLaunchctlPrint, retireCatalogJob, startLaunchdWatchdog, watchdogLabels,
 } from '../server/launchd-watchdog'
 
 // What execFile rejects with: `launchctl print` exits 113 for a job that is not
@@ -304,6 +304,7 @@ describe('retiring the legacy model-catalog job', () => {
       },
       remove: async (path) => { removed.push(path) },
     }).then(() => null, (error: unknown) => error as Error)
+    expect(failure).toBeInstanceOf(CatalogStillLoadedError)
     expect(failure?.message).toContain(`could not unload the legacy ${CATALOG_LABEL} job`)
     expect(failure?.message).toContain('a second model-check scheduler')
     expect(removed).toEqual([])
@@ -319,21 +320,21 @@ describe('retiring the legacy model-catalog job', () => {
       },
       remove: async (path) => { removed.push(path) },
     }).then(() => null, (error: unknown) => error as Error)
-    expect(failure).toBeInstanceOf(Error)
-    expect(failure?.message).toContain('launchctl print')
+    expect(failure).toBeInstanceOf(CatalogStillLoadedError)
+    expect(failure?.message).toContain('could not confirm')
     expect(removed).toEqual([])
   })
 })
 
 describe('leaving exactly one daily model scheduler', () => {
-  function harness(run: (args: string[]) => Promise<string>) {
+  function harness(run: (args: string[]) => Promise<string>, remove: (path: string) => Promise<void> = async () => {}) {
     const logs: string[] = []
     const errors: string[] = []
     let standDowns = 0
     const settled = ensureSingleModelScheduler({
       domain: 'gui/501',
       run,
-      remove: async () => {},
+      remove,
       stopScheduler: () => { standDowns += 1 },
       log: (line) => logs.push(line),
       logError: (line) => errors.push(line),
@@ -368,5 +369,18 @@ describe('leaving exactly one daily model scheduler', () => {
     expect(h.errors).toHaveLength(1)
     expect(h.errors[0]).toContain(`could not unload the legacy ${CATALOG_LABEL} job`)
     expect(h.errors[0]).toContain('the in-process daily model check is stopped until the server restarts')
+  })
+
+  it('keeps its own check when only the plist removal fails after an unload', async () => {
+    const h = harness(
+      async () => '',
+      async () => { throw Object.assign(new Error(`EACCES: permission denied, unlink 'x.plist'`), { code: 'EACCES' }) },
+    )
+    await expect(h.settled).resolves.toBeUndefined()
+    expect(h.logs).toEqual([])
+    expect(h.standDowns()).toBe(0)
+    expect(h.errors).toHaveLength(1)
+    expect(h.errors[0]).toContain('EACCES')
+    expect(h.errors[0]).toContain('its plist remains')
   })
 })

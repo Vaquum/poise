@@ -11,12 +11,14 @@ const mocks = vi.hoisted(() => ({
   // The Chat WebSocket attaches to the production server's upgrade event;
   // shutdown ordering is what this file checks, so it is a no-op here.
   attachChatSockets: vi.fn<() => void>(),
+  stopDailyModelRefresh: vi.fn<() => void>(),
 }))
 
 vi.mock('../server/cache-plugin', () => ({
   createPoiseMiddleware: mocks.createPoiseMiddleware,
   stopPoiseRuntime: mocks.stopPoiseRuntime,
   attachChatSockets: mocks.attachChatSockets,
+  stopDailyModelRefresh: mocks.stopDailyModelRefresh,
 }))
 
 vi.mock('../server/db', () => ({

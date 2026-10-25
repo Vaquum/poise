@@ -355,7 +355,7 @@ async function main() {
   // No calendar job for the model catalog: the production server runs the
   // daily check itself at 07:00 in the timezone saved in Settings, so a
   // timezone change takes effect without reinstalling. The legacy job is
-  // retired below, where the other jobs are unloaded.
+  // retired at the end, once the service is back up.
   // The empty plan on a clean install must not write, unload, or start any
   // pre-existing datastore launchd job owned outside this Poise installation.
   if (datastoreDb) {
@@ -419,7 +419,6 @@ async function main() {
   if (!selfUpdating) await bootout(updaterLabel)
   await bootout(monitorLabel)
   await bootout(serviceLabel)
-  await retireCatalogJob({ launchAgents, domain, run })
   for (const job of datastoreServices) await bootout(job.label)
   await run('/bin/launchctl', ['enable', `${domain}/${serviceLabel}`])
   await run('/bin/launchctl', ['enable', `${domain}/${monitorLabel}`])
@@ -445,6 +444,10 @@ async function main() {
     await bootstrap(updaterPlist)
     await start(updaterLabel)
   }
+  // Last: retiring the legacy catalog job throws when the old job survives,
+  // and must not abort the install before the service it just restarted is
+  // back up. Everything above is already running if this fails.
+  await retireCatalogJob({ launchAgents, domain, run })
   console.log(`Installed ${serviceLabel} at ${commit} with its Caller (${Object.entries(manifest.packages).map(([name, version]) => `${name} ${version}`).join(', ')})`)
   if (!datastoreDb) console.log('Add your first GitHub organization in Settings to initialize its datastore.')
   if (!health.healthy) {
