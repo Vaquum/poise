@@ -1063,7 +1063,10 @@ heap capture or expression execution. Its fixed protocol commands are
 `Profiler.enable/start/stop/disable` and `Runtime.discardConsoleEntries`; the
 last command releases console references before disconnect. `SIGUSR1` remains
 refused. Imported production modules, local launchers and development servers
-do not install the capture handler. Native signal-report/heap options make
+do not install the capture handler. Service mode supplied by `.env` installs
+it after secure loading/validation and before logging/runtime startup;
+environment-supplied service mode installs it before dotenv loading.
+Native signal-report/heap options make
 capture unavailable; operators must check availability before signalling,
 since a JS handler cannot prevent Node's independent native signal actions.
 

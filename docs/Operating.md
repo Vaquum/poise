@@ -22,6 +22,10 @@ The direct service-mode production server accepts at most one operator-requested
 does not enable SIGUSR1 inspection. There is no HTTP trigger or environment
 override for duration, output or commands. This is an optional diagnostic,
 not a responsiveness fix or an unlimited-load acceptance test.
+Environment-supplied service mode installs the handler before dotenv loading;
+mode supplied by a secured `.env` installs it immediately after validation,
+before logging/runtime startup. Neither path is ready for an operator signal
+until its process-specific availability record exists.
 
 Before sending any signal, complete this preflight in the workspace's PID
 namespace:

@@ -34,6 +34,9 @@ if (isProductionEntrypoint && process.env.POISE_MODE === 'service') installProdu
 // misconfigured service mode stops here, naming every variable at fault.
 await loadSecureDotenv()
 readServiceConfig()
+// Service mode can come from the secured .env too. Environment-supplied mode
+// was armed before loading it; installation is idempotent for that path.
+if (isProductionEntrypoint && process.env.POISE_MODE === 'service') installProductionCpuCapture()
 const { startLogging } = await import('./logging')
 startLogging({ captureFatal: true })
 const { attachChatSockets, createPoiseMiddleware, stopDailyModelRefresh, stopPoiseRuntime } = await import('./cache-plugin')
