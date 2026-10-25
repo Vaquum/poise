@@ -9,6 +9,9 @@ default per behavior. `agent-interface --models` prints it as JSON.
 `agent-interface --refresh-models` asks each CLI what it offers today and rewrites
 the runtime copy under the data directory when something changed; a family whose
 CLI cannot answer keeps its rows and is reported as unavailable.
+`--refresh-models --families a,b` probes only the named families and reports
+the rest skipped with their rows kept; an explicit empty `--families ""`
+probes nothing.
 
 # Authoring content
 
