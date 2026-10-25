@@ -510,19 +510,18 @@ class TestSincePositions(TestCase):
         self.assertEqual(failure.exception.code, "review_contract_violation")
         self.assertIn("no submitted verdict", str(failure.exception))
 
-    def test_partially_stale_verdict_submits_only_submittable_findings(self):
+    def test_partially_stale_verdict_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
         verdict = {"action": "request_changes", "comments": [
             {"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "kept"},
             {"path": "src/kept.py", "line": 99, "side": "RIGHT", "body": "stale"}]}
-        result, calls, _ = self._run(self._packet("c" * 40, self.REMOVAL), verdict,
-                                     self._full(self.REMOVAL + "\n" + kept,
-                                              paths=("src/gone.py", "src/kept.py")))
-        self.assertIn('"review_id": 91', result)
-        self.assertEqual(calls[-1][0][1], "--request-changes")
-        self.assertEqual(json.loads(calls[-1][0][4]), [verdict["comments"][0]])
-        self.assertIn("dropped before submission", result)
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, self.REMOVAL), verdict,
+                       self._full(self.REMOVAL + "\n" + kept,
+                                paths=("src/gone.py", "src/kept.py")))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
 
     def test_full_review_left_findings_keep_todays_behavior(self):
         verdict = {"action": "request_changes",
