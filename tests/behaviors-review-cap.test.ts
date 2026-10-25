@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, arrangeCli, recordCompletedInitialReview } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, fixture, recordCompletedInitialReview } from './behaviors-runtime-fixture'
 
 // The review-round cap: Approve Pull Requests files the capped round's
 // findings as one follow-up issue and approves instead of requesting changes
@@ -163,6 +163,141 @@ describe('review-round cap', () => {
     expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
       '--pr-approve', '#17', '--review-cap-reached', '--review-round', '2', '--review-cap', '2',
     ]))
+  })
+
+  it('passes the round-5 flag with four retained negative rounds', async () => {
+    arrangeCli(true)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    runtime.setReviewCap(5)
+    recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: 'b'.repeat(40) })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T10:00:00Z/r=1/head=${'c'.repeat(40)}`,
+      headSha: 'c'.repeat(40), callId: 'd'.repeat(32),
+    })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T11:00:00Z/r=2/head=${'e'.repeat(40)}`,
+      headSha: 'e'.repeat(40), callId: 'f'.repeat(32),
+    })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T12:00:00Z/r=3/head=${'f'.repeat(40)}`,
+      headSha: 'f'.repeat(40), callId: 'a'.repeat(32),
+    })
+    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(4)
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      '--pr-approve', '#17', '--review-cap-reached', '--review-round', '5', '--review-cap', '5',
+    ]))
+  })
+
+  it('pins the capped round on approval replay admission', async () => {
+    arrangeCli(false, false, {
+      reviewerLatestState: 'DISMISSED',
+      reviewerLatestCommit: HEAD_SHA,
+      reviewerReviewsSinceItems: [{ id: 91, state: 'DISMISSED', commit: HEAD_SHA }],
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user')
+    runtime.setReviewCap(5)
+    recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: 'b'.repeat(40) })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T10:00:00Z/r=1/head=${'c'.repeat(40)}`,
+      headSha: 'c'.repeat(40), callId: 'd'.repeat(32),
+    })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T11:00:00Z/r=2/head=${'e'.repeat(40)}`,
+      headSha: 'e'.repeat(40), callId: 'f'.repeat(32),
+    })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T12:00:00Z/r=3/head=${'f'.repeat(40)}`,
+      headSha: 'f'.repeat(40), callId: 'a'.repeat(32),
+    })
+
+    await expect(runtime.admitReplay('pr_approve', pr.repo, pr.number)).resolves.toMatchObject({
+      author: pr.author, reviewCapReached: { reviewRound: 5, reviewCap: 5 },
+    })
+  })
+
+  it('leaves replay uncapped below the cap', async () => {
+    arrangeCli(false, false, {
+      reviewerLatestState: 'DISMISSED',
+      reviewerLatestCommit: HEAD_SHA,
+      reviewerReviewsSinceItems: [{ id: 91, state: 'DISMISSED', commit: HEAD_SHA }],
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user')
+    runtime.setReviewCap(10)
+    recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: 'b'.repeat(40) })
+
+    const admission = await runtime.admitReplay('pr_approve', pr.repo, pr.number)
+    expect(admission).toMatchObject({ author: pr.author })
+    expect(admission).not.toHaveProperty('reviewCapReached')
+  })
+
+  it('counts a completed round on a stale head exactly once across restarts', async () => {
+    arrangeCli(true)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    runtime.setReviewCap(5)
+    recordCompletedInitialReview(db, { outcome: 'changes_requested', headSha: 'b'.repeat(40) })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T10:00:00Z/r=1/head=${'c'.repeat(40)}`,
+      headSha: 'c'.repeat(40), callId: 'd'.repeat(32),
+    })
+    recordCompletedApprovalRound(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-07-10T11:00:00Z/r=2/head=${'e'.repeat(40)}`,
+      headSha: 'e'.repeat(40), callId: 'f'.repeat(32),
+    })
+    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(3)
+
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][1]).not.toContain('--review-cap-reached')
+    const claim = db.listBehaviorLaunchClaims('approve-prs')[0]
+
+    // Caller posts its change request on the expected head; the author
+    // pushes before verification finishes.
+    fixture.agentLogs = [agentLog({
+      id: 'a'.repeat(32), behavior: 'pr_approve', status: 'completed',
+      action: 'requested_changes', outcome: 'changes_requested',
+      head_sha: claim.launchExpectedHead, expected_head: claim.launchExpectedHead,
+      review_id: 91, actor: claim.launchActor, source: claim.launchSource,
+      correlation_id: claim.launchCorrelationId,
+      started_at: new Date().toISOString(),
+      started_at_precise: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    })]
+    await resetLogCache()
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(4)
+    const completed = db.db.prepare(
+      'SELECT launch_completed_at AS completedAt, launch_call_id AS callId FROM behavior_seen WHERE key = ? AND target = ?',
+    ).get('approve-prs', claim.target) as { completedAt: string, callId: string }
+
+    const restarted = await restartModules()
+    restarted.behaviors.startBehaviorsRuntime()
+    await restarted.behaviors.runEnabledBehaviorsOnce()
+    expect(restarted.database.countReviewRounds(pr.repo, pr.number)).toBe(4)
+    expect(restarted.database.db.prepare(
+      'SELECT launch_completed_at AS completedAt, launch_call_id AS callId FROM behavior_seen WHERE key = ? AND target = ?',
+    ).get('approve-prs', claim.target)).toEqual(completed)
+    expect(restarted.database.listBehaviorDeadLetters()).toEqual([])
+    // Any follow-on approval launch after the fourth round is the capped
+    // round 5, never another change request.
+    for (const [, args] of mocks.spawnDetached.mock.calls.slice(1)) {
+      expect(args).toEqual(expect.arrayContaining(
+        ['--review-cap-reached', '--review-round', '5', '--review-cap', '5']))
+    }
   })
 
   it('stays capped past the cap', async () => {

@@ -556,8 +556,9 @@ describe('approval eligibility and review activity', () => {
     prior.database.recordSeen('review-new-prs', `${pr.repo}#${pr.number}:secondary`)
     expect(prior.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
     fixture.agentLogs = [agentLog({
-      behavior: 'pr_approve', status: 'superseded', outcome: 'superseded',
-      expected_head: prior.expectedHead, head_sha: NEXT_HEAD_SHA,
+      behavior: 'pr_approve', status: 'failed', error: 'submitted approval was dismissed as stale after the target moved',
+      error_code: 'approval_dismissed_stale',
+      expected_head: prior.expectedHead,
       started_at: new Date(Date.parse(prior.requestedAt) + 1_000).toISOString(),
       completed_at: new Date().toISOString(), review_id: 91,
       actor: prior.actor, source: prior.source, correlation_id: prior.correlationId,

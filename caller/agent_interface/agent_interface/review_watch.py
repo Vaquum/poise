@@ -48,7 +48,7 @@ class ReviewWatch:
         try:
             done = subprocess.run(
                 [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), "--head-sha",
-                 f"https://github.com/{self.repo}/pull/{self.number}", "--token-user", self.actor],
+                 f"#{self.number}", "--repository", self.repo, "--token-user", self.actor],
                 cwd=self.pwd, text=True, capture_output=True, timeout=timeout,
             )
             if done.returncode:

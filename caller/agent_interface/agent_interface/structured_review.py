@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,7 +25,7 @@ from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, bounde
 from .atoms import packet as fetch_packet
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
-from .review_watch import ReviewWatch
+from .review_watch import ReviewSuperseded, ReviewWatch
 from . import progress, review_budget, review_receipt, review_stages
 from . import review_cap as followup
 
@@ -350,6 +351,12 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
     raise AssertionError("review rounds did not return a verdict")
 
 
+def _refused_head(output: str) -> str | None:
+    """The observed head when the pre-POST head check refused the review."""
+    match = re.search(r"pull-request head changed: expected [0-9a-f]{40}, got ([0-9a-f]{40})", output)
+    return match[1] if match else None
+
+
 def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         pr: str, actor_name: str, head: str, timeout_s: int, *, repository=None,
         packet: str = "", capped: bool = False,
@@ -435,6 +442,11 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         transient = review_receipt.record_failure(done.stderr or done.stdout)
         if transient is not None:
             raise review_receipt.SubmissionError(transient)
+        superseded = _refused_head((done.stderr or done.stdout).strip())
+        if superseded is not None:
+            # The pre-POST head check refused: proved no review, so the run
+            # is superseded, not a contract violation.
+            raise ReviewSuperseded(superseded)
         cause = bounded_cause((done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}")
         raise review_budget.ReviewLimitError(
             f"review submission rejected: {cause}", "review_contract_violation",
@@ -454,8 +466,10 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                     stderr=cause, provider=model.provider, submission="noop"))
         raise review_receipt.SubmissionError(
             "review submission returned no receipt; publication uncertain, reconcile before retry")
-    # The outer governed behavior reads authoritative review facts afterward,
-    # including head supersession when GitHub correctly rejects a stale verdict.
+    # The outer governed behavior reads authoritative review facts afterward:
+    # a receipted review reconciles as completed even when the head moved
+    # after the POST, because GitHub pins the stale verdict instead of
+    # rejecting it.
     return raw.strip() + "\n" + (done.stdout or done.stderr).strip() + capped_note
 
 

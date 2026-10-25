@@ -13,7 +13,7 @@ TOP_HELP = """usage: github-interface BEHAVIOR ...
 behaviors:
   --pr-review PR [--p p2] [--since-head SHA] --expected-head SHA --token-user USER
   --approve-pr PR --expected-head SHA --token-user USER
-  --head-sha PR --token-user USER
+  --head-sha PR --token-user USER [--repository OWNER/REPO]
   --list-failing-ci PR [--repository OWNER/REPO]
   --read-failing-ci-log LOG_ID
   --checkout-pr-head PR
@@ -283,6 +283,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior == "--head-sha":
         parser = argparse.ArgumentParser(prog="github-interface --head-sha PR")
+        _add_repository(parser)
         return parser
 
     if behavior == "--mergeable":

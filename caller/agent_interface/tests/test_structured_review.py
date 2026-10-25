@@ -193,6 +193,24 @@ class TestStructuredVerdict(TestCase):
                                           json.dumps([FINDING]), "--expected-head", "a" * 40, "--token-user", "bit-mis"])
         self.assertEqual(mutation.kwargs["cwd"], "/repo")
 
+    def test_stale_head_refusal_at_submit_is_superseded_not_a_violation(self):
+        from agent_interface.review_watch import ReviewSuperseded
+
+        def process(args, **kwargs):
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=1, stdout="",
+                                       stderr="error: pull-request head changed: expected %s, got %s" % ("a" * 40, "b" * 40))
+            Path(args[args.index("--output-last-message") + 1]).write_text(
+                json.dumps({"action": "request_changes", "comments": [FINDING]}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process):
+            with self.assertRaises(ReviewSuperseded) as raised:
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertEqual(raised.exception.head_sha, "b" * 40)
+
     def test_clean_and_approval_are_distinct_terminal_actions(self):
         for behavior, action, flag in (("pr_review", "reviewed_clean", "--reviewed-clean"), ("pr_approve", "approve", "--approve-pr")):
             with self.subTest(behavior=behavior):
