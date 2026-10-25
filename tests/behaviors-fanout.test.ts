@@ -150,19 +150,31 @@ describe('review-new-prs prepare pool', () => {
 describe('prepare pool startup', () => {
   it('starts workers across event-loop turns instead of all at once', async () => {
     const { behaviors: runtime } = await loadModules()
-    // Gated tasks keep a worker from chaining onto a later item before the
-    // next worker starts, as production CLI waits do.
+    // Enter from the check phase so the next immediate observes real loop
+    // progress. A microtask-only yield would start every worker before it.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const items = ['a', 'b', 'c', 'd', 'e']
     const gate = deferred<void>()
+    const entered = items.map(() => deferred<void>())
     const started: string[] = []
-    const done = runtime.forEachPool(['a', 'b', 'c'], 3, async (item) => {
+    const progress = new Promise<number>((resolve) => setImmediate(() => resolve(started.length)))
+    const done = runtime.forEachPool(items, items.length, async (item) => {
       started.push(item)
+      entered[items.indexOf(item)].resolve()
       await gate.promise
     })
-    // Only the first start happens synchronously; the rest wait their turn.
-    expect(started).toEqual(['a'])
-    gate.resolve()
-    await done
-    expect(started).toEqual(['a', 'b', 'c'])
+    try {
+      expect(started).toEqual(['a'])
+      const entriesBeforeProgress = await progress
+      expect(entriesBeforeProgress).toBeGreaterThan(0)
+      expect(entriesBeforeProgress).toBeLessThan(items.length)
+      // No worker can consume another item before all intended workers enter.
+      await Promise.all(entered.map(({ promise }) => promise))
+      expect(started).toEqual(items)
+    } finally {
+      gate.resolve()
+      await done
+    }
   })
 
   it('completes while the clock is faked', async () => {

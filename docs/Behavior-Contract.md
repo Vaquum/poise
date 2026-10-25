@@ -216,9 +216,10 @@ check on the usual backoff; a failed batch holds each of its targets the
 same way. Each record settles on its own timeout inside the batch, so one
 hung read cannot take its completed siblings with it. Review preparation
 and approval launches run in small pools instead of one process per pull
-request at once. Pool workers start across event-loop turns, so one
-tick's synchronous CLI forks never land back-to-back in a single drain
-and stall queued requests behind the whole burst. The review checkout
+request at once. Initial pool worker entries yield to the event loop,
+spreading their synchronous prefixes across callbacks. Shared asynchronous
+preparation and later completion waves can still bring CLI starts together;
+this is not a global limit on forks per turn. The review checkout
 provisions in the launch phase after the claim, outside the sweep
 deadline; a checkout failure there releases the claim and records a
 `preflight_failed` outcome.

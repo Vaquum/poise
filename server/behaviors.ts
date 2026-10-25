@@ -1205,8 +1205,8 @@ const PR_OPERATION_EVALUATION_LEASE_MS = 65_000
 // One behavior tick's per-PR work stays inside the CLI budget: evidence
 // batches of ten fit the 30 s CLI budget under load, and preparation and
 // approval launches run in small pools instead of fanning out over every
-// candidate at once. Pool workers start across event-loop turns, so one
-// tick's synchronous forks never land back-to-back in a single drain.
+// candidate at once. Initial worker entries yield to the event loop;
+// later task continuations can still converge after shared async work.
 export const PR_READ_BATCH_SIZE = 10
 export const REVIEW_PREPARE_CONCURRENCY = 5
 export const APPROVE_FIRE_CONCURRENCY = 3
@@ -2293,10 +2293,8 @@ function loopTurn(): Promise<void> {
 
 // A fixed pool: queued items check the sweep deadline when they start, not
 // only when they are enqueued, so an ended sweep begins no new CLI work.
-// Workers start across event-loop turns: each worker's first task reaches
-// its synchronous spawn without crossing a macrotask, so starting every
-// worker at once lands each fork back-to-back in one drain and stalls
-// queued requests behind the whole burst.
+// Initial worker entries yield to the loop so their synchronous prefixes
+// do not all run in one drain. This does not space later continuations.
 export async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
   let next = 0
   const worker = async (): Promise<void> => {
@@ -5201,9 +5199,8 @@ async function readSubIssues(entries: readonly EligibleIssue[]): Promise<Map<str
       }
     }
   }
-  // Readers start across event-loop turns like forEachPool workers: each
-  // reader's first CLI spawn is synchronous, so starting every reader at
-  // once lands each fork back-to-back in one drain.
+  // Space initial reader entries like forEachPool workers; subsequent
+  // reads can still converge after their asynchronous work completes.
   const readers: Array<Promise<void>> = []
   const readerCount = Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length)
   for (let started = 0; started < readerCount; started++) {
