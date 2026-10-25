@@ -108,17 +108,28 @@ describe('review checkout provisioning through Caller', () => {
     const holder = withProcessLock({ path: lockPath }, async () => { entered(); await gate })
     const controller = new AbortController()
     let attempt: Promise<string> | undefined
+    let lockSpy: ReturnType<typeof vi.spyOn> | undefined
     try {
       await holding
       mocks.runFile.mockClear()
+      const locks = await import('../server/process-lock')
+      const acquire = locks.withProcessLock
+      let reached!: () => void
+      const waiting = new Promise<void>((resolve) => { reached = resolve })
+      lockSpy = vi.spyOn(locks, 'withProcessLock').mockImplementation((options, operation) => {
+        const pending = acquire(options, operation)
+        if (options.path === lockPath) reached()
+        return pending
+      })
       attempt = resolveCheckout(controller.signal)
       const outcome = attempt.then(() => 'unexpected admission', (error: Error) => error.message)
-      await vi.waitFor(() => expect(mocks.runFile).toHaveBeenCalled())
+      await waiting
       controller.abort(new Error('review cancelled'))
       expect(await Promise.race([outcome, new Promise<string>((resolve) => setTimeout(() => resolve('still waiting'), 300))]))
         .toBe('review cancelled')
       expect(mocks.runFile.mock.calls.some(([, args]) => args[0] === '--checkout-repo')).toBe(false)
     } finally {
+      lockSpy?.mockRestore()
       release()
       await holder
       await attempt?.catch(() => undefined)
