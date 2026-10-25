@@ -27,7 +27,7 @@ import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
-import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
+import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
 import { readBehaviorEstimates } from './behavior-estimates'
 import { listCapabilities } from './capabilities'
@@ -725,41 +725,87 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         // ── /api/agent-logs — Swarm's data source ──
-        // Wraps `agent-interface --logs`. Returns the JSON array as-is
-        // under a `logs` envelope so the front-end can extend it later
-        // without a breaking change.
+        // History pages come from Caller's bounded newest-first reads; each
+        // page costs its own rows plus an exact total that counts without
+        // loading. The running lane answers from its own indexed read.
         if (path === '/api/agent-logs' && req.method === 'GET') {
           const query = new URLSearchParams(url.split('?')[1] || '')
           const limitText = query.get('limit')
           const limit = limitText === null ? undefined : Number(limitText)
-          if (limitText !== null && (!/^[1-9]\d*$/.test(limitText) || !Number.isSafeInteger(limit) || limit! > 100)) {
-            return json(res, 400, { error: 'limit must be an integer from 1 to 100' })
+          if (limitText !== null && (!/^[1-9]\d*$/.test(limitText) || !Number.isSafeInteger(limit) || limit! > 1000)) {
+            return json(res, 400, { error: 'limit must be an integer from 1 to 1000' })
           }
           const status = query.get('status')
           if (status !== null && status !== 'running') {
             return json(res, 400, { error: 'status must be running' })
           }
+          const cursor = query.get('cursor')
+          if (cursor !== null && !/^[1-9][0-9]*$/.test(cursor)) {
+            return json(res, 400, { error: 'cursor is invalid' })
+          }
+          const search = query.get('search')
+          if (search !== null && (search.length < 1 || search.length > 2048)) {
+            return json(res, 400, { error: 'search must be 1..2048 characters' })
+          }
+          const id = query.get('id')
+          if (id !== null && !/^[0-9a-fA-F]{32}$/.test(id)) {
+            return json(res, 400, { error: 'id must be a 32-character call id' })
+          }
+          if (id !== null && (limit !== undefined || cursor !== null || search !== null || status !== null)) {
+            return json(res, 400, { error: 'id cannot combine with limit, cursor, search or status' })
+          }
+          if ((cursor !== null || search !== null) && limit === undefined) {
+            return json(res, 400, { error: 'cursor and search require limit' })
+          }
+          if ((cursor !== null || search !== null) && status !== null) {
+            return json(res, 400, { error: 'cursor and search require history reads' })
+          }
+          // History without a bound would load the full log to slice it;
+          // Swarm pages instead. Running stays unpaged: it is already few.
+          if (status === null && limit === undefined && id === null) {
+            return json(res, 400, { error: 'limit is required for history reads; page with cursor' })
+          }
           try {
             const orgs = selectedOrg ? selectOrganizations(selectedOrg) : null
-            // The running lane answers from its own indexed read; the
-            // history lane never queues it. Filtering stays here, so the
-            // read is exact even when Caller cannot pre-filter.
-            const snapshot = status === null ? await fetchAgentLogSnapshot() : await fetchRunningAgentLogSnapshot()
             const belongs = (repo: string | null) => !orgs || (!!repo && orgs.some((org) => repoBelongsTo(repo, org.login)))
-            const selected = snapshot.entries.filter((entry) => belongs(entry.repo))
-            const quarantined = snapshot.quarantined.filter((row) => !row.repo || belongs(row.repo)
+            // One exact call by primary key for settled-running refresh.
+            if (id !== null) {
+              const snapshot = await fetchAgentLogById(id)
+              const selected = snapshot.entries.filter((entry) => belongs(entry.repo))
+              const quarantined = snapshot.quarantined.filter((row) => !row.repo || belongs(row.repo)
+                || selected.some((entry) => row.id === entry.id
+                  || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
+              const readable = selected.filter((entry) => !snapshot.quarantined.some((row) => row.id === entry.id
+                  || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
+              return json(res, 200, { logs: readable, quarantined })
+            }
+            // The running lane answers from its own indexed read; history
+            // pages never queue it. Filtering stays here too, so the read
+            // is exact even when Caller cannot pre-filter.
+            if (status !== null) {
+              const snapshot = await fetchRunningAgentLogSnapshot()
+              const selected = snapshot.entries.filter((entry) => belongs(entry.repo))
+              const quarantined = snapshot.quarantined.filter((row) => !row.repo || belongs(row.repo)
+                || selected.some((entry) => row.id === entry.id
+                  || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
+              const readable = selected.filter((entry) => !snapshot.quarantined.some((row) => row.id === entry.id
+                  || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
+              const logs = readable.filter((entry) => entry.status === status)
+              const scopedQuarantined = quarantined.filter((row) => !row.status || row.status === status)
+              return json(res, 200, { logs: limit === undefined ? logs : logs.slice(0, limit), quarantined: scopedQuarantined,
+                ...(limit === undefined ? {} : { total: logs.length }) })
+            }
+            const page = await fetchAgentLogPage(limit!, cursor, {
+              ...(orgs?.length === 1 ? { org: orgs[0].login } : {}),
+              ...(search !== null ? { search } : {}),
+            })
+            const selected = page.entries.filter((entry) => belongs(entry.repo))
+            const quarantined = page.quarantined.filter((row) => !row.repo || belongs(row.repo)
               || selected.some((entry) => row.id === entry.id
                 || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
-            const readable = selected.filter((entry) => !snapshot.quarantined.some((row) => row.id === entry.id
+            const readable = selected.filter((entry) => !page.quarantined.some((row) => row.id === entry.id
                 || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
-            // A running-only read arrives pre-filtered from its own lane;
-            // quarantined rows stay when their status is unreadable
-            // (uncertainty, not absence) or matches.
-            const logs = status === null ? readable : readable.filter((entry) => entry.status === status)
-            const scopedQuarantined = status === null ? quarantined
-              : quarantined.filter((row) => !row.status || row.status === status)
-            return json(res, 200, { logs: limit === undefined ? logs : logs.slice(0, limit), quarantined: scopedQuarantined,
-              ...(limit === undefined ? {} : { total: logs.length }) })
+            return json(res, 200, { logs: readable, quarantined, total: page.total, nextCursor: page.nextCursor })
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })
           }

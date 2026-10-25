@@ -18,6 +18,22 @@ function history(org = 'acme', length = 60) {
   }))
 }
 
+// Paged history mock: newest-first pages behind an index cursor, with an
+// exact total and server search over the prompt. Running reads are empty:
+// these histories are completed. Cursor is opaque to the view.
+function paged(logs: ReturnType<typeof history>, url: URL, firstSize: number) {
+  const search = url.searchParams.get('search') || ''
+  const filtered = search
+    ? logs.filter((row) => `${row.prompt} ${row.repo} ${row.pr_id}`.toLowerCase().includes(search.toLowerCase()))
+    : logs
+  const cursor = url.searchParams.get('cursor')
+  const start = cursor === null ? 0 : Number(cursor)
+  const size = cursor === null ? firstSize : filtered.length - start
+  const slice = filtered.slice(start, start + size)
+  const next = start + slice.length
+  return { logs: slice, total: filtered.length, nextCursor: next < filtered.length ? String(next) : null }
+}
+
 async function ready(page: Page) { await workspace(page); await settled(page) }
 const rows = '#swarm-tbody > .agent-row'
 
@@ -25,9 +41,12 @@ test('Swarm paints recent calls before the complete history arrives and retains 
   await ready(page)
   const older = deferred(), logs = history()
   await page.route('**/api/agent-logs**', async route => {
-    if (new URL(route.request().url()).searchParams.has('limit')) return route.fulfill({ json: { logs: logs.slice(0, 50), total: 60 } })
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    if (url.searchParams.has('search')) return route.fulfill({ json: paged(logs, url, 200) })
+    if (url.searchParams.get('cursor') === null) return route.fulfill({ json: paged(logs, url, 50) })
     await older.promise
-    await route.fulfill({ json: { logs } })
+    await route.fulfill({ json: paged(logs, url, 200) })
   })
   try {
     const start = Date.now()
@@ -35,7 +54,7 @@ test('Swarm paints recent calls before the complete history arrives and retains 
     await expect(page.locator(rows)).toHaveCount(50, { timeout: 2000 })
     await expect(page.locator('#swarm-stale')).toHaveCount(0)
     await expect(page.locator('#swarm-count')).toHaveText('50')
-    console.log(`Swarm recent calls: ${Date.now() - start}ms; full-history response still held`)
+    console.log(`Swarm recent calls: ${Date.now() - start}ms; older-history page still held`)
     const control = await page.locator(rows).first().getByRole('button', { name: 'Toggle detail' }).elementHandle()
     await control!.focus()
     older.release()
@@ -54,9 +73,12 @@ test('Swarm completes a large history without blocking the preview controls', as
   await ready(page)
   const older = deferred(), logs = history('acme', 6280)
   await page.route('**/api/agent-logs**', async route => {
-    if (new URL(route.request().url()).searchParams.has('limit')) return route.fulfill({ json: { logs: logs.slice(0, 50), total: logs.length } })
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    if (url.searchParams.has('search')) return route.fulfill({ json: paged(logs, url, 200) })
+    if (url.searchParams.get('cursor') === null) return route.fulfill({ json: paged(logs, url, 50) })
     await older.promise
-    await route.fulfill({ json: { logs } })
+    await route.fulfill({ json: paged(logs, url, 6230) })
   })
   try {
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
@@ -91,13 +113,16 @@ test('Swarm completes a large history without blocking the preview controls', as
   } finally { older.release() }
 })
 
-test('a failed complete-history read keeps recent calls, reports incompleteness and recovers', async ({ page }) => {
+test('a failed older-history page keeps recent calls, reports incompleteness and recovers', async ({ page }) => {
   await ready(page)
   const logs = history()
   let reads = 0
   await page.route('**/api/agent-logs**', route => {
-    if (new URL(route.request().url()).searchParams.has('limit')) return route.fulfill({ json: { logs: logs.slice(0, 50), total: 60 } })
-    return ++reads === 1 ? route.fulfill({ status: 502, json: { error: 'History unavailable' } }) : route.fulfill({ json: { logs } })
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    if (url.searchParams.has('search')) return route.fulfill({ json: paged(logs, url, 200) })
+    if (url.searchParams.get('cursor') === null) return route.fulfill({ json: paged(logs, url, 50) })
+    return ++reads === 1 ? route.fulfill({ status: 502, json: { error: 'History unavailable' } }) : route.fulfill({ json: paged(logs, url, 200) })
   })
   await page.getByRole('button', { name: 'Swarm', exact: true }).click()
   await expect(page.locator(rows)).toHaveCount(50)
@@ -115,11 +140,20 @@ test('a failed complete-history read keeps recent calls, reports incompleteness 
 test('returning to Swarm paints history received while hidden before its new refresh', async ({ page }) => {
   await ready(page)
   const first = deferred(), refresh = deferred(), logs = history('acme', 6280)
-  let completeReads = 0
+  let historyReads = 0
   await page.route('**/api/agent-logs**', async route => {
-    if (new URL(route.request().url()).searchParams.has('limit')) return route.fulfill({ json: { logs: logs.slice(0, 50), total: logs.length } })
-    await (++completeReads === 1 ? first.promise : refresh.promise)
-    await route.fulfill({ json: { logs } })
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    if (url.searchParams.has('search')) return route.fulfill({ json: paged(logs, url, 200) })
+    if (url.searchParams.get('cursor') !== null) {
+      historyReads++
+      await first.promise
+      await route.fulfill({ json: paged(logs, url, 6230) })
+      return
+    }
+    if (++historyReads === 1) return route.fulfill({ json: paged(logs, url, 50) })
+    await refresh.promise
+    await route.fulfill({ json: paged(logs, url, 50) })
   })
   try {
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
@@ -134,7 +168,10 @@ test('returning to Swarm paints history received while hidden before its new ref
       }) as typeof document.createElement
       return { count: () => created }
     })
-    const received = page.waitForResponse(response => new URL(response.url()).pathname === '/api/agent-logs' && !new URL(response.url()).searchParams.has('limit'))
+    const received = page.waitForResponse(response => {
+      const url = new URL(response.url())
+      return url.pathname === '/api/agent-logs' && url.searchParams.has('cursor')
+    })
     first.release()
     await (await received).finished()
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
@@ -146,7 +183,7 @@ test('returning to Swarm paints history received while hidden before its new ref
     await page.locator('#swarm-search').fill('acme run 6280')
     await expect(page.locator(rows)).toHaveCount(1)
     await expect(page.locator(rows)).toContainText('#6280')
-    await expect.poll(() => completeReads).toBe(2)
+    await expect.poll(() => historyReads).toBe(3)
   } finally { first.release(); refresh.release() }
 })
 
@@ -157,11 +194,12 @@ test('a late initial read cannot restart Swarm polling after leaving', async ({ 
   await page.route('**/api/agent-logs**', async route => {
     reads++
     await initial.promise
-    await route.fulfill({ json: { logs, total: 1 } })
+    const url = new URL(route.request().url())
+    await route.fulfill({ json: url.searchParams.get('status') === 'running' ? { logs: [] } : { logs, total: 1, nextCursor: null } })
   })
   try {
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
-    await expect.poll(() => reads).toBe(1)
+    await expect.poll(() => reads).toBe(2)
     await page.getByRole('button', { name: 'Archive', exact: true }).click()
     const received = page.waitForResponse(response => new URL(response.url()).pathname === '/api/agent-logs')
     initial.release()
@@ -169,11 +207,11 @@ test('a late initial read cannot restart Swarm polling after leaving', async ({ 
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
     await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
     await page.waitForTimeout(150)
-    expect(reads).toBe(1)
+    expect(reads).toBe(2)
   } finally { initial.release() }
 })
 
-test('switching accounts supersedes an older pending full-history read', async ({ page }) => {
+test('switching accounts supersedes an older pending history page', async ({ page }) => {
   await ready(page)
   const organizations = ['acme', 'beta'].map(login => ({ login, managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: null }))
   await page.route('**/api/settings', route => route.fulfill({ json: { org: 'acme', me: 'octocat', timezone: 'UTC', organizations, models: {} } }))
@@ -181,10 +219,15 @@ test('switching accounts supersedes an older pending full-history read', async (
   await page.reload(); await settled(page)
   const older = deferred()
   await page.route('**/api/agent-logs**', async route => {
-    const url = new URL(route.request().url()), org = url.searchParams.get('org') || 'acme', logs = history(org)
-    if (url.searchParams.has('limit')) return route.fulfill({ json: { logs: org === 'beta' ? logs.slice(0, 1) : logs.slice(0, 50), total: org === 'beta' ? 1 : 60 } })
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    const org = url.searchParams.get('org') || 'acme', logs = history(org)
+    if (url.searchParams.has('search')) return route.fulfill({ json: paged(logs, url, 200) })
+    if (url.searchParams.get('cursor') === null) {
+      return route.fulfill({ json: paged(logs, url, org === 'beta' ? 1 : 50) })
+    }
     await older.promise
-    await route.fulfill({ json: { logs } })
+    await route.fulfill({ json: paged(logs, url, 200) })
   })
   try {
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
@@ -204,12 +247,13 @@ test('switching accounts supersedes an older pending full-history read', async (
 test('an empty-history refresh failure remains visible on re-entry while another read is pending', async ({ page }) => {
   await ready(page)
   const refresh = deferred()
-  let completeReads = 0
+  let historyReads = 0
   await page.route('**/api/agent-logs**', async route => {
-    if (new URL(route.request().url()).searchParams.has('limit')) return route.fulfill({ json: { logs: [], total: 0 } })
-    if (++completeReads === 1) return route.fulfill({ status: 502, json: { error: 'History unavailable' } })
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    if (++historyReads === 1) return route.fulfill({ status: 502, json: { error: 'History unavailable' } })
     await refresh.promise
-    await route.fulfill({ json: { logs: [] } })
+    await route.fulfill({ json: { logs: [], total: 0, nextCursor: null } })
   })
   try {
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
@@ -218,7 +262,7 @@ test('an empty-history refresh failure remains visible on re-entry while another
     await expect(await feedback(page)).toContainText('History unavailable')
     await page.getByRole('button', { name: 'Archive', exact: true }).click()
     await page.getByRole('button', { name: 'Swarm', exact: true }).click()
-    await expect.poll(() => completeReads).toBe(2)
+    await expect.poll(() => historyReads).toBe(2)
     await expect(await feedback(page)).toContainText('History unavailable')
     refresh.release()
     await expect((await feedback(page)).locator('.nr-card').filter({ hasText: 'Swarm is not updating' })).toHaveCount(0)

@@ -29,14 +29,17 @@ old or new bounds intersect the viewport receive layout/entry motion. Clipped
 departures use the captured geometry without reading styles after each removal.
 Spatial offsets are non-inherited CSS properties: an actor moves its subtree
 without recalculating every descendant's styles on each animation frame.
-Swarm retains full history for search, grouping and counts, but mounts at most
+Swarm pages bounded history for search, grouping and counts, mounting at most
 200 run rows per Previous/Next page, including expanded identical runs. Detail
-rows belong only to mounted runs. Page changes replace rows directly; refresh
-retains keyed controls and follows a focused run across page boundaries. Search
-and organization changes reset the page. Deep links select their target's page.
-Leaving clears row DOM; late reads update only data. Cached return restores the
-page and disclosure state without entry motion. No offscreen rows are prepared.
-Refreshes recompute current values and skip unchanged row markup.
+rows belong only to mounted runs. Each history read costs its own page plus an
+exact total that counts without loading; running statuses refresh from their
+own indexed read. Page changes replace rows directly and load older pages on
+demand; refresh retains keyed controls and follows a focused run across page
+boundaries. Search and organization changes reset to the first page. Deep links
+load their target's page. Leaving clears row DOM; late reads update only data.
+Cached return restores the page and disclosure state without entry motion. No
+offscreen rows are prepared. Refreshes recompute current values and skip
+unchanged row markup.
 Structural lists reveal new actors once and retire
 departed visuals inertly. Changed text and elapsed time remain immediate.
 Batch departures use geometry captured before the layout mutation; retiring
@@ -115,7 +118,8 @@ service operations and asynchronous loading. The settlement helper waits for
 both runtime channels and native animations.
 
 The Swarm browser tests retain 6,280 distinct calls while checking bounded page
-DOM, full-history filtering, deep links, disclosure/action state, refresh focus,
-and empty hidden DOM. Chromium performance counters retain the long-task and
-navigation budgets, including cold page transitions; other motion semantics
-remain covered by the runtime and interaction suites.
+DOM, bounded history reads with complete filtering, deep links,
+disclosure/action state, refresh focus, and empty hidden DOM. Chromium
+performance counters retain the long-task and navigation budgets, including
+cold page transitions; other motion semantics remain covered by the runtime and
+interaction suites.

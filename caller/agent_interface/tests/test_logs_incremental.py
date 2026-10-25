@@ -241,3 +241,81 @@ class LogsIncrementalCase(TestCase):
         for after in ["-1", "01", "unknown", str(2**63)]:
             with self.assertRaises(ValueError):
                 agent_interface.logs_session_since(after, "session", "author_content", "topic")
+
+    def test_paged_reads_filter_by_org_and_search_with_exact_total(self):
+        with agent_interface.db() as conn:
+            conn.executemany(
+                "insert into calls (id, model, prompt, started_at, ended_at, status, repo, pr_id, actor, behavior, outcome, error) values (?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    ("0" * 32, "opus", "Review alpha", 1761000000.0, 1761000060.0, "completed", "Acme/project", "1", "bot", "pr_review", "approved", ""),
+                    ("1" * 32, "opus", "Review beta", 1761000001.0, 1761000061.0, "completed", "acme/other", "2", "bot", "pr_review", "clean", ""),
+                    ("2" * 32, "opus", "Review gamma", 1761000002.0, 1761000062.0, "failed", "beta/project", "3", "bot", "pr_review", None, "boom"),
+                    ("3" * 32, "opus", "chat turn", 1761000003.0, 1761000063.0, "completed", None, None, None, "chat", None, ""),
+                ],
+            )
+        org = agent_interface.logs_page(10, org="acme")
+        self.assertEqual(org["total"], 2)
+        self.assertEqual([r["id"] for r in org["rows"]], ["0" * 32, "1" * 32])
+        self.assertIsNone(org["nextCursor"])
+        upper = agent_interface.logs_page(10, org="ACME")
+        self.assertEqual(upper["total"], 2)
+        search = agent_interface.logs_page(10, search="gamma")
+        self.assertEqual(search["total"], 1)
+        self.assertEqual([r["id"] for r in search["rows"]], ["2" * 32])
+        target = agent_interface.logs_page(10, search="acme/project#1")
+        self.assertEqual([r["id"] for r in target["rows"]], ["0" * 32])
+        hash_pr = agent_interface.logs_page(10, search="#2")
+        self.assertEqual([r["id"] for r in hash_pr["rows"]], ["1" * 32])
+        both = agent_interface.logs_page(10, org="acme", search="review")
+        self.assertEqual(both["total"], 2)
+        first = agent_interface.logs_page(1, org="acme")
+        self.assertEqual(first["total"], 2)
+        self.assertEqual([r["id"] for r in first["rows"]], ["1" * 32])
+        self.assertIsNotNone(first["nextCursor"])
+        second = agent_interface.logs_page(1, cursor=first["nextCursor"], org="acme")
+        self.assertEqual(second["total"], 2)
+        self.assertEqual([r["id"] for r in second["rows"]], ["0" * 32])
+        self.assertIsNone(second["nextCursor"])
+        done = self.cli("--logs", "--limit", "10", "--org", "acme", "--search", "review")
+        self.assertEqual((done.returncode, done.stderr), (0, ""), done.stderr)
+        page = json.loads(done.stdout)
+        self.assertEqual(page["total"], 2)
+        self.assertEqual(len(page["rows"]), 2)
+
+    def test_paged_reads_reject_bad_org_search_and_flag_combinations(self):
+        self.seed(2)
+        for args, message in (
+            (("--logs", "--limit", "2", "--org", "a/b"), "logs page org is invalid"),
+            (("--logs", "--limit", "2", "--search", ""), "logs page search must be"),
+            (("--logs", "--org", "acme"), "--org and --search require --limit"),
+            (("--logs", "--search", "x"), "--org and --search require --limit"),
+            (("--logs", "--status", "running", "--org", "acme"), "--status running cannot combine"),
+        ):
+            done = self.cli(*args)
+            self.assertEqual(done.returncode, 2, args)
+            self.assertIn(message, done.stderr, args)
+        with self.assertRaises(ValueError):
+            agent_interface.logs_page(10, org="a/b")
+        with self.assertRaises(ValueError):
+            agent_interface.logs_page(10, search="")
+        with self.assertRaises(ValueError):
+            agent_interface.logs_page(10, search="x" * 2049)
+
+    def test_org_paged_read_uses_index_and_stays_flat(self):
+        self.seed(TEN_X_ROWS)
+        with agent_interface.db() as conn:
+            conn.execute("update calls set repo='acme/project' where rowid % 2 = 0")
+            conn.execute("update calls set repo='beta/project' where rowid % 2 = 1")
+            plan = conn.execute(
+                "explain query plan select id from calls where "
+                + agent_interface.LOG_OWNER_SQL + "=? order by rowid desc limit 3",
+                ("acme",),
+            ).fetchall()
+        details = " ".join(row[3] for row in plan)
+        self.assertIn("calls_owner", details)
+        started = time.monotonic()
+        page = agent_interface.logs_page(200, org="acme")
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(page["rows"]), 200)
+        self.assertEqual(page["total"], TEN_X_ROWS // 2)
+        self.assertLess(elapsed, 2, f"org paged read took {elapsed:.2f}s")

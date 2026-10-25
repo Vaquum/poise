@@ -332,16 +332,17 @@ describe('the handling log', () => {
     mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
       if (command === 'agent-interface' && args[0] === '--logs') {
         const now = new Date().toISOString()
-        return { stdout: JSON.stringify([{ id: 'a'.repeat(32), pr_id: '9', repo: 'acme/api', actor: 'review-bot',
+        const rows = [{ id: 'a'.repeat(32), pr_id: '9', repo: 'acme/api', actor: 'review-bot',
           model: 'opus-5-xhigh', behavior: 'pr_review', session_id: null, prompt: '', started_at: now,
           started_at_precise: now, completed_at: now, time_elapsed: '1m', status: 'completed', outcome: 'clean',
           head_sha: 'b'.repeat(40), expected_head: 'b'.repeat(40), source: 'poise:review-new-prs',
-          correlation_id: 'correlation-fixture', action: 'reviewed_clean', response: null, error: '' }]), stderr: '' }
+          correlation_id: 'correlation-fixture', action: 'reviewed_clean', response: null, error: '' }]
+        return { stdout: JSON.stringify(args.includes('--limit') ? { rows, nextCursor: null, total: rows.length } : rows), stderr: '' }
       }
       if (command === 'agent-interface' && args[0] === '--diagnostics') return { stdout: JSON.stringify({ version: 1, streamId: 'f'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }) }
       throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
     })
-    expect((await call('GET', '/api/agent-logs')).status).toBe(200)
+    expect((await call('GET', '/api/agent-logs?limit=100')).status).toBe(200)
 
     const state = await handled()
     expect(state.body.handled).toHaveLength(3)
@@ -352,7 +353,7 @@ describe('the handling log', () => {
       outcome: 'clean', actor: 'caller' })
 
     // A second sighting of the same run records nothing new.
-    expect((await call('GET', '/api/agent-logs')).status).toBe(200)
+    expect((await call('GET', '/api/agent-logs?limit=100')).status).toBe(200)
     expect((await handled()).body.handled).toHaveLength(3)
   })
 
