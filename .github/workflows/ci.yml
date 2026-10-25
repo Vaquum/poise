@@ -154,6 +154,10 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.browser_shards) }}
     steps:
       - uses: actions/checkout@v4
+      - name: Align checkout ownership with the container test user
+        run: |
+          chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+          git -c safe.directory= ls-files --error-unmatch package.json
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
