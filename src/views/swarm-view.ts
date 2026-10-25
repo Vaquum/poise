@@ -696,6 +696,7 @@ function renderShell() {
       quarantined = []
       totalMatching = 0
       historyCursor = null
+      historyComplete = false
       incompleteTotal = null
       loadingHistory = false
       clearRows()
@@ -1119,6 +1120,7 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
     quarantined = []
     totalMatching = 0
     historyCursor = null
+    historyComplete = false
     incompleteTotal = null
     loadingHistory = false
     lastLoadedAt = 0
@@ -1211,6 +1213,7 @@ export async function focusCall(callId: string): Promise<void> {
     quarantined = []
     totalMatching = 0
     historyCursor = null
+    historyComplete = false
     incompleteTotal = null
     loadingHistory = false
     lastLoadedAt = 0
@@ -1275,6 +1278,10 @@ let incompleteTotal: number | null = null
 let loadingHistory = false
 let totalMatching = 0
 let historyCursor: string | null = null
+// Whether the walk reached the end of the current org/search. A null cursor
+// alone cannot tell an exhausted walk from a cleared one (a new search whose
+// matches are all cached), so the refresh path tracks them apart.
+let historyComplete = false
 // Calls that arrived through history pages (not the running feed), so the
 // pager can tell cached running rows apart from covered history ranges.
 let historyIds = new Set<string>()
@@ -1306,6 +1313,7 @@ async function applyFirstPage(data: LogFeed, total: number, cursor: string | nul
   quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
   totalMatching = total
   historyCursor = cursor
+  historyComplete = cursor === null
   incompleteTotal = historyCursor !== null ? totalMatching : null
   loadingHistory = historyCursor !== null
   lastLoadError = null
@@ -1317,13 +1325,36 @@ async function applyFirstPage(data: LogFeed, total: number, cursor: string | nul
 
 function appendPage(data: LogFeed, cursor: string | null, current: () => boolean): boolean {
   if (!current()) return false
-  const seen = new Set(entries.map((entry) => entry.id))
-  for (const entry of data.logs || []) {
-    historyIds.add(entry.id)
-    if (!seen.has(entry.id)) {
-      seen.add(entry.id)
-      entries.push(entry)
+  const retained = new Set(entries.map((entry) => entry.id))
+  const page = data.logs || []
+  // A shifted cursor can return rows newer than retained older pages — the
+  // arrival gap — so each unseen row slots ahead of its next older page-mate
+  // already cached, keeping server order (page order breaks timestamp ties).
+  // Rows with no cached older page-mate are older than the cache and append.
+  let older: string | null = null
+  const before = new Map<string, LogEntry[]>()
+  const tail: LogEntry[] = []
+  for (let index = page.length - 1; index >= 0; index--) {
+    const row = page[index]!
+    historyIds.add(row.id)
+    if (retained.has(row.id)) { older = row.id; continue }
+    if (older === null) tail.push(row)
+    else {
+      const group = before.get(older)
+      if (group) group.push(row)
+      else before.set(older, [row])
     }
+  }
+  tail.reverse()
+  for (const group of before.values()) group.reverse()
+  if (before.size || tail.length) {
+    const merged: LogEntry[] = []
+    for (const entry of entries) {
+      const group = before.get(entry.id)
+      if (group) merged.push(...group)
+      merged.push(entry)
+    }
+    entries = [...merged, ...tail]
   }
   const seenQuarantined = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}`))
   for (const row of Array.isArray(data.quarantined) ? data.quarantined : []) {
@@ -1335,6 +1366,7 @@ function appendPage(data: LogFeed, cursor: string | null, current: () => boolean
   }
   if (typeof data.total === 'number') totalMatching = data.total
   historyCursor = cursor
+  historyComplete = cursor === null
   incompleteTotal = historyCursor !== null ? totalMatching : null
   loadingHistory = historyCursor !== null
   lastLoadedAt = Date.now()
@@ -1377,7 +1409,14 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
     historyArrivals = (history.quarantined || [])
       .some((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
   }
-  if (historyArrivals) historyIds = new Set((history.logs || []).map((entry) => entry.id))
+  // Overlap is read before the covered set is rewritten: a completed walk
+  // stays complete while the fresh first page still touches it, so an
+  // unchanged refresh — or arrivals shifting boundaries by less than a
+  // page — cannot reopen exhausted history. Only a disjoint fresh page
+  // (more than a page of arrivals) falls back to the reset below.
+  const historyOverlaps = (history.logs || []).some((entry) => historyIds.has(entry.id))
+  const keepComplete = historyComplete && (!historyArrivals || historyOverlaps)
+  if (historyArrivals && !keepComplete) historyIds = new Set((history.logs || []).map((entry) => entry.id))
   else for (const entry of history.logs || []) historyIds.add(entry.id)
   // New unreadable calls shift page boundaries exactly like readable ones;
   // ignoring them would keep a stale cursor that skips the intervening range.
@@ -1409,7 +1448,11 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   // retained cursor still points past them into unloaded history — but a
   // cleared cursor (a new search whose matches are all cached) must still
   // adopt the fresh one, or older matches stay unreachable behind null.
-  if (arrivals || historyCursor === null) historyCursor = history.nextCursor ?? null
+  // A completed walk adopts nothing: the fresh first page describes that
+  // page, not the retained range, so adopting it would re-enable Next on
+  // the final page and refetch rows that are already cached.
+  if (!keepComplete && (arrivals || historyCursor === null)) historyCursor = history.nextCursor ?? null
+  historyComplete = historyCursor === null
   incompleteTotal = historyCursor !== null ? totalMatching : null
   loadingHistory = historyCursor !== null
   lastLoadError = null
@@ -1691,6 +1734,7 @@ export async function initSwarmView() {
       loadingHistory = false
       totalMatching = 0
       historyCursor = null
+      historyComplete = false
       pageIndex = 0
       clearRows()
       viewEl.querySelector<HTMLElement>('#swarm-table')!.hidden = true
