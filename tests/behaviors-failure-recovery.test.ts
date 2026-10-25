@@ -352,13 +352,126 @@ describe('worker failure classification and recovery', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
   })
 
+  it('retries a budget-exhausted approval on the same head once the backoff expires', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    const launched = await launchApprovalBeforeCrash()
+    const callId = 'e'.repeat(32)
+    fixture.agentLogs = [agentLog({
+      id: callId,
+      behavior: 'pr_approve',
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'failed',
+      action: null,
+      outcome: null,
+      model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1',
+      error_code: 'review_budget_exhausted',
+      error: 'Review reached its total time limit; needs attention',
+      expected_head: launched.expectedHead,
+      actor: launched.actor,
+      source: launched.source,
+      correlation_id: launched.correlationId,
+    })]
+    await resetLogCache()
+
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    const failure = runtime.getBehaviorsRuntimeHealth().failures.find((entry) => entry.target === launched.target)
+    expect(failure).toMatchObject({ diagnostic: { severity: 'warning', code: 'review_budget_exhausted' } })
+    // The held row carries the automatic retry time, so a pending retry never looks stuck.
+    expect(runtime.getBehaviorDiagnosticIncidents(null).find((incident) => incident.callId === callId)?.nextRetryAt)
+      .toBe(failure?.nextRetryAt)
+
+    // No push, no replay: the same head relaunches once the backoff expires.
+    vi.setSystemTime(new Date(Date.now() + runtime.BEHAVIOR_RETRY_BASE_MS))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(mocks.spawnDetached.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+    expect(db.listBehaviorDeadLetters()).toHaveLength(1)
+  })
+
+  it('gives a 429 approval its verdict on the same head without a push or a replay', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    const launched = await launchApprovalBeforeCrash()
+    fixture.agentLogs = [agentLog({
+      id: 'e'.repeat(32),
+      behavior: 'pr_approve',
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'failed',
+      action: 'not_started',
+      outcome: 'preflight_failed',
+      review_policy: 'bounded-v1',
+      error_code: 'review_provider_error',
+      error: 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)',
+      expected_head: launched.expectedHead,
+      actor: launched.actor,
+      source: launched.source,
+      correlation_id: launched.correlationId,
+    })]
+    await resetLogCache()
+
+    const { behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+
+    vi.setSystemTime(new Date(Date.now() + runtime.BEHAVIOR_RETRY_BASE_MS))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(mocks.spawnDetached.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+  })
+
+  it('holds a budget-exhausted approval when the submission is uncertain', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    const launched = await launchApprovalBeforeCrash()
+    fixture.agentLogs = [agentLog({
+      id: 'e'.repeat(32),
+      behavior: 'pr_approve',
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'failed',
+      action: null,
+      outcome: null,
+      model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1',
+      error_code: 'review_budget_exhausted',
+      error: 'Review reached its total time limit; needs attention; could not prove a safe recovery: review activity unavailable',
+      expected_head: launched.expectedHead,
+      actor: launched.actor,
+      source: launched.source,
+      correlation_id: launched.correlationId,
+    })]
+    await resetLogCache()
+
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+
+    // Even past any backoff, an uncertain submission never retries itself.
+    vi.setSystemTime(new Date(Date.now() + 2 * 60 * 60_000))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(db.getFailedBehaviorLaunch('approve-prs', launched.target)?.launchCallId).toBe('e'.repeat(32))
+    expect(db.listBehaviorDeadLetters()).toHaveLength(1)
+  })
+
   it('allows an explicit model change after a bounded no-action failure', async () => {
     const launched = await launchApprovalBeforeCrash()
     fixture.agentLogs = [agentLog({
       id: 'f'.repeat(32), behavior: 'pr_approve',
       started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
       status: 'failed', action: null, outcome: null, model: 'opus-5-xhigh',
-      review_policy: 'bounded-v1', error_code: 'review_budget_exhausted', error: 'Review needs attention',
+      review_policy: 'bounded-v1', error_code: 'model_output_limit', error: 'Review needs attention',
       expected_head: launched.expectedHead, actor: launched.actor,
       source: launched.source, correlation_id: launched.correlationId,
     })]

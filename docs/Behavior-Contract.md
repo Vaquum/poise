@@ -153,6 +153,9 @@ cause and no receipt; Poise retries it only after live GitHub evidence proves
 no reviewer action. Submission rejections, `no_review` no-ops, malformed or
 duplicate verdicts and duplicate GitHub reviews are contract violations and
 held. Uncertain submissions are reconciled from live receipts before any retry.
+A budget-exhausted run that proved it posted nothing retries the same head
+automatically on backoff once the provider answers again; its held row shows
+the next retry time.
 After account recovery, a successful explicit replay on the same head, model,
 and reviewer reconciles the held no-action attempt. Its GitHub review receipt
 must be present in live evidence before it becomes durable approval evidence.
@@ -346,7 +349,7 @@ that head provisions it again. User checkouts are never removed.
 
 A closed legacy failure can recover when Caller subsequently supplies an exact
 `not_started` / `preflight_failed` result. The same no-action rule applies before
-and after restart. Bounded, oversized-packet and invalid-result holds retain
+and after restart. Other bounded, oversized-packet and invalid-result holds retain
 their existing rules; unrelated reviewers’ submitted receipts do not override
 an exact proof that this particular run never submitted.
 

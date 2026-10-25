@@ -184,6 +184,16 @@ describe('behavior diagnostic groups', () => {
     expect(entry!.detail).not.toContain('2026-10-17T10:10:00.000Z')
   })
 
+  it('shows the next automatic retry on a held incident row', () => {
+    const diagnostics = snapshot()
+    diagnostics.deadLetters.push({ id: 'letter', behavior: 'approve-prs', target: 'acme/web#3',
+      error: 'Review reached its total time limit; needs attention', createdAt: '2026-10-17T10:07:00.000Z',
+      nextRetryAt: '2026-10-17T10:10:00.000Z' })
+    const [entry] = behaviorDiagnosticGroups(diagnostics)[0]!.entries
+    expect(entry!.next).toBe('2026-10-17T10:10:00.000Z')
+    expect(entry!.detail).not.toContain('next check')
+  })
+
   it('keeps failures apart when only their next check differs', () => {
     const diagnostics = snapshot()
     for (const nextRetryAt of ['2026-10-17T10:10:00.000Z', '2026-10-17T10:20:00.000Z']) {
