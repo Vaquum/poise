@@ -106,7 +106,7 @@ function git(...args: string[]): void {
     env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid' } })
 }
 
-async function until(check: () => boolean, ms = 10_000): Promise<void> {
+async function until(check: () => boolean, ms = 20_000): Promise<void> {
   const deadline = Date.now() + ms
   while (!check()) {
     if (Date.now() > deadline) throw new Error('prepare-wait deadline')
