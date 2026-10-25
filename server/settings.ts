@@ -294,13 +294,13 @@ const saveSettings = db.transaction((partial: Partial<Settings>, catalog: Catalo
     const v = partial[k]
     if (typeof v !== 'string') continue
     const trimmed = v.trim()
-    // The legacy org keeps the shape check only: saveAll() re-sends the
-    // stored org on every save, and there is no org field left to fix a
-    // stored value with, so tightening it here would brick Settings saves.
+    // The legacy org keeps the shape check only: there is no org field left
+    // to fix a stored value with, so tightening it here would brick saves
+    // that carry it.
     // A value identical to the stored one is likewise grandfathered past the
-    // consecutive-hyphen check: the account fields ride along on every save,
-    // so refusing a stored value would refuse every save on installs that
-    // stored one while the rule was permissive.
+    // consecutive-hyphen check: the Settings panel only sends drafted fields,
+    // but other API callers may still send a stored value, and refusing it
+    // would refuse their saves on installs that stored one while permissive.
     const unchanged = (k === 'me' || k === 'agentAccount') && trimmed === (getMeta(k) || '')
     if (ACCOUNT_KEYS.has(k) && trimmed && (!GITHUB_NAME.test(trimmed) || (k !== 'org' && !unchanged && trimmed.includes('--')))) {
       throw new Error(`${k} must be a GitHub name: letters, digits and single hyphens`)
