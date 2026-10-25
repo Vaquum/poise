@@ -272,6 +272,10 @@ main-thread stall figures, so queueing and its cause stay visible together.
 The checkout lease is shared by Poise development, Poise production and the
 compatible Caller writing behavior. Turns in different checkouts can run
 concurrently; another session on the same checkout is visibly queued.
+Once admitted, a turn still shows `queued` while it prepares, naming its
+current step — checkout, turn input, checkout snapshot, pending settings,
+job baseline — and preparation past its budget fails the turn naming the
+step instead of hanging; Stop reaches the awaited work directly.
 Per-session workspaces make same-checkout contention rare; it remains for
 forks and handoffs on one workspace, development versus production, and
 orphan holds. The lease covers startup, execution, tool services and

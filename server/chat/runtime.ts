@@ -53,7 +53,7 @@ import { localCheckoutPath } from '../gh'
 import { discardUnclaimedWorkspace, ensureLocalWorkspace, ensureWorkerWorkspace, ensureWorkerWorkspaceDirectory, LOCAL_CHAT_ROOT, workerWorkspaceRef, workspaceMarkerValid } from './local-workspace'
 import { restorePrunedArtifacts } from '../storage-maintenance'
 import { catalogueAgents } from './catalog-agents'
-import { runFile, scrubbedChildEnvironment } from '../process'
+import { isAbortError, runFile, scrubbedChildEnvironment } from '../process'
 import { CheckoutLease, canonicalCheckout, describeHolder, leaseHostAlive, type AcquireResult, type CheckoutLeaseOptions } from './checkout-lock'
 import { ATTACHMENT_DIR, attachmentPath, ensureExcluded, inlineText, safeAttachmentName, sha256Of } from './attachments'
 import { readCheckoutBytes, readCheckoutTextFile, writeCheckoutTextFile } from './client-fs'
@@ -62,11 +62,12 @@ import { CallerCompatError, callerTurns as defaultCallerTurns, type CallerTurns 
 import { legacyIdFor, quoteImportedHistory, readLegacyConversation } from './legacy-import'
 import { forkStagedDocument, isBridgeProblem, refreshDocument, stageDocument, stagedDocumentPrompt, unstageDocument, writeBackDocument, type StagedDocument } from './editor-bridge'
 import {
-  GitError, PathError, assertBranchName, branchExists, branchTip, checkoutPrHead, checkpoint, createBranch, deleteBranch,
+  GitError, GuardedWorkerStuckError, PathError, assertBranchName, branchExists, branchTip, checkoutPrHead, checkpoint, createBranch, deleteBranch,
   inspectCheckout, inspectTaskRepo, linkedWorktrees, moveBranch, resolveInsideCheckout, revertDiff, switchBranch, unpushedCommits, type RecordedDiff,
 } from './git'
 import {
-  AGENT_IDS, CHAT_LIMITS, SLOT_WAIT_REASON, SWITCH_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type EditDecision, type NewSessionRequest,
+  AGENT_IDS, CHAT_LIMITS, PREPARE_BASELINE_REASON, PREPARE_CHECKOUT_REASON, PREPARE_INPUT_REASON, PREPARE_SETTINGS_REASON, PREPARE_SNAPSHOT_REASON,
+  SLOT_WAIT_REASON, SWITCH_WAIT_REASON, type AgentId, type Attachment, type BranchRequest, type ChatActor, type ChatEnvelope, type ChatEvent, type ChatSubject, type EditDecision, type NewSessionRequest,
   type Mention, type PermissionOption, type PersonActor, type PoiseActor, type PromptInput, type PromptReceipt, type Question, type SessionContext, type SessionRecord, type SessionStatus, type StallRepo, type StallState, type StalledJob, type StopReason, type ToolKind, type TurnSource, type WorkspaceState,
 } from './protocol'
 import { actorOf, nativeName } from './actors'
@@ -151,6 +152,17 @@ const WORKER_NOOP_REPEAT_LIMIT = 20
 const STOP_SETTLE_MS = 2_000
 const CLOSE_GRACE_MS = 5_000
 const SERVICE_SETTLE_MS = 5_000
+/** Aggregate bound on a turn's queued preparation: checkout, input,
+ *  snapshot, pending settings and the job baseline, after the legitimate
+ *  slot, lease and update waits. Past it the turn fails naming its step;
+ *  a started native turn is never bounded by it. */
+const PREPARATION_BUDGET_MS = 300_000
+/** One snapshot's own bound: past it the turn continues with the partial
+ *  snapshot and a warning instead of failing. */
+const CHECKOUT_SNAPSHOT_BUDGET_MS = 120_000
+/** A preparation step past this names itself with its elapsed time in the
+ *  diagnostics, so the next slow preparation arrives with its stage. */
+const PREPARE_SLOW_MS = 30_000
 /** How long an upload waits for a busy checkout before it is refused. */
 const ATTACHMENT_LEASE_WAIT_MS = 15_000
 const TITLE_CHARS = 60
@@ -169,6 +181,43 @@ export class ChatError extends HttpError {
   constructor(statusCode: number, message: string, readonly code: string, readonly detail?: { manager?: { id: string } }) {
     super(statusCode, message)
     this.name = 'ChatError'
+  }
+}
+
+/** The named pre-prompt steps between admission and the native prompt. */
+type PrepareStep = 'checkout' | 'input' | 'snapshot' | 'settings' | 'baseline'
+const PREPARE_REASONS: Record<PrepareStep, string> = {
+  checkout: PREPARE_CHECKOUT_REASON,
+  input: PREPARE_INPUT_REASON,
+  snapshot: PREPARE_SNAPSHOT_REASON,
+  settings: PREPARE_SETTINGS_REASON,
+  baseline: PREPARE_BASELINE_REASON,
+}
+
+/** A queued preparation step that exceeded the aggregate budget: the turn
+ *  fails with its stage and elapsed time instead of hanging unnamed. */
+export class PreparationTimeoutError extends Error {
+  constructor(readonly step: PrepareStep, readonly reason: string, readonly elapsedMs: number, readonly budgetMs: number) {
+    super(`preparation timed out during '${reason}' after ${(elapsedMs / 1000).toFixed(1)}s of a ${budgetMs / 1000}s budget`)
+    this.name = 'PreparationTimeoutError'
+  }
+}
+
+/** Await a promise someone else settles until `signal` aborts: the waiter
+ *  detaches while the work runs on, so a late settlement can never resume
+ *  the abandoned wait. */
+async function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted()
+  let onAbort: (() => void) | undefined
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      onAbort = () => reject(isAbortError(signal.reason) ? signal.reason as Error
+        : Object.assign(new Error('The operation was aborted', { cause: signal.reason }), { name: 'AbortError', code: 'ABORT_ERR' }))
+      signal.addEventListener('abort', onAbort, { once: true })
+      promise.then(resolve, reject)
+    })
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort)
   }
 }
 
@@ -203,6 +252,9 @@ interface RunningTurn {
   noOp?: { open: Map<string, { kind: ToolKind, title: string, input?: unknown }>, lastOutput: Map<string, string>, repeats: number }
   /** Set when the turn must end as an error (mirror failure, lost lease, forced stop). */
   failure?: string
+  /** Set when a preparation worker survived termination: the checkout
+   *  stays locked past this turn, and the message says so. */
+  checkoutRetained?: string
   /** The one implementing turn of a `/poise` change: its settlement is the
    *  change's outcome; later discussion turns in the session are not. */
   implementsChange?: boolean
@@ -315,6 +367,10 @@ export interface RuntimeOptions {
   /** How long an adoption waits for the LIVE boundary; 60 s by default.
    *  Tests hold it short to prove a failed adoption ends the turn. */
   adoptionLiveTimeoutMs?: number
+  /** Bounds for a turn's queued preparation; production defaults apply
+   *  when absent. Tests hold them short to prove a blocked step fails
+   *  named and a started native turn outlives them. */
+  prepareBudgets?: { totalMs?: number, snapshotMs?: number }
   /** The self-update controller client. Absent or unconfigured: `/poise`
    *  answers with an actionable error and no controller IO ever happens. */
   selfUpdate?: SelfUpdateBridge | null
@@ -2027,7 +2083,7 @@ export class ChatRuntime extends EventEmitter {
    *  branch (fresh sessions), switch the checkout to it, register the gate,
    *  then create/resume/fork the native session. Failures become a readable
    *  error event and the `error` status; nothing is retried on its own. */
-  private async startSession(session: LiveSession, options: { fresh?: boolean, forkFrom?: SessionRecord, lease?: CheckoutLease } = {}): Promise<void> {
+  private async startSession(session: LiveSession, options: { fresh?: boolean, forkFrom?: SessionRecord, lease?: CheckoutLease, signal?: AbortSignal } = {}): Promise<void> {
     if (session.adapter?.alive) return
     if (!options.lease && session.lease?.held) {
       await this.stopProcess(session)
@@ -2036,7 +2092,7 @@ export class ChatRuntime extends EventEmitter {
     const record = session.record
     const startup = new AbortController()
     session.startup = startup
-    const signal = AbortSignal.any([session.lifecycle.signal, startup.signal, ...(session.turn ? [session.turn.abort.signal] : [])])
+    const signal = AbortSignal.any([session.lifecycle.signal, startup.signal, ...(session.turn ? [session.turn.abort.signal] : []), ...(options.signal ? [options.signal] : [])])
     this.setStatus(session, 'starting')
     let lease = options.lease
     let freed = true
@@ -2055,7 +2111,7 @@ export class ChatRuntime extends EventEmitter {
       signal.throwIfAborted()
       const fresh = recreated || options.fresh || (!record.nativeSessionId && record.branch.provisional && !record.branch.baseSha)
       if (fresh) await this.prepareBranch(session, lease)
-      await this.prepareCheckout(session, lease)
+      await this.prepareCheckout(session, lease, options.signal)
       if ((fresh || options.forkFrom) && record.context?.kind === 'document' && record.context.slug) {
         session.staged = options.forkFrom
           ? await forkStagedDocument(record.checkout, record.id, record.context.slug, { sessionId: options.forkFrom.id, staged: options.forkFrom.staged })
@@ -3311,6 +3367,10 @@ export class ChatRuntime extends EventEmitter {
     let checkoutBefore: CheckoutSnapshot | null = null
     let started = false
     let editorContext = false
+    let prepareTimer: ReturnType<typeof setTimeout> | null = null
+    const disarmPreparation = (): void => {
+      if (prepareTimer) { clearTimeout(prepareTimer); prepareTimer = null }
+    }
     session.draining = false
     try {
       if (turn.abort.signal.aborted) throw new Error(turn.failure || 'cancelled before it started')
@@ -3400,60 +3460,87 @@ export class ChatRuntime extends EventEmitter {
       }
       session.lease = lease
       session.relayDetached = false
+      const turnLease = lease
       lease.onLost(() => {
         try { this.emit_(record.id, { type: 'error', message: 'the checkout lease was lost; stopping the turn', recoverable: true }) } catch { /* mirror */ }
         turn.failure = 'the checkout lease was lost'
         turn.abort.abort()
         void adapter.cancel()
       })
-      await this.prepareCheckout(session, lease)
+      // The slot, lease and update waits ended above; they are legitimate
+      // and unbounded, and the budget below never counts them. Preparation
+      // past the budget fails the turn naming its step; Stop aborts the
+      // same signal, so cancellation reaches the awaited work directly.
+      const prepareBudgetMs = this.options.prepareBudgets?.totalMs ?? PREPARATION_BUDGET_MS
+      const prepareBudget = new AbortController()
+      const prep = { signal: AbortSignal.any([turn.abort.signal, prepareBudget.signal]), budgetMs: prepareBudgetMs }
+      prepareTimer = setTimeout(() => prepareBudget.abort(), prepareBudgetMs)
+      await this.preparing(session, turn, 'checkout', prep, (signal) => this.prepareCheckout(session, turnLease, signal))
       if (session.relay) {
         const gateIdent = storage.getWorker(record.id)?.ident
         if (!gateIdent) throw new Error('the checkout lease was lost before the turn started')
         if (!lease.registerWorker({ pid: session.relay.gatePid, pgid: session.relay.gatePgid, ident: gateIdent })) throw new Error('the checkout lease was lost before the turn started')
         storage.setWorkerLeaseToken(record.id, lease.currentToken)
       }
-      let adapterInput = await this.resolveInput(session, nativeInput, turn.queueItem?.sourceSessionId ?? turn.inputSourceSessionId)
-      if (turn.review) adapterInput = await prepareReview(record.checkout, record.id, turn.id, turn.review.throughSeq, turn.review.target, { ...adapterInput, text: input.text }, turn.abort.signal)
-      // Every ordinary turn of an Editor session reads the voice guide, the
-      // saved document and the edit format from a read-only file written
-      // here, under the held lease. A /review, /compact or bare /reset turn
-      // is about the conversation and gets none.
-      if (!turn.review && turn.contextAction !== 'compact' && record.subject?.surface.startsWith('editor-')) {
-        adapterInput = await prepareEditorContext(record.checkout, record, turn.id, adapterInput, turn.abort.signal)
-        editorContext = true
-      }
-      if (session.staged) {
-        const report = await refreshDocument(record.checkout, session.staged)
-        if (report.kind === 'refreshed' || report.kind === 'staged') this.saveRecord(session)
-        if (isBridgeProblem(report)) this.emit_(record.id, { type: 'error', message: report.message, recoverable: true })
-      }
+      const prepared = await this.preparing(session, turn, 'input', prep, async () => {
+        let next = await this.resolveInput(session, nativeInput, turn.queueItem?.sourceSessionId ?? turn.inputSourceSessionId)
+        if (turn.review) next = await prepareReview(record.checkout, record.id, turn.id, turn.review.throughSeq, turn.review.target, { ...next, text: input.text }, turn.abort.signal)
+        // Every ordinary turn of an Editor session reads the voice guide, the
+        // saved document and the edit format from a read-only file written
+        // here, under the held lease. A /review, /compact or bare /reset turn
+        // is about the conversation and gets none.
+        let editor = false
+        if (!turn.review && turn.contextAction !== 'compact' && record.subject?.surface.startsWith('editor-')) {
+          // Set before the call: if preparation aborts after the file lands,
+          // final cleanup must still remove it. Removal is best-effort when
+          // the file was never created.
+          editorContext = true
+          next = await prepareEditorContext(record.checkout, record, turn.id, next, turn.abort.signal)
+          editor = true
+        }
+        if (session.staged) {
+          const report = await refreshDocument(record.checkout, session.staged)
+          if (report.kind === 'refreshed' || report.kind === 'staged') this.saveRecord(session)
+          if (isBridgeProblem(report)) this.emit_(record.id, { type: 'error', message: report.message, recoverable: true })
+        }
+        return { next, editor }
+      })
+      const adapterInput = prepared.next
+      editorContext = prepared.editor
       // Capture before the native prompt can write, not in an asynchronous
       // item/started notification that races the tool's filesystem effects.
-      checkoutBefore = await captureCheckoutSnapshot(record.checkout, session.staged ? [session.staged.path] : [])
+      checkoutBefore = await this.preparing(session, turn, 'snapshot', prep, (signal) =>
+        captureCheckoutSnapshot(record.checkout, session.staged ? [session.staged.path] : [], {}, {
+          signal, turnSignal: turn.abort.signal, deadlineMs: this.options.prepareBudgets?.snapshotMs ?? CHECKOUT_SNAPSHOT_BUDGET_MS,
+        }))
       // Settings may change during the handshake or a checkout wait. No native
       // user prompt has started yet, so use the newest acknowledged policy now.
-      await session.steering
-      while (record.safeModePending) {
-        turn.abort.signal.throwIfAborted()
-        try {
-          await this.stopProcess(session)
-          await this.startSession(session, { lease })
-        } catch (failure) {
-          // A failed replacement may still own a live worker even though the
-          // prompt was never invoked. Final cleanup must verify its exit too.
-          terminate = true
-          throw failure
+      await this.preparing(session, turn, 'settings', prep, async (signal) => {
+        await abortable(session.steering, signal)
+        while (record.safeModePending) {
+          turn.abort.signal.throwIfAborted()
+          try {
+            await this.stopProcess(session)
+            await this.startSession(session, { lease: turnLease, signal })
+          } catch (failure) {
+            // A failed replacement may still own a live worker even though the
+            // prompt was never invoked. Final cleanup must verify its exit too.
+            terminate = true
+            throw failure
+          }
+          await abortable(session.steering, signal)
         }
-        await session.steering
-      }
+      })
       adapter = session.adapter!
       if (turn.abort.signal.aborted) throw new Error(turn.failure || 'cancelled before the agent prompt')
       // The baseline's process listing settles before 'running' publishes:
       // callers treat 'running' as prompt-invoked, so the window after it
       // stays free of subprocess latency. A safe-mode restart below replaces
       // the group and re-takes it there.
-      await this.snapshotJobBaseline(session, turn)
+      await this.preparing(session, turn, 'baseline', prep, (signal) => this.snapshotJobBaseline(session, turn, signal))
+      // The preparation budget ends where the native turn starts: a running
+      // turn, however long held, is never bounded by it.
+      disarmPreparation()
       this.setStatus(session, 'running')
       if (record.queuedHandoff) adapterInput.text = `${record.queuedHandoff}\n\n[Current task]\n${adapterInput.text}`
       if (turn.contextAction === 'compact' && storage.findEvent(record.id, event => event.type === 'text.delta') && !record.queuedHandoff) {
@@ -3548,6 +3635,7 @@ export class ChatRuntime extends EventEmitter {
         } catch { /* mirror */ }
       }
     } finally {
+      disarmPreparation()
       turn.releasePrompt()
       this.releaseLocalTurnSlot(turn)
       if (editorContext) await removeEditorContext(record.checkout, record.id, turn.id)
@@ -3648,8 +3736,8 @@ export class ChatRuntime extends EventEmitter {
         }
       }
       if (lease?.held) {
-        if (freed) { lease.clearWorker(); lease.release() }
-        else { try { this.emit_(record.id, { type: 'error', message: 'the checkout stays locked: the agent process could not be stopped', recoverable: false }) } catch { /* mirror */ } }
+        if (freed && !turn.checkoutRetained) { lease.clearWorker(); lease.release() }
+        else { try { this.emit_(record.id, { type: 'error', message: turn.checkoutRetained || 'the checkout stays locked: the agent process could not be stopped', recoverable: false }) } catch { /* mirror */ } }
       }
       if (lease && session.lease === lease && !lease.held) session.lease = null
       // A fork learns its native id from the agent's first frames.
@@ -3661,7 +3749,7 @@ export class ChatRuntime extends EventEmitter {
       // A failed turn shows an Error dot even though a live adapter idles the chat.
       record.lastStopReason = stopReason
       if (record.status !== 'closed') {
-        if (!freed) this.setStatus(session, 'error', record.orphanNotice || 'the agent process could not be stopped')
+        if (!freed || turn.checkoutRetained) this.setStatus(session, 'error', turn.checkoutRetained || record.orphanNotice || 'the agent process could not be stopped')
         else if (session.adapter?.alive) this.setStatus(session, 'idle')
         // An agent that closed itself after a turn (Claude does after a stop,
         // so a queued interjection can never run) resumes on the next prompt.
@@ -4141,6 +4229,52 @@ export class ChatRuntime extends EventEmitter {
     turn.localSlot = undefined
   }
 
+  /** Run one queued preparation step under its label: the session shows
+   *  the step from the synchronous set below until the next step, so the
+   *  wait it replaces never lingers, and a slow step names itself with
+   *  its elapsed time. `prep.signal` combines the turn's Stop with the
+   *  aggregate preparation budget: a Stop rethrows for cancellation, a
+   *  budget expiry fails the turn naming the step. A checkout worker
+   *  that survived termination retains the checkout past the turn. */
+  private async preparing<T>(session: LiveSession, turn: RunningTurn, step: PrepareStep,
+    prep: { signal: AbortSignal, budgetMs: number }, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const reason = PREPARE_REASONS[step]
+    if (session.record.queuedBehind !== reason || session.record.status !== 'queued') {
+      session.record.queuedBehind = reason
+      this.setStatus(session, 'queued')
+    }
+    const startedAt = Date.now()
+    try {
+      prep.signal.throwIfAborted()
+      const result = await run(prep.signal)
+      prep.signal.throwIfAborted()
+      return result
+    } catch (error) {
+      if (error instanceof GuardedWorkerStuckError) {
+        const message = `preparation step '${reason}' could not settle: its checkout worker is still alive; the checkout stays locked`
+        turn.failure = message
+        turn.checkoutRetained = message
+        throw new Error(message, { cause: error })
+      }
+      if (turn.abort.signal.aborted) throw error
+      if (prep.signal.aborted) {
+        const elapsedMs = Date.now() - startedAt
+        diagnostic({ level: 'error', operation: 'chat.turn.prepare_timeout', target: turn.id,
+          message: `preparation timed out during '${reason}'`,
+          context: { sessionId: session.record.id, turnId: turn.id, step, reason, elapsedMs, budgetMs: prep.budgetMs } })
+        throw new PreparationTimeoutError(step, reason, elapsedMs, prep.budgetMs)
+      }
+      throw error
+    } finally {
+      const elapsedMs = Date.now() - startedAt
+      if (elapsedMs >= PREPARE_SLOW_MS) {
+        diagnostic({ level: 'warning', operation: 'chat.turn.prepare_slow', target: turn.id,
+          message: `preparation step '${reason}' took ${(elapsedMs / 1000).toFixed(1)}s`,
+          context: { sessionId: session.record.id, turnId: turn.id, step, reason, elapsedMs } })
+      }
+    }
+  }
+
   /** Count an adopted turn against the local cap without parking it
    *  behind the waiters: the turn already runs, so admission control
    *  must not delay its visibility. Survivors take precedence — new
@@ -4203,35 +4337,38 @@ export class ChatRuntime extends EventEmitter {
   /** The checkout must be on the session's branch before the agent runs.
    *  The outgoing session's uncommitted work is committed on its own
    *  branch; a dirty checkout on a branch no session owns is refused by name. */
-  private async prepareCheckout(session: LiveSession, lease: CheckoutLease): Promise<void> {
+  private async prepareCheckout(session: LiveSession, lease: CheckoutLease, signal?: AbortSignal): Promise<void> {
     const record = session.record
-    const state = await inspectCheckout(record.checkout)
+    const state = await inspectCheckout(record.checkout, signal ? { signal } : {})
     if (state.currentBranch !== record.branch.name) {
-      await this.makeCheckoutSwitchable(session, lease)
-      await switchBranch(lease, record.checkout, record.branch.name)
+      await this.makeCheckoutSwitchable(session, lease, signal)
+      await switchBranch(lease, record.checkout, record.branch.name, signal ? { signal } : {})
     }
     lease.setBranch(record.branch.name)
-    await this.restorePrunedWorkspace(session)
+    await this.restorePrunedWorkspace(session, signal)
   }
 
   /** Reinstall what storage maintenance pruned from an idle scratch
    *  workspace. Best-effort: a failure never stops the turn, and the agent
-   *  reinstalls whatever is still missing. */
-  private async restorePrunedWorkspace(session: LiveSession): Promise<void> {
+   *  reinstalls whatever is still missing. An abort is not a failure: it
+   *  stops the installers and propagates with the step. */
+  private async restorePrunedWorkspace(session: LiveSession, signal?: AbortSignal): Promise<void> {
     if (session.record.workspaceKind !== 'poise-local') return
     try {
-      const restored = await restorePrunedArtifacts(session.record.checkout, this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT)
+      const restored = await restorePrunedArtifacts(session.record.checkout, this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT,
+        undefined, signal ? { signal } : {})
       if (restored.length) {
         this.emit_(session.record.id, { type: 'status.changed', status: session.record.status, detail: `storage maintenance had pruned ${restored.join(', ')} while idle; reinstalled` })
       }
     } catch (error) {
+      if (isAbortError(error)) throw error
       console.error(`[chat] reinstalling pruned artifacts failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
-  private async makeCheckoutSwitchable(session: LiveSession, lease: CheckoutLease): Promise<void> {
+  private async makeCheckoutSwitchable(session: LiveSession, lease: CheckoutLease, signal?: AbortSignal): Promise<void> {
     const record = session.record
-    const state = await inspectCheckout(record.checkout)
+    const state = await inspectCheckout(record.checkout, signal ? { signal } : {})
     if (!state.dirty) return
     const owner = storage.listSessions(this.instance).find((s) => s.checkout === record.checkout && s.branch.name === state.currentBranch && s.status !== 'closed')
       // A session's own scratch workspace holds only its own agent's work —
@@ -4244,7 +4381,7 @@ export class ChatRuntime extends EventEmitter {
     if (!owner) {
       throw new GitError(`the checkout at ${record.checkout} has ${state.dirtyFiles} uncommitted change(s) on ${state.currentBranch || 'a detached HEAD'}, which no chat session owns; commit or stash them yourself`, 'dirty_unowned')
     }
-    const result = await checkpoint(lease, record.checkout, state.currentBranch)
+    const result = await checkpoint(lease, record.checkout, state.currentBranch, signal ? { signal } : {})
     if (result.committed) {
       // Only the branch that received the checkpoint stops being
       // provisional: a self-checkpoint lands on the agent's own branch,
@@ -4269,10 +4406,14 @@ export class ChatRuntime extends EventEmitter {
       let retained = ''
       if (!state.currentBranch && owner.id === record.id && result.sha) {
         const name = `poise/checkpoint/${record.id.slice(0, 8)}-${result.sha.slice(0, 12)}`
+        // Load-bearing like the post-commit read: the branch must land even
+        // when the caller aborted, or the commit dangles once a later
+        // switch moves away from the now-clean checkout.
         await moveBranch(lease, record.checkout, name, result.sha)
         retained = ` (kept on branch ${name})`
       }
       this.emit_(record.id, { type: 'status.changed', status: session.record.status, detail: `checkpointed ${owner.title}'s changes on ${state.currentBranch || 'a detached HEAD'}${retained}` })
+      signal?.throwIfAborted()
     }
   }
 
@@ -4434,14 +4575,14 @@ export class ChatRuntime extends EventEmitter {
    *  turn would freeze the turn's jobs as pre-existing — and an exhausted
    *  failure warns instead of degrading silently. Detection and the reap
    *  need no retry: their misses heal on the next pass. */
-  private async snapshotJobBaseline(session: LiveSession, turn: RunningTurn): Promise<void> {
+  private async snapshotJobBaseline(session: LiveSession, turn: RunningTurn, signal?: AbortSignal): Promise<void> {
     turn.jobBaseline = undefined
     try {
       const worker = storage.getWorker(session.record.id)
       const pgid = session.relay?.gatePgid ?? worker?.gatePgid
       if (!pgid) return
       let members: GroupMember[] | null = null
-      for (let attempt = 0; attempt < 3 && !members; attempt++) members = await groupMembers(pgid)
+      for (let attempt = 0; attempt < 3 && !members; attempt++) members = await groupMembers(pgid, signal ? { signal } : {})
       if (!members) {
         diagnostic({ level: 'warning', operation: 'chat.work.baseline_failed',
           message: 'The turn started without a job baseline; its background jobs cannot be tracked',

@@ -794,6 +794,24 @@ describe('artifact restore', () => {
     await mkdir(dir, { recursive: true })
     await expect(maintenance.restorePrunedArtifacts(dir, chatRoot, async () => { throw new Error('must not run') })).resolves.toEqual([])
   })
+
+  it('aborts a running reinstall on its signal instead of swallowing the abort', async () => {
+    const id = 'dddddddd-dddd-dddd-dddd-dddddddddddd'
+    const checkout = await makeWorkspace(id)
+    await writeFile(join(checkout, 'package.json'), '{"name":"x"}\n')
+    await writeFile(join(chatRoot, 'workers', id, '.poise-maintenance.json'), JSON.stringify({ prunedAt: new Date().toISOString(), pruned: ['node_modules'] }))
+    const controller = new AbortController()
+    let sawSignal = false
+    const pending = maintenance.restorePrunedArtifacts(checkout, chatRoot, (_command, _args, opts) => new Promise((_resolve, reject) => {
+      sawSignal = !!opts?.signal
+      opts?.signal?.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })), { once: true })
+    }), { signal: controller.signal })
+    await new Promise((r) => setTimeout(r, 50))
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(sawSignal).toBe(true)
+    await expect(lstat(join(chatRoot, 'workers', id, '.poise-maintenance.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
 })
 
 describe('session claims', () => {

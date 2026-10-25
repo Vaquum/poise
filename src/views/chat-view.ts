@@ -34,7 +34,7 @@ import { recoverDraft } from '../chat-draft-recovery'
 import { parseChatCommandChain as parseChain, commandBody } from '../../server/chat/commands'
 import { commandDraftText } from '../chat-command-draft'
 import { recentMessages } from '../chat-message-history'
-import { reconcileSession } from '../chat-session-state'
+import { applyStatusChanged, reconcileSession } from '../chat-session-state'
 import { reserveQueuedMessage, releaseQueuedMessage } from '../chat-queue'
 import { createQueuePanel } from './chat-queue'
 import { createMemoriesPane } from './chat-memories'
@@ -1142,7 +1142,7 @@ function onEvent(env: ChatEnvelope): void {
     upsertRecord({ ...ev.session, lastSeq: env.seq }, { pending: false })
   } else if (ev.type === 'status.changed') {
     // The server stamps its own save; the pane orders by that change.
-    e.record = { ...e.record, status: ev.status, queuedBehind: ev.queuedBehind, updatedAt: env.at }
+    e.record = applyStatusChanged(e.record, ev, env.at)
   } else if (ev.type === 'queue.updated') {
     acceptQueue(e, ev.queue)
   } else if (ev.type === 'commands.updated') {

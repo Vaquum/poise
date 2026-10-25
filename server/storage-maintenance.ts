@@ -16,7 +16,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { getMeta, setMeta } from './db'
 import { diagnostic } from './logging'
-import { runFile } from './process'
+import { isAbortError, runFile } from './process'
 import { raiseAlert, resolveAlert } from './alerts/store'
 import { canonicalCheckout, CheckoutLease } from './chat/checkout-lock'
 import { inspectCheckout } from './chat/git'
@@ -925,15 +925,19 @@ interface PruneMarker {
 
 /** Reinstall what maintenance pruned, on the next turn. Best-effort and
  *  non-fatal: whatever still fails is the agent's to reinstall. Runs under
- *  the turn's checkout lease. */
+ *  the turn's checkout lease. An abort stops the installers and propagates,
+ *  like any other awaited preparation work — best-effort never means
+ *  unkillable. */
 export async function restorePrunedArtifacts(
   checkout: string,
   chatRoot: string = LOCAL_CHAT_ROOT,
-  run: (command: string, args: readonly string[], options?: { cwd?: string, timeoutMs?: number }) => Promise<{ stdout: string }> = (command, args, opts) =>
+  run: (command: string, args: readonly string[], options?: { cwd?: string, timeoutMs?: number, signal?: AbortSignal }) => Promise<{ stdout: string }> = (command, args, opts) =>
     runFile(command, args, { ...opts, timeoutMs: opts?.timeoutMs ?? 300_000, maxOutputBytes: 1024 * 1024 }),
+  options: { signal?: AbortSignal } = {},
 ): Promise<string[]> {
   const ref = workerWorkspaceRef(chatRoot, checkout)
   if (!ref) return []
+  options.signal?.throwIfAborted()
   const markerPath = join(ref.home, PRUNE_MARKER)
   let marker: PruneMarker
   try {
@@ -956,17 +960,18 @@ export async function restorePrunedArtifacts(
         : lockfile === 'yarn' ? ['yarn', ['install', '--frozen-lockfile'] as const]
           : lockfile === 'pnpm' ? ['pnpm', ['install', '--frozen-lockfile'] as const]
             : ['npm', ['install', '--no-audit', '--no-fund'] as const]
-      await run(command, [...args], { cwd: checkout, timeoutMs: 300_000 })
+      await run(command, [...args], { cwd: checkout, timeoutMs: 300_000, ...(options.signal ? { signal: options.signal } : {}) })
       restored.push('node_modules')
     }
     const venv = marker.pruned.find((name) => (name === '.venv' || name === 'venv'))
     if (venv && (await missing(venv)) && !(await missing('requirements.txt'))) {
-      await run('python3', ['-m', 'venv', venv], { cwd: checkout, timeoutMs: 120_000 })
+      await run('python3', ['-m', 'venv', venv], { cwd: checkout, timeoutMs: 120_000, ...(options.signal ? { signal: options.signal } : {}) })
       const pip = process.platform === 'win32' ? join(venv, 'Scripts', 'pip') : join(venv, 'bin', 'pip')
-      await run(pip, ['install', '-r', 'requirements.txt'], { cwd: checkout, timeoutMs: 300_000 })
+      await run(pip, ['install', '-r', 'requirements.txt'], { cwd: checkout, timeoutMs: 300_000, ...(options.signal ? { signal: options.signal } : {}) })
       restored.push(venv)
     }
   } catch (error) {
+    if (isAbortError(error)) throw error
     console.error(`[storage] reinstalling pruned artifacts in ${checkout} failed: ${error instanceof Error ? error.message : String(error)}`)
   } finally {
     await rm(markerPath, { force: true })

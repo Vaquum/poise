@@ -372,6 +372,13 @@ function abortError(signal: AbortSignal, killSignal: NodeJS.Signals): Error {
   })
 }
 
+/** Whether `error` is an aborted operation: a runFile abort, a
+ *  `throwIfAborted`, or a guarded worker stopped by its signal. */
+export function isAbortError(error: unknown): boolean {
+  return !!error && typeof error === 'object'
+    && ((error as { name?: unknown }).name === 'AbortError' || (error as { code?: unknown }).code === 'ABORT_ERR')
+}
+
 async function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): Promise<void> {
   const pid = child.pid
   if (!pid) return
