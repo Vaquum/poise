@@ -5949,7 +5949,7 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
     const reviewCapReached = reviewCap !== null && reviewRound !== null && reviewRound >= reviewCap
       ? { reviewRound, reviewCap }
       : undefined
-    return { author, actor, accounts, reviewEnvironment, reviewCapReached }
+    return { author, actor, accounts, reviewEnvironment, ...(reviewCapReached ? { reviewCapReached } : {}) }
   }
 }
 
