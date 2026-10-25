@@ -41,6 +41,12 @@ db.exec(`
     event TEXT NOT NULL,
     PRIMARY KEY (session_id, seq)
   );
+  -- One turn's finish, looked up by finalizeTurn on every turn end: without
+  -- it the dedup read scans the whole transcript. Partial, so only the
+  -- ~one-per-turn finish rows are indexed, and read INDEXED BY so the
+  -- planner needs no table statistics to use it.
+  CREATE INDEX IF NOT EXISTS idx_chat_events_turn_finished ON chat_events(session_id, json_extract(event, '$.turnId'))
+    WHERE json_extract(event, '$.type') = 'turn.finished';
 
   CREATE TABLE IF NOT EXISTS chat_pending (
     request_id TEXT PRIMARY KEY,
@@ -348,6 +354,16 @@ export function findEvent(sessionId: string, predicate: (event: ChatEvent) => bo
   return null
 }
 
+/** One turn's committed finish, newest first like findEvent: the dedup read
+ *  for finalizeTurn, answered from the partial finish index instead of a
+ *  whole-transcript scan with a JSON parse per row. */
+export function findTurnFinished(sessionId: string, turnId: string): ChatEnvelope | null {
+  const row = db.prepare(`SELECT seq, at, event FROM chat_events INDEXED BY idx_chat_events_turn_finished
+    WHERE session_id = ? AND json_extract(event, '$.type') = 'turn.finished' AND json_extract(event, '$.turnId') = ?
+    ORDER BY seq DESC LIMIT 1`).get(sessionId, turnId) as { seq: number, at: string, event: string } | undefined
+  return row ? { seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent } : null
+}
+
 export interface PendingRequest { requestId: string, sessionId: string, kind: 'permission' | 'question', seq: number }
 
 /** One open request with its stored title and ask time, for the handling
@@ -566,7 +582,7 @@ export const finalizeTurn = db.transaction((
   ledger?: { callId: string, instance: string },
   canAdvanceQueue = true,
 ): ChatEnvelope => {
-  const previous = findEvent(sessionId, candidate => candidate.type === 'turn.finished' && candidate.turnId === event.turnId)
+  const previous = findTurnFinished(sessionId, event.turnId)
   const envelope = previous ?? appendEvent(sessionId, event)
   const terminal = envelope.event as Extract<ChatEvent, { type: 'turn.finished' }>
   if (ledger) {
