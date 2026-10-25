@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { groupMembers, spawnWorker, workerGateStatus, workerIdentityMatches } from '../../server/chat/worker'
+import { canSignalGroup, groupMembers, processGroupId, signalGroup, spawnWorker, workerGateStatus, workerGroupMatches, workerIdentityMatches } from '../../server/chat/worker'
 
 let root = ''
 
@@ -79,5 +79,39 @@ describe('worker gate verification', () => {
     } finally {
       await gate.terminate(2_000)
     }
+  }, 25_000)
+})
+
+describe('worker group kill scope', () => {
+  it('refuses the groups that are never a worker', () => {
+    // 0 is the caller's own group, 1 reaches every process it may signal.
+    expect(canSignalGroup(0)).toBe(false)
+    expect(canSignalGroup(1)).toBe(false)
+    expect(canSignalGroup(-5)).toBe(false)
+    expect(canSignalGroup(Number.NaN)).toBe(false)
+    expect(canSignalGroup(2.5)).toBe(false)
+    expect(canSignalGroup(2)).toBe(true)
+    expect(() => signalGroup(0, 'SIGTERM')).toThrow(RangeError)
+    expect(() => signalGroup(1, 'SIGTERM')).toThrow(RangeError)
+    // A dead group past pid_max is a silent no-op, never an error.
+    expect(() => signalGroup(2 ** 30 - 1, 'SIGTERM')).not.toThrow()
+  })
+
+  it('matches a live gate to its own group only', async () => {
+    const first = spawnWorker('true', [], { cwd: root })
+    const second = spawnWorker('true', [], { cwd: root })
+    try {
+      expect(processGroupId(first.pid)).toBe(first.pid)
+      expect(await workerGroupMatches(first.pid, first.pgid, first.ident)).toBe(true)
+      // A recorded pgid naming another session's live group is not ours,
+      // even though the gate itself verifies.
+      expect(await workerGroupMatches(first.pid, second.pgid, first.ident)).toBe(false)
+      expect(await workerGroupMatches(first.pid, first.pgid, second.ident)).toBe(false)
+    } finally {
+      await first.terminate(2_000)
+      await second.terminate(2_000)
+    }
+    expect(processGroupId(first.pid)).toBeNull()
+    expect(await workerGroupMatches(first.pid, first.pgid, first.ident)).toBe(false)
   }, 25_000)
 })
