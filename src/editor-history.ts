@@ -96,15 +96,18 @@ export function readEditorHistory(store: HistoryStore, slug: string, text: strin
  */
 export function writeEditorHistory(store: HistoryStore, slug: string, snapshot: EditorHistorySnapshot): number {
   const key = editorHistoryKey(slug)
-  if (!snapshot.undo.length && !snapshot.redo.length) {
-    store.removeItem(key)
-    return 0
-  }
   const overhead = JSON.stringify({ version: 1, current: snapshot.current, undo: [], redo: [] }).length
   if (overhead > HISTORY_BYTE_BUDGET) {
+    // Checked before the empty-stacks fast path: live trimming may have
+    // already removed every step, but an oversized document still cannot
+    // keep a timeline, and the caller must report that instead of 'kept'.
     // A stale timeline for this document must not linger and spend quota.
     try { store.removeItem(key) } catch { /* the budget error below carries the failure */ }
     throw new EditorHistoryTooLargeError(slug, overhead)
+  }
+  if (!snapshot.undo.length && !snapshot.redo.length) {
+    store.removeItem(key)
+    return 0
   }
   const undo = snapshot.undo.slice()
   const redo = snapshot.redo.slice()

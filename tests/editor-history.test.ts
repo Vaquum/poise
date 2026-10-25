@@ -115,6 +115,15 @@ describe('history byte budget', () => {
     expect(store.getItem(editorHistoryKey('notes'))).toBeNull()
   })
 
+  it('refuses an oversized document even after live trimming emptied its stacks', () => {
+    const store = storage()
+    writeEditorHistory(store, 'notes', snapshot())
+    const huge = 'x'.repeat(HISTORY_BYTE_BUDGET)
+    expect(() => writeEditorHistory(store, 'notes', { version: 1, current: entry(huge), undo: [], redo: [] }))
+      .toThrow(EditorHistoryTooLargeError)
+    expect(store.getItem(editorHistoryKey('notes'))).toBeNull()
+  })
+
   it('removes the timeline when trimming drops every step', () => {
     const store = storage()
     const probe = 'c'.repeat(1_000_000)
