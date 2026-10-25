@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   diagnostic: vi.fn(),
   runFile: vi.fn(),
   workerBuild: vi.fn<(outfile: string) => void>(),
-  models: {} as Record<string, { default: string, fallback: string }>,
+  models: {} as import('../server/models').ModelSettings,
   agentAccount: 'bit-mis',
   // The scheduler's replay check; these tests admit everything unless told not to.
   admit: vi.fn(async () => ({ author: 'poise-user', actor: 'bit-mis', accounts: { me: 'poise-user', agent: 'bit-mis' } })),
@@ -708,9 +708,11 @@ describe('manual review model selection', () => {
     })
   })
 
-  it('launches the chosen default and fallback, and skips the Claude gate for Codex', async () => {
-    const choice = { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' }
-    mocks.models = { pr_review: choice, pr_approve: choice }
+  it('launches the chosen slot and recovers with the next, and skips the Claude gate for Codex', async () => {
+    mocks.models = {
+      slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' },
+      places: { pr_review: { slot: 'primary' }, pr_approve: { slot: 'primary' } },
+    }
     const { triggerPrReview, replayAgentJob } = await import('../server/agent')
     const { spawnDetached } = await import('../server/process')
     const { claudeAuth } = await import('../server/claude-auth')
@@ -723,7 +725,7 @@ describe('manual review model selection', () => {
   })
 
   it('falls back to the catalog default when the chosen model was retired', async () => {
-    mocks.models = { pr_review: { default: 'opus-4.8-max', fallback: 'gpt-6-astra-ultra' } }
+    mocks.models = { slots: { primary: 'opus-4.8-max', secondary: 'gpt-6-astra-ultra' } }
     const { triggerPrReview } = await import('../server/agent')
     const { spawnDetached } = await import('../server/process')
     await triggerPrReview('https://github.com/o/r/pull/12')
@@ -910,7 +912,10 @@ describe('issue review rows', () => {
   })
 
   it('replays an issue review with the Issue review default and no head or checkout', async () => {
-    mocks.models = { issue_review: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' } }
+    mocks.models = {
+      slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' },
+      places: { issue_review: { slot: 'primary' } },
+    }
     mocks.runFile.mockResolvedValue({ stdout: CATALOG_STDOUT, stderr: '' })
     const { invalidateCatalog } = await import('../server/models')
     invalidateCatalog()

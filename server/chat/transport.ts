@@ -477,19 +477,21 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
     }
     if (path === '/api/chat/agents' && req.method === 'GET') {
       const { agents, catalog } = await runtime.agents()
-      const { resolveChoice } = await import('../models')
+      const { resolvePlace, resolveSlots } = await import('../models')
       const { getModelSettings } = await import('../settings')
       const { launchable } = await import('../review-model')
       const { claudeAuth } = await import('../claude-auth')
-      const choice = resolveChoice(catalog, 'chat', getModelSettings().chat)
-      const effective = launchable(catalog, undefined, choice)
-      const fallbackReason = effective !== choice.default
-        ? `${choice.default} needs the Claude.ai sign-in (${claudeAuth.snapshot().status}); ${choice.fallback} is available`
+      const stored = getModelSettings()
+      const choice = resolvePlace(catalog, 'chat', stored)
+      const slots = resolveSlots(catalog, stored.slots)
+      const effective = launchable(catalog, undefined, choice, slots)
+      const fallbackReason = effective !== choice.model
+        ? `${choice.model} needs the Claude.ai sign-in (${claudeAuth.snapshot().status}); ${effective} is available`
         : undefined
       const settings = getChatSettings()
       return json(res, 200, {
         agents: agents.map((a) => ({ id: a.id, label: a.label, available: a.available, reason: a.reason, models: a.models, efforts: a.efforts })),
-        defaults: { model: choice.default, fallback: choice.fallback, fallbackReason },
+        defaults: { model: choice.model, fallback: effective, fallbackReason },
         settings,
       }), true
     }

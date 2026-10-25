@@ -7,7 +7,7 @@ import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
 import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings, SettingsConflictError } from './settings'
-import { MODEL_PLACES, canaryClaudeModel, loadCatalog, placeProviders, readCatalogReport, resolveChoice } from './models'
+import { MODEL_PLACES, canaryClaudeModel, loadCatalog, placeProviders, readCatalogReport, resolvePlace, resolveSlots } from './models'
 import { refreshModelCatalog } from './models-refresh'
 import { deleteModelPreset, listModelPresets, saveModelPreset } from './model-presets'
 import { claudeAuth, type ClaudeAuthCheckOptions, type ClaudeAuthSnapshot, type ClaudeAuthStatus } from './claude-auth'
@@ -653,20 +653,26 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         // ── Models ──
-        // The catalog Caller exports, the default and fallback resolved for
-        // every place Poise launches a model, the places Caller decides on its
-        // own, and the last daily refresh report.
+        // The catalog Caller exports, the three slot models resolved once, the
+        // slot each place runs, the places Caller decides on its own, and the
+        // last daily refresh report.
         if (url === '/api/models' && req.method === 'GET') {
           try {
             const catalog = await loadCatalog()
             const stored = getModelSettings()
-            const places = MODEL_PLACES.map((place) => ({
-              ...place,
-              ...resolveChoice(catalog, place.key, stored[place.key]),
-              stored: stored[place.key] || null,
-              // Which providers this place may launch; null means all of them.
-              providers: placeProviders(catalog, place.key),
-            }))
+            const slots = { ...resolveSlots(catalog, stored.slots), stored: stored.slots || null }
+            const places = MODEL_PLACES.map((place) => {
+              const resolved = resolvePlace(catalog, place.key, stored)
+              return {
+                ...place,
+                slot: resolved.slot,
+                model: resolved.model,
+                notes: resolved.notes,
+                stored: stored.places?.[place.key] || null,
+                // Which providers this place may launch; null means all of them.
+                providers: placeProviders(catalog, place.key),
+              }
+            })
             const fixed = [
               { key: 'content', label: '/content', model: catalog.behaviors.author_content, why: 'Authors content, in the voice guide AGENT_INTERFACE_VOICE_GUIDE names when one is set; set by the Caller catalog.' },
               { key: 'consensus', label: '/consensus', model: catalog.behaviors.debate_moderator, why: `Moderates the debate; participants: ${catalog.debate_participants.join(', ')}.` },
@@ -674,7 +680,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               { key: 'issue_simplify', label: 'Simplify issue', model: catalog.behaviors.issue_simplify, why: 'Caller behavior; set by the Caller catalog.' },
               { key: 'canary', label: 'Sign-in check', model: canaryClaudeModel(catalog)?.identity ?? 'unavailable', why: 'One minimal Claude request on the cheapest catalog row that proves the Claude.ai sign-in; runs once at boot and while unhealthy, never per launch.' },
             ]
-            return json(res, 200, { catalog, places, fixed, refresh: await readCatalogReport(), presets: listModelPresets() })
+            return json(res, 200, { catalog, slots, places, fixed, refresh: await readCatalogReport(), presets: listModelPresets() })
           } catch (err: any) {
             return json(res, httpStatus(err, 503), { error: err.message || String(err) })
           }
