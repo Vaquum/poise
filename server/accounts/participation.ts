@@ -5,19 +5,24 @@
 // rule; this module only assembles its inputs.
 
 import { listAccounts } from './index'
-import { accountLogins } from './logins'
+import { accountLoginsStrict } from './logins'
 import type { AccountId } from './types'
 
 export interface ProviderEvidence {
   logins: Partial<Record<AccountId, string>>
-  live: { claude: boolean | null, codex: boolean | null }
+  live: { claude: boolean | 'missing' | null, codex: boolean | 'missing' | null }
 }
 
+/** Throws on a corrupt record, so the check fails instead of skipping
+ *  configured providers. A CLI that is not installed reports 'missing',
+ *  which skips: only a failed read is unknown. */
 export async function providerEvidence(): Promise<ProviderEvidence> {
   const accounts = await listAccounts()
-  const signedIn = (id: AccountId): boolean | null => {
+  const observed = (id: AccountId): boolean | 'missing' | null => {
     const found = accounts.find((account) => account.id === id)
-    return found && typeof found.signedIn === 'boolean' ? found.signedIn : null
+    if (!found) return null
+    if (!found.installed) return 'missing'
+    return typeof found.signedIn === 'boolean' ? found.signedIn : null
   }
-  return { logins: accountLogins(), live: { claude: signedIn('claude'), codex: signedIn('codex') } }
+  return { logins: accountLoginsStrict(), live: { claude: observed('claude'), codex: observed('codex') } }
 }

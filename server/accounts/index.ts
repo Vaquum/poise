@@ -57,10 +57,14 @@ export async function listAccounts(id?: AccountId): Promise<ConnectedAccount[]> 
   // Join after the cached probe settles: setup edits must be visible at once,
   // including when a probe was already pending before a confirmation was removed.
   const logins = accountLogins()
-  for (const account of result) {
-    if ((account.id === 'claude' || account.id === 'codex') && account.signedIn === true && !logins[account.id]) {
-      recordObservedSignIn(account.id)
+  try {
+    for (const account of result) {
+      if ((account.id === 'claude' || account.id === 'codex') && account.signedIn === true && !logins[account.id]) {
+        recordObservedSignIn(account.id)
+      }
     }
+  } catch (error) {
+    console.error('[accounts] could not record an observed sign-in:', error)
   }
   return result.map(account => {
     const recorded = { ...account, signInRecordedAt: logins[account.id] }

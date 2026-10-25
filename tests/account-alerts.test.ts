@@ -79,6 +79,27 @@ describe('sign-in alerts from Connected accounts', () => {
     expect(open()).toEqual([])
   })
 
+  it('changes nothing while the provider record is corrupt', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      configured({ codex: AT })
+      producers.accountsChecked([cli('codex', false)], nobody)
+      expect(open()).toEqual(['sign-in:codex'])
+      database.setMeta('account_logins', 'not json')
+      // An open demand stays open, and no new one is raised.
+      producers.accountsChecked([cli('codex', false)], nobody)
+      expect(open()).toEqual(['sign-in:codex'])
+      producers.accountsChecked([cli('codex', false), cli('grok', false)], nobody)
+      expect(rows()).toHaveLength(1)
+      // A live-verified sign-in still clears its own demand.
+      producers.accountsChecked([cli('codex', true)], nobody)
+      expect(open()).toEqual([])
+      expect(errors).toHaveBeenCalled()
+    } finally {
+      errors.mockRestore()
+    }
+  })
+
   it('change nothing while a CLI cannot say, is not installed, or is Claude, which its monitor alerts for', () => {
     configured({ codex: AT })
     producers.accountsChecked([cli('codex', false)], nobody)

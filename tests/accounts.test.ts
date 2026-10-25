@@ -10,6 +10,7 @@ import { invalidateAccounts, listAccounts, AccountsCache, ACCOUNTS_CACHE_MS, ACC
 import { probeAccount, probeAccounts, type RunCommand } from '../server/accounts/status'
 import type { ConnectedAccount } from '../server/accounts/types'
 import { accountLogins, markLogin, recordLogin } from '../server/accounts/logins'
+import { providerEvidence } from '../server/accounts/participation'
 import { setMeta } from '../server/db'
 import { runFile } from '../server/process'
 import { STATUS, fakeCalls, script, writeFakeClis } from './fixtures/accounts/fake-clis'
@@ -444,6 +445,24 @@ describe('durable login evidence joined to Accounts', () => {
   it('records nothing for a signed-out, unknown or unreported sign-in', async () => {
     await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeSignedOut), codex: script('codex', STATUS.codexSignedOut), grok: script('grok') })
     await listAccounts()
+    expect(accountLogins()).toEqual({})
+  })
+
+  it('forwards the record with the live sign-in, and a missing CLI as missing', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt), grok: script('grok') })
+    markLogin('grok', true)
+    await expect(providerEvidence()).resolves.toEqual({
+      logins: { codex: expect.any(String), grok: expect.any(String) },
+      live: { claude: 'missing', codex: true },
+    })
+  })
+
+  it('fails evidence closed on a corrupt record while reads still list', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
+    setMeta('account_logins', 'not json')
+    await expect(providerEvidence()).rejects.toThrow(/corrupt/)
+    // Displayed history stays lenient: the read path survives.
+    expect((await listAccounts()).find(account => account.id === 'codex')).toMatchObject({ signedIn: true })
     expect(accountLogins()).toEqual({})
   })
 })

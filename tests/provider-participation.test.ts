@@ -105,6 +105,11 @@ describe('the eligibility rule', () => {
       JSON.stringify({ logins: {}, live: { claude: 'yes', codex: null } }),
       JSON.stringify({ logins: {}, live: { claude: false } }),
     ]) expect(() => parseEvidence(raw)).toThrow(EligibilityError)
+    // A CLI the server found missing skips; only a failed read is unknown.
+    expect(parseEvidence(JSON.stringify({ logins: {}, live: { claude: 'missing', codex: false } }))).toEqual({
+      logins: {}, live: { claude: 'missing', codex: false },
+    })
+    expect(decideEligibility({}, { claude: 'missing', codex: 'missing' }).eligible).toEqual([])
   })
 
   it('reuses an overlapping report only when its participation context still matches', () => {
@@ -156,6 +161,36 @@ describe('the durable record', () => {
     recordObservedParticipation(path, 'grok')
     expect(dbLogins(path)).toEqual({ codex: AT })
   })
+
+  it('keeps a login that finishes while the memo holds the database', async () => {
+    const path = join(root, 'cache.db')
+    seedDb(path, {})
+    // Another process takes the write lock first and records a login like
+    // the server would; the memo must wait for it, not overwrite it.
+    const holder = spawn(process.execPath, ['-e', `
+      const fs = require('node:fs');
+      const Database = require('better-sqlite3');
+      const db = new Database(process.env.POISE_TEST_DB);
+      db.exec('BEGIN IMMEDIATE');
+      fs.writeFileSync(process.env.POISE_TEST_DB + '.ready', 'held');
+      setTimeout(() => {
+        db.prepare("INSERT INTO meta (key, value) VALUES ('account_logins', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value")
+          .run(JSON.stringify({ codex: '${AT}' }));
+        db.exec('COMMIT');
+        db.close();
+      }, 1500);
+    `], { cwd: resolve('.'), env: { ...process.env, POISE_TEST_DB: path }, stdio: 'ignore' })
+    const closed = new Promise((resolve, reject) => holder.once('close', code => (code === 0 ? resolve(code) : reject(new Error(`holder exited ${code}`)))))
+    try {
+      for (let i = 0; i < 100 && !existsSync(path + '.ready'); i++) await new Promise(resolve => setTimeout(resolve, 100))
+      expect(existsSync(path + '.ready')).toBe(true)
+      recordObservedParticipation(path, 'claude')
+      await closed
+      expect(dbLogins(path)).toEqual({ codex: AT, claude: expect.any(String) })
+    } finally {
+      holder.kill()
+    }
+  }, 30_000)
 })
 
 describe('standalone eligibility', () => {
@@ -215,6 +250,21 @@ describe('standalone eligibility', () => {
       antigravity: withUpdates('antigravity', script('antigravity')),
     })
     expect(await resolveEligibility(env())).toMatchObject({ eligible: ['claude'], source: 'standalone' })
+  })
+
+  it('an unrecorded Claude whose CLI is missing is skipped without asking the wrapper', async () => {
+    seedDb(dbPath, { grok: AT })
+    await writeFakeClis(bin, home, {
+      codex: withUpdates('codex', script('codex', STATUS.codexSignedOut)),
+      grok: withUpdates('grok', script('grok')),
+      muse: script('muse'),
+      antigravity: withUpdates('antigravity', script('antigravity')),
+    })
+    // No claude launcher: the wrapper would only report its own failure.
+    const { eligible, skipped } = await resolveEligibility(env())
+    expect(eligible).toEqual(['grok'])
+    expect(skipped.claude).toBe(SKIP_REASON)
+    expect((await fakeCalls(home)).some(call => call.name === 'claude')).toBe(false)
   })
 
   it('an unreadable status answer or a silent CLI fails eligibility', async () => {
@@ -304,7 +354,7 @@ console.log(JSON.stringify({ checked_at: new Date().toISOString(), families: Obj
   }
 }
 
-const EVIDENCE = (logins: Record<string, string>, live: { claude: boolean | null, codex: boolean | null }) => ({ logins, live })
+const EVIDENCE = (logins: Record<string, string>, live: { claude: boolean | 'missing' | null, codex: boolean | 'missing' | null }) => ({ logins, live })
 
 describe('the refresh script', () => {
   let cases: ScriptCase[] = []
@@ -350,6 +400,20 @@ describe('the refresh script', () => {
     expect(names).toContain('claude')
     expect(names).not.toContain('grok')
     expect(names).not.toContain('muse')
+  })
+
+  it('checks on when the server found Claude and Codex not installed', async () => {
+    const { run } = await prepare({
+      grok: withUpdates('grok', script('grok')),
+      muse: script('muse'),
+      antigravity: withUpdates('antigravity', script('antigravity')),
+    }, { evidence: EVIDENCE({ grok: AT }, { claude: 'missing', codex: 'missing' }) })
+    const { code, report } = await run()
+    expect(code).toBe(0)
+    expect(report.eligible).toEqual(['grok'])
+    expect(report.families.grok).toMatchObject({ status: 'ok' })
+    expect(report.families.claude).toMatchObject({ status: 'skipped', reason: SKIP_REASON })
+    expect(report.families.codex).toMatchObject({ status: 'skipped', reason: SKIP_REASON })
   })
 
   it('keeps the bare all-provider Caller call when every provider participates', async () => {

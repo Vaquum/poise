@@ -5,9 +5,10 @@
 // error, never a silent skip. Plain JavaScript, so both the TypeScript
 // server and the standalone refresh script resolve the same rule.
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, constants } from 'node:fs'
+import { access } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { delimiter, dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Database from 'better-sqlite3'
 
@@ -66,28 +67,54 @@ export function readAccountLogins(dbPath = participationDbPath()) {
 }
 
 /** Remember a positive live observation, so a later lost sign-in reads as
- *  a failure, not as never configured. Best effort: the observation still
- *  applies to this run when the memo cannot be kept. */
+ *  a failure, not as never configured. The read and the write hold one
+ *  write transaction, so an overlapping server login can neither be erased
+ *  nor erase this memo. Best effort: the observation still applies to this
+ *  run when the memo cannot be kept. */
 export function recordObservedParticipation(dbPath, provider) {
   if (!LIVE_PROVIDERS.includes(provider) || !existsSync(dbPath)) return
   let db
   try {
     db = new Database(dbPath, { timeout: 5000 })
+    db.exec('BEGIN IMMEDIATE')
     let raw
     try {
       raw = db.prepare('SELECT value FROM meta WHERE key = ?').get(LOGINS_KEY)?.value
     } catch {
+      db.exec('ROLLBACK')
       return
     }
-    const current = loginsFromValue(dbPath, raw)
-    if (current[provider]) return
-    db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value')
-      .run(LOGINS_KEY, JSON.stringify({ ...current, [provider]: new Date().toISOString() }))
+    let current
+    try {
+      current = loginsFromValue(dbPath, raw)
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+    if (!current[provider]) {
+      db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value')
+        .run(LOGINS_KEY, JSON.stringify({ ...current, [provider]: new Date().toISOString() }))
+    }
+    db.exec('COMMIT')
   } catch (error) {
+    try {
+      db?.exec('ROLLBACK')
+    } catch { /* already rolled back */ }
     console.error(`[models] could not record the observed ${provider} sign-in: ${error instanceof Error ? error.message : String(error)}`)
   } finally {
     db?.close()
   }
+}
+
+/** Resolve a provider launcher on PATH. Shared with the updaters, and with
+ *  the Claude probe, whose wrapper failure alone cannot tell a missing CLI
+ *  from a failed one. */
+export async function executable(command, env) {
+  const candidates = isAbsolute(command) ? [command] : (env.PATH || '').split(delimiter).filter(Boolean).filter(isAbsolute).map(dir => join(dir, command))
+  for (const path of candidates) {
+    try { await access(path, constants.X_OK); return path } catch { /* next PATH entry */ }
+  }
+  throw new Error(`${command} is not installed on Poise's PATH`)
 }
 
 /** `claude auth status --json`: signed in means a Claude subscription, the
@@ -174,6 +201,13 @@ function runProbe(command, args, { env, timeoutMs }) {
 async function probeLive(provider, env) {
   const timeoutMs = ELIGIBILITY_PROBE_TIMEOUT_MS
   if (provider === 'claude') {
+    // The wrapper hides a missing CLI behind its own exit code, so look for
+    // the launcher before asking it anything.
+    try {
+      await executable('claude', { PATH: env.PATH })
+    } catch {
+      return { live: 'missing' }
+    }
     const probeEnv = probeEnvironment(env, ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SHELL_PREFIX'])
     for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN']) delete probeEnv[key]
     probeEnv.CLAUDE_CLI = CLAUDE_WRAPPER
@@ -248,13 +282,13 @@ export function parseEvidence(raw) {
   } catch (error) {
     throw new EligibilityError(`POISE_PROVIDER_EVIDENCE is not JSON: ${error instanceof Error ? error.message : String(error)}`)
   }
-  const problem = 'POISE_PROVIDER_EVIDENCE must be { logins: { <provider>: <iso> }, live: { claude: true | false | null, codex: true | false | null } }'
+  const problem = 'POISE_PROVIDER_EVIDENCE must be { logins: { <provider>: <iso> }, live: { claude: true | false | \'missing\' | null, codex: true | false | \'missing\' | null } }'
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new EligibilityError(problem)
   const { logins, live } = value
   if (!logins || typeof logins !== 'object' || Array.isArray(logins)
     || Object.values(logins).some(at => typeof at !== 'string')) throw new EligibilityError(problem)
   if (!live || typeof live !== 'object' || Array.isArray(live)
-    || !LIVE_PROVIDERS.every(provider => live[provider] === true || live[provider] === false || live[provider] === null)) {
+    || !LIVE_PROVIDERS.every(provider => live[provider] === true || live[provider] === false || live[provider] === 'missing' || live[provider] === null)) {
     throw new EligibilityError(problem)
   }
   return { logins, live }

@@ -7,8 +7,9 @@ export interface Eligibility {
 }
 export interface ProviderEvidenceInput {
   logins: Partial<Record<string, string>>
-  live: Record<LiveProvider, boolean | null>
+  live: Record<LiveProvider, boolean | 'missing' | null>
 }
+export function executable(command: string, env: NodeJS.ProcessEnv): Promise<string>
 export class EligibilityError extends Error {}
 export const PROVIDERS: Provider[]
 export const SKIP_REASON: string

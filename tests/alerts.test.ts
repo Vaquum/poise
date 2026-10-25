@@ -175,6 +175,21 @@ describe('the alert producers', () => {
     expect(unresolved()).toEqual([expect.objectContaining({ key: 'sign-in:claude' })])
   })
 
+  it('changes nothing for Claude while the provider record is corrupt', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      database.setMeta('account_logins', JSON.stringify({ claude: '2026-10-20T06:00:00.000Z' }))
+      producers.claudeAuthStatusChanged('reauth_required')
+      expect(unresolved()).toEqual([expect.objectContaining({ key: 'sign-in:claude' })])
+      database.setMeta('account_logins', 'not json')
+      producers.claudeAuthStatusChanged('reauth_required')
+      expect(unresolved()).toEqual([expect.objectContaining({ key: 'sign-in:claude' })])
+      expect(errors).toHaveBeenCalled()
+    } finally {
+      errors.mockRestore()
+    }
+  })
+
   it('alerts once per held behavior target until its incident has cleared', () => {
     producers.behaviorHeld('review-new-prs', 'acme/app#12', false)
     producers.behaviorHeld('review-new-prs', 'acme/app#12', true)

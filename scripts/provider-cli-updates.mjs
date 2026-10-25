@@ -3,12 +3,11 @@ import { environmentSecrets, redact } from '../gateway/src/diagnostics/redaction
 // Refresh the actual standalone provider launchers, never an IDE's bundled CLI.
 import { spawn } from 'node:child_process'
 import { access, cp, mkdir, readFile, rename, rm, writeFile, realpath } from 'node:fs/promises'
-import { constants } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { dirname, delimiter, isAbsolute, join } from 'node:path'
+import { dirname, delimiter, join } from 'node:path'
 import { homedir } from 'node:os'
 import Database from 'better-sqlite3'
-import { PROVIDERS, SKIP_REASON } from './provider-participation.mjs'
+import { PROVIDERS, SKIP_REASON, executable } from './provider-participation.mjs'
 
 export { PROVIDERS }
 export const CLI_UPDATE_TIMEOUT_MS = 120_000
@@ -39,14 +38,6 @@ function updateEnvironment(source) {
   const keys = ['HOME', 'USERPROFILE', 'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TEMP', 'TMP', 'USER', 'LANG', 'LC_ALL', 'SHELL', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME']
   return { ...Object.fromEntries(keys.filter(key => source[key] !== undefined).map(key => [key, source[key]])), CI: '1', NO_COLOR: '1' }
 }
-async function executable(command, env) {
-  const candidates = isAbsolute(command) ? [command] : (env.PATH || '').split(delimiter).filter(Boolean).filter(isAbsolute).map(dir => join(dir, command))
-  for (const path of candidates) {
-    try { await access(path, constants.X_OK); return path } catch { /* next PATH entry */ }
-  }
-  throw new Error(`${command} is not installed on Poise's PATH`)
-}
-
 /** Run only the selected provider's updater, without a shell or model prompt. */
 export function runUpdateCommand(command, args, { env, cwd, timeoutMs = CLI_UPDATE_TIMEOUT_MS }) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('timeoutMs must be a positive integer')

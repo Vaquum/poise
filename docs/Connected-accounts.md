@@ -76,7 +76,12 @@ status positively verifies a usable sign-in.
   unreadable stays participating and reports the failure. A provider with
   neither history nor a verified sign-in is skipped when the evidence
   establishes it as unconfigured. A failed eligibility read is unknown and
-  fails the check; it never reads as unconfigured.
+  fails the check; it never reads as unconfigured. A corrupt record fails
+  closed the same way: checks fail and alerts stay as they are.
+- Status reads use each CLI's default credential store. The Codex probe does
+  not follow CODEX_HOME, like Connect and the server probes, so a sign-in
+  held only there reads as signed out; connecting Codex through Poise
+  records it and brings it into the checks.
 - Deliberate withdrawal is setup's withdrawal for Grok, Muse and Antigravity,
   which removes the record. Claude and Codex have no Disconnect in Poise, so
   a previously configured one stays participating and reports a lost sign-in.
