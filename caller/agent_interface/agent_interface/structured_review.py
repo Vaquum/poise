@@ -4,7 +4,9 @@ Claude reviews with governed tools (claude_acl). Every other provider —
 Codex, Grok Build, Antigravity, Muse — gets the same immutable packet with
 no tools, in an empty work directory, and answers with one JSON verdict that
 Caller validates and submits. A run that used a tool, failed, or answered
-anything but the verdict submits nothing.
+anything but the verdict submits nothing. A packet larger than one provider
+call reliably finishes is reviewed in file-group stages; every stage's
+findings combine into the single submitted verdict.
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, bounde
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
 from .review_watch import ReviewWatch
-from . import progress, review_budget, review_receipt
+from . import progress, review_budget, review_receipt, review_stages
 from . import review_cap as followup
 
 
@@ -194,6 +196,100 @@ def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
     return followup.issue_reference(issue)
 
 
+def _admit(text: str) -> None:
+    prompt_bytes = len(text.encode("utf-8"))
+    if prompt_bytes > MAX_GOVERNED_PROMPT_BYTES:
+        raise AgentPreflightError(
+            "PR packet is too large for a reliable atomic review: "
+            f"{prompt_bytes} bytes exceeds {MAX_GOVERNED_PROMPT_BYTES} after data exclusions; "
+            "reduce the remaining review input",
+            "review_packet_too_large",
+            diagnostic_envelope(operation="provider.input_admission", phase="before_provider_launch",
+                                outcome="resource_failure",
+                                context={"actual_input_bytes": prompt_bytes,
+                                         "input_limit_bytes": MAX_GOVERNED_PROMPT_BYTES, "provider_started": False}),
+        )
+
+
+def _stage_texts(text: str, packet: str) -> list[str]:
+    if not packet:
+        return [text]
+    stages = review_stages.split(packet)
+    if len(stages) == 1:
+        return [text]
+    if packet not in text:
+        raise review_stages.StageError("staged review packet differs from the review prompt")
+    return [text.replace(packet, stage, 1) for stage in stages]
+
+
+def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
+                 timeout_s: int, deadline: float, repository, behavior: str) -> tuple[str, dict]:
+    schema = verdict_schema(behavior, inspection=repository is not None)
+    (root / "verdict.schema.json").write_text(json.dumps(schema))
+    context = ""
+    for round_number in range(MAX_INSPECTION_ROUNDS + 1):
+        timeout = review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS)
+        if repository is not None:
+            timeout = min(deadline - monotonic(), timeout)
+        if timeout <= 0:
+            raise review_budget.ReviewLimitError("Review reached its total time limit", "review_budget_exhausted")
+        if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
+            # Loop-driven growth, not #186's initial-packet overflow: keep
+            # it out of the packet block so the head is not pinned.
+            raise review_budget.ReviewLimitError(
+                "Repository inspection exceeds the review prompt limit; needs attention",
+                "review_budget_exhausted",
+                diagnostic_envelope(operation="provider.review", phase="inspection_context",
+                                    outcome="resource_failure", provider=model.provider))
+        # Last round decides on evidence already held: offer only the
+        # terminal verdict, never another inspection step.
+        if repository is not None and round_number == MAX_INSPECTION_ROUNDS:
+            schema = verdict_schema(behavior, inspection=False)
+            (root / "verdict.schema.json").write_text(json.dumps(schema))
+        remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
+                     f"Analysis time remaining: {int(timeout)} seconds. "
+                     "Batch independent inspection requests in one step. "
+                     "Return a terminal verdict as soon as the supplied evidence is sufficient. "
+                     "Do not repeat completed reads or searches."
+                     if repository is not None else "")
+        raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
+        progress.stage("validating", "Validating review result")
+        if repository is None:
+            return raw, validate_verdict(raw, behavior)
+        step = _loads_no_duplicates(raw)
+        if round_number == MAX_INSPECTION_ROUNDS and isinstance(step, dict) \
+                and set(step) == {"action", "comments"}:
+            # The final round offers the terminal-only verdict schema,
+            # which has no requests property at all.
+            return raw, validate_verdict(raw, behavior)
+        if not isinstance(step, dict) or set(step) != {"action", "comments", "requests"}:
+            raise InvalidVerdict("review step must contain action, comments, and requests")
+        requests = step["requests"]
+        if not isinstance(requests, list):
+            raise InvalidVerdict("review requests must be an array")
+        if step["action"] != "inspect":
+            if requests:
+                raise InvalidVerdict("terminal verdict must not request repository inspection")
+            return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments")}), behavior)
+        if round_number == MAX_INSPECTION_ROUNDS:
+            raise review_budget.ReviewLimitError(
+                "Repository inspection limit reached; needs attention",
+                "review_budget_exhausted",
+                diagnostic_envelope(operation="provider.review", phase="inspection_rounds",
+                                    outcome="resource_failure", provider=model.provider,
+                                    context={"rounds": MAX_INSPECTION_ROUNDS}))
+        if not 1 <= len(requests) <= 8:
+            raise InvalidVerdict("invalid repository inspection request count")
+        # Validate provisional findings without submitting anything.
+        validate_verdict(json.dumps({"action": "request_changes" if step["comments"] else
+                                    "reviewed_clean" if behavior == "pr_review" else "approve",
+                                    "comments": step["comments"]}), behavior)
+        progress.stage("inspecting", "Inspecting pinned repository")
+        result = repository.inspect(requests)
+        context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
+    raise AssertionError("review rounds did not return a verdict")
+
+
 def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         pr: str, actor_name: str, head: str, timeout_s: int, *, repository=None,
         packet: str = "", capped: bool = False,
@@ -205,76 +301,35 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     if ask is None:
         raise AgentPreflightError(f"{model.provider} cannot return a structured review verdict")
     try:
+        stage_texts = _stage_texts(text, packet)
+        staged = len(stage_texts) > 1
         with tempfile.TemporaryDirectory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
             root = Path(work)
-            schema = verdict_schema(behavior, inspection=repository is not None)
-            (root / "verdict.schema.json").write_text(json.dumps(schema))
             deadline = monotonic() + timeout_s
-            context = ""
-            for round_number in range(MAX_INSPECTION_ROUNDS + 1):
-                timeout = review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS)
-                if repository is not None:
-                    timeout = min(deadline - monotonic(), timeout)
-                if timeout <= 0:
-                    raise review_budget.ReviewLimitError("Review reached its total time limit", "review_budget_exhausted")
-                if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
-                    # Loop-driven growth, not #186's initial-packet overflow: keep
-                    # it out of the packet block so the head is not pinned.
-                    raise review_budget.ReviewLimitError(
-                        "Repository inspection exceeds the review prompt limit; needs attention",
-                        "review_budget_exhausted",
-                        diagnostic_envelope(operation="provider.review", phase="inspection_context",
-                                            outcome="resource_failure", provider=model.provider))
-                # Last round decides on evidence already held: offer only the
-                # terminal verdict, never another inspection step.
-                if repository is not None and round_number == MAX_INSPECTION_ROUNDS:
-                    schema = verdict_schema(behavior, inspection=False)
-                    (root / "verdict.schema.json").write_text(json.dumps(schema))
-                remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
-                             f"Analysis time remaining: {int(timeout)} seconds. "
-                             "Batch independent inspection requests in one step. "
-                             "Return a terminal verdict as soon as the supplied evidence is sufficient. "
-                             "Do not repeat completed reads or searches."
-                             if repository is not None else "")
-                raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
-                progress.stage("validating", "Validating review result")
-                if repository is None:
-                    verdict = validate_verdict(raw, behavior)
-                    break
-                step = _loads_no_duplicates(raw)
-                if round_number == MAX_INSPECTION_ROUNDS and isinstance(step, dict) \
-                        and set(step) == {"action", "comments"}:
-                    # The final round offers the terminal-only verdict schema,
-                    # which has no requests property at all.
-                    verdict = validate_verdict(raw, behavior)
-                    break
-                if not isinstance(step, dict) or set(step) != {"action", "comments", "requests"}:
-                    raise InvalidVerdict("review step must contain action, comments, and requests")
-                requests = step["requests"]
-                if not isinstance(requests, list):
-                    raise InvalidVerdict("review requests must be an array")
-                if step["action"] != "inspect":
-                    if requests:
-                        raise InvalidVerdict("terminal verdict must not request repository inspection")
-                    verdict = validate_verdict(json.dumps({key: step[key] for key in ("action", "comments")}), behavior)
-                    break
-                if round_number == MAX_INSPECTION_ROUNDS:
-                    raise review_budget.ReviewLimitError(
-                        "Repository inspection limit reached; needs attention",
-                        "review_budget_exhausted",
-                        diagnostic_envelope(operation="provider.review", phase="inspection_rounds",
-                                            outcome="resource_failure", provider=model.provider,
-                                            context={"rounds": MAX_INSPECTION_ROUNDS}))
-                if not 1 <= len(requests) <= 8:
-                    raise InvalidVerdict("invalid repository inspection request count")
-                # Validate provisional findings without submitting anything.
-                validate_verdict(json.dumps({"action": "request_changes" if step["comments"] else
-                                            "reviewed_clean" if behavior == "pr_review" else "approve",
-                                            "comments": step["comments"]}), behavior)
-                progress.stage("inspecting", "Inspecting pinned repository")
-                result = repository.inspect(requests)
-                context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
+            prior: list[dict] = []
+            for index, stage_text in enumerate(stage_texts):
+                _admit(stage_text)
+                if staged:
+                    progress.stage("reviewing", f"Reviewing file group {index + 1} of {len(stage_texts)}")
+                    if prior:
+                        stage_text += ("\n\nFindings already recorded in earlier file groups "
+                                       "(do not repeat them):\n" + json.dumps(prior))
+                raw, verdict = _review_once(root, ask, model, system, stage_text, watch,
+                                             timeout_s, deadline, repository, behavior)
+                prior.extend(verdict["comments"])
+            if staged:
+                terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
+                verdict = validate_verdict(json.dumps(
+                    {"action": "request_changes" if prior else terminal, "comments": prior}), behavior)
+                raw = json.dumps(verdict)
+    except review_stages.StageError as error:
+        cause = bounded_cause(str(error) or "invalid review packet stages")
+        diagnostic = diagnostic_envelope(operation="provider.review", phase="staging",
+                                         outcome="invalid_output", stderr=cause,
+                                         provider=model.provider, submission="none")
+        raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {cause}",
+                                  "review_contract_violation", diagnostic) from error
     except subprocess.TimeoutExpired as error:
         raise review_budget.ReviewLimitError("Review reached its total time limit; needs attention", "review_budget_exhausted") from error
     except (ValueError, OSError) as error:

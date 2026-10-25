@@ -225,20 +225,23 @@ def run_agent(
     review_round: int | None = None,
     review_cap: int | None = None,
 ) -> str:
-    prompt_bytes = len(text.encode("utf-8"))
-    if prompt_bytes > MAX_GOVERNED_PROMPT_BYTES:
-        raise AgentPreflightError(
-            "PR packet is too large for a reliable atomic review: "
-            f"{prompt_bytes} bytes exceeds {MAX_GOVERNED_PROMPT_BYTES} after data exclusions; "
-            "reduce the remaining review input",
-            "review_packet_too_large",
-            diagnostic_envelope(operation="provider.input_admission", phase="before_provider_launch",
-                                outcome="resource_failure",
-                                context={"actual_input_bytes": prompt_bytes,
-                                         "input_limit_bytes": MAX_GOVERNED_PROMPT_BYTES, "provider_started": False}),
-        )
     spec = CATALOG.review_model(behavior, model)
-    if spec.provider != "claude":
+    if spec.provider == "claude":
+        prompt_bytes = len(text.encode("utf-8"))
+        if prompt_bytes > MAX_GOVERNED_PROMPT_BYTES:
+            raise AgentPreflightError(
+                "PR packet is too large for a reliable atomic review: "
+                f"{prompt_bytes} bytes exceeds {MAX_GOVERNED_PROMPT_BYTES} after data exclusions; "
+                "reduce the remaining review input",
+                "review_packet_too_large",
+                diagnostic_envelope(operation="provider.input_admission", phase="before_provider_launch",
+                                    outcome="resource_failure",
+                                    context={"actual_input_bytes": prompt_bytes,
+                                             "input_limit_bytes": MAX_GOVERNED_PROMPT_BYTES, "provider_started": False}),
+            )
+    else:
+        # Structured providers stage a large packet into file groups first;
+        # the runner admits each stage against the same limit.
         from .structured_review import run
         return run(pwd, system, text, spec, behavior, pr, actor_name, head, timeout_s, repository=repository,
                    packet=packet, capped=capped, review_round=review_round, review_cap=review_cap)

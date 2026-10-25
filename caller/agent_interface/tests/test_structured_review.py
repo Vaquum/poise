@@ -250,6 +250,82 @@ def muse_stream(text: str | None, tasks=("model.meta.response",), terminal="comp
     return "\n".join(json.dumps(line) for line in lines) + "\n"
 
 
+def staged_packet(paths):
+    diff = "\n".join(
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new"
+        for path in paths)
+    return json.dumps({"action": "read", "repository": "o/r", "pull_number": 12, "head_sha": "a" * 40,
+                       "diff": diff, "files": [{"filename": path, "status": "modified",
+                                                "old_mode": "100644", "new_mode": "100644"} for path in paths],
+                       "excluded_files": [], "review_scope": "Review the complete retained diff."},
+                      separators=(",", ":"))
+
+
+class TestStagedReview(TestCase):
+    def _run(self, packet, verdicts, text_packet=None):
+        pending = list(verdicts)
+        calls = []
+
+        def process(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == "github-interface":
+                action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
+                          "--approve-pr": "approved_pr"}[args[1]]
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": action, "review_id": 91, "head_sha": "a" * 40}), stderr="")
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(pending.pop(0)))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        text = f"policy\n\nPR packet:\n{text_packet or packet}\n\nAllowed:\nnone"
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process):
+            result = structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                           "pr_review", "https://github.com/o/r/pull/12", "bit-mis",
+                                           "a" * 40, 60, packet=packet)
+        return result, calls
+
+    def test_group_findings_combine_into_one_head_pinned_verdict(self):
+        first = {"path": "src/f00.py", "line": 1, "side": "RIGHT", "body": "first group defect"}
+        second = {"path": "src/f08.py", "line": 1, "side": "RIGHT", "body": "second group defect"}
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        result, calls = self._run(packet, [{"action": "request_changes", "comments": [first]},
+                                           {"action": "request_changes", "comments": [second]}])
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(len(calls), 3)
+        (first_args, first_kwargs), (second_args, second_kwargs), (mutation, _) = calls
+        self.assertIn("file group 1 of 2", first_kwargs["input"])
+        self.assertIn("src/f00.py", first_kwargs["input"])
+        self.assertNotIn("src/f08.py", first_kwargs["input"])
+        self.assertIn("file group 2 of 2", second_kwargs["input"])
+        self.assertIn("Findings already recorded in earlier file groups", second_kwargs["input"])
+        self.assertIn("first group defect", second_kwargs["input"])
+        self.assertEqual(mutation[:4], ["github-interface", "--request-changes", "#12", "--comments-json"])
+        self.assertEqual(json.loads(mutation[4]), [first, second])
+        self.assertEqual(mutation[5:], ["--expected-head", "a" * 40, "--token-user", "bit-mis"])
+
+    def test_clean_groups_combine_into_one_clean_verdict(self):
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        result, calls = self._run(packet, [{"action": "reviewed_clean", "comments": []},
+                                           {"action": "reviewed_clean", "comments": []}])
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(calls[-1][0][1], "--reviewed-clean")
+
+    def test_small_packet_with_packet_runs_one_unchanged_stage(self):
+        packet = staged_packet(["src/only.py"])
+        result, calls = self._run(packet, [{"action": "reviewed_clean", "comments": []}])
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1]["input"], f"system\n\npolicy\n\nPR packet:\n{packet}\n\nAllowed:\nnone")
+        self.assertNotIn("file group", calls[0][1]["input"])
+
+    def test_mismatched_packet_and_prompt_is_a_contract_violation(self):
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(packet, [{"action": "reviewed_clean", "comments": []}],
+                      text_packet=staged_packet(["src/other.py"]))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+
+
 class TestOtherProviderVerdicts(TestCase):
     """Grok, Antigravity and Muse answer with the same verdict the Codex path submits."""
 

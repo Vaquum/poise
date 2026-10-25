@@ -71,4 +71,5 @@ def run(
         return atoms.run_agent(
             pwd, SYSTEM + " " + review_repository.POLICY, text, tools, "pr_review", timeout_s,
             model=spec.identity, pr=pr, actor_name=actor, head=expected_head, repository=repository,
+            packet=packet,
         )
