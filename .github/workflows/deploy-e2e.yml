@@ -5,12 +5,20 @@ on:
     paths:
       - 'deploy/**'
       - 'gateway/**'
+      - '.github/workflows/deploy.yml'
+      - '.github/workflows/sync-upstream.yml'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/caller.yml'
       - '.github/workflows/deploy-e2e.yml'
   push:
     branches: [main]
     paths:
       - 'deploy/**'
       - 'gateway/**'
+      - '.github/workflows/deploy.yml'
+      - '.github/workflows/sync-upstream.yml'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/caller.yml'
       - '.github/workflows/deploy-e2e.yml'
   workflow_dispatch:
 

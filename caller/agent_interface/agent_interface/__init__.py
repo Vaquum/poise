@@ -905,6 +905,9 @@ def run_pr_approve(
     p: str | None = None,
     model: str | None = None,
     recovery_model: str | None = None,
+    capped: bool = False,
+    review_round: int | None = None,
+    review_cap: int | None = None,
 ):
     return run_governed_behavior(
         pr_approve,
@@ -920,6 +923,9 @@ def run_pr_approve(
         p,
         model,
         recovery_model,
+        capped,
+        review_round,
+        review_cap,
     )
 
 
@@ -1064,7 +1070,12 @@ def run_governed_behavior(
     p: str | None = None,
     model: str | None = None,
     recovery_model: str | None = None,
+    capped: bool = False,
+    review_round: int | None = None,
+    review_cap: int | None = None,
 ):
+    if capped and (behavior != "pr_approve" or review_round is None or review_cap is None):
+        raise ValueError("a capped round needs pr_approve with its round and cap numbers")
     spec = CATALOG.review_model(behavior, model)
     recovery = CATALOG.review_model(behavior, recovery_model or CATALOG.behaviors["review_recovery"])
     name = spec.identity
@@ -1116,7 +1127,8 @@ def run_governed_behavior(
             raise SystemExit(1)
         try:
             try:
-                response, recovered_result = _run_review_with_recovery(mod, behavior, review_pr, pwd, actor, expected_head, note, timeout_s, p, spec, recovery, before, id_)
+                response, recovered_result = _run_review_with_recovery(mod, behavior, review_pr, pwd, actor, expected_head, note, timeout_s, p, spec, recovery, before, id_,
+                                                                       capped=capped, review_round=review_round, review_cap=review_cap)
             except ReviewSuperseded as cancelled:
                 response = str(cancelled)
                 result = {"action": None, "outcome": "superseded", "head_sha": cancelled.head_sha}
@@ -1226,9 +1238,12 @@ def run_governed_behavior(
             raise
 
 
-def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id):
+def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
+                              capped=False, review_round=None, review_cap=None):
+    # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
+    cap_kwargs = {"capped": capped, "review_round": review_round, "review_cap": review_cap} if behavior == "pr_approve" else {}
     try:
-        return mod.run(pwd, pr, actor, head, note, seconds, p, model=spec.identity), None
+        return mod.run(pwd, pr, actor, head, note, seconds, p, model=spec.identity, **cap_kwargs), None
     except (review_budget.ReviewLimitError, subprocess.TimeoutExpired, review_receipt.SubmissionError) as error:
         if isinstance(error, review_budget.ReviewLimitError):
             failure = error
@@ -1278,7 +1293,7 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             raise review_budget.ReviewLimitError("Recovery was already attempted; needs attention", "review_recovery_failed")
         progress.stage("recovering", f"Output limit reached; recovering once with {recovery.identity}")
         try:
-            response = mod.run(pwd, pr, actor, head, note, seconds, p, model=recovery.identity)
+            response = mod.run(pwd, pr, actor, head, note, seconds, p, model=recovery.identity, **cap_kwargs)
             return response, None
         except ReviewSuperseded:
             raise
@@ -1606,7 +1621,7 @@ behaviors:
   --read-reasoning HASH
   --chat MESSAGE --model MODEL [--session ID] [--pwd DIR]
   --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--model MODEL] [--recovery-model MODEL]
-  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--model MODEL] [--recovery-model MODEL]
+  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N]
   --fix-failing-ci PR [--pwd DIR]
   --issue-simplify ISSUE [--pwd DIR]
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--note TEXT]
@@ -1651,6 +1666,17 @@ def required_flag(flag: str) -> str:
     if not value:
         usage(error=f"{flag} is required")
     return value
+
+
+def _review_cap_number(flag: str, capped: bool) -> int | None:
+    value = flag_value(flag)
+    if value is None:
+        return None
+    if not capped:
+        usage(error=f"{flag} needs --review-cap-reached")
+    if not value.isdigit() or int(value) < 1:
+        usage(error=f"{flag} must be a positive integer")
+    return int(value)
 
 
 def main():
@@ -1792,6 +1818,11 @@ def main():
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--pr-approve":
+        capped = "--review-cap-reached" in sys.argv
+        review_round = _review_cap_number("--review-round", capped)
+        review_cap = _review_cap_number("--review-cap", capped)
+        if capped and (review_round is None or review_cap is None):
+            usage(error="--review-cap-reached needs --review-round N and --review-cap N")
         run_pr_approve(
             sys.argv[2],
             required_flag("--actor"),
@@ -1803,6 +1834,9 @@ def main():
             p=flag_value("--p"),
             model=flag_value("--model"),
             recovery_model=flag_value("--recovery-model"),
+            capped=capped,
+            review_round=review_round,
+            review_cap=review_cap,
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--fix-failing-ci":
