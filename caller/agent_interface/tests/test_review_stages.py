@@ -102,6 +102,50 @@ class TestSplit(TestCase):
                           "old_mode": "100644", "new_mode": "100644"}]
         self.assertEqual(review_stages.split(json.dumps(node)), [json.dumps(node)])
 
+    def test_quoted_plus_plus_plus_path_matches_its_retained_file(self):
+        # Git C-quotes +++ paths holding double quotes, backslashes, or
+        # non-ASCII bytes; the parser must unquote before matching.
+        cases = [('we"ird.py', 'we\\"ird.py'),
+                 ("back\\slash.py", "back\\\\slash.py"),
+                 ("caf\u00e9.py", "caf\\303\\251.py")]
+        for retained, quoted in cases:
+            with self.subTest(retained=retained):
+                diff = "\n".join([f'diff --git "a/{quoted}" "b/{quoted}"',
+                                  f'--- "a/{quoted}"', f'+++ "b/{quoted}"',
+                                  "@@ -1 +1 @@", "-old", "+new"])
+                node = json.loads(packet([]))
+                node["diff"] = diff
+                node["files"] = [{"filename": retained, "status": "modified",
+                                  "old_mode": "100644", "new_mode": "100644"}]
+                self.assertEqual(review_stages.split(json.dumps(node)), [json.dumps(node)])
+
+    def test_quoted_deletion_matches_its_old_path(self):
+        diff = "\n".join(['diff --git "a/we\\"ird.py" "b/we\\"ird.py"',
+                          '--- "a/we\\"ird.py"', "+++ /dev/null",
+                          "@@ -1 +0,0 @@", "-gone"])
+        sets = review_stages.diff_line_sets(diff, ['we"ird.py'])
+        self.assertEqual(sets['we"ird.py']["left"], {1})
+
+    def test_quoted_pure_rename_matches_both_sides(self):
+        diff = "\n".join(['diff --git "a/o\\"ld.py" "b/n\\"ew.py"',
+                          "similarity index 100%",
+                          'rename from "o\\"ld.py"',
+                          'rename to "n\\"ew.py"'])
+        node = json.loads(packet([]))
+        node["diff"] = diff
+        node["files"] = [{"filename": name, "status": status,
+                          "old_mode": "100644", "new_mode": "100644"}
+                         for name, status in (('o"ld.py', "removed"), ('n"ew.py', "added"))]
+        self.assertEqual(review_stages.split(json.dumps(node)), [json.dumps(node)])
+
+    def test_unquoted_quote_wrapped_path_prefers_the_raw_match(self):
+        # With quoting disabled a literal quote-wrapped name still matches raw.
+        diff = "\n".join(['diff --git a/"q.py" b/"q.py"',
+                          '--- a/"q.py"', '+++ b/"q.py"',
+                          "@@ -1 +1 @@", "-old", "+new"])
+        sets = review_stages.diff_line_sets(diff, ['"q.py"'])
+        self.assertEqual(sets['"q.py"']["right"], {1})
+
     def test_section_for_an_unretained_file_fails_loud(self):
         node = json.loads(packet(["kept.py"]))
         node["diff"] += "\n" + section("dropped.py")
@@ -141,6 +185,16 @@ class TestSplit(TestCase):
         self.assertEqual(sets["src/a.py"]["right"], {10, 11, 12})
         self.assertEqual(sets["src/gone.py"]["left"], {1, 2})
         self.assertEqual(sets["src/gone.py"]["right"], set())
+
+    def test_diff_left_contents_maps_left_lines_to_content(self):
+        diff = "\n".join([
+            "diff --git a/src/a.py b/src/a.py",
+            "--- a/src/a.py", "+++ b/src/a.py",
+            "@@ -10,4 +10,4 @@",
+            " ctx1", "-old1", "+new1", " ctx2",
+        ])
+        contents = review_stages.diff_left_contents(diff, ["src/a.py"])
+        self.assertEqual(contents["src/a.py"], {10: "ctx1", 11: "old1", 12: "ctx2"})
 
     def test_malformed_hunk_header_fails_loud(self):
         diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ bogus @@\n-x\n"

@@ -223,32 +223,65 @@ def _stage_texts(text: str, packet: str) -> list[str]:
     return [text.replace(packet, stage, 1) for stage in stages]
 
 
-def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str, verdict: dict) -> None:
-    """A since-scoped verdict's LEFT comments name removed lines, which are
-    only submittable while the pull request diff still carries them. Check
-    those positions against the full diff before the single submission, so a
-    bad position fails here instead of rejecting the whole review at GitHub."""
-    left = [comment for comment in verdict["comments"] if comment["side"] == "LEFT"]
-    if not left or not packet:
-        return
+def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str,
+                              verdict: dict, behavior: str) -> list[dict]:
+    """Remap a since-scoped verdict onto the full pull request diff.
+
+    The model reviewed the diff since the last head: RIGHT numbers already
+    name current-head lines, but LEFT numbers name previous-head lines, so
+    each LEFT comment is remapped to base coordinates by matching its removed
+    content. Findings the pull request diff no longer carries (a follow-up
+    reverted the file, or added then removed the line) are dropped, since
+    GitHub would reject the whole submission for one stale position; when
+    nothing submittable remains the verdict flips clean. A comment on a line
+    the since diff never showed is a model error and fails loudly. Returns
+    the dropped findings."""
+    if not packet or not verdict["comments"]:
+        return []
     try:
         node = json.loads(packet)
     except ValueError:
-        return
+        return []
     if not isinstance(node, dict) or not node.get("since_head_sha"):
-        return
+        return []
     try:
         level = node.get("p")
         full = json.loads(fetch_packet(pwd, pr, actor_name, head,
                                        f"p{level}" if level is not None else None, since_head=None))
         retained = [entry["filename"] for entry in full["files"]]
         sets = review_stages.diff_line_sets(full["diff"], retained)
+        since_files = [entry["filename"] for entry in node.get("files", [])]
+        since_diff = node.get("diff")
+        since_left = review_stages.diff_left_contents(
+            since_diff if isinstance(since_diff, str) else "", since_files)
+        full_left = review_stages.diff_left_contents(full["diff"], retained)
     except (ValueError, KeyError, TypeError) as error:
-        raise InvalidVerdict(f"cannot validate removed-line positions: {error}") from error
-    for comment in left:
-        if comment["line"] not in sets.get(comment["path"], {}).get("left", set()):
+        raise InvalidVerdict(f"cannot validate since-diff positions: {error}") from error
+    by_content: dict[tuple[str, str], list[int]] = {}
+    for path, lines in full_left.items():
+        for number, content in lines.items():
+            by_content.setdefault((path, content), []).append(number)
+    kept, dropped = [], []
+    for comment in verdict["comments"]:
+        if comment["side"] == "RIGHT":
+            if comment["line"] in sets.get(comment["path"], {}).get("right", set()):
+                kept.append(comment)
+            else:
+                dropped.append({key: comment[key] for key in ("path", "line", "side")})
+            continue
+        content = since_left.get(comment["path"], {}).get(comment["line"])
+        if content is None:
             raise InvalidVerdict(
-                f"comment on {comment['path']}:{comment['line']} (LEFT) is outside the pull request diff")
+                f"comment on {comment['path']}:{comment['line']} (LEFT) is outside the reviewed since diff")
+        candidates = by_content.get((comment["path"], content), [])
+        if not candidates:
+            dropped.append({key: comment[key] for key in ("path", "line", "side")})
+        else:
+            kept.append({**comment, "line": min(candidates)})
+    verdict["comments"][:] = kept
+    if not kept:
+        verdict["action"] = "reviewed_clean" if behavior == "pr_review" else "approve"
+    return dropped
 
 
 def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
@@ -352,7 +385,10 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 verdict = validate_verdict(json.dumps(
                     {"action": "request_changes" if prior else terminal, "comments": prior}), behavior)
                 raw = json.dumps(verdict)
-            _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
+            dropped = _validate_since_positions(pwd, pr, actor_name, head, packet, verdict, behavior)
+            if dropped:
+                raw += ("\nSince-diff findings outside the pull request diff "
+                        f"dropped before submission: {json.dumps(dropped)}")
     except review_stages.StageError as error:
         cause = bounded_cause(str(error) or "invalid review packet stages")
         diagnostic = diagnostic_envelope(operation="provider.review", phase="staging",

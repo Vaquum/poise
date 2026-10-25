@@ -400,14 +400,19 @@ class TestApproveSinceHead(TestCase):
 
 
 class TestSincePositions(TestCase):
-    def _packet(self, since):
-        node = json.loads(staged_packet(["src/gone.py"]))
+    REMOVAL = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                         "@@ -10,3 +10,2 @@", " context", "-removed", " context2"])
+
+    def _packet(self, since, diff=None, paths=("src/gone.py",)):
+        node = json.loads(staged_packet(list(paths)))
         node["p"] = 2
         node["since_head_sha"] = since
+        if diff is not None:
+            node["diff"] = diff
         return json.dumps(node)
 
-    def _full(self, diff):
-        node = json.loads(staged_packet(["src/gone.py"]))
+    def _full(self, diff, paths=("src/gone.py",)):
+        node = json.loads(staged_packet(list(paths)))
         node["diff"] = diff
         return json.dumps(node)
 
@@ -432,31 +437,82 @@ class TestSincePositions(TestCase):
         return result, calls, fetch
 
     def test_removal_finding_inside_the_pr_diff_submits(self):
-        diff = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
-                          "@@ -10,3 +10,3 @@", " context", "-removed", " context2"])
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
-        result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(diff))
+        result, calls, fetch = self._run(self._packet("c" * 40, self.REMOVAL), verdict,
+                                         self._full(self.REMOVAL))
         self.assertIn('"review_id": 91', result)
         fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
                                       "a" * 40, "p2", since_head=None)
         self.assertEqual(calls[-1][0][1], "--request-changes")
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
-    def test_removal_finding_outside_the_pr_diff_is_a_contract_violation(self):
-        diff = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
-                          "@@ -10,3 +10,3 @@", " context", "-removed", " context2"])
+    def test_removal_finding_outside_the_reviewed_since_diff_is_a_contract_violation(self):
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 99, "side": "LEFT", "body": "stale"}]}
         with self.assertRaises(atoms.AgentPreflightError) as failure:
-            self._run(self._packet("c" * 40), verdict, self._full(diff))
+            self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(self.REMOVAL))
         self.assertEqual(failure.exception.code, "review_contract_violation")
 
-    def test_right_only_since_verdict_fetches_no_full_packet(self):
+    def test_left_finding_remaps_onto_shifted_pr_coordinates(self):
+        shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                             "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
         verdict = {"action": "request_changes",
-                   "comments": [{"path": "src/gone.py", "line": 1, "side": "RIGHT", "body": "defect"}]}
-        result, _, fetch = self._run(self._packet("c" * 40), verdict, "unused")
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        result, calls, _ = self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(shifted))
         self.assertIn('"review_id": 91', result)
-        fetch.assert_not_called()
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(5, "LEFT")])
+
+    def test_left_finding_absent_from_the_pr_diff_is_dropped(self):
+        other = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                           "@@ -4,3 +4,3 @@", " context", "-other", "+replacement", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        result, calls, fetch = self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(other))
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_called_once()
+        self.assertEqual(calls[-1][0][1], "--approve-pr")
+        self.assertIn("dropped before submission", result)
+
+    def test_right_finding_inside_the_pr_diff_submits(self):
+        full = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                          "@@ -1,1 +1,2 @@", " old", "+new"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 2, "side": "RIGHT", "body": "defect"}]}
+        result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(full))
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
+                                      "a" * 40, "p2", since_head=None)
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_right_finding_on_a_reverted_file_is_dropped_and_flips_clean(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "revert issue"}]}
+        result, calls, fetch = self._run(self._packet("c" * 40, self.REMOVAL), verdict,
+                                         self._full(kept, paths=("src/kept.py",)))
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_called_once()
+        self.assertEqual(calls[-1][0][1], "--approve-pr")
+        self.assertIn("dropped before submission", result)
+
+    def test_partially_stale_verdict_submits_only_submittable_findings(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes", "comments": [
+            {"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "kept"},
+            {"path": "src/kept.py", "line": 99, "side": "RIGHT", "body": "stale"}]}
+        result, calls, _ = self._run(self._packet("c" * 40, self.REMOVAL), verdict,
+                                     self._full(self.REMOVAL + "\n" + kept,
+                                              paths=("src/gone.py", "src/kept.py")))
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+        self.assertEqual(json.loads(calls[-1][0][4]), [verdict["comments"][0]])
+        self.assertIn("dropped before submission", result)
 
     def test_full_review_left_findings_keep_todays_behavior(self):
         verdict = {"action": "request_changes",

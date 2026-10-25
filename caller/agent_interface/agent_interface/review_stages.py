@@ -20,6 +20,33 @@ class StageError(ValueError):
     """The packet cannot be staged without dropping reviewed code."""
 
 
+_SIMPLE_ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+                   "t": "\t", "v": "\v", "\\": "\\", '"': '"'}
+
+
+def _unquote(path: str) -> str:
+    """Undo git's C-style path quoting (core.quotePath) for diff matching."""
+    if len(path) < 2 or not path.startswith('"') or not path.endswith('"'):
+        return path
+    out = bytearray()
+    body, i = path[1:-1], 0
+    while i < len(body):
+        char = body[i]
+        if char != "\\" or i + 1 >= len(body):
+            out += char.encode("utf-8", "surrogateescape")
+            i += 1
+        elif body[i + 1] in _SIMPLE_ESCAPES:
+            out += _SIMPLE_ESCAPES[body[i + 1]].encode("utf-8")
+            i += 2
+        elif body[i + 1] in "01234567":
+            out.append(int(body[i + 1:i + 4], 8))
+            i += 4
+        else:
+            out += body[i + 1].encode("utf-8", "surrogateescape")
+            i += 2
+    return bytes(out).decode("utf-8", "surrogateescape")
+
+
 def split(packet: str) -> list[str]:
     """One packet per file group, or the untouched packet when it fits."""
     try:
@@ -73,21 +100,29 @@ def _covers(section: list[str], retained: list[str]) -> set[str]:
     for line in section:
         # Git terminates a space-containing ---/+++ path with a tab; strip
         # that terminator (not path content) before matching retained files.
-        if line.startswith("rename from ") and line.removeprefix("rename from ").removesuffix("\t") in retained:
-            paths.add(line.removeprefix("rename from ").removesuffix("\t"))
+        if line.startswith("rename from "):
+            old = line.removeprefix("rename from ").removesuffix("\t")
+            if old not in retained:
+                old = _unquote(old)
+            if old in retained:
+                paths.add(old)
     return paths
 
 
 def _primary(section: list[str], retained: list[str]) -> str:
     for line in section:
         if line.startswith("+++ "):
-            path = line.removeprefix("+++ ").removesuffix("\t")
-            if path == "/dev/null":
+            raw = line.removeprefix("+++ ").removesuffix("\t")
+            if raw == "/dev/null":
                 old = next((item for item in section if item.startswith("--- ")), "")
-                old = old.removesuffix("\t")
-                path = old.removeprefix("--- a/") if old.startswith("--- a/") else old
+                old = old.removeprefix("--- ").removesuffix("\t")
+                path = old.removeprefix("a/")
+                if path not in retained:
+                    path = _unquote(old).removeprefix("a/")
             else:
-                path = path.removeprefix("b/")
+                path = raw.removeprefix("b/")
+                if path not in retained:
+                    path = _unquote(raw).removeprefix("b/")
             if path not in retained:
                 raise StageError(f"diff section for {path!r} names no retained file")
             return path
@@ -99,6 +134,16 @@ def _primary(section: list[str], retained: list[str]) -> str:
     for cut in [match.start() for match in re.finditer(" b/", rest)]:
         if rest[cut + 3:] in retained:
             found = rest[cut + 3:]
+    if found is None:
+        # C-quoted header ("a/old" "b/new"): the b/ split sits inside
+        # quotes, so split on the quote-space-quote pair boundaries instead.
+        start = 0
+        while (boundary := rest.find('" "', start)) != -1:
+            candidate = _unquote(rest[boundary + 2:]).removeprefix("b/")
+            if candidate in retained:
+                found = candidate
+                break
+            start = boundary + 1
     if found is None:
         raise StageError(f"diff section without a retained file: {section[0][:80]!r}")
     return found
@@ -117,32 +162,52 @@ def _pack(sections: list[tuple[list[str], set[str]]]) -> list[list[tuple[list[st
     return groups
 
 
+def _hunk_lines(section: list[str]):
+    """Yield (kind, old, new, content) for diff lines inside hunks."""
+    old, new, in_hunk = 0, 0, False
+    for line in section:
+        if line.startswith("@@ "):
+            match = _HUNK.match(line)
+            if match is None:
+                raise StageError(f"unparseable diff hunk header: {line[:60]!r}")
+            old, new, in_hunk = int(match.group(1)), int(match.group(2)), True
+        elif in_hunk and line.startswith(" "):
+            yield "context", old, new, line[1:]
+            old += 1
+            new += 1
+        elif in_hunk and line.startswith("-"):
+            yield "removed", old, new, line[1:]
+            old += 1
+        elif in_hunk and line.startswith("+"):
+            yield "added", old, new, line[1:]
+            new += 1
+
+
 def diff_line_sets(diff: str, retained: list[str]) -> dict[str, dict[str, set[int]]]:
     """Per-file hunk line numbers by side, for validating comment positions
     against the pull request diff GitHub will judge them on."""
     sets: dict[str, dict[str, set[int]]] = {}
     for section in _sections(diff):
         lines = sets.setdefault(_primary(section, retained), {"left": set(), "right": set()})
-        old, new, in_hunk = 0, 0, False
-        for line in section:
-            if line.startswith("@@ "):
-                match = _HUNK.match(line)
-                if match is None:
-                    raise StageError(f"unparseable diff hunk header: {line[:60]!r}")
-                old, new, in_hunk = int(match.group(1)), int(match.group(2)), True
-            elif in_hunk and line.startswith(" "):
-                # Context lines accept comments on either side, as they do at GitHub.
+        for kind, old, new, _content in _hunk_lines(section):
+            # Context lines accept comments on either side, as they do at GitHub.
+            if kind in ("context", "removed"):
                 lines["left"].add(old)
+            if kind in ("context", "added"):
                 lines["right"].add(new)
-                old += 1
-                new += 1
-            elif in_hunk and line.startswith("-"):
-                lines["left"].add(old)
-                old += 1
-            elif in_hunk and line.startswith("+"):
-                lines["right"].add(new)
-                new += 1
     return sets
+
+
+def diff_left_contents(diff: str, retained: list[str]) -> dict[str, dict[int, str]]:
+    """Per-file LEFT-side hunk line contents, for remapping since-diff
+    positions (previous-head coordinates) onto the pull request diff."""
+    contents: dict[str, dict[int, str]] = {}
+    for section in _sections(diff):
+        lines = contents.setdefault(_primary(section, retained), {})
+        for kind, old, _new, content in _hunk_lines(section):
+            if kind in ("context", "removed"):
+                lines[old] = content
+    return contents
 
 
 def _render(node: dict, total: int, index: int, sections: list[str], entries: list[dict]) -> str:
