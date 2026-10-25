@@ -429,6 +429,23 @@ describe('durable login evidence joined to Accounts', () => {
     expect((await listAccounts('claude'))[0]).toMatchObject({ signedIn: false, detail: expect.stringContaining('not to a Claude subscription') })
     expect((await listAccounts('claude'))[0]).not.toHaveProperty('signInRecordedAt')
   })
+
+  it('remembers a positively observed Claude/Codex sign-in, including one made outside Poise', async () => {
+    await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeSubscription), codex: script('codex', STATUS.codexChatGpt) })
+    expect(accountLogins()).toEqual({})
+    await listAccounts()
+    const observed = accountLogins()
+    expect(observed.claude).toEqual(expect.any(String))
+    expect(observed.codex).toEqual(expect.any(String))
+    await listAccounts()
+    expect(accountLogins()).toEqual(observed)
+  })
+
+  it('records nothing for a signed-out, unknown or unreported sign-in', async () => {
+    await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeSignedOut), codex: script('codex', STATUS.codexSignedOut), grok: script('grok') })
+    await listAccounts()
+    expect(accountLogins()).toEqual({})
+  })
 })
 
 

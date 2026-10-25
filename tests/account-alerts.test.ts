@@ -22,7 +22,11 @@ beforeAll(async () => {
 
 beforeEach(() => {
   database.db.prepare('DELETE FROM alerts').run()
+  database.setMeta('account_logins', '{}')
 })
+
+const AT = '2026-10-20T06:00:00.000Z'
+const configured = (logins: Record<string, string>) => database.setMeta('account_logins', JSON.stringify(logins))
 
 afterAll(async () => {
   database.closeDatabase()
@@ -46,7 +50,8 @@ const held = (login: string, signedIn = true): GhAccount => ({ login, active: fa
 const nobody = { me: '', agentAccount: '' }
 
 describe('sign-in alerts from Connected accounts', () => {
-  it('alert once for a CLI that says it is not signed in, until it says it is', () => {
+  it('alert once for a configured CLI that says it is not signed in, until it says it is', () => {
+    configured({ codex: AT })
     producers.accountsChecked([cli('codex', false)], nobody)
     expect(rows()).toEqual([{
       kind: 'sign_in_needed', key: 'sign-in:codex', resolved: null, url: '/?settings=accounts',
@@ -62,7 +67,20 @@ describe('sign-in alerts from Connected accounts', () => {
     expect(open()).toEqual(['sign-in:codex'])
   })
 
+  it('raise no sign-in demand for an installed CLI that was never configured', () => {
+    producers.accountsChecked([cli('codex', false)], nobody)
+    expect(rows()).toEqual([])
+    // A demand raised while it was configured clears once it is withdrawn.
+    configured({ codex: AT })
+    producers.accountsChecked([cli('codex', false)], nobody)
+    expect(open()).toEqual(['sign-in:codex'])
+    configured({})
+    producers.accountsChecked([cli('codex', false)], nobody)
+    expect(open()).toEqual([])
+  })
+
   it('change nothing while a CLI cannot say, is not installed, or is Claude, which its monitor alerts for', () => {
+    configured({ codex: AT })
     producers.accountsChecked([cli('codex', false)], nobody)
     for (const accounts of [
       [cli('codex', null)],

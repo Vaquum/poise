@@ -19,6 +19,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   database.db.prepare('DELETE FROM alerts').run()
+  database.setMeta('account_logins', '{}')
 })
 
 afterAll(async () => {
@@ -143,7 +144,8 @@ describe('the alerts store', () => {
 })
 
 describe('the alert producers', () => {
-  it('alerts when Claude needs a new sign-in, until it is signed in again', () => {
+  it('alerts when a configured Claude needs a new sign-in, until it is signed in again', () => {
+    database.setMeta('account_logins', JSON.stringify({ claude: '2026-10-20T06:00:00.000Z' }))
     producers.claudeAuthStatusChanged('reauth_required')
     expect(rows()).toEqual([{
       kind: 'sign_in_needed', key: 'sign-in:claude', resolved: null, url: '/',
@@ -162,6 +164,15 @@ describe('the alert producers', () => {
       vi.stubEnv('POISE_MODE', undefined)
     }
     expect(unresolved()).toEqual([expect.objectContaining({ body: 'Claude-backed work is paused. Connect Claude in Settings → Accounts.' })])
+  })
+
+  it('raises no sign-in demand for a Claude that was never configured, and remembers a verified one', () => {
+    producers.claudeAuthStatusChanged('reauth_required')
+    expect(rows()).toEqual([])
+    producers.claudeAuthStatusChanged('authenticated')
+    expect(database.getMeta('account_logins')).toContain('"claude"')
+    producers.claudeAuthStatusChanged('reauth_required')
+    expect(unresolved()).toEqual([expect.objectContaining({ key: 'sign-in:claude' })])
   })
 
   it('alerts once per held behavior target until its incident has cleared', () => {

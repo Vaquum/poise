@@ -6,13 +6,15 @@ vi.mock('../server/process', () => ({
 }))
 vi.mock('../server/logging', () => ({ diagnostic: mocks.diagnostic }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/caller', catalogReportPath: () => '/poise/report.json', invalidateCatalog: mocks.invalidate }))
+vi.mock('../server/accounts/participation', () => ({ providerEvidence: async () => ({ logins: {}, live: { claude: null, codex: null } }) }))
 import { refreshModelCatalog } from '../server/models-refresh'
 beforeEach(() => { mocks.diagnostic.mockReset(); mocks.run.mockReset(); mocks.invalidate.mockClear() })
 it('coalesces manual checks and invalidates the catalogue only after settlement', async () => {
   let finish!: (result: { stdout: string }) => void
   mocks.run.mockImplementation(() => new Promise(resolve => { finish = resolve }))
   const first = refreshModelCatalog(), second = refreshModelCatalog()
-  expect(first).toBe(second); expect(mocks.run).toHaveBeenCalledTimes(1)
+  expect(first).toBe(second)
+  await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledTimes(1))
   expect(mocks.invalidate).not.toHaveBeenCalled()
   finish({ stdout: JSON.stringify({ families: { claude: { status: 'ok' } } }) })
   await first; expect(mocks.invalidate).toHaveBeenCalledTimes(1)
@@ -37,6 +39,7 @@ it('starts no check while a drain pauses background work, but keeps one already 
   background.pauseReleaseBackground()
   try {
     expect(refreshModelCatalog()).toBe(running)
+    await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledTimes(1))
     finish({ stdout: JSON.stringify({ families: { claude: { status: 'ok' } } }) })
     await running
     await expect(refreshModelCatalog()).rejects.toMatchObject({ statusCode: 503, message: 'Poise is installing an update; the model check has not started.' })
@@ -53,4 +56,11 @@ it('retains updater failure evidence even when discovery succeeds with the exist
   await expect(refreshModelCatalog()).resolves.toEqual(report)
   expect(mocks.diagnostic).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ operation: 'provider.cli_update', component: 'claude', level: 'warning',
     stderr: 'precise updater cause', exitCode: 9, context: expect.objectContaining({ configuredExecutable: 'claude', resolvedExecutable: '/fixture/claude', elapsedMs: 51 }) }))
+})
+it('stays silent for skipped providers while a participating failure still warns', async () => {
+  const report = { families: { claude: { status: 'ok' }, grok: { status: 'skipped', reason: 'never_configured' }, codex: { status: 'unavailable', error: 'signed out' } },
+    cli_updates: { grok: { status: 'skipped', reason: 'never_configured' }, muse: { status: 'skipped', reason: 'never_configured' } }, eligible: ['claude', 'codex'] }
+  mocks.run.mockResolvedValueOnce({ stdout: JSON.stringify(report) })
+  await expect(refreshModelCatalog()).resolves.toEqual(report)
+  expect(mocks.diagnostic).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ operation: 'models.discovery', component: 'codex', level: 'warning' }))
 })
