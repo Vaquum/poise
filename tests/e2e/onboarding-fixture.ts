@@ -14,7 +14,7 @@ export interface SetupState {
   me: string
   agentAccount: string
   timezone: string
-  models: Record<string, Record<string, string>>
+  models: { slots?: Record<string, string>, places?: Record<string, { slot: string }> }
   organizations: Organization[]
   devices: PairedDevice[]
   /** The accounts gh holds a working sign-in for. */
@@ -47,9 +47,11 @@ const CATALOG = {
   path: '/models.toml',
 }
 
+const SLOTS = { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-high', tertiary: 'grok-5-heavy' }
+
 const PLACES = [
-  { key: 'chat', label: 'Chat', why: 'New chats in Chat and chats started from Current cards.', review: false, reviewers: false, providers: null, default: 'gpt-6-astra-ultra', fallback: 'opus-5-high', notes: [], stored: null },
-  { key: 'pr_review', label: 'PR review', why: 'Automatic and manual reviews, including replays.', review: true, reviewers: true, providers: ['claude', 'codex', 'grok', 'muse'], default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'muse-2-deep', tertiary: 'grok-5-heavy', notes: [], stored: null },
+  { key: 'chat', label: 'Chat', why: 'New chats in Chat and chats started from Current cards.', review: false, reviewers: false, providers: null, slot: 'primary', model: 'gpt-6-astra-ultra', notes: [], stored: null },
+  { key: 'pr_review', label: 'PR review', why: 'Automatic and manual reviews, including replays.', review: true, reviewers: true, providers: ['claude', 'codex', 'grok', 'muse'], slot: 'primary', model: 'gpt-6-astra-ultra', notes: [], stored: null },
 ]
 
 export async function setupWorkspace(page: Page, initial: Partial<SetupState> = {}): Promise<SetupState> {
@@ -110,7 +112,7 @@ export async function setupWorkspace(page: Page, initial: Partial<SetupState> = 
         const recorded = { ...account, signInRecordedAt: state.logins[account.id] }
         return hasRecordedSignIn(recorded) ? recorded : account
       }) } })
-      case '/api/models': return route.fulfill({ json: { catalog: CATALOG, places: PLACES, fixed: [], refresh: null } })
+      case '/api/models': return route.fulfill({ json: { catalog: CATALOG, slots: SLOTS, places: PLACES, fixed: [], refresh: null } })
       case '/api/claude-auth': return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
       case '/api/current': return route.fulfill({ json: { cards: [] } })
       case '/_poise/api/account':

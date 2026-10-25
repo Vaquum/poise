@@ -2,9 +2,9 @@
 // Loaded once at startup from /api/settings, refreshed whenever the user saves
 // in the Settings panel.
 
-export interface ModelChoice {
-  default: string
-  fallback: string
+export interface ModelSettings {
+  slots?: { primary?: string, secondary?: string, tertiary?: string }
+  places?: Partial<Record<string, { slot: string }>>
 }
 
 export interface Organization {
@@ -24,9 +24,9 @@ export interface AppSettings {
   // The GitHub user reviews and comments are posted as.
   agentAccount?: string
   timezone: string
-  // Per place that launches a model (chat, editor, pr_review, pr_approve):
-  // the identities picked as default and fallback. Absent = Caller default.
-  models?: Partial<Record<string, ModelChoice>>
+  // The three slot models chosen once, and the slot each place that launches
+  // a model runs. Absent = Caller default.
+  models?: ModelSettings
   // Chat view: the prefix for branches new sessions cut, how long an idle
   // session keeps its agent process alive, how many Poise-local turns may
   // run concurrently, and how long running turns may hold up a Poise update.

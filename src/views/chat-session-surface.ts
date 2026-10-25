@@ -143,7 +143,7 @@ function persistEditState(state: EditState): void {
 }
 
 interface ModelPlaceAnswer {
-  places: Array<{ key: string, default?: string }>
+  places: Array<{ key: string, model?: string }>
   catalog: { models: Array<{ identity: string, provider: string }> }
 }
 
@@ -405,7 +405,7 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
   async function placeDefault(): Promise<{ agent: AgentId, model: string }> {
     const answer = await (await fetch('/api/models', { cache: 'no-store' })).json() as ModelPlaceAnswer
     const place = subject.surface === 'current' ? 'chat' : 'editor'
-    const identity = answer.places.find((row) => row.key === place)?.default
+    const identity = answer.places.find((row) => row.key === place)?.model
     if (!identity) throw new Error(`${place === 'chat' ? 'Chat' : 'Editor chat'} has no default model. Choose one in the console.`)
     const provider = answer.catalog.models.find((row) => row.identity === identity)?.provider
     return { agent: (provider || 'grok') as AgentId, model: identity }

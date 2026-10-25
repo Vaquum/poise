@@ -69,17 +69,18 @@ test('walks a new workspace through setup in order, saving each step where Setti
   // 7. Models: only signed-in providers can be chosen; the rest are dimmed.
   await expect(page.locator('.ob-title')).toHaveText('Choose your models')
   await expect(page.locator('.ob-chip-on')).toHaveText(['Claude', 'Grok'])
-  const chatDefault = page.locator('.ob-place[data-place="chat"] select[data-slot="default"]')
-  // The proposed default's provider (Codex) is not signed in, so a signed-in model replaces it.
-  await expect(chatDefault).toHaveValue('opus-5-max')
-  expect(await chatDefault.locator('option[value="gpt-6-astra-ultra"]').evaluate((option) => (option as HTMLOptionElement).disabled)).toBe(true)
-  await expect(chatDefault.locator('optgroup[label="Not signed in"] option')).toHaveCount(2)
-  await expect(page.locator('.ob-place[data-place="pr_review"] select')).toHaveCount(4)
+  const primary = page.locator('[data-slots] select[data-slot="primary"]')
+  // The proposed primary's provider (Codex) is not signed in, so a signed-in model replaces it.
+  await expect(primary).toHaveValue('opus-5-max')
+  expect(await primary.locator('option[value="gpt-6-astra-ultra"]').evaluate((option) => (option as HTMLOptionElement).disabled)).toBe(true)
+  await expect(primary.locator('optgroup[label="Not signed in"] option')).toHaveCount(2)
+  await expect(page.locator('[data-slots] select')).toHaveCount(3)
+  await expect(page.locator('.ob-place[data-place="pr_review"] select')).toHaveCount(1)
   await next(page).click()
   await expect(page.locator('.ob-title')).toHaveText('Connect this computer')
   expect(state.models).toEqual({
-    chat: { default: 'opus-5-max', fallback: 'opus-5-high' },
-    pr_review: { default: 'opus-5-max', fallback: 'opus-5-high', secondary: 'grok-5-heavy', tertiary: 'gpt-6-astra-ultra' },
+    slots: { primary: 'opus-5-max', secondary: 'opus-5-high', tertiary: 'grok-5-heavy' },
+    places: { chat: { slot: 'primary' }, pr_review: { slot: 'primary' } },
   })
 
   // 8. This computer, through the gateway's pairing.

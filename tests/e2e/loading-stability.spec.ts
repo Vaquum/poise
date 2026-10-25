@@ -89,7 +89,7 @@ test('Settings isolates slow Models and account probes while retaining fast acco
   await page.route('**/api/models', async route => {
     models++
     await modelRead.promise
-    await route.fulfill({ json: { catalog: { models: [], review_providers: [] }, places: [], fixed: [], presets: [], refresh: null } })
+    await route.fulfill({ json: { catalog: { models: [], review_providers: [] }, slots: { primary: '', secondary: '', tertiary: '', notes: [], stored: null }, places: [], fixed: [], presets: [], refresh: null } })
   })
   await page.route('**/api/accounts**', async route => {
     accountReads++

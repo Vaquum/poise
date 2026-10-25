@@ -724,9 +724,9 @@ export function isValidSetting(v: unknown): v is BehaviorSetting {
   return typeof v === 'string' && (VALID_SETTINGS as string[]).includes(v)
 }
 
-// How many of a review place's reviewers (default, secondary, tertiary)
-// review each new pull request or issue — at the same time, each as its own
-// launch. One by default; a wider panel is a deliberate choice in Behaviors.
+// How many of the slots from a review place's slot on review each new pull
+// request or issue — at the same time, each as its own launch. One by
+// default; a wider panel is a deliberate choice in Behaviors.
 export type ReviewerCount = 1 | 2 | 3
 const DEFAULT_REVIEWERS: ReviewerCount = 1
 export type PanelBehavior = 'review-new-prs' | 'review-new-issues'

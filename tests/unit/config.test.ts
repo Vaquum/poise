@@ -68,7 +68,7 @@ describe('settings cache', () => {
 
   it('does not overwrite a saved model with an older in-flight refresh', async () => {
     const previous = { org: 'acme', me: 'octocat', timezone: 'UTC', models: {} }
-    const saved = { ...previous, models: { chat: { default: 'grok-4.6-xhigh', fallback: 'opus-5-max' } } }
+    const saved = { ...previous, models: { slots: { primary: 'grok-4.6-xhigh' }, places: { chat: { slot: 'primary' } } } }
     let resolve!: (value: Response) => void
     vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((done) => { resolve = done })))
     const loading = config.loadSettings()

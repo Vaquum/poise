@@ -116,31 +116,43 @@ describe('the models expectation', () => {
   it('adopts the still-empty read for a draft made with nothing stored', () => {
     expect(modelsExpect(new Set(['chat']), new Map([['chat', null]]), {}))
       .toEqual({})
-    expect(modelsExpect(new Set(['chat']), new Map([['chat', null]]), { pr_review: { default: 'a' } }))
-      .toEqual({ pr_review: { default: 'a' } })
+    expect(modelsExpect(new Set(['chat']), new Map([['chat', null]]), { places: { pr_review: { slot: 'primary' } } }))
+      .toEqual({ places: { pr_review: { slot: 'primary' } } })
+    expect(modelsExpect(new Set(['slots']), new Map([['slots', null]]), {}))
+      .toEqual({})
   })
 
-  it('forces a refusal when the place gained a stored choice under the draft', () => {
-    expect(modelsExpect(new Set(['chat']), new Map([['chat', null]]), { chat: { default: 'n' } }))
-      .toEqual({ chat: null })
+  it('forces a refusal when the leaf gained a stored choice under the draft', () => {
+    expect(modelsExpect(new Set(['chat']), new Map([['chat', null]]), { places: { chat: { slot: 'secondary' } } }))
+      .toEqual({ places: { chat: null } })
+    expect(modelsExpect(new Set(['slots']), new Map([['slots', null]]), { slots: { primary: 'n' } }))
+      .toEqual({ slots: null })
   })
 
   it('keeps the read basis for a draft made with a stored choice', () => {
-    expect(modelsExpect(new Set(['chat']), new Map([['chat', { default: 's' }]]), { chat: { default: 'n' } }))
-      .toEqual({ chat: { default: 's' } })
+    expect(modelsExpect(new Set(['chat']), new Map([['chat', { slot: 'primary' }]]), { places: { chat: { slot: 'secondary' } } }))
+      .toEqual({ places: { chat: { slot: 'primary' } } })
+    expect(modelsExpect(new Set(['slots']), new Map([['slots', { primary: 's' }]]), { slots: { primary: 'n' } }))
+      .toEqual({ slots: { primary: 's' } })
+  })
+
+  it('keeps fresh values for clean leaves across both halves', () => {
+    expect(modelsExpect(new Set(['chat']), new Map([['chat', { slot: 'primary' }]]),
+      { slots: { primary: 'n' }, places: { chat: { slot: 'secondary' }, pr_review: { slot: 'tertiary' } } }))
+      .toEqual({ slots: { primary: 'n' }, places: { chat: { slot: 'primary' }, pr_review: { slot: 'tertiary' } } })
   })
 })
 
 describe('model choice validation', () => {
-  it('names the place whose reviewers collide', () => {
-    expect(validateModelChoices({ pr_review: { default: 'a', fallback: 'a' } })).toBe('pr_review: the fallback must differ from the default.')
-    expect(validateModelChoices({ pr_review: { default: 'a', fallback: 'b', secondary: 'a' } })).toBe('pr_review: the secondary reviewer must differ from the default.')
-    expect(validateModelChoices({ pr_review: { default: 'a', fallback: 'b', secondary: 'c', tertiary: 'c' } })).toBe('pr_review: the tertiary reviewer must differ from the default and the secondary.')
+  it('names the slots that run the same model', () => {
+    expect(validateModelChoices({ slots: { primary: 'a', tertiary: 'a' } })).toBe('Model slots primary and tertiary must be different models.')
+    expect(validateModelChoices({ slots: { primary: 'a', secondary: 'a', tertiary: 'b' } })).toBe('Model slots primary and secondary must be different models.')
   })
 
-  it('accepts distinct choices, including a secondary that matches the fallback', () => {
-    expect(validateModelChoices({ chat: { default: 'a', fallback: 'b' } })).toBeNull()
-    expect(validateModelChoices({ pr_review: { default: 'a', fallback: 'b', secondary: 'b', tertiary: 'c' } })).toBeNull()
+  it('accepts distinct slot models, a partial draft, and place slots unchecked', () => {
+    expect(validateModelChoices({ slots: { primary: 'a', secondary: 'b', tertiary: 'c' } })).toBeNull()
+    expect(validateModelChoices({ slots: { secondary: 'b' } })).toBeNull()
+    expect(validateModelChoices({ places: { chat: { slot: 'tertiary' } } })).toBeNull()
     expect(validateModelChoices({})).toBeNull()
   })
 })
@@ -150,13 +162,15 @@ describe('the refused save', () => {
     const baselines = new Map<string, unknown>([
       ['timezone', 'UTC'],
       ['chat', { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }],
-      ['models', { chat: { default: 'a', fallback: 'b' } }],
+      ['models', { slots: { primary: 'a' }, places: { chat: { slot: 'primary' } } }],
     ])
     expect(conflictLeaves({ timezone: 'Europe/Berlin' }, baselines)).toEqual([{ field: 'timezone', leaf: null, current: 'Europe/Berlin' }])
     expect(conflictLeaves({ chat: { branchPrefix: 'agent/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 } }, baselines))
       .toEqual([{ field: 'chat', leaf: 'branchPrefix', current: 'agent/' }])
-    expect(conflictLeaves({ models: { chat: { default: 'c', fallback: 'b' } } }, baselines))
-      .toEqual([{ field: 'models', leaf: 'chat', current: { default: 'c', fallback: 'b' } }])
+    expect(conflictLeaves({ models: { slots: { primary: 'a' }, places: { chat: { slot: 'secondary' } } } }, baselines))
+      .toEqual([{ field: 'models', leaf: 'chat', current: { slot: 'secondary' } }])
+    expect(conflictLeaves({ models: { slots: { primary: 'b' }, places: { chat: { slot: 'primary' } } } }, baselines))
+      .toEqual([{ field: 'models', leaf: 'slots', current: { primary: 'b' } }])
   })
 
   it('names the field when shapes differ without a moved leaf', () => {
@@ -170,8 +184,9 @@ describe('the refused save', () => {
       .toBe('Time zone is now "Europe/Berlin". Your edits are kept — Save again to overwrite, or Read again for the saved values.')
     expect(conflictMessage([
       { field: 'chat', leaf: 'idleTimeoutMinutes', current: 0 },
-      { field: 'models', leaf: 'chat', current: { default: 'c', fallback: 'b' } },
-    ])).toBe('Idle timeout is now 0; Models "chat" is now default "c", fallback "b". Your edits are kept — Save again to overwrite, or Read again for the saved values.')
+      { field: 'models', leaf: 'chat', current: { slot: 'secondary' } },
+      { field: 'models', leaf: 'slots', current: { primary: 'a', secondary: 'b' } },
+    ])).toBe('Idle timeout is now 0; Models "chat" is now slot "secondary"; Models "slots" is now primary "a", secondary "b". Your edits are kept — Save again to overwrite, or Read again for the saved values.')
     expect(conflictMessage([])).toBe('Settings changed on the server. Your edits are kept — Save again to overwrite, or Read again for the saved values.')
   })
 

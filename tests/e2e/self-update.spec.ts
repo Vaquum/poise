@@ -87,7 +87,7 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     if (/^\/api\/editor\/doc\/[^/]+\/reviews(?:\/sync)?$/.test(path)) { await route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } }); return }
     if (state.editor && path.startsWith('/api/editor/')) { await state.editor(path, method, route); return }
     if (path === '/api/settings') { await route.fulfill({ json: { org: 'acme', me: 'octocat', timezone: 'UTC', models: {}, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 } } }); return }
-    if (path === '/api/models') { await route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } }); return }
+    if (path === '/api/models') { await route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, slots: { primary: '', secondary: '', tertiary: '', notes: [], stored: null }, places: [], fixed: [], refresh: null } }); return }
     if (path === '/api/claude-auth') { await route.fulfill({ json: { status: 'authenticated', reason: null, checkedAt: NOW, verifiedAt: NOW, authMethod: 'claude.ai', subscriptionType: 'max', loginInProgress: false } }); return }
     if (path === '/api/repos') { await route.fulfill({ json: { repos: [] } }); return }
     if (path === '/api/chat/agents') { await route.fulfill({ json: AGENTS }); return }

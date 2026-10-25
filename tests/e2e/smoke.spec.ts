@@ -71,29 +71,30 @@ async function installApiRoutes(
   })
 }
 
-type ModelChoice = { default: string, fallback: string, secondary?: string, tertiary?: string }
+type ModelSettings = { slots?: Record<string, string>, places?: Record<string, { slot: string }> }
 
 // What /api/models answers for the catalog fixture and the given choices:
-// every place resolved to its stored choice or the Caller default, and the
-// PR review place with its secondary and tertiary reviewer.
-function modelsResponse(models: Record<string, ModelChoice>) {
+// the three slot models resolved once, and every place on its slot.
+function modelsResponse(models: ModelSettings) {
+  const slots = {
+    primary: models.slots?.primary || 'opus-5-xhigh',
+    secondary: models.slots?.secondary || 'gpt-6-astra-ultra',
+    tertiary: models.slots?.tertiary || 'grok-4.6-xhigh',
+    notes: [],
+    stored: models.slots || null,
+  }
   const places = [
     { key: 'chat', label: 'Chat', why: 'Card chats.', review: false, reviewers: false, seed: 'author_content' },
     { key: 'editor', label: 'Editor chat', why: 'Editor chats.', review: false, reviewers: false, seed: 'author_content' },
     { key: 'pr_review', label: 'PR review', why: 'Reviews.', review: true, reviewers: true, seed: 'pr_review' },
     { key: 'pr_approve', label: 'PR approval', why: 'Approvals.', review: true, reviewers: false, seed: 'pr_approve' },
-  ].map((place) => ({
-    ...place,
-    default: models[place.key]?.default || CATALOG.behaviors[place.seed as keyof typeof CATALOG.behaviors],
-    fallback: models[place.key]?.fallback || CATALOG.behaviors.review_recovery,
-    ...(place.reviewers
-      ? { secondary: models[place.key]?.secondary || 'gpt-6-astra-ultra', tertiary: models[place.key]?.tertiary || 'grok-4.6-xhigh' }
-      : {}),
-    notes: [],
-    stored: models[place.key] || null,
-  }))
+  ].map((place) => {
+    const slot = models.places?.[place.key]?.slot || 'primary'
+    const model = slot === 'secondary' ? slots.secondary : slot === 'tertiary' ? slots.tertiary : slots.primary
+    return { ...place, slot, model, notes: [], stored: models.places?.[place.key] || null }
+  })
   const fixed = [{ key: 'content', label: '/content', model: CATALOG.behaviors.author_content, why: 'Set by Caller.' }]
-  return { catalog: CATALOG, places, fixed, refresh: null }
+  return { catalog: CATALOG, slots, places, fixed, refresh: null }
 }
 
 test.beforeEach(async ({ page }) => {
@@ -207,8 +208,8 @@ test('keeps the empty dashboard layout visually stable', async ({ page }) => {
   })
 })
 
-test('saves a review model choice and restores it after reload', async ({ page }) => {
-  let settings: { org: string, me: string, timezone: string, models: Record<string, ModelChoice> } = { org: 'acme', me: 'octocat', timezone: 'UTC', models: {} }
+test('saves the slot models and a place slot, and restores them after reload', async ({ page }) => {
+  let settings: { org: string, me: string, timezone: string, models: ModelSettings } = { org: 'acme', me: 'octocat', timezone: 'UTC', models: {} }
   await page.route('**/api/settings', async (route) => {
     if (route.request().method() === 'POST') settings = { ...settings, ...route.request().postDataJSON() }
     await route.fulfill({ json: settings })
@@ -219,32 +220,32 @@ test('saves a review model choice and restores it after reload', async ({ page }
   await page.goto('/')
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
   await page.locator('[data-settings="models"]').click()
-  const model = page.getByLabel('PR review default model')
-  await expect(model).toHaveValue('opus-5-xhigh')
-  await expect(page.getByLabel('PR review fallback model')).toHaveValue('gpt-6-astra-ultra')
-  // Every place offers every catalog model; review places follow the providers Caller lists.
-  await expect(model.locator('option')).toHaveCount(14)
-  await expect(page.getByLabel('Chat default model', { exact: true }).locator('option')).toHaveCount(14)
+  // The three models are chosen once; every slot select offers every catalog model.
+  await expect(page.getByLabel('Primary model', { exact: true })).toHaveValue('opus-5-xhigh')
+  await expect(page.getByLabel('Secondary model', { exact: true })).toHaveValue('gpt-6-astra-ultra')
+  await expect(page.getByLabel('Tertiary model', { exact: true })).toHaveValue('grok-4.6-xhigh')
+  await expect(page.getByLabel('Primary model', { exact: true }).locator('option')).toHaveCount(14)
+  // Everywhere else picks a slot and shows the model it resolves to.
+  await expect(page.getByLabel('PR review slot', { exact: true })).toHaveValue('primary')
+  await expect(page.locator('.st-place[data-place="pr_review"] .st-fixed-model')).toHaveText('opus-5-xhigh')
   await expect(page.locator('.st-models-fixed')).toContainText('opus-5-max')
-  // Only the PR review place names a secondary and a tertiary reviewer.
-  await expect(page.getByLabel('PR review secondary reviewer')).toHaveValue('gpt-6-astra-ultra')
-  await expect(page.getByLabel('PR review tertiary reviewer')).toHaveValue('grok-4.6-xhigh')
-  await expect(page.getByLabel('PR approval secondary reviewer')).toHaveCount(0)
-  await model.selectOption('gpt-6-astra-ultra')
-  await page.getByLabel('PR review fallback model').selectOption('opus-5-xhigh')
-  await page.getByLabel('PR review secondary reviewer').selectOption('gpt-6-astra-ultra')
+  await page.getByLabel('Secondary model', { exact: true }).selectOption('opus-5-xhigh')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
-  await expect(page.locator('.st-status')).toHaveText('pr_review: the secondary reviewer must differ from the default.')
-  await page.getByLabel('PR review secondary reviewer').selectOption('muse-spark-1.3-contributor-max')
+  await expect(page.locator('.st-status')).toHaveText('Model slots primary and secondary must be different models.')
+  await page.getByLabel('Secondary model', { exact: true }).selectOption('muse-spark-1.3-contributor-max')
+  await page.getByLabel('PR review slot', { exact: true }).selectOption('secondary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
-  expect(settings.models.pr_review).toEqual({ default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh', secondary: 'muse-spark-1.3-contributor-max', tertiary: 'grok-4.6-xhigh' })
+  expect(settings.models).toEqual({
+    slots: { primary: 'opus-5-xhigh', secondary: 'muse-spark-1.3-contributor-max', tertiary: 'grok-4.6-xhigh' },
+    places: { pr_review: { slot: 'secondary' } },
+  })
   await page.reload()
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
   await page.locator('[data-settings="models"]').click()
-  await expect(page.getByLabel('PR review default model')).toHaveValue('gpt-6-astra-ultra')
-  await expect(page.getByLabel('PR review fallback model')).toHaveValue('opus-5-xhigh')
-  await expect(page.getByLabel('PR review secondary reviewer')).toHaveValue('muse-spark-1.3-contributor-max')
+  await expect(page.getByLabel('Secondary model', { exact: true })).toHaveValue('muse-spark-1.3-contributor-max')
+  await expect(page.getByLabel('PR review slot', { exact: true })).toHaveValue('secondary')
+  await expect(page.locator('.st-place[data-place="pr_review"] .st-fixed-model')).toHaveText('muse-spark-1.3-contributor-max')
 })
 
 test('keeps your GitHub account and the agent account under GitHub in Settings', async ({ page }) => {
