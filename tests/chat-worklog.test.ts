@@ -52,6 +52,15 @@ describe('status dots', () => {
     expect(dot('running', 'not a time')).toEqual({ state: 'working', label: 'Working' })
   })
 
+  it('names the queued wait in the session list', () => {
+    const queued = (queuedBehind?: string) =>
+      sessionDot({ status: 'queued', updatedAt: '2026-10-21T16:02:00.000Z', queuedBehind }, NOW, 'Europe/Helsinki')
+    expect(queued('preparing the checkout')).toEqual({ state: 'queued', label: 'Queued · preparing the checkout · since 19:02' })
+    expect(queued('waiting for a free agent slot')).toEqual({ state: 'queued', label: 'Queued · waiting for a free agent slot · since 19:02' })
+    expect(queued('chat "Work" on chat/abc')).toEqual({ state: 'queued', label: 'Queued · chat "Work" on chat/abc · since 19:02' })
+    expect(queued(undefined)).toEqual({ state: 'queued', label: 'Queued · since 19:02' })
+  })
+
   it('shows Stalled for an idle chat whose turn left work behind', () => {
     expect(dot('idle', '2026-10-21T16:02:00.000Z', [], 'end_turn', STALL)).toEqual({ state: 'attention', label: 'Stalled · 19:02' })
     expect(dot('running', '2026-10-21T16:02:00.000Z', [], 'end_turn', STALL).state).toBe('working')

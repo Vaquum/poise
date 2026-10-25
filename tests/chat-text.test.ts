@@ -27,7 +27,13 @@ describe('queued status text', () => {
     expect(queuedStatusText('waiting for a free agent slot')).toBe('waiting for a free agent slot')
     expect(queuedStatusText('waiting for the Poise update')).toBe('waiting for the Poise update')
     expect(queuedStatusText('chat "Work" on chat/abc (Poise production)')).toBe('queued behind chat "Work" on chat/abc (Poise production)')
-    expect(queuedStatusText(undefined)).toBe('queued behind another session')
+    expect(queuedStatusText(undefined)).toBe('queued')
+  })
+
+  it('reads preparation steps verbatim, never as queued behind', () => {
+    for (const step of ['preparing the checkout', 'preparing the turn input', 'capturing the checkout snapshot', 'applying pending settings', 'taking the job baseline']) {
+      expect(queuedStatusText(step)).toBe(step)
+    }
   })
 })
 

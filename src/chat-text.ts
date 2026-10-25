@@ -1,15 +1,16 @@
 // Pure Chat session copy: queueing and delete-confirmation wording. The
 // delete preview is best-effort — the server decides authoritatively when
 // the session is deleted and reports the outcome with the delete.
-import { SLOT_WAIT_REASON, SWITCH_WAIT_REASON } from '../server/chat/protocol'
+import { PREPARE_WAIT_REASONS, SLOT_WAIT_REASON, SWITCH_WAIT_REASON } from '../server/chat/protocol'
 import type { SessionRecord } from '../server/chat/protocol'
 
-/** What a `queued` session shows: the agent-slot and update waits read
- *  verbatim, checkout contention reads as `queued behind …`. */
+/** What a `queued` session shows: the agent-slot, update and preparation
+ *  waits read verbatim, checkout contention reads as `queued behind …`. */
 export function queuedStatusText(queuedBehind?: string): string {
-  if (!queuedBehind) return 'queued behind another session'
+  if (!queuedBehind) return 'queued'
   if (queuedBehind === SLOT_WAIT_REASON) return SLOT_WAIT_REASON
   if (queuedBehind === SWITCH_WAIT_REASON) return SWITCH_WAIT_REASON
+  if (PREPARE_WAIT_REASONS.includes(queuedBehind)) return queuedBehind
   return `queued behind ${queuedBehind}`
 }
 

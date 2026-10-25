@@ -21,14 +21,14 @@ export interface WorklogDot {
  *  stopped or was cut still shows Error. An idle chat whose turn left work
  *  behind shows Stalled until the state clears. */
 export function sessionDot(
-  s: { status: SessionStatus, updatedAt: string, pendingRequests?: string[], lastStopReason?: StopReason, stall?: StallState },
+  s: { status: SessionStatus, updatedAt: string, pendingRequests?: string[], lastStopReason?: StopReason, stall?: StallState, queuedBehind?: string },
   now: number,
   timeZone: string,
 ): WorklogDot {
   const at = Number.isNaN(Date.parse(s.updatedAt)) ? null : shortTime(s.updatedAt, timeZone, now)
   const since = (word: string): string => at ? `${word} · since ${at}` : word
   const moment = (word: string): string => at ? `${word} · ${at}` : word
-  if (s.status === 'queued') return { state: 'queued', label: since('Queued') }
+  if (s.status === 'queued') return { state: 'queued', label: since(s.queuedBehind ? `Queued · ${s.queuedBehind}` : 'Queued') }
   if (s.status === 'waiting' || (s.pendingRequests?.length || 0) > 0) return { state: 'attention', label: since('Waiting for you') }
   if (s.status === 'error' || s.status === 'interrupted') {
     return { state: 'error', label: moment(s.status === 'interrupted' ? 'Interrupted' : 'Error') }

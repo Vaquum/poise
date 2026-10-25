@@ -31,6 +31,20 @@ export const SLOT_WAIT_REASON = 'waiting for a free agent slot'
  *  waits behind the Poise update instead of starting. */
 export const SWITCH_WAIT_REASON = 'waiting for the Poise update'
 
+/** What a `queued` turn is in once its slot and checkout-lease waits ended:
+ *  the pre-prompt preparation step it is running. The chat reads these
+ *  verbatim, never as `queued behind …`. */
+export const PREPARE_CHECKOUT_REASON = 'preparing the checkout'
+export const PREPARE_INPUT_REASON = 'preparing the turn input'
+export const PREPARE_SNAPSHOT_REASON = 'capturing the checkout snapshot'
+export const PREPARE_SETTINGS_REASON = 'applying pending settings'
+export const PREPARE_BASELINE_REASON = 'taking the job baseline'
+
+/** Every preparation reason, for the verbatim read. */
+export const PREPARE_WAIT_REASONS: readonly string[] = [
+  PREPARE_CHECKOUT_REASON, PREPARE_INPUT_REASON, PREPARE_SNAPSHOT_REASON, PREPARE_SETTINGS_REASON, PREPARE_BASELINE_REASON,
+]
+
 /** Which optional controls the view shows for a session. `permissions`,
  *  `questions`, `steer` and `resume` are required of every v1 adapter; the
  *  rest are honest flags — a control for a false flag is hidden, never faked. */
@@ -153,7 +167,8 @@ export interface SessionRecord {
   cliChecking?: boolean
   cliVersion?: string
   cliWarning?: string
-  /** Who holds the checkout while this session is `queued`. */
+  /** What a `queued` session waits for: the checkout holder, the agent-slot
+   *  or Poise-update wait, or the preparation step after those waits ended. */
   queuedBehind?: string
   /** Native session/thread id kept for resume. Absent until the adapter created one. */
   nativeSessionId?: string
