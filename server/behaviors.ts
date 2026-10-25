@@ -39,6 +39,7 @@ import {
   completeFailedBehaviorReplay,
   completeIssueReviewLaunchOwned,
   countBehaviorDeadLetters,
+  countReviewRounds,
   hasExpiredPreLaunchClaim,
   completeSeenOwned,
   getFailedBehaviorLaunch,
@@ -129,7 +130,7 @@ function organizationOwns(repoOrTarget: string): boolean {
 }
 
 function isGlobalPreference(key: string): boolean {
-  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci|review_new_issues)_(?:enabled|setting|reviewers|scratchpad)$/.test(key)
+  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci|review_new_issues)_(?:enabled|setting|reviewers|review_cap|scratchpad)$/.test(key)
     || /^behavior_review_new_issues_(?:repos|authors|slot_since)$/.test(key)
     || /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci)_skip_repos$/.test(key)
 }
@@ -751,6 +752,37 @@ export function isValidReviewers(v: unknown): v is ReviewerCount {
 export function setReviewers(count: ReviewerCount, key: PanelBehavior = 'review-new-prs'): void {
   if (key === 'review-new-issues') setIssueSlotSince(getReviewers(key), count)
   setMeta(reviewersKey(key), String(count))
+}
+
+// The review-round cap for Approve Pull Requests: once a pull request has
+// completed this many change-request rounds, the next round files its
+// findings as one follow-up issue and approves instead of requesting changes
+// again. Off (null) unless set. 2 is the floor so the cap can only fire
+// inside a follow-up round — round 1 is the initial review, which approves
+// nothing and runs as a panel the cap must never split.
+export const REVIEW_CAP_MIN = 2
+export const REVIEW_CAP_MAX = 10
+const REVIEW_CAP_KEY = `${META_PREFIX}approve_prs_review_cap`
+
+export function getReviewCap(): number | null {
+  const value = Number(getMeta(REVIEW_CAP_KEY) || '')
+  return Number.isInteger(value) && value >= REVIEW_CAP_MIN && value <= REVIEW_CAP_MAX ? value : null
+}
+
+export function isValidReviewCap(v: unknown): v is number | null {
+  return v === null
+    || (typeof v === 'number' && Number.isInteger(v) && v >= REVIEW_CAP_MIN && v <= REVIEW_CAP_MAX)
+}
+
+export function setReviewCap(cap: number | null): void {
+  setMeta(REVIEW_CAP_KEY, cap === null ? '' : String(cap))
+}
+
+// The round number the next approve-prs launch for this pull request is:
+// completed change-request rounds so far, plus one for the run itself. Read
+// from the durable launch ledger, so it survives restarts.
+export function reviewRoundNumber(repo: string, number: number): number {
+  return countReviewRounds(repo, number) + 1
 }
 
 // The primary reviewer keeps the pull request's own claim key, so ledgers
@@ -3584,6 +3616,12 @@ async function fireApprove(
     throw new Error(`approval PR operation ownership was lost for ${pr.repo}#${pr.number}`)
   }
   const source = 'poise:approve-prs'
+  // The review-round cap: from the capped round on, this run files its
+  // findings as one follow-up issue and approves instead of requesting
+  // changes again. The round is pinned here, at preparation time.
+  const reviewCap = getReviewCap()
+  const reviewRound = reviewCap === null ? null : reviewRoundNumber(pr.repo, pr.number)
+  const reviewCapReached = reviewCap !== null && reviewRound !== null && reviewRound >= reviewCap
   const args = [
     '--pr-approve',
     `#${num}`,
@@ -3602,6 +3640,9 @@ async function fireApprove(
     '--pwd',
     pwd,
     ...noteArgs('approve-prs'),
+    ...(reviewCapReached
+      ? ['--review-cap-reached', '--review-round', String(reviewRound), '--review-cap', String(reviewCap)]
+      : []),
   ]
   // The model read above awaits: a pause landing in that window must
   // still hold this launch, so this is the last check before it.
