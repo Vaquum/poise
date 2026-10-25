@@ -148,22 +148,35 @@ describe('review-new-prs prepare pool', () => {
 })
 
 describe('prepare pool startup', () => {
-  it('lets the event loop run between worker starts instead of forking back-to-back', async () => {
+  it('starts workers across event-loop turns instead of all at once', async () => {
     const { behaviors: runtime } = await loadModules()
-    // Drain anything queued, so the marker below is the first loop callback.
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    const order: string[] = []
-    setImmediate(() => { order.push('loop') })
-    await runtime.forEachPool(['a', 'b'], 2, async (item) => {
-      order.push(`start-${item}`)
-      // Production tasks await their CLI; without a real wait one worker
-      // would drain the queue before the second starts.
-      await new Promise<void>((resolve) => setImmediate(resolve))
+    // Gated tasks keep a worker from chaining onto a later item before the
+    // next worker starts, as production CLI waits do.
+    const gate = deferred<void>()
+    const started: string[] = []
+    const done = runtime.forEachPool(['a', 'b', 'c'], 3, async (item) => {
+      started.push(item)
+      await gate.promise
     })
-    // Worker starts spread across loop turns: queued loop work runs after
-    // the first start instead of behind the whole fan-out.
-    expect(order[0]).toBe('start-a')
-    expect(order[1]).toBe('loop')
+    // Only the first start happens synchronously; the rest wait their turn.
+    expect(started).toEqual(['a'])
+    gate.resolve()
+    await done
+    expect(started).toEqual(['a', 'b', 'c'])
+  })
+
+  it('completes while the clock is faked', async () => {
+    vi.useFakeTimers()
+    try {
+      const { behaviors: runtime } = await loadModules()
+      const seen: string[] = []
+      await runtime.forEachPool(['a', 'b'], 2, async (item) => {
+        seen.push(item)
+      })
+      expect(seen.sort()).toEqual(['a', 'b'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
