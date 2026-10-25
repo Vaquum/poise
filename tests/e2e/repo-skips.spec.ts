@@ -86,7 +86,7 @@ test('skips repositories with Select all for an account and for everything, and 
   const dialog = page.getByRole('dialog', { name: 'Setting for Approve Pull Requests' })
   await expect(dialog).toBeVisible()
   await expect(pill).toHaveAttribute('aria-expanded', 'true')
-  await expect(dialog.locator('.bt-filter')).toBeFocused()
+  await expect(dialog.getByLabel('Review cap')).toBeFocused()
   await expect(dialog.getByLabel('Priority')).toBeHidden()
   await expect(dialog.getByLabel('Trusted authors')).toBeHidden()
   const all = dialog.getByRole('checkbox', { name: 'Select all repositories' })

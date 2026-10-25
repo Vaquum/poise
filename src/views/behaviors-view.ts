@@ -12,7 +12,7 @@ import { layout, watchPanel } from '../motion'
 // runtime — the view is just a UI for state, not the place where
 // agent automations actually run.
 
-import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getLastSucceeded, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
+import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewCap, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getLastSucceeded, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
 import { organizationErrors } from '../organizations'
 import { notificationCountsFor, onNotificationItems, openNotifications } from './notification-rail'
 import type { ItemGroup } from '../notification-items'
@@ -283,7 +283,8 @@ function writeReviewers(key: BehaviorKey, value: ReviewerCount): void {
 //   count.
 // - The PR behaviors skip the ticked repositories. Their list is grouped by
 //   account, with a Select all for each account and one for the whole list;
-//   Review New Pull Requests also chooses its priority ceiling here.
+//   Review New Pull Requests also chooses its priority ceiling here, and
+//   Approve Pull Requests its review-round cap.
 // Like the memory panel, every way of closing it — Done, Escape, a click
 // outside, leaving the view — saves what changed; a save that fails keeps it
 // open next to the error rather than closing over the choice.
@@ -294,7 +295,7 @@ let orgReposLoading: Promise<void> | null = null
 let triggersPanelEl: HTMLElement | null = null
 let triggersKey: BehaviorKey | null = null
 let triggersDraft = new Set<string>()
-let triggersLoaded = { repos: [] as string[], authors: [] as string[], skipRepos: [] as string[], setting: 'p2' as BehaviorSetting }
+let triggersLoaded = { repos: [] as string[], authors: [] as string[], skipRepos: [] as string[], setting: 'p2' as BehaviorSetting, reviewCap: null as number | null }
 let triggersSaving: Promise<boolean> | null = null
 
 function shortRepo(repo: string): string {
@@ -324,17 +325,22 @@ function triggersPresentation(key: BehaviorKey) {
   if (meta.hasSkips) {
     const skipped = getSkipRepos(key)
     const ceiling = meta.hasSetting ? settingLabel(getSetting(key)) : ''
+    const cap = meta.hasReviewCap ? getReviewCap(key) : null
+    const capLabel = cap ? `Cap ${cap}` : ''
+    // The ceiling and the cap never share a row; whichever leads, the
+    // skipped count must stay readable next to it.
+    const lead = ceiling || capLabel
     return {
       none: false,
       unknown,
       // A whole account skipped runs into hundreds; the count must stay
       // readable in the cell next to the ceiling.
-      label: ceiling
-        ? (skipped.length ? `${ceiling}, skip ${skipped.length}` : ceiling)
+      label: lead
+        ? (skipped.length ? `${lead}, skip ${skipped.length}` : lead)
         : (skipped.length ? `Skip ${skipped.length}` : 'All repos'),
       title: unknown
         ? 'The setting could not be read from the server.'
-        : [ceiling ? `Priority ${ceiling}` : '', skipped.length ? `Skipped: ${skipped.join(', ')}` : 'Acts in every repository']
+        : [ceiling ? `Priority ${ceiling}` : '', cap ? `Review cap: round ${cap} files its findings as one follow-up issue and approves` : '', skipped.length ? `Skipped: ${skipped.join(', ')}` : 'Acts in every repository']
           .filter(Boolean).join(' · '),
       open,
     }
@@ -510,10 +516,19 @@ function buildTriggersPanel(): HTMLElement {
   panel.id = 'behavior-triggers-panel'
   panel.setAttribute('role', 'dialog')
   const ceilings = SETTING_OPTIONS.map((option) => `<option value="${option.value}">${escapeHtml(option.label)}</option>`).join('')
+  const caps = ['<option value="">Off</option>']
+    .concat(Array.from({ length: 9 }, (_, index) => {
+      const rounds = index + 2
+      return `<option value="${rounds}">${rounds} rounds</option>`
+    })).join('')
   panel.innerHTML = `
     <div class="bt-section bt-ceiling" hidden>
       <label class="bt-label" for="bt-ceiling">Priority</label>
       <select id="bt-ceiling" class="behavior-setting bt-ceiling-select">${ceilings}</select>
+    </div>
+    <div class="bt-section bt-review-cap" hidden>
+      <label class="bt-label" for="bt-review-cap">Review cap</label>
+      <select id="bt-review-cap" class="behavior-setting bt-review-cap-select" title="From this round on, Approve files the round's findings as one follow-up issue and approves instead of requesting changes. Off disables the cap.">${caps}</select>
     </div>
     <div class="bt-section">
       <label class="bt-label bt-repos-label" for="bt-filter">Repositories</label>
@@ -598,13 +613,15 @@ function openTriggersPanel(key: BehaviorKey) {
   triggersPanelEl.dataset.mode = mode
   triggersPanelEl.setAttribute('aria-label', meta.hasSkips ? `Setting for ${meta.label}` : 'Repositories and authors that trigger Review New Issues')
   triggersPanelEl.querySelector<HTMLElement>('.bt-ceiling')!.hidden = !(meta.hasSkips && meta.hasSetting)
+  triggersPanelEl.querySelector<HTMLElement>('.bt-review-cap')!.hidden = !(meta.hasSkips && meta.hasReviewCap)
   triggersPanelEl.querySelector<HTMLElement>('.bt-authors-section')!.hidden = meta.hasSkips
   triggersPanelEl.querySelector('.bt-repos-label')!.textContent = meta.hasSkips ? 'Skip repositories' : 'Repositories'
   triggersPanelEl.querySelector('.bt-repos')!.setAttribute('aria-label', meta.hasSkips ? 'Repositories to skip' : 'Repositories')
   triggersKey = key
-  triggersLoaded = { repos: getRepos(key), authors: getAuthors(key), skipRepos: getSkipRepos(key), setting: getSetting(key) }
+  triggersLoaded = { repos: getRepos(key), authors: getAuthors(key), skipRepos: getSkipRepos(key), setting: getSetting(key), reviewCap: getReviewCap(key) }
   triggersDraft = new Set(meta.hasSkips ? triggersLoaded.skipRepos : triggersLoaded.repos)
   triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value = triggersLoaded.setting
+  triggersPanelEl.querySelector<HTMLSelectElement>('.bt-review-cap-select')!.value = triggersLoaded.reviewCap === null ? '' : String(triggersLoaded.reviewCap)
   triggersPanelEl.querySelector<HTMLInputElement>('.bt-filter')!.value = ''
   triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value = triggersLoaded.authors.join(', ')
   setTriggersStatus('')
@@ -621,8 +638,8 @@ function openTriggersPanel(key: BehaviorKey) {
   setTimeout(() => {
     document.addEventListener('mousedown', onTriggersOutside)
     document.addEventListener('keydown', onTriggersKeydown)
-    // The first control: the ceiling where there is one, otherwise the filter.
-    const first = triggersPanelEl?.querySelector<HTMLElement>('.bt-ceiling:not([hidden]) select')
+    // The first control: the ceiling or cap where there is one, otherwise the filter.
+    const first = triggersPanelEl?.querySelector<HTMLElement>('.bt-ceiling:not([hidden]) select, .bt-review-cap:not([hidden]) select')
       ?? triggersPanelEl?.querySelector<HTMLInputElement>('.bt-filter')
     first?.focus()
   }, 0)
@@ -650,6 +667,9 @@ function closeTriggersPanel(force = false): Promise<boolean> {
     if (!same(draft, [...triggersLoaded.skipRepos].sort())) changes.skipRepos = draft
     const setting = triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value as BehaviorSetting
     if (meta.hasSetting && setting !== triggersLoaded.setting) changes.setting = setting
+    const capValue = triggersPanelEl.querySelector<HTMLSelectElement>('.bt-review-cap-select')!.value
+    const reviewCap = capValue === '' ? null : Number(capValue)
+    if (meta.hasReviewCap && reviewCap !== triggersLoaded.reviewCap) changes.reviewCap = reviewCap
   } else {
     const authors = parseAuthors(triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value)
     const invalid = authors.filter((name) => !GITHUB_LOGIN.test(name))
