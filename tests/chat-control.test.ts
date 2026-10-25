@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
@@ -10,6 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, t
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
+import type { CheckoutLeaseOptions } from '../server/chat/checkout-lock'
 import type { Capabilities, ChatEnvelope, ChatEvent, PromptInput, ServerFrame, SessionRecord } from '../server/chat/protocol'
 import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
@@ -152,13 +153,14 @@ async function workspaceManager() {
   if (!model) throw new Error('fixture lacks grok')
   return runtime.create({ agent: 'grok', model: model.identity, role: 'manager', deferStart: true })
 }
-function makeRuntime() {
+function makeRuntime(leaseProbes?: CheckoutLeaseOptions) {
   // This file pins control behavior, not the shared turn budget: an open
   // budget lets a manager's workers all run while check-semaphore and
   // behaviors-check-slots pin the default budget instead.
   return new Runtime({ instance, instanceLabel: 'test', callerTurns: null, catalog: async () => CATALOG,
     adapters: { grok: adapter, claude: adapter, codex: adapter, muse: forkAdapter }, requireClaudeReady: async () => {}, probeAgent: async () => ({ ok: true }),
-    localWorkspaceRoot: workspaceRoot, idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => 64, controlContext: id => control.context(id) })
+    localWorkspaceRoot: workspaceRoot, idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => 64, controlContext: id => control.context(id),
+    ...(leaseProbes ? { leaseProbes } : {}) })
 }
 async function restart() {
   const stopped = runtime.stop()
@@ -1162,6 +1164,13 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('resumes an interrupted worker on its next ordinary wake while other chats wait', async () => {
+    // The crashed server's lease must look like a dead process held it.
+    await control.stop()
+    await runtime.stop()
+    runtime = makeRuntime({ hostPid: spawnSync('true').pid, now: () => Date.now() - 120_000 })
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') })
+    control.attach(server)
+    control.start()
     const model = CATALOG.models.find(m => m.provider === 'grok')
     if (!model) throw new Error('fixture lacks grok')
     const m = await workspaceManager()
