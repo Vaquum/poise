@@ -127,16 +127,38 @@ function syncFieldsFromCache() {
   // first characters someone has already typed into an empty field. Only fill
   // a field the person is not currently in.
   const active = document.activeElement
-  if (meInput && meInput !== active && !dirtyFields.has(meInput)) meInput.value = s.me
-  if (agentInput && agentInput !== active && !dirtyFields.has(agentInput)) agentInput.value = s.agentAccount ?? ''
-  if (tzSelect && tzSelect !== active && !dirtyFields.has(tzSelect)) {
+  // A synced input shows a fresh read, so its baseline moves with it: the
+  // next draft is based on what is shown. Drafted and focused fields keep
+  // both their text and their baseline.
+  const synced = (input: HTMLInputElement | HTMLSelectElement | null): input is HTMLInputElement | HTMLSelectElement =>
+    !!input && input !== active && !dirtyFields.has(input)
+  if (synced(meInput)) {
+    meInput.value = s.me
+    saveBaselines.set('me', s.me)
+  }
+  if (synced(agentInput)) {
+    agentInput.value = s.agentAccount ?? ''
+    saveBaselines.set('agentAccount', s.agentAccount ?? '')
+  }
+  if (synced(tzSelect)) {
     const fallback = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return 'UTC' } })()
     tzSelect.value = ensureTimezoneOption(s.timezone || fallback)
+    // The stored zone, not the displayed fallback: the server holds '' while
+    // nothing is saved, and the fallback would 409 against it.
+    saveBaselines.set('timezone', s.timezone)
   }
-  if (branchPrefixInput && branchPrefixInput !== active && !dirtyFields.has(branchPrefixInput)) branchPrefixInput.value = s.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
-  if (idleTimeoutInput && idleTimeoutInput !== active && !dirtyFields.has(idleTimeoutInput)) idleTimeoutInput.value = String(s.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes)
-  if (maxConcurrentLocalTurnsInput && maxConcurrentLocalTurnsInput !== active && !dirtyFields.has(maxConcurrentLocalTurnsInput)) maxConcurrentLocalTurnsInput.value = String(s.chat?.maxConcurrentLocalTurns ?? CHAT_DEFAULTS.maxConcurrentLocalTurns)
-  if (updateTurnBoundInput && updateTurnBoundInput !== active && !dirtyFields.has(updateTurnBoundInput)) updateTurnBoundInput.value = String(s.chat?.updateTurnBoundMinutes ?? CHAT_DEFAULTS.updateTurnBoundMinutes)
+  // The chat baseline is whole: it moves only when every chat input synced,
+  // so a draft keeps the basis it was written against.
+  let chatSynced = true
+  if (synced(branchPrefixInput)) branchPrefixInput.value = s.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
+  else chatSynced = false
+  if (synced(idleTimeoutInput)) idleTimeoutInput.value = String(s.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes)
+  else chatSynced = false
+  if (synced(maxConcurrentLocalTurnsInput)) maxConcurrentLocalTurnsInput.value = String(s.chat?.maxConcurrentLocalTurns ?? CHAT_DEFAULTS.maxConcurrentLocalTurns)
+  else chatSynced = false
+  if (synced(updateTurnBoundInput)) updateTurnBoundInput.value = String(s.chat?.updateTurnBoundMinutes ?? CHAT_DEFAULTS.updateTurnBoundMinutes)
+  else chatSynced = false
+  if (chatSynced) saveBaselines.set('chat', { ...(s.chat ?? CHAT_DEFAULTS) })
   showNotificationsChoice(s.notifications?.enabled !== false)
 }
 
@@ -160,6 +182,8 @@ const saveNotifications = sendLatest(async (enabled: boolean) => {
   const data = await res.json().catch(() => null)
   if (!res.ok || !data || typeof data !== 'object') throw new Error((data as { error?: string } | null)?.error || `HTTP ${res.status}`)
   setLocalSettings(data)
+  // The response carries full settings, which may be newer than the display.
+  syncFieldsFromCache()
   window.dispatchEvent(new CustomEvent('poise:notifications-changed'))
 }, (error, enabled) => {
   showNotificationsChoice(getCachedSettings().notifications?.enabled !== false)
@@ -794,6 +818,8 @@ async function usePreset(): Promise<void> {
     dirtyModels.clear()
     saveBaselines.delete('models')
     setLocalSettings(data)
+    // The response carries full settings, which may be newer than the display.
+    syncFieldsFromCache()
     // Shown at once, so a Save before the reload below lands posts these choices, not the previous ones.
     if (lastModels) {
       for (const place of lastModels.places) {

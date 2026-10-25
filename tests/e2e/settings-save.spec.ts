@@ -359,3 +359,48 @@ test('read again prefers the refreshed value over the 409 snapshot', async ({ pa
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts[1].expect).toEqual({ timezone: 'Europe/Berlin' })
 })
+
+test('a save after a failed-refresh read-again re-baselines the shown value', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  let refuses = true
+  let failNextGet = false
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      if (refuses) {
+        refuses = false
+        failNextGet = true
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { timezone: 'Europe/Helsinki' } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      state.settings = { ...state.settings, ...rest }
+    } else if (failNextGet) {
+      // The conflict refresh fails: Read again falls back to the snapshot.
+      failNextGet = false
+      await route.fulfill({ status: 500, json: { error: 'settings unavailable' } })
+      return
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'general')
+  await page.locator('#st-timezone').selectOption('Europe/Madrid')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toContainText('Time zone is now "Europe/Helsinki"')
+  await page.getByRole('button', { name: 'Read again' }).click()
+  await expect(page.locator('#st-timezone')).toHaveValue('Europe/Helsinki')
+  // Another tab saves Berlin; an unrelated save shows it.
+  state.settings = { ...state.settings, timezone: 'Europe/Berlin' }
+  await page.getByLabel('Your GitHub account').fill('octocat2')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  await expect(page.locator('#st-timezone')).toHaveValue('Europe/Berlin')
+  // The next draft baselines the shown Berlin, not the retained Helsinki.
+  await page.locator('#st-timezone').selectOption('Europe/Madrid')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts[2].expect).toEqual({ timezone: 'Europe/Berlin' })
+})
