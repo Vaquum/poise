@@ -256,8 +256,9 @@ the capped round: the run must not request changes again. It files that
 round's findings as one follow-up issue via `github-interface
 --create-pr-linked-issue` and approves; a round with no findings approves
 without filing. The issue body starts with a marker for its pull request and
-head (`<!-- poise:review-cap #N@sha -->`), then one head-pinned finding per
-section. A rejected filing approves nothing and raises a contract violation;
+head (`<!-- poise:review-cap #N@sha -->`), then one finding per section, each
+pinned to the reviewed head — or to its base for removed-side findings.
+A rejected filing approves nothing and raises a contract violation;
 an uncertain filing (timeout, transient GitHub error, exit 0 without a
 receipt) raises a submission error for Poise to reconcile, and the retry
 reuses the marked issue instead of filing again. Structured providers review

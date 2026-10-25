@@ -52,6 +52,7 @@ def render_body(
     repo: str,
     pr_number: str,
     head: str,
+    base: str,
     review_round: int,
     review_cap: int,
     comments: list[dict],
@@ -68,8 +69,12 @@ def render_body(
     for index, comment in enumerate(comments, 1):
         path = str(comment.get("path") or "")
         line = comment.get("line")
-        permalink = f"https://github.com/{repo}/blob/{head.lower()}/{path}#L{line}"
-        lines.append(f"### {index}. `{path}:{line}` ([permalink]({permalink}))")
+        side = comment.get("side") if comment.get("side") in ("LEFT", "RIGHT") else "RIGHT"
+        # A removed-side finding names old-file lines: pin it to the base blob,
+        # where that file and those lines exist, not to the reviewed head.
+        pin = base.lower() if side == "LEFT" else head.lower()
+        permalink = f"https://github.com/{repo}/blob/{pin}/{path}#L{line}"
+        lines.append(f"### {index}. `{path}:{line}` ({side}, [permalink]({permalink}))")
         lines.append("")
         lines.append(str(comment.get("body") or "").strip())
         lines.append("")

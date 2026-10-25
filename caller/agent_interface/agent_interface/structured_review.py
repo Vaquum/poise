@@ -171,7 +171,14 @@ def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
         node = None
     repo = node.get("repository") if isinstance(node, dict) else None
     number = node.get("pull_number") if isinstance(node, dict) else None
-    if not isinstance(repo, str) or "/" not in repo or not isinstance(number, int) or number < 1:
+    pull = node.get("pull") if isinstance(node, dict) else None
+    base = pull.get("base", {}).get("sha") if isinstance(pull, dict) and isinstance(pull.get("base"), dict) else None
+    try:
+        base_sha = expected_head(base) if isinstance(base, str) else None
+    except ValueError:
+        base_sha = None
+    if not isinstance(repo, str) or "/" not in repo or not isinstance(number, int) or number < 1 \
+            or base_sha is None:
         raise review_budget.ReviewLimitError(
             "a capped approval round needs a readable PR packet", "review_contract_violation")
     existing = followup.find_capped_issue(packet, str(number), head)
@@ -182,7 +189,7 @@ def _file_capped_followup(packet: str, pr: str, actor_name: str, head: str,
         pr_ref(pr),
         actor(actor_name),
         followup.render_title(repo, str(number), review_round),
-        followup.render_body(repo, str(number), head, review_round, review_cap, comments),
+        followup.render_body(repo, str(number), head, base_sha, review_round, review_cap, comments),
     )
     return followup.issue_reference(issue)
 

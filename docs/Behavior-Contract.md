@@ -170,8 +170,9 @@ in the pull request's repository and approves instead of requesting changes
 again. A capped round with no findings is a plain approval with no issue.
 The issue carries a marker for its pull request and head
 (`<!-- poise:review-cap #N@sha -->`), one section per finding with its
-severity where the provider reports one, path and line, a permalink pinned to
-the reviewed head, and a link back to the pull request; a retry or replay
+severity where the provider reports one, path, line and side, a permalink
+pinned to the reviewed head (to its base for removed-side findings), and a
+link back to the pull request; a retry or replay
 reuses the marked issue and never files a second one for the same head.
 The capped approval reconciles as the ordinary head-pinned approved outcome.
 When the issue cannot be created, nothing is approved and the run fails loudly

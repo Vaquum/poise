@@ -13,12 +13,15 @@ from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 
 HEAD = "c" * 40
+BASE = "b" * 40
 FINDING = {"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "Crashes on empty input."}
+REMOVED_FINDING = {"path": "src/old.py", "line": 9, "side": "LEFT", "body": "Deleted helper still referenced."}
 PACKET = json.dumps({
     "action": "read",
     "repository": "o/r",
     "pull_number": 12,
     "head_sha": HEAD,
+    "pull": {"base": {"sha": BASE}},
     "linked_issues": [],
 })
 
@@ -29,6 +32,7 @@ def packet_with_issue(body):
         "repository": "o/r",
         "pull_number": 12,
         "head_sha": HEAD,
+        "pull": {"base": {"sha": BASE}},
         "linked_issues": [{"number": 7, "html_url": "https://github.com/o/r/issues/7", "body": body}],
     })
 
@@ -119,13 +123,20 @@ class TestFollowupIssue(TestCase):
         self.assertIsNone(followup.find_capped_issue("not json", "12", HEAD))
 
     def test_rendered_body_pins_findings_to_the_head(self):
-        body = followup.render_body("o/r", "12", HEAD, 5, 5, [FINDING])
+        body = followup.render_body("o/r", "12", HEAD, BASE, 5, 5, [FINDING])
         self.assertTrue(body.startswith(followup.marker("12", HEAD)))
         self.assertIn("round 5", body)
         self.assertIn("cap of 5 rounds", body)
         self.assertIn(f"https://github.com/o/r/blob/{HEAD}/src/main.py#L4", body)
+        self.assertIn("(RIGHT,", body)
         self.assertIn("Crashes on empty input.", body)
         self.assertEqual(followup.render_title("o/r", "12", 5), "Review follow-up for o/r#12 (round 5)")
+
+    def test_removed_side_findings_pin_to_the_base(self):
+        body = followup.render_body("o/r", "12", HEAD, BASE, 5, 5, [REMOVED_FINDING])
+        self.assertIn(f"https://github.com/o/r/blob/{BASE}/src/old.py#L9", body)
+        self.assertIn("(LEFT,", body)
+        self.assertNotIn(HEAD, body.split("## Findings")[1])
 
     def test_filing_failure_approves_nothing(self):
         def process(args, **kwargs):
@@ -208,6 +219,30 @@ class TestStructuredCappedConversion(TestCase):
         result, _ = self._run({"action": "approve", "comments": []}, github)
         self.assertEqual(seen, ["--approve-pr"])
         self.assertNotIn("round 5 of 5", result)
+
+    def test_capped_removed_side_finding_links_the_base(self):
+        bodies = {}
+
+        def github(args):
+            if args[1] == "--create-pr-linked-issue":
+                bodies["body"] = args[args.index("--body") + 1]
+                return issue_reply()
+            return approval_reply()
+
+        self._run({"action": "request_changes", "comments": [REMOVED_FINDING]}, github)
+        self.assertIn(f"/blob/{BASE}/src/old.py#L9", bodies["body"])
+        self.assertIn("(LEFT,", bodies["body"])
+
+    def test_capped_round_without_a_base_fails_loudly(self):
+        packet = json.dumps({"action": "read", "repository": "o/r", "pull_number": 12,
+                             "head_sha": HEAD, "linked_issues": []})
+
+        def github(args):
+            raise AssertionError("no GitHub call may precede the packet check")
+
+        with self.assertRaises(review_budget.ReviewLimitError) as failure:
+            self._run({"action": "request_changes", "comments": [FINDING]}, github, packet=packet)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
 
     def test_capped_replay_reuses_the_marked_issue(self):
         seen = []

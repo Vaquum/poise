@@ -73,8 +73,9 @@ def capped_rules(
         "If blocking findings remain and no such issue exists, file ONE follow-up issue with "
         f"exactly this command shape: `{issue_command}`. The body starts with the marker line "
         f"`{followup.marker(number, head)}`, then one section per finding with its severity, "
-        "path, line, a permalink pinned to the supplied head, and the defect-and-impact sentence. "
-        "The issue links back to the pull request itself.",
+        "path, line, side, a permalink pinned to the supplied head for new-side findings or "
+        "to the packet's pull.base.sha for removed-side findings, and the defect-and-impact "
+        "sentence. The issue links back to the pull request itself.",
         "File the issue BEFORE approving. If no blocking finding remains, approve without filing an issue.",
         "If filing the issue fails, submit NOTHING and report the error: never approve a round whose findings were lost.",
         "Finish with exactly one atomic approval. Never request changes on a capped round.",
