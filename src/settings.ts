@@ -15,7 +15,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 // panel never invents a label for one.
 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
-import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, validateGeneralDraft, validateModelChoices, type ConflictLeaf, type GeneralDraft, type GeneralField, type GeneralTopField, type ModelChoice } from './settings-save'
+import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, mergeSaveBaseline, validateGeneralDraft, validateModelChoices, type ConflictLeaf, type GeneralDraft, type GeneralField, type GeneralTopField, type ModelChoice } from './settings-save'
 import { productionSummary, type ProductionUpdate } from './production-status'
 import { clockDay, logTime, shortTime } from './clock'
 import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, MUSE_API_KEY_LOGIN, type ConnectedAccount } from '../server/accounts/types'
@@ -992,13 +992,15 @@ async function saveGeneral(): Promise<void> {
     for (const [input, value] of savedValues) {
       if (input.value === value) dirtyFields.delete(input)
     }
-    // A draft typed mid-save keeps a baseline at what the server now holds:
-    // the save succeeded, so that is what was sent.
     for (const top of payload.fields) {
       if (topInputs(top).every((input) => !input || !dirtyFields.has(input))) saveBaselines.delete(top)
-      else saveBaselines.set(top, payload.body[top])
+      else saveBaselines.set(top, mergeSaveBaseline(saveBaselines.get(top), payload.body[top]))
     }
     setLocalSettings(data)
+    // Untouched inputs show what the save response carries: another tab's
+    // edit that landed in it must be seen before the next draft is based on
+    // it. Drafts are skipped, as on every sync.
+    syncFieldsFromCache()
     renderOrganizations()
     renderAccounts()
     setHelp('Saved.', 'ok')
@@ -1064,8 +1066,18 @@ async function saveModels(): Promise<void> {
       if (section && deepEqual(sectionChoice(section), sent)) dirtyModels.delete(key)
     }
     if (dirtyModels.size === 0) saveBaselines.delete('models')
-    else saveBaselines.set('models', { ...((saveBaselines.get('models') as Record<string, unknown> | undefined) ?? {}), ...changes })
+    else saveBaselines.set('models', mergeSaveBaseline(saveBaselines.get('models'), changes))
+    // Stored mirrors the save at once, mirroring the server's merge: a draft
+    // made before the reload below lands reads its baseline from it, not from
+    // the pre-save catalog.
+    if (lastModels) {
+      for (const [key, sent] of Object.entries(changes)) {
+        const place = lastModels.places.find((entry) => entry.key === key)
+        if (place) place.stored = { ...place.stored, ...sent }
+      }
+    }
     setLocalSettings(data)
+    syncFieldsFromCache()
     renderOrganizations()
     renderAccounts()
     setHelp('Saved.', 'ok')
@@ -1114,6 +1126,16 @@ function applyReread(): void {
   dismissReread()
   if (!conflict) return
   for (const entry of conflict.leaves) revertConflictLeaf(entry)
+  // The re-render reads the catalog: refresh it from the 409's saved choices
+  // first, since the conflict reload may have failed.
+  for (const entry of conflict.leaves) {
+    if (entry.field !== 'models') continue
+    if (entry.leaf === null && isRecord(entry.current)) {
+      for (const [key, choice] of Object.entries(entry.current)) updateStoredChoice(key, choice)
+    } else if (entry.leaf !== null) {
+      updateStoredChoice(entry.leaf, entry.current)
+    }
+  }
   if (conflict.leaves.some((entry) => entry.field === 'models') && lastModels) renderPlaces(lastModels)
   for (const [input, top] of [[meInput, 'me'], [agentInput, 'agentAccount'], [tzSelect, 'timezone']] as const) {
     if (input && !dirtyFields.has(input)) saveBaselines.delete(top)
@@ -1123,6 +1145,26 @@ function applyReread(): void {
   }
   if (dirtyModels.size === 0) saveBaselines.delete('models')
   setHelp('Read the latest saved values.', 'info')
+}
+
+// A saved model choice from the 409, written into the catalog the re-render
+// and later baselines read. The server replaces each place's stored choice
+// whole, so this replaces whole too.
+function updateStoredChoice(key: string, choice: unknown): void {
+  if (!isRecord(choice) || typeof choice.default !== 'string' || typeof choice.fallback !== 'string') return
+  const place = lastModels?.places.find((entry) => entry.key === key)
+  if (!place) return
+  const stored = {
+    default: choice.default,
+    fallback: choice.fallback,
+    ...(typeof choice.secondary === 'string' ? { secondary: choice.secondary } : {}),
+    ...(typeof choice.tertiary === 'string' ? { tertiary: choice.tertiary } : {}),
+  }
+  place.default = stored.default
+  place.fallback = stored.fallback
+  place.secondary = stored.secondary
+  place.tertiary = stored.tertiary
+  place.stored = stored
 }
 
 function revertConflictLeaf(entry: ConflictLeaf): void {

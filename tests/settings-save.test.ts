@@ -4,6 +4,7 @@ import {
   conflictMessage,
   deepEqual,
   generalPayload,
+  mergeSaveBaseline,
   validateGeneralDraft,
   validateModelChoices,
   type GeneralDraft,
@@ -144,6 +145,15 @@ describe('the refused save', () => {
       { field: 'models', leaf: 'chat', current: { default: 'c', fallback: 'b' } },
     ])).toBe('Idle timeout is now 0; Models "chat" is now default "c", fallback "b". Your edits are kept — Save again to overwrite, or Read again for the saved values.')
     expect(conflictMessage([])).toBe('Settings changed on the server. Your edits are kept — Save again to overwrite, or Read again for the saved values.')
+  })
+
+  it('keeps a mid-save draft on the full server object, not only the sent leaves', () => {
+    const before = { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }
+    expect(mergeSaveBaseline(before, { idleTimeoutMinutes: 0 })).toEqual({ branchPrefix: 'chat/', idleTimeoutMinutes: 0, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 })
+    expect(mergeSaveBaseline({ chat: { default: 'a', fallback: 'b' } }, { editor: { default: 'c', fallback: 'd' } }))
+      .toEqual({ chat: { default: 'a', fallback: 'b' }, editor: { default: 'c', fallback: 'd' } })
+    expect(mergeSaveBaseline('UTC', 'Europe/Berlin')).toBe('Europe/Berlin')
+    expect(mergeSaveBaseline(undefined, { idleTimeoutMinutes: 0 })).toEqual({ idleTimeoutMinutes: 0 })
   })
 
   it('compares values structurally', () => {

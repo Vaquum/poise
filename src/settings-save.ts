@@ -108,6 +108,14 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
+// A draft typed mid-save keeps a baseline at what the server now holds: the
+// save succeeded, so that is the previous baseline with the sent leaves
+// applied. Storing only the sent leaves would 409 the next save against the
+// server's whole-object comparison.
+export function mergeSaveBaseline(before: unknown, sent: unknown): unknown {
+  return isRecord(before) && isRecord(sent) ? { ...before, ...sent } : sent
+}
+
 export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true
   if (Array.isArray(a) || Array.isArray(b)) {

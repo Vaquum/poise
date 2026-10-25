@@ -241,3 +241,85 @@ test('idle timeout accepts 0 as no idle expiry and preserves a stored 0', async 
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Idle timeout must be a whole number of minutes between 0 and 10080.')
 })
+
+test('a save shows another tab\'s edit that landed in the response', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  await page.goto('/')
+  await openSection(page, 'general')
+  await expect(page.locator('#st-timezone')).toHaveValue('UTC')
+  // Another tab saves Berlin; this tab has not re-read yet.
+  state.settings = { ...state.settings, timezone: 'Europe/Berlin' }
+  await page.getByLabel('Your GitHub account').fill('octocat2')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  // Untouched inputs follow the response, so the next draft is based on what is shown.
+  await expect(page.locator('#st-timezone')).toHaveValue('Europe/Berlin')
+  expect(state.posts).toHaveLength(1)
+  expect(state.posts[0]).not.toHaveProperty('timezone')
+})
+
+test('a model draft made during the catalog reload baselines the saved choices', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  let loads = 0
+  await page.route('**/api/models', async (route) => {
+    loads += 1
+    // The reload after a save lands late; drafts made meanwhile must still
+    // baseline the saved choices, not the pre-save catalog.
+    if (loads > 1) await new Promise((resolve) => setTimeout(resolve, 1500))
+    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as Record<string, ModelChoice>) })
+  })
+  await page.goto('/')
+  await openSection(page, 'models')
+  await page.getByLabel('Chat default model', { exact: true }).selectOption('gpt-6-astra-ultra')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  await page.getByLabel('Editor chat default model', { exact: true }).selectOption('fable-5.1-max')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts).toHaveLength(2)
+  // The second save's expectation carries the first save's choice: without
+  // the stored mirror it would carry the pre-save absence and 409.
+  const sent = state.posts[0].models as Record<string, ModelChoice>
+  const expected = (state.posts[1].expect as Record<string, Record<string, ModelChoice>>).models
+  expect(expected.chat).toEqual(sent.chat)
+})
+
+test('read again shows the saved values when the conflict reload fails', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  let loads = 0
+  await page.route('**/api/models', async (route) => {
+    loads += 1
+    if (loads > 1) {
+      await route.fulfill({ status: 500, json: { error: 'catalog unavailable' } })
+      return
+    }
+    await route.fulfill({ json: modelsResponse({}) })
+  })
+  const saved = { chat: { default: 'gpt-6-astra-ultra', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery } }
+  let refuses = true
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      if (refuses) {
+        refuses = false
+        state.settings = { ...state.settings, models: saved }
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { models: saved } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      state.settings = { ...state.settings, models: { ...(state.settings.models as object), ...((rest.models ?? {}) as object) } }
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'models')
+  const chatDefault = page.getByLabel('Chat default model', { exact: true })
+  await chatDefault.selectOption('muse-spark-1.3-contributor-max')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toContainText('Models "chat" is now')
+  await page.getByRole('button', { name: 'Read again' }).click()
+  // The reload failed, but the 409 carried the saved choice.
+  await expect(chatDefault).toHaveValue('gpt-6-astra-ultra')
+})
