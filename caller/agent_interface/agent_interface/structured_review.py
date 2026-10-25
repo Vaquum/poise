@@ -224,18 +224,18 @@ def _stage_texts(text: str, packet: str) -> list[str]:
 
 
 def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str,
-                              verdict: dict, behavior: str) -> list[dict]:
+                              verdict: dict) -> list[dict]:
     """Remap a since-scoped verdict onto the full pull request diff.
 
     The model reviewed the diff since the last head: RIGHT numbers already
     name current-head lines, but LEFT numbers name previous-head lines, so
     each LEFT comment is remapped to base coordinates by matching its removed
-    content. Findings the pull request diff no longer carries (a follow-up
-    reverted the file, or added then removed the line) are dropped, since
-    GitHub would reject the whole submission for one stale position; when
-    nothing submittable remains the verdict flips clean. A comment on a line
-    the since diff never showed is a model error and fails loudly. Returns
-    the dropped findings."""
+    content. Findings the pull request diff no longer carries are dropped,
+    since GitHub would reject the whole submission for one stale position;
+    but a missing anchor never proves the defect is gone, so when nothing
+    submittable remains the review fails closed instead of approving. A
+    comment on a line the since diff never showed is a model error and fails
+    loudly. Returns the dropped findings."""
     if not packet or not verdict["comments"]:
         return []
     try:
@@ -280,7 +280,9 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
             kept.append({**comment, "line": min(candidates)})
     verdict["comments"][:] = kept
     if not kept:
-        verdict["action"] = "reviewed_clean" if behavior == "pr_review" else "approve"
+        raise InvalidVerdict(
+            "since-diff findings cannot be anchored on the pull request diff; "
+            "refusing to approve without verified positions")
     return dropped
 
 
@@ -385,7 +387,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 verdict = validate_verdict(json.dumps(
                     {"action": "request_changes" if prior else terminal, "comments": prior}), behavior)
                 raw = json.dumps(verdict)
-            dropped = _validate_since_positions(pwd, pr, actor_name, head, packet, verdict, behavior)
+            dropped = _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
             if dropped:
                 raw += ("\nSince-diff findings outside the pull request diff "
                         f"dropped before submission: {json.dumps(dropped)}")

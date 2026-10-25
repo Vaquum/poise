@@ -465,16 +465,27 @@ class TestSincePositions(TestCase):
         submitted = json.loads(calls[-1][0][4])
         self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(5, "LEFT")])
 
-    def test_left_finding_absent_from_the_pr_diff_is_dropped(self):
+    def test_left_finding_absent_from_the_pr_diff_fails_closed(self):
         other = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
                            "@@ -4,3 +4,3 @@", " context", "-other", "+replacement", " context2"])
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
-        result, calls, fetch = self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(other))
-        self.assertIn('"review_id": 91', result)
-        fetch.assert_called_once()
-        self.assertEqual(calls[-1][0][1], "--approve-pr")
-        self.assertIn("dropped before submission", result)
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(other))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
+
+    def test_added_then_deleted_finding_fails_closed_without_approving(self):
+        deleted = "\n".join(["diff --git a/src/helper.py b/src/helper.py", "--- a/src/helper.py",
+                             "+++ /dev/null", "@@ -1,1 +0,0 @@", "-def helper():"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/helper.py", "line": 1, "side": "LEFT",
+                                "body": "deleted while still imported"}]}
+        empty = json.dumps({"action": "read", "diff": "", "files": []})
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, deleted, paths=("src/helper.py",)), verdict, empty)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
 
     def test_right_finding_inside_the_pr_diff_submits(self):
         full = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
@@ -488,17 +499,16 @@ class TestSincePositions(TestCase):
         self.assertEqual(calls[-1][0][1], "--request-changes")
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
-    def test_right_finding_on_a_reverted_file_is_dropped_and_flips_clean(self):
+    def test_right_finding_on_a_reverted_file_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "revert issue"}]}
-        result, calls, fetch = self._run(self._packet("c" * 40, self.REMOVAL), verdict,
-                                         self._full(kept, paths=("src/kept.py",)))
-        self.assertIn('"review_id": 91', result)
-        fetch.assert_called_once()
-        self.assertEqual(calls[-1][0][1], "--approve-pr")
-        self.assertIn("dropped before submission", result)
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, self.REMOVAL), verdict,
+                       self._full(kept, paths=("src/kept.py",)))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
 
     def test_partially_stale_verdict_submits_only_submittable_findings(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
