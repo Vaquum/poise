@@ -87,8 +87,8 @@ export async function datastoreServicesCurrent({ home, binRoot, run, environment
   if (!present) return true
   const me = settings.me?.trim() || ''
   if (!me) return false
-  // As install-production.mjs embeds it: GH_TOKEN="$(gh auth token --user 'me')".
-  return services[0].includes(`gh auth token --user '${me}'`)
+  // As install-production.mjs embeds it, xml-escaped: GH_TOKEN="$(gh auth token --user &apos;me&apos;)".
+  return services[0].includes(`gh auth token --user &apos;${me}&apos;`)
 }
 
 function requireCommit(value, label) {

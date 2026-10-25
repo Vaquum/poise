@@ -16,16 +16,18 @@ async function temporaryHome() {
 }
 
 describe('the settings database every consumer opens', () => {
-  it('is ~/.poise/cache.db, the same default the server opens', async () => {
+  it('is ~/.poise/cache.db when POISE_DB is unset or empty, the same default the server opens', async () => {
     const home = await temporaryHome()
     expect(settingsDatabasePath(home, {})).toBe(join(home, '.poise', 'cache.db'))
-    // A blank POISE_DB is unset, as in server/db.ts.
-    expect(settingsDatabasePath(home, { POISE_DB: '  ' })).toBe(join(home, '.poise', 'cache.db'))
+    expect(settingsDatabasePath(home, { POISE_DB: '' })).toBe(join(home, '.poise', 'cache.db'))
   })
 
-  it('is the database POISE_DB names when one is configured', async () => {
+  it('is POISE_DB verbatim when set, exactly as the server opens it', async () => {
     const home = await temporaryHome()
-    expect(settingsDatabasePath(home, { POISE_DB: ` ${join(home, 'custom.db')} ` })).toBe(join(home, 'custom.db'))
+    expect(settingsDatabasePath(home, { POISE_DB: join(home, 'custom.db') })).toBe(join(home, 'custom.db'))
+    // server/db.ts does not trim: a name with whitespace opens that file.
+    expect(settingsDatabasePath(home, { POISE_DB: '  ' })).toBe('  ')
+    expect(settingsDatabasePath(home, { POISE_DB: `${join(home, 'custom.db')} ` })).toBe(`${join(home, 'custom.db')} `)
   })
 })
 
@@ -86,14 +88,14 @@ describe('reading saved settings outside the server', () => {
 })
 
 describe("a migration's explicit write to Settings", () => {
-  it('upserts the key', async () => {
+  it('inserts the key only when still absent, so a concurrent save wins', async () => {
     const run = vi.fn(async () => ({ stdout: '', stderr: '' }))
     await writeSavedSetting({ run, database: '/home/test/.poise/cache.db', key: 'me', value: 'octocat' })
     expect(run).toHaveBeenCalledOnce()
     expect(run.mock.calls[0][0]).toBe('/usr/bin/sqlite3')
     expect(run.mock.calls[0][1]).toEqual([
       '/home/test/.poise/cache.db',
-      "INSERT INTO meta(key, value) VALUES ('me', 'octocat') ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+      "INSERT INTO meta(key, value) VALUES ('me', 'octocat') ON CONFLICT(key) DO NOTHING;",
     ])
   })
 

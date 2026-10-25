@@ -42,17 +42,23 @@ const NO_SAVED_ACCOUNT = 'No GitHub account is saved. Set Your GitHub account in
 // never-saved value into Settings explicitly; a cleared value stays cleared
 // and fails naming the setting.
 export async function resolveLegacySyncUser({ home, run, environment = process.env }) {
-  const { database, present, settings } = await readSavedSettings({ home, run, environment })
-  if (!present) throw new Error(NO_SAVED_ACCOUNT)
-  if (!('me' in settings)) {
-    const migrated = environment.POISE_GITHUB_USER?.trim() || ''
-    if (!migrated) throw new Error(NO_SAVED_ACCOUNT)
-    if (!GITHUB_LOGIN.test(migrated)) throw new Error('POISE_GITHUB_USER must be a GitHub username')
-    await writeSavedSetting({ run, database, key: 'me', value: migrated })
-    return { user: migrated, migrated: true }
-  }
-  const me = settings.me?.trim() || ''
+  const first = await readSavedSettings({ home, run, environment })
+  if (!first.present) throw new Error(NO_SAVED_ACCOUNT)
+  if ('me' in first.settings) return savedSyncUser(first.settings.me)
+  const migrated = environment.POISE_GITHUB_USER?.trim() || ''
+  if (!migrated) throw new Error(NO_SAVED_ACCOUNT)
+  if (!GITHUB_LOGIN.test(migrated)) throw new Error('POISE_GITHUB_USER must be a GitHub username')
+  await writeSavedSetting({ run, database: first.database, key: 'me', value: migrated })
+  // A Settings save that landed after the read wins over the migration: the
+  // write only inserts when the key is still absent, so what is read now is
+  // what the jobs authenticate as.
+  const current = await readSavedSettings({ home, run, environment })
+  return savedSyncUser(current.settings.me, migrated)
+}
+
+function savedSyncUser(value, migrated = undefined) {
+  const me = value?.trim() || ''
   if (!me) throw new Error(NO_SAVED_ACCOUNT)
   if (!GITHUB_LOGIN.test(me)) throw new Error('The GitHub account in Settings → General is not a GitHub username')
-  return { user: me, migrated: false }
+  return { user: me, migrated: migrated !== undefined && me === migrated }
 }

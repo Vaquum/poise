@@ -65,13 +65,18 @@ describe('production legacy datastore selection', () => {
 
 describe('legacy sync identity', () => {
   // The installer resolves the sync user through this alone: any gh call —
-  // the old active-account fallback — fails the test.
-  function sqliteRun(rows) {
+  // the old active-account fallback — fails the test. `afterWrite` is what
+  // reads see once the migration has written, standing in for the database.
+  function sqliteRun(rows, afterWrite = null) {
     const writes = []
+    let written = false
     const run = async (command, args) => {
       if (command !== '/usr/bin/sqlite3') throw new Error(`Unexpected command: ${command}`)
-      if (args[0] === '-json') return { stdout: JSON.stringify(rows), stderr: '' }
+      if (args[0] === '-json') {
+        return { stdout: JSON.stringify(written && afterWrite !== null ? afterWrite : rows), stderr: '' }
+      }
       writes.push(args)
+      written = true
       return { stdout: '', stderr: '' }
     }
     return { run, writes }
@@ -100,10 +105,20 @@ describe('legacy sync identity', () => {
 
   it('migrates POISE_GITHUB_USER into Settings once, when nothing was ever saved', async () => {
     const database = await savedDb(home)
-    const { run, writes } = sqliteRun([])
+    const { run, writes } = sqliteRun([], [{ key: 'me', value: 'migrated-person' }])
     expect(await resolveLegacySyncUser({ home, run, environment: { POISE_GITHUB_USER: 'migrated-person' } }))
       .toEqual({ user: 'migrated-person', migrated: true })
-    expect(writes).toEqual([[database, "INSERT INTO meta(key, value) VALUES ('me', 'migrated-person') ON CONFLICT(key) DO UPDATE SET value = excluded.value;"]])
+    expect(writes).toEqual([[database, "INSERT INTO meta(key, value) VALUES ('me', 'migrated-person') ON CONFLICT(key) DO NOTHING;"]])
+  })
+
+  it('lets a Settings save that lands mid-migration win over the migrated value', async () => {
+    await savedDb(home)
+    const saved = sqliteRun([], [{ key: 'me', value: 'concurrent-person' }])
+    expect(await resolveLegacySyncUser({ home, run: saved.run, environment: { POISE_GITHUB_USER: 'migrated-person' } }))
+      .toEqual({ user: 'concurrent-person', migrated: false })
+    const cleared = sqliteRun([], [{ key: 'me', value: '' }])
+    await expect(resolveLegacySyncUser({ home, run: cleared.run, environment: { POISE_GITHUB_USER: 'migrated-person' } }))
+      .rejects.toThrow('No GitHub account is saved. Set Your GitHub account in Settings → General')
   })
 
   it('leaves a cleared account cleared and fails naming the setting', async () => {

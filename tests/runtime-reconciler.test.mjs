@@ -150,7 +150,7 @@ describe('production runtime reconciliation', () => {
           for (const kind of ['sync', 'reconcile', 'health']) {
             await writeFile(
               join(launchAgents, `com.vaquum.github-datastore.${kind}.plist`),
-              `<string>exec '${executable}'; GH_TOKEN="$(gh auth token --user 'old-user')"</string>`,
+              `<string>exec &apos;${executable}&apos;; GH_TOKEN="$(gh auth token --user &apos;old-user&apos;)"</string>`,
             )
           }
           await mkdir(join(home, '.poise'), { recursive: true })
@@ -211,15 +211,15 @@ describe('datastore service currency', () => {
     }
   })
 
-  // As install-production.mjs embeds it: the sync job authenticates as the
-  // saved account through that account's gh token.
+  // As install-production.mjs embeds it, xml-escaped: the sync job
+  // authenticates as the saved account through that account's gh token.
   async function installed(home, executable, user) {
     const launchAgents = join(home, 'Library', 'LaunchAgents')
     await mkdir(launchAgents, { recursive: true })
     for (const label of labels) {
       await writeFile(
         join(launchAgents, `${label}.plist`),
-        `<string>exec '${executable}' --db x sync; GH_TOKEN="$(gh auth token --user '${user}')"</string>`,
+        `<string>exec &apos;${executable}&apos; --db x sync; GH_TOKEN="$(gh auth token --user &apos;${user}&apos;)"</string>`,
       )
     }
     await mkdir(join(home, '.poise'), { recursive: true })
