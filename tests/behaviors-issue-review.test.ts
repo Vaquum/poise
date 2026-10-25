@@ -604,6 +604,66 @@ describe('Review New Issues sub-issues', () => {
     issues = issues.map((row) => numbers.includes(row.number as number) ? { ...row, created_at: ago(11 * MINUTE) } : row)
   }
 
+  it('yields to a real callback during reader startup and reads all eight issues at width four', async () => {
+    const { behaviors: runtime } = await start()
+    issues = Array.from({ length: 8 }, (_, index) => issue(500 + index))
+    const original = mocks.runFile.getMockImplementation()!
+    let release!: () => void, entered!: () => void, observed!: (count: number) => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const fourEntered = new Promise<void>((resolve) => { entered = resolve })
+    const progress = new Promise<number>((resolve) => { observed = resolve })
+    const reads: string[] = []
+    let active = 0, peak = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command !== 'github-interface' || args[0] !== '--sub-issues') return original(command, args, options)
+      reads.push(args[1]); active++; peak = Math.max(peak, active)
+      if (reads.length === 1) setImmediate(() => observed(reads.length))
+      if (reads.length === 4) entered()
+      try { await gate; return await original(command, args, options) }
+      finally { active-- }
+    })
+    const done = runtime.runEnabledBehaviorsOnce()
+    try {
+      const beforeProgress = await progress
+      expect(beforeProgress).toBeGreaterThan(0)
+      expect(beforeProgress).toBeLessThan(4)
+      await fourEntered
+      expect(reads).toHaveLength(4)
+      expect(peak).toBe(4)
+    } finally { release(); await done }
+    expect(reads.sort()).toEqual(issues.map(row => `#${row.number}`).sort())
+    expect(peak).toBe(4)
+    expect(active).toBe(0)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
+  it('reports the first reader rejection instead of the earlier array entry after startup', async () => {
+    const { behaviors: runtime } = await start()
+    issues = [issue(500), issue(501), issue(502), issue(503)]
+    const original = mocks.runFile.getMockImplementation()!
+    const first = new Error('reader B failed first'), later = new Error('reader A failed later')
+    let rejectA!: (error: Error) => void
+    const waiting = new Promise<never>((_resolve, reject) => { rejectA = reject })
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { signal?: AbortSignal }) => {
+      if (command !== 'github-interface' || args[0] !== '--sub-issues') return original(command, args, options)
+      if (args[1] === '#500') return await waiting
+      if (args[1] === '#501') {
+        if (!options?.signal) throw new Error('missing operation signal')
+        // Simulate an expired operation, not lifecycle shutdown: reader
+        // failures propagate while runBehaviorCycle still records the error.
+        vi.spyOn(options.signal, 'aborted', 'get').mockReturnValue(true)
+        queueMicrotask(() => queueMicrotask(() => rejectA(later)))
+        throw first
+      }
+      return original(command, args, options)
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const failure = vi.mocked(console.error).mock.calls.find(([line]) => String(line).includes(`${KEY} operation failed:`))
+    expect(failure?.[1]).toBe(first)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([expect.objectContaining({ error: first.message })])
+    expect(launches()).toEqual([])
+  })
+
   it('owns reader rejections when shutdown interrupts pool startup', async () => {
     const { behaviors: runtime } = await start()
     issues = [issue(500), issue(501), issue(502), issue(503)]

@@ -213,6 +213,21 @@ describe('prepare pool startup', () => {
       process.off('unhandledRejection', onUnhandled)
     }
   })
+
+  it('preserves the first observed rejection when several workers fail during startup', async () => {
+    const { behaviors: runtime } = await loadModules()
+    const first = new Error('B failed first')
+    const later = new Error('A failed later')
+    let rejectA!: (error: Error) => void
+    const waiting = new Promise<void>((_resolve, reject) => { rejectA = reject })
+    await expect(runtime.forEachPool(['a', 'b', 'c'], 3, async (item) => {
+      if (item === 'a') await waiting
+      if (item === 'b') {
+        queueMicrotask(() => queueMicrotask(() => rejectA(later)))
+        throw first
+      }
+    })).rejects.toBe(first)
+  })
 })
 
 describe('review checkout in the launch phase', () => {

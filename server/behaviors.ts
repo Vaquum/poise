@@ -2330,6 +2330,7 @@ function loopTurn(): Promise<void> {
 // only when they are enqueued, so an ended sweep begins no new CLI work.
 // Initial worker entries yield to the loop so their synchronous prefixes
 // do not all run in one drain. This does not space later continuations.
+// Exported for the fixture-backed startup and failure guards only.
 export async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
   let next = 0
   const worker = async (): Promise<void> => {
@@ -2341,17 +2342,19 @@ export async function forEachPool<T>(items: readonly T[], limit: number, task: (
     }
   }
   const workers: Array<Promise<void>> = []
+  let firstFailure: { error: unknown } | undefined
   const count = Math.min(limit, items.length)
   for (let started = 0; started < count; started++) {
     const running = worker()
     // Own the rejection before the stagger below yields: a worker that fails
     // fast must not read as unhandled while Promise.all is not yet attached.
-    // This only marks it handled; Promise.all still fails with it.
-    void running.catch(() => undefined)
+    // Retain time order too: already-rejected promises in the later aggregate
+    // would otherwise select by array order instead of original failure order.
+    void running.catch((error: unknown) => { firstFailure ??= { error } })
     workers.push(running)
     if (started + 1 < count) await loopTurn()
   }
-  await Promise.all(workers)
+  await Promise.all(workers).catch((error: unknown) => { throw firstFailure ? firstFailure.error : error })
 }
 
 // One pull request as the datastore has it, whatever its state; null when it
@@ -5251,16 +5254,17 @@ async function readSubIssues(entries: readonly EligibleIssue[]): Promise<Map<str
   // Space initial reader entries like forEachPool workers; subsequent
   // reads can still converge after their asynchronous work completes.
   const readers: Array<Promise<void>> = []
+  let firstFailure: { error: unknown } | undefined
   const readerCount = Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length)
   for (let started = 0; started < readerCount; started++) {
     const running = reader()
     // Same ownership as forEachPool workers: own the rejection before the
-    // stagger below yields; Promise.all still fails with it.
-    void running.catch(() => undefined)
+    // stagger below yields, retaining the first observed original failure.
+    void running.catch((error: unknown) => { firstFailure ??= { error } })
     readers.push(running)
     if (started + 1 < readerCount) await loopTurn()
   }
-  await Promise.all(readers)
+  await Promise.all(readers).catch((error: unknown) => { throw firstFailure ? firstFailure.error : error })
   return subIssues
 }
 
