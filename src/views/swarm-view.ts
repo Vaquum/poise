@@ -1482,8 +1482,13 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   // completed). totalMatching still holds the previous refresh here; the
   // update below runs after this read. Absorbed arrivals never reopen, and
   // disjoint pages reset below; only net shrinkage can still mask growth.
-  const absorbedBad = [...(history.quarantined || []), ...(running.quarantined || [])]
-    .filter((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`)).length
+  // Count distinct quarantine keys: a quarantined running row arrives in
+  // both feeds, and counting it twice would mask one hidden match's growth.
+  const absorbedBad = new Set(
+    [...(history.quarantined || []), ...(running.quarantined || [])]
+      .filter((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
+      .map((row) => `${row.id || ''}:${row.index}:${row.error}`),
+  ).size
   const hiddenGrowth = historyComplete && typeof history.total === 'number'
     && history.total - totalMatching > absorbedLogs + absorbedBad
   const keepComplete = historyComplete && (!historyArrivals || historyOverlaps) && !hiddenGrowth

@@ -450,6 +450,53 @@ test('an exhausted search reopens when arrivals and a hidden match land together
   expect(cursorReads).toEqual(['search:200', 'search:200'])
 })
 
+test('an exhausted search reopens when a quarantined arrival lands in both feeds with a hidden match', async ({ page }) => {
+  await ready(page)
+  let logs = history('acme', 250).map((row, index) => ({ ...row, prompt: `alpha run ${index + 1}` }))
+  const runningCall = { ...logs[0], id: 'acme-900', pr_id: '900', prompt: 'nightly run',
+    status: 'running', completed_at: null, response: '', error: '', time_elapsed: '' }
+  let running = [runningCall]
+  // Same new quarantined running row in both refresh feeds: one arrival key.
+  const dupe = { index: 3, error: 'log row is not an object', id: 'c'.repeat(32),
+    repo: null, prId: null, correlationId: null, behavior: null, sessionId: null }
+  let quarantined: typeof dupe[] = []
+  const cursorReads: string[] = []
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running')
+      return route.fulfill({ json: { logs: running, quarantined } })
+    const cursor = url.searchParams.get('cursor')
+    if (cursor !== null) cursorReads.push(url.searchParams.has('search') ? `search:${cursor}` : cursor)
+    const feed = pagedBounded(logs, url, 200)
+    // Caller totals count every match; Poise splits the unreadable rows after.
+    return route.fulfill({ json: { ...feed, total: feed.total + quarantined.length,
+      quarantined: cursor === null ? quarantined : [] } })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await page.locator('#swarm-search').fill('alpha')
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 200+')
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–250 / 250')
+  await expect(pagerNext(page)).toBeDisabled()
+  // The running call completes beyond the first page while the quarantined
+  // row lands in both feeds: growth of two past one absorbed arrival must
+  // reopen the walk for the hidden match.
+  const completed = { ...runningCall, prompt: 'nightly run alpha', status: 'completed',
+    completed_at: '2026-10-14T08:01:00Z', response: 'available', time_elapsed: '1m' }
+  logs = [...logs.slice(0, 225), completed, ...logs.slice(225)]
+  running = []
+  quarantined = [dupe]
+  await settledRefresh(page)
+  await expect(page.locator('#swarm-page')).toHaveText('201–250 / 250+')
+  await expect(pagerNext(page)).toBeEnabled()
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–251 / 251')
+  await expect(page.locator(`${rows}[data-id="acme-900"]`)).toHaveCount(1)
+  await expect(pagerNext(page)).toBeDisabled()
+  expect(cursorReads).toEqual(['search:200', 'search:200'])
+})
+
 test('a cleared search still reaches rows its narrowing discarded', async ({ page }) => {
   await ready(page)
   const logs = history('acme', 450).map((row, index) => index < 250
