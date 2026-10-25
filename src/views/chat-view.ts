@@ -2771,6 +2771,9 @@ export async function initChatView(): Promise<void> {
     // hidden — that is what lets a running turn be re-joined on return
     // without a refetch — so these listeners live for the app's lifetime.
     window.addEventListener('poise:models-updated', () => { void loadAgents(true) })
+    // A saved default or preset changes what an untouched console shows and
+    // sends; reload the same authoritative defaults Send uses.
+    window.addEventListener('poise:models-changed', () => { void loadAgents(true) })
     chatClient.on('switches', acceptSwitches)
     chatClient.on('session', record => {
       discoveryRevision++

@@ -1300,6 +1300,18 @@ test('keeps a fresh message when its saved default has retired from the catalogu
   expect(sock.framesOf('prompt')).toHaveLength(0)
 })
 
+test('a saved Chat default change updates the untouched console without sending', async ({ page }) => {
+  const state = makeState([]); state.agents = structuredClone(AGENTS)
+  await installRoutes(page, state); const sock = await installSocket(page, state)
+  await page.goto('/')
+  await expect(page.locator('.chat-default-model')).toHaveText('Opus 5 · Max')
+  state.agents.defaults = { model: 'gpt-6-astra-ultra', fallback: 'opus-5-max' }
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:models-changed')))
+  await expect(page.locator('.chat-default-model')).toHaveText('GPT 6 Astra · Ultra')
+  expect(sock.framesOf('prompt')).toHaveLength(0)
+  expect(state.calls.filter(call => call.method === 'POST')).toHaveLength(0)
+})
+
 test('keeps a failed fresh message editable without switching model or opening a dialog', async ({ page }) => {
   const state = makeState([])
   await installRoutes(page, state)
@@ -1389,7 +1401,7 @@ test('leaves a writable fresh console after the final session is deleted', async
   await input(page).fill('A fresh start')
   await input(page).press('Enter')
   await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
-  expect(state.calls.find(c => c.method === 'POST' && c.path === '/api/chat/sessions')?.body).toMatchObject({ model: 'opus-5-high', effort: 'high' })
+  expect(state.calls.find(c => c.method === 'POST' && c.path === '/api/chat/sessions')?.body).toMatchObject({ model: 'opus-5-max', effort: 'max' })
 })
 
 test('resizes the sessions pane from its edge and remembers width across reload and collapse', async ({ page }) => {
@@ -1911,7 +1923,7 @@ test('Auto-merge can be chosen in the fresh console before sending a Poise batch
   await input(page).fill(text)
   await input(page).press('Enter')
   await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
-  expect(state.calls.find(c => c.method === 'POST' && c.path === '/api/chat/sessions')?.body).toMatchObject({ autoMerge: true, agent: 'claude', model: 'opus-5-high' })
+  expect(state.calls.find(c => c.method === 'POST' && c.path === '/api/chat/sessions')?.body).toMatchObject({ autoMerge: true, agent: 'claude', model: 'opus-5-max' })
   expect(sock.framesOf('prompt')[0].command).toMatchObject({ text, sessionId: 'new-1' })
   expect(sock.framesOf('poise.change')).toHaveLength(0)
   await expect(toggle).toHaveAttribute('aria-pressed', 'true')
@@ -1976,7 +1988,7 @@ test('queues five idle messages before the first task, with an expanded collapsi
     await expect(queuedRows(page).last().locator('select')).toBeEnabled()
   }
   expect(sock.framesOf('prompt')).toHaveLength(0); expect(sock.framesOf('steer')).toHaveLength(0)
-  expect(state.calls.filter(c => c.path === '/api/chat/sessions' && c.method === 'POST').map(c => c.body)).toEqual([{ agent: 'claude', model: 'opus-5-high', effort: 'high', deferStart: true, safeMode: false }])
+  expect(state.calls.filter(c => c.path === '/api/chat/sessions' && c.method === 'POST').map(c => c.body)).toEqual([{ agent: 'claude', model: 'opus-5-max', effort: 'max', deferStart: true, safeMode: false }])
   await expect(queuePanel(page)).toHaveAttribute('open', '')
   expect((await queuePanel(page).boundingBox())!.y + (await queuePanel(page).boundingBox())!.height).toBeLessThanOrEqual((await page.locator('.chat-v-composer').boundingBox())!.y)
   await input(page).fill('The first real task')
