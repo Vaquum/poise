@@ -593,16 +593,15 @@ class DeployWiringTest(unittest.TestCase):
         self.assertIn('ref: ${{ github.sha }}', deploy)
         self.assertIn('ref: ${{ steps.gate.outputs.sha }}', deploy)
         self.assertIn('SHA: ${{ steps.gate.outputs.sha }}', deploy)
-        self.assertNotIn('workflow_run.head_sha', deploy)
         self.assertEqual(deploy.count("if: steps.gate.outputs.proceed == 'true'"), 3)
 
-    def test_job_ignores_unsuccessful_and_foreign_runs(self):
+    def test_every_completion_reaches_the_gate(self):
         deploy = self.workflow('deploy.yml')
-        for guard in ("workflow_run.conclusion == 'success'",
-                      "workflow_run.event == 'push'",
-                      "workflow_run.head_branch == 'main'",
-                      'workflow_run.head_repository.full_name == github.repository'):
-            self.assertIn(guard, deploy)
+        self.assertIn("if: vars.POISE_DEPLOY_HOST != ''", deploy)
+        for skipped in ('workflow_run.conclusion', 'workflow_run.event',
+                        'workflow_run.head_branch', 'workflow_run.head_repository',
+                        'workflow_run.head_sha'):
+            self.assertNotIn(skipped, deploy)
 
     def test_gate_may_read_workflow_runs(self):
         permissions = self.workflow('deploy.yml').split('concurrency:')[0]

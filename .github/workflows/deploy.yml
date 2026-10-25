@@ -3,13 +3,14 @@
 # sets no POISE_DEPLOY_HOST variable, so autonomio/poise deploys nowhere.
 #
 # It deploys only the tip of main, and only once that exact commit's
-# required CI passed on it: every CI and Caller completion wakes the
-# workflow, and the gate in deploy/actions/gate.sh judges the current tip
-# again, so a stale wake-up for an older SHA deploys the green tip instead
-# of losing its deploy (and may redeploy it when nothing newer waits). A
-# run started by hand checks the same gate, so applying settings needs
-# green CI on the tip too. Deploys therefore land once CI passes, about
-# ten to twenty minutes after the push, and a commit CI never tested never
+# required CI passed on it: every CI and Caller completion — success,
+# failure, or cancelled — wakes the workflow, and the gate in
+# deploy/actions/gate.sh judges the current tip again, so any wake-up,
+# even for a failed run on an older SHA, deploys the green tip instead of
+# losing its deploy (and may redeploy it when nothing newer waits). A run
+# started by hand checks the same gate, so applying settings needs green
+# CI on the tip too. Deploys therefore land once CI passes, about ten to
+# twenty minutes after the push, and a commit CI never tested never
 # deploys.
 name: Deploy
 
@@ -31,13 +32,7 @@ concurrency:
 jobs:
   deploy:
     name: Deploy to the server
-    if: >
-      vars.POISE_DEPLOY_HOST != '' &&
-      (github.event_name == 'workflow_dispatch' ||
-        (github.event.workflow_run.conclusion == 'success' &&
-          github.event.workflow_run.event == 'push' &&
-          github.event.workflow_run.head_branch == 'main' &&
-          github.event.workflow_run.head_repository.full_name == github.repository))
+    if: vars.POISE_DEPLOY_HOST != ''
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
