@@ -630,6 +630,70 @@ test('saving models again after a failed catalog reload retries against the refu
   expect((state.posts[2].expect as Record<string, Record<string, ModelChoice>>).models.editor).toEqual(editorSaved)
 })
 
+test('a fallback edit after a failed catalog reload keeps the refused default', async ({ page }) => {
+  const recovery = (CATALOG.behaviors as Record<string, string>).review_recovery
+  const chatStored = { default: 'fable-5.1-max', fallback: recovery }
+  const editorStored = { default: 'opus-5-max', fallback: recovery }
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: { chat: chatStored, editor: editorStored } })
+  let loads = 0
+  await page.route('**/api/models', async (route) => {
+    loads += 1
+    // Only the conflict reload fails; later reloads read the server again.
+    if (loads === 2) {
+      await route.fulfill({ status: 500, json: { error: 'catalog unavailable' } })
+      return
+    }
+    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as Record<string, ModelChoice>) })
+  })
+  const deepEqual = (a: unknown, b: unknown): boolean => {
+    if (a === b) return true
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false
+    const left = a as Record<string, unknown>
+    const right = b as Record<string, unknown>
+    const keys = Object.keys(left)
+    return keys.length === Object.keys(right).length && keys.every((key) => deepEqual(left[key], right[key]))
+  }
+  // The stub refuses like the server: the whole stored models object must
+  // match the expectation, and a refusal carries the current values.
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      const models = state.settings.models as Record<string, ModelChoice>
+      const expected = (body.expect as { models?: Record<string, ModelChoice> } | undefined)?.models
+      if (expected && !deepEqual(models, expected)) {
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { models } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      state.settings = { ...state.settings, models: { ...models, ...((rest.models ?? {}) as object) } }
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'models')
+  await page.getByLabel('Chat default model', { exact: true }).selectOption('muse-spark-1.3-contributor-max')
+  // Another tab saves the untouched editor place before this tab's save.
+  const editorSaved = { default: 'opus-5-xhigh', fallback: recovery }
+  state.settings = { ...state.settings, models: { chat: chatStored, editor: editorSaved } }
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toContainText('Models "editor" is now')
+  // The untouched place shows the refused choice, not the stale catalog.
+  const editorDefault = page.getByLabel('Editor chat default model', { exact: true })
+  const editorFallback = page.getByLabel('Editor chat fallback model', { exact: true })
+  await expect(editorDefault).toHaveValue('opus-5-xhigh')
+  await expect(editorFallback).toHaveValue(recovery)
+  // Editing only the fallback keeps the refused default: the save carries
+  // what is shown, not the stale pre-conflict choice.
+  await editorFallback.selectOption('gpt-6-astra-max')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts).toHaveLength(2)
+  expect((state.posts[1].models as Record<string, ModelChoice>).editor).toEqual({ default: 'opus-5-xhigh', fallback: 'gpt-6-astra-max' })
+  expect((state.settings.models as Record<string, ModelChoice>).editor).toEqual({ default: 'opus-5-xhigh', fallback: 'gpt-6-astra-max' })
+})
+
 test('a model draft made with nothing stored refuses after another tab fills the place', async ({ page }) => {
   const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
   await setupModels(page, state)

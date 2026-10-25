@@ -1260,9 +1260,12 @@ async function handleConflict(section: 'general' | 'models', current: Record<str
     // The reload failed, but the refusal carries the saved choice for every
     // place that moved: refresh the comparison baseline from it, so Save
     // again compares untouched places against what the server holds instead
-    // of failing again on the same stale read. Drafts stay put; Read again
-    // still applies and shows the saved values.
+    // of failing again on the same stale read. The selects are rendered from
+    // it at once, as a landed reload would: a baseline moved under a stale
+    // display would base a later draft on unseen values. Drafts stay put;
+    // Read again still applies and shows the saved values.
     applyRefusedModelChoices(leaves)
+    if (lastModels) renderPlaces(lastModels)
   }
   renderOrganizations()
   renderAccounts()
