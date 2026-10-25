@@ -313,9 +313,14 @@ test('still saves Settings that keep stored consecutive-hyphen accounts', async 
   await page.locator('[data-settings="general"]').click()
   await expect(page.getByLabel('Your GitHub account')).toHaveValue('a--b')
   await expect(page.getByLabel('GitHub automation account')).toHaveValue('x--y')
+  // A save carries only drafts: the stored accounts are not re-sent, so they cannot block it.
+  await page.locator('#st-timezone').selectOption('Europe/Helsinki')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(posts).toHaveLength(1)
+  expect(posts[0]).not.toHaveProperty('me')
+  expect(posts[0]).not.toHaveProperty('agentAccount')
+  expect(settings.me).toBe('a--b')
 })
 
 test('shows in Settings whether production is on main', async ({ page }) => {
