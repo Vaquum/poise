@@ -81,7 +81,7 @@ async function setup(page: Page, initial = [organization('acme')], me = 'octocat
         diagnostics: state.diagnostics,
       } })
     }
-    if (url.pathname === '/api/models') return route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } })
+    if (url.pathname === '/api/models') return route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, slots: { primary: '', secondary: '', tertiary: '', notes: [], stored: null }, places: [], fixed: [], refresh: null } })
     if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (url.pathname === '/api/behavior-metrics') return route.fulfill({ json: { behaviors: Object.fromEntries(BEHAVIORS.map(({ key }) => [key, null])), error: null } })
     if (url.pathname === '/api/analytics') return route.fulfill({ json: emptyAnalyticsReport(url) })

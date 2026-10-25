@@ -1,7 +1,7 @@
 import { db, getMeta, setMeta } from './db'
 import { invalidateRepoListCache } from './gh'
 import { HttpError } from './http'
-import { type Catalog, type ModelSettings, isModelPlace, validateModelSettings } from './models'
+import { type Catalog, type ModelPlace, type ModelPlaceChoice, type ModelSettings, type ModelSlotChoices, assertSlotsDistinct, isModelPlace, isModelSlot, migrateLegacyModelSettings, validateModelSettings } from './models'
 
 // GitHub logins and organization names: 1–39 characters, alphanumerics and
 // hyphens, not leading or trailing; your account and the agent account
@@ -33,7 +33,7 @@ export interface Settings {
   // comments are posted as. It must be signed in to gh on this machine.
   agentAccount: string
   timezone: string
-  // Per place: the identity the user picked as default and as fallback. What
+  // The three slot models chosen once, and the slot each place runs. What
   // actually launches is resolved against the live catalog (server/models.ts).
   models: ModelSettings
   chat: ChatSettings
@@ -211,8 +211,32 @@ const ACCOUNT_KEYS: ReadonlySet<string> = new Set(['org', 'me', 'agentAccount'])
 function legacyReviewModels(): ModelSettings {
   const legacy = getMeta('reviewModel')
   if (legacy !== 'astra') return {}
-  const choice = { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' }
-  return { pr_review: choice, pr_approve: choice }
+  return {
+    slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' },
+    places: { pr_review: { slot: 'primary' }, pr_approve: { slot: 'primary' } },
+  }
+}
+
+function readModelSettings(record: Record<string, unknown>): ModelSettings {
+  const settings: ModelSettings = {}
+  const slots = record.slots
+  if (slots && typeof slots === 'object' && !Array.isArray(slots)) {
+    const picked: ModelSlotChoices = {}
+    for (const [slot, identity] of Object.entries(slots as Record<string, unknown>)) {
+      if (isModelSlot(slot) && typeof identity === 'string' && identity) picked[slot] = identity
+    }
+    if (Object.keys(picked).length > 0) settings.slots = picked
+  }
+  const places = record.places
+  if (places && typeof places === 'object' && !Array.isArray(places)) {
+    const picked: Partial<Record<ModelPlace, ModelPlaceChoice>> = {}
+    for (const [place, value] of Object.entries(places as Record<string, unknown>)) {
+      const slot = (value as { slot?: unknown } | null)?.slot
+      if (isModelPlace(place) && isModelSlot(slot)) picked[place] = { slot }
+    }
+    if (Object.keys(picked).length > 0) settings.places = picked
+  }
+  return settings
 }
 
 export function getModelSettings(): ModelSettings {
@@ -220,19 +244,12 @@ export function getModelSettings(): ModelSettings {
   if (!raw) return legacyReviewModels()
   let parsed: unknown
   try { parsed = JSON.parse(raw) } catch { return {} }
-  if (typeof parsed !== 'object' || parsed === null) return {}
-  const models: ModelSettings = {}
-  for (const [place, value] of Object.entries(parsed as Record<string, any>)) {
-    if (isModelPlace(place) && typeof value?.default === 'string' && typeof value?.fallback === 'string') {
-      models[place] = {
-        default: value.default,
-        fallback: value.fallback,
-        ...(typeof value.secondary === 'string' ? { secondary: value.secondary } : {}),
-        ...(typeof value.tertiary === 'string' ? { tertiary: value.tertiary } : {}),
-      }
-    }
-  }
-  return models
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
+  const record = parsed as Record<string, unknown>
+  // Slots and places are the stored shape; anything else is a per-place
+  // choice from before slots, migrated on read.
+  if ('slots' in record || 'places' in record) return readModelSettings(record)
+  return migrateLegacyModelSettings(record)
 }
 
 export function getSettings(): Settings {
@@ -315,7 +332,16 @@ const saveSettings = db.transaction((partial: Partial<Settings>, catalog: Catalo
   let models: ModelSettings | undefined
   if ('models' in partial && partial.models !== undefined) {
     if (!catalog) throw new Error('the model catalog is unavailable; model settings were not saved')
-    models = { ...getModelSettings(), ...validateModelSettings(catalog, partial.models) }
+    const patch = validateModelSettings(catalog, partial.models)
+    const base = getModelSettings()
+    const slots = { ...base.slots, ...patch.slots }
+    // A partial slot save can still collide with a stored slot: the patch
+    // alone validated, so only the merged whole can tell.
+    assertSlotsDistinct(slots)
+    models = {
+      ...(Object.keys(slots).length > 0 ? { slots } : {}),
+      ...((base.places || patch.places) ? { places: { ...base.places, ...patch.places } } : {}),
+    }
   }
   let chat: ChatSettings | undefined
   if ('chat' in partial && partial.chat !== undefined) chat = validateChatSettings(partial.chat)

@@ -56,22 +56,17 @@ describe('the catalog Poise reads from Caller', () => {
   })
 })
 
-describe('resolving a place against the live catalog', () => {
-  it('seeds every place from the Caller default and the recovery model', () => {
-    expect(models.resolveChoice(catalog, 'chat', undefined)).toEqual({ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', notes: [] })
-    expect(models.resolveChoice(catalog, 'pr_approve', undefined)).toEqual({ default: 'opus-5-xhigh', fallback: 'gpt-6-astra-ultra', notes: [] })
-  })
-
-  it('seeds the PR review panel with one family per reviewer, the default first', () => {
-    expect(models.resolveChoice(catalog, 'pr_review', undefined)).toEqual({
-      default: 'opus-5-xhigh',
-      fallback: 'gpt-6-astra-ultra',
+describe('resolving the slots against the live catalog', () => {
+  it('seeds the three models from the review default and a family-diverse panel', () => {
+    expect(models.resolveSlots(catalog, undefined)).toEqual({
+      primary: 'opus-5-xhigh',
       secondary: 'gpt-6-astra-ultra',
       tertiary: 'grok-4.6-xhigh',
       notes: [],
     })
-    // A default from another family walks the debate participants from it outward.
-    expect(models.resolveChoice(catalog, 'pr_review', { default: 'grok-4.6-xhigh', fallback: 'opus-5-max' })).toMatchObject({
+    // A primary from another family walks the debate participants from it outward.
+    expect(models.resolveSlots(catalog, { primary: 'grok-4.6-xhigh' })).toMatchObject({
+      primary: 'grok-4.6-xhigh',
       secondary: 'opus-5-max',
       tertiary: 'gpt-6-astra-ultra',
     })
@@ -80,138 +75,182 @@ describe('resolving a place against the live catalog', () => {
     expect(models.seedReviewers(claudeOnly, 'opus-5-max')).toEqual({ secondary: 'opus-5-xhigh', tertiary: 'fable-5.1-max' })
   })
 
-  it('keeps stored reviewers and replaces a retired one with its seed', () => {
-    const stored = { default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'muse-spark-1.3-contributor-max', tertiary: 'gemini-3.8-flash-high' }
-    expect(models.resolveChoice(catalog, 'pr_review', stored)).toEqual({ ...stored, notes: [] })
-    const resolved = models.resolveChoice(catalog, 'pr_review', { ...stored, tertiary: 'gemini-3.1-pro-high' })
+  it('keeps stored slot models and replaces a retired one with its seed', () => {
+    const stored = { primary: 'opus-5-max', secondary: 'muse-spark-1.3-contributor-max', tertiary: 'gemini-3.8-flash-high' }
+    expect(models.resolveSlots(catalog, stored)).toEqual({ ...stored, notes: [] })
+    const resolved = models.resolveSlots(catalog, { ...stored, tertiary: 'gemini-3.1-pro-high' })
     expect(resolved.tertiary).toBe('grok-4.6-xhigh')
     expect(resolved.notes).toEqual(['gemini-3.1-pro-high is no longer in the catalog; using grok-4.6-xhigh.'])
   })
 
-  it('lists the reviewers Behaviors asks for, primary first', () => {
-    const choice = { default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh', tertiary: 'muse-spark-1.3-contributor-max' }
-    expect(models.reviewerModels(choice, 1)).toEqual([{ slot: 'primary', model: 'opus-5-max' }])
-    expect(models.reviewerModels(choice, 2)).toEqual([{ slot: 'primary', model: 'opus-5-max' }, { slot: 'secondary', model: 'grok-4.6-xhigh' }])
-    expect(models.reviewerModels(choice, 3).map((r) => r.slot)).toEqual(['primary', 'secondary', 'tertiary'])
-    expect(models.reviewerModels(choice, 7).length).toBe(3)
-    expect(models.reviewerModels({ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra' }, 3)).toEqual([{ slot: 'primary', model: 'opus-5-max' }])
-  })
-
-  it('keeps a stored choice while the catalog still has it', () => {
-    const stored = { default: 'grok-4.6-xhigh', fallback: 'muse-spark-1.3-contributor-max' }
-    expect(models.resolveChoice(catalog, 'chat', stored)).toEqual({ ...stored, notes: [] })
-  })
-
-  it('replaces a retired identity with the seed and says so', () => {
-    const resolved = models.resolveChoice(catalog, 'pr_approve', { default: 'opus-5-high', fallback: 'gpt-6-astra-xhigh' })
-    expect(resolved).toEqual({
-      default: 'opus-5-xhigh',
-      fallback: 'gpt-6-astra-ultra',
-      notes: [
-        'opus-5-high is no longer in the catalog; using opus-5-xhigh.',
-        'gpt-6-astra-xhigh is no longer in the catalog; using gpt-6-astra-ultra.',
-      ],
+  it('replaces a retired primary past the saved later slots instead of repeating one', () => {
+    // The review default already sits in Secondary; the replacement must skip it.
+    expect(models.resolveSlots(catalog, { primary: 'opus-4.8-max', secondary: 'opus-5-xhigh', tertiary: 'gemini-3.8-flash-high' })).toEqual({
+      primary: 'gpt-6-astra-ultra',
+      secondary: 'opus-5-xhigh',
+      tertiary: 'gemini-3.8-flash-high',
+      notes: ['opus-4.8-max is no longer in the catalog; using gpt-6-astra-ultra.'],
     })
   })
 
-  it('lets a review place use any provider Caller lists as reviewing', () => {
-    const stored = { default: 'grok-4.6-xhigh', fallback: 'muse-spark-1.3-contributor-max' }
-    expect(models.resolveChoice(catalog, 'pr_review', stored)).toMatchObject({ ...stored, notes: [] })
-    expect(models.resolveChoice(catalog, 'pr_approve', { default: 'gemini-3.8-flash-high', fallback: 'gpt-5.6-sol-ultra' })).toEqual({ default: 'gemini-3.8-flash-high', fallback: 'gpt-5.6-sol-ultra', notes: [] })
+  it('seeds a missing seat past the stored picks instead of repeating one', () => {
+    // The tertiary seed for this primary is the stored secondary itself.
+    expect(models.resolveSlots(catalog, { primary: 'opus-5-xhigh', secondary: 'grok-4.6-xhigh' })).toEqual({
+      primary: 'opus-5-xhigh',
+      secondary: 'grok-4.6-xhigh',
+      tertiary: 'gpt-6-astra-ultra',
+      notes: [],
+    })
+  })
+})
+
+describe('resolving a place against the slots', () => {
+  const slots = { primary: 'opus-5-max', secondary: 'grok-4.6-xhigh', tertiary: 'gpt-6-astra-ultra' }
+
+  it('runs every place on Primary until it picks another slot', () => {
+    expect(models.resolvePlace(catalog, 'chat', {})).toEqual({ slot: 'primary', model: 'opus-5-xhigh', notes: [] })
+    expect(models.resolvePlace(catalog, 'pr_approve', {})).toEqual({ slot: 'primary', model: 'opus-5-xhigh', notes: [] })
+    const settings = { slots, places: { pr_approve: { slot: 'tertiary' } } } as never
+    expect(models.resolvePlace(catalog, 'pr_approve', settings)).toEqual({ slot: 'tertiary', model: 'gpt-6-astra-ultra', notes: [] })
+    expect(models.resolvePlace(catalog, 'chat', settings)).toEqual({ slot: 'primary', model: 'opus-5-max', notes: [] })
   })
 
-  it('never resolves a review place to a model its providers cannot review with', () => {
-    const resolved = models.resolveChoice(narrow, 'pr_review', { default: 'grok-4.6-xhigh', fallback: 'opus-5-max' })
-    expect(resolved.default).toBe('opus-5-xhigh')
-    expect(resolved.fallback).toBe('opus-5-max')
-    expect(resolved.notes[0]).toContain('grok-4.6-xhigh is no longer in the catalog')
+  it('moves a place to the first following slot it can run, and says so', () => {
+    const settings = { slots, places: { pr_approve: { slot: 'secondary' } } } as never
+    // Grok cannot review on the narrow catalog; the tertiary Codex model can.
+    const resolved = models.resolvePlace(narrow, 'pr_approve', settings)
+    expect(resolved).toEqual({
+      slot: 'tertiary',
+      model: 'gpt-6-astra-ultra',
+      notes: ['PR approval cannot run grok-4.6-xhigh; using gpt-6-astra-ultra.'],
+    })
+  })
+
+  it('falls back to the place seed when no slot model can run there', () => {
+    const unusable = { primary: 'grok-4.6-xhigh', secondary: 'grok-4.6-high', tertiary: 'gemini-3.8-flash-high' }
+    expect(models.resolvePlace(narrow, 'pr_approve', { slots: unusable })).toEqual({
+      slot: 'primary',
+      model: 'opus-5-xhigh',
+      notes: ['PR approval cannot run grok-4.6-xhigh; using opus-5-xhigh.'],
+    })
+  })
+
+  it('lists the reviewers Behaviors asks for, the place slot first', () => {
+    expect(models.slotPanel(catalog, 'pr_review', slots, 'primary', 1)).toEqual([
+      { slot: 'primary', model: 'opus-5-max', recovery: 'grok-4.6-xhigh' },
+    ])
+    expect(models.slotPanel(catalog, 'pr_review', slots, 'primary', 2)).toEqual([
+      { slot: 'primary', model: 'opus-5-max', recovery: 'grok-4.6-xhigh' },
+      { slot: 'secondary', model: 'grok-4.6-xhigh', recovery: 'gpt-6-astra-ultra' },
+    ])
+    expect(models.slotPanel(catalog, 'pr_review', slots, 'primary', 7).map((r) => r.slot)).toEqual(['primary', 'secondary', 'tertiary'])
+    // A panel starting past Primary runs fewer than asked when the slots run out.
+    expect(models.slotPanel(catalog, 'pr_review', slots, 'secondary', 3)).toEqual([
+      { slot: 'secondary', model: 'grok-4.6-xhigh', recovery: 'gpt-6-astra-ultra' },
+      { slot: 'tertiary', model: 'gpt-6-astra-ultra', recovery: 'gpt-6-astra-ultra' },
+    ])
+    // A panel never launches a model the place cannot run.
+    expect(models.slotPanel(narrow, 'pr_review', slots, 'primary', 3)).toEqual([
+      { slot: 'primary', model: 'opus-5-max', recovery: 'gpt-6-astra-ultra' },
+      { slot: 'tertiary', model: 'gpt-6-astra-ultra', recovery: 'gpt-6-astra-ultra' },
+    ])
+  })
+
+  it("recovers with the next runnable slot, else Caller's own recovery", () => {
+    expect(models.recoveryModel(catalog, 'pr_approve', slots, 'primary')).toBe('grok-4.6-xhigh')
+    expect(models.recoveryModel(catalog, 'pr_approve', slots, 'tertiary')).toBe('gpt-6-astra-ultra')
+    expect(models.recoveryModel(narrow, 'pr_approve', slots, 'primary')).toBe('gpt-6-astra-ultra')
   })
 })
 
 describe('validating what the settings pane saves', () => {
-  it('accepts catalog identities per known place and returns only those', () => {
+  it('accepts slot models and place slots, and returns only those', () => {
     const next = models.validateModelSettings(catalog, {
-      chat: { default: 'gemini-3.8-flash-high', fallback: 'opus-5-max', extra: 'ignored' },
-      pr_review: { default: 'muse-spark-1.3-contributor-max', fallback: 'grok-4.6-high' },
+      slots: { primary: 'gemini-3.8-flash-high', tertiary: 'opus-5-max' },
+      places: { pr_review: { slot: 'secondary', extra: 'ignored' } },
     })
     expect(next).toEqual({
-      chat: { default: 'gemini-3.8-flash-high', fallback: 'opus-5-max' },
-      pr_review: { default: 'muse-spark-1.3-contributor-max', fallback: 'grok-4.6-high' },
+      slots: { primary: 'gemini-3.8-flash-high', tertiary: 'opus-5-max' },
+      places: { pr_review: { slot: 'secondary' } },
     })
   })
 
-  it('accepts reviewers for the PR review place only, each a different model', () => {
-    const saved = models.validateModelSettings(catalog, {
-      pr_review: { default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh', tertiary: 'muse-spark-1.3-contributor-max' },
-      pr_approve: { default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh' },
-    })
-    expect(saved.pr_review).toEqual({ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh', tertiary: 'muse-spark-1.3-contributor-max' })
-    expect(saved.pr_approve).toEqual({ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra' })
-    expect(models.validateModelSettings(catalog, { pr_review: { default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh' } }).pr_review)
-      .toEqual({ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh' })
-    for (const [choice, message] of [
-      [{ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'opus' }, /PR review secondary must be a model from the catalog/],
-      [{ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'opus-5-max' }, /secondary reviewer must differ from its default/],
-      [{ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh', tertiary: 'grok-4.6-xhigh' }, /tertiary reviewer must differ/],
-      [{ default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', tertiary: 'opus-5-max' }, /tertiary reviewer must differ/],
-    ] as const) {
-      expect(() => models.validateModelSettings(catalog, { pr_review: choice })).toThrow(message)
-    }
-    expect(() => models.validateModelSettings(narrow, { pr_review: { default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh' } }))
-      .toThrow(/PR review secondary must be a claude or codex model/)
+  it('accepts a partial save of either half', () => {
+    expect(models.validateModelSettings(catalog, { slots: { secondary: 'grok-4.6-xhigh' } }))
+      .toEqual({ slots: { secondary: 'grok-4.6-xhigh' } })
+    expect(models.validateModelSettings(catalog, { places: { chat: { slot: 'tertiary' } } }))
+      .toEqual({ places: { chat: { slot: 'tertiary' } } })
+    expect(models.validateModelSettings(catalog, {})).toEqual({})
   })
 
-  it('holds a review place to the providers an older Caller lists', () => {
-    expect(() => models.validateModelSettings(narrow, { pr_review: { default: 'muse-spark-1.3-contributor-max', fallback: 'opus-5-xhigh' } }))
-      .toThrow(/PR review default must be a claude or codex model/)
+  it('refuses two slots running the same model', () => {
+    expect(() => models.validateModelSettings(catalog, { slots: { primary: 'opus-5-max', tertiary: 'opus-5-max' } }))
+      .toThrow(/model slots primary and tertiary must be different models/)
+    expect(() => models.assertSlotsDistinct({ primary: 'opus-5-max', secondary: 'opus-5-max' })).toThrow(/must be different models/)
+    expect(() => models.assertSlotsDistinct({ primary: 'opus-5-max' })).not.toThrow()
   })
 
   it.each([
-    [{ chat: { default: 'opus', fallback: 'opus-5-max' } }, /Chat default must be a model from the catalog/],
-    [{ pr_approve: { default: 'opus-5-xhigh', fallback: 'opus-5-xhigh' } }, /PR approval fallback must differ/],
-    [{ canary: { default: 'opus-5-max', fallback: 'opus-5-xhigh' } }, /unknown model place canary/],
-    ['opus-5-max', /object of places/],
+    [{ slots: { primary: 'opus' } }, /model slot primary must be a model from the catalog/],
+    [{ slots: { fourth: 'opus-5-max' } }, /unknown model slot fourth/],
+    [{ slots: 'opus-5-max' }, /must be an object of primary, secondary and tertiary/],
+    [{ places: { chat: { slot: 'default' } } }, /Chat slot must be primary, secondary or tertiary/],
+    [{ places: { canary: { slot: 'primary' } } }, /unknown model place canary/],
+    [{ places: 'primary' }, /model places must be an object of places/],
+    [{ chat: { default: 'opus-5-max', fallback: 'opus-5-xhigh' } }, /unknown models section chat/],
+    ['opus-5-max', /object with slots and places/],
   ])('rejects %j', (value, message) => {
     expect(() => models.validateModelSettings(catalog, value)).toThrow(message)
+  })
+})
+
+describe('migrating per-place choices into slots', () => {
+  it('folds the review panels into the slots and points each place at its old default', () => {
+    // Chat's own default is the fourth distinct identity; the three slots
+    // cannot hold it, so Chat follows Primary.
+    expect(models.migrateLegacyModelSettings({
+      pr_review: { default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'grok-4.6-xhigh', tertiary: 'muse-spark-1.3-contributor-max' },
+      pr_approve: { default: 'grok-4.6-xhigh', fallback: 'opus-5-xhigh' },
+      chat: { default: 'gemini-3.8-flash-high', fallback: 'opus-5-max' },
+    })).toEqual({
+      slots: { primary: 'opus-5-max', secondary: 'grok-4.6-xhigh', tertiary: 'muse-spark-1.3-contributor-max' },
+      places: { pr_review: { slot: 'primary' }, pr_approve: { slot: 'secondary' }, chat: { slot: 'primary' } },
+    })
+  })
+
+  it('keeps the fallbacks when fewer than three defaults were chosen', () => {
+    expect(models.migrateLegacyModelSettings({
+      pr_approve: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' },
+    })).toEqual({
+      slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' },
+      places: { pr_approve: { slot: 'primary' } },
+    })
+  })
+
+  it('ignores places without a default and fallback, and returns nothing for none', () => {
+    expect(models.migrateLegacyModelSettings({ chat: { default: 'opus-5-max' } })).toEqual({})
+    expect(models.migrateLegacyModelSettings({})).toEqual({})
   })
 })
 
 describe('the Issue review place', () => {
   const issueOnly = { ...catalog, issue_review_providers: ['claude', 'grok'] }
 
-  it('seeds from the PR review default and draws its panel from the issue review providers', () => {
+  it('runs its slot, and draws its panel from the issue review providers', () => {
     expect(models.placeProviders(catalog, 'issue_review')).toEqual(['antigravity', 'claude', 'codex', 'grok', 'muse'])
-    expect(models.resolveChoice(catalog, 'issue_review', undefined)).toEqual({
-      default: 'opus-5-xhigh',
-      fallback: 'gpt-6-astra-ultra',
-      secondary: 'gpt-6-astra-ultra',
-      tertiary: 'grok-4.6-xhigh',
-      notes: [],
-    })
-    // Only the providers Caller can run an issue review with.
-    const narrowed = models.resolveChoice(issueOnly, 'issue_review', { default: 'opus-5-max', fallback: 'gpt-6-astra-ultra', secondary: 'muse-spark-1.3-contributor-max' })
-    expect(narrowed.secondary).toBe('grok-4.6-xhigh')
-    expect(narrowed.notes).toContain('muse-spark-1.3-contributor-max is no longer in the catalog; using grok-4.6-xhigh.')
+    const slots = { primary: 'opus-5-max', secondary: 'muse-spark-1.3-contributor-max', tertiary: 'grok-4.6-xhigh' }
+    expect(models.resolvePlace(issueOnly, 'issue_review', { slots })).toEqual({ slot: 'primary', model: 'opus-5-max', notes: [] })
+    // Muse cannot run an issue review on the narrowed catalog; the panel skips it.
+    expect(models.slotPanel(issueOnly, 'issue_review', slots, 'primary', 3)).toEqual([
+      { slot: 'primary', model: 'opus-5-max', recovery: 'grok-4.6-xhigh' },
+      { slot: 'tertiary', model: 'grok-4.6-xhigh', recovery: 'gpt-6-astra-ultra' },
+    ])
   })
 
   it('says Caller must be updated, and keeps the choice, when Caller has no issue review', () => {
-    const stored = { default: 'grok-4.6-xhigh', fallback: 'opus-5-max', secondary: 'muse-spark-1.3-contributor-max' }
-    const resolved = models.resolveChoice(PRE_ISSUE_REVIEW_CATALOG as any, 'issue_review', stored)
-    expect(resolved).toMatchObject({ default: 'grok-4.6-xhigh', fallback: 'opus-5-max', secondary: 'muse-spark-1.3-contributor-max' })
-    expect(resolved.notes).toEqual(['Update Caller: Issue review is unavailable.'])
-    expect(() => models.validateModelSettings(PRE_ISSUE_REVIEW_CATALOG as any, { issue_review: stored }))
-      .toThrow(/Update Caller: Issue review is unavailable/)
-  })
-
-  it('saves a panel of different models from the issue review providers', () => {
-    const saved = models.validateModelSettings(issueOnly, {
-      issue_review: { default: 'grok-4.6-xhigh', fallback: 'opus-5-max', secondary: 'opus-5-xhigh', tertiary: 'fable-5.1-max' },
-    })
-    expect(saved.issue_review).toEqual({ default: 'grok-4.6-xhigh', fallback: 'opus-5-max', secondary: 'opus-5-xhigh', tertiary: 'fable-5.1-max' })
-    expect(() => models.validateModelSettings(issueOnly, { issue_review: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-max' } }))
-      .toThrow(/Issue review default must be a claude or grok model/)
-    expect(() => models.validateModelSettings(issueOnly, { issue_review: { default: 'grok-4.6-xhigh', fallback: 'opus-5-max', secondary: 'grok-4.6-xhigh' } }))
-      .toThrow(/secondary reviewer must differ/)
+    const settings = { slots: { primary: 'grok-4.6-xhigh', secondary: 'opus-5-max' }, places: { issue_review: { slot: 'secondary' } } } as never
+    const resolved = models.resolvePlace(PRE_ISSUE_REVIEW_CATALOG as any, 'issue_review', settings)
+    expect(resolved).toEqual({ slot: 'secondary', model: 'opus-5-max', notes: ['Update Caller: Issue review is unavailable.'] })
   })
 })
 

@@ -3,7 +3,7 @@
 // Using one saves its choices through Settings' own validation.
 
 import { getMeta, setMeta } from './db'
-import { type Catalog, type ModelSettings, validateModelSettings } from './models'
+import { type Catalog, type ModelSettings, migrateLegacyModelSettings, validateModelSettings } from './models'
 
 const KEY = 'model_presets'
 export const MAX_MODEL_PRESETS = 12
@@ -21,8 +21,16 @@ export function listModelPresets(): ModelPreset[] {
   let parsed: unknown
   try { parsed = JSON.parse(raw) } catch { return [] }
   if (!Array.isArray(parsed)) return []
-  return parsed.filter((preset): preset is ModelPreset => typeof preset?.name === 'string'
-    && typeof preset?.savedAt === 'string' && typeof preset?.models === 'object' && preset.models !== null)
+  return parsed
+    .filter((preset): preset is ModelPreset => typeof preset?.name === 'string'
+      && typeof preset?.savedAt === 'string' && typeof preset?.models === 'object' && preset.models !== null)
+    .map((preset) => {
+      // A configuration saved before slots folds into them on read, so using
+      // it still saves through Settings' own validation.
+      const models = preset.models as unknown as Record<string, unknown>
+      if ('slots' in models || 'places' in models) return preset
+      return { ...preset, models: migrateLegacyModelSettings(models) }
+    })
 }
 
 function presetName(value: unknown): string {

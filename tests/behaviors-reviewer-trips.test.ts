@@ -10,7 +10,7 @@ function modelOf(call: unknown[]): string {
   return args[args.indexOf('--model') + 1]
 }
 
-async function startPrReviews(models: Record<string, string>) {
+async function startPrReviews(slots: { primary: string, secondary: string, tertiary: string }) {
   arrangeCli(false)
   mocks.spawnDetached.mockResolvedValue(undefined)
   const { database: db, behaviors: runtime } = await loadModules()
@@ -19,9 +19,19 @@ async function startPrReviews(models: Record<string, string>) {
   db.setMeta('behavior_review_new_prs_keyver', '3')
   db.setMeta('behavior_review_new_prs_enabled', '1')
   db.setMeta('behavior_review_new_prs_reviewers', '1')
-  db.setMeta('models', JSON.stringify({ pr_review: models }))
+  db.setMeta('models', JSON.stringify({ slots, places: { pr_review: { slot: 'primary' } } }))
   db.recordSeen('review-new-prs', '__snapshot_v3__')
   return { db, runtime }
+}
+
+function tripReviewer(db: { setMeta: (key: string, value: string) => void }, identity: string): void {
+  db.setMeta(`behavior_review_new_prs_failure:reviewer:${identity}`, JSON.stringify({
+    kind: 'operation',
+    consecutiveFailures: 1,
+    lastFailureAtMs: Date.now(),
+    nextRetryAtMs: Date.now() + 3_600_000,
+    error: `${identity} cannot review delivery probe`,
+  }))
 }
 
 function failedLog(
@@ -63,8 +73,7 @@ describe('reviewer account trips', () => {
 
   it.each(accountFailures)('trips the reviewer on $name and falls back to the next reviewer', async ({ error, extras }) => {
     const { db, runtime } = await startPrReviews({
-      default: 'grok-4.6-xhigh', fallback: 'gpt-6-astra-ultra',
-      secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
+      primary: 'grok-4.6-xhigh', secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
     })
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
@@ -101,9 +110,11 @@ describe('reviewer account trips', () => {
 
   it('waits while every reviewer is tripped, then retries and clears on success', async () => {
     const { db, runtime } = await startPrReviews({
-      default: 'grok-4.6-xhigh', fallback: 'gpt-6-astra-ultra',
-      secondary: 'grok-4.6-xhigh', tertiary: 'grok-4.6-xhigh',
+      primary: 'grok-4.6-xhigh', secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
     })
+    // Every slot but the primary is already down: tripping the primary must
+    // wait, not substitute.
+    for (const identity of ['opus-5-xhigh', 'gpt-6-astra-ultra']) tripReviewer(db, identity)
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
 
@@ -118,9 +129,9 @@ describe('reviewer account trips', () => {
     // Tripped, released, and nothing to fall back to: the review waits.
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
     expect(db.listBehaviorDeadLetters()).toEqual([])
-    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
       expect.objectContaining({ target: 'reviewer:grok-4.6-xhigh' }),
-    ])
+    ]))
 
     // Still waiting on the next tick: no launch, no new incident.
     await runtime.runEnabledBehaviorsOnce()
@@ -153,7 +164,10 @@ describe('reviewer account trips', () => {
     await resetLogCache()
     fixture.listedPrs = [pr, { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18' }]
     await runtime.runEnabledBehaviorsOnce()
-    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    // The probe's success clears its own trip; the other two slots stay down.
+    expect(runtime.getBehaviorsRuntimeHealth().failures.map((failure) => failure.target).sort()).toEqual([
+      'reviewer:gpt-6-astra-ultra', 'reviewer:opus-5-xhigh',
+    ])
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
     expect(mocks.spawnDetached.mock.calls[2][1]).toContain('#18')
     expect(modelOf(mocks.spawnDetached.mock.calls[2])).toBe('grok-4.6-xhigh')
@@ -161,8 +175,7 @@ describe('reviewer account trips', () => {
 
   it('leaves an ordinary review failure on the per-target path without tripping', async () => {
     const { db, runtime } = await startPrReviews({
-      default: 'opus-5-xhigh', fallback: 'gpt-6-astra-ultra',
-      secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
+      primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
     })
     await runtime.runEnabledBehaviorsOnce()
     expect(modelOf(mocks.spawnDetached.mock.calls[0])).toBe('opus-5-xhigh')
@@ -188,8 +201,7 @@ describe('reviewer account trips', () => {
 
   it('retires trips for reviewers no place configures, and keeps the rest', async () => {
     const { db, runtime } = await startPrReviews({
-      default: 'opus-5-xhigh', fallback: 'gpt-6-astra-ultra',
-      secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
+      primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
     })
     for (const identity of ['retired-model-1-max', 'grok-4.6-xhigh']) {
       db.setMeta(`behavior_review_new_prs_failure:reviewer:${identity}`, JSON.stringify({
@@ -229,9 +241,9 @@ describe('reviewer account trips', () => {
 
   it('probes a due trip with one launch while the other waiting targets hold', async () => {
     const { db, runtime } = await startPrReviews({
-      default: 'grok-4.6-xhigh', fallback: 'gpt-6-astra-ultra',
-      secondary: 'grok-4.6-xhigh', tertiary: 'grok-4.6-xhigh',
+      primary: 'grok-4.6-xhigh', secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
     })
+    for (const identity of ['opus-5-xhigh', 'gpt-6-astra-ultra']) tripReviewer(db, identity)
     await runtime.runEnabledBehaviorsOnce()
     const key = `${pr.repo}#${pr.number}`
     fixture.agentLogs = [failedLog(db, key, 'grok-4.6-xhigh', {
@@ -249,9 +261,9 @@ describe('reviewer account trips', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(db.listBehaviorLaunchClaims('review-new-prs')).toHaveLength(1)
     expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('grok-4.6-xhigh')
-    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
       expect.objectContaining({ target: 'reviewer:grok-4.6-xhigh', consecutiveFailures: 2 }),
-    ])
+    ]))
 
     // The probe's failure re-trips instead of launching the waiter.
     const probe = db.listBehaviorLaunchClaims('review-new-prs')[0]
@@ -276,15 +288,14 @@ describe('reviewer account trips', () => {
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(db.listBehaviorDeadLetters()).toEqual([])
-    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
       expect.objectContaining({ target: 'reviewer:grok-4.6-xhigh', consecutiveFailures: 3 }),
-    ])
+    ]))
   })
 
   it('trips the recovery model on its 402 and holds the target', async () => {
     const { db, runtime } = await startPrReviews({
-      default: 'opus-5-xhigh', fallback: 'gpt-6-astra-ultra',
-      secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
+      primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
     })
     await runtime.runEnabledBehaviorsOnce()
     expect(modelOf(mocks.spawnDetached.mock.calls[0])).toBe('opus-5-xhigh')
@@ -320,8 +331,7 @@ describe('reviewer account trips', () => {
 
   it('clears only the recovery trip when a verdict comes from the recovery', async () => {
     const { db, runtime } = await startPrReviews({
-      default: 'opus-5-xhigh', fallback: 'gpt-6-astra-ultra',
-      secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
+      primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
     })
     for (const identity of ['opus-5-xhigh', 'grok-4.6-xhigh']) {
       db.setMeta(`behavior_review_new_prs_failure:reviewer:${identity}`, JSON.stringify({
@@ -360,8 +370,7 @@ describe('reviewer account trips', () => {
 
   it('holds a target whose run posted before its account error, without tripping', async () => {
     const { db, runtime } = await startPrReviews({
-      default: 'grok-4.6-xhigh', fallback: 'gpt-6-astra-ultra',
-      secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
+      primary: 'grok-4.6-xhigh', secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
     })
     await runtime.runEnabledBehaviorsOnce()
     expect(modelOf(mocks.spawnDetached.mock.calls[0])).toBe('grok-4.6-xhigh')

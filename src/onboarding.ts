@@ -671,34 +671,30 @@ function aiStep(ctx: StepContext): StepView {
 }
 
 interface CatalogModel { identity: string, provider: string }
+interface ModelSlots { primary: string, secondary: string, tertiary: string }
 interface ModelPlace {
   key: string
   label: string
   why: string
-  review: boolean
-  reviewers: boolean
-  providers?: string[] | null
-  default: string
-  fallback: string
-  secondary?: string
-  tertiary?: string
+  slot: Slot
+  stored: { slot: Slot } | null
 }
-interface ModelsAnswer { catalog: { models: CatalogModel[], review_providers: string[] }, places: ModelPlace[] }
-type Slot = 'default' | 'fallback' | 'secondary' | 'tertiary'
-const SLOT_LABELS: Record<Slot, string> = { default: 'Default', fallback: 'Fallback', secondary: 'Secondary reviewer', tertiary: 'Tertiary reviewer' }
+interface ModelsAnswer { catalog: { models: CatalogModel[], review_providers: string[] }, slots: ModelSlots, places: ModelPlace[] }
+type Slot = 'primary' | 'secondary' | 'tertiary'
+const MODEL_SLOTS: readonly Slot[] = ['primary', 'secondary', 'tertiary']
+const SLOT_LABELS: Record<Slot, string> = { primary: 'Primary', secondary: 'Secondary', tertiary: 'Tertiary' }
 
-/** For each slot of a place, the stored or proposed model when its provider is
+/** For each of the three slots, the resolved model when its provider is
  *  signed in, otherwise the first signed-in model no earlier slot took. */
-function proposeChoice(place: ModelPlace, eligible: CatalogModel[], usable: Set<string>): Record<Slot, string> {
-  const slots: Slot[] = place.reviewers ? ['default', 'fallback', 'secondary', 'tertiary'] : ['default', 'fallback']
+function proposeSlots(slots: ModelSlots, models: CatalogModel[], usable: Set<string>): Record<Slot, string> {
   const choice = {} as Record<Slot, string>
   const taken = new Set<string>()
-  const provider = (identity: string) => eligible.find((model) => model.identity === identity)?.provider
-  for (const slot of slots) {
-    const current = place[slot] ?? ''
+  const provider = (identity: string) => models.find((model) => model.identity === identity)?.provider
+  for (const slot of MODEL_SLOTS) {
+    const current = slots[slot] ?? ''
     const keep = current && !taken.has(current) && usable.has(provider(current) ?? '')
-    const next = keep ? current : eligible.find((model) => usable.has(model.provider) && !taken.has(model.identity))?.identity
-      ?? (current && !taken.has(current) ? current : eligible.find((model) => !taken.has(model.identity))?.identity ?? '')
+    const next = keep ? current : models.find((model) => usable.has(model.provider) && !taken.has(model.identity))?.identity
+      ?? (current && !taken.has(current) ? current : models.find((model) => !taken.has(model.identity))?.identity ?? '')
     choice[slot] = next
     if (next) taken.add(next)
   }
@@ -718,7 +714,7 @@ function modelsStep(ctx: StepContext): StepView {
     try {
       const [res, accounts] = await Promise.all([fetch('/api/models', { cache: 'no-store' }), ctx.accounts(false)])
       const data = await res.json() as ModelsAnswer & { error?: string }
-      if (!res.ok || !data.catalog || !Array.isArray(data.places)) throw new Error(data.error || `HTTP ${res.status}`)
+      if (!res.ok || !data.catalog || !data.slots || !Array.isArray(data.places)) throw new Error(data.error || `HTTP ${res.status}`)
       if (disposed) return
       answer = data
       const usable = signedIn(accounts) as Set<string>
@@ -726,35 +722,43 @@ function modelsStep(ctx: StepContext): StepView {
       chips.innerHTML = providers.map((provider) => `
         <span class="ob-chip${usable.has(provider) ? ' ob-chip-on' : ''}">${usable.has(provider) ? CHECK : ''}${escapeHtml(NAMES[provider as AccountId] ?? provider)}</span>`).join('')
         + `<span class="st-help st-help-info ob-chip-note">${usable.size ? 'Models from providers you have not signed in to are dimmed.' : 'No AI account is signed in yet, so every model is dimmed. Go back to sign in, or choose now and sign in later.'}</span>`
-      placesEl.innerHTML = data.places.map((place) => {
-        const allowed = place.providers !== undefined ? place.providers : place.review ? data.catalog.review_providers : null
-        const eligible = allowed ? data.catalog.models.filter((model) => allowed.includes(model.provider)) : data.catalog.models
-        const choice = proposeChoice(place, eligible, usable)
-        const options = (selected: string) => {
-          const on = eligible.filter((model) => usable.has(model.provider))
-          const off = eligible.filter((model) => !usable.has(model.provider))
-          const option = (model: CatalogModel, disabled: boolean) => `<option value="${escapeHtml(model.identity)}"${model.identity === selected ? ' selected' : ''}${disabled && model.identity !== selected ? ' disabled' : ''}>${escapeHtml(model.identity)}</option>`
-          return (on.length ? `<optgroup label="Signed in">${on.map((model) => option(model, false)).join('')}</optgroup>` : '')
-            + (off.length ? `<optgroup label="Not signed in">${off.map((model) => option(model, true)).join('')}</optgroup>` : '')
-        }
-        const slots = (Object.keys(choice) as Slot[])
-        const provider = (identity: string) => eligible.find((model) => model.identity === identity)?.provider ?? ''
-        return `
-          <div class="ob-place" data-place="${escapeHtml(place.key)}">
-            <div class="ob-place-head"><span class="ob-place-name">${escapeHtml(place.label)}</span></div>
-            <div class="st-help st-help-info ob-place-why">${escapeHtml(place.why)}</div>
-            <div class="ob-place-grid">${slots.map((slot) => {
+      const eligible = data.catalog.models
+      const choice = proposeSlots(data.slots, eligible, usable)
+      const options = (selected: string) => {
+        const on = eligible.filter((model) => usable.has(model.provider))
+        const off = eligible.filter((model) => !usable.has(model.provider))
+        const option = (model: CatalogModel, disabled: boolean) => `<option value="${escapeHtml(model.identity)}"${model.identity === selected ? ' selected' : ''}${disabled && model.identity !== selected ? ' disabled' : ''}>${escapeHtml(model.identity)}</option>`
+        return (on.length ? `<optgroup label="Signed in">${on.map((model) => option(model, false)).join('')}</optgroup>` : '')
+          + (off.length ? `<optgroup label="Not signed in">${off.map((model) => option(model, true)).join('')}</optgroup>` : '')
+      }
+      const provider = (identity: string) => eligible.find((model) => model.identity === identity)?.provider ?? ''
+      const slotOptions = (selected: string) => MODEL_SLOTS.map((slot) => `<option value="${slot}"${slot === selected ? ' selected' : ''}>${SLOT_LABELS[slot]}</option>`).join('')
+      placesEl.innerHTML = `
+          <div class="ob-place" data-slots>
+            <div class="ob-place-head"><span class="ob-place-name">Models</span></div>
+            <div class="st-help st-help-info ob-place-why">The three models, chosen once. Every place below runs one of these slots.</div>
+            <div class="ob-place-grid">${MODEL_SLOTS.map((slot) => {
               const off = !!choice[slot] && !usable.has(provider(choice[slot]))
               return `
               <label class="ob-model">
                 <span class="st-sublabel">${SLOT_LABELS[slot]}</span>
-                <select class="st-select${off ? ' ob-model-off' : ''}" data-slot="${slot}" aria-label="${escapeHtml(place.label)} ${SLOT_LABELS[slot].toLowerCase()}">${options(choice[slot])}</select>
+                <select class="st-select${off ? ' ob-model-off' : ''}" data-slot="${slot}" aria-label="${SLOT_LABELS[slot]} model">${options(choice[slot])}</select>
                 ${off ? `<span class="st-help st-help-info">Needs ${escapeHtml(NAMES[provider(choice[slot]) as AccountId] ?? provider(choice[slot]))}; there are not enough signed-in models for every slot.</span>` : ''}
               </label>`
             }).join('')}
             </div>
           </div>`
-      }).join('')
+        + data.places.map((place) => `
+          <div class="ob-place" data-place="${escapeHtml(place.key)}">
+            <div class="ob-place-head"><span class="ob-place-name">${escapeHtml(place.label)}</span></div>
+            <div class="st-help st-help-info ob-place-why">${escapeHtml(place.why)}</div>
+            <div class="ob-place-grid">
+              <label class="ob-model">
+                <span class="st-sublabel">Slot</span>
+                <select class="st-select" data-place-slot aria-label="${escapeHtml(place.label)} slot">${slotOptions(place.stored?.slot ?? place.slot)}</select>
+              </label>
+            </div>
+          </div>`).join('')
       // A choice changed to a signed-in model is no longer dimmed.
       placesEl.addEventListener('change', (event) => {
         const select = event.target as HTMLSelectElement
@@ -774,18 +778,26 @@ function modelsStep(ctx: StepContext): StepView {
     element: view,
     ready: () => !!answer,
     leave: async () => {
-      const models: Record<string, Partial<Record<Slot, string>>> = {}
-      for (const place of placesEl.querySelectorAll<HTMLElement>('.ob-place')) {
-        const choice: Partial<Record<Slot, string>> = {}
-        for (const select of place.querySelectorAll<HTMLSelectElement>('select[data-slot]')) choice[select.dataset.slot as Slot] = select.value
-        if (choice.default && choice.fallback && choice.default === choice.fallback) {
-          ctx.status(`${place.querySelector('.ob-place-name')?.textContent}: the fallback must differ from the default.`, 'error')
+      const slots: Partial<Record<Slot, string>> = {}
+      const slotsEl = placesEl.querySelector<HTMLElement>('[data-slots]')
+      for (const select of slotsEl?.querySelectorAll<HTMLSelectElement>('select[data-slot]') ?? []) slots[select.dataset.slot as Slot] = select.value
+      const seen = new Map<string, Slot>()
+      for (const slot of MODEL_SLOTS) {
+        const identity = slots[slot]
+        if (!identity) continue
+        const clash = seen.get(identity)
+        if (clash) {
+          ctx.status(`Model slots ${clash} and ${slot} must be different models.`, 'error')
           return false
         }
-        models[place.dataset.place ?? ''] = choice
+        seen.set(identity, slot)
+      }
+      const places: Record<string, { slot: string }> = {}
+      for (const place of placesEl.querySelectorAll<HTMLElement>('.ob-place[data-place]')) {
+        places[place.dataset.place ?? ''] = { slot: place.querySelector<HTMLSelectElement>('select[data-place-slot]')?.value || 'primary' }
       }
       try {
-        await postJson('/api/settings', { models })
+        await postJson('/api/settings', { models: { slots, places } })
         await loadSettings({ fresh: true })
         window.dispatchEvent(new CustomEvent('poise:models-changed'))
         return true

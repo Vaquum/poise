@@ -132,7 +132,7 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
       await route.fulfill({ json: board })
       return
     }
-    if (path === '/api/models') { await route.fulfill({ json: state.models || { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } }); return }
+    if (path === '/api/models') { await route.fulfill({ json: state.models || { catalog: { models: [], review_providers: [], path: '' }, slots: { primary: '', secondary: '', tertiary: '', notes: [], stored: null }, places: [], fixed: [], refresh: null } }); return }
     if (path === '/api/chat/legacy' && method === 'GET') {
       const subject = url.searchParams.get('subject') || ''
       const key = subject.slice(subject.indexOf(':') + 1)

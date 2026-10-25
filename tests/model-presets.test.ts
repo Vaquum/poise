@@ -12,7 +12,7 @@ vi.mock('../server/db', () => ({
 
 const { deleteModelPreset, listModelPresets, saveModelPreset, MAX_MODEL_PRESETS } = await import('../server/model-presets')
 const catalog = CATALOG as never
-const CHAT = { chat: { default: 'grok-4.6-xhigh', fallback: 'opus-5-max' } }
+const CHAT = { slots: { primary: 'grok-4.6-xhigh', secondary: 'opus-5-max' }, places: { chat: { slot: 'primary' as const } } }
 const NOW = new Date('2026-10-09T12:00:00Z')
 
 beforeEach(() => mocks.store.clear())
@@ -21,7 +21,7 @@ describe('saved model configurations', () => {
   it('saves the choices under a name, replaces one of the same name, and deletes it', () => {
     expect(listModelPresets()).toEqual([])
     expect(saveModelPreset({ name: ' Quota day ', models: CHAT }, catalog, NOW)).toEqual([{ name: 'Quota day', models: CHAT, savedAt: NOW.toISOString() }])
-    const other = { chat: { default: 'opus-5-max', fallback: 'grok-4.6-high' } }
+    const other = { slots: { primary: 'opus-5-max', secondary: 'grok-4.6-high' } }
     saveModelPreset({ name: 'Normal', models: other }, catalog, NOW)
     expect(saveModelPreset({ name: 'quota DAY', models: other }, catalog, NOW).map((preset) => [preset.name, preset.models])).toEqual([
       ['Normal', other], ['quota DAY', other],
@@ -33,9 +33,17 @@ describe('saved model configurations', () => {
   it('refuses a missing or long name, choices the catalog does not have, and none at all', () => {
     expect(() => saveModelPreset({ name: '  ', models: CHAT }, catalog)).toThrow(/Name the configuration/)
     expect(() => saveModelPreset({ name: 'x'.repeat(41), models: CHAT }, catalog)).toThrow(/Name the configuration/)
-    expect(() => saveModelPreset({ name: 'Bad', models: { chat: { default: 'no-such-model', fallback: 'opus-5-max' } } }, catalog)).toThrow(/catalog/)
+    expect(() => saveModelPreset({ name: 'Bad', models: { slots: { primary: 'no-such-model' } } }, catalog)).toThrow(/catalog/)
     expect(() => saveModelPreset({ name: 'Empty', models: {} }, catalog)).toThrow(/at least one model choice/)
     expect(listModelPresets()).toEqual([])
+  })
+
+  it('migrates a configuration saved before slots', () => {
+    mocks.store.set('model_presets', JSON.stringify([{ name: 'Old',
+      models: { pr_approve: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' } }, savedAt: NOW.toISOString() }]))
+    expect(listModelPresets()).toEqual([{ name: 'Old',
+      models: { slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' }, places: { pr_approve: { slot: 'primary' } } },
+      savedAt: NOW.toISOString() }])
   })
 
   it('keeps at most twelve, and ignores a stored value it cannot read', () => {

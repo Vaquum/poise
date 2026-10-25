@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
+function modelOf(call: unknown[]): string {
+  const args = call[1] as string[]
+  return args[args.indexOf('--model') + 1]
+}
+
 describe('worker failure classification and recovery', () => {
 
   it('recovers a failed review only after GitHub proves no reviewer action', async () => {
@@ -352,13 +357,10 @@ describe('worker failure classification and recovery', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
   })
 
-  it('retries a budget-exhausted approval on the same head once the backoff expires', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+  it('falls a budget-exhausted approval to the next slot on the same head', async () => {
     const launched = await launchApprovalBeforeCrash()
-    const callId = 'e'.repeat(32)
     fixture.agentLogs = [agentLog({
-      id: callId,
+      id: 'e'.repeat(32),
       behavior: 'pr_approve',
       started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
       started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
@@ -380,24 +382,17 @@ describe('worker failure classification and recovery', () => {
     runtime.startBehaviorsRuntime()
     await runtime.runEnabledBehaviorsOnce()
 
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    const failure = runtime.getBehaviorsRuntimeHealth().failures.find((entry) => entry.target === launched.target)
-    expect(failure).toMatchObject({ diagnostic: { severity: 'warning', code: 'review_budget_exhausted' } })
-    // The held row carries the automatic retry time, so a pending retry never looks stuck.
-    expect(runtime.getBehaviorDiagnosticIncidents(null).find((incident) => incident.callId === callId)?.nextRetryAt)
-      .toBe(failure?.nextRetryAt)
-
-    // No push, no replay: the same head relaunches once the backoff expires.
-    vi.setSystemTime(new Date(Date.now() + runtime.BEHAVIOR_RETRY_BASE_MS))
-    await runtime.runEnabledBehaviorsOnce()
+    // No push, no replay, no backoff wait: the next slot relaunches the same head.
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
     expect(mocks.spawnDetached.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
-    expect(db.listBehaviorDeadLetters()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ target: 'reviewer:opus-5-xhigh' }),
+    ])
+    expect(db.listBehaviorDeadLetters()).toEqual([])
   })
 
-  it('gives a 429 approval its verdict on the same head without a push or a replay', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+  it('falls a 429 approval to the next slot on the same head without a push or a replay', async () => {
     const launched = await launchApprovalBeforeCrash()
     fixture.agentLogs = [agentLog({
       id: 'e'.repeat(32),
@@ -407,6 +402,7 @@ describe('worker failure classification and recovery', () => {
       status: 'failed',
       action: 'not_started',
       outcome: 'preflight_failed',
+      model: 'opus-5-xhigh',
       review_policy: 'bounded-v1',
       error_code: 'review_provider_error',
       error: 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)',
@@ -417,15 +413,17 @@ describe('worker failure classification and recovery', () => {
     })]
     await resetLogCache()
 
-    const { behaviors: runtime } = await restartModules()
+    const { database: db, behaviors: runtime } = await restartModules()
     runtime.startBehaviorsRuntime()
     await runtime.runEnabledBehaviorsOnce()
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
 
-    vi.setSystemTime(new Date(Date.now() + runtime.BEHAVIOR_RETRY_BASE_MS))
-    await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
     expect(mocks.spawnDetached.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ target: 'reviewer:opus-5-xhigh' }),
+    ])
+    expect(db.listBehaviorDeadLetters()).toEqual([])
   })
 
   it('holds a budget-exhausted approval when the submission is uncertain', async () => {
@@ -467,6 +465,9 @@ describe('worker failure classification and recovery', () => {
 
   it('allows an explicit model change after a bounded no-action failure', async () => {
     const launched = await launchApprovalBeforeCrash()
+    // An output limit still holds: only provider failures before a verdict —
+    // a rate limit, a dead provider, an exhausted budget — trip and fall
+    // through the slots.
     fixture.agentLogs = [agentLog({
       id: 'f'.repeat(32), behavior: 'pr_approve',
       started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),

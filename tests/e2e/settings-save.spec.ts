@@ -6,27 +6,37 @@ import { CATALOG } from '../model-catalog-fixture'
 // the save, and another tab's edit to the same field is refused with its
 // current value instead of silently overwritten.
 
-type ModelChoice = { default: string, fallback: string, secondary?: string, tertiary?: string }
+type ModelSettings = { slots?: Record<string, string>, places?: Record<string, { slot: string }> }
 const CHAT = { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }
 
-function modelsResponse(models: Record<string, ModelChoice>) {
+function modelsResponse(models: ModelSettings) {
+  const slots = {
+    primary: models.slots?.primary || 'opus-5-xhigh',
+    secondary: models.slots?.secondary || 'gpt-6-astra-ultra',
+    tertiary: models.slots?.tertiary || 'grok-4.6-xhigh',
+    notes: [],
+    stored: models.slots || null,
+  }
   const places = [
     { key: 'chat', label: 'Chat', why: 'Card chats.', review: false, reviewers: false, seed: 'author_content' },
     { key: 'editor', label: 'Editor chat', why: 'Editor chats.', review: false, reviewers: false, seed: 'author_content' },
     { key: 'pr_review', label: 'PR review', why: 'Reviews.', review: true, reviewers: true, seed: 'pr_review' },
     { key: 'pr_approve', label: 'PR approval', why: 'Approvals.', review: true, reviewers: false, seed: 'pr_approve' },
-  ].map((place) => ({
-    ...place,
-    default: models[place.key]?.default || (CATALOG.behaviors as Record<string, string>)[place.seed],
-    fallback: models[place.key]?.fallback || (CATALOG.behaviors as Record<string, string>).review_recovery,
-    ...(place.reviewers
-      ? { secondary: models[place.key]?.secondary || 'gpt-6-astra-ultra', tertiary: models[place.key]?.tertiary || 'grok-4.6-xhigh' }
-      : {}),
-    notes: [],
-    stored: models[place.key] || null,
-  }))
+  ].map((place) => {
+    const slot = models.places?.[place.key]?.slot || 'primary'
+    const model = slot === 'secondary' ? slots.secondary : slot === 'tertiary' ? slots.tertiary : slots.primary
+    return { ...place, slot, model, notes: [], stored: models.places?.[place.key] || null }
+  })
   const fixed = [{ key: 'content', label: '/content', model: (CATALOG.behaviors as Record<string, string>).author_content, why: 'Set by Caller.' }]
-  return { catalog: CATALOG, places, fixed, refresh: null }
+  return { catalog: CATALOG, slots, places, fixed, refresh: null }
+}
+
+// The stub merges like the server: each models half merges separately.
+function mergeModels(prev: ModelSettings, next: ModelSettings): ModelSettings {
+  return {
+    ...(prev.slots || next.slots ? { slots: { ...prev.slots, ...next.slots } } : {}),
+    ...(prev.places || next.places ? { places: { ...prev.places, ...next.places } } : {}),
+  }
 }
 
 interface SettingsStub {
@@ -44,8 +54,9 @@ async function setupSettings(page: Page, initial: Record<string, unknown>): Prom
       state.posts.push(body)
       const { expect: _ignored, ...rest } = body
       const merged = { ...state.settings, ...rest }
-      for (const key of ['chat', 'models'] as const) {
-        if (rest[key] && typeof rest[key] === 'object') merged[key] = { ...(state.settings[key] as object), ...(rest[key] as object) }
+      if (rest.chat && typeof rest.chat === 'object') merged.chat = { ...(state.settings.chat as object), ...(rest.chat as object) }
+      if (rest.models && typeof rest.models === 'object') {
+        merged.models = mergeModels((state.settings.models ?? {}) as ModelSettings, rest.models as ModelSettings)
       }
       state.settings = merged
     }
@@ -56,7 +67,7 @@ async function setupSettings(page: Page, initial: Record<string, unknown>): Prom
 
 async function setupModels(page: Page, state: SettingsStub): Promise<void> {
   await page.route('**/api/models', async (route) => {
-    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as Record<string, ModelChoice>) })
+    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as ModelSettings) })
   })
 }
 
@@ -86,13 +97,13 @@ test('a models save sends only the edited place and leaves general drafts alone'
   await openSection(page, 'general')
   await page.locator('#st-timezone').selectOption('Europe/Berlin')
   await openSection(page, 'models')
-  await page.getByLabel('Chat default model', { exact: true }).selectOption('muse-spark-1.3-contributor-max')
+  await page.getByLabel('Chat slot', { exact: true }).selectOption('secondary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts).toHaveLength(1)
   expect(Object.keys(state.posts[0]).sort()).toEqual(['expect', 'models'])
-  expect(Object.keys(state.posts[0].models as object)).toEqual(['chat'])
-  expect((state.posts[0].models as Record<string, ModelChoice>).chat.default).toBe('muse-spark-1.3-contributor-max')
+  expect(Object.keys(state.posts[0].models as object)).toEqual(['places'])
+  expect((state.posts[0].models as ModelSettings).places?.chat?.slot).toBe('secondary')
   expect(state.posts[0].expect).toEqual({ models: {} })
   // The other tab's timezone is untouched, and the general draft is intact.
   expect(state.settings.timezone).toBe('UTC')
@@ -105,8 +116,8 @@ test('an invalid model draft does not block a general save', async ({ page }) =>
   await setupModels(page, state)
   await page.goto('/')
   await openSection(page, 'models')
-  const fallback = page.getByLabel('Chat fallback model', { exact: true })
-  await fallback.selectOption(await page.getByLabel('Chat default model', { exact: true }).inputValue())
+  const secondary = page.getByLabel('Secondary model', { exact: true })
+  await secondary.selectOption(await page.getByLabel('Primary model', { exact: true }).inputValue())
   await openSection(page, 'general')
   await page.locator('#st-timezone').selectOption('Europe/Berlin')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
@@ -116,7 +127,7 @@ test('an invalid model draft does not block a general save', async ({ page }) =>
   expect(state.posts[0].timezone).toBe('Europe/Berlin')
   // The invalid draft was neither committed nor cleared.
   await openSection(page, 'models')
-  await expect(fallback).toHaveValue(await page.getByLabel('Chat default model', { exact: true }).inputValue())
+  await expect(secondary).toHaveValue(await page.getByLabel('Primary model', { exact: true }).inputValue())
   expect(state.settings.models).toEqual({})
 })
 
@@ -172,29 +183,29 @@ test('a stale models save reads the place back without losing other drafts', asy
       state.posts.push(body)
       if (refuses) {
         refuses = false
-        const current = { chat: { default: 'opus-5-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery } }
+        const current = { places: { chat: { slot: 'primary' } } }
         state.settings = { ...state.settings, models: current }
         await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { models: current } } })
         return
       }
       const { expect: _ignored, ...rest } = body
-      state.settings = { ...state.settings, models: { ...(state.settings.models as object), ...((rest.models ?? {}) as object) } }
+      state.settings = { ...state.settings, models: mergeModels(state.settings.models as ModelSettings, (rest.models ?? {}) as ModelSettings) }
     }
     await route.fulfill({ json: state.settings })
   })
   await page.goto('/')
   await openSection(page, 'models')
-  const chatDefault = page.getByLabel('Chat default model', { exact: true })
-  const editorDefault = page.getByLabel('Editor chat default model', { exact: true })
-  await chatDefault.selectOption('muse-spark-1.3-contributor-max')
-  await editorDefault.selectOption('fable-5.1-max')
+  const chatSlot = page.getByLabel('Chat slot', { exact: true })
+  const editorSlot = page.getByLabel('Editor chat slot', { exact: true })
+  await chatSlot.selectOption('secondary')
+  await editorSlot.selectOption('tertiary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toContainText('Models "chat" is now')
-  await expect(chatDefault).toHaveValue('muse-spark-1.3-contributor-max')
+  await expect(chatSlot).toHaveValue('secondary')
   await page.getByRole('button', { name: 'Read again' }).click()
   // Only the stale place takes the saved value; the other draft stays.
-  await expect(chatDefault).toHaveValue('opus-5-max')
-  await expect(editorDefault).toHaveValue('fable-5.1-max')
+  await expect(chatSlot).toHaveValue('primary')
+  await expect(editorSlot).toHaveValue('tertiary')
 })
 
 test('update turn bound drafts survive close and reopen, and save with Enter', async ({ page }) => {
@@ -266,21 +277,21 @@ test('a model draft made during the catalog reload baselines the saved choices',
     // The reload after a save lands late; drafts made meanwhile must still
     // baseline the saved choices, not the pre-save catalog.
     if (loads > 1) await new Promise((resolve) => setTimeout(resolve, 1500))
-    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as Record<string, ModelChoice>) })
+    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as ModelSettings) })
   })
   await page.goto('/')
   await openSection(page, 'models')
-  await page.getByLabel('Chat default model', { exact: true }).selectOption('muse-spark-1.3-contributor-max')
+  await page.getByLabel('Chat slot', { exact: true }).selectOption('secondary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
-  await page.getByLabel('Editor chat default model', { exact: true }).selectOption('fable-5.1-max')
+  await page.getByLabel('Editor chat slot', { exact: true }).selectOption('tertiary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts).toHaveLength(2)
   // The second save's expectation carries the first save's choice: without
   // the stored mirror it would carry the pre-save absence and 409.
-  const sent = state.posts[0].models as Record<string, ModelChoice>
-  const expected = (state.posts[1].expect as Record<string, Record<string, ModelChoice>>).models
+  const sent = (state.posts[0].models as ModelSettings).places!
+  const expected = ((state.posts[1].expect as Record<string, ModelSettings>).models.places!)
   expect(expected.chat).toEqual(sent.chat)
 })
 
@@ -294,9 +305,9 @@ test('read again shows the saved values when the conflict reload fails', async (
       await route.fulfill({ status: 500, json: { error: 'catalog unavailable' } })
       return
     }
-    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as Record<string, ModelChoice>) })
+    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as ModelSettings) })
   })
-  const saved = { chat: { default: 'fable-5.1-max', fallback: 'opus-5-max' } }
+  const saved = { places: { chat: { slot: 'secondary' } } }
   let refuses = true
   await page.unroute('**/api/settings')
   await page.route('**/api/settings', async (route) => {
@@ -310,29 +321,29 @@ test('read again shows the saved values when the conflict reload fails', async (
         return
       }
       const { expect: _ignored, ...rest } = body
-      state.settings = { ...state.settings, models: { ...(state.settings.models as object), ...((rest.models ?? {}) as object) } }
+      state.settings = { ...state.settings, models: mergeModels(state.settings.models as ModelSettings, (rest.models ?? {}) as ModelSettings) }
     }
     await route.fulfill({ json: state.settings })
   })
   await page.goto('/')
   await openSection(page, 'models')
-  const chatDefault = page.getByLabel('Chat default model', { exact: true })
-  await chatDefault.selectOption('muse-spark-1.3-contributor-max')
+  const chatSlot = page.getByLabel('Chat slot', { exact: true })
+  await chatSlot.selectOption('tertiary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toContainText('Models "chat" is now')
   await page.getByRole('button', { name: 'Read again' }).click()
   // The reload failed, but the 409 carried the saved choice.
-  await expect(chatDefault).toHaveValue('fable-5.1-max')
+  await expect(chatSlot).toHaveValue('secondary')
   // Another tab saves again; the next reload reads it, and the next draft
   // baselines the reloaded choice rather than the 409 snapshot.
-  const newer = { chat: { default: 'opus-5-xhigh', fallback: 'opus-5-max' } }
+  const newer = { places: { chat: { slot: 'tertiary' } } }
   state.settings = { ...state.settings, models: newer }
   await page.keyboard.press('Escape')
   await openSection(page, 'models')
-  await page.getByLabel('Editor chat default model', { exact: true }).selectOption('fable-5.1-max')
+  await page.getByLabel('Editor chat slot', { exact: true }).selectOption('secondary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
-  expect((state.posts[1].expect as Record<string, Record<string, ModelChoice>>).models).toEqual(newer)
+  expect((state.posts[1].expect as Record<string, ModelSettings>).models).toEqual(newer)
 })
 
 test('read again prefers the refreshed value over the 409 snapshot', async ({ page }) => {
@@ -525,8 +536,8 @@ test('saving again after a conflict retries against the refused value', async ({
 })
 
 test('saving models again after a conflict retries against the refused choice', async ({ page }) => {
-  const stored = { default: 'fable-5.1-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery }
-  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: { chat: stored } })
+  const stored = { slot: 'tertiary' }
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: { places: { chat: stored } } })
   await setupModels(page, state)
   let refuses = true
   await page.unroute('**/api/settings')
@@ -536,34 +547,32 @@ test('saving models again after a conflict retries against the refused choice', 
       state.posts.push(body)
       if (refuses) {
         refuses = false
-        const current = { chat: { default: 'opus-5-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery } }
+        const current = { places: { chat: { slot: 'primary' } } }
         state.settings = { ...state.settings, models: current }
         await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { models: current } } })
         return
       }
       const { expect: _ignored, ...rest } = body
-      state.settings = { ...state.settings, models: { ...(state.settings.models as object), ...((rest.models ?? {}) as object) } }
+      state.settings = { ...state.settings, models: mergeModels(state.settings.models as ModelSettings, (rest.models ?? {}) as ModelSettings) }
     }
     await route.fulfill({ json: state.settings })
   })
   await page.goto('/')
   await openSection(page, 'models')
-  const chatDefault = page.getByLabel('Chat default model', { exact: true })
-  await chatDefault.selectOption('muse-spark-1.3-contributor-max')
+  const chatSlot = page.getByLabel('Chat slot', { exact: true })
+  await chatSlot.selectOption('secondary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toContainText('Models "chat" is now')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts).toHaveLength(2)
-  expect((state.posts[1].expect as Record<string, Record<string, unknown>>).models.chat)
-    .toEqual({ default: 'opus-5-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery })
+  expect(((state.posts[1].expect as Record<string, ModelSettings>).models.places ?? {}).chat).toEqual({ slot: 'primary' })
 })
 
 test('saving models again after a failed catalog reload retries against the refusal', async ({ page }) => {
-  const recovery = (CATALOG.behaviors as Record<string, string>).review_recovery
-  const chatStored = { default: 'fable-5.1-max', fallback: recovery }
-  const editorStored = { default: 'opus-5-max', fallback: recovery }
-  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: { chat: chatStored, editor: editorStored } })
+  const chatStored = { slot: 'tertiary' }
+  const editorStored = { slot: 'secondary' }
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: { places: { chat: chatStored, editor: editorStored } } })
   let loads = 0
   await page.route('**/api/models', async (route) => {
     loads += 1
@@ -572,7 +581,7 @@ test('saving models again after a failed catalog reload retries against the refu
       await route.fulfill({ status: 500, json: { error: 'catalog unavailable' } })
       return
     }
-    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as Record<string, ModelChoice>) })
+    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as ModelSettings) })
   })
   const deepEqual = (a: unknown, b: unknown): boolean => {
     if (a === b) return true
@@ -589,27 +598,27 @@ test('saving models again after a failed catalog reload retries against the refu
     if (route.request().method() === 'POST') {
       const body = route.request().postDataJSON() as Record<string, unknown>
       state.posts.push(body)
-      const models = state.settings.models as Record<string, ModelChoice>
-      const expected = (body.expect as { models?: Record<string, ModelChoice> } | undefined)?.models
+      const models = state.settings.models as ModelSettings
+      const expected = (body.expect as { models?: ModelSettings } | undefined)?.models
       if (expected && !deepEqual(models, expected)) {
         await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { models } } })
         return
       }
       const { expect: _ignored, ...rest } = body
-      state.settings = { ...state.settings, models: { ...models, ...((rest.models ?? {}) as object) } }
+      state.settings = { ...state.settings, models: mergeModels(models, (rest.models ?? {}) as ModelSettings) }
     }
     await route.fulfill({ json: state.settings })
   })
   await page.goto('/')
   await openSection(page, 'models')
-  const chatDefault = page.getByLabel('Chat default model', { exact: true })
-  await chatDefault.selectOption('muse-spark-1.3-contributor-max')
+  const chatSlot = page.getByLabel('Chat slot', { exact: true })
+  await chatSlot.selectOption('primary')
   // Another tab saves the untouched editor place before this tab's save.
-  const editorSaved = { default: 'opus-5-xhigh', fallback: recovery }
-  state.settings = { ...state.settings, models: { chat: chatStored, editor: editorSaved } }
+  const editorSaved = { slot: 'primary' }
+  state.settings = { ...state.settings, models: { places: { chat: chatStored, editor: editorSaved } } }
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toContainText('Models "editor" is now')
-  await expect(chatDefault).toHaveValue('muse-spark-1.3-contributor-max')
+  await expect(chatSlot).toHaveValue('primary')
   // Save again compares the untouched place against the refusal, not the
   // stale catalog, and carries only the edited place.
   const reloaded = page.waitForResponse('**/api/models')
@@ -617,24 +626,22 @@ test('saving models again after a failed catalog reload retries against the refu
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   await reloaded
   expect(state.posts).toHaveLength(2)
-  expect(Object.keys(state.posts[1].models as object)).toEqual(['chat'])
-  expect((state.posts[1].expect as Record<string, Record<string, ModelChoice>>).models.editor).toEqual(editorSaved)
-  expect((state.settings.models as Record<string, ModelChoice>).editor).toEqual(editorSaved)
+  expect(Object.keys((state.posts[1].models as ModelSettings).places as object)).toEqual(['chat'])
+  expect(((state.posts[1].expect as Record<string, ModelSettings>).models.places ?? {}).editor).toEqual(editorSaved)
+  expect(((state.settings.models as ModelSettings).places ?? {}).editor).toEqual(editorSaved)
   // A later genuine concurrent change still conflicts.
-  const editorNewer = { default: 'fable-5.1-xhigh', fallback: recovery }
-  state.settings = { ...state.settings, models: { ...(state.settings.models as object), editor: editorNewer } }
-  await chatDefault.selectOption('gpt-6-astra-max')
+  const editorNewer = { slot: 'tertiary' }
+  state.settings = { ...state.settings, models: { places: { ...((state.settings.models as ModelSettings).places ?? {}), editor: editorNewer } } }
+  await chatSlot.selectOption('secondary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toContainText('Models "editor" is now')
   expect(state.posts).toHaveLength(3)
-  expect((state.posts[2].expect as Record<string, Record<string, ModelChoice>>).models.editor).toEqual(editorSaved)
+  expect(((state.posts[2].expect as Record<string, ModelSettings>).models.places ?? {}).editor).toEqual(editorSaved)
 })
 
-test('a fallback edit after a failed catalog reload keeps the refused default', async ({ page }) => {
-  const recovery = (CATALOG.behaviors as Record<string, string>).review_recovery
-  const chatStored = { default: 'fable-5.1-max', fallback: recovery }
-  const editorStored = { default: 'opus-5-max', fallback: recovery }
-  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: { chat: chatStored, editor: editorStored } })
+test('a slots edit after a failed catalog reload keeps the refused models', async ({ page }) => {
+  const slotsStored = { primary: 'fable-5.1-max', secondary: 'opus-5-max', tertiary: 'grok-4.6-xhigh' }
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: { slots: slotsStored, places: { chat: { slot: 'tertiary' } } } })
   let loads = 0
   await page.route('**/api/models', async (route) => {
     loads += 1
@@ -643,7 +650,7 @@ test('a fallback edit after a failed catalog reload keeps the refused default', 
       await route.fulfill({ status: 500, json: { error: 'catalog unavailable' } })
       return
     }
-    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as Record<string, ModelChoice>) })
+    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as ModelSettings) })
   })
   const deepEqual = (a: unknown, b: unknown): boolean => {
     if (a === b) return true
@@ -660,38 +667,41 @@ test('a fallback edit after a failed catalog reload keeps the refused default', 
     if (route.request().method() === 'POST') {
       const body = route.request().postDataJSON() as Record<string, unknown>
       state.posts.push(body)
-      const models = state.settings.models as Record<string, ModelChoice>
-      const expected = (body.expect as { models?: Record<string, ModelChoice> } | undefined)?.models
+      const models = state.settings.models as ModelSettings
+      const expected = (body.expect as { models?: ModelSettings } | undefined)?.models
       if (expected && !deepEqual(models, expected)) {
         await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { models } } })
         return
       }
       const { expect: _ignored, ...rest } = body
-      state.settings = { ...state.settings, models: { ...models, ...((rest.models ?? {}) as object) } }
+      state.settings = { ...state.settings, models: mergeModels(models, (rest.models ?? {}) as ModelSettings) }
     }
     await route.fulfill({ json: state.settings })
   })
   await page.goto('/')
   await openSection(page, 'models')
-  await page.getByLabel('Chat default model', { exact: true }).selectOption('muse-spark-1.3-contributor-max')
-  // Another tab saves the untouched editor place before this tab's save.
-  const editorSaved = { default: 'opus-5-xhigh', fallback: recovery }
-  state.settings = { ...state.settings, models: { chat: chatStored, editor: editorSaved } }
+  await page.getByLabel('Primary model', { exact: true }).selectOption('muse-spark-1.3-contributor-max')
+  // Another tab saves the slots and the untouched chat place before this tab's save.
+  const slotsSaved = { primary: 'opus-5-xhigh', secondary: 'opus-5-max', tertiary: 'grok-4.6-xhigh' }
+  state.settings = { ...state.settings, models: { slots: slotsSaved, places: { chat: { slot: 'primary' } } } }
   await page.getByRole('button', { name: 'Save', exact: true }).click()
-  await expect(page.locator('.st-status')).toContainText('Models "editor" is now')
-  // The untouched place shows the refused choice, not the stale catalog.
-  const editorDefault = page.getByLabel('Editor chat default model', { exact: true })
-  const editorFallback = page.getByLabel('Editor chat fallback model', { exact: true })
-  await expect(editorDefault).toHaveValue('opus-5-xhigh')
-  await expect(editorFallback).toHaveValue(recovery)
-  // Editing only the fallback keeps the refused default: the save carries
+  await expect(page.locator('.st-status')).toContainText('Models "slots" is now')
+  // The untouched selects show the refused models, not the stale catalog.
+  const secondary = page.getByLabel('Secondary model', { exact: true })
+  const tertiary = page.getByLabel('Tertiary model', { exact: true })
+  await expect(secondary).toHaveValue('opus-5-max')
+  await expect(tertiary).toHaveValue('grok-4.6-xhigh')
+  await expect(page.getByLabel('Chat slot', { exact: true })).toHaveValue('primary')
+  // Editing only the secondary keeps the refused tertiary: the save carries
   // what is shown, not the stale pre-conflict choice.
-  await editorFallback.selectOption('gpt-6-astra-max')
+  await secondary.selectOption('gpt-6-astra-max')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts).toHaveLength(2)
-  expect((state.posts[1].models as Record<string, ModelChoice>).editor).toEqual({ default: 'opus-5-xhigh', fallback: 'gpt-6-astra-max' })
-  expect((state.settings.models as Record<string, ModelChoice>).editor).toEqual({ default: 'opus-5-xhigh', fallback: 'gpt-6-astra-max' })
+  const carried = { primary: 'muse-spark-1.3-contributor-max', secondary: 'gpt-6-astra-max', tertiary: 'grok-4.6-xhigh' }
+  expect((state.posts[1].models as ModelSettings).slots).toEqual(carried)
+  expect((state.settings.models as ModelSettings).slots).toEqual(carried)
+  expect(((state.posts[1].expect as Record<string, ModelSettings>).models.places ?? {}).chat).toEqual({ slot: 'primary' })
 })
 
 test('a model draft made with nothing stored refuses after another tab fills the place', async ({ page }) => {
@@ -699,26 +709,27 @@ test('a model draft made with nothing stored refuses after another tab fills the
   await setupModels(page, state)
   await page.goto('/')
   await openSection(page, 'models')
-  const chatDefault = page.getByLabel('Chat default model', { exact: true })
-  const editorDefault = page.getByLabel('Editor chat default model', { exact: true })
-  await chatDefault.selectOption('muse-spark-1.3-contributor-max')
-  // Another tab saves both places; reopening reads its choices under the draft.
+  const chatSlot = page.getByLabel('Chat slot', { exact: true })
+  const editorSlot = page.getByLabel('Editor chat slot', { exact: true })
+  await chatSlot.selectOption('secondary')
+  // Another tab saves the slots and both places; reopening reads its choices
+  // under the draft.
   const saved = {
-    chat: { default: 'opus-5-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery },
-    editor: { default: 'fable-5.1-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery },
+    slots: { primary: 'opus-5-max', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh' },
+    places: { chat: { slot: 'primary' }, editor: { slot: 'tertiary' } },
   }
   state.settings = { ...state.settings, models: saved }
   await page.keyboard.press('Escape')
   await openSection(page, 'models')
   // The editor select proves the reload landed; the chat draft is kept.
-  await expect(editorDefault).toHaveValue('fable-5.1-max')
-  await expect(chatDefault).toHaveValue('muse-spark-1.3-contributor-max')
+  await expect(editorSlot).toHaveValue('tertiary')
+  await expect(chatSlot).toHaveValue('secondary')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   // The stub answers where a real server would refuse; the wire expectation
   // carries the refusal.
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts).toHaveLength(1)
-  expect(state.posts[0].expect).toEqual({ models: { chat: null, editor: saved.editor } })
+  expect(state.posts[0].expect).toEqual({ models: { slots: saved.slots, places: { chat: null, editor: saved.places.editor } } })
 })
 
 test('editing the same input after an Enter save compares against the save', async ({ page }) => {

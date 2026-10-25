@@ -18,7 +18,7 @@ const SUBJECT: ChatSubject = { surface: 'editor-document', key: 'draft', label: 
 function modelsState() {
   return {
     catalog: { models: [{ identity: 'opus-5-max', selector: 'claude-opus-5', effort: 'max', provider: 'claude' }], review_providers: [], path: '' },
-    places: [{ key: 'editor', default: 'opus-5-max' }],
+    places: [{ key: 'editor', model: 'opus-5-max' }],
     fixed: [],
     refresh: null,
   }

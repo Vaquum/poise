@@ -3,8 +3,8 @@
 // Caller owns the names: `agent-interface --models` exports one row per
 // identity (<family>-<version>-<effort>) with the provider CLI behind it and
 // the default per Caller behavior. Poise never spells a model name itself; it
-// reads this catalog, lets the user pick a default and a fallback for each
-// place that launches a model, and resolves those against the live catalog on
+// reads this catalog, lets the user pick the three slot models once — Primary,
+// Secondary, Tertiary — and resolves every place against the live catalog on
 // every launch — a refresh can retire an identity overnight.
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
@@ -145,13 +145,13 @@ export function isPlaceModel(catalog: Catalog, place: ModelPlace, identity: stri
 }
 
 // Every place in Poise that launches a model, with the Caller behavior whose
-// catalog default seeds it. `review` places follow the providers the catalog
-// lists as reviewing (every one of them since Caller #39) and their fallback
-// is the recovery model Caller switches to after a Claude output limit; for
-// the others the fallback is used when the default cannot be launched — its
-// provider is not signed in, or a refresh retired it. The PR review place
-// also names a secondary and a tertiary reviewer: Behaviors decides how many
-// of the three review each new pull request, at the same time.
+// catalog default seeds it when no slot model can run there. Each place picks
+// a slot — Primary, Secondary or Tertiary — never a model; the slot models are
+// chosen once, and changing one changes it everywhere. `review` places follow
+// the providers the catalog lists as reviewing (every one of them since Caller
+// #39). Reviewer places run a panel: Behaviors decides how many of the slots,
+// starting at the place's slot, review each new pull request or issue, at the
+// same time.
 export const MODEL_PLACES = [
   {
     key: 'chat',
@@ -172,7 +172,7 @@ export const MODEL_PLACES = [
   {
     key: 'pr_review',
     label: 'PR review',
-    why: 'Automatic and manual reviews, including replays. The fallback takes over once if Claude hits its output limit. When Behaviors asks for more than one reviewer, the secondary and tertiary review each new pull request alongside the default, at the same time.',
+    why: 'Automatic and manual reviews, including replays. The next slot takes over once if Claude hits its output limit. When Behaviors asks for more than one reviewer, the following slots review each new pull request alongside it, at the same time.',
     review: true,
     reviewers: true,
     seed: 'pr_review',
@@ -180,7 +180,7 @@ export const MODEL_PLACES = [
   {
     key: 'pr_approve',
     label: 'PR approval',
-    why: 'Automatic approvals and approval replays. The fallback takes over once if Claude hits its output limit.',
+    why: 'Automatic approvals and approval replays. The next slot takes over once if Claude hits its output limit.',
     review: true,
     reviewers: false,
     seed: 'pr_approve',
@@ -188,28 +188,43 @@ export const MODEL_PLACES = [
   {
     key: 'issue_review',
     label: 'Issue review',
-    why: 'Review New Issues and its replays. Each reviewer runs its own CLI with full access in a fresh checkout and comments as the review agent. When Behaviors asks for more than one reviewer, the secondary and tertiary review each new issue alongside the default, at the same time. The fallback takes over once if Claude hits its output limit.',
+    why: 'Review New Issues and its replays. Each reviewer runs its own CLI with full access in a fresh checkout and comments as the review agent. When Behaviors asks for more than one reviewer, the following slots review each new issue alongside it, at the same time. The next slot takes over once if Claude hits its output limit.',
     review: true,
     reviewers: true,
     seed: 'pr_review',
   },
 ] as const
 
-export type ReviewerSlot = 'primary' | 'secondary' | 'tertiary'
-export const REVIEWER_SLOTS: readonly ReviewerSlot[] = ['primary', 'secondary', 'tertiary']
+export type ModelSlot = 'primary' | 'secondary' | 'tertiary'
+export const MODEL_SLOTS: readonly ModelSlot[] = ['primary', 'secondary', 'tertiary']
+// Panels, the ledger and claim keys name reviewer positions with the same
+// three slots: a panel reviewer runs a slot model.
+export type ReviewerSlot = ModelSlot
+export const REVIEWER_SLOTS: readonly ReviewerSlot[] = MODEL_SLOTS
+
+export function isModelSlot(value: unknown): value is ModelSlot {
+  return value === 'primary' || value === 'secondary' || value === 'tertiary'
+}
 
 export type ModelPlace = typeof MODEL_PLACES[number]['key']
 export const MODEL_PLACE_KEYS = MODEL_PLACES.map((p) => p.key) as ModelPlace[]
 
-export interface ModelChoice {
-  default: string
-  fallback: string
-  // Reviewer places only: who reviews alongside the default.
+// Stored: the three models chosen once, and the slot each place runs. Either
+// half may be missing or partial; resolution seeds what is not there.
+export interface ModelSlotChoices {
+  primary?: string
   secondary?: string
   tertiary?: string
 }
 
-export type ModelSettings = Partial<Record<ModelPlace, ModelChoice>>
+export interface ModelPlaceChoice {
+  slot: ModelSlot
+}
+
+export interface ModelSettings {
+  slots?: ModelSlotChoices
+  places?: Partial<Record<ModelPlace, ModelPlaceChoice>>
+}
 
 export function isModelPlace(value: string): value is ModelPlace {
   return (MODEL_PLACE_KEYS as string[]).includes(value)
@@ -217,7 +232,10 @@ export function isModelPlace(value: string): value is ModelPlace {
 
 // Stored choices are validated against the catalog at save time; a later
 // refresh can still retire one, so every read resolves again and says so.
-export interface ResolvedChoice extends ModelChoice {
+export interface ResolvedSlots {
+  primary: string
+  secondary: string
+  tertiary: string
   notes: string[]
 }
 
@@ -244,98 +262,184 @@ export function seedReviewers(catalog: Catalog, primary: string, place: ModelPla
   return { secondary: chosen[0] ?? primary, tertiary: chosen[1] ?? chosen[0] ?? primary }
 }
 
-export function resolveChoice(catalog: Catalog, place: ModelPlace, stored: ModelChoice | undefined): ResolvedChoice {
-  const spec = MODEL_PLACES.find((p) => p.key === place)!
-  const seedDefault = catalog.behaviors[spec.seed]
-  const seedFallback = catalog.behaviors.review_recovery
+// The three slot models, resolved against the live catalog: what was chosen
+// while the catalog still has it, else the review default and a family-diverse
+// panel seeded from it — the same three the PR review place used to seed.
+export function resolveSlots(catalog: Catalog, stored: ModelSlotChoices | undefined): ResolvedSlots {
+  const seedPrimary = catalog.behaviors.pr_review
   const notes: string[] = []
+  const usable = (identity: string | undefined) => !!identity && !!catalogModel(catalog, identity)
+  let primary = stored?.primary
+  if (!usable(primary)) {
+    // Like the later seats, the replacement must not repeat a saved pick:
+    // the retired primary's seed may already sit in Secondary or Tertiary.
+    const kept = [stored?.secondary, stored?.tertiary]
+    const primarySeeds = seedReviewers(catalog, seedPrimary)
+    const replacement = [seedPrimary, primarySeeds.secondary, primarySeeds.tertiary]
+      .find((candidate) => usable(candidate) && !kept.includes(candidate)) ?? seedPrimary
+    if (primary) notes.push(`${primary} is no longer in the catalog; using ${replacement}.`)
+    primary = replacement
+  }
+  const seeds = seedReviewers(catalog, primary!)
+  const resolved: Record<ModelSlot, string> = { primary: primary!, secondary: '', tertiary: '' }
+  for (const slot of ['secondary', 'tertiary'] as const) {
+    let identity = stored?.[slot]
+    if (!usable(identity)) {
+      // A seed may repeat a stored pick — partial slots, or a legacy pair
+      // migrated into them — so a later seat takes the next seed instead.
+      const seed = [seeds[slot], seeds.secondary, seeds.tertiary]
+        .find((candidate) => candidate !== resolved.primary && candidate !== resolved.secondary)
+        ?? seeds[slot]
+      if (identity) notes.push(`${identity} is no longer in the catalog; using ${seed}.`)
+      identity = seed
+    }
+    resolved[slot] = identity!
+  }
+  return { ...resolved, notes }
+}
+
+export interface ResolvedPlace {
+  slot: ModelSlot
+  model: string
+  notes: string[]
+}
+
+// What a place launches: its slot's model when the place can run it, else the
+// first following slot's model it can run, else the place's Caller seed —
+// every read resolves to something launchable, and says what moved.
+export function resolvePlace(catalog: Catalog, place: ModelPlace, settings: ModelSettings): ResolvedPlace {
+  const spec = MODEL_PLACES.find((p) => p.key === place)!
+  const slots = resolveSlots(catalog, settings.slots)
+  const chosen = settings.places?.[place]?.slot ?? 'primary'
   // A Caller without the place's capability can launch none of its models;
   // keep what was chosen for when it can, and say why nothing runs meanwhile.
   if (placeProviders(catalog, place)?.length === 0) {
-    const kept = {
-      default: stored?.default ?? seedDefault,
-      fallback: stored?.fallback ?? seedFallback,
-      ...(spec.reviewers ? { secondary: stored?.secondary ?? seedDefault, tertiary: stored?.tertiary ?? seedDefault } : {}),
+    return { slot: chosen, model: slots[chosen], notes: [...slots.notes, `Update Caller: ${spec.label} is unavailable.`] }
+  }
+  for (const slot of MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(chosen))) {
+    if (isPlaceModel(catalog, place, slots[slot])) {
+      const notes = [...slots.notes]
+      if (slot !== chosen) notes.push(`${spec.label} cannot run ${slots[chosen]}; using ${slots[slot]}.`)
+      return { slot, model: slots[slot], notes }
     }
-    return { ...kept, notes: [`Update Caller: ${spec.label} is unavailable.`] }
   }
-  const usable = (identity: string | undefined) => !!identity && isPlaceModel(catalog, place, identity)
-  let chosen = stored?.default
-  if (!usable(chosen)) {
-    if (chosen) notes.push(`${chosen} is no longer in the catalog; using ${seedDefault}.`)
-    chosen = seedDefault
-  }
-  let fallback = stored?.fallback
-  if (!usable(fallback)) {
-    if (fallback) notes.push(`${fallback} is no longer in the catalog; using ${seedFallback}.`)
-    fallback = seedFallback
-  }
-  if (!spec.reviewers) return { default: chosen!, fallback: fallback!, notes }
-  const seeds = seedReviewers(catalog, chosen!, place)
-  const panel: Pick<ModelChoice, 'secondary' | 'tertiary'> = {}
-  for (const slot of ['secondary', 'tertiary'] as const) {
-    let reviewer = stored?.[slot]
-    if (!usable(reviewer)) {
-      if (reviewer) notes.push(`${reviewer} is no longer in the catalog; using ${seeds[slot]}.`)
-      reviewer = seeds[slot]
-    }
-    panel[slot] = reviewer
-  }
-  return { default: chosen!, fallback: fallback!, ...panel, notes }
+  const seed = catalog.behaviors[spec.seed]
+  return { slot: chosen, model: seed, notes: [...slots.notes, `${spec.label} cannot run ${slots[chosen]}; using ${seed}.`] }
 }
 
-// The models that review a new pull request, primary first, for the number
-// of reviewers Behaviors asks for.
-export function reviewerModels(choice: ModelChoice, count: number): Array<{ slot: ReviewerSlot, model: string }> {
-  const models = [choice.default, choice.secondary, choice.tertiary]
-  return REVIEWER_SLOTS
-    .slice(0, Math.max(1, Math.min(REVIEWER_SLOTS.length, count)))
-    .map((slot, index) => ({ slot, model: models[index]! }))
-    .filter((entry) => typeof entry.model === 'string' && entry.model.length > 0)
+// The reviewers of a new pull request or issue: the place's slot first, then
+// the following slots it can run, as many as Behaviors asks for. A panel
+// starting past Primary runs fewer than asked when the slots run out; it
+// never wraps, and it never launches a model the place cannot run.
+export function slotPanel(
+  catalog: Catalog,
+  place: ModelPlace,
+  slots: { primary: string, secondary: string, tertiary: string },
+  start: ModelSlot,
+  count: number,
+): Array<{ slot: ModelSlot, model: string, recovery: string }> {
+  return MODEL_SLOTS
+    .slice(MODEL_SLOTS.indexOf(start))
+    .filter((slot) => isPlaceModel(catalog, place, slots[slot]))
+    .slice(0, Math.max(1, Math.min(MODEL_SLOTS.length, count)))
+    .map((slot) => ({ slot, model: slots[slot], recovery: recoveryModel(catalog, place, slots, slot) }))
+}
+
+// The recovery model Caller switches to after a Claude output limit: the
+// first following slot's model the place can run, else Caller's own recovery.
+export function recoveryModel(
+  catalog: Catalog,
+  place: ModelPlace,
+  slots: { primary: string, secondary: string, tertiary: string },
+  after: ModelSlot,
+): string {
+  for (const slot of MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(after) + 1)) {
+    if (isPlaceModel(catalog, place, slots[slot])) return slots[slot]
+  }
+  return catalog.behaviors.review_recovery
+}
+
+export function assertSlotsDistinct(slots: ModelSlotChoices | undefined): void {
+  const seen = new Map<string, ModelSlot>()
+  for (const slot of MODEL_SLOTS) {
+    const identity = slots?.[slot]
+    if (!identity) continue
+    const clash = seen.get(identity)
+    if (clash) throw new Error(`model slots ${clash} and ${slot} must be different models`)
+    seen.set(identity, slot)
+  }
 }
 
 export function validateModelSettings(catalog: Catalog, models: unknown): ModelSettings {
   if (typeof models !== 'object' || models === null || Array.isArray(models)) {
-    throw new Error('models must be an object of places')
+    throw new Error('models must be an object with slots and places')
   }
   const next: ModelSettings = {}
-  for (const [place, value] of Object.entries(models as Record<string, unknown>)) {
-    if (!isModelPlace(place)) throw new Error(`unknown model place ${place}`)
-    const spec = MODEL_PLACES.find((p) => p.key === place)!
-    const choice = value as Record<string, unknown>
-    const fields: Array<'default' | 'fallback' | 'secondary' | 'tertiary'> = ['default', 'fallback']
-    if (spec.reviewers) {
-      for (const slot of ['secondary', 'tertiary'] as const) if (choice?.[slot] !== undefined) fields.push(slot)
+  const raw = models as Record<string, unknown>
+  for (const key of Object.keys(raw)) {
+    if (key !== 'slots' && key !== 'places') throw new Error(`unknown models section ${key}`)
+  }
+  if (raw.slots !== undefined) {
+    if (typeof raw.slots !== 'object' || raw.slots === null || Array.isArray(raw.slots)) {
+      throw new Error('model slots must be an object of primary, secondary and tertiary')
     }
-    const providers = placeProviders(catalog, place)
-    for (const field of fields) {
-      const identity = choice?.[field]
+    const slots: ModelSlotChoices = {}
+    for (const [slot, identity] of Object.entries(raw.slots as Record<string, unknown>)) {
+      if (!isModelSlot(slot)) throw new Error(`unknown model slot ${slot}`)
       if (typeof identity !== 'string' || !catalogModel(catalog, identity)) {
-        throw new Error(`${spec.label} ${field} must be a model from the catalog`)
+        throw new Error(`model slot ${slot} must be a model from the catalog`)
       }
-      if (!isPlaceModel(catalog, place, identity)) {
-        throw new Error(providers?.length
-          ? `${spec.label} ${field} must be a ${providers.join(' or ')} model`
-          : `Update Caller: ${spec.label} is unavailable`)
-      }
+      slots[slot] = identity
     }
-    if (choice.default === choice.fallback) {
-      throw new Error(`${spec.label} fallback must differ from its default`)
+    assertSlotsDistinct(slots)
+    if (Object.keys(slots).length > 0) next.slots = slots
+  }
+  if (raw.places !== undefined) {
+    if (typeof raw.places !== 'object' || raw.places === null || Array.isArray(raw.places)) {
+      throw new Error('model places must be an object of places')
     }
-    if (fields.includes('secondary') && choice.secondary === choice.default) {
-      throw new Error(`${spec.label} secondary reviewer must differ from its default`)
+    const places: Partial<Record<ModelPlace, ModelPlaceChoice>> = {}
+    for (const [place, value] of Object.entries(raw.places as Record<string, unknown>)) {
+      if (!isModelPlace(place)) throw new Error(`unknown model place ${place}`)
+      const spec = MODEL_PLACES.find((p) => p.key === place)!
+      const slot = (value as { slot?: unknown } | null)?.slot
+      if (!isModelSlot(slot)) throw new Error(`${spec.label} slot must be primary, secondary or tertiary`)
+      places[place] = { slot }
     }
-    if (fields.includes('tertiary') && (choice.tertiary === choice.default || choice.tertiary === choice.secondary)) {
-      throw new Error(`${spec.label} tertiary reviewer must differ from the default and the secondary`)
-    }
-    next[place] = {
-      default: choice.default as string,
-      fallback: choice.fallback as string,
-      ...(fields.includes('secondary') ? { secondary: choice.secondary as string } : {}),
-      ...(fields.includes('tertiary') ? { tertiary: choice.tertiary as string } : {}),
-    }
+    if (Object.keys(places).length > 0) next.places = places
   }
   return next
+}
+
+// Stored before slots: each place named its own default, fallback and panel.
+// Fold those into the three slots, most deliberate first — the review panels,
+// then every place's default, then the fallbacks — and point each place at
+// the slot holding its old default, or Primary when none does.
+export function migrateLegacyModelSettings(raw: Record<string, unknown>): ModelSettings {
+  const at = (place: ModelPlace, field: string): string | undefined => {
+    const value = (raw[place] as Record<string, unknown> | undefined)?.[field]
+    return typeof value === 'string' && value ? value : undefined
+  }
+  const places = MODEL_PLACE_KEYS.filter((place) => at(place, 'default') && at(place, 'fallback'))
+  if (places.length === 0) return {}
+  const candidates = [
+    ...(['pr_review', 'issue_review'] as const).flatMap((place) => [at(place, 'default'), at(place, 'secondary'), at(place, 'tertiary')]),
+    ...MODEL_PLACE_KEYS.map((place) => at(place, 'default')),
+    ...MODEL_PLACE_KEYS.map((place) => at(place, 'fallback')),
+  ].filter((identity, index, all) => !!identity && all.indexOf(identity) === index) as string[]
+  const slots: ModelSlotChoices = {}
+  for (const [index, slot] of MODEL_SLOTS.entries()) {
+    if (candidates[index]) slots[slot] = candidates[index]
+  }
+  const slotOf = new Map<string, ModelSlot>()
+  for (const [index, slot] of MODEL_SLOTS.entries()) {
+    if (candidates[index]) slotOf.set(candidates[index], slot)
+  }
+  const mapped: Partial<Record<ModelPlace, ModelPlaceChoice>> = {}
+  for (const place of places) {
+    mapped[place] = { slot: slotOf.get(at(place, 'default')!) ?? 'primary' }
+  }
+  return { slots, places: mapped }
 }
 
 // The daily refresh (scripts/refresh-models.mjs, run by Poise itself at 07:00

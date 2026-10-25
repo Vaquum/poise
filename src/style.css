@@ -1561,7 +1561,7 @@ tr:hover .review-btn { opacity: 1; }
 #menu-surface .st-input, #menu-surface .st-select { border-radius: var(--r-sm); }
 #menu-surface .st-save, #menu-surface .st-clear { border-radius: var(--r-sm); }
 #menu-surface .tp-group-label { border-bottom: var(--b-hair); }
-#menu-surface .tp-section:has(.st-model-default) { padding-bottom: var(--sp-3); border-bottom: var(--b-hair); }
+#menu-surface .tp-section:has(.st-slot-primary, .st-place-slot) { padding-bottom: var(--sp-3); border-bottom: var(--b-hair); }
 #menu-surface .st-help:empty, #menu-surface .st-clear[hidden], #menu-surface .st-fixed-heading[hidden] { display: none; }
 #menu-surface .st-production-updater { display: inline-block; font-size: .6875rem; color: var(--text-tertiary); margin-top: var(--sp-2); }
 #menu-surface .st-production-updater[hidden], .menu-item[hidden] { display: none; }

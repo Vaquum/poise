@@ -15,7 +15,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 // panel never invents a label for one.
 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
-import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, modelsExpect, rereadValue, validateGeneralDraft, validateModelChoices, type ConflictLeaf, type GeneralDraft, type GeneralField, type ModelChoice } from './settings-save'
+import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, modelsExpect, rereadValue, validateGeneralDraft, validateModelChoices, type ConflictLeaf, type GeneralDraft, type GeneralField, type ModelsDraft, type ModelSlotDraft } from './settings-save'
 import { productionSummary, type ProductionUpdate } from './production-status'
 import { clockDay, logTime, shortTime } from './clock'
 import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, MUSE_API_KEY_LOGIN, type ConnectedAccount } from '../server/accounts/types'
@@ -28,6 +28,16 @@ import './views/connected-accounts.css'
 import type { TerminalPanel } from './views/terminal-panel'
 
 interface CatalogModel { identity: string, provider: string, selector: string, effort: string }
+type ModelSlot = 'primary' | 'secondary' | 'tertiary'
+const MODEL_SLOTS: readonly ModelSlot[] = ['primary', 'secondary', 'tertiary']
+const SLOT_LABELS: Record<ModelSlot, string> = { primary: 'Primary', secondary: 'Secondary', tertiary: 'Tertiary' }
+interface ModelSlots {
+  primary: string
+  secondary: string
+  tertiary: string
+  notes: string[]
+  stored: { primary?: string, secondary?: string, tertiary?: string } | null
+}
 interface ModelPlace {
   key: string
   label: string
@@ -35,21 +45,17 @@ interface ModelPlace {
   review: boolean
   // The providers this place may launch; null for all of them.
   providers?: string[] | null
-  // The PR review and Issue review places also name a secondary and a
-  // tertiary reviewer; Behaviors decides how many of the three review each
-  // new pull request or issue.
   reviewers: boolean
-  default: string
-  fallback: string
-  secondary?: string
-  tertiary?: string
+  // The slot this place runs, and the model that resolves to.
+  slot: ModelSlot
+  model: string
   notes: string[]
-  stored: { default: string, fallback: string, secondary?: string, tertiary?: string } | null
+  stored: { slot: ModelSlot } | null
 }
-const REVIEWER_SLOTS = ['secondary', 'tertiary'] as const
 interface FixedPlace { key: string, label: string, model: string, why: string }
 interface ModelsResponse {
   catalog: { models: CatalogModel[], review_providers: string[], path: string }
+  slots: ModelSlots
   places: ModelPlace[]
   fixed: FixedPlace[]
   refresh: ModelRefreshReport | null
@@ -57,7 +63,7 @@ interface ModelsResponse {
 }
 
 // A saved model configuration: model choices kept under a name to switch to in one step.
-interface ModelPreset { name: string, models: Record<string, ModelChoice>, savedAt: string }
+interface ModelPreset { name: string, models: { slots?: ModelSlotDraft, places?: Record<string, { slot: string }> }, savedAt: string }
 
 let panelEl: HTMLElement | null = null
 let publishing: PublishingSection | null = null
@@ -688,67 +694,93 @@ function openFromAddress(): void {
 
 // ── Models tab ──────────────────────────────────────────────────────────
 
-function modelOptions(models: CatalogModel[], place: ModelPlace, reviewProviders: string[], selected: string): string {
-  // The server names the providers a place may launch; older servers only
-  // said whether it reviews.
-  const providers = place.providers !== undefined ? place.providers : place.review ? reviewProviders : null
-  const eligible = providers ? models.filter((m) => providers.includes(m.provider)) : models
-  return eligible
+function modelOptions(models: CatalogModel[], selected: string): string {
+  // Slot models may come from any provider; each place runs the first of its
+  // slot onward that it can launch.
+  return models
     .map((m) => `<option value="${escapeHtml(m.identity)}"${m.identity === selected ? ' selected' : ''}>${escapeHtml(m.identity)}</option>`)
     .join('')
 }
 
-function sectionChoice(section: HTMLElement): ModelChoice {
-  const choice: ModelChoice = {
-    default: section.querySelector<HTMLSelectElement>('.st-model-default')?.value || '',
-    fallback: section.querySelector<HTMLSelectElement>('.st-model-fallback')?.value || '',
-  }
-  for (const slot of REVIEWER_SLOTS) {
-    const value = section.querySelector<HTMLSelectElement>(`.st-model-${slot}`)?.value
+function slotOptions(selected: string): string {
+  return MODEL_SLOTS
+    .map((slot) => `<option value="${slot}"${slot === selected ? ' selected' : ''}>${SLOT_LABELS[slot]}</option>`)
+    .join('')
+}
+
+function slotsChoice(section: HTMLElement): ModelSlotDraft {
+  const choice: ModelSlotDraft = {}
+  for (const slot of MODEL_SLOTS) {
+    const value = section.querySelector<HTMLSelectElement>(`.st-slot-${slot}`)?.value
     if (value) choice[slot] = value
   }
   return choice
 }
 
+function placeChoice(section: HTMLElement): { slot: string } {
+  return { slot: section.querySelector<HTMLSelectElement>('.st-place-slot')?.value || 'primary' }
+}
+
 // The stored model choices a save compares against: what the server held when
 // this tab read the catalog. Cloned, so later renders cannot move it.
-function storedModelsSnapshot(): Record<string, unknown> {
-  const snapshot: Record<string, unknown> = {}
+function storedModelsSnapshot(): { slots?: Record<string, string>, places?: Record<string, { slot: string }> } {
+  const snapshot: { slots?: Record<string, string>, places?: Record<string, { slot: string }> } = {}
+  if (lastModels?.slots.stored) snapshot.slots = { ...lastModels.slots.stored } as Record<string, string>
+  const places: Record<string, { slot: string }> = {}
   for (const place of lastModels?.places ?? []) {
-    if (place.stored) snapshot[place.key] = { ...place.stored }
+    if (place.stored) places[place.key] = { ...place.stored }
   }
+  if (Object.keys(places).length > 0) snapshot.places = places
   return snapshot
 }
 
 function renderPlaces(data: ModelsResponse) {
   if (!modelsEl || !fixedEl) return
-  const kept = new Map<string, ModelChoice>()
+  const slotsSection = modelsEl.querySelector<HTMLElement>('.st-slots')
+  const keptSlots = slotsSection && dirtyModels.has('slots') ? slotsChoice(slotsSection) : null
+  const kept = new Map<string, { slot: string }>()
   for (const section of modelsEl.querySelectorAll<HTMLElement>('.st-place')) {
     const key = section.dataset.place || ''
     if (!dirtyModels.has(key)) continue
-    kept.set(key, sectionChoice(section))
+    kept.set(key, placeChoice(section))
   }
-  patchContent(modelsEl, data.places.map((place) => {
-    const current: ModelChoice = kept.get(place.key)
-      || { default: place.default, fallback: place.fallback, secondary: place.secondary, tertiary: place.tertiary }
-    const providers = place.providers !== undefined ? place.providers : place.review ? data.catalog.review_providers : null
-    const notes = place.notes.map((n) => `<div class="st-help st-help-${providers?.length === 0 ? 'error' : 'warn'}">${escapeHtml(n)}</div>`).join('')
-    const reviewers = place.reviewers
-      ? REVIEWER_SLOTS.map((slot) => `
-        <label class="st-sublabel">${slot === 'secondary' ? 'Secondary reviewer' : 'Tertiary reviewer'}</label>
-        <select class="st-select st-model-${slot}" aria-label="${escapeHtml(place.label)} ${slot} reviewer">${modelOptions(data.catalog.models, place, data.catalog.review_providers, current[slot] || '')}</select>`).join('')
-      : ''
-    return `
+  const slots = data.slots
+  const currentSlots: ModelSlotDraft = keptSlots
+    || { primary: slots.primary, secondary: slots.secondary, tertiary: slots.tertiary }
+  const slotsNotes = slots.notes.map((n) => `<div class="st-help st-help-warn">${escapeHtml(n)}</div>`).join('')
+  patchContent(modelsEl, `
+      <div class="tp-section st-slots" data-slots>
+        <label class="tp-label" ${helpAttributes('The three models, chosen once. Every place below runs one of these slots; changing a slot changes it everywhere. When a chosen model fails before a verdict, the run moves to the next slot.')}>Models</label>
+        ${MODEL_SLOTS.map((slot) => `
+        <label class="st-sublabel">${SLOT_LABELS[slot]}</label>
+        <select class="st-select st-slot-${slot}" aria-label="${SLOT_LABELS[slot]} model">${modelOptions(data.catalog.models, currentSlots[slot] || '')}</select>`).join('')}
+        ${slotsNotes}
+      </div>`
+    + data.places.map((place) => {
+      const current = kept.get(place.key) || { slot: place.slot }
+      const providers = place.providers !== undefined ? place.providers : place.review ? data.catalog.review_providers : null
+      const notes = place.notes.map((n) => `<div class="st-help st-help-${providers?.length === 0 ? 'error' : 'warn'}">${escapeHtml(n)}</div>`).join('')
+      return `
       <div class="tp-section st-place" data-place="${escapeHtml(place.key)}">
         <label class="tp-label" ${helpAttributes(place.why)}>${escapeHtml(place.label)}</label>
-        <label class="st-sublabel">Default</label>
-        <select class="st-select st-model-default" aria-label="${escapeHtml(place.label)} default model">${modelOptions(data.catalog.models, place, data.catalog.review_providers, current.default)}</select>
-        <label class="st-sublabel" ${helpAttributes("Used when the default model cannot complete the request.")}>Fallback</label>
-        <select class="st-select st-model-fallback" aria-label="${escapeHtml(place.label)} fallback model">${modelOptions(data.catalog.models, place, data.catalog.review_providers, current.fallback)}</select>
-        ${reviewers}
+        <label class="st-sublabel">Slot</label>
+        <select class="st-select st-place-slot" aria-label="${escapeHtml(place.label)} slot">${slotOptions(current.slot)}</select>
+        <div class="st-fixed-model"><code>${escapeHtml(place.model)}</code></div>
         ${notes}
       </div>`
-  }).join(''))
+    }).join(''))
+  const renderedSlots = modelsEl.querySelector<HTMLElement>('.st-slots')
+  if (renderedSlots) {
+    renderedSlots.onchange = () => {
+      // The stored slots these showed when drafted. Nothing stored is
+      // recorded as an explicit null basis, so a save after another tab
+      // filled the slots is refused instead of silently adopting it.
+      if (!modelsBasis.has('slots')) {
+        modelsBasis.set('slots', lastModels?.slots.stored ? { ...lastModels.slots.stored } : null)
+      }
+      dirtyModels.add('slots')
+    }
+  }
   for (const section of modelsEl.querySelectorAll<HTMLElement>('.st-place')) {
     section.onchange = () => {
       const key = section.dataset.place || ''
@@ -804,7 +836,7 @@ async function loadModels(signal?: AbortSignal): Promise<boolean> {
     const data = await res.json()
     if (generation !== modelsGeneration) return false
     if (!res.ok) throw new Error(data.error || 'Model catalog unavailable')
-    if (!data.catalog || !Array.isArray(data.catalog.models) || !Array.isArray(data.places) || !Array.isArray(data.fixed)) throw new Error('The model catalogue response is unreadable')
+    if (!data.catalog || !Array.isArray(data.catalog.models) || !isRecord(data.slots) || !Array.isArray(data.places) || !Array.isArray(data.fixed)) throw new Error('The model catalogue response is unreadable')
     const fresh = data as ModelsResponse
     if (presetsAt !== presetsGeneration) fresh.presets = lastModels?.presets ?? fresh.presets
     lastModels = fresh
@@ -896,11 +928,15 @@ async function usePreset(): Promise<void> {
     syncFieldsFromCache()
     // Shown at once, so a Save before the reload below lands posts these choices, not the previous ones.
     if (lastModels) {
+      if (preset.models.slots) {
+        Object.assign(lastModels.slots, preset.models.slots)
+        lastModels.slots.stored = { ...lastModels.slots.stored, ...preset.models.slots }
+      }
       for (const place of lastModels.places) {
-        const choice = preset.models[place.key]
+        const choice = preset.models.places?.[place.key]
         // Stored too, mirroring the server's merge: a draft made after this
         // Use reads its baseline from it.
-        if (choice) { Object.assign(place, choice); place.stored = { ...place.stored, ...choice } }
+        if (choice) { place.slot = choice.slot as ModelSlot; place.stored = { slot: place.slot } }
       }
       renderPlaces(lastModels)
     }
@@ -917,16 +953,22 @@ async function deletePreset(): Promise<void> {
   if (name && await postPresets('/api/models/presets/delete', { name })) setHelp(`Deleted "${name}".`, 'ok')
 }
 
-function collectModels(): Record<string, ModelChoice> | null {
+function collectModels(): ModelsDraft | null {
   if (!modelsEl) return null
-  const models: Record<string, ModelChoice> = {}
+  const models: ModelsDraft = {}
+  const slotsSection = modelsEl.querySelector<HTMLElement>('.st-slots')
+  if (slotsSection) {
+    const slots = slotsChoice(slotsSection)
+    if (slots.primary && slots.secondary && slots.tertiary) models.slots = slots
+  }
+  const places: Record<string, { slot: string }> = {}
   for (const section of modelsEl.querySelectorAll<HTMLElement>('.st-place')) {
     const key = section.dataset.place || ''
-    const choice = sectionChoice(section)
-    if (!key || !choice.default || !choice.fallback) continue
-    models[key] = choice
+    if (!key) continue
+    places[key] = placeChoice(section)
   }
-  return Object.keys(models).length ? models : null
+  if (Object.keys(places).length > 0) models.places = places
+  return models.slots || models.places ? models : null
 }
 
 async function refreshModels(): Promise<void> {
@@ -1131,20 +1173,27 @@ async function saveModels(): Promise<void> {
   if (!saveBtn || !modelsEl) return
   if (saving) return
   dismissReread()
+  const slotsSection = modelsEl.querySelector<HTMLElement>('.st-slots')
   const sections = [...modelsEl.querySelectorAll<HTMLElement>('.st-place')]
-  if (sections.length === 0) {
+  if (!slotsSection && sections.length === 0) {
     setHelp('Model choices have not loaded yet.', 'info')
     return
   }
-  const changes: Record<string, ModelChoice> = {}
+  const changes: ModelsDraft = {}
+  const dirty = new Set<string>()
+  if (slotsSection && dirtyModels.has('slots')) {
+    changes.slots = slotsChoice(slotsSection)
+    dirty.add('slots')
+  }
+  const places: Record<string, { slot: string }> = {}
   for (const section of sections) {
     const key = section.dataset.place || ''
     if (!key || !dirtyModels.has(key)) continue
-    const choice = sectionChoice(section)
-    if (!choice.default || !choice.fallback) continue
-    changes[key] = choice
+    places[key] = placeChoice(section)
+    dirty.add(key)
   }
-  if (Object.keys(changes).length === 0) {
+  if (Object.keys(places).length > 0) changes.places = places
+  if (!changes.slots && !changes.places) {
     setHelp('No changes to save.', 'info')
     return
   }
@@ -1158,7 +1207,7 @@ async function saveModels(): Promise<void> {
   saveBtn.disabled = true
   saveBtn.textContent = 'Saving…'
   try {
-    const expect = { models: modelsExpect(new Set(Object.keys(changes)), modelsBasis, storedModelsSnapshot()) }
+    const expect = { models: modelsExpect(dirty, modelsBasis, storedModelsSnapshot()) }
     const res = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ models: changes, expect }),
@@ -1173,9 +1222,15 @@ async function saveModels(): Promise<void> {
       setHelp(data.error || 'Failed to save settings', 'error')
       return
     }
-    for (const [key, sent] of Object.entries(changes)) {
+    if (changes.slots && slotsSection) {
+      if (deepEqual(slotsChoice(slotsSection), changes.slots)) {
+        dirtyModels.delete('slots')
+        modelsBasis.delete('slots')
+      } else modelsBasis.set('slots', changes.slots)
+    }
+    for (const [key, sent] of Object.entries(places)) {
       const section = modelsEl.querySelector<HTMLElement>(`.st-place[data-place="${CSS.escape(key)}"]`)
-      if (section && deepEqual(sectionChoice(section), sent)) {
+      if (section && deepEqual(placeChoice(section), sent)) {
         dirtyModels.delete(key)
         modelsBasis.delete(key)
       } else modelsBasis.set(key, sent)
@@ -1184,9 +1239,10 @@ async function saveModels(): Promise<void> {
     // made before the reload below lands reads its baseline from it, not from
     // the pre-save catalog.
     if (lastModels) {
-      for (const [key, sent] of Object.entries(changes)) {
+      if (changes.slots) lastModels.slots.stored = { ...lastModels.slots.stored, ...changes.slots }
+      for (const [key, sent] of Object.entries(places)) {
         const place = lastModels.places.find((entry) => entry.key === key)
-        if (place) place.stored = { ...place.stored, ...sent }
+        if (place) place.stored = { slot: sent.slot as ModelSlot }
       }
     }
     setLocalSettings(data)
@@ -1228,7 +1284,11 @@ function rebaseConflictLeaf(entry: ConflictLeaf): void {
         if (input && dirtyFields.has(input)) generalBasis.set(sub, value)
       }
     } else if (entry.field === 'models' && isRecord(entry.current)) {
-      for (const [place, choice] of Object.entries(entry.current)) {
+      // A whole-section leaf, reached only when shapes differ: every drafted
+      // leaf takes the saved value.
+      if (dirtyModels.has('slots') && entry.current.slots !== undefined) modelsBasis.set('slots', entry.current.slots)
+      const places = isRecord(entry.current.places) ? entry.current.places : entry.current
+      for (const [place, choice] of Object.entries(places)) {
         if (dirtyModels.has(place)) modelsBasis.set(place, choice)
       }
     }
@@ -1304,7 +1364,11 @@ function applyRefusedModelChoices(leaves: ConflictLeaf[]): void {
   for (const entry of leaves) {
     if (entry.field !== 'models') continue
     if (entry.leaf === null && isRecord(entry.current)) {
-      for (const [key, choice] of Object.entries(entry.current)) updateStoredChoice(key, choice)
+      for (const [key, choice] of Object.entries(entry.current)) {
+        if (key === 'places' && isRecord(choice)) {
+          for (const [place, slotChoice] of Object.entries(choice)) updateStoredChoice(place, slotChoice)
+        } else updateStoredChoice(key, choice)
+      }
     } else if (entry.leaf !== null) {
       updateStoredChoice(entry.leaf, entry.current)
     }
@@ -1312,23 +1376,25 @@ function applyRefusedModelChoices(leaves: ConflictLeaf[]): void {
 }
 
 // A saved model choice from the 409, written into the catalog the re-render
-// and later baselines read. The server replaces each place's stored choice
-// whole, so this replaces whole too.
+// and later baselines read. The server merges each half's stored choices, so
+// this merges too.
 function updateStoredChoice(key: string, choice: unknown): void {
-  if (!isRecord(choice) || typeof choice.default !== 'string' || typeof choice.fallback !== 'string') return
-  const place = lastModels?.places.find((entry) => entry.key === key)
-  if (!place) return
-  const stored = {
-    default: choice.default,
-    fallback: choice.fallback,
-    ...(typeof choice.secondary === 'string' ? { secondary: choice.secondary } : {}),
-    ...(typeof choice.tertiary === 'string' ? { tertiary: choice.tertiary } : {}),
+  if (!lastModels || !isRecord(choice)) return
+  if (key === 'slots') {
+    const stored: Record<string, string> = {}
+    for (const slot of MODEL_SLOTS) {
+      if (typeof choice[slot] === 'string' && choice[slot]) stored[slot] = choice[slot] as string
+    }
+    if (Object.keys(stored).length === 0) return
+    Object.assign(lastModels.slots, stored)
+    lastModels.slots.stored = { ...lastModels.slots.stored, ...stored }
+    return
   }
-  place.default = stored.default
-  place.fallback = stored.fallback
-  place.secondary = stored.secondary
-  place.tertiary = stored.tertiary
-  place.stored = stored
+  if (typeof choice.slot !== 'string') return
+  const place = lastModels.places.find((entry) => entry.key === key)
+  if (!place || !MODEL_SLOTS.includes(choice.slot as ModelSlot)) return
+  place.slot = choice.slot as ModelSlot
+  place.stored = { slot: place.slot }
 }
 
 // A reverted input shows a saved value again: it records that value for the

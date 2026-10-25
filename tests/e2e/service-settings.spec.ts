@@ -84,7 +84,7 @@ async function setup(page: Page, mode: 'service' | 'local', isAdmin = false) {
     if (url.pathname === '/api/snippets') {
       return route.fulfill({ json: { snippets: [{ trigger: ';combo', replace: 'Work closely together.' }], version: 'a'.repeat(64), skills: { revision: 0, switches: [] }, desktop: 'poise-link' } })
     }
-    if (url.pathname === '/api/models') return route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, places: [], fixed: [], refresh: null } })
+    if (url.pathname === '/api/models') return route.fulfill({ json: { catalog: { models: [], review_providers: [], path: '' }, slots: { primary: '', secondary: '', tertiary: '', notes: [], stored: null }, places: [], fixed: [], refresh: null } })
     if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (url.pathname === '/api/gh') return route.fulfill({ json: { records: [], count: 0, errors: [] } })
     return route.fulfill({ json: {} })
@@ -261,17 +261,24 @@ test('saves the model choices under a name and switches back to them in one step
   await setup(page, 'service')
   const posts: Array<{ path: string, body: unknown }> = []
   const chat = { key: 'chat', label: 'Chat', why: 'Card chats.', review: false, reviewers: false, notes: [], stored: null, providers: null }
-  let chosen = { default: 'opus-5-max', fallback: 'gpt-6-astra-max' }
-  let presets = [{ name: 'Quota day', models: { chat: { default: 'gpt-6-astra-max', fallback: 'opus-5-max' } }, savedAt: '2026-10-09T12:00:00Z' }]
+  const currentSlots = { primary: 'opus-5-max', secondary: 'gpt-6-astra-max', tertiary: 'grok-4.6-xhigh' }
+  const quotaSlots = { primary: 'gpt-6-astra-max', secondary: 'opus-5-max', tertiary: 'grok-4.6-xhigh' }
+  let chosen = { slots: { ...currentSlots }, places: { chat: { slot: 'primary' } } }
+  let presets = [{ name: 'Quota day', models: { slots: { ...quotaSlots }, places: { chat: { slot: 'primary' } } }, savedAt: '2026-10-09T12:00:00Z' }]
   let loads = 0
   await page.route('**/api/models', async (route) => {
     // What the server holds when the read starts; every read after the first is slow.
-    const answer = { places: [{ ...chat, ...chosen }], presets: [...presets] }
+    const answer = {
+      slots: { ...chosen.slots, notes: [], stored: null },
+      places: [{ ...chat, slot: chosen.places.chat.slot, model: (chosen.slots as Record<string, string>)[chosen.places.chat.slot] }],
+      presets: [...presets],
+    }
     loads += 1
     if (loads > 1) await new Promise((resolve) => setTimeout(resolve, 800))
     return route.fulfill({ json: { catalog: { models: [
       { identity: 'opus-5-max', provider: 'claude', selector: 'claude-opus-5', effort: 'max' },
       { identity: 'gpt-6-astra-max', provider: 'codex', selector: 'gpt-6-astra', effort: 'max' },
+      { identity: 'grok-4.6-xhigh', provider: 'grok', selector: 'grok-4.6', effort: 'xhigh' },
     ], review_providers: [], path: '' }, fixed: [], refresh: null, ...answer } })
   })
   await page.route('**/api/models/presets', async (route) => {
@@ -288,9 +295,9 @@ test('saves the model choices under a name and switches back to them in one step
   })
   await page.route('**/api/settings', (route) => {
     if (route.request().method() !== 'POST') return route.fallback()
-    const body = route.request().postDataJSON() as { models: { chat: typeof chosen } }
+    const body = route.request().postDataJSON() as { models: typeof chosen }
     posts.push({ path: 'settings', body })
-    chosen = body.models.chat
+    chosen = body.models
     return route.fulfill({ json: { org: '', me: 'octocat', agentAccount: '', timezone: 'UTC', models: body.models, chat: { branchPrefix: 'chat/', idleTimeoutMinutes: 120 }, organizations: [] } })
   })
   await page.goto('/')
@@ -306,15 +313,15 @@ test('saves the model choices under a name and switches back to them in one step
   await expect(page.getByRole('button', { name: 'Delete', exact: true })).toBeDisabled()
   await expect(page.locator('.st-status')).toHaveText('Saved the model choices as "Normal".')
   await expect(page.getByRole('button', { name: 'Use', exact: true })).toBeEnabled()
-  expect(posts[0]).toEqual({ path: 'save', body: { name: 'Normal', models: { chat: { default: 'opus-5-max', fallback: 'gpt-6-astra-max' } } } })
+  expect(posts[0]).toEqual({ path: 'save', body: { name: 'Normal', models: chosen } })
 
   // Using one shows its choices at once, before the slow reload, so a Save right away keeps them.
   const reload = page.waitForResponse((response) => response.url().endsWith('/api/models'))
   await saved.selectOption('Quota day')
   await page.getByRole('button', { name: 'Use', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Using "Quota day".')
-  expect(posts[1]).toEqual({ path: 'settings', body: { models: { chat: { default: 'gpt-6-astra-max', fallback: 'opus-5-max' } } } })
-  await expect(page.getByLabel('Chat default model')).toHaveValue('gpt-6-astra-max')
+  expect(posts[1]).toEqual({ path: 'settings', body: { models: presets[0].models } })
+  await expect(page.getByLabel('Primary model', { exact: true })).toHaveValue('gpt-6-astra-max')
 
   // A delete while that reload is on its way stays deleted when the older answer lands.
   await saved.selectOption('Normal')
@@ -322,7 +329,7 @@ test('saves the model choices under a name and switches back to them in one step
   await expect(page.locator('.st-status')).toHaveText('Deleted "Normal".')
   await reload
   await expect(saved.locator('option')).toHaveText(['Quota day'])
-  await expect(page.getByLabel('Chat default model')).toHaveValue('gpt-6-astra-max')
+  await expect(page.getByLabel('Primary model', { exact: true })).toHaveValue('gpt-6-astra-max')
 })
 
 test('a failed first device read stays visible until a later read succeeds', async ({ page }) => {

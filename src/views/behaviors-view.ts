@@ -240,9 +240,9 @@ function settingCell(meta: typeof BEHAVIORS[number]): string {
   return '<span class="last-dash">—</span>'
 }
 
-// Reviewers cell — how many of the PR review place's models (Settings →
-// Models: default, secondary, tertiary) review each new pull request, all
-// at the same time. One is the default; the other behaviors show a dash.
+// Reviewers cell — how many of the slots from the PR review place's slot on
+// (Settings → Models) review each new pull request, all at the same time.
+// One is the default; the other behaviors show a dash.
 const REVIEWER_OPTIONS: ReviewerCount[] = [1, 2, 3]
 const reviewersInFlight = new Set<BehaviorKey>()
 

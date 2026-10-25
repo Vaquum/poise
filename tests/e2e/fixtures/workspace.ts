@@ -37,7 +37,8 @@ export async function workspace(page: Page, view = 'current', fontResponse?: Pro
     ] } })
     if (path === '/api/models') return route.fulfill({ json: {
       catalog: { models: [{ identity: 'opus-5-max', provider: 'claude', selector: 'opus', effort: 'max' }, { identity: 'gpt-6-astra-max', provider: 'codex', selector: 'gpt-6-astra', effort: 'max' }], review_providers: [], path: '' },
-      places: [{ key: 'chat', label: 'Chat', why: 'The default model for new chats.', review: false, reviewers: false, default: 'opus-5-max', fallback: 'gpt-6-astra-max', notes: [], stored: null }],
+      slots: { primary: 'opus-5-max', secondary: 'gpt-6-astra-max', tertiary: 'gpt-6-astra-max', notes: [], stored: null },
+      places: [{ key: 'chat', label: 'Chat', why: 'The default model for new chats.', review: false, reviewers: false, slot: 'primary', model: 'opus-5-max', notes: [], stored: null }],
       fixed: [], presets: [], refresh: null,
     } })
     if (path === '/api/analytics') return route.fulfill({ json: {

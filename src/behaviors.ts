@@ -23,8 +23,8 @@ export interface BehaviorMeta {
   // the run files its findings as one follow-up issue and approves.
   hasReviewCap: boolean
   // Whether this behavior chooses how many reviewers act on each pull
-  // request (the PR review place's default, secondary and tertiary, in
-  // parallel). Only the initial review does; the others show a dash.
+  // request (the slots from the PR review place's slot on, in parallel).
+  // Only the initial review does; the others show a dash.
   hasReviewers: boolean
   // Whether this behavior has a memory scratchpad — true only for the
   // agent-backed behaviors whose prompt the note can be injected into.

@@ -94,15 +94,22 @@ export function generalPayload(draft: GeneralDraft, dirty: ReadonlySet<GeneralFi
   return fields.length > 0 ? { body, expect, fields } : null
 }
 
-export interface ModelChoice { default: string, fallback: string, secondary?: string, tertiary?: string }
+export interface ModelSlotDraft { primary?: string, secondary?: string, tertiary?: string }
+export interface ModelsDraft { slots?: ModelSlotDraft, places?: Record<string, { slot: string }> }
 
-// Only drafted places are validated, like the general fields above.
-export function validateModelChoices(changes: Record<string, ModelChoice>): string | null {
-  for (const [key, choice] of Object.entries(changes)) {
-    if (choice.default === choice.fallback) return `${key}: the fallback must differ from the default.`
-    if (choice.secondary && choice.secondary === choice.default) return `${key}: the secondary reviewer must differ from the default.`
-    if (choice.tertiary && (choice.tertiary === choice.default || choice.tertiary === choice.secondary)) {
-      return `${key}: the tertiary reviewer must differ from the default and the secondary.`
+// Only the drafted half is validated, like the general fields above: the
+// three slot models must be different models. Place slots need no check;
+// their pickers only offer the three slots.
+export function validateModelChoices(draft: ModelsDraft): string | null {
+  const slots = draft.slots
+  if (slots) {
+    const seen = new Map<string, string>()
+    for (const slot of ['primary', 'secondary', 'tertiary'] as const) {
+      const identity = slots[slot]
+      if (!identity) continue
+      const clash = seen.get(identity)
+      if (clash) return `Model slots ${clash} and ${slot} must be different models.`
+      seen.set(identity, slot)
     }
   }
   return null
@@ -125,15 +132,31 @@ export function wholeExpect(dirty: ReadonlySet<string>, basis: ReadonlyMap<strin
   return expect
 }
 
-// A model draft written while nothing was stored adopts the still-empty fresh
-// read — but if the place has since gained a stored choice, the expectation
-// carries null, which matches nothing, so the save is refused with the
-// current values instead of silently overwriting an unseen change.
-export function modelsExpect(dirty: ReadonlySet<string>, basis: ReadonlyMap<string, unknown>, fresh: Record<string, unknown>): Record<string, unknown> {
-  const expect = wholeExpect(dirty, basis, fresh)
-  for (const place of dirty) {
-    if (basis.get(place) === null && place in fresh) expect[place] = null
+// The whole models object the server compares for a partially written save:
+// fresh values for clean leaves, each draft's own read basis for drafted
+// ones. The leaves are the slots as one and each place as its own. A draft
+// written while nothing was stored adopts the still-empty fresh read — but if
+// the leaf has since gained a stored value, the expectation carries null,
+// which matches nothing, so the save is refused with the current values
+// instead of silently overwriting an unseen change.
+export function modelsExpect(
+  dirty: ReadonlySet<string>,
+  basis: ReadonlyMap<string, unknown>,
+  fresh: { slots?: unknown, places?: Record<string, unknown> },
+): Record<string, unknown> {
+  const expect: Record<string, unknown> = {}
+  if (dirty.has('slots') || fresh.slots !== undefined) {
+    if (dirty.has('slots') && basis.has('slots') && basis.get('slots') !== null) expect.slots = basis.get('slots')
+    else if (dirty.has('slots') && basis.get('slots') === null && fresh.slots !== undefined) expect.slots = null
+    else if (fresh.slots !== undefined) expect.slots = fresh.slots
   }
+  const places: Record<string, unknown> = { ...(fresh.places ?? {}) }
+  for (const leaf of dirty) {
+    if (leaf === 'slots') continue
+    if (basis.has(leaf) && basis.get(leaf) !== null) places[leaf] = basis.get(leaf)
+    else if (basis.get(leaf) === null && fresh.places && leaf in fresh.places) places[leaf] = null
+  }
+  if (fresh.places !== undefined || Object.keys(places).length > 0) expect.places = places
   return expect
 }
 
@@ -149,13 +172,28 @@ export function deepEqual(a: unknown, b: unknown): boolean {
 
 export interface ConflictLeaf { field: string, leaf: string | null, current: unknown }
 
+// The moved halves of a refused models save: the slots as one leaf, each
+// place as its own.
+export function modelsConflictLeaves(current: Record<string, unknown>, baseline: Record<string, unknown>): ConflictLeaf[] {
+  const leaves: ConflictLeaf[] = []
+  if (!deepEqual(current.slots, baseline.slots)) leaves.push({ field: 'models', leaf: 'slots', current: current.slots ?? null })
+  const places = isRecord(current.places) ? current.places : {}
+  const base = isRecord(baseline.places) ? baseline.places : {}
+  for (const place of [...new Set([...Object.keys(places), ...Object.keys(base)])].sort()) {
+    if (!deepEqual(places[place], base[place])) leaves.push({ field: 'models', leaf: place, current: places[place] ?? null })
+  }
+  return leaves
+}
+
 // The refused save's `current`, narrowed to the drafted leaves that actually
 // moved, so the message and Read again name what changed, not the section.
 export function conflictLeaves(current: Record<string, unknown>, baselines: ReadonlyMap<string, unknown>): ConflictLeaf[] {
   const leaves: ConflictLeaf[] = []
   for (const [field, value] of Object.entries(current)) {
     const baseline = baselines.get(field)
-    if (isRecord(value) && isRecord(baseline)) {
+    if (field === 'models' && isRecord(value) && isRecord(baseline)) {
+      leaves.push(...modelsConflictLeaves(value, baseline))
+    } else if (isRecord(value) && isRecord(baseline)) {
       let moved = false
       for (const [sub, subValue] of Object.entries(value)) {
         if (!deepEqual(subValue, baseline[sub])) {
@@ -182,11 +220,12 @@ function formatScalar(value: unknown): string {
 }
 
 function formatChoice(value: unknown): string {
-  if (isRecord(value) && typeof value.default === 'string') {
-    const parts = [`default ${formatScalar(value.default)}`, `fallback ${formatScalar(value.fallback)}`]
-    if (typeof value.secondary === 'string') parts.push(`secondary ${formatScalar(value.secondary)}`)
-    if (typeof value.tertiary === 'string') parts.push(`tertiary ${formatScalar(value.tertiary)}`)
-    return parts.join(', ')
+  if (isRecord(value) && typeof value.slot === 'string') return `slot ${formatScalar(value.slot)}`
+  if (isRecord(value)) {
+    const parts = ['primary', 'secondary', 'tertiary']
+      .filter((slot) => typeof value[slot] === 'string')
+      .map((slot) => `${slot} ${formatScalar(value[slot])}`)
+    if (parts.length > 0) return parts.join(', ')
   }
   return formatScalar(value)
 }

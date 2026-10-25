@@ -249,42 +249,62 @@ describe('readiness', () => {
 })
 
 
-describe('model choices per place', () => {
+describe('model slots and place slots', () => {
   const catalog = CATALOG as any
 
-  it('stores a default and fallback per place and keeps them across unrelated saves', () => {
+  it('stores the slot models and place slots, and keeps them across unrelated saves', () => {
     expect(getSettings().models).toEqual({})
-    const chosen = { pr_review: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' } }
+    const chosen = { slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' }, places: { pr_review: { slot: 'secondary' as const } } }
     expect(setSettings({ models: chosen }, catalog).models).toEqual(chosen)
     expect(setSettings({ timezone: 'UTC' }).models).toEqual(chosen)
-    const more = setSettings({ models: { chat: { default: 'grok-4.6-xhigh', fallback: 'opus-5-max' } } }, catalog).models
-    expect(more).toEqual({ ...chosen, chat: { default: 'grok-4.6-xhigh', fallback: 'opus-5-max' } })
+    const more = setSettings({ models: { places: { chat: { slot: 'tertiary' } } } }, catalog).models
+    expect(more).toEqual({ ...chosen, places: { pr_review: { slot: 'secondary' }, chat: { slot: 'tertiary' } } })
+    const slots = setSettings({ models: { slots: { tertiary: 'grok-4.6-xhigh' } } }, catalog).models
+    expect(slots).toEqual({ slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh', tertiary: 'grok-4.6-xhigh' }, places: more.places })
+  })
+
+  it('refuses a partial slot save that collides with a stored slot', () => {
+    setSettings({ models: { slots: { primary: 'gpt-6-astra-ultra' } } }, catalog)
+    expect(() => setSettings({ models: { slots: { tertiary: 'gpt-6-astra-ultra' } } }, catalog)).toThrow(/must be different models/)
+    expect(getSettings().models).toEqual({ slots: { primary: 'gpt-6-astra-ultra' } })
   })
 
   it('reads the pre-identity review preference until it is saved over', () => {
     mocks.store.set('reviewModel', 'astra')
     expect(getSettings().models).toEqual({
-      pr_review: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' },
-      pr_approve: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' },
+      slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' },
+      places: { pr_review: { slot: 'primary' }, pr_approve: { slot: 'primary' } },
     })
     mocks.store.set('reviewModel', 'opus')
     expect(getSettings().models).toEqual({})
   })
 
+  it('migrates per-place choices stored before slots, without rewriting them', () => {
+    mocks.store.set('models', JSON.stringify({ pr_approve: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' } }))
+    expect(getSettings().models).toEqual({
+      slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' },
+      places: { pr_approve: { slot: 'primary' } },
+    })
+    expect(mocks.store.get('models')).toBe(JSON.stringify({ pr_approve: { default: 'gpt-6-astra-ultra', fallback: 'opus-5-xhigh' } }))
+    mocks.store.set('models', 'not json')
+    expect(getSettings().models).toEqual({})
+  })
+
   it('rejects choices the catalog cannot honor without partially saving other settings', () => {
     const cases: Array<[unknown, RegExp]> = [
-      [{ chat: { default: 'opus', fallback: 'opus-5-max' } }, /from the catalog/],
-      [{ pr_review: { default: 'grok-4.6-xhigh', fallback: 'grok-4.6-xhigh' } }, /differ/],
-      [{ chat: { default: 'opus-5-max', fallback: 'opus-5-max' } }, /differ/],
-      [{ content: { default: 'opus-5-max', fallback: 'opus-5-xhigh' } }, /unknown model place/],
-      [[], /object of places/],
+      [{ slots: { primary: 'opus' } }, /from the catalog/],
+      [{ slots: { primary: 'opus-5-max', secondary: 'opus-5-max' } }, /different models/],
+      [{ places: { chat: { slot: 'default' } } }, /must be primary, secondary or tertiary/],
+      [{ places: { content: { slot: 'primary' } } }, /unknown model place/],
+      [{ chat: { default: 'opus-5-max', fallback: 'opus-5-xhigh' } }, /unknown models section/],
+      [[], /object with slots and places/],
     ]
     for (const [models, message] of cases) {
       expect(() => setSettings({ org: 'Vaquum', models: models as any }, catalog)).toThrow(message)
       expect(getSettings().org).toBe('')
       expect(getSettings().models).toEqual({})
     }
-    expect(() => setSettings({ models: { chat: { default: 'opus-5-max', fallback: 'grok-4.6-high' } } })).toThrow(/catalog is unavailable/)
+    expect(() => setSettings({ models: { places: { chat: { slot: 'primary' } } } })).toThrow(/catalog is unavailable/)
   })
 })
 

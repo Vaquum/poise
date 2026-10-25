@@ -14,7 +14,7 @@ function modelsState() {
       { identity: 'opus-5-max', selector: 'claude-opus-5', effort: 'max', provider: 'claude' },
       { identity: 'opus-5-high', selector: 'claude-opus-5', effort: 'high', provider: 'claude' },
     ], review_providers: [], path: '' },
-    places: [{ key: 'chat', default: 'opus-5-max' }],
+    places: [{ key: 'chat', model: 'opus-5-max' }],
     fixed: [],
     refresh: null,
   }
