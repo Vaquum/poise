@@ -54,7 +54,7 @@ describe('review cap client mirror', () => {
     expect(posts).toEqual([{ url: '/api/behaviors/approve-prs', body: { reviewCap: 5 } }])
     expect(behaviors.getReviewCap('approve-prs')).toBe(5)
 
-    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+    vi.stubGlobal('fetch', async (_url: string, init?: RequestInit) => {
       if (init?.method === 'POST') return { ok: false, status: 400, json: async () => ({ error: 'nope' }) }
       return { ok: true, json: async () => state(5) }
     })
