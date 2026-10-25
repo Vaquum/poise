@@ -556,8 +556,9 @@ describe('approval eligibility and review activity', () => {
     prior.database.recordSeen('review-new-prs', `${pr.repo}#${pr.number}:secondary`)
     expect(prior.database.latestApprovalBasisLaunch(pr.repo, pr.number)).toBeNull()
     fixture.agentLogs = [agentLog({
-      behavior: 'pr_approve', status: 'superseded', outcome: 'superseded',
-      expected_head: prior.expectedHead, head_sha: NEXT_HEAD_SHA,
+      behavior: 'pr_approve', status: 'failed', error: 'submitted approval was dismissed as stale after the target moved',
+      error_code: 'approval_dismissed_stale',
+      expected_head: prior.expectedHead,
       started_at: new Date(Date.parse(prior.requestedAt) + 1_000).toISOString(),
       completed_at: new Date().toISOString(), review_id: 91,
       actor: prior.actor, source: prior.source, correlation_id: prior.correlationId,
@@ -899,5 +900,52 @@ describe('approval eligibility and review activity', () => {
     expect(modules.database.hasSeen('approve-prs', `${pr.repo}#17@head=${head}`)).toBe(eligible || occupiedHead)
     if (variant !== 'head-new-model') expect(modules.database.getFailedBehaviorLaunch('approve-prs', heldTarget)).not.toBeNull()
     expect(modules.database.listBehaviorDeadLetters()).toHaveLength(1)
+  })
+
+  it('retries a budget-exhausted dismissed approval on the same head after backoff', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+    const prior = await launchApprovalBeforeCrash()
+    const args: string[] = mocks.spawnDetached.mock.calls[0][1]
+    const model = args[args.indexOf('--model') + 1]
+    recordCompletedInitialReview(prior.database, { target: `${pr.repo}#17:tertiary`,
+      outcome: 'changes_requested', headSha: NEXT_HEAD_SHA })
+    const call = agentLog({
+      behavior: 'pr_approve', status: 'failed', action: null, outcome: null,
+      review_policy: 'bounded-v1', error_code: 'review_budget_exhausted',
+      error: 'Review reached its total time limit; needs attention', model, expected_head: prior.expectedHead,
+      actor: prior.actor, source: prior.source, correlation_id: prior.correlationId,
+      started_at: new Date(Date.parse(prior.requestedAt) + 1_000).toISOString(),
+    })
+    fixture.agentLogs = [call]
+    arrangeCli(true, false, {}, { commits_after_request: 0, response_count: 0 })
+    const modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('approve-prs', prior.target)).not.toBeNull()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    // The dismissed-recovery target occupies this head: move the failed launch there.
+    const heldTarget = `${pr.repo}#${pr.number}@head=${HEAD_SHA}`
+    modules.database.db.prepare('UPDATE behavior_seen SET target = ? WHERE key = ? AND target = ?')
+      .run(heldTarget, 'approve-prs', prior.target)
+    modules.database.db.prepare('UPDATE behavior_dead_letters SET target = ? WHERE behavior = ? AND target = ?')
+      .run(heldTarget, 'approve-prs', prior.target)
+    const failureKey = `behavior_approve_prs_failure:${prior.target}`
+    const stored = modules.database.getMeta(failureKey)
+    if (!stored) throw new Error('expected a backoff failure for the budget-exhausted launch')
+    modules.database.setMeta(`behavior_approve_prs_failure:${heldTarget}`, stored)
+    modules.database.setMeta(failureKey, '')
+    await resetLogCache()
+    arrangeCli(false, false, { headSha: HEAD_SHA, reviewerLatestState: 'DISMISSED',
+      latestActivityAt: new Date().toISOString() }, { reviewer_latest_state: 'DISMISSED' })
+    fixture.listedPrs = [{ ...pr, updated_at: '2026-07-15T12:00:01Z' }]
+    // Still inside the backoff: no relaunch.
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    // Past the backoff the same head relaunches through dismissed recovery.
+    vi.setSystemTime(new Date(Date.now() + modules.behaviors.BEHAVIOR_RETRY_BASE_MS))
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(mocks.spawnDetached.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
   })
 })

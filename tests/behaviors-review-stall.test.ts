@@ -85,9 +85,14 @@ describe('review-new-prs under load', () => {
     const original = mocks.runFile.getMockImplementation()!
     let slowEntered = false
     let fastPrepared = false
+    let resolveSlowEntered!: () => void
+    let resolveFastPrepared!: () => void
+    const slowEnteredPromise = new Promise<void>((resolve) => { resolveSlowEntered = resolve })
+    const fastPreparedPromise = new Promise<void>((resolve) => { resolveFastPrepared = resolve })
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
       if (command === 'github-interface' && args[0] === '--head-sha' && String(args[1]) === '#17') {
         slowEntered = true
+        resolveSlowEntered()
         const signal = (options as { signal?: AbortSignal } | undefined)?.signal
         if (signal?.aborted) throw signal.reason
         // A check that never answers until the sweep deadline aborts it, as a
@@ -100,6 +105,7 @@ describe('review-new-prs under load', () => {
       if (command === 'github-interface' && args[0] === '--requested-changes-addressed'
         && String(args[1]) === '#18') {
         fastPrepared = true
+        resolveFastPrepared()
       }
       return result
     })
@@ -108,7 +114,7 @@ describe('review-new-prs under load', () => {
     // Real I/O (checkout directories, lock files) drains while the fake clock
     // stays put, so the fast PR is fully prepared before the deadline fires.
     const pump = () => new Promise<void>((resolve) => setImmediate(resolve))
-    for (let i = 0; i < 1000 && !(slowEntered && fastPrepared); i++) await pump()
+    await Promise.all([slowEnteredPromise, fastPreparedPromise])
     expect(slowEntered && fastPrepared).toBe(true)
     for (let i = 0; i < 20; i++) await pump()
     await vi.advanceTimersByTimeAsync(56_000)

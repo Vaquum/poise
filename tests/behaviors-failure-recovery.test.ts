@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
+function modelOf(call: unknown[]): string {
+  const args = call[1] as string[]
+  return args[args.indexOf('--model') + 1]
+}
+
 describe('worker failure classification and recovery', () => {
 
   it('recovers a failed review only after GitHub proves no reviewer action', async () => {
@@ -350,6 +355,112 @@ describe('worker failure classification and recovery', () => {
     fixture.listedPrs = fixture.listedPrs.map((row) => ({ ...row, updated_at: '2026-07-15T12:00:01Z' }))
     await modules.behaviors.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+  })
+
+  it('falls a budget-exhausted approval to the next slot on the same head', async () => {
+    const launched = await launchApprovalBeforeCrash()
+    fixture.agentLogs = [agentLog({
+      id: 'e'.repeat(32),
+      behavior: 'pr_approve',
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'failed',
+      action: null,
+      outcome: null,
+      model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1',
+      error_code: 'review_budget_exhausted',
+      error: 'Review reached its total time limit; needs attention',
+      expected_head: launched.expectedHead,
+      actor: launched.actor,
+      source: launched.source,
+      correlation_id: launched.correlationId,
+    })]
+    await resetLogCache()
+
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+
+    // No push, no replay, no backoff wait: the next slot relaunches the same head.
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
+    expect(mocks.spawnDetached.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ target: 'reviewer:opus-5-xhigh' }),
+    ])
+    expect(db.listBehaviorDeadLetters()).toEqual([])
+  })
+
+  it('falls a 429 approval to the next slot on the same head without a push or a replay', async () => {
+    const launched = await launchApprovalBeforeCrash()
+    fixture.agentLogs = [agentLog({
+      id: 'e'.repeat(32),
+      behavior: 'pr_approve',
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'failed',
+      action: 'not_started',
+      outcome: 'preflight_failed',
+      model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1',
+      error_code: 'review_provider_error',
+      error: 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)',
+      expected_head: launched.expectedHead,
+      actor: launched.actor,
+      source: launched.source,
+      correlation_id: launched.correlationId,
+    })]
+    await resetLogCache()
+
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
+    expect(mocks.spawnDetached.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ target: 'reviewer:opus-5-xhigh' }),
+    ])
+    expect(db.listBehaviorDeadLetters()).toEqual([])
+  })
+
+  it('holds a budget-exhausted approval when the submission is uncertain', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    const launched = await launchApprovalBeforeCrash()
+    fixture.agentLogs = [agentLog({
+      id: 'e'.repeat(32),
+      behavior: 'pr_approve',
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'failed',
+      action: null,
+      outcome: null,
+      model: 'opus-5-xhigh',
+      review_policy: 'bounded-v1',
+      error_code: 'review_budget_exhausted',
+      error: 'Review reached its total time limit; needs attention; could not prove a safe recovery: review activity unavailable',
+      expected_head: launched.expectedHead,
+      actor: launched.actor,
+      source: launched.source,
+      correlation_id: launched.correlationId,
+    })]
+    await resetLogCache()
+
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+
+    // Even past any backoff, an uncertain submission never retries itself.
+    vi.setSystemTime(new Date(Date.now() + 2 * 60 * 60_000))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(db.getFailedBehaviorLaunch('approve-prs', launched.target)?.launchCallId).toBe('e'.repeat(32))
+    expect(db.listBehaviorDeadLetters()).toHaveLength(1)
   })
 
   it('allows an explicit model change after a bounded no-action failure', async () => {

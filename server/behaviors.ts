@@ -929,6 +929,10 @@ function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, 
   const kind = reviewerTripKind(call)
   const identity = kind ? tripIdentity(call) : null
   if (!kind || !identity || !postedNothing(call)) return false
+  // Caller verifies against live GitHub before failing a bounded run, and
+  // says so when it cannot: an uncertain submission holds on every slot
+  // instead of risking a duplicate verdict.
+  if (call.review_comments != null || /could not prove a safe recovery/.test(call.error || '')) return false
   tripReviewer(behavior, identity, kind, call.id)
   if (tripHoldsTarget(call)) return false
   releaseOwnedClaim(behavior, claim.target, claim.claimId)
@@ -1615,7 +1619,7 @@ function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry |
     recordBehaviorDeadLetter(claim, message, call.id)
     const retryFailure = claim.key === ISSUES_KEY
       ? call.error_code !== 'stopped' && (call.receipts != null || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))
-      : !boundedReviewFailure(call) && call.error_code !== 'review_packet_too_large'
+      : (!boundedReviewFailure(call) || budgetExhaustedProvenNoAction(call)) && call.error_code !== 'review_packet_too_large'
     if (retryFailure) recordBehaviorFailure(claim.key as BehaviorKey, 'worker', message, claim.target,
       claim.key === ISSUES_KEY ? { errorCode: call.error_code, held: !issueFailureCanRetry(claim.target, call), callId: call.id } : {})
   })()
@@ -1904,6 +1908,17 @@ async function reconcileBehaviorLaunchClaims(
       || String(call.outcome || '') === 'superseded'
       || call.error === SUPERSEDED_AGENT_ERROR
     if (superseded) {
+      if (call.review_id != null || call.receipts != null) {
+        // A run that posted must never be silently released: a superseded
+        // result always carries the observed current head, which proves
+        // nothing, but a review id or issue receipts prove a publication
+        // happened. Quarantine it so the round is flagged, not erased.
+        const posted = call.review_id != null ? `review ${call.review_id}` : 'issue comments'
+        quarantineClaim(claim, 'invalid_result',
+          `superseded run posted ${posted}; retained to prevent round loss`, call.id,
+          quarantineEvidence(snapshot, claim, call).mayRun)
+        continue
+      }
       if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
         captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
           state: 'superseded', activity: status === 'superseded' ? 'settled' : 'unknown', stateSource: 'native',
@@ -1915,9 +1930,28 @@ async function reconcileBehaviorLaunchClaims(
       )
       continue
     }
+    if (FAILED_AGENT_STATUSES.has(status) && call.error_code === 'approval_dismissed_stale') {
+      // The run posted an approval that GitHub dismissed as stale after the
+      // target moved: no approval authority, but the current head needs a
+      // fresh evaluation, not a hold. Release like a supersede.
+      if (releaseOwnedClaim(behavior, claim.target, claim.claimId)) {
+        captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+          state: 'superseded', activity: 'settled', stateSource: 'native',
+          outcome: 'superseded', head: call.head_sha, completedAt: call.completed_at })
+        clearBehaviorFailure(behavior, claim.target, claim.launchActor)
+      }
+      console.log(
+        `[behaviors] ${behavior} approval dismissed as stale for ${claim.launchRepo}#${claim.launchPr}; current head will be reconsidered`,
+      )
+      continue
+    }
     if (FAILED_AGENT_STATUSES.has(status) && boundedReviewFailure(call)) {
       if (releaseTrippedCall(behavior, claim, call)) continue
-      deadLetterClaim(claim, call.error || 'Review needs attention')
+      const message = call.error || 'Review needs attention'
+      if (deadLetterClaim(claim, message) && budgetExhaustedProvenNoAction(call)) {
+        recordBehaviorFailure(behavior, 'worker', message, claim.target,
+          { errorCode: call.error_code, held: false, callId: call.id })
+      }
       continue
     }
     const preflightFailed = FAILED_AGENT_STATUSES.has(status)
@@ -2129,11 +2163,16 @@ async function automatedReviewEnvironment(repo: string, number: number, reviewer
   if (snapshot.quarantined.some((row) => quarantinedLogMayMatch(row, { repo, prId: String(number) }))) {
     throw new Error('Cannot establish ownership of automated reviews: Caller evidence is unreadable')
   }
+  // A stale-dismissed approval failed its run, but its review is a verified
+  // Poise publication: leaving it out would brand it manual and hold every
+  // later approval on an agent-authored pull request.
   const ids = snapshot.entries.filter((row) => row.repo === repo && row.pr_id === String(number)
     && row.actor?.toLowerCase() === reviewer.toLowerCase()
     && ['poise:review-new-prs', 'poise:approve-prs', 'poise:manual-review', 'poise:replay'].includes(row.source || '')
     && ['pr_review', 'pr_approve'].includes(row.behavior || '')
-    && ['completed', 'superseded'].includes(row.status) && unambiguousAgentCall(snapshot, row)
+    && (['completed', 'superseded'].includes(row.status)
+      || (row.status === 'failed' && row.error_code === 'approval_dismissed_stale'))
+    && unambiguousAgentCall(snapshot, row)
     && Number.isSafeInteger(row.review_id) && (row.review_id || 0) > 0).map((row) => row.review_id!)
   return { GITHUB_INTERFACE_AUTOMATED_REVIEWS: JSON.stringify(ids) }
 }
@@ -3198,6 +3237,19 @@ function boundedReviewFailure(call: LogEntry): boolean {
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
 }
 
+// A budget-exhausted run that proved it posted nothing is a provider-side
+// failure, not an ambiguous side effect: Caller verifies against live
+// GitHub before failing this way, and says so when it cannot. It retries
+// the same head on backoff once the provider answers again; only an
+// uncertain submission holds.
+function budgetExhaustedProvenNoAction(call: LogEntry): boolean {
+  return call.review_policy === REVIEW_POLICY
+    && call.error_code === 'review_budget_exhausted'
+    && postedNothing(call)
+    && call.review_comments == null
+    && !/could not prove a safe recovery/.test(call.error || '')
+}
+
 // An explicit operator retry releases only failed slots whose live GitHub
 // inventory proves no unclaimed or pending publication. The scheduler owns
 // the next launch; this API neither submits reviews nor rewrites Caller logs.
@@ -3351,7 +3403,7 @@ async function releaseFailedBehaviorIfNoAction(
       }
     }
   }
-  if (boundedReviewFailure(call) && call.model === configuredModel
+  if (boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call) && call.model === configuredModel
     && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
   const blockedPacket = call.action === 'not_started'
     && call.outcome === 'preflight_failed'
@@ -3599,9 +3651,10 @@ async function dismissedApprovalHeld(pr: DatastorePr, head: string, model: strin
       || call.expected_head !== head || !Number.isFinite(Date.parse(claim.launchRequestedAt))
       || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
       || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)
-      || call.action !== 'not_started' || call.outcome !== 'preflight_failed'
+      || (!budgetExhaustedProvenNoAction(call)
+        && (call.action !== 'not_started' || call.outcome !== 'preflight_failed'))
       || call.head_sha !== null || call.review_id != null || call.receipts != null || call.review_comments != null) return true
-    return boundedReviewFailure(call) && call.model === model
+    return boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call) && call.model === model
       || !behaviorRetryDue('approve-prs', claim.target)
   })
 }
@@ -5935,7 +5988,7 @@ export class ReplayRefusedError extends HttpError {
   }
 }
 
-export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv } | void> {
+export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, number: number): Promise<{ author: string, actor: string, accounts: ReturnType<typeof prAccounts>, reviewEnvironment?: NodeJS.ProcessEnv, reviewCapReached?: { reviewRound: number, reviewCap: number } } | void> {
   const owner = repo.split('/')[0].toLowerCase()
   const org = readyOrganizations().find((candidate) => candidate.login.toLowerCase() === owner)
   if (!org) throw new ReplayRefusedError(`${repo} does not belong to a ready GitHub account`)
@@ -5962,7 +6015,16 @@ export async function admitReplay(behavior: BehaviorAgentLaunch, repo: string, n
     }
   })
   if (refusal) throw new ReplayRefusedError(refusal)
-  if (author && actor && accounts) return { author, actor, accounts, reviewEnvironment }
+  if (author && actor && accounts) {
+    // The replayed approval round is pinned here, like a scheduled launch
+    // pins its round at preparation time.
+    const reviewCap = behavior === 'pr_approve' ? getReviewCap() : null
+    const reviewRound = reviewCap === null ? null : reviewRoundNumber(repo, number)
+    const reviewCapReached = reviewCap !== null && reviewRound !== null && reviewRound >= reviewCap
+      ? { reviewRound, reviewCap }
+      : undefined
+    return { author, actor, accounts, reviewEnvironment, ...(reviewCapReached ? { reviewCapReached } : {}) }
+  }
 }
 
 // A replay carries no call identity — behavior, repository and number only —
@@ -6539,6 +6601,14 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
 export function getBehaviorDiagnosticIncidents(snapshot: AgentLogSnapshot | null) {
   const scoped = () => behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot,
     BEHAVIOR_KEYS.flatMap((behavior) => [...listBehaviorLaunchClaims(behavior), ...failedBehaviorLaunches(behavior)]))
+    // A held row shows when its automatic retry runs: the failure clock for
+    // this exact attempt, never a newer attempt's clock on an older row.
+    .map((incident): typeof incident & { nextRetryAt?: string } => {
+      if (!incident.callId || !(BEHAVIOR_KEYS as readonly string[]).includes(incident.behavior)) return incident
+      const failure = readBehaviorFailure(incident.behavior as BehaviorKey, incident.target)
+      if (failure?.callId !== incident.callId) return incident
+      return { ...incident, nextRetryAt: new Date(failure.nextRetryAtMs).toISOString() }
+    })
   if (behaviorOrganization.getStore() !== undefined) return scoped()
   const organizations = readyOrganizations()
   return organizations.length ? organizations.flatMap((org) => behaviorOrganization.run(org, scoped)) : scoped()

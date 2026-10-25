@@ -31,6 +31,10 @@ def cancel_when_idle(path: str) -> bool:
             fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return False
+        if "submitted" in gate.read():
+            # A sealed submission already posted: cancellation stops the
+            # remaining provider work, never the posted action itself.
+            return False
         gate.write("cancelled\n")
         gate.flush()
         return True

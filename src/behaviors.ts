@@ -96,6 +96,7 @@ export interface BehaviorDiagnostics {
     correlationId?: string | null
     callId?: string | null
     diagnostic?: DiagnosticClassification
+    nextRetryAt?: string
   }>
   holds: Array<{
     org?: string

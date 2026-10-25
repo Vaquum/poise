@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
   models: {} as import('../server/models').ModelSettings,
   agentAccount: 'bit-mis',
   // The scheduler's replay check; these tests admit everything unless told not to.
-  admit: vi.fn(async () => ({ author: 'poise-user', actor: 'bit-mis', accounts: { me: 'poise-user', agent: 'bit-mis' } })),
+  admit: vi.fn(async (): Promise<{ author: string, actor: string, accounts: { me: string, agent: string }, reviewCapReached?: { reviewRound: number, reviewCap: number } }> => ({ author: 'poise-user', actor: 'bit-mis', accounts: { me: 'poise-user', agent: 'bit-mis' } })),
 }))
 
 vi.mock('esbuild', async importOriginal => {
@@ -693,6 +693,17 @@ describe('manual review model selection', () => {
     ])
     expect(new Set(admissions.map(({ admissionKey }) => admissionKey)).size).toBe(2)
     for (const admission of admissions) expect(admission.admissionKey).toBe(admission.nativeId)
+  })
+
+  it('runs an approval replay under the effective cap', async () => {
+    const { replayAgentJob } = await import('../server/agent')
+    const { spawnDetached } = await import('../server/process')
+    mocks.admit.mockResolvedValueOnce({ author: 'poise-user', actor: 'bit-mis',
+      accounts: { me: 'poise-user', agent: 'bit-mis' },
+      reviewCapReached: { reviewRound: 5, reviewCap: 5 } })
+    await replayAgentJob({ behavior: 'pr_approve', repo: 'o/r', pr_id: 12 }, mocks.admit)
+    expect(vi.mocked(spawnDetached).mock.calls[0][1]).toEqual(expect.arrayContaining(
+      ['--pr-approve', '--review-cap-reached', '--review-round', '5', '--review-cap', '5']))
   })
 
   it('records a rejected spawn and preserves its exact error', async () => {
