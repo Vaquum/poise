@@ -4,6 +4,7 @@ import {
   conflictMessage,
   deepEqual,
   generalPayload,
+  modelsExpect,
   rereadValue,
   validateGeneralDraft,
   validateModelChoices,
@@ -108,6 +109,25 @@ describe('the whole expectation', () => {
       .toEqual({ branchPrefix: 'agent/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 })
     expect(wholeExpect(new Set(['chat']), new Map(), { chat: { default: 'a' } })).toEqual({ chat: { default: 'a' } })
     expect(wholeExpect(new Set(['chat']), new Map([['chat', { default: 'b' }]]), { chat: { default: 'a' } })).toEqual({ chat: { default: 'b' } })
+  })
+})
+
+describe('the models expectation', () => {
+  it('adopts the still-empty read for a draft made with nothing stored', () => {
+    expect(modelsExpect(new Set(['chat']), new Map([['chat', null]]), {}))
+      .toEqual({})
+    expect(modelsExpect(new Set(['chat']), new Map([['chat', null]]), { pr_review: { default: 'a' } }))
+      .toEqual({ pr_review: { default: 'a' } })
+  })
+
+  it('forces a refusal when the place gained a stored choice under the draft', () => {
+    expect(modelsExpect(new Set(['chat']), new Map([['chat', null]]), { chat: { default: 'n' } }))
+      .toEqual({ chat: null })
+  })
+
+  it('keeps the read basis for a draft made with a stored choice', () => {
+    expect(modelsExpect(new Set(['chat']), new Map([['chat', { default: 's' }]]), { chat: { default: 'n' } }))
+      .toEqual({ chat: { default: 's' } })
   })
 })
 

@@ -491,3 +491,156 @@ test('saving a remaining draft after read-again succeeds without a second confli
   expect(state.posts).toHaveLength(2)
   expect(state.posts[1].expect).toEqual({ chat: { ...CHAT, idleTimeoutMinutes: 0, maxConcurrentLocalTurns: 6 } })
 })
+
+test('saving again after a conflict retries against the refused value', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  let refuses = true
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      if (refuses) {
+        refuses = false
+        state.settings = { ...state.settings, timezone: 'Europe/Helsinki' }
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { timezone: 'Europe/Helsinki' } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      state.settings = { ...state.settings, ...rest }
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'general')
+  await page.locator('#st-timezone').selectOption('Europe/Madrid')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toContainText('Time zone is now "Europe/Helsinki"')
+  // Save again without reading again: an intentional overwrite of Helsinki.
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts).toHaveLength(2)
+  expect(state.posts[1].expect).toEqual({ timezone: 'Europe/Helsinki' })
+  expect(state.settings.timezone).toBe('Europe/Madrid')
+})
+
+test('saving models again after a conflict retries against the refused choice', async ({ page }) => {
+  const stored = { default: 'fable-5.1-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery }
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: { chat: stored } })
+  await setupModels(page, state)
+  let refuses = true
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      if (refuses) {
+        refuses = false
+        const current = { chat: { default: 'opus-5-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery } }
+        state.settings = { ...state.settings, models: current }
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { models: current } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      state.settings = { ...state.settings, models: { ...(state.settings.models as object), ...((rest.models ?? {}) as object) } }
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'models')
+  const chatDefault = page.getByLabel('Chat default model', { exact: true })
+  await chatDefault.selectOption('muse-spark-1.3-contributor-max')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toContainText('Models "chat" is now')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts).toHaveLength(2)
+  expect((state.posts[1].expect as Record<string, Record<string, unknown>>).models.chat)
+    .toEqual({ default: 'opus-5-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery })
+})
+
+test('a model draft made with nothing stored refuses after another tab fills the place', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  await setupModels(page, state)
+  await page.goto('/')
+  await openSection(page, 'models')
+  const chatDefault = page.getByLabel('Chat default model', { exact: true })
+  const editorDefault = page.getByLabel('Editor chat default model', { exact: true })
+  await chatDefault.selectOption('muse-spark-1.3-contributor-max')
+  // Another tab saves both places; reopening reads its choices under the draft.
+  const saved = {
+    chat: { default: 'opus-5-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery },
+    editor: { default: 'fable-5.1-max', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery },
+  }
+  state.settings = { ...state.settings, models: saved }
+  await page.keyboard.press('Escape')
+  await openSection(page, 'models')
+  // The editor select proves the reload landed; the chat draft is kept.
+  await expect(editorDefault).toHaveValue('fable-5.1-max')
+  await expect(chatDefault).toHaveValue('muse-spark-1.3-contributor-max')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  // The stub answers where a real server would refuse; the wire expectation
+  // carries the refusal.
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts).toHaveLength(1)
+  expect(state.posts[0].expect).toEqual({ models: { chat: null, editor: saved.editor } })
+})
+
+test('editing the same input after an Enter save compares against the save', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  await page.goto('/')
+  await openSection(page, 'general')
+  const me = page.getByLabel('Your GitHub account')
+  await me.fill('octocat2')
+  await me.press('Enter')
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  // Still focused: the next draft starts from the save, not the pre-save read.
+  await me.fill('octocat3')
+  await me.press('Enter')
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts).toHaveLength(2)
+  expect(state.posts[1].expect).toEqual({ me: 'octocat2' })
+})
+
+test('a remaining draft retries clean after a failed-refresh read-again', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  let refuses = true
+  let failNextGet = false
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      if (refuses) {
+        refuses = false
+        failNextGet = true
+        state.settings = { ...state.settings, chat: { ...CHAT, idleTimeoutMinutes: 0 } }
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { chat: { ...CHAT, idleTimeoutMinutes: 0 } } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      const merged = { ...state.settings, ...rest }
+      if (rest.chat && typeof rest.chat === 'object') merged.chat = { ...(state.settings.chat as object), ...(rest.chat as object) }
+      state.settings = merged
+    } else if (failNextGet) {
+      failNextGet = false
+      await route.fulfill({ status: 500, json: { error: 'settings unavailable' } })
+      return
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'general')
+  await page.locator('#st-chat-idle-timeout').fill('45')
+  await page.locator('#st-chat-branch-prefix').fill('agent/')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toContainText('Idle timeout is now 0')
+  await page.getByRole('button', { name: 'Read again' }).click()
+  await expect(page.locator('#st-chat-idle-timeout')).toHaveValue('0')
+  await expect(page.locator('#st-chat-branch-prefix')).toHaveValue('agent/')
+  // The retry compares the remaining draft against the refusal's chat.
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts).toHaveLength(2)
+  expect(state.posts[1].expect).toEqual({ chat: { ...CHAT, idleTimeoutMinutes: 0 } })
+})

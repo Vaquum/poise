@@ -115,11 +115,24 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 // The whole object the server compares for a partially written field: fresh
 // values for clean leaves, each draft's own read basis for drafted ones. A
 // single whole baseline cannot represent drafts written against different
-// reads, so the expectation is built per leaf instead.
+// reads, so the expectation is built per leaf instead. A null basis — drafted
+// while nothing was stored — is left out here; modelsExpect decides it below.
 export function wholeExpect(dirty: ReadonlySet<string>, basis: ReadonlyMap<string, unknown>, fresh: Record<string, unknown>): Record<string, unknown> {
   const expect: Record<string, unknown> = { ...fresh }
   for (const leaf of dirty) {
-    if (basis.has(leaf)) expect[leaf] = basis.get(leaf)
+    if (basis.has(leaf) && basis.get(leaf) !== null) expect[leaf] = basis.get(leaf)
+  }
+  return expect
+}
+
+// A model draft written while nothing was stored adopts the still-empty fresh
+// read — but if the place has since gained a stored choice, the expectation
+// carries null, which matches nothing, so the save is refused with the
+// current values instead of silently overwriting an unseen change.
+export function modelsExpect(dirty: ReadonlySet<string>, basis: ReadonlyMap<string, unknown>, fresh: Record<string, unknown>): Record<string, unknown> {
+  const expect = wholeExpect(dirty, basis, fresh)
+  for (const place of dirty) {
+    if (basis.get(place) === null && place in fresh) expect[place] = null
   }
   return expect
 }

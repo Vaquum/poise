@@ -15,7 +15,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 // panel never invents a label for one.
 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
-import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, rereadValue, validateGeneralDraft, validateModelChoices, wholeExpect, type ConflictLeaf, type GeneralDraft, type GeneralField, type ModelChoice } from './settings-save'
+import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, modelsExpect, rereadValue, validateGeneralDraft, validateModelChoices, type ConflictLeaf, type GeneralDraft, type GeneralField, type ModelChoice } from './settings-save'
 import { productionSummary, type ProductionUpdate } from './production-status'
 import { clockDay, logTime, shortTime } from './clock'
 import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, MUSE_API_KEY_LOGIN, type ConnectedAccount } from '../server/accounts/types'
@@ -752,11 +752,12 @@ function renderPlaces(data: ModelsResponse) {
   for (const section of modelsEl.querySelectorAll<HTMLElement>('.st-place')) {
     section.onchange = () => {
       const key = section.dataset.place || ''
-      // The stored choice this place showed when drafted. Nothing stored
-      // leaves no basis: the expectation omits the place, like the server.
+      // The stored choice this place showed when drafted. Nothing stored is
+      // recorded as an explicit null basis, so a save after another tab
+      // filled the place is refused instead of silently adopting it.
       if (key && !modelsBasis.has(key)) {
         const stored = lastModels?.places.find((entry) => entry.key === key)?.stored
-        if (stored) modelsBasis.set(key, { ...stored })
+        modelsBasis.set(key, stored ? { ...stored } : null)
       }
       dirtyModels.add(key)
     }
@@ -1096,12 +1097,16 @@ async function saveGeneral(): Promise<void> {
       if (input.value === value) dirtyFields.delete(input)
     }
     // A draft typed mid-save keeps a basis at what the server now holds: the
-    // save succeeded, so that is what was sent for its own leaf.
+    // save succeeded, so that is what was sent for its own leaf. The sent
+    // value is also the next shown-server value, even for a still-focused
+    // input the sync below skips.
     const sentChat = payload.body.chat as Record<string, unknown> | undefined
     for (const leaf of payload.fields) {
       const input = generalInput(leaf)
+      const sent = sentChat && leaf in sentChat ? sentChat[leaf] : payload.body[leaf]
+      if (typeof sent === 'string' || typeof sent === 'number') readValues.set(leaf, sent)
       if (!input || !dirtyFields.has(input)) generalBasis.delete(leaf)
-      else generalBasis.set(leaf, sentChat && leaf in sentChat ? sentChat[leaf] : payload.body[leaf])
+      else generalBasis.set(leaf, sent)
     }
     setLocalSettings(data)
     // Untouched inputs show what the save response carries: another tab's
@@ -1153,7 +1158,7 @@ async function saveModels(): Promise<void> {
   saveBtn.disabled = true
   saveBtn.textContent = 'Saving…'
   try {
-    const expect = { models: wholeExpect(new Set(Object.keys(changes)), modelsBasis, storedModelsSnapshot()) }
+    const expect = { models: modelsExpect(new Set(Object.keys(changes)), modelsBasis, storedModelsSnapshot()) }
     const res = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ models: changes, expect }),
@@ -1207,13 +1212,48 @@ function conflictCurrent(data: unknown): Record<string, unknown> | null {
   return isRecord(current) ? current : null
 }
 
+// Saving again after seeing the refusal is an intentional overwrite: each
+// moved leaf that is still drafted rebases onto the refused value, so the
+// retry compares against what the server holds instead of failing again on
+// the same stale read. Clean leaves keep no basis and read fresh.
+function rebaseConflictLeaf(entry: ConflictLeaf): void {
+  if (entry.leaf === null) {
+    if (entry.field === 'me' || entry.field === 'agentAccount' || entry.field === 'timezone') {
+      const input = generalInput(entry.field)
+      if (input && dirtyFields.has(input)) generalBasis.set(entry.field, entry.current)
+    } else if (entry.field === 'chat' && isRecord(entry.current)) {
+      for (const [sub, value] of Object.entries(entry.current)) {
+        if (sub !== 'branchPrefix' && sub !== 'idleTimeoutMinutes' && sub !== 'maxConcurrentLocalTurns' && sub !== 'updateTurnBoundMinutes') continue
+        const input = generalInput(sub as GeneralField)
+        if (input && dirtyFields.has(input)) generalBasis.set(sub, value)
+      }
+    } else if (entry.field === 'models' && isRecord(entry.current)) {
+      for (const [place, choice] of Object.entries(entry.current)) {
+        if (dirtyModels.has(place)) modelsBasis.set(place, choice)
+      }
+    }
+  } else if (entry.field === 'chat') {
+    const input = generalInput(entry.leaf as GeneralField)
+    if (input && dirtyFields.has(input)) generalBasis.set(entry.leaf, entry.current)
+  } else if (entry.field === 'models') {
+    if (dirtyModels.has(entry.leaf)) modelsBasis.set(entry.leaf, entry.current)
+  }
+}
+
 // Another tab saved the same field first: the server refused and sent what it
-// holds. Drafts stay put with their basis for an intentional retry; everything
-// unedited is read again at once, and Read again offers the saved values.
+// holds. Drafts stay put, rebased onto the refusal for an intentional retry;
+// everything unedited is read again at once, and Read again offers the values.
 async function handleConflict(section: 'general' | 'models', current: Record<string, unknown>, sentExpect: Record<string, unknown>): Promise<void> {
   const leaves = conflictLeaves(current, new Map(Object.entries(sentExpect)))
   await loadSettings({ fresh: true })
   const generalRefreshed = settingsLoadOk()
+  if (!generalRefreshed) {
+    // The reload failed, but the refusal carries a server read fresher than
+    // the cache: merge it in so a remaining draft's clean leaves compare
+    // against what the server holds.
+    setLocalSettings({ ...getCachedSettings(), ...current })
+  }
+  for (const entry of leaves) rebaseConflictLeaf(entry)
   syncFieldsFromCache()
   const modelsRefreshed = section === 'models' ? await loadModels() : false
   renderOrganizations()
