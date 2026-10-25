@@ -84,7 +84,8 @@ UTC (logged) until one is set. A timezone change takes effect without
 reinstalling; a drain skips the run. There is no separate calendar job: the
 installer removes the legacy personal-install launchd job on upgrade, and an
 installed server retires it at startup too, which is what covers managed
-installs that never re-run the installer.
+installs that never re-run the installer. If the old job cannot be confirmed
+gone, the server stands its own check down (loudly) instead of running two.
 
 ## Failure and recovery
 

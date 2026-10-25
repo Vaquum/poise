@@ -12,7 +12,7 @@ import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
 import { TERMINAL_WS_PATH, type TerminalPreset } from './terminal/protocol'
 import type { TerminalCommand } from './terminal/pty'
-import { catalogRetirementEnabled, retireCatalogJob, startLaunchdWatchdog } from './launchd-watchdog'
+import { catalogRetirementEnabled, ensureSingleModelScheduler, startLaunchdWatchdog } from './launchd-watchdog'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
 // Security validation must run before dotenv reads the file and before modules
@@ -22,7 +22,7 @@ await loadSecureDotenv()
 readServiceConfig()
 const { startLogging } = await import('./logging')
 startLogging({ captureFatal: true })
-const { attachChatSockets, createPoiseMiddleware, stopPoiseRuntime } = await import('./cache-plugin')
+const { attachChatSockets, createPoiseMiddleware, stopDailyModelRefresh, stopPoiseRuntime } = await import('./cache-plugin')
 const { closeDatabase } = await import('./db')
 
 const DEFAULT_HOST = '127.0.0.1'
@@ -493,14 +493,11 @@ export async function startProductionServer(options: ProductionServerOptions = {
   const stopWatchdog = startLaunchdWatchdog()
   if (stopWatchdog) server.once('close', stopWatchdog)
   // The daily model check runs in this server now; an installed server
-  // retires the legacy calendar job it replaces. Managed installs never
-  // re-run the installer, so this is what retires theirs.
+  // retires the legacy calendar job it replaces — or stands its own check
+  // down when the old job survives, so the two can never both fire. Managed
+  // installs never re-run the installer, so this is what retires theirs.
   if (catalogRetirementEnabled()) {
-    retireCatalogJob().then(({ unloaded }) => {
-      if (unloaded) console.log('[launchd-watchdog] retired the legacy model-catalog launchd job; the daily model check now runs in this server')
-    }, (error: unknown) => {
-      console.error(`[launchd-watchdog] ${error instanceof Error ? error.message : String(error)}`)
-    })
+    void ensureSingleModelScheduler({ stopScheduler: stopDailyModelRefresh })
   }
   return server
 }

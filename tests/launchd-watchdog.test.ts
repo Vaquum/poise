@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
-  assess, CATALOG_LABEL, catalogRetirementEnabled, createLaunchdWatchdog, graceMs, isNotLoaded, parseLaunchctlPrint,
-  retireCatalogJob, startLaunchdWatchdog, watchdogLabels,
+  assess, CATALOG_LABEL, catalogRetirementEnabled, createLaunchdWatchdog, ensureSingleModelScheduler, graceMs, isNotLoaded,
+  parseLaunchctlPrint, retireCatalogJob, startLaunchdWatchdog, watchdogLabels,
 } from '../server/launchd-watchdog'
 
 // What execFile rejects with: `launchctl print` exits 113 for a job that is not
@@ -322,5 +322,51 @@ describe('retiring the legacy model-catalog job', () => {
     expect(failure).toBeInstanceOf(Error)
     expect(failure?.message).toContain('launchctl print')
     expect(removed).toEqual([])
+  })
+})
+
+describe('leaving exactly one daily model scheduler', () => {
+  function harness(run: (args: string[]) => Promise<string>) {
+    const logs: string[] = []
+    const errors: string[] = []
+    let standDowns = 0
+    const settled = ensureSingleModelScheduler({
+      domain: 'gui/501',
+      run,
+      remove: async () => {},
+      stopScheduler: () => { standDowns += 1 },
+      log: (line) => logs.push(line),
+      logError: (line) => errors.push(line),
+    })
+    return { settled, logs, errors, standDowns: () => standDowns }
+  }
+
+  it('says so when it retires a loaded job and keeps its own check', async () => {
+    const h = harness(async () => '')
+    await expect(h.settled).resolves.toBeUndefined()
+    expect(h.logs).toEqual([`[launchd-watchdog] retired the legacy ${CATALOG_LABEL} job; the daily model check now runs in this server`])
+    expect(h.errors).toEqual([])
+    expect(h.standDowns()).toBe(0)
+  })
+
+  it('stays silent when there is nothing to retire', async () => {
+    const h = harness(async () => { throw notLoaded() })
+    await expect(h.settled).resolves.toBeUndefined()
+    expect(h.logs).toEqual([])
+    expect(h.errors).toEqual([])
+    expect(h.standDowns()).toBe(0)
+  })
+
+  it('stands its own check down when the old job survives, loudly', async () => {
+    const h = harness(async (args) => {
+      if (args[0] === 'bootout') throw Object.assign(new Error('Operation not permitted'), { code: 1 })
+      return printed({ state: 'running', runs: 12 })
+    })
+    await expect(h.settled).resolves.toBeUndefined()
+    expect(h.logs).toEqual([])
+    expect(h.standDowns()).toBe(1)
+    expect(h.errors).toHaveLength(1)
+    expect(h.errors[0]).toContain(`could not unload the legacy ${CATALOG_LABEL} job`)
+    expect(h.errors[0]).toContain('the in-process daily model check is stopped until the server restarts')
   })
 })

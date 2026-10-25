@@ -161,6 +161,13 @@ export function getSelfUpdateService(): SelfUpdateService {
   return selfUpdate
 }
 
+/** Stop the in-process daily model check. The production server stands its
+ *  own scheduler down when the legacy launchd job it replaces survives, so
+ *  the two can never both fire; the next restart retries the retirement. */
+export function stopDailyModelRefresh(): void {
+  dailyModelRefresh?.stop()
+}
+
 /** Serve /ws/chat and /ws/terminal on an HTTP server (production server or
  *  Vite's). */
 export function attachChatSockets(server: Server): void {

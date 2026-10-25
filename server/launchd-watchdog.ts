@@ -217,6 +217,29 @@ export async function retireCatalogJob(options: CatalogRetirementOptions = {}): 
   return { unloaded }
 }
 
+export interface SingleSchedulerOptions extends CatalogRetirementOptions {
+  stopScheduler?: () => void
+  log?: (message: string) => void
+  logError?: (message: string) => void
+}
+
+/** Leave exactly one daily model scheduler behind: retire the legacy
+ *  launchd job, or — when it cannot be confirmed gone — stand the
+ *  in-process scheduler down so the surviving job stays the single one.
+ *  Never throws; every outcome is reported through the injected log. */
+export async function ensureSingleModelScheduler(options: SingleSchedulerOptions = {}): Promise<void> {
+  const stopScheduler = options.stopScheduler || (() => {})
+  const log = options.log || ((message: string) => console.log(message))
+  const logError = options.logError || ((message: string) => console.error(message))
+  try {
+    const { unloaded } = await retireCatalogJob(options)
+    if (unloaded) log(`[launchd-watchdog] retired the legacy ${CATALOG_LABEL} job; the daily model check now runs in this server`)
+  } catch (error) {
+    stopScheduler()
+    logError(`[launchd-watchdog] ${error instanceof Error ? error.message : String(error)}; the in-process daily model check is stopped until the server restarts`)
+  }
+}
+
 export function startLaunchdWatchdog(env: NodeJS.ProcessEnv = process.env): (() => void) | null {
   if (process.platform !== 'darwin') return null
   const labels = watchdogLabels(env.POISE_LAUNCHD_WATCHDOG)
