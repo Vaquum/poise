@@ -223,6 +223,9 @@ check_tools() {
     output=$(docker exec "$workspace" $command) || fail "$command failed"
     pass "${output%%$'\n'*}"
   done
+  docker exec "$workspace" sh -c 'RIPGREP_CONFIG_PATH=/opt/poise/scripts/agent-tools.ripgreprc rg --version' >/dev/null \
+    || fail "the shipped agent ripgrep default is missing or does not parse"
+  pass "agent ripgrep default ships and parses"
 }
 
 # Runs the image in the foreground with OPTIONS, expecting the entrypoint to
