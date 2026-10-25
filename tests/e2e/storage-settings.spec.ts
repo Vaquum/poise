@@ -109,6 +109,25 @@ test('a storage read that never answers times out with a retry', async ({ page }
   await expect(page.locator('.st-storage-row')).toHaveCount(2)
 })
 
+test('a failed reread after maintenance keeps the run line and offers a retry', async ({ page }) => {
+  await workspace(page)
+  await page.route('**/api/storage*', (route) => route.fulfill({ json: { ...BREAKDOWN, at: new Date().toISOString() } }))
+  await page.route('**/api/storage/maintenance', (route) => route.fulfill({ json: RUN }))
+  await openGeneral(page)
+  await expect(page.locator('.st-storage-row')).toHaveCount(2)
+  await page.unroute('**/api/storage*')
+  await page.route('**/api/storage*', (route) => route.fulfill({ status: 500, json: { error: 'reread blew up' } }))
+  await page.locator('.st-storage-dry-run').click()
+  await expect(page.locator('.st-storage-status')).toContainText('Dry run reclaimed 1.0 GB')
+  const retry = page.locator('.st-storage-retry')
+  await expect(retry).toBeVisible()
+  await page.unroute('**/api/storage*')
+  await page.route('**/api/storage*', (route) => route.fulfill({ json: { ...BREAKDOWN, at: new Date().toISOString() } }))
+  await retry.click()
+  await expect(page.locator('.st-storage-row')).toHaveCount(2)
+  await expect(retry).toBeHidden()
+})
+
 test('partial and stale results read as dated, with unavailable told apart from zero', async ({ page }) => {
   await workspace(page)
   let calls = 0

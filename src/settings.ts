@@ -509,7 +509,9 @@ async function runStorageMaintenance(dryRun: boolean): Promise<void> {
       renderStorageBreakdown(fresh.categories)
       showStorageRetry(!!fresh.stale || fresh.complete === false)
     } catch {
-      // The run's own result line stands; the next open retries the sizes.
+      // The run's own result line stands, but its sizes are stale: offer a
+      // reread rather than leave pre-run numbers under a success message.
+      showStorageRetry(true)
     }
   } catch (error) {
     storageError((error as Error).message)

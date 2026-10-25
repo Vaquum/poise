@@ -720,10 +720,12 @@ export async function runStorageMaintenance(options: MaintenanceOptions = {}): P
   report.finishedAt = new Date().toISOString()
   // A real run changes what the summary measures; a dry run changes nothing.
   // The epoch keeps a scan that started before this run from repopulating
-  // the cache with pre-maintenance sizes when it finishes.
+  // the cache with pre-maintenance sizes when it finishes, and dropping the
+  // in-flight scan keeps reads issued after this run from joining it.
   if (!dryRun) {
     storageCache = null
     storageEpoch += 1
+    storageInflight = null
   }
   if (!dryRun) {
     try {
@@ -784,32 +786,39 @@ export interface StorageStatusOptions {
  *  One scan answers concurrent readers, and its observation answers Settings
  *  opens until STORAGE_STATUS_TTL_MS passes. A refresh that fails serves the
  *  previous observation marked stale; only a failure with nothing cached
- *  throws. A scan that a maintenance run overtakes answers its own waiters
- *  without repopulating the cache. */
+ *  throws. A maintenance run drops the in-flight scan, so reads issued after
+ *  it re-measure; the dropped scan answers its own waiters without
+ *  repopulating the cache. */
 export async function storageStatus(options: StorageStatusOptions = {}): Promise<StorageStatus> {
   const now = options.now ?? Date.now()
   if (!options.fresh && storageCache && now - storageCache.at < STORAGE_STATUS_TTL_MS) return storageCache.status
-  storageInflight ??= (async () => {
+  if (!storageInflight) {
     const epoch = storageEpoch
-    try {
-      const breakdown = await (options.breakdown ?? storageBreakdown)()
-      const status: StorageStatus = {
-        ...breakdown, pressure: breakdown.disk.usedPercent >= PRESSURE_USED_PCT,
-        lastRun: lastMaintenanceRun(), stale: false, error: undefined,
+    const scan = (async (): Promise<StorageStatus> => {
+      try {
+        const breakdown = await (options.breakdown ?? storageBreakdown)()
+        const status: StorageStatus = {
+          ...breakdown, pressure: breakdown.disk.usedPercent >= PRESSURE_USED_PCT,
+          lastRun: lastMaintenanceRun(), stale: false, error: undefined,
+        }
+        // A maintenance run that finished mid-scan invalidated the cache; its
+        // sizes are stale, so this observation answers its own waiters only.
+        if (epoch === storageEpoch) storageCache = { at: now, status }
+        return status
+      } catch (error) {
+        if (storageCache) {
+          return { ...storageCache.status, stale: true, error: messageOf(error) }
+        }
+        throw error
       }
-      // A maintenance run that finished mid-scan invalidated the cache; its
-      // sizes are stale, so this observation answers its own waiters only.
-      if (epoch === storageEpoch) storageCache = { at: now, status }
-      return status
-    } catch (error) {
-      if (storageCache) {
-        return { ...storageCache.status, stale: true, error: messageOf(error) }
-      }
-      throw error
-    } finally {
-      storageInflight = null
-    }
-  })()
+    })()
+    storageInflight = scan
+    // An older scan must not clear a newer one a maintenance run started. A
+    // two-handler then, not finally: the scan itself may reject, and that
+    // rejection already has its waiter.
+    const settled = () => { if (storageInflight === scan) storageInflight = null }
+    void scan.then(settled, settled)
+  }
   return storageInflight
 }
 
