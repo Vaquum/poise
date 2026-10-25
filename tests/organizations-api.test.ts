@@ -586,8 +586,9 @@ describe('global behavior settings API', () => {
     }
   })
 
-  // A held whole-log read must not slow the dashboard or health: behaviors
-  // walks bounded recent pages on its own, and health reads no log at all.
+  // A held paged-history read must not slow the dashboard or health:
+  // behaviors walks bounded selections on its own lanes, and health reads
+  // no log at all.
   it('keeps behaviors and health responsive while a history read runs', async () => {
     behaviorLogs = [{
       id: '1'.repeat(32), behavior: 'pr_review',
@@ -600,15 +601,15 @@ describe('global behavior settings API', () => {
     let releaseHistory!: (value: { stdout: string, stderr: string }) => void
     const held = new Promise<{ stdout: string, stderr: string }>((resolve) => { releaseHistory = resolve })
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: RunFileOptions) => {
-      if (command === 'agent-interface' && args[0] === '--logs' && args.length === 1) return held
+      if (command === 'agent-interface' && args[0] === '--logs' && args.includes('--limit')) return held
       return cli(command, args, options)
     })
     // Steady-state latencies: one unmeasured round warms the path first.
     await fetch(`${base}/api/behaviors`)
     await fetch(`${base}/api/health`)
-    const history = fetch(`${base}/api/agent-logs`)
+    const history = fetch(`${base}/api/agent-logs?limit=100`)
     try {
-      await vi.waitFor(() => expect(mocks.runFile.mock.calls.some(([, args]) => args.length === 1)).toBe(true))
+      await vi.waitFor(() => expect(mocks.runFile.mock.calls.some(([, args]) => args.includes('--limit'))).toBe(true))
       const latencies: number[] = []
       for (let index = 0; index < 20; index++) {
         for (const path of ['/api/behaviors', '/api/health']) {
@@ -625,7 +626,7 @@ describe('global behavior settings API', () => {
         at: '2026-10-01T12:00:00Z', target: 'Legacy/same-repo#1',
       })
     } finally {
-      releaseHistory({ stdout: JSON.stringify(behaviorLogs), stderr: '' })
+      releaseHistory({ stdout: JSON.stringify({ rows: behaviorLogs, nextCursor: null, total: behaviorLogs.length }), stderr: '' })
     }
     await expect(history.then((response) => response.status)).resolves.toBe(200)
   })

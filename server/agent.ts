@@ -468,6 +468,9 @@ export async function fetchAgentLogPage(
     try { ({ stdout } = await spawnAgentLogRead(args, signal)) }
     catch (error) { throw callerUpdateError(args, error) ?? error }
     const page = parseAgentLogPage(stdout, source)
+    // Swarm history previously arrived as whole-log snapshots; paged reads
+    // still feed Caller-completion recording and pending projections.
+    observeAgentSnapshot(page)
     return freezeAgentLogSnapshot(page)
   })
   return snapshot as AgentLogPage
