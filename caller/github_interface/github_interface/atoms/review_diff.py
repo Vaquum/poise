@@ -26,6 +26,9 @@ BULK_SUFFIXES = {".json", ".jsonl", ".ndjson", ".csv", ".tsv"}
 OPAQUE_SUFFIXES = {".gz", ".zip", ".tar", ".bz2", ".xz", ".7z", ".pdf", ".parquet", ".arrow"}
 FILE_STATUS = {"A": "added", "D": "removed", "M": "modified", "T": "changed"}
 PACKET_LIMIT_CODE = "review_packet_too_large"
+SINCE_HEAD_UNKNOWN_CODE = "review_since_head_unknown"
+SINCE_DROPPED_NOTE = (" A follow-up diff was requested, but the base moved since the last review, "
+                      "so this round is not limited to changes since the last review.")
 
 
 class ReviewPacketTooLarge(RuntimeError):
@@ -174,7 +177,7 @@ def _excluded(file: dict[str, Any], sizes: dict[str, int], compact: bool | None 
 
 async def _bounded_packet(git, files: list[dict[str, Any]], retained: list[str],
                          excluded: list[dict[str, Any]], context: dict[str, Any] | None,
-                         merge_base: str, head: str) -> dict[str, Any]:
+                         merge_base: str, head: str, since: str | None = None) -> dict[str, Any]:
     """The largest verified fitting sorted prefix of retained files, with the
     rest listed explicitly as omitted. A rename-aware diff is not strictly
     monotone in the file set, so the search keeps the largest prefix it
@@ -196,11 +199,13 @@ async def _bounded_packet(git, files: list[dict[str, Any]], retained: list[str],
             return None
         omitted = [{"path": path, "reason": "omitted from the bounded review packet; not reviewed"}
                    for path in ordered[count:]]
-        scope = (f"Review the retained diff below. Coverage is partial: {len(omitted)} of {len(ordered)} "
+        scope = (_since_lede(since) +
+                 f"Review the retained diff below. Coverage is partial: {len(omitted)} of {len(ordered)} "
                  f"retained files, listed in omitted_files, were not reviewed; "
                  f"do not infer their correctness from this packet.")
         if excluded:
             scope += " Excluded file contents were not reviewed either; do not infer their correctness from this packet."
+        scope += _since_positioning(since)
         packet = {
             "diff": diff,
             "files": [{"filename": path, "status": FILE_STATUS[meta[path]["status"]],
@@ -208,6 +213,7 @@ async def _bounded_packet(git, files: list[dict[str, Any]], retained: list[str],
             "excluded_files": excluded,
             "omitted_files": omitted,
             "merge_base_sha": merge_base,
+            "since_head_sha": since,
             "review_scope": scope,
         }
         if len(json.dumps({**(context or {}), **packet}, indent=2).encode("utf-8")) > MAX_PACKET_BYTES:
@@ -232,19 +238,60 @@ async def _bounded_packet(git, files: list[dict[str, Any]], retained: list[str],
     return best
 
 
+def _since_lede(since: str | None) -> str:
+    if since is None:
+        return ""
+    return ("Follow-up review: the retained diff covers only changes since the last reviewed head. "
+            "Earlier PR code was reviewed in prior rounds; review ONLY this diff, using the supplied "
+            "threads and comments as context. ")
+
+
+def _since_positioning(since: str | None) -> str:
+    if since is None:
+        return ""
+    return (" New findings on current lines must reference RIGHT-side (current-head) lines. "
+            "When the removal itself is the defect, comment on the removed (LEFT-side) line. "
+            "Reaffirm existing unresolved findings with their original locations.")
+
+
 async def review_diff(
     client: GitHubClient, owner: str, repo: str, pull: dict[str, Any],
     context: dict[str, Any] | None = None,
+    since: str | None = None,
 ) -> dict[str, Any]:
     head = pull["head"]["sha"]
     base = pull["base"]["sha"]
-    # GitHub returns file patches only on comparison page 1. Page 2 gives us
-    # the merge base without downloading the full patch-heavy comparison.
-    comparison = await client.get(
-        f"/repos/{owner}/{repo}/compare/{base}...{head}",
-        params={"page": 2, "per_page": 1},
-    )
-    merge_base = comparison["merge_base_commit"]["sha"]
+    new_base = None
+    since_dropped = False
+    if since is not None:
+        # A rebase or base update between the last review and now pulls
+        # base-only changes into a since...head comparison, whose findings
+        # could target paths absent from the PR diff. Widen to the full
+        # diff when the base moved under the comparison instead.
+        try:
+            old_base = (await client.get(
+                f"/repos/{owner}/{repo}/compare/{base}...{since}",
+                params={"page": 2, "per_page": 1},
+            ))["merge_base_commit"]["sha"]
+        except RuntimeError as error:
+            if str(error).startswith("GitHub 404:"):
+                raise RuntimeError(f"{SINCE_HEAD_UNKNOWN_CODE}: last reviewed head {since} is not fetchable") from error
+            raise
+        new_base = (await client.get(
+            f"/repos/{owner}/{repo}/compare/{base}...{head}",
+            params={"page": 2, "per_page": 1},
+        ))["merge_base_commit"]["sha"]
+        if old_base != new_base:
+            since, since_dropped = None, True
+    if since is None:
+        # GitHub returns file patches only on comparison page 1. Page 2 gives us
+        # the merge base without downloading the full patch-heavy comparison.
+        merge_base = new_base if new_base is not None else (await client.get(
+            f"/repos/{owner}/{repo}/compare/{base}...{head}",
+            params={"page": 2, "per_page": 1},
+        ))["merge_base_commit"]["sha"]
+    else:
+        merge_base = since
     env = _env(client.token)
     with tempfile.TemporaryDirectory(prefix="caller-review-") as directory:
         async def git(*args: str, limit: int = MAX_DIFF_BYTES) -> bytes:
@@ -260,7 +307,12 @@ async def review_diff(
         await git("remote", "add", "origin", f"https://github.com/{owner}/{repo}.git")
         await git("config", "remote.origin.promisor", "true")
         await git("config", "remote.origin.partialclonefilter", "blob:none")
-        await git("fetch", "--quiet", "--no-tags", "--depth=1", "--filter=blob:none", "origin", merge_base, head)
+        try:
+            await git("fetch", "--quiet", "--no-tags", "--depth=1", "--filter=blob:none", "origin", merge_base, head)
+        except GitProcessError as error:
+            if since is not None:
+                raise RuntimeError(f"{SINCE_HEAD_UNKNOWN_CODE}: last reviewed head {since} is not fetchable") from error
+            raise
         raw = await git("diff", "--raw", "--no-abbrev", "--no-renames", "-z", merge_base, head, "--", limit=4_000_000)
         files = _changes(raw)
         sizes = await _blob_sizes(client, owner, repo, files)
@@ -286,6 +338,14 @@ async def review_diff(
                     "--find-renames", merge_base, head, "--",
                     *(f":(literal){path}" for path in retained),
                 )).decode("utf-8", errors="replace") if retained else ""
+                if since is None:
+                    scope = ("Review the complete retained diff. Excluded file contents were not reviewed; "
+                             "do not infer their correctness from this packet.")
+                else:
+                    scope = (_since_lede(since) + "Excluded file contents were not reviewed either; "
+                             "do not infer their correctness from this packet." + _since_positioning(since))
+                if since_dropped:
+                    scope += SINCE_DROPPED_NOTE
                 packet = {
                     "diff": diff,
                     "files": [{"filename": f["filename"],
@@ -293,7 +353,8 @@ async def review_diff(
                                "old_mode": f["old_mode"], "new_mode": f["new_mode"]} for f in files if f["filename"] in retained_paths],
                     "excluded_files": excluded,
                     "merge_base_sha": merge_base,
-                    "review_scope": "Review the complete retained diff. Excluded file contents were not reviewed; do not infer their correctness from this packet.",
+                    "since_head_sha": since,
+                    "review_scope": scope,
                 }
                 packet_bytes = len(json.dumps({**(context or {}), **packet}, indent=2).encode("utf-8"))
                 if packet_bytes > MAX_PACKET_BYTES:
@@ -301,5 +362,8 @@ async def review_diff(
                 return packet
             except ReviewPacketTooLarge:
                 if compact:
-                    return await _bounded_packet(git, files, retained, excluded, context, merge_base, head)
+                    bounded = await _bounded_packet(git, files, retained, excluded, context, merge_base, head, since)
+                    if since_dropped:
+                        bounded["review_scope"] += SINCE_DROPPED_NOTE
+                    return bounded
         raise AssertionError("review packet compaction did not finish")

@@ -11,6 +11,18 @@ FROM node:22-bookworm AS poise
 WORKDIR /src
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
+# The shared Playwright Chromium every workspace process runs browser e2e
+# specs against, installed by the repository's own locked Playwright so the
+# browser build always matches the @playwright/test version agents run:
+# workers run `npm run test:e2e -- <spec>` with no install step. It stays
+# read-only below: Chromium keeps its profiles under tmp, never beside its
+# binaries. A copy of the same locked CLI goes along for the final stage's
+# install-deps, so the system libraries match this Playwright too.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+RUN npx --no-install playwright install chromium \
+ && mkdir -p /opt/playwright-pin/node_modules \
+ && cp -r node_modules/playwright-core /opt/playwright-pin/node_modules/playwright-core \
+ && chmod -R a-w,a+rX /opt/playwright-browsers
 COPY . .
 # .dockerignore leaves .git out, so the builder declares the commit:
 # deploy/install.sh and deploy/upgrade.sh pass it for a clean checkout, and
@@ -100,6 +112,13 @@ COPY --from=caller /opt/caller/venv /opt/caller/venv
 COPY --from=poise /src/package.json /opt/poise/package.json
 COPY --from=poise /src/node_modules /opt/poise/node_modules
 COPY --from=poise /src/dist /opt/poise/dist
+# The shared, read-only Playwright Chromium, and its system libraries as the
+# repository's own locked Playwright names them: every workspace process runs
+# browser e2e against these, and nothing installs browsers at runtime.
+COPY --from=poise /opt/playwright-browsers /opt/playwright-browsers
+COPY --from=poise /opt/playwright-pin /tmp/playwright-pin
+RUN node /tmp/playwright-pin/node_modules/playwright-core/cli.js install-deps chromium \
+ && rm -rf /tmp/playwright-pin
 COPY scripts /opt/poise/scripts
 COPY gateway/src/diagnostics/redaction.mjs /opt/poise/gateway/src/diagnostics/redaction.mjs
 COPY caller /opt/poise/caller
@@ -120,6 +139,7 @@ ENV HOME=/home/poise \
     CALLER_BIN_ROOT=/opt/caller/venv/bin \
     AGENT_INTERFACE_ROOT=/opt/poise/caller/agent_interface \
     AGENT_INTERFACE_DATA_DIR=/home/poise/.poise/agent-interface \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers \
     POISE_HOST=0.0.0.0 \
     POISE_PORT=5555
 

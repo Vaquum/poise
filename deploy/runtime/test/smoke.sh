@@ -228,6 +228,34 @@ check_tools() {
   pass "agent ripgrep default ships and parses"
 }
 
+# The shared, read-only Playwright Chromium every workspace process runs
+# browser e2e against: the image names it, both engines and ffmpeg launch
+# from it (so their system libraries are installed), and the workspace user
+# cannot write to any of it.
+check_browsers() {
+  local browsers chrome shell ffmpeg binary output
+  browsers=$(docker exec "$workspace" printenv PLAYWRIGHT_BROWSERS_PATH) \
+    || fail "PLAYWRIGHT_BROWSERS_PATH is not set"
+  [ "$browsers" = /opt/playwright-browsers ] || fail "PLAYWRIGHT_BROWSERS_PATH is $browsers"
+  chrome=$(docker exec "$workspace" sh -c 'ls /opt/playwright-browsers/chromium-*/chrome-linux64/chrome') \
+    || fail "no shared Chromium under $browsers"
+  shell=$(docker exec "$workspace" sh -c 'ls /opt/playwright-browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell') \
+    || fail "no shared headless shell under $browsers"
+  ffmpeg=$(docker exec "$workspace" sh -c 'ls /opt/playwright-browsers/ffmpeg-*/ffmpeg-linux') \
+    || fail "no shared ffmpeg under $browsers"
+  for binary in "$chrome" "$shell" "$ffmpeg"; do
+    [ "$(printf '%s\n' "$binary" | wc -l)" = 1 ] || fail "several shared browsers match: $binary"
+    docker exec "$workspace" test ! -w "$binary" || fail "$binary is writable"
+  done
+  docker exec "$workspace" test ! -w "$browsers" || fail "$browsers is writable"
+  output=$(docker exec "$workspace" "$chrome" --version) || fail "$chrome --version failed"
+  pass "shared $output launches"
+  output=$(docker exec "$workspace" "$shell" --version) || fail "$shell --version failed"
+  pass "shared $output launches"
+  docker exec "$workspace" "$ffmpeg" -version >/dev/null || fail "$ffmpeg -version failed"
+  pass "shared ffmpeg launches; the browsers are read-only"
+}
+
 # Runs the image in the foreground with OPTIONS, expecting the entrypoint to
 # refuse to start, and prints what it said.
 refused() {
@@ -286,6 +314,7 @@ contract() {
   done
   check_user
   check_tools
+  check_browsers
   docker exec "$workspace" node --input-type=module --eval "await import('/opt/poise/scripts/provider-cli-updates.mjs'); const runtime = await import('/opt/poise/dist/runtime-diagnostic.js'); if (typeof runtime.recordRuntimeDiagnostic !== 'function') throw new Error('supervisor diagnostic adapter missing')" \
     || fail "standalone maintenance diagnostics or its canonical redactor is missing"
   pass "standalone maintenance diagnostics load without a provider or network"

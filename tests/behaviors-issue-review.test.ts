@@ -598,6 +598,45 @@ describe('Review New Issues sub-issues', () => {
     issues = issues.map((row) => numbers.includes(row.number as number) ? { ...row, created_at: ago(11 * MINUTE) } : row)
   }
 
+  it('owns reader rejections when shutdown interrupts pool startup', async () => {
+    const { behaviors: runtime } = await start()
+    issues = [issue(500), issue(501), issue(502), issue(503)]
+    const original = mocks.runFile.getMockImplementation()!
+    const reads: string[] = []
+    let shutdown: Promise<void> | undefined
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { signal?: AbortSignal }) => {
+      if (command !== 'github-interface' || args[0] !== '--sub-issues') return original(command, args, options)
+      reads.push(args[1])
+      const signal = options?.signal
+      if (!signal) throw new Error('missing reader operation signal')
+      const pending = new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason)
+        else signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+      if (reads.length === 1) setImmediate(() => { shutdown = runtime.stopBehaviorsRuntime() })
+      return await pending
+    })
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      runtime.startBehaviorsRuntime()
+      await runtime.runEnabledBehaviorsOnce()
+      await shutdown
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(reads.length).toBeGreaterThan(0)
+      expect(shutdown).toBeDefined()
+      expect(unhandled).toEqual([])
+      expect(launches()).toEqual([])
+      expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+      expect(runtime.getBehaviorsRuntimeHealth().running).toBe(false)
+    } finally {
+      await runtime.stopBehaviorsRuntime()
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
   it('quarantines a corrupt parent review and its covered issues while another issue launches', async () => {
     const { behaviors, database } = await start()
     issues = [issue(500, { created_at: ago(30 * MINUTE) }), issue(501)]

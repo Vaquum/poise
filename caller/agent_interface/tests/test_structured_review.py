@@ -94,6 +94,7 @@ class TestReviewModel(TestCase):
             for identity in ("gpt-6-astra-ultra", "grok-4.6-xhigh", "gemini-3.8-flash-high", "muse-spark-1.3-contributor-max"):
                 repository = SimpleNamespace(prompt=lambda: "repo guidance", root=Path("/tmp/review"))
                 with patch.object(atoms, "packet", return_value="immutable packet"), patch.object(atoms, "run_agent") as run, \
+                        patch.object(atoms, "last_reviewed_head", return_value=None), \
                         patch.object(review_repository, "prepare", return_value=nullcontext(repository)):
                     mod.run("/tmp", "12", "bit-mis", "a" * 40, note="memory", p="p1", model=identity)
                     text = run.call_args.args[2]
@@ -266,6 +267,380 @@ def muse_stream(text: str | None, tasks=("model.meta.response",), terminal="comp
         lines.append({"payload_type": "run.output.delta", "payload": {"kind": "run_output_delta", "text": text}})
     lines.append({"payload_type": f"run.terminal.{terminal}", "payload": {"kind": "run_terminal", "terminal": terminal, "text": text, "reason": None}})
     return "\n".join(json.dumps(line) for line in lines) + "\n"
+
+
+def staged_packet(paths):
+    diff = "\n".join(
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new"
+        for path in paths)
+    return json.dumps({"action": "read", "repository": "o/r", "pull_number": 12, "head_sha": "a" * 40,
+                       "diff": diff, "files": [{"filename": path, "status": "modified",
+                                                "old_mode": "100644", "new_mode": "100644"} for path in paths],
+                       "excluded_files": [], "review_scope": "Review the complete retained diff."},
+                      separators=(",", ":"))
+
+
+class TestStagedReview(TestCase):
+    def _run(self, packet, verdicts, text_packet=None):
+        pending = list(verdicts)
+        calls = []
+
+        def process(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == "github-interface":
+                action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
+                          "--approve-pr": "approved_pr"}[args[1]]
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": action, "review_id": 91, "head_sha": "a" * 40}), stderr="")
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(pending.pop(0)))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        text = f"policy\n\nPR packet:\n{text_packet or packet}\n\nAllowed:\nnone"
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process):
+            result = structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                           "pr_review", "https://github.com/o/r/pull/12", "bit-mis",
+                                           "a" * 40, 60, packet=packet)
+        return result, calls
+
+    def test_group_findings_combine_into_one_head_pinned_verdict(self):
+        first = {"path": "src/f00.py", "line": 1, "side": "RIGHT", "body": "first group defect"}
+        second = {"path": "src/f08.py", "line": 1, "side": "RIGHT", "body": "second group defect"}
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        result, calls = self._run(packet, [{"action": "request_changes", "comments": [first]},
+                                           {"action": "request_changes", "comments": [second]}])
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(len(calls), 3)
+        (first_args, first_kwargs), (second_args, second_kwargs), (mutation, _) = calls
+        self.assertIn("file group 1 of 2", first_kwargs["input"])
+        self.assertIn("src/f00.py", first_kwargs["input"])
+        self.assertNotIn("src/f08.py", first_kwargs["input"])
+        self.assertIn("file group 2 of 2", second_kwargs["input"])
+        self.assertIn("Findings already recorded in earlier file groups", second_kwargs["input"])
+        self.assertIn("first group defect", second_kwargs["input"])
+        self.assertEqual(mutation[:4], ["github-interface", "--request-changes", "#12", "--comments-json"])
+        self.assertEqual(json.loads(mutation[4]), [first, second])
+        self.assertEqual(mutation[5:], ["--expected-head", "a" * 40, "--token-user", "bit-mis"])
+
+    def test_clean_groups_combine_into_one_clean_verdict(self):
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        result, calls = self._run(packet, [{"action": "reviewed_clean", "comments": []},
+                                           {"action": "reviewed_clean", "comments": []}])
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(calls[-1][0][1], "--reviewed-clean")
+
+    def test_small_packet_with_packet_runs_one_unchanged_stage(self):
+        packet = staged_packet(["src/only.py"])
+        result, calls = self._run(packet, [{"action": "reviewed_clean", "comments": []}])
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1]["input"], f"system\n\npolicy\n\nPR packet:\n{packet}\n\nAllowed:\nnone")
+        self.assertNotIn("file group", calls[0][1]["input"])
+
+    def test_mismatched_packet_and_prompt_is_a_contract_violation(self):
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(packet, [{"action": "reviewed_clean", "comments": []}],
+                      text_packet=staged_packet(["src/other.py"]))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+
+    def test_stages_keep_repository_inspection_with_one_combined_submission(self):
+        request = {"operation": "read", "path": "src/old.py", "query": "", "start_line": 1}
+        calls = []
+
+        def ask(root, model, system, text, schema, watch, timeout):
+            calls.append(text)
+            self.assertIn("requests", schema["required"])
+            if "file group 1 of 2" in text and "Previous review step" not in text:
+                return json.dumps({"action": "inspect", "comments": [], "requests": [request]})
+            path = "src/f00.py" if "file group 1 of 2" in text else "src/f08.py"
+            finding = {"path": path, "line": 1, "side": "RIGHT", "body": "defect"}
+            return json.dumps({"action": "request_changes", "comments": [finding], "requests": []})
+
+        repo = review_repository.Repository(Path("/tmp/review"), {"head_sha": "a" * 40})
+        inspected = {"action": "review_context", "head_sha": "a" * 40, "results": []}
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40})
+        with patch.dict(structured_review.ASK, {"codex": ask}), \
+                patch.object(repo, "inspect", return_value=inspected) as inspect, \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit:
+            structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"), "pr_review",
+                                  "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60,
+                                  repository=repo, packet=packet)
+        inspect.assert_called_once_with([request])
+        submit.assert_called_once()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("file group 2 of 2", calls[2])
+        self.assertEqual(len(json.loads(submit.call_args.args[0][4])), 2)
+
+
+class TestApproveSinceHead(TestCase):
+    def _run(self, since, packets):
+        with patch.object(atoms, "last_reviewed_head", return_value=since) as history, \
+                patch.object(atoms, "packet", side_effect=packets) as packet, \
+                patch.object(atoms, "run_agent", return_value="verdict") as run:
+            self.assertEqual(pr_approve.run("/tmp", "12", "bit-mis", "a" * 40, model="gpt-6-astra-ultra"), "verdict")
+        return history, packet, run
+
+    def test_follow_up_reviews_the_diff_since_the_last_reviewed_head(self):
+        _, packet, run = self._run("c" * 40, ["since packet"])
+        packet.assert_called_once_with("/tmp", "12", "bit-mis", "a" * 40, None, since_head="c" * 40)
+        self.assertIn("since packet", run.call_args.args[2])
+
+    def test_same_head_reviews_the_full_packet(self):
+        _, packet, _ = self._run("a" * 40, ["full packet"])
+        packet.assert_called_once_with("/tmp", "12", "bit-mis", "a" * 40, None, since_head=None)
+
+    def test_first_review_has_no_since_head(self):
+        _, packet, _ = self._run(None, ["full packet"])
+        packet.assert_called_once_with("/tmp", "12", "bit-mis", "a" * 40, None, since_head=None)
+
+    def test_unfetchable_since_head_falls_back_to_the_full_diff(self):
+        unknown = atoms.AgentPreflightError("error: review_since_head_unknown: gone", "review_since_head_unknown")
+        _, packet, run = self._run("c" * 40, [unknown, "full packet"])
+        self.assertEqual(packet.call_count, 2)
+        self.assertEqual(packet.call_args_list[0].kwargs, {"since_head": "c" * 40})
+        self.assertEqual(packet.call_args_list[1].kwargs, {"since_head": None})
+        self.assertIn("full packet", run.call_args.args[2])
+        self.assertIn("c" * 40, run.call_args.args[2])
+
+    def test_other_packet_failures_do_not_fall_back(self):
+        with patch.object(atoms, "last_reviewed_head", return_value="c" * 40), \
+                patch.object(atoms, "packet",
+                             side_effect=atoms.AgentPreflightError("too large", "review_packet_too_large")) as packet, \
+                patch.object(atoms, "run_agent") as run:
+            with self.assertRaises(atoms.AgentPreflightError):
+                pr_approve.run("/tmp", "12", "bit-mis", "a" * 40, model="gpt-6-astra-ultra")
+        packet.assert_called_once()
+        run.assert_not_called()
+
+
+class TestSincePositions(TestCase):
+    REMOVAL = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                         "@@ -10,3 +10,2 @@", " context", "-removed", " context2"])
+
+    def _packet(self, since, diff=None, paths=("src/gone.py",)):
+        node = json.loads(staged_packet(list(paths)))
+        node["p"] = 2
+        node["since_head_sha"] = since
+        if diff is not None:
+            node["diff"] = diff
+        return json.dumps(node)
+
+    def _full(self, diff, paths=("src/gone.py",)):
+        node = json.loads(staged_packet(list(paths)))
+        node["diff"] = diff
+        return json.dumps(node)
+
+    def _run(self, packet, verdict, full, **options):
+        calls = []
+
+        def process(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}), stderr="")
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process), \
+                patch.object(structured_review, "fetch_packet", return_value=full) as fetch:
+            result = structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                           "pr_approve", "https://github.com/o/r/pull/12", "bit-mis",
+                                           "a" * 40, 60, packet=packet, **options)
+        return result, calls, fetch
+
+    def test_removal_finding_inside_the_pr_diff_submits(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        result, calls, fetch = self._run(self._packet("c" * 40, self.REMOVAL), verdict,
+                                         self._full(self.REMOVAL))
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
+                                      "a" * 40, "p2", since_head=None)
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_removal_finding_outside_the_reviewed_since_diff_is_a_contract_violation(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 99, "side": "LEFT", "body": "stale"}]}
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(self.REMOVAL))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+
+    def test_left_finding_remaps_onto_shifted_pr_coordinates(self):
+        shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                             "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        result, calls, _ = self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(shifted))
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(5, "LEFT")])
+
+    def test_reaffirmed_left_finding_keeps_its_original_thread_coordinates(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 5, "side": "LEFT", "body": "still blocks"}]}
+        for outdated in (False, True):
+            with self.subTest(outdated=outdated):
+                node = json.loads(self._packet("c" * 40, self.REMOVAL))
+                node["review_threads"] = [{"path": "src/gone.py", "line": 5, "side": "LEFT",
+                                          "is_resolved": False, "is_outdated": outdated,
+                                          "bodies": ["still blocks"]}]
+                _, calls, _ = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
+                self.assertEqual(calls[-1][0][1], "--request-changes")
+                self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_resolved_thread_cannot_validate_a_finding_outside_the_since_diff(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 5, "side": "LEFT", "body": "still blocks"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 5, "side": "LEFT",
+                                  "is_resolved": True, "is_outdated": True, "bodies": ["still blocks"]}]
+        with self.assertRaises(atoms.AgentPreflightError):
+            self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
+
+    def test_repeated_removed_text_maps_using_current_head_position(self):
+        since = "\n".join(["diff --git a/src/gone.py b/src/gone.py",
+                           "--- a/src/gone.py", "+++ b/src/gone.py",
+                           "@@ -10,3 +30,2 @@", " context", "-return None", " context2"])
+        full = "\n".join(["diff --git a/src/gone.py b/src/gone.py",
+                          "--- a/src/gone.py", "+++ b/src/gone.py",
+                          "@@ -4,3 +10,3 @@", " context", "-return None", "+first", " context2",
+                          "@@ -40,3 +30,3 @@", " context", "-return None", "+second", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "second removal"}]}
+        _, calls, _ = self._run(self._packet("c" * 40, since), verdict, self._full(full))
+        self.assertEqual(json.loads(calls[-1][0][4])[0]["line"], 41)
+
+    def test_left_finding_absent_from_the_pr_diff_fails_closed(self):
+        other = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                           "@@ -4,3 +4,3 @@", " context", "-other", "+replacement", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(other))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
+
+    def test_added_then_deleted_finding_fails_closed_without_approving(self):
+        deleted = "\n".join(["diff --git a/src/helper.py b/src/helper.py", "--- a/src/helper.py",
+                             "+++ /dev/null", "@@ -1,1 +0,0 @@", "-def helper():"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/helper.py", "line": 1, "side": "LEFT",
+                                "body": "deleted while still imported"}]}
+        empty = json.dumps({"action": "read", "diff": "", "files": []})
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, deleted, paths=("src/helper.py",)), verdict, empty)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
+
+    def test_right_finding_inside_the_pr_diff_submits(self):
+        full = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                          "@@ -1,1 +1,2 @@", " old", "+new"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 2, "side": "RIGHT", "body": "defect"}]}
+        result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(full))
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
+                                      "a" * 40, "p2", since_head=None)
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_right_finding_on_a_reverted_file_fails_closed(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "revert issue"}]}
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, self.REMOVAL), verdict,
+                       self._full(kept, paths=("src/kept.py",)))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
+
+    def test_reaffirmed_prior_left_finding_absent_from_since_diff_submits(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                "body": "still removed upstream"}]}
+        node = json.loads(self._packet("c" * 40, kept, paths=("src/kept.py",)))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False,
+                                  "bodies": ["still removed upstream"]}]
+        result, calls, _ = self._run(json.dumps(node), verdict,
+                                     self._full(self.REMOVAL + "\n" + kept,
+                                              paths=("src/gone.py", "src/kept.py")))
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_left_finding_on_repeated_text_anchors_at_the_current_head(self):
+        full = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
+                          "@@ -1,5 +1,3 @@", " def a():", "-    return None", " def b():",
+                          "-    return None", " tail"])
+        since = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
+                           "@@ -8,3 +2,2 @@", " def b():", "-    return None", " tail"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/dup.py", "line": 9, "side": "LEFT", "body": "needed"}]}
+        result, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/dup.py",)), verdict,
+                                     self._full(full, paths=("src/dup.py",)))
+        self.assertIn('"review_id": 91', result)
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(4, "LEFT")])
+
+    def test_left_finding_on_indistinguishable_repeats_fails_closed(self):
+        full = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
+                          "@@ -1,4 +1,2 @@", " ctx", "-x", "-x", " tail"])
+        since = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
+                           "@@ -1,3 +1,2 @@", " ctx", "-x", " tail"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/dup.py", "line": 2, "side": "LEFT", "body": "which one"}]}
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, since, paths=("src/dup.py",)), verdict,
+                       self._full(full, paths=("src/dup.py",)))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
+
+    def test_partially_stale_verdict_fails_closed(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes", "comments": [
+            {"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "kept"},
+            {"path": "src/kept.py", "line": 99, "side": "RIGHT", "body": "stale"}]}
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, self.REMOVAL), verdict,
+                       self._full(self.REMOVAL + "\n" + kept,
+                                paths=("src/gone.py", "src/kept.py")))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
+
+    def test_capped_partial_stale_verdict_preserves_every_finding_or_fails_closed(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes", "comments": [
+            {"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "removed helper is still imported"},
+            {"path": "src/kept.py", "line": 2, "side": "RIGHT", "body": "another defect"}]}
+        with patch.object(structured_review, "_file_capped_followup", return_value="https://github.com/o/r/issues/99") as followup:
+            with self.assertRaises(atoms.AgentPreflightError) as failure:
+                self._run(self._packet("c" * 40, self.REMOVAL + "\n" + kept,
+                                       paths=("src/gone.py", "src/kept.py")), verdict,
+                          self._full(kept, paths=("src/kept.py",)),
+                          capped=True, review_round=5, review_cap=5)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        followup.assert_not_called()
+
+    def test_full_review_left_findings_keep_todays_behavior(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 99, "side": "LEFT", "body": "defect"}]}
+        result, _, fetch = self._run(self._packet(None), verdict, "unused")
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_not_called()
 
 
 class TestOtherProviderVerdicts(TestCase):

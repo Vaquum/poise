@@ -147,6 +147,74 @@ describe('review-new-prs prepare pool', () => {
   })
 })
 
+describe('prepare pool startup', () => {
+  it('starts workers across event-loop turns instead of all at once', async () => {
+    const { behaviors: runtime } = await loadModules()
+    // Enter from the check phase so the next immediate observes real loop
+    // progress. A microtask-only yield would start every worker before it.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const items = ['a', 'b', 'c', 'd', 'e']
+    const gate = deferred<void>()
+    const entered = items.map(() => deferred<void>())
+    const started: string[] = []
+    const progress = new Promise<number>((resolve) => setImmediate(() => resolve(started.length)))
+    const done = runtime.forEachPool(items, items.length, async (item) => {
+      started.push(item)
+      entered[items.indexOf(item)].resolve()
+      await gate.promise
+    })
+    try {
+      expect(started).toEqual(['a'])
+      const entriesBeforeProgress = await progress
+      expect(entriesBeforeProgress).toBeGreaterThan(0)
+      expect(entriesBeforeProgress).toBeLessThan(items.length)
+      // No worker can consume another item before all intended workers enter.
+      await Promise.all(entered.map(({ promise }) => promise))
+      expect(started).toEqual(items)
+    } finally {
+      gate.resolve()
+      await done
+    }
+  })
+
+  it('completes while the clock is faked', async () => {
+    vi.useFakeTimers()
+    try {
+      const { behaviors: runtime } = await loadModules()
+      const seen: string[] = []
+      await runtime.forEachPool(['a', 'b'], 2, async (item) => {
+        seen.push(item)
+      })
+      expect(seen.sort()).toEqual(['a', 'b'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports a fast worker failure without an unhandled rejection', async () => {
+    const { behaviors: runtime } = await loadModules()
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      // A synchronous throw before any await, as the prepare and approval
+      // tasks can fail ahead of their local try blocks.
+      const failure = new Error('worker failed fast')
+      await expect(runtime.forEachPool(['a', 'b', 'c'], 3, async (item) => {
+        if (item === 'a') throw failure
+      })).rejects.toBe(failure)
+      // Let any unhandled rejection fire before asserting there was none.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+})
+
 describe('review checkout in the launch phase', () => {
   async function startReviewing() {
     arrangeCli(false)

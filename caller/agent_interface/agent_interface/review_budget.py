@@ -30,9 +30,18 @@ def packet_cache():
     return budget.packets if budget else None
 
 
+def usage():
+    budget = _current.get()
+    if budget is None:
+        return None
+    return {"used_seconds": monotonic() - budget.started, "total_seconds": budget.allowance}
+
+
 class ReviewBudget:
     def __init__(self, seconds=REVIEW_TIMEOUT_SECONDS, cap=REVIEW_TIMEOUT_SECONDS):
-        self.deadline = monotonic() + min(seconds, cap)
+        self.allowance = min(seconds, cap)
+        self.started = monotonic()
+        self.deadline = self.started + self.allowance
         self.packets = {}
 
     def __enter__(self):

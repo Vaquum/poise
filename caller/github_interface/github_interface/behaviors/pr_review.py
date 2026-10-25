@@ -10,6 +10,7 @@ from github_interface.atoms.review_diff import review_diff
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head, repository
 from github_interface.context import pull_number as parse_pull_number
+from github_interface.context import since_head as parse_since_head
 
 REQUIRE_TOKEN_USER = True
 DEFAULT_P = 2
@@ -19,6 +20,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     owner, repo = repository(payload)
     pull_number = parse_pull_number(payload)
     required_head = expected_head(payload)
+    since = parse_since_head(payload)
     p = _p(payload.get("p"))
 
     pull = await get_pull(client, owner, repo, pull_number)
@@ -46,7 +48,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "resolved_threads": [thread for thread in threads if thread["is_resolved"]],
         "linked_issues": issues,
     }
-    packet_diff = await review_diff(client, owner, repo, pull, context)
+    packet_diff = await review_diff(client, owner, repo, pull, context, since=since)
     latest = await get_pull(client, owner, repo, pull_number)
     if latest["head"]["sha"] != required_head or latest["base"]["sha"] != pull["base"]["sha"]:
         raise RuntimeError("pull-request head or base changed while building review packet")
