@@ -214,6 +214,8 @@ it('creates /worker from the default file while a worker exists and never replac
   const listed = await getSnippets()
   expect(listed.json.snippets).toContainEqual({ trigger: ';worker', replace: WORKER_SNIPPET_DEFAULT })
   expect(WORKER_SNIPPET_DEFAULT).toContain('Open the PR early.')
+  expect(WORKER_SNIPPET_DEFAULT).toContain('npm run test:e2e -- <spec>')
+  expect(WORKER_SNIPPET_DEFAULT).toContain('one at a time per workspace')
   expect(WORKER_SNIPPET_DEFAULT).toContain('CI runs the full suite.')
   expect(WORKER_SNIPPET_DEFAULT).toContain('Poise wakes you')
   expect(WORKER_SNIPPET_DEFAULT).not.toContain('muse-spark')

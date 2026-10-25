@@ -7,7 +7,11 @@ Poise uses Node 22 (minimum 22.13), matching the workspace image and gateway.
 
 `npm run check` remains the complete local lint, unit/integration and production
 build gate. `npm run test:e2e` prepares isolated fixtures, builds the application
-and runs Chromium. `npm run verify` runs both.
+and runs Chromium. `npm run verify` runs both. Local runs serialize one at a
+time per workspace: `npm run test:e2e` holds the lock from before its build
+(`scripts/with-e2e-lock.mjs`), and a bare `npx playwright test` takes the
+same lock in `globalSetup` after its webServer build, so either may wait for
+another run to finish. CI shards skip it and run concurrently by design.
 
 The native merge queue runs the complete lint/types/audit and production-build
 jobs, two unit/integration shards and four Chromium shards. Browser shards
