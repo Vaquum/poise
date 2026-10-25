@@ -3,7 +3,7 @@ import { scrollToActor } from '../motion'
 import { retire, reveal } from '../motion'
 import { patchContent } from '../dom-patch'
 import { registerReloadGuard, registerReloadSnapshot } from '../self-update-watch'
-import { editorHistoryKey, HISTORY_LIMIT, readEditorHistory, writeEditorHistory, type EditorHistoryEntry } from '../editor-history'
+import { editorHistoryKey, EditorHistoryTooLargeError, HISTORY_BYTE_BUDGET, HISTORY_LIMIT, readEditorHistory, trimHistoryStacks, writeEditorHistory, type EditorHistoryEntry } from '../editor-history'
 import { ICON_PUBLISH, closePublishPanel, togglePublishPanel } from './editor-publish'
 import { setGoogleConnectionResult, setGoogleNavigationGuard, takeGoogleConnectionResult, takeGooglePublishReturn } from '../google'
 import { EditorReviews } from './editor-reviews'
@@ -1137,7 +1137,10 @@ function serializeDoc(): string {
 // So we keep our own history of whole-document markdown snapshots plus a
 // caret position, and own Cmd+Z / Cmd+Shift+Z outright. Documents here
 // are capped at 5 MiB and typically a few KB, so full snapshots are far
-// cheaper than tracking deltas correctly.
+// cheaper than tracking deltas correctly. Both the live stacks and the
+// persisted timeline are bounded by HISTORY_BYTE_BUDGET (see
+// editor-history); oldest steps go first, and every reduction is
+// reported through setMeta so it stays visible.
 // Plain typing coalesces into one undo step until this much idle time
 // passes; structural edits close the step immediately.
 const HISTORY_COALESCE_MS = 450
@@ -1150,22 +1153,62 @@ let historyBatchTimer: number | null = null
 // Set while we rebuild the document from a snapshot, so the resulting
 // DOM churn doesn't record history of its own.
 let historySuppress = false
+// The trim notice fires once per document; every batch past the budget
+// would otherwise repeat it.
+let historyTrimNoticed = false
 
-function persistEditorHistory(): boolean {
-  if (!currentSlug || !docEl || currentSlug === deletingSlug) return true
-  try {
-    writeEditorHistory(sessionStorage, currentSlug, {
-      version: 1, current: captureHistoryEntry(), undo: historyUndo, redo: historyRedo,
-    })
-    return true
-  } catch (error) {
-    console.error('[editor] history could not be preserved:', error)
-    setMeta('Undo history could not be preserved — browser storage unavailable')
-    return false
+// The byte budget binds the live stacks too: 300 whole-document
+// snapshots of a 5 MiB document would otherwise hold 1.5 GiB.
+function trimHistoryMemory(): void {
+  const dropped = trimHistoryStacks(historyUndo, historyRedo, HISTORY_BYTE_BUDGET)
+  if (dropped > 0 && !historyTrimNoticed) {
+    historyTrimNoticed = true
+    console.warn(`[editor] history dropped ${dropped} steps to stay within its byte budget`)
+    setMeta('Older undo steps were dropped to stay within the undo history budget')
   }
 }
 
-registerReloadSnapshot(persistEditorHistory)
+type HistoryPersistOutcome = 'kept' | 'trimmed' | 'too-large' | 'unavailable'
+
+function historyPersistNotice(outcome: Exclude<HistoryPersistOutcome, 'kept'>): string {
+  switch (outcome) {
+    case 'trimmed': return 'Older undo steps were dropped to fit browser storage'
+    case 'too-large': return 'Undo history could not be preserved — document too large for browser storage'
+    case 'unavailable': return 'Undo history could not be preserved — browser storage unavailable'
+  }
+}
+
+// Best-effort: the document is saved before this runs, so losing undo
+// steps must never trap navigation on a saved document — loadDoc keeps
+// going and inherits the notice below. Callers gate only an update
+// reload, and only on a transient failure that waiting might clear.
+function persistEditorHistory(): HistoryPersistOutcome {
+  if (!currentSlug || !docEl || currentSlug === deletingSlug) return 'kept'
+  try {
+    const dropped = writeEditorHistory(sessionStorage, currentSlug, {
+      version: 1, current: captureHistoryEntry(), undo: historyUndo, redo: historyRedo,
+    })
+    if (dropped > 0) {
+      console.warn(`[editor] history trimmed ${dropped} steps to fit the byte budget`)
+      setMeta(historyPersistNotice('trimmed'))
+      return 'trimmed'
+    }
+    return 'kept'
+  } catch (error) {
+    if (error instanceof EditorHistoryTooLargeError) {
+      console.error('[editor] history exceeds its byte budget:', error)
+      setMeta(historyPersistNotice('too-large'))
+      return 'too-large'
+    }
+    console.error('[editor] history could not be preserved:', error)
+    setMeta(historyPersistNotice('unavailable'))
+    return 'unavailable'
+  }
+}
+
+// A document that can never fit its budget must not stall the update
+// forever; only a transient storage failure is worth waiting out.
+registerReloadSnapshot(() => persistEditorHistory() !== 'unavailable')
 
 function captureHistoryEntry(): EditorHistoryEntry {
   const pos = caretSourcePosition()
@@ -1189,6 +1232,7 @@ function resetEditorHistory(): void {
   historyUndo = []
   historyRedo = []
   historyPre = null
+  historyTrimNoticed = false
   historyBatchOpen = false
   if (historyBatchTimer !== null) { clearTimeout(historyBatchTimer); historyBatchTimer = null }
 }
@@ -1216,6 +1260,7 @@ function commitHistoryBatch(immediate: boolean): void {
       historyUndo.push(historyPre)
       if (historyUndo.length > HISTORY_LIMIT) historyUndo.shift()
       historyRedo = []
+      trimHistoryMemory()
     }
     historyBatchOpen = true
   }
@@ -1233,6 +1278,7 @@ function recordHistoryPoint(): void {
   historyUndo.push(captureHistoryEntry())
   if (historyUndo.length > HISTORY_LIMIT) historyUndo.shift()
   historyRedo = []
+  trimHistoryMemory()
 }
 
 function restoreHistoryEntry(entry: EditorHistoryEntry): void {
@@ -1261,6 +1307,7 @@ function undoEditor(): void {
   if (!prev) return
   historyRedo.push(captureHistoryEntry())
   if (historyRedo.length > HISTORY_LIMIT) historyRedo.shift()
+  trimHistoryMemory()
   restoreHistoryEntry(prev)
 }
 
@@ -1271,6 +1318,7 @@ function redoEditor(): void {
   if (!next) return
   historyUndo.push(captureHistoryEntry())
   if (historyUndo.length > HISTORY_LIMIT) historyUndo.shift()
+  trimHistoryMemory()
   restoreHistoryEntry(next)
 }
 
@@ -2314,7 +2362,9 @@ async function loadDoc(slug: string) {
     // in flight. Drain once more so keystrokes made during that request
     // cannot be stranded when currentSlug changes below.
     if (!(await flushBeforeLeavingDocument('switch documents')) || requestId !== loadRequestId) return
-    if (!persistEditorHistory()) return
+    // The document is saved here, so history preservation is best-effort:
+    // losing undo steps must never trap navigation on a saved document.
+    const historyOutcome = persistEditorHistory()
     currentSlug = nextSlug
     docEl.contentEditable = googleImporting ? 'false' : 'true'
     articleReviews?.clear()
@@ -2338,6 +2388,9 @@ async function loadDoc(slug: string) {
     try { localStorage.setItem(LAST_OPEN_KEY, currentSlug) } catch { /* ignore */ }
     setTriggerTitle()
     setMetaForCurrent()
+    // setMetaForCurrent clears the notice persistEditorHistory just
+    // reported; the new document inherits it so the loss stays visible.
+    if (historyOutcome !== 'kept') setMeta(historyPersistNotice(historyOutcome))
     docEl.focus()
     placeCaretAtEnd()
     if (restored) {
