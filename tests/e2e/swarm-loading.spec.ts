@@ -36,6 +36,43 @@ function paged(logs: ReturnType<typeof history>, url: URL, firstSize: number) {
 
 async function ready(page: Page) { await workspace(page); await settled(page) }
 const rows = '#swarm-tbody > .agent-row'
+const pagerNext = (page: Page) => page.locator('#swarm-pagination [data-page="next"]')
+
+// Bounded variant of paged: continuations return at most `size` rows like the
+// first page, so exhaustion, search continuation and gap transitions are
+// exercisable. Server search matches the prompt, repo and pr_id.
+function pagedBounded(logs: ReturnType<typeof history>, url: URL, size: number) {
+  const search = url.searchParams.get('search') || ''
+  const filtered = search
+    ? logs.filter((row) => `${row.prompt} ${row.repo} ${row.pr_id}`.toLowerCase().includes(search.toLowerCase()))
+    : logs
+  const cursor = url.searchParams.get('cursor')
+  const start = cursor === null ? 0 : Number(cursor)
+  const slice = filtered.slice(start, start + size)
+  const next = start + slice.length
+  return { logs: slice, total: filtered.length, nextCursor: next < filtered.length ? String(next) : null }
+}
+
+function boundedRoute(page: Page, logs: () => ReturnType<typeof history>, cursorReads: string[]) {
+  return page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    const cursor = url.searchParams.get('cursor')
+    if (cursor !== null && !url.searchParams.has('search')) cursorReads.push(cursor)
+    else if (cursor !== null) cursorReads.push(`search:${cursor}`)
+    return route.fulfill({ json: pagedBounded(logs(), url, 200) })
+  })
+}
+
+async function settledRefresh(page: Page) {
+  const received = page.waitForResponse(response => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/agent-logs' && url.searchParams.get('status') === 'running'
+  })
+  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+  await (await received).finished()
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+}
 
 test('Swarm paints recent calls before the complete history arrives and retains controls', async ({ page }) => {
   await ready(page)
@@ -268,4 +305,62 @@ test('an empty-history refresh failure remains visible on re-entry while another
     await expect((await feedback(page)).locator('.nr-card').filter({ hasText: 'Swarm is not updating' })).toHaveCount(0)
     await expect(page.locator('#swarm-empty')).toHaveCount(0)
   } finally { refresh.release() }
+})
+
+test('a new search with cached first-page matches still reaches older matches', async ({ page }) => {
+  await ready(page)
+  const logs = history('acme', 450).map((row, index) => index < 250
+    ? { ...row, prompt: `alpha run ${index + 1}` }
+    : { ...row, prompt: `beta run ${index + 1}` })
+  const cursorReads: string[] = []
+  await boundedRoute(page, () => logs, cursorReads)
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await page.locator('#swarm-search').fill('alpha')
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 200+')
+  await expect(pagerNext(page)).toBeEnabled()
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–250 / 250')
+  await expect(page.locator(rows).first()).toContainText('#201')
+  await expect(page.locator(rows)).toContainText('#250')
+  expect(cursorReads).toEqual(['search:200'])
+})
+
+test('an unchanged refresh preserves a partially loaded continuation', async ({ page }) => {
+  await ready(page)
+  const logs = history('acme', 450)
+  const cursorReads: string[] = []
+  await boundedRoute(page, () => logs, cursorReads)
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 400+')
+  expect(cursorReads).toEqual(['200'])
+  await settledRefresh(page)
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 400+')
+  await expect(pagerNext(page)).toBeEnabled()
+  expect(cursorReads).toEqual(['200'])
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('401–450 / 450')
+  await expect(pagerNext(page)).toBeDisabled()
+  expect(cursorReads).toEqual(['200', '400'])
+})
+
+test('a deep link to a missing run does not re-walk exhausted history', async ({ page }) => {
+  await ready(page)
+  const logs = history('acme', 401)
+  const cursorReads: string[] = []
+  await boundedRoute(page, () => logs, cursorReads)
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  for (;;) {
+    if (!await pagerNext(page).isEnabled()) break
+    const before = await page.locator('#swarm-page').textContent()
+    await pagerNext(page).click()
+    await expect(page.locator('#swarm-page')).not.toHaveText(before!)
+  }
+  await expect(page.locator('#swarm-page')).toHaveText('401–401 / 401')
+  expect(cursorReads).toEqual(['200', '400'])
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:goto-swarm-call', { detail: { id: 'missing-call' } })))
+  await expect(await feedback(page)).toContainText('No run found')
+  expect(cursorReads).toEqual(['200', '400'])
 })
