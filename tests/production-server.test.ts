@@ -20,6 +20,15 @@ let server: Server
 let baseUrl = ''
 let production: typeof import('../server/production')
 const auth = createAuthenticatedClaudeAuth()
+// The in-process daily model check announces itself once on startup. The log
+// lines are kept in a plain array: the suite restores spies before each test,
+// but this runs while the server below is created.
+const startupLogs: string[] = []
+const realLog = console.log.bind(console)
+vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+  startupLogs.push(args.map((part) => String(part)).join(' '))
+  realLog(...args)
+})
 
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-production-test-'))
@@ -77,6 +86,12 @@ afterAll(async () => {
 })
 
 describe('production server', () => {
+  it('schedules the daily model check in-process, at 07:00 UTC until a timezone is set', () => {
+    const logs = startupLogs.join('\n')
+    expect(logs).toContain('[models] no timezone is set in Settings; the daily model check runs at 07:00 UTC')
+    expect(logs).toContain('(07:00 UTC)')
+  })
+
   it('serves the built client with security headers', async () => {
     const response = await fetch(baseUrl, { headers: { Accept: 'text/html' } })
     expect(response.status).toBe(200)
