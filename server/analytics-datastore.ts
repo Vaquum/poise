@@ -157,4 +157,3 @@ export async function readAnalyticsDatastores(input: AnalyticsDatastoreQuery): P
   }
   return { issues, prs, errors }
 }
-
