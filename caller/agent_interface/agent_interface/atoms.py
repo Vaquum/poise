@@ -220,6 +220,10 @@ def run_agent(
     actor_name: str = "",
     head: str = "",
     repository=None,
+    packet: str = "",
+    capped: bool = False,
+    review_round: int | None = None,
+    review_cap: int | None = None,
 ) -> str:
     prompt_bytes = len(text.encode("utf-8"))
     if prompt_bytes > MAX_GOVERNED_PROMPT_BYTES:
@@ -236,7 +240,8 @@ def run_agent(
     spec = CATALOG.review_model(behavior, model)
     if spec.provider != "claude":
         from .structured_review import run
-        return run(pwd, system, text, spec, behavior, pr, actor_name, head, timeout_s, repository=repository)
+        return run(pwd, system, text, spec, behavior, pr, actor_name, head, timeout_s, repository=repository,
+                   packet=packet, capped=capped, review_round=review_round, review_cap=review_cap)
     from .review_watch import ReviewWatch
     with ReviewWatch(pwd, pr, actor_name, head) as watch:
         done = watch.run(

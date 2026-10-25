@@ -30,6 +30,7 @@ describe('configuration', () => {
       google: null,
       githubUrl: 'https://github.com',
       githubApiUrl: 'https://api.github.com',
+      releaseRepo: 'autonomio/poise',
       allowedUsers: [],
       allowedOrgs: [],
       admins: ['root'],
@@ -203,6 +204,16 @@ describe('configuration', () => {
   it('allows plain-http GitHub URLs only for loopback test servers', () => {
     expect(loadConfig({ ...BASE, POISE_GITHUB_URL: 'http://127.0.0.1:4000/', POISE_GITHUB_API_URL: 'http://localhost:4001' }))
       .toMatchObject({ githubUrl: 'http://127.0.0.1:4000', githubApiUrl: 'http://localhost:4001' })
+  })
+
+  it('points releases at a fork that POISE_RELEASE_REPO names, and refuses a malformed one', () => {
+    expect(loadConfig({ ...BASE, POISE_RELEASE_REPO: 'fork/poise' }).releaseRepo).toBe('fork/poise')
+    expect(loadConfig({ ...BASE, POISE_RELEASE_REPO: '  ' }).releaseRepo).toBe('autonomio/poise')
+    for (const value of ['not a repo', 'a/b/c', '/leading', 'trailing/', 'a--b/poise', 'a/']) {
+      expect(problems({ ...BASE, POISE_RELEASE_REPO: value })).toEqual([
+        `POISE_RELEASE_REPO must be a GitHub repository like owner/name; got "${value}"`,
+      ])
+    }
   })
 })
 

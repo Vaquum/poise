@@ -7,14 +7,30 @@ import { getMeta, setMeta } from './db'
 
 const KEY = 'running_release'
 
+/** The repository Poise's releases come from, unless POISE_RELEASE_REPO names a fork's. */
+export const DEFAULT_RELEASE_REPO = 'autonomio/poise'
+const RELEASE_REPO = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/
+
+/** The release source the menu attributes this Poise to: the override when
+ *  set, else the official repository. A malformed override fails the release
+ *  endpoint naming it rather than linking nowhere. */
+export function releaseRepo(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.POISE_RELEASE_REPO?.trim()
+  if (!configured) return DEFAULT_RELEASE_REPO
+  if (!RELEASE_REPO.test(configured)) throw new Error(`POISE_RELEASE_REPO must be a GitHub repository like owner/name; got "${configured}"`)
+  return configured
+}
+
 export interface RunningRelease {
   /** The source commit of the running bundle; null for a build without one. */
   commit: string | null
   /** When this Poise first ran that commit; null when it is not known. */
   since: string | null
+  /** The repository the commit belongs to, for the menu's link and label. */
+  repo: string
 }
 
-function stored(): RunningRelease | null {
+function stored(): Pick<RunningRelease, 'commit' | 'since'> | null {
   const raw = getMeta(KEY)
   if (!raw) return null
   try {
@@ -34,7 +50,7 @@ export function recordRunningRelease(commit: string | null = BUILD_SHA, now = Da
 }
 
 export function runningRelease(commit: string | null = BUILD_SHA): RunningRelease {
-  if (!commit) return { commit: null, since: null }
+  if (!commit) return { commit: null, since: null, repo: releaseRepo() }
   const record = stored()
-  return { commit, since: record?.commit === commit ? record.since : null }
+  return { commit, since: record?.commit === commit ? record.since : null, repo: releaseRepo() }
 }

@@ -6,6 +6,7 @@
 import base64
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -366,6 +367,248 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('is a checkout of https://github.com/someone/else.git', result.stderr)
         self.assertEqual(self.calls_made(), [])
+
+
+class GateTest(unittest.TestCase):
+    """deploy/actions/gate.sh with a fake gh serving canned API answers."""
+
+    REPO = 'fork/poise'
+    TIP = 'b' * 40
+
+    FAKE_GH = """#!/bin/sh
+# Serves canned API answers from $GH_FIXTURES; $GH_FAIL names files that fail.
+path="$2"
+case "$path" in
+  *commits/main) file=tip.json;;
+  *workflows/ci.yml/runs*) file=ci-runs.json;;
+  *workflows/caller.yml/runs*) file=caller-runs.json;;
+  *actions/runs/*/jobs*) file=jobs.json;;
+  *) echo "unexpected gh api path: $path" >&2; exit 99;;
+esac
+printf '%s\\n' "$path" >>"$GH_CALLS"
+case " $GH_FAIL " in *" $file "*) echo "boom" >&2; exit 1;; esac
+cat "$GH_FIXTURES/$file"
+"""
+
+    def setUp(self):
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.bin = os.path.join(self.work.name, 'bin')
+        self.fixtures = os.path.join(self.work.name, 'fixtures')
+        os.mkdir(self.bin)
+        os.mkdir(self.fixtures)
+        self.calls = os.path.join(self.work.name, 'gh-calls.log')
+        self.output = os.path.join(self.work.name, 'github-output')
+        self.summary = os.path.join(self.work.name, 'github-summary')
+        write_script(os.path.join(self.bin, 'gh'), self.FAKE_GH)
+
+    def workflow_run(self, run_id, **changes):
+        payload = {
+            'id': run_id,
+            'run_number': run_id,
+            'run_attempt': 1,
+            'event': 'push',
+            'head_branch': 'main',
+            'head_repository': {'full_name': self.REPO},
+            'head_sha': self.TIP,
+            'status': 'completed',
+            'conclusion': 'success',
+            'html_url': f'https://github.com/{self.REPO}/actions/runs/{run_id}',
+            'created_at': '2026-10-25T06:00:00Z',
+        }
+        payload.update(changes)
+        return payload
+
+    def fixture(self, name, payload):
+        with open(os.path.join(self.fixtures, name), 'w') as file:
+            json.dump(payload, file)
+
+    def green(self):
+        self.fixture('tip.json', {'sha': self.TIP})
+        self.fixture('ci-runs.json', {'total_count': 1, 'workflow_runs': [self.workflow_run(101)]})
+        self.fixture('caller-runs.json', {'total_count': 1, 'workflow_runs': [self.workflow_run(102)]})
+        self.jobs()
+
+    def jobs(self, *failed):
+        steps = [{'name': name, 'conclusion': 'failure' if name in failed else 'success'}
+                 for name in ('Set up job', 'Audit dependencies', 'Complete job')]
+        self.fixture('jobs.json', {'total_count': 1, 'jobs': [{'steps': steps}]})
+
+    def gate(self, trigger='workflow_run', fail=''):
+        env = clean_env(
+            PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
+            GH_FIXTURES=self.fixtures, GH_CALLS=self.calls, GH_FAIL=fail,
+            GITHUB_OUTPUT=self.output, GITHUB_STEP_SUMMARY=self.summary,
+            REPO=self.REPO, TRIGGER=trigger,
+        )
+        result = subprocess.run([os.path.join(ACTIONS, 'gate.sh')], capture_output=True, text=True, env=env)
+        outputs = {}
+        if os.path.exists(self.output):
+            with open(self.output) as file:
+                for line in file.read().splitlines():
+                    name, _, value = line.partition('=')
+                    outputs[name] = value
+        return result, outputs
+
+    def summary_text(self):
+        if not os.path.exists(self.summary):
+            return ''
+        with open(self.summary) as file:
+            return file.read()
+
+    def test_proceeds_when_both_workflows_passed_on_the_tip(self):
+        self.green()
+        result, outputs = self.gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'true', 'sha': self.TIP})
+        self.assertEqual(result.stdout.splitlines()[-1], 'proceed=true')
+        self.assertIn('runs/101', result.stdout)
+        self.assertIn('runs/102', result.stdout)
+        self.assertIn(self.TIP, self.summary_text())
+
+    def test_judges_the_current_tip_whatever_woke_it(self):
+        self.green()
+        result, _ = self.gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(self.calls) as file:
+            calls = file.read().splitlines()
+        self.assertIn(f'repos/{self.REPO}/commits/main', calls)
+        for workflow in ('ci.yml', 'caller.yml'):
+            self.assertIn(f'repos/{self.REPO}/actions/workflows/{workflow}/runs?head_sha={self.TIP}&per_page=30', calls)
+
+    def test_refuses_a_failed_workflow_naming_the_run_and_step(self):
+        for trigger, hint in [('workflow_run', 'their success wakes the gate again'),
+                              ('workflow_dispatch', 'then dispatch again')]:
+            with self.subTest(trigger=trigger):
+                self.green()
+                self.fixture('ci-runs.json', {'total_count': 1,
+                                              'workflow_runs': [self.workflow_run(101, conclusion='failure')]})
+                self.jobs('Audit dependencies')
+                result, outputs = self.gate(trigger=trigger)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('runs/101', result.stderr)
+                self.assertIn('attempt 1', result.stderr)
+                self.assertIn('Audit dependencies', result.stderr)
+                self.assertIn(hint, result.stderr)
+                self.assertEqual(outputs, {})
+
+    def test_refuses_when_a_workflow_never_ran(self):
+        self.green()
+        self.fixture('caller-runs.json', {'total_count': 0, 'workflow_runs': []})
+        result, _ = self.gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no caller.yml run', result.stderr)
+
+    def test_skips_a_running_workflow_and_refuses_it_on_dispatch(self):
+        self.green()
+        self.fixture('caller-runs.json', {'total_count': 1, 'workflow_runs': [
+            self.workflow_run(102, status='in_progress', conclusion=None)]})
+        result, outputs = self.gate(trigger='workflow_run')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['proceed'], 'false')
+        self.assertIn('still in_progress', result.stderr)
+        result, _ = self.gate(trigger='workflow_dispatch')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('still in_progress', result.stderr)
+        self.assertIn('dispatch again', result.stderr)
+
+    def test_ignores_runs_from_other_events_repositories_and_branches(self):
+        self.green()
+        decoys = [
+            self.workflow_run(201, event='pull_request', head_repository={'full_name': 'mallory/poise'}),
+            self.workflow_run(202, event='workflow_dispatch'),
+            self.workflow_run(203, head_branch='feature'),
+            self.workflow_run(204, head_repository={'full_name': 'mallory/poise'}),
+        ]
+        self.fixture('ci-runs.json', {'total_count': len(decoys), 'workflow_runs': decoys})
+        result, _ = self.gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no ci.yml run', result.stderr)
+
+    def test_accepts_a_green_rerun(self):
+        self.green()
+        self.fixture('ci-runs.json', {'total_count': 1, 'workflow_runs': [self.workflow_run(101, run_attempt=2)]})
+        result, outputs = self.gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['proceed'], 'true')
+        self.assertIn('attempt 2', result.stdout)
+
+    def test_judges_the_newest_run_not_an_older_green_one(self):
+        self.green()
+        self.fixture('ci-runs.json', {'total_count': 2, 'workflow_runs': [
+            self.workflow_run(101, conclusion='success', created_at='2026-10-25T06:00:00Z'),
+            self.workflow_run(103, conclusion='failure', created_at='2026-10-25T07:00:00Z'),
+        ]})
+        result, _ = self.gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('runs/103', result.stderr)
+
+    def test_refuses_a_cancelled_conclusion(self):
+        self.green()
+        self.fixture('caller-runs.json', {'total_count': 1,
+                                           'workflow_runs': [self.workflow_run(102, conclusion='cancelled')]})
+        result, _ = self.gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('cancelled', result.stderr)
+
+    def test_refuses_loudly_when_the_api_fails(self):
+        self.green()
+        for failing in ('tip.json', 'ci-runs.json', 'caller-runs.json'):
+            with self.subTest(failing=failing):
+                result, _ = self.gate(fail=failing)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('cannot read', result.stderr)
+        self.fixture('ci-runs.json', {'total_count': 1,
+                                      'workflow_runs': [self.workflow_run(101, conclusion='failure')]})
+        result, _ = self.gate(fail='jobs.json')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('runs/101', result.stderr)
+
+    def test_refuses_an_unknown_trigger(self):
+        self.green()
+        result, _ = self.gate(trigger='push')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no deploy trigger', result.stderr)
+
+
+class DeployWiringTest(unittest.TestCase):
+    """deploy.yml keeps invoking the gate the way GateTest proves it."""
+
+    def workflow(self, name):
+        with open(os.path.join(ROOT, '.github', 'workflows', name)) as file:
+            return file.read()
+
+    def test_deploy_runs_on_ci_and_caller_completion_only(self):
+        triggers = self.workflow('deploy.yml').split('permissions:')[0].split('\non:\n')[1]
+        self.assertIn('workflow_run:', triggers)
+        self.assertNotRegex(triggers, r'(?m)^  push:')
+        for name in ('ci.yml', 'caller.yml'):
+            match = re.search(r'^name: (.+)$', self.workflow(name), re.MULTILINE)
+            self.assertTrue(match, name)
+            self.assertIn(match.group(1), triggers)
+
+    def test_gate_judges_before_any_ssh_and_pins_what_it_approved(self):
+        deploy = self.workflow('deploy.yml')
+        self.assertLess(deploy.index('deploy/actions/gate.sh'), deploy.index('deploy/actions/ssh-setup.sh'))
+        self.assertIn('ref: ${{ github.sha }}', deploy)
+        self.assertIn('ref: ${{ steps.gate.outputs.sha }}', deploy)
+        self.assertIn('SHA: ${{ steps.gate.outputs.sha }}', deploy)
+        self.assertEqual(deploy.count("if: steps.gate.outputs.proceed == 'true'"), 3)
+
+    def test_every_completion_reaches_the_gate(self):
+        deploy = self.workflow('deploy.yml')
+        self.assertIn("if: vars.POISE_DEPLOY_HOST != ''", deploy)
+        for skipped in ('workflow_run.conclusion', 'workflow_run.event',
+                        'workflow_run.head_branch', 'workflow_run.head_repository',
+                        'workflow_run.head_sha'):
+            self.assertNotIn(skipped, deploy)
+
+    def test_gate_may_read_workflow_runs(self):
+        permissions = self.workflow('deploy.yml').split('concurrency:')[0]
+        self.assertIn('actions: read', permissions)
+
+    def test_audit_step_classifies_transport_failures(self):
+        self.assertIn('run: node scripts/npm-audit.mjs', self.workflow('ci.yml'))
 
 
 class LintTest(unittest.TestCase):

@@ -15,6 +15,17 @@ const SIZE_UNITS: Record<string, number> = { '': 1, b: 1, k: 1024, m: 1024 ** 2,
 const MIN_MEMORY_BYTES = 6 * 1024 ** 2
 const MAX_DRAIN_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 
+/** The repository Poise's releases come from, unless POISE_RELEASE_REPO names a fork's. */
+export const DEFAULT_RELEASE_REPO = 'autonomio/poise'
+
+const REPO_NAME = /^[A-Za-z0-9_.-]+$/
+
+/** A GitHub repository as owner/name. */
+export function isReleaseRepo(value: string): boolean {
+  const parts = value.split('/')
+  return parts.length === 2 && isGitHubName(parts[0]) && REPO_NAME.test(parts[1])
+}
+
 export interface Config {
   domain: string
   insecureHttp: boolean
@@ -23,6 +34,8 @@ export interface Config {
   google: { clientId: string; clientSecret: string } | null
   githubUrl: string
   githubApiUrl: string
+  /** The repository Poise Link releases and release links point at (POISE_RELEASE_REPO). */
+  releaseRepo: string
   allowedUsers: string[]
   allowedOrgs: string[]
   admins: string[]
@@ -152,6 +165,14 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   const githubUrl = serviceUrl('POISE_GITHUB_URL', 'https://github.com')
   const githubApiUrl = serviceUrl('POISE_GITHUB_API_URL', 'https://api.github.com')
 
+  const releaseRepoValue = read('POISE_RELEASE_REPO') ?? DEFAULT_RELEASE_REPO
+  let releaseRepo = DEFAULT_RELEASE_REPO
+  if (!isReleaseRepo(releaseRepoValue)) {
+    problems.push(`POISE_RELEASE_REPO must be a GitHub repository like owner/name; got "${releaseRepoValue}"`)
+  } else {
+    releaseRepo = releaseRepoValue
+  }
+
   const nameList = (name: string, kind: string): string[] => {
     const names = new Set<string>()
     for (const value of (read(name) ?? '').split(/[\s,]+/).filter(Boolean)) {
@@ -260,6 +281,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     google: googleClientId && googleClientSecret ? { clientId: googleClientId, clientSecret: googleClientSecret } : null,
     githubUrl,
     githubApiUrl,
+    releaseRepo,
     allowedUsers,
     allowedOrgs,
     admins,

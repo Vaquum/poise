@@ -40,6 +40,7 @@ address, contact or policy is included in the image or overwritten on upgrade.
 | `POISE_PROXY_LISTEN` | | | The address a proxy the server already runs reaches the gateway at, which `deploy/compose.proxy.yaml` publishes it on: one IP address and port such as `127.0.0.1:8080` or `[::1]:8080`, never `0.0.0.0` or `[::]`. The TLS ask is answered there too |
 | `POISE_GITHUB_URL` | | `https://github.com` | GitHub web origin; tests point it at a fake |
 | `POISE_GITHUB_API_URL` | | `https://api.github.com` | GitHub API origin; tests point it at a fake |
+| `POISE_RELEASE_REPO` | | `autonomio/poise` | Repository the Poise Link installer links and each workspace's release attribution point at, as `owner/name`; a fork's own releases. Passed to every workspace, which picks it up when its container is recreated |
 | `POISE_INSECURE_HTTP` | | | `1` serves plain http for local and CI end-to-end runs; refused unless the domain is `*.localhost` or `*.test` |
 
 The GitHub OAuth App's callback URL is `https://<POISE_DOMAIN>/auth/callback`.

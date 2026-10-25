@@ -17,7 +17,7 @@ import { callerPython, setupCaller } from './caller-setup.mjs'
 import { installStopGate, stopGateManifest } from './stop-gate-runtime.mjs'
 import { servicePath } from './production-path.mjs'
 import { requireProductionDotenv } from './production-env.mjs'
-import { legacyDatastoreServices, resolveLegacyDatastore } from './legacy-datastore.mjs'
+import { legacyDatastoreServices, resolveLegacyDatastore, resolveLegacySyncUser } from './legacy-datastore.mjs'
 import { prepareInstalledBundle } from './start-production.mjs'
 import { selectNodeRuntime } from './self-update/node-runtime.mjs'
 
@@ -231,22 +231,19 @@ async function main() {
   }
   await requireProductionDotenv(dotenvPath)
   loadDotenv({ path: dotenvPath, quiet: true })
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(
-    process.env.REVIEW_AGENT_USERNAME || '',
-  )) throw new Error('REVIEW_AGENT_USERNAME must be configured before production installation')
 
   const datastoreDb = await resolveLegacyDatastore({ home, configuredPath: process.env.POISE_DATASTORE_DB })
   const datastoreServices = legacyDatastoreServices(datastoreDb, launchAgents)
-  const githubUser = datastoreDb
-    ? process.env.POISE_GITHUB_USER || await commandOutput('gh', ['api', 'user', '--jq', '.login'])
-    : null
-  if (datastoreDb && !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/.test(githubUser)) {
-    throw new Error('POISE_GITHUB_USER must be a GitHub username')
-  }
+  // The sync jobs authenticate as your saved GitHub account; a never-saved
+  // one migrates once from POISE_GITHUB_USER, explicitly.
+  const legacyUser = datastoreDb ? await resolveLegacySyncUser({ home, run, environment: process.env }) : null
+  if (legacyUser?.migrated) console.log(`Saved ${legacyUser.user} from POISE_GITHUB_USER as Your GitHub account in Settings.`)
+  const githubUser = legacyUser?.user ?? null
 
   const [node, python] = await Promise.all([supportedNode(), callerPython()])
   const commit = await commandOutput('git', ['-C', projectRoot, 'rev-parse', 'HEAD'])
-  await setupCaller({ root: callerRoot, python, run })
+  // Before the slow Caller build: the hooks fix the saved agent account, and
+  // a missing one fails here naming the setting instead of after it.
   const manifest = await stopGateManifest({ callerRoot, commit })
   await installStopGate({
     home,
@@ -254,6 +251,7 @@ async function main() {
     python,
     run,
   })
+  await setupCaller({ root: callerRoot, python, run })
   const nodeEnvironment = {
     ...process.env,
     PATH: `${dirname(node)}:${process.env.PATH || '/usr/bin:/bin'}`,
@@ -347,6 +345,7 @@ async function main() {
       LANG: process.env.LANG || 'en_US.UTF-8',
       PATH: path,
       POISE_HEALTH_URL: `http://127.0.0.1:${process.env.POISE_PORT || '5555'}/api/health`,
+      ...(process.env.POISE_DB ? { POISE_DB: process.env.POISE_DB } : {}),
       TMPDIR: process.env.TMPDIR || '/tmp',
     })),
     key('RunAtLoad', '<true/>'),

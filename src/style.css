@@ -3730,7 +3730,8 @@ tr:hover .stop-btn { opacity: 1; }
    repositories to skip, listed under their account with a Select all for each
    account and one for the whole list. */
 .bt-section[hidden] { display: none; }
-.bt-ceiling .behavior-setting { align-self: flex-start; margin-top: 4px; }
+.bt-ceiling .behavior-setting,
+.bt-review-cap .behavior-setting { align-self: flex-start; margin-top: 4px; }
 .bt-repo.bt-all,
 .bt-repo.bt-group { font-weight: 600; }
 .bt-repo.bt-grouped { padding-left: 28px; }

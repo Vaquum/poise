@@ -2,6 +2,7 @@ import { constants } from 'node:fs'
 import { access, chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { callerVersions } from './caller.mjs'
+import { readSavedSettings } from './saved-settings.mjs'
 
 function paths(home) {
   const root = join(home, '.local', 'share', 'caller-pr-stop-gate')
@@ -23,16 +24,6 @@ async function executable(path) {
   }
 }
 
-async function exists(path) {
-  try {
-    await access(path)
-    return true
-  } catch (error) {
-    if (error?.code === 'ENOENT') return false
-    throw error
-  }
-}
-
 /** The Caller a gate is installed from: its source directory, the Poise
  *  commit that carries it and the package versions. */
 export async function stopGateManifest({ callerRoot, commit }) {
@@ -47,18 +38,25 @@ function sameManifest(actual, expected) {
 
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
 
-// Poise's saved settings, read from its database: the gate is configured
-// while Poise may not be running.
-async function savedSettings(home, run) {
-  const database = join(home, '.poise', 'cache.db')
-  // A first install precedes Poise's first start: nothing is saved yet.
-  if (!await exists(database)) return {}
-  const result = await run('/usr/bin/sqlite3', [
-    '-json',
-    database,
-    "SELECT key, value FROM meta WHERE key IN ('org', 'me', 'agentAccount');",
-  ], { capture: true })
-  return Object.fromEntries(JSON.parse(result.stdout.trim() || '[]').map((row) => [row.key, row.value]))
+// Identity the gate fixes into hooks comes only from saved Settings, or from
+// the seed the first start writes there. Inherited identity variables are
+// removed without being read: a cleared account must fail, never borrow the
+// installer's shell. Kept in step with CALLER_ACCOUNT_ENV (server/process.ts)
+// and the hook's own CALLER_PR_REVIEWER / CALLER_GITHUB_READER.
+const INHERITED_IDENTITY_ENV = [
+  'CALLER_PR_GATE_SCOPE',
+  'CALLER_PR_REVIEWER',
+  'GITHUB_INTERFACE_USER',
+  'GITHUB_INTERFACE_AGENT_USER',
+  'CALLER_GITHUB_READER',
+]
+
+function withoutInheritedIdentity(environment) {
+  const scrubbed = { ...environment }
+  for (const key of Object.keys(scrubbed)) {
+    if (INHERITED_IDENTITY_ENV.some((name) => name.toLowerCase() === key.toLowerCase())) delete scrubbed[key]
+  }
+  return scrubbed
 }
 
 function login(value, label) {
@@ -68,16 +66,26 @@ function login(value, label) {
 }
 
 async function gateEnvironment(home, run, environment = process.env) {
-  const saved = await savedSettings(home, run)
-  const organization = login(environment.POISE_GITHUB_ORG?.trim() || saved.org, 'GitHub organization')
-  // The gate waits for the agent account saved in Settings; before Poise has
-  // started, for the REVIEW_AGENT_USERNAME that will seed it.
-  const agent = login('agentAccount' in saved ? saved.agentAccount : environment.REVIEW_AGENT_USERNAME, 'agent account')
+  // The gate is configured while Poise may not be running, so Settings is
+  // read from its database, the same one the server opens.
+  const { present, settings: saved } = await readSavedSettings({ home, run, environment })
+  const organization = login(saved.org, 'GitHub organization')
   const me = login(saved.me, 'GitHub account')
+  let agent
+  if (present) {
+    // Settings decides, cleared included.
+    agent = login(saved.agentAccount, 'agent account')
+    if (!agent) throw new Error('No agent account is saved. Set the agent account in Settings → General: the stop gate waits for its approval.')
+  } else {
+    // A first install precedes Poise's first start: the gate waits for the
+    // REVIEW_AGENT_USERNAME that start will seed Settings with.
+    agent = login(environment.REVIEW_AGENT_USERNAME, 'agent account')
+    if (!agent) throw new Error('No agent account is saved. Set REVIEW_AGENT_USERNAME so the first start seeds it, then install again.')
+  }
   return {
-    ...environment,
+    ...withoutInheritedIdentity(environment),
     ...(organization ? { CALLER_PR_GATE_SCOPE: `${organization}/*` } : {}),
-    ...(agent ? { GITHUB_INTERFACE_AGENT_USER: agent } : {}),
+    GITHUB_INTERFACE_AGENT_USER: agent,
     ...(me ? { CALLER_GITHUB_READER: me } : {}),
   }
 }

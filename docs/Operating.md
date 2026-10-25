@@ -311,11 +311,19 @@ land.
      `~/.ssh/authorized_keys`.
 3. **Set the fork's variables and secrets** under Settings → Secrets and
    variables → Actions (below).
-4. **Run the Deploy workflow** on the fork's **Actions** tab. It signs in to
-   the server, brings the checkout to the commit, cloning it the first time,
-   writes `deploy/.env`, and runs `deploy/install.sh` the first time and
-   `deploy/upgrade.sh --no-pull` after that. Every push to the fork's main
-   deploys the same way, and a deployment that fails fails the run.
+4. **Start CI with a push, then run the Deploy workflow** on the fork's
+   **Actions** tab. The fork deploys only a commit whose CI and Caller runs
+   both passed on that exact commit, so a new fork with no runs yet deploys
+   nothing until its first push has gone green; an empty commit suffices.
+   Once green, the workflow signs in to the server, brings the checkout to
+   the commit, cloning it the first time, writes `deploy/.env`, and runs
+   `deploy/install.sh` the first time and `deploy/upgrade.sh --no-pull`
+   after that. Every push to the fork's main deploys the same way once its
+   CI passes, about ten to twenty minutes later, and a deployment that
+   fails fails the run. A commit CI never tested, or one whose CI failed,
+   is refused: re-run the failed jobs and the deploy follows their success.
+   Every completion re-checks the current tip, so a re-run for an older
+   commit deploys the green tip instead of losing its deploy.
 
 The workflow reaches the server with these:
 
@@ -336,7 +344,8 @@ variables of the fork: `POISE_DOMAIN`, `POISE_GITHUB_CLIENT_ID`,
 others you need. The OAuth App's client secret is the secret
 `POISE_GITHUB_CLIENT_SECRET`. The workflow writes `deploy/.env` anew at every
 deployment, so change settings in the fork, not on the server, and run the
-workflow to apply them. Of what a run brings, only `deploy/.env` stays on the
+workflow to apply them. A run started by hand checks the same gate, so
+applying settings needs green CI on the tip too. Of what a run brings, only `deploy/.env` stays on the
 server: the checkout fetches with the run's own token, which expires with the
 run, and the settings reach the server over SSH alone, never on a command
 line.
@@ -351,6 +360,13 @@ rejects an incomplete pair or a Google secret stored as a variable before
 contacting the server. It rewrites both values into the protected `deploy/.env`
 on each deployment, so configure them in Actions rather than editing that file.
 
+**Serving the fork's own releases.** Set `POISE_RELEASE_REPO` to the fork,
+as an Actions variable like the settings above. The gateway then serves the
+fork's Poise Link installer links to every workspace's Settings, and each
+workspace attributes its release to the fork once its container is recreated.
+Tag `link-v*` in the fork to publish its own Poise Link builds; until then
+the links point at releases that do not exist yet.
+
 **Keeping up with autonomio/poise.** For the fork to update itself, it needs
 both of these:
 
@@ -361,8 +377,9 @@ both of these:
 
 The Sync workflow then merges autonomio/poise's main into the fork's main
 every five minutes, as the **Sync fork** button on the fork's page does, and
-deploys what that brought in, so a merged change reaches the server within
-minutes. GitHub may start a scheduled run some minutes late when it is busy.
+what that brought in deploys once its CI passes, so a merged change reaches
+the server about ten to twenty-five minutes later. GitHub may start a
+scheduled run some minutes late when it is busy.
 A change to Poise alone then reaches the running workspaces within five more
 minutes. A change to the system under `deploy/runtime/` first waits for their
 running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
@@ -372,6 +389,9 @@ a workflow file, anything under `.github/workflows/`. autonomio/poise changes
 its workflows from time to time. Without the token, the first such change
 stops the sync, and the fork stays on the commit before it until someone
 presses **Sync fork**. The workflow uses the token for its merges only.
+Without the token the scheduled sync's merges also start no CI — a push
+the workflow token makes starts no workflow — so the deploy gate refuses
+them. Set the token and the next merged change deploys once its CI passes.
 
 To make the token, open GitHub → Settings → Developer settings → Personal
 access tokens → **Fine-grained tokens** → **Generate new token**, or this
@@ -552,8 +572,8 @@ deploy/upgrade.sh
 It pulls the newest commit of the branch the checkout follows (fast-forward
 only), rebuilds the workspace image, lets Compose recreate Caddy or the
 gateway if they changed, and lists the workspaces that run an older image.
-A fork that deploys itself does this at every push to its main
-([Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
+A fork that deploys itself does this once CI passes on what a push to its
+main brought ([Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
 
 It then proves the deploy landed: for up to ten minutes it waits for every
 workspace to serve the new commit — a running one through its health check,

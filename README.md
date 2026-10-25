@@ -398,6 +398,15 @@ A new installation can start without an initialized datastore; add the first
 GitHub account in Settings. Existing databases and their sync services are retained.
 An explicitly configured `POISE_DATASTORE_DB` must point to an existing file.
 
+Installation, the stop gates and the hourly reconciler all use the GitHub
+identities saved in Settings — your account, the agent account and the
+organization — from the database `POISE_DB` names. A missing or cleared
+identity fails naming the setting instead of borrowing the installer's
+environment or `gh`'s active account. `REVIEW_AGENT_USERNAME` only seeds the
+agent account on a first install and start without one saved; `POISE_GITHUB_USER`
+migrates a never-saved account into Settings once, for existing legacy-sync
+installs. Neither is required when Settings already holds the accounts.
+
 The macOS installer builds Poise and the checkout's Caller virtualenv
 (`caller/.venv`, as `npm run caller:setup` does), installs the Claude and Codex
 stop gates from `caller/`, and registers three per-user launchd services. They
@@ -419,6 +428,8 @@ The stop gates wait for the agent account's approval and read pull requests as
 your GitHub account. Installing them fixes both accounts into the hook from
 Settings — before Poise's first start, the agent account is the
 `REVIEW_AGENT_USERNAME` that will seed it — and fails without an agent account.
+A changed account reaches the hooks on the next reconciler run; a changed
+account on a legacy-sync install reinstalls the sync jobs with it.
 
 Keep the production checkout outside `~/dev` (for example
 `~/.poise/production`): the updater needs it permanently on `main` and clean,
@@ -530,6 +541,7 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 | `POISE_PORT` | Production port | `5555` |
 | `POISE_DB` | SQLite path | `~/.poise/cache.db` |
 | `POISE_DATASTORE_DB` | Existing account’s Caller datastore | github-datastore's default under `~/.local/share/github-datastore` |
+| `POISE_GITHUB_USER` | One-time migration into Your GitHub account when never saved, for legacy sync; ignored after that | unset |
 | `POISE_EDITOR_DIR` | Markdown and annotation directory | `~/.poise/editor` |
 | `POISE_CHAT_ATTACHMENTS_DIR` | Durable chat attachments | `~/.poise/chat-attachments` |
 | `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default; `~/.poise/snippets` in service mode |
@@ -540,13 +552,28 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 | `POISE_CHAT_ROOT` | Chat workspace storage | `.poise-chat/` in the installation; `~/.poise/chat` in service mode |
 | `POISE_VOICE_GUIDE_PATH` | Optional editor-chat voice guide | unset |
 | `AGENT_INTERFACE_VOICE_GUIDE` | Optional voice guide `/content` writes in; without one it writes without | unset |
-| `REVIEW_AGENT_USERNAME` | Seeds the agent account (Settings → GitHub) on the first start without one saved; ignored after that | unset |
+| `REVIEW_AGENT_USERNAME` | Optional seed for the agent account (Settings → GitHub) on the first install and start without one saved; ignored after that | unset |
+| `POISE_RELEASE_REPO` | Repository the release links and menu attribution point at, as `owner/name`; a fork's own releases | `autonomio/poise` |
 | `CONFAB_URL` | Optional Confab service | `http://localhost:8000` |
 | `CONFAB_API_KEY` | Optional Confab bearer credential | unset |
 
 The browser keeps view, filter, typography, refresh, and theme preferences in
 `localStorage`. SQLite uses WAL mode and stores local settings, manual cards,
 and automation deduplication state. Editor documents remain plain Markdown.
+
+### Fixed values
+
+What is configurable and what is deliberately fixed:
+
+| Value | Disposition |
+| --- | --- |
+| Release/download/attribution repository | Configurable: `POISE_RELEASE_REPO` as `owner/name`, default `autonomio/poise`. It drives the Poise Link installer links the gateway serves, the installer's release links, and the menu's release attribution. A fork sets it once per deployment; see [Run your own Poise from a fork](docs/Operating.md#run-your-own-poise-from-a-fork) |
+| Release host `github.com` | Product invariant: releases are distributed from github.com. The deployment's own GitHub for sign-in and API calls is separately configurable in the gateway (`POISE_GITHUB_URL`, `POISE_GITHUB_API_URL`) |
+| `com.vaquum.*` launchd labels, the Poise Link bundle identifier and launch agent | Product invariant: renaming one orphans the installed jobs, agents and login items and breaks upgrades. They select no GitHub identity |
+| `github.com` API, clone and browser URLs in Poise and Caller | Product invariant: Poise and Caller work against github.com through `gh` and `git`; there is no GitHub Enterprise mode outside the gateway sign-in above |
+| Self-update trust root (`package.json` repository) | Product invariant: the controller releases the repository its trusted copy names and refuses to let a change touch that field, so a candidate release can never redirect what judges it. It never follows `POISE_RELEASE_REPO` |
+| Release branch `main` | Product invariant: Poise releases from `main`, which the production updater fast-forwards and the self-update controller tracks |
+| Daily model refresh at 07:00 | Schedule invariant; the time zone it runs in is the Settings user choice |
 
 ## Quality gates
 

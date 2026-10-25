@@ -44,7 +44,7 @@ import { listSessions } from './chat/storage'
 import { handleGoogleApi } from './google/api'
 import { validateGoogleEnvironment } from './google/accounts'
 import { getBehaviorDiagnosticIncidents } from './behaviors'
-import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, setPaused as setBehaviorPaused, getPausedUntil as getBehaviorPausedUntil, getPausedBy as getBehaviorPausedBy, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, setReviewCap as setBehaviorReviewCap, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getReviewCap, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isValidReviewCap, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, setPaused as setBehaviorPaused, getPausedUntil as getBehaviorPausedUntil, getPausedBy as getBehaviorPausedBy, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceRuntime, stopStorageMaintenanceRuntime, storageStatus } from './storage-maintenance'
 import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
@@ -887,6 +887,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               enabled: enabled['approve-prs'],
               setting: null,
               reviewers: null,
+              // The review-round cap: null is off, otherwise 2-10 rounds.
+              reviewCap: getReviewCap(),
               skipRepos: getRepositorySkips('approve-prs'),
               scratchpad: scratch['approve-prs'],
               lastTriggered: lastFor('pr_approve', 'poise:approve-prs'),
@@ -952,7 +954,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           })
         }
 
-        // POST /api/behaviors/<key> { enabled?, pausedUntil?, setting?, reviewers?: 1|2|3, repos?: string[], authors?: string[], skipRepos?: string[], scratchpad? }
+        // POST /api/behaviors/<key> { enabled?, pausedUntil?, setting?, reviewers?: 1|2|3, reviewCap?: number|null, repos?: string[], authors?: string[], skipRepos?: string[], scratchpad? }
         // — every field optional; several can be sent in one call.
         const behaviorMatch = url.match(/^\/api\/behaviors\/([a-z0-9-]+)(?:\?|$)/)
         if (behaviorMatch && req.method === 'POST') {
@@ -989,6 +991,14 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               }
               if (!isValidReviewers(body.reviewers)) {
                 return json(res, 400, { error: 'reviewers must be 1, 2 or 3' })
+              }
+            }
+            if ('reviewCap' in body) {
+              if (key !== 'approve-prs') {
+                return json(res, 400, { error: 'only approve-prs takes a review cap' })
+              }
+              if (!isValidReviewCap(body.reviewCap)) {
+                return json(res, 400, { error: 'reviewCap must be null or an integer from 2 to 10' })
               }
             }
             if (('repos' in body || 'authors' in body) && key !== 'review-new-issues') {
@@ -1055,6 +1065,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             // the first tick observes the submitted setting and memory.
             if ('setting' in body) setBehaviorSetting(key, body.setting)
             if ('reviewers' in body && isPanelBehavior(key)) setBehaviorReviewers(body.reviewers, key)
+            if ('reviewCap' in body && key === 'approve-prs') setBehaviorReviewCap(body.reviewCap)
             if ('repos' in body) setIssueRepositories(body.repos)
             if ('authors' in body) setIssueAuthors(body.authors)
             if ('skipRepos' in body && isSkippableBehavior(key)) setRepositorySkips(key, body.skipRepos)
@@ -1074,6 +1085,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               pausedBy: getBehaviorPausedBy(key),
               setting: getSettingMap()[key],
               reviewers: isPanelBehavior(key) ? getReviewers(key) : null,
+              ...(key === 'approve-prs' ? { reviewCap: getReviewCap() } : {}),
               ...(key === 'review-new-issues' ? {
                 repos: getIssueRepositories().map((entry) => entry.repo),
                 authors: getIssueAuthors(),
