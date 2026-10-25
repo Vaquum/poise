@@ -488,9 +488,9 @@ test('an exhausted search reopens when a quarantined arrival lands in both feeds
   running = []
   quarantined = [dupe]
   await settledRefresh(page)
-  await expect(page.locator('#swarm-page')).toHaveText('201–250 / 250+')
-  await expect(pagerNext(page)).toBeEnabled()
-  await pagerNext(page).click()
+  // The refresh replays the page-2 continuation, which returns the 50
+  // retained matches plus the newly matching completion and exhausts the
+  // reopened walk in one fetch — no further Next is needed.
   await expect(page.locator('#swarm-page')).toHaveText('201–251 / 251')
   await expect(page.locator(`${rows}[data-id="acme-900"]`)).toHaveCount(1)
   await expect(pagerNext(page)).toBeDisabled()
