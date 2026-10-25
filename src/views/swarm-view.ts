@@ -690,6 +690,7 @@ function renderShell() {
       searchQuery = next
       pageIndex = 0
       entries = []
+      historyIds.clear()
       quarantined = []
       totalMatching = 0
       historyCursor = null
@@ -1113,6 +1114,7 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
     searchQuery = ''
     if (searchEl) searchEl.value = ''
     entries = []
+    historyIds.clear()
     quarantined = []
     totalMatching = 0
     historyCursor = null
@@ -1129,8 +1131,9 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
   // `behavior === 'pr_review'`, so the "Last triggered" links for approve-prs
   // and resolve-unblocking — which produce pr_approve and other behaviours —
   // matched nothing and the click did nothing.
+  const pollBefore = pollSequence
   const match = await ensureTarget((e) => e.repo === repo && String(e.pr_id) === String(pr_id))
-  if (viewEl.hidden) return
+  if (viewEl.hidden || pollBefore !== pollSequence) return
   if (!match) {
     notFocusable(`No run found for ${repo}#${pr_id}.`)
     return
@@ -1194,6 +1197,7 @@ export async function focusCall(callId: string): Promise<void> {
     searchQuery = ''
     if (searchEl) searchEl.value = ''
     entries = []
+    historyIds.clear()
     quarantined = []
     totalMatching = 0
     historyCursor = null
@@ -1204,16 +1208,20 @@ export async function focusCall(callId: string): Promise<void> {
   }
   await pollOnce()
   if (mine !== callFocusSequence || viewEl.hidden) return
+  // A refresh starting mid-lookup cancels it via pollSequence while this
+  // focus stays current; that cancellation is not a missing call either.
+  let pollBefore = pollSequence
   let match = await ensureTarget((entry) => entry.id === callId)
   // An aborted lookup (navigated away or superseded) is not a missing call:
   // returning here keeps the global organization filter untouched.
-  if (mine !== callFocusSequence || viewEl.hidden) return
+  if (mine !== callFocusSequence || viewEl.hidden || pollBefore !== pollSequence) return
   if (!match && getSelectedOrganization()) {
     setSelectedOrganization('')
     await pollOnce()
     if (mine !== callFocusSequence || viewEl.hidden) return
+    pollBefore = pollSequence
     match = await ensureTarget((entry) => entry.id === callId)
-    if (mine !== callFocusSequence || viewEl.hidden) return
+    if (mine !== callFocusSequence || viewEl.hidden || pollBefore !== pollSequence) return
   }
   if (!match) {
     notFocusable(`No run found for call ${callId}.`)
@@ -1257,6 +1265,9 @@ let incompleteTotal: number | null = null
 let loadingHistory = false
 let totalMatching = 0
 let historyCursor: string | null = null
+// Calls that arrived through history pages (not the running feed), so the
+// pager can tell cached running rows apart from covered history ranges.
+let historyIds = new Set<string>()
 
 const HISTORY_PAGE_LIMIT = 200
 
@@ -1281,6 +1292,7 @@ function historyUrl(org: string, cursor: string | null, search: string): string 
 async function applyFirstPage(data: LogFeed, total: number, cursor: string | null, current: () => boolean): Promise<void> {
   if (!current()) return
   entries = data.logs || []
+  historyIds = new Set(entries.map((entry) => entry.id))
   quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
   totalMatching = total
   historyCursor = cursor
@@ -1297,6 +1309,7 @@ function appendPage(data: LogFeed, cursor: string | null, current: () => boolean
   if (!current()) return false
   const seen = new Set(entries.map((entry) => entry.id))
   for (const entry of data.logs || []) {
+    historyIds.add(entry.id)
     if (!seen.has(entry.id)) {
       seen.add(entry.id)
       entries.push(entry)
@@ -1341,6 +1354,7 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
     if (!known.has(id)) arrivals = true
     known.set(id, entry)
   }
+  for (const entry of history.logs || []) historyIds.add(entry.id)
   // New unreadable calls shift page boundaries exactly like readable ones;
   // ignoring them would keep a stale cursor that skips the intervening range.
   if (!arrivals) {
@@ -1382,7 +1396,11 @@ async function loadMoreForView(current: () => boolean): Promise<void> {
   const org = getSelectedOrganization()
   const search = searchQuery
   const needed = pageIndex * PAGE_SIZE + 1
-  if (groupRows(groupRuns(visible())).length >= needed) return
+  // Count history-covered rows only: cached running calls from the running
+  // feed must not satisfy the guard, or pagination would advance past
+  // unloaded intervening history to display them.
+  const covered = groupRows(groupRuns(entries.filter((entry) => historyIds.has(entry.id) && matchesSearch(entry))))
+  if (covered.length >= needed) return
   const data = await readLogFeed(historyUrl(org, historyCursor, search))
   if (!current() || org !== getSelectedOrganization() || search !== searchQuery) return
   appendPage(data, data.nextCursor ?? null, current)
@@ -1422,10 +1440,13 @@ async function settleStaleRunning(freshIds: Set<string>, current: () => boolean)
       continue
     }
     const bad = (Array.isArray(data.quarantined) ? data.quarantined : []).find((item) => item.id === stale[index]!.id)
-    if (bad && !quarantined.some((item) => item.id === bad.id && item.index === bad.index)) {
-      quarantined.push(bad)
+    // The cached running row leaves even when its quarantine entry arrived
+    // earlier through a refresh feed; otherwise the unreadable terminal
+    // call would stay marked as running indefinitely.
+    if (bad) {
       byId.delete(stale[index]!.id)
       changed = true
+      if (!quarantined.some((item) => item.id === bad.id && item.index === bad.index)) quarantined.push(bad)
     }
   }
   // Failed lookups keep their old running rows for the next refresh, but say
@@ -1599,6 +1620,7 @@ export async function initSwarmView() {
     attachClicks()
     window.addEventListener('poise:organization-filter-changed', () => {
       entries = []
+      historyIds.clear()
       quarantined = []
       lastLoadError = null
       lastLoadedAt = 0
