@@ -2,7 +2,8 @@ export type Provider = 'claude' | 'codex' | 'grok' | 'antigravity' | 'muse'
 export interface CliUpdate {
   provider: Provider
   configuredExecutable?: string
-  status: 'current' | 'updated' | 'unavailable'
+  status: 'current' | 'updated' | 'unavailable' | 'skipped'
+  reason?: string
   checkedAt: string
   path?: string
   resolvedPath?: string
@@ -18,6 +19,7 @@ export interface UpdateOptions {
   root?: string
   run?: typeof runUpdateCommand
   timeoutMs?: number
+  providers?: Provider[]
 }
 export const PROVIDERS: Provider[]
 export const CLI_UPDATE_TIMEOUT_MS: number
@@ -26,4 +28,6 @@ export function ensureProviderCli(provider: Provider, options?: UpdateOptions): 
 export function ensureProviderClis(options?: UpdateOptions): Promise<Record<Provider, CliUpdate>>
 
 export function terminateUpdateChildren(): void
+export function trackUpdateChild(child: object): void
+export function untrackUpdateChild(child: object): void
 export function withModelRefreshLock<T>(reportPath: string, operation: () => Promise<T>): Promise<T>

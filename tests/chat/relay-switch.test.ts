@@ -297,6 +297,44 @@ describe('release switch adoption', () => {
     }
   }, 60_000)
 
+  it('adopts a relay-held turn when the checkout is on the worker\'s own PR branch', async () => {
+    const instance = 'poise-switch-own-branch:db'
+    const chatRoot = join(root, 'chat-root-own-branch')
+    const first = makeRuntime(instance, { hosts: [], adapters: [], auto: false, replayTurns: [] }, { localWorkspaceRoot: chatRoot })
+    const session = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', role: 'worker' })
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    first.runtime.prompt(session.id, { text: 'Prime the relay', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    const peer = await first.controls.hosts[0].spawn('sh', ['-c', 'sleep 60']) as RelayConnection
+    await waitFor(() => worker.pgidAlive(peer.gatePgid))
+    first.controls.adapters[0].finish()
+    await waitFor(() => lastStatus(first.events, session.id) === 'idle')
+    const { turnId } = requireTurn(first.runtime.prompt(session.id, { text: 'Survive the switch', attachments: [], mentions: [] }))
+    await waitFor(() => first.runtime.get(session.id)?.status === 'running')
+    await new Promise((r) => setTimeout(r, 200))
+    // The agent cut its PR branch mid-turn — the normal worker case.
+    git(['switch', '-c', 'fix/pr-640'], session.checkout)
+    await first.runtime.stop()
+    expect(storage.getOpenTurn(session.id)?.turnId).toBe(turnId)
+
+    let releaseReplay = () => {}
+    const gate = new Promise<void>((resolve) => { releaseReplay = resolve })
+    const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [], replayGate: gate }, { localWorkspaceRoot: chatRoot })
+    try {
+      await second.runtime.recover()
+      await waitFor(() => second.controls.replayTurns.length === 1)
+      expect(second.controls.replayTurns[0].turnId).toBe(turnId)
+      expect(second.runtime.get(session.id)?.status).toBe('running')
+      await second.controls.replayTurns[0].live
+      releaseReplay()
+      await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 1)
+      expect(ofType(second.events, session.id, 'turn.finished')[0]).toMatchObject({ turnId, stopReason: 'end_turn' })
+    } finally {
+      releaseReplay()
+      await second.runtime.stop({ handover: false })
+    }
+  }, 60_000)
+
   it('terminates a stopped turn at shutdown instead of handing it over', async () => {
     const instance = 'poise-switch-stop-handover:db'
     const first = makeRuntime(instance, { hosts: [], adapters: [], auto: false, replayTurns: [] })

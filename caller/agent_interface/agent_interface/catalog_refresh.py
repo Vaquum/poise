@@ -274,18 +274,28 @@ def render(models: dict[str, Model], behaviors: dict[str, str], participants: li
     return "\n".join(lines) + "\n"
 
 
-def refresh(probes: dict | None = None, path: Path | None = None) -> dict:
+def refresh(probes: dict | None = None, path: Path | None = None, families: list[str] | None = None) -> dict:
     catalog = load_catalog(catalog_path())
     target = path or RUNTIME_CATALOG_PATH
+    selected = list(families) if families is not None else list(FAMILIES)
+    for family in selected:
+        if family not in FAMILIES:
+            raise ValueError(f"unknown model family {family}")
     report: dict = {"checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "path": str(target), "families": {}}
     models: dict[str, Model] = {}
     for family in FAMILIES:
-        try:
-            found = (probes or PROBES)[family]()
-            report["families"][family] = {"status": "ok", "models": [m.identity for m in found]}
-        except Exception as error:
+        if family not in selected:
+            # A skipped family keeps its rows exactly like a failed probe
+            # does, so behaviors and debate participants pointing at it stay.
             found = family_rows(catalog, family)
-            report["families"][family] = {"status": "unavailable", "error": str(error), "models": [m.identity for m in found]}
+            report["families"][family] = {"status": "skipped", "reason": "never_configured", "models": [m.identity for m in found]}
+        else:
+            try:
+                found = (probes or PROBES)[family]()
+                report["families"][family] = {"status": "ok", "models": [m.identity for m in found]}
+            except Exception as error:
+                found = family_rows(catalog, family)
+                report["families"][family] = {"status": "unavailable", "error": str(error), "models": [m.identity for m in found]}
         models.update({m.identity: m for m in found})
     behaviors = {behavior: successor(identity, catalog, models) for behavior, identity in catalog.behaviors.items()}
     participants = list(dict.fromkeys(successor(p, catalog, models) for p in catalog.debate_participants))

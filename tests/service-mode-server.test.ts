@@ -94,6 +94,10 @@ else process.stdout.write('[]')
   server.prependListener('upgrade', fromGatewayNetwork)
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   port = (server.address() as { port: number }).port
+  // Codex was configured here, so its signed-out CLI raises the sign-in
+  // demand the accounts tests expect, and clears it once signed in again.
+  const { setMeta } = await import('../server/db')
+  setMeta('account_logins', JSON.stringify({ codex: '2026-10-20T06:00:00.000Z' }))
 })
 
 afterAll(async () => {

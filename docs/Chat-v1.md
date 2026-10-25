@@ -313,7 +313,10 @@ reconnects to live relays, rebuilds each adapter over the spooled bytes, and
 continues the turn without repeating a persisted event or writing to the
 agent. Adoption works across releases: relay identity does not name the
 install directory, so a new release adopts relays still running from the
-previous one. A handoff that never reaches LIVE within a minute fails
+previous one. Adoption accepts the checkout on any branch of the session's
+own scratch workspace — a worker's agent cuts its PR branch there — and
+only there; a shared checkout must still be on the session's branch. A
+handoff that never reaches LIVE within a minute fails
 instead: the turn is interrupted and its processes terminated, never left
 running unseen. The adopted relay retires when its turn settles; the next
 prompt starts a fresh relay and resumes the same native session. Open turns

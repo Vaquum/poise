@@ -698,12 +698,24 @@ not use the gateway's discarded OAuth token.
   - Each command has 10 seconds. Answers are kept for 15 seconds and dropped
     whenever a terminal exits.
   - Every read records sign-in alerts (`sign_in_needed`): one for an
-    installed CLI that says it is not signed in, and one each for the
-    person's own account and the GitHub automation account while gh does not hold it
-    signed in. Each clears once signed in again; Claude's alert stays its
-    auth monitor's. In service mode Poise also reads the accounts every 15
-    minutes, so the alerts come while the browser is closed. They open
-    `/?settings=accounts`, Settings → Accounts.
+    installed, configured CLI that says it is not signed in, and one each for
+    the person's own account and the GitHub automation account while gh does
+    not hold it signed in. A provider with no configuration record raises no
+    sign-in demand, and a stale demand clears once the provider reads as
+    unconfigured. Each clears once signed in again; Claude's alert stays its
+    auth monitor's, gated on the same participation. In service mode Poise
+    also reads the accounts every 15 minutes, so the alerts come while the
+    browser is closed. They open `/?settings=accounts`, Settings → Accounts.
+  - Participation: a provider takes part in model maintenance when
+    `account_logins` records it, or when its live status positively verifies
+    a usable sign-in (Claude/Codex; the observation is then recorded, so a
+    later lost sign-in reads as a failure). Grok, Muse and Antigravity have
+    no live status: their history is their only signal. Providers with
+    neither record nor verified sign-in are skipped with reason
+    `never_configured`; eligibility that cannot be established fails the
+    check. A check with no eligible providers reports every provider skipped
+    and succeeds neutrally. The server forwards its own observation to the
+    refresh script; the standalone job resolves the same rule itself.
 - Connect opens a terminal in the browser, inside the workspace, running that
   CLI's own login (`login.label`):
 
@@ -722,9 +734,10 @@ not use the gateway's discarded OAuth token.
   In local and service mode, a successful Connect exit records a timestamp in
   Poise's existing `account_logins` map, independently of setup progress. Grok
   and Muse can therefore show the completed sign-in immediately and after a
-  restart; storing a Muse API key records Muse the same way. A failed/signaled
-  login, startup failure or shell exit adds no evidence; failed reconnects
-  retain any earlier historical confirmation.
+  restart; storing a Muse API key records Muse the same way. A positively
+  observed Claude/Codex sign-in, including one made outside Poise, records
+  the same way. A failed/signaled login, startup failure or shell exit adds
+  no evidence; failed reconnects retain any earlier historical confirmation.
   Antigravity's app exit never creates a confirmation. Existing entries,
   including indistinguishable older automatic Antigravity entries, are kept.
   Missing CLIs and failed version probes retain history without showing a

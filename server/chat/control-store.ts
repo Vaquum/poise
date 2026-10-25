@@ -222,15 +222,19 @@ export function inbox(instance: string, recipient: string, after = 0): InternalM
 /** Per recipient, two candidates: the oldest pending ordinary row and the
  *  oldest pending timer row. A hold excludes the recipient from both: while
  *  a chat is held, its timers skip their firings and turns other chats
- *  would start in it wait. Page by 100 recipients, retaining both candidates
- *  at the boundary. The tick picks at most one row per recipient. */
+ *  would start in it wait. An interrupted worker is an ordinary candidate
+ *  too — pause or not, since the interruption itself set the pause —
+ *  while admission resumes only one a restart cut short with no stop
+ *  pending on the cut turn. Page by 100 recipients, retaining both
+ *  candidates at the boundary. The tick picks at most one row per recipient. */
 export function pending(instance: string, afterRecipient = '', now = Date.now()): InternalMessage[] {
   const page = db.prepare(`WITH candidates AS (
       SELECT ${INBOX_COLUMNS} FROM chat_control_inbox
       WHERE instance = ? AND state = 'pending' AND timer_id IS NULL
         AND seq IN (SELECT MIN(seq) FROM chat_control_inbox WHERE instance = ? AND state = 'pending' AND timer_id IS NULL GROUP BY recipient)
-        AND recipient IN (SELECT id FROM chat_sessions WHERE status = 'idle')
-        AND recipient NOT IN (SELECT session FROM chat_control_paused WHERE instance = ?)
+        AND ((recipient IN (SELECT id FROM chat_sessions WHERE status = 'idle')
+          AND recipient NOT IN (SELECT session FROM chat_control_paused WHERE instance = ?))
+          OR recipient IN (SELECT id FROM chat_sessions WHERE status = 'interrupted' AND role = 'worker'))
         AND recipient NOT IN (SELECT session FROM chat_control_holds WHERE instance = ?)
       UNION ALL
       SELECT ${INBOX_COLUMNS} FROM chat_control_inbox i
