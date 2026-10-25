@@ -42,7 +42,7 @@ jobs:
           fi
       - name: Audit dependencies
         if: steps.deps.outputs.changed == 'true'
-        run: npm audit --audit-level=high
+        run: node scripts/npm-audit.mjs
       - name: Lint
         run: npm run lint
       - name: Typecheck client, server and tests
