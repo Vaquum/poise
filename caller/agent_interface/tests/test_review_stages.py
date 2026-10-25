@@ -146,6 +146,18 @@ class TestSplit(TestCase):
         sets = review_stages.diff_line_sets(diff, ['"q.py"'])
         self.assertEqual(sets['"q.py"']["right"], {1})
 
+    def test_mode_only_section_matches_longest_retained_path(self):
+        # A mode-only section for "x b/y" must not be attributed to the
+        # retained suffix "y", which would leave "x b/y" uncovered.
+        node = json.loads(packet([]))
+        node["diff"] = "\n".join(["diff --git a/x b/y b/x b/y", "old mode 100644", "new mode 100755",
+                                  "diff --git a/y b/y", "old mode 100644", "new mode 100755"])
+        node["files"] = [{"filename": name, "status": "modified",
+                          "old_mode": "100644", "new_mode": "100755"} for name in ("y", "x b/y")]
+        stages = review_stages.split(json.dumps(node))
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(json.loads(stages[0])["diff"].count("new mode"), 2)
+
     def test_section_for_an_unretained_file_fails_loud(self):
         node = json.loads(packet(["kept.py"]))
         node["diff"] += "\n" + section("dropped.py")

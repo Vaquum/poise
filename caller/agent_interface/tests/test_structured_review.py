@@ -528,6 +528,46 @@ class TestSincePositions(TestCase):
         self.assertEqual(failure.exception.code, "review_contract_violation")
         self.assertIn("no submitted verdict", str(failure.exception))
 
+    def test_reaffirmed_prior_left_finding_absent_from_since_diff_submits(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                "body": "still removed upstream"}]}
+        result, calls, _ = self._run(self._packet("c" * 40, kept, paths=("src/kept.py",)), verdict,
+                                     self._full(self.REMOVAL + "\n" + kept,
+                                              paths=("src/gone.py", "src/kept.py")))
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_left_finding_on_repeated_text_anchors_by_context(self):
+        full = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
+                          "@@ -1,5 +1,3 @@", " def a():", "-    return None", " def b():",
+                          "-    return None", " tail"])
+        since = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
+                           "@@ -8,3 +8,2 @@", " def b():", "-    return None", " tail"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/dup.py", "line": 9, "side": "LEFT", "body": "needed"}]}
+        result, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/dup.py",)), verdict,
+                                     self._full(full, paths=("src/dup.py",)))
+        self.assertIn('"review_id": 91', result)
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(4, "LEFT")])
+
+    def test_left_finding_on_indistinguishable_repeats_fails_closed(self):
+        full = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
+                          "@@ -1,5 +1,3 @@", " ctx", "-x", " ctx", "-x", " ctx"])
+        since = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
+                           "@@ -1,3 +1,2 @@", " ctx", "-x", " ctx"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/dup.py", "line": 2, "side": "LEFT", "body": "which one"}]}
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40, since, paths=("src/dup.py",)), verdict,
+                       self._full(full, paths=("src/dup.py",)))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertIn("no submitted verdict", str(failure.exception))
+
     def test_partially_stale_verdict_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])

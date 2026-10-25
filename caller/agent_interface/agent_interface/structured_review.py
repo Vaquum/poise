@@ -224,6 +224,36 @@ def _stage_texts(text: str, packet: str) -> list[str]:
     return [text.replace(packet, stage, 1) for stage in stages]
 
 
+def _neighbors(index: dict[int, str], number: int) -> tuple[list[str], list[str]]:
+    """Up to two neighboring contents on each side of a diff line."""
+    keys = sorted(index)
+    at = keys.index(number)
+    below = [index[keys[j]] for j in range(max(0, at - 2), at)]
+    above = [index[keys[j]] for j in range(at + 1, min(len(keys), at + 3))]
+    return below, above
+
+
+def _anchor(since_lines: dict[int, str], full_lines: dict[int, str],
+            since_number: int, candidates: list[int]) -> int:
+    """The PR-base line matching a since-diff removal, disambiguated by
+    neighboring context when the removed text repeats."""
+    if len(candidates) == 1:
+        return candidates[0]
+    want_below, want_above = _neighbors(since_lines, since_number)
+    scored = []
+    for candidate in candidates:
+        below, above = _neighbors(full_lines, candidate)
+        score = sum(1 for pair in zip(reversed(want_below), reversed(below)) if pair[0] == pair[1])
+        score += sum(1 for pair in zip(want_above, above) if pair[0] == pair[1])
+        scored.append((score, candidate))
+    best = max(score for score, _ in scored)
+    winners = [candidate for score, candidate in scored if score == best]
+    if len(winners) > 1:
+        raise InvalidVerdict(
+            "removed line matches several pull request lines; refusing an unverified anchor")
+    return winners[0]
+
+
 def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str,
                               verdict: dict) -> None:
     """Remap a since-scoped verdict onto the full pull request diff.
@@ -231,11 +261,12 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
     The model reviewed the diff since the last head: RIGHT numbers already
     name current-head lines, but LEFT numbers name previous-head lines, so
     each LEFT comment is remapped to base coordinates by matching its removed
-    content. A missing anchor never proves the defect is gone: if any finding
-    cannot be anchored, the review fails closed before submitting an incomplete
-    change request or filing incomplete findings for a capped approval. A
-    comment on a line the since diff never showed is a model error and fails
-    loudly."""
+    content, disambiguated by neighboring context when the text repeats. A
+    LEFT comment the since diff never showed may reaffirm a prior finding in
+    base coordinates and is kept when the pull request diff carries it. A
+    missing anchor never proves the defect is gone: if any finding cannot be
+    anchored, the review fails closed before submitting an incomplete change
+    request or filing incomplete findings for a capped approval."""
     if not packet or not verdict["comments"]:
         return
     try:
@@ -271,13 +302,18 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
             continue
         content = since_left.get(comment["path"], {}).get(comment["line"])
         if content is None:
+            if comment["line"] in full_left.get(comment["path"], {}):
+                kept.append(comment)
+                continue
             raise InvalidVerdict(
                 f"comment on {comment['path']}:{comment['line']} (LEFT) is outside the reviewed since diff")
         candidates = by_content.get((comment["path"], content), [])
         if not candidates:
             dropped.append({key: comment[key] for key in ("path", "line", "side")})
         else:
-            kept.append({**comment, "line": min(candidates)})
+            line = _anchor(since_left[comment["path"]], full_left[comment["path"]],
+                           comment["line"], candidates)
+            kept.append({**comment, "line": line})
     if dropped:
         raise InvalidVerdict(
             "follow-up findings cannot be anchored to the full PR diff; no review submitted")
