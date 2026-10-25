@@ -128,6 +128,9 @@ def init_db():
             create index if not exists calls_behavior_owner_started on calls(
                 behavior, source, lower(substr(repo || '/',1,instr(repo || '/','/')-1)), started_at desc, id desc
             ) where repo is not null and repo != '' and pr_id is not null and pr_id != '';
+            create index if not exists calls_owner on calls(
+                lower(substr(repo || '/',1,instr(repo || '/','/')-1))
+            );
             create index if not exists calls_session_behavior on calls(session_id, behavior);
             create trigger if not exists calls_diagnostic_insert after insert on calls
             when new.status != 'running' and (coalesce(new.error,'') != '' or new.error_code is not null or new.diagnostic is not null)
@@ -603,12 +606,26 @@ def logs_session_since(after: str, session: str, behavior: str, prompt: str) -> 
     return [_log_row(row) for row in rows]
 
 
-def logs_page(limit: int, cursor: str | None = None) -> dict:
+LOGS_SEARCH_MAX = 2048
+LOGS_SEARCH_SQL = """lower(
+    coalesce(id,'') || ' ' || coalesce(model,'') || ' ' || coalesce(recovery_model,'')
+    || ' ' || coalesce(behavior,'') || ' ' || coalesce(prompt,'') || ' ' || coalesce(status,'')
+    || ' ' || coalesce(actor,'') || ' ' || coalesce(repo,'') || ' ' || coalesce(pr_id,'')
+    || ' ' || coalesce(repo,'') || '#' || coalesce(pr_id,'')
+    || ' ' || '#' || coalesce(pr_id,'')
+    || ' ' || coalesce(session_id,'') || ' ' || coalesce(outcome,'') || ' ' || coalesce(error,'')
+) like '%' || ? || '%' escape '\\'"""
+
+
+def logs_page(limit: int, cursor: str | None = None, org: str | None = None, search: str | None = None) -> dict:
     """One bounded newest-first history page; rows stay oldest-first in it.
 
     Pages walk back by insertion order (rowid), so concurrent appends never
     shift them. The cursor is the next page's exclusive rowid bound, opaque
-    to callers. Each page costs its own rows, never the retained history."""
+    to callers. Each page costs its own rows, never the retained history.
+    Org narrows to one owner (case-insensitive); search matches the same
+    fields Swarm filters on (case-insensitive substring). Total counts all
+    matching rows without loading them."""
     if type(limit) is not int or not 1 <= limit <= LOGS_PAGE_LIMIT_MAX:
         raise ValueError(f"logs page limit must be 1..{LOGS_PAGE_LIMIT_MAX}")
     bound: int | None = None
@@ -616,19 +633,39 @@ def logs_page(limit: int, cursor: str | None = None) -> dict:
         if not re.fullmatch(r"[1-9][0-9]*", cursor):
             raise ValueError("logs page cursor is invalid")
         bound = int(cursor)
+    if org is not None:
+        if not isinstance(org, str) or not 1 <= len(org) <= 128 or "\x00" in org or "/" in org:
+            raise ValueError("logs page org is invalid")
+        org = org.lower()
+    if search is not None:
+        if not isinstance(search, str) or not 1 <= len(search) <= LOGS_SEARCH_MAX:
+            raise ValueError(f"logs page search must be 1..{LOGS_SEARCH_MAX} characters")
+        search = search.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     reap_interrupted()
+    filters: list[str] = []
+    params: list[object] = []
+    if org is not None:
+        filters.append(f"{LOG_OWNER_SQL}=?")
+        params.append(org)
+    if search is not None:
+        filters.append(LOGS_SEARCH_SQL)
+        params.append(search)
+    where = f" where {' and '.join(filters)}" if filters else ""
     with db() as conn:
+        total = conn.execute(f"select count(*) from calls{where}", params).fetchone()[0]
+        page_where = where + (" and" if where else " where") + " rowid < ?" if bound is not None else where
+        page_params = [*params, bound] if bound is not None else params
         rows = conn.execute(
-            f"select rowid, {LOG_ROW_COLUMNS} from calls"
-            + (" where rowid < ?" if bound is not None else "")
+            f"select rowid, {LOG_ROW_COLUMNS} from calls{page_where}"
             + " order by rowid desc limit ?",
-            ((bound, limit + 1) if bound is not None else (limit + 1,)),
+            (*page_params, limit + 1),
         ).fetchall()
     page = rows[:limit]
     oldest = page[-1]["rowid"] if page else None
     return {
         "rows": [_log_row(r) for r in reversed(page)],
         "nextCursor": str(oldest) if len(rows) > limit and oldest is not None else None,
+        "total": total,
     }
 
 
@@ -1596,7 +1633,7 @@ HELP = """usage: agent-interface BEHAVIOR ...
 behaviors:
   --models
   --refresh-models
-  --logs [--status running] [--limit 1..1000] [--cursor CURSOR]
+  --logs [--status running] [--limit 1..1000] [--cursor CURSOR] [--org OWNER] [--search TEXT]
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
   --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
@@ -1703,7 +1740,7 @@ def main():
         i = 0
         while i < len(rest):
             flag = rest[i]
-            if flag not in ("--status", "--limit", "--cursor", "--after", "--session", "--behavior", "--prompt") or flag in seen or i + 1 >= len(rest):
+            if flag not in ("--status", "--limit", "--cursor", "--org", "--search", "--after", "--session", "--behavior", "--prompt") or flag in seen or i + 1 >= len(rest):
                 usage()
             seen[flag] = rest[i + 1]
             i += 2
@@ -1717,17 +1754,19 @@ def main():
                 usage(error=str(error))
             print(json.dumps(selected, separators=(",", ":")))
             return
-        if "--status" in seen and ("--limit" in seen or "--cursor" in seen):
-            usage(error="--status running cannot combine with --limit or --cursor")
+        if "--status" in seen and ("--limit" in seen or "--cursor" in seen or "--org" in seen or "--search" in seen):
+            usage(error="--status running cannot combine with --limit, --cursor, --org or --search")
         if "--cursor" in seen and "--limit" not in seen:
             usage(error="--cursor requires --limit")
+        if ("--org" in seen or "--search" in seen) and "--limit" not in seen:
+            usage(error="--org and --search require --limit")
         if "--limit" in seen:
             try:
                 limit = int(seen["--limit"])
             except ValueError:
                 usage(error="--limit must be an integer")
             try:
-                payload: object = logs_page(limit, seen.get("--cursor"))
+                payload: object = logs_page(limit, seen.get("--cursor"), seen.get("--org"), seen.get("--search"))
             except ValueError as error:
                 usage(error=str(error))
         else:

@@ -61,7 +61,7 @@ const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
 async function cli(command: string, args: string[], options: RunFileOptions) {
   const json = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' })
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
-  if (command === 'agent-interface' && args[0] === '--logs' && args.includes('--limit')) return json({ rows: [], nextCursor: null })
+  if (command === 'agent-interface' && args[0] === '--logs' && args.includes('--limit')) return json({ rows: [], nextCursor: null, total: 0 })
   if (command === 'agent-interface' && args[0] === '--logs') return json([])
   if (command === 'github-datastore' && args[0] === 'health') {
     if (healthFailure) throw healthFailure

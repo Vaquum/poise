@@ -658,10 +658,17 @@ function renderShell() {
   viewEl.querySelector('#swarm-pagination')!.addEventListener('click', event => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-page]')
     if (!button || button.disabled) return
-    pageIndex += button.dataset.page === 'next' ? 1 : -1
-    clearRows()
-    render(false)
-    if (button.disabled) viewEl.querySelector<HTMLButtonElement>('#swarm-pagination button:not(:disabled)')?.focus()
+    void (async () => {
+      pageIndex += button.dataset.page === 'next' ? 1 : -1
+      clearRows()
+      render(false)
+      const mine = pollSequence
+      const org = getSelectedOrganization()
+      const search = searchQuery
+      const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery
+      await loadMoreForView(current)
+      if (button.disabled) viewEl.querySelector<HTMLButtonElement>('#swarm-pagination button:not(:disabled)')?.focus()
+    })()
   })
   searchEl.addEventListener('input', () => {
     if (searchDebounce) clearTimeout(searchDebounce)
@@ -670,8 +677,17 @@ function renderShell() {
       if (next === searchQuery) return
       searchQuery = next
       pageIndex = 0
+      entries = []
+      quarantined = []
+      totalMatching = 0
+      historyCursor = null
+      incompleteTotal = null
+      loadingHistory = false
+      lastLoadedAt = 0
       clearRows()
       render(false)
+      renderStaleBanner()
+      void pollOnce()
     }, 90)
   })
 }
@@ -843,10 +859,12 @@ function render(animate = true) {
   pageIndex = Math.min(pageIndex, Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1))
   const start = pageIndex * PAGE_SIZE
   const pager = viewEl.querySelector<HTMLElement>('#swarm-pagination')!
-  pager.hidden = rows.length <= PAGE_SIZE
+  const moreHistory = historyCursor !== null
+  pager.hidden = rows.length <= PAGE_SIZE && !moreHistory
   pager.querySelector<HTMLButtonElement>('[data-page="previous"]')!.disabled = pageIndex === 0
-  pager.querySelector<HTMLButtonElement>('[data-page="next"]')!.disabled = start + PAGE_SIZE >= rows.length
-  viewEl.querySelector<HTMLElement>('#swarm-page')!.textContent = rows.length ? `${start + 1}–${Math.min(start + PAGE_SIZE, rows.length)} / ${rows.length}` : ''
+  pager.querySelector<HTMLButtonElement>('[data-page="next"]')!.disabled = start + PAGE_SIZE >= rows.length && !moreHistory
+  viewEl.querySelector<HTMLElement>('#swarm-page')!.textContent = rows.length
+    ? `${start + 1}–${Math.min(start + PAGE_SIZE, rows.length)} / ${rows.length}${moreHistory ? '+' : ''}` : ''
   displayedGroups = new Map(groups.map((group) => [group.entries[0].id, group]))
   const table = viewEl.querySelector<HTMLElement>('#swarm-table')!
   const countEl = viewEl.querySelector<HTMLElement>('#swarm-count')!
@@ -1072,6 +1090,25 @@ function attachClicks() {
 // inline.
 export async function focusRow(repo: string, pr_id: string): Promise<void> {
   if (!viewEl || !bodyEl) return
+  // An active filter can hide the very row we were asked to focus. Clearing it
+  // is what the person meant by following the link — silently doing nothing
+  // was not. Server search would exclude it before it loads.
+  if (searchQuery) {
+    if (searchDebounce) {
+      clearTimeout(searchDebounce)
+      searchDebounce = null
+    }
+    searchQuery = ''
+    if (searchEl) searchEl.value = ''
+    entries = []
+    quarantined = []
+    totalMatching = 0
+    historyCursor = null
+    incompleteTotal = null
+    loadingHistory = false
+    lastLoadedAt = 0
+    pageIndex = 0
+  }
   // Pull fresh logs so behaviors that just fired show up immediately.
   await pollOnce()
   if (viewEl.hidden) return
@@ -1080,19 +1117,10 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
   // `behavior === 'pr_review'`, so the "Last triggered" links for approve-prs
   // and resolve-unblocking — which produce pr_approve and other behaviours —
   // matched nothing and the click did nothing.
-  const match = entries.find((e) =>
-    e.repo === repo && String(e.pr_id) === String(pr_id),
-  )
+  const match = await ensureTarget((e) => e.repo === repo && String(e.pr_id) === String(pr_id))
   if (!match) {
     notFocusable(`No run found for ${repo}#${pr_id}.`)
     return
-  }
-  // An active filter can hide the very row we were asked to focus. Clearing it
-  // is what the person meant by following the link — silently doing nothing
-  // was not.
-  if (!matchesSearch(match)) {
-    searchQuery = ''
-    if (searchEl) searchEl.value = ''
   }
   showRun(match)
   const row = bodyEl.querySelector<HTMLTableRowElement>(`tr.agent-row[data-id="${match.id}"]`)
@@ -1145,25 +1173,35 @@ function showRun(match: LogEntry): void {
 export async function focusCall(callId: string): Promise<void> {
   const mine = ++callFocusSequence
   if (!viewEl || !bodyEl) return
+  if (searchQuery) {
+    if (searchDebounce) {
+      clearTimeout(searchDebounce)
+      searchDebounce = null
+    }
+    searchQuery = ''
+    if (searchEl) searchEl.value = ''
+    entries = []
+    quarantined = []
+    totalMatching = 0
+    historyCursor = null
+    incompleteTotal = null
+    loadingHistory = false
+    lastLoadedAt = 0
+    pageIndex = 0
+  }
   await pollOnce()
   if (mine !== callFocusSequence || viewEl.hidden) return
-  let match = entries.find((entry) => entry.id === callId)
+  let match = await ensureTarget((entry) => entry.id === callId)
   if (!match && getSelectedOrganization()) {
     setSelectedOrganization('')
     await pollOnce()
     if (mine !== callFocusSequence || viewEl.hidden) return
-    match = entries.find((entry) => entry.id === callId)
+    match = await ensureTarget((entry) => entry.id === callId)
   }
   if (!match) {
     notFocusable(`No run found for call ${callId}.`)
     return
   }
-  if (searchDebounce) {
-    clearTimeout(searchDebounce)
-    searchDebounce = null
-  }
-  searchQuery = ''
-  if (searchEl) searchEl.value = ''
   showRun(match)
   const row = bodyEl.querySelector<HTMLTableRowElement>(`tr.agent-row[data-id="${CSS.escape(callId)}"]`)
   if (!row) {
@@ -1194,14 +1232,19 @@ function notFocusable(message: string): void {
 // click. Callers now join the request that is already running.
 let pollInFlight: Promise<void> | null = null
 let pollOrganization = ''
+let pollSearch = ''
 let pollSequence = 0
 
-interface LogFeed { logs?: LogEntry[], quarantined?: QuarantinedLog[], total?: number }
+interface LogFeed { logs?: LogEntry[], quarantined?: QuarantinedLog[], total?: number, nextCursor?: string | null }
 let incompleteTotal: number | null = null
 let loadingHistory = false
+let totalMatching = 0
+let historyCursor: string | null = null
 
-async function readLogFeed(org: string, recent = false): Promise<LogFeed> {
-  const res = await fetch(organizationUrl(recent ? '/api/agent-logs?limit=50' : '/api/agent-logs', org))
+const HISTORY_PAGE_LIMIT = 200
+
+async function readLogFeed(url: string): Promise<LogFeed> {
+  const res = await fetch(url)
   if (!res.ok) {
     const text = await res.text().catch(() => '')
     let detail = ''
@@ -1211,16 +1254,57 @@ async function readLogFeed(org: string, recent = false): Promise<LogFeed> {
   return res.json()
 }
 
-async function applyLogFeed(data: LogFeed, current: () => boolean): Promise<void> {
+function historyUrl(org: string, cursor: string | null, search: string): string {
+  let path = `/api/agent-logs?limit=${HISTORY_PAGE_LIMIT}`
+  if (cursor !== null) path += `&cursor=${encodeURIComponent(cursor)}`
+  if (search) path += `&search=${encodeURIComponent(search)}`
+  return organizationUrl(path, org)
+}
+
+async function applyFirstPage(data: LogFeed, total: number, cursor: string | null, current: () => boolean): Promise<void> {
   if (!current()) return
   entries = data.logs || []
-  incompleteTotal = typeof data.total === 'number' && data.total > entries.length ? data.total : null
-  loadingHistory = incompleteTotal !== null
-  lastLoadError = null
   quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
+  totalMatching = total
+  historyCursor = cursor
+  incompleteTotal = historyCursor !== null ? totalMatching : null
+  loadingHistory = historyCursor !== null
+  lastLoadError = null
   lastLoadedAt = Date.now()
   render()
   renderStaleBanner()
+  refreshExpandedDetails()
+}
+
+function appendPage(data: LogFeed, cursor: string | null, current: () => boolean): boolean {
+  if (!current()) return false
+  const seen = new Set(entries.map((entry) => entry.id))
+  for (const entry of data.logs || []) {
+    if (!seen.has(entry.id)) {
+      seen.add(entry.id)
+      entries.push(entry)
+    }
+  }
+  const seenQuarantined = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}`))
+  for (const row of Array.isArray(data.quarantined) ? data.quarantined : []) {
+    const key = `${row.id || ''}:${row.index}`
+    if (!seenQuarantined.has(key)) {
+      seenQuarantined.add(key)
+      quarantined.push(row)
+    }
+  }
+  if (typeof data.total === 'number') totalMatching = data.total
+  historyCursor = cursor
+  incompleteTotal = historyCursor !== null ? totalMatching : null
+  loadingHistory = historyCursor !== null
+  lastLoadedAt = Date.now()
+  render()
+  renderStaleBanner()
+  refreshExpandedDetails()
+  return true
+}
+
+function refreshExpandedDetails(): void {
   for (const entry of entries) {
     const state = expanded.get(entry.id)
     if (state) void loadReasoning(entry.id)
@@ -1228,26 +1312,85 @@ async function applyLogFeed(data: LogFeed, current: () => boolean): Promise<void
   }
 }
 
+function mergeRefresh(history: LogFeed, running: LogFeed): void {
+  const fresh = new Map<string, LogEntry>()
+  for (const entry of running.logs || []) fresh.set(entry.id, entry)
+  for (const entry of history.logs || []) {
+    if (!fresh.has(entry.id)) fresh.set(entry.id, entry)
+  }
+  const known = new Map(entries.map((entry) => [entry.id, entry]))
+  for (const [id, entry] of fresh) known.set(id, entry)
+  entries = [...known.values()].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
+  const seenQuarantined = new Set<string>()
+  const mergedQuarantined: QuarantinedLog[] = []
+  for (const row of [...(history.quarantined || []), ...(running.quarantined || []), ...quarantined]) {
+    const key = `${row.id || ''}:${row.index}:${row.error}`
+    if (!seenQuarantined.has(key)) {
+      seenQuarantined.add(key)
+      mergedQuarantined.push(row)
+    }
+  }
+  quarantined = mergedQuarantined
+  if (typeof history.total === 'number') totalMatching = history.total
+  // Previously loaded older pages stay valid: new arrivals prepend larger
+  // rowids and never shift the cursor into unloaded history.
+  incompleteTotal = historyCursor !== null ? totalMatching : null
+  loadingHistory = historyCursor !== null
+  lastLoadError = null
+  lastLoadedAt = Date.now()
+  render()
+  renderStaleBanner()
+  refreshExpandedDetails()
+}
+
+async function loadMoreForView(current: () => boolean): Promise<void> {
+  while (current() && historyCursor !== null) {
+    const org = getSelectedOrganization()
+    const search = searchQuery
+    const needed = (pageIndex + 1) * PAGE_SIZE
+    if (groupRows(groupRuns(visible())).length >= needed) return
+    const data = await readLogFeed(historyUrl(org, historyCursor, search))
+    if (!current() || org !== getSelectedOrganization() || search !== searchQuery) return
+    if (!appendPage(data, data.nextCursor ?? null, current)) return
+    if ((data.logs || []).length === 0 && (data.quarantined || []).length === 0 && data.nextCursor) continue
+  }
+}
+
 function pollOnce(): Promise<void> {
   const org = getSelectedOrganization()
-  if (pollInFlight && pollOrganization === org) return pollInFlight
+  const search = searchQuery
+  if (pollInFlight && pollOrganization === org && pollSearch === search) return pollInFlight
   pollOrganization = org
+  pollSearch = search
   const mine = ++pollSequence
-  const current = () => mine === pollSequence && org === getSelectedOrganization()
+  const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery
   const run = (async () => {
     try {
-      if (!lastLoadedAt) {
-        const recent = await readLogFeed(org, true)
-        if (!current()) return
-        await applyLogFeed(recent, current)
-        if (!current() || incompleteTotal === null) return
-      }
-      const data = await readLogFeed(org)
+      const [history, running] = await Promise.all([
+        readLogFeed(historyUrl(org, null, search)),
+        readLogFeed(organizationUrl('/api/agent-logs?status=running', org)),
+      ])
       if (!current()) return
-      await applyLogFeed(data, current)
+      if (!lastLoadedAt || entries.length === 0) {
+        await applyFirstPage(history, history.total ?? (history.logs || []).length, history.nextCursor ?? null, current)
+        if (!current()) return
+        if ((running.logs || []).length) {
+          const known = new Set(entries.map((entry) => entry.id))
+          const extra = (running.logs || []).filter((entry) => !known.has(entry.id) && matchesSearch(entry))
+          if (extra.length) {
+            entries = [...extra, ...entries].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
+            render()
+          }
+        }
+      } else {
+        if (!current()) return
+        mergeRefresh(history, running)
+      }
+      if (!current()) return
+      await loadMoreForView(current)
     } catch (err) {
       if (!current()) return
-      loadingHistory = false
+      loadingHistory = historyCursor !== null
       lastLoadError = (err as Error).message
       if (entries.length > 0) render()
       renderStaleBanner()
@@ -1257,6 +1400,21 @@ function pollOnce(): Promise<void> {
   })()
   pollInFlight = run
   return run
+}
+
+async function ensureTarget(predicate: (entry: LogEntry) => boolean): Promise<LogEntry | undefined> {
+  const mine = pollSequence
+  const org = getSelectedOrganization()
+  const search = searchQuery
+  const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery && viewEl && !viewEl.hidden
+  let match = entries.find(predicate)
+  while (!match && historyCursor !== null && current()) {
+    const data = await readLogFeed(historyUrl(org, historyCursor, search))
+    if (!current()) return undefined
+    if (!appendPage(data, data.nextCursor ?? null, current)) return undefined
+    match = entries.find(predicate)
+  }
+  return match
 }
 
 // Once Swarm had rows, a failing refresh was invisible: the table froze on the
@@ -1343,6 +1501,8 @@ export async function initSwarmView() {
       lastLoadedAt = 0
       incompleteTotal = null
       loadingHistory = false
+      totalMatching = 0
+      historyCursor = null
       pageIndex = 0
       clearRows()
       viewEl.querySelector<HTMLElement>('#swarm-table')!.hidden = true

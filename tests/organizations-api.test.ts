@@ -69,9 +69,44 @@ function writeIndex(path: string, login: string) {
 
 async function cli(command: string, args: string[], options: RunFileOptions) {
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
-  // Paged reads speak the envelope; the small fixture log fits one final page.
+  // Paged reads speak the envelope with Caller's newest-first pagination,
+  // org pre-filter and exact total. Fixture order is insertion order.
   if (command === 'agent-interface' && args[0] === '--logs' && args.includes('--limit')) {
-    return { stdout: JSON.stringify({ rows: behaviorLogs, nextCursor: null }), stderr: '' }
+    const flag = (name: string) => {
+      const at = args.indexOf(name)
+      return at >= 0 ? args[at + 1]! : undefined
+    }
+    const limit = Number(flag('--limit'))
+    const cursor = flag('--cursor')
+    const org = flag('--org')
+    const search = flag('--search')
+    const ownerOf = (repo: unknown) => typeof repo === 'string' ? repo.split('/', 1)[0].toLowerCase() : null
+    const matchesSearch = (row: Record<string, unknown>) => {
+      if (search === undefined) return true
+      const q = search.toLowerCase()
+      const repo = typeof row.repo === 'string' ? row.repo : ''
+      const pr = row.pr_id === null || row.pr_id === undefined ? '' : String(row.pr_id)
+      return [
+        row.id, row.model, row.recovery_model, row.behavior, row.prompt, row.status,
+        row.actor, row.repo, row.pr_id, row.session_id, row.outcome, row.error,
+        repo && pr ? `${repo}#${pr}` : (repo || (pr ? `#${pr}` : '')),
+      ].some((field) => String(field ?? '').toLowerCase().includes(q))
+    }
+    const matching = (behaviorLogs as Record<string, unknown>[])
+      .map((row, index) => ({ row, rowid: index + 1 }))
+      .filter(({ row }) => (org === undefined || ownerOf(row.repo) === org.toLowerCase()) && matchesSearch(row))
+    const total = matching.length
+    const bound = cursor === undefined ? undefined : Number(cursor)
+    const older = bound === undefined ? matching : matching.filter(({ rowid }) => rowid < bound)
+    const newestFirst = [...older].reverse()
+    const slice = newestFirst.slice(0, limit + 1)
+    const page = slice.slice(0, limit)
+    const oldest = page.length ? page[page.length - 1]!.rowid : null
+    return { stdout: JSON.stringify({
+      rows: [...page].reverse().map(({ row }) => row),
+      nextCursor: slice.length > limit && oldest !== null ? String(oldest) : null,
+      total,
+    }), stderr: '' }
   }
   if (command === 'agent-interface' && args[0] === '--logs') return { stdout: JSON.stringify(behaviorLogs), stderr: '' }
   if (command === 'github-interface' && args[0] === '--view-repos') {
@@ -375,29 +410,33 @@ describe('global behavior settings API', () => {
       model: 'test', prompt: '', time_elapsed: '1s' }
     behaviorLogs = [healthy, { ...healthy, id: '2'.repeat(32), pr_id: '2',
       correlation_id: 'unreadable-review', outcome: null }]
-    const response = await fetch(`${base}/api/agent-logs`)
+    const response = await fetch(`${base}/api/agent-logs?limit=100`)
     expect(response.status).toBe(200)
     const data = await response.json()
     expect(data.logs).toMatchObject([{ id: healthy.id }])
     expect(data.quarantined).toMatchObject([{ id: '2'.repeat(32), prId: '2' }])
+    expect(data.total).toBe(2)
+    expect(data.nextCursor).toBeNull()
     const diagnostics = await state()
     expect(diagnostics['review-new-prs']!.lastTriggered).toMatchObject({ target: 'Legacy/same-repo#1' })
-    behaviorLogs = [healthy, { ...healthy, repo: 'elsewhere/repo', outcome: null }]
+    // Caller pre-filters by org; a non-matching row never reaches the page.
+    // Real Caller rows cannot share an id or correlation (primary key and
+    // unique index), so cross-org ambiguity cannot arise at the source.
+    behaviorLogs = [healthy, { ...healthy, id: '3'.repeat(32), repo: 'elsewhere/repo', outcome: null,
+      correlation_id: 'elsewhere-review' }]
     await resetLogCache()
-    const scoped = await (await fetch(`${base}/api/agent-logs?org=Legacy`)).json()
-    expect(scoped.logs).toEqual([])
-    expect(scoped.quarantined).toMatchObject([{
-      id: healthy.id, repo: 'elsewhere/repo', correlationId: 'healthy-review',
-      error: expect.stringContaining('incomplete terminal outcome'),
-    }])
-    // A duplicate correlation has the same ambiguity even with a different
-    // call ID and an apparently unrelated reported organization.
-    behaviorLogs = [healthy, { ...healthy, id: '3'.repeat(32), repo: 'elsewhere/repo', outcome: null }]
+    const scoped = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=100`)).json()
+    expect(scoped.logs).toMatchObject([{ id: healthy.id }])
+    expect(scoped.quarantined).toEqual([])
+    expect(scoped.total).toBe(1)
+    // Within one org a duplicate id still withholds: the page carries both
+    // rows and the readable one is not served while ambiguous.
+    behaviorLogs = [healthy, { ...healthy, repo: 'Legacy/same-repo', outcome: null }]
     await resetLogCache()
-    const conflictingCorrelation = await (await fetch(`${base}/api/agent-logs?org=Legacy`)).json()
+    const conflictingCorrelation = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=100`)).json()
     expect(conflictingCorrelation.logs).toEqual([])
     expect(conflictingCorrelation.quarantined).toMatchObject([{
-      id: '3'.repeat(32), repo: 'elsewhere/repo', correlationId: 'healthy-review',
+      id: healthy.id, repo: 'Legacy/same-repo', correlationId: 'healthy-review',
       error: expect.stringContaining('incomplete terminal outcome'),
     }])
   })
@@ -411,25 +450,43 @@ describe('global behavior settings API', () => {
     behaviorLogs = [{ ...row(900), actor: 42 }, ...Array.from({ length: 80 }, (_, index) => row(index + 1)), row(901, 'beta/other')]
     const data = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=2`)).json()
     expect(data.logs.map((entry: { id: string }) => entry.id)).toEqual([row(80).id, row(79).id])
-    expect(data.total).toBe(80)
-    expect(data.quarantined).toMatchObject([{ id: row(900).id, error: expect.stringContaining('invalid actor') }])
-    const full = await (await fetch(`${base}/api/agent-logs?org=Legacy`)).json()
-    expect(full.logs).toHaveLength(80)
-    expect(full).not.toHaveProperty('total')
+    // Total counts matching rows at the source, including the unreadable one.
+    expect(data.total).toBe(81)
+    expect(data.nextCursor).toEqual(expect.any(String))
+    // The unreadable row is older than this page; it arrives with its page.
+    expect(data.quarantined).toEqual([])
+    const second = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=80&cursor=${data.nextCursor}`)).json()
+    expect(second.quarantined).toMatchObject([{ id: row(900).id, error: expect.stringContaining('invalid actor') }])
+    expect(second.total).toBe(81)
     const conflict = { ...row(80), actor: 42 }
     behaviorLogs.push(conflict)
     await resetLogCache()
     const withheld = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=1`)).json()
-    expect(withheld.logs[0].id).toBe(row(79).id)
-    expect(withheld.total).toBe(79)
+    expect(withheld.logs).toEqual([])
+    expect(withheld.total).toBe(82)
     expect(withheld.quarantined).toEqual(expect.arrayContaining([expect.objectContaining({ id: row(80).id })]))
   })
 
-  it.each(['0', '-1', '101', '1.5', 'abc', ''])('rejects invalid agent-log preview limit %s before reading Caller', async limit => {
+  it.each(['0', '-1', '1001', '1.5', 'abc', ''])('rejects invalid agent-log preview limit %s before reading Caller', async limit => {
     const before = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs').length
     const response = await fetch(`${base}/api/agent-logs?limit=${limit}`)
     expect(response.status).toBe(400)
-    expect((await response.json()).error).toContain('limit must be an integer from 1 to 100')
+    expect((await response.json()).error).toContain('limit must be an integer from 1 to 1000')
+    expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toHaveLength(before)
+  })
+
+  it('requires a bound for history reads and validates cursor and search before reading Caller', async () => {
+    const before = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs').length
+    for (const path of ['/api/agent-logs', '/api/agent-logs?org=Legacy', '/api/agent-logs?cursor=5', '/api/agent-logs?search=x']) {
+      const response = await fetch(`${base}${path}`)
+      expect(response.status).toBe(400)
+      expect((await response.json()).error).toMatch(/limit is required|cursor and search require limit/)
+    }
+    for (const path of ['/api/agent-logs?limit=10&cursor=0', '/api/agent-logs?limit=10&cursor=oldest',
+      '/api/agent-logs?limit=10&search=', '/api/agent-logs?limit=10&status=running&cursor=5']) {
+      const response = await fetch(`${base}${path}`)
+      expect(response.status).toBe(400)
+    }
     expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toHaveLength(before)
   })
 
@@ -455,7 +512,7 @@ describe('global behavior settings API', () => {
     expect(running.logs.map((entry: { id: string }) => entry.id)).toEqual([row(8).id, row(1).id])
     expect(running.quarantined.map((entry: { id: string }) => entry.id)).toEqual([row(5).id, row(7).id])
     expect(running).not.toHaveProperty('total')
-    const full = await (await fetch(`${base}/api/agent-logs?org=Legacy`)).json()
+    const full = await (await fetch(`${base}/api/agent-logs?org=Legacy&limit=100`)).json()
     expect(running.logs).toEqual(full.logs.filter((entry: { status: string }) => entry.status === 'running'))
     const preview = await (await fetch(`${base}/api/agent-logs?org=Legacy&status=running&limit=1`)).json()
     expect(preview.logs.map((entry: { id: string }) => entry.id)).toEqual([row(8).id])
