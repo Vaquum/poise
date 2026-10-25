@@ -1542,7 +1542,7 @@ function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry |
     recordBehaviorDeadLetter(claim, message, call.id)
     const retryFailure = claim.key === ISSUES_KEY
       ? call.error_code !== 'stopped' && (call.receipts != null || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))
-      : !boundedReviewFailure(call) && call.error_code !== 'review_packet_too_large'
+      : (!boundedReviewFailure(call) || budgetExhaustedProvenNoAction(call)) && call.error_code !== 'review_packet_too_large'
     if (retryFailure) recordBehaviorFailure(claim.key as BehaviorKey, 'worker', message, claim.target,
       claim.key === ISSUES_KEY ? { errorCode: call.error_code, held: !issueFailureCanRetry(claim.target, call), callId: call.id } : {})
   })()
@@ -1878,7 +1878,11 @@ async function reconcileBehaviorLaunchClaims(
           continue
         }
       }
-      deadLetterClaim(claim, call.error || 'Review needs attention')
+      const message = call.error || 'Review needs attention'
+      if (deadLetterClaim(claim, message) && budgetExhaustedProvenNoAction(call)) {
+        recordBehaviorFailure(behavior, 'worker', message, claim.target,
+          { errorCode: call.error_code, held: false, callId: call.id })
+      }
       continue
     }
     const preflightFailed = FAILED_AGENT_STATUSES.has(status)
@@ -3180,6 +3184,19 @@ function boundedReviewFailure(call: LogEntry): boolean {
       || /^\w+ behavior must produce exactly one atomic /.test(call.error || ''))
 }
 
+// A budget-exhausted run that proved it posted nothing is a provider-side
+// failure, not an ambiguous side effect: Caller verifies against live
+// GitHub before failing this way, and says so when it cannot. It retries
+// the same head on backoff once the provider answers again; only an
+// uncertain submission holds.
+function budgetExhaustedProvenNoAction(call: LogEntry): boolean {
+  return call.review_policy === REVIEW_POLICY
+    && call.error_code === 'review_budget_exhausted'
+    && postedNothing(call)
+    && call.review_comments == null
+    && !/could not prove a safe recovery/.test(call.error || '')
+}
+
 // An explicit operator retry releases only failed slots whose live GitHub
 // inventory proves no unclaimed or pending publication. The scheduler owns
 // the next launch; this API neither submits reviews nor rewrites Caller logs.
@@ -3333,7 +3350,7 @@ async function releaseFailedBehaviorIfNoAction(
       }
     }
   }
-  if (boundedReviewFailure(call) && call.model === configuredModel
+  if (boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call) && call.model === configuredModel
     && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
   const blockedPacket = call.action === 'not_started'
     && call.outcome === 'preflight_failed'
@@ -3581,9 +3598,10 @@ async function dismissedApprovalHeld(pr: DatastorePr, head: string, model: strin
       || call.expected_head !== head || !Number.isFinite(Date.parse(claim.launchRequestedAt))
       || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
       || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)
-      || call.action !== 'not_started' || call.outcome !== 'preflight_failed'
+      || (!budgetExhaustedProvenNoAction(call)
+        && (call.action !== 'not_started' || call.outcome !== 'preflight_failed'))
       || call.head_sha !== null || call.review_id != null || call.receipts != null || call.review_comments != null) return true
-    return boundedReviewFailure(call) && call.model === model
+    return boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call) && call.model === model
       || !behaviorRetryDue('approve-prs', claim.target)
   })
 }
@@ -6532,6 +6550,14 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
 export function getBehaviorDiagnosticIncidents(snapshot: AgentLogSnapshot | null) {
   const scoped = () => behaviorIncidentDiagnostics(listBehaviorDeadLetters(500), snapshot,
     BEHAVIOR_KEYS.flatMap((behavior) => [...listBehaviorLaunchClaims(behavior), ...failedBehaviorLaunches(behavior)]))
+    // A held row shows when its automatic retry runs: the failure clock for
+    // this exact attempt, never a newer attempt's clock on an older row.
+    .map((incident): typeof incident & { nextRetryAt?: string } => {
+      if (!incident.callId || !(BEHAVIOR_KEYS as readonly string[]).includes(incident.behavior)) return incident
+      const failure = readBehaviorFailure(incident.behavior as BehaviorKey, incident.target)
+      if (failure?.callId !== incident.callId) return incident
+      return { ...incident, nextRetryAt: new Date(failure.nextRetryAtMs).toISOString() }
+    })
   if (behaviorOrganization.getStore() !== undefined) return scoped()
   const organizations = readyOrganizations()
   return organizations.length ? organizations.flatMap((org) => behaviorOrganization.run(org, scoped)) : scoped()
