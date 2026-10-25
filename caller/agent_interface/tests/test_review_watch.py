@@ -415,6 +415,36 @@ class TestRateLimitAbort(TestCase):
             abort.scan(out, err)
             self.assertIsNotNone(abort.since)
 
+    def test_bare_mention_without_throttle_action_never_aborts(self):
+        abort = RateLimitAbort()
+        abort.note(b'{"type":"assistant","text":"mind the rate_limit window here"}\n')
+        abort.note(b"reasoning: the rate limit resets hourly, keep reviewing\n")
+        self.assertIsNone(abort.since)
+        proc = SimpleNamespace(pid=1234)
+        with patch.object(review_watch, "monotonic", return_value=1_000_000.0), \
+                patch.object(review_watch, "_stop_process_group") as stop:
+            abort.check("claude", proc)
+        stop.assert_not_called()
+
+    def test_throttle_action_counts_without_a_status_code(self):
+        abort = RateLimitAbort()
+        abort.note(b"error: rate limit exceeded, retrying in 30s\n")
+        self.assertIsNotNone(abort.since)
+
+    def test_check_leaves_a_split_fragment_for_the_next_read(self):
+        abort = RateLimitAbort()
+        with tempfile.TemporaryFile(mode="w+t") as out, tempfile.TemporaryFile(mode="w+t") as err:
+            out.write("Reconnecting...")
+            out.flush()
+            abort.scan(out, err)
+            self.assertIsNone(abort.since)
+            abort.check("codex", SimpleNamespace())
+            self.assertEqual(abort.pending_out, b"Reconnecting...")
+            out.write(" 2/5, waiting\n")
+            out.flush()
+            abort.scan(out, err)
+            self.assertIsNotNone(abort.since)
+
     def test_scan_reads_stderr_too(self):
         abort = RateLimitAbort()
         with tempfile.TemporaryFile(mode="w+t") as out, tempfile.TemporaryFile(mode="w+t") as err:

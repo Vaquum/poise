@@ -939,14 +939,16 @@ function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, 
   return true
 }
 
-// The reviewers that launch now: the roster without tripped identities, the
-// next configured reviewers sliding into their places, slots positional.
+// The reviewers that launch now: the admitted slots as targets, each running
+// the next untripped model — the substitute verdict lands on the waiting
+// slot instead of stranding its ledger aggregate.
 async function launchReviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review'): Promise<ReviewPanel> {
   const full = await reviewPanel(REVIEWER_SLOTS.length, place)
-  const reviewers = full.reviewers
-    .filter(({ model }) => !reviewerTripped(model))
-    .slice(0, count)
-    .map(({ model }, index) => ({ slot: REVIEWER_SLOTS[index], model }))
+  const targets = full.reviewers.slice(0, count)
+  const models = full.reviewers.filter(({ model }) => !reviewerTripped(model)).slice(0, count)
+  const reviewers = targets.slice(0, models.length).map((target, index) => ({
+    slot: target.slot, model: models[index].model, recovery: models[index].recovery,
+  }))
   return { ...full, reviewers }
 }
 
@@ -970,7 +972,11 @@ async function retireStaleReviewerTrips(): Promise<void> {
     }
   }
   try {
-    configured.add((await reviewChoice('pr_approve')).model)
+    const approval = await reviewChoice('pr_approve')
+    // Every slot model, not just the approval's current one: a fallback
+    // running on a later slot trips that model, and a review tick must not
+    // retire the trip while the backoff still holds it.
+    for (const slot of MODEL_SLOTS) configured.add(resolveSlots(approval.catalog, getModelSettings().slots)[slot])
   } catch {
     return
   }
@@ -980,14 +986,20 @@ async function retireStaleReviewerTrips(): Promise<void> {
 }
 
 // The approval slot that launches now: the PR approval place's slot unless
-// tripped, else the next slot the place can run; null when every slot is
-// tripped. A peek: the probe claim happens beside the spawn, like a panel.
+// tripped, else the next slot the place can run; null when every runnable
+// slot is tripped. When no slot runs there at all, the catalog seed still
+// approves. A peek: the probe claim happens beside the spawn, like a panel.
 async function approvalSlot(): Promise<{ slot: ReviewerSlot, model: string, recovery: string, catalog: Catalog } | null> {
   const choice = await reviewChoice('pr_approve')
   const slots = resolveSlots(choice.catalog, getModelSettings().slots)
-  for (const slot of MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(choice.slot))) {
+  const runnable = MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(choice.slot))
+    .filter((slot) => isPlaceModel(choice.catalog, 'pr_approve', slots[slot]))
+  if (runnable.length === 0) {
+    return { slot: choice.slot, model: choice.model, recovery: recoveryModel(choice.catalog, 'pr_approve', slots, choice.slot), catalog: choice.catalog }
+  }
+  for (const slot of runnable) {
     const model = slots[slot]
-    if (!isPlaceModel(choice.catalog, 'pr_approve', model) || reviewerTripped(model)) continue
+    if (reviewerTripped(model)) continue
     return { slot, model, recovery: recoveryModel(choice.catalog, 'pr_approve', slots, slot), catalog: choice.catalog }
   }
   return null
@@ -2466,7 +2478,7 @@ function settleClaimAfterExit(
 async function slotModel(slot: ReviewerSlot): Promise<{ model: string, recovery: string, catalog: Catalog } | null> {
   const panel = await launchReviewPanel(getReviewers('review-new-prs'))
   const reviewer = panel.reviewers.find((entry) => entry.slot === slot)
-  return reviewer ? { model: reviewer.model, recovery: panel.recovery, catalog: panel.catalog } : null
+  return reviewer ? { model: reviewer.model, recovery: reviewer.recovery, catalog: panel.catalog } : null
 }
 
 interface PreparedReviewTarget {
@@ -5470,7 +5482,7 @@ async function planIssueReviews(
 async function issueSlotModel(slot: ReviewerSlot): Promise<{ model: string, recovery: string, catalog: Catalog } | null> {
   const panel = await launchReviewPanel(getReviewers(ISSUES_KEY), 'issue_review')
   const reviewer = panel.reviewers.find((entry) => entry.slot === slot)
-  return reviewer ? { model: reviewer.model, recovery: panel.recovery, catalog: panel.catalog } : null
+  return reviewer ? { model: reviewer.model, recovery: reviewer.recovery, catalog: panel.catalog } : null
 }
 
 async function fireIssueReview(

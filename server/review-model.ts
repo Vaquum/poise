@@ -36,22 +36,24 @@ export async function reviewChoice(place: ReviewPlace): Promise<ReviewChoice> {
 }
 
 export interface ReviewPanel {
-  reviewers: Array<{ slot: ModelSlot, model: string }>
-  recovery: string
+  reviewers: Array<{ slot: ModelSlot, model: string, recovery: string }>
   catalog: Catalog
 }
 
 // The reviewers of a new pull request or issue, the place's slot first: as
-// many of the following slots as Behaviors asks for. When no slot model can
-// run there, the one launchable resolution still reviews.
+// many of the following slots as Behaviors asks for, each with the recovery
+// model after its own slot. When no slot model can run there, the one
+// launchable resolution still reviews.
 export async function reviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review'): Promise<ReviewPanel> {
   const catalog = await supportedCatalog(place)
   const settings = getModelSettings()
   const start = resolvePlace(catalog, place, settings)
   const slots = resolveSlots(catalog, settings.slots)
   const reviewers = slotPanel(catalog, place, slots, start.slot, count)
-  if (reviewers.length === 0) reviewers.push({ slot: start.slot, model: start.model })
-  return { reviewers, recovery: recoveryModel(catalog, place, slots, start.slot), catalog }
+  if (reviewers.length === 0) {
+    reviewers.push({ slot: start.slot, model: start.model, recovery: recoveryModel(catalog, place, slots, start.slot) })
+  }
+  return { reviewers, catalog }
 }
 
 // Whether launching this identity needs the Claude.ai sign-in Poise monitors.

@@ -676,6 +676,8 @@ interface ModelPlace {
   key: string
   label: string
   why: string
+  slot: Slot
+  stored: { slot: Slot } | null
 }
 interface ModelsAnswer { catalog: { models: CatalogModel[], review_providers: string[] }, slots: ModelSlots, places: ModelPlace[] }
 type Slot = 'primary' | 'secondary' | 'tertiary'
@@ -730,7 +732,7 @@ function modelsStep(ctx: StepContext): StepView {
           + (off.length ? `<optgroup label="Not signed in">${off.map((model) => option(model, true)).join('')}</optgroup>` : '')
       }
       const provider = (identity: string) => eligible.find((model) => model.identity === identity)?.provider ?? ''
-      const slotOptions = MODEL_SLOTS.map((slot) => `<option value="${slot}">${SLOT_LABELS[slot]}</option>`).join('')
+      const slotOptions = (selected: string) => MODEL_SLOTS.map((slot) => `<option value="${slot}"${slot === selected ? ' selected' : ''}>${SLOT_LABELS[slot]}</option>`).join('')
       placesEl.innerHTML = `
           <div class="ob-place" data-slots>
             <div class="ob-place-head"><span class="ob-place-name">Models</span></div>
@@ -753,7 +755,7 @@ function modelsStep(ctx: StepContext): StepView {
             <div class="ob-place-grid">
               <label class="ob-model">
                 <span class="st-sublabel">Slot</span>
-                <select class="st-select" data-place-slot aria-label="${escapeHtml(place.label)} slot">${slotOptions}</select>
+                <select class="st-select" data-place-slot aria-label="${escapeHtml(place.label)} slot">${slotOptions(place.stored?.slot ?? place.slot)}</select>
               </label>
             </div>
           </div>`).join('')

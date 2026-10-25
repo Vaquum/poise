@@ -26,10 +26,26 @@ RATE_LIMIT_ABORT_SECONDS = 60
 _RATE_LIMIT_MARKERS = (
     b"reconnecting",
     b"exceeded retry limit",
+    b"too many requests",
+)
+_RATE_LIMIT_WORDS = (
     b"rate limit",
     b"rate_limit",
     b"rate-limit",
-    b"too many requests",
+)
+# A bare mention ("mind the rate_limit window") is assistant prose, not a
+# throttle event: provider diagnostics say what they are doing about it.
+_THROTTLE_COMPANIONS = (
+    b"retry",
+    b"retries",
+    b"reconnect",
+    b"backoff",
+    b"waiting",
+    b"attempt",
+    b"exceed",
+    b"throttl",
+    b"cooldown",
+    b"429",
 )
 _STATUS_429 = re.compile(rb"(?:status|http_status)\D{0,3}429\b")
 _GITHUB_STATUS = re.compile(rb"github\s+\d{3}")
@@ -46,7 +62,10 @@ def _rate_limited(line: bytes) -> bool:
     if _GITHUB_STATUS.search(lowered):
         # GitHub's own limit: switching models cannot fix it.
         return False
-    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS) or bool(_STATUS_429.search(lowered))
+    if any(marker in lowered for marker in _RATE_LIMIT_MARKERS) or _STATUS_429.search(lowered):
+        return True
+    return any(word in lowered for word in _RATE_LIMIT_WORDS) \
+        and any(companion in lowered for companion in _THROTTLE_COMPANIONS)
 
 
 class RateLimitAbort:
@@ -94,15 +113,10 @@ class RateLimitAbort:
         else:
             self.since = None
 
-    def flush(self) -> None:
-        for attr in ("pending_out", "pending_err"):
-            pending = getattr(self, attr)
-            if pending:
-                self.feed(pending)
-                setattr(self, attr, b"")
-
     def check(self, provider: str | None, process: subprocess.Popen) -> None:
-        self.flush()
+        # Only complete lines judge: a pending fragment may hold half a
+        # marker, and feeding it early would both lose the signal and reset
+        # the clock. scan() carries fragments across reads instead.
         if self.since is None or monotonic() - self.since < RATE_LIMIT_ABORT_SECONDS:
             return
         _stop_process_group(process)

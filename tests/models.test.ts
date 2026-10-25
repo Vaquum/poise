@@ -82,6 +82,16 @@ describe('resolving the slots against the live catalog', () => {
     expect(resolved.tertiary).toBe('grok-4.6-xhigh')
     expect(resolved.notes).toEqual(['gemini-3.1-pro-high is no longer in the catalog; using grok-4.6-xhigh.'])
   })
+
+  it('seeds a missing seat past the stored picks instead of repeating one', () => {
+    // The tertiary seed for this primary is the stored secondary itself.
+    expect(models.resolveSlots(catalog, { primary: 'opus-5-xhigh', secondary: 'grok-4.6-xhigh' })).toEqual({
+      primary: 'opus-5-xhigh',
+      secondary: 'grok-4.6-xhigh',
+      tertiary: 'gpt-6-astra-ultra',
+      notes: [],
+    })
+  })
 })
 
 describe('resolving a place against the slots', () => {
@@ -116,18 +126,23 @@ describe('resolving a place against the slots', () => {
   })
 
   it('lists the reviewers Behaviors asks for, the place slot first', () => {
-    expect(models.slotPanel(catalog, 'pr_review', slots, 'primary', 1)).toEqual([{ slot: 'primary', model: 'opus-5-max' }])
+    expect(models.slotPanel(catalog, 'pr_review', slots, 'primary', 1)).toEqual([
+      { slot: 'primary', model: 'opus-5-max', recovery: 'grok-4.6-xhigh' },
+    ])
     expect(models.slotPanel(catalog, 'pr_review', slots, 'primary', 2)).toEqual([
-      { slot: 'primary', model: 'opus-5-max' }, { slot: 'secondary', model: 'grok-4.6-xhigh' },
+      { slot: 'primary', model: 'opus-5-max', recovery: 'grok-4.6-xhigh' },
+      { slot: 'secondary', model: 'grok-4.6-xhigh', recovery: 'gpt-6-astra-ultra' },
     ])
     expect(models.slotPanel(catalog, 'pr_review', slots, 'primary', 7).map((r) => r.slot)).toEqual(['primary', 'secondary', 'tertiary'])
     // A panel starting past Primary runs fewer than asked when the slots run out.
     expect(models.slotPanel(catalog, 'pr_review', slots, 'secondary', 3)).toEqual([
-      { slot: 'secondary', model: 'grok-4.6-xhigh' }, { slot: 'tertiary', model: 'gpt-6-astra-ultra' },
+      { slot: 'secondary', model: 'grok-4.6-xhigh', recovery: 'gpt-6-astra-ultra' },
+      { slot: 'tertiary', model: 'gpt-6-astra-ultra', recovery: 'gpt-6-astra-ultra' },
     ])
     // A panel never launches a model the place cannot run.
     expect(models.slotPanel(narrow, 'pr_review', slots, 'primary', 3)).toEqual([
-      { slot: 'primary', model: 'opus-5-max' }, { slot: 'tertiary', model: 'gpt-6-astra-ultra' },
+      { slot: 'primary', model: 'opus-5-max', recovery: 'gpt-6-astra-ultra' },
+      { slot: 'tertiary', model: 'gpt-6-astra-ultra', recovery: 'gpt-6-astra-ultra' },
     ])
   })
 
@@ -217,7 +232,8 @@ describe('the Issue review place', () => {
     expect(models.resolvePlace(issueOnly, 'issue_review', { slots })).toEqual({ slot: 'primary', model: 'opus-5-max', notes: [] })
     // Muse cannot run an issue review on the narrowed catalog; the panel skips it.
     expect(models.slotPanel(issueOnly, 'issue_review', slots, 'primary', 3)).toEqual([
-      { slot: 'primary', model: 'opus-5-max' }, { slot: 'tertiary', model: 'grok-4.6-xhigh' },
+      { slot: 'primary', model: 'opus-5-max', recovery: 'grok-4.6-xhigh' },
+      { slot: 'tertiary', model: 'grok-4.6-xhigh', recovery: 'gpt-6-astra-ultra' },
     ])
   })
 

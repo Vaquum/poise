@@ -279,8 +279,13 @@ export function resolveSlots(catalog: Catalog, stored: ModelSlotChoices | undefi
   for (const slot of ['secondary', 'tertiary'] as const) {
     let identity = stored?.[slot]
     if (!usable(identity)) {
-      if (identity) notes.push(`${identity} is no longer in the catalog; using ${seeds[slot]}.`)
-      identity = seeds[slot]
+      // A seed may repeat a stored pick — partial slots, or a legacy pair
+      // migrated into them — so a later seat takes the next seed instead.
+      const seed = [seeds[slot], seeds.secondary, seeds.tertiary]
+        .find((candidate) => candidate !== resolved.primary && candidate !== resolved.secondary)
+        ?? seeds[slot]
+      if (identity) notes.push(`${identity} is no longer in the catalog; using ${seed}.`)
+      identity = seed
     }
     resolved[slot] = identity!
   }
@@ -326,12 +331,12 @@ export function slotPanel(
   slots: { primary: string, secondary: string, tertiary: string },
   start: ModelSlot,
   count: number,
-): Array<{ slot: ModelSlot, model: string }> {
+): Array<{ slot: ModelSlot, model: string, recovery: string }> {
   return MODEL_SLOTS
     .slice(MODEL_SLOTS.indexOf(start))
     .filter((slot) => isPlaceModel(catalog, place, slots[slot]))
     .slice(0, Math.max(1, Math.min(MODEL_SLOTS.length, count)))
-    .map((slot) => ({ slot, model: slots[slot] }))
+    .map((slot) => ({ slot, model: slots[slot], recovery: recoveryModel(catalog, place, slots, slot) }))
 }
 
 // The recovery model Caller switches to after a Claude output limit: the
