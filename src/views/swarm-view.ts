@@ -689,14 +689,15 @@ function renderShell() {
       if (next === searchQuery) return
       searchQuery = next
       pageIndex = 0
-      entries = []
+      // Filter the cache at once so the control answers while its server
+      // read is still out; the read refreshes the matches behind it.
+      entries = entries.filter(matchesSearch)
       historyIds.clear()
       quarantined = []
       totalMatching = 0
       historyCursor = null
       incompleteTotal = null
       loadingHistory = false
-      lastLoadedAt = 0
       clearRows()
       render(false)
       renderStaleBanner()
@@ -1132,7 +1133,7 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
   // and resolve-unblocking — which produce pr_approve and other behaviours —
   // matched nothing and the click did nothing.
   const pollBefore = pollSequence
-  const match = await ensureTarget((e) => e.repo === repo && String(e.pr_id) === String(pr_id))
+  const match = await ensureTarget((e) => e.repo === repo && String(e.pr_id) === String(pr_id), true)
   if (viewEl.hidden || pollBefore !== pollSequence) return
   if (!match) {
     notFocusable(`No run found for ${repo}#${pr_id}.`)
@@ -1350,19 +1351,38 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   }
   const known = new Map(entries.map((entry) => [entry.id, entry]))
   let arrivals = false
+  // A fresh history page carrying unseen rows shifts every retained page
+  // boundary: the cached older page is no longer contiguous with the new
+  // cursor, so its ids must leave the covered set or Next would skip the
+  // gap and display older cached history as the next page.
+  let historyArrivals = false
+  for (const entry of history.logs || []) {
+    if (!known.has(entry.id)) historyArrivals = true
+  }
   for (const [id, entry] of fresh) {
     if (!known.has(id)) arrivals = true
     known.set(id, entry)
   }
-  for (const entry of history.logs || []) historyIds.add(entry.id)
+  const knownBadBefore = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}:${row.error}`))
+  if (!historyArrivals) {
+    historyArrivals = (history.quarantined || [])
+      .some((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
+  }
+  if (historyArrivals) historyIds = new Set((history.logs || []).map((entry) => entry.id))
+  else for (const entry of history.logs || []) historyIds.add(entry.id)
   // New unreadable calls shift page boundaries exactly like readable ones;
   // ignoring them would keep a stale cursor that skips the intervening range.
   if (!arrivals) {
-    const knownBad = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}:${row.error}`))
     arrivals = [...(history.quarantined || []), ...(running.quarantined || [])]
-      .some((row) => !knownBad.has(`${row.id || ''}:${row.index}:${row.error}`))
+      .some((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
   }
-  entries = [...known.values()].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
+  // Fresh first, then retained: the feeds arrive newest-first, and the
+  // stable time sort keeps that server order for ties, so a new arrival
+  // lands above the rows it displaced instead of sorting by id.
+  const withMs = [...fresh.values(), ...entries.filter((entry) => !fresh.has(entry.id))]
+    .map((entry) => [startedAtMs(entry), entry] as const)
+  withMs.sort((a, b) => b[0] - a[0])
+  entries = withMs.map(([, entry]) => entry)
   const seenQuarantined = new Set<string>()
   const mergedQuarantined: QuarantinedLog[] = []
   for (const row of [...(history.quarantined || []), ...(running.quarantined || []), ...quarantined]) {
@@ -1455,13 +1475,27 @@ async function settleStaleRunning(freshIds: Set<string>, current: () => boolean)
     lastLoadError = `Settle failed for ${failures.length} running call${failures.length === 1 ? '' : 's'} (${failures.join(', ')}): ${settled.find((item) => item.error)?.error || 'lookup failed'}`
   }
   if (!changed && !failures.length) return
-  entries = [...byId.values()].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
+  // Stable: ties keep the retained order instead of reshuffling by id.
+  const withMs = [...byId.values()].map((entry) => [startedAtMs(entry), entry] as const)
+  withMs.sort((a, b) => b[0] - a[0])
+  entries = withMs.map(([, entry]) => entry)
   render()
   renderStaleBanner()
   refreshExpandedDetails()
 }
 
-function pollOnce(): Promise<void> {
+// Entry fills the first page behind the recent rows: small histories arrive
+// whole, larger ones stop at the mount bound, one bounded page per request.
+// Later polls never chase: pagination, search and deep links page on demand.
+async function chaseHistoryFill(current: () => boolean, org: string, search: string): Promise<void> {
+  while (current() && historyCursor !== null && entries.length < PAGE_SIZE) {
+    const data = await readLogFeed(historyUrl(org, historyCursor, search))
+    if (!current() || org !== getSelectedOrganization() || search !== searchQuery) return
+    appendPage(data, data.nextCursor ?? null, current)
+  }
+}
+
+function pollOnce(chase = false): Promise<void> {
   const org = getSelectedOrganization()
   const search = searchQuery
   if (pollInFlight && pollOrganization === org && pollSearch === search) return pollInFlight
@@ -1471,19 +1505,21 @@ function pollOnce(): Promise<void> {
   const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery
   const run = (async () => {
     try {
-      const [history, running] = await Promise.all([
-        readLogFeed(historyUrl(org, null, search)),
-        readLogFeed(organizationUrl('/api/agent-logs?status=running', org)),
-      ])
-      if (!current()) return
       if (!lastLoadedAt || entries.length === 0) {
+        const [history, running] = await Promise.all([
+          readLogFeed(historyUrl(org, null, search)),
+          readLogFeed(organizationUrl('/api/agent-logs?status=running', org)),
+        ])
+        if (!current()) return
         await applyFirstPage(history, history.total ?? (history.logs || []).length, history.nextCursor ?? null, current)
         if (!current()) return
         if ((running.logs || []).length) {
           const known = new Set(entries.map((entry) => entry.id))
           const extra = (running.logs || []).filter((entry) => !known.has(entry.id) && matchesSearch(entry))
           if (extra.length) {
-            entries = [...extra, ...entries].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
+            const withMs = [...extra, ...entries].map((entry) => [startedAtMs(entry), entry] as const)
+            withMs.sort((a, b) => b[0] - a[0])
+            entries = withMs.map(([, entry]) => entry)
             render()
           }
         }
@@ -1503,7 +1539,17 @@ function pollOnce(): Promise<void> {
           }
           if (added) renderStaleBanner()
         }
+        if (chase && current()) await chaseHistoryFill(current, org, search)
       } else {
+        if (!current()) return
+        const history = await readLogFeed(historyUrl(org, null, search))
+        if (!current()) return
+        // History holds every call including running ones, so a refresh
+        // whose first page is complete already saw them all; the running
+        // lane only matters while older history is still unloaded.
+        const running: LogFeed = history.nextCursor == null
+          ? { logs: [] }
+          : await readLogFeed(organizationUrl('/api/agent-logs?status=running', org))
         if (!current()) return
         mergeRefresh(history, running)
         if (!current()) return
@@ -1526,18 +1572,22 @@ function pollOnce(): Promise<void> {
   return run
 }
 
-async function ensureTarget(predicate: (entry: LogEntry) => boolean): Promise<LogEntry | undefined> {
+async function ensureTarget(predicate: (entry: LogEntry) => boolean, preferHistory = false): Promise<LogEntry | undefined> {
   const mine = pollSequence
   const org = getSelectedOrganization()
   const search = searchQuery
   const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery && viewEl && !viewEl.hidden
-  let match = entries.find(predicate)
+  // History pages arrive newest-first, so the first history-backed match is
+  // the newest run; a running-feed match may be older than unloaded history.
+  const find = (historyOnly: boolean) => entries.find((entry) => predicate(entry) && (!historyOnly || historyIds.has(entry.id)))
+  let match = find(preferHistory)
   while (!match && historyCursor !== null && current()) {
     const data = await readLogFeed(historyUrl(org, historyCursor, search))
     if (!current()) return undefined
     if (!appendPage(data, data.nextCursor ?? null, current)) return undefined
-    match = entries.find(predicate)
+    match = find(preferHistory)
   }
+  if (!match && preferHistory) match = entries.find(predicate)
   return match
 }
 
@@ -1644,7 +1694,7 @@ export async function initSwarmView() {
   if (lastLoadedAt) queueMicrotask(() => { render(false); renderStaleBanner() })
   startSwarmPolling()
   if (!startedTickTimer) startedTickTimer = setInterval(refreshStartedCells, STARTED_TICK_MS)
-  await pollOnce()
+  await pollOnce(true)
 }
 
 export function stopSwarmRefresh() {
