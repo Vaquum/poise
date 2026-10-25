@@ -1204,7 +1204,8 @@ const PR_OPERATION_EVALUATION_LEASE_MS = 65_000
 // One behavior tick's per-PR work stays inside the CLI budget: evidence
 // batches of ten fit the 30 s CLI budget under load, and preparation and
 // approval launches run in small pools instead of fanning out over every
-// candidate at once.
+// candidate at once. Pool workers start across event-loop turns, so one
+// tick's synchronous forks never land back-to-back in a single drain.
 export const PR_READ_BATCH_SIZE = 10
 export const REVIEW_PREPARE_CONCURRENCY = 5
 export const APPROVE_FIRE_CONCURRENCY = 3
@@ -2277,16 +2278,26 @@ function orderByCursor(prs: DatastorePr[], cursorKey: string): DatastorePr[] {
 
 // A fixed pool: queued items check the sweep deadline when they start, not
 // only when they are enqueued, so an ended sweep begins no new CLI work.
-async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
+// Workers start across event-loop turns: each worker's first task reaches
+// its synchronous spawn without crossing a macrotask, so starting every
+// worker at once lands each fork back-to-back in one drain and stalls
+// queued requests behind the whole burst.
+export async function forEachPool<T>(items: readonly T[], limit: number, task: (item: T) => Promise<void>): Promise<void> {
   let next = 0
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+  const worker = async (): Promise<void> => {
     for (;;) {
       if (behaviorAborted()) return
       const index = next++
       if (index >= items.length) return
       await task(items[index]!)
     }
-  })
+  }
+  const workers: Array<Promise<void>> = []
+  const count = Math.min(limit, items.length)
+  for (let started = 0; started < count; started++) {
+    workers.push(worker())
+    if (started + 1 < count) await new Promise<void>((resolve) => setImmediate(resolve))
+  }
   await Promise.all(workers)
 }
 
@@ -5170,7 +5181,16 @@ async function readSubIssues(entries: readonly EligibleIssue[]): Promise<Map<str
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length) }, reader))
+  // Readers start across event-loop turns like forEachPool workers: each
+  // reader's first CLI spawn is synchronous, so starting every reader at
+  // once lands each fork back-to-back in one drain.
+  const readers: Array<Promise<void>> = []
+  const readerCount = Math.min(SUB_ISSUE_READS_AT_ONCE, entries.length)
+  for (let started = 0; started < readerCount; started++) {
+    readers.push(reader())
+    if (started + 1 < readerCount) await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+  await Promise.all(readers)
   return subIssues
 }
 

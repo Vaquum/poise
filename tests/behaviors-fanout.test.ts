@@ -147,6 +147,26 @@ describe('review-new-prs prepare pool', () => {
   })
 })
 
+describe('prepare pool startup', () => {
+  it('lets the event loop run between worker starts instead of forking back-to-back', async () => {
+    const { behaviors: runtime } = await loadModules()
+    // Drain anything queued, so the marker below is the first loop callback.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const order: string[] = []
+    setImmediate(() => { order.push('loop') })
+    await runtime.forEachPool(['a', 'b'], 2, async (item) => {
+      order.push(`start-${item}`)
+      // Production tasks await their CLI; without a real wait one worker
+      // would drain the queue before the second starts.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+    })
+    // Worker starts spread across loop turns: queued loop work runs after
+    // the first start instead of behind the whole fan-out.
+    expect(order[0]).toBe('start-a')
+    expect(order[1]).toBe('loop')
+  })
+})
+
 describe('review checkout in the launch phase', () => {
   async function startReviewing() {
     arrangeCli(false)
