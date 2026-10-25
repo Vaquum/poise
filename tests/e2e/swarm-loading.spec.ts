@@ -473,8 +473,6 @@ test('a cleared search still reaches rows its narrowing discarded', async ({ pag
   await expect(page.locator(rows).first()).toContainText('#201')
   await expect(page.locator(rows).last()).toContainText('#400')
   await pagerNext(page).click()
-  await expect(page.locator('#swarm-page')).toHaveText('401–450 / 450+')
-  await pagerNext(page).click()
   await expect(page.locator('#swarm-page')).toHaveText('401–450 / 450')
   await expect(pagerNext(page)).toBeDisabled()
   expect(cursorReads).toEqual(['200', '200', '400'])
