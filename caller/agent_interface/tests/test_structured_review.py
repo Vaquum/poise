@@ -416,7 +416,7 @@ class TestSincePositions(TestCase):
         node["diff"] = diff
         return json.dumps(node)
 
-    def _run(self, packet, verdict, full):
+    def _run(self, packet, verdict, full, **options):
         calls = []
 
         def process(args, **kwargs):
@@ -433,7 +433,7 @@ class TestSincePositions(TestCase):
                 patch.object(structured_review, "fetch_packet", return_value=full) as fetch:
             result = structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
                                            "pr_approve", "https://github.com/o/r/pull/12", "bit-mis",
-                                           "a" * 40, 60, packet=packet)
+                                           "a" * 40, 60, packet=packet, **options)
         return result, calls, fetch
 
     def test_removal_finding_inside_the_pr_diff_submits(self):
@@ -510,19 +510,20 @@ class TestSincePositions(TestCase):
         self.assertEqual(failure.exception.code, "review_contract_violation")
         self.assertIn("no submitted verdict", str(failure.exception))
 
-    def test_partially_stale_verdict_submits_only_submittable_findings(self):
+    def test_capped_partial_stale_verdict_preserves_every_finding_or_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
         verdict = {"action": "request_changes", "comments": [
-            {"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "kept"},
-            {"path": "src/kept.py", "line": 99, "side": "RIGHT", "body": "stale"}]}
-        result, calls, _ = self._run(self._packet("c" * 40, self.REMOVAL), verdict,
-                                     self._full(self.REMOVAL + "\n" + kept,
-                                              paths=("src/gone.py", "src/kept.py")))
-        self.assertIn('"review_id": 91', result)
-        self.assertEqual(calls[-1][0][1], "--request-changes")
-        self.assertEqual(json.loads(calls[-1][0][4]), [verdict["comments"][0]])
-        self.assertIn("dropped before submission", result)
+            {"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "removed helper is still imported"},
+            {"path": "src/kept.py", "line": 2, "side": "RIGHT", "body": "another defect"}]}
+        with patch.object(structured_review, "_file_capped_followup", return_value="https://github.com/o/r/issues/99") as followup:
+            with self.assertRaises(atoms.AgentPreflightError) as failure:
+                self._run(self._packet("c" * 40, self.REMOVAL + "\n" + kept,
+                                       paths=("src/gone.py", "src/kept.py")), verdict,
+                          self._full(kept, paths=("src/kept.py",)),
+                          capped=True, review_round=5, review_cap=5)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        followup.assert_not_called()
 
     def test_full_review_left_findings_keep_todays_behavior(self):
         verdict = {"action": "request_changes",

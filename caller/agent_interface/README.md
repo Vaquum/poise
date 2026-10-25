@@ -281,7 +281,9 @@ findings on current lines stay on current-head lines, while a defect caused
 by a removal is commented on the removed line and validated against the full
 pull request diff before the single submission. An unfetchable last head, or
 a base that moved since the last review, widens the round to the full diff
-instead. Every run reports its budget usage
+instead. Any finding without a verified position fails the review before
+submission, including a capped round's follow-up issue and approval.
+Every run reports its budget usage
 (`used_seconds` of `total_seconds`) in its terminal progress snapshot and in
 the completion result, so a near-miss is visible before it fails.
 
