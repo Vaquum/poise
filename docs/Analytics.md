@@ -128,25 +128,36 @@ On entry the board remains in its loading state until both the selected-day
 snapshot and the initial live-quota read settle, then exposes all available
 cards together. Quota cannot appear as a completed view while the main metrics
 are still pending, and prepared metrics wait for that initial quota read too.
-Read failures retain their existing notices and do not leave the board loading.
+Read failures appear in Notifications; failed content is absent, never replaced
+with zero counts, and the board leaves its loading state.
 Overlapping quota refreshes share the pending read. Leaving aborts it, and a
-five-second quota deadline settles failures instead of starving the initial board.
+five-second UI quota deadline settles failures instead of starving the initial board.
+This bounds the initial gate even when the server's shared quota refresh takes
+longer; a later scheduled read can show its result.
 Subsequent quota and metric refreshes retain independent schedules.
 Each datastore read runs in a one-shot worker thread using the captured account
 configuration and involvement scopes. SQLite work therefore completes without
 repeatedly yielding into the server's command-launch and background-work queue.
-The worker is terminated after its result, error or 15-second read deadline;
-its production asset is required rather than falling back to the server thread.
+The worker is terminated after its result, error, client disconnect or
+15-second read deadline. Account read errors retain partial reports; exceeding
+the whole-request deadline fails the request rather than inventing partial totals.
+Its production asset is required rather than falling back to the server thread.
 Analytics' short-lived read-only connections allow up to 1 GiB of mapped
 database address space per account, avoiding repeated page copies through the
 service sandbox. This is not a heap allocation or a stored database change;
-each connection retains its transaction snapshot, including with WAL writers.
-Each account read keeps one database snapshot and yields to other server
-work after 64 scanned candidates or once eight milliseconds of processing have elapsed. Discussion
+each connection retains its transaction snapshot, including with WAL writers
+and checkpoints. Pages beyond the cap use ordinary SQLite I/O. Mapped pages
+contribute file-backed RSS separately from JavaScript heap use.
+[SQLite's mapped-I/O tradeoff](https://www.sqlite.org/mmap.html) applies:
+a mapped-page I/O fault can terminate the process. Never overwrite an active
+datastore in place; the supported deployment restore creates fresh volumes
+([Operating](Operating.md)).
+Each account read keeps one database snapshot and yields between accounts
+inside its worker after 64 scanned candidates or once eight milliseconds of processing have elapsed. Discussion
 counts and stored JSON for sizes and merger identity are read only for pull
 requests merged inside the requested window. Openings, closings and first
-reviews do not parse unrelated discussion payloads; year history therefore
-does not hold up day or quota reads while processing its records.
+reviews do not parse unrelated discussion payloads. Separate workers keep
+year-history SQLite reads off the server thread that serves day and quota reads.
 Involvement membership comes directly from the indexed associations, without
 aggregating the evidence descriptions that the full user view supplies.
 The date filter seeks each repository's existing update-time index before

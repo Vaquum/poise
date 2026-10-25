@@ -251,27 +251,27 @@ export function computeHistory(input: {
 
 export { prepareMergedDetails } from './analytics-datastore'
 
-async function readScoped(window: AnalyticsWindow, orgLogin?: string) {
+async function readScoped(window: AnalyticsWindow, orgLogin?: string, signal?: AbortSignal) {
   const organizations = selectOrganizations(orgLogin)
   if (!organizations.length) throw new HttpError(409, 'No GitHub account is ready yet')
   const me = getMeta('me') || ''
   return readAnalyticsInWorker({ organizations, me, window,
-    scopes: { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) } })
+    scopes: { issue: involvementScopes('issue', me), pr: involvementScopes('pr', me) } }, signal)
 }
 
-export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string, dailyBounds?: string[]): Promise<AnalyticsReport> {
+export async function readAnalytics(window: AnalyticsWindow, orgLogin?: string, dailyBounds?: string[], signal?: AbortSignal): Promise<AnalyticsReport> {
   if (dailyBounds && (dailyBounds.length !== 8 || dailyBounds[0] !== window.since || dailyBounds.at(-1) !== window.until)) {
     throw new HttpError(400, 'daily bounds must cover the requested seven-day window')
   }
   const agent = agentAccount()
-  const { issues, prs, errors } = await readScoped(window, orgLogin)
+  const { issues, prs, errors } = await readScoped(window, orgLogin, signal)
   const input = { window, issues, prs, behaviors: listCompletedBehaviorActions(), agent, errors }
   return { ...computeAnalytics(input), ...(dailyBounds ? { daily: computeHistory({ ...input, bounds: dailyBounds }).periods } : {}) }
 }
 
 /** One local datastore read across every period, then each period counted alike. */
-export async function readAnalyticsHistory(bounds: string[], orgLogin?: string): Promise<AnalyticsHistory> {
+export async function readAnalyticsHistory(bounds: string[], orgLogin?: string, signal?: AbortSignal): Promise<AnalyticsHistory> {
   const agent = agentAccount()
-  const { issues, prs, errors } = await readScoped({ since: bounds[0], until: bounds.at(-1)! }, orgLogin)
+  const { issues, prs, errors } = await readScoped({ since: bounds[0], until: bounds.at(-1)! }, orgLogin, signal)
   return computeHistory({ bounds, issues, prs, errors, behaviors: listCompletedBehaviorActions(), agent })
 }

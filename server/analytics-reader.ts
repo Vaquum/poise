@@ -29,25 +29,32 @@ async function workerAsset(): Promise<URL> {
 }
 
 /** One read owns one worker and always reaps it, including error and timeout. */
-export async function readAnalyticsInWorker(input: AnalyticsDatastoreQuery): Promise<AnalyticsDatastoreRecords> {
-  const worker = new Worker(await (asset ??= workerAsset()))
+export async function readAnalyticsInWorker(input: AnalyticsDatastoreQuery, signal?: AbortSignal): Promise<AnalyticsDatastoreRecords> {
+  signal?.throwIfAborted()
+  const url = await (asset ??= workerAsset())
+  signal?.throwIfAborted()
+  const worker = new Worker(url)
   worker.unref()
   try {
     return await new Promise<AnalyticsDatastoreRecords>((resolve, reject) => {
       let settled = false
       const timer = setTimeout(() => fail(new Error('Analytics datastore read timed out')), 15_000)
+      const abort = () => fail(signal?.reason)
       const fail = (error: unknown) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
         reject(error)
       }
+      signal?.addEventListener('abort', abort, { once: true })
       worker.once('error', fail)
       worker.once('exit', code => fail(new Error(`Analytics reader stopped (exit ${code})`)))
       worker.once('message', (reply: AnalyticsWorkerReply) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
         if (reply?.ok && Array.isArray(reply.records?.issues) && Array.isArray(reply.records.prs) && Array.isArray(reply.records.errors)) {
           resolve(reply.records)
         } else if (reply && !reply.ok) {

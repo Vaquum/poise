@@ -1117,28 +1117,24 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
         }
 
-        // ── /api/analytics/history — the headline numbers per period ──
-        // ?bounds= lists the period edges (zoned times, increasing); ?org=
-        // narrows to one account.
-        if (path === '/api/analytics/history' && req.method === 'GET') {
+        // ── Analytics day and history; abandoned reads release their worker ──
+        if ((path === '/api/analytics' || path === '/api/analytics/history') && req.method === 'GET') {
+          const controller = new AbortController()
+          const close = () => controller.abort(new Error('Analytics client disconnected'))
+          res.once('close', close)
+          if (res.destroyed) close()
           try {
             const query = new URLSearchParams(url.split('?')[1] || '')
-            return json(res, 200, await readAnalyticsHistory(parseBounds(query.get('bounds')), selectedOrg))
+            const report = path === '/api/analytics/history'
+              ? await readAnalyticsHistory(parseBounds(query.get('bounds')), selectedOrg, controller.signal)
+              : await readAnalytics(parseWindow(query.get('since'), query.get('until')), selectedOrg, query.has('dailyBounds') ? parseBounds(query.get('dailyBounds')) : undefined, controller.signal)
+            if (!res.destroyed) return json(res, 200, report)
           } catch (err: any) {
-            return json(res, httpStatus(err, 502), { error: err.message || String(err) })
+            if (!res.destroyed) return json(res, httpStatus(err, 502), { error: err.message || String(err) })
+          } finally {
+            res.off('close', close)
           }
-        }
-
-        // ── /api/analytics — the Analytics view's headline numbers ──
-        // ?since=&until= bound the window (ISO with a timezone, either may be
-        // absent); ?org= narrows to one account like every other read.
-        if (path === '/api/analytics' && req.method === 'GET') {
-          try {
-            const query = new URLSearchParams(url.split('?')[1] || '')
-            return json(res, 200, await readAnalytics(parseWindow(query.get('since'), query.get('until')), selectedOrg, query.has('dailyBounds') ? parseBounds(query.get('dailyBounds')) : undefined))
-          } catch (err: any) {
-            return json(res, httpStatus(err, 502), { error: err.message || String(err) })
-          }
+          return
         }
 
         // ── /api/chat/* — Chat v1 sessions (server/chat) ──

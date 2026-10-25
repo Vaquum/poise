@@ -652,7 +652,11 @@ describe('reading what Current shows', () => {
       const pending = readAnalyticsDatastores(input)
       // The first PR slice has opened the snapshot; its issue read is later.
       seed(issue(129, '2026-10-06T00:00:00Z'), 'issue', true, writer)
+      expect(writer.pragma('wal_checkpoint(PASSIVE)')).toMatchObject([{ busy: 0 }])
+      writer.pragma('busy_timeout = 0')
+      expect(writer.pragma('wal_checkpoint(TRUNCATE)')).toMatchObject([{ busy: 1 }])
       expect((await pending).issues).toHaveLength(0)
+      expect(writer.pragma('wal_checkpoint(TRUNCATE)')).toMatchObject([{ busy: 0 }])
       expect((await readAnalyticsDatastores(input)).issues).toHaveLength(1)
       expect(mappings).toEqual([1073741824, 1073741824])
     } finally {
