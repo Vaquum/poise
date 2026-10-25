@@ -97,6 +97,172 @@ class TestGovernedOutcomes(TestCase):
             {"action": None, "outcome": "superseded", "head_sha": "b" * 40},
         )
 
+    def test_posted_change_request_wins_over_a_moved_head(self) -> None:
+        for behavior in ("pr_review", "pr_approve"):
+            with self.subTest(behavior=behavior):
+                before = self._facts(reviewer_reviews_since_items=[])
+                after = self._facts(
+                    head_sha="b" * 40,
+                    reviewer_reviews_since_items=[
+                        self._item(91, state="CHANGES_REQUESTED", commit="a" * 40)
+                    ],
+                )
+                receipt = {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}
+
+                with patch.object(agent_interface, "review_facts", return_value=after):
+                    result = agent_interface.behavior_outcome(
+                        object(), behavior, "68", "/tmp", "bit-mis", "a" * 40,
+                        before, receipt=receipt, call_id="call-1",
+                    )
+
+                self.assertEqual(result, {
+                    "action": "requested_changes",
+                    "outcome": "changes_requested",
+                    "head_sha": "a" * 40,
+                })
+
+    def test_posted_approval_wins_over_a_moved_head(self) -> None:
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            head_sha="b" * 40,
+            reviewer_reviews_since_items=[
+                self._item(92, state="APPROVED", commit="a" * 40)
+            ],
+        )
+        receipt = {"action": "approved_pr", "review_id": 92, "head_sha": "a" * 40}
+
+        with patch.object(agent_interface, "review_facts", return_value=after):
+            result = agent_interface.behavior_outcome(
+                object(), "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                before, receipt=receipt, call_id="call-1",
+            )
+
+        self.assertEqual(result, {
+            "action": "approved", "outcome": "approved", "head_sha": "a" * 40,
+        })
+
+    def test_clean_supersede_with_no_posted_review_is_unchanged(self) -> None:
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(head_sha="b" * 40, reviewer_reviews_since_items=[])
+
+        with patch.object(agent_interface, "review_facts", return_value=after):
+            result = agent_interface.behavior_outcome(
+                object(), "pr_approve", "68", "/tmp", "bit-mis", "a" * 40, before
+            )
+
+        self.assertEqual(result, {
+            "action": None, "outcome": "superseded", "head_sha": "b" * 40,
+        })
+
+    def test_dismissed_change_request_keeps_its_original_kind(self) -> None:
+        for head in ("a" * 40, "b" * 40):
+            with self.subTest(head=head):
+                before = self._facts(reviewer_reviews_since_items=[])
+                after = self._facts(
+                    head_sha=head,
+                    reviewer_reviews_since_items=[
+                        self._item(91, state="DISMISSED", commit="a" * 40)
+                    ],
+                )
+                receipt = {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}
+
+                with patch.object(agent_interface, "review_facts", return_value=after):
+                    result = agent_interface.behavior_outcome(
+                        object(), "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                        before, receipt=receipt, call_id="call-1",
+                    )
+
+                self.assertEqual(result, {
+                    "action": "requested_changes",
+                    "outcome": "changes_requested",
+                    "head_sha": "a" * 40,
+                })
+
+    def test_dismissed_approval_on_a_moved_head_is_a_typed_release(self) -> None:
+        from agent_interface import review_budget
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            head_sha="b" * 40,
+            reviewer_reviews_since_items=[
+                self._item(92, state="DISMISSED", commit="a" * 40)
+            ],
+        )
+        receipt = {"action": "approved_pr", "review_id": 92, "head_sha": "a" * 40}
+
+        with patch.object(agent_interface, "review_facts", return_value=after):
+            with self.assertRaises(review_budget.ReviewLimitError) as raised:
+                agent_interface.behavior_outcome(
+                    object(), "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                    before, receipt=receipt, call_id="call-1",
+                )
+        self.assertEqual(raised.exception.code, "approval_dismissed_stale")
+
+    def test_dismissed_approval_on_an_unchanged_head_fails_loudly(self) -> None:
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            reviewer_reviews_since_items=[
+                self._item(92, state="DISMISSED", commit="a" * 40)
+            ],
+        )
+        receipt = {"action": "approved_pr", "review_id": 92, "head_sha": "a" * 40}
+
+        with patch.object(agent_interface, "review_facts", return_value=after):
+            with self.assertRaisesRegex(RuntimeError, "dismissed before verification"):
+                agent_interface.behavior_outcome(
+                    object(), "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                    before, receipt=receipt, call_id="call-1",
+                )
+
+    def test_interrupted_run_adopts_a_posted_review_on_a_moved_head(self) -> None:
+        import subprocess as process
+        from types import SimpleNamespace
+
+        from agent_interface import pr_review
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            head_sha="b" * 40,
+            reviewer_reviews_since_items=[
+                self._item(91, state="CHANGES_REQUESTED", commit="a" * 40)
+            ],
+        )
+        receipt = {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}
+        spec = SimpleNamespace(identity="model-a", provider="codex")
+        recovery = SimpleNamespace(identity="model-b", provider="codex")
+
+        def expired(*args, **kwargs):
+            raise process.TimeoutExpired("codex", 60)
+
+        with patch.object(pr_review, "run", side_effect=expired), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            review_receipt._current.set(receipt)
+            try:
+                response, result = agent_interface._run_review_with_recovery(
+                    pr_review, "pr_review", "68", "/tmp", "bit-mis", "a" * 40,
+                    "", 60, None, spec, recovery, before, "call-1",
+                )
+            finally:
+                review_receipt._current.set(None)
+
+        self.assertIn("time limit", response)
+        self.assertEqual(result, {
+            "action": "requested_changes",
+            "outcome": "changes_requested",
+            "head_sha": "a" * 40,
+        })
+
+    @staticmethod
+    def _item(review_id: int, state: str, commit: str) -> dict:
+        return {
+            "id": review_id,
+            "node_id": f"node-{review_id}",
+            "state": state,
+            "commit": commit,
+            "submitted_at": "2026-10-25T13:51:24Z",
+        }
+
     @staticmethod
     def _facts(**updates):
         facts = {

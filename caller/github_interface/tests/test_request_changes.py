@@ -7,14 +7,16 @@ HEAD = "c" * 40
 
 
 class FakeClient:
-    def __init__(self, rest_comments: list[dict[str, Any]], review: dict[str, Any], threads: list[dict[str, Any]] | None = None):
+    def __init__(self, rest_comments: list[dict[str, Any]], review: dict[str, Any], threads: list[dict[str, Any]] | None = None,
+                 pull: dict[str, Any] | None = None):
         self._rest_comments = rest_comments
         self._review = review
         self._threads = threads or []
+        self._pull = pull or {"state": "open", "draft": False, "user": {"login": "person"}, "head": {"sha": HEAD}}
         self.posts: list[tuple[str, dict[str, Any]]] = []
 
     async def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
-        return {"state": "open", "draft": False, "user": {"login": "person"}, "head": {"sha": HEAD}}
+        return self._pull
 
     async def paginate(self, path: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         return self._rest_comments
@@ -84,6 +86,14 @@ class TestRequestChanges(IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["outcome"], "changes_requested")
         self.assertEqual(result["head_sha"], HEAD)
+
+    async def test_moved_head_refuses_before_post(self) -> None:
+        moved = {"state": "open", "draft": False, "user": {"login": "person"}, "head": {"sha": "d" * 40}}
+        fake = FakeClient([], review(), pull=moved)
+
+        with self.assertRaisesRegex(RuntimeError, "pull-request head changed"):
+            await request_changes.run(fake, payload([COMMENT]))
+        self.assertEqual(fake.posts, [])
 
     async def test_wrong_review_state_fails_closed(self) -> None:
         fake = FakeClient([], review(state="COMMENTED"))

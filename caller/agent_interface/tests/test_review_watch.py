@@ -55,6 +55,13 @@ class TestHeadObservation(TestCase):
 
 
 class TestSubmissionGate(TestCase):
+    def test_cancellation_refuses_a_gate_with_a_sealed_submission(self):
+        with ReviewWatch("/tmp", PR, "bit-mis", HEAD) as watch:
+            with submission_gate(watch.gate_path) as seal:
+                seal()
+            self.assertFalse(cancel_when_idle(watch.gate_path))
+            self.assertEqual(Path(watch.gate_path).read_text(), "submitted\n")
+
     def test_cancellation_waits_for_submission_and_then_blocks_new_commands(self):
         with ReviewWatch("/tmp", PR, "bit-mis", HEAD) as watch:
             with submission_gate(watch.gate_path):
@@ -130,6 +137,29 @@ class TestSupervisedProcess(TestCase):
             self.assertEqual(done.stderr, prompt)
             self.assertEqual(done.returncode, 0)
             self.assertGreater(check.call_count, 0)
+
+    def test_submission_during_head_check_wins_over_cancellation(self):
+        worker = (
+            "import fcntl, sys, time; gate_path, receipt_path = sys.argv[1], sys.argv[2]; "
+            "gate = open(gate_path, 'r+'); fcntl.flock(gate, fcntl.LOCK_EX); "
+            "open(receipt_path, 'w').write('{\"action\": \"requested_changes\", \"review_id\": 91, "
+            "\"head_sha\": \"" + HEAD + "\"}'); "
+            "gate.seek(0, 2); gate.write('submitted\\n'); gate.flush(); time.sleep(.3)"
+        )
+        with ReviewWatch("/tmp", PR, "bit-mis", HEAD) as watch:
+            def head(_timeout):
+                deadline = monotonic() + 5
+                while "submitted" not in Path(watch.gate_path).read_text():
+                    self.assertLess(monotonic(), deadline, "provider never submitted")
+                    sleep(.01)
+                return NEW_HEAD
+            with patch.object(watch, "changed_head", side_effect=head):
+                done = watch.run([sys.executable, "-c", worker, watch.gate_path, watch.receipt_path],
+                                 input="", cwd="/tmp", timeout=10, env=os.environ.copy())
+            self.assertEqual(done.returncode, 0)
+            self.assertEqual(Path(watch.gate_path).read_text(), "submitted\n")
+            from agent_interface import review_receipt
+            self.assertEqual((review_receipt.get() or {}).get("review_id"), 91)
 
     def test_completion_during_head_check_wins_over_cancellation(self):
         with ReviewWatch("/tmp", PR, "bit-mis", HEAD) as watch:
@@ -259,6 +289,55 @@ class TestCancellationOutcome(TestCase):
         self.assertIsNone(row["action"])
         self.assertFalse(row["error"])
         self.assertEqual(json.loads(output.getvalue())["outcome"], "superseded")
+
+    def test_cancellation_after_submission_verifies_the_posted_review(self):
+        from agent_interface import review_receipt
+
+        before = {"reviewer_reviews_since_items": []}
+        after = {
+            "state": "OPEN", "draft": False, "head_sha": NEW_HEAD,
+            "reviewer_reviews_since_items": [{
+                "id": 91, "node_id": "node-91", "state": "CHANGES_REQUESTED",
+                "commit": HEAD, "submitted_at": "2026-10-25T13:51:24Z",
+            }],
+        }
+
+        def submitted_then_cancelled(*args, **kwargs):
+            review_receipt.record(json.dumps(
+                {"action": "requested_changes", "review_id": 91, "head_sha": HEAD}))
+            raise ReviewSuperseded(NEW_HEAD)
+
+        with tempfile.TemporaryDirectory() as work, \
+                patch.object(agent_interface, "DB", Path(work) / "calls.sqlite3"), \
+                patch.object(agent_interface, "RESPONSES", Path(work) / "responses"), \
+                patch.object(agent_interface, "review_facts", side_effect=[before, after]), \
+                patch.object(pr_review, "run", side_effect=submitted_then_cancelled), \
+                redirect_stdout(io.StringIO()) as output:
+            agent_interface.init_db()
+            agent_interface.run_pr_review(PR, "bit-mis", HEAD, "poise:review-new-prs", "correlation", model="opus-5-high")
+            row = agent_interface.logs()[0]
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["action"], "requested_changes")
+        self.assertEqual(row["outcome"], "changes_requested")
+        self.assertEqual(row["head_sha"], HEAD)
+        self.assertEqual(row["review_id"], 91)
+        printed = json.loads(output.getvalue())
+        self.assertEqual(printed["outcome"], "changes_requested")
+
+    def test_watch_argv_parses_with_the_real_github_interface_cli(self):
+        from github_interface.cli import _parser
+        from github_interface.context import pull_number, repository
+
+        watch = ReviewWatch("/tmp", PR, "bit-mis", HEAD)
+        body = {"action": "head_sha", "repository": "o/r", "pull_number": 12, "head_sha": NEW_HEAD}
+        with patch.object(review_watch.subprocess, "run",
+                          return_value=SimpleNamespace(returncode=0, stdout=json.dumps(body))) as run:
+            self.assertEqual(watch.changed_head(10), NEW_HEAD)
+        argv = run.call_args.args[0]
+        payload = {"pr": argv[2], **vars(_parser(argv[1]).parse_args(argv[3:]))}
+        self.assertEqual(pull_number(payload), 12)
+        self.assertEqual(repository(payload), ("o", "r"))
+        self.assertEqual(payload["token_user"], "bit-mis")
 
     def test_watcher_receives_the_repository_captured_at_launch(self):
         with patch.object(agent_interface, "track", return_value="run"), \
