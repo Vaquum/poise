@@ -248,11 +248,11 @@ export interface GroupMember {
  *  its parent reaps it, but it is finished — listing it would withhold its
  *  completion wake. Null when the table cannot be read — callers skip
  *  group decisions, never invent them. */
-export async function groupMembers(pgid: number): Promise<GroupMember[] | null> {
+export async function groupMembers(pgid: number, options: { signal?: AbortSignal } = {}): Promise<GroupMember[] | null> {
   if (!pgid || !Number.isSafeInteger(pgid) || pgid <= 1) return null
   let stdout: string
   try {
-    ({ stdout } = await runFile('ps', ['-eo', 'pid=,pgid=,ppid=,stat=,command='], { timeoutMs: 5_000, maxOutputBytes: 4 * 1024 * 1024 }))
+    ({ stdout } = await runFile('ps', ['-eo', 'pid=,pgid=,ppid=,stat=,command='], { timeoutMs: 5_000, maxOutputBytes: 4 * 1024 * 1024, ...(options.signal ? { signal: options.signal } : {}) }))
   } catch {
     return null
   }

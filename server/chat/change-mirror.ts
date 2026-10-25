@@ -34,13 +34,19 @@ function isGeneratedCache(path: string): boolean {
   return parts.includes('__pycache__') || (parts[parts.length - 1]?.endsWith('.pyc') ?? false)
 }
 
-async function inventory(checkout: string, ignored: boolean): Promise<string[]> {
+async function inventory(checkout: string, ignored: boolean, signal?: AbortSignal): Promise<string[]> {
   const args = ignored
     ? ['ls-files', '-z', '--others', '--ignored', '--exclude-standard']
     : ['ls-files', '-z', '--cached', '--others', '--exclude-standard']
-  const result = await runFile('git', args, { cwd: checkout, timeoutMs: 30_000, maxOutputBytes: 16 * 1024 * 1024 })
+  const result = await runFile('git', args, { cwd: checkout, timeoutMs: 30_000, maxOutputBytes: 16 * 1024 * 1024, ...(signal ? { signal } : {}) })
   return [...new Set(result.stdout.split('\0').filter(Boolean))].filter(allowedName).sort()
 }
+
+/** How a turn bounds its pre-prompt snapshot: `signal` fires when the
+ *  aggregate preparation budget expires, `turnSignal` on Stop, and
+ *  `deadlineMs` caps this snapshot alone. A stop throws; a budget expiry
+ *  degrades to a partial snapshot the turn continues with. */
+export interface SnapshotBudget { signal: AbortSignal, turnSignal: AbortSignal, deadlineMs: number }
 
 /** Ignored file names are inventoried but their contents are not copied.
  * Knowing an old ignored path existed prevents an ignore-rule change from
@@ -49,15 +55,22 @@ export async function captureCheckoutSnapshot(
   checkout: string,
   extraPaths: string[] = [],
   overrides: Partial<MirrorLimits> = {},
+  budget?: SnapshotBudget,
 ): Promise<CheckoutSnapshot> {
   const limits = { ...DEFAULT_LIMITS, ...overrides }
   const result: CheckoutSnapshot = { files: new Map(), ignored: new Set(), inventoryComplete: true, warnings: [], startedAt: Date.now() }
   let names: string[] = []
   try {
-    const [visible, ignored] = await Promise.all([inventory(checkout, false), inventory(checkout, true)])
+    const [visible, ignored] = await Promise.all([inventory(checkout, false, budget?.signal), inventory(checkout, true, budget?.signal)])
     names = [...new Set([...visible, ...extraPaths.filter(allowedName)])].filter(name => !isGeneratedCache(name)).sort()
     result.ignored = new Set(ignored)
   } catch (error) {
+    if (budget?.turnSignal.aborted) throw error
+    if (budget?.signal.aborted) {
+      result.inventoryComplete = false
+      result.warnings.push('checkout snapshot stopped: preparation budget exceeded')
+      return result
+    }
     result.inventoryComplete = false
     result.warnings.push(`checkout inventory failed: ${error instanceof Error ? error.message : String(error)}`)
     names = [...new Set(extraPaths.filter(allowedName))].filter(name => !isGeneratedCache(name)).sort()
@@ -67,8 +80,16 @@ export async function captureCheckoutSnapshot(
     result.warnings.push(`checkout inventory exceeds ${limits.maxFiles} files`)
     names = names.slice(0, limits.maxFiles)
   }
-  let budget = limits.maxTotalBytes
+  let remaining = limits.maxTotalBytes
   for (const path of names) {
+    budget?.turnSignal.throwIfAborted()
+    if (budget && (budget.signal.aborted || Date.now() - result.startedAt >= budget.deadlineMs)) {
+      result.inventoryComplete = false
+      result.warnings.push(budget.signal.aborted
+        ? 'checkout snapshot stopped: preparation budget exceeded'
+        : 'checkout snapshot time budget exceeded')
+      break
+    }
     let info
     try { info = await lstat(join(checkout, path)) }
     catch (error: any) {
@@ -93,7 +114,7 @@ export async function captureCheckoutSnapshot(
     }
     if (!info.isFile() || info.isSymbolicLink()) { unknown('not a regular non-symlink file'); continue }
     if (info.size > limits.maxFileBytes) { unknown(`file exceeds ${limits.maxFileBytes} bytes`); continue }
-    if (info.size > budget) { unknown('turn snapshot byte budget exceeded'); continue }
+    if (info.size > remaining) { unknown('turn snapshot byte budget exceeded'); continue }
     try {
       // Allocate/read at most this file's observed size; a concurrent growth
       // is refused, not silently truncated into a plausible pre-image.
@@ -102,7 +123,7 @@ export async function captureCheckoutSnapshot(
       if (after.ino !== info.ino || after.dev !== info.dev || after.size !== info.size || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) {
         unknown('file changed while its snapshot was being read'); continue
       }
-      budget -= bytes.length
+      remaining -= bytes.length
       const hash = createHash('sha256').update(bytes).digest('hex')
       const text = bytes.toString('utf8')
       if (bytes.includes(0) || !Buffer.from(text, 'utf8').equals(bytes)) {

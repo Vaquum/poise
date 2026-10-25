@@ -114,4 +114,10 @@ describe('worker group kill scope', () => {
     expect(processGroupId(first.pid)).toBeNull()
     expect(await workerGroupMatches(first.pid, first.pgid, first.ident)).toBe(false)
   }, 25_000)
+
+  it('reads no baseline for an aborted listing', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    await expect(groupMembers(process.pid, { signal: controller.signal })).resolves.toBeNull()
+  })
 })

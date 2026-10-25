@@ -15,7 +15,7 @@
 
 import { lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
-import { runFile, type ExpectedFailure } from '../process'
+import { isAbortError, runFile, type ExpectedFailure } from '../process'
 import type { CheckoutLease } from './checkout-lock'
 import { spawnWorker } from './worker'
 
@@ -42,11 +42,12 @@ export interface CheckoutInspection {
   headSha: string
 }
 
-async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure, env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure, env?: NodeJS.ProcessEnv, signal?: AbortSignal } = {}): Promise<string> {
   try {
-    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}), ...(options.env ? { env: options.env } : {}) })
+    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}), ...(options.env ? { env: options.env } : {}), ...(options.signal ? { signal: options.signal } : {}) })
     return stdout
   } catch (error: any) {
+    if (isAbortError(error)) throw error
     const detail = String(error?.stderr || error?.message || error).trim()
     throw new GitError(`git ${args[0]} failed: ${detail}`)
   }
@@ -60,31 +61,31 @@ export function assertBranchName(name: string): string {
   return value
 }
 
-export async function inspectCheckout(checkout: string): Promise<CheckoutInspection> {
-  const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'])
+export async function inspectCheckout(checkout: string, options: { signal?: AbortSignal } = {}): Promise<CheckoutInspection> {
+  const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'], options)
   const lines = status.split('\n').filter((line) => line.length > 0)
   const header = lines[0] || ''
   const detached = header.includes('(no branch)') || header.includes('HEAD (no branch)')
   const currentBranch = detached ? '' : header.replace(/^## /, '').split('...')[0].split(' ')[0]
   const dirtyFiles = lines.slice(1).length
-  const branches = (await git(checkout, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']))
+  const branches = (await git(checkout, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'], options))
     .split('\n').map((line) => line.trim()).filter(Boolean)
-  const headSha = (await git(checkout, ['rev-parse', 'HEAD'], { expected: { codes: [128], stderr: /unknown revision|Needed a single revision/ } }).catch(() => '')).trim()
+  const headSha = (await git(checkout, ['rev-parse', 'HEAD'], { ...options, expected: { codes: [128], stderr: /unknown revision|Needed a single revision/ } }).catch(() => '')).trim()
   return {
     currentBranch,
     detached,
     dirty: dirtyFiles > 0,
     dirtyFiles,
-    defaultBranch: await defaultBranch(checkout, branches),
+    defaultBranch: await defaultBranch(checkout, branches, options),
     branches,
     headSha,
   }
 }
 
-export async function defaultBranch(checkout: string, branches?: string[]): Promise<string> {
-  const remoteHead = (await git(checkout, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { expected: { codes: [128], stderr: /is not a symbolic ref/ } }).catch(() => '')).trim()
+export async function defaultBranch(checkout: string, branches?: string[], options: { signal?: AbortSignal } = {}): Promise<string> {
+  const remoteHead = (await git(checkout, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { ...options, expected: { codes: [128], stderr: /is not a symbolic ref/ } }).catch(() => '')).trim()
   if (remoteHead) return remoteHead.replace(/^origin\//, '')
-  const known = branches ?? (await git(checkout, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'])).split('\n').map((line) => line.trim())
+  const known = branches ?? (await git(checkout, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'], options)).split('\n').map((line) => line.trim())
   for (const candidate of ['main', 'master']) if (known.includes(candidate)) return candidate
   return known[0] || 'main'
 }
@@ -240,11 +241,31 @@ async function unpushedTaskCommits(checkout: string): Promise<number> {
 
 export interface GuardedResult { stdout: string, stderr: string, code: number | null }
 
+/** A guarded command's worker group survived termination after its signal
+ *  aborted: the lease registration stays, and the caller retains the
+ *  checkout instead of releasing it to the next writer. */
+export class GuardedWorkerStuckError extends Error {
+  constructor(command: string, options?: { cause?: unknown }) {
+    super(`the ${command} worker is still alive after termination; the checkout stays locked`, options)
+    this.name = 'GuardedWorkerStuckError'
+  }
+}
+
+const GUARDED_ABORTED: unique symbol = Symbol('guarded-aborted')
+
+function abortErrorLike(reason: unknown): Error {
+  if (isAbortError(reason)) return reason as Error
+  return Object.assign(new Error('The operation was aborted', { cause: reason }), { name: 'AbortError', code: 'ABORT_ERR' })
+}
+
 /** Run a mutating command under the caller's checkout lease: the gate is
  *  registered as the lease's worker before it may start, and cleared after
- *  it exited. The lease must be held. */
-export async function runGuarded(lease: CheckoutLease, command: string, args: readonly string[], options: { cwd: string, timeoutMs?: number, env?: NodeJS.ProcessEnv }): Promise<GuardedResult> {
+ *  it exited. The lease must be held. An aborted signal terminates the
+ *  group and settles only once it is verified dead — or with a stuck error
+ *  that keeps the registration when termination cannot be verified. */
+export async function runGuarded(lease: CheckoutLease, command: string, args: readonly string[], options: { cwd: string, timeoutMs?: number, env?: NodeJS.ProcessEnv, signal?: AbortSignal }): Promise<GuardedResult> {
   if (!lease.held) throw new GitError('checkout lease is not held', 'conflict')
+  options.signal?.throwIfAborted()
   const worker = spawnWorker(command, args, { cwd: options.cwd, env: options.env })
   const output = { stdout: [] as Buffer[], stderr: [] as Buffer[], bytes: 0 }
   const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
@@ -258,29 +279,51 @@ export async function runGuarded(lease: CheckoutLease, command: string, args: re
     throw new GitError('checkout lease was lost before the command could start', 'conflict')
   }
   const timeout = setTimeout(() => { worker.terminate(2_000).catch(() => undefined) }, options.timeoutMs ?? GIT_TIMEOUT_MS)
+  const signal = options.signal
   let settled = false
+  let onAbort: (() => void) | null = null
   try {
     worker.go()
-    const exit = await worker.exited
-    // The gate exits only after its group is empty; a killed gate can still
-    // leave descendants, and those keep the lease's worker registration.
-    if (worker.alive) await worker.terminate(2_000)
+    let exit: { code: number | null } | typeof GUARDED_ABORTED
+    if (signal) {
+      let fire!: () => void
+      const sentry = new Promise<typeof GUARDED_ABORTED>((resolve) => { fire = () => resolve(GUARDED_ABORTED) })
+      onAbort = fire
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+      exit = await Promise.race([worker.exited, sentry])
+    } else {
+      exit = await worker.exited
+    }
+    try {
+      // The gate exits only after its group is empty; a killed gate can still
+      // leave descendants, and those keep the lease's worker registration.
+      if (worker.alive) await worker.terminate(2_000)
+    } catch (error) {
+      if (signal?.aborted) throw new GuardedWorkerStuckError(command, { cause: error })
+      throw error
+    }
+    if (signal?.aborted) {
+      settled = true
+      throw abortErrorLike(signal.reason)
+    }
     settled = true
     return {
       stdout: Buffer.concat(output.stdout).toString('utf8'),
       stderr: Buffer.concat(output.stderr).toString('utf8'),
-      code: exit.code,
+      code: (exit as { code: number | null }).code,
     }
   } finally {
     clearTimeout(timeout)
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort)
     // Only a settled group may be unregistered: the lease keeps blocking
     // other writers while anything of this command could still write.
     if (settled && !worker.alive) lease.clearWorker()
   }
 }
 
-async function guardedGit(lease: CheckoutLease, checkout: string, args: string[]): Promise<string> {
-  const result = await runGuarded(lease, 'git', args, { cwd: checkout })
+async function guardedGit(lease: CheckoutLease, checkout: string, args: string[], options: { signal?: AbortSignal } = {}): Promise<string> {
+  const result = await runGuarded(lease, 'git', args, { cwd: checkout, ...(options.signal ? { signal: options.signal } : {}) })
   if (result.code !== 0) {
     throw new GitError(`git ${args[0]} failed: ${(result.stderr || result.stdout).trim().slice(0, 2_000)}`)
   }
@@ -290,26 +333,26 @@ async function guardedGit(lease: CheckoutLease, checkout: string, args: string[]
 /** Commit everything (tracked and untracked, not ignored) on `branch` as a
  *  checkpoint. Refuses when the checkout is not on `branch` — the caller's
  *  view of the world has drifted and nothing may be committed blindly. */
-export async function checkpoint(lease: CheckoutLease, checkout: string, branch: string): Promise<{ committed: boolean, sha?: string }> {
-  const state = await inspectCheckout(checkout)
+export async function checkpoint(lease: CheckoutLease, checkout: string, branch: string, options: { signal?: AbortSignal } = {}): Promise<{ committed: boolean, sha?: string }> {
+  const state = await inspectCheckout(checkout, options)
   if (state.currentBranch !== branch) {
     throw new GitError(`checkout is on ${state.currentBranch || 'a detached HEAD'}, not ${branch}; refusing to checkpoint`, 'branch_drift')
   }
   if (!state.dirty) return { committed: false }
-  await guardedGit(lease, checkout, ['add', '--all'])
+  await guardedGit(lease, checkout, ['add', '--all'], options)
   // --no-verify: a checkpoint is mechanical, the author squashes before a
   // PR; a slow or failing pre-commit hook must not block switching sessions.
-  await guardedGit(lease, checkout, ['commit', '--quiet', '--no-verify', '-m', CHECKPOINT_MESSAGE])
-  const sha = (await git(checkout, ['rev-parse', 'HEAD'])).trim()
+  await guardedGit(lease, checkout, ['commit', '--quiet', '--no-verify', '-m', CHECKPOINT_MESSAGE], options)
+  const sha = (await git(checkout, ['rev-parse', 'HEAD'], options)).trim()
   return { committed: true, sha }
 }
 
-export async function switchBranch(lease: CheckoutLease, checkout: string, branch: string): Promise<void> {
+export async function switchBranch(lease: CheckoutLease, checkout: string, branch: string, options: { signal?: AbortSignal } = {}): Promise<void> {
   const name = assertBranchName(branch)
-  const state = await inspectCheckout(checkout)
+  const state = await inspectCheckout(checkout, options)
   if (state.currentBranch === name) return
   if (state.dirty) throw new GitError(`checkout on ${state.currentBranch} has ${state.dirtyFiles} uncommitted change(s); refusing to switch`, 'dirty_unowned')
-  await guardedGit(lease, checkout, ['switch', '--quiet', name])
+  await guardedGit(lease, checkout, ['switch', '--quiet', name], options)
 }
 
 /** Create `name` at `from`; returns the commit it starts at, which is what
@@ -328,10 +371,10 @@ export async function branchTip(checkout: string, name: string): Promise<string>
 
 /** Point `name` at `sha`, creating or moving it. Used to retain a
  *  checkpoint made on a detached HEAD, which no branch would keep. */
-export async function moveBranch(lease: CheckoutLease, checkout: string, name: string, sha: string): Promise<void> {
+export async function moveBranch(lease: CheckoutLease, checkout: string, name: string, sha: string, options: { signal?: AbortSignal } = {}): Promise<void> {
   const branch = assertBranchName(name)
   if (!/^[0-9a-f]{4,64}$/i.test(sha)) throw new GitError('invalid checkpoint SHA', 'invalid')
-  await guardedGit(lease, checkout, ['branch', '--quiet', '--force', branch, sha])
+  await guardedGit(lease, checkout, ['branch', '--quiet', '--force', branch, sha], options)
 }
 
 export async function deleteBranch(lease: CheckoutLease, checkout: string, name: string): Promise<void> {

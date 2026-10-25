@@ -303,3 +303,34 @@ describe('turn-level checkout change mirror', () => {
     expect(events[1]).toMatchObject({ path: 'base.txt', oldText: 'original\n', newText: 'shell edit\n' })
   })
 })
+
+describe('snapshot budget', () => {
+  const idle = () => ({ signal: new AbortController().signal, turnSignal: new AbortController().signal })
+
+  it('degrades to a partial snapshot past its own deadline', async () => {
+    await writeFile(join(repo, 'extra.txt'), 'extra\n')
+    const snapshot = await captureCheckoutSnapshot(repo, [], {}, { ...idle(), deadlineMs: 0 })
+    expect(snapshot.inventoryComplete).toBe(false)
+    expect(snapshot.warnings).toEqual(['checkout snapshot time budget exceeded'])
+    expect(snapshot.files.size).toBe(0)
+    // The uncaptured content still compares conservatively.
+    await writeFile(join(repo, 'after.txt'), 'after\n')
+    const result = compareCheckoutSnapshots(snapshot, await captureCheckoutSnapshot(repo, [...snapshot.files.keys()]))
+    expect(result.warnings.length).toBeGreaterThan(0)
+  })
+
+  it('throws on Stop instead of degrading', async () => {
+    const turn = new AbortController()
+    turn.abort()
+    await expect(captureCheckoutSnapshot(repo, [], {}, { ...idle(), turnSignal: turn.signal, deadlineMs: 60_000 }))
+      .rejects.toMatchObject({ name: 'AbortError' })
+  })
+
+  it('degrades instead of throwing when the preparation budget expires', async () => {
+    const prep = new AbortController()
+    prep.abort()
+    const snapshot = await captureCheckoutSnapshot(repo, [], {}, { ...idle(), signal: prep.signal, deadlineMs: 60_000 })
+    expect(snapshot.inventoryComplete).toBe(false)
+    expect(snapshot.warnings).toEqual(['checkout snapshot stopped: preparation budget exceeded'])
+  })
+})
