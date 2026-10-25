@@ -79,6 +79,15 @@ describe('sign-in alerts from Connected accounts', () => {
     expect(open()).toEqual([])
   })
 
+  it('clears a stale demand once its CLI is gone without a record', () => {
+    configured({ codex: AT })
+    producers.accountsChecked([cli('codex', false)], nobody)
+    expect(open()).toEqual(['sign-in:codex'])
+    configured({})
+    producers.accountsChecked([cli('codex', false, false)], nobody)
+    expect(open()).toEqual([])
+  })
+
   it('changes nothing while the provider record is corrupt', () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {

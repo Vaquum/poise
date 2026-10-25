@@ -1,23 +1,41 @@
 import { beforeEach, expect, it, vi } from 'vitest'
-const mocks = vi.hoisted(() => ({ run: vi.fn(), invalidate: vi.fn(), diagnostic: vi.fn() }))
+const mocks = vi.hoisted(() => ({ run: vi.fn(), invalidate: vi.fn(), diagnostic: vi.fn(), evidence: vi.fn() }))
 vi.mock('../server/process', () => ({
   CLAUDE_SUBSCRIPTION_CLI: '/poise/scripts/claude-subscription.mjs',
   claudeSubscriptionEnvironment: () => ({}), scrubbedChildEnvironment: () => ({}), runFile: mocks.run,
 }))
 vi.mock('../server/logging', () => ({ diagnostic: mocks.diagnostic }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/caller', catalogReportPath: () => '/poise/report.json', invalidateCatalog: mocks.invalidate }))
-vi.mock('../server/accounts/participation', () => ({ providerEvidence: async () => ({ logins: {}, live: { claude: null, codex: null } }) }))
+vi.mock('../server/accounts/participation', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../server/accounts/participation')>()
+  return { ...actual, providerEvidence: mocks.evidence }
+})
 import { refreshModelCatalog } from '../server/models-refresh'
-beforeEach(() => { mocks.diagnostic.mockReset(); mocks.run.mockReset(); mocks.invalidate.mockClear() })
+beforeEach(() => { mocks.diagnostic.mockReset(); mocks.run.mockReset(); mocks.invalidate.mockClear()
+  mocks.evidence.mockReset(); mocks.evidence.mockResolvedValue({ logins: {}, live: { claude: null, codex: null } }) })
 it('coalesces manual checks and invalidates the catalogue only after settlement', async () => {
   let finish!: (result: { stdout: string }) => void
   mocks.run.mockImplementation(() => new Promise(resolve => { finish = resolve }))
   const first = refreshModelCatalog(), second = refreshModelCatalog()
-  expect(first).toBe(second)
   await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledTimes(1))
   expect(mocks.invalidate).not.toHaveBeenCalled()
   finish({ stdout: JSON.stringify({ families: { claude: { status: 'ok' } } }) })
-  await first; expect(mocks.invalidate).toHaveBeenCalledTimes(1)
+  await expect(second).resolves.toEqual(await first); expect(mocks.invalidate).toHaveBeenCalledTimes(1)
+})
+it('re-runs the check when participation changes mid-flight instead of sharing the stale report', async () => {
+  let finish!: (result: { stdout: string }) => void
+  mocks.run.mockImplementation(() => new Promise(resolve => { finish = resolve }))
+  const first = refreshModelCatalog()
+  await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledTimes(1))
+  // Codex connects while the first check runs: the late request must wait
+  // out the stale check, then re-observe and run again.
+  mocks.evidence.mockResolvedValueOnce({ logins: { codex: { lastLoginAt: '2026-10-25T09:00:00.000Z', lastSource: 'observed', lastOutcome: 'success' } }, live: { claude: null, codex: null } })
+  mocks.run.mockImplementationOnce(async () => ({ stdout: JSON.stringify({ families: { codex: { status: 'ok' } } }) }))
+  const second = refreshModelCatalog()
+  finish({ stdout: JSON.stringify({ families: { claude: { status: 'ok' } } }) })
+  await expect(first).resolves.toEqual({ families: { claude: { status: 'ok' } } })
+  await expect(second).resolves.toEqual({ families: { codex: { status: 'ok' } } })
+  expect(mocks.run).toHaveBeenCalledTimes(2)
 })
 it('returns a structured discovery failure even when the script exits nonzero', async () => {
   const report = { families: {}, error: 'Discovery timed out', cli_updates: { claude: { status: 'current', after: '2.1.280' } } }
@@ -36,12 +54,12 @@ it('starts no check while a drain pauses background work, but keeps one already 
   let finish!: (result: { stdout: string }) => void
   mocks.run.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
   const running = refreshModelCatalog()
+  await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledTimes(1))
   background.pauseReleaseBackground()
   try {
-    expect(refreshModelCatalog()).toBe(running)
-    await vi.waitFor(() => expect(mocks.run).toHaveBeenCalledTimes(1))
+    const second = refreshModelCatalog()
     finish({ stdout: JSON.stringify({ families: { claude: { status: 'ok' } } }) })
-    await running
+    await expect(second).resolves.toEqual(await running)
     await expect(refreshModelCatalog()).rejects.toMatchObject({ statusCode: 503, message: 'Poise is installing an update; the model check has not started.' })
     expect(mocks.run).toHaveBeenCalledTimes(1)
   } finally {

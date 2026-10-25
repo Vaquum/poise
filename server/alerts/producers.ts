@@ -120,9 +120,9 @@ const GH_ROLES = [
  *  installed, configured CLI that says it is not signed in alerts until it
  *  says it is; for gh, so does your GitHub account or the agent account when
  *  gh does not hold it signed in. A CLI that was never configured raises no
- *  sign-in demand, and one whose state is unknown, or whose record is
- *  corrupt, changes nothing. Claude is left to its auth monitor
- *  (claudeAuthStatusChanged). */
+ *  sign-in demand, and a stale demand clears once its CLI is gone without a
+ *  record. One whose state is unknown, or whose record is corrupt, changes
+ *  nothing. Claude is left to its auth monitor (claudeAuthStatusChanged). */
 export function accountsChecked(accounts: readonly ConnectedAccount[], identities: GitHubIdentities): void {
   let configured: AccountLogins | null
   try {
@@ -132,14 +132,23 @@ export function accountsChecked(accounts: readonly ConnectedAccount[], identitie
     configured = null
   }
   for (const account of accounts) {
-    if (account.id === 'claude' || !account.installed) continue
+    if (account.id === 'claude') continue
     if (account.id === 'gh') {
+      if (!account.installed) continue
       ghAccountsChecked(account, identities)
       continue
     }
-    if (account.signedIn === null) continue
     const name = ACCOUNT_NAMES[account.id] ?? account.id
     const dedupeKey = `sign-in:${account.id}`
+    if (!account.installed) {
+      // Gone without a record it reads as never configured: clear a stale
+      // demand. A configured provider keeps its demand until signed in.
+      if (configured !== null && !configured[account.id]) {
+        record(`the end of the ${name} sign-in alert`, () => resolveAlert(dedupeKey))
+      }
+      continue
+    }
+    if (account.signedIn === null) continue
     if (account.signedIn) {
       record(`the end of the ${name} sign-in alert`, () => resolveAlert(dedupeKey))
       continue
