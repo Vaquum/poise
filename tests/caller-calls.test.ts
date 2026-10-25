@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { liveCallerCalls } from '../server/service/caller-calls'
+import { CALLER_CALLS_READ_TIMEOUT_MS, liveCallerCalls } from '../server/service/caller-calls'
 
 // The Caller calls a release switch leaves running: Caller's own records,
 // whichever server started them, counted while each process is alive.
@@ -39,5 +39,28 @@ describe('Caller calls still running', () => {
     dir = await mkdtemp(join(tmpdir(), 'poise-caller-calls-'))
     expect(liveCallerCalls(dir)).toBe(0)
     expect(liveCallerCalls(undefined)).toBe(0)
+  })
+
+  it('bounds the health read instead of waiting a full second on a locked store', () => {
+    expect(CALLER_CALLS_READ_TIMEOUT_MS).toBe(100)
+  })
+
+  it('says it cannot tell while another writer holds the store', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'poise-caller-calls-'))
+    const path = join(dir, 'calls.sqlite3')
+    const setup = new Database(path)
+    setup.exec('create table calls (id text, status text, pid integer, runner text)')
+    setup.prepare('insert into calls values (?, ?, ?, ?)').run('alive', 'running', process.pid, null)
+    setup.close()
+    const holder = new Database(path)
+    holder.exec('BEGIN EXCLUSIVE')
+    holder.prepare('insert into calls values (?, ?, ?, ?)').run('held', 'running', process.pid, null)
+    try {
+      expect(liveCallerCalls(dir)).toBeNull()
+    } finally {
+      holder.exec('ROLLBACK')
+      holder.close()
+    }
+    expect(liveCallerCalls(dir)).toBe(1)
   })
 })

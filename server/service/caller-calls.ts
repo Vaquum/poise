@@ -32,6 +32,12 @@ function alive(pid: number): boolean {
   }
 }
 
+/** How long one service-health read waits on Caller's records: an uncontended
+ *  open-select-close costs under 2 ms at 13 rows, so 100 ms keeps generous
+ *  headroom while bounding a contended health handler to a tenth of its
+ *  former worst case. Unknown stays safe: health reports idle false. */
+export const CALLER_CALLS_READ_TIMEOUT_MS = 100
+
 /** Caller calls recorded as running whose process is alive, whichever server
  *  started them; null when the records exist but cannot be read. */
 export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR): number | null {
@@ -39,7 +45,7 @@ export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR):
   if (!path || !existsSync(path)) return 0
   let db: InstanceType<typeof Database> | undefined
   try {
-    db = new Database(path, { readonly: true, fileMustExist: true, timeout: 1_000 })
+    db = new Database(path, { readonly: true, fileMustExist: true, timeout: CALLER_CALLS_READ_TIMEOUT_MS })
     // A turn Poise runs itself is recorded with an external runner and no process.
     const rows = db.prepare("select pid from calls where status = 'running' and pid is not null and runner is null").all() as Array<{ pid: unknown }>
     return rows.filter(({ pid }) => Number.isSafeInteger(Number(pid)) && Number(pid) > 0 && alive(Number(pid))).length
