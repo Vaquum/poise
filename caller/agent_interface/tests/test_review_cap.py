@@ -138,6 +138,12 @@ class TestFollowupIssue(TestCase):
         self.assertIn("(LEFT,", body)
         self.assertNotIn(HEAD, body.split("## Findings")[1])
 
+    def test_special_characters_in_paths_do_not_break_the_link(self):
+        finding = {"path": "docs/C#-notes.md", "line": 1, "side": "RIGHT", "body": "Stale link."}
+        body = followup.render_body("o/r", "12", HEAD, BASE, 5, 5, [finding])
+        self.assertIn(f"https://github.com/o/r/blob/{HEAD}/docs/C%23-notes.md#L1", body)
+        self.assertIn("`docs/C#-notes.md:1`", body)
+
     def test_filing_failure_approves_nothing(self):
         def process(args, **kwargs):
             return SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 422: Issues are disabled")

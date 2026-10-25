@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from urllib.parse import quote
 
 from . import progress, review_budget, review_receipt
 from .atoms import bounded_cause
@@ -72,8 +73,10 @@ def render_body(
         side = comment.get("side") if comment.get("side") in ("LEFT", "RIGHT") else "RIGHT"
         # A removed-side finding names old-file lines: pin it to the base blob,
         # where that file and those lines exist, not to the reviewed head.
+        # The path is URL-encoded (slashes kept): a raw `#` or space would
+        # break the link or swallow the line anchor.
         pin = base.lower() if side == "LEFT" else head.lower()
-        permalink = f"https://github.com/{repo}/blob/{pin}/{path}#L{line}"
+        permalink = f"https://github.com/{repo}/blob/{pin}/{quote(path)}#L{line}"
         lines.append(f"### {index}. `{path}:{line}` ({side}, [permalink]({permalink}))")
         lines.append("")
         lines.append(str(comment.get("body") or "").strip())
