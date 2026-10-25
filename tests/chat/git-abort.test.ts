@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { CheckoutLease } from '../../server/chat/checkout-lock'
-import { GuardedWorkerStuckError, runGuarded } from '../../server/chat/git'
+import { GuardedWorkerStuckError, checkpoint, runGuarded } from '../../server/chat/git'
 import { isAbortError } from '../../server/process'
 import type { SpawnWorkerOptions, WorkerHandle } from '../../server/chat/worker'
 
@@ -35,6 +35,27 @@ vi.mock('../../server/chat/worker', async (importOriginal) => {
   }
 })
 
+const abortStubs = vi.hoisted(() => ({
+  abortAtPostCommitRevParse: null as { controller: AbortController, revParses: number } | null,
+}))
+
+vi.mock('../../server/process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../server/process')>()
+  return {
+    ...actual,
+    runFile: (command: string, args: readonly string[], options?: import('../../server/process').RunFileOptions) => {
+      const gate = abortStubs.abortAtPostCommitRevParse
+      if (gate && command === 'git' && args[0] === 'rev-parse' && args[1] === 'HEAD') {
+        gate.revParses += 1
+        // checkpoint() reads the head once to inspect, then once to resolve
+        // the commit it just made: abort at the second read.
+        if (gate.revParses === 2) gate.controller.abort()
+      }
+      return actual.runFile(command, args, options)
+    },
+  }
+})
+
 vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 
 let root = ''
@@ -51,6 +72,8 @@ beforeAll(async () => {
   checkout = join(root, 'repo')
   await mkdir(checkout)
   git(['init', '-q', '-b', 'main'])
+  git(['config', 'user.email', 't@example.invalid'])
+  git(['config', 'user.name', 't'])
   await writeFile(join(checkout, 'README.md'), '# repo\n')
   git(['add', '-A'])
   git(['commit', '-q', '-m', 'init'])
@@ -111,5 +134,23 @@ describe('guarded command abort', () => {
     controller.abort()
     await expect(pending).rejects.toBeInstanceOf(GuardedWorkerStuckError)
     expect(l.read()?.worker_pid).toBe(424242)
+  })
+
+  it('retains a landed checkpoint when the abort arrives at its post-commit read', async () => {
+    const l = lease()
+    await writeFile(join(checkout, 'dirty.txt'), 'uncommitted\n')
+    const controller = new AbortController()
+    abortStubs.abortAtPostCommitRevParse = { controller, revParses: 0 }
+    try {
+      const result = await checkpoint(l, checkout, 'main', { signal: controller.signal })
+      expect(result).toMatchObject({ committed: true })
+      expect(result.sha).toMatch(/^[0-9a-f]{40}$/)
+      expect(controller.signal.aborted).toBe(true)
+    } finally {
+      abortStubs.abortAtPostCommitRevParse = null
+    }
+    // The checkpoint commit stays reachable; the fixture returns to pristine.
+    git(['reset', '--quiet', 'HEAD~1'])
+    await rm(join(checkout, 'dirty.txt'))
   })
 })

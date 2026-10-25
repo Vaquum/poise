@@ -343,7 +343,10 @@ export async function checkpoint(lease: CheckoutLease, checkout: string, branch:
   // --no-verify: a checkpoint is mechanical, the author squashes before a
   // PR; a slow or failing pre-commit hook must not block switching sessions.
   await guardedGit(lease, checkout, ['commit', '--quiet', '--no-verify', '-m', CHECKPOINT_MESSAGE], options)
-  const sha = (await git(checkout, ['rev-parse', 'HEAD'], options)).trim()
+  // Read-only and load-bearing: a landed commit must resolve its sha even
+  // when the caller's signal aborted, so the caller retains it on a branch.
+  // The caller still honors the abort right after this returns.
+  const sha = (await git(checkout, ['rev-parse', 'HEAD'])).trim()
   return { committed: true, sha }
 }
 

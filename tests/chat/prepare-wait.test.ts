@@ -15,6 +15,7 @@ import type { ChatRuntime } from '../../server/chat/runtime'
 
 const stubs = vi.hoisted(() => ({
   hangCommands: new Set<string>(),
+  hangGitFirstArgs: new Set<string>(),
   githubCalls: 0,
   hangSnapshot: false,
   stuckCheckout: false,
@@ -30,7 +31,8 @@ vi.mock('../../server/process', async (importOriginal) => {
     ...actual,
     runFile: (command: string, args: readonly string[], options?: import('../../server/process').RunFileOptions) => {
       if (command === 'github-interface') stubs.githubCalls += 1
-      if (!stubs.hangCommands.has(command)) return actual.runFile(command, args, options)
+      const parked = stubs.hangCommands.has(command) || (command === 'git' && stubs.hangGitFirstArgs.has(args[0] ?? ''))
+      if (!parked) return actual.runFile(command, args, options)
       if (options?.signal?.aborted) return Promise.reject(abortLike(options.signal.reason))
       return new Promise<import('../../server/process').RunFileResult>((resolve, reject) => {
         let settled = false
@@ -57,6 +59,7 @@ vi.mock('../../server/process', async (importOriginal) => {
  *  cleanup parked finishes, so the runtime can stop. */
 function unhang(): void {
   stubs.hangCommands.clear()
+  stubs.hangGitFirstArgs.clear()
   for (const gate of stubs.parked.splice(0)) gate()
 }
 
@@ -186,6 +189,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   stubs.hangCommands.clear()
+  stubs.hangGitFirstArgs.clear()
   stubs.githubCalls = 0
   stubs.hangSnapshot = false
   stubs.stuckCheckout = false
@@ -367,6 +371,37 @@ describe('queued preparation waits', () => {
     runtime.prompt(record.id, promptInput('second try'))
     await until(() => finished(runtime, record.id).length === 2)
     expect(finished(runtime, record.id)[1]).toMatchObject({ stopReason: 'end_turn' })
+  })
+
+  it('aborts a settings restart inside its startup checkout work', async () => {
+    const controls = controllableAdapter()
+    const runtime = makeRuntime(controls, { budgets: { totalMs: 3_000 } })
+    const record = await idleSession(runtime, 'restart settings')
+    controls.setSafeModeImpl(async () => 'next_turn')
+    // Park the turn in its queued window, then defer safe mode mid-turn so
+    // the settings step restarts the native process for it. (Deferred
+    // before the prompt, the pre-turn startup would absorb the restart.)
+    stubs.hangGitFirstArgs.add('status')
+    runtime.prompt(record.id, promptInput('work please'))
+    await until(() => runtime.get(record.id)?.queuedBehind === 'preparing the checkout')
+    await runtime.setSafeMode(record.id, true)
+    expect(runtime.get(record.id)?.safeModePending).toBe(true)
+    // The parked checkout read goes through for real; the synchronous
+    // re-arm parks the restart's startup read while ls-files passes.
+    unhang()
+    stubs.hangGitFirstArgs.add('status')
+    // The settings step restarts the native process; its startup parks on
+    // the re-armed read. (The settings label itself shows only until the
+    // restart flips to starting, so the event sequence pins it below.)
+    await until(() => runtime.get(record.id)?.status === 'starting')
+    await until(() => finished(runtime, record.id).length === 1)
+    expect(finished(runtime, record.id)[0]).toMatchObject({ stopReason: 'error' })
+    expect(finished(runtime, record.id)[0].error).toContain("preparation timed out during 'applying pending settings'")
+    expect(reasons(runtime, record.id)).toContain('applying pending settings')
+    expect(controls.prompts).toHaveLength(0)
+    unhang()
+    expect(runtime.checkSlots.stats()).toMatchObject({ running: 0 })
+    expect(new CheckoutLease(record.checkout, { ownerKind: 'test', ownerId: 't', ownerLabel: 't', instance: 'test' }).read()).toBeNull()
   })
 
   it('replaces the slot wait label once admitted', async () => {

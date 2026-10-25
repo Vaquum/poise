@@ -2083,7 +2083,7 @@ export class ChatRuntime extends EventEmitter {
    *  branch (fresh sessions), switch the checkout to it, register the gate,
    *  then create/resume/fork the native session. Failures become a readable
    *  error event and the `error` status; nothing is retried on its own. */
-  private async startSession(session: LiveSession, options: { fresh?: boolean, forkFrom?: SessionRecord, lease?: CheckoutLease } = {}): Promise<void> {
+  private async startSession(session: LiveSession, options: { fresh?: boolean, forkFrom?: SessionRecord, lease?: CheckoutLease, signal?: AbortSignal } = {}): Promise<void> {
     if (session.adapter?.alive) return
     if (!options.lease && session.lease?.held) {
       await this.stopProcess(session)
@@ -2092,7 +2092,7 @@ export class ChatRuntime extends EventEmitter {
     const record = session.record
     const startup = new AbortController()
     session.startup = startup
-    const signal = AbortSignal.any([session.lifecycle.signal, startup.signal, ...(session.turn ? [session.turn.abort.signal] : [])])
+    const signal = AbortSignal.any([session.lifecycle.signal, startup.signal, ...(session.turn ? [session.turn.abort.signal] : []), ...(options.signal ? [options.signal] : [])])
     this.setStatus(session, 'starting')
     let lease = options.lease
     let freed = true
@@ -2111,7 +2111,7 @@ export class ChatRuntime extends EventEmitter {
       signal.throwIfAborted()
       const fresh = recreated || options.fresh || (!record.nativeSessionId && record.branch.provisional && !record.branch.baseSha)
       if (fresh) await this.prepareBranch(session, lease)
-      await this.prepareCheckout(session, lease)
+      await this.prepareCheckout(session, lease, options.signal)
       if ((fresh || options.forkFrom) && record.context?.kind === 'document' && record.context.slug) {
         session.staged = options.forkFrom
           ? await forkStagedDocument(record.checkout, record.id, record.context.slug, { sessionId: options.forkFrom.id, staged: options.forkFrom.staged })
@@ -3517,7 +3517,7 @@ export class ChatRuntime extends EventEmitter {
           turn.abort.signal.throwIfAborted()
           try {
             await this.stopProcess(session)
-            await this.startSession(session, { lease: turnLease })
+            await this.startSession(session, { lease: turnLease, signal })
           } catch (failure) {
             // A failed replacement may still own a live worker even though the
             // prompt was never invoked. Final cleanup must verify its exit too.
