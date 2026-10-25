@@ -482,7 +482,7 @@ main() {
 	has sha256sum || has shasum || fail "this installer needs sha256sum or shasum to check the downloads"
 	RELEASE_REPO=${POISE_RELEASE_REPO:-autonomio/poise}
 	case $RELEASE_REPO in
-	*/*/* | *//* | /* | */ | *[!A-Za-z0-9_./-]*) fail "POISE_RELEASE_REPO must be a GitHub repository like owner/name" ;;
+	*/*/* | /* | */ | *[!A-Za-z0-9_./-]*) fail "POISE_RELEASE_REPO must be a GitHub repository like owner/name" ;;
 	*/*) ;;
 	*) fail "POISE_RELEASE_REPO must be a GitHub repository like owner/name" ;;
 	esac
