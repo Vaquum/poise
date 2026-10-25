@@ -404,3 +404,46 @@ test('an exhausted search reopens when a call beyond the first page starts match
   await expect(pagerNext(page)).toBeDisabled()
   expect(cursorReads).toEqual(['search:200', 'search:200'])
 })
+
+test('an exhausted search reopens when arrivals and a hidden match land together', async ({ page }) => {
+  await ready(page)
+  let logs = history('acme', 250).map((row, index) => ({ ...row, prompt: `alpha run ${index + 1}` }))
+  const runningCall = { ...logs[0], id: 'acme-900', pr_id: '900', prompt: 'nightly run',
+    status: 'running', completed_at: null, response: '', error: '', time_elapsed: '' }
+  let running = [runningCall]
+  const cursorReads: string[] = []
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: running } })
+    const cursor = url.searchParams.get('cursor')
+    if (cursor !== null) cursorReads.push(url.searchParams.has('search') ? `search:${cursor}` : cursor)
+    return route.fulfill({ json: pagedBounded(logs, url, 200) })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await page.locator('#swarm-search').fill('alpha')
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 200+')
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–250 / 250')
+  await page.locator('#swarm-pagination [data-page="previous"]').click()
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 250')
+  // Fifty overlapping arrivals plus a completion beyond the first page: total
+  // growth past the absorbed rows must reopen the walk for the hidden match.
+  // The completed prompt gains the term the way its status would server-side.
+  const fresh = Array.from({ length: 50 }, (_, index) => ({
+    ...logs[0], id: `acme-new-${index}`, pr_id: `new-${index + 1}`, prompt: `alpha arrival ${index + 1}`,
+  }))
+  const completed = { ...runningCall, prompt: 'nightly run alpha', status: 'completed',
+    completed_at: '2026-10-14T08:01:00Z', response: 'available', time_elapsed: '1m' }
+  logs = [...fresh, ...logs]
+  logs.splice(300, 0, completed)
+  running = []
+  await settledRefresh(page)
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 301+')
+  await expect(pagerNext(page)).toBeEnabled()
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–301 / 301')
+  await expect(page.locator(`${rows}[data-id="acme-900"]`)).toContainText('Approved')
+  await expect(pagerNext(page)).toBeDisabled()
+  expect(cursorReads).toEqual(['search:200', 'search:200'])
+})

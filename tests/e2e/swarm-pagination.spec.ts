@@ -396,3 +396,40 @@ test('a continuation repositions a running-feed row instead of anchoring to it',
   expect(second).toEqual(old.slice(200, 250).map(entry => entry.id))
   await expect(next(page)).toBeDisabled()
 })
+
+test('a straddling continuation outranks older cached ties', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const old = history().slice(0, 401)
+  let logs: typeof old = old
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    return route.fulfill({ json: paged(logs, url, 200) })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  for (;;) {
+    if (!await next(page).isEnabled()) break
+    const before = await page.locator('#swarm-page').textContent()
+    await next(page).click()
+    await expect(page.locator('#swarm-page')).not.toHaveText(before!)
+  }
+  await expect(page.locator('#swarm-page')).toHaveText('401–401 / 401')
+  for (const label of ['201–400 / 401', '1–200 / 401']) {
+    await previous(page).click()
+    await expect(page.locator('#swarm-page')).toHaveText(label)
+  }
+  // Every row shares one timestamp: only the page structure can place the
+  // overlap-free continuation above the older cache it straddles.
+  const fresh = Array.from({ length: 400 }, (_, index) => ({
+    ...old[0], id: id(8100 + index), pr_id: `tied-${index + 1}`,
+  }))
+  logs = [...fresh, ...old]
+  await refreshed(page, true)
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 601+')
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 801+')
+  await expect(page.locator(rows)).toHaveCount(200)
+  const second = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(second).toEqual(logs.slice(200, 400).map(entry => entry.id))
+  expect(second[0]).toBe(fresh[200].id)
+})
