@@ -187,6 +187,21 @@ describe('PR account routing', () => {
     expect(mocks.spawnDetached.mock.calls[0][2].env.GITHUB_INTERFACE_AUTOMATED_REVIEWS).toBe('[91]')
   })
 
+  it('keeps a stale-dismissed approval owned instead of holding as the main user', async () => {
+    const { db, behaviors } = await initial()
+    db.setMeta('behavior_review_new_prs_enabled', '0')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { outcome: 'changes_requested' })
+    db.db.prepare('UPDATE behavior_seen SET launch_actor = ? WHERE launch_repo = ?').run('poise-user', pr.repo)
+    fixture.agentLogs = [agentLog({ id: 'c'.repeat(32), actor: 'poise-user', behavior: 'pr_approve', source: 'poise:approve-prs',
+      status: 'failed', error: 'submitted approval was dismissed as stale after the target moved',
+      error_code: 'approval_dismissed_stale', review_id: 91, correlation_id: 'old-call' })]
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA, reviewerReviewIdsSince: [91] })
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0][2].env.GITHUB_INTERFACE_AUTOMATED_REVIEWS).toBe('[91]')
+  })
+
   it('holds an unclaimed manual thread or approval beside automated findings', async () => {
     const { db, behaviors } = await initial()
     db.setMeta('behavior_review_new_prs_enabled', '0')

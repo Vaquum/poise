@@ -1323,6 +1323,14 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             if own is None and (_count(facts, "reviewer_reviews_since") != _count(before, "reviewer_reviews_since")
                     or facts.get("reviewer_latest_any_review_id") != before.get("reviewer_latest_any_review_id")):
                 raise RuntimeError("review activity changed without matching counters")
+        except review_budget.ReviewLimitError as typed:
+            if typed.code == "approval_dismissed_stale":
+                # A stale-dismissed approval reconciles as a typed release
+                # even when the provider failed first: the current head still
+                # needs a fresh evaluation, not a hold.
+                raise
+            raise review_budget.ReviewLimitError(
+                f"{failure}; could not prove a safe recovery: {typed}", failure.code, failure.diagnostic) from typed
         except Exception as verification:
             raise review_budget.ReviewLimitError(
                 f"{failure}; could not prove a safe recovery: {verification}", failure.code, failure.diagnostic) from verification

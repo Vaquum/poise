@@ -2106,11 +2106,16 @@ async function automatedReviewEnvironment(repo: string, number: number, reviewer
   if (snapshot.quarantined.some((row) => quarantinedLogMayMatch(row, { repo, prId: String(number) }))) {
     throw new Error('Cannot establish ownership of automated reviews: Caller evidence is unreadable')
   }
+  // A stale-dismissed approval failed its run, but its review is a verified
+  // Poise publication: leaving it out would brand it manual and hold every
+  // later approval on an agent-authored pull request.
   const ids = snapshot.entries.filter((row) => row.repo === repo && row.pr_id === String(number)
     && row.actor?.toLowerCase() === reviewer.toLowerCase()
     && ['poise:review-new-prs', 'poise:approve-prs', 'poise:manual-review', 'poise:replay'].includes(row.source || '')
     && ['pr_review', 'pr_approve'].includes(row.behavior || '')
-    && ['completed', 'superseded'].includes(row.status) && unambiguousAgentCall(snapshot, row)
+    && (['completed', 'superseded'].includes(row.status)
+      || (row.status === 'failed' && row.error_code === 'approval_dismissed_stale'))
+    && unambiguousAgentCall(snapshot, row)
     && Number.isSafeInteger(row.review_id) && (row.review_id || 0) > 0).map((row) => row.review_id!)
   return { GITHUB_INTERFACE_AUTOMATED_REVIEWS: JSON.stringify(ids) }
 }

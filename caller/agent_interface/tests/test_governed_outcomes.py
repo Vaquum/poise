@@ -253,6 +253,41 @@ class TestGovernedOutcomes(TestCase):
             "head_sha": "a" * 40,
         })
 
+    def test_interrupted_run_keeps_a_stale_dismissal_typed(self) -> None:
+        import subprocess as process
+        from types import SimpleNamespace
+
+        from agent_interface import pr_approve, review_budget
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            head_sha="b" * 40,
+            reviewer_reviews_since_items=[
+                self._item(92, state="DISMISSED", commit="a" * 40)
+            ],
+        )
+        receipt = {"action": "approved_pr", "review_id": 92, "head_sha": "a" * 40}
+        spec = SimpleNamespace(identity="model-a", provider="codex")
+        recovery = SimpleNamespace(identity="model-b", provider="codex")
+
+        def expired(*args, **kwargs):
+            raise process.TimeoutExpired("codex", 60)
+
+        with patch.object(pr_approve, "run", side_effect=expired), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            review_receipt._current.set(receipt)
+            try:
+                with self.assertRaises(review_budget.ReviewLimitError) as raised:
+                    agent_interface._run_review_with_recovery(
+                        pr_approve, "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                        "", 60, None, spec, recovery, before, "call-1",
+                    )
+            finally:
+                review_receipt._current.set(None)
+
+        self.assertEqual(raised.exception.code, "approval_dismissed_stale")
+
     @staticmethod
     def _item(review_id: int, state: str, commit: str) -> dict:
         return {
