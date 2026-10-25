@@ -44,6 +44,10 @@ beforeAll(async () => {
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   port = (server.address() as { port: number }).port
+  // Claude was configured here, so its lapsing sign-in raises the alert the
+  // event-stream tests expect.
+  const { setMeta } = await import('../server/db')
+  setMeta('account_logins', JSON.stringify({ claude: '2026-10-20T06:00:00.000Z' }))
 })
 
 afterAll(async () => {
