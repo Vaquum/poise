@@ -1323,21 +1323,49 @@ async function applyFirstPage(data: LogFeed, total: number, cursor: string | nul
   refreshExpandedDetails()
 }
 
+// Rows with no older covered page-mate are older than the cache — or newer
+// than it, when a multi-page arrival gap leaves the first continuation
+// without overlap. Slot them by start time so newer calls land above the
+// older cached page; ties stay after retained rows, as appended.
+function slotTail(merged: LogEntry[], tail: LogEntry[]): LogEntry[] {
+  const placed = [...merged]
+  const at = placed.map(startedAtMs)
+  for (const row of tail) {
+    const ms = startedAtMs(row)
+    let index = placed.length
+    while (index > 0 && at[index - 1]! < ms) index--
+    placed.splice(index, 0, row)
+    at.splice(index, 0, ms)
+  }
+  return placed
+}
+
 function appendPage(data: LogFeed, cursor: string | null, current: () => boolean): boolean {
   if (!current()) return false
   const retained = new Set(entries.map((entry) => entry.id))
+  // Only ids the history walk already covered pin server positions: a row
+  // cached from the running feed alone sits where a timestamp tie put it,
+  // so anchoring to it would slot fetched rows onto the wrong page.
+  const covered = new Set(historyIds)
   const page = data.logs || []
   // A shifted cursor can return rows newer than retained older pages — the
-  // arrival gap — so each unseen row slots ahead of its next older page-mate
-  // already cached, keeping server order (page order breaks timestamp ties).
-  // Rows with no cached older page-mate are older than the cache and append.
+  // arrival gap — so each unseen row slots ahead of its next older covered
+  // page-mate, keeping server order (page order breaks timestamp ties). A
+  // running-feed row gains its history slot the same way on first contact.
   let older: string | null = null
   const before = new Map<string, LogEntry[]>()
   const tail: LogEntry[] = []
+  const move = new Set<string>()
   for (let index = page.length - 1; index >= 0; index--) {
     const row = page[index]!
     historyIds.add(row.id)
-    if (retained.has(row.id)) { older = row.id; continue }
+    if (covered.has(row.id)) {
+      if (retained.has(row.id)) older = row.id
+      continue
+    }
+    // The fresh page row wins over the retained running-feed copy, as it
+    // does on the refresh path.
+    if (retained.has(row.id)) move.add(row.id)
     if (older === null) tail.push(row)
     else {
       const group = before.get(older)
@@ -1347,14 +1375,15 @@ function appendPage(data: LogFeed, cursor: string | null, current: () => boolean
   }
   tail.reverse()
   for (const group of before.values()) group.reverse()
-  if (before.size || tail.length) {
+  if (before.size || tail.length || move.size) {
+    const kept = move.size ? entries.filter((entry) => !move.has(entry.id)) : entries
     const merged: LogEntry[] = []
-    for (const entry of entries) {
+    for (const entry of kept) {
       const group = before.get(entry.id)
       if (group) merged.push(...group)
       merged.push(entry)
     }
-    entries = [...merged, ...tail]
+    entries = tail.length ? slotTail(merged, tail) : merged
   }
   const seenQuarantined = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}`))
   for (const row of Array.isArray(data.quarantined) ? data.quarantined : []) {
@@ -1415,7 +1444,15 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   // page — cannot reopen exhausted history. Only a disjoint fresh page
   // (more than a page of arrivals) falls back to the reset below.
   const historyOverlaps = (history.logs || []).some((entry) => historyIds.has(entry.id))
-  const keepComplete = historyComplete && (!historyArrivals || historyOverlaps)
+  // A completed walk still reopens when the server counts matches the cache
+  // cannot see: a quiet refresh whose total grew means a row beyond the first
+  // page newly matches this query (a running call that just completed), and
+  // no arrival carried it. totalMatching still holds the previous refresh
+  // here; the update below runs after this read. Newcomers in hand never
+  // reopen: overlapping arrivals are cached above, disjoint ones reset below.
+  const hiddenGrowth = historyComplete && !historyArrivals
+    && typeof history.total === 'number' && history.total > totalMatching
+  const keepComplete = historyComplete && (!historyArrivals || historyOverlaps) && !hiddenGrowth
   if (historyArrivals && !keepComplete) historyIds = new Set((history.logs || []).map((entry) => entry.id))
   else for (const entry of history.logs || []) historyIds.add(entry.id)
   // New unreadable calls shift page boundaries exactly like readable ones;
