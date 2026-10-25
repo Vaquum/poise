@@ -692,8 +692,13 @@ function renderShell() {
       // Filter the cache at once so the control answers while its server
       // read is still out; the read refreshes the matches behind it.
       entries = entries.filter(matchesSearch)
-      // Pinned positions survive: the kept matches' server-relative order is
-      // still valid for the next query, which orders by the same insertion id.
+      // Pinned positions survive for the kept matches: their server-relative
+      // order is still valid for the next query, which orders by the same
+      // insertion id. Discarded ids must leave the pinned set, or a later
+      // continuation skips their rows as already placed and the pager
+      // reports a complete walk with history missing.
+      const kept = new Set(entries.map((entry) => entry.id))
+      pinnedIds = new Set([...pinnedIds].filter((id) => kept.has(id)))
       historyIds.clear()
       quarantined = []
       totalMatching = 0

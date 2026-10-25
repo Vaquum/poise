@@ -449,3 +449,33 @@ test('an exhausted search reopens when arrivals and a hidden match land together
   await expect(pagerNext(page)).toBeDisabled()
   expect(cursorReads).toEqual(['search:200', 'search:200'])
 })
+
+test('a cleared search still reaches rows its narrowing discarded', async ({ page }) => {
+  await ready(page)
+  const logs = history('acme', 450).map((row, index) => index < 250
+    ? { ...row, prompt: `alpha run ${index + 1}` }
+    : { ...row, prompt: `beta run ${index + 1}` })
+  const cursorReads: string[] = []
+  await boundedRoute(page, () => logs, cursorReads)
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 400+')
+  // Narrowing discards the walked alpha rows from the cache; clearing must
+  // release their pinned ids, or the next continuation skips them as placed.
+  await page.locator('#swarm-search').fill('beta')
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 200')
+  await expect(pagerNext(page)).toBeDisabled()
+  await page.locator('#swarm-search').fill('')
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 400+')
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 450+')
+  await expect(page.locator(rows).first()).toContainText('#201')
+  await expect(page.locator(rows).last()).toContainText('#400')
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('401–450 / 450+')
+  await pagerNext(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('401–450 / 450')
+  await expect(pagerNext(page)).toBeDisabled()
+  expect(cursorReads).toEqual(['200', '200', '400'])
+})
