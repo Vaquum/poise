@@ -1,4 +1,5 @@
 import { feedback } from './fixtures/view-feedback'
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
@@ -8,8 +9,15 @@ import { DiagnosticStore, DEFAULT_LOG_POLICY } from '../../gateway/src/diagnosti
 import { workspace } from './fixtures/workspace'
 
 const storePath = resolve('test-results/e2e/logging.db')
-const component = 'logging-fixture'
-const callId = (index: number) => (index + 1).toString(16).padStart(32, '0')
+// Playwright retries this serial file as one group against the same logging.db,
+// and local reruns skip prepare:e2e. Event ids are content-addressed but their
+// payloads carry Date.now(), so re-seeding fixed ids always throws a
+// conflicting-identity error and no retry could ever run. Each worker module
+// therefore seeds its own component + id namespace; every query in this spec
+// is already scoped by prefs.component, so earlier attempts' rows stay invisible.
+const run = randomBytes(4).toString('hex')
+const component = `logging-fixture-${run}`
+const callId = (index: number) => run + (index + 1).toString(16).padStart(24, '0')
 const fixtures: LogEvent[] = []
 const lateIds: string[] = []
 const prefs = { component, workspace: '', account: '', repository: '', callId: '', correlationId: '', incidentId: '',
@@ -65,6 +73,27 @@ async function ready(page: Page, path?: string, timezone = 'UTC'): Promise<void>
 }
 
 // Only this file uses the real API/store; other browser fixtures intercept it.
+interface LoggingPoll { hidden: boolean; logging: boolean }
+// Polls are attributed in the page at fetch time. Playwright `request` events
+// arrive asynchronously, so a poll issued before the counting window could be
+// counted after it (false positive), and one issued at the end of runFor could
+// arrive after the assertion (false negative). A bare `after` match would also
+// count unrelated endpoints such as /api/chat/sessions/:id?after=.
+async function trackLoggingPolls(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const polls: Array<{ hidden: boolean; logging: boolean }> = []
+    const native = window.fetch.bind(window)
+    Object.assign(window, { loggingPolls: polls })
+    window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.href)
+      if (url.pathname === '/api/logging' && url.searchParams.has('after'))
+        polls.push({ hidden: document.hidden, logging: !document.getElementById('view-logging')?.hidden })
+      return native(input, init)
+    }) as typeof window.fetch
+  })
+}
+const loggingPolls = (page: Page): Promise<LoggingPoll[]> =>
+  page.evaluate(() => (window as unknown as { loggingPolls: LoggingPoll[] }).loggingPolls)
 test.describe.configure({ mode: 'serial' })
 test.beforeAll(() => {
   const now = Date.now()
@@ -75,8 +104,8 @@ test.beforeAll(() => {
         context: { exit_code: 128, timeout_seconds: 15, elapsed_ms: 23, provider_started: false } } }, 'local')!
     fixtures.push(normalize({ ...input, truncated: true, condition: 'fixture-fetch', cause: ['underlying retained cause', 'x'.repeat(512)], resources: { usedBytes: 42, measuredAt: new Date(now - 1000).toISOString(), measurement: 'statfs' } }, now, ['fixture-secret'])!)
   }
-  for (const level of ['critical', 'warning']) fixtures.push(normalize({ id: 'fixture-' + level, component, source: 'poise', level, operation: 'fixture', workspace: 'local', message: level + ' representative evidence' }, now)!)
-  const foreign = normalize({ id: 'fixture-bob', component, source: 'caller', level: 'error', operation: 'fetch', workspace: 'bob', message: 'never reveal bob-private-evidence' }, now)!
+  for (const level of ['critical', 'warning']) fixtures.push(normalize({ id: `fixture-${level}-${run}`, component, source: 'poise', level, operation: 'fixture', workspace: 'local', message: level + ' representative evidence' }, now)!)
+  const foreign = normalize({ id: `fixture-bob-${run}`, component, source: 'caller', level: 'error', operation: 'fetch', workspace: 'bob', message: 'never reveal bob-private-evidence' }, now)!
   const db = new DiagnosticStore(storePath, DEFAULT_LOG_POLICY)
   try { for (let i = 0; i < fixtures.length; i += 100) db.append(fixtures.slice(i, i + 100)); db.append([foreign]) }
   finally { db.close() }
@@ -192,6 +221,7 @@ test('uses Settings civil day/week boundaries across the spring DST transition',
 })
 
 test('discards a delayed older filter response and stops polling in a hidden document', async ({ page }) => {
+  await trackLoggingPolls(page)
   await ready(page)
   let release!: () => void
   const released = new Promise<void>((resolve) => { release = resolve })
@@ -212,13 +242,14 @@ test('discards a delayed older filter response and stops polling in a hidden doc
     await expect(rows(page)).toHaveCount(1)
     await expect(rows(page).first()).toContainText('critical representative')
     await page.clock.install()
-    let reads = 0
-    page.on('request', (request) => { if (new URL(request.url()).searchParams.has('after')) reads++ })
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: true }); document.dispatchEvent(new Event('visibilitychange')) })
+    const mark = (await loggingPolls(page)).length
     await page.clock.runFor(45_000)
-    expect(reads).toBe(0)
+    const held = await loggingPolls(page)
+    expect(held.length).toBe(mark)
+    expect(held.some((poll) => poll.hidden)).toBe(false)
     await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, value: false }); document.dispatchEvent(new Event('visibilitychange')) })
-    await expect.poll(() => reads).toBe(1)
+    await expect.poll(async () => (await loggingPolls(page)).filter((poll) => !poll.hidden).length).toBeGreaterThan(mark)
   } finally { release() }
 })
 
@@ -294,10 +325,11 @@ test('cold links reveal an event outside the first page, widen bounds, persist v
 })
 
 test('late older ingestions stay behind an explicit control and pagination retains its snapshot', async ({ page }) => {
+  await trackLoggingPolls(page)
   await ready(page)
   await page.clock.install()
   const initial = await rows(page).evaluateAll((items) => items.map((row) => (row as HTMLElement).dataset.id))
-  const late = normalize({ id: 'browser-late', time: new Date(Date.now() - 86_400_000).toISOString(), source: 'poise', component, workspace: 'local', level: 'warning', operation: 'late', message: 'late older evidence' })!
+  const late = normalize({ id: `browser-late-${run}`, time: new Date(Date.now() - 86_400_000).toISOString(), source: 'poise', component, workspace: 'local', level: 'warning', operation: 'late', message: 'late older evidence' })!
   const db = new DiagnosticStore(storePath)
   try { db.append([late]); lateIds.push(late.id) } finally { db.close() }
   await action(page, 'next').click()
@@ -312,11 +344,13 @@ test('late older ingestions stay behind an explicit control and pagination retai
   expect(await rows(page).evaluateAll((items) => items.map((row) => (row as HTMLElement).dataset.id))).toEqual(initial)
   await action(page, 'new').click()
   await expect(status(page)).toContainText('123 matching retained events')
-  let polls = 0
-  page.on('request', (request) => { if (new URL(request.url()).searchParams.has('after')) polls++ })
   await page.getByRole('button', { name: 'Current', exact: true }).click()
+  await expect(page.locator('#view-logging')).toBeHidden()
+  const mark = (await loggingPolls(page)).length
   await page.clock.runFor(45_000)
-  expect(polls).toBe(0)
+  const polls = await loggingPolls(page)
+  expect(polls.length).toBe(mark)
+  expect(polls.some((poll) => !poll.logging)).toBe(false)
 })
 
 test('custom interval drafts survive refresh, use zoned civil bounds, and reject invalid ranges honestly', async ({ page }) => {
