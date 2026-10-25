@@ -46,6 +46,12 @@ export const PRESSURE_CLEAR_PCT = 75
 export const PRESSURE_RUN_COOLDOWN_MS = 60 * 60_000
 /** Files this fresh are never evicted: they may be in use right now. */
 export const CACHE_FRESH_MS = 5 * 60_000
+/** One Settings storage read walks at most this many entries across every category. */
+export const STORAGE_SCAN_MAX_ENTRIES = 100_000
+/** One Settings storage read spends at most this long walking trees. */
+export const STORAGE_SCAN_TIMEOUT_MS = 5_000
+/** One measured storage summary answers Settings opens for this long. */
+export const STORAGE_STATUS_TTL_MS = 60_000
 
 export const CACHE_CAP_BYTES = {
   pip: 1024 ** 3,
@@ -59,17 +65,25 @@ const PRESSURE_ALERT_KEY = 'workspace-storage-pressure'
 const PRUNE_MARKER = '.poise-maintenance.json'
 const HEX32 = /^[0-9a-f]{32}$/
 
+export type StorageCategoryStatus = 'ok' | 'partial' | 'unavailable'
+
 export interface StorageCategory {
   key: string
   label: string
   path: string
-  bytes: number
+  /** Measured bytes, or null when nothing usable could be read. */
+  bytes: number | null
+  status: StorageCategoryStatus
+  /** Why a partial or unavailable category stopped short, for the reader. */
+  error?: string
 }
 
 export interface StorageBreakdown {
   at: string
   categories: StorageCategory[]
   disk: { path: string, totalBytes: number, freeBytes: number, usedPercent: number }
+  /** False when any category stopped short of a full measurement. */
+  complete: boolean
 }
 
 export interface HeldItem {
@@ -121,6 +135,10 @@ function errorCode(error: unknown): unknown {
   return (error as { code?: unknown })?.code
 }
 
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 /** Cache roots, honoring each tool's own override exactly as the tool does. */
 export function cacheDirs(home: string = homedir(), env: NodeJS.ProcessEnv = process.env): {
   pip: string, uv: string, npm: string, agentWork: string, mirrors: string,
@@ -164,11 +182,107 @@ async function diskUsage(path: string): Promise<{ totalBytes: number, freeBytes:
   return { totalBytes, freeBytes, usedPercent }
 }
 
-/** The workspace storage breakdown: the managed categories plus disk totals. */
-export async function storageBreakdown(home: string = homedir(), chatRoot: string = LOCAL_CHAT_ROOT, stateRoot?: string): Promise<StorageBreakdown> {
+export interface MeasureOptions {
+  /** Shared across one breakdown: every examined path counts as one entry. */
+  budget?: { entries: number, maxEntries: number }
+  /** Entry budget for a standalone measurement; a shared budget wins. */
+  maxEntries?: number
+  /** Walk budget in milliseconds for a standalone measurement. */
+  timeoutMs?: number
+  /** Epoch milliseconds the walk may run until; checked before each entry. */
+  deadlineMs?: number
+  now?: () => number
+}
+
+export interface MeasuredDir {
+  bytes: number | null
+  status: StorageCategoryStatus
+  entries: number
+  error?: string
+}
+
+/** Logical bytes under a path, following no symlinks, within a shared entry
+ *  budget and a time deadline. Missing reads as zero; anything else that
+ *  stops the walk reports partial (a measured prefix) or unavailable
+ *  (nothing usable), never a silent zero. A missing path costs no budget:
+ *  it is one lstat with an honest answer. */
+export async function measureDir(path: string, options: MeasureOptions = {}): Promise<MeasuredDir> {
+  const clock = options.now ?? Date.now
+  const deadlineMs = options.deadlineMs ?? clock() + (options.timeoutMs ?? STORAGE_SCAN_TIMEOUT_MS)
+  const budget = options.budget ?? { entries: 0, maxEntries: options.maxEntries ?? STORAGE_SCAN_MAX_ENTRIES }
+  const expired = (): string | null => {
+    if (budget.entries >= budget.maxEntries) return `the storage scan stopped after ${budget.maxEntries} entries`
+    if (clock() >= deadlineMs) return 'the storage scan timed out'
+    return null
+  }
+  let top
+  try {
+    top = await lstat(path)
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return { bytes: 0, status: 'ok', entries: 0 }
+    return { bytes: null, status: 'unavailable', entries: 0, error: messageOf(error) }
+  }
+  const beforeStart = expired()
+  if (beforeStart) return { bytes: null, status: 'unavailable', entries: 0, error: beforeStart }
+  if (!top.isDirectory() || top.isSymbolicLink()) {
+    budget.entries += 1
+    return { bytes: top.size, status: 'ok', entries: 1 }
+  }
+  let total = 0
+  let entries = 0
+  let failure: string | null = null
+  const stack: string[] = [path]
+  while (stack.length) {
+    const limit = expired()
+    if (limit) {
+      failure = limit
+      break
+    }
+    const current = stack.pop()!
+    let info
+    try {
+      info = current === path ? top : await lstat(current)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') continue
+      failure ??= `${current}: ${messageOf(error)}`
+      continue
+    }
+    entries += 1
+    budget.entries += 1
+    total += info.size
+    if (!info.isDirectory() || info.isSymbolicLink()) continue
+    try {
+      for (const entry of await readdir(current)) stack.push(join(current, entry))
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') continue
+      failure ??= `${current}: ${messageOf(error)}`
+    }
+  }
+  if (!failure) return { bytes: total, status: 'ok', entries }
+  // Only the category root itself was seen: its content is entirely unknown.
+  if (entries <= 1) return { bytes: null, status: 'unavailable', entries, error: failure }
+  return { bytes: total, status: 'partial', entries, error: failure }
+}
+
+export interface StorageBreakdownOptions {
+  maxEntries?: number
+  timeoutMs?: number
+  now?: () => number
+}
+
+/** The workspace storage breakdown: the managed categories plus disk totals.
+ *  The categories share one entry budget and one deadline, so one large tree
+ *  cannot hold the read past its bound; categories past it report partial or
+ *  unavailable instead of a silent zero. */
+export async function storageBreakdown(
+  home: string = homedir(), chatRoot: string = LOCAL_CHAT_ROOT, stateRoot?: string, options: StorageBreakdownOptions = {},
+): Promise<StorageBreakdown> {
   const root = stateRoot ?? poiseStateRoot()
   const caches = cacheDirs(home)
-  const categories = [
+  const clock = options.now ?? Date.now
+  const budget = { entries: 0, maxEntries: options.maxEntries ?? STORAGE_SCAN_MAX_ENTRIES }
+  const deadlineMs = clock() + (options.timeoutMs ?? STORAGE_SCAN_TIMEOUT_MS)
+  const measured = await Promise.all([
     { key: 'chat-workers', label: 'Chat worker workspaces', path: join(chatRoot, 'workers') },
     { key: 'review-checkouts', label: 'Review checkouts', path: join(root, 'review-checkouts') },
     { key: 'incident-recovery', label: 'Incident snapshots', path: join(root, 'incident-recovery') },
@@ -177,8 +291,14 @@ export async function storageBreakdown(home: string = homedir(), chatRoot: strin
     { key: 'npm', label: 'npm cache', path: caches.npm },
     { key: 'agent-work', label: 'Issue-review work dirs', path: caches.agentWork },
     { key: 'mirrors', label: 'GitHub mirrors', path: caches.mirrors },
-  ].map(async (category) => ({ ...category, bytes: await dirSize(category.path).catch(() => 0) }))
-  return { at: new Date().toISOString(), categories: await Promise.all(categories), disk: { path: home, ...(await diskUsage(home)) } }
+  ].map(async (category) => {
+    const dir = await measureDir(category.path, { budget, deadlineMs, now: clock })
+    return { ...category, bytes: dir.bytes, status: dir.status, error: dir.error }
+  }))
+  return {
+    at: new Date().toISOString(), categories: measured, disk: { path: home, ...(await diskUsage(home)) },
+    complete: measured.every((category) => category.status === 'ok'),
+  }
 }
 
 export function claimsForCheckout(checkout: string): WorkspaceClaim[] {
@@ -570,6 +690,8 @@ export async function runStorageMaintenance(options: MaintenanceOptions = {}): P
     report.trimmedBytes = await (options.trim ?? trimFilesystem)(home)
   }
   report.finishedAt = new Date().toISOString()
+  // A real run changes what the summary measures; a dry run changes nothing.
+  if (!dryRun) storageCache = null
   if (!dryRun) {
     try {
       setMeta(LAST_RUN_KEY, JSON.stringify(report))
@@ -607,14 +729,57 @@ export function lastMaintenanceRun(): MaintenanceReport | null {
   }
 }
 
-/** The Settings and diagnostics payload: breakdown, disk, pressure, last run. */
-export async function storageStatus(): Promise<StorageBreakdown & { pressure: boolean, lastRun: MaintenanceReport | null }> {
-  const breakdown = await storageBreakdown()
-  return { ...breakdown, pressure: breakdown.disk.usedPercent >= PRESSURE_USED_PCT, lastRun: lastMaintenanceRun() }
+export interface StorageStatus extends StorageBreakdown {
+  pressure: boolean
+  lastRun: MaintenanceReport | null
+  /** True when this is the previous observation, served because a refresh failed. */
+  stale: boolean
+  /** Why a stale observation could not be refreshed. */
+  error?: string
+}
+
+export interface StorageStatusOptions {
+  /** Measure now even when a live cache entry exists (the Settings retry path). */
+  fresh?: boolean
+  now?: number
+  /** Injectable scan; production measures the real trees. */
+  breakdown?: () => Promise<StorageBreakdown>
+}
+
+/** The Settings and diagnostics payload: breakdown, disk, pressure, last run.
+ *
+ *  One scan answers concurrent readers, and its observation answers Settings
+ *  opens until STORAGE_STATUS_TTL_MS passes. A refresh that fails serves the
+ *  previous observation marked stale; only a failure with nothing cached
+ *  throws. */
+export async function storageStatus(options: StorageStatusOptions = {}): Promise<StorageStatus> {
+  const now = options.now ?? Date.now()
+  if (!options.fresh && storageCache && now - storageCache.at < STORAGE_STATUS_TTL_MS) return storageCache.status
+  storageInflight ??= (async () => {
+    try {
+      const breakdown = await (options.breakdown ?? storageBreakdown)()
+      const status: StorageStatus = {
+        ...breakdown, pressure: breakdown.disk.usedPercent >= PRESSURE_USED_PCT,
+        lastRun: lastMaintenanceRun(), stale: false, error: undefined,
+      }
+      storageCache = { at: now, status }
+      return status
+    } catch (error) {
+      if (storageCache) {
+        return { ...storageCache.status, stale: true, error: messageOf(error) }
+      }
+      throw error
+    } finally {
+      storageInflight = null
+    }
+  })()
+  return storageInflight
 }
 
 let running: Promise<MaintenanceReport> | null = null
 let lastPressureRun = 0
+let storageCache: { at: number, status: StorageStatus } | null = null
+let storageInflight: Promise<StorageStatus> | null = null
 
 /** One pass unless one is already running, in which case the running report. */
 export function runStorageMaintenanceOnce(options: MaintenanceOptions = {}): Promise<MaintenanceReport> {

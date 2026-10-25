@@ -764,6 +764,18 @@ before constructing the canonical lease. Ownership/Git initialization and
 the post-wait existence check run under that same held lease. Foreign
 markers are refused; an unsettled initializer worker keeps its lease.
 
+Settings → General reads a cached storage summary: one scan answers
+concurrent requests, and its observation answers Settings opens for 60
+seconds. Each read walks at most 100,000 entries or 5 seconds across every
+category; a category past either bound reports partial (a measured prefix)
+or unavailable, while a missing directory still reads as zero. When a
+refresh fails, the panel keeps the last update, marked stale with its age
+and the refresh error; a failed first read, and a read that never answers
+within 15 seconds, show an error instead. Partial, stale and failed reads
+offer Retry, which re-measures at once (`GET /api/storage?fresh=1`). A
+completed maintenance run drops the cached summary, so the next open
+measures the reclaimed space.
+
 ### Giving space back on a VM host
 
 When Poise runs [in a virtual machine](#in-a-virtual-machine-on-a-shared-server),
