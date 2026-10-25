@@ -349,8 +349,8 @@ export function parseAgentLogList(list: unknown[]): AgentLogSnapshot {
 
 // Decode one bounded history page. Strict envelope: a bare row array is a
 // whole-log read, never a page, so it fails loud instead of silently ending
-// the walk early.
-export function parseAgentLogPage(stdout: string, source: string): AgentLogSnapshot & { nextCursor: string | null } {
+// the walk early. Total counts all matching rows without loading them.
+export function parseAgentLogPage(stdout: string, source: string): AgentLogSnapshot & { nextCursor: string | null, total: number } {
   const trimmed = stdout.trim()
   if (!trimmed) throw new Error(`${source} returned empty output`)
   let page: unknown
@@ -363,10 +363,12 @@ export function parseAgentLogPage(stdout: string, source: string): AgentLogSnaps
     : null
   const rows = envelope?.rows
   const nextCursor = envelope?.nextCursor ?? null
-  if (!envelope || !Array.isArray(rows) || !(nextCursor === null || typeof nextCursor === 'string')) {
+  const total = envelope?.total
+  if (!envelope || !Array.isArray(rows) || !(nextCursor === null || typeof nextCursor === 'string')
+    || typeof total !== 'number' || !Number.isSafeInteger(total) || total < 0) {
     throw new Error(`${source} returned an invalid page`)
   }
-  return { ...parseAgentLogList(rows), nextCursor }
+  return { ...parseAgentLogList(rows), nextCursor, total }
 }
 
 // Co-waiters alias one snapshot; freezing makes misuse fail loud.

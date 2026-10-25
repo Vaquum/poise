@@ -171,11 +171,10 @@ async function main() {
   // this process (rather than spawning a child) keeps launchd supervising the
   // real server, so KeepAlive and signal handling behave as before.
   const bundle = pathToFileURL(join(projectRoot, 'dist', 'server.js')).href
-  const { startProductionServer, createProductionShutdown } = await import(bundle)
+  const { startProductionServer, createProductionShutdown, refuseInspectorActivation, registerProductionShutdownSignals } = await import(bundle)
+  refuseInspectorActivation()
   const server = await startProductionServer()
-  const shutdown = createProductionShutdown(server)
-  process.once('SIGINT', shutdown)
-  process.once('SIGTERM', shutdown)
+  registerProductionShutdownSignals(createProductionShutdown(server))
 }
 
 const isEntrypoint = process.argv[1]

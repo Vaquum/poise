@@ -81,7 +81,7 @@ beforeEach(async () => {
   mocks.runFile.mockReset().mockImplementation(async (command: string, args: string[]) => {
     if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
     if (command === 'agent-interface' && args[0] === '--logs') {
-      return { stdout: JSON.stringify(args.includes('--limit') ? { rows: [], nextCursor: null } : []), stderr: '' }
+      return { stdout: JSON.stringify(args.includes('--limit') ? { rows: [], nextCursor: null, total: 0 } : []), stderr: '' }
     }
     if (command === 'github-datastore' && args[0] === 'health') {
       const now = new Date().toISOString()

@@ -122,7 +122,7 @@ function fakeCaller(): CallerTurns & { starts: any[], finishes: any[] } {
 
 const runtimes: Array<import('../../server/chat/runtime').ChatRuntime> = []
 
-function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: FakeControls, caller?: CallerTurns | null, leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions, prepareCli?: import('../../server/chat/runtime').RuntimeOptions['prepareCli'], catalog?: () => Promise<any>, extensions?: import('../../server/chat/runtime').RuntimeExtensions } = {}) {
+function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: FakeControls, caller?: CallerTurns | null, leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions, prepareCli?: import('../../server/chat/runtime').RuntimeOptions['prepareCli'], catalog?: () => Promise<any>, branchPrefix?: () => string, extensions?: import('../../server/chat/runtime').RuntimeExtensions } = {}) {
   const controls: FakeControls = options.controls ?? { hosts: [], adapters: [], startCount: 0 }
   const runtime = new runtimeModule.ChatRuntime({
     instance: options.instance ?? 'poise-test:db',
@@ -132,6 +132,7 @@ function makeRuntime(options: { agent?: AgentId, instance?: string, controls?: F
     catalog: options.catalog ?? (async () => CATALOG as any),
     resolveCheckout: async () => repo,
     idleTimeoutMinutes: () => 0,
+    branchPrefix: options.branchPrefix,
     requireClaudeReady: async () => {},
     leaseProbes: options.leaseProbes,
     prepareCli: options.prepareCli,
@@ -279,6 +280,33 @@ describe('chat runtime', () => {
     expect(ofType(events, session.id, 'turn.finished').at(-1).stopReason).toBe('cancelled')
     await waitFor(() => lastStatus(events, session.id) === 'idle')
     expect(caller.finishes.at(-1).status).toBe('cancelled')
+    await runtime.stop()
+  }, 40_000)
+
+  for (const prefix of ['custom/', 'agent/']) {
+    it(`cuts the generated branch under the saved prefix ${prefix} when none is requested`, async () => {
+      const { runtime, events } = makeRuntime({ branchPrefix: () => prefix })
+      const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo' })
+      expect(session.branch).toMatchObject({ name: `${prefix}${session.id}`, origin: 'new', provisional: true })
+      await waitFor(() => lastStatus(events, session.id) === 'idle')
+      expect(git(['rev-parse', '--verify', `refs/heads/${prefix}${session.id}`])).toBeTruthy()
+      await runtime.prompt(session.id, { text: 'hello there', attachments: [], mentions: [] })
+      await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
+      expect(git(['rev-parse', '--abbrev-ref', 'HEAD'])).toBe(`${prefix}${session.id}`)
+      expect(runtime.get(session.id)?.workspace).toMatchObject({ currentBranch: `${prefix}${session.id}`, onBranch: true })
+      await runtime.stop()
+    }, 40_000)
+  }
+
+  it('keeps explicit new branch names under a custom prefix', async () => {
+    const { runtime, events } = makeRuntime({ branchPrefix: () => 'custom/' })
+    const plain = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'plain' } })
+    expect(plain.branch).toMatchObject({ name: 'custom/plain', origin: 'new' })
+    const scoped = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { new: 'feat/scoped' } })
+    expect(scoped.branch).toMatchObject({ name: 'feat/scoped', origin: 'new' })
+    await waitFor(() => lastStatus(events, plain.id) === 'idle' && lastStatus(events, scoped.id) === 'idle')
+    expect(git(['rev-parse', '--verify', 'refs/heads/custom/plain'])).toBeTruthy()
+    expect(git(['rev-parse', '--verify', 'refs/heads/feat/scoped'])).toBeTruthy()
     await runtime.stop()
   }, 40_000)
 

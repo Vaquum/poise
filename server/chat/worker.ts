@@ -112,7 +112,14 @@ async function waitUntilDead(pgid: number, ms: number): Promise<boolean> {
   return true
 }
 
+/** Only a real worker group is ever signalled: 0 is the caller's own
+ *  group and 1 reaches every process it may signal — neither is a worker. */
+export function canSignalGroup(pgid: number): boolean {
+  return Number.isSafeInteger(pgid) && pgid > 1
+}
+
 export function signalGroup(pgid: number, signal: NodeJS.Signals): void {
+  if (!canSignalGroup(pgid)) throw new RangeError(`refusing to signal process group ${String(pgid)}`)
   try { process.kill(-pgid, signal) } catch { /* group already gone */ }
 }
 
@@ -131,6 +138,41 @@ export function pgidAlive(pgid: number | null | undefined): boolean {
   try { process.kill(-pgid, 0); return true } catch (error: any) {
     return error?.code !== 'ESRCH'
   }
+}
+
+/** The process group `pid` currently belongs to, or null when it cannot
+ *  be read. Linux parses /proc (like processStartTime); anything else
+ *  asks ps. Compared only for equality with the recorded pgid, so a
+ *  regrouped gate reads as a different group. */
+export function processGroupId(pid: number | null | undefined): number | null {
+  if (!pid || !Number.isSafeInteger(pid) || pid <= 0) return null
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      // Fields after comm (see processStartTime): pgrp is field 5.
+      const pgrp = Number(stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[5 - 3])
+      return Number.isSafeInteger(pgrp) && pgrp > 0 ? pgrp : null
+    } catch {
+      return null
+    }
+  }
+  try {
+    const pgrp = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 }).trim())
+    return Number.isSafeInteger(pgrp) && pgrp > 0 ? pgrp : null
+  } catch {
+    return null
+  }
+}
+
+/** Whether the recorded worker still owns its group: the recorded pgid
+ *  is signallable, the gate pid is alive in that group, and it still
+ *  carries the recorded ident. Anything else (a stale registration, a
+ *  regrouped gate, pid reuse, an unreadable table) is "no" — the caller
+ *  must not signal the recorded pgid. */
+export async function workerGroupMatches(gatePid: number, gatePgid: number, ident: string): Promise<boolean> {
+  if (!canSignalGroup(gatePgid)) return false
+  if (processGroupId(gatePid) !== gatePgid) return false
+  return workerIdentityMatches(gatePid, ident)
 }
 
 /** Start time of `pid` as an opaque same-machine token, or null when it

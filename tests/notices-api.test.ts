@@ -110,6 +110,37 @@ afterEach(async () => {
 const waiting = { kind: 'chat_waiting', dedupeKey: 'chat-waiting:s1', title: 'Claude Code is waiting for you', body: 'Allow it?', path: '/', target: { chat: 's1' } } as const
 const ready = { kind: 'pr_ready', dedupeKey: 'pr-ready:acme/api#1', title: 'acme/api#1 is ready to merge', body: 'Change 1', path: '/', target: { pullRequest: 'https://github.com/acme/api/pull/1' } } as const
 
+it.each([
+  { path: '/api/analytics?since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z', method: 'readAnalytics' as const },
+  { path: '/api/analytics/history?bounds=2026-10-01T00:00:00Z,2026-10-02T00:00:00Z', method: 'readAnalyticsHistory' as const },
+])('cancels server work when the client abandons $method', async ({ path, method }) => {
+  const analytics = await import('../server/analytics')
+  let signal: AbortSignal | undefined
+  let release: (() => void) | undefined
+  const read = vi.spyOn(analytics, method).mockImplementation((...args: Parameters<typeof analytics.readAnalytics> | Parameters<typeof analytics.readAnalyticsHistory>) => {
+    const last = args.at(-1)
+    signal = last instanceof AbortSignal ? last : undefined
+    return new Promise<never>((_resolve, reject) => {
+      release = () => reject(new Error('released test read'))
+      signal?.addEventListener('abort', () => reject(signal!.reason), { once: true })
+    })
+  })
+  const controller = new AbortController()
+  const pending = fetch(base + path, { signal: controller.signal }).catch(error => error)
+  try {
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+    expect(signal).toBeInstanceOf(AbortSignal)
+    controller.abort()
+    await pending
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true))
+  } finally {
+    controller.abort()
+    release?.()
+    await pending
+    read.mockRestore()
+  }
+})
+
 describe('the notices API', () => {
   it('retains source evidence when Off is selected during an actual quota API read', async () => {
     database!.setMeta('me', 'octocat')
@@ -301,16 +332,17 @@ describe('the handling log', () => {
     mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
       if (command === 'agent-interface' && args[0] === '--logs') {
         const now = new Date().toISOString()
-        return { stdout: JSON.stringify([{ id: 'a'.repeat(32), pr_id: '9', repo: 'acme/api', actor: 'review-bot',
+        const rows = [{ id: 'a'.repeat(32), pr_id: '9', repo: 'acme/api', actor: 'review-bot',
           model: 'opus-5-xhigh', behavior: 'pr_review', session_id: null, prompt: '', started_at: now,
           started_at_precise: now, completed_at: now, time_elapsed: '1m', status: 'completed', outcome: 'clean',
           head_sha: 'b'.repeat(40), expected_head: 'b'.repeat(40), source: 'poise:review-new-prs',
-          correlation_id: 'correlation-fixture', action: 'reviewed_clean', response: null, error: '' }]), stderr: '' }
+          correlation_id: 'correlation-fixture', action: 'reviewed_clean', response: null, error: '' }]
+        return { stdout: JSON.stringify(args.includes('--limit') ? { rows, nextCursor: null, total: rows.length } : rows), stderr: '' }
       }
       if (command === 'agent-interface' && args[0] === '--diagnostics') return { stdout: JSON.stringify({ version: 1, streamId: 'f'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }) }
       throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
     })
-    expect((await call('GET', '/api/agent-logs')).status).toBe(200)
+    expect((await call('GET', '/api/agent-logs?limit=100')).status).toBe(200)
 
     const state = await handled()
     expect(state.body.handled).toHaveLength(3)
@@ -321,7 +353,7 @@ describe('the handling log', () => {
       outcome: 'clean', actor: 'caller' })
 
     // A second sighting of the same run records nothing new.
-    expect((await call('GET', '/api/agent-logs')).status).toBe(200)
+    expect((await call('GET', '/api/agent-logs?limit=100')).status).toBe(200)
     expect((await handled()).body.handled).toHaveLength(3)
   })
 

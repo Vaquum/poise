@@ -658,10 +658,29 @@ function renderShell() {
   viewEl.querySelector('#swarm-pagination')!.addEventListener('click', event => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-page]')
     if (!button || button.disabled) return
-    pageIndex += button.dataset.page === 'next' ? 1 : -1
-    clearRows()
-    render(false)
-    if (button.disabled) viewEl.querySelector<HTMLButtonElement>('#swarm-pagination button:not(:disabled)')?.focus()
+    void (async () => {
+      // Load before rendering: painting first would clamp the requested
+      // next page back to the loaded rows and never fetch older history.
+      const previous = pageIndex
+      pageIndex = Math.max(0, pageIndex + (button.dataset.page === 'next' ? 1 : -1))
+      const mine = pollSequence
+      const org = getSelectedOrganization()
+      const search = searchQuery
+      const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery
+      try {
+        await loadMoreForView(current)
+      } catch (err) {
+        if (!current()) return
+        pageIndex = previous
+        lastLoadError = (err as Error).message
+        renderStaleBanner()
+        return
+      }
+      if (!current()) return
+      clearRows()
+      render(false)
+      if (button.disabled) viewEl.querySelector<HTMLButtonElement>('#swarm-pagination button:not(:disabled)')?.focus()
+    })()
   })
   searchEl.addEventListener('input', () => {
     if (searchDebounce) clearTimeout(searchDebounce)
@@ -670,8 +689,19 @@ function renderShell() {
       if (next === searchQuery) return
       searchQuery = next
       pageIndex = 0
+      // Filter the cache at once so the control answers while its server
+      // read is still out; the read refreshes the matches behind it.
+      entries = entries.filter(matchesSearch)
+      historyIds.clear()
+      quarantined = []
+      totalMatching = 0
+      historyCursor = null
+      incompleteTotal = null
+      loadingHistory = false
       clearRows()
       render(false)
+      renderStaleBanner()
+      void pollOnce()
     }, 90)
   })
 }
@@ -843,10 +873,12 @@ function render(animate = true) {
   pageIndex = Math.min(pageIndex, Math.max(0, Math.ceil(rows.length / PAGE_SIZE) - 1))
   const start = pageIndex * PAGE_SIZE
   const pager = viewEl.querySelector<HTMLElement>('#swarm-pagination')!
-  pager.hidden = rows.length <= PAGE_SIZE
+  const moreHistory = historyCursor !== null
+  pager.hidden = rows.length <= PAGE_SIZE && !moreHistory
   pager.querySelector<HTMLButtonElement>('[data-page="previous"]')!.disabled = pageIndex === 0
-  pager.querySelector<HTMLButtonElement>('[data-page="next"]')!.disabled = start + PAGE_SIZE >= rows.length
-  viewEl.querySelector<HTMLElement>('#swarm-page')!.textContent = rows.length ? `${start + 1}–${Math.min(start + PAGE_SIZE, rows.length)} / ${rows.length}` : ''
+  pager.querySelector<HTMLButtonElement>('[data-page="next"]')!.disabled = start + PAGE_SIZE >= rows.length && !moreHistory
+  viewEl.querySelector<HTMLElement>('#swarm-page')!.textContent = rows.length
+    ? `${start + 1}–${Math.min(start + PAGE_SIZE, rows.length)} / ${rows.length}${moreHistory ? '+' : ''}` : ''
   displayedGroups = new Map(groups.map((group) => [group.entries[0].id, group]))
   const table = viewEl.querySelector<HTMLElement>('#swarm-table')!
   const countEl = viewEl.querySelector<HTMLElement>('#swarm-count')!
@@ -1072,6 +1104,26 @@ function attachClicks() {
 // inline.
 export async function focusRow(repo: string, pr_id: string): Promise<void> {
   if (!viewEl || !bodyEl) return
+  // An active filter can hide the very row we were asked to focus. Clearing it
+  // is what the person meant by following the link — silently doing nothing
+  // was not. Server search would exclude it before it loads.
+  if (searchQuery) {
+    if (searchDebounce) {
+      clearTimeout(searchDebounce)
+      searchDebounce = null
+    }
+    searchQuery = ''
+    if (searchEl) searchEl.value = ''
+    entries = []
+    historyIds.clear()
+    quarantined = []
+    totalMatching = 0
+    historyCursor = null
+    incompleteTotal = null
+    loadingHistory = false
+    lastLoadedAt = 0
+    pageIndex = 0
+  }
   // Pull fresh logs so behaviors that just fired show up immediately.
   await pollOnce()
   if (viewEl.hidden) return
@@ -1080,19 +1132,12 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
   // `behavior === 'pr_review'`, so the "Last triggered" links for approve-prs
   // and resolve-unblocking — which produce pr_approve and other behaviours —
   // matched nothing and the click did nothing.
-  const match = entries.find((e) =>
-    e.repo === repo && String(e.pr_id) === String(pr_id),
-  )
+  const pollBefore = pollSequence
+  const match = await ensureTarget((e) => e.repo === repo && String(e.pr_id) === String(pr_id), true)
+  if (viewEl.hidden || pollBefore !== pollSequence) return
   if (!match) {
     notFocusable(`No run found for ${repo}#${pr_id}.`)
     return
-  }
-  // An active filter can hide the very row we were asked to focus. Clearing it
-  // is what the person meant by following the link — silently doing nothing
-  // was not.
-  if (!matchesSearch(match)) {
-    searchQuery = ''
-    if (searchEl) searchEl.value = ''
   }
   showRun(match)
   const row = bodyEl.querySelector<HTMLTableRowElement>(`tr.agent-row[data-id="${match.id}"]`)
@@ -1115,6 +1160,15 @@ const highlightTimers = new WeakMap<HTMLTableRowElement, number>()
 function highlightRow(row: HTMLTableRowElement): void {
   viewFeedback('swarm-navigation', 'Swarm run unavailable', '')
   scrollToActor(row, 'center')
+  // If the animated scroll never arrives, focus strands below the fold with
+  // no further render to rescue it; place the row instantly once motion has
+  // had its chance. No-op whenever the spring centers the row itself.
+  window.setTimeout(() => {
+    if (!row.isConnected || !viewEl || viewEl.hidden) return
+    const box = row.getBoundingClientRect()
+    if (box.bottom > 0 && box.top < innerHeight && box.right > 0 && box.left < innerWidth) return
+    row.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior })
+  }, 900)
   const previous = highlightTimers.get(row)
   if (previous !== undefined) window.clearTimeout(previous)
   // A second navigation to the same row starts its pulse again.
@@ -1145,25 +1199,44 @@ function showRun(match: LogEntry): void {
 export async function focusCall(callId: string): Promise<void> {
   const mine = ++callFocusSequence
   if (!viewEl || !bodyEl) return
+  if (searchQuery) {
+    if (searchDebounce) {
+      clearTimeout(searchDebounce)
+      searchDebounce = null
+    }
+    searchQuery = ''
+    if (searchEl) searchEl.value = ''
+    entries = []
+    historyIds.clear()
+    quarantined = []
+    totalMatching = 0
+    historyCursor = null
+    incompleteTotal = null
+    loadingHistory = false
+    lastLoadedAt = 0
+    pageIndex = 0
+  }
   await pollOnce()
   if (mine !== callFocusSequence || viewEl.hidden) return
-  let match = entries.find((entry) => entry.id === callId)
+  // A refresh starting mid-lookup cancels it via pollSequence while this
+  // focus stays current; that cancellation is not a missing call either.
+  let pollBefore = pollSequence
+  let match = await ensureTarget((entry) => entry.id === callId)
+  // An aborted lookup (navigated away or superseded) is not a missing call:
+  // returning here keeps the global organization filter untouched.
+  if (mine !== callFocusSequence || viewEl.hidden || pollBefore !== pollSequence) return
   if (!match && getSelectedOrganization()) {
     setSelectedOrganization('')
     await pollOnce()
     if (mine !== callFocusSequence || viewEl.hidden) return
-    match = entries.find((entry) => entry.id === callId)
+    pollBefore = pollSequence
+    match = await ensureTarget((entry) => entry.id === callId)
+    if (mine !== callFocusSequence || viewEl.hidden || pollBefore !== pollSequence) return
   }
   if (!match) {
     notFocusable(`No run found for call ${callId}.`)
     return
   }
-  if (searchDebounce) {
-    clearTimeout(searchDebounce)
-    searchDebounce = null
-  }
-  searchQuery = ''
-  if (searchEl) searchEl.value = ''
   showRun(match)
   const row = bodyEl.querySelector<HTMLTableRowElement>(`tr.agent-row[data-id="${CSS.escape(callId)}"]`)
   if (!row) {
@@ -1194,14 +1267,22 @@ function notFocusable(message: string): void {
 // click. Callers now join the request that is already running.
 let pollInFlight: Promise<void> | null = null
 let pollOrganization = ''
+let pollSearch = ''
 let pollSequence = 0
 
-interface LogFeed { logs?: LogEntry[], quarantined?: QuarantinedLog[], total?: number }
+interface LogFeed { logs?: LogEntry[], quarantined?: QuarantinedLog[], total?: number, nextCursor?: string | null }
 let incompleteTotal: number | null = null
 let loadingHistory = false
+let totalMatching = 0
+let historyCursor: string | null = null
+// Calls that arrived through history pages (not the running feed), so the
+// pager can tell cached running rows apart from covered history ranges.
+let historyIds = new Set<string>()
 
-async function readLogFeed(org: string, recent = false): Promise<LogFeed> {
-  const res = await fetch(organizationUrl(recent ? '/api/agent-logs?limit=50' : '/api/agent-logs', org))
+const HISTORY_PAGE_LIMIT = 200
+
+async function readLogFeed(url: string): Promise<LogFeed> {
+  const res = await fetch(url)
   if (!res.ok) {
     const text = await res.text().catch(() => '')
     let detail = ''
@@ -1211,16 +1292,59 @@ async function readLogFeed(org: string, recent = false): Promise<LogFeed> {
   return res.json()
 }
 
-async function applyLogFeed(data: LogFeed, current: () => boolean): Promise<void> {
+function historyUrl(org: string, cursor: string | null, search: string): string {
+  let path = `/api/agent-logs?limit=${HISTORY_PAGE_LIMIT}`
+  if (cursor !== null) path += `&cursor=${encodeURIComponent(cursor)}`
+  if (search) path += `&search=${encodeURIComponent(search)}`
+  return organizationUrl(path, org)
+}
+
+async function applyFirstPage(data: LogFeed, total: number, cursor: string | null, current: () => boolean): Promise<void> {
   if (!current()) return
   entries = data.logs || []
-  incompleteTotal = typeof data.total === 'number' && data.total > entries.length ? data.total : null
-  loadingHistory = incompleteTotal !== null
-  lastLoadError = null
+  historyIds = new Set(entries.map((entry) => entry.id))
   quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
+  totalMatching = total
+  historyCursor = cursor
+  incompleteTotal = historyCursor !== null ? totalMatching : null
+  loadingHistory = historyCursor !== null
+  lastLoadError = null
   lastLoadedAt = Date.now()
   render()
   renderStaleBanner()
+  refreshExpandedDetails()
+}
+
+function appendPage(data: LogFeed, cursor: string | null, current: () => boolean): boolean {
+  if (!current()) return false
+  const seen = new Set(entries.map((entry) => entry.id))
+  for (const entry of data.logs || []) {
+    historyIds.add(entry.id)
+    if (!seen.has(entry.id)) {
+      seen.add(entry.id)
+      entries.push(entry)
+    }
+  }
+  const seenQuarantined = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}`))
+  for (const row of Array.isArray(data.quarantined) ? data.quarantined : []) {
+    const key = `${row.id || ''}:${row.index}`
+    if (!seenQuarantined.has(key)) {
+      seenQuarantined.add(key)
+      quarantined.push(row)
+    }
+  }
+  if (typeof data.total === 'number') totalMatching = data.total
+  historyCursor = cursor
+  incompleteTotal = historyCursor !== null ? totalMatching : null
+  loadingHistory = historyCursor !== null
+  lastLoadedAt = Date.now()
+  render()
+  renderStaleBanner()
+  refreshExpandedDetails()
+  return true
+}
+
+function refreshExpandedDetails(): void {
   for (const entry of entries) {
     const state = expanded.get(entry.id)
     if (state) void loadReasoning(entry.id)
@@ -1228,26 +1352,228 @@ async function applyLogFeed(data: LogFeed, current: () => boolean): Promise<void
   }
 }
 
-function pollOnce(): Promise<void> {
+function mergeRefresh(history: LogFeed, running: LogFeed): void {
+  const fresh = new Map<string, LogEntry>()
+  for (const entry of running.logs || []) fresh.set(entry.id, entry)
+  for (const entry of history.logs || []) {
+    if (!fresh.has(entry.id)) fresh.set(entry.id, entry)
+  }
+  const known = new Map(entries.map((entry) => [entry.id, entry]))
+  let arrivals = false
+  // A fresh history page carrying unseen rows shifts every retained page
+  // boundary: the cached older page is no longer contiguous with the new
+  // cursor, so its ids must leave the covered set or Next would skip the
+  // gap and display older cached history as the next page.
+  let historyArrivals = false
+  for (const entry of history.logs || []) {
+    if (!known.has(entry.id)) historyArrivals = true
+  }
+  for (const [id, entry] of fresh) {
+    if (!known.has(id)) arrivals = true
+    known.set(id, entry)
+  }
+  const knownBadBefore = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}:${row.error}`))
+  if (!historyArrivals) {
+    historyArrivals = (history.quarantined || [])
+      .some((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
+  }
+  if (historyArrivals) historyIds = new Set((history.logs || []).map((entry) => entry.id))
+  else for (const entry of history.logs || []) historyIds.add(entry.id)
+  // New unreadable calls shift page boundaries exactly like readable ones;
+  // ignoring them would keep a stale cursor that skips the intervening range.
+  if (!arrivals) {
+    arrivals = [...(history.quarantined || []), ...(running.quarantined || [])]
+      .some((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
+  }
+  // Fresh first, then retained: the feeds arrive newest-first, and the
+  // stable time sort keeps that server order for ties, so a new arrival
+  // lands above the rows it displaced instead of sorting by id.
+  const withMs = [...fresh.values(), ...entries.filter((entry) => !fresh.has(entry.id))]
+    .map((entry) => [startedAtMs(entry), entry] as const)
+  withMs.sort((a, b) => b[0] - a[0])
+  entries = withMs.map(([, entry]) => entry)
+  const seenQuarantined = new Set<string>()
+  const mergedQuarantined: QuarantinedLog[] = []
+  for (const row of [...(history.quarantined || []), ...(running.quarantined || []), ...quarantined]) {
+    const key = `${row.id || ''}:${row.index}:${row.error}`
+    if (!seenQuarantined.has(key)) {
+      seenQuarantined.add(key)
+      mergedQuarantined.push(row)
+    }
+  }
+  quarantined = mergedQuarantined
+  if (typeof history.total === 'number') totalMatching = history.total
+  // New arrivals shift page boundaries: more than a page of them would leave
+  // the retained cursor skipping the intervening calls, so follow the fresh
+  // first page instead. Without arrivals the older pages stay valid and the
+  // retained cursor still points past them into unloaded history — but a
+  // cleared cursor (a new search whose matches are all cached) must still
+  // adopt the fresh one, or older matches stay unreachable behind null.
+  if (arrivals || historyCursor === null) historyCursor = history.nextCursor ?? null
+  incompleteTotal = historyCursor !== null ? totalMatching : null
+  loadingHistory = historyCursor !== null
+  lastLoadError = null
+  lastLoadedAt = Date.now()
+  render()
+  renderStaleBanner()
+  refreshExpandedDetails()
+}
+
+// One bounded page per call for the requested view page: grouping can
+// collapse hundreds of runs into one row, so looping to fill the page
+// would drain the whole log on histories of identical runs.
+async function loadMoreForView(current: () => boolean): Promise<void> {
+  if (!current() || historyCursor === null) return
   const org = getSelectedOrganization()
-  if (pollInFlight && pollOrganization === org) return pollInFlight
+  const search = searchQuery
+  const needed = pageIndex * PAGE_SIZE + 1
+  // Count history-covered rows only: cached running calls from the running
+  // feed must not satisfy the guard, or pagination would advance past
+  // unloaded intervening history to display them.
+  const covered = groupRows(groupRuns(entries.filter((entry) => historyIds.has(entry.id) && matchesSearch(entry))))
+  if (covered.length >= needed) return
+  const data = await readLogFeed(historyUrl(org, historyCursor, search))
+  if (!current() || org !== getSelectedOrganization() || search !== searchQuery) return
+  appendPage(data, data.nextCursor ?? null, current)
+}
+
+// A loaded running call that finishes outside the newest page is in neither
+// refresh feed; settle each by its primary key instead of showing it as
+// running indefinitely. Few at a time: running calls are already few.
+async function settleStaleRunning(freshIds: Set<string>, current: () => boolean): Promise<void> {
+  const org = getSelectedOrganization()
+  const stale = entries.filter((entry) => isRunning(entry) && !freshIds.has(entry.id))
+  if (!stale.length) return
+  const settled = await Promise.all(stale.map(async (entry) => {
+    try {
+      return { data: await readLogFeed(organizationUrl(`/api/agent-logs?id=${encodeURIComponent(entry.id)}`, org)), error: null as string | null }
+    } catch (err) {
+      return { data: null, error: (err as Error).message }
+    }
+  }))
+  if (!current()) return
+  let changed = false
+  const failures: string[] = []
+  const byId = new Map(entries.map((entry) => [entry.id, entry]))
+  for (let index = 0; index < stale.length; index++) {
+    const { data } = settled[index]!
+    if (!data) {
+      failures.push(stale[index]!.id.slice(0, 8))
+      continue
+    }
+    const row = (data.logs || [])[0]
+    if (row) {
+      // A terminal row outside this search no longer belongs to its cache;
+      // retaining the old running entry would show it as running forever.
+      if (matchesSearch(row)) byId.set(row.id, row)
+      else byId.delete(row.id)
+      changed = true
+      continue
+    }
+    const bad = (Array.isArray(data.quarantined) ? data.quarantined : []).find((item) => item.id === stale[index]!.id)
+    // The cached running row leaves even when its quarantine entry arrived
+    // earlier through a refresh feed; otherwise the unreadable terminal
+    // call would stay marked as running indefinitely.
+    if (bad) {
+      byId.delete(stale[index]!.id)
+      changed = true
+      if (!quarantined.some((item) => item.id === bad.id && item.index === bad.index)) quarantined.push(bad)
+    }
+  }
+  // Failed lookups keep their old running rows for the next refresh, but say
+  // so: silent retries would display obsolete statuses as fresh indefinitely.
+  if (failures.length) {
+    lastLoadError = `Settle failed for ${failures.length} running call${failures.length === 1 ? '' : 's'} (${failures.join(', ')}): ${settled.find((item) => item.error)?.error || 'lookup failed'}`
+  }
+  if (!changed && !failures.length) return
+  // Stable: ties keep the retained order instead of reshuffling by id.
+  const withMs = [...byId.values()].map((entry) => [startedAtMs(entry), entry] as const)
+  withMs.sort((a, b) => b[0] - a[0])
+  entries = withMs.map(([, entry]) => entry)
+  render()
+  renderStaleBanner()
+  refreshExpandedDetails()
+}
+
+// Entry fills the first page behind the recent rows: small histories arrive
+// whole, larger ones stop at the mount bound, one bounded page per request.
+// Quarantine records count toward the bound too, or a mostly-unreadable
+// history would chase every cursor. Later polls never chase: pagination,
+// search and deep links page on demand.
+async function chaseHistoryFill(current: () => boolean, org: string, search: string): Promise<void> {
+  while (current() && historyCursor !== null && entries.length + quarantined.length < PAGE_SIZE) {
+    const data = await readLogFeed(historyUrl(org, historyCursor, search))
+    if (!current() || org !== getSelectedOrganization() || search !== searchQuery) return
+    appendPage(data, data.nextCursor ?? null, current)
+  }
+}
+
+function pollOnce(chase = false): Promise<void> {
+  const org = getSelectedOrganization()
+  const search = searchQuery
+  if (pollInFlight && pollOrganization === org && pollSearch === search) return pollInFlight
   pollOrganization = org
+  pollSearch = search
   const mine = ++pollSequence
-  const current = () => mine === pollSequence && org === getSelectedOrganization()
+  const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery
   const run = (async () => {
     try {
-      if (!lastLoadedAt) {
-        const recent = await readLogFeed(org, true)
+      if (!lastLoadedAt || entries.length === 0) {
+        const [history, running] = await Promise.all([
+          readLogFeed(historyUrl(org, null, search)),
+          readLogFeed(organizationUrl('/api/agent-logs?status=running', org)),
+        ])
         if (!current()) return
-        await applyLogFeed(recent, current)
-        if (!current() || incompleteTotal === null) return
+        await applyFirstPage(history, history.total ?? (history.logs || []).length, history.nextCursor ?? null, current)
+        if (!current()) return
+        if ((running.logs || []).length) {
+          const known = new Set(entries.map((entry) => entry.id))
+          const extra = (running.logs || []).filter((entry) => !known.has(entry.id) && matchesSearch(entry))
+          if (extra.length) {
+            const withMs = [...extra, ...entries].map((entry) => [startedAtMs(entry), entry] as const)
+            withMs.sort((a, b) => b[0] - a[0])
+            entries = withMs.map(([, entry]) => entry)
+            render()
+          }
+        }
+        // Unreadable active calls outside the first history page still warn
+        // on first paint; waiting for a later refresh would omit them.
+        const freshBad = running.quarantined || []
+        if (freshBad.length) {
+          const seen = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}:${row.error}`))
+          let added = false
+          for (const row of freshBad) {
+            const key = `${row.id || ''}:${row.index}:${row.error}`
+            if (!seen.has(key)) {
+              seen.add(key)
+              quarantined.push(row)
+              added = true
+            }
+          }
+          if (added) renderStaleBanner()
+        }
+        if (chase && current()) await chaseHistoryFill(current, org, search)
+      } else {
+        if (!current()) return
+        const history = await readLogFeed(historyUrl(org, null, search))
+        if (!current()) return
+        // History holds every call including running ones, so a refresh
+        // whose first page is complete already saw them all; the running
+        // lane only matters while older history is still unloaded.
+        const running: LogFeed = history.nextCursor == null
+          ? { logs: [] }
+          : await readLogFeed(organizationUrl('/api/agent-logs?status=running', org))
+        if (!current()) return
+        mergeRefresh(history, running)
+        if (!current()) return
+        const freshIds = new Set([...(history.logs || []), ...(running.logs || [])].map((entry) => entry.id))
+        await settleStaleRunning(freshIds, current)
       }
-      const data = await readLogFeed(org)
       if (!current()) return
-      await applyLogFeed(data, current)
+      await loadMoreForView(current)
     } catch (err) {
       if (!current()) return
-      loadingHistory = false
+      loadingHistory = historyCursor !== null
       lastLoadError = (err as Error).message
       if (entries.length > 0) render()
       renderStaleBanner()
@@ -1257,6 +1583,25 @@ function pollOnce(): Promise<void> {
   })()
   pollInFlight = run
   return run
+}
+
+async function ensureTarget(predicate: (entry: LogEntry) => boolean, preferHistory = false): Promise<LogEntry | undefined> {
+  const mine = pollSequence
+  const org = getSelectedOrganization()
+  const search = searchQuery
+  const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery && viewEl && !viewEl.hidden
+  // History pages arrive newest-first, so the first history-backed match is
+  // the newest run; a running-feed match may be older than unloaded history.
+  const find = (historyOnly: boolean) => entries.find((entry) => predicate(entry) && (!historyOnly || historyIds.has(entry.id)))
+  let match = find(preferHistory)
+  while (!match && historyCursor !== null && current()) {
+    const data = await readLogFeed(historyUrl(org, historyCursor, search))
+    if (!current()) return undefined
+    if (!appendPage(data, data.nextCursor ?? null, current)) return undefined
+    match = find(preferHistory)
+  }
+  if (!match && preferHistory) match = entries.find(predicate)
+  return match
 }
 
 // Once Swarm had rows, a failing refresh was invisible: the table froze on the
@@ -1338,11 +1683,14 @@ export async function initSwarmView() {
     attachClicks()
     window.addEventListener('poise:organization-filter-changed', () => {
       entries = []
+      historyIds.clear()
       quarantined = []
       lastLoadError = null
       lastLoadedAt = 0
       incompleteTotal = null
       loadingHistory = false
+      totalMatching = 0
+      historyCursor = null
       pageIndex = 0
       clearRows()
       viewEl.querySelector<HTMLElement>('#swarm-table')!.hidden = true
@@ -1359,7 +1707,7 @@ export async function initSwarmView() {
   if (lastLoadedAt) queueMicrotask(() => { render(false); renderStaleBanner() })
   startSwarmPolling()
   if (!startedTickTimer) startedTickTimer = setInterval(refreshStartedCells, STARTED_TICK_MS)
-  await pollOnce()
+  await pollOnce(true)
 }
 
 export function stopSwarmRefresh() {

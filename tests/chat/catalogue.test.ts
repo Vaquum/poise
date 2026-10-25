@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { catalogueAgents } from '../../server/chat/catalog-agents'
-import { catalogueFamilies, familyForIdentity, quickSessionRequest, consoleModelLabel } from '../../src/chat-catalog'
+import { catalogueFamilies, familyForIdentity, quickSessionModel, quickSessionRequest, consoleModelLabel } from '../../src/chat-catalog'
 import { CATALOG } from '../model-catalog-fixture'
 
 describe('Chat uses the whole catalogue', () => {
@@ -35,19 +35,29 @@ describe('Chat uses the whole catalogue', () => {
 
 
 describe('Fresh console model policy', () => {
-  const model = { identity: 'opus-5-high', provider: 'claude', selector: 'claude-opus-5', effort: 'high' }
-  const catalog = { ...CATALOG, models: [...CATALOG.models, model] }
-  it('uses exactly the catalogue Opus 5 High variant, independent of the configured default', async () => {
-    const agents = await catalogueAgents(catalog, true, async () => ({ ok: true }))
-    expect(quickSessionRequest(agents)).toEqual({ agent: 'claude', model: 'opus-5-high', effort: 'high' })
-  })
-  it('does not substitute another effort when the requested default has retired', async () => {
+  it('sends the saved Chat default with its actual effort', async () => {
     const agents = await catalogueAgents(CATALOG, true, async () => ({ ok: true }))
-    expect(() => quickSessionRequest(agents)).toThrow(/not in the current catalogue/)
+    expect(quickSessionRequest(agents, undefined, 'opus-5-max')).toEqual({ agent: 'claude', model: 'opus-5-max', effort: 'max' })
+    expect(quickSessionModel(agents, 'opus-5-max')).toMatchObject({ identity: 'opus-5-max', effort: 'max' })
   })
-  it('does not silently fall back when Claude is signed out', async () => {
-    const agents = await catalogueAgents(catalog, false, async () => ({ ok: true }))
-    expect(() => quickSessionRequest(agents)).toThrow(/unavailable/)
+  it('sends a non-Claude saved default without switching providers', async () => {
+    const agents = await catalogueAgents(CATALOG, true, async () => ({ ok: true }))
+    expect(quickSessionRequest(agents, undefined, 'grok-4.6-high')).toEqual({ agent: 'grok', model: 'grok-4.6-high', effort: 'high' })
+    expect(quickSessionRequest(agents, undefined, 'gpt-6-astra-ultra')).toEqual({ agent: 'codex', model: 'gpt-6-astra-ultra', effort: 'ultra' })
+  })
+  it('keeps a deliberate console choice instead of the saved default', async () => {
+    const agents = await catalogueAgents(CATALOG, true, async () => ({ ok: true }))
+    expect(quickSessionRequest(agents, 'gpt-6-astra-max', 'opus-5-max')).toEqual({ agent: 'codex', model: 'gpt-6-astra-max', effort: 'max' })
+  })
+  it('does not substitute another model when the saved default has retired', async () => {
+    const agents = await catalogueAgents(CATALOG, true, async () => ({ ok: true }))
+    expect(() => quickSessionRequest(agents, undefined, 'retired-model-max')).toThrow(/not in the current catalogue/)
+    expect(quickSessionModel(agents, 'retired-model-max')).toBeUndefined()
+  })
+  it('does not silently fall back when the default provider is unavailable', async () => {
+    const agents = await catalogueAgents(CATALOG, false, async () => ({ ok: true }))
+    expect(() => quickSessionRequest(agents, undefined, 'opus-5-max')).toThrow(/unavailable/)
+    expect(quickSessionRequest(agents, undefined, 'grok-4.6-high')).toEqual({ agent: 'grok', model: 'grok-4.6-high', effort: 'high' })
   })
 })
 
@@ -71,17 +81,18 @@ describe('Console model selection', () => {
   })
 })
 
-// New CLI releases retire yesterday's concrete default, not the Opus/High policy.
-it('follows the latest discovered Opus High without rewriting explicit choices', async () => {
+// Discovery retires concrete identities; the server re-resolves the saved
+// default, and the console sends that resolution verbatim.
+it('sends a re-resolved default verbatim without rewriting explicit choices', async () => {
   const models = [
-    { identity: 'opus-5-high', provider: 'claude', selector: 'claude-opus-5', effort: 'high' },
+    { identity: 'opus-5.5-max', provider: 'claude', selector: 'claude-opus-5-5', effort: 'max' },
     { identity: 'opus-5.5-high', provider: 'claude', selector: 'claude-opus-5-5', effort: 'high' },
-    { identity: 'opus-5.10-high', provider: 'claude', selector: 'claude-opus-5-10', effort: 'high' },
   ]
   const agents = await catalogueAgents({ ...CATALOG, models }, true, async () => ({ ok: true }))
-  expect(quickSessionRequest(agents)).toMatchObject({ model: 'opus-5.10-high', effort: 'high' })
-  expect(quickSessionRequest(agents, 'opus-5-high')).toMatchObject({ model: 'opus-5-high' })
-  agents.find(a => a.id === 'claude')!.models = models.slice(1)
-  expect(() => quickSessionRequest(agents, 'opus-5-high')).toThrow(/not in the current catalogue/)
+  expect(quickSessionRequest(agents, undefined, 'opus-5.5-max')).toMatchObject({ model: 'opus-5.5-max', effort: 'max' })
+  expect(() => quickSessionRequest(agents, undefined, 'opus-5-max')).toThrow(/not in the current catalogue/)
+  expect(quickSessionRequest(agents, 'opus-5.5-high', 'opus-5.5-max')).toMatchObject({ model: 'opus-5.5-high' })
+  agents.find(a => a.id === 'claude')!.models = models.slice(0, 1)
+  expect(() => quickSessionRequest(agents, 'opus-5.5-high', 'opus-5.5-max')).toThrow(/not in the current catalogue/)
   expect(consoleModelLabel('opus-5.5-high')).toBe('Opus 5.5 · High')
 })

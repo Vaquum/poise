@@ -30,7 +30,7 @@ import { diagnostic } from './logging'
 import { requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { resolveReviewCheckout } from './review-checkout'
-import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
+import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogPage, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
 import type { AgentLogParseReply, AgentLogParseRequest } from './agent-log-worker'
 import type { AgentLogIdentity, AgentLogSnapshot, LogEntry } from './agent-log-parse'
 
@@ -430,6 +430,64 @@ export async function fetchAgentLogsSince(
 ): Promise<AgentLogSnapshot> {
   return selectedAgentLogSnapshot(['--logs', '--after', after, '--session', selection.session,
     '--behavior', selection.behavior, '--prompt', selection.prompt], options)
+}
+
+// One exact call by id for Swarm's settled-running refresh. A primary-key
+// read, so retained history never raises its cost. Observes like history
+// pages: a run that finished outside the newest page still records its
+// completion. Other selected readers keep their existing behavior.
+export async function fetchAgentLogById(
+  id: string,
+  options: { signal?: AbortSignal, fresh?: boolean } = {},
+): Promise<AgentLogSnapshot> {
+  if (!/^[0-9a-fA-F]{32}$/.test(id)) throw new Error('agent call id must be 32 hex characters')
+  const snapshot = await selectedAgentLogSnapshot(['--logs', '--select', JSON.stringify({ latest: [], ids: [id] })], options)
+  observeAgentSnapshot(snapshot)
+  return snapshot
+}
+
+export interface AgentLogPage extends AgentLogSnapshot {
+  nextCursor: string | null
+  total: number
+}
+
+// One bounded history page for Swarm: newest-first rows behind a stable
+// cursor, with an exact total that counts without loading. Reuses the
+// per-args lanes, so concurrent identical pages share one child and the
+// running lane never queues behind history. The page object extends the
+// snapshot the lane caches; co-waiters alias it frozen.
+export async function fetchAgentLogPage(
+  limit: number,
+  cursor: string | null,
+  filter: { org?: string, search?: string } = {},
+  options: { signal?: AbortSignal, fresh?: boolean } = {},
+): Promise<AgentLogPage> {
+  const args = ['--logs', '--limit', String(limit)]
+  if (cursor !== null) args.push('--cursor', cursor)
+  if (filter.org !== undefined) args.push('--org', filter.org)
+  if (filter.search !== undefined) args.push('--search', filter.search)
+  const key = JSON.stringify(args)
+  let lane = selectedAgentLogLanes.get(key)
+  if (!lane) {
+    for (const [oldKey, old] of selectedAgentLogLanes) {
+      if (!old.running && !old.queued && (!old.cached || Date.now() >= old.cached.expiresAt || selectedAgentLogLanes.size >= 32)) selectedAgentLogLanes.delete(oldKey)
+    }
+    if (selectedAgentLogLanes.size >= 32) throw new Error('agent log selection capacity is full; retry after current reads settle')
+    lane = { args, source: 'agent-interface --logs paged read', running: null, queued: null, cached: null }
+    selectedAgentLogLanes.set(key, lane)
+  }
+  const source = lane.source
+  const snapshot = await laneAgentLogSnapshot(lane, options, async signal => {
+    let stdout: string
+    try { ({ stdout } = await spawnAgentLogRead(args, signal)) }
+    catch (error) { throw callerUpdateError(args, error) ?? error }
+    const page = parseAgentLogPage(stdout, source)
+    // Swarm history previously arrived as whole-log snapshots; paged reads
+    // still feed Caller-completion recording and pending projections.
+    observeAgentSnapshot(page)
+    return freezeAgentLogSnapshot(page)
+  })
+  return snapshot as AgentLogPage
 }
 
 export async function fetchAgentLogWatermark(): Promise<string> {
