@@ -858,6 +858,13 @@ A degraded dependency never changes a status code. Alert on
 process existing. Ledger queue stalls, worker failures and capture loss
 also alert through Poise Link and the page's notices.
 
+A responsive health endpoint does not prove that PR automation is making
+progress. For a stalled backlog, inspect enabled behavior statuses and recent
+successful review and approval outcomes alongside dependency readiness. If
+`/api/service/health` reports `draining: true`, inspect the gateway's
+`workspace.drain.waiting` counts and upgrade deadline before attributing the
+admission pause to a provider failure.
+
 ## Troubleshooting
 
 - **`install.sh` says a port is in use.** Another web server holds port 80
