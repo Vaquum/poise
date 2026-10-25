@@ -282,7 +282,7 @@ test('an exhausted identical-run history keeps its pager hidden across refreshes
   expect(cursorReads).toEqual(['200', '400'])
   await refreshed(page, true)
   await expect(pager).toBeHidden()
-  await expect(next(page)).toBeDisabled()
+  await expect(page.locator('#swarm-pagination [data-page="next"]')).toBeDisabled()
   expect(cursorReads).toEqual(['200', '400'])
 })
 
@@ -335,4 +335,64 @@ test('arrivals larger than a page merge into run order and keep newest-target se
   expect(second[0]).toBe(gapNewest.id)
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:goto-swarm-row', { detail: { repo: 'acme/target', pr_id: '999' } })))
   await expect(page.locator(`${rows}[data-id="${gapNewest.id}"]`)).toHaveClass(/agent-row-focus/)
+})
+
+test('a first continuation without overlap slots newer calls above the older cache', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const base = Date.parse('2026-10-14T08:00:00Z')
+  const at = (index: number) => new Date(base - index * 1000).toISOString()
+  const old = history().slice(0, 401).map((entry, index) => ({ ...entry, started_at: at(index) }))
+  let logs: typeof old = old
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    return route.fulfill({ json: paged(logs, url, 200) })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  for (;;) {
+    if (!await next(page).isEnabled()) break
+    const before = await page.locator('#swarm-page').textContent()
+    await next(page).click()
+    await expect(page.locator('#swarm-page')).not.toHaveText(before!)
+  }
+  await expect(page.locator('#swarm-page')).toHaveText('401–401 / 401')
+  for (const label of ['201–400 / 401', '1–200 / 401']) {
+    await previous(page).click()
+    await expect(page.locator('#swarm-page')).toHaveText(label)
+  }
+  const fresh = Array.from({ length: 400 }, (_, index) => ({
+    ...old[0], id: id(8000 + index), pr_id: `fresh-${index + 1}`,
+    started_at: new Date(base + (400 - index) * 1000).toISOString(),
+  }))
+  logs = [...fresh, ...old]
+  await refreshed(page, true)
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 601+')
+  const first = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(first).toEqual(logs.slice(0, 200).map(entry => entry.id))
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 801+')
+  await expect(page.locator(rows)).toHaveCount(200)
+  const second = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(second).toEqual(logs.slice(200, 400).map(entry => entry.id))
+  expect(second[0]).toBe(fresh[200].id)
+})
+
+test('a continuation repositions a running-feed row instead of anchoring to it', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const base = history().slice(0, 250)
+  const runningOld = { ...base[225], id: id(9000), status: 'running', completed_at: null, response: '', error: '', time_elapsed: '' }
+  const old = base.map((entry, index) => index === 225 ? runningOld : entry)
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [runningOld] } })
+    return route.fulfill({ json: paged(old, url, 200) })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 201+')
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–250 / 250')
+  await expect(page.locator(rows)).toHaveCount(50)
+  const second = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(second).toEqual(old.slice(200, 250).map(entry => entry.id))
+  await expect(next(page)).toBeDisabled()
 })
