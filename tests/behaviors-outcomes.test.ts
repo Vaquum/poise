@@ -118,7 +118,7 @@ describe('review outcome evidence and registration', () => {
     }
   })
 
-  it.each(['model_output_limit', 'review_budget_exhausted', 'review_recovery_failed', 'review_contract_violation', 'review_provider_blocked', 'stopped'])('holds %s across restarts, without blocking another PR or a new head', async (code) => {
+  it.each(['model_output_limit', 'review_recovery_failed', 'review_contract_violation', 'review_provider_blocked', 'stopped'])('holds %s across restarts, without blocking another PR or a new head', async (code) => {
     const behavior = 'approve-prs' as 'review-new-prs' | 'approve-prs'
     const launched = behavior === 'review-new-prs'
       ? await launchReviewBeforeCrash() : await launchApprovalBeforeCrash()

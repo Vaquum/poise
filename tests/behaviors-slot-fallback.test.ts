@@ -165,15 +165,16 @@ function failedApproveLog(
 describe('approval fallback through the slots', () => {
   const slots = { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh', tertiary: 'grok-4.6-xhigh' }
 
-  it('moves an approval to the next slot on a 429 and records each slot in the ledger', async () => {
+  it.each([
+    { name: 'a 429', overrides: { error: RATE_LIMIT_ERROR, error_code: 'review_provider_error', action: 'not_started', outcome: 'preflight_failed' } },
+    { name: 'an exhausted budget', overrides: { error: 'Review reached its total time limit; needs attention', error_code: 'review_budget_exhausted', review_policy: 'bounded-v1' } },
+  ])('moves an approval to the next slot on $name and records each slot in the ledger', async ({ overrides }) => {
     const { db, runtime } = await startApprovals(slots)
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
     expect(modelOf(mocks.spawnDetached.mock.calls[0])).toBe('gpt-6-astra-ultra')
 
-    fixture.agentLogs = [failedApproveLog(db, 'gpt-6-astra-ultra', {
-      error: RATE_LIMIT_ERROR, error_code: 'review_provider_error', action: 'not_started', outcome: 'preflight_failed',
-    })]
+    fixture.agentLogs = [failedApproveLog(db, 'gpt-6-astra-ultra', overrides)]
     await resetLogCache()
     await runtime.runEnabledBehaviorsOnce()
 
