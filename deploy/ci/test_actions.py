@@ -373,7 +373,6 @@ class GateTest(unittest.TestCase):
     """deploy/actions/gate.sh with a fake gh serving canned API answers."""
 
     REPO = 'fork/poise'
-    SHA = 'a' * 40
     TIP = 'b' * 40
 
     FAKE_GH = """#!/bin/sh
@@ -411,7 +410,7 @@ cat "$GH_FIXTURES/$file"
             'event': 'push',
             'head_branch': 'main',
             'head_repository': {'full_name': self.REPO},
-            'head_sha': self.SHA,
+            'head_sha': self.TIP,
             'status': 'completed',
             'conclusion': 'success',
             'html_url': f'https://github.com/{self.REPO}/actions/runs/{run_id}',
@@ -424,8 +423,8 @@ cat "$GH_FIXTURES/$file"
         with open(os.path.join(self.fixtures, name), 'w') as file:
             json.dump(payload, file)
 
-    def green(self, tip=None):
-        self.fixture('tip.json', {'sha': tip or self.SHA})
+    def green(self):
+        self.fixture('tip.json', {'sha': self.TIP})
         self.fixture('ci-runs.json', {'total_count': 1, 'workflow_runs': [self.workflow_run(101)]})
         self.fixture('caller-runs.json', {'total_count': 1, 'workflow_runs': [self.workflow_run(102)]})
         self.jobs()
@@ -435,12 +434,12 @@ cat "$GH_FIXTURES/$file"
                  for name in ('Set up job', 'Audit dependencies', 'Complete job')]
         self.fixture('jobs.json', {'total_count': 1, 'jobs': [{'steps': steps}]})
 
-    def gate(self, sha=None, trigger='workflow_run', fail=''):
+    def gate(self, trigger='workflow_run', fail=''):
         env = clean_env(
             PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
             GH_FIXTURES=self.fixtures, GH_CALLS=self.calls, GH_FAIL=fail,
             GITHUB_OUTPUT=self.output, GITHUB_STEP_SUMMARY=self.summary,
-            REPO=self.REPO, SHA=sha or self.SHA, TRIGGER=trigger,
+            REPO=self.REPO, TRIGGER=trigger,
         )
         result = subprocess.run([os.path.join(ACTIONS, 'gate.sh')], capture_output=True, text=True, env=env)
         outputs = {}
@@ -461,23 +460,24 @@ cat "$GH_FIXTURES/$file"
         self.green()
         result, outputs = self.gate()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(outputs, {'proceed': 'true', 'sha': self.SHA})
+        self.assertEqual(outputs, {'proceed': 'true', 'sha': self.TIP})
         self.assertEqual(result.stdout.splitlines()[-1], 'proceed=true')
         self.assertIn('runs/101', result.stdout)
         self.assertIn('runs/102', result.stdout)
-        self.assertIn(self.SHA, self.summary_text())
+        self.assertIn(self.TIP, self.summary_text())
 
-    def test_skips_a_sha_that_is_no_longer_the_tip(self):
-        self.green(tip=self.TIP)
-        result, outputs = self.gate()
+    def test_judges_the_current_tip_whatever_woke_it(self):
+        self.green()
+        result, _ = self.gate()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(outputs, {'proceed': 'false', 'sha': self.SHA})
-        self.assertIn(self.TIP, result.stderr)
         with open(self.calls) as file:
-            self.assertEqual(file.read().splitlines(), [f'repos/{self.REPO}/commits/main'])
+            calls = file.read().splitlines()
+        self.assertIn(f'repos/{self.REPO}/commits/main', calls)
+        for workflow in ('ci.yml', 'caller.yml'):
+            self.assertIn(f'repos/{self.REPO}/actions/workflows/{workflow}/runs?head_sha={self.TIP}&per_page=30', calls)
 
     def test_refuses_a_failed_workflow_naming_the_run_and_step(self):
-        for trigger, hint in [('workflow_run', 'their success triggers the deploy'),
+        for trigger, hint in [('workflow_run', 'their success wakes the gate again'),
                               ('workflow_dispatch', 'then dispatch again')]:
             with self.subTest(trigger=trigger):
                 self.green()
@@ -564,12 +564,6 @@ cat "$GH_FIXTURES/$file"
         self.assertEqual(result.returncode, 1)
         self.assertIn('runs/101', result.stderr)
 
-    def test_refuses_a_bad_sha_without_calling_the_api(self):
-        result, _ = self.gate(sha='not-a-sha')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('no deployable SHA', result.stderr)
-        self.assertFalse(os.path.exists(self.calls))
-
     def test_refuses_an_unknown_trigger(self):
         self.green()
         result, _ = self.gate(trigger='push')
@@ -596,9 +590,11 @@ class DeployWiringTest(unittest.TestCase):
     def test_gate_judges_before_any_ssh_and_pins_what_it_approved(self):
         deploy = self.workflow('deploy.yml')
         self.assertLess(deploy.index('deploy/actions/gate.sh'), deploy.index('deploy/actions/ssh-setup.sh'))
-        self.assertIn('ref: ${{ github.event.workflow_run.head_sha || github.sha }}', deploy)
+        self.assertIn('ref: ${{ github.sha }}', deploy)
+        self.assertIn('ref: ${{ steps.gate.outputs.sha }}', deploy)
         self.assertIn('SHA: ${{ steps.gate.outputs.sha }}', deploy)
-        self.assertEqual(deploy.count("if: steps.gate.outputs.proceed == 'true'"), 2)
+        self.assertNotIn('workflow_run.head_sha', deploy)
+        self.assertEqual(deploy.count("if: steps.gate.outputs.proceed == 'true'"), 3)
 
     def test_job_ignores_unsuccessful_and_foreign_runs(self):
         deploy = self.workflow('deploy.yml')

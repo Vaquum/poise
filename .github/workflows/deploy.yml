@@ -2,13 +2,15 @@
 # "Run your own Poise from a fork"). It does nothing in a repository that
 # sets no POISE_DEPLOY_HOST variable, so autonomio/poise deploys nowhere.
 #
-# It deploys only a commit whose required CI passed on that exact commit:
-# every CI and Caller completion re-evaluates the gate in
-# deploy/actions/gate.sh, which refuses anything but the tip of main with
-# both workflows green on it. A run started by hand checks the same gate,
-# so applying settings needs green CI on the tip too. Deploys therefore
-# land once CI passes, about ten to twenty minutes after the push, and a
-# commit CI never tested never deploys.
+# It deploys only the tip of main, and only once that exact commit's
+# required CI passed on it: every CI and Caller completion wakes the
+# workflow, and the gate in deploy/actions/gate.sh judges the current tip
+# again, so a stale wake-up for an older SHA deploys the green tip instead
+# of losing its deploy (and may redeploy it when nothing newer waits). A
+# run started by hand checks the same gate, so applying settings needs
+# green CI on the tip too. Deploys therefore land once CI passes, about
+# ten to twenty minutes after the push, and a commit CI never tested never
+# deploys.
 name: Deploy
 
 on:
@@ -40,19 +42,24 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Check out the commit CI tested
+      - name: Check out the tip for the gate scripts
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
 
-      - name: Refuse any SHA whose required CI did not pass on it
+      - name: Refuse any tip whose required CI did not pass on it
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
           TRIGGER: ${{ github.event_name }}
         run: deploy/actions/gate.sh
+
+      - name: Check out the approved commit
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.gate.outputs.sha }}
 
       - name: Set up SSH
         if: steps.gate.outputs.proceed == 'true'

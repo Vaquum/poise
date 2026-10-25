@@ -322,6 +322,8 @@ land.
    CI passes, about ten to twenty minutes later, and a deployment that
    fails fails the run. A commit CI never tested, or one whose CI failed,
    is refused: re-run the failed jobs and the deploy follows their success.
+   Every completion re-checks the current tip, so a re-run for an older
+   commit deploys the green tip instead of losing its deploy.
 
 The workflow reaches the server with these:
 
