@@ -692,10 +692,18 @@ function renderShell() {
       // Filter the cache at once so the control answers while its server
       // read is still out; the read refreshes the matches behind it.
       entries = entries.filter(matchesSearch)
+      // Pinned positions survive for the kept matches: their server-relative
+      // order is still valid for the next query, which orders by the same
+      // insertion id. Discarded ids must leave the pinned set, or a later
+      // continuation skips their rows as already placed and the pager
+      // reports a complete walk with history missing.
+      const kept = new Set(entries.map((entry) => entry.id))
+      pinnedIds = new Set([...pinnedIds].filter((id) => kept.has(id)))
       historyIds.clear()
       quarantined = []
       totalMatching = 0
       historyCursor = null
+      historyComplete = false
       incompleteTotal = null
       loadingHistory = false
       clearRows()
@@ -1116,9 +1124,11 @@ export async function focusRow(repo: string, pr_id: string): Promise<void> {
     if (searchEl) searchEl.value = ''
     entries = []
     historyIds.clear()
+    pinnedIds.clear()
     quarantined = []
     totalMatching = 0
     historyCursor = null
+    historyComplete = false
     incompleteTotal = null
     loadingHistory = false
     lastLoadedAt = 0
@@ -1208,9 +1218,11 @@ export async function focusCall(callId: string): Promise<void> {
     if (searchEl) searchEl.value = ''
     entries = []
     historyIds.clear()
+    pinnedIds.clear()
     quarantined = []
     totalMatching = 0
     historyCursor = null
+    historyComplete = false
     incompleteTotal = null
     loadingHistory = false
     lastLoadedAt = 0
@@ -1275,9 +1287,19 @@ let incompleteTotal: number | null = null
 let loadingHistory = false
 let totalMatching = 0
 let historyCursor: string | null = null
+// Whether the walk reached the end of the current org/search. A null cursor
+// alone cannot tell an exhausted walk from a cleared one (a new search whose
+// matches are all cached), so the refresh path tracks them apart.
+let historyComplete = false
 // Calls that arrived through history pages (not the running feed), so the
 // pager can tell cached running rows apart from covered history ranges.
 let historyIds = new Set<string>()
+// Ids whose cached position is history-pinned (server order). Unlike the
+// covered set, a reset keeps these: retained older pages stay valid anchors
+// for gap rows. Query resets that empty the cache clear it; a search keeps
+// its filtered matches, whose server-relative order survives filtering
+// because the server orders every query by insertion id.
+let pinnedIds = new Set<string>()
 
 const HISTORY_PAGE_LIMIT = 200
 
@@ -1303,9 +1325,11 @@ async function applyFirstPage(data: LogFeed, total: number, cursor: string | nul
   if (!current()) return
   entries = data.logs || []
   historyIds = new Set(entries.map((entry) => entry.id))
+  pinnedIds = new Set(entries.map((entry) => entry.id))
   quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
   totalMatching = total
   historyCursor = cursor
+  historyComplete = cursor === null
   incompleteTotal = historyCursor !== null ? totalMatching : null
   loadingHistory = historyCursor !== null
   lastLoadError = null
@@ -1315,15 +1339,82 @@ async function applyFirstPage(data: LogFeed, total: number, cursor: string | nul
   refreshExpandedDetails()
 }
 
+// Rows with no older pinned page-mate are older than the cache — or newer
+// than it, when a multi-page arrival gap leaves the first continuation
+// without overlap. Slot them by start time so newer calls land above the
+// older cached page; ties stay after retained rows, as appended — except
+// stale rows, which a straddling page provably outranks (below).
+function slotTail(merged: LogEntry[], tail: LogEntry[], stale: Set<string>): LogEntry[] {
+  const placed = [...merged]
+  const at = placed.map(startedAtMs)
+  for (const row of tail) {
+    const ms = startedAtMs(row)
+    let index = placed.length
+    while (index > 0 && (at[index - 1]! < ms || stale.has(placed[index - 1]!.id))) index--
+    placed.splice(index, 0, row)
+    at.splice(index, 0, ms)
+  }
+  return placed
+}
+
 function appendPage(data: LogFeed, cursor: string | null, current: () => boolean): boolean {
   if (!current()) return false
-  const seen = new Set(entries.map((entry) => entry.id))
-  for (const entry of data.logs || []) {
-    historyIds.add(entry.id)
-    if (!seen.has(entry.id)) {
-      seen.add(entry.id)
-      entries.push(entry)
+  const retained = new Set(entries.map((entry) => entry.id))
+  // Only history-pinned ids anchor: a row cached from the running feed alone
+  // sits where a timestamp tie put it, so anchoring to it would slot fetched
+  // rows onto the wrong page. Retained older pages stay pinned across the
+  // reset that uncovers them, keeping gap anchors exact.
+  const pinned = new Set(pinnedIds)
+  const covered = new Set(historyIds)
+  const page = data.logs || []
+  // A shifted cursor can return rows newer than retained older pages — the
+  // arrival gap — so each unseen row slots ahead of its next older pinned
+  // page-mate, keeping server order (page order breaks timestamp ties). A
+  // running-feed row gains its history slot the same way on first contact.
+  let older: string | null = null
+  const before = new Map<string, LogEntry[]>()
+  const tail: LogEntry[] = []
+  const move = new Set<string>()
+  for (let index = page.length - 1; index >= 0; index--) {
+    const row = page[index]!
+    historyIds.add(row.id)
+    pinnedIds.add(row.id)
+    if (pinned.has(row.id)) {
+      if (retained.has(row.id)) older = row.id
+      continue
     }
+    // The fresh page row wins over the retained running-feed copy, as it
+    // does on the refresh path.
+    if (retained.has(row.id)) move.add(row.id)
+    if (older === null) tail.push(row)
+    else {
+      const group = before.get(older)
+      if (group) group.push(row)
+      else before.set(older, [row])
+    }
+  }
+  tail.reverse()
+  for (const group of before.values()) group.reverse()
+  if (before.size || tail.length || move.size) {
+    const kept = move.size ? entries.filter((entry) => !move.has(entry.id)) : entries
+    const merged: LogEntry[] = []
+    for (const entry of kept) {
+      const group = before.get(entry.id)
+      if (group) merged.push(...group)
+      merged.push(entry)
+    }
+    // Stale rows sit below any straddling page: retained, completed, outside
+    // both the covered walk and this page, so the page outranks them whether
+    // or not timestamps agree. Running rows stay out: their server position
+    // is unknown, and page rows place themselves by page order instead.
+    const stale = new Set<string>()
+    if (tail.length) {
+      const pageIds = new Set(page.map((row) => row.id))
+      for (const entry of kept) {
+        if (!covered.has(entry.id) && !pageIds.has(entry.id) && !isRunning(entry)) stale.add(entry.id)
+      }
+    }
+    entries = tail.length ? slotTail(merged, tail, stale) : merged
   }
   const seenQuarantined = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}`))
   for (const row of Array.isArray(data.quarantined) ? data.quarantined : []) {
@@ -1335,6 +1426,7 @@ function appendPage(data: LogFeed, cursor: string | null, current: () => boolean
   }
   if (typeof data.total === 'number') totalMatching = data.total
   historyCursor = cursor
+  historyComplete = cursor === null
   incompleteTotal = historyCursor !== null ? totalMatching : null
   loadingHistory = historyCursor !== null
   lastLoadedAt = Date.now()
@@ -1365,8 +1457,9 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   // cursor, so its ids must leave the covered set or Next would skip the
   // gap and display older cached history as the next page.
   let historyArrivals = false
+  let absorbedLogs = 0
   for (const entry of history.logs || []) {
-    if (!known.has(entry.id)) historyArrivals = true
+    if (!known.has(entry.id)) { historyArrivals = true; absorbedLogs++ }
   }
   for (const [id, entry] of fresh) {
     if (!known.has(id)) arrivals = true
@@ -1377,8 +1470,31 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
     historyArrivals = (history.quarantined || [])
       .some((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
   }
-  if (historyArrivals) historyIds = new Set((history.logs || []).map((entry) => entry.id))
+  // Overlap is read before the covered set is rewritten: a completed walk
+  // stays complete while the fresh first page still touches it, so an
+  // unchanged refresh — or arrivals shifting boundaries by less than a
+  // page — cannot reopen exhausted history. Only a disjoint fresh page
+  // (more than a page of arrivals) falls back to the reset below.
+  const historyOverlaps = (history.logs || []).some((entry) => historyIds.has(entry.id))
+  // A completed walk still reopens when the server counts matches beyond the
+  // newcomers in hand: total growth past the absorbed first-page rows means a
+  // row beyond that page newly matches this query (a running call that just
+  // completed). totalMatching still holds the previous refresh here; the
+  // update below runs after this read. Absorbed arrivals never reopen, and
+  // disjoint pages reset below; only net shrinkage can still mask growth.
+  // Count distinct quarantine keys: a quarantined running row arrives in
+  // both feeds, and counting it twice would mask one hidden match's growth.
+  const absorbedBad = new Set(
+    [...(history.quarantined || []), ...(running.quarantined || [])]
+      .filter((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
+      .map((row) => `${row.id || ''}:${row.index}:${row.error}`),
+  ).size
+  const hiddenGrowth = historyComplete && typeof history.total === 'number'
+    && history.total - totalMatching > absorbedLogs + absorbedBad
+  const keepComplete = historyComplete && (!historyArrivals || historyOverlaps) && !hiddenGrowth
+  if (historyArrivals && !keepComplete) historyIds = new Set((history.logs || []).map((entry) => entry.id))
   else for (const entry of history.logs || []) historyIds.add(entry.id)
+  for (const entry of history.logs || []) pinnedIds.add(entry.id)
   // New unreadable calls shift page boundaries exactly like readable ones;
   // ignoring them would keep a stale cursor that skips the intervening range.
   if (!arrivals) {
@@ -1409,7 +1525,11 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   // retained cursor still points past them into unloaded history — but a
   // cleared cursor (a new search whose matches are all cached) must still
   // adopt the fresh one, or older matches stay unreachable behind null.
-  if (arrivals || historyCursor === null) historyCursor = history.nextCursor ?? null
+  // A completed walk adopts nothing: the fresh first page describes that
+  // page, not the retained range, so adopting it would re-enable Next on
+  // the final page and refetch rows that are already cached.
+  if (!keepComplete && (arrivals || historyCursor === null)) historyCursor = history.nextCursor ?? null
+  historyComplete = historyCursor === null
   incompleteTotal = historyCursor !== null ? totalMatching : null
   loadingHistory = historyCursor !== null
   lastLoadError = null
@@ -1684,6 +1804,7 @@ export async function initSwarmView() {
     window.addEventListener('poise:organization-filter-changed', () => {
       entries = []
       historyIds.clear()
+      pinnedIds.clear()
       quarantined = []
       lastLoadError = null
       lastLoadedAt = 0
@@ -1691,6 +1812,7 @@ export async function initSwarmView() {
       loadingHistory = false
       totalMatching = 0
       historyCursor = null
+      historyComplete = false
       pageIndex = 0
       clearRows()
       viewEl.querySelector<HTMLElement>('#swarm-table')!.hidden = true
