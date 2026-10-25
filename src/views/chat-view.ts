@@ -1208,7 +1208,7 @@ function ensureQuickSession(firstPrompt?: ComposerDraft, title?: string, deferSt
   quickSessionPromise = (async () => {
     const catalogue = await loadAgents(true)
     if (!catalogue) throw new Error('Could not load the model catalogue. Your message has not been sent.')
-    const request = quickSessionRequest(catalogue.agents, selectedModel)
+    const request = quickSessionRequest(catalogue.agents, selectedModel, catalogue.defaults.model)
     if (selectedAutoMerge) request.autoMerge = true
     request.safeMode = selectedSafeMode
     if (freshSubject) request.subject = freshSubject
@@ -1261,7 +1261,7 @@ async function queueDraft(draft: ComposerDraft): Promise<void> {
     queueRender(); return
   }
   const requestedModel = draft.model || chain.model || source?.record.model || freshModelIdentity
-  const model = requestedModel || quickSessionModel(agentsInfo?.agents || [])?.identity || ''
+  const model = requestedModel || quickSessionModel(agentsInfo?.agents || [], agentsInfo?.defaults.model)?.identity || ''
   const agent = agentsInfo?.agents.find(agent => agent.models.some(option => option.identity === model))
   const effort = agent?.models.find(option => option.identity === model)?.effort || ''
   const id = crypto.randomUUID()
@@ -2455,9 +2455,9 @@ function wakeNote(s: SessionRecord): string {
 function composerStateFor(e: SessionEntry | null): void {
   if (!e) {
     composer.setCommands([], { model: true, modes: false, fork: false })
-    const model = freshModelIdentity || quickSessionModel(agentsInfo?.agents || [])?.identity
+    const model = freshModelIdentity || agentsInfo?.defaults.model
     const restoring = !!restoredSnapshot?.activeSessionId
-    composer.setState({ running: false, disabled: !!quickSessionPromise || restoring, placeholder: restoring ? 'Loading your conversation…' : quickSessionPromise ? 'Starting the session…' : undefined, modelLabel: model ? consoleModelLabel(model) : 'Opus · High', modelIdentity: model, sessionId: null })
+    composer.setState({ running: false, disabled: !!quickSessionPromise || restoring, placeholder: restoring ? 'Loading your conversation…' : quickSessionPromise ? 'Starting the session…' : undefined, modelLabel: model ? consoleModelLabel(model) : 'Choose model', modelIdentity: model || undefined, sessionId: null })
     return
   }
   const s = e.record
@@ -2771,6 +2771,9 @@ export async function initChatView(): Promise<void> {
     // hidden — that is what lets a running turn be re-joined on return
     // without a refetch — so these listeners live for the app's lifetime.
     window.addEventListener('poise:models-updated', () => { void loadAgents(true) })
+    // A saved default or preset changes what an untouched console shows and
+    // sends; reload the same authoritative defaults Send uses.
+    window.addEventListener('poise:models-changed', () => { void loadAgents(true) })
     chatClient.on('switches', acceptSwitches)
     chatClient.on('session', record => {
       discoveryRevision++

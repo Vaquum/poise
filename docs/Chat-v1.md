@@ -66,7 +66,8 @@ documents, or opening another external target cancels a pending conversation han
 ## Fresh console and split pane
 
 The empty console is writable without selecting or creating a session first.
-Its initial choice is the current catalogue's `opus-5-high` identity. Clicking
+Its initial choice is the saved Chat default (Settings → Models → Chat),
+resolved against the current catalogue, like New session. Clicking
 the model label opens an anchored dropdown grouped by provider, with each
 model's catalogue effort variants and a checkmark on the current choice.
 Unavailable variants remain visible with their provider's reason and cannot

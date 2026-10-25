@@ -1911,7 +1911,10 @@ export class ChatRuntime extends EventEmitter {
     const local = !request.repo
     const id = randomUUID()
     if (!local && !/^[^/\s]+\/[^/\s]+$/.test(request.repo!)) throw new ChatError(400, 'repo must be owner/name', 'invalid')
-    const branch = normalizeBranchRequest(request.branch ?? { new: `chat/${id}` }, this.branchPrefix())
+    // An omitted branch is the bare id; normalization applies the saved
+    // prefix. A synthesized `chat/<id>` would read as already explicit and
+    // ignore that setting.
+    const branch = normalizeBranchRequest(request.branch ?? { new: id }, this.branchPrefix())
     if (agent === 'claude' && !request.deferStart) await this.requireClaudeReady()
     // A bound checkout wins: a handoff stays in its source's workspace
     // instead of provisioning a fresh one. Otherwise every new Poise-local
