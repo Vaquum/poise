@@ -3,6 +3,7 @@ import { releaseBackgroundPaused, trackReleaseBackground } from './release-backg
 // The scheduled job and manual check share CLI updates, discovery and receipts.
 import { dirname, join } from 'node:path'
 import { callerBinRoot } from '../scripts/caller.mjs'
+import { providerEvidence } from './accounts/participation'
 import { HttpError } from './http'
 import { agentInterfaceCwd, catalogReportPath, invalidateCatalog } from './models'
 import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, runFile, scrubbedChildEnvironment } from './process'
@@ -16,9 +17,12 @@ export function refreshModelCatalog(): Promise<Record<string, unknown>> {
   const finished = trackReleaseBackground()
   pending = (async () => {
     let stdout: string
+    // The accounts the server already observed, so the script applies the
+    // eligibility rule without probing the CLIs again.
+    const evidence = await providerEvidence()
     try { ({ stdout } = await runFile(process.execPath, [join(dirname(CLAUDE_SUBSCRIPTION_CLI), 'refresh-models.mjs'), '--json'], {
       cwd: agentInterfaceCwd(),
-      env: { ...scrubbedChildEnvironment('agent-interface', claudeSubscriptionEnvironment()), CALLER_BIN_ROOT: callerBinRoot(), POISE_MODEL_CATALOG_REPORT: catalogReportPath() },
+      env: { ...scrubbedChildEnvironment('agent-interface', claudeSubscriptionEnvironment()), CALLER_BIN_ROOT: callerBinRoot(), POISE_MODEL_CATALOG_REPORT: catalogReportPath(), POISE_PROVIDER_EVIDENCE: JSON.stringify(evidence) },
       timeoutMs: 15 * 60_000, killSignal: 'SIGTERM',
     })) } catch (error) {
       // The script emits a durable structured failure even on a nonzero exit.
@@ -52,7 +56,7 @@ export function refreshModelCatalog(): Promise<Record<string, unknown>> {
           launchExecutable: update.launchPath ?? null, cwd: evidence.cwd ?? null, elapsedMs: evidence.elapsedMs ?? null } })
     }
     for (const [family, value] of Object.entries(report.families)) {
-      if (value && typeof value === 'object' && 'status' in value && value.status !== 'ok') diagnostic({
+      if (value && typeof value === 'object' && 'status' in value && value.status !== 'ok' && value.status !== 'skipped') diagnostic({
         level: 'warning', operation: 'models.discovery', component: family,
         message: 'error' in value && typeof value.error === 'string' ? value.error : 'Model discovery did not return a healthy result',
         context: { family, status: value.status, reportPath: catalogReportPath(), configuredExecutable: updates[family]?.configuredExecutable ?? process.env[family.toUpperCase() + '_CLI'] ?? null,

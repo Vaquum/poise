@@ -8,8 +8,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { dirname, delimiter, isAbsolute, join } from 'node:path'
 import { homedir } from 'node:os'
 import Database from 'better-sqlite3'
+import { PROVIDERS, SKIP_REASON } from './provider-participation.mjs'
 
-export const PROVIDERS = ['claude', 'codex', 'grok', 'antigravity', 'muse']
+export { PROVIDERS }
 export const CLI_UPDATE_TIMEOUT_MS = 120_000
 const COMMANDS = { claude: 'claude', codex: 'codex', grok: 'grok', antigravity: 'agy', muse: 'muse' }
 const inflight = new Map()
@@ -21,6 +22,15 @@ export function terminateUpdateChildren() {
   for (const child of children) {
     try { if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL') } catch { /* already gone */ }
   }
+}
+
+/** Eligibility probes join the same owned set while they run. */
+export function trackUpdateChild(child) {
+  children.add(child)
+}
+
+export function untrackUpdateChild(child) {
+  children.delete(child)
 }
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -231,8 +241,16 @@ export function ensureProviderCli(provider, options = {}) {
   inflight.set(key, task)
   return task
 }
+/** Update the selected providers; the rest are reported skipped without a
+ *  receipt, since no verification happened. Absent selection updates all. */
 export async function ensureProviderClis(options = {}) {
-  return Object.fromEntries(await Promise.all(PROVIDERS.map(async provider => [provider, await ensureProviderCli(provider, options)])))
+  const only = options.providers ?? PROVIDERS
+  for (const provider of only) if (!PROVIDERS.includes(provider)) throw new Error(`Unknown provider ${provider}`)
+  return Object.fromEntries(await Promise.all(PROVIDERS.map(async provider => [provider,
+    only.includes(provider)
+      ? await ensureProviderCli(provider, options)
+      : { provider, status: 'skipped', reason: SKIP_REASON, checkedAt: new Date().toISOString() },
+  ])))
 }
 
 /** The daily job and Settings share one discovery writer across Poise processes. */

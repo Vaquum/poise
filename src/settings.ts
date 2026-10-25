@@ -669,14 +669,14 @@ function renderCatalogStatus(data: ModelsResponse) {
   } else line += ' Not checked yet; the daily check runs at 07:00.'
   catalogStatusEl.dataset.help = line
   catalogStatusEl.tabIndex = 0
-  const failed = report && modelRefreshSummary(report).level === 'error'
+  const level = report ? modelRefreshSummary(report).level : 'ok'
   const checkedAt = report?.completed_at || report?.checked_at
   const when = checkedAt ? new Date(checkedAt) : null
   const checked = when && !Number.isNaN(when.getTime()) ? `Checked ${shortTime(when.getTime(), effectiveTimezone(), Date.now())}` : 'Checked'
-  catalogStatusEl.textContent = failed
-    ? modelRefreshSummary(report).text
-    : `${data.catalog.models.length} models · ${report ? checked : 'Not checked yet'}`
-  catalogStatusEl.classList.toggle('st-help-error', !!failed)
+  catalogStatusEl.textContent = level === 'ok'
+    ? `${data.catalog.models.length} models · ${report ? checked : 'Not checked yet'}`
+    : modelRefreshSummary(report!).text
+  catalogStatusEl.classList.toggle('st-help-error', level === 'error')
 }
 
 async function loadModels(signal?: AbortSignal): Promise<boolean> {
@@ -828,7 +828,7 @@ async function refreshModels(): Promise<void> {
   progress()
   const ticker = setInterval(progress, 1000)
   const deadline = setTimeout(() => controller.abort(), MODEL_CHECK_TIMEOUT_MS)
-  let summary: { text: string, level: 'ok' | 'error' }
+  let summary: { text: string, level: 'ok' | 'neutral' | 'error' }
   try {
     const res = await fetch('/api/models/refresh', { method: 'POST', signal: controller.signal })
     const data = await res.json()
@@ -847,11 +847,11 @@ async function refreshModels(): Promise<void> {
     refreshBtn.textContent = 'Check now'
   }
   if (lastModels) renderCatalogStatus(lastModels)
-  if (summary.level === 'error' && catalogStatusEl) {
+  if (summary.level !== 'ok' && catalogStatusEl) {
     catalogStatusEl.textContent = summary.text
-    catalogStatusEl.classList.add('st-help-error')
+    catalogStatusEl.classList.toggle('st-help-error', summary.level === 'error')
   }
-  setHelp(summary.text, summary.level)
+  setHelp(summary.text, summary.level === 'error' ? 'error' : summary.level === 'neutral' ? 'info' : 'ok')
 }
 
 // ── Save ────────────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@
 
 import { createHash } from 'node:crypto'
 import { materialFailureCause } from '../../gateway/src/diagnostics/material-cause'
+import { accountLogins, recordObservedSignIn } from '../accounts/logins'
 import { CONNECTED_ACCOUNTS_PATH, GITHUB_AUTOMATION_SIGN_IN_TITLE, type AccountId, type ConnectedAccount } from '../accounts/types'
 import { behaviorLedgerSnapshot, type BehaviorLedgerSnapshot } from '../behavior-ledger'
 import type { ClaudeAuthStatus } from '../claude-auth'
@@ -56,14 +57,21 @@ function minutes(ms: number): string {
 const CLAUDE_SIGN_IN = 'sign-in:claude'
 const ACCOUNTS: AlertTarget = { settings: 'accounts' }
 
-/** The Claude auth monitor's status: `reauth_required` alerts, and the alert
- *  clears once Claude is `authenticated` again. Other states say nothing. */
+/** The Claude auth monitor's status: `reauth_required` alerts for a Claude
+ *  that was configured, and the alert clears once Claude is `authenticated`
+ *  again, which also records the configuration. A Claude that was never
+ *  configured raises no sign-in demand. Other states say nothing. */
 export function claudeAuthStatusChanged(status: ClaudeAuthStatus): void {
   if (status === 'authenticated') {
+    record('the observed Claude sign-in', () => recordObservedSignIn('claude'))
     record('the end of the Claude sign-in alert', () => resolveAlert(CLAUDE_SIGN_IN))
     return
   }
   if (status !== 'reauth_required') return
+  if (!accountLogins().claude) {
+    record('the end of the Claude sign-in alert', () => resolveAlert(CLAUDE_SIGN_IN))
+    return
+  }
   record('the Claude sign-in alert', () => raiseAlert({
     kind: 'sign_in_needed',
     dedupeKey: CLAUDE_SIGN_IN,
@@ -101,11 +109,13 @@ const GH_ROLES = [
 ]
 
 /** What Connected accounts read from each CLI's own status command. An
- *  installed CLI that says it is not signed in alerts until it says it is;
- *  for gh, so does your GitHub account or the agent account when gh does not
- *  hold it signed in. A CLI whose state is unknown changes nothing, and Claude
+ *  installed, configured CLI that says it is not signed in alerts until it
+ *  says it is; for gh, so does your GitHub account or the agent account when
+ *  gh does not hold it signed in. A CLI that was never configured raises no
+ *  sign-in demand, and one whose state is unknown changes nothing. Claude
  *  is left to its auth monitor (claudeAuthStatusChanged). */
 export function accountsChecked(accounts: readonly ConnectedAccount[], identities: GitHubIdentities): void {
+  const configured = accountLogins()
   for (const account of accounts) {
     if (account.id === 'claude' || !account.installed) continue
     if (account.id === 'gh') {
@@ -115,7 +125,7 @@ export function accountsChecked(accounts: readonly ConnectedAccount[], identitie
     if (account.signedIn === null) continue
     const name = ACCOUNT_NAMES[account.id] ?? account.id
     const dedupeKey = `sign-in:${account.id}`
-    if (account.signedIn) {
+    if (account.signedIn || !configured[account.id]) {
       record(`the end of the ${name} sign-in alert`, () => resolveAlert(dedupeKey))
       continue
     }

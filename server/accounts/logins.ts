@@ -23,6 +23,16 @@ export function accountLogins(): AccountLogins {
   }
 }
 
+/** A live status positively verified a Claude/Codex sign-in, including one
+ *  made outside Poise. Remembered once: history proves configuration, and a
+ *  later lost sign-in must read as a failure, not as never configured. */
+export function recordObservedSignIn(id: AccountId): void {
+  if (id !== 'claude' && id !== 'codex') return
+  const logins = accountLogins()
+  if (logins[id]) return
+  setMeta(LOGINS_KEY, JSON.stringify({ ...logins, [id]: new Date().toISOString() }))
+}
+
 /** A Connect terminal's login exited with `code`; a clean exit is a finished
  *  login, except where the terminal runs a whole app rather than a login.
  *  Storing a Muse API key counts as its login. */
