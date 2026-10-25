@@ -68,7 +68,9 @@ the Manager, Poise or another chat — since its previous notice for that worker
 most 20, then `more`. Those ride along and start no turn of their own. An active creating
 chat can read its inbox directly. Admission records the new turn ID; it is not proof
 that the agent completed the task. Failed/stopped/interrupted work pauses
-automatic dispatch until explicit chat activity. A running or armed task queue
+automatic dispatch until explicit chat activity — except a worker a restart
+cut short with no stop pending on the cut turn, which resumes on its next
+wake instead of waiting for Resume. A running or armed task queue
 takes priority over new messages; unarmed waiting items and failed ones never
 hold ordinary delivery. Stop preserves pending messages and bindings.
 Dispatch preserves each recipient's message order while rotating across
