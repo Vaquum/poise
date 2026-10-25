@@ -398,6 +398,15 @@ A new installation can start without an initialized datastore; add the first
 GitHub account in Settings. Existing databases and their sync services are retained.
 An explicitly configured `POISE_DATASTORE_DB` must point to an existing file.
 
+Installation, the stop gates and the hourly reconciler all use the GitHub
+identities saved in Settings — your account, the agent account and the
+organization — from the database `POISE_DB` names. A missing or cleared
+identity fails naming the setting instead of borrowing the installer's
+environment or `gh`'s active account. `REVIEW_AGENT_USERNAME` only seeds the
+agent account on a first install and start without one saved; `POISE_GITHUB_USER`
+migrates a never-saved account into Settings once, for existing legacy-sync
+installs. Neither is required when Settings already holds the accounts.
+
 The macOS installer builds Poise and the checkout's Caller virtualenv
 (`caller/.venv`, as `npm run caller:setup` does), installs the Claude and Codex
 stop gates from `caller/`, and registers three per-user launchd services. They
@@ -419,6 +428,8 @@ The stop gates wait for the agent account's approval and read pull requests as
 your GitHub account. Installing them fixes both accounts into the hook from
 Settings — before Poise's first start, the agent account is the
 `REVIEW_AGENT_USERNAME` that will seed it — and fails without an agent account.
+A changed account reaches the hooks on the next reconciler run; a changed
+account on a legacy-sync install reinstalls the sync jobs with it.
 
 Keep the production checkout outside `~/dev` (for example
 `~/.poise/production`): the updater needs it permanently on `main` and clean,
@@ -530,6 +541,7 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 | `POISE_PORT` | Production port | `5555` |
 | `POISE_DB` | SQLite path | `~/.poise/cache.db` |
 | `POISE_DATASTORE_DB` | Existing account’s Caller datastore | github-datastore's default under `~/.local/share/github-datastore` |
+| `POISE_GITHUB_USER` | One-time migration into Your GitHub account when never saved, for legacy sync; ignored after that | unset |
 | `POISE_EDITOR_DIR` | Markdown and annotation directory | `~/.poise/editor` |
 | `POISE_CHAT_ATTACHMENTS_DIR` | Durable chat attachments | `~/.poise/chat-attachments` |
 | `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default; `~/.poise/snippets` in service mode |
@@ -540,7 +552,7 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 | `POISE_CHAT_ROOT` | Chat workspace storage | `.poise-chat/` in the installation; `~/.poise/chat` in service mode |
 | `POISE_VOICE_GUIDE_PATH` | Optional editor-chat voice guide | unset |
 | `AGENT_INTERFACE_VOICE_GUIDE` | Optional voice guide `/content` writes in; without one it writes without | unset |
-| `REVIEW_AGENT_USERNAME` | Seeds the agent account (Settings → GitHub) on the first start without one saved; ignored after that | unset |
+| `REVIEW_AGENT_USERNAME` | Optional seed for the agent account (Settings → GitHub) on the first install and start without one saved; ignored after that | unset |
 | `CONFAB_URL` | Optional Confab service | `http://localhost:8000` |
 | `CONFAB_API_KEY` | Optional Confab bearer credential | unset |
 
