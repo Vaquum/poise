@@ -18,7 +18,7 @@ Settings → Models → **Check now** and the existing scheduled model check run
 1. Resolve which providers participate ([Connected accounts](Connected-accounts.md#which-providers-a-model-check-maintains)):
    configured providers, plus Claude/Codex when the live status verifies a
    sign-in. The server forwards the accounts it already observed, so the
-   script does not probe the CLIs again; the standalone launchd run resolves
+   script does not probe the CLIs again; a direct script run resolves
    the same rule itself from the same database and status commands.
 2. Update the participating Claude, Codex, Grok, Antigravity and Muse CLIs
    concurrently. Nonparticipating providers are skipped without an update.
@@ -44,8 +44,7 @@ Caller installation `/api/health` checks, including a workspace release's
 separate `venv/bin` directory. A missing configured executable fails without
 trying another installation or PATH. The receipt records `caller_executable`
 on success and failure, with bounded failure diagnostics when spawning fails.
-Direct script runs, including the personal-install launchd job, resolve the
-same setting themselves.
+Direct script runs resolve the same setting themselves.
 
 Discovery never runs inference. Claude reads its local model cache, Codex and
 Grok read their model caches, Antigravity lists its models, and Muse reads the
@@ -76,6 +75,14 @@ variables, not model prompts or API tokens.
 Only the selected provider is maintained on a native Chat turn. Caller-backed
 card/editor chat, reviews, approvals, content and debate maintain their selected
 providers before launch too. No unrelated packages or IDE bundles are upgraded.
+
+## Scheduling
+
+The scheduled check runs inside the Poise server — in service mode and on a
+personal installation alike — at 07:00 in the timezone saved in Settings, or
+UTC (logged) until one is set. A timezone change takes effect without
+reinstalling; a drain skips the run. There is no separate calendar job: the
+installer removes the legacy personal-install launchd job on upgrade.
 
 ## Failure and recovery
 

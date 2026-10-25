@@ -1204,7 +1204,7 @@ function buildPanel(): HTMLElement {
         <div class="tp-group-label st-fixed-heading" ${helpAttributes("These model choices are fixed by Caller.")} hidden>Fixed models</div>
         <div class="st-models-fixed"></div>
 
-        <div class="tp-group-label" ${helpAttributes("Models are checked daily at 07:00 in your time zone. Check now refreshes provider CLIs and the model list.")}>Model catalog</div>
+        <div class="tp-group-label" ${helpAttributes("Models are checked daily at 07:00 in your time zone, or UTC until one is set. Check now refreshes provider CLIs and the model list.")}>Model catalog</div>
         <div class="tp-section">
           <div class="st-help st-help-info st-catalog-status"></div>
           <div class="st-row st-row-tight">
