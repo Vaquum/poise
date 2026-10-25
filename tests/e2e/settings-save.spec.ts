@@ -289,11 +289,12 @@ test('read again shows the saved values when the conflict reload fails', async (
   let loads = 0
   await page.route('**/api/models', async (route) => {
     loads += 1
-    if (loads > 1) {
+    // Only the conflict reload fails; later reloads read the server again.
+    if (loads === 2) {
       await route.fulfill({ status: 500, json: { error: 'catalog unavailable' } })
       return
     }
-    await route.fulfill({ json: modelsResponse({}) })
+    await route.fulfill({ json: modelsResponse((state.settings.models ?? {}) as Record<string, ModelChoice>) })
   })
   const saved = { chat: { default: 'fable-5.1-max', fallback: 'opus-5-max' } }
   let refuses = true
@@ -322,6 +323,16 @@ test('read again shows the saved values when the conflict reload fails', async (
   await page.getByRole('button', { name: 'Read again' }).click()
   // The reload failed, but the 409 carried the saved choice.
   await expect(chatDefault).toHaveValue('fable-5.1-max')
+  // Another tab saves again; the next reload reads it, and the next draft
+  // baselines the reloaded choice rather than the 409 snapshot.
+  const newer = { chat: { default: 'opus-5-xhigh', fallback: 'opus-5-max' } }
+  state.settings = { ...state.settings, models: newer }
+  await page.keyboard.press('Escape')
+  await openSection(page, 'models')
+  await page.getByLabel('Editor chat default model', { exact: true }).selectOption('fable-5.1-max')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect((state.posts[1].expect as Record<string, Record<string, ModelChoice>>).models).toEqual(newer)
 })
 
 test('read again prefers the refreshed value over the 409 snapshot', async ({ page }) => {
@@ -441,4 +452,42 @@ test('a focused input keeps the baseline its shown text was read against', async
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts[1].expect).toEqual({ me: 'octocat' })
+})
+
+test('saving a remaining draft after read-again succeeds without a second conflict', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  let refuses = true
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      if (refuses) {
+        refuses = false
+        // The 409 carries idle 0; the refresh then reads conc 6 as well.
+        state.settings = { ...state.settings, chat: { ...CHAT, idleTimeoutMinutes: 0, maxConcurrentLocalTurns: 6 } }
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { chat: { ...CHAT, idleTimeoutMinutes: 0 } } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      const merged = { ...state.settings, ...rest }
+      if (rest.chat && typeof rest.chat === 'object') merged.chat = { ...(state.settings.chat as object), ...(rest.chat as object) }
+      state.settings = merged
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'general')
+  await page.locator('#st-chat-idle-timeout').fill('45')
+  await page.locator('#st-chat-branch-prefix').fill('agent/')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toContainText('Idle timeout is now 0')
+  await page.getByRole('button', { name: 'Read again' }).click()
+  await expect(page.locator('#st-chat-idle-timeout')).toHaveValue('0')
+  await expect(page.locator('#st-chat-branch-prefix')).toHaveValue('agent/')
+  // The retry expects the refreshed chat with the remaining draft's own basis.
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts).toHaveLength(2)
+  expect(state.posts[1].expect).toEqual({ chat: { ...CHAT, idleTimeoutMinutes: 0, maxConcurrentLocalTurns: 6 } })
 })

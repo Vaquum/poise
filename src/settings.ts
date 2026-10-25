@@ -15,7 +15,7 @@ import { MODEL_CHECK_TIMEOUT_MS, modelRefreshSummary, type ModelRefreshReport } 
 // panel never invents a label for one.
 
 import { getSettings as getCachedSettings, setLocalSettings, loadSettings, settingsLoadOk, getRefreshRate, setRefreshRate, getTheme, setTheme, getOrganizations, setOrganizations, settingsReady, effectiveTimezone, type Organization } from './config'
-import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, mergeSaveBaseline, rereadValue, validateGeneralDraft, validateModelChoices, type ConflictLeaf, type GeneralDraft, type GeneralField, type GeneralTopField, type ModelChoice } from './settings-save'
+import { CHAT_DEFAULTS, GITHUB_NAME, conflictLeaves, conflictMessage, deepEqual, generalPayload, isRecord, rereadValue, validateGeneralDraft, validateModelChoices, wholeExpect, type ConflictLeaf, type GeneralDraft, type GeneralField, type ModelChoice } from './settings-save'
 import { productionSummary, type ProductionUpdate } from './production-status'
 import { clockDay, logTime, shortTime } from './clock'
 import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, MUSE_API_KEY_LOGIN, type ConnectedAccount } from '../server/accounts/types'
@@ -82,10 +82,14 @@ let notificationsStatusEl: HTMLElement | null = null
 // reloads until Save, exactly like the text fields keep typed text.
 const dirtyModels = new Set<string>()
 const dirtyFields = new Set<HTMLInputElement | HTMLSelectElement>()
-// The values this tab read, captured per top-level settings field when its
-// first draft is made. A save carries them as `expect`, so another tab's edit
-// to the same field is refused with 409 instead of silently overwritten.
-const saveBaselines = new Map<string, unknown>()
+// The values this tab read, captured per input when its draft is made. A save
+// carries them as `expect`, so another tab's edit to the same field is
+// refused with 409 instead of silently overwritten. Per leaf, because drafts
+// under one object can be written against different reads.
+// The last server value each general input was shown, for the basis above.
+const readValues = new Map<GeneralField, string | number>()
+const generalBasis = new Map<string, unknown>()
+const modelsBasis = new Map<string, unknown>()
 // A refused save's read-again offer: the section it was saving, the leaves
 // that moved elsewhere, and whether each conflict refresh landed — Read again
 // prefers the refresh over the 409's snapshot when it did.
@@ -127,38 +131,45 @@ function syncFieldsFromCache() {
   // first characters someone has already typed into an empty field. Only fill
   // a field the person is not currently in.
   const active = document.activeElement
-  // A synced input shows a fresh read, so its baseline moves with it: the
-  // next draft is based on what is shown. Drafted and focused fields keep
-  // both their text and their baseline.
+  // A synced input records the server value it shows, for the next draft's
+  // basis. Drafted and focused fields keep both their text and their basis.
   const synced = (input: HTMLInputElement | HTMLSelectElement | null): input is HTMLInputElement | HTMLSelectElement =>
     !!input && input !== active && !dirtyFields.has(input)
   if (synced(meInput)) {
     meInput.value = s.me
-    saveBaselines.set('me', s.me)
+    readValues.set('me', s.me)
   }
   if (synced(agentInput)) {
     agentInput.value = s.agentAccount ?? ''
-    saveBaselines.set('agentAccount', s.agentAccount ?? '')
+    readValues.set('agentAccount', s.agentAccount ?? '')
   }
   if (synced(tzSelect)) {
     const fallback = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return 'UTC' } })()
     tzSelect.value = ensureTimezoneOption(s.timezone || fallback)
     // The stored zone, not the displayed fallback: the server holds '' while
     // nothing is saved, and the fallback would 409 against it.
-    saveBaselines.set('timezone', s.timezone)
+    readValues.set('timezone', s.timezone)
   }
-  // The chat baseline is whole: it moves only when every chat input synced,
-  // so a draft keeps the basis it was written against.
-  let chatSynced = true
-  if (synced(branchPrefixInput)) branchPrefixInput.value = s.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
-  else chatSynced = false
-  if (synced(idleTimeoutInput)) idleTimeoutInput.value = String(s.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes)
-  else chatSynced = false
-  if (synced(maxConcurrentLocalTurnsInput)) maxConcurrentLocalTurnsInput.value = String(s.chat?.maxConcurrentLocalTurns ?? CHAT_DEFAULTS.maxConcurrentLocalTurns)
-  else chatSynced = false
-  if (synced(updateTurnBoundInput)) updateTurnBoundInput.value = String(s.chat?.updateTurnBoundMinutes ?? CHAT_DEFAULTS.updateTurnBoundMinutes)
-  else chatSynced = false
-  if (chatSynced) saveBaselines.set('chat', { ...(s.chat ?? CHAT_DEFAULTS) })
+  if (synced(branchPrefixInput)) {
+    const value = s.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
+    branchPrefixInput.value = value
+    readValues.set('branchPrefix', value)
+  }
+  if (synced(idleTimeoutInput)) {
+    const value = s.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes
+    idleTimeoutInput.value = String(value)
+    readValues.set('idleTimeoutMinutes', value)
+  }
+  if (synced(maxConcurrentLocalTurnsInput)) {
+    const value = s.chat?.maxConcurrentLocalTurns ?? CHAT_DEFAULTS.maxConcurrentLocalTurns
+    maxConcurrentLocalTurnsInput.value = String(value)
+    readValues.set('maxConcurrentLocalTurns', value)
+  }
+  if (synced(updateTurnBoundInput)) {
+    const value = s.chat?.updateTurnBoundMinutes ?? CHAT_DEFAULTS.updateTurnBoundMinutes
+    updateTurnBoundInput.value = String(value)
+    readValues.set('updateTurnBoundMinutes', value)
+  }
   showNotificationsChoice(s.notifications?.enabled !== false)
 }
 
@@ -740,8 +751,14 @@ function renderPlaces(data: ModelsResponse) {
   }).join(''))
   for (const section of modelsEl.querySelectorAll<HTMLElement>('.st-place')) {
     section.onchange = () => {
-      if (!saveBaselines.has('models')) saveBaselines.set('models', storedModelsSnapshot())
-      dirtyModels.add(section.dataset.place || '')
+      const key = section.dataset.place || ''
+      // The stored choice this place showed when drafted. Nothing stored
+      // leaves no basis: the expectation omits the place, like the server.
+      if (key && !modelsBasis.has(key)) {
+        const stored = lastModels?.places.find((entry) => entry.key === key)?.stored
+        if (stored) modelsBasis.set(key, { ...stored })
+      }
+      dirtyModels.add(key)
     }
   }
   patchContent(fixedEl, data.fixed.map((place) => `
@@ -872,7 +889,7 @@ async function usePreset(): Promise<void> {
     const data = await res.json()
     if (!res.ok) { setHelp(data.error || `"${name}" could not be used`, 'error'); return }
     dirtyModels.clear()
-    saveBaselines.delete('models')
+    modelsBasis.clear()
     setLocalSettings(data)
     // The response carries full settings, which may be newer than the display.
     syncFieldsFromCache()
@@ -968,16 +985,25 @@ let saving = false
 // commits nor is blocked by General drafts, and the reverse. Untouched fields
 // are never sent, so another tab's edits to them survive this save.
 
-// The first draft under a top-level field captures what this tab read for the
-// save's `expect`.
-function markGeneralDirty(field: HTMLInputElement | HTMLSelectElement, top: GeneralTopField): void {
-  if (!saveBaselines.has(top)) {
-    const cached = getCachedSettings()
-    if (top === 'chat') saveBaselines.set(top, { ...(cached.chat ?? CHAT_DEFAULTS) })
-    else if (top === 'agentAccount') saveBaselines.set(top, cached.agentAccount ?? '')
-    else saveBaselines.set(top, cached[top])
-  }
+// The first draft under an input captures the server value it was shown for
+// the save's `expect` — never the cache, which a background read may have
+// moved past the display while the input was focused.
+function markGeneralDirty(field: HTMLInputElement | HTMLSelectElement, key: GeneralField): void {
+  if (!generalBasis.has(key)) generalBasis.set(key, readValues.get(key) ?? cacheGeneralValue(key))
   dirtyFields.add(field)
+}
+
+function cacheGeneralValue(key: GeneralField): unknown {
+  const cached = getCachedSettings()
+  switch (key) {
+    case 'me': return cached.me
+    case 'agentAccount': return cached.agentAccount ?? ''
+    case 'timezone': return cached.timezone
+    case 'branchPrefix': return cached.chat?.branchPrefix ?? CHAT_DEFAULTS.branchPrefix
+    case 'idleTimeoutMinutes': return cached.chat?.idleTimeoutMinutes ?? CHAT_DEFAULTS.idleTimeoutMinutes
+    case 'maxConcurrentLocalTurns': return cached.chat?.maxConcurrentLocalTurns ?? CHAT_DEFAULTS.maxConcurrentLocalTurns
+    case 'updateTurnBoundMinutes': return cached.chat?.updateTurnBoundMinutes ?? CHAT_DEFAULTS.updateTurnBoundMinutes
+  }
 }
 
 // An emptied field is not a zero: Number('') is 0, which the idle timeout now
@@ -1012,12 +1038,6 @@ function generalInput(field: GeneralField): HTMLInputElement | HTMLSelectElement
   }
 }
 
-function topInputs(top: GeneralTopField): Array<HTMLInputElement | HTMLSelectElement | null> {
-  return top === 'chat'
-    ? [branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput, updateTurnBoundInput]
-    : [generalInput(top)]
-}
-
 function generalDirtyFields(): Set<GeneralField> {
   const dirty = new Set<GeneralField>()
   for (const field of ['me', 'agentAccount', 'timezone', 'branchPrefix', 'idleTimeoutMinutes', 'maxConcurrentLocalTurns', 'updateTurnBoundMinutes'] as const) {
@@ -1046,7 +1066,7 @@ async function saveGeneral(): Promise<void> {
     generalInput(problem.field)?.focus()
     return
   }
-  const payload = generalPayload(draft, dirty, saveBaselines)
+  const payload = generalPayload(draft, dirty, generalBasis, { ...(cached.chat ?? CHAT_DEFAULTS) })
   if (!payload) {
     setHelp('No changes to save.', 'info')
     return
@@ -1065,7 +1085,7 @@ async function saveGeneral(): Promise<void> {
     const data = await res.json()
     const conflicted = res.status === 409 ? conflictCurrent(data) : null
     if (conflicted) {
-      await handleConflict('general', conflicted)
+      await handleConflict('general', conflicted, payload.expect)
       return
     }
     if (!res.ok) {
@@ -1075,9 +1095,13 @@ async function saveGeneral(): Promise<void> {
     for (const [input, value] of savedValues) {
       if (input.value === value) dirtyFields.delete(input)
     }
-    for (const top of payload.fields) {
-      if (topInputs(top).every((input) => !input || !dirtyFields.has(input))) saveBaselines.delete(top)
-      else saveBaselines.set(top, mergeSaveBaseline(saveBaselines.get(top), payload.body[top]))
+    // A draft typed mid-save keeps a basis at what the server now holds: the
+    // save succeeded, so that is what was sent for its own leaf.
+    const sentChat = payload.body.chat as Record<string, unknown> | undefined
+    for (const leaf of payload.fields) {
+      const input = generalInput(leaf)
+      if (!input || !dirtyFields.has(input)) generalBasis.delete(leaf)
+      else generalBasis.set(leaf, sentChat && leaf in sentChat ? sentChat[leaf] : payload.body[leaf])
     }
     setLocalSettings(data)
     // Untouched inputs show what the save response carries: another tab's
@@ -1129,15 +1153,15 @@ async function saveModels(): Promise<void> {
   saveBtn.disabled = true
   saveBtn.textContent = 'Saving…'
   try {
-    const baseline = saveBaselines.get('models')
+    const expect = { models: wholeExpect(new Set(Object.keys(changes)), modelsBasis, storedModelsSnapshot()) }
     const res = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ models: changes, ...(baseline === undefined ? {} : { expect: { models: baseline } }) }),
+      body: JSON.stringify({ models: changes, expect }),
     })
     const data = await res.json()
     const conflicted = res.status === 409 ? conflictCurrent(data) : null
     if (conflicted) {
-      await handleConflict('models', conflicted)
+      await handleConflict('models', conflicted, expect)
       return
     }
     if (!res.ok) {
@@ -1146,10 +1170,11 @@ async function saveModels(): Promise<void> {
     }
     for (const [key, sent] of Object.entries(changes)) {
       const section = modelsEl.querySelector<HTMLElement>(`.st-place[data-place="${CSS.escape(key)}"]`)
-      if (section && deepEqual(sectionChoice(section), sent)) dirtyModels.delete(key)
+      if (section && deepEqual(sectionChoice(section), sent)) {
+        dirtyModels.delete(key)
+        modelsBasis.delete(key)
+      } else modelsBasis.set(key, sent)
     }
-    if (dirtyModels.size === 0) saveBaselines.delete('models')
-    else saveBaselines.set('models', mergeSaveBaseline(saveBaselines.get('models'), changes))
     // Stored mirrors the save at once, mirroring the server's merge: a draft
     // made before the reload below lands reads its baseline from it, not from
     // the pre-save catalog.
@@ -1183,12 +1208,10 @@ function conflictCurrent(data: unknown): Record<string, unknown> | null {
 }
 
 // Another tab saved the same field first: the server refused and sent what it
-// holds. Drafts stay put for an intentional retry; everything unedited is
-// read again at once, and Read again offers the saved values for the rest.
-async function handleConflict(section: 'general' | 'models', current: Record<string, unknown>): Promise<void> {
-  const leaves = conflictLeaves(current, saveBaselines)
-  // Baselines move to what the server holds, so Save again retries with intent.
-  for (const [field, value] of Object.entries(current)) saveBaselines.set(field, value)
+// holds. Drafts stay put with their basis for an intentional retry; everything
+// unedited is read again at once, and Read again offers the saved values.
+async function handleConflict(section: 'general' | 'models', current: Record<string, unknown>, sentExpect: Record<string, unknown>): Promise<void> {
+  const leaves = conflictLeaves(current, new Map(Object.entries(sentExpect)))
   await loadSettings({ fresh: true })
   const generalRefreshed = settingsLoadOk()
   syncFieldsFromCache()
@@ -1227,25 +1250,6 @@ function applyReread(): void {
     }
   }
   if (conflict.leaves.some((entry) => entry.field === 'models') && lastModels) renderPlaces(lastModels)
-  // Baselines clear only past a landed refresh: without one the cache still
-  // holds pre-conflict values, and the kept 409 baselines stay the newest
-  // known server state for the next draft.
-  if (conflict.generalRefreshed) {
-    // A baseline clears only while its input shows the cache: a focused
-    // input keeps its older text — and the baseline it was read against —
-    // so the next draft is still compared to what was shown.
-    if (meInput && !dirtyFields.has(meInput) && meInput.value === cached.me) saveBaselines.delete('me')
-    if (agentInput && !dirtyFields.has(agentInput) && agentInput.value === (cached.agentAccount ?? '')) saveBaselines.delete('agentAccount')
-    if (tzSelect && !dirtyFields.has(tzSelect) && tzSelect.value === cached.timezone) saveBaselines.delete('timezone')
-    const chat = cached.chat ?? CHAT_DEFAULTS
-    const chatInputs = [branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput, updateTurnBoundInput]
-    const chatShown = [chat.branchPrefix, String(chat.idleTimeoutMinutes), String(chat.maxConcurrentLocalTurns), String(chat.updateTurnBoundMinutes)]
-    if (chatInputs.every((input) => !input || !dirtyFields.has(input))
-      && chatInputs.every((input, index) => !input || input.value === chatShown[index])) {
-      saveBaselines.delete('chat')
-    }
-  }
-  if (conflict.modelsRefreshed && dirtyModels.size === 0) saveBaselines.delete('models')
   setHelp('Read the latest saved values.', 'info')
 }
 
@@ -1269,51 +1273,56 @@ function updateStoredChoice(key: string, choice: unknown): void {
   place.stored = stored
 }
 
+// A reverted input shows a saved value again: it records that value for the
+// next draft's basis and drops the draft's own.
+function revertGeneralInput(input: HTMLInputElement | HTMLSelectElement | null, key: GeneralField, value: unknown): void {
+  if (!input) return
+  if (typeof value === 'string' || typeof value === 'number') {
+    if (input === tzSelect && typeof value === 'string') input.value = ensureTimezoneOption(value)
+    else input.value = String(value)
+    readValues.set(key, value)
+  }
+  dirtyFields.delete(input)
+  generalBasis.delete(key)
+}
+
 function revertConflictLeaf(entry: ConflictLeaf): void {
-  const text = (value: unknown): string => (typeof value === 'string' || typeof value === 'number' ? String(value) : '')
+  // Only drafts are reverted: clean inputs stay owned by the sync, which
+  // skips focused fields the revert must not clobber.
   if (entry.leaf === null) {
-    if (entry.field === 'me' && meInput) {
-      meInput.value = text(entry.current)
-      dirtyFields.delete(meInput)
-    } else if (entry.field === 'agentAccount' && agentInput) {
-      agentInput.value = text(entry.current)
-      dirtyFields.delete(agentInput)
-    } else if (entry.field === 'timezone' && tzSelect) {
-      tzSelect.value = ensureTimezoneOption(text(entry.current))
-      dirtyFields.delete(tzSelect)
-    } else if (entry.field === 'chat') {
+    if (entry.field === 'me' && meInput && dirtyFields.has(meInput)) revertGeneralInput(meInput, 'me', entry.current)
+    else if (entry.field === 'agentAccount' && agentInput && dirtyFields.has(agentInput)) revertGeneralInput(agentInput, 'agentAccount', entry.current)
+    else if (entry.field === 'timezone' && tzSelect && dirtyFields.has(tzSelect)) revertGeneralInput(tzSelect, 'timezone', entry.current)
+    else if (entry.field === 'chat') {
       // A whole-section leaf, reached only when shapes differ: every drafted
       // chat field takes the saved value.
       const current = isRecord(entry.current) ? entry.current : {}
       const cached = getCachedSettings().chat ?? CHAT_DEFAULTS
-      const saved = (key: 'branchPrefix' | 'idleTimeoutMinutes' | 'maxConcurrentLocalTurns' | 'updateTurnBoundMinutes'): string => {
-        const value = current[key] ?? cached[key]
-        return typeof value === 'string' || typeof value === 'number' ? String(value) : ''
-      }
-      const pairs = [[branchPrefixInput, saved('branchPrefix')], [idleTimeoutInput, saved('idleTimeoutMinutes')], [maxConcurrentLocalTurnsInput, saved('maxConcurrentLocalTurns')], [updateTurnBoundInput, saved('updateTurnBoundMinutes')]] as const
-      for (const [input, value] of pairs) {
-        if (input && dirtyFields.has(input)) {
-          input.value = value
-          dirtyFields.delete(input)
-        }
+      const pairs: Array<[HTMLInputElement | null, GeneralField, unknown]> = [
+        [branchPrefixInput, 'branchPrefix', current.branchPrefix ?? cached.branchPrefix],
+        [idleTimeoutInput, 'idleTimeoutMinutes', current.idleTimeoutMinutes ?? cached.idleTimeoutMinutes],
+        [maxConcurrentLocalTurnsInput, 'maxConcurrentLocalTurns', current.maxConcurrentLocalTurns ?? cached.maxConcurrentLocalTurns],
+        [updateTurnBoundInput, 'updateTurnBoundMinutes', current.updateTurnBoundMinutes ?? cached.updateTurnBoundMinutes],
+      ]
+      for (const [input, key, value] of pairs) {
+        if (input && dirtyFields.has(input)) revertGeneralInput(input, key, value)
       }
     } else if (entry.field === 'models') {
       dirtyModels.clear()
+      modelsBasis.clear()
     }
     return
   }
   if (entry.field === 'chat') {
-    const input = entry.leaf === 'branchPrefix' ? branchPrefixInput
-      : entry.leaf === 'idleTimeoutMinutes' ? idleTimeoutInput
-        : entry.leaf === 'maxConcurrentLocalTurns' ? maxConcurrentLocalTurnsInput
-          : entry.leaf === 'updateTurnBoundMinutes' ? updateTurnBoundInput : null
-    if (input) {
-      input.value = text(entry.current)
-      dirtyFields.delete(input)
-    }
+    const key = entry.leaf as GeneralField
+    const input = generalInput(key)
+    if (input && dirtyFields.has(input)) revertGeneralInput(input, key, entry.current)
     return
   }
-  if (entry.field === 'models') dirtyModels.delete(entry.leaf)
+  if (entry.field === 'models') {
+    dirtyModels.delete(entry.leaf)
+    modelsBasis.delete(entry.leaf)
+  }
 }
 
 function timezoneOptions(): string[] {
@@ -1591,10 +1600,10 @@ function buildPanel(): HTMLElement {
   for (const inp of [meInput, agentInput, branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput, updateTurnBoundInput]) {
     inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveActiveSection() })
   }
-  for (const [field, top] of [[meInput, 'me'], [agentInput, 'agentAccount'], [tzSelect, 'timezone'], [branchPrefixInput, 'chat'], [idleTimeoutInput, 'chat'], [maxConcurrentLocalTurnsInput, 'chat'], [updateTurnBoundInput, 'chat']] as const) {
+  for (const [field, key] of [[meInput, 'me'], [agentInput, 'agentAccount'], [tzSelect, 'timezone'], [branchPrefixInput, 'branchPrefix'], [idleTimeoutInput, 'idleTimeoutMinutes'], [maxConcurrentLocalTurnsInput, 'maxConcurrentLocalTurns'], [updateTurnBoundInput, 'updateTurnBoundMinutes']] as const) {
     if (!field) continue
-    field.addEventListener('input', () => markGeneralDirty(field, top))
-    field.addEventListener('change', () => markGeneralDirty(field, top))
+    field.addEventListener('input', () => markGeneralDirty(field, key))
+    field.addEventListener('change', () => markGeneralDirty(field, key))
   }
 
   // Refresh-rate toggle — applies live (no Save needed); each view's

@@ -15,7 +15,6 @@ export const CHAT_DEFAULTS = { branchPrefix: 'chat/', idleTimeoutMinutes: 120, m
 export const GITHUB_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/
 
 export type GeneralField = 'me' | 'agentAccount' | 'timezone' | 'branchPrefix' | 'idleTimeoutMinutes' | 'maxConcurrentLocalTurns' | 'updateTurnBoundMinutes'
-export type GeneralTopField = 'me' | 'agentAccount' | 'timezone' | 'chat'
 
 export interface GeneralDraft {
   me: string
@@ -64,29 +63,33 @@ export function validateGeneralDraft(draft: GeneralDraft, stored: { me: string, 
   return null
 }
 
-export interface GeneralPayload { body: Record<string, unknown>, expect: Record<string, unknown>, fields: GeneralTopField[] }
+export interface GeneralPayload { body: Record<string, unknown>, expect: Record<string, unknown>, fields: GeneralField[] }
 
 // The smallest supported partial update: only drafted fields, with the values
 // this tab read for the fields it sends, so a stale draft is refused instead
 // of overwriting another tab's save.
-export function generalPayload(draft: GeneralDraft, dirty: ReadonlySet<GeneralField>, baselines: ReadonlyMap<string, unknown>): GeneralPayload | null {
+export function generalPayload(draft: GeneralDraft, dirty: ReadonlySet<GeneralField>, basis: ReadonlyMap<string, unknown>, freshChat: Record<string, unknown>): GeneralPayload | null {
   const body: Record<string, unknown> = {}
   const expect: Record<string, unknown> = {}
-  const fields: GeneralTopField[] = []
+  const fields: GeneralField[] = []
   for (const key of ['me', 'agentAccount', 'timezone'] as const) {
     if (!dirty.has(key)) continue
     body[key] = draft[key]
     fields.push(key)
-    if (baselines.has(key)) expect[key] = baselines.get(key)
+    if (basis.has(key)) expect[key] = basis.get(key)
   }
   const chat: Record<string, unknown> = {}
+  const chatLeaves = new Set<string>()
   for (const key of ['branchPrefix', 'idleTimeoutMinutes', 'maxConcurrentLocalTurns', 'updateTurnBoundMinutes'] as const) {
-    if (dirty.has(key)) chat[key] = draft[key]
+    if (dirty.has(key)) {
+      chat[key] = draft[key]
+      chatLeaves.add(key)
+      fields.push(key)
+    }
   }
   if (Object.keys(chat).length > 0) {
     body.chat = chat
-    fields.push('chat')
-    if (baselines.has('chat')) expect.chat = baselines.get('chat')
+    expect.chat = wholeExpect(chatLeaves, basis, freshChat)
   }
   return fields.length > 0 ? { body, expect, fields } : null
 }
@@ -109,12 +112,16 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
-// A draft typed mid-save keeps a baseline at what the server now holds: the
-// save succeeded, so that is the previous baseline with the sent leaves
-// applied. Storing only the sent leaves would 409 the next save against the
-// server's whole-object comparison.
-export function mergeSaveBaseline(before: unknown, sent: unknown): unknown {
-  return isRecord(before) && isRecord(sent) ? { ...before, ...sent } : sent
+// The whole object the server compares for a partially written field: fresh
+// values for clean leaves, each draft's own read basis for drafted ones. A
+// single whole baseline cannot represent drafts written against different
+// reads, so the expectation is built per leaf instead.
+export function wholeExpect(dirty: ReadonlySet<string>, basis: ReadonlyMap<string, unknown>, fresh: Record<string, unknown>): Record<string, unknown> {
+  const expect: Record<string, unknown> = { ...fresh }
+  for (const leaf of dirty) {
+    if (basis.has(leaf)) expect[leaf] = basis.get(leaf)
+  }
+  return expect
 }
 
 export function deepEqual(a: unknown, b: unknown): boolean {
