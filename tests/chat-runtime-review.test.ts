@@ -253,6 +253,27 @@ it('rolls back the whole terminal update if its Caller outbox write fails', asyn
 })
 
 
+it('answers one turn finish from its index instead of scanning the transcript', async () => {
+  const storage = await import('../server/chat/storage')
+  const { db } = await import('../server/db')
+  const { default: Database } = await import('better-sqlite3')
+  const id = await session()
+  const turnId = randomUUID()
+  storage.appendEvent(id, { type: 'turn.started', turnId, prompt: { text: 't', attachments: [], mentions: [] } })
+  storage.finalizeTurn(id, { type: 'turn.finished', turnId, stopReason: 'end_turn' })
+  expect(storage.findTurnFinished(id, turnId)).toEqual(storage.findEvent(id, event => event.type === 'turn.finished' && event.turnId === turnId))
+  expect(storage.findTurnFinished(id, randomUUID())).toBeNull()
+  const prepare = vi.spyOn(Database.prototype, 'prepare')
+  let sql: string | undefined
+  try {
+    storage.findTurnFinished(id, turnId)
+    sql = prepare.mock.calls.map(([statement]) => String(statement)).find(statement => statement.includes('turn.finished'))
+  } finally { prepare.mockRestore() }
+  const plan = db.prepare<string[], { detail: string }>('EXPLAIN QUERY PLAN ' + sql).all(id, turnId).map(row => row.detail)
+  expect(plan.join('\n')).toContain('USING INDEX idx_chat_events_turn_finished')
+})
+
+
 it('uses the actual recent turns for a handoff after a transcript exceeds one history page', async () => {
   const storage = await import('../server/chat/storage')
   const id = await session()

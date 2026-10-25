@@ -4,6 +4,7 @@ import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } f
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import {
+  AGENT_RIPGREP_CONFIG,
   CLAUDE_SUBSCRIPTION_CLI,
   MAX_PROCESS_ARG_BYTES,
   assertProcessArgSize,
@@ -15,6 +16,7 @@ import {
   spawnDetached,
   type CallerAccounts,
 } from '../server/process'
+import { spawnWorker } from '../server/chat/worker'
 
 function processExists(pid: number): boolean {
   try {
@@ -1119,6 +1121,88 @@ describe('the /content voice guide', () => {
     expect(scrubbedChildEnvironment('agent-interface').AGENT_INTERFACE_VOICE_GUIDE).toBe('/guides/voice.md')
     for (const command of ['github-interface', 'github-datastore', 'claude', 'gh']) {
       expect(scrubbedChildEnvironment(command).AGENT_INTERFACE_VOICE_GUIDE, command).toBeUndefined()
+    }
+  })
+})
+
+describe('Agent tool CPU defaults', () => {
+  let savedGo: string | undefined
+  let savedRg: string | undefined
+
+  beforeEach(() => {
+    savedGo = process.env.GOMAXPROCS
+    savedRg = process.env.RIPGREP_CONFIG_PATH
+    delete process.env.GOMAXPROCS
+    delete process.env.RIPGREP_CONFIG_PATH
+  })
+
+  afterEach(() => {
+    if (savedGo === undefined) delete process.env.GOMAXPROCS
+    else process.env.GOMAXPROCS = savedGo
+    if (savedRg === undefined) delete process.env.RIPGREP_CONFIG_PATH
+    else process.env.RIPGREP_CONFIG_PATH = savedRg
+    vi.unstubAllEnvs()
+  })
+
+  it('gives every child GOMAXPROCS=2 unless one is set', () => {
+    for (const command of ['agent-interface', 'claude', 'codex', 'gh', 'grok', 'muse', 'taskkill.exe']) {
+      expect(scrubbedChildEnvironment(command).GOMAXPROCS, command).toBe('2')
+    }
+  })
+
+  it('keeps an explicitly configured GOMAXPROCS', () => {
+    vi.stubEnv('GOMAXPROCS', '8')
+    expect(scrubbedChildEnvironment('agent-interface').GOMAXPROCS).toBe('8')
+    expect(scrubbedChildEnvironment('agent-interface', { GOMAXPROCS: '4' }).GOMAXPROCS).toBe('4')
+  })
+
+  it('lets a call remove GOMAXPROCS explicitly', () => {
+    expect(scrubbedChildEnvironment('agent-interface', { GOMAXPROCS: undefined }).GOMAXPROCS).toBeUndefined()
+  })
+
+  it('points external ripgrep at the shipped two-thread config unless one is set', () => {
+    for (const command of ['agent-interface', 'claude', 'codex', 'gh']) {
+      expect(scrubbedChildEnvironment(command).RIPGREP_CONFIG_PATH, command).toBe(AGENT_RIPGREP_CONFIG)
+    }
+  })
+
+  it('keeps an explicitly configured ripgrep config', () => {
+    vi.stubEnv('RIPGREP_CONFIG_PATH', '/user/rg.conf')
+    expect(scrubbedChildEnvironment('agent-interface').RIPGREP_CONFIG_PATH).toBe('/user/rg.conf')
+    expect(scrubbedChildEnvironment('agent-interface', { RIPGREP_CONFIG_PATH: '/call/rg.conf' }).RIPGREP_CONFIG_PATH).toBe('/call/rg.conf')
+  })
+
+  it('lets a call remove the ripgrep default explicitly', () => {
+    expect(scrubbedChildEnvironment('agent-interface', { RIPGREP_CONFIG_PATH: undefined }).RIPGREP_CONFIG_PATH).toBeUndefined()
+  })
+
+  // External tools are grandchildren: the agent CLI inherits the worker's
+  // environment and passes it on, as Caller's os.environ.copy() does.
+  it('delivers both defaults to a real child and its own child', async () => {
+    const read = 'process.stdout.write(JSON.stringify({ go: process.env.GOMAXPROCS, rg: process.env.RIPGREP_CONFIG_PATH }))'
+    const probe = ['-e', [
+      "const { execFileSync } = require('node:child_process')",
+      `const child = JSON.parse(execFileSync(process.execPath, ['-e', ${JSON.stringify(read)}]))`,
+      'process.stdout.write(JSON.stringify({ go: process.env.GOMAXPROCS, rg: process.env.RIPGREP_CONFIG_PATH, child }))',
+    ].join(';')]
+    const { stdout } = await runFile(process.execPath, probe)
+    expect(JSON.parse(stdout)).toEqual({
+      go: '2',
+      rg: AGENT_RIPGREP_CONFIG,
+      child: { go: '2', rg: AGENT_RIPGREP_CONFIG },
+    })
+  })
+
+  it('delivers both defaults through the worker gate to the started command', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'poise-worker-env-'))
+    try {
+      const out = join(dir, 'env.json')
+      const worker = spawnWorker(process.execPath, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify({ go: process.env.GOMAXPROCS, rg: process.env.RIPGREP_CONFIG_PATH }))`], { cwd: dir })
+      worker.go()
+      await worker.exited
+      expect(JSON.parse(await readFile(out, 'utf8'))).toEqual({ go: '2', rg: AGENT_RIPGREP_CONFIG })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
     }
   })
 })
