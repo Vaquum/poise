@@ -485,10 +485,21 @@ describe('queued preparation waits', () => {
     const runtime = makeRuntime(controls)
     const record = await idleSession(runtime, 'no github')
     stubs.hangCommands.add('github-interface')
+    // Event-driven, not wall-clock: the turn ends whenever the loaded
+    // runner gets there. A turn that truly hangs still fails at testTimeout.
+    const turnDone = new Promise<void>((resolve) => {
+      const onEvent = (): void => {
+        if (finished(runtime, record.id).length > 0) {
+          runtime.off('event', onEvent)
+          resolve()
+        }
+      }
+      runtime.on('event', onEvent)
+    })
     runtime.prompt(record.id, promptInput('work please'))
-    await until(() => runtime.get(record.id)?.status === 'running')
-    await until(() => runtime.get(record.id)?.status === 'idle')
+    await turnDone
     expect(stubs.githubCalls).toBe(0)
+    expect(finished(runtime, record.id)).toHaveLength(1)
     expect(finished(runtime, record.id)[0]).toMatchObject({ stopReason: 'end_turn' })
   })
 
