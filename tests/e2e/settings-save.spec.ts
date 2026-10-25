@@ -404,3 +404,41 @@ test('a save after a failed-refresh read-again re-baselines the shown value', as
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts[2].expect).toEqual({ timezone: 'Europe/Berlin' })
 })
+
+test('a focused input keeps the baseline its shown text was read against', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  let refuses = true
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      if (refuses) {
+        refuses = false
+        // Another tab saved its account name; the conflict refresh reads it.
+        state.settings = { ...state.settings, me: 'octocat2' }
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { timezone: 'Europe/Helsinki' } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      state.settings = { ...state.settings, ...rest }
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'general')
+  const me = page.getByLabel('Your GitHub account')
+  await page.locator('#st-timezone').selectOption('Europe/Madrid')
+  // Enter saves from inside the account field, so it stays focused while the
+  // conflict refresh lands and keeps its shown text.
+  await me.click()
+  await me.press('Enter')
+  await expect(page.locator('.st-status')).toContainText('Time zone is now "Europe/Helsinki"')
+  await expect(me).toHaveValue('octocat')
+  await page.getByRole('button', { name: 'Read again' }).click()
+  // The next draft is compared to the shown octocat, not the unseen octocat2.
+  await me.fill('octocat3')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts[1].expect).toEqual({ me: 'octocat' })
+})

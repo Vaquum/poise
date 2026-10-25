@@ -1231,10 +1231,17 @@ function applyReread(): void {
   // holds pre-conflict values, and the kept 409 baselines stay the newest
   // known server state for the next draft.
   if (conflict.generalRefreshed) {
-    for (const [input, top] of [[meInput, 'me'], [agentInput, 'agentAccount'], [tzSelect, 'timezone']] as const) {
-      if (input && !dirtyFields.has(input)) saveBaselines.delete(top)
-    }
-    if ([branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput, updateTurnBoundInput].every((input) => !input || !dirtyFields.has(input))) {
+    // A baseline clears only while its input shows the cache: a focused
+    // input keeps its older text — and the baseline it was read against —
+    // so the next draft is still compared to what was shown.
+    if (meInput && !dirtyFields.has(meInput) && meInput.value === cached.me) saveBaselines.delete('me')
+    if (agentInput && !dirtyFields.has(agentInput) && agentInput.value === (cached.agentAccount ?? '')) saveBaselines.delete('agentAccount')
+    if (tzSelect && !dirtyFields.has(tzSelect) && tzSelect.value === cached.timezone) saveBaselines.delete('timezone')
+    const chat = cached.chat ?? CHAT_DEFAULTS
+    const chatInputs = [branchPrefixInput, idleTimeoutInput, maxConcurrentLocalTurnsInput, updateTurnBoundInput]
+    const chatShown = [chat.branchPrefix, String(chat.idleTimeoutMinutes), String(chat.maxConcurrentLocalTurns), String(chat.updateTurnBoundMinutes)]
+    if (chatInputs.every((input) => !input || !dirtyFields.has(input))
+      && chatInputs.every((input, index) => !input || input.value === chatShown[index])) {
       saveBaselines.delete('chat')
     }
   }
