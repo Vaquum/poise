@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -12,18 +13,104 @@ from threading import current_thread, main_thread
 
 from . import atoms, progress, review_budget, review_receipt
 from .review_gate import cancel_when_idle, submission_active
-from .provider_progress import ProviderStream
+from .provider_progress import ProviderStream, READ_BYTES
 
 PROGRESS_SECONDS = 1
 POLL_SECONDS = 30
 HEAD_TIMEOUT_SECONDS = 10
 STOP_GRACE_SECONDS = 2
+# A provider CLI stuck in its own reconnect loop (codex retries a 429 for
+# twenty minutes) hands off after a minute of nothing but rate-limit
+# signals, so Poise can move the run to the next slot on budget instead.
+RATE_LIMIT_ABORT_SECONDS = 60
+_RATE_LIMIT_MARKERS = (
+    b"reconnecting",
+    b"exceeded retry limit",
+    b"rate limit",
+    b"rate_limit",
+    b"rate-limit",
+    b"too many requests",
+)
+_STATUS_429 = re.compile(rb"(?:status|http_status)\D{0,3}429\b")
+_GITHUB_STATUS = re.compile(rb"github\s+\d{3}")
 
 
 class ReviewSuperseded(RuntimeError):
     def __init__(self, head_sha: str):
         self.head_sha = atoms.expected_head(head_sha)
         super().__init__(f"Review stopped early: PR head changed to {self.head_sha}")
+
+
+def _rate_limited(line: bytes) -> bool:
+    lowered = line.lower()
+    if _GITHUB_STATUS.search(lowered):
+        # GitHub's own limit: switching models cannot fix it.
+        return False
+    return any(marker in lowered for marker in _RATE_LIMIT_MARKERS) or bool(_STATUS_429.search(lowered))
+
+
+class RateLimitAbort:
+    """Kill a provider run stalled on its own rate limit.
+
+    The first rate-limit signal starts a minute's grace for the provider's
+    own retry; any output line without a signal resets it. Past the minute
+    with nothing but signals (or silence), the run is killed so Poise can
+    move the review to the next slot instead of waiting out the budget.
+    """
+
+    def __init__(self) -> None:
+        self.out_offset = 0
+        self.err_offset = 0
+        self.pending_out = b""
+        self.pending_err = b""
+        self.since: float | None = None
+        self.signal = b""
+
+    def scan(self, stdout, stderr) -> None:
+        for stream, offsets in ((stdout, ("out_offset", "pending_out")), (stderr, ("err_offset", "pending_err"))):
+            try:
+                chunk = os.pread(stream.fileno(), READ_BYTES, getattr(self, offsets[0]))
+            except OSError:
+                continue
+            setattr(self, offsets[0], getattr(self, offsets[0]) + len(chunk))
+            data = getattr(self, offsets[1]) + chunk
+            *lines, rest = data.split(b"\n")
+            # A marker can straddle two reads; only the tail can hold half of one.
+            setattr(self, offsets[1], rest[-1024:])
+            for line in lines:
+                self.feed(line)
+
+    def note(self, chunk: bytes) -> None:
+        for line in chunk.split(b"\n"):
+            self.feed(line)
+
+    def feed(self, line: bytes) -> None:
+        if not line.strip():
+            return
+        if _rate_limited(line):
+            if self.since is None:
+                self.since = monotonic()
+            self.signal = line.strip()[:200]
+        else:
+            self.since = None
+
+    def flush(self) -> None:
+        for attr in ("pending_out", "pending_err"):
+            pending = getattr(self, attr)
+            if pending:
+                self.feed(pending)
+                setattr(self, attr, b"")
+
+    def check(self, provider: str | None, process: subprocess.Popen) -> None:
+        self.flush()
+        if self.since is None or monotonic() - self.since < RATE_LIMIT_ABORT_SECONDS:
+            return
+        _stop_process_group(process)
+        excerpt = self.signal.decode("utf-8", "replace") if self.signal else ""
+        raise review_budget.ReviewLimitError(
+            f"Provider rate-limited this run for over a minute ({provider or 'unknown'}); "
+            f"handing off so the next model can run instead{(': ' + excerpt) if excerpt else ''}",
+            "review_provider_error")
 
 
 class ReviewWatch:
@@ -72,6 +159,7 @@ class ReviewWatch:
         deadline = monotonic() + timeout
         next_head_check = monotonic() + POLL_SECONDS
         events = ProviderStream(provider)
+        limited = RateLimitAbort()
         progress.stage("waiting_provider", "Waiting for provider", timeout=timeout)
         # Files avoid pipe backpressure while the supervisor checks GitHub.
         with tempfile.TemporaryFile(mode="w+t") as stdin, \
@@ -90,6 +178,7 @@ class ReviewWatch:
             try:
                 while True:
                     events.read(stdout)
+                    limited.scan(stdout, stderr)
                     review_receipt.record_file(self.receipt_path)
                     if provider:
                         try:
@@ -110,6 +199,9 @@ class ReviewWatch:
                                 "Provider exited during a GitHub submission; needs reconciliation",
                                 "review_recovery_failed")
                         return subprocess.CompletedProcess(args, process.returncode, stdout.read(), stderr.read())
+                    # Completion wins over the abort: a run that just exited
+                    # reports its own result, never a handoff.
+                    limited.check(provider, process)
                     remaining = deadline - monotonic()
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(args, timeout)

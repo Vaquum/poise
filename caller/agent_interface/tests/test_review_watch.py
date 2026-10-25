@@ -17,7 +17,8 @@ from agent_interface import atoms, bash_guard, claude_acl, pr_review, structured
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_gate import cancel_when_idle, submission_gate
 from agent_interface import review_watch
-from agent_interface.review_watch import ReviewSuperseded, ReviewWatch
+from agent_interface.review_budget import ReviewLimitError
+from agent_interface.review_watch import RateLimitAbort, ReviewSuperseded, ReviewWatch
 
 HEAD = "a" * 40
 NEW_HEAD = "b" * 40
@@ -274,3 +275,86 @@ class TestCancellationOutcome(TestCase):
                 patch.object(structured_review.subprocess, "run") as submit, self.assertRaises(ReviewSuperseded):
             structured_review.run("/tmp", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR, "bit-mis", HEAD, 30)
         submit.assert_not_called()
+
+
+class TestRateLimitAbort(TestCase):
+    def test_healthy_output_never_starts_the_clock(self):
+        abort = RateLimitAbort()
+        abort.note(b'{"type":"turn","text":"reviewing line 429"}\nmore progress\n')
+        self.assertIsNone(abort.since)
+        abort.check("codex", SimpleNamespace())
+
+    def test_signal_then_progress_resets_the_clock(self):
+        abort = RateLimitAbort()
+        with patch.object(review_watch, "monotonic", side_effect=[100.0, 130.0]):
+            abort.note(b"Reconnecting... 1/5 (last status: 429 Too Many Requests)\n")
+            self.assertEqual(abort.since, 100.0)
+            abort.note(b'{"type":"assistant","text":"back to work"}\n')
+            self.assertIsNone(abort.since)
+            abort.check("codex", SimpleNamespace())
+
+    def test_minute_of_signals_aborts_with_a_handoff(self):
+        abort = RateLimitAbort()
+        proc = SimpleNamespace(pid=1234)
+        with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
+                patch.object(review_watch, "_stop_process_group") as stop:
+            abort.note(b"Reconnecting... 1/5\n")
+            abort.note(b"Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)\n")
+            with self.assertRaises(ReviewLimitError) as raised:
+                abort.check("codex", proc)
+        self.assertEqual(raised.exception.code, "review_provider_error")
+        self.assertIn("rate-limited", str(raised.exception))
+        self.assertIn("next model", str(raised.exception))
+        self.assertIn("429 Too Many Requests", str(raised.exception))
+        stop.assert_called_once_with(proc)
+
+    def test_silence_after_a_signal_aborts(self):
+        abort = RateLimitAbort()
+        with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
+                patch.object(review_watch, "_stop_process_group"):
+            abort.note(b"Provider retry: rate limit; attempt 3; waiting 120s\n")
+            with self.assertRaises(ReviewLimitError):
+                abort.check("claude", SimpleNamespace())
+
+    def test_github_limits_never_start_the_clock(self):
+        abort = RateLimitAbort()
+        abort.note(b"error: GitHub 429: rate limit exceeded for resource\n")
+        abort.note(b"error: GitHub 403 rate-limit: {}\n")
+        self.assertIsNone(abort.since)
+        with patch.object(review_watch, "monotonic", return_value=10_000.0):
+            abort.check("codex", SimpleNamespace())
+
+    def test_marker_across_reads_still_counts(self):
+        abort = RateLimitAbort()
+        with tempfile.TemporaryFile(mode="w+t") as out, tempfile.TemporaryFile(mode="w+t") as err:
+            out.write("rate")
+            out.flush()
+            abort.scan(out, err)
+            self.assertIsNone(abort.since)
+            out.write(" limit exceeded, backing off\n")
+            out.flush()
+            abort.scan(out, err)
+            self.assertIsNotNone(abort.since)
+
+    def test_scan_reads_stderr_too(self):
+        abort = RateLimitAbort()
+        with tempfile.TemporaryFile(mode="w+t") as out, tempfile.TemporaryFile(mode="w+t") as err:
+            err.write("Reconnecting... 1/5\n")
+            err.flush()
+            abort.scan(out, err)
+            self.assertIsNotNone(abort.since)
+
+    def test_check_kills_the_process_group(self):
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            abort = RateLimitAbort()
+            abort.note(b"Reconnecting... 1/5\n")
+            assert abort.since is not None
+            with patch.object(review_watch, "monotonic", return_value=abort.since + 61):
+                with self.assertRaises(ReviewLimitError):
+                    abort.check("codex", proc)
+            self.assertIsNotNone(proc.poll())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
