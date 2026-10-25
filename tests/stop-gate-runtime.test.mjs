@@ -151,14 +151,121 @@ describe('stop-gate runtime reconciliation', () => {
     expect(env).toEqual({ REVIEW_AGENT_USERNAME: 'seed-bot', GITHUB_INTERFACE_AGENT_USER: 'seed-bot' })
   })
 
-  it('once Poise has saved the agent account, Settings decides, cleared included', async () => {
+  it('once Poise has saved the agent account, Settings decides', async () => {
     const home = await temporaryHome()
     await savedPoise(home)
     expect((await configuredEnvironment(home, SAVED, { REVIEW_AGENT_USERNAME: 'seed-bot' })).env)
       .toMatchObject({ GITHUB_INTERFACE_AGENT_USER: 'review-bot', CALLER_GITHUB_READER: 'octocat' })
+  })
+
+  it('uses a second unrelated saved identity set verbatim', async () => {
+    const home = await temporaryHome()
+    await savedPoise(home)
+    const other = JSON.stringify([
+      { key: 'agentAccount', value: 'alice-bot' },
+      { key: 'me', value: 'alice' },
+      { key: 'org', value: 'acme' },
+    ])
+    expect((await configuredEnvironment(home, other, {})).env).toMatchObject({
+      CALLER_PR_GATE_SCOPE: 'acme/*',
+      GITHUB_INTERFACE_AGENT_USER: 'alice-bot',
+      CALLER_GITHUB_READER: 'alice',
+    })
+  })
+
+  it('applies a changed account to the next configuration', async () => {
+    const home = await temporaryHome()
+    const bin = join(home, '.local', 'share', 'caller-pr-stop-gate', 'bin')
+    await mkdir(bin, { recursive: true })
+    await executable(join(bin, 'agent-interface'))
+    await savedPoise(home)
+    let saved = SAVED
+    const run = vi.fn(async (command) => (command === '/usr/bin/sqlite3' ? { stdout: saved, stderr: '' } : { stdout: '', stderr: '' }))
+    await configureStopGate({ home, run, environment: {} })
+    expect(run.mock.lastCall[2].env).toMatchObject({ GITHUB_INTERFACE_AGENT_USER: 'review-bot' })
+    saved = JSON.stringify([{ key: 'agentAccount', value: 'alice-bot' }])
+    await configureStopGate({ home, run, environment: {} })
+    expect(run.mock.lastCall[2].env).toMatchObject({ GITHUB_INTERFACE_AGENT_USER: 'alice-bot' })
+  })
+
+  it('ignores stale identity environment variables, including a conflicting reviewer and org', async () => {
+    const home = await temporaryHome()
+    await savedPoise(home)
+    const { env, run } = await configuredEnvironment(home, SAVED, {
+      CALLER_PR_REVIEWER: 'inherited-reviewer',
+      GITHUB_INTERFACE_AGENT_USER: 'inherited-agent',
+      GITHUB_INTERFACE_USER: 'inherited-person',
+      CALLER_GITHUB_READER: 'inherited-reader',
+      CALLER_PR_GATE_SCOPE: 'inherited-org/*',
+      POISE_GITHUB_ORG: 'inherited-org',
+      REVIEW_AGENT_USERNAME: 'seed-bot',
+    })
+    expect(env).toMatchObject({
+      CALLER_PR_GATE_SCOPE: 'Vaquum/*',
+      GITHUB_INTERFACE_AGENT_USER: 'review-bot',
+      CALLER_GITHUB_READER: 'octocat',
+    })
+    for (const stale of ['CALLER_PR_REVIEWER', 'GITHUB_INTERFACE_USER']) expect(env[stale]).toBeUndefined()
+    expect(env.CALLER_PR_GATE_SCOPE).not.toContain('inherited-org')
+    // The gate never consults gh: no active account can stand in.
+    expect(run.mock.calls.some(([command]) => command === 'gh')).toBe(false)
+  })
+
+  it('fails naming the setting when the saved agent is cleared, never restoring the seed', async () => {
+    const home = await temporaryHome()
+    const bin = join(home, '.local', 'share', 'caller-pr-stop-gate', 'bin')
+    await mkdir(bin, { recursive: true })
+    await executable(join(bin, 'agent-interface'))
+    await savedPoise(home)
     const cleared = JSON.stringify([{ key: 'agentAccount', value: '' }])
-    expect((await configuredEnvironment(home, cleared, { REVIEW_AGENT_USERNAME: 'seed-bot' })).env)
-      .toEqual({ REVIEW_AGENT_USERNAME: 'seed-bot' })
+    const run = vi.fn(async (command) => (command === '/usr/bin/sqlite3' ? { stdout: cleared, stderr: '' } : { stdout: '', stderr: '' }))
+    await expect(configureStopGate({
+      home,
+      run,
+      environment: { REVIEW_AGENT_USERNAME: 'seed-bot', GITHUB_INTERFACE_AGENT_USER: 'inherited-agent' },
+    })).rejects.toThrow('No agent account is saved. Set the agent account in Settings → General')
+    expect(run.mock.calls.some(([, args]) => args?.[0] === '--install-pr-stop-gate')).toBe(false)
+  })
+
+  it('drops scope and reader when org and human account clear, without failing', async () => {
+    const home = await temporaryHome()
+    await savedPoise(home)
+    const { env } = await configuredEnvironment(home, JSON.stringify([{ key: 'agentAccount', value: 'review-bot' }]), {})
+    expect(env.GITHUB_INTERFACE_AGENT_USER).toBe('review-bot')
+    expect(env.CALLER_PR_GATE_SCOPE).toBeUndefined()
+    expect(env.CALLER_GITHUB_READER).toBeUndefined()
+  })
+
+  it('before the first start, fails naming the seed when none is set', async () => {
+    const home = await temporaryHome()
+    const bin = join(home, '.local', 'share', 'caller-pr-stop-gate', 'bin')
+    await mkdir(bin, { recursive: true })
+    await executable(join(bin, 'agent-interface'))
+    const run = vi.fn(async () => ({ stdout: '', stderr: '' }))
+    await expect(configureStopGate({ home, run, environment: {} }))
+      .rejects.toThrow('No agent account is saved. Set REVIEW_AGENT_USERNAME so the first start seeds it')
+    expect(run).not.toHaveBeenCalled()
+    await expect(configureStopGate({ home, run, environment: { REVIEW_AGENT_USERNAME: 'not a login' } }))
+      .rejects.toThrow('Configured agent account is invalid')
+  })
+
+  it('reads the database POISE_DB names, not the default one', async () => {
+    const home = await temporaryHome()
+    const database = join(home, 'custom.db')
+    await writeFile(database, '')
+    const other = JSON.stringify([
+      { key: 'agentAccount', value: 'alice-bot' },
+      { key: 'me', value: 'alice' },
+      { key: 'org', value: 'acme' },
+    ])
+    const { env, run } = await configuredEnvironment(home, other, { POISE_DB: database })
+    expect(env).toMatchObject({
+      CALLER_PR_GATE_SCOPE: 'acme/*',
+      GITHUB_INTERFACE_AGENT_USER: 'alice-bot',
+      CALLER_GITHUB_READER: 'alice',
+    })
+    const sqlite = run.mock.calls.find(([command]) => command === '/usr/bin/sqlite3')
+    expect(sqlite[1][1]).toBe(database)
   })
 
   it('refuses a saved account that is not a GitHub login', async () => {

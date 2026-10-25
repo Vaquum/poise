@@ -1,5 +1,8 @@
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
+import { readSavedSettings, writeSavedSetting } from './saved-settings.mjs'
+
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
 
 // Existing installations keep their external Caller database and launchd
 // jobs. A clean install has no legacy source: Settings creates managed org
@@ -30,4 +33,26 @@ export function legacyDatastoreServices(databasePath, launchAgents) {
     const label = `com.vaquum.github-datastore.${kind}`
     return { kind, label, path: join(launchAgents, `${label}.plist`) }
   })
+}
+
+const NO_SAVED_ACCOUNT = 'No GitHub account is saved. Set Your GitHub account in Settings → General, then install again.'
+
+// The GitHub user the legacy sync jobs authenticate as: your account saved in
+// Settings, never gh's active account. POISE_GITHUB_USER only migrates a
+// never-saved value into Settings explicitly; a cleared value stays cleared
+// and fails naming the setting.
+export async function resolveLegacySyncUser({ home, run, environment = process.env }) {
+  const { database, present, settings } = await readSavedSettings({ home, run, environment })
+  if (!present) throw new Error(NO_SAVED_ACCOUNT)
+  if (!('me' in settings)) {
+    const migrated = environment.POISE_GITHUB_USER?.trim() || ''
+    if (!migrated) throw new Error(NO_SAVED_ACCOUNT)
+    if (!GITHUB_LOGIN.test(migrated)) throw new Error('POISE_GITHUB_USER must be a GitHub username')
+    await writeSavedSetting({ run, database, key: 'me', value: migrated })
+    return { user: migrated, migrated: true }
+  }
+  const me = settings.me?.trim() || ''
+  if (!me) throw new Error(NO_SAVED_ACCOUNT)
+  if (!GITHUB_LOGIN.test(me)) throw new Error('The GitHub account in Settings → General is not a GitHub username')
+  return { user: me, migrated: false }
 }
