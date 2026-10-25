@@ -432,6 +432,20 @@ export async function fetchAgentLogsSince(
     '--behavior', selection.behavior, '--prompt', selection.prompt], options)
 }
 
+// One exact call by id for Swarm's settled-running refresh. A primary-key
+// read, so retained history never raises its cost. Observes like history
+// pages: a run that finished outside the newest page still records its
+// completion. Other selected readers keep their existing behavior.
+export async function fetchAgentLogById(
+  id: string,
+  options: { signal?: AbortSignal, fresh?: boolean } = {},
+): Promise<AgentLogSnapshot> {
+  if (!/^[0-9a-fA-F]{32}$/.test(id)) throw new Error('agent call id must be 32 hex characters')
+  const snapshot = await selectedAgentLogSnapshot(['--logs', '--select', JSON.stringify({ latest: [], ids: [id] })], options)
+  observeAgentSnapshot(snapshot)
+  return snapshot
+}
+
 export interface AgentLogPage extends AgentLogSnapshot {
   nextCursor: string | null
   total: number

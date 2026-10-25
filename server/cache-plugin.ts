@@ -27,7 +27,7 @@ import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
-import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
+import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
 import { readBehaviorEstimates } from './behavior-estimates'
 import { listCapabilities } from './capabilities'
@@ -746,6 +746,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           if (search !== null && (search.length < 1 || search.length > 2048)) {
             return json(res, 400, { error: 'search must be 1..2048 characters' })
           }
+          const id = query.get('id')
+          if (id !== null && !/^[0-9a-fA-F]{32}$/.test(id)) {
+            return json(res, 400, { error: 'id must be a 32-character call id' })
+          }
+          if (id !== null && (limit !== undefined || cursor !== null || search !== null || status !== null)) {
+            return json(res, 400, { error: 'id cannot combine with limit, cursor, search or status' })
+          }
           if ((cursor !== null || search !== null) && limit === undefined) {
             return json(res, 400, { error: 'cursor and search require limit' })
           }
@@ -754,12 +761,23 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
           // History without a bound would load the full log to slice it;
           // Swarm pages instead. Running stays unpaged: it is already few.
-          if (status === null && limit === undefined) {
+          if (status === null && limit === undefined && id === null) {
             return json(res, 400, { error: 'limit is required for history reads; page with cursor' })
           }
           try {
             const orgs = selectedOrg ? selectOrganizations(selectedOrg) : null
             const belongs = (repo: string | null) => !orgs || (!!repo && orgs.some((org) => repoBelongsTo(repo, org.login)))
+            // One exact call by primary key for settled-running refresh.
+            if (id !== null) {
+              const snapshot = await fetchAgentLogById(id)
+              const selected = snapshot.entries.filter((entry) => belongs(entry.repo))
+              const quarantined = snapshot.quarantined.filter((row) => !row.repo || belongs(row.repo)
+                || selected.some((entry) => row.id === entry.id
+                  || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
+              const readable = selected.filter((entry) => !snapshot.quarantined.some((row) => row.id === entry.id
+                  || (!!entry.correlation_id && row.correlationId === entry.correlation_id)))
+              return json(res, 200, { logs: readable, quarantined })
+            }
             // The running lane answers from its own indexed read; history
             // pages never queue it. Filtering stays here too, so the read
             // is exact even when Caller cannot pre-filter.

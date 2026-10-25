@@ -108,6 +108,21 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
       total,
     }), stderr: '' }
   }
+  // Single-id point reads filter to the requested call, like Caller's
+  // primary-key lookup. Other selections keep the full fixture for the
+  // behavior tests that rely on it.
+  if (command === 'agent-interface' && args[0] === '--logs' && args[1] === '--select') {
+    try {
+      const selection = JSON.parse(args[2]!) as { latest?: unknown[], ids?: unknown }
+      if (Array.isArray(selection.latest) && selection.latest.length === 0 && Array.isArray(selection.ids) && selection.ids.length === 1) {
+        const wanted = String(selection.ids[0]).toLowerCase()
+        const found = (behaviorLogs as Record<string, unknown>[]).filter((row) => String(row.id ?? '').toLowerCase() === wanted)
+        return { stdout: JSON.stringify(found), stderr: '' }
+      }
+    } catch {
+      // Fall through to the full fixture; the server validates instead.
+    }
+  }
   if (command === 'agent-interface' && args[0] === '--logs') return { stdout: JSON.stringify(behaviorLogs), stderr: '' }
   if (command === 'github-interface' && args[0] === '--view-repos') {
     return { stdout: JSON.stringify({ repos: [{ full_name: `${args[1]}/same-repo` }] }), stderr: '' }
@@ -488,6 +503,35 @@ describe('global behavior settings API', () => {
       expect(response.status).toBe(400)
     }
     expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toHaveLength(before)
+  })
+
+  it('serves one exact call by id for settled-running refresh', async () => {
+    const target = 'a'.repeat(32)
+    behaviorLogs = [
+      { id: target, repo: 'Legacy/same-repo', pr_id: '9', model: 'test', behavior: 'pr_review',
+        prompt: '', actor: 'review-bot', status: 'completed', outcome: null,
+        started_at: '2026-10-01T12:00:00Z', completed_at: '2026-10-01T12:01:00Z', time_elapsed: '1m' },
+      { id: 'b'.repeat(32), repo: 'Legacy/same-repo', pr_id: '10', model: 'test', behavior: 'pr_review',
+        prompt: '', actor: 'review-bot', status: 'running',
+        started_at: '2026-10-01T12:00:00Z', completed_at: null, time_elapsed: '1m', outcome: null },
+    ]
+    const data = await (await fetch(`${base}/api/agent-logs?id=${target}`)).json()
+    expect(data.logs.map((entry: { id: string }) => entry.id)).toEqual([target])
+    expect(data.quarantined).toEqual([])
+    const missing = await (await fetch(`${base}/api/agent-logs?id=${'c'.repeat(32)}`)).json()
+    expect(missing.logs).toEqual([])
+    const scoped = await (await fetch(`${base}/api/agent-logs?id=${target}&org=Legacy`)).json()
+    expect(scoped.logs.map((entry: { id: string }) => entry.id)).toEqual([target])
+    const before = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs').length
+    for (const path of [`/api/agent-logs?id=short`, `/api/agent-logs?id=${target}&limit=1`,
+      `/api/agent-logs?id=${target}&status=running`]) {
+      const response = await fetch(`${base}${path}`)
+      expect(response.status).toBe(400)
+    }
+    expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toHaveLength(before)
+    const selected = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs' && args[1] === '--select')
+    expect(selected.length).toBeGreaterThan(0)
+    for (const [, args] of selected) expect(args.join(' ')).not.toContain('--limit')
   })
 
   it('serves a running-only agent-log read for the Current accent', async () => {

@@ -659,14 +659,17 @@ function renderShell() {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-page]')
     if (!button || button.disabled) return
     void (async () => {
-      pageIndex += button.dataset.page === 'next' ? 1 : -1
-      clearRows()
-      render(false)
+      // Load before rendering: painting first would clamp the requested
+      // next page back to the loaded rows and never fetch older history.
+      pageIndex = Math.max(0, pageIndex + (button.dataset.page === 'next' ? 1 : -1))
       const mine = pollSequence
       const org = getSelectedOrganization()
       const search = searchQuery
       const current = () => mine === pollSequence && org === getSelectedOrganization() && search === searchQuery
       await loadMoreForView(current)
+      if (!current()) return
+      clearRows()
+      render(false)
       if (button.disabled) viewEl.querySelector<HTMLButtonElement>('#swarm-pagination button:not(:disabled)')?.focus()
     })()
   })
@@ -1319,7 +1322,11 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
     if (!fresh.has(entry.id)) fresh.set(entry.id, entry)
   }
   const known = new Map(entries.map((entry) => [entry.id, entry]))
-  for (const [id, entry] of fresh) known.set(id, entry)
+  let arrivals = false
+  for (const [id, entry] of fresh) {
+    if (!known.has(id)) arrivals = true
+    known.set(id, entry)
+  }
   entries = [...known.values()].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
   const seenQuarantined = new Set<string>()
   const mergedQuarantined: QuarantinedLog[] = []
@@ -1332,8 +1339,11 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   }
   quarantined = mergedQuarantined
   if (typeof history.total === 'number') totalMatching = history.total
-  // Previously loaded older pages stay valid: new arrivals prepend larger
-  // rowids and never shift the cursor into unloaded history.
+  // New arrivals shift page boundaries: more than a page of them would leave
+  // the retained cursor skipping the intervening calls, so follow the fresh
+  // first page instead. Without arrivals the older pages stay valid and the
+  // retained cursor still points past them into unloaded history.
+  if (arrivals) historyCursor = history.nextCursor ?? null
   incompleteTotal = historyCursor !== null ? totalMatching : null
   loadingHistory = historyCursor !== null
   lastLoadError = null
@@ -1343,17 +1353,58 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   refreshExpandedDetails()
 }
 
+// One bounded page per call for the requested view page: grouping can
+// collapse hundreds of runs into one row, so looping to fill the page
+// would drain the whole log on histories of identical runs.
 async function loadMoreForView(current: () => boolean): Promise<void> {
-  while (current() && historyCursor !== null) {
-    const org = getSelectedOrganization()
-    const search = searchQuery
-    const needed = (pageIndex + 1) * PAGE_SIZE
-    if (groupRows(groupRuns(visible())).length >= needed) return
-    const data = await readLogFeed(historyUrl(org, historyCursor, search))
-    if (!current() || org !== getSelectedOrganization() || search !== searchQuery) return
-    if (!appendPage(data, data.nextCursor ?? null, current)) return
-    if ((data.logs || []).length === 0 && (data.quarantined || []).length === 0 && data.nextCursor) continue
+  if (!current() || historyCursor === null) return
+  const org = getSelectedOrganization()
+  const search = searchQuery
+  const needed = pageIndex * PAGE_SIZE + 1
+  if (groupRows(groupRuns(visible())).length >= needed) return
+  const data = await readLogFeed(historyUrl(org, historyCursor, search))
+  if (!current() || org !== getSelectedOrganization() || search !== searchQuery) return
+  appendPage(data, data.nextCursor ?? null, current)
+}
+
+// A loaded running call that finishes outside the newest page is in neither
+// refresh feed; settle each by its primary key instead of showing it as
+// running indefinitely. Few at a time: running calls are already few.
+async function settleStaleRunning(freshIds: Set<string>, current: () => boolean): Promise<void> {
+  const org = getSelectedOrganization()
+  const stale = entries.filter((entry) => isRunning(entry) && !freshIds.has(entry.id))
+  if (!stale.length) return
+  const settled = await Promise.all(stale.map(async (entry) => {
+    try {
+      return await readLogFeed(organizationUrl(`/api/agent-logs?id=${encodeURIComponent(entry.id)}`, org))
+    } catch {
+      return null
+    }
+  }))
+  if (!current()) return
+  let changed = false
+  const byId = new Map(entries.map((entry) => [entry.id, entry]))
+  for (let index = 0; index < stale.length; index++) {
+    const data = settled[index]
+    if (!data) continue
+    const row = (data.logs || [])[0]
+    if (row && matchesSearch(row)) {
+      byId.set(row.id, row)
+      changed = true
+      continue
+    }
+    const bad = (Array.isArray(data.quarantined) ? data.quarantined : []).find((item) => item.id === stale[index]!.id)
+    if (bad && !quarantined.some((item) => item.id === bad.id && item.index === bad.index)) {
+      quarantined.push(bad)
+      byId.delete(stale[index]!.id)
+      changed = true
+    }
   }
+  if (!changed) return
+  entries = [...byId.values()].sort((a, b) => startedAtMs(b) - startedAtMs(a) || (a.id < b.id ? -1 : 1))
+  render()
+  renderStaleBanner()
+  refreshExpandedDetails()
 }
 
 function pollOnce(): Promise<void> {
@@ -1385,6 +1436,9 @@ function pollOnce(): Promise<void> {
       } else {
         if (!current()) return
         mergeRefresh(history, running)
+        if (!current()) return
+        const freshIds = new Set([...(history.logs || []), ...(running.logs || [])].map((entry) => entry.id))
+        await settleStaleRunning(freshIds, current)
       }
       if (!current()) return
       await loadMoreForView(current)
