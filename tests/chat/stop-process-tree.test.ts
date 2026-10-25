@@ -14,6 +14,7 @@ import { CATALOG } from '../model-catalog-fixture'
 
 let root = ''
 let repo = ''
+let repoB = ''
 let runtimeModule: typeof import('../../server/chat/runtime')
 let storage: typeof import('../../server/chat/storage')
 let worker: typeof import('../../server/chat/worker')
@@ -22,6 +23,16 @@ function git(args: string[], cwd = repo): string {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.invalid' } })
   if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`)
   return result.stdout.trim()
+}
+
+async function initRepo(dir: string): Promise<void> {
+  await mkdir(dir)
+  git(['init', '-q', '-b', 'main'], dir)
+  git(['config', 'user.email', 't@example.invalid'], dir)
+  git(['config', 'user.name', 't'], dir)
+  await writeFile(join(dir, 'README.md'), '# repo\n')
+  git(['add', '-A'], dir)
+  git(['commit', '-q', '-m', 'init'], dir)
 }
 
 interface FakeControls {
@@ -80,7 +91,7 @@ class FakeAdapter implements Adapter {
 
 const runtimes: Array<import('../../server/chat/runtime').ChatRuntime> = []
 
-function makeRuntime(instance: string, controls?: FakeControls) {
+function makeRuntime(instance: string, controls?: FakeControls, checkout?: string) {
   const owned: FakeControls = controls ?? { hosts: [], adapters: [], auto: true }
   const caller: CallerTurns = {
     async start() { return 'a'.repeat(32) },
@@ -92,7 +103,7 @@ function makeRuntime(instance: string, controls?: FakeControls) {
     adapters: { grok: (host: AdapterHost) => { const a = new FakeAdapter(host, owned); owned.hosts.push(host); owned.adapters.push(a); return a } },
     callerTurns: caller,
     catalog: async () => CATALOG as any,
-    resolveCheckout: async () => repo,
+    resolveCheckout: async () => checkout ?? repo,
     idleTimeoutMinutes: () => 0,
     requireClaudeReady: async () => {},
   })
@@ -107,13 +118,9 @@ beforeAll(async () => {
   process.env.POISE_DB = join(root, 'cache.db')
   process.env.POISE_LOCK_DIR = join(root, 'locks')
   repo = join(root, 'repo')
-  await mkdir(repo)
-  git(['init', '-q', '-b', 'main'])
-  git(['config', 'user.email', 't@example.invalid'])
-  git(['config', 'user.name', 't'])
-  await writeFile(join(repo, 'README.md'), '# repo\n')
-  git(['add', '-A'])
-  git(['commit', '-q', '-m', 'init'])
+  await initRepo(repo)
+  repoB = join(root, 'repo-b')
+  await initRepo(repoB)
   vi.resetModules()
   runtimeModule = await import('../../server/chat/runtime')
   storage = await import('../../server/chat/storage')
@@ -131,9 +138,11 @@ afterAll(async () => {
 
 afterEach(async () => {
   for (const runtime of runtimes.splice(0)) await runtime.stop({ handover: false }).catch(() => undefined)
-  spawnSync('git', ['checkout', '-q', '--', '.'], { cwd: repo })
-  spawnSync('git', ['clean', '-fdq'], { cwd: repo })
-  spawnSync('git', ['switch', '-q', 'main'], { cwd: repo })
+  for (const dir of [repo, repoB]) {
+    spawnSync('git', ['checkout', '-q', '--', '.'], { cwd: dir })
+    spawnSync('git', ['clean', '-fdq'], { cwd: dir })
+    spawnSync('git', ['switch', '-q', 'main'], { cwd: dir })
+  }
 })
 
 async function waitFor(check: () => boolean, ms = 8_000): Promise<void> {
@@ -205,4 +214,76 @@ describe('Stop ends the turn and its process tree', () => {
     expect(ofType(events, session.id, 'turn.finished').at(-1)).toMatchObject({ stopReason: 'end_turn' })
     await runtime.stop({ handover: false })
   }, 40_000)
+})
+
+describe('One session never kills another session\u2019s worker (#650)', () => {
+  it('closing one chat leaves the other chat\u2019s worker group and turn running', async () => {
+    const workerCommand = { command: 'sh', args: ['-c', 'sleep 30 & wait'] }
+    const first = makeRuntime('poise-group-isolation-a:db', { hosts: [], adapters: [], auto: false, startWorker: workerCommand }, repo)
+    const second = makeRuntime('poise-group-isolation-b:db', { hosts: [], adapters: [], auto: false, startWorker: workerCommand }, repoB)
+    const sessionA = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    const sessionB = await second.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, sessionA.id) === 'idle')
+    await waitFor(() => lastStatus(second.events, sessionB.id) === 'idle')
+    first.runtime.prompt(sessionA.id, { text: 'first turn', attachments: [], mentions: [] })
+    second.runtime.prompt(sessionB.id, { text: 'second turn', attachments: [], mentions: [] })
+    await waitFor(() => first.runtime.get(sessionA.id)?.status === 'running')
+    await waitFor(() => second.runtime.get(sessionB.id)?.status === 'running')
+    const recordedA = storage.getWorker(sessionA.id)
+    const recordedB = storage.getWorker(sessionB.id)
+    expect(recordedA).not.toBeNull()
+    expect(recordedB).not.toBeNull()
+    expect(recordedA!.gatePgid).not.toBe(recordedB!.gatePgid)
+
+    await first.runtime.close(sessionA.id)
+
+    // The closed chat's worker group is verifiably dead...
+    expect(worker.pgidAlive(recordedA!.gatePgid)).toBe(false)
+    // ...while the other chat's worker group and turn are untouched...
+    expect(worker.pgidAlive(recordedB!.gatePgid)).toBe(true)
+    expect(worker.pidAlive(recordedB!.gatePid)).toBe(true)
+    expect(second.runtime.get(sessionB.id)?.status).toBe('running')
+    // ...and still answer to their own session: stopping B settles it.
+    const stopped = await second.runtime.cancel(sessionB.id)
+    expect(stopped.settled).toBe(true)
+    expect(worker.pgidAlive(recordedB!.gatePgid)).toBe(false)
+    await first.runtime.stop({ handover: false })
+    await second.runtime.stop({ handover: false })
+  }, 60_000)
+
+  it('never signals a recorded group that names another session\u2019s live worker', async () => {
+    // A stale registration: A's worker verifies (its gate is alive and
+    // carries the recorded ident) but its recorded pgid names B's live
+    // group. Terminating A's recorded worker must refuse rather than
+    // signal B's group, and must keep A's rows for the next recovery.
+    const first = makeRuntime('poise-stale-group:db', {
+      hosts: [], adapters: [], auto: true,
+      startWorker: { command: 'sh', args: ['-c', 'sleep 30 & wait'] },
+    })
+    const sessionA = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    const sessionB = await first.runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh', repo: 'acme/repo', branch: { existing: 'main' } })
+    await waitFor(() => lastStatus(first.events, sessionA.id) === 'idle')
+    await waitFor(() => lastStatus(first.events, sessionB.id) === 'idle')
+    const recordedA = storage.getWorker(sessionA.id)
+    const recordedB = storage.getWorker(sessionB.id)
+    expect(recordedA).not.toBeNull()
+    expect(recordedB).not.toBeNull()
+    expect(worker.pgidAlive(recordedB!.gatePgid)).toBe(true)
+    // B is invisible to recovery; only A's row is judged.
+    storage.forgetWorker(sessionB.id)
+    storage.recordWorker({ ...recordedA!, gatePgid: recordedB!.gatePgid })
+
+    const second = makeRuntime('poise-stale-group:db', { hosts: [], adapters: [], auto: true })
+    await second.runtime.recover()
+
+    // B's live group was never signalled, and A's worker was left alone
+    // with its rows kept instead of being freed.
+    expect(worker.pgidAlive(recordedB!.gatePgid)).toBe(true)
+    expect(worker.pidAlive(recordedB!.gatePid)).toBe(true)
+    expect(worker.pgidAlive(recordedA!.gatePgid)).toBe(true)
+    expect(storage.getWorker(sessionA.id)).not.toBeNull()
+    expect(second.runtime.get(sessionA.id)?.orphanNotice).toContain('stop it by hand')
+    await first.runtime.stop({ handover: false })
+    await second.runtime.stop({ handover: false })
+  }, 60_000)
 })
