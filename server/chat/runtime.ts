@@ -5288,7 +5288,7 @@ function implementingTurnOutcome(sessionId: string): { started: boolean, finishe
     cursor = page.events[page.events.length - 1].seq
   }
   if (turnId === null) return { started: false, finished: null }
-  const found = storage.findEvent(sessionId, (e) => e.type === 'turn.finished' && e.turnId === turnId)
+  const found = storage.findTurnFinished(sessionId, turnId)
   return { started: true, finished: found?.event.type === 'turn.finished' ? found.event : null }
 }
 

@@ -663,7 +663,10 @@ export class Switchboard implements SwitchboardControl {
   state(): SwitchboardState {
     const board = store.board(this.instance)
     const session = this.live()
-    const chats = new Map(this.runtime.list().map(chat => [chat.id, chat]))
+    // Items only attribute title, agent, model, existence and halted
+    // state: raw records, not the per-session queue and timer summaries
+    // runtime.list() computes for the session list.
+    const chats = new Map(storage.listSessions(this.instance).map(chat => [chat.id, chat]))
     const status = !session ? 'off' : this.halted(session) ? 'stopped' : board.paused ? 'paused' : 'live'
     const last = store.lastCommitted(this.instance)
     const missing = !session && !!board.session
