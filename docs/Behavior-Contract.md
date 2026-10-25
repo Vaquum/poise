@@ -156,6 +156,34 @@ held. Uncertain submissions are reconciled from live receipts before any retry.
 After account recovery, a successful explicit replay on the same head, model,
 and reviewer reconciles the held no-action attempt. Its GitHub review receipt
 must be present in live evidence before it becomes durable approval evidence.
+
+Approve Pull Requests carries a review-round cap: off unless set, otherwise an
+integer from 2 to 10. A round is a completed change-request round on the pull
+request — one per head the automated reviewers sent back, so a parallel
+initial panel on one head is one round, and failed, held, quarantined,
+superseded and manual runs add none. The count is read from the durable launch
+ledger at preparation time, so it survives restarts. From the capped round on
+(round ≥ cap, never = cap alone, so a push after a capped approval cannot
+reopen the loop), the run files that round's findings as one follow-up issue
+in the pull request's repository and approves instead of requesting changes
+again. A capped round with no findings is a plain approval with no issue.
+The issue carries a marker for its pull request and head
+(`<!-- poise:review-cap #N@sha -->`), one section per finding with its
+severity where the provider reports one, path and line, a permalink pinned to
+the reviewed head, and a link back to the pull request; a retry or replay
+reuses the marked issue and never files a second one for the same head.
+The capped approval reconciles as the ordinary head-pinned approved outcome.
+When the issue cannot be created, nothing is approved and the run fails loudly
+with a contract violation; an uncertain filing is reconciled from live
+evidence before anything retries. The cap is literal: the capped round defers
+every severity and approves, so with Merge Pull Requests on, a pull request
+can merge with deferred findings and the follow-up issue is their only
+remaining record. Structured providers convert a change request into the
+issue-plus-approval deterministically in the harness; Claude runs the capped
+tool contract (file the issue, then approve — request-changes is not offered)
+and submits nothing when filing fails. A human's change request still blocks
+as before, and the row's Skip list and pause/disable guards apply to capped
+runs like any other launch.
 `resolve-unblocking` uses the upstream strong
 resolution primitive, which revalidates the complete gate before every thread
 mutation.
