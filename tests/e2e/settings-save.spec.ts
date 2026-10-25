@@ -86,13 +86,13 @@ test('a models save sends only the edited place and leaves general drafts alone'
   await openSection(page, 'general')
   await page.locator('#st-timezone').selectOption('Europe/Berlin')
   await openSection(page, 'models')
-  await page.getByLabel('Chat default model', { exact: true }).selectOption('gpt-6-astra-ultra')
+  await page.getByLabel('Chat default model', { exact: true }).selectOption('muse-spark-1.3-contributor-max')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   expect(state.posts).toHaveLength(1)
   expect(Object.keys(state.posts[0]).sort()).toEqual(['expect', 'models'])
   expect(Object.keys(state.posts[0].models as object)).toEqual(['chat'])
-  expect((state.posts[0].models as Record<string, ModelChoice>).chat.default).toBe('gpt-6-astra-ultra')
+  expect((state.posts[0].models as Record<string, ModelChoice>).chat.default).toBe('muse-spark-1.3-contributor-max')
   expect(state.posts[0].expect).toEqual({ models: {} })
   // The other tab's timezone is untouched, and the general draft is intact.
   expect(state.settings.timezone).toBe('UTC')
@@ -270,7 +270,7 @@ test('a model draft made during the catalog reload baselines the saved choices',
   })
   await page.goto('/')
   await openSection(page, 'models')
-  await page.getByLabel('Chat default model', { exact: true }).selectOption('gpt-6-astra-ultra')
+  await page.getByLabel('Chat default model', { exact: true }).selectOption('muse-spark-1.3-contributor-max')
   await page.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(page.locator('.st-status')).toHaveText('Saved.')
   await page.getByLabel('Editor chat default model', { exact: true }).selectOption('fable-5.1-max')
@@ -295,7 +295,7 @@ test('read again shows the saved values when the conflict reload fails', async (
     }
     await route.fulfill({ json: modelsResponse({}) })
   })
-  const saved = { chat: { default: 'gpt-6-astra-ultra', fallback: (CATALOG.behaviors as Record<string, string>).review_recovery } }
+  const saved = { chat: { default: 'fable-5.1-max', fallback: 'opus-5-max' } }
   let refuses = true
   await page.unroute('**/api/settings')
   await page.route('**/api/settings', async (route) => {
@@ -321,5 +321,41 @@ test('read again shows the saved values when the conflict reload fails', async (
   await expect(page.locator('.st-status')).toContainText('Models "chat" is now')
   await page.getByRole('button', { name: 'Read again' }).click()
   // The reload failed, but the 409 carried the saved choice.
-  await expect(chatDefault).toHaveValue('gpt-6-astra-ultra')
+  await expect(chatDefault).toHaveValue('fable-5.1-max')
+})
+
+test('read again prefers the refreshed value over the 409 snapshot', async ({ page }) => {
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
+  let refuses = true
+  await page.unroute('**/api/settings')
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      state.posts.push(body)
+      if (refuses) {
+        // The 409 carries Helsinki, but another tab saves Berlin right after;
+        // the conflict refresh sees Berlin.
+        refuses = false
+        state.settings = { ...state.settings, timezone: 'Europe/Berlin' }
+        await route.fulfill({ status: 409, json: { error: 'Settings changed since this tab read them. Nothing was saved; read again and retry.', current: { timezone: 'Europe/Helsinki' } } })
+        return
+      }
+      const { expect: _ignored, ...rest } = body
+      state.settings = { ...state.settings, ...rest }
+    }
+    await route.fulfill({ json: state.settings })
+  })
+  await page.goto('/')
+  await openSection(page, 'general')
+  await page.locator('#st-timezone').selectOption('Europe/Madrid')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toContainText('Time zone is now "Europe/Helsinki"')
+  await page.getByRole('button', { name: 'Read again' }).click()
+  // The refresh (Berlin) wins over the older snapshot (Helsinki).
+  await expect(page.locator('#st-timezone')).toHaveValue('Europe/Berlin')
+  // And the next draft baselines what is shown.
+  await page.locator('#st-timezone').selectOption('Europe/Madrid')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(state.posts[1].expect).toEqual({ timezone: 'Europe/Berlin' })
 })
