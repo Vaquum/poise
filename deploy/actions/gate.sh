@@ -20,7 +20,7 @@ required=(ci.yml caller.yml)
 fail() {
   echo "::error::$1" >&2
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    printf '### Deploy gate refused `%s`\n\n%s\n' "${SHA:-?}" "$1" >>"$GITHUB_STEP_SUMMARY"
+    printf '### Deploy gate refused %s\n\n%s\n' "${SHA:-?}" "$1" >>"$GITHUB_STEP_SUMMARY"
   fi
   exit 1
 }
@@ -28,7 +28,7 @@ fail() {
 skip() {
   echo "::notice::$1" >&2
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    printf '### Deploy gate skipped `%s`\n\n%s\n' "$SHA" "$1" >>"$GITHUB_STEP_SUMMARY"
+    printf '### Deploy gate skipped %s\n\n%s\n' "$SHA" "$1" >>"$GITHUB_STEP_SUMMARY"
   fi
   echo "proceed=false"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
@@ -93,7 +93,7 @@ for line in "${evidence[@]}"; do
 done
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
-    printf '### Deploy gate passed for `%s`\n\n' "$SHA"
+    printf '### Deploy gate passed for %s\n\n' "$SHA"
     for line in "${evidence[@]}"; do
       printf '%s\n' "- $line"
     done
