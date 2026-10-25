@@ -153,6 +153,9 @@ cause and no receipt; Poise retries it only after live GitHub evidence proves
 no reviewer action. Submission rejections, `no_review` no-ops, malformed or
 duplicate verdicts and duplicate GitHub reviews are contract violations and
 held. Uncertain submissions are reconciled from live receipts before any retry.
+A budget-exhausted run that proved it posted nothing retries the same head
+automatically on backoff once the provider answers again; its held row shows
+the next retry time.
 After account recovery, a successful explicit replay on the same head, model,
 and reviewer reconciles the held no-action attempt. Its GitHub review receipt
 must be present in live evidence before it becomes durable approval evidence.
@@ -223,9 +226,13 @@ check on the usual backoff; a failed batch holds each of its targets the
 same way. Each record settles on its own timeout inside the batch, so one
 hung read cannot take its completed siblings with it. Review preparation
 and approval launches run in small pools instead of one process per pull
-request at once. The review checkout provisions in the launch phase after
-the claim, outside the sweep deadline; a checkout failure there releases
-the claim and records a `preflight_failed` outcome.
+request at once. Initial pool worker entries yield to the event loop,
+spreading their synchronous prefixes across callbacks. Shared asynchronous
+preparation and later completion waves can still bring CLI starts together;
+this is not a global limit on forks per turn. The review checkout
+provisions in the launch phase after the claim, outside the sweep
+deadline; a checkout failure there releases the claim and records a
+`preflight_failed` outcome.
 Scheduled ticks start each ready account a few seconds apart so their CLI
 bursts don't collide, and the service health and behavior diagnostics expose
 the current minute window of event-loop delay, where fan-out stalls show up
@@ -353,7 +360,7 @@ that head provisions it again. User checkouts are never removed.
 
 A closed legacy failure can recover when Caller subsequently supplies an exact
 `not_started` / `preflight_failed` result. The same no-action rule applies before
-and after restart. Bounded, oversized-packet and invalid-result holds retain
+and after restart. Other bounded, oversized-packet and invalid-result holds retain
 their existing rules; unrelated reviewers’ submitted receipts do not override
 an exact proof that this particular run never submitted.
 

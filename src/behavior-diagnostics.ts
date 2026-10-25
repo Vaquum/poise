@@ -113,7 +113,7 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
     if (existing && (!letter.diagnostic || (existing.code === classification.code && existing.severity === classification.severity))) continue
     add(classification, ref, diagnosticMessage(classification.code, cause),
       `${letter.behavior} ${letter.target}: ${cause} (${letter.attemptCount ?? 1} attempts)`,
-      { behavior: letter.behavior, target: letter.target, at: letter.createdAt || null, next: null, callId: letter.callId, correlationId: letter.correlationId, ...evidenceAttachment(letter) })
+      { behavior: letter.behavior, target: letter.target, at: letter.createdAt || null, next: letter.nextRetryAt ?? null, callId: letter.callId, correlationId: letter.correlationId, ...evidenceAttachment(letter) })
   }
   if (diagnostics.runtimeError) {
     add(diagnosticClassification('runtime_unhealthy'), 'Behaviors', diagnostics.runtimeError, 'Poise runtime needs repair.')

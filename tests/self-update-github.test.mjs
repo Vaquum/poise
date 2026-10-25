@@ -235,14 +235,16 @@ describe('GitHub client', () => {
 
 describe('required workflow aggregate', () => {
   const { jobs } = parse(readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
-  const program = jobs.verify.steps[0].run.match(/^node -e '([\s\S]+)'\s*$/)[1]
+  const command = jobs.verify.steps.find((step) => step.run)?.run
   const results = Object.fromEntries(jobs.verify.needs.map((name) => [name, { result: 'success' }]))
-  const run = (results) => spawnSync(process.execPath, ['-e', program], {
+  results.plan.outputs = { mode: 'full' }
+  const run = (results) => spawnSync(process.execPath, command.slice('node '.length).split(' '), {
     env: { ...process.env, RESULTS: JSON.stringify(results) }, encoding: 'utf8',
   })
 
   it('binds self-update to every CI prerequisite, including jobs skipped after failure', () => {
     expect(REQUIRED_CONTEXTS).toEqual([jobs.verify.name])
+    expect(command).toBe('node .github/workflows/ci.mjs verify')
     expect(jobs.verify.if).toBe('${{ always() }}')
     expect(jobs.verify.needs.toSorted()).toEqual(Object.keys(jobs).filter((name) => name !== 'verify').toSorted())
     expect(run(results).status).toBe(0)
