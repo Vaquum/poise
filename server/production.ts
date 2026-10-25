@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url'
 import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeaders } from './http'
 import { assertCallerRelease } from './caller-release'
 import { refuseInspectorActivation, registerProductionShutdownSignals } from './production-signals'
+// In-process launchers (scripts/start-production.mjs, scripts/self-update/launch.mjs)
+// import these from the bundle, so they are re-exported here.
+export { refuseInspectorActivation, registerProductionShutdownSignals }
 import { assertSecureDotenv, loadSecureDotenv, validateConfabUrl } from './runtime-config'
 import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'

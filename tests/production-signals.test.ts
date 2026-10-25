@@ -133,3 +133,9 @@ it('names a release switch in the shutdown log', async () => {
   expect(stdout()).toContain('[poise] release switch requested; shutting down (exit 75)')
   expect(stdout()).toContain('shutdown-called exit=75')
 }, 15_000)
+
+it('re-exports the signal helpers from the production entry for in-process launchers', async () => {
+  const production = await import('../server/production')
+  expect(typeof production.refuseInspectorActivation).toBe('function')
+  expect(typeof production.registerProductionShutdownSignals).toBe('function')
+}, 15_000)
