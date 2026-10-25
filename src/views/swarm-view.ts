@@ -1397,8 +1397,10 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   // New arrivals shift page boundaries: more than a page of them would leave
   // the retained cursor skipping the intervening calls, so follow the fresh
   // first page instead. Without arrivals the older pages stay valid and the
-  // retained cursor still points past them into unloaded history.
-  if (arrivals) historyCursor = history.nextCursor ?? null
+  // retained cursor still points past them into unloaded history — but a
+  // cleared cursor (a new search whose matches are all cached) must still
+  // adopt the fresh one, or older matches stay unreachable behind null.
+  if (arrivals || historyCursor === null) historyCursor = history.nextCursor ?? null
   incompleteTotal = historyCursor !== null ? totalMatching : null
   loadingHistory = historyCursor !== null
   lastLoadError = null
@@ -1486,9 +1488,11 @@ async function settleStaleRunning(freshIds: Set<string>, current: () => boolean)
 
 // Entry fills the first page behind the recent rows: small histories arrive
 // whole, larger ones stop at the mount bound, one bounded page per request.
-// Later polls never chase: pagination, search and deep links page on demand.
+// Quarantine records count toward the bound too, or a mostly-unreadable
+// history would chase every cursor. Later polls never chase: pagination,
+// search and deep links page on demand.
 async function chaseHistoryFill(current: () => boolean, org: string, search: string): Promise<void> {
-  while (current() && historyCursor !== null && entries.length < PAGE_SIZE) {
+  while (current() && historyCursor !== null && entries.length + quarantined.length < PAGE_SIZE) {
     const data = await readLogFeed(historyUrl(org, historyCursor, search))
     if (!current() || org !== getSelectedOrganization() || search !== searchQuery) return
     appendPage(data, data.nextCursor ?? null, current)

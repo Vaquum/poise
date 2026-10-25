@@ -1647,7 +1647,7 @@ HELP = """usage: agent-interface BEHAVIOR ...
 
 behaviors:
   --models
-  --refresh-models
+  --refresh-models [--families claude,codex]
   --logs [--status running] [--limit 1..1000] [--cursor CURSOR] [--org OWNER] [--search TEXT]
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
@@ -1724,9 +1724,21 @@ def main():
     if sys.argv[1:] == ["--models"]:
         print(json.dumps({**CATALOG.export(), "policy": review_budget.REVIEW_POLICY}, indent=2))
         return
-    if sys.argv[1:] == ["--refresh-models"]:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--refresh-models":
         from . import catalog_refresh
-        print(json.dumps(catalog_refresh.refresh(), indent=2))
+        rest = sys.argv[2:]
+        if not rest:
+            print(json.dumps(catalog_refresh.refresh(), indent=2))
+            return
+        # Absent selection probes every family; an explicit selection probes
+        # only it, and an explicit empty selection probes nothing.
+        if len(rest) != 2 or rest[0] != "--families":
+            usage(error="--refresh-models takes only --families <a,b>")
+        names = [] if rest[1] == "" else rest[1].split(",")
+        unknown = [name for name in names if name not in catalog_refresh.FAMILIES]
+        if unknown:
+            usage(error=f"unknown model family {unknown[0]}")
+        print(json.dumps(catalog_refresh.refresh(families=names), indent=2))
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--stop":
         call_id = sys.argv[2]

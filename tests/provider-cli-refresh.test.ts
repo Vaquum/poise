@@ -41,8 +41,11 @@ console.log(JSON.stringify({ checked_at: new Date().toISOString(), changed: true
   const start = (signal: AbortSignal) => {
     if (disposed) throw new Error('The refresh case has already been cleaned up')
     signal.throwIfAborted()
+    // Every provider participates: these process tests cover the runner, and
+    // provider-participation.test.ts covers the eligibility itself.
+    const evidence = JSON.stringify({ logins: Object.fromEntries(['claude', 'codex', 'grok', 'antigravity', 'muse'].map(name => [name, '2026-10-20T06:00:00.000Z'])), live: { claude: null, codex: null } })
     const child = spawn(process.execPath, [resolve('scripts/refresh-models.mjs'), '--json'], {
-      env: { HOME: root, PATH: [join(root, 'bin'), dirname(process.execPath), '/usr/bin', '/bin'].join(delimiter), AGENT_INTERFACE_ROOT: root, CALLER_BIN_ROOT: join(root, 'caller-bin'), POISE_MODEL_CATALOG_REPORT: join(root, 'report.json') },
+      env: { HOME: root, PATH: [join(root, 'bin'), dirname(process.execPath), '/usr/bin', '/bin'].join(delimiter), AGENT_INTERFACE_ROOT: root, CALLER_BIN_ROOT: join(root, 'caller-bin'), POISE_MODEL_CATALOG_REPORT: join(root, 'report.json'), POISE_PROVIDER_EVIDENCE: evidence },
       signal, killSignal: 'SIGTERM', stdio: ['ignore', 'pipe', 'pipe'],
     })
     const closed = new Promise<{ code: number | null, error?: Error }>(resolveClosed => {

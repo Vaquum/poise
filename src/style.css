@@ -2313,6 +2313,7 @@ tr:hover .review-btn { opacity: 1; }
 .st-storage-row span:last-child {
   font-variant-numeric: tabular-nums;
 }
+.st-storage-retry[hidden] { display: none; }
 
 .st-save,
 .st-clear {

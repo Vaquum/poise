@@ -546,7 +546,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // maintenance run, plus on-demand runs from Settings.
         if (path === '/api/storage' && req.method === 'GET') {
           try {
-            return json(res, 200, await storageStatus())
+            const fresh = new URLSearchParams(url.split('?')[1] || '').get('fresh') === '1'
+            return json(res, 200, await storageStatus({ fresh }))
           } catch (err: any) {
             return json(res, httpStatus(err, 500), { error: err.message || String(err) })
           }

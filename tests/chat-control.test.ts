@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
@@ -10,6 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi, t
 import { WebSocket } from 'ws'
 import { CATALOG } from './model-catalog-fixture'
 import type { Adapter, AdapterHost, TurnResult } from '../server/chat/adapters/types'
+import type { CheckoutLeaseOptions } from '../server/chat/checkout-lock'
 import type { Capabilities, ChatEnvelope, ChatEvent, PromptInput, ServerFrame, SessionRecord } from '../server/chat/protocol'
 import { autoMergeInstructions } from '../server/chat/auto-merge'
 import { actorName } from '../src/views/chat-transcript'
@@ -152,13 +153,14 @@ async function workspaceManager() {
   if (!model) throw new Error('fixture lacks grok')
   return runtime.create({ agent: 'grok', model: model.identity, role: 'manager', deferStart: true })
 }
-function makeRuntime() {
+function makeRuntime(leaseProbes?: CheckoutLeaseOptions) {
   // This file pins control behavior, not the shared turn budget: an open
   // budget lets a manager's workers all run while check-semaphore and
   // behaviors-check-slots pin the default budget instead.
   return new Runtime({ instance, instanceLabel: 'test', callerTurns: null, catalog: async () => CATALOG,
     adapters: { grok: adapter, claude: adapter, codex: adapter, muse: forkAdapter }, requireClaudeReady: async () => {}, probeAgent: async () => ({ ok: true }),
-    localWorkspaceRoot: workspaceRoot, idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => 64, controlContext: id => control.context(id) })
+    localWorkspaceRoot: workspaceRoot, idleTimeoutMinutes: () => 0, maxConcurrentLocalTurns: () => 64, controlContext: id => control.context(id),
+    ...(leaseProbes ? { leaseProbes } : {}) })
 }
 async function restart() {
   const stopped = runtime.stop()
@@ -1160,6 +1162,68 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(prompts.get(recipient.id)![2].text).toContain('Run past the failure')
     expect(store.inbox(runtime.instance, recipient.id).find(m => m.body === 'Run past the failure')?.state).toBe('admitted')
   })
+
+  it('resumes an interrupted worker on its next ordinary wake while other chats wait', async () => {
+    // The crashed server's lease must look like a dead process held it.
+    await control.stop()
+    await runtime.stop()
+    runtime = makeRuntime({ hostPid: spawnSync('true').pid, now: () => Date.now() - 120_000 })
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') })
+    control.attach(server)
+    control.start()
+    const model = CATALOG.models.find(m => m.provider === 'grok')
+    if (!model) throw new Error('fixture lacks grok')
+    const m = await workspaceManager()
+    const workerSession = await runtime.create({ agent: 'grok', model: model.identity, role: 'worker', title: 'Worker', deferStart: true })
+    const person = await manager('grok', 'Person')
+    // Both mid-turn when the server crashes: no relay, so recovery interrupts.
+    runtime.prompt(workerSession.id, { text: 'Work', attachments: [], mentions: [] })
+    runtime.prompt(person.id, { text: 'Work', attachments: [], mentions: [] })
+    await until(() => prompts.has(workerSession.id) && prompts.has(person.id))
+    await control.stop()
+    runtime.removeAllListeners('event')
+    runtime = makeRuntime()
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') })
+    control.attach(server)
+    await runtime.recover()
+    control.start()
+    expect(runtime.get(workerSession.id)?.status).toBe('interrupted')
+    expect(runtime.get(person.id)?.status).toBe('interrupted')
+    // A worker stopped before the crash and one an agent failure left
+    // interrupted keep waiting: only a restart-cut turn resumes.
+    const stopped = await runtime.create({ agent: 'grok', model: model.identity, role: 'worker', title: 'Stopped', deferStart: true })
+    const stopTurn = randomUUID()
+    storage.saveSession({ ...storage.getSession(stopped.id)!, status: 'interrupted', interruptedTurnId: stopTurn, stopRequestedTurnId: stopTurn, nativeSessionId: 'native-stopped' })
+    Object.assign((runtime as any).live.get(stopped.id).record,
+      { status: 'interrupted', interruptedTurnId: stopTurn, stopRequestedTurnId: stopTurn, nativeSessionId: 'native-stopped' })
+    store.pauseDelivery(instance, stopped.id)
+    const failed = await runtime.create({ agent: 'grok', model: model.identity, role: 'worker', title: 'Failed', deferStart: true })
+    storage.saveSession({ ...storage.getSession(failed.id)!, status: 'interrupted', nativeSessionId: 'native-failed' })
+    Object.assign((runtime as any).live.get(failed.id).record, { status: 'interrupted', nativeSessionId: 'native-failed' })
+    store.pauseDelivery(instance, failed.id)
+    // The next wake resumes the worker; the other chats still wait for Resume.
+    store.message(instance, workerSession.id, m.id, 'Keep going', `wake-worker:${randomUUID()}`)
+    store.message(instance, person.id, m.id, 'Keep going', `wake-person:${randomUUID()}`)
+    store.message(instance, stopped.id, m.id, 'Keep going', `wake-stopped:${randomUUID()}`)
+    store.message(instance, failed.id, m.id, 'Keep going', `wake-failed:${randomUUID()}`)
+    prompts.clear()
+    await control.tick()
+    await until(() => prompts.has(workerSession.id))
+    expect(prompts.get(workerSession.id)).toHaveLength(1)
+    expect(prompts.get(person.id)).toBeUndefined()
+    expect(prompts.get(stopped.id)).toBeUndefined()
+    expect(prompts.get(failed.id)).toBeUndefined()
+    expect(store.inbox(instance, workerSession.id).find(row => row.body === 'Keep going')?.state).toBe('admitted')
+    expect(store.inbox(instance, person.id).find(row => row.body === 'Keep going')?.state).toBe('pending')
+    expect(store.inbox(instance, stopped.id).find(row => row.body === 'Keep going')?.state).toBe('pending')
+    expect(store.inbox(instance, failed.id).find(row => row.body === 'Keep going')?.state).toBe('pending')
+    // The wake healed the interruption's pause: later wakes keep flowing.
+    finishes.get(workerSession.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(workerSession.id)?.status === 'idle')
+    store.message(instance, workerSession.id, m.id, 'Again', `wake-again:${randomUUID()}`)
+    await control.tick()
+    await until(() => (prompts.get(workerSession.id) ?? []).length === 2)
+  }, 60_000)
 
   it('starts no native work when the atomic inbox admission write fails', async () => {
     const parent = await manager()
