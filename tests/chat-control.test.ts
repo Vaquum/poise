@@ -1161,6 +1161,43 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     expect(store.inbox(runtime.instance, recipient.id).find(m => m.body === 'Run past the failure')?.state).toBe('admitted')
   })
 
+  it('resumes an interrupted worker on its next ordinary wake while other chats wait', async () => {
+    const model = CATALOG.models.find(m => m.provider === 'grok')
+    if (!model) throw new Error('fixture lacks grok')
+    const m = await workspaceManager()
+    const workerSession = await runtime.create({ agent: 'grok', model: model.identity, role: 'worker', title: 'Worker', deferStart: true })
+    const person = await manager('grok', 'Person')
+    // Both mid-turn when the server crashes: no relay, so recovery interrupts.
+    runtime.prompt(workerSession.id, { text: 'Work', attachments: [], mentions: [] })
+    runtime.prompt(person.id, { text: 'Work', attachments: [], mentions: [] })
+    await until(() => prompts.has(workerSession.id) && prompts.has(person.id))
+    await control.stop()
+    runtime.removeAllListeners('event')
+    runtime = makeRuntime()
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') })
+    control.attach(server)
+    await runtime.recover()
+    control.start()
+    expect(runtime.get(workerSession.id)?.status).toBe('interrupted')
+    expect(runtime.get(person.id)?.status).toBe('interrupted')
+    // The next wake resumes the worker; the person's chat still waits for Resume.
+    store.message(instance, workerSession.id, m.id, 'Keep going', `wake-worker:${randomUUID()}`)
+    store.message(instance, person.id, m.id, 'Keep going', `wake-person:${randomUUID()}`)
+    prompts.clear()
+    await control.tick()
+    await until(() => prompts.has(workerSession.id))
+    expect(prompts.get(workerSession.id)).toHaveLength(1)
+    expect(prompts.get(person.id)).toBeUndefined()
+    expect(store.inbox(instance, workerSession.id).find(row => row.body === 'Keep going')?.state).toBe('admitted')
+    expect(store.inbox(instance, person.id).find(row => row.body === 'Keep going')?.state).toBe('pending')
+    // The wake healed the interruption's pause: later wakes keep flowing.
+    finishes.get(workerSession.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(workerSession.id)?.status === 'idle')
+    store.message(instance, workerSession.id, m.id, 'Again', `wake-again:${randomUUID()}`)
+    await control.tick()
+    await until(() => (prompts.get(workerSession.id) ?? []).length === 2)
+  }, 60_000)
+
   it('starts no native work when the atomic inbox admission write fails', async () => {
     const parent = await manager()
     store.message(runtime.instance, parent.id, 'fixture', 'Run this task once')
