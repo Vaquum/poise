@@ -19,7 +19,11 @@ Each CI unit shard also uses one worker: the real process/lease fixtures must
 not compete with another test file. Per-test deadlines stay unchanged; the
 job budget allows the serial file execution. Local Vitest defaults stay at two.
 
-Pull requests use `.github/ci.mjs` to select work against the PR base SHA:
+All CI helper entry points live under the controller's existing protected
+`.github/workflows/` prefix. The delegated-policy regression derives the live
+workflow commands and rejects direct edits or renames out of that boundary.
+
+Pull requests use `.github/workflows/ci.mjs` to select work against the PR base SHA:
 
 - Documentation-only changes omit application jobs.
 - Recognized frontend areas run the affected Vitest import graph and their

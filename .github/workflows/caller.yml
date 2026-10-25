@@ -40,7 +40,7 @@ jobs:
 
       - name: Select Caller tests or reuse queue evidence
         id: plan
-        run: node .github/ci.mjs plan caller.yml
+        run: node .github/workflows/ci.mjs plan caller.yml
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BASE: ${{ github.event.pull_request.base.sha }}

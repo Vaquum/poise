@@ -40,7 +40,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: git fetch --no-tags --depth=1 origin "$BASE"
       - id: plan
-        run: node .github/ci.mjs plan ci.yml
+        run: node .github/workflows/ci.mjs plan ci.yml
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
@@ -75,7 +75,7 @@ jobs:
         if: steps.deps.outputs.changed == 'true'
         run: node scripts/npm-audit.mjs
       - name: Lint
-        run: npm run lint && npx eslint --no-ignore .github/ci.mjs
+        run: npm run lint && npx eslint --no-ignore .github/workflows/ci.mjs
       - name: Typecheck client, server and tests
         run: npm run typecheck
 
@@ -128,7 +128,7 @@ jobs:
           BASE: ${{ needs.plan.outputs.base }}
         run: git fetch --no-tags --depth=1 origin "$BASE"
       - name: Run unit and integration shard with timings
-        run: node .github/ci.mjs unit
+        run: node .github/workflows/ci.mjs unit
         env:
           CI_TEST_MODE: ${{ needs.plan.outputs.mode }}
           CI_TEST_SHARD: ${{ matrix.shard }}
@@ -174,7 +174,7 @@ jobs:
       # Each shard owns its server, databases and real-API fixtures.
       # One worker preserves the fixture contracts within a shard.
       - name: Run browser shard against the production build
-        run: node .github/ci.mjs browser
+        run: node .github/workflows/ci.mjs browser
         env:
           CI_TEST_MODE: ${{ needs.plan.outputs.mode }}
           CI_TEST_SHARD: ${{ matrix.shard }}
@@ -202,4 +202,4 @@ jobs:
       - name: Require every selected gate or exact-commit reuse to succeed
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: node .github/ci.mjs verify
+        run: node .github/workflows/ci.mjs verify

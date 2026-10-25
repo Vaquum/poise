@@ -1,10 +1,26 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { parse } from 'yaml'
 import { describeViolations, evaluatePolicy, reviewPolicy } from '../scripts/self-update/policy.mjs'
 
 const file = (path, overrides = {}) => ({ status: 'M', oldMode: '100644', newMode: '100644', path, ...overrides })
 const texts = (before, after) => async side => side === 'base' ? before : after
 
 describe('Poise-only delegated change policy', () => {
+  it('keeps live CI helper entry points inside the delegated review boundary', () => {
+    const ci = parse(readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'))
+    const caller = parse(readFileSync(new URL('../.github/workflows/caller.yml', import.meta.url), 'utf8'))
+    const helpers = new Set([...Object.values(ci.jobs), ...Object.values(caller.jobs)]
+      .flatMap(job => job.steps ?? [])
+      .filter(step => /^node \.github\//.test(step.run ?? ''))
+      .map(step => step.run.split(/\s+/)[1]))
+    expect(helpers.size).toBeGreaterThan(0)
+    for (const path of helpers) {
+      expect(evaluatePolicy([file(path)]).allowed, path).toBe(false)
+      expect(evaluatePolicy([file('scripts/ordinary.mjs', { status: 'R', oldPath: path })]).allowed, `rename ${path}`).toBe(false)
+    }
+  })
+
   it('allows ordinary frontend, backend, scripts, documents and dependency locks', () => {
     for (const path of ['src/views/chat.ts', 'server/editor.ts', 'server/chat/adapters/muse.ts', 'scripts/export-fixture.mjs', 'package-lock.json', 'LICENSE', 'README.md', 'SECURITY.md', '.gitignore', '.github/ISSUE_TEMPLATE/bug.md', 'tests/chat/runtime.test.ts']) {
       expect(evaluatePolicy([file(path)]), path).toEqual({ allowed: true, violations: [] })

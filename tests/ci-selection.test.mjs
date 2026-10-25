@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parse } from 'yaml'
-import { callerAffected, reusableRun, selectTests, verify } from '../.github/ci.mjs'
+import { callerAffected, reusableRun, selectTests, verify } from '../.github/workflows/ci.mjs'
 
 const browsers = ['smoke', 'service-mode', 'independent-startup', 'swarm-loading', 'swarm-pagination', 'analytics', 'settings-save', 'chat', 'notices']
   .map(name => `tests/e2e/${name}.spec.ts`)
@@ -67,7 +67,7 @@ describe('PR test admission', () => {
   })
 
   it.each(['server/process.ts', 'scripts/build-server.mjs', 'src/style.css', 'src/http.ts', 'src/main.ts', 'package-lock.json',
-    'vitest.config.ts', 'tests/e2e/fixtures/chat.ts', 'tests/home-isolation.ts', '.github/ci.mjs', 'new-root-config.json'])
+    'vitest.config.ts', 'tests/e2e/fixtures/chat.ts', 'tests/home-isolation.ts', '.github/workflows/ci.mjs', 'new-root-config.json'])
   ('runs everything for shared or unknown changes: %s', path => {
     expect(select([path]).mode).toBe('full')
   })
@@ -84,7 +84,7 @@ describe('PR test admission', () => {
 
   it('does not run Caller on frontend-only PRs, but retains shared and unknown coverage', () => {
     expect(callerAffected(['src/views/swarm-view.ts', 'tests/e2e/swarm-loading.spec.ts', 'docs/Testing.md'])).toBe(false)
-    for (const path of ['caller/agent_interface/agent_interface/__init__.py', 'server/process.ts', 'package-lock.json', 'tests/chat/checkout-lock.test.ts', '.github/ci.mjs', 'new-config']) {
+    for (const path of ['caller/agent_interface/agent_interface/__init__.py', 'server/process.ts', 'package-lock.json', 'tests/chat/checkout-lock.test.ts', '.github/workflows/ci.mjs', 'new-config']) {
       expect(callerAffected([path]), path).toBe(true)
     }
     expect(callerAffected([])).toBe(true)
@@ -157,7 +157,7 @@ describe('required aggregate', () => {
     expect(ci.jobs.browser.container.image).toBe('${{ needs.plan.outputs.browser_image }}')
     expect(ci.jobs.unit.steps[0].with['fetch-depth']).toBe(2)
     expect(JSON.stringify(ci.jobs.browser.steps)).not.toContain('playwright install')
-    expect(readFileSync('.github/ci.mjs', 'utf8')).toContain("'--workers=1'")
+    expect(readFileSync('.github/workflows/ci.mjs', 'utf8')).toContain("'--workers=1'")
     expect(ci.permissions.actions).toBe('read')
   })
 })

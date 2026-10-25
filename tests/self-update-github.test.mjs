@@ -244,7 +244,7 @@ describe('required workflow aggregate', () => {
 
   it('binds self-update to every CI prerequisite, including jobs skipped after failure', () => {
     expect(REQUIRED_CONTEXTS).toEqual([jobs.verify.name])
-    expect(command).toBe('node .github/ci.mjs verify')
+    expect(command).toBe('node .github/workflows/ci.mjs verify')
     expect(jobs.verify.if).toBe('${{ always() }}')
     expect(jobs.verify.needs.toSorted()).toEqual(Object.keys(jobs).filter((name) => name !== 'verify').toSorted())
     expect(run(results).status).toBe(0)
