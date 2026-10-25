@@ -10,13 +10,44 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  plan:
+    name: Select tests or reuse queue evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      base: ${{ steps.plan.outputs.base }}
+      browser_files: ${{ steps.plan.outputs.browser_files }}
+      browser_image: ${{ steps.plan.outputs.browser_image }}
+      unit_shards: ${{ steps.plan.outputs.unit_shards }}
+      browser_shards: ${{ steps.plan.outputs.browser_shards }}
+      reuse_url: ${{ steps.plan.outputs.reuse_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - name: Fetch PR comparison base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: git fetch --no-tags --depth=1 origin "$BASE"
+      - id: plan
+        run: node .github/workflows/ci.mjs plan ci.yml
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+
   static:
+    needs: plan
+    if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'affected'
     name: Lint, types & audit (Node 22)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -44,11 +75,13 @@ jobs:
         if: steps.deps.outputs.changed == 'true'
         run: node scripts/npm-audit.mjs
       - name: Lint
-        run: npm run lint
+        run: npm run lint && npx eslint --no-ignore .github/workflows/ci.mjs
       - name: Typecheck client, server and tests
         run: npm run typecheck
 
   build:
+    needs: plan
+    if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'affected'
     name: Production build (Node 22)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -68,22 +101,38 @@ jobs:
           retention-days: 1
 
   unit:
-    name: Unit & integration (${{ matrix.shard }}/2)
+    needs: plan
+    if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'affected'
+    name: Unit & integration (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # One worker per shard keeps process/lease fixtures from competing with
+    # another file. Keep test deadlines; allow the serial file execution.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: ${{ fromJSON(needs.plan.outputs.unit_shards) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Vitest --changed uses BASE...HEAD; retain the PR merge's parents.
+          fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
           cache: npm
       - run: npm ci
+      - name: Fetch affected-test base
+        if: needs.plan.outputs.mode == 'affected'
+        env:
+          BASE: ${{ needs.plan.outputs.base }}
+        run: git fetch --no-tags --depth=1 origin "$BASE"
       - name: Run unit and integration shard with timings
-        run: npm test -- --shard=${{ matrix.shard }}/2 --reporter=default --reporter=json --outputFile=test-results/vitest.json
+        run: node .github/workflows/ci.mjs unit
+        env:
+          CI_TEST_MODE: ${{ needs.plan.outputs.mode }}
+          CI_TEST_SHARD: ${{ matrix.shard }}
+          BASE: ${{ needs.plan.outputs.base }}
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -93,18 +142,24 @@ jobs:
           retention-days: 7
 
   browser:
-    name: Browser Chromium (${{ matrix.shard }}/4)
-    needs: build
+    name: Browser Chromium (${{ matrix.shard }})
+    needs: [plan, build]
+    if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'affected'
+    container:
+      image: ${{ needs.plan.outputs.browser_image }}
+      options: --ipc=host
     runs-on: ubuntu-latest
-    # Worst observed 2026-10-22: ~11 min uncached Playwright install (slow apt
-    # mirror) + ~8 min slowest all-pass shard; 25 leaves about a third headroom.
-    timeout-minutes: 25
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: ${{ fromJSON(needs.plan.outputs.browser_shards) }}
     steps:
       - uses: actions/checkout@v4
+      - name: Align checkout ownership with the container test user
+        run: |
+          chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+          git -c safe.directory= ls-files --error-unmatch package.json
       - uses: actions/setup-node@v4
         with:
           node-version-file: .node-version
@@ -114,13 +169,16 @@ jobs:
         with:
           name: production-build
           path: dist/
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
+      - name: Require the locked browser in the prepared image
+        run: node -e "const {chromium}=require('@playwright/test'); require('node:fs').accessSync(chromium.executablePath())"
       # Each shard owns its server, databases and real-API fixtures.
       # One worker preserves the fixture contracts within a shard.
       - name: Run browser shard against the production build
-        run: npm run test:e2e -- --shard=${{ matrix.shard }}/4 --workers=1
+        run: node .github/workflows/ci.mjs browser
         env:
+          CI_TEST_MODE: ${{ needs.plan.outputs.mode }}
+          CI_TEST_SHARD: ${{ matrix.shard }}
+          CI_BROWSER_FILES: ${{ needs.plan.outputs.browser_files }}
           POISE_E2E_PREBUILT: '1'
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
@@ -136,12 +194,12 @@ jobs:
     # Preserve the protected context and self-update contract.
     name: Verify (Node 22)
     if: ${{ always() }}
-    needs: [static, build, unit, browser]
+    needs: [plan, static, build, unit, browser]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
-      - name: Require every gate to succeed
+      - uses: actions/checkout@v4
+      - name: Require every selected gate or exact-commit reuse to succeed
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: |
-          node -e 'const results = JSON.parse(process.env.RESULTS); if (!Object.keys(results).length) throw new Error("No gate results"); for (const [gate, result] of Object.entries(results)) { console.log(gate + ": " + result.result); if (result.result !== "success") process.exitCode = 1 }'
+        run: node .github/workflows/ci.mjs verify
