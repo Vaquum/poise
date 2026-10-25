@@ -1189,16 +1189,34 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     control.start()
     expect(runtime.get(workerSession.id)?.status).toBe('interrupted')
     expect(runtime.get(person.id)?.status).toBe('interrupted')
-    // The next wake resumes the worker; the person's chat still waits for Resume.
+    // A worker stopped before the crash and one an agent failure left
+    // interrupted keep waiting: only a restart-cut turn resumes.
+    const stopped = await runtime.create({ agent: 'grok', model: model.identity, role: 'worker', title: 'Stopped', deferStart: true })
+    const stopTurn = randomUUID()
+    storage.saveSession({ ...storage.getSession(stopped.id)!, status: 'interrupted', interruptedTurnId: stopTurn, stopRequestedTurnId: stopTurn, nativeSessionId: 'native-stopped' })
+    Object.assign((runtime as any).live.get(stopped.id).record,
+      { status: 'interrupted', interruptedTurnId: stopTurn, stopRequestedTurnId: stopTurn, nativeSessionId: 'native-stopped' })
+    store.pauseDelivery(instance, stopped.id)
+    const failed = await runtime.create({ agent: 'grok', model: model.identity, role: 'worker', title: 'Failed', deferStart: true })
+    storage.saveSession({ ...storage.getSession(failed.id)!, status: 'interrupted', nativeSessionId: 'native-failed' })
+    Object.assign((runtime as any).live.get(failed.id).record, { status: 'interrupted', nativeSessionId: 'native-failed' })
+    store.pauseDelivery(instance, failed.id)
+    // The next wake resumes the worker; the other chats still wait for Resume.
     store.message(instance, workerSession.id, m.id, 'Keep going', `wake-worker:${randomUUID()}`)
     store.message(instance, person.id, m.id, 'Keep going', `wake-person:${randomUUID()}`)
+    store.message(instance, stopped.id, m.id, 'Keep going', `wake-stopped:${randomUUID()}`)
+    store.message(instance, failed.id, m.id, 'Keep going', `wake-failed:${randomUUID()}`)
     prompts.clear()
     await control.tick()
     await until(() => prompts.has(workerSession.id))
     expect(prompts.get(workerSession.id)).toHaveLength(1)
     expect(prompts.get(person.id)).toBeUndefined()
+    expect(prompts.get(stopped.id)).toBeUndefined()
+    expect(prompts.get(failed.id)).toBeUndefined()
     expect(store.inbox(instance, workerSession.id).find(row => row.body === 'Keep going')?.state).toBe('admitted')
     expect(store.inbox(instance, person.id).find(row => row.body === 'Keep going')?.state).toBe('pending')
+    expect(store.inbox(instance, stopped.id).find(row => row.body === 'Keep going')?.state).toBe('pending')
+    expect(store.inbox(instance, failed.id).find(row => row.body === 'Keep going')?.state).toBe('pending')
     // The wake healed the interruption's pause: later wakes keep flowing.
     finishes.get(workerSession.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(workerSession.id)?.status === 'idle')

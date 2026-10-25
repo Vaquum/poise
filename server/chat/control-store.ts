@@ -223,9 +223,10 @@ export function inbox(instance: string, recipient: string, after = 0): InternalM
  *  oldest pending timer row. A hold excludes the recipient from both: while
  *  a chat is held, its timers skip their firings and turns other chats
  *  would start in it wait. An interrupted worker is an ordinary candidate
- *  too — its next wake resumes it — pause or not, since the interruption
- *  itself set the pause. Page by 100 recipients, retaining both candidates
- *  at the boundary. The tick picks at most one row per recipient. */
+ *  too — pause or not, since the interruption itself set the pause —
+ *  while admission resumes only one a restart cut short with no stop
+ *  pending on the cut turn. Page by 100 recipients, retaining both
+ *  candidates at the boundary. The tick picks at most one row per recipient. */
 export function pending(instance: string, afterRecipient = '', now = Date.now()): InternalMessage[] {
   const page = db.prepare(`WITH candidates AS (
       SELECT ${INBOX_COLUMNS} FROM chat_control_inbox
