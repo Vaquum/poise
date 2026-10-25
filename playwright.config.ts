@@ -22,6 +22,8 @@ const isolation = isolatedEnvironment(mkdtempSync(resolve(e2eRoot, 'isolation-')
 
 export default defineConfig({
   testDir: './tests/e2e',
+  // Local runs serialize one at a time per workspace (tests/e2e/global-setup.ts).
+  globalSetup: './tests/e2e/global-setup.ts',
   outputDir: 'test-results/playwright',
   snapshotPathTemplate: '{testDir}/{testFilePath}-snapshots/{arg}{-projectName}{ext}',
   fullyParallel: true,
