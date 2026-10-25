@@ -1,7 +1,7 @@
-// The daily model-catalogue refresh inside Poise in service mode
-// (docs/Service-architecture.md, "Scheduling"): at 07:00 in the timezone set
-// in Settings, the same check launchd starts on a personal computer and
-// Settings → Models → Check now starts on demand.
+// The daily model-catalogue refresh inside Poise, in service mode and on a
+// personal production server (docs/Service-architecture.md, "Scheduling"):
+// at 07:00 in the timezone set in Settings, the same check Settings →
+// Models → Check now starts on demand.
 
 export const DAILY_REFRESH_HOUR = 7
 const LOCAL_TIME = `${String(DAILY_REFRESH_HOUR).padStart(2, '0')}:00`

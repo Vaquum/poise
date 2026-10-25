@@ -15,7 +15,7 @@ import { readServiceConfig, type ServiceConfig } from './service/config'
 import { WS_PATH } from './chat/protocol'
 import { TERMINAL_WS_PATH, type TerminalPreset } from './terminal/protocol'
 import type { TerminalCommand } from './terminal/pty'
-import { startLaunchdWatchdog } from './launchd-watchdog'
+import { catalogRetirementEnabled, ensureSingleModelScheduler, startLaunchdWatchdog } from './launchd-watchdog'
 import type { ClaudeAuthRuntime } from './cache-plugin'
 
 // The production server refuses the inspector before anything slower runs
@@ -34,7 +34,7 @@ await loadSecureDotenv()
 readServiceConfig()
 const { startLogging } = await import('./logging')
 startLogging({ captureFatal: true })
-const { attachChatSockets, createPoiseMiddleware, stopPoiseRuntime } = await import('./cache-plugin')
+const { attachChatSockets, createPoiseMiddleware, stopDailyModelRefresh, stopPoiseRuntime } = await import('./cache-plugin')
 const { closeDatabase } = await import('./db')
 
 const DEFAULT_HOST = '127.0.0.1'
@@ -504,6 +504,13 @@ export async function startProductionServer(options: ProductionServerOptions = {
   // Production only: the installer names the launchd jobs to keep alive.
   const stopWatchdog = startLaunchdWatchdog()
   if (stopWatchdog) server.once('close', stopWatchdog)
+  // The daily model check runs in this server now; an installed server
+  // retires the legacy calendar job it replaces — or stands its own check
+  // down when the old job survives, so the two can never both fire. Managed
+  // installs never re-run the installer, so this is what retires theirs.
+  if (catalogRetirementEnabled()) {
+    void ensureSingleModelScheduler({ stopScheduler: stopDailyModelRefresh })
+  }
   return server
 }
 

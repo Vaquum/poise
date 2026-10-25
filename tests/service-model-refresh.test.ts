@@ -70,13 +70,36 @@ describe('the next 07:00 in a timezone', () => {
   })
 })
 
-describe('the daily model check in service mode', () => {
+describe('the daily model check', () => {
   it('runs once a day at 07:00 local time through a daylight saving change', async () => {
     const { clock, runs, schedule } = harness('2026-03-27T12:00:00Z', 'Europe/Helsinki')
     schedule.start()
     await clock.advanceTo(t('2026-03-31T00:00:00Z'))
     expect(runs).toEqual(['2026-03-28T05:00:00.000Z', '2026-03-29T04:00:00.000Z', '2026-03-30T04:00:00.000Z'])
     schedule.stop()
+  })
+
+  it('runs once on the repeated-hour day when daylight saving ends', async () => {
+    // Helsinki falls back at 01:00Z on 25 October 2026; the day has 25 hours
+    // but a single 07:00.
+    const { clock, runs, schedule } = harness('2026-10-24T05:00:00Z', 'Europe/Helsinki')
+    schedule.start()
+    await clock.advanceTo(t('2026-10-26T06:00:00Z'))
+    expect(runs).toEqual(['2026-10-25T05:00:00.000Z', '2026-10-26T05:00:00.000Z'])
+    schedule.stop()
+  })
+
+  it('does not repeat a run after a restart later the same day', async () => {
+    const first = harness('2026-06-10T00:00:00Z', 'UTC')
+    first.schedule.start()
+    await first.clock.advanceTo(t('2026-06-10T08:00:00Z'))
+    expect(first.runs).toEqual(['2026-06-10T07:00:00.000Z'])
+    first.schedule.stop()
+    const second = harness('2026-06-10T08:00:00Z', 'UTC')
+    second.schedule.start()
+    await second.clock.advanceTo(t('2026-06-11T08:00:00Z'))
+    expect(second.runs).toEqual(['2026-06-11T07:00:00.000Z'])
+    second.schedule.stop()
   })
 
   it('moves to the new timezone as soon as Settings changes it', async () => {
