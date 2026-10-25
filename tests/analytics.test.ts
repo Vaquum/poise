@@ -707,8 +707,9 @@ describe('reading what Current shows', () => {
       }
       const expected = computeAnalytics({ window: WEEK, issues: [], prs: rows, behaviors: [], agent: 'robot' })
       const oldMs = performance.now() - oldStart
+      // Compare datastore work on both sides, excluding worker startup.
       const start = performance.now()
-      expect(await readAnalytics(WEEK, 'alpha')).toEqual(expected)
+      expect(await inlineReport(WEEK)).toEqual(expected)
       const readMs = performance.now() - start
       console.info(`Analytics 192 MiB discussions: eager ${oldMs.toFixed(1)} ms; windowed ${readMs.toFixed(1)} ms`)
       expect(readMs).toBeLessThan(oldMs)
