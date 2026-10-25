@@ -129,7 +129,14 @@ snapshot and the initial live-quota read settle, then exposes all available
 cards together. Quota cannot appear as a completed view while the main metrics
 are still pending, and prepared metrics wait for that initial quota read too.
 Read failures retain their existing notices and do not leave the board loading.
+Overlapping quota refreshes share the pending read. Leaving aborts it, and a
+five-second quota deadline settles failures instead of starving the initial board.
 Subsequent quota and metric refreshes retain independent schedules.
+Each datastore read runs in a one-shot worker thread using the captured account
+configuration and involvement scopes. SQLite work therefore completes without
+repeatedly yielding into the server's command-launch and background-work queue.
+The worker is terminated after its result, error or 15-second read deadline;
+its production asset is required rather than falling back to the server thread.
 Analytics' short-lived read-only connections allow up to 1 GiB of mapped
 database address space per account, avoiding repeated page copies through the
 service sandbox. This is not a heap allocation or a stored database change;

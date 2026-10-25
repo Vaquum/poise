@@ -393,6 +393,32 @@ test('publishes quota and daily cards together in canonical order when quota arr
   expect(await page.evaluate(() => localStorage.getItem('poise-analytics-card-order'))).toBeNull()
 })
 
+test('shares a pending initial quota read across visible-tab refreshes', async ({ page }) => {
+  await workspace(page)
+  let reads = 0, release!: () => void
+  const waiting = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/github-quota', async route => {
+    reads++
+    await waiting
+    await route.fulfill({ json: quotaReport() })
+  })
+  await page.goto('/')
+  try {
+    await openAnalytics(page)
+    await expect.poll(() => reads).toBe(1)
+    await expect(value(page, 'Pull requests merged')).toHaveText('4')
+    await page.evaluate(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    await expect(value(page, 'Pull requests merged')).toBeHidden()
+    expect(reads).toBe(1)
+  } finally { release() }
+  await expect(value(page, 'Pull requests merged')).toBeVisible()
+  await expect(page.locator('.github-quota-usage').first()).toBeVisible()
+  expect(reads).toBe(1)
+})
+
 test('reopening reserves the saved quota slot with loading content until fresh usage arrives', async ({ page }) => {
   await workspace(page)
   let hold = false, release!: () => void, reads = 0

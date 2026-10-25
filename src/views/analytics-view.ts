@@ -19,6 +19,7 @@ let quotaMarkup = ''
 let foregroundPending = false
 let initialQuotaPending = false
 let historyPending = false
+let quotaRead: AbortController | null = null
 const dragGrip = '<span class="analytics-drag-grip" aria-hidden="true"></span>'
 function renderCards(): void {
   const broken = new Set([...viewEl.querySelectorAll<HTMLImageElement>('.github-quota-avatar img.broken')].map(img => img.getAttribute('src')))
@@ -143,10 +144,14 @@ function quotaCharts(bucket: GithubQuotaBucket, now: number): string {
 }
 
 async function readQuota(): Promise<void> {
+  if (quotaRead) return
+  const controller = new AbortController()
+  quotaRead = controller
+  const timeout = setTimeout(() => controller.abort(new Error('GitHub quota read timed out')), 5_000)
   const generation = ++quotaGeneration
   const content = viewEl.querySelector<HTMLElement>('.analytics-board')!
   try {
-    const response = await fetch('/api/github-quota')
+    const response = await fetch('/api/github-quota', { signal: controller.signal })
     const data: GithubQuotaReport & { error?: string } = await response.json()
     if (!response.ok || !Array.isArray(data.accounts)) throw new Error(data.error || 'GitHub API quota could not be read.')
     if (generation !== quotaGeneration) return
@@ -187,6 +192,8 @@ async function readQuota(): Promise<void> {
     quotaMarkup = ''
     noticeFeed.reportReadErrors('analytics-quota', [readFailure('GitHub quota is unavailable', error)])
   } finally {
+    clearTimeout(timeout)
+    if (quotaRead === controller) quotaRead = null
     if (generation === quotaGeneration) {
       initialQuotaPending = false
       renderCards()
@@ -611,6 +618,8 @@ export function stopAnalyticsRefresh(): void {
   analyticsRead?.abort()
   analyticsRead = null
   quotaGeneration++
+  quotaRead?.abort()
+  quotaRead = null
   historyGeneration++
   historyRead?.abort()
   historyRead = null
