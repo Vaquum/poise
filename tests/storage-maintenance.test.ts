@@ -730,6 +730,21 @@ describe('storage status cache', () => {
     await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
     expect(scripted.calls()).toBe(2)
   })
+
+  it('does not let a scan overtaken by maintenance repopulate the cache', async () => {
+    const scripted = scriptedBreakdown([{}, {}])
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const now = 70_000
+    const pending = maintenance.storageStatus({ now, breakdown: () => gate.then(scripted.breakdown) })
+    await maintenance.runStorageMaintenance({ now, chatRoot, stateRoot, home, trim: async () => null, claims: () => [] })
+    release()
+    const first = await pending
+    expect(first.stale).toBe(false)
+    const second = await maintenance.storageStatus({ now, breakdown: scripted.breakdown })
+    expect(second).not.toBe(first)
+    expect(scripted.calls()).toBe(2)
+  })
 })
 
 describe('artifact restore', () => {

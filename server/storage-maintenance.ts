@@ -10,7 +10,7 @@
 // simply leaves the rest for the next run — and dry-run classifies exactly
 // like a real run without deleting anything.
 
-import { lstat, readdir, readFile, rm } from 'node:fs/promises'
+import { lstat, opendir, readdir, readFile, rm } from 'node:fs/promises'
 import { statfs } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -252,7 +252,35 @@ export async function measureDir(path: string, options: MeasureOptions = {}): Pr
     total += info.size
     if (!info.isDirectory() || info.isSymbolicLink()) continue
     try {
-      for (const entry of await readdir(current)) stack.push(join(current, entry))
+      // Read incrementally: one readdir call would load and queue every
+      // child of a wide directory before either budget is checked again.
+      // Queueing past what the entry budget can still visit is pointless,
+      // so the budget gates pushes as well as pops. Manual reads, not
+      // for-await: the iterator closes the handle by itself, which would
+      // make the explicit close below throw.
+      const dir = await opendir(current)
+      try {
+        let sinceCheck = 0
+        let entry = await dir.read()
+        while (entry) {
+          stack.push(join(current, entry.name))
+          sinceCheck += 1
+          if (sinceCheck >= 64) {
+            sinceCheck = 0
+            const limit = expired()
+              ?? (stack.length > budget.maxEntries - budget.entries + 64 ? `the storage scan stopped after ${budget.maxEntries} entries` : null)
+            // Stops reading, not examining: what is already queued is still
+            // measured below, up to the budget.
+            if (limit) {
+              failure = limit
+              break
+            }
+          }
+          entry = await dir.read()
+        }
+      } finally {
+        await dir.close()
+      }
     } catch (error) {
       if (errorCode(error) === 'ENOENT') continue
       failure ??= `${current}: ${messageOf(error)}`
@@ -691,7 +719,12 @@ export async function runStorageMaintenance(options: MaintenanceOptions = {}): P
   }
   report.finishedAt = new Date().toISOString()
   // A real run changes what the summary measures; a dry run changes nothing.
-  if (!dryRun) storageCache = null
+  // The epoch keeps a scan that started before this run from repopulating
+  // the cache with pre-maintenance sizes when it finishes.
+  if (!dryRun) {
+    storageCache = null
+    storageEpoch += 1
+  }
   if (!dryRun) {
     try {
       setMeta(LAST_RUN_KEY, JSON.stringify(report))
@@ -751,18 +784,22 @@ export interface StorageStatusOptions {
  *  One scan answers concurrent readers, and its observation answers Settings
  *  opens until STORAGE_STATUS_TTL_MS passes. A refresh that fails serves the
  *  previous observation marked stale; only a failure with nothing cached
- *  throws. */
+ *  throws. A scan that a maintenance run overtakes answers its own waiters
+ *  without repopulating the cache. */
 export async function storageStatus(options: StorageStatusOptions = {}): Promise<StorageStatus> {
   const now = options.now ?? Date.now()
   if (!options.fresh && storageCache && now - storageCache.at < STORAGE_STATUS_TTL_MS) return storageCache.status
   storageInflight ??= (async () => {
+    const epoch = storageEpoch
     try {
       const breakdown = await (options.breakdown ?? storageBreakdown)()
       const status: StorageStatus = {
         ...breakdown, pressure: breakdown.disk.usedPercent >= PRESSURE_USED_PCT,
         lastRun: lastMaintenanceRun(), stale: false, error: undefined,
       }
-      storageCache = { at: now, status }
+      // A maintenance run that finished mid-scan invalidated the cache; its
+      // sizes are stale, so this observation answers its own waiters only.
+      if (epoch === storageEpoch) storageCache = { at: now, status }
       return status
     } catch (error) {
       if (storageCache) {
@@ -780,6 +817,7 @@ let running: Promise<MaintenanceReport> | null = null
 let lastPressureRun = 0
 let storageCache: { at: number, status: StorageStatus } | null = null
 let storageInflight: Promise<StorageStatus> | null = null
+let storageEpoch = 0
 
 /** One pass unless one is already running, in which case the running report. */
 export function runStorageMaintenanceOnce(options: MaintenanceOptions = {}): Promise<MaintenanceReport> {
