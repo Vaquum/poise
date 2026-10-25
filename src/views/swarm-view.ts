@@ -1160,6 +1160,15 @@ const highlightTimers = new WeakMap<HTMLTableRowElement, number>()
 function highlightRow(row: HTMLTableRowElement): void {
   viewFeedback('swarm-navigation', 'Swarm run unavailable', '')
   scrollToActor(row, 'center')
+  // If the animated scroll never arrives, focus strands below the fold with
+  // no further render to rescue it; place the row instantly once motion has
+  // had its chance. No-op whenever the spring centers the row itself.
+  window.setTimeout(() => {
+    if (!row.isConnected || !viewEl || viewEl.hidden) return
+    const box = row.getBoundingClientRect()
+    if (box.bottom > 0 && box.top < innerHeight && box.right > 0 && box.left < innerWidth) return
+    row.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior })
+  }, 900)
   const previous = highlightTimers.get(row)
   if (previous !== undefined) window.clearTimeout(previous)
   // A second navigation to the same row starts its pulse again.
