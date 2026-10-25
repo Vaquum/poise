@@ -20,6 +20,9 @@
 // can never start a real production job.
 
 import { execFile } from 'node:child_process'
+import { rm } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 export interface LaunchdJob {
   running: boolean
@@ -157,6 +160,103 @@ export function createLaunchdWatchdog(options: LaunchdWatchdogOptions): () => Pr
       } catch (error) {
         log(`[launchd-watchdog] could not start ${label}: ${(error as Error).message}`)
       }
+    }
+  }
+}
+
+// The legacy personal-install model-catalog calendar job. The daily check
+// runs inside the production server now, so an installed server retires this
+// job on startup: managed installs never re-run the installer (nor does its
+// updater run new code — it is frozen at the pre-manage checkout), so the
+// server is the only new code that runs there.
+export const CATALOG_LABEL = 'com.vaquum.poise.model-catalog'
+
+/** Only an installed production server names launchd jobs: the unmanaged
+ *  installer sets the variable and managed plists inherit it, while a dev
+ *  server or a test server never does — so those can never unload a real
+ *  job. Service mode is excluded too: it refuses this variable outright. */
+export function catalogRetirementEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return process.platform === 'darwin' && !!env.POISE_LAUNCHD_WATCHDOG
+}
+
+export interface CatalogRetirementOptions {
+  domain?: string
+  launchAgentsDir?: string
+  run?: (args: string[]) => Promise<string>
+  remove?: (path: string) => Promise<void>
+}
+
+/** The legacy job is still loaded, or launchd could not confirm it is gone:
+ *  the failure that must stand the in-process scheduler down. Any other
+ *  retirement failure — the plist could not be removed after a confirmed
+ *  unload — reports just as loudly but keeps the single working scheduler. */
+export class CatalogStillLoadedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'CatalogStillLoadedError'
+  }
+}
+
+/** Unload the legacy job and remove its plist, so the old calendar schedule
+ *  and the server's own in-process check cannot both fire. Resolves whether
+ *  a loaded job was unloaded — silently false when there is nothing to
+ *  retire — and rejects loudly when the old job cannot be confirmed gone. */
+export async function retireCatalogJob(options: CatalogRetirementOptions = {}): Promise<{ unloaded: boolean }> {
+  const domain = options.domain || `gui/${process.getuid?.() ?? 0}`
+  const run = options.run || launchctl
+  const remove = options.remove || ((path: string) => rm(path, { force: true }))
+  let unloaded = true
+  try {
+    await run(['bootout', `${domain}/${CATALOG_LABEL}`])
+  } catch (bootoutError) {
+    // A failed unload is only benign when the job is really gone: verify
+    // with print rather than assume it was absent.
+    let loaded = true
+    try {
+      await run(['print', `${domain}/${CATALOG_LABEL}`])
+    } catch (printError) {
+      if (!isNotLoaded(printError)) {
+        throw new CatalogStillLoadedError(`could not confirm the legacy ${CATALOG_LABEL} job is unloaded; refusing to run a second model-check scheduler alongside it`,
+          { cause: printError })
+      }
+      loaded = false
+    }
+    if (loaded) {
+      throw new CatalogStillLoadedError(`could not unload the legacy ${CATALOG_LABEL} job; refusing to run a second model-check scheduler alongside it`,
+        { cause: bootoutError })
+    }
+    unloaded = false
+  }
+  await remove(join(options.launchAgentsDir || join(homedir(), 'Library', 'LaunchAgents'), `${CATALOG_LABEL}.plist`))
+  return { unloaded }
+}
+
+export interface SingleSchedulerOptions extends CatalogRetirementOptions {
+  stopScheduler?: () => void
+  log?: (message: string) => void
+  logError?: (message: string) => void
+}
+
+/** Leave exactly one daily model scheduler behind: retire the legacy
+ *  launchd job, or — when it cannot be confirmed gone — stand the
+ *  in-process scheduler down so the surviving job stays the single one.
+ *  Never throws; every outcome is reported through the injected log. */
+export async function ensureSingleModelScheduler(options: SingleSchedulerOptions = {}): Promise<void> {
+  const stopScheduler = options.stopScheduler || (() => {})
+  const log = options.log || ((message: string) => console.log(message))
+  const logError = options.logError || ((message: string) => console.error(message))
+  try {
+    const { unloaded } = await retireCatalogJob(options)
+    if (unloaded) log(`[launchd-watchdog] retired the legacy ${CATALOG_LABEL} job; the daily model check now runs in this server`)
+  } catch (error) {
+    // Only a job that may still be loaded stands this server's check down.
+    // A leftover plist after a confirmed unload reports just as loudly but
+    // keeps the single working scheduler; the next restart retries it.
+    if (error instanceof CatalogStillLoadedError) {
+      stopScheduler()
+      logError(`[launchd-watchdog] ${error.message}; the in-process daily model check is stopped until the server restarts`)
+    } else {
+      logError(`[launchd-watchdog] ${error instanceof Error ? error.message : String(error)}; the legacy job is unloaded but its plist remains — delete it so launchd can never load it again`)
     }
   }
 }

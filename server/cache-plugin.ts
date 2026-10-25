@@ -115,7 +115,8 @@ let terminalSockets: TerminalSocketServer | null = null
 // Service mode only: Connected accounts read on a schedule, for their alerts.
 let stopAccountsCheck: (() => void) | null = null
 let selfUpdate: SelfUpdateService | null = null
-// Service mode only: the gateway's drain and the in-process daily model check.
+// Service mode only: the gateway's drain. The in-process daily model check
+// runs in service mode and on the personal production server.
 let serviceControl: ServiceControl | null = null
 let dailyModelRefresh: DailyModelRefresh | null = null
 // What paired Poise Link devices read: snippets, alerts and the event stream.
@@ -158,6 +159,13 @@ function cutSynthesis(synthesis: string): { synthesis: string, truncated: boolea
 export function getSelfUpdateService(): SelfUpdateService {
   if (!selfUpdate) throw new Error('the chat runtime is not started')
   return selfUpdate
+}
+
+/** Stop the in-process daily model check. The production server stands its
+ *  own scheduler down when the legacy launchd job it replaces survives, so
+ *  the two can never both fire; the next restart retries the retirement. */
+export function stopDailyModelRefresh(): void {
+  dailyModelRefresh?.stop()
 }
 
 /** Serve /ws/chat and /ws/terminal on an HTTP server (production server or
@@ -248,15 +256,21 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
     })
     if (service) {
       serviceControl = new ServiceControl(chatRuntime, { drainTimeoutSeconds: service.drainTimeoutSeconds, switchTurnBoundMinutes: () => getChatSettings().updateTurnBoundMinutes })
+      stopAccountsCheck = scheduleAccountsCheck(checkAccounts)
+    } else {
+      selfUpdate = new SelfUpdateService(chatRuntime, bridge)
+    }
+    // The daily model check runs inside the server wherever the server is the
+    // installation — service mode and the personal production server — at
+    // 07:00 in the timezone saved in Settings. A dev server never schedules
+    // one.
+    if (service || label === 'production') {
       dailyModelRefresh = new DailyModelRefresh({
         timeZone: () => getSettings().timezone,
         refresh: refreshModelCatalog,
         paused: releaseBackgroundPaused,
       })
       dailyModelRefresh.start()
-      stopAccountsCheck = scheduleAccountsCheck(checkAccounts)
-    } else {
-      selfUpdate = new SelfUpdateService(chatRuntime, bridge)
     }
     void chatRuntime.recover().then(() => { chatControl?.start(); chatSwitchboard?.start() }).catch((error: unknown) => {
       console.error('[chat] startup reconciliation failed:', error)

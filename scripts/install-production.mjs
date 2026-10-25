@@ -40,11 +40,9 @@ const launchAgents = join(home, 'Library', 'LaunchAgents')
 const serviceLabel = 'com.vaquum.poise'
 const monitorLabel = 'com.vaquum.poise.health'
 const updaterLabel = 'com.vaquum.poise.caller-update'
-const catalogLabel = 'com.vaquum.poise.model-catalog'
 const servicePlist = join(launchAgents, `${serviceLabel}.plist`)
 const monitorPlist = join(launchAgents, `${monitorLabel}.plist`)
 const updaterPlist = join(launchAgents, `${updaterLabel}.plist`)
-const catalogPlist = join(launchAgents, `${catalogLabel}.plist`)
 const logRoot = join(stateRoot, 'logs')
 const domain = `gui/${process.getuid()}`
 const dotenvPath = join(projectRoot, '.env')
@@ -353,19 +351,12 @@ async function main() {
     key('StandardOutPath', `<string>${xml(join(logRoot, 'caller-update.out.log'))}</string>`),
     key('StandardErrorPath', `<string>${xml(join(logRoot, 'caller-update.err.log'))}</string>`),
   ])
-  // Once a day, first thing in the morning: ask each model CLI for its latest
-  // model and efforts and keep the catalog current. Calendar-only — a caller
-  // update reinstalls these services and must not trigger a fresh round of
-  // model probes each time.
-  const catalog = plist([
-    key('Label', `<string>${catalogLabel}</string>`),
-    key('ProgramArguments', array([node, join(projectRoot, 'scripts', 'refresh-models.mjs')])),
-    key('WorkingDirectory', `<string>${xml(projectRoot)}</string>`),
-    key('EnvironmentVariables', dictionary(environment)),
-    key('StartCalendarInterval', '<dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>'),
-    key('StandardOutPath', `<string>${xml(join(logRoot, 'model-catalog.out.log'))}</string>`),
-    key('StandardErrorPath', `<string>${xml(join(logRoot, 'model-catalog.err.log'))}</string>`),
-  ])
+  // No calendar job for the model catalog: the production server runs the
+  // daily check itself at 07:00 in the timezone saved in Settings, so a
+  // timezone change takes effect without reinstalling. The running server
+  // retires the legacy job at startup (server/launchd-watchdog.ts) — the
+  // only retirer, so its stand-down decision can never race a concurrent
+  // unload. That also covers managed installs, which never run this script.
   // The empty plan on a clean install must not write, unload, or start any
   // pre-existing datastore launchd job owned outside this Poise installation.
   if (datastoreDb) {
@@ -422,7 +413,6 @@ async function main() {
     atomicWrite(servicePlist, service),
     atomicWrite(monitorPlist, monitor),
     atomicWrite(updaterPlist, updater),
-    atomicWrite(catalogPlist, catalog),
     ...datastoreServices.map((job) => atomicWrite(job.path, job.content)),
   ])
   const selfUpdating = process.env.POISE_RUNTIME_RECONCILER === '1'
@@ -430,18 +420,15 @@ async function main() {
   if (!selfUpdating) await bootout(updaterLabel)
   await bootout(monitorLabel)
   await bootout(serviceLabel)
-  await bootout(catalogLabel)
   for (const job of datastoreServices) await bootout(job.label)
   await run('/bin/launchctl', ['enable', `${domain}/${serviceLabel}`])
   await run('/bin/launchctl', ['enable', `${domain}/${monitorLabel}`])
   await run('/bin/launchctl', ['enable', `${domain}/${updaterLabel}`])
-  await run('/bin/launchctl', ['enable', `${domain}/${catalogLabel}`])
   for (const job of datastoreServices) await run('/bin/launchctl', ['enable', `${domain}/${job.label}`])
   for (const job of datastoreServices.filter((job) => job.kind === 'sync')) {
     await bootstrap(job.path)
     await start(job.label)
   }
-  await bootstrap(catalogPlist)
   for (const job of datastoreServices.filter((job) => job.kind !== 'sync')) {
     await bootstrap(job.path)
     if (job.kind !== 'reconcile') await start(job.label)

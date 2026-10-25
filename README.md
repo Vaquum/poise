@@ -268,10 +268,11 @@ launching the default alone.
 The catalog holds the latest model of each family with its top two efforts
 (three for Claude, so reviews can run at high; Claude keeps Opus and Fable,
 Codex Astra and Sol).
-Every morning at 07:00 `com.vaquum.poise.model-catalog` asks each CLI what it
-offers (`agent-interface --refresh-models`) and rewrites the catalog when
-something changed; Settings → Models → Check now does the same on demand and
-shows the last report. Reviews need Caller 0.3.0 or newer (`agent-interface
+Every morning at 07:00 in the timezone saved in Settings (UTC until one is
+set), Poise asks each CLI what it offers (`agent-interface --refresh-models`)
+and rewrites the catalog when something changed; Settings → Models → Check now
+does the same on demand and shows the last report. Reviews need Caller 0.3.0
+or newer (`agent-interface
 --models`); an older Caller fails before launching a worker. The compatible
 review policy is `bounded-v1`: reviews have a total 23m33s budget. Timeouts and
 failed recovery remain visible and are held across restarts for the same

@@ -99,6 +99,9 @@ const SAFE_ENV = [
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SHELL_PREFIX',
   'AGENT_INTERFACE_BASH_ALLOW',
+  // Non-secret agent tool configuration selected upstream
+  // (server/process.ts): the native CLI and its tool children read these.
+  'GOMAXPROCS', 'RIPGREP_CONFIG_PATH',
 ]
 
 const LOGIN_ENV = [

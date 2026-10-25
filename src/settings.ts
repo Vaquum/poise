@@ -1256,6 +1256,17 @@ async function handleConflict(section: 'general' | 'models', current: Record<str
   for (const entry of leaves) rebaseConflictLeaf(entry)
   syncFieldsFromCache()
   const modelsRefreshed = section === 'models' ? await loadModels() : false
+  if (section === 'models' && !modelsRefreshed) {
+    // The reload failed, but the refusal carries the saved choice for every
+    // place that moved: refresh the comparison baseline from it, so Save
+    // again compares untouched places against what the server holds instead
+    // of failing again on the same stale read. The selects are rendered from
+    // it at once, as a landed reload would: a baseline moved under a stale
+    // display would base a later draft on unseen values. Drafts stay put;
+    // Read again still applies and shows the saved values.
+    applyRefusedModelChoices(leaves)
+    if (lastModels) renderPlaces(lastModels)
+  }
   renderOrganizations()
   renderAccounts()
   pendingConflict = { section, leaves, generalRefreshed, modelsRefreshed }
@@ -1280,17 +1291,24 @@ function applyReread(): void {
   // The re-render reads the catalog: without a landed reload it still holds
   // pre-conflict choices, so the 409's saved choices are applied first.
   if (!conflict.modelsRefreshed) {
-    for (const entry of conflict.leaves) {
-      if (entry.field !== 'models') continue
-      if (entry.leaf === null && isRecord(entry.current)) {
-        for (const [key, choice] of Object.entries(entry.current)) updateStoredChoice(key, choice)
-      } else if (entry.leaf !== null) {
-        updateStoredChoice(entry.leaf, entry.current)
-      }
-    }
+    applyRefusedModelChoices(conflict.leaves)
   }
   if (conflict.leaves.some((entry) => entry.field === 'models') && lastModels) renderPlaces(lastModels)
   setHelp('Read the latest saved values.', 'info')
+}
+
+// The saved model choices a failed catalog reload borrows from the refusal:
+// every moved place, so the retry's untouched leaves compare against what
+// the server holds. Idempotent; Read again repeats it before re-rendering.
+function applyRefusedModelChoices(leaves: ConflictLeaf[]): void {
+  for (const entry of leaves) {
+    if (entry.field !== 'models') continue
+    if (entry.leaf === null && isRecord(entry.current)) {
+      for (const [key, choice] of Object.entries(entry.current)) updateStoredChoice(key, choice)
+    } else if (entry.leaf !== null) {
+      updateStoredChoice(entry.leaf, entry.current)
+    }
+  }
 }
 
 // A saved model choice from the 409, written into the catalog the re-render
@@ -1542,7 +1560,7 @@ function buildPanel(): HTMLElement {
         <div class="tp-group-label st-fixed-heading" ${helpAttributes("These model choices are fixed by Caller.")} hidden>Fixed models</div>
         <div class="st-models-fixed"></div>
 
-        <div class="tp-group-label" ${helpAttributes("Models are checked daily at 07:00 in your time zone. Check now refreshes provider CLIs and the model list.")}>Model catalog</div>
+        <div class="tp-group-label" ${helpAttributes("Models are checked daily at 07:00 in your time zone, or UTC until one is set. Check now refreshes provider CLIs and the model list.")}>Model catalog</div>
         <div class="tp-section">
           <div class="st-help st-help-info st-catalog-status"></div>
           <div class="st-row st-row-tight">

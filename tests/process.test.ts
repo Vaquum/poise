@@ -1205,6 +1205,62 @@ describe('Agent tool CPU defaults', () => {
       await rm(dir, { recursive: true, force: true })
     }
   })
+
+  // The subscription wrapper rebuilds its native child's environment from
+  // its own allowlist: explicitly selected tool settings must survive that
+  // boundary, on the SDK stream-json invocation Chat uses and the --print
+  // invocation Caller uses, while a provider credential in the wrapper's
+  // own environment still reaches neither the native CLI nor its tool
+  // child.
+  it('carries selected tool settings through the subscription wrapper to the native CLI and its tool child', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'poise-claude-tool-env-'))
+    try {
+      const overrideConfig = join(dir, 'override.ripgreprc')
+      await writeFile(overrideConfig, '--threads=8\n')
+      const source = `#!/usr/bin/env node
+const { execFileSync } = require('node:child_process')
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }))
+  process.exit(0)
+}
+const read = 'process.stdout.write(JSON.stringify({ go: process.env.GOMAXPROCS ?? null, rg: process.env.RIPGREP_CONFIG_PATH ?? null, key: process.env.ANTHROPIC_API_KEY ?? null }))'
+const tool = JSON.parse(execFileSync(process.execPath, ['-e', read]))
+process.stdout.write(JSON.stringify({
+  go: process.env.GOMAXPROCS ?? null,
+  rg: process.env.RIPGREP_CONFIG_PATH ?? null,
+  key: process.env.ANTHROPIC_API_KEY ?? null,
+  tool,
+}))
+`
+      await writeFile(join(dir, 'claude'), source, { mode: 0o700 })
+      const env = {
+        PATH: `${dir}${delimiter}${process.env.PATH || ''}`,
+        GOMAXPROCS: '8',
+        RIPGREP_CONFIG_PATH: overrideConfig,
+        ANTHROPIC_API_KEY: 'credential-sentinel-must-not-pass',
+      }
+      const expected = {
+        go: '8',
+        rg: overrideConfig,
+        key: null,
+        tool: { go: '8', rg: overrideConfig, key: null },
+      }
+      // Chat drives the wrapper through the SDK's stream-json invocation.
+      const chat = await runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'haiku',
+      ], { env })
+      expect(JSON.parse(chat.stdout)).toEqual(expected)
+      // Caller drives it through --print.
+      const caller = await runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--print', '--model', 'haiku', 'review this',
+      ], { env })
+      expect(JSON.parse(caller.stdout)).toEqual(expected)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('Caller command resolution', () => {
