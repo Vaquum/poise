@@ -553,23 +553,17 @@ describe('Review New Issues', () => {
     }
   })
 
-  it('holds a stopped or time-limited reviewer for a person instead of relaunching it', async () => {
-    for (const errorCode of ['stopped', 'review_budget_exhausted']) {
-      const { behaviors } = await start()
-      issues = [issue(452)]
-      await behaviors.runEnabledBehaviorsOnce()
-      agentLogs = [finished(`${REPO}#452`, { status: 'failed', error: 'held', error_code: errorCode })]
-      await resetLogCache()
-      await behaviors.runEnabledBehaviorsOnce()
-      // A hold is not an outage: nothing backs the behavior off.
-      expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
-      await behaviors.runEnabledBehaviorsOnce()
-      expect(launches()).toHaveLength(1)
-      await behaviors.stopBehaviorsRuntime()
-      database!.closeDatabase()
-      mocks.spawnDetached.mockClear()
-      await rm(join(tempRoot, 'cache.db'), { force: true })
-    }
+  it('holds a stopped reviewer for a person instead of relaunching it', async () => {
+    const { behaviors } = await start()
+    issues = [issue(452)]
+    await behaviors.runEnabledBehaviorsOnce()
+    agentLogs = [finished(`${REPO}#452`, { status: 'failed', error: 'held', error_code: 'stopped' })]
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    // A hold is not an outage: nothing backs the behavior off.
+    expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(1)
   })
 
   it('says Caller must be updated rather than launching against one without issue review', async () => {
@@ -757,14 +751,15 @@ describe('Review New Issues sub-issues', () => {
     expect(launches()).toHaveLength(3)
   })
 
-  it.each(['retryable', 'bounded', 'posted'] as const)('restores %s issue failures after a feed outage without blocking fresh issue capacity', async (kind) => {
+  it.each(['retryable', 'stopped', 'posted'] as const)('restores %s issue failures after a feed outage without blocking fresh issue capacity', async (kind) => {
     const { behaviors, database } = await start({ reviewers: 3 })
     issues = [issue(500)]
     await behaviors.runEnabledBehaviorsOnce()
     const targets = [ref(500), `${ref(500)}:secondary`, `${ref(500)}:tertiary`]
+    // An exhausted budget trips and falls through the slots now; a stop still holds.
     const failed = targets.map((target) => finished(target, {
       status: 'failed', error: `${kind} worker failure`,
-      ...(kind === 'bounded' ? { error_code: 'review_budget_exhausted' } : {}),
+      ...(kind === 'stopped' ? { error_code: 'stopped' } : {}),
       ...(kind === 'posted' ? { receipts: [] } : {}),
     }))
     const original = mocks.runFile.getMockImplementation()!

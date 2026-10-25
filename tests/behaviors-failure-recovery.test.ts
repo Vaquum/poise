@@ -354,11 +354,14 @@ describe('worker failure classification and recovery', () => {
 
   it('allows an explicit model change after a bounded no-action failure', async () => {
     const launched = await launchApprovalBeforeCrash()
+    // An output limit still holds: only provider failures before a verdict —
+    // a rate limit, a dead provider, an exhausted budget — trip and fall
+    // through the slots.
     fixture.agentLogs = [agentLog({
       id: 'f'.repeat(32), behavior: 'pr_approve',
       started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
       status: 'failed', action: null, outcome: null, model: 'opus-5-xhigh',
-      review_policy: 'bounded-v1', error_code: 'review_budget_exhausted', error: 'Review needs attention',
+      review_policy: 'bounded-v1', error_code: 'model_output_limit', error: 'Review needs attention',
       expected_head: launched.expectedHead, actor: launched.actor,
       source: launched.source, correlation_id: launched.correlationId,
     })]

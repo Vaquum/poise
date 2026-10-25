@@ -40,10 +40,12 @@ Behaviors → **Review New Issues**:
 - **Reviewers** chooses how many of the Issue review models review each issue.
 - **Active** is the switch.
 
-Settings → Models → **Issue review** names the models: a default, the
-fallback Caller switches to once after a Claude output limit, and the
-secondary and tertiary reviewers. It offers every provider Caller can run with
-full access — all five: Claude, Codex, Grok, Antigravity and Muse.
+Settings → Models names the three slot models once — Primary, Secondary,
+Tertiary — and **Issue review** picks which slot it runs. Caller switches to
+the next slot once after a Claude output limit; when a slot's provider fails
+before a verdict, the run moves to the next slot instead. It offers every
+provider Caller can run with full access — all five: Claude, Codex, Grok,
+Antigravity and Muse.
 
 ## Which issues
 
