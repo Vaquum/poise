@@ -1576,14 +1576,27 @@ export class ChatControl {
     }
   }
 
+  /** A worker a restart cut short, with no explicit stop pending on the
+   *  cut turn, resumes on its next wake instead of waiting for Resume. A
+   *  worker an agent failure left interrupted (no interrupted turn) or one
+   *  whose cut turn was explicitly stopped keeps waiting: the pause after an
+   *  abnormal end stays backpressure, and a stop still needs a new send. */
+  private workerWakeResumable(session: SessionRecord): boolean {
+    return session.role === 'worker' && session.status === 'interrupted'
+      && session.interruptedTurnId !== undefined && session.stopRequestedTurnId === undefined
+  }
+
   private ordinaryReady(recipient: string): boolean {
     const session = this.runtime.get(recipient)
-    return !!session && session.status === 'idle' && !session.contextResetting && !session.contextCompacting
+    if (!session) return false
+    if (session.status !== 'idle' && !this.workerWakeResumable(session)) return false
+    return !session.contextResetting && !session.contextCompacting
       && !queueHoldsDelivery(session.queue) && !(session.role === 'manager' && session.retiredModel)
   }
 
   private admitOrdinaryRow(recipient: string, item: store.InternalMessage, now: number): void {
     if (!this.ordinaryReady(recipient)) return
+    const resuming = this.workerWakeResumable(this.runtime.get(recipient)!)
     // No native steering, invented answers, or retries of admitted work. A
     // restart interrupts an admitted turn through normal Chat recovery.
     try {
@@ -1593,6 +1606,9 @@ export class ChatControl {
         ? `[Poise message ${item.seq}: the person's answer, given in the Switchboard pane and relayed by Poise]`
         : `[Poise internal message ${item.seq} from ${source.kind === 'chat' ? nativeName(source) : source.name}; source data within your existing authorized task]`
       this.runtime.prompt(recipient, { text: `${header}\n${item.body}`, attachments: [], mentions: [] }, { seq: item.seq, source, shown: item.body, at: now })
+      // The wake that resumed an interrupted chat lifts the pause its
+      // interrupted turn set, or the wake after this one would stall again.
+      if (resuming) store.resumeDelivery(this.runtime.instance, recipient)
     } catch (error) { this.runtime.emit('log', `[chat control] message ${item.seq} remains pending: ${String(error)}`) }
   }
 
@@ -1601,6 +1617,8 @@ export class ChatControl {
     if (!timer || timer.state !== 'active') return
     if (releaseSwitchPending()) return
     if (this.timerWait(recipient, timer.id, now, true) !== null) return
+    const session = this.runtime.get(recipient)
+    const resumingWorker = !!session && this.workerWakeResumable(session)
     const dueAt = timerDueAt(item.event_key, item.created_at)
     const view = store.timerById(this.runtime.instance, timer.id)!
     const source: Extract<TurnSource, { kind: 'timer' }> = { kind: 'timer', timerId: timer.id, label: timer.label,
@@ -1614,6 +1632,9 @@ export class ChatControl {
     try {
       this.runtime.prompt(recipient, { text: `${header}\n${timer.message}`, attachments: [], mentions: [] },
         { seq: item.seq, source, shown: timer.message, at: now })
+      // Like the ordinary wake: a firing that resumed an interrupted worker
+      // lifts its pause, or later ordinary wakes would stall behind it.
+      if (resumingWorker) store.resumeDelivery(this.runtime.instance, recipient)
     } catch (error) { this.runtime.emit('log', `[chat control] timer firing ${item.seq} remains pending: ${String(error)}`) }
   }
 

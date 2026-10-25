@@ -876,9 +876,14 @@ export class ChatRuntime extends EventEmitter {
         void session.adapter?.cancel()
       })
       // The checkout must already be on the session's branch: switching it
-      // under a running agent would move the agent's writes elsewhere.
+      // under a running agent would move the agent's writes elsewhere. A
+      // session's own scratch workspace holds only its own agent's work —
+      // even on a branch the agent cut itself for its PR — so any branch
+      // there is the chat's own. Shared checkouts keep the strict check.
       const state = await inspectCheckout(record.checkout)
-      if (state.currentBranch !== record.branch.name) {
+      const ownWorkspace = record.workspaceKind === 'poise-local'
+        && workerWorkspaceRef(this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT, record.checkout)?.id === record.id
+      if (state.currentBranch !== record.branch.name && !ownWorkspace) {
         throw new Error(`the checkout is on ${state.currentBranch || 'a detached HEAD'}, not ${record.branch.name}`)
       }
       turn.abort.signal.throwIfAborted()

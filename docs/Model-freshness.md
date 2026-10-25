@@ -15,11 +15,28 @@ not used. Poise's subscription wrapper launches the standalone Claude executable
 Settings → Models → **Check now** and the existing scheduled model check run
 `scripts/refresh-models.mjs`. Both perform the same sequence:
 
-1. Update installed Claude, Codex, Grok, Antigravity and Muse CLIs concurrently.
-2. Read the actual launcher's version again, detecting duplicate-install issues.
-3. Ask Caller's release-managed `agent-interface --refresh-models` for models.
-4. Atomically record the CLI results and per-provider discovery results, then
+1. Resolve which providers participate ([Connected accounts](Connected-accounts.md#which-providers-a-model-check-maintains)):
+   configured providers, plus Claude/Codex when the live status verifies a
+   sign-in. The server forwards the accounts it already observed, so the
+   script does not probe the CLIs again; the standalone launchd run resolves
+   the same rule itself from the same database and status commands.
+2. Update the participating Claude, Codex, Grok, Antigravity and Muse CLIs
+   concurrently. Nonparticipating providers are skipped without an update.
+3. Read the actual launcher's version again, detecting duplicate-install issues.
+4. Ask Caller's release-managed `agent-interface --refresh-models` for the
+   participating providers' models (`--families` names a strict subset; the
+   bare call still checks all five). With no eligible providers Caller is
+   not started at all.
+5. Atomically record the CLI results and per-provider discovery results, then
    invalidate Poise's model cache.
+
+Each provider's CLI result and discovery result is `ok`, `skipped` (with the
+reason `never_configured`) or a failure. Skipped providers keep their
+catalogue rows, saved selections, behavior bindings and debate participants;
+nothing is dropped. A check with no eligible providers reports every provider
+skipped and the neutral "No connected providers to check. Connect one in
+Settings → Accounts." It exits successfully: skipped is not a warning or an
+error, but eligibility that cannot be established is.
 
 Discovery uses the parent server's resolved `CALLER_BIN_ROOT` (default
 `caller/.venv/bin`), passed explicitly to the refresh child. This is the same
@@ -50,10 +67,12 @@ native packages; other Codex installations use `codex update`. Grok and Antigrav
 use their update commands. Muse's launcher performs a synchronous update; its
 release build is checked as well as its semantic version.
 
-Overlapping requests share a check. Separate Poise processes serialize updates
-for each launcher and discovery for the shared report. A subsequent launch
-checks again rather than trusting a time-to-live cache. Updaters receive only
-installation/network environment variables, not model prompts or API tokens.
+Overlapping requests share a check only when its participation context still
+matches; a provider connected while the request waited gets its own check.
+Separate Poise processes serialize updates for each launcher and discovery
+for the shared report. A subsequent launch checks again rather than trusting
+a time-to-live cache. Updaters receive only installation/network environment
+variables, not model prompts or API tokens.
 Only the selected provider is maintained on a native Chat turn. Caller-backed
 card/editor chat, reviews, approvals, content and debate maintain their selected
 providers before launch too. No unrelated packages or IDE bundles are upgraded.
@@ -61,9 +80,11 @@ providers before launch too. No unrelated packages or IDE bundles are upgraded.
 ## Failure and recovery
 
 A CLI check has a two-minute total budget, including lock acquisition and
-version probes. Discovery has a ten-minute deadline. The enclosing manual check
+version probes. Discovery has a ten-minute deadline. A standalone eligibility
+probe has ten seconds per status command. The enclosing manual check
 and browser request also have deadlines; Checking cannot remain disabled
-indefinitely. A terminated standalone refresh runner kills its updater groups.
+indefinitely. A terminated standalone refresh runner kills its updater and
+probe groups.
 
 Offline, authentication, permissions or installation failures are not reported
 as a verified latest version. Existing installed CLIs remain usable with a
@@ -73,8 +94,9 @@ existing choices and reports the affected CLI/provider instead of claiming
 
 The Settings view shows elapsed time in neutral text while checking, clearing
 any previous failure message and error color. A failed check is red; a successful
-check restores the neutral catalog status. It then shows versions and the
-completed result. Refreshing the catalogue updates an untouched fresh console
+check restores the neutral catalog status. A check with no connected providers
+says so in neutral text instead of claiming nothing new. It then shows versions
+and the completed result. Refreshing the catalogue updates an untouched fresh console
 to the latest discovered Opus with High effort. Explicit model selections and
 existing conversations are not silently moved to another model.
 
@@ -83,7 +105,8 @@ existing conversations are not silently moved to another model.
 Tests use isolated executables and version files, never the user's installations.
 They cover updater ordering, shared checks, npm prefixes, Muse release builds,
 failed discovery receipts, retry, cancellation/cleanup, native resume between
-turns, catalogue invalidation, new-model defaults and browser timeout recovery.
+turns, catalogue invalidation, new-model defaults, provider participation and
+skipping, entry-point agreement and browser timeout recovery.
 
 Upgrade compatibility: older pages stored the fixed `opus-5-high` fresh-console
 default without recording whether it was explicitly chosen. That legacy value

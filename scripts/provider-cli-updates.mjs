@@ -3,13 +3,13 @@ import { environmentSecrets, redact } from '../gateway/src/diagnostics/redaction
 // Refresh the actual standalone provider launchers, never an IDE's bundled CLI.
 import { spawn } from 'node:child_process'
 import { access, cp, mkdir, readFile, rename, rm, writeFile, realpath } from 'node:fs/promises'
-import { constants } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { dirname, delimiter, isAbsolute, join } from 'node:path'
+import { dirname, delimiter, join } from 'node:path'
 import { homedir } from 'node:os'
 import Database from 'better-sqlite3'
+import { PROVIDERS, SKIP_REASON, executable } from './provider-participation.mjs'
 
-export const PROVIDERS = ['claude', 'codex', 'grok', 'antigravity', 'muse']
+export { PROVIDERS }
 export const CLI_UPDATE_TIMEOUT_MS = 120_000
 const COMMANDS = { claude: 'claude', codex: 'codex', grok: 'grok', antigravity: 'agy', muse: 'muse' }
 const inflight = new Map()
@@ -23,20 +23,21 @@ export function terminateUpdateChildren() {
   }
 }
 
+/** Eligibility probes join the same owned set while they run. */
+export function trackUpdateChild(child) {
+  children.add(child)
+}
+
+export function untrackUpdateChild(child) {
+  children.delete(child)
+}
+
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
 const hash = text => createHash('sha256').update(text).digest('hex')
 function updateEnvironment(source) {
   const keys = ['HOME', 'USERPROFILE', 'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'TMPDIR', 'TEMP', 'TMP', 'USER', 'LANG', 'LC_ALL', 'SHELL', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME']
   return { ...Object.fromEntries(keys.filter(key => source[key] !== undefined).map(key => [key, source[key]])), CI: '1', NO_COLOR: '1' }
 }
-async function executable(command, env) {
-  const candidates = isAbsolute(command) ? [command] : (env.PATH || '').split(delimiter).filter(Boolean).filter(isAbsolute).map(dir => join(dir, command))
-  for (const path of candidates) {
-    try { await access(path, constants.X_OK); return path } catch { /* next PATH entry */ }
-  }
-  throw new Error(`${command} is not installed on Poise's PATH`)
-}
-
 /** Run only the selected provider's updater, without a shell or model prompt. */
 export function runUpdateCommand(command, args, { env, cwd, timeoutMs = CLI_UPDATE_TIMEOUT_MS }) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('timeoutMs must be a positive integer')
@@ -231,8 +232,16 @@ export function ensureProviderCli(provider, options = {}) {
   inflight.set(key, task)
   return task
 }
+/** Update the selected providers; the rest are reported skipped without a
+ *  receipt, since no verification happened. Absent selection updates all. */
 export async function ensureProviderClis(options = {}) {
-  return Object.fromEntries(await Promise.all(PROVIDERS.map(async provider => [provider, await ensureProviderCli(provider, options)])))
+  const only = options.providers ?? PROVIDERS
+  for (const provider of only) if (!PROVIDERS.includes(provider)) throw new Error(`Unknown provider ${provider}`)
+  return Object.fromEntries(await Promise.all(PROVIDERS.map(async provider => [provider,
+    only.includes(provider)
+      ? await ensureProviderCli(provider, options)
+      : { provider, status: 'skipped', reason: SKIP_REASON, checkedAt: new Date().toISOString() },
+  ])))
 }
 
 /** The daily job and Settings share one discovery writer across Poise processes. */

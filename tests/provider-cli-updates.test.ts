@@ -57,6 +57,22 @@ describe('provider CLI maintenance', () => {
     expect(await ensureProviderCli('grok', { root, env, run })).toMatchObject({ status: 'unavailable', before: '1.0.0', error: 'download unavailable' })
     expect(await ensureProviderCli('grok', { root, env, run })).toMatchObject({ status: 'updated', after: '1.1.0' })
   })
+  it('updates only the selected providers and reports the rest skipped without a receipt', async () => {
+    const run = fakeRunner()
+    const report = await ensureProviderClis({ root, env, run, providers: ['claude', 'codex'] })
+    expect(Object.keys(report)).toHaveLength(5)
+    // The shared fake's version is racy across providers; both ran updates.
+    for (const id of ['claude', 'codex'] as const) expect(report[id].status).toMatch(/^(updated|current)$/)
+    expect(report.grok).toMatchObject({ provider: 'grok', status: 'skipped', reason: 'never_configured' })
+    expect(report.muse.status).toBe('skipped')
+    // Two providers times version, update and version again; nothing else ran.
+    expect(run).toHaveBeenCalledTimes(6)
+    const { readdir } = await import('node:fs/promises')
+    expect((await readdir(root)).filter(name => name.endsWith('.json'))).toHaveLength(2)
+  })
+  it('rejects an unknown selected provider', async () => {
+    await expect(ensureProviderClis({ root, env, run: fakeRunner(), providers: ['claude', 'unknown' as unknown as Provider] })).rejects.toThrow('Unknown provider unknown')
+  })
   it('reports a missing provider without installing another provider or launching a model', async () => {
     await rm(join(root, 'bin', 'muse'))
     const run = fakeRunner()
@@ -85,6 +101,22 @@ describe('truthful model-check feedback', () => {
   it('separates CLI changes from model changes and rejects an empty report', () => {
     expect(modelRefreshSummary({})).toMatchObject({ level: 'error' })
     expect(modelRefreshSummary({ changed: true, families: { claude: { status: 'ok' } }, cli_updates: { claude: { status: 'updated', before: '2.1.274', after: '2.1.280' } } })).toMatchObject({ level: 'ok', text: expect.stringContaining('2.1.274 → 2.1.280') })
+  })
+  it('treats skipped providers as neither failure nor news', () => {
+    const report = { changed: false, families: { claude: { status: 'ok' }, grok: { status: 'skipped', reason: 'never_configured' } },
+      cli_updates: { claude: { status: 'current' }, grok: { status: 'skipped', reason: 'never_configured' } } }
+    expect(modelRefreshSummary(report)).toMatchObject({ level: 'ok', text: 'Catalog checked; nothing new.' })
+  })
+  it('answers no connected providers neutrally instead of claiming nothing new', () => {
+    const skipped = Object.fromEntries(['claude', 'codex', 'grok', 'antigravity', 'muse'].map(name => [name, { status: 'skipped', reason: 'never_configured' }]))
+    expect(modelRefreshSummary({ families: { ...skipped }, cli_updates: { ...skipped } }))
+      .toEqual({ text: 'No connected providers to check. Connect one in Settings → Accounts.', level: 'neutral' })
+  })
+  it('still fails a participating provider beside skipped ones', () => {
+    const report = { families: { claude: { status: 'ok' }, codex: { status: 'unavailable', error: 'signed out' }, grok: { status: 'skipped', reason: 'never_configured' } } }
+    const result = modelRefreshSummary(report)
+    expect(result.level).toBe('error')
+    expect(result.text).toContain('codex: signed out')
   })
 })
 

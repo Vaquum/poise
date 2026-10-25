@@ -349,11 +349,18 @@ async function loadProduction(): Promise<void> {
 
 // ── Storage ─────────────────────────────────────────────────────────────
 
-interface StorageCategoryJson { key: string, label: string, path: string, bytes: number }
+interface StorageCategoryJson {
+  key: string, label: string, path: string, bytes: number | null,
+  status?: 'ok' | 'partial' | 'unavailable', error?: string,
+}
 interface StorageStatusJson {
+  at: string
   categories: StorageCategoryJson[]
   disk: { path: string, totalBytes: number, freeBytes: number, usedPercent: number }
   pressure: boolean
+  complete?: boolean
+  stale?: boolean
+  error?: string
   lastRun: { finishedAt: string, dryRun: boolean, reclaimedBytes: number, held: Array<{ path: string, reason: string }>, errors: unknown[] } | null
 }
 interface MaintenanceRunJson {
@@ -365,8 +372,11 @@ interface MaintenanceRunJson {
   errors: Array<{ message: string }>
 }
 
-let storageLoading: Promise<void> | null = null
 let storageRunning = false
+let storageGeneration = 0
+
+/** A storage read that never answers leaves "Loading storage…" by this bound. */
+const STORAGE_FETCH_TIMEOUT_MS = 15_000
 
 function storageSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '—'
@@ -380,11 +390,35 @@ function storageSize(bytes: number): string {
   return unit === 0 ? `${value} bytes` : `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`
 }
 
+function storageCategoryValue(category: StorageCategoryJson): string {
+  if (typeof category.bytes !== 'number' || category.status === 'unavailable') return 'unavailable'
+  if (category.status === 'partial') return `${storageSize(category.bytes)} (partial)`
+  return storageSize(category.bytes)
+}
+
 function renderStorageBreakdown(categories: StorageCategoryJson[]): void {
   const breakdownEl = panelEl?.querySelector<HTMLElement>('.st-storage-breakdown')
   if (!breakdownEl) return
   breakdownEl.innerHTML = categories.map((category) =>
-    `<div class="st-storage-row"><span>${escapeHtml(category.label)}</span><span>${escapeHtml(storageSize(category.bytes))}</span></div>`).join('')
+    `<div class="st-storage-row"${category.error ? ` title="${escapeHtml(category.error)}"` : ''}><span>${escapeHtml(category.label)}</span><span>${escapeHtml(storageCategoryValue(category))}</span></div>`).join('')
+}
+
+function showStorageRetry(visible: boolean): void {
+  const retry = panelEl?.querySelector<HTMLButtonElement>('.st-storage-retry')
+  if (retry) retry.hidden = !visible
+}
+
+function storageMeasuredAge(at: string): string | null {
+  const measured = Date.parse(at)
+  if (!Number.isFinite(measured)) return null
+  const ago = Date.now() - measured
+  if (ago < 0) return null
+  if (ago < 60_000) return 'just now'
+  if (ago < 3_600_000) {
+    const minutes = Math.floor(ago / 60_000)
+    return `${minutes} minute${minutes === 1 ? '' : 's'} ago`
+  }
+  return shortTime(measured, effectiveTimezone(), Date.now())
 }
 
 function renderStorage(data: StorageStatusJson): void {
@@ -399,8 +433,13 @@ function renderStorage(data: StorageStatusJson): void {
   } else {
     lines.push('Maintenance has not run yet.')
   }
+  const age = storageMeasuredAge(data.at)
+  if (age) lines.push(data.stale ? `Showing the last update, measured ${age}.` : `Measured ${age}.`)
+  if (data.stale) lines.push(`Could not refresh: ${data.error || 'the storage read failed'}.`)
+  else if (data.complete === false) lines.push('Some categories could not be measured.')
   statusEl.textContent = lines.join(' ')
-  statusEl.className = `st-help st-help-${data.pressure ? 'warn' : 'info'} st-storage-status`
+  statusEl.className = `st-help st-help-${data.pressure || data.stale || data.complete === false ? 'warn' : 'info'} st-storage-status`
+  showStorageRetry(!!data.stale || data.complete === false)
   renderStorageBreakdown(data.categories)
 }
 
@@ -409,37 +448,47 @@ function storageError(message: string): void {
   if (!statusEl) return
   statusEl.textContent = message
   statusEl.className = 'st-help st-help-error st-storage-status'
+  showStorageRetry(true)
 }
 
-async function fetchStorage(): Promise<StorageStatusJson | null> {
-  try {
-    const res = await fetch('/api/storage')
-    const data = await res.json() as StorageStatusJson & { error?: string }
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-    return data
-  } catch {
-    // Leave whatever was shown; the next open tries again.
-    return null
+async function fetchStorage(fresh = false): Promise<StorageStatusJson> {
+  const res = await fetch(`/api/storage${fresh ? '?fresh=1' : ''}`, { signal: AbortSignal.timeout(STORAGE_FETCH_TIMEOUT_MS) })
+  const data = await res.json().catch(() => null) as (StorageStatusJson & { error?: string }) | null
+  if (!res.ok) throw new Error(data?.error || `The storage read failed (HTTP ${res.status}).`)
+  if (!data || !Array.isArray(data.categories) || !data.disk || typeof data.disk !== 'object') {
+    throw new Error('The storage answer is unreadable.')
   }
+  return data
 }
 
-async function loadStorage(): Promise<void> {
+async function loadStorage(fresh = false): Promise<void> {
   if (!panelEl || storageRunning) return
-  storageLoading ??= (async () => {
-    try {
-      const data = await fetchStorage()
-      if (data) renderStorage(data)
-    } finally {
-      storageLoading = null
-    }
-  })()
-  await storageLoading
+  const generation = ++storageGeneration
+  const statusEl = panelEl.querySelector<HTMLElement>('.st-storage-status')
+  if (statusEl) {
+    statusEl.textContent = 'Loading storage…'
+    statusEl.className = 'st-help st-help-info st-storage-status'
+  }
+  try {
+    const data = await fetchStorage(fresh)
+    if (generation !== storageGeneration || !panelEl) return
+    renderStorage(data)
+  } catch (error) {
+    if (generation !== storageGeneration || !panelEl) return
+    // AbortSignal.timeout aborts with TimeoutError; a manual abort would be AbortError.
+    const timedOut = error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')
+    storageError(timedOut
+      ? `The storage read timed out after ${STORAGE_FETCH_TIMEOUT_MS / 1000} seconds.`
+      : error instanceof Error ? error.message : String(error))
+  }
 }
 
 async function runStorageMaintenance(dryRun: boolean): Promise<void> {
   if (!panelEl || storageRunning) return
   storageRunning = true
-  for (const button of panelEl.querySelectorAll<HTMLButtonElement>('.st-storage-run, .st-storage-dry-run')) button.disabled = true
+  // A read already in flight must not land over the run's result line.
+  storageGeneration++
+  for (const button of panelEl.querySelectorAll<HTMLButtonElement>('.st-storage-run, .st-storage-dry-run, .st-storage-retry')) button.disabled = true
   try {
     const res = await fetch('/api/storage/maintenance', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dryRun }),
@@ -455,13 +504,20 @@ async function runStorageMaintenance(dryRun: boolean): Promise<void> {
       statusEl.className = `st-help st-help-${data.errors.length ? 'warn' : 'ok'} st-storage-status`
     }
     // Fresh sizes under the run's own result line.
-    const fresh = await fetchStorage()
-    if (fresh) renderStorageBreakdown(fresh.categories)
+    try {
+      const fresh = await fetchStorage()
+      renderStorageBreakdown(fresh.categories)
+      showStorageRetry(!!fresh.stale || fresh.complete === false)
+    } catch {
+      // The run's own result line stands, but its sizes are stale: offer a
+      // reread rather than leave pre-run numbers under a success message.
+      showStorageRetry(true)
+    }
   } catch (error) {
     storageError((error as Error).message)
   } finally {
     storageRunning = false
-    for (const button of panelEl?.querySelectorAll<HTMLButtonElement>('.st-storage-run, .st-storage-dry-run') ?? []) button.disabled = false
+    for (const button of panelEl?.querySelectorAll<HTMLButtonElement>('.st-storage-run, .st-storage-dry-run, .st-storage-retry') ?? []) button.disabled = false
   }
 }
 
@@ -669,14 +725,14 @@ function renderCatalogStatus(data: ModelsResponse) {
   } else line += ' Not checked yet; the daily check runs at 07:00.'
   catalogStatusEl.dataset.help = line
   catalogStatusEl.tabIndex = 0
-  const failed = report && modelRefreshSummary(report).level === 'error'
+  const level = report ? modelRefreshSummary(report).level : 'ok'
   const checkedAt = report?.completed_at || report?.checked_at
   const when = checkedAt ? new Date(checkedAt) : null
   const checked = when && !Number.isNaN(when.getTime()) ? `Checked ${shortTime(when.getTime(), effectiveTimezone(), Date.now())}` : 'Checked'
-  catalogStatusEl.textContent = failed
-    ? modelRefreshSummary(report).text
-    : `${data.catalog.models.length} models · ${report ? checked : 'Not checked yet'}`
-  catalogStatusEl.classList.toggle('st-help-error', !!failed)
+  catalogStatusEl.textContent = level === 'ok'
+    ? `${data.catalog.models.length} models · ${report ? checked : 'Not checked yet'}`
+    : modelRefreshSummary(report!).text
+  catalogStatusEl.classList.toggle('st-help-error', level === 'error')
 }
 
 async function loadModels(signal?: AbortSignal): Promise<boolean> {
@@ -828,7 +884,7 @@ async function refreshModels(): Promise<void> {
   progress()
   const ticker = setInterval(progress, 1000)
   const deadline = setTimeout(() => controller.abort(), MODEL_CHECK_TIMEOUT_MS)
-  let summary: { text: string, level: 'ok' | 'error' }
+  let summary: { text: string, level: 'ok' | 'neutral' | 'error' }
   try {
     const res = await fetch('/api/models/refresh', { method: 'POST', signal: controller.signal })
     const data = await res.json()
@@ -847,11 +903,11 @@ async function refreshModels(): Promise<void> {
     refreshBtn.textContent = 'Check now'
   }
   if (lastModels) renderCatalogStatus(lastModels)
-  if (summary.level === 'error' && catalogStatusEl) {
+  if (summary.level !== 'ok' && catalogStatusEl) {
     catalogStatusEl.textContent = summary.text
-    catalogStatusEl.classList.add('st-help-error')
+    catalogStatusEl.classList.toggle('st-help-error', summary.level === 'error')
   }
-  setHelp(summary.text, summary.level)
+  setHelp(summary.text, summary.level === 'error' ? 'error' : summary.level === 'neutral' ? 'info' : 'ok')
 }
 
 // ── Save ────────────────────────────────────────────────────────────────
@@ -1102,6 +1158,7 @@ function buildPanel(): HTMLElement {
           <div class="st-row st-row-tight">
             <button type="button" class="st-clear st-storage-run">Run maintenance now</button>
             <button type="button" class="st-clear st-storage-dry-run">Dry run</button>
+            <button type="button" class="st-clear st-storage-retry" hidden>Retry</button>
           </div>
 
         </div>
@@ -1199,6 +1256,7 @@ function buildPanel(): HTMLElement {
   refreshBtn.addEventListener('click', () => { void refreshModels() })
   panel.querySelector('.st-storage-run')!.addEventListener('click', () => { void runStorageMaintenance(false) })
   panel.querySelector('.st-storage-dry-run')!.addEventListener('click', () => { void runStorageMaintenance(true) })
+  panel.querySelector('.st-storage-retry')!.addEventListener('click', () => { void loadStorage(true) })
   notificationsPicker = panel.querySelector('.st-notifications-picker')
   notificationsStatusEl = panel.querySelector('.st-notifications-status')
   notificationsPicker!.addEventListener('click', (event) => {

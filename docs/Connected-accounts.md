@@ -59,17 +59,51 @@ or token. Otherwise it runs only the status commands above and passes on only
 the account name one prints. Answers are kept for 15 seconds, so reopening
 Settings does not run every CLI again, and dropped whenever a terminal exits.
 
+## Which providers a model check maintains
+
+A model check maintains only participating providers: a provider participates
+when Poise has a durable record that it was configured, or when its live
+status positively verifies a usable sign-in.
+
+- The record is the existing `account_logins` history: a Connect login that
+  finished, a setup confirmation, or a Claude/Codex sign-in the server
+  observed, including one made outside Poise. History proves configuration,
+  never current credential validity.
+- Grok, Muse and Antigravity have no live status command, so their history
+  is their only participation signal. Claude and Codex participate on history
+  or a verified live sign-in.
+- A recorded provider whose CLI is now missing, signed out, broken or
+  unreadable stays participating and reports the failure. A provider with
+  neither history nor a verified sign-in is skipped when the evidence
+  establishes it as unconfigured. A failed eligibility read is unknown and
+  fails the check; it never reads as unconfigured. A corrupt record fails
+  closed the same way: checks fail and alerts stay as they are.
+- Status reads use each CLI's default credential store. The Codex probe does
+  not follow CODEX_HOME, like Connect and the server probes, so a sign-in
+  held only there reads as signed out; connecting Codex through Poise
+  records it and brings it into the checks.
+- Deliberate withdrawal is setup's withdrawal for Grok, Muse and Antigravity,
+  which removes the record. Claude and Codex have no Disconnect in Poise, so
+  a previously configured one stays participating and reports a lost sign-in.
+
+The manual server route, the service daily scheduler and the personal
+launchd job resolve the same rule from the same database. Connecting a
+provider does not refresh the catalogue at once; its rows wait for the next
+check.
+
 ## Alerts
 
 Each read also records a sign-in alert, which Poise Link shows on the desktop:
-for an installed CLI that says it is not signed in (Codex, today), and for
-your GitHub account or the GitHub automation account while gh does not hold it signed in.
+for an installed, configured CLI that says it is not signed in (Codex, today),
+and for your GitHub account or the GitHub automation account while gh does not
+hold it signed in. A provider that was never configured raises no sign-in
+demand, and a stale demand clears once the provider reads as unconfigured.
 An alert comes once and again only after it has cleared, which happens when
 the CLI or the account is signed in again; a CLI that cannot say changes
-nothing. Claude's alert comes from Poise's own Claude sign-in check instead.
-In service mode Poise reads the accounts every 15 minutes as well, so the
-alerts come while no browser is open. Each one opens the workspace on
-Settings → Accounts (`/?settings=accounts`).
+nothing. Claude's alert comes from Poise's own Claude sign-in check instead,
+gated on the same participation. In service mode Poise reads the accounts
+every 15 minutes as well, so the alerts come while no browser is open. Each
+one opens the workspace on Settings → Accounts (`/?settings=accounts`).
 
 ## The terminal
 
