@@ -90,12 +90,17 @@ class TestSplit(TestCase):
                                               ("gone.py", "removed"))]
         self.assertEqual(review_stages.split(json.dumps(node)), [json.dumps(node)])
 
-    def test_spaced_path_matches_its_plus_plus_plus_line(self):
+    def test_spaced_path_matches_its_tab_terminated_plus_plus_plus_line(self):
+        # Git terminates a space-containing ---/+++ path with a tab; the
+        # parser must strip that terminator before matching retained files.
         node = json.loads(packet([]))
-        node["diff"] = section("my dir/file.txt")
+        node["diff"] = ("diff --git a/my dir/file.txt b/my dir/file.txt\n"
+                        "--- a/my dir/file.txt\t\n"
+                        "+++ b/my dir/file.txt\t\n"
+                        "@@ -1 +1 @@\n-old\n+new\n")
         node["files"] = [{"filename": "my dir/file.txt", "status": "modified",
                           "old_mode": "100644", "new_mode": "100644"}]
-        self.assertEqual(len(review_stages.split(json.dumps(node))), 1)
+        self.assertEqual(review_stages.split(json.dumps(node)), [json.dumps(node)])
 
     def test_section_for_an_unretained_file_fails_loud(self):
         node = json.loads(packet(["kept.py"]))
@@ -119,6 +124,28 @@ class TestSplit(TestCase):
             scope = json.loads(stage)["review_scope"]
             self.assertIn("since the last reviewed head", scope)
             self.assertIn("RIGHT-side", scope)
+
+    def test_diff_line_sets_split_hunks_by_side(self):
+        diff = "\n".join([
+            "diff --git a/src/a.py b/src/a.py",
+            "--- a/src/a.py", "+++ b/src/a.py",
+            "@@ -10,4 +10,4 @@",
+            " ctx1", "-old1", "+new1", " ctx2",
+            "diff --git a/src/gone.py b/src/gone.py",
+            "--- a/src/gone.py", "+++ /dev/null",
+            "@@ -1,2 +0,0 @@",
+            "-line1", "-line2",
+        ])
+        sets = review_stages.diff_line_sets(diff, ["src/a.py", "src/gone.py"])
+        self.assertEqual(sets["src/a.py"]["left"], {10, 11, 12})
+        self.assertEqual(sets["src/a.py"]["right"], {10, 11, 12})
+        self.assertEqual(sets["src/gone.py"]["left"], {1, 2})
+        self.assertEqual(sets["src/gone.py"]["right"], set())
+
+    def test_malformed_hunk_header_fails_loud(self):
+        diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ bogus @@\n-x\n"
+        with self.assertRaises(review_stages.StageError):
+            review_stages.diff_line_sets(diff, ["f"])
 
     def test_bounded_packet_keeps_its_omitted_files_in_every_stage(self):
         paths = [f"src/f{i:02d}.py" for i in range(9)]

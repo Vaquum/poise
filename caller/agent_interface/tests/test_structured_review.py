@@ -399,6 +399,73 @@ class TestApproveSinceHead(TestCase):
         run.assert_not_called()
 
 
+class TestSincePositions(TestCase):
+    def _packet(self, since):
+        node = json.loads(staged_packet(["src/gone.py"]))
+        node["p"] = 2
+        node["since_head_sha"] = since
+        return json.dumps(node)
+
+    def _full(self, diff):
+        node = json.loads(staged_packet(["src/gone.py"]))
+        node["diff"] = diff
+        return json.dumps(node)
+
+    def _run(self, packet, verdict, full):
+        calls = []
+
+        def process(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}), stderr="")
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process), \
+                patch.object(structured_review, "fetch_packet", return_value=full) as fetch:
+            result = structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                           "pr_approve", "https://github.com/o/r/pull/12", "bit-mis",
+                                           "a" * 40, 60, packet=packet)
+        return result, calls, fetch
+
+    def test_removal_finding_inside_the_pr_diff_submits(self):
+        diff = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                          "@@ -10,3 +10,3 @@", " context", "-removed", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(diff))
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
+                                      "a" * 40, "p2", since_head=None)
+        self.assertEqual(calls[-1][0][1], "--request-changes")
+
+    def test_removal_finding_outside_the_pr_diff_is_a_contract_violation(self):
+        diff = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                          "@@ -10,3 +10,3 @@", " context", "-removed", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 99, "side": "LEFT", "body": "stale"}]}
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(self._packet("c" * 40), verdict, self._full(diff))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+
+    def test_right_only_since_verdict_fetches_no_full_packet(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 1, "side": "RIGHT", "body": "defect"}]}
+        result, _, fetch = self._run(self._packet("c" * 40), verdict, "unused")
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_not_called()
+
+    def test_full_review_left_findings_keep_todays_behavior(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 99, "side": "LEFT", "body": "defect"}]}
+        result, _, fetch = self._run(self._packet(None), verdict, "unused")
+        self.assertIn('"review_id": 91', result)
+        fetch.assert_not_called()
+
+
 class TestOtherProviderVerdicts(TestCase):
     """Grok, Antigravity and Muse answer with the same verdict the Codex path submits."""
 

@@ -21,6 +21,7 @@ from pathlib import Path
 from time import monotonic
 
 from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, bounded_cause, expected_head, pr_ref, provider_blocked
+from .atoms import packet as fetch_packet
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
 from .review_watch import ReviewWatch
@@ -222,6 +223,34 @@ def _stage_texts(text: str, packet: str) -> list[str]:
     return [text.replace(packet, stage, 1) for stage in stages]
 
 
+def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str, verdict: dict) -> None:
+    """A since-scoped verdict's LEFT comments name removed lines, which are
+    only submittable while the pull request diff still carries them. Check
+    those positions against the full diff before the single submission, so a
+    bad position fails here instead of rejecting the whole review at GitHub."""
+    left = [comment for comment in verdict["comments"] if comment["side"] == "LEFT"]
+    if not left or not packet:
+        return
+    try:
+        node = json.loads(packet)
+    except ValueError:
+        return
+    if not isinstance(node, dict) or not node.get("since_head_sha"):
+        return
+    try:
+        level = node.get("p")
+        full = json.loads(fetch_packet(pwd, pr, actor_name, head,
+                                       f"p{level}" if level is not None else None, since_head=None))
+        retained = [entry["filename"] for entry in full["files"]]
+        sets = review_stages.diff_line_sets(full["diff"], retained)
+    except (ValueError, KeyError, TypeError) as error:
+        raise InvalidVerdict(f"cannot validate removed-line positions: {error}") from error
+    for comment in left:
+        if comment["line"] not in sets.get(comment["path"], {}).get("left", set()):
+            raise InvalidVerdict(
+                f"comment on {comment['path']}:{comment['line']} (LEFT) is outside the pull request diff")
+
+
 def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
                  timeout_s: int, deadline: float, repository, behavior: str) -> tuple[str, dict]:
     schema = verdict_schema(behavior, inspection=repository is not None)
@@ -323,6 +352,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 verdict = validate_verdict(json.dumps(
                     {"action": "request_changes" if prior else terminal, "comments": prior}), behavior)
                 raw = json.dumps(verdict)
+            _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
     except review_stages.StageError as error:
         cause = bounded_cause(str(error) or "invalid review packet stages")
         diagnostic = diagnostic_envelope(operation="provider.review", phase="staging",

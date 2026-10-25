@@ -27,6 +27,8 @@ OPAQUE_SUFFIXES = {".gz", ".zip", ".tar", ".bz2", ".xz", ".7z", ".pdf", ".parque
 FILE_STATUS = {"A": "added", "D": "removed", "M": "modified", "T": "changed"}
 PACKET_LIMIT_CODE = "review_packet_too_large"
 SINCE_HEAD_UNKNOWN_CODE = "review_since_head_unknown"
+SINCE_DROPPED_NOTE = (" A follow-up diff was requested, but the base moved since the last review, "
+                      "so this round is not limited to changes since the last review.")
 
 
 class ReviewPacketTooLarge(RuntimeError):
@@ -247,8 +249,9 @@ def _since_lede(since: str | None) -> str:
 def _since_positioning(since: str | None) -> str:
     if since is None:
         return ""
-    return (" New findings must reference RIGHT-side (current-head) lines; "
-            "reaffirm existing unresolved findings with their original locations.")
+    return (" New findings on current lines must reference RIGHT-side (current-head) lines. "
+            "When the removal itself is the defect, comment on the removed (LEFT-side) line. "
+            "Reaffirm existing unresolved findings with their original locations.")
 
 
 async def review_diff(
@@ -258,14 +261,35 @@ async def review_diff(
 ) -> dict[str, Any]:
     head = pull["head"]["sha"]
     base = pull["base"]["sha"]
+    new_base = None
+    since_dropped = False
+    if since is not None:
+        # A rebase or base update between the last review and now pulls
+        # base-only changes into a since...head comparison, whose findings
+        # could target paths absent from the PR diff. Widen to the full
+        # diff when the base moved under the comparison instead.
+        try:
+            old_base = (await client.get(
+                f"/repos/{owner}/{repo}/compare/{base}...{since}",
+                params={"page": 2, "per_page": 1},
+            ))["merge_base_commit"]["sha"]
+        except RuntimeError as error:
+            if str(error).startswith("GitHub 404:"):
+                raise RuntimeError(f"{SINCE_HEAD_UNKNOWN_CODE}: last reviewed head {since} is not fetchable") from error
+            raise
+        new_base = (await client.get(
+            f"/repos/{owner}/{repo}/compare/{base}...{head}",
+            params={"page": 2, "per_page": 1},
+        ))["merge_base_commit"]["sha"]
+        if old_base != new_base:
+            since, since_dropped = None, True
     if since is None:
         # GitHub returns file patches only on comparison page 1. Page 2 gives us
         # the merge base without downloading the full patch-heavy comparison.
-        comparison = await client.get(
+        merge_base = new_base if new_base is not None else (await client.get(
             f"/repos/{owner}/{repo}/compare/{base}...{head}",
             params={"page": 2, "per_page": 1},
-        )
-        merge_base = comparison["merge_base_commit"]["sha"]
+        ))["merge_base_commit"]["sha"]
     else:
         merge_base = since
     env = _env(client.token)
@@ -320,6 +344,8 @@ async def review_diff(
                 else:
                     scope = (_since_lede(since) + "Excluded file contents were not reviewed either; "
                              "do not infer their correctness from this packet." + _since_positioning(since))
+                if since_dropped:
+                    scope += SINCE_DROPPED_NOTE
                 packet = {
                     "diff": diff,
                     "files": [{"filename": f["filename"],
@@ -336,5 +362,8 @@ async def review_diff(
                 return packet
             except ReviewPacketTooLarge:
                 if compact:
-                    return await _bounded_packet(git, files, retained, excluded, context, merge_base, head, since)
+                    bounded = await _bounded_packet(git, files, retained, excluded, context, merge_base, head, since)
+                    if since_dropped:
+                        bounded["review_scope"] += SINCE_DROPPED_NOTE
+                    return bounded
         raise AssertionError("review packet compaction did not finish")

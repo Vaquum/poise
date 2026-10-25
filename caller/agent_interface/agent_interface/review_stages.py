@@ -13,6 +13,7 @@ import re
 
 STAGE_MAX_FILES = 8
 STAGE_MAX_DIFF_BYTES = 200_000
+_HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
 class StageError(ValueError):
@@ -70,17 +71,20 @@ def _covers(section: list[str], retained: list[str]) -> set[str]:
     a deletion), plus the old path of a rename whose new path it carries."""
     paths = {_primary(section, retained)}
     for line in section:
-        if line.startswith("rename from ") and line.removeprefix("rename from ") in retained:
-            paths.add(line.removeprefix("rename from "))
+        # Git terminates a space-containing ---/+++ path with a tab; strip
+        # that terminator (not path content) before matching retained files.
+        if line.startswith("rename from ") and line.removeprefix("rename from ").removesuffix("\t") in retained:
+            paths.add(line.removeprefix("rename from ").removesuffix("\t"))
     return paths
 
 
 def _primary(section: list[str], retained: list[str]) -> str:
     for line in section:
         if line.startswith("+++ "):
-            path = line.removeprefix("+++ ")
+            path = line.removeprefix("+++ ").removesuffix("\t")
             if path == "/dev/null":
                 old = next((item for item in section if item.startswith("--- ")), "")
+                old = old.removesuffix("\t")
                 path = old.removeprefix("--- a/") if old.startswith("--- a/") else old
             else:
                 path = path.removeprefix("b/")
@@ -113,14 +117,43 @@ def _pack(sections: list[tuple[list[str], set[str]]]) -> list[list[tuple[list[st
     return groups
 
 
+def diff_line_sets(diff: str, retained: list[str]) -> dict[str, dict[str, set[int]]]:
+    """Per-file hunk line numbers by side, for validating comment positions
+    against the pull request diff GitHub will judge them on."""
+    sets: dict[str, dict[str, set[int]]] = {}
+    for section in _sections(diff):
+        lines = sets.setdefault(_primary(section, retained), {"left": set(), "right": set()})
+        old, new, in_hunk = 0, 0, False
+        for line in section:
+            if line.startswith("@@ "):
+                match = _HUNK.match(line)
+                if match is None:
+                    raise StageError(f"unparseable diff hunk header: {line[:60]!r}")
+                old, new, in_hunk = int(match.group(1)), int(match.group(2)), True
+            elif in_hunk and line.startswith(" "):
+                # Context lines accept comments on either side, as they do at GitHub.
+                lines["left"].add(old)
+                lines["right"].add(new)
+                old += 1
+                new += 1
+            elif in_hunk and line.startswith("-"):
+                lines["left"].add(old)
+                old += 1
+            elif in_hunk and line.startswith("+"):
+                lines["right"].add(new)
+                new += 1
+    return sets
+
+
 def _render(node: dict, total: int, index: int, sections: list[str], entries: list[dict]) -> str:
     scope = (f"Staged review: file group {index + 1} of {total}. "
              "Review ONLY the retained diff below. Other file groups are reviewed in separate "
              "stages; do not infer their correctness from this packet.")
     if node.get("since_head_sha"):
         scope += (" This group covers only changes since the last reviewed head. "
-                  "New findings must reference RIGHT-side (current-head) lines; "
-                  "reaffirm existing unresolved findings with their original locations.")
+                  "New findings on current lines must reference RIGHT-side (current-head) lines; "
+                  "when the removal itself is the defect, comment on the removed (LEFT-side) line. "
+                  "Reaffirm existing unresolved findings with their original locations.")
     if node.get("excluded_files"):
         scope += " Excluded file contents were not reviewed either; do not infer their correctness from this packet."
     omitted = node.get("omitted_files") or []

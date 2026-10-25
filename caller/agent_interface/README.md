@@ -276,9 +276,12 @@ runs in file-group stages (at most 8 files or 200,000 diff bytes each), all
 under the same head watch and budget. Every stage's findings combine into the
 single verdict the harness submits; a packet that fits in one group runs
 exactly as before. A follow-up (`--pr-approve`) round reviews the diff since
-the reviewer's last submitted review instead of the whole PR again, with new
-findings on current-head lines; an unfetchable last head falls back to the
-full diff once and says so in the prompt. Every run reports its budget usage
+the reviewer's last submitted review instead of the whole PR again: new
+findings on current lines stay on current-head lines, while a defect caused
+by a removal is commented on the removed line and validated against the full
+pull request diff before the single submission. An unfetchable last head, or
+a base that moved since the last review, widens the round to the full diff
+instead. Every run reports its budget usage
 (`used_seconds` of `total_seconds`) in its terminal progress snapshot and in
 the completion result, so a near-miss is visible before it fails.
 

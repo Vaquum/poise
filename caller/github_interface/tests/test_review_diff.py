@@ -216,7 +216,7 @@ class TestBoundedCoverage(IsolatedAsyncioTestCase):
 
 
 class TestSinceHeadDiff(IsolatedAsyncioTestCase):
-    async def _packet(self, since=None, fetch_error=None):
+    async def _packet(self, since=None, fetch_error=None, bases=None, compare_error=None):
         base, head, old = 'a' * 40, 'b' * 40, 'c' * 40
         raw = f':100644 100644 {old} {head} M\0code.py\0'.encode()
         calls = []
@@ -233,17 +233,22 @@ class TestSinceHeadDiff(IsolatedAsyncioTestCase):
 
         client = AsyncMock()
         client.token = 'test-token'
-        client.get.return_value = {'merge_base_commit': {'sha': base}}
+        if compare_error is not None:
+            client.get.side_effect = compare_error
+        elif bases is not None:
+            client.get.side_effect = [{'merge_base_commit': {'sha': sha}} for sha in bases]
+        else:
+            client.get.return_value = {'merge_base_commit': {'sha': base}}
         with patch.object(rd, '_git', side_effect=git_result), \
                 patch.object(rd, '_blob_sizes', AsyncMock(return_value={old: 100, head: 100})):
             packet = await rd.review_diff(client, 'o', 'r', {'base': {'sha': base}, 'head': {'sha': head}},
                                           since=since)
         return packet, calls, client
 
-    async def test_since_head_diffs_since_to_head_without_compare_call(self):
+    async def test_stable_base_diffs_since_to_head(self):
         since = 'c' * 40
-        packet, calls, client = await self._packet(since=since)
-        client.get.assert_not_awaited()
+        packet, calls, client = await self._packet(since=since, bases=['a' * 40, 'a' * 40])
+        self.assertEqual(client.get.await_count, 2)
         fetch = next(args for args in calls if args[:1] == ('fetch',))
         self.assertEqual(fetch[-2:], (since, 'b' * 40))
         raw = next(args for args in calls if '--raw' in args)
@@ -253,6 +258,23 @@ class TestSinceHeadDiff(IsolatedAsyncioTestCase):
         self.assertEqual([entry['filename'] for entry in packet['files']], ['code.py'])
         self.assertIn('Follow-up review', packet['review_scope'])
         self.assertIn('RIGHT-side', packet['review_scope'])
+
+    async def test_moved_base_widens_to_the_full_pr_diff(self):
+        old_base, new_base = 'd' * 40, 'e' * 40
+        packet, calls, client = await self._packet(since='c' * 40, bases=[old_base, new_base])
+        self.assertEqual(client.get.await_count, 2)
+        fetch = next(args for args in calls if args[:1] == ('fetch',))
+        self.assertEqual(fetch[-2:], (new_base, 'b' * 40))
+        raw = next(args for args in calls if '--raw' in args)
+        self.assertEqual(raw[5:7], (new_base, 'b' * 40))
+        self.assertEqual(packet['merge_base_sha'], new_base)
+        self.assertIsNone(packet['since_head_sha'])
+        self.assertIn('not limited to changes since the last review', packet['review_scope'])
+        self.assertNotIn('Follow-up review', packet['review_scope'])
+
+    async def test_gc_since_head_compare_is_an_unknown_since_head(self):
+        with self.assertRaisesRegex(RuntimeError, 'review_since_head_unknown'):
+            await self._packet(since='c' * 40, compare_error=RuntimeError('GitHub 404: Not Found'))
 
     async def test_full_packet_marks_no_since_head(self):
         packet, _, _ = await self._packet()
