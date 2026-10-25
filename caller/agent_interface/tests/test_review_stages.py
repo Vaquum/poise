@@ -109,6 +109,17 @@ class TestSplit(TestCase):
         with self.assertRaisesRegex(review_stages.StageError, "ghost.py"):
             review_stages.split(json.dumps(node))
 
+    def test_staged_follow_up_keeps_the_current_head_positioning(self):
+        paths = [f"src/f{i:02d}.py" for i in range(9)]
+        node = json.loads(packet(paths))
+        node["since_head_sha"] = "c" * 40
+        stages = review_stages.split(json.dumps(node))
+        self.assertEqual(len(stages), 2)
+        for stage in stages:
+            scope = json.loads(stage)["review_scope"]
+            self.assertIn("since the last reviewed head", scope)
+            self.assertIn("RIGHT-side", scope)
+
     def test_bounded_packet_keeps_its_omitted_files_in_every_stage(self):
         paths = [f"src/f{i:02d}.py" for i in range(9)]
         raw = packet(paths, omitted_files=[{"path": "src/rest.py", "reason": "omitted"}])

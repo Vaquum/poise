@@ -249,9 +249,14 @@ class TestSinceHeadDiff(IsolatedAsyncioTestCase):
         raw = next(args for args in calls if '--raw' in args)
         self.assertEqual(raw[5:7], (since, 'b' * 40))
         self.assertEqual(packet['merge_base_sha'], since)
+        self.assertEqual(packet['since_head_sha'], since)
         self.assertEqual([entry['filename'] for entry in packet['files']], ['code.py'])
         self.assertIn('Follow-up review', packet['review_scope'])
         self.assertIn('RIGHT-side', packet['review_scope'])
+
+    async def test_full_packet_marks_no_since_head(self):
+        packet, _, _ = await self._packet()
+        self.assertIsNone(packet['since_head_sha'])
 
     async def test_unfetchable_since_head_is_a_distinct_error(self):
         from github_interface.atoms.process_diagnostic import GitProcessError

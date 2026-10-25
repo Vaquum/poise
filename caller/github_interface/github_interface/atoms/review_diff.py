@@ -211,6 +211,7 @@ async def _bounded_packet(git, files: list[dict[str, Any]], retained: list[str],
             "excluded_files": excluded,
             "omitted_files": omitted,
             "merge_base_sha": merge_base,
+            "since_head_sha": since,
             "review_scope": scope,
         }
         if len(json.dumps({**(context or {}), **packet}, indent=2).encode("utf-8")) > MAX_PACKET_BYTES:
@@ -326,6 +327,7 @@ async def review_diff(
                                "old_mode": f["old_mode"], "new_mode": f["new_mode"]} for f in files if f["filename"] in retained_paths],
                     "excluded_files": excluded,
                     "merge_base_sha": merge_base,
+                    "since_head_sha": since,
                     "review_scope": scope,
                 }
                 packet_bytes = len(json.dumps({**(context or {}), **packet}, indent=2).encode("utf-8"))

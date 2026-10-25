@@ -117,6 +117,10 @@ def _render(node: dict, total: int, index: int, sections: list[str], entries: li
     scope = (f"Staged review: file group {index + 1} of {total}. "
              "Review ONLY the retained diff below. Other file groups are reviewed in separate "
              "stages; do not infer their correctness from this packet.")
+    if node.get("since_head_sha"):
+        scope += (" This group covers only changes since the last reviewed head. "
+                  "New findings must reference RIGHT-side (current-head) lines; "
+                  "reaffirm existing unresolved findings with their original locations.")
     if node.get("excluded_files"):
         scope += " Excluded file contents were not reviewed either; do not infer their correctness from this packet."
     omitted = node.get("omitted_files") or []
