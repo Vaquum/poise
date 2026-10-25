@@ -47,11 +47,10 @@ export async function main() {
   const launch = await resolveLaunch()
   Object.assign(process.env, launch.env)
   process.chdir(launch.root)
-  const { startProductionServer, createProductionShutdown } = await import(pathToFileURL(launch.bundle).href)
+  const { startProductionServer, createProductionShutdown, refuseInspectorActivation, registerProductionShutdownSignals } = await import(pathToFileURL(launch.bundle).href)
+  refuseInspectorActivation()
   const server = await startProductionServer()
-  const shutdown = createProductionShutdown(server)
-  process.once('SIGINT', shutdown)
-  process.once('SIGTERM', shutdown)
+  registerProductionShutdownSignals(createProductionShutdown(server))
   console.log(`[poise] serving release ${launch.releaseId} (${launch.sha.slice(0, 12)}) from ${launch.root}`)
 }
 
