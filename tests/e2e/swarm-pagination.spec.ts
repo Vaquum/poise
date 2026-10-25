@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { feedback } from './fixtures/view-feedback'
 import { workspace } from './fixtures/workspace'
 import { settled } from './fixtures/motion'
 
@@ -17,6 +18,33 @@ function deferred() {
   let release!: () => void
   const promise = new Promise<void>(resolve => { release = resolve })
   return { promise, release }
+}
+
+// Bounded history mock: every read — first page and continuations — returns
+// at most `size` newest-first rows behind an index cursor, with an exact
+// total. Whole-history fixtures cannot exercise exhaustion or gap transitions.
+function paged<T>(logs: T[], url: URL, size: number) {
+  const cursor = url.searchParams.get('cursor')
+  const start = cursor === null ? 0 : Number(cursor)
+  const slice = logs.slice(start, start + size)
+  const next = start + slice.length
+  return { logs: slice, total: logs.length, nextCursor: next < logs.length ? String(next) : null }
+}
+
+// Settle a refresh tick: the running lane is read after the history page, so
+// its response proves both refresh inputs landed; single-page histories skip
+// that lane, so their history read is the signal instead.
+async function refreshed(page: Page, multiPage: boolean) {
+  const received = page.waitForResponse(response => {
+    const url = new URL(response.url())
+    if (url.pathname !== '/api/agent-logs') return false
+    return multiPage
+      ? url.searchParams.get('status') === 'running'
+      : !url.searchParams.has('cursor') && !url.searchParams.has('status')
+  })
+  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+  await (await received).finished()
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
 }
 
 // Process ordered mutations, rather than sampling the final DOM: a full mount
@@ -163,4 +191,245 @@ test('replay and Stop retain exact targets and busy state across pages and off-p
     await next(page).click(); await expect(stopButton).toBeEnabled()
     expect(replayBodies).toHaveLength(1); expect(stopBodies).toHaveLength(1)
   } finally { replay.release(); stop.release() }
+})
+
+for (const size of [200, 201, 400, 401]) {
+  test(`an exhausted ${size}-call history stays complete across refreshes and re-entry`, async ({ page }) => {
+    await workspace(page); await settled(page)
+    const logs = history().slice(0, size)
+    const cursorReads: string[] = []
+    const historyNotices: string[] = []
+    page.on('console', message => {
+      if (message.type() === 'info' && message.text().includes('[swarm-history]')) historyNotices.push(message.text())
+    })
+    await page.route('**/api/agent-logs**', route => {
+      const url = new URL(route.request().url())
+      if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+      const cursor = url.searchParams.get('cursor')
+      if (cursor !== null) cursorReads.push(cursor)
+      return route.fulfill({ json: paged(logs, url, 200) })
+    })
+    await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+    const pager = page.getByRole('group', { name: 'Swarm pages' })
+    const start = size - ((size - 1) % 200) - 1
+    if (size > 200) {
+      for (;;) {
+        if (!await next(page).isEnabled()) break
+        const before = await page.locator('#swarm-page').textContent()
+        await next(page).click()
+        await expect(page.locator('#swarm-page')).not.toHaveText(before!)
+      }
+      await expect(page.locator('#swarm-page')).toHaveText(`${start + 1}–${size} / ${size}`)
+      await expect(next(page)).toBeDisabled()
+    } else {
+      await expect(page.locator(rows)).toHaveCount(200)
+      await expect(pager).toBeHidden()
+    }
+    const reads = [...cursorReads]
+    const complete = async () => {
+      if (size > 200) {
+        await expect(page.locator('#swarm-page')).toHaveText(`${start + 1}–${size} / ${size}`)
+        await expect(next(page)).toBeDisabled()
+      } else {
+        await expect(pager).toBeHidden()
+      }
+      expect(cursorReads).toEqual(reads)
+    }
+    historyNotices.length = 0
+    await refreshed(page, size > 200)
+    await refreshed(page, size > 200)
+    await complete()
+    expect(historyNotices.filter(text => text.includes('Loading older runs'))).toEqual([])
+    await page.getByRole('button', { name: 'Archive', exact: true }).click()
+    const returned = page.waitForResponse(response => {
+      const url = new URL(response.url())
+      if (url.pathname !== '/api/agent-logs') return false
+      return size > 200
+        ? url.searchParams.get('status') === 'running'
+        : !url.searchParams.has('cursor') && !url.searchParams.has('status')
+    })
+    await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+    await (await returned).finished()
+    await complete()
+    expect(cursorReads).toEqual(reads)
+  })
+}
+
+test('an exhausted identical-run history keeps its pager hidden across refreshes', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const base = history().slice(0, 401)
+  const first = base[0]
+  const logs = base.map((entry) => ({ ...first, id: entry.id, response: null }))
+  const cursorReads: string[] = []
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    const cursor = url.searchParams.get('cursor')
+    if (cursor !== null) cursorReads.push(cursor)
+    return route.fulfill({ json: paged(logs, url, 200) })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(1)
+  const pager = page.getByRole('group', { name: 'Swarm pages' })
+  await expect(pager).toBeVisible()
+  for (const [fetched, count] of [[1, '400'], [2, '401']] as const) {
+    await expect(next(page)).toBeEnabled()
+    await next(page).click()
+    await expect.poll(() => cursorReads.length).toBe(fetched)
+    await expect(page.locator('#swarm-count')).toHaveText(count)
+  }
+  await expect(pager).toBeHidden()
+  expect(cursorReads).toEqual(['200', '400'])
+  await refreshed(page, true)
+  await expect(pager).toBeHidden()
+  await expect(page.locator('#swarm-pagination [data-page="next"]')).toBeDisabled()
+  expect(cursorReads).toEqual(['200', '400'])
+})
+
+test('arrivals larger than a page merge into run order and keep newest-target selection', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const old = history().slice(0, 401)
+  // The older target match is set before the first read: a continuation page
+  // never refreshes the fields of an id it already holds.
+  old[50] = { ...old[50], repo: 'acme/target', pr_id: '999' }
+  let logs: typeof old = old
+  const quarantined = [
+    { index: 1, error: 'invalid terminal outcome', id: 'b'.repeat(32),
+      repo: 'o/r', prId: '2', correlationId: 'claim-2', behavior: 'pr_review', sessionId: null },
+    { index: 2, error: 'log row is not an object', id: null,
+      repo: null, prId: null, correlationId: null, behavior: null, sessionId: null },
+  ]
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    return route.fulfill({ json: { ...paged(logs, url, 200), quarantined } })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  for (;;) {
+    if (!await next(page).isEnabled()) break
+    const before = await page.locator('#swarm-page').textContent()
+    await next(page).click()
+    await expect(page.locator('#swarm-page')).not.toHaveText(before!)
+  }
+  await expect(page.locator('#swarm-page')).toHaveText('401–401 / 401')
+  await expect(await feedback(page)).toContainText('2 unreadable worker log row(s) isolated')
+  for (const label of ['201–400 / 401', '1–200 / 401']) {
+    await previous(page).click()
+    await expect(page.locator('#swarm-page')).toHaveText(label)
+  }
+  const fresh = Array.from({ length: 300 }, (_, index) => ({
+    ...old[0], id: id(7000 + index), pr_id: `new-${index + 1}`,
+  }))
+  const gapNewest = { ...fresh[200], repo: 'acme/target', pr_id: '999' }
+  fresh[200] = gapNewest
+  logs = [...fresh, ...old]
+  await refreshed(page, true)
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 601+')
+  const first = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(first).toEqual(logs.slice(0, 200).map(entry => entry.id))
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 701+')
+  await expect(page.locator(rows)).toHaveCount(200)
+  const second = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(second).toEqual(logs.slice(200, 400).map(entry => entry.id))
+  expect(second[0]).toBe(gapNewest.id)
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:goto-swarm-row', { detail: { repo: 'acme/target', pr_id: '999' } })))
+  await expect(page.locator(`${rows}[data-id="${gapNewest.id}"]`)).toHaveClass(/agent-row-focus/)
+})
+
+test('a first continuation without overlap slots newer calls above the older cache', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const base = Date.parse('2026-10-14T08:00:00Z')
+  const at = (index: number) => new Date(base - index * 1000).toISOString()
+  const old = history().slice(0, 401).map((entry, index) => ({ ...entry, started_at: at(index) }))
+  let logs: typeof old = old
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    return route.fulfill({ json: paged(logs, url, 200) })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  for (;;) {
+    if (!await next(page).isEnabled()) break
+    const before = await page.locator('#swarm-page').textContent()
+    await next(page).click()
+    await expect(page.locator('#swarm-page')).not.toHaveText(before!)
+  }
+  await expect(page.locator('#swarm-page')).toHaveText('401–401 / 401')
+  for (const label of ['201–400 / 401', '1–200 / 401']) {
+    await previous(page).click()
+    await expect(page.locator('#swarm-page')).toHaveText(label)
+  }
+  const fresh = Array.from({ length: 400 }, (_, index) => ({
+    ...old[0], id: id(8000 + index), pr_id: `fresh-${index + 1}`,
+    started_at: new Date(base + (400 - index) * 1000).toISOString(),
+  }))
+  logs = [...fresh, ...old]
+  await refreshed(page, true)
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 601+')
+  const first = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(first).toEqual(logs.slice(0, 200).map(entry => entry.id))
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 801+')
+  await expect(page.locator(rows)).toHaveCount(200)
+  const second = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(second).toEqual(logs.slice(200, 400).map(entry => entry.id))
+  expect(second[0]).toBe(fresh[200].id)
+})
+
+test('a continuation repositions a running-feed row instead of anchoring to it', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const base = history().slice(0, 250)
+  const runningOld = { ...base[225], id: id(9000), status: 'running', completed_at: null, response: '', error: '', time_elapsed: '' }
+  const old = base.map((entry, index) => index === 225 ? runningOld : entry)
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [runningOld] } })
+    return route.fulfill({ json: paged(old, url, 200) })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 201+')
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–250 / 250')
+  await expect(page.locator(rows)).toHaveCount(50)
+  const second = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(second).toEqual(old.slice(200, 250).map(entry => entry.id))
+  await expect(next(page)).toBeDisabled()
+})
+
+test('a straddling continuation outranks older cached ties', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const old = history().slice(0, 401)
+  let logs: typeof old = old
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    return route.fulfill({ json: paged(logs, url, 200) })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  for (;;) {
+    if (!await next(page).isEnabled()) break
+    const before = await page.locator('#swarm-page').textContent()
+    await next(page).click()
+    await expect(page.locator('#swarm-page')).not.toHaveText(before!)
+  }
+  await expect(page.locator('#swarm-page')).toHaveText('401–401 / 401')
+  for (const label of ['201–400 / 401', '1–200 / 401']) {
+    await previous(page).click()
+    await expect(page.locator('#swarm-page')).toHaveText(label)
+  }
+  // Every row shares one timestamp: only the page structure can place the
+  // overlap-free continuation above the older cache it straddles.
+  const fresh = Array.from({ length: 400 }, (_, index) => ({
+    ...old[0], id: id(8100 + index), pr_id: `tied-${index + 1}`,
+  }))
+  logs = [...fresh, ...old]
+  await refreshed(page, true)
+  await expect(page.locator('#swarm-page')).toHaveText('1–200 / 601+')
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–400 / 801+')
+  await expect(page.locator(rows)).toHaveCount(200)
+  const second = await page.locator(rows).evaluateAll(elements => elements.map(element => (element as HTMLElement).dataset.id!))
+  expect(second).toEqual(logs.slice(200, 400).map(entry => entry.id))
+  expect(second[0]).toBe(fresh[200].id)
 })
