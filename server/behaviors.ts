@@ -3567,9 +3567,10 @@ async function dismissedApprovalHeld(pr: DatastorePr, head: string, model: strin
       || call.expected_head !== head || !Number.isFinite(Date.parse(claim.launchRequestedAt))
       || !Number.isFinite(Date.parse(agentCallStartedAt(call)))
       || Date.parse(agentCallStartedAt(call)) < Date.parse(claim.launchRequestedAt)
-      || call.action !== 'not_started' || call.outcome !== 'preflight_failed'
+      || (!budgetExhaustedProvenNoAction(call)
+        && (call.action !== 'not_started' || call.outcome !== 'preflight_failed'))
       || call.head_sha !== null || call.review_id != null || call.receipts != null || call.review_comments != null) return true
-    return boundedReviewFailure(call) && call.model === model
+    return boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call) && call.model === model
       || !behaviorRetryDue('approve-prs', claim.target)
   })
 }
