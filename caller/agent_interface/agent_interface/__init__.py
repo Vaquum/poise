@@ -1200,6 +1200,7 @@ def run_governed_behavior(
                 "correlation_id": correlation_id,
                 "response": response,
                 "completed_at": utc_stamp(ended_at),
+                "budget": review_budget.usage(),
                 **result,
             }, indent=2))
         except review_receipt.SubmissionError as e:

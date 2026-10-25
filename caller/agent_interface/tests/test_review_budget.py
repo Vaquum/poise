@@ -47,6 +47,28 @@ class TestReviewBudget(TestCase):
             with budget.ReviewBudget(): atoms.packet('/tmp', '#1', 'bit-mis', HEAD)
             self.assertEqual(run.call_count, 2)
 
+    def test_budget_usage_reports_elapsed_against_the_capped_allowance(self):
+        self.assertIsNone(budget.usage())
+        with patch.object(budget, 'monotonic', return_value=100), budget.ReviewBudget(3600):
+            with patch.object(budget, 'monotonic', return_value=130):
+                used = budget.usage()
+            self.assertEqual(used['total_seconds'], 1413)
+            self.assertEqual(used['used_seconds'], 30)
+        self.assertIsNone(budget.usage())
+
+    def test_terminal_progress_and_completion_report_budget_usage(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / 'calls.sqlite3'
+            with sqlite3.connect(database) as db:
+                db.execute("create table calls(id text, ended_at real, progress text)")
+                db.execute("insert into calls values('run', null, null)")
+            with budget.ReviewBudget(100), progress.Progress(database, 'run'):
+                snapshot = json.loads(progress.terminal('completed'))
+            self.assertEqual(snapshot['budget']['total_seconds'], 100)
+            self.assertGreaterEqual(snapshot['budget']['used_seconds'], 0)
+            self.assertLessEqual(snapshot['budget']['used_seconds'], 100)
+
 class TestPreparationDeadlines(TestCase):
     def test_packet_git_deadline_does_not_claim_the_total_budget_expired(self):
         diagnostic = {"version": 1, "source": "caller", "severity": "error", "operation": "fetch",
@@ -82,6 +104,20 @@ class TestRecovery(TestCase):
         self.assertEqual(row['review_policy'], 'bounded-v1')
         self.assertEqual(row['recovery_model'], 'gpt-6-astra-ultra')
         self.assertEqual(row['model'], 'opus-5-high')
+
+    def test_completion_print_reports_budget_usage(self):
+        self.mod.run.side_effect = ['done']
+        output = io.StringIO()
+        with patch.object(api, 'review_facts', side_effect=[facts(), approved()]), redirect_stdout(output):
+            try:
+                api.run_governed_behavior(self.mod, 'pr_approve', 'https://github.com/o/r/pull/1',
+                    'bit-mis', HEAD, 'poise:approve-prs', uuid4().hex, pwd=self.directory.name,
+                    model='gpt-6-astra-ultra')
+            except SystemExit:
+                pass
+        printed = json.loads(output.getvalue())
+        self.assertEqual(printed['budget']['total_seconds'], budget.REVIEW_TIMEOUT_SECONDS)
+        self.assertGreaterEqual(printed['budget']['used_seconds'], 0)
 
     def test_terminal_contract_failure_is_logged_with_its_hold_code(self):
         row = self.execute([atoms.AgentPreflightError('invalid review verdict', 'review_contract_violation')],
