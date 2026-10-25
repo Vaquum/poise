@@ -4,6 +4,11 @@ import { join } from 'node:path'
 import type { ChatRuntime } from '../server/chat/runtime'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, recordCompletedInitialReview, launchApprovalBeforeCrash, agentLog, fixture, type ReviewActivityFixture } from './behaviors-runtime-fixture'
 
+function modelOf(call: unknown[]): string {
+  const args = call[1] as string[]
+  return args[args.indexOf('--model') + 1]
+}
+
 describe('approval eligibility and review activity', () => {
 
   it('starts a current-head follow-up for a public author reply without a newer commit', async () => {
@@ -902,9 +907,7 @@ describe('approval eligibility and review activity', () => {
     expect(modules.database.listBehaviorDeadLetters()).toHaveLength(1)
   })
 
-  it('retries a budget-exhausted dismissed approval on the same head after backoff', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] })
-    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+  it('falls a budget-exhausted dismissed approval to the next slot on the same head', async () => {
     const prior = await launchApprovalBeforeCrash()
     const args: string[] = mocks.spawnDetached.mock.calls[0][1]
     const model = args[args.indexOf('--model') + 1]
@@ -918,34 +921,16 @@ describe('approval eligibility and review activity', () => {
       started_at: new Date(Date.parse(prior.requestedAt) + 1_000).toISOString(),
     })
     fixture.agentLogs = [call]
-    arrangeCli(true, false, {}, { commits_after_request: 0, response_count: 0 })
     const modules = await restartModules()
     modules.behaviors.startBehaviorsRuntime()
     await modules.behaviors.runEnabledBehaviorsOnce()
-    expect(modules.database.getFailedBehaviorLaunch('approve-prs', prior.target)).not.toBeNull()
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    // The dismissed-recovery target occupies this head: move the failed launch there.
-    const heldTarget = `${pr.repo}#${pr.number}@head=${HEAD_SHA}`
-    modules.database.db.prepare('UPDATE behavior_seen SET target = ? WHERE key = ? AND target = ?')
-      .run(heldTarget, 'approve-prs', prior.target)
-    modules.database.db.prepare('UPDATE behavior_dead_letters SET target = ? WHERE behavior = ? AND target = ?')
-      .run(heldTarget, 'approve-prs', prior.target)
-    const failureKey = `behavior_approve_prs_failure:${prior.target}`
-    const stored = modules.database.getMeta(failureKey)
-    if (!stored) throw new Error('expected a backoff failure for the budget-exhausted launch')
-    modules.database.setMeta(`behavior_approve_prs_failure:${heldTarget}`, stored)
-    modules.database.setMeta(failureKey, '')
-    await resetLogCache()
-    arrangeCli(false, false, { headSha: HEAD_SHA, reviewerLatestState: 'DISMISSED',
-      latestActivityAt: new Date().toISOString() }, { reviewer_latest_state: 'DISMISSED' })
-    fixture.listedPrs = [{ ...pr, updated_at: '2026-07-15T12:00:01Z' }]
-    // Still inside the backoff: no relaunch.
-    await modules.behaviors.runEnabledBehaviorsOnce()
-    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
-    // Past the backoff the same head relaunches through dismissed recovery.
-    vi.setSystemTime(new Date(Date.now() + modules.behaviors.BEHAVIOR_RETRY_BASE_MS))
-    await modules.behaviors.runEnabledBehaviorsOnce()
+    // No backoff wait: the next slot relaunches the same head.
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('gpt-6-astra-ultra')
     expect(mocks.spawnDetached.mock.calls[1]?.[1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+    expect(modules.behaviors.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ target: `reviewer:${model}` }),
+    ])
+    expect(modules.database.listBehaviorDeadLetters()).toEqual([])
   })
 })
