@@ -4,7 +4,9 @@ In Accounts, choose **Connect Google**, select an account in Google's ordinary
 browser page and approve access. Add Google account repeats that flow for another
 email. Rows use the same components, type scale and theme tokens as agent accounts.
 Connected, Needs sign-in and Disconnected describe the account grant; an individual
-file can still have a separate access problem.
+file can still have a separate access problem. A disconnect is acknowledged at
+once and invalidates accounts reads that started before it; out-of-order reads
+cannot replace a newer observation.
 
 Connecting from Editor Publish saves text and annotations before leaving. The
 Editor cannot change during that transition. A failed save leaves the draft on

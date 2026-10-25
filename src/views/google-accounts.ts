@@ -1,7 +1,10 @@
 import { beginGoogleConnection, escapeGoogleHtml as escape, googleCall, onGoogleNavigationReturn, takeGoogleConnectionResult, type GoogleSettings } from '../google'
 
 export function googleAccountsSection(element: HTMLElement): { refresh(): Promise<void> } {
-  let settings: GoogleSettings | null = null, busy = false
+  // Reads and the disconnect mutation share one generation: an acknowledged
+  // mutation outranks older reads, and out-of-order reads cannot replace a
+  // newer observation.
+  let settings: GoogleSettings | null = null, busy = false, generation = 0
   element.innerHTML = '<div class="st-account-group"><h3 class="tp-group-label">Google accounts</h3><div class="google-account-list st-account-group"></div><div class="st-account-actions"><button type="button" class="st-clear google-connect" disabled>Add Google account</button></div><p class="st-help st-help-info google-account-status" role="status" tabindex="-1"></p></div>'
   const status = element.querySelector<HTMLElement>('.google-account-status')!, list = element.querySelector<HTMLElement>('.google-account-list')!, add = element.querySelector<HTMLButtonElement>('.google-connect')!
   const say = (message: string, focus = false) => { status.textContent = message; if (focus) status.focus({ preventScroll: true }) }
@@ -13,11 +16,14 @@ export function googleAccountsSection(element: HTMLElement): { refresh(): Promis
     if (settings && !settings.configured) say('Google connections are unavailable. Ask the Poise operator to enable Google.')
   }
   const refresh = async () => {
+    const current = ++generation
     try {
-      settings = await googleCall<GoogleSettings>('/api/google/accounts'); render()
+      const next = await googleCall<GoogleSettings>('/api/google/accounts')
+      if (current !== generation) return
+      settings = next; render()
       const result = takeGoogleConnectionResult()
       if (result) say(result, true)
-    } catch (error) { say((error as Error).message) }
+    } catch (error) { if (current === generation) say((error as Error).message) }
   }
   element.addEventListener('click', event => {
     const target = (event.target as HTMLElement).closest<HTMLElement>('[data-google-disconnect], [data-google-reconnect], [data-google-add], .google-connect')
@@ -28,6 +34,7 @@ export function googleAccountsSection(element: HTMLElement): { refresh(): Promis
       try {
         if (target.dataset.googleDisconnect) {
           settings = await googleCall<GoogleSettings>('/api/google/disconnect', { accountId: target.dataset.googleDisconnect })
+          generation++
           say('Google account disconnected.', true)
         } else {
           say('Opening Google…')
