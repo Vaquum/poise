@@ -548,7 +548,12 @@ test.describe('in a browser on UTC', () => {
     const settings = page.locator('#settings-panel')
     const zone = settings.locator('#st-timezone')
     await expect(zone).toHaveValue('Mars/Olympus')
-    // Saving it as it is is refused, in words that name it.
+    // An untouched value is not sent: there is nothing to save until a choice is drafted.
+    await settings.locator('.st-save').click()
+    await expect(settings.locator('.st-status')).toHaveText('No changes to save.')
+    // Drafting it as it is and saving is refused, in words that name it.
+    await zone.selectOption('Europe/Helsinki')
+    await zone.selectOption('Mars/Olympus')
     await settings.locator('.st-save').click()
     await expect(settings.locator('.st-status')).toHaveText('timezone must be a time zone the Poise server knows, such as Europe/Helsinki; "Mars/Olympus" is not one')
     await zone.selectOption('Europe/Helsinki')
