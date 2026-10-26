@@ -44,7 +44,7 @@ export interface CheckoutInspection {
 
 async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure, env?: NodeJS.ProcessEnv, signal?: AbortSignal } = {}): Promise<string> {
   try {
-    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}), ...(options.env ? { env: options.env } : {}), ...(options.signal ? { signal: options.signal } : {}) })
+    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}), env: { ...options.env, GIT_OPTIONAL_LOCKS: '0' }, ...(options.signal ? { signal: options.signal } : {}) })
     return stdout
   } catch (error: any) {
     if (isAbortError(error)) throw error
