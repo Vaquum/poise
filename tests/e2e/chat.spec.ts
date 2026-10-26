@@ -994,20 +994,32 @@ test('a failed delete restores the open chat with its unsent draft', async ({ pa
   await page.locator('.chat-session-item[data-id="s2"]').click()
   await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/active/)
   await input(page).fill('unsent words')
+  // Let the opening click's own timer expire harmlessly first.
+  await page.waitForTimeout(300)
+  // Freeze the clock so the fresh click-to-open timer below is still pending
+  // when the failure lands; it must not yank the pane back afterwards. Raw
+  // clicks: checked clicks would wait on frozen frames.
+  await page.clock.install()
+  await page.clock.pauseAt(Date.now())
   const row = page.locator('.chat-session-item[data-id="s2"]')
-  await row.hover()
-  await row.locator('.chat-session-delete').click()
+  await row.dispatchEvent('click')
+  await row.locator('.chat-session-delete').dispatchEvent('click')
   await expect(row.locator('.chat-session-delete')).toHaveText('Sure?')
-  await row.locator('.chat-session-delete').click()
+  await row.locator('.chat-session-delete').dispatchEvent('click')
   await expect.poll(() => state.calls.filter((c) => c.method === 'DELETE').length).toBe(1)
   await expect(page.locator('.chat-notice')).toHaveText('Delete failed — database is locked')
+  // Past the click-to-open window: renders flush, and any uncancelled stale
+  // timer fires here.
+  await page.clock.runFor(500)
   await expect(page.locator('.chat-session-item')).toHaveCount(2)
   await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/selected/)
   // The pane stays on the survivor; reopening the restored chat brings its draft back.
   await expect(page.locator('.chat-session-item[data-id="s1"]')).toHaveClass(/active/)
-  await page.locator('.chat-session-item[data-id="s2"]').click()
+  await row.dispatchEvent('click')
+  await page.clock.runFor(300)
   await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/active/)
   await expect(input(page)).toHaveValue('unsent words')
+  await page.clock.resume()
 })
 
 test('typing into the fresh console mid-batch survives a full delete', async ({ page }) => {

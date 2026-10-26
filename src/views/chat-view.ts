@@ -681,6 +681,22 @@ let armedDelete: { id: string, until: number, bulk: string[] | null } | null = n
 let selectedIds = new Set<string>()
 let selectAnchor: string | null = null
 let clickTimer: ReturnType<typeof setTimeout> | null = null
+let clickTarget: string | null = null
+
+/** Drop a pending click-to-open, e.g. when modifiers turn the click into a
+ *  selection gesture instead. */
+function clearClickTimer(): void {
+  if (clickTimer) clearTimeout(clickTimer)
+  clickTimer = null
+  clickTarget = null
+}
+
+/** A delete supersedes a pending click-to-open for the chats it hides: the
+ *  stale timer must not yank the pane back if a failure restores them. */
+function cancelPendingOpen(targets: string[]): void {
+  if (clickTarget && targets.includes(clickTarget)) clearClickTimer()
+}
+
 let lastSidebarHtml = ''
 
 function renderSidebar(): void {
@@ -860,14 +876,14 @@ function attachSidebar(): void {
     const id = item.dataset.id!
     if (e.shiftKey) {
       e.preventDefault()
-      if (clickTimer) { clearTimeout(clickTimer); clickTimer = null }
+      clearClickTimer()
       selectRange(id)
       renderSidebar()
       return
     }
     if (e.metaKey || e.ctrlKey) {
       e.preventDefault()
-      if (clickTimer) { clearTimeout(clickTimer); clickTimer = null }
+      clearClickTimer()
       toggleSelected(id)
       renderSidebar()
       return
@@ -877,9 +893,11 @@ function attachSidebar(): void {
     selectedIds = new Set([id])
     selectAnchor = id
     renderSidebar()
-    if (clickTimer) clearTimeout(clickTimer)
+    clearClickTimer()
+    clickTarget = id
     clickTimer = setTimeout(() => {
       clickTimer = null
+      clickTarget = null
       void selectSession(id)
     }, CLICK_DELAY_MS)
   })
@@ -887,7 +905,7 @@ function attachSidebar(): void {
     if ((e.target as HTMLElement).closest('button')) return
     const item = (e.target as HTMLElement).closest<HTMLElement>('.chat-session-item')
     if (!item) return
-    if (clickTimer) { clearTimeout(clickTimer); clickTimer = null }
+    clearClickTimer()
     e.preventDefault()
     startRename(item)
   })
@@ -1034,6 +1052,7 @@ function resetAfterActiveDeleted(): void {
 async function deleteSession(id: string): Promise<void> {
   const e = sessions.get(id)
   if (!e || deleting.has(id)) return
+  cancelPendingOpen([id])
   if (e.pending) {
     const wasActive = activeId === id
     purgeDeleted(id)
@@ -1085,6 +1104,7 @@ async function deleteSession(id: string): Promise<void> {
 async function deleteSessions(ids: string[]): Promise<void> {
   const targets = ids.filter((id) => sessions.has(id) && !deleting.has(id))
   if (!targets.length) return
+  cancelPendingOpen(targets)
   // Titles up front: a target deleted concurrently is already gone when its
   // turn comes, and then no entry is left to name it from.
   const titles = new Map<string, string>()
