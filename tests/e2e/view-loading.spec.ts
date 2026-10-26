@@ -433,6 +433,53 @@ test('Snippets paints its library while GitHub settings are pending', async ({ p
 })
 
 
+for (const failSaveRead of [false, true]) test(`a snippet started during its initial read saves the current library${failSaveRead ? ' after a failed read and retry' : ''}`, async ({ page }) => {
+  await setup(page, 'snippets')
+  const initial = deferred(), saving = deferred()
+  const retained = { trigger: ';retained', replace: 'Keep the existing snippet' }
+  const newer = { trigger: ';newer', replace: 'Added by another tab' }
+  let reads = 0
+  const writes: Array<{ snippets: Array<{ trigger: string, replace: string }>, base_version: string }> = []
+  await page.route('**/api/snippets', async route => {
+    if (route.request().method() === 'PUT') {
+      const body = route.request().postDataJSON() as typeof writes[number]
+      writes.push(body)
+      return route.fulfill({ json: { snippets: body.snippets, version: 'saved' } })
+    }
+    const read = ++reads
+    if (read === 1) await initial.promise
+    if (read === 2) await saving.promise
+    if (read === 2 && failSaveRead) return route.fulfill({ status: 503, json: { error: 'Library temporarily unavailable' } })
+    return route.fulfill({ json: { snippets: read === 1 ? [retained] : [retained, newer], version: read === 1 ? 'initial' : 'current' } })
+  })
+  try {
+    await page.goto('/')
+    await expect.poll(() => reads).toBe(1)
+    await page.getByRole('button', { name: 'Add snippet', exact: true }).click()
+    await page.getByLabel('Snippet trigger', { exact: true }).fill(';draft')
+    const body = page.getByLabel('Snippet instructions', { exact: true })
+    await body.fill('Keep my draft')
+    const received = page.waitForResponse(response => new URL(response.url()).pathname === '/api/snippets')
+    initial.release()
+    await (await received).finished()
+    await expect(body).toHaveValue('Keep my draft')
+    const save = page.locator('.snip-save')
+    await save.click()
+    await expect.poll(() => reads).toBe(2)
+    await expect(save).toBeDisabled()
+    saving.release()
+    if (failSaveRead) {
+      await expect(await feedback(page, 'Snippets could not be read')).toContainText('Library temporarily unavailable')
+      await expect(body).toHaveValue('Keep my draft')
+      await expect(save).toBeEnabled()
+      expect(writes).toHaveLength(0)
+      await save.click()
+    }
+    await expect(page.locator('.snip-row[data-trigger=";draft"]')).toContainText('Keep my draft')
+    expect(writes).toEqual([{ snippets: [retained, newer, { trigger: ';draft', replace: 'Keep my draft' }], base_version: 'current' }])
+  } finally { initial.release(); saving.release() }
+})
+
 test('returning to Editor retries the remembered file while its original library read is pending', async ({ page }) => {
   await setup(page, 'editor', 'remembered')
   await editorDocuments(page)

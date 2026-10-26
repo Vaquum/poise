@@ -336,6 +336,16 @@ async function save(editRow: HTMLTableRowElement) {
   const replace = bodyInput.value
   if (!trigger) { setStatus('Trigger is required.', 'error'); triggerInput.focus(); return }
   if (!replace.trim()) { setStatus('Snippet body is required.', 'error'); bodyInput.focus(); return }
+  if (!snippetVersion) {
+    saving = true
+    setMutationDisabled(editRow, true)
+    try {
+      if (!await fetchSnippets()) return
+    } finally {
+      saving = false
+      setMutationDisabled(editRow, false)
+    }
+  }
   if (editingTrigger != null && !snippets.some((s) => s.trigger === editingTrigger)) {
     setStatus('This snippet was removed or renamed elsewhere. Your edit is preserved; copy it before reloading.', 'error')
     return
