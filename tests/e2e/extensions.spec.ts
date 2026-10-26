@@ -168,17 +168,32 @@ test('imports a pasted configuration, storing what looks like a key as a secret'
 })
 
 
-test('a failed removal restores the server in place and permits retry', async ({ page }) => {
+async function seedDisabledServers(page: Page, titles: string[]): Promise<void> {
   await open(page)
   await removeAll(page)
-  for (const title of ['Before', 'Remove me', 'After']) {
+  for (const title of titles) {
     const created = await page.request.post('/api/extensions/servers', { data: {
       spec: { name: title.toLowerCase().replaceAll(' ', '-'), title, source: 'custom', transport: 'stdio', command: process.execPath, args: [fixture], env: [], auth: 'none' },
       secrets: {}, enabled: { default: false, workspaces: { local: false } },
     } })
     expect(created.ok()).toBe(true)
   }
+  await expect.poll(async () => {
+    const state = await (await page.request.get('/api/extensions')).json() as { directory: { syncing: boolean }, servers: Array<{ status: { state: string } }> }
+    return !state.directory.syncing && state.servers.every(server => server.status.state !== 'checking')
+  }).toBe(true)
   await page.reload()
+  await expect(page.locator('.ext-matrix tbody tr')).toHaveCount(titles.length)
+}
+
+function heldReply() {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => { release = resolve })
+  return { promise, release }
+}
+
+test('a failed removal retains the server in place and permits retry', async ({ page }) => {
+  await seedDisabledServers(page, ['Before', 'Remove me', 'After'])
   const row = page.locator('.ext-matrix tbody tr', { hasText: 'Remove me' })
   await expect(row).toBeVisible()
   const order = await page.locator('.ext-matrix .ext-server b').allTextContents()
@@ -214,4 +229,52 @@ test('a failed removal restores the server in place and permits retry', async ({
     await expect(row).toHaveCount(0)
     expect(((await (await page.request.get('/api/extensions')).json()).servers as Array<{ id: string }>).some(server => server.id === id)).toBe(false)
   } finally { release() }
+})
+
+
+test('removing a server already deleted in another tab reconciles its absence', async ({ page }) => {
+  await seedDisabledServers(page, ['Already gone'])
+  const row = page.locator('.ext-matrix tbody tr', { hasText: 'Already gone' })
+  const id = await row.getAttribute('data-id')
+  await row.locator('.ext-col-server').click()
+  await page.locator('#extensions-panel [data-remove]').click()
+  expect((await page.request.delete(`/api/extensions/servers/${id}`)).ok()).toBe(true)
+  const deleted = page.waitForResponse(response => response.request().method() === 'DELETE' && response.url().endsWith(`/${id}`))
+  await page.locator('#extensions-panel [data-remove-yes]').click()
+  expect((await deleted).status()).toBe(404)
+  await expect(row).toHaveCount(0)
+  await expect(page.locator('.ext-notice')).toHaveText('Already gone removed. Chats lose its tools from their next turn.')
+})
+
+for (const completion of [[0, 1], [1, 0]]) test(`overlapping failed removals keep server order, completion ${completion.join('-')}`, async ({ page }) => {
+  await seedDisabledServers(page, ['Alpha', 'Beta', 'Gamma'])
+  const rows = page.locator('.ext-matrix tbody tr')
+  const order = await page.locator('.ext-matrix .ext-server b').allTextContents()
+  const ids = await rows.evaluateAll(elements => elements.map(element => element.getAttribute('data-id')!))
+  const targets = ids.slice(0, 2)
+  const gates = targets.map(() => heldReply())
+  const requested: string[] = []
+  await page.route('**/api/extensions/servers/*', async route => {
+    const id = new URL(route.request().url()).pathname.split('/').at(-1)!
+    const index = targets.indexOf(id)
+    if (route.request().method() !== 'DELETE' || index < 0) return route.continue()
+    requested.push(id)
+    await gates[index].promise
+    await route.fulfill({ status: 503, json: { error: `Removal failed: ${id}` } })
+  })
+  try {
+    for (const id of targets) {
+      await page.locator(`.ext-matrix tr[data-id="${id}"] .ext-col-server`).click()
+      await page.locator('#extensions-panel [data-remove]').click()
+      await page.locator('#extensions-panel [data-remove-yes]').click()
+      await expect.poll(() => requested).toContain(id)
+    }
+    await expect(page.locator('.ext-matrix .ext-server b')).toHaveText(order)
+    for (const index of completion) {
+      gates[index].release()
+      await expect(page.locator('.ext-notice')).toContainText(`Removal failed: ${targets[index]}`)
+      await expect(page.locator('.ext-matrix .ext-server b')).toHaveText(order)
+    }
+    expect(((await (await page.request.get('/api/extensions')).json()).servers as Array<unknown>)).toHaveLength(3)
+  } finally { for (const gate of gates) gate.release() }
 })

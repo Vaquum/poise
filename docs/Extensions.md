@@ -26,8 +26,8 @@ Turning a server off, editing it or removing it applies from each chat's
 next turn. A turn already running keeps the tools it started with. Removing a
 server also removes its secrets and Activity; a check or sign-in still running
 for it finishes without recording anything.
-If removal fails, the server stays in its original place in the list so the
-removal can be retried.
+The row stays in place until removal is confirmed. A failed removal can be
+retried; a server already removed in another tab is treated as removed.
 
 ## Directory
 
