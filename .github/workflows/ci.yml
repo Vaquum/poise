@@ -106,8 +106,9 @@ jobs:
     name: Unit & integration (${{ matrix.shard }})
     runs-on: ubuntu-latest
     # One worker per shard keeps process/lease fixtures from competing with
-    # another file. Keep test deadlines; allow the serial file execution.
-    timeout-minutes: 15
+    # another file. The affected-test fallback can run the full suite here.
+    # Keep test deadlines; allow that serial execution to finish.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
