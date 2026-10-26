@@ -34,7 +34,8 @@ Pull requests use `.github/workflows/ci.mjs` to select work against the PR base 
   browser suites, plus `smoke`, `service-mode` and `independent-startup`.
   Changed browser specs are included directly. These runs use one unit and one
   browser shard. An empty Vitest graph runs all unit tests instead of passing
-  without tests.
+  without tests. The unit job has a 25-minute budget for that serial fallback;
+  individual test deadlines stay unchanged.
 - Shared code, configuration, fixtures, deleted source/tests and unknown paths
   run all gates. The frontend-to-browser mapping is deliberately conservative;
   adding an unmapped surface keeps full coverage.
