@@ -118,6 +118,13 @@ const sessions = new Map<string, SessionEntry>()
 let discoveryRevision = 0
 let order: string[] = []
 let activeId: string | null = null
+// Chats hidden while their DELETE is in flight: they stay in `sessions` and
+// `order` so a failure restores them in place with pins intact, and so reload
+// paths cannot resurrect what was never removed.
+const deleting = new Set<string>()
+// Bulk deletes run with bounded concurrency so one slow stop or lease wait
+// does not hold the rest; the browser allows about six connections per origin.
+const DELETE_CONCURRENCY = 5
 let agentsInfo: AgentsResponse | null = null
 let agentsPromise: Promise<AgentsResponse | null> | null = null
 let renderQueued = false
@@ -523,6 +530,7 @@ function attachReloadGuards(): void {
     if (memories.editor.state.dirty) blockers.push('unsaved:memories')
     if (memories.editor.state.saving || memorySubmissions) blockers.push('saving:memories')
     if (chatClient.pendingCount() > 0 || modelUpdates.size || pendingSwitchDrafts.size) blockers.push('command')
+    if (deleting.size > 0) blockers.push('command')
     if (composer.isUploading()) blockers.push('upload')
     if (quickSessionPromise || firstPromptPending) blockers.push('session-create')
     for (const e of sessions.values()) if (e.pending) { blockers.push('session-create'); break }
@@ -595,10 +603,12 @@ function sortOrder(): void {
   // New sessions join the end, deleted ones leave; a restored order keeps its
   // slots, so pins survive a reload, while unpinned chats take change order.
   // Pins are not pruned here: records arrive one at a time, and a pin whose
-  // session has not been upserted yet must survive until it is seen.
+  // session has not been upserted yet must survive until it is seen. A chat
+  // hidden by an in-flight delete holds its slot like a pin, so a failure
+  // restores it where it was.
   for (const id of sessions.keys()) if (!order.includes(id)) order.push(id)
   order = order.filter((id) => sessions.has(id))
-  order = applyWorklogOrder(order, (id) => pins.has(id), compareEntries,
+  order = applyWorklogOrder(order, (id) => pins.has(id) || deleting.has(id), compareEntries,
     (id) => sessions.get(id)!.pending || sessions.get(id)!.record.role === 'manager')
 }
 
@@ -639,10 +649,11 @@ async function readSessions(): Promise<void> {
     const seen = new Set<string>()
     for (const s of list) { upsertRecord(s); seen.add(s.id) }
     // Sessions gone from the server (deleted elsewhere) leave the list, but a
-    // pending one the server has not answered for yet stays.
+    // pending one the server has not answered for yet stays, as does one
+    // hidden by its own in-flight delete until that DELETE answers.
     for (const id of Array.from(sessions.keys())) {
       const e = sessions.get(id)!
-      if (!seen.has(id) && !e.pending && discoveryAtRequest === discoveryRevision) {
+      if (!seen.has(id) && !e.pending && !deleting.has(id) && discoveryAtRequest === discoveryRevision) {
         sessions.delete(id)
         order = order.filter((x) => x !== id)
         pins.delete(id)
@@ -687,6 +698,12 @@ function listed(id: string): boolean {
   return record?.context?.kind !== 'switchboard' || !!record.forkedFrom
 }
 
+/** Sidebar-visible: listed and not hidden by an in-flight delete. `listed()`
+ *  alone still drives the header's Switchboard observer mode. */
+function isVisible(id: string): boolean {
+  return listed(id) && !deleting.has(id)
+}
+
 /** The chat that created this one, when one did: the live creator while it
  *  exists (following renames), the frozen snapshot once it is gone. */
 function creatorHtml(s: SessionRecord): string {
@@ -702,7 +719,7 @@ function creatorHtml(s: SessionRecord): string {
 }
 
 function sidebarHtml(): string {
-  const visible = order.filter(listed)
+  const visible = order.filter(isVisible)
   if (!visible.length) {
     return '<div class="chat-empty chat-sidebar-empty">No sessions yet.</div>'
   }
@@ -749,7 +766,7 @@ function unpinSession(id: string): void {
 function placePinned(id: string, slot: number): void {
   if (sessions.get(id)?.record.role === 'manager') return
   const rest = order.filter((x) => x !== id)
-  const restVisible = rest.filter(listed)
+  const restVisible = rest.filter(isVisible)
   const at = Math.max(0, Math.min(restVisible.length, slot))
   const anchor = restVisible[at]
   const index = anchor ? rest.indexOf(anchor) : rest.length
@@ -761,7 +778,7 @@ function placePinned(id: string, slot: number): void {
 }
 
 function moveSession(id: string, delta: -1 | 1): void {
-  const visible = order.filter(listed)
+  const visible = order.filter(isVisible)
   const from = visible.indexOf(id)
   if (from < 0) return
   const to = Math.max(0, Math.min(visible.length - 1, from + delta))
@@ -772,7 +789,7 @@ function moveSession(id: string, delta: -1 | 1): void {
 /** Shift+click: everything between the anchor and `id` in list order. The
  *  anchor falls back to the open chat, so a first shift+click still spans. */
 function selectRange(id: string): void {
-  const visible = order.filter(listed)
+  const visible = order.filter(isVisible)
   if (!visible.includes(id)) return
   if (!selectAnchor || !visible.includes(selectAnchor)) selectAnchor = activeId && visible.includes(activeId) ? activeId : id
   const from = visible.indexOf(selectAnchor)
@@ -782,7 +799,7 @@ function selectRange(id: string): void {
 
 /** Cmd/Ctrl+click: one chat in or out; the anchor follows the click. */
 function toggleSelected(id: string): void {
-  if (!sessions.has(id)) return
+  if (!sessions.has(id) || deleting.has(id)) return
   if (selectedIds.has(id)) selectedIds.delete(id)
   else selectedIds.add(id)
   selectAnchor = id
@@ -823,7 +840,7 @@ function attachSidebar(): void {
       if (!armed) {
         // Deleting from inside a multi-selection arms the whole selection.
         const bulk = selectedIds.size > 1 && selectedIds.has(id)
-          ? order.filter((x) => listed(x) && selectedIds.has(x))
+          ? order.filter((x) => isVisible(x) && selectedIds.has(x))
           : null
         armedDelete = { id, until: Date.now() + DELETE_ARM_MS, bulk }
         renderSidebar()
@@ -928,7 +945,7 @@ function attachSidebar(): void {
       unpinSession(id)
       return
     }
-    const visible = order.filter(listed)
+    const visible = order.filter(isVisible)
     let slot = end ? visible.length - 1 : visible.indexOf(id)
     if (target) {
       const restVisible = visible.filter((x) => x !== id)
@@ -983,20 +1000,19 @@ function startRename(item: HTMLElement): void {
   input.addEventListener('blur', () => { void finish(true) })
 }
 
-/** One chat gone on the server (which stops a running one first) and out of
- *  the local list. Single and bulk delete share this path. */
-async function destroySession(id: string, e: SessionEntry): Promise<boolean> {
-  const removed = !e.pending ? (await chatClient.deleteSession(id)).workspaceRemoved : false
+/** One chat purged locally after its DELETE succeeded. Failures never reach
+ *  here, so pins and order survive for the restore. */
+function purgeDeleted(id: string): void {
   chatClient.unsubscribe(id)
   sessions.delete(id)
   order = order.filter((x) => x !== id)
   pins.delete(id)
   selectedIds.delete(id)
   if (selectAnchor === id) selectAnchor = null
-  return removed
+  deleting.delete(id)
 }
 
-/** The open chat is gone: blank the pane and move to the next listed one. */
+/** The open chat is gone: blank the pane and move to the next visible one. */
 function resetAfterActiveDeleted(): void {
   // Nothing is on screen now; selecting the next session must treat it
   // as a switch (fresh transcript, its own draft), not a no-op.
@@ -1004,59 +1020,136 @@ function resetAfterActiveDeleted(): void {
   composerStateFor(null)
   transcript.clear()
   composer.setDraft(freshDraft)
-  const next = order.find(listed)
+  const next = order.find(isVisible)
   if (next) void selectSession(next)
   else { composer.setDraft(freshDraft); setNotice(null) }
 }
 
 async function deleteSession(id: string): Promise<void> {
   const e = sessions.get(id)
-  if (!e) return
+  if (!e || deleting.has(id)) return
+  if (e.pending) {
+    const wasActive = activeId === id
+    purgeDeleted(id)
+    if (wasActive) resetAfterActiveDeleted()
+    queueRender()
+    return
+  }
+  const workspaceKind = e.record.workspaceKind
+  const wasActive = activeId === id
+  deleting.add(id)
+  selectedIds.delete(id)
+  if (selectAnchor === id) selectAnchor = null
+  if (wasActive) resetAfterActiveDeleted()
+  setNotice('Deleting 1 chat…', 'info')
+  queueRender()
   try {
-    const removed = await destroySession(id, e)
-    if (activeId === id) resetAfterActiveDeleted()
+    const { workspaceRemoved } = await chatClient.deleteSession(id)
+    purgeDeleted(id)
     // The server reports what the delete actually did; only a Poise-local
     // session can take a workspace with it.
-    if (removed) setNotice('Session deleted; its workspace was removed.', 'info')
-    else if (e.record.workspaceKind === 'poise-local') setNotice('Session deleted; its workspace was kept.', 'info')
+    if (workspaceRemoved) setNotice('Session deleted; its workspace was removed.', 'info')
+    else if (workspaceKind === 'poise-local') setNotice('Session deleted; its workspace was kept.', 'info')
+    else setNotice('Session deleted.', 'info')
     queueRender()
   } catch (err) {
+    // A 404 means another tab or cleanup already deleted it: the outcome the
+    // user asked for, so count it as deleted instead of failing.
+    if (err instanceof ChatHttpError && err.status === 404) {
+      purgeDeleted(id)
+      setNotice('Session deleted.', 'info')
+      queueRender()
+      return
+    }
+    deleting.delete(id)
+    selectedIds.add(id)
+    if (!selectAnchor) selectAnchor = id
+    // The pane blanked at click time when nothing visible remained; reopen
+    // the restored row unless the user moved on meanwhile.
+    if (wasActive && !activeId && sessions.has(id)) resetAfterActiveDeleted()
     setNotice(`Delete failed — ${(err as Error).message}`)
     queueRender()
   }
 }
 
-/** Delete a multi-selection after its single confirmation. A failure deletes
- *  nothing further for that chat but never stops the rest; the notice then
- *  reports the count plus each failure with its reason. */
+/** Delete a multi-selection after its single confirmation. The rows hide in
+ *  the same frame; the DELETEs run behind with bounded concurrency, so one
+ *  slow stop never holds the rest. A failure restores its row in place with
+ *  its pin intact and stays selected, and the notice names every failure. */
 async function deleteSessions(ids: string[]): Promise<void> {
-  const targets = ids.filter((id) => sessions.has(id))
+  const targets = ids.filter((id) => sessions.has(id) && !deleting.has(id))
   if (!targets.length) return
   // Titles up front: a target deleted concurrently is already gone when its
   // turn comes, and then no entry is left to name it from.
   const titles = new Map<string, string>()
   for (const id of targets) titles.set(id, sessionTitle(sessions.get(id)!.record))
-  const failures: { title: string, message: string }[] = []
-  let deleted = 0
-  for (const id of targets) {
-    const e = sessions.get(id)
-    if (!e) {
-      failures.push({ title: titles.get(id)!, message: 'already deleted' })
-      continue
-    }
-    try {
-      await destroySession(id, e)
-      deleted += 1
-    } catch (err) {
-      failures.push({ title: sessionTitle(e.record), message: (err as Error).message })
+  const prevAnchor = selectAnchor
+  const wasActiveDeleted = !!activeId && targets.includes(activeId)
+  // Pending sessions never reached the server: purge them at once.
+  const pendingTargets = targets.filter((id) => sessions.get(id)!.pending)
+  for (const id of pendingTargets) purgeDeleted(id)
+  const networkTargets = targets.filter((id) => sessions.has(id))
+  for (const id of networkTargets) {
+    deleting.add(id)
+    selectedIds.delete(id)
+    if (selectAnchor === id) selectAnchor = null
+  }
+  if (activeId && targets.includes(activeId)) resetAfterActiveDeleted()
+  if (!networkTargets.length) {
+    setNotice(`Deleted ${targets.length} ${targets.length === 1 ? 'chat' : 'chats'}.`, 'info')
+    queueRender()
+    return
+  }
+  setNotice(`Deleting ${targets.length} ${targets.length === 1 ? 'chat' : 'chats'}…`, 'info')
+  queueRender()
+  type DeleteResult = { id: string, ok: true } | { id: string, ok: false, title: string, message: string }
+  const results: DeleteResult[] = new Array(networkTargets.length)
+  let cursor = 0
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = cursor++
+      if (index >= networkTargets.length) return
+      const id = networkTargets[index]!
+      if (!sessions.has(id)) {
+        results[index] = { id, ok: false, title: titles.get(id)!, message: 'already deleted' }
+        deleting.delete(id)
+        continue
+      }
+      try {
+        await chatClient.deleteSession(id)
+        purgeDeleted(id)
+        results[index] = { id, ok: true }
+      } catch (err) {
+        if (err instanceof ChatHttpError && err.status === 404) {
+          purgeDeleted(id)
+          results[index] = { id, ok: true }
+        } else {
+          deleting.delete(id)
+          results[index] = { id, ok: false, title: titles.get(id)!, message: (err as Error).message }
+        }
+      }
     }
   }
-  // Successes already left the selection in destroySession; failures stay
-  // selected so the list still shows what the notice names.
-  // Only the open chat's own deletion moves the pane, read fresh like the
-  // single delete does: the user may have opened a survivor mid-flight, and
-  // a JEV builder holds an activeId outside the sessions map that must stay.
-  if (activeId && targets.includes(activeId) && !sessions.has(activeId)) resetAfterActiveDeleted()
+  await Promise.all(Array.from({ length: Math.min(DELETE_CONCURRENCY, networkTargets.length) }, () => worker()))
+  let deleted = pendingTargets.length
+  const failures: { title: string, message: string }[] = []
+  const failedIds: string[] = []
+  for (const r of results) {
+    if (r.ok) deleted += 1
+    else {
+      failures.push({ title: r.title, message: r.message })
+      failedIds.push(r.id)
+      selectedIds.add(r.id)
+    }
+  }
+  if (!selectAnchor && failedIds.length) {
+    selectAnchor = prevAnchor && failedIds.includes(prevAnchor) ? prevAnchor : failedIds[0]!
+  }
+  // The pane blanked at click time when nothing visible remained; reopen the
+  // first survivor now unless the user moved on, and never steal a survivor
+  // opened mid-flight. A JEV builder holds an activeId outside the sessions
+  // map that must stay.
+  if (wasActiveDeleted && !activeId) resetAfterActiveDeleted()
   if (!failures.length) {
     setNotice(`Deleted ${deleted} ${deleted === 1 ? 'chat' : 'chats'}.`, 'info')
   } else {
@@ -1071,7 +1164,7 @@ async function deleteSessions(ids: string[]): Promise<void> {
 async function selectSession(id: string, restoring = false): Promise<void> {
   if (!restoring) jev?.leave(); mainEl?.classList.remove('jev-mode')
   const e = sessions.get(id)
-  if (!e) return
+  if (!e || deleting.has(id)) return
   if (!activeId) freshDraft = composer.getDraft()
   if (activeId && activeId !== id) {
     const prev = sessions.get(activeId)
