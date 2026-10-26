@@ -212,7 +212,7 @@ test('pointer takeover uses the moving sidebar width and releases the spring', a
   await expect(page.locator('#view-chat')).not.toHaveClass(/chat-sidebar-resizing/)
 })
 
-test('a delayed session deletion cannot flash outside a collapsed sidebar fade', async ({ page }) => {
+test('an immediate session deletion cannot flash outside a collapsed sidebar fade', async ({ page }) => {
   await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'chat') })
   const state = makeState([session(), session({ id: 's2', title: 'Remaining session' })])
   await installRoutes(page, state); await installSocket(page)
@@ -227,8 +227,8 @@ test('a delayed session deletion cannot flash outside a collapsed sidebar fade',
   await page.goto('/'); await settled(page)
   const row = page.locator('.chat-session-list > [data-id="s1"]')
   const original = await row.elementHandle()
-  await row.locator('.chat-session-delete').click(); await row.locator('.chat-session-delete').click()
-  await expect.poll(() => requested).toBe(true)
+  // Collapse first: the row hides on the next frame after confirming, so the
+  // removal lands mid-fade and must not flash outside it.
   await page.getByRole('button', { name: 'Toggle sessions' }).click()
   await freeze(page)
   await expect(page.locator('.chat-session-list')).toHaveCSS('opacity', '0')
@@ -239,14 +239,18 @@ test('a delayed session deletion cannot flash outside a collapsed sidebar fade',
       for (const record of records) for (const node of record.addedNodes) if (node instanceof HTMLElement && node.matches('.chat-session-item[data-flow-retiring]')) window.retiredSessionOpacities.push(Number(getComputedStyle(node).opacity))
     }).observe(document.body, { childList: true })
   })
-  releaseDelete(); await resume(page)
+  // Raw clicks: a checked click would scroll or wait on frozen frames.
+  await row.locator('.chat-session-delete').dispatchEvent('click'); await row.locator('.chat-session-delete').dispatchEvent('click')
+  await expect.poll(() => requested).toBe(true)
+  await resume(page)
   await expect.poll(() => original!.evaluate(element => element.isConnected)).toBe(false)
   expect(await page.evaluate(() => window.retiredSessionOpacities.every(opacity => opacity === 0))).toBe(true)
+  releaseDelete()
   await settled(page)
   await expect(page.locator('.chat-session-list > [data-id="s2"]')).toHaveCount(1)
 })
 
-test('a delayed session deletion cannot reveal a row scrolled above its list', async ({ page }) => {
+test('an immediate session deletion cannot reveal a row scrolled above its list', async ({ page }) => {
   await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'chat') })
   const state = makeState(Array.from({ length: 40 }, (_, index) => session({ id: `s${index + 1}`, title: `Session ${index + 1}` })))
   await installRoutes(page, state); await installSocket(page)
@@ -260,8 +264,8 @@ test('a delayed session deletion cannot reveal a row scrolled above its list', a
   })
   await page.goto('/'); await settled(page)
   const row = page.locator('.chat-session-list > [data-id="s1"]'), original = await row.elementHandle()
-  await row.locator('.chat-session-delete').click(); await row.locator('.chat-session-delete').click()
-  await expect.poll(() => requested).toBe(true)
+  // Scroll first: the row hides on the next frame after confirming, so the
+  // removal must not resurrect what scrolled out of view.
   const presentation = await page.locator('.chat-session-list').evaluate(element => {
     const row = element.querySelector<HTMLElement>('[data-id="s1"]')!
     element.scrollTop += row.getBoundingClientRect().bottom - element.getBoundingClientRect().top + 2
@@ -273,9 +277,12 @@ test('a delayed session deletion cannot reveal a row scrolled above its list', a
   })
   expect(presentation.top).toBeGreaterThan(0)
   expect(presentation.bottom).toBeLessThan(presentation.clip)
-  releaseDelete()
+  // Raw clicks: a checked click would scroll the row back into view first.
+  await row.locator('.chat-session-delete').dispatchEvent('click'); await row.locator('.chat-session-delete').dispatchEvent('click')
+  await expect.poll(() => requested).toBe(true)
   await expect.poll(() => original!.evaluate(element => element.isConnected)).toBe(false)
   expect(await page.evaluate(() => window.retiredSessionOpacities)).toEqual([])
+  releaseDelete()
   await settled(page)
 })
 
