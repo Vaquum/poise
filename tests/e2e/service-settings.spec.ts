@@ -74,6 +74,15 @@ async function setup(page: Page, mode: 'service' | 'local', isAdmin = false) {
         state.admin.users = state.admin.users.map((user) => user.handle === body?.handle ? { ...user, disabled: true, access: 'disabled by octocat' } : user)
         return route.fulfill({ json: state.admin })
       }
+      if (path === 'admin/users/enable') {
+        state.admin.users = state.admin.users.map((user) => user.handle === body?.handle ? { ...user, disabled: false, access: 'allow list' } : user)
+        return route.fulfill({ json: state.admin })
+      }
+      if (['admin/workspaces/start', 'admin/workspaces/stop', 'admin/workspaces/restart'].includes(path)) {
+        state.admin.users = state.admin.users.map((user) => user.handle === body?.handle
+          ? { ...user, workspace: { state: path.endsWith('/stop') ? 'exited' : 'running', image: user.workspace?.image ?? null } } : user)
+        return route.fulfill({ json: state.admin })
+      }
       return route.fulfill({ status: 404, json: { error: 'not_found', message: 'There is nothing at this address.' } })
     }
     if (url.pathname === '/api/workspace') return route.fulfill({ json: mode === 'service' ? { mode: 'service', owner: 'octocat' } : { mode: 'local' } })
@@ -236,6 +245,29 @@ test('gives the gateway\'s admins an Admin tab that manages people and workspace
   await expect(page.locator('.st-tabs')).toHaveCount(0)
   await page.getByRole('button', { name: 'Back to menu' }).click()
   await expect(page.locator('#menu-popover [data-settings="admin"]')).toBeVisible()
+})
+
+test('Admin keeps distinct user and workspace controls through consecutive changes', async ({ page }) => {
+  const state = await setup(page, 'service', true)
+  state.admin.users[1].disabled = true
+  await page.goto('/?settings=admin')
+  const alice = page.locator('.ad-user[data-user="alice"]')
+  const changes = [
+    ['users/enable', 'Enable', 'alice is enabled.'],
+    ['workspaces/start', 'Start', 'The workspace of alice is started.'],
+    ['workspaces/stop', 'Stop', 'The workspace of alice is stopped.'],
+    ['workspaces/restart', 'Restart', 'The workspace of alice is restarted.'],
+  ] as const
+  for (const [change, label, status] of changes) {
+    await alice.getByRole('button', { name: label, exact: true }).click()
+    await expect(page.locator('.ad-status')).toHaveText(status)
+    for (const name of ['Start', 'Stop', 'Restart', 'Disable']) {
+      await expect(alice.getByRole('button', { name, exact: true })).toBeVisible()
+    }
+    expect(state.gatewayCalls.at(-1)).toEqual({ path: `admin/${change}`, body: { handle: 'alice' } })
+  }
+  await expect(alice.locator('.ad-user-state')).toHaveText('running')
+  await expect(page.locator('.ad-user[data-user="octocat"] .ad-actions button')).toHaveText(['Start', 'Stop', 'Restart'])
 })
 
 test('gateway Admin disk warnings are amber and start failures stay red in both themes', async ({ page }) => {
