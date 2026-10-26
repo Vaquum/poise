@@ -90,6 +90,7 @@ test('marks /worker as built in, edits it without a Delete, and refuses it in no
   expect(sock.framesOf('prompt')).toEqual([])
 
   await page.locator('.chat-session-item[data-id="s1"]').click()
+  await expect(page.locator('.chat-session-item[data-id="s1"]')).toHaveClass(/active/)
   await input(page).fill('/reset /worker hello')
   await input(page).press('Enter')
   await expect(page.locator('.chat-notice')).toHaveText('/worker is not supported in non-worker chats.')
