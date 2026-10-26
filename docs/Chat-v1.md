@@ -249,7 +249,17 @@ its own scratch workspace only when no other session still uses it, its
 branch tip never moved, and its tree is clean; otherwise the workspace is
 kept, and the delete confirmation says which applies. Lock files are never
 deleted, and no server sweeps workspaces by its own session table: development
-and production share the chat root but keep separate session tables. A setting
+and production share the chat root but keep separate session tables.
+Shift+click selects a range in list order and Cmd/Ctrl+click toggles one
+chat; Esc clears the selection and a plain click starts a fresh one.
+Deleting from inside a multi-selection arms one confirmation naming the
+count, and confirming hides every selected row in the same frame while the
+DELETEs run behind with bounded concurrency, so one slow stop never holds
+the rest; single delete hides its row the same way. The open chat moves to
+the first remaining chat at once. A failure restores its row where it was,
+still pinned and selected, and the notice names each failure; a target
+already gone on the server counts as deleted. A delete in flight blocks a
+safe reload until it answers. A setting
 caps concurrently running heavy work (default 4): Poise-local turns and the
 agent runs background behaviors launch draw from the one pool, so builds and
 test suites cannot pile past the cap no matter which surface started them. A
