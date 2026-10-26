@@ -438,7 +438,7 @@ for (const failSaveRead of [false, true]) test(`a snippet started during its ini
   const initial = deferred(), saving = deferred()
   const retained = { trigger: ';retained', replace: 'Keep the existing snippet' }
   const newer = { trigger: ';newer', replace: 'Added by another tab' }
-  let reads = 0
+  let initialReads = 0, saveReads = 0, saveStarted = false
   const writes: Array<{ snippets: Array<{ trigger: string, replace: string }>, base_version: string }> = []
   await page.route('**/api/snippets', async route => {
     if (route.request().method() === 'PUT') {
@@ -446,15 +446,16 @@ for (const failSaveRead of [false, true]) test(`a snippet started during its ini
       writes.push(body)
       return route.fulfill({ json: { snippets: body.snippets, version: 'saved' } })
     }
-    const read = ++reads
-    if (read === 1) await initial.promise
-    if (read === 2) await saving.promise
-    if (read === 2 && failSaveRead) return route.fulfill({ status: 503, json: { error: 'Library temporarily unavailable' } })
-    return route.fulfill({ json: { snippets: read === 1 ? [retained] : [retained, newer], version: read === 1 ? 'initial' : 'current' } })
+    const savingDraft = saveStarted
+    if (!savingDraft) { initialReads++; await initial.promise }
+    const read = savingDraft ? ++saveReads : 0
+    if (read === 1) await saving.promise
+    if (read === 1 && failSaveRead) return route.fulfill({ status: 503, json: { error: 'Library temporarily unavailable' } })
+    return route.fulfill({ json: { snippets: savingDraft ? [retained, newer] : [retained], version: savingDraft ? 'current' : 'initial' } })
   })
   try {
     await page.goto('/')
-    await expect.poll(() => reads).toBe(1)
+    await expect.poll(() => initialReads).toBeGreaterThan(0)
     await page.getByRole('button', { name: 'Add snippet', exact: true }).click()
     await page.getByLabel('Snippet trigger', { exact: true }).fill(';draft')
     const body = page.getByLabel('Snippet instructions', { exact: true })
@@ -464,8 +465,9 @@ for (const failSaveRead of [false, true]) test(`a snippet started during its ini
     await (await received).finished()
     await expect(body).toHaveValue('Keep my draft')
     const save = page.locator('.snip-save')
+    saveStarted = true
     await save.click()
-    await expect.poll(() => reads).toBe(2)
+    await expect.poll(() => saveReads).toBe(1)
     await expect(save).toBeDisabled()
     saving.release()
     if (failSaveRead) {
