@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
@@ -48,6 +48,36 @@ function lease(): CheckoutLease {
   if (!l.tryAcquire().acquired) throw new Error('could not acquire test lease')
   return l
 }
+
+describe('read-only Git inspection', () => {
+  it.each([
+    ['checkout', inspectCheckout],
+    ['task', inspectTaskRepo],
+  ] as const)('%s inspection does not refresh the index', async (name, inspect) => {
+    const repo = join(root, `inspection-${name}`)
+    await mkdir(repo)
+    git(['init', '-q', '-b', 'main'], repo)
+    git(['config', 'user.email', 't@example.invalid'], repo)
+    git(['config', 'user.name', 't'], repo)
+    const tracked = join(repo, 'tracked.txt')
+    await writeFile(tracked, 'original\n')
+    git(['add', '.'], repo)
+    git(['commit', '-qm', 'initial'], repo)
+    const index = join(repo, '.git', 'index')
+    const before = await readFile(index)
+    // Unchanged contents with different stat data make ordinary status
+    // refresh the index. A background inspection must leave it untouched.
+    const changedTime = new Date('2020-01-01T00:00:00Z')
+    await utimes(tracked, changedTime, changedTime)
+    expect(await inspect(repo)).toMatchObject({ dirtyFiles: 0 })
+    expect(await readFile(index)).toEqual(before)
+
+    await writeFile(tracked, 'changed\n')
+    await writeFile(join(repo, 'untracked.txt'), 'new\n')
+    expect(await inspect(repo)).toMatchObject({ dirtyFiles: 2 })
+    expect(await readFile(index)).toEqual(before)
+  })
+})
 
 describe('checkout-scoped paths', () => {
   it('serves files inside the checkout and refuses traversal, .git and symlink escapes', async () => {

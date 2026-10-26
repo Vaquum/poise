@@ -296,6 +296,9 @@ acquired the lease — the pid plus its start time — so a pid the operating
 system reused after a restart never pins a dead lease.
 A Poise-side filesystem operation must finish before the lease is released;
 killing an agent cannot cancel filesystem work already executing in Poise.
+Background Git inspections skip optional index-cache writes, so cancelling a
+read cannot leave that cache's lock blocking the next chat. Git writes retain
+their normal locks and the registered worker gate.
 
 These are cooperative application locks. They do not prevent a person or an
 unrelated program from modifying the checkout outside Poise. Native agents
