@@ -166,3 +166,52 @@ test('imports a pasted configuration, storing what looks like a key as a secret'
   expect(((await (await page.request.get('/api/extensions')).json()).servers as Array<{ name: string }>).map((server) => server.name).sort()).toEqual(['fixture', 'fixture-2'])
   await removeAll(page)
 })
+
+
+test('a failed removal restores the server in place and permits retry', async ({ page }) => {
+  await open(page)
+  await removeAll(page)
+  for (const title of ['Before', 'Remove me', 'After']) {
+    const created = await page.request.post('/api/extensions/servers', { data: {
+      spec: { name: title.toLowerCase().replaceAll(' ', '-'), title, source: 'custom', transport: 'stdio', command: process.execPath, args: [fixture], env: [], auth: 'none' },
+      secrets: {}, enabled: { default: false, workspaces: { local: false } },
+    } })
+    expect(created.ok()).toBe(true)
+  }
+  await page.reload()
+  const row = page.locator('.ext-matrix tbody tr', { hasText: 'Remove me' })
+  await expect(row).toBeVisible()
+  const order = await page.locator('.ext-matrix .ext-server b').allTextContents()
+  const id = await row.getAttribute('data-id')
+  let fail = true, release!: () => void
+  const held = new Promise<void>(resolve => { release = resolve })
+  await page.route(`**/api/extensions/servers/${id}`, async route => {
+    if (route.request().method() === 'DELETE' && fail) {
+      fail = false
+      await held
+      return route.fulfill({ status: 503, json: { error: 'Removal temporarily unavailable' } })
+    }
+    await route.continue()
+  })
+  try {
+    await row.locator('.ext-col-server').click()
+    await page.locator('#extensions-panel [data-remove]').click()
+    await page.locator('#extensions-panel [data-remove-no]').click()
+    await expect(row).toBeVisible()
+    await page.locator('#extensions-panel [data-remove]').click()
+    await page.locator('#extensions-panel [data-remove-yes]').click()
+    await expect.poll(() => fail).toBe(false)
+    release()
+    await expect(page.locator('.ext-notice')).toContainText('Removal temporarily unavailable')
+    expect(((await (await page.request.get('/api/extensions')).json()).servers as Array<{ id: string }>).some(server => server.id === id)).toBe(true)
+    await expect(row).toBeVisible()
+    await expect(page.locator('.ext-matrix .ext-server b')).toHaveText(order)
+    await row.locator('.ext-col-server').click()
+    await page.locator('#extensions-panel [data-remove]').click()
+    const deleted = page.waitForResponse(response => response.request().method() === 'DELETE' && response.url().endsWith(`/${id}`))
+    await page.locator('#extensions-panel [data-remove-yes]').click()
+    expect((await deleted).ok()).toBe(true)
+    await expect(row).toHaveCount(0)
+    expect(((await (await page.request.get('/api/extensions')).json()).servers as Array<{ id: string }>).some(server => server.id === id)).toBe(false)
+  } finally { release() }
+})

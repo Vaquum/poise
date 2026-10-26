@@ -534,13 +534,14 @@ async function signIn(id: string): Promise<void> {
   }
 }
 
-async function serverAction(id: string, path: string, method: string, body?: unknown): Promise<void> {
+async function serverAction(id: string, path: string, method: string, body?: unknown, onFailure?: () => void): Promise<void> {
   const p = panel?.kind === 'server' ? panel : null
   try {
     const result = await api<ServerView | { ok: true }>(`/api/extensions/servers/${id}${path}`, method, body)
     if ('id' in result) replaceServer(result)
     await load()
   } catch (error) {
+    onFailure?.()
     if (p) { p.error = (error as Error).message } else notice = { text: (error as Error).message, tone: 'error' }
     render()
   }
@@ -601,7 +602,17 @@ function onClick(event: MouseEvent): void {
     if ('signOut' in d) { void serverAction(id, '/sign-out', 'POST'); return }
     if ('remove' in d) { panel.confirm = true; render(); return }
     if ('removeNo' in d) { panel.confirm = false; render(); return }
-    if ('removeYes' in d) { const server = data?.servers.find((candidate) => candidate.id === id); panel = null; notice = { text: `${server?.title ?? 'The server'} removed. Chats lose its tools from their next turn.`, tone: 'info' }; if (data) data.servers = data.servers.filter((candidate) => candidate.id !== id); void serverAction(id, '', 'DELETE'); return }
+    if ('removeYes' in d) {
+      const index = data?.servers.findIndex((candidate) => candidate.id === id) ?? -1
+      const server = data?.servers[index]
+      panel = null
+      notice = { text: `${server?.title ?? 'The server'} removed. Chats lose its tools from their next turn.`, tone: 'info' }
+      if (data) data.servers = data.servers.filter((candidate) => candidate.id !== id)
+      void serverAction(id, '', 'DELETE', undefined, () => {
+        if (data && server && !data.servers.some((candidate) => candidate.id === id)) data.servers.splice(Math.min(index, data.servers.length), 0, server)
+      })
+      return
+    }
     if ('edit' in d) { const server = data?.servers.find((candidate) => candidate.id === id); if (server) { form = editForm(server); tab = 'custom'; panel = null; render() } return }
   }
 }
