@@ -87,7 +87,7 @@ async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> 
   const text = await response.text()
   let parsed: { error?: string } | null = null
   try { parsed = text ? JSON.parse(text) : null } catch { /* reported below */ }
-  if (!response.ok) throw new Error(parsed?.error || `Extensions answered ${response.status}.`)
+  if (!response.ok) throw Object.assign(new Error(parsed?.error || `Extensions answered ${response.status}.`), { status: response.status })
   return parsed as T
 }
 
@@ -546,6 +546,25 @@ async function serverAction(id: string, path: string, method: string, body?: unk
   }
 }
 
+async function removeServer(id: string): Promise<void> {
+  const title = data?.servers.find((server) => server.id === id)?.title ?? 'The server'
+  panel = null
+  notice = { text: `Removing ${title}…`, tone: 'info' }
+  render()
+  try {
+    await api(`/api/extensions/servers/${id}`, 'DELETE')
+  } catch (error) {
+    if (!(error instanceof Error && 'status' in error && error.status === 404)) {
+      notice = { text: (error as Error).message, tone: 'error' }
+      render()
+      return
+    }
+  }
+  if (data) data.servers = data.servers.filter((server) => server.id !== id)
+  notice = { text: `${title} removed. Chats lose its tools from their next turn.`, tone: 'info' }
+  await load()
+}
+
 async function loadEvents(p: Extract<Panel, { kind: 'server' }>): Promise<void> {
   try { p.events = (await api<{ events: ServerEvent[] }>(`/api/extensions/servers/${p.id}/events`)).events } catch (error) { p.error = (error as Error).message; p.events = [] }
   render()
@@ -601,7 +620,7 @@ function onClick(event: MouseEvent): void {
     if ('signOut' in d) { void serverAction(id, '/sign-out', 'POST'); return }
     if ('remove' in d) { panel.confirm = true; render(); return }
     if ('removeNo' in d) { panel.confirm = false; render(); return }
-    if ('removeYes' in d) { const server = data?.servers.find((candidate) => candidate.id === id); panel = null; notice = { text: `${server?.title ?? 'The server'} removed. Chats lose its tools from their next turn.`, tone: 'info' }; if (data) data.servers = data.servers.filter((candidate) => candidate.id !== id); void serverAction(id, '', 'DELETE'); return }
+    if ('removeYes' in d) { void removeServer(id); return }
     if ('edit' in d) { const server = data?.servers.find((candidate) => candidate.id === id); if (server) { form = editForm(server); tab = 'custom'; panel = null; render() } return }
   }
 }
