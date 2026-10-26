@@ -26,7 +26,7 @@ function moment(ms: number): string {
 }
 
 function action(user: AdminUser, change: AdminChange, label: string, danger = false): string {
-  return `<button type="button" class="st-clear${danger ? ' ad-danger' : ''}" data-change="${change}" data-handle="${escapeHtml(user.handle)}">${label}</button>`
+  return `<button type="button" class="st-clear${danger ? ' ad-danger' : ''}" data-key="${change}:${escapeHtml(user.handle)}" data-change="${change}" data-handle="${escapeHtml(user.handle)}">${label}</button>`
 }
 
 /** Bytes as a person reads them: 2.4 GB. */

@@ -160,7 +160,8 @@ the workspace.
     `{ login }`.
   - `POST /_poise/api/admin/workspaces/start`, `…/stop`, `…/restart`,
     `/_poise/api/admin/users/disable` and `…/enable` take `{ handle }`.
-  - Each answers with the updated overview.
+  - Each answers with the updated overview. Settings keeps each user's
+    workspace and access controls available after applying that overview.
 - Failures answer `{ error, message }` with their HTTP status.
 - `GET /_poise/api/logging`, `/logging/events/ID`, `/logging/health` and
   `/logging/export` read retained central diagnostics through a bounded worker.
