@@ -981,6 +981,66 @@ test('single delete hides its row at once while the DELETE is held', async ({ pa
   await expect(page.locator('.chat-notice')).toHaveText('Session deleted.')
 })
 
+test('a failed delete restores the open chat with its unsent draft', async ({ page }) => {
+  const state = makeState([
+    session({ id: 's1', title: 'First', createdAt: '2026-09-16T10:00:00.000Z' }),
+    session({ id: 's2', title: 'Second', createdAt: '2026-09-18T10:00:00.000Z' }),
+  ])
+  state.deleteErrors = { s2: { status: 500, json: { error: 'database is locked' } } }
+  await installRoutes(page, state)
+  await installSocket(page)
+  await page.goto('/')
+  await expect(page.locator('.chat-session-item')).toHaveCount(2)
+  await page.locator('.chat-session-item[data-id="s2"]').click()
+  await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/active/)
+  await input(page).fill('unsent words')
+  const row = page.locator('.chat-session-item[data-id="s2"]')
+  await row.hover()
+  await row.locator('.chat-session-delete').click()
+  await expect(row.locator('.chat-session-delete')).toHaveText('Sure?')
+  await row.locator('.chat-session-delete').click()
+  await expect.poll(() => state.calls.filter((c) => c.method === 'DELETE').length).toBe(1)
+  await expect(page.locator('.chat-notice')).toHaveText('Delete failed — database is locked')
+  await expect(page.locator('.chat-session-item')).toHaveCount(2)
+  await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/selected/)
+  // The pane stays on the survivor; reopening the restored chat brings its draft back.
+  await expect(page.locator('.chat-session-item[data-id="s1"]')).toHaveClass(/active/)
+  await page.locator('.chat-session-item[data-id="s2"]').click()
+  await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/active/)
+  await expect(input(page)).toHaveValue('unsent words')
+})
+
+test('typing into the fresh console mid-batch survives a full delete', async ({ page }) => {
+  const state = makeState([
+    session({ id: 's1', title: 'First', createdAt: '2026-09-16T10:00:00.000Z' }),
+    session({ id: 's2', title: 'Second', createdAt: '2026-09-18T10:00:00.000Z' }),
+  ])
+  const releases: (() => void)[] = []
+  state.deleteDelay = () => new Promise<void>((r) => { releases.push(r) })
+  await installRoutes(page, state)
+  await installSocket(page)
+  await page.goto('/')
+  await expect(page.locator('.chat-session-item')).toHaveCount(2)
+  await page.locator('.chat-session-item[data-id="s2"]').click()
+  await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/active/)
+  await page.locator('.chat-session-item[data-id="s1"]').click({ modifiers: ['Shift'] })
+  await expect(page.locator('.chat-session-item.selected')).toHaveCount(2)
+  const row = page.locator('.chat-session-item[data-id="s2"]')
+  await row.hover()
+  await row.locator('.chat-session-delete').click()
+  await expect(row.locator('.chat-session-delete')).toHaveAttribute('title', 'Delete 2 chats?')
+  await row.locator('.chat-session-delete').click()
+  await expect(page.locator('.chat-session-item')).toHaveCount(0)
+  await expect(page.locator('.chat-notice')).toHaveText('Deleting 2 chats…')
+  await expect.poll(() => state.calls.filter((c) => c.method === 'DELETE').length).toBe(2)
+  await input(page).fill('fresh words')
+  for (const release of releases) release()
+  await expect.poll(() => state.calls.filter((c) => c.method === 'DELETE').map((c) => c.path).sort()).toEqual(['/api/chat/sessions/s1', '/api/chat/sessions/s2'])
+  await expect(page.locator('.chat-session-item')).toHaveCount(0)
+  await expect(input(page)).toHaveValue('fresh words')
+  await expect(page.locator('.chat-notice')).toHaveText('Deleted 2 chats.')
+})
+
 test('creates a session from the dialog with a pending entry before the server answers', async ({ page }) => {
   const state = makeState([], {})
   let release: () => void = () => {}

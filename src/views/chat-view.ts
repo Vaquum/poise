@@ -1016,6 +1016,12 @@ function purgeDeleted(id: string): void {
 function resetAfterActiveDeleted(): void {
   // Nothing is on screen now; selecting the next session must treat it
   // as a switch (fresh transcript, its own draft), not a no-op.
+  // The outgoing draft must survive the blank: into its retained entry when
+  // a delete hid the open chat (a failure restores it there), else into the
+  // fresh draft when leaving an already-blank console mid-batch.
+  const outgoing = activeId ? sessions.get(activeId) : null
+  if (outgoing) outgoing.draft = composer.getDraft()
+  else if (activeId === null) freshDraft = composer.getDraft()
   activeId = null
   composerStateFor(null)
   transcript.clear()
