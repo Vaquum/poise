@@ -15,8 +15,8 @@ export function pull(changes: Partial<Extract<WorkStage, { kind: 'pull' }>> = {}
       ready: true, mergeQueue: false, queueEntry: null, mergeSha: null, ...changes } }
 }
 export function receipt(changes: Partial<WorkActionReceipt> = {}): WorkActionReceipt {
-  return { attempt: 'native-attempt-17', action: 'merge', basisRevision: 1, head: HEAD,
-    state: 'uncertain', retryAt: null, reference: 'behavior_seen:merge-prs:vaquum/poise-test#17', at: NOW, ...changes }
+  return { attempt: 'native-attempt-17', action: 'merge', basisRevision: 1, head: HEAD, issueBodyRevision: null,
+    state: 'uncertain', retryAt: null, reference: 'behavior_seen:merge-prs:vaquum/poise-test#17', requestedAt: NOW, at: NOW, ...changes }
 }
 export function plan(): WorkObservation {
   return { ...pull(), stage: { kind: 'plan', card: 'plan-17', markdown: '# Fix login\n\nKeep this requirement.',

@@ -52,15 +52,21 @@ export class WorkRehearsal {
   importReceipt(work: string, event: string, receipt: WorkActionReceipt): void {
     this.db.transaction(() => {
       const current = this.read(work)
-      if (!current || !Number.isSafeInteger(receipt.basisRevision) || receipt.basisRevision < 1 || receipt.basisRevision > current.observation.revision || !receipt.reference) throw new Error('receipt needs its recorded observation and native reference')
+      if (!current || !Number.isSafeInteger(receipt.basisRevision) || receipt.basisRevision < 1 || receipt.basisRevision > current.observation.revision
+        || !Number.isSafeInteger(receipt.requestedAt) || receipt.requestedAt < 0 || receipt.requestedAt > receipt.at || !receipt.reference) throw new Error('receipt needs its recorded observation and native reference')
       if (!this.append(work, event, 'receipt', receipt, receipt.at)) return
       const prior = current.receipt
       if (prior?.attempt === receipt.attempt && (prior.action !== receipt.action || prior.head !== receipt.head
-        || prior.basisRevision !== receipt.basisRevision || receipt.at < prior.at
-        || (prior.state === 'finished' && receipt.state !== 'finished'))) throw new Error('native attempt identity or settlement conflicts')
+        || prior.issueBodyRevision !== receipt.issueBodyRevision || prior.basisRevision !== receipt.basisRevision || prior.requestedAt !== receipt.requestedAt)) throw new Error('native attempt identity or settlement conflicts')
+      // Late native facts remain in immutable history without replacing newer ownership or backoff.
+      if (prior && (receipt.basisRevision < prior.basisRevision || receipt.requestedAt < prior.requestedAt
+        || (prior.attempt === receipt.attempt && receipt.at < prior.at))) return
+      if (prior?.attempt === receipt.attempt && prior.state === 'finished' && receipt.state !== 'finished') throw new Error('native attempt settlement conflicts')
       if (prior && ['running', 'uncertain'].includes(prior.state) && prior.attempt !== receipt.attempt) {
         throw new Error('an unsettled attempt cannot be replaced')
       }
+      if (prior && prior.attempt !== receipt.attempt && prior.basisRevision === receipt.basisRevision
+        && prior.requestedAt === receipt.requestedAt) throw new Error('native attempt order is ambiguous')
       this.db.prepare('UPDATE v2_rehearsal_current SET receipt = ? WHERE work_id = ?').run(JSON.stringify(receipt), work)
     }).immediate()
   }

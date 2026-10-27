@@ -31,14 +31,17 @@ export interface WorkActionReceipt {
   action: WorkAction
   basisRevision: number
   head: string | null
+  issueBodyRevision: string | null
   /** Finished means the worker ended, never that its promised artifact exists. */
   state: 'running' | 'uncertain' | 'not-started' | 'finished'
   retryAt: number | null
   reference: string
+  /** Native intent admission time, stable across settlements of this attempt. */
+  requestedAt: number
   at: number
 }
 export type WorkDecision =
-  | { kind: 'propose', action: WorkAction, basisRevision: number, head: string | null }
+  | { kind: 'propose', action: WorkAction, basisRevision: number, head: string | null, issueBodyRevision: string | null }
   | { kind: 'wait' | 'inspect' | 'complete', reason: string }
 
 /** One advancing function, over already collected evidence. It cannot perform I/O. */
@@ -54,6 +57,7 @@ export function advanceWork(work: WorkObservation, receipt: WorkActionReceipt | 
     }
     return { kind: 'complete', reason: `confirmed merge ${stage.mergeSha}` }
   }
+  if (stage.kind === 'pull' && stage.queueEntry !== null) return { kind: 'wait', reason: `native merge queue ${stage.queueEntry}` }
   if (work.refusal) return { kind: 'wait', reason: work.refusal }
   if (work.held) return { kind: 'wait', reason: 'person stopped or held this work' }
   if (receipt) {
@@ -68,11 +72,13 @@ export function advanceWork(work: WorkObservation, receipt: WorkActionReceipt | 
     }
   }
   const propose = (action: WorkAction): WorkDecision => {
-    if (receipt?.state === 'finished' && receipt.action === action
-      && (stage.kind !== 'pull' || stage.head === receipt.head)) {
-      return { kind: 'inspect', reason: `worker finished without a verified ${action} outcome` }
+    if (receipt?.state === 'finished' && receipt.action === action) {
+      const changedArtifact = stage.kind === 'pull' ? stage.head !== receipt.head
+        : stage.kind === 'issue' && action === 'review-issue' && receipt.issueBodyRevision != null
+          && stage.bodyRevision !== receipt.issueBodyRevision
+      if (!changedArtifact) return { kind: 'inspect', reason: `worker finished without a verified ${action} outcome` }
     }
-    return { kind: 'propose', action, basisRevision: work.revision, head: stage.kind === 'pull' ? stage.head : null }
+    return { kind: 'propose', action, basisRevision: work.revision, head: stage.kind === 'pull' ? stage.head : null, issueBodyRevision: stage.kind === 'issue' ? stage.bodyRevision : null }
   }
   if (stage.kind === 'plan') {
     return stage.assigned ? propose('create-issue') : { kind: 'wait', reason: 'plan has not been assigned' }
@@ -99,7 +105,6 @@ export function advanceWork(work: WorkObservation, receipt: WorkActionReceipt | 
   if (stage.review === 'needed' || stage.reviewedHead !== stage.head) return propose('review-pr')
   if (stage.unresolved > 0) return propose('resolve-threads')
   if (stage.approvedHead !== stage.head) return propose('approve')
-  if (stage.queueEntry !== null) return { kind: 'wait', reason: `native merge queue ${stage.queueEntry}` }
   if (stage.ready !== true) return { kind: 'inspect', reason: 'native merge readiness is not confirmed' }
   return propose('merge')
 }

@@ -9,7 +9,7 @@ function recording(manager: string | null = 'm1'): RehearsalTableData {
   return { manager, observedAt: now, release: null, error: null,
     rows: [{ title: 'Fix login', manager, worker: manager ? { id: 's2', title: 'Login worker', status: 'idle' } : null,
       work: { ...plan(), checkedAt: now, mode: manager ? 'interactive' : 'headless' },
-      decision: { kind: 'propose', action: 'create-issue', basisRevision: 1, head: null },
+      decision: { kind: 'propose', action: 'create-issue', basisRevision: 1, head: null, issueBodyRevision: null },
       history: [{ seq: 1, at: now, text: 'Plan assigned; issue publication not observed' }] }] }
 }
 
@@ -99,6 +99,25 @@ test('keeps Manager / task table / Switchboard together, with retained history a
   })).toBe(true)
   const frames = socket.frames.length
   const writes = state.calls.filter(call => call.method !== 'GET').length
+  const fits = () => page.evaluate(() => {
+    const layout = document.querySelector('.chat-layout')!.getBoundingClientRect()
+    const main = document.querySelector('.chat-main')!.getBoundingClientRect()
+    const panes = [...document.querySelector('.chat-layout')!.children].filter(node => getComputedStyle(node).position !== 'absolute')
+    return main.width >= 320 && panes.every(node => node.getBoundingClientRect().right <= layout.right + 1)
+  })
+  await expect.poll(() => page.locator('#chat-switchboard-pane').evaluate(el => el.hasAttribute('data-motion-running'))).toBe(false)
+  await page.getByRole('separator', { name: 'Resize Switchboard', exact: true }).press('End')
+  await expect.poll(() => page.evaluate(() => {
+    const layout = document.querySelector('.chat-layout')!.getBoundingClientRect()
+    const board = document.querySelector('#chat-switchboard-pane')!.getBoundingClientRect()
+    const occupied = [...document.querySelector('.chat-layout')!.children]
+      .filter(node => !node.classList.contains('chat-main') && node.id !== 'chat-switchboard-pane' && getComputedStyle(node).position !== 'absolute')
+      .reduce((sum, node) => sum + node.getBoundingClientRect().width, 0)
+    return Math.abs(board.width - (layout.width - occupied - 320)) < 2
+  })).toBe(true)
+  await expect.poll(fits).toBe(true)
+  await page.getByRole('separator', { name: 'Resize sessions pane', exact: true }).press('End')
+  await expect.poll(fits).toBe(true)
   await table.getByRole('slider', { name: 'Resize work table' }).press('ArrowLeft')
   expect((await page.locator('.chat-main').boundingBox())!.width).toBeGreaterThanOrEqual(320)
   data.rows[0].work = { ...pull(), checkedAt: Date.now(), revision: 2 }

@@ -30,7 +30,7 @@ export function attachChatSidebar(view: HTMLElement, onLayout: () => void): { ca
     sidebar.style.width = `${Math.max(0, pixels)}px`
   }
   // Docked panes on the right take their width from the chat, not the overlay ones.
-  const docked = () => [view.querySelector<HTMLElement>('.chat-memories-pane'), view.querySelector<HTMLElement>('.chat-switchboard-pane')]
+  const docked = () => [view.querySelector<HTMLElement>('.chat-memories-pane'), view.querySelector<HTMLElement>('.chat-switchboard-pane'), view.querySelector<HTMLElement>('.work-rehearsal-table')]
     .filter((pane): pane is HTMLElement => !!pane)
   const bounds = () => {
     const occupied = docked().reduce((sum, pane) => getComputedStyle(pane).position !== 'absolute' ? sum + pane.getBoundingClientRect().width : sum, 0)

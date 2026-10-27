@@ -52,12 +52,30 @@ describe.each(['headless', 'interactive'] as const)('%s work decisions', mode =>
     expect(advanceWork({ ...work, mode }, null, NOW)).toMatchObject({ kind: 'propose', action })
   })
 
+  it('reviews a changed issue body after a finished review of its earlier revision', () => {
+    const work = { ...issue(), revision: 2 }
+    if (work.stage.kind !== 'issue') throw new Error('fixture issue expected')
+    const finished = receipt({ action: 'review-issue', state: 'finished', head: null, issueBodyRevision: 'body-1' })
+    expect(advanceWork({ ...work, mode }, finished, NOW).kind).toBe('inspect')
+    work.stage.bodyRevision = 'body-2'
+    expect(advanceWork({ ...work, mode }, { ...finished, issueBodyRevision: null }, NOW).kind).toBe('inspect')
+    expect(advanceWork({ ...work, mode }, finished, NOW)).toMatchObject({ kind: 'propose', action: 'review-issue', issueBodyRevision: 'body-2' })
+    work.stage.reviewedRevision = 'body-2'
+    expect(advanceWork({ ...work, mode }, finished, NOW)).toMatchObject({ kind: 'propose', action: 'implement' })
+  })
+
   it('retains native merge-queue policy instead of churning behind branches', () => {
     const work = pull({ ci: { head: HEAD, pending: false, failing: [], mergeableState: 'behind' }, mergeQueue: true })
     expect(advanceWork({ ...work, mode }, null, NOW)).toMatchObject({ kind: 'propose', action: 'merge' })
     if (work.stage.kind !== 'pull') throw new Error('fixture pull expected')
     work.stage.mergeQueue = null
     expect(advanceWork(work, null, NOW).kind).toBe('inspect')
+    for (const queued of [pull({ ci: red }), pull({ ci: running, ciStuck: true, greyCiEligible: true }),
+      pull({ ci: { ...running, mergeable: false } }), pull({ review: 'changes' }), pull({ approvedHead: null })]) {
+      if (queued.stage.kind !== 'pull') throw new Error('fixture pull expected')
+      queued.stage.queueEntry = 'MQE_17'
+      expect(advanceWork({ ...queued, mode }, null, NOW)).toEqual({ kind: 'wait', reason: 'native merge queue MQE_17' })
+    }
   })
 
   it('does not convert missing evidence, closed state, or a finished turn into completion', () => {
@@ -112,6 +130,25 @@ it('recovers proposals and action uncertainty from durable receipts after restar
   rehearsal.observe('issue:17@2', { ...issue(), revision: 2 })
   expect(rehearsal.propose(work.id, NOW)).toMatchObject({ kind: 'propose', action: 'review-issue' })
   expect(V2_EXECUTION_ENABLED).toBe(false)
+})
+
+it.each([{ basisRevision: 1, at: NOW + 20 }, { basisRevision: 2, at: NOW + 20 }])('retains a late older native receipt without replacing a newer retry deadline after restart: %s', async older => {
+  root = await mkdtemp(join(tmpdir(), 'poise-rehearsal-order-'))
+  const path = join(root, 'proof.db')
+  db = new Database(path)
+  let rehearsal = new WorkRehearsal(db)
+  const work = { ...pull({ ci: red }), revision: 2 }
+  rehearsal.observe('red-head@2', work)
+  const newer = receipt({ attempt: 'new-repair', action: 'repair-ci', basisRevision: 2,
+    state: 'not-started', requestedAt: NOW + 10, at: NOW + 10, retryAt: NOW + 1000, reference: 'Caller:new-repair' })
+  rehearsal.importReceipt(work.id, 'new-repair@1', newer)
+  rehearsal.importReceipt(work.id, 'old-review@2', receipt({ attempt: 'old-review', action: 'review-pr',
+    state: 'finished', ...older, requestedAt: NOW, reference: 'Caller:old-review' }))
+  expect(rehearsal.history(work.id).filter(event => event.kind === 'receipt')).toHaveLength(2)
+  db.close(); db = new Database(path); rehearsal = new WorkRehearsal(db)
+  expect(rehearsal.read(work.id)?.receipt).toEqual(newer)
+  expect(rehearsal.propose(work.id, NOW + 20)).toEqual({ kind: 'wait', reason: `safe no-write retry at ${NOW + 1000}` })
+  expect(rehearsal.propose(work.id, NOW + 1000)).toMatchObject({ kind: 'propose', action: 'repair-ci' })
 })
 
 it('rejects conflicting replay identities and never changes an imported record', () => {

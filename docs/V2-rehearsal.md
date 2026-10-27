@@ -23,6 +23,13 @@ that exceed macOS's filesystem path-length bound. This is not a locally green
 baseline; a one-file isolated rerun reproduced all eight failures. The unchanged Linux cases remain required on the candidate; no
 assertions, deadlines or platform skips are weakened for this rehearsal.
 
+The local full browser run of the first candidate passed 873 of 874 cases.
+The bulk-selection case failed at its Control-click toggle on macOS. An
+isolated repeat preserving every assertion and changing only Control to Meta
+passed there; the canonical Control case passed in Linux CI without retry.
+The original failed report and trace remain retained; this is not presented as
+a locally green canonical browser gate.
+
 The functional fixes are actual merges, with successful `Verify (Node 22)`
 checks on these exact PR candidates:
 
@@ -63,7 +70,10 @@ GitHub, start a timer, spawn a worker, change a binding or mutate a work item.
 `WorkRehearsal` is opened explicitly on the test's isolated SQLite connection.
 It appends bounded immutable observations, imported native action receipts and
 proposals, with event identity checks and an indexed current projection. Duplicate
-triggers retain one proposal. Restart reads the current observation and receipt,
+triggers retain one proposal. Native receipts pin the issue body revision as
+well as a PR head. Late older receipts stay in history without replacing a
+newer attempt or retry deadline. Native intent admission time orders attempts
+independently of their later settlement times. Restart reads the current observation and receipt,
 not retained history. No production database is opened by importing it.
 Its unbounded append history is appropriate to a bounded offline recording;
 production retention/admission is not implemented or enabled here.
@@ -74,14 +84,15 @@ native attempt keeps ownership; an uncertain write requires reconciliation;
 a recorded no-write outcome may retry after its existing backoff. A finished
 worker requires a new artifact observation. Repeated unchanged observations
 cannot substitute for an issue, a PR, completed CI, resolved conversations,
-current-head approval or actual merge. A native queue entry is a wait.
+current-head approval or actual merge. A native queue entry retains ownership before CI/review/branch repair proposals. It is a wait.
 
 The new work table is mounted only by the isolated browser fixture, between
 Poise's actual Manager Chat component and actual Switchboard pane. It renders
 recorded rows and their timestamped history, keeps pre-PR tasks associated with
 their later PR, filters by Manager relationship, and renders unread/stale flags
 as `?`. It retains the snapshot and error after a failed read. Opening, updating
-or resizing it performs no model or work-item action. It adds no polling.
+or resizing it performs no model or work-item action. It adds no polling. Existing Switchboard and sessions-pane resize bounds
+include the additional docked table, preserving the Chat floor at their limits.
 The regular Chat composer, permissions, questions, timers, Stop and worker
 navigation are the existing controls. This proves the composition without
 publishing an alternate browser entry or enabling a live task trial.
