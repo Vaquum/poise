@@ -128,7 +128,9 @@ describe('Rerun Grey CI', () => {
       '--expected-head', HEAD, '--author', 'octocat', '--token-user', 'review-bot'])
     expect(runtime.getGreyCiLastFired()).toEqual({ at: expect.any(String), target: `${REPO}#7`, url: `https://github.com/${REPO}/actions/runs/100` })
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
-    expect(db.db.prepare('SELECT behavior, status FROM behavior_runs').all()).toEqual([{ behavior: 'rerun-grey-ci', status: 'completed' }])
+    const runs = db.db.prepare('SELECT id, behavior, status, outcome FROM behavior_runs').all() as Array<{ id: string }>
+    expect(runs).toEqual([{ id: expect.any(String), behavior: 'rerun-grey-ci', status: 'completed', outcome: 'rerun_requested' }])
+    expect(mocks.captureAdmission.mock.calls[0][0].nativeId).toBe(runs[0]!.id)
     expect(mocks.captureAdmission).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       behavior: 'rerun-grey-ci', repository: REPO, number: 7, head: HEAD,
       workflow: { id: 70, runId: 100, attempt: 2, event: 'pull_request_review' },
@@ -198,6 +200,12 @@ describe('Rerun Grey CI', () => {
     vi.useFakeTimers(); await vi.advanceTimersByTimeAsync(61_000)
     outcome = 'rerun_requested'; response = {}; await runtime.runEnabledBehaviorsOnce()
     expect(rerunCalls()).toHaveLength(2)
+    // The failure and its recovery are each retained once with their own
+    // disposition: the failed read stays a failure, the rerun a delivery.
+    expect(db.db.prepare('SELECT status, outcome FROM behavior_runs ORDER BY started_at').all()).toEqual([
+      { status: 'failed', outcome: 'read_failed' },
+      { status: 'completed', outcome: 'rerun_requested' },
+    ])
   })
   it('checks ten ordinary PRs with one batch call and no individual REST operations', async () => {
     enable(); pulls = Array.from({ length: 10 }, (_, i) => pull(REPO, i + 1)); greyNumbers = new Set()
