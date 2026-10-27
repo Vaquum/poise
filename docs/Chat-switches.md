@@ -33,6 +33,8 @@ snippet; adding a snippet makes its instructions available in Chat as well.
 The view shows each snippet's Chat invocation beside its text-expansion trigger.
 Definitions persist in the existing Espanso `match/poise.yml` across reloads,
 restarts, updates and `/reset`. Espanso need not be installed for Chat use.
+You can start a snippet while its library is loading. The first Save reads the
+current library before adding it, preserving your draft and existing snippets.
 
 ## Chaining and updates
 

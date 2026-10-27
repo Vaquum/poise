@@ -336,6 +336,16 @@ async function save(editRow: HTMLTableRowElement) {
   const replace = bodyInput.value
   if (!trigger) { setStatus('Trigger is required.', 'error'); triggerInput.focus(); return }
   if (!replace.trim()) { setStatus('Snippet body is required.', 'error'); bodyInput.focus(); return }
+  if (!snippetVersion) {
+    saving = true
+    setMutationDisabled(editRow, true)
+    try {
+      if (!await fetchSnippets()) return
+    } finally {
+      saving = false
+      setMutationDisabled(editRow, false)
+    }
+  }
   if (editingTrigger != null && !snippets.some((s) => s.trigger === editingTrigger)) {
     setStatus('This snippet was removed or renamed elsewhere. Your edit is preserved; copy it before reloading.', 'error')
     return
@@ -554,15 +564,17 @@ async function fetchSnippets(): Promise<boolean> {
       // back as the YAML parser's message, with line and column. Keep it: it
       // is the only thing that tells the user which file to look at and why.
       const body = await res.json().catch(() => ({})) as { error?: string }
+      if (generation !== loadGeneration) return false
       loadError = body.error || `The snippets file could not be read (HTTP ${res.status}).`
       return false
     }
     const data = await res.json()
+    if (generation !== loadGeneration) return false
     if (!Array.isArray(data.snippets) || typeof data.version !== 'string') {
       loadError = 'The server returned an unreadable snippet list.'
       return false
     }
-    if (generation !== loadGeneration || tbodyEl?.querySelector('.snip-expand-row') !== editorAtStart) return false
+    if (tbodyEl?.querySelector('.snip-expand-row') !== editorAtStart) return false
     skills = parseChatSwitches(data.skills) ?? skills
     snippets = Array.isArray(data.snippets) ? data.snippets : []
     snippetVersion = data.version
@@ -570,6 +582,7 @@ async function fetchSnippets(): Promise<boolean> {
     loadError = null
     return true
   } catch (err) {
+    if (generation !== loadGeneration) return false
     // Leave the current list intact; a stale save will conflict safely.
     loadError = (err as Error)?.message
       ? `Could not reach Poise to read your snippets (${(err as Error).message}).`
