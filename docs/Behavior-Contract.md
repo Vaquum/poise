@@ -213,7 +213,25 @@ as before, and the row's Skip list and pause/disable guards apply to capped
 runs like any other launch.
 `resolve-unblocking` uses the upstream strong
 resolution primitive, which revalidates the complete gate before every thread
-mutation.
+mutation. Before Caller starts, an admitted resolution persists its target,
+actor, head and shared direct-run/firing/diagnostic identity. Every post-admission exit,
+including deadline cancellation, disable and access holds, retains recovery
+independently of the presentation failure row. Validated retry scheduling reads
+the original CLI evidence before presentation selection drops rate headers.
+Earlier uncertain invocations remain linked when a later invocation fails or
+leaves unresolved work. Unchanged thread counts and draft status prove no
+recovery. The target's empty-thread read can settle same-head failed work;
+positive closed/merged lifecycle evidence supersedes obsolete work while
+retaining unknown effects. Absence from the open inventory is insufficient.
+Native disposition receipts remain on their direct runs, with legacy unmatched
+identities retained separately rather than inventing correlation. Late callbacks
+cannot replace a newer attempt or a settled receipt; a late no-op preserves its
+receipt before its idle run is discarded. Missing-target lifecycle reads respect
+the retained attempt's retry deadline too. At 32 unreconciled
+invocations the target requires reconciliation before another admission; no
+uncertain evidence is dropped. One missing target is read at the end of each
+existing resolver pass, using its reader, deadline and access holds; no timer or
+new polling loop is added. The mutation never runs merely to clear a diagnostic.
 
 Load timeouts — an expired sweep deadline, a slow CLI, lock contention — retry
 on a short clock of a few minutes, not the hour-long backoff of hard failures.
