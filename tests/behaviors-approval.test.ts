@@ -907,6 +907,75 @@ describe('approval eligibility and review activity', () => {
     expect(modules.database.listBehaviorDeadLetters()).toHaveLength(1)
   })
 
+  it('holds a superseded approval across dismissal when the head returns to its input', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    const prior = await launchApprovalBeforeCrash()
+    const args: string[] = mocks.spawnDetached.mock.calls[0][1]
+    const model = args[args.indexOf('--model') + 1]
+    const call = agentLog({
+      behavior: 'pr_approve', status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      review_policy: 'bounded-v1', error_code: 'review_contract_violation',
+      error: 'codex review produced no submitted verdict: cannot validate since-diff positions: p must look like p2',
+      model, expected_head: prior.expectedHead,
+      actor: prior.actor, source: prior.source, correlation_id: prior.correlationId,
+      started_at: new Date(Date.parse(prior.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(prior.requestedAt) + 1_001).toISOString(),
+    })
+    fixture.agentLogs = [call]
+    arrangeCli(true, false, {}, { commits_after_request: 0, response_count: 0 })
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    recordCompletedInitialReview(db, { target: `${pr.repo}#17:tertiary`,
+      outcome: 'changes_requested', headSha: NEXT_HEAD_SHA })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    // The approval ran on the dismissed path: move its records onto the head target.
+    const heldTarget = `${pr.repo}#17@head=${HEAD_SHA}`
+    db.db.prepare('UPDATE behavior_seen SET target = ? WHERE key = ? AND target = ?')
+      .run(heldTarget, 'approve-prs', prior.target)
+    db.db.prepare('UPDATE behavior_dead_letters SET target = ? WHERE behavior = ? AND target = ?')
+      .run(heldTarget, 'approve-prs', prior.target)
+    expect(db.getFailedBehaviorLaunch('approve-prs', heldTarget)?.launchCallId).toBe(call.id)
+
+    // A replacement request fails too. It still settles the obsolete
+    // incident as superseded; both failed launches stay retained.
+    const replacementTarget = `${pr.repo}#17@head=${NEXT_HEAD_SHA}`
+    const replacementId = db.claimSeenOwned('approve-prs', replacementTarget)!
+    expect(db.markBehaviorLaunchIntentOwned({ key: 'approve-prs', target: replacementTarget,
+      claimId: replacementId, launchBehavior: 'pr_approve', repo: pr.repo, pr: pr.number,
+      requestedAt: new Date().toISOString(), expectedHead: NEXT_HEAD_SHA, actor: prior.actor,
+      source: 'poise:approve-prs', correlationId: replacementId })).toBe(true)
+    const replacementCallId = 'd'.repeat(32)
+    expect(db.linkBehaviorLaunchCallOwned('approve-prs', replacementTarget, replacementId, replacementCallId)).toBe(true)
+    expect(db.setBehaviorLaunchErrorOwned('approve-prs', replacementTarget, replacementId, 'provider failed')).toBe(true)
+    expect(db.completeSeenOwned('approve-prs', replacementTarget, replacementId)).toBe(true)
+    db.recordBehaviorDeadLetter(db.getFailedBehaviorLaunch('approve-prs', replacementTarget)!, 'provider failed')
+    // An hour later the pass revisits the held row and finds the replacement.
+    const settled = db.reconcileBehaviorDeadLetters(new Set([`${pr.repo}#${pr.number}`]),
+      ['review-new-prs', 'approve-prs'], undefined, undefined, 200, Date.now() + 61 * 60_000)
+    expect(settled.find((row) => row.target === heldTarget)).toMatchObject({ disposition: 'superseded' })
+    expect(settled.find((row) => row.target === replacementTarget)).toMatchObject({ disposition: 'held' })
+    expect(db.listBehaviorDeadLetters().map((row) => row.target)).toEqual([replacementTarget])
+
+    // The head returns to the original input with the review dismissed: the
+    // retained bounded failure still holds the same model.
+    fixture.listedPrs = [{ ...pr, updated_at: '2026-07-15T12:00:01Z' }]
+    arrangeCli(false, false, { headSha: HEAD_SHA, reviewerLatestState: 'DISMISSED',
+      latestActivityAt: new Date().toISOString() }, { reviewer_latest_state: 'DISMISSED' })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(db.getFailedBehaviorLaunch('approve-prs', heldTarget)?.launchCallId).toBe(call.id)
+
+    // An explicit model change lifts the hold: the original input relaunches.
+    db.setMeta('models', JSON.stringify({ pr_approve: {
+      default: model === 'gpt-6-astra-ultra' ? 'opus-5-xhigh' : 'gpt-6-astra-ultra', fallback: model,
+    } }))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(mocks.spawnDetached.mock.calls[1][1]).toEqual(expect.arrayContaining(['--expected-head', HEAD_SHA]))
+  })
+
   it('falls a budget-exhausted dismissed approval to the next slot on the same head', async () => {
     const prior = await launchApprovalBeforeCrash()
     const args: string[] = mocks.spawnDetached.mock.calls[0][1]

@@ -135,7 +135,9 @@ describe('Merge Pull Requests', () => {
     expect(runtime.getMergePrsLastFired()).toEqual({ at: expect.any(String), target: `${REPO}#7` })
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
-    expect(db.db.prepare('SELECT behavior, status FROM behavior_runs').all()).toEqual([{ behavior: 'merge-prs', status: 'completed' }])
+    const runs = db.db.prepare('SELECT id, behavior, status, outcome FROM behavior_runs').all() as Array<{ id: string }>
+    expect(runs).toEqual([{ id: expect.any(String), behavior: 'merge-prs', status: 'completed', outcome: 'merged' }])
+    expect(mocks.captureAdmission.mock.calls[0][0].nativeId).toBe(runs[0]!.id)
     expect(mocks.captureAdmission).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       behavior: 'merge-prs', repository: REPO, number: 7, head: HEAD,
     }))
@@ -147,7 +149,7 @@ describe('Merge Pull Requests', () => {
     db = await import('../server/db'); runtime = await import('../server/behaviors')
     expect(runtime.getEnabledMap()['merge-prs']).toBe(true)
     expect(runtime.getMergePrsLastFired()).toEqual(first)
-    expect(db.db.prepare('SELECT status FROM behavior_runs').all()).toEqual([{ status: 'completed' }])
+    expect(db.db.prepare('SELECT status, outcome FROM behavior_runs').all()).toEqual([{ status: 'completed', outcome: 'merged' }])
   })
   it.each(['not_ready', 'superseded', 'already_merged', 'in_queue'])('does not report a merge for %s', async (value) => {
     enable(); outcome = value
@@ -156,10 +158,16 @@ describe('Merge Pull Requests', () => {
     expect(mergeCalls()).toHaveLength(1)
     expect(runtime.getMergePrsLastFired()).toBeNull()
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+    const disposition = value === 'in_queue' ? 'waiting' : value
     expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       state: value === 'superseded' ? 'superseded' : 'completed',
-      outcome: value === 'in_queue' ? 'waiting' : value,
+      outcome: disposition,
     }))
+    // The durable run keeps the firing's disposition under the same
+    // correlation key, so it stays classifiable after ledger eviction.
+    const runs = db.db.prepare('SELECT id, status, outcome FROM behavior_runs').all() as Array<{ id: string }>
+    expect(runs).toEqual([{ id: expect.any(String), status: 'completed', outcome: disposition }])
+    expect(mocks.captureAdmission.mock.calls[0][0].nativeId).toBe(runs[0]!.id)
   })
   it('records an enqueue as a write with its entry reference and updates the receipt', async () => {
     enable(); outcome = 'enqueued'; response = { queue_entry_id: 'MQE_1' }
@@ -316,6 +324,9 @@ describe('Merge Pull Requests', () => {
     expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       state: 'completed', outcome: 'updated',
     }))
+    const runs = db.db.prepare('SELECT id, status, outcome FROM behavior_runs').all() as Array<{ id: string }>
+    expect(runs).toEqual([{ id: expect.any(String), status: 'completed', outcome: 'updated' }])
+    expect(mocks.captureAdmission.mock.calls[0][0].nativeId).toBe(runs[0]!.id)
   })
   it('leaves PRs that are neither ready nor behind alone', async () => {
     // Caller clears the behind flag for conflicts and change requests; the
