@@ -1,0 +1,828 @@
+# Poise
+
+Poise is an engineering dashboard for GitHub work, agent activity,
+automations, snippets, and long-form writing. It is a TypeScript application
+with a framework-free browser client, a Node server, and a small SQLite store.
+
+This repository runs Poise as a self-hosted service: several people sign in at
+one public address, and each gets their own Poise, agent CLIs, GitHub accounts
+and data in an isolated workspace. [Service architecture](docs/Service-architecture.md)
+describes how the gateway, the workspaces, Poise and the Poise Link desktop
+companion fit together. The rest of this README describes the Poise application
+itself, which still runs on a single computer for development.
+
+Poise Link, the desktop companion in `link/`, keeps Espanso's snippets in sync
+and shows Poise alerts as native notifications; see [Poise Link](docs/Poise-Link.md).
+
+## Run the service
+
+`deploy/` runs the service on one Linux server with Docker: point DNS at the
+server, create a GitHub OAuth App, fill in `deploy/.env`, and run
+`deploy/install.sh`. `deploy/upgrade.sh` upgrades it, and `deploy/backup.sh`
+and `deploy/restore.sh` back it up and restore it.
+[Operating Poise](docs/Operating.md) is the operator guide.
+
+## Capabilities
+
+- **Current** — manual idea/concept/plan cards beside live issues and PRs.
+- **Swarm** — agent run status, live review activity, responses, and safe replay controls.
+- **Chat** — native coding-agent sessions with streaming, tools, permissions and checkout-bound work.
+- **Archive** — failed GitHub Actions by default, plus searchable issue and PR history. Full-width tables follow Swarm, with separate linked Org and Repo columns.
+- **Behaviors** — scheduled review, approval, unblocking, and issue-review automations.
+- **Snippets** — simple Espanso trigger management, and Import from an existing Espanso file.
+- **Editor** — atomic Markdown storage, annotations, and agent-backed chat.
+- **Publishing** — an Editor document published as a pull request to one or more websites kept in GitHub repositories, each described by its own `publish.yaml`. See [Publishing](docs/Publishing.md).
+- **Analytics** — a full view from the burger menu, one day at a time against a seven-day baseline. Reorder cards for productivity, work type and review friction, per merged pull request and live GitHub API quota by dragging their headers or using the keyboard. The browser remembers their order; two shared heights and the Tactile spring keep the layout consistent. See [Analytics](docs/Analytics.md) for layout and measurement definitions.
+- **Extensions** — MCP servers for Chat, from the burger menu: a directory mirrored from the official MCP Registry, custom remote or local servers, and a switch per workspace. Claude, Codex, Muse and Grok chats get the servers switched on for their repository from their next turn; secrets stay write-only and out of logs and transcripts. See [Extensions](docs/Extensions.md).
+- **Notifications** — what needs you and what Behaviors is doing, in a rail that docks beside the page on a wide window. It covers a failed behavior, a sign-in or a Chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. See [Notifications](docs/Notifications.md).
+
+Settings reads only the selected section's expensive data. Accounts shows each
+CLI result independently, with pending checks and failures named alongside it.
+External font stylesheets load after first paint; system fonts keep the app
+usable while typography is unavailable or still loading.
+Editor, Snippets and Chat start independently of GitHub settings. Editor opens the
+remembered document while discovering the library; its open selector updates as
+soon as discovery finishes and distinguishes loading, failure and an empty library.
+Opening a Chat-created document starts fresh discovery without delaying its body;
+an older library response cannot remove the new selector entry or disturb a draft.
+Discovery reads through the first nonempty title line, uses at most eight concurrent
+file reads and reuses summaries while filesystem metadata is unchanged.
+Returning to Editor keeps the open document, draft, selection and undo history;
+its document picker refreshes in the background. Undo and redo history also survive
+app updates and refreshes in the same browser tab, separately for each document
+(up to 300 steps per stack). History restores only when the saved text still
+matches; external edits start a new timeline. An update waits if browser storage
+cannot preserve history. Other views keep their cached
+content usable while a refresh runs, and leaving stops their visible-only work
+even when an earlier read has not finished.
+
+## Requirements
+
+- macOS, Linux, or WSL. Native Windows is not supported.
+- Node.js 22.13 or newer within Node 22, and npm. `.node-version` selects this runtime line.
+- `gh`, authenticated with `gh auth login`.
+- Claude Code, authenticated to a Claude Pro or Max subscription with
+  `claude auth login --claudeai`. Poise does not require an Anthropic API key.
+  On Linux/WSL, in-app sign-in requires an active graphical desktop session.
+- Python 3.13 for [Caller](caller/README.md), the three CLIs Poise drives
+  (`agent-interface`, `github-interface`, `github-datastore`). They live in
+  `caller/`, and `npm run caller:setup` builds `caller/.venv`, which Poise runs
+  them from.
+- The other provider CLIs the catalog offers — `codex`, `grok` (Grok Build),
+  `agy` (Antigravity), `muse` — each signed in. The production services run
+  with their own `PATH` (Caller's virtualenv, then `~/.local/bin`, then Homebrew
+  and the system), not the shell's; `npm run doctor` looks each CLI up there.
+- `python3` on Poise's `PATH` for the terminal in Settings → Accounts.
+- Espanso is optional and only required for system-wide snippet expansion.
+
+Validate the local integrations without changing external state:
+
+```bash
+npm run doctor
+```
+
+GitHub credentials stay in `gh`. Poise resolves the selected account's token
+through `gh` for issue creation and GitHub account datastore activation and sync;
+it does not persist or expose that token. On upgrade, the schema migration removes the
+retired plaintext `github_token` row while preserving legacy content tables.
+
+Claude credentials stay in Claude Code's local credential store. Poise checks
+the subscription session in the background, pauses only Claude-backed work
+when verification fails, and opens the Claude.ai sign-in flow from an in-app
+prompt. Ambiguous provider failures also offer reconnection without labeling a
+network outage as a rejected credential. A local wrapper uses an exact process
+environment allowlist, an isolated Anthropic profile store, and one merged
+settings overlay that neutralizes provider credentials and credential helpers.
+Immediately before each model process, it requires Claude Code to report the
+Claude.ai first-party provider. This keeps Poise-owned calls from silently
+switching to Console/API credentials. Real Claude failures update the shared
+readiness state reactively: an expired credential demands sign-in again, while
+quota exhaustion holds launches as signed-in-but-out-of-quota without asking
+for a re-login. Anything else leaves the shared state alone. Poise disables
+Claude Code's built-in request retry loop.
+
+Verification polls free local status once per minute, plus one minimal canary
+on the cheapest catalog Claude row at startup, after sign-in, and while
+unhealthy only. Launches never probe first; concurrent launch gates share the
+cached result. The rare canary consumes Pro/Max usage. Anthropic can bill
+account-level [Usage
+Credits](https://support.claude.com/en/articles/12429409-manage-usage-credits-for-paid-claude-plans)
+after included limits; disable them under Claude account Settings > Usage if you
+need a hard spending cap. Poise can isolate provider credentials, but it cannot
+change that account-level billing control. Transient canary failures back off
+for up to one hour; expired tokens fail closed until sign-in succeeds. Worker retry
+delays apply only to the failed target and reviewer. Retryable failures require
+proof that no action was posted; bounded failures remain held on unchanged input.
+Target and repository checks keep their own retry delays and diagnostics; a missing
+checkout or inaccessible repository does not mark the scheduler unhealthy. Shared
+scan or log-feed failures remain visible until a successful read confirms recovery.
+
+## Development
+
+```bash
+npm ci
+npm run caller:setup
+cp .env.example .env
+chmod 600 .env
+npm run dev
+```
+
+Open <http://localhost:5555>. Configure your GitHub account, your agent
+account, timezone, refresh interval, and theme in Settings. Add GitHub
+organizations and personal accounts there, using the organization name or
+personal username (for example, `octocat`). Settings refuses a time zone the
+Poise server does not know. The browser shows times in the saved zone, or in
+its own while none is saved. A saved zone the browser does not know, from
+older data or a direct API write, raises a notice naming it, and times use the
+browser's own zone until you choose another.
+
+### Your GitHub account and your agent account
+
+Settings → General → GitHub holds two accounts, and no GitHub account is fixed
+anywhere in Poise or Caller:
+
+- **Your GitHub account** scopes Current and Archive's issue/PR history to
+  what you are involved in. Archive's Actions filter reads workflows across ready
+  accounts independently of that involvement. Repository lists, account
+  indexing and issues opened from Current or the Editor also use your account.
+- **GitHub automation account** is the GitHub user your reviews and comments are posted
+  as: PR reviews and approvals, conversation resolution, issue reviews, and
+  the checkouts and reads they need. It is optional to save, but every
+  automation and manual review that posts fails, saying where to set it, while
+  it is missing.
+
+Both must be signed in to `gh` on this machine (`gh auth login` once per
+account); the server and Caller ask `gh` for the named account's token and
+never act as `gh`'s active account. Every `github-interface` and
+`agent-interface` process Poise starts gets your account as
+`GITHUB_INTERFACE_USER` and the agent account as `GITHUB_INTERFACE_AGENT_USER`,
+read from Settings when the process starts, and calls that act as a particular
+account name it with `--token-user`.
+`REVIEW_AGENT_USERNAME` from the environment only seeds the agent account, on
+the first start without one saved; after that Settings is the only source,
+including when you clear it. Review New Issues trusts the authors you list;
+until you save a list, that is your account and the agent account.
+
+### Multiple GitHub accounts
+
+Settings → General → GitHub accounts → Add starts datastore activation immediately.
+Poise indexes the account’s repositories, builds your user involvement view, syncs, and
+checks freshness before marking it Ready. Progress and retryable errors appear
+in Settings; closing the panel does not stop activation. Large repository
+histories can take longer than a few minutes. Interrupted activation resumes
+when Poise restarts. Completed item work is retained across activation retries;
+completed databases are reused without reinitialization.
+Your GitHub account configured in Settings must be signed in through `gh` and
+able to read those repositories. Caller currently requires visible repositories
+and indexed issues or PRs; an empty account reports an activation error until it
+has data.
+
+### Connected accounts
+
+Settings → Accounts shows each agent CLI (Claude Code, Codex, gh, Grok, Muse,
+Antigravity) with its version and what its own status command says about its
+sign-in. Grok, Muse and Antigravity have no status command; **Signed in here**
+records a completed Connect login or setup confirmation, survives restarts,
+and does not verify current validity. Antigravity needs manual confirmation
+in setup; an app exit is insufficient. gh lists every account it holds, marks your GitHub account and the
+agent account, and says when either is not signed in to gh. A CLI or GitHub
+account that is not signed in also raises a sign-in alert, which opens this
+tab (`/?settings=accounts`). Connect opens a
+terminal in Settings running that CLI's own login, and the rows refresh when
+it exits; Open a shell starts your login shell. Poise never reads the CLIs'
+credentials. At most two terminals run at once, and one closes after 15 idle
+minutes. See [Connected accounts](docs/Connected-accounts.md).
+
+Current, Archive, and Swarm combine GitHub accounts and offer an account
+filter. Repository identities retain their owner; Archive and Swarm show
+separate Org and Repo columns. Repository-free manual cards,
+Editor, Snippets, and local chats remain personal. If one account's reads
+fail, available results remain visible with an explicit error. Current paints personal cards and GitHub lanes as
+each read arrives; repository discovery and agent activity do not delay them.
+Current keeps an issue draft open while its write is pending and closes it
+after confirmation. A failed write retains the draft for an explicit retry.
+A later refresh failure does not reopen the draft or report the confirmed
+write as failed.
+Archive paints its page before the full-history total is available, showing
+an available-row count until that read finishes.
+
+Behaviors uses one shared set of enabled flags, review settings, repository
+selections, skipped repositories, trusted authors, and memory across all ready
+GitHub accounts. Account filters in Current, Archive, and Swarm do not change
+automation scope. The repository pickers list the repositories of all ready
+accounts by their full `owner/repo` names. Newly activated accounts use the
+same behavior settings.
+Enabling PR review for the first time records a baseline for existing accounts.
+Accounts added while PR review is already enabled process eligible existing open
+PRs when they become ready. Review history, onboarding baselines, and retry state
+remain separate per account. Your GitHub account, the agent account, model
+choices, and appearance remain shared.
+
+Each added account has a separate datastore under
+`~/.poise/datastores/<account>/github.sqlite` (beside a custom `POISE_DB` when set).
+Poise syncs these databases every minute and reconciles daily while running.
+Daily reconciliation checkpoints completed repositories and item versions and
+yields after a 20-second work budget, checked between item expansions. An
+in-flight GraphQL batch may finish beyond that budget. Each chunk is followed
+by an ordinary sync and the unchanged 120-second health gate; incomplete chunks
+resume on the next refresh without marking the daily reconciliation complete.
+Interrupted full-build retries also retain item progress instead of starting over.
+For retry markers left by older releases, Poise first repairs the index in the
+same short chunks; it publishes no fresh success until repair and a delta sync finish.
+Failed syncs back off from one minute to one hour. When GitHub exhausts the
+authenticated user’s API quota, all managed accounts wait until GitHub’s reset
+time, including after a restart. Settings shows that time and resumes activation
+or sync automatically; Retry cannot bypass the quota wait.
+The existing account's externally managed datastore keeps its existing
+sync service. `POISE_DATASTORE_DB` selects that legacy database explicitly.
+Activation never initializes over the existing account's database.
+
+Models have one name everywhere: the identity `<family>-<version>-<effort>`
+from Caller's catalog (`opus-5-max`, `gpt-6-astra-ultra`, …), the same string
+the Swarm log records. Settings → Models lists every place Poise launches a
+model — Chat, Editor chat, PR review, PR approval, Issue review — with a default and a
+fallback each, plus the places Caller decides on its own (`/content`,
+`/consensus`, fix failing CI, simplify issue, the sign-in check). Every place
+offers every catalog model; review places follow the providers Caller lists as
+reviewing (all five since Caller #39: Claude with governed tools, the others
+with a structured verdict), and their fallback is the recovery model Caller
+switches to once after a Claude output limit. For chat places the fallback
+launches when the default's provider is not signed in. A choice the catalog no
+longer contains resolves to the Caller default and says so in the pane.
+
+The PR review place also names a secondary and a tertiary reviewer (seeded
+from different families than the default). The Reviewers column of the
+Behaviors view decides how many of the three review each new pull request —
+primary only by default, primary + secondary, or all three — and they run at
+the same time, each as its own Swarm row with its own model and Stop button.
+Every review posts as your agent account, so the pull request ends up with
+the union of their findings; a bug two reviewers find in the same minutes can
+appear twice, since github-interface deduplicates only against threads already
+posted. Each run reports the review it submitted (Caller records the GitHub
+review id as its receipt), so a reviewer that dies is relaunched exactly like a
+single review is: once every review posted since its launch is accounted for by
+a sibling. Approvals stay with the default model. A wider panel applies to
+pull requests opened after the change; the manual Review button in Swarm keeps
+launching the default alone.
+
+The catalog holds the latest model of each family with its top two efforts
+(three for Claude, so reviews can run at high; Claude keeps Opus and Fable,
+Codex Astra and Sol).
+Every morning at 07:00 in the timezone saved in Settings (UTC until one is
+set), Poise asks each CLI what it offers (`agent-interface --refresh-models`)
+and rewrites the catalog when something changed; Settings → Models → Check now
+does the same on demand and shows the last report. Reviews need Caller 0.3.0
+or newer (`agent-interface
+--models`); an older Caller fails before launching a worker. The compatible
+review policy is `bounded-v1`: reviews have a total 23m33s budget. Timeouts and
+failed recovery remain visible and are held across restarts for the same
+input/model; new commits, new approval input, or a model change can be retried.
+
+Worker retry delays are scoped to the failed PR or issue and its reviewer.
+Other targets keep launching, and completed runs keep reconciling during that
+retry delay. A reviewer that needs unavailable provider authentication waits
+without holding the other providers in its panel. Ordinary worker errors do
+not change shared authentication state; provider sign-in checks own that state.
+Unreadable worker log rows are quarantined by their available identity. Healthy
+results still reconcile. Attributable invalid results remain held across log
+rotation, rewritten logs, restarts, and model or commit changes. Unidentified
+evidence holds unresolved launches until a trustworthy matching run record restores
+normal reconciliation, retry, and timeout handling.
+Issue holds preserve their original child coverage; confirmed terminal holds do not
+consume worker slots. Uncertain live workers still count toward the concurrency limit.
+Swarm identifies unreadable targets and their errors alongside valid live runs, and
+persistent incidents keep holds visible after the source logs disappear.
+
+## Behaviors
+
+Behaviors runs the automations that act as your agent account: Review New Pull
+Requests, Approve Pull Requests, Resolve Unblocking Conversations, Merge Pull
+Requests, Rerun Grey CI and Review New Issues. Each row's Setting cell opens a dropdown, saved by every way of
+closing it.
+
+The five pull-request behaviors act on your open pull requests in every
+repository of your ready accounts except the ones ticked under **Skip
+repositories**. The list groups repositories by account, with Select all for
+each account and for the whole list; Select all ticks the repositories listed
+now, so one created later is not skipped until it is ticked. The cell shows how
+many are skipped, beside Review New Pull Requests' priority ceiling, which is
+chosen in the same dropdown. Nothing happens in a skipped repository: its pull
+requests are not claimed, read, launched or retried. Untick a repository and
+its open pull requests are picked up on the next run like new ones. The
+baseline Review New Pull Requests took when it was first turned on still
+holds, so the pull requests that were already open then are not reviewed.
+Several people's automations can work in the same repository: each acts only
+as its own agent account.
+
+**Merge Pull Requests** is off by default. Turn it on to merge your eligible
+pull requests automatically on the server's one-minute tick, including ones
+already open. It follows Current's green status: the merge button is available,
+checks have passed (or none exist), and no live conversation remains unresolved.
+Yellow or unknown pull requests wait. Caller rereads readiness and pins the head
+SHA when merging; GitHub still enforces repository protections. It prefers squash
+when allowed, then a merge commit, then rebase. On a branch with a native merge
+queue it instead enqueues the pinned head for GitHub to integrate, and never
+resubmits an entry the queue ejected: a new head or a manual requeue releases
+the rejection. Skip repositories applies here too.
+Last triggered links to the last merge action: the confirmed merged pull request,
+or the queued pull request on a queue branch. Merge failures appear
+in Behaviors diagnostics and retry with backoff. It runs without an agent model or
+an open browser tab. Turning it off stops subsequent merge launches.
+
+When off, this behavior adds no GitHub API requests. When on, Caller checks up to
+50 eligible PRs in one fresh GraphQL query per ready account, with no per-PR REST
+polling. At the one-minute cadence, ten blocked PRs in one account therefore use
+60 GraphQL queries per hour, rather than 1,200 REST reads. Checks and conversations
+are reevaluated even when the head has not changed. Separate accounts and batches
+add queries; the query returns GitHub's actual `graphql_cost` in points.
+Only a green candidate invokes the merge primitive: three REST reads, one fresh
+GraphQL readiness query and one REST merge write, in addition to its shared
+batch read. On a queue branch the write is a head-pinned enqueue instead, and
+already-queued PRs are skipped from the batch evidence without per-PR calls.
+These are normal-path counts; transient retries can add requests.
+Skipped, draft and foreign-author candidates are excluded from discovery locally.
+A partial target-read failure is visible without holding other readable targets.
+The scan deadline and resume cursor may defer some evaluations to the next tick.
+
+**Rerun Grey CI** is off by default. Enable it to request one rerun of an eligible
+current-head workflow that completed as cancelled or stale. Failed/timed-out,
+successful, active, intentionally skipped and neutral workflows are excluded.
+Caller verifies the PR, author, head, workflow attempt, every job and the latest
+replacement run before requesting recovery. A workflow containing a failed or
+active job is refused. The behavior never cancels a running workflow.
+Repository skips apply. Last triggered links to the requested workflow rerun;
+it confirms the request, not that CI passed. No model is launched.
+
+Discovery checks up to 50 PRs per ready account in one GraphQL query each minute,
+with zero per-PR REST polling. A positive candidate normally adds five REST reads
+and one rerun write; large workflow/job inventories require extra pages. Transient
+read retries may add calls. When disabled, this behavior adds zero requests.
+This is additional discovery traffic when Merge Pull Requests is also enabled.
+A durable workflow/head/event marker allows one automatic recovery on that head,
+including across restarts or disable/enable. If a write receipt is uncertain,
+the marker and a visible diagnostic hold it rather than risk duplicate reruns.
+A manual rerun or new head remains available through GitHub.
+
+Replay in Swarm runs only what the scheduler itself would run. A pull request
+must be open, not a draft, yours, and outside that behavior's skipped
+repositories; an issue must be open, by a trusted author, in a repository
+opted in to Review New Issues. Anything else is refused, and Swarm shows why
+under the row. See [Behavior integration contract](docs/Behavior-Contract.md).
+
+## Review New Issues
+
+Behaviors → Review New Issues gives each new issue in the repositories you opt
+in — and every sub-issue it makes part of itself — an adversarial review by
+one to three reviewers at once, the Issue review models in Settings → Models.
+A sub-issue that its parent's review covers gets no review of its own.
+Each reviewer is its provider's own CLI with full access to a fresh checkout,
+so it can read the whole repository and run the tests; Caller posts its
+comments as your agent account. Nothing is reviewed until a repository is
+ticked in the row's Setting dropdown, and only issues by the trusted authors
+listed there count — your account and the agent account until you save a
+list. Swarm shows every reviewer like a PR review. See
+[Review New Issues](docs/Issue-review.md).
+
+## Production
+
+```bash
+brew install node@22 python@3.13
+npm ci
+npm run install:production
+```
+
+Installers use Node 22 (minimum 22.13). `POISE_NODE`, when set, must name that
+runtime; otherwise installation uses Homebrew's stable Node 22 path, then the
+invoking Node 22. Self-update bootstrap rejects services configured with another Node line.
+
+A new installation can start without an initialized datastore; add the first
+GitHub account in Settings. Existing databases and their sync services are retained.
+An explicitly configured `POISE_DATASTORE_DB` must point to an existing file.
+
+Installation, the stop gates and the hourly reconciler all use the GitHub
+identities saved in Settings — your account, the agent account and the
+organization — from the database `POISE_DB` names. A missing or cleared
+identity fails naming the setting instead of borrowing the installer's
+environment or `gh`'s active account. `REVIEW_AGENT_USERNAME` only seeds the
+agent account on a first install and start without one saved; `POISE_GITHUB_USER`
+migrates a never-saved account into Settings once, for existing legacy-sync
+installs. Neither is required when Settings already holds the accounts.
+
+The macOS installer builds Poise and the checkout's Caller virtualenv
+(`caller/.venv`, as `npm run caller:setup` does), installs the Claude and Codex
+stop gates from `caller/`, and registers three per-user launchd services. They
+keep Poise alive, check `/api/health`, and reconcile Poise `main` (which carries
+Caller) and both agent hooks every minute; a Caller that `/api/health` does not
+report ready is reinstalled. Updates use fast-forward only and refuse to
+overwrite a dirty production checkout; a fast-forward whose install did not
+complete is installed again on the next run. Output is in
+`~/.poise/logs/caller-update.out.log` and failures are in
+`~/.poise/logs/caller-update.err.log`. Each run also records its outcome in
+`~/.poise/production-update.json`: Settings → General shows the deployed
+commit against `main` from it, and the health monitor sends a desktop
+notification when the updater has been failing for five minutes or has not
+run for ten, and again when it recovers. A transition to degraded health
+produces a desktop notification; expired Claude authentication also opens
+Poise's subscription sign-in prompt.
+
+The stop gates wait for the agent account's approval and read pull requests as
+your GitHub account. Installing them fixes both accounts into the hook from
+Settings — before Poise's first start, the agent account is the
+`REVIEW_AGENT_USERNAME` that will seed it — and fails without an agent account.
+A changed account reaches the hooks on the next reconciler run; a changed
+account on a legacy-sync install reinstalls the sync jobs with it.
+
+Keep the production checkout outside `~/dev` (for example
+`~/.poise/production`): the updater needs it permanently on `main` and clean,
+which a working checkout is not.
+
+The production build emits the browser client under `dist/client` and the Node
+entrypoint at `dist/server.js`. The server binds `127.0.0.1:5555` by default.
+Outside [service mode](#service-mode) Poise refuses non-loopback bindings: its
+API can create GitHub issues, launch agents, and modify local files, so it is
+not a network service.
+Keep `.env` owner-readable only (`chmod 600 .env`) because it may contain the
+Confab API credential; production startup rejects broader permissions and a
+Caller whose CLIs cannot run.
+
+## Service mode
+
+With `POISE_MODE=service` Poise runs as the single-user application inside
+one workspace container behind the gateway, as
+[Service architecture](docs/Service-architecture.md) specifies. Without it
+nothing on this page changes. The gateway passes:
+
+| Variable | Value |
+| --- | --- |
+| `POISE_MODE` | `service`; any other value stops startup |
+| `POISE_WORKSPACE_HANDLE` | The owner's GitHub login in lower case |
+| `POISE_WORKSPACE_OWNER` | The owner's GitHub login |
+| `POISE_PUBLIC_ORIGIN` | `https://<handle>.<domain>`; plain `http://` only on a `localhost`, `*.localhost` or `*.test` host, for local and CI end-to-end runs |
+| `POISE_GATEWAY_PUBLIC_KEY` | The gateway's Ed25519 public key: its SPKI PEM as single-line base64 |
+
+Startup checks all of them and stops with one message naming each variable
+that is missing or invalid.
+
+**Requests.** `POISE_HOST=0.0.0.0` is allowed. Every request that does not
+come from loopback, the page and its assets included, needs the gateway's
+identity assertion in `X-Poise-Identity` with a scope that reaches the route,
+the workspace's public host in `Host`, and exactly `POISE_PUBLIC_ORIGIN`,
+scheme included, when it sends `Origin`. Cookies and `Authorization` headers
+never identify anyone: the gateway keeps its own credentials. The Chat and
+terminal WebSockets apply the same rules, and the terminal opens only to the
+`browser` scope; an upgrade to any other path is answered and closed.
+Loopback requests keep the local rules, so the container's own health check
+needs no assertion.
+
+**Storage.** Everything lives under `~/.poise` in the home volume: Chat
+workspaces in `~/.poise/chat`, snippets in `~/.poise/snippets/poise.yml` and
+Caller's data in `~/.poise/agent-interface`, which every Caller process gets
+as `AGENT_INTERFACE_DATA_DIR`. An explicit `POISE_CHAT_ROOT`,
+`POISE_ESPANSO_MATCH_DIR` or `AGENT_INTERFACE_DATA_DIR` still wins. Chat
+storage no longer needs a git checkout of Poise.
+
+**Service endpoints**, from loopback or with the gateway's `admin` scope:
+
+- `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
+  runningCallerCalls, backgroundWork, idle, draining }`. `version` is the
+  commit the running bundle was built from (`null` for a development build).
+  `activeChatTurns` counts the Chat turns recorded open. `runningCallerCalls`
+  counts the Caller processes this server launched for agent work (behavior
+  runs, manual reviews and replays, card chats, `/content`) that it has not
+  seen exit, plus `/consensus` debates still running. `backgroundWork` counts
+  everything else a restart would cut: Chat startups, operations and agent
+  processes, background work (behavior ticks, provider CLI updates, the model
+  check) and browser launches still in their handler. `idle` is true only
+  when all three are zero; the gateway recreates a container once it is.
+- `POST /api/service/drain` stops admitting new Chat turns (queued messages
+  included), scheduled behavior launches, and launches from the browser
+  (`/api/pr-review`, `/api/agent-replay`, `/api/chat-content`, `/api/debate`,
+  `/api/chat`, `/api/models/refresh`), which answer 503 with code `draining`.
+  Work already running continues. One Chat turn holds the drain at most 30
+  minutes: past that the drain stops it with a transcript notice naming the
+  update. It returns the health body. The gateway renews a drain by
+  calling it again while it waits; one that is not renewed
+  lapses `POISE_DRAIN_TIMEOUT` seconds (default 5400; read from the
+  workspace's environment and validated at startup) plus five minutes after
+  the last drain call, so a gateway that stops renewing it cannot leave the
+  workspace refusing work.
+- `POST /api/service/resume` lifts the drain; the owner's browser may call it
+  too.
+
+**Poise Link.** A paired device reads `/api/link/*` with the gateway's `link`
+scope: its snippets (plain pairs only), the workspace's alerts and an event
+stream that announces both. The workspace records an alert when Claude needs a
+new sign-in, a behavior gives up on a pull request or issue, a GitHub account's
+datastore sync has been failing for 15 minutes, a Chat agent waits for a
+permission or an answer, and when a Chat turn longer than two minutes finishes.
+[Poise Link](docs/Poise-Link.md#the-workspace-side) describes the API.
+
+**Daily model check.** At 07:00 in the timezone set in Settings, Poise runs
+the same check as Settings → Models → Check now, in place of the launchd job.
+With no timezone set it uses UTC and logs that; a name that is not a timezone
+is reported and nothing runs until it is corrected. A drain skips the run.
+
+**Turned off**, each saying so where the feature would otherwise be offered:
+
+- the self-update controller and Improve Poise from Poise (`/api/self-update*`
+  and `/poise`);
+- the production updater, its Settings line and its desktop notification;
+- launchd recovery of legacy datastore sync;
+- Espanso detection: the desktop copy is synced through Poise Link, with
+  connection status in Settings → Accounts → Poise Link;
+- Claude sign-in through a local browser: `POST /api/claude-auth/login`
+  answers 409 and points to Settings → Connected accounts, where the sign-in
+  banner's button opens Claude's login in a terminal.
+
+## Configuration
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `POISE_HOST` | Production bind address; loopback only outside service mode | `127.0.0.1` |
+| `POISE_PORT` | Production port | `5555` |
+| `POISE_DB` | SQLite path | `~/.poise/cache.db` |
+| `POISE_DATASTORE_DB` | Existing account’s Caller datastore | github-datastore's default under `~/.local/share/github-datastore` |
+| `POISE_GITHUB_USER` | One-time migration into Your GitHub account when never saved, for legacy sync; ignored after that | unset |
+| `POISE_EDITOR_DIR` | Markdown and annotation directory | `~/.poise/editor` |
+| `POISE_CHAT_ATTACHMENTS_DIR` | Durable chat attachments | `~/.poise/chat-attachments` |
+| `POISE_ESPANSO_MATCH_DIR` | Espanso match directory override | macOS Espanso default; `~/.poise/snippets` in service mode |
+| `AGENT_INTERFACE_ROOT` | `agent-interface` working directory | `caller/agent_interface` |
+| `CALLER_BIN_ROOT` | Directory Poise runs Caller's CLIs from; explicitly passed to model-refresh children | `caller/.venv/bin` |
+| `AGENT_INTERFACE_DATA_DIR` | Durable agent-interface calls and responses | `caller/agent_interface/data`; `~/.poise/agent-interface` in service mode |
+| `POISE_PYTHON` | Python 3.13 that builds Caller's virtualenv | Homebrew `python@3.13`, then `python3.13` on `PATH` |
+| `POISE_CHAT_ROOT` | Chat workspace storage | `.poise-chat/` in the installation; `~/.poise/chat` in service mode |
+| `POISE_VOICE_GUIDE_PATH` | Optional editor-chat voice guide | unset |
+| `AGENT_INTERFACE_VOICE_GUIDE` | Optional voice guide `/content` writes in; without one it writes without | unset |
+| `REVIEW_AGENT_USERNAME` | Optional seed for the agent account (Settings → GitHub) on the first install and start without one saved; ignored after that | unset |
+| `POISE_RELEASE_REPO` | Repository the release links and menu attribution point at, as `owner/name`; a fork's own releases | `autonomio/poise` |
+| `CONFAB_URL` | Optional Confab service | `http://localhost:8000` |
+| `CONFAB_API_KEY` | Optional Confab bearer credential | unset |
+
+The browser keeps view, filter, typography, refresh, and theme preferences in
+`localStorage`. SQLite uses WAL mode and stores local settings, manual cards,
+and automation deduplication state. Editor documents remain plain Markdown.
+
+### Fixed values
+
+What is configurable and what is deliberately fixed:
+
+| Value | Disposition |
+| --- | --- |
+| Release/download/attribution repository | Configurable: `POISE_RELEASE_REPO` as `owner/name`, default `autonomio/poise`. It drives the Poise Link installer links the gateway serves, the installer's release links, and the menu's release attribution. A fork sets it once per deployment; see [Run your own Poise from a fork](docs/Operating.md#run-your-own-poise-from-a-fork) |
+| Release host `github.com` | Product invariant: releases are distributed from github.com. The deployment's own GitHub for sign-in and API calls is separately configurable in the gateway (`POISE_GITHUB_URL`, `POISE_GITHUB_API_URL`) |
+| `com.vaquum.*` launchd labels, the Poise Link bundle identifier and launch agent | Product invariant: renaming one orphans the installed jobs, agents and login items and breaks upgrades. They select no GitHub identity |
+| `github.com` API, clone and browser URLs in Poise and Caller | Product invariant: Poise and Caller work against github.com through `gh` and `git`; there is no GitHub Enterprise mode outside the gateway sign-in above |
+| Self-update trust root (`package.json` repository) | Product invariant: the controller releases the repository its trusted copy names and refuses to let a change touch that field, so a candidate release can never redirect what judges it. It never follows `POISE_RELEASE_REPO` |
+| Release branch `main` | Product invariant: Poise releases from `main`, which the production updater fast-forwards and the self-update controller tracks |
+| Daily model refresh at 07:00 | Schedule invariant; the time zone it runs in is the Settings user choice |
+
+## Quality gates
+
+```bash
+npm run check      # typecheck, lint, unit/integration tests, production build
+npm run test:e2e   # Playwright smoke and visual regression tests
+npm run verify     # both suites
+caller/.venv/bin/python -m pytest caller/agent_interface/tests caller/github_interface/tests caller/github_datastore/tests
+```
+
+CI uses Node 22 for every Poise gate: lint/types/audit, production build, two
+unit/integration shards and four Chromium shards. Browser shards reuse the
+production build. `Verify (Node 22)` requires every job to pass. Per-shard timing
+reports support profiling; see [Testing](docs/Testing.md). The Caller workflow
+runs Caller's tests on Python 3.13.
+
+## Architecture
+
+- `src/` — browser views and interaction logic.
+- `server/cache-plugin.ts` — shared API middleware for development/production.
+- `server/production.ts` — static and API server, loopback-only outside service mode.
+- `server/service/` — service mode: configuration, identity assertions, drain and health, the daily model check.
+- `server/process.ts` — bounded external process execution.
+- `server/db.ts` — SQLite schema, migrations, and automation claims.
+- `caller/` — Caller, the Python CLIs Poise drives ([caller/README.md](caller/README.md)).
+- `tests/` — unit, integration, browser, and visual regression coverage.
+
+See [SECURITY.md](SECURITY.md) for the supported trust boundary.
+
+## Stopping a run
+
+Every Swarm row that is still running has a Stop button. The first click arms
+it ("Sure?"), the second click asks Caller to stop the run: `agent-interface
+--stop` signals the call's process group and closes the row as failed with
+`error_code: stopped`. A stopped review or approval is held for that head like
+a bounded failure — it is not relaunched by the next tick; a new head or a
+replay is a fresh decision. A stop is not counted against the Claude sign-in.
+Needs a Caller release with `--stop`; older releases answer "Update Caller".
+
+## Review activity in Swarm
+
+Swarm first shows the 50 newest readable calls, then loads the complete history.
+Large histories prepare their rows in batches so the recent calls and navigation
+stay usable while the remaining rows are prepared.
+The count and loading message identify the partial history; a failed full read
+keeps those calls visible and reports the missing history. Account scoping and
+quarantine checks apply before the preview limit, so unreadable/conflicting rows
+are never made actionable by the preview. Returning to Swarm paints received
+history immediately while a fresh read runs. The optional `limit=1` through
+`limit=100` on `GET /api/agent-logs` returns a newest-first preview and its
+`total` readable-run count. Unbounded reads retain the full-history response.
+The optional `status=running` returns only running rows (plus quarantined rows
+whose status is unreadable or running); Current's running-job accent uses it
+instead of the full history.
+
+With a current Caller release, review/approval rows show the last
+observed stage. Expand a row for timestamped activity, worker heartbeat age, last
+provider event age, and the current stage deadline. Active runs refresh every 15
+seconds while Swarm is visible. Missing heartbeats, provider silence, incomplete
+events, and runs without instrumentation are labeled explicitly. These labels
+report observations; they do not change review outcomes or trigger retries.
+Each minute records whether new reasoning activity arrived. Expand **Provider
+reasoning** to read the latest 65,536 characters exposed by the provider, when
+available. These details load on demand, outside the main log payload. Polling
+updates existing rows and text in place, preserving expansion and scroll position.
+
+## Native-agent Chat
+
+The full Chat view owns persistent sessions for Claude Code, Codex, Grok Build
+and Muse. New sessions use Git-ignored storage inside Poise, with no repository
+or branch picker. It includes inline permissions and
+questions, steering, Stop, durable transcripts, and Current/Swarm/Editor
+handoffs. It requires the companion Caller turn-recording and checkout-lock
+changes; the existing pane stays available for `/content`, `/consensus` and
+Editor annotations in v1.
+
+The fresh console accepts a message directly. Opus 5 High is the starting
+default; click its label in the console to choose another catalogue model and
+effort from the dropdown. First Send uses that choice without a creation dialog.
+The draft and model choice survive session-creation errors. The sessions
+pane is edge-resizable, remembers its width, and expands/collapses smoothly
+while respecting reduced-motion preferences.
+
+The New session model picker lists all five catalogue providers and each
+model’s exact effort variants. Unavailable integrations, including the current
+Antigravity CLI’s missing interactive permission channel, remain visible with
+an explanation. Existing sessions are preserved.
+
+The activity icon beside Fork switches between the detailed transcript and
+messages with any pending questions, permissions or errors. Local file links
+open read-only previews, and internal Muse reminder cards are not displayed.
+
+See [Chat v1](docs/Chat-v1.md) for architecture, recovery, release integration
+and the distinction between automated coverage and live-agent verification.
+
+## Queue follow-ups
+
+Use `/queue <message>` to add a task to the collapsible Queue section above
+the console. Each row chooses its own agent, model and effort. During a turn,
+items wait for its completion; while idle, they wait for the next task you
+send normally, then run one by one. Queueing alone never starts a turn.
+Saved items survive reloads, and Stop preserves the waiting tail.
+See [Queued Chat messages](docs/Queue.md).
+
+## Improve Poise from Poise
+
+After the one-time release-controller installation, a Poise implementation
+request in Chat can proceed through implementation, checks, CI, automatic PR
+merge, a verified release and safe tab refresh. Natural requests are supported;
+`/poise` is an optional shortcut. Other repositories, and Caller in `caller/`,
+do not inherit this merge authority. The persistent deployment card provides
+one-click **Revert** for the latest eligible change, backed by a retained
+release rather than another agent turn. Caller and persistent application data
+keep their existing versions and locations.
+
+See [Self-improvement](docs/Self-improvement.md) for the setup commands, release
+boundary, independent recovery, maintenance, and verification record. The
+initial controller/bootstrap PR is reviewed manually; routine eligible Poise
+changes do not require another merge confirmation.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Auto-merge batches
+
+The Auto-merge header icon enables **Auto-merge** for the selected session.
+The agent carries all requested changes and PRs across repositories through
+checks, fixes and verified merges, deferring non-blocking questions until the
+end. It is off by default, retained per session, and available before the
+first message. Native tool approvals use once-only decisions recorded in the
+transcript. See [Auto-merge mode](docs/Auto-merge.md).
+
+## Chat memories
+
+The rightmost **Memories** icon opens a free-text pane. Its autosaved text is
+shared across Chat sessions and included last in every outgoing Chat prompt,
+after attachments and other injected context. This includes queued tasks,
+steering, handoffs and Poise implementation messages. Closing the pane leaves
+memories active; clearing the text removes the appendix from future messages.
+See [Memories](docs/Memories.md) for persistence and recovery details.
+
+## Switchboard
+
+The Switchboard pane, on the right of Chat, shows what every chat in the
+workspace is doing: what is blocked, what finished and what needs your
+decision. A Muse chat observes the other chats and reports; Poise schedules
+it, shows its reports as one row per chat, and delivers your answers to the
+chat that asked. Every update has **Explain**, and every decision offers the
+chat's own choices plus an answer in your own words. Drag the pane to any
+width; it snaps at one third and one half. See [Switchboard](docs/Switchboard.md).
+
+## Chat reliability
+
+Unsent composer drafts and partial question answers survive ordinary tab
+refreshes when browser storage is available. Failed submissions preserve
+newer writing, and queued/Poise-change attachments follow their receiving
+session rather than depending on an old conversation remaining open.
+See [quality control](docs/Quality-Control.md) for the combined interaction,
+recovery, native-protocol and release verification coverage.
+
+## Recall recent Chat messages
+
+Press Up in an empty Chat console to browse the last ten messages in that
+conversation. Up/Down selects a single-line row above the input; Enter or a
+click restores its full text for editing, never sends it. Escape dismisses.
+See [Console message history](docs/Message-history.md).
+
+## Chat controls
+
+Safe mode is off by default; turn it on for native risk approvals without a sandbox.
+Reasoning is a separate, default-off display toggle. Icon tooltips appear after
+one second and use short labels. See [Chat controls](docs/Chat-controls.md).
+
+## Model choices and critical reply review
+
+Type **`/model`** to choose from the catalogue in a list immediately above the
+console. Pick a provider/model/effort, then continue with a task or another
+switch. **`/model` → choose → `/review`** asks the chosen model for an
+adversarial, evidence-based critique of the latest assistant reply. The
+reviewer can inspect the full prior conversation and any relevant background,
+not just a Git diff. Optional focus follows `/review`.
+
+A review or model-prefixed task submitted during active work goes into the
+queue; it does not interrupt that work or change the active agent mid-turn.
+The selected model and command chips survive refresh. See
+[Chat command chains and reply review](docs/Chat-commands.md).
+
+`/create /your-skill` followed by its text saves a reusable, user-named switch.
+Skills and snippets are one shared library: edit them in **Snippets**, or add
+a snippet there and invoke it in Chat. Use it in any future message, including
+queued tasks and command chains. The Snippets view shows its `/name` invocation.
+See [Create reusable Chat switches](docs/Chat-switches.md).
+
+## Conversation context
+
+Use `/compact` to compact the native model context while keeping Chat history.
+Use `/reset` to clear conversation history and start a fresh native context in
+the same chat. They work with model selection and queued messages. Workspace
+files and shared Memories remain intact. See [Chat context controls](docs/Chat-context.md).
+
+## Model and CLI freshness
+
+Poise checks and updates installed provider CLIs before discovery and native
+Chat turns. Discovery itself runs no inference: every family is read from a
+free source. Settings → Models → Check now shows progress and failures explicitly;
+fresh chats follow the latest discovered Opus High rather than a pinned version.
+See [Provider CLI and model freshness](docs/Model-freshness.md).
+
+## JEV typed primitives
+
+Select **JEV · Primitive builder** in New session to evaluate explicit state
+with Noul, Choice and Score questions, rather than send chat messages. The
+builder supports mixed question batches, typed result cards, request JSON,
+reusable Snippets templates and saved evaluation history. Configure the
+server-only `JEV_API_KEY` in `.env`. See [JEV primitive workspaces](docs/Jev-primitives.md).
+
+[Menu and Settings](docs/Menu.md) describes the direct Settings destinations,
+attached panels and contextual help.
+
+Grey CI recovery intents are shared by repository, workflow, event and head,
+independent of PR number or changes to the acting account. Intent is persisted
+before launch; a restart rehydrates unconfirmed requests as visible holds even
+if the workflow is now running or green. Diagnostics belong to each workflow,
+so a different successful rerun cannot clear an unresolved hold. A `read_failed`
+receipt proves no write occurred: its intent is released and the visible read
+failure retries with backoff. Errors after the write begins remain held.
+
+Archive's Actions filter reads workflow runs independently of PR involvement, including
+push and deployment runs after merge. Failed selects GitHub's `failure` conclusion;
+Any includes all conclusions and active runs. It reads at most the latest 100 runs
+per repository for the selected outcome. Snapshot limits remain diagnostic API
+metadata and do not produce notices in Archive; read failures remain visible.
+Search and date filters apply within that snapshot. Older runs remain
+available in GitHub. Workflow reads start only while Actions is selected, share a
+five-minute cache across pages, counts, search, date and account filters, and make
+one API request per discovered repository per outcome per cache interval.
+Repository discovery uses the existing cache; no workflow jobs or logs are polled.
+Healthy workflow snapshots expire five minutes after their reads complete;
+unavailable or partial reads retry after one minute, reusing healthy repositories.
+Expired reads send authenticated ETags: unchanged `304` responses reuse the
+verified snapshot and do not consume GitHub's primary REST rate limit.
+
+Archive's Actions, Issues and PR controls are independent toggles; PR selects only
+pull requests. Actions has its own Failed/Any outcome control, while Any/Open
+applies to issues and pull requests. Selected sources render independently and
+merge by update time. Query results remain in memory across toggles; full-history
+counts run after the first page and never block pagination. Actions returns a
+persisted snapshot immediately while refreshing expired data, publishes repository
+results progressively on a cold read, and shows an animated loader until that
+snapshot completes. Unavailable reads remain explicit beside retained results.

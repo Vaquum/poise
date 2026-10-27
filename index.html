@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Poise</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Main view -->
+      <section id="view-main" class="view">
+        <header class="view-header">
+          <div class="filter-cluster" id="main-filters">
+            <div class="range-picker" id="filter-type">
+              <button data-filter="action" class="active">Actions</button>
+              <button data-filter="issue">Issues</button>
+              <button data-filter="pr">PR</button>
+            </div>
+            <div class="range-picker" id="filter-action-status" aria-label="Actions outcome">
+              <button data-action-status="failed" class="active">Failed</button>
+              <button data-action-status="all">Any</button>
+            </div>
+            <div class="range-picker" id="filter-status" aria-label="Issue and PR status">
+              <button data-status="all" class="active">Any</button>
+              <button data-status="open">Open</button>
+            </div>
+            <div class="range-picker" id="time-picker">
+              <button data-time="all" class="active">Any time</button>
+              <button data-time="today">Today</button>
+              <button data-time="yesterday">Yesterday</button>
+              <button data-time="week">This week</button>
+            </div>
+            <div class="search-cluster">
+              <input class="search-input" id="search-input" type="search" placeholder="Filter…" autocomplete="off" spellcheck="false" />
+              <span class="filter-count" id="count"></span>
+            </div>
+          </div>
+        </header>
+        <main>
+          <table id="table">
+            <thead>
+              <tr>
+                <th class="col-type"></th>
+                <th class="col-title">Title</th>
+                <th class="col-last">Author</th>
+                <th class="col-org">Org</th>
+                <th class="col-repo">Repo</th>
+                <th class="col-owner">Owner</th>
+                <th class="col-state">Status</th>
+                <th class="col-updated">Updated</th>
+                <th class="col-action"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+          <div id="loader" class="loader" role="status" aria-label="Loading Archive"><span></span><span></span><span></span></div>
+        </main>
+      </section>
+
+      <!-- Current (kanban) view (lazy-rendered into this container) -->
+      <section id="view-current" class="view" hidden></section>
+
+      <!-- Swarm (live ops dashboard) view (lazy-rendered into this container) -->
+      <section id="view-swarm" class="view" hidden></section>
+
+      <!-- Chat (coding-agent sessions) view (lazy-rendered into this container) -->
+      <section id="view-chat" class="view" hidden></section>
+
+      <!-- Behaviors view (lazy-rendered into this container) -->
+      <section id="view-behaviors" class="view" hidden></section>
+
+      <!-- Snippets view (lazy-rendered into this container) -->
+      <section id="view-snippets" class="view" hidden></section>
+
+      <!-- Editor view (lazy-rendered into this container) -->
+      <section id="view-editor" class="view" hidden></section>
+
+      <!-- Analytics view, opened from the burger menu (lazy-rendered into this container) -->
+      <section id="view-analytics" class="view" hidden></section>
+      <section id="view-logging" class="view" hidden></section>
+      <section id="view-extensions" class="view" hidden></section>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

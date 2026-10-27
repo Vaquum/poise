@@ -1,0 +1,295 @@
+import { expect, test, type Page } from '@playwright/test'
+import { organization, setupWorkspace } from './onboarding-fixture'
+
+// First-run setup in a workspace behind the gateway, with Poise's API and the
+// gateway's stood in for (onboarding-fixture.ts).
+
+const dialog = (page: Page) => page.getByRole('dialog', { name: /./ })
+const next = (page: Page) => page.locator('.ob-next')
+
+test('walks a new workspace through setup in order, saving each step where Settings keeps it', async ({ page }) => {
+  const state = await setupWorkspace(page)
+  await page.goto('/')
+  await expect(dialog(page)).toBeVisible()
+  // Everything else is dimmed and out of reach while setup runs.
+  await expect(page.locator('#app')).toHaveAttribute('inert', '')
+  await expect(page.locator('.ob-count')).toHaveText('Step 1 of 8 · Theme')
+  await expect(page.locator('.ob-title')).toHaveText('Choose how Poise looks')
+  await expect(page.locator('.ob-back')).toBeHidden()
+
+  // 1. Theme, applied at once.
+  await page.locator('[data-choice="dark"]').click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  await next(page).click()
+
+  // 2. GitHub: the connection is checked with GitHub before Continue opens.
+  await expect(page.locator('.ob-title')).toHaveText('Connect your GitHub account')
+  await expect(page.locator('.ob-intro')).toContainText('octocat')
+  await expect(page.locator('.ob-connection')).toHaveAttribute('data-state', 'connected')
+  await expect(page.locator('.ob-connection-text')).toContainText('GitHub confirms the account works')
+  await next(page).click()
+
+  // 3. The agent account, prefilled from Settings and checked the same way.
+  await expect(page.locator('.ob-title')).toHaveText('Add the agent account')
+  await expect(page.locator('#ob-agent-login')).toHaveValue('octo-agent')
+  await expect(page.locator('.ob-connection')).toHaveAttribute('data-state', 'connected')
+  await expect(page.locator('.ob-skip')).toBeHidden()
+  await next(page).click()
+  expect(state.writes.filter((write) => write.path === '/api/onboarding/github').map((write) => write.body)).toEqual([
+    { role: 'me', login: 'octocat' },
+    { role: 'agent', login: 'octo-agent' },
+  ])
+
+  // 4. Organizations: one that failed before GitHub was connected is retried.
+  await expect(page.locator('.ob-title')).toHaveText('Add your organizations')
+  await expect(page.locator('.ob-org[data-org="acme"] .ob-org-state')).toHaveText('Activating…')
+  await page.locator('.ob-org-input').fill('octo-org')
+  await page.locator('.ob-org-input').press('Enter')
+  await expect(page.locator('.ob-org[data-org="octo-org"]')).toBeVisible()
+  await next(page).click()
+
+  // 5. Time zone and refresh rate.
+  await expect(page.locator('.ob-title')).toHaveText('Time zone and refresh rate')
+  await page.locator('#ob-timezone').selectOption('Europe/Helsinki')
+  await page.locator('.ob-refresh [data-rate="5m"]').click()
+  await next(page).click()
+  await expect(page.locator('.ob-title')).toHaveText('Sign in to your AI accounts')
+  expect(state.timezone).toBe('Europe/Helsinki')
+  expect(await page.evaluate(() => localStorage.getItem('poise-refresh-rate'))).toBe('5m')
+
+  // 6. AI accounts in one place; a CLI that cannot report its sign-in counts once its login finished here.
+  await expect(page.locator('.ob-ai-row')).toHaveCount(5)
+  await expect(page.locator('.ob-ai-row[data-account="claude"] .ob-ai-state')).toHaveText('Signed in as octo@example.test')
+  await expect(page.locator('.ob-ai-row[data-account="codex"] .ob-ai-connect')).toHaveText('Connect')
+  await expect(page.locator('.ob-ai-row[data-account="grok"] .ob-ai-state')).toHaveText('Signed in here')
+  await expect(page.locator('.ob-ai-row[data-account="muse"] .ob-ai-state')).toHaveText('Not signed in yet')
+  await expect(page.locator('.ob-ai-row[data-account="antigravity"] .ob-ai-connect')).toBeDisabled()
+  await next(page).click()
+
+  // 7. Models: only signed-in providers can be chosen; the rest are dimmed.
+  await expect(page.locator('.ob-title')).toHaveText('Choose your models')
+  await expect(page.locator('.ob-chip-on')).toHaveText(['Claude', 'Grok'])
+  const primary = page.locator('[data-slots] select[data-slot="primary"]')
+  // The proposed primary's provider (Codex) is not signed in, so a signed-in model replaces it.
+  await expect(primary).toHaveValue('opus-5-max')
+  expect(await primary.locator('option[value="gpt-6-astra-ultra"]').evaluate((option) => (option as HTMLOptionElement).disabled)).toBe(true)
+  await expect(primary.locator('optgroup[label="Not signed in"] option')).toHaveCount(2)
+  await expect(page.locator('[data-slots] select')).toHaveCount(3)
+  await expect(page.locator('.ob-place[data-place="pr_review"] select')).toHaveCount(1)
+  await next(page).click()
+  await expect(page.locator('.ob-title')).toHaveText('Connect this computer')
+  expect(state.models).toEqual({
+    slots: { primary: 'opus-5-max', secondary: 'opus-5-high', tertiary: 'grok-5-heavy' },
+    places: { chat: { slot: 'primary' }, pr_review: { slot: 'primary' } },
+  })
+
+  // 8. This computer, through the gateway's pairing.
+  const link = page.locator('.ob-dialog .pl')
+  await expect(link.locator('.pl-command-text')).toContainText('install.sh | sh')
+  await link.locator('.pl-code').fill('BCDF-GHJK')
+  await link.locator('.pl-approve').click()
+  await expect(page.locator('.ob-status')).toHaveText('This computer is paired. Continue when you are ready.', { timeout: 10_000 })
+  await next(page).click()
+
+  // Finish: where to change all of it, then Poise itself.
+  await expect(page.locator('.ob-title')).toHaveText('You\'re all set')
+  await expect(page.locator('.ob-count')).toHaveText('Setup complete')
+  await expect(page.locator('.ob-summary-row')).toContainText([
+    'Dark', 'octocat', 'octo-agent', 'acme (activating), octo-org (activating)', 'Europe/Helsinki, refreshing every 5 minutes',
+    'Claude, Grok', '1 computer paired with Poise Link',
+  ])
+  await expect(page.locator('.ob-later')).toBeHidden()
+  await expect(page.locator('.ob-settings-hint')).toContainText('Open the menu ☰ at the top right and choose Settings')
+  await expect(next(page)).toHaveText('Open Poise')
+  await next(page).click()
+  await expect(page.locator('.ob-backdrop')).toHaveCount(0)
+  await expect(page.locator('#app')).not.toHaveAttribute('inert', '')
+  await expect(page.locator('#menu-toggle')).toBeVisible()
+  await page.locator('#menu-toggle').click()
+  await expect(page.locator('#menu-toggle')).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.locator('#menu-popover')).toBeVisible()
+  expect(state.status).toBe('done')
+  expect(state.writes.filter((write) => write.path === '/api/onboarding').map((write) => write.body.step ?? 'done')).toEqual([
+    'github', 'agent', 'organizations', 'time', 'ai', 'models', 'link', 'finish', 'done',
+  ])
+
+  // Done stays done.
+  await page.reload()
+  await expect(page.locator('#view-current')).toBeVisible()
+  await expect(page.locator('.ob-backdrop')).toHaveCount(0)
+})
+
+test('connects GitHub through its one-time code, with gh answered and out of sight', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  const state = await setupWorkspace(page, { step: 'github', githubAccounts: [] })
+  // gh's own sign-in, as the workspace's terminal socket relays it.
+  const inputs: string[] = []
+  let approve: (() => void) | null = null
+  await page.exposeFunction('approveAtGitHub', () => approve?.())
+  await page.routeWebSocket(/\/ws\/terminal\?preset=gh$/, (socket) => {
+    const out = (text: string) => socket.send(JSON.stringify({ type: 'output', data: Buffer.from(text).toString('base64') }))
+    socket.onMessage((message) => {
+      const frame = JSON.parse(String(message)) as { type: string, data?: string }
+      if (frame.type !== 'input') return
+      inputs.push(frame.data ?? '')
+      if (inputs.length === 1) {
+        out('\u001b[0;32m?\u001b[0m Authenticate Git with your GitHub credentials? \u001b[0;36mYes\u001b[0m\r\n\r\n'
+          + '\u001b[0;33m!\u001b[0m Failed to copy one-time code to clipboard\r\n'
+          + '\u001b[0;33m!\u001b[0m First copy your one-time code: \u001b[0;1;39m0281-B27E\u001b[0m\r\n'
+          + 'Press Enter to open https://github.com/login/device in your browser... ')
+      } else if (inputs.length === 2) {
+        out('\r\n\u001b[0;31m!\u001b[0m Failed opening a web browser at https://github.com/login/device\r\n')
+      }
+    })
+    out('\u001b[0;32m?\u001b[0m \u001b[0;1;39mAuthenticate Git with your GitHub credentials? \u001b[0m(Y/n) ')
+    // The person approves at GitHub; gh says so and exits.
+    approve = () => {
+      state.githubAccounts.push('octocat')
+      out('\u001b[0;32m\u2713\u001b[0m Authentication complete.\r\n\u001b[0;32m\u2713\u001b[0m Logged in as octocat\r\n')
+      socket.send(JSON.stringify({ type: 'exit', code: 0 }))
+      void socket.close({ code: 1000 })
+    }
+  })
+  await page.goto('/')
+  await expect(page.locator('.ob-title')).toHaveText('Connect your GitHub account')
+  await expect(page.locator('.ob-connection-text')).toHaveText('Not connected yet.')
+  await expect(next(page)).toBeDisabled()
+
+  await page.locator('.ob-connect').click()
+  await expect(page.locator('.ob-device')).toBeVisible()
+  await expect(page.locator('.ob-device-code')).toHaveText('0281-B27E')
+  // The code's own buttons are the only actions while it shows.
+  await expect(page.locator('.ob-connect')).toBeHidden()
+  await expect(page.locator('.ob-device-status-text')).toHaveText('Waiting for you to approve at GitHub…')
+  // gh's own output, its failed clipboard and browser included, stays folded away.
+  await expect(page.locator('.st-terminal')).toHaveCount(0)
+  await expect(page.locator('.ob-device-log')).not.toHaveAttribute('open', '')
+  await expect(page.locator('.ob-device-log pre')).toContainText('Failed opening a web browser')
+  expect(inputs).toEqual(['\r', '\r'])
+
+  // One click copies the code and opens GitHub's device page (stood in for: no test reaches GitHub).
+  await context.route(/^https:\/\/github\.com\//, (route) => route.fulfill({ contentType: 'text/html', body: '<title>GitHub</title>' }))
+  const popup = page.waitForEvent('popup')
+  await page.locator('.ob-device-copy').click()
+  expect((await popup).url()).toBe('https://github.com/login/device')
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('0281-B27E')
+
+  await page.evaluate(() => (window as unknown as { approveAtGitHub: () => void }).approveAtGitHub())
+  await expect(page.locator('.ob-connection')).toHaveAttribute('data-state', 'connected')
+  await expect(page.locator('.ob-device')).toBeHidden()
+  await expect(page.locator('.ob-connect')).toHaveText('Reconnect')
+  await expect(next(page)).toBeEnabled()
+  expect(state.me).toBe('octocat')
+})
+
+test('lets the person say whether a CLI that cannot report its sign-in is signed in', async ({ page }) => {
+  const state = await setupWorkspace(page, { step: 'ai', me: 'octocat' })
+  await page.goto('/')
+  const row = (id: string) => page.locator(`.ob-ai-row[data-account="${id}"]`)
+  await expect(row('muse').locator('.ob-ai-state')).toHaveText('Not signed in yet')
+  await expect(row('grok').locator('.ob-ai-state')).toHaveText('Signed in here')
+  // Claude and Codex report their own sign-in; an uninstalled CLI has nothing to mark.
+  await expect(row('claude').locator('.ob-ai-mark')).toHaveCount(0)
+  await expect(row('codex').locator('.ob-ai-mark')).toHaveCount(0)
+  await expect(row('antigravity').locator('.ob-ai-mark')).toHaveCount(0)
+
+  await row('muse').locator('.ob-ai-mark').click()
+  await expect(row('muse').locator('.ob-ai-state')).toHaveText('Signed in here')
+  await expect(row('muse').locator('.ob-ai-mark')).toHaveText('Not signed in')
+  await row('grok').locator('.ob-ai-mark').click()
+  await expect(row('grok').locator('.ob-ai-state')).toHaveText('Not signed in yet')
+  expect(Object.keys(state.logins)).toEqual(['muse'])
+  expect(state.writes.filter((write) => 'account' in write.body).map((write) => write.body)).toEqual([
+    { account: 'muse', signedIn: true },
+    { account: 'grok', signedIn: false },
+  ])
+
+  // Models offers what is signed in now.
+  await next(page).click()
+  await expect(page.locator('.ob-chip-on')).toHaveText(['Claude', 'Muse'])
+})
+
+test('resumes where setup was left, and lets the steps be revisited with Back', async ({ page }) => {
+  await setupWorkspace(page, { step: 'time', me: 'octocat' })
+  await page.goto('/')
+  await expect(page.locator('.ob-count')).toHaveText('Step 5 of 8 · Time')
+  await expect(page.locator('.ob-rail-done')).toHaveCount(4)
+  await page.locator('.ob-back').click()
+  await expect(page.locator('.ob-title')).toHaveText('Add your organizations')
+  // Finish later closes setup for now; it opens again at the same step.
+  await page.locator('.ob-later').click()
+  await expect(page.locator('.ob-backdrop')).toHaveCount(0)
+  await page.reload()
+  await expect(page.locator('.ob-title')).toHaveText('Add your organizations')
+})
+
+test('opens at pairing when Poise Link sends the person to /link during setup', async ({ page }) => {
+  await setupWorkspace(page, { step: 'github' })
+  await page.goto('/?settings=link')
+  await expect(page.locator('.ob-title')).toHaveText('Connect this computer')
+  await expect(page.locator('.ob-count')).toHaveText('Step 8 of 8 · This computer')
+  await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
+  await expect(page).toHaveURL(/\/$/)
+})
+
+test('never opens setup in a workspace that is already set up, and offers to run it again', async ({ page }) => {
+  await setupWorkspace(page, { status: 'done', step: 'finish', me: 'octocat', organizations: [organization('acme', 'ready')] })
+  await page.goto('/')
+  await expect(page.locator('#view-current')).toBeVisible()
+  await expect(page.locator('.ob-backdrop')).toHaveCount(0)
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('[data-settings="general"]').click()
+  await page.locator('.st-run-setup').click()
+  await expect(page.locator('.ob-title')).toHaveText('Choose how Poise looks')
+  await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
+})
+
+
+test('setup cooldowns are neutral while genuine activation and sync failures stay red', async ({ page }) => {
+  const retryAt = new Date(Date.now() + 3_600_000).toISOString()
+  const state = await setupWorkspace(page, { step: 'organizations', me: 'octocat', organizations: [
+    { ...organization('waiting-new', 'initializing', 'GitHub cooldown; resuming automatically.'), stage: 'rate-limited', retryAt },
+    { ...organization('waiting-ready', 'ready', 'GitHub cooldown; resuming automatically.'), stage: 'rate-limited', retryAt },
+    organization('activation-failed', 'error', 'Activation failed: access denied.'),
+    organization('sync-failed', 'ready', 'Sync failed: repository read denied.'),
+  ] })
+  // Setup retries failed activation once after sign-in; this backend failure persists.
+  await page.route('**/api/organizations/activation-failed/retry', route => route.fulfill({ status: 202, json: { organizations: state.organizations } }))
+  await page.goto('/')
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+    for (const login of ['waiting-new', 'waiting-ready']) {
+      const row = page.locator(`.ob-org[data-org="${login}"]`)
+      await expect.soft(row.locator('.ob-org-state')).toHaveText('Waiting for GitHub')
+      await expect.soft(row.locator('.ob-org-state')).toHaveCSS('color', theme === 'light' ? 'rgb(92, 99, 109)' : 'rgb(197, 203, 209)')
+      await expect.soft(row.locator('.st-help')).toHaveCSS('color', 'rgb(142, 149, 158)')
+      await expect.soft(row.getByRole('button', { name: 'Retry' })).toHaveCount(0)
+    }
+    for (const login of ['activation-failed', 'sync-failed']) {
+      const row = page.locator(`.ob-org[data-org="${login}"]`)
+      await expect.soft(row.locator('.ob-org-state')).toHaveCSS('color', 'rgb(184, 80, 72)')
+      await expect.soft(row.locator('.st-help-error')).toHaveCSS('color', 'rgb(184, 80, 72)')
+      await expect(row.getByRole('button', { name: 'Retry' })).toBeEnabled()
+    }
+  }
+})
+
+test('optional setup probes warn while an unavailable model catalog blocks progress', async ({ page }) => {
+  for (const [step, path, text, blocked] of [
+    ['ai', '**/api/accounts**', 'Could not ask the CLIs:', false],
+    ['link', '**/_poise/api/account', 'The gateway did not answer:', false],
+    ['models', '**/api/models', 'The model catalog is unavailable:', true],
+  ] as const) {
+    await setupWorkspace(page, { step, me: 'octocat' })
+    await page.route(path, route => route.fulfill({ status: 503, json: { error: 'Fixture read unavailable' } }))
+    await page.goto('/')
+    const note = page.locator('.ob-dialog .st-help').filter({ hasText: text })
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => document.documentElement.dataset.theme = value, theme)
+      await expect.soft(note).toHaveCSS('color', blocked ? 'rgb(184, 80, 72)' : 'rgb(168, 121, 43)')
+      if (blocked) await expect(next(page)).toBeDisabled()
+      else await expect(next(page)).toBeEnabled()
+    }
+    await page.unroute(path)
+  }
+})

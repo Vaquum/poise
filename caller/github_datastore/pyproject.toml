@@ -1,0 +1,15 @@
+[project]
+name = "github-datastore"
+version = "0.2.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+github-datastore = "github_datastore.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

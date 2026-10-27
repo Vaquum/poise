@@ -1,0 +1,113 @@
+/* Settings → Publishing. A site is the account card's frame: name, then its
+   repository in mono, then one line of state; every colour is a token. */
+
+.pb-sites {
+  display: grid;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.pb-site {
+  padding: var(--sp-3);
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+  min-width: 0;
+}
+
+.pb-site-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.pb-site-name {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.pb-site-repo {
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.625rem;
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.pb-site-actions {
+  display: flex;
+  gap: var(--sp-1);
+  margin-left: auto;
+}
+
+.pb-site-actions .st-clear {
+  padding: 4px 10px;
+}
+
+.pb-site-actions .pb-confirm {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.pb-site-state {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* The same dot as an account's state. */
+.pb-site-state::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  transform: translateY(-1px);
+}
+
+.pb-site-state-ready::before { background: var(--a3); box-shadow: 0 0 0 3px var(--tint-a3); }
+.pb-site-state-problem::before { background: var(--a5); box-shadow: 0 0 0 3px var(--tint-a5); }
+
+.pb-site-warning {
+  margin-top: 4px;
+  font-size: 0.6875rem;
+  color: var(--amber);
+  overflow-wrap: anywhere;
+}
+
+.pb-describe {
+  margin-top: var(--sp-3);
+}
+
+.pb-description {
+  display: block;
+  width: 100%;
+  min-height: 12rem;
+  padding: 8px 10px;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.6875rem;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  color: var(--text);
+  outline: none;
+  resize: vertical;
+  tab-size: 2;
+  transition: border-color var(--flow-feedback) ease-out;
+}
+
+.pb-description:focus { border-color: var(--text); }
+
+.pb-describe-row {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+
+.pb-status:empty { display: none; }

@@ -1,0 +1,5 @@
+# Poise's default ripgrep configuration for agent tool descendants
+# (server/process.ts). Two search threads bound per-search CPU without
+# changing matches; an explicitly set RIPGREP_CONFIG_PATH and explicit
+# command-line flags always win. Keep match behavior out of this file.
+--threads=2

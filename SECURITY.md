@@ -1,0 +1,290 @@
+# Security policy
+
+## Supported deployments
+
+Poise is supported two ways:
+
+- **As a service** (`deploy/`, [Operating Poise](docs/Operating.md)): Caddy and the gateway are the only public entry, and each person's Poise runs in its own workspace container behind them.
+- **On a single computer**, bound to loopback, as a one-person application.
+
+Never expose a workspace or a single-computer Poise directly. Their capabilities include launching unsandboxed agent processes, modifying files, and acting on GitHub with the person's accounts. They are safe only behind the gateway's identity assertions, or on loopback.
+
+## The service
+
+[Service architecture](docs/Service-architecture.md) is the precise contract. In short:
+
+### Sign-in and routing
+
+- People sign in with GitHub at the apex domain. The gateway admits allow-listed logins, members of allowed organisations, and admins. It reads the login and discards the GitHub token.
+- A handle stays with the GitHub account id that first claimed it, so a renamed and reclaimed login cannot take over a workspace.
+- Each workspace host serves only its owner. Admins get no implicit access, but can disable anyone, which ends that person's sessions and device tokens at once.
+- Sessions use host-only, `HttpOnly`, `Secure`, `SameSite=Lax` cookies. Workspace hosts get their session through single-use tickets bound to the requesting browser (`poise_bind`), so a ticket minted by someone else cannot sign a visitor into the wrong workspace.
+
+### What the gateway relays
+
+- The gateway strips its own cookies, a device's `Authorization` header and any client-sent identity header before forwarding.
+- It adds a fresh 60-second Ed25519 identity assertion naming the owner and a scope.
+- Workspaces cannot set cookies: every `Set-Cookie` they send is dropped.
+- Request bodies are bounded at 32 MiB, and the gateway bounds what it reads back from a workspace. This keeps one person from exhausting the shared gateway.
+
+### The host
+
+- The gateway holds the Docker socket, which is root on the host. Run the service on a host dedicated to it, and keep `deploy/.env` and the gateway's data volume (with its signing key) readable only by the operator.
+- Anyone with root on the host can read every workspace volume, including each person's agent CLI logins. People using the service must trust its operator.
+- Backups contain the same material. `deploy/backup.sh` writes each one into a directory only its owner can open (`umask 077`). Keep them on storage with the same protection.
+
+### Workspaces
+
+- Each person's workspace is a container:
+  - running as uid 10001 with every capability dropped and `no-new-privileges`;
+  - under memory, CPU and process limits;
+  - on a network shared only with the gateway.
+- Isolation between people is that container boundary. Set `POISE_WORKSPACE_RUNTIME=runsc` (gVisor) where a stronger boundary is wanted.
+- Inside a workspace, agents run unsandboxed with the person's own credentials: anything those credentials allow, an agent can do. The browser terminal in Settings → Accounts is a shell as that same user, open only to the owner's browser scope.
+
+### Poise Link
+
+- Device tokens are stored hashed. They reach only `/api/link/*`, and expire after 30 idle days or 365 days.
+- A revoked, expired or disabled device gets 401 and pairs again.
+- Poise Link accepts only plain trigger/replace string pairs and writes its own rendering of them. Nothing the server sends can become an Espanso shell, script, form or variable.
+- Notifications open only http(s) addresses.
+
+### Review status
+
+The service had adversarial reviews of the gateway (twice), service mode, and the deployment end to end. A final review across the whole system was stopped before it finished. What it confirmed is fixed:
+- The relay and read bounds above.
+- An unescaped model picker in Chat.
+- The workspace home folder's permissions.
+
+The areas it did not finish are listed in the [open security follow-up](https://github.com/autonomio/poise/issues?q=is%3Aopen+label%3Asecurity).
+
+### Service mode
+
+With `POISE_MODE=service` Poise is one person's workspace behind the gateway
+and listens beyond loopback inside its container. Every request that does not
+come from loopback, the page and its assets included, must carry the gateway's
+identity assertion: an EdDSA (Ed25519) JWT verified against the gateway's
+public key, issued by `poise-gateway` for this workspace's audience with the
+owner as subject (in any case), at most five seconds in the future, not
+expired beyond five seconds of skew, living at most 120 seconds, and with a
+scope that reaches the route (`browser` every route, `link` only
+`/api/link/*`, `admin` only `/api/service/*`). `Host` must be the public host
+and `Origin`, when sent, exactly the public origin; cross-site API calls are
+refused. Anything else is refused before a handler runs. The assertion header
+is removed before any check, so Poise never echoes, logs or forwards it, and
+no cookie or `Authorization` header ever stands in for an assertion.
+Assertions are not tracked for replay: their short lifetime and the gateway,
+which mints one per request, bound that risk. Loopback requests keep the
+local rules: whatever runs inside the container is already the owner's.
+Isolation between people is the container boundary, as
+[Service architecture](docs/Service-architecture.md) describes.
+
+## Reporting
+
+Report vulnerabilities through the repository's GitHub Security Advisory
+interface. Do not include credentials, private repository content, agent
+responses, or local file contents in a public issue.
+
+## Secrets
+
+Keep `.env` local. Confab credentials are read server-side and are never
+embedded in the browser bundle. GitHub authentication is owned by `gh`. For
+issue creation, Poise resolves the selected account's token through `gh` and
+passes it only to that short-lived `gh api` subprocess; Poise does not persist
+or expose the token. Every GitHub action the server and Caller take names its
+account — your GitHub account or your agent account from Settings — and none
+falls back to `gh`'s active account, so with several accounts signed in nothing
+posts as the wrong one; a missing account stops the action. Because upgrades
+are otherwise non-destructive, schema initialization explicitly purges the
+retired plaintext `github_token` metadata row while preserving legacy content
+tables.
+
+Claude authentication is owned by Claude Code's local credential store. Poise
+retains only sanitized in-memory health metadata; it never returns tokens,
+account email, organization identifiers, or login output through its API.
+Claude-backed subprocesses use a monitored local wrapper that discards
+non-allowlisted environment variables, isolates the separate Anthropic profile
+store, and consumes caller settings into one overlay where Poise-controlled
+provider fields win. It neutralizes API helpers plus Anthropic, AWS, Bedrock,
+Mantle, Vertex, Foundry, gateway, socket, and identity-token routes. Immediately
+before every model process, the same effective environment must report an exact
+Claude.ai/first-party status or the launch fails closed. A durable exponential
+per-behavior circuit breaker suppresses repeated model calls and external scans
+after failures, and the wrapper disables Claude Code's own provider request
+retries. Sanitized breaker state is exposed through `/api/health`; provider
+output is not. The supported path remains the user's Claude.ai Pro or Max
+subscription on macOS, Linux, or WSL; native Windows is rejected rather than
+falling back to a shell-based wrapper.
+
+This isolation prevents provider-credential fallback, but it cannot disable
+Anthropic account-level Usage Credits. Users requiring a hard spending cap must
+disable Usage Credits under Claude account Settings > Usage.
+
+## Chat sessions
+
+The Chat WebSocket applies the same loopback host and browser-origin boundary
+as the HTTP API. Requests and output buffering are bounded. Mutating commands
+use durable receipts, so reconnecting or retrying an uncertain request cannot
+silently start the same work twice. Transcript events, attachment records and
+Caller delivery state remain local data.
+
+Checkout locks coordinate Poise instances and compatible Caller writers; they
+are not a system-wide filesystem lock. Registered worker groups and in-flight
+Poise file operations must settle before releasing a checkout. Uncertainty
+keeps it blocked rather than allowing another writer to proceed. Native
+agents now launch without an OS sandbox in both Chat permission modes. Safe
+mode is off by default (full access); enabling it retains native risk-based
+approvals. A working directory is not a filesystem boundary. Poise's own filesystem
+services use checked checkout paths, bounded reads and atomic writes.
+
+Uploaded files have server-issued, session-owned records. Editor handoffs use
+separate staged copies and version-checked writeback; conflicts are preserved.
+Revert requires a trustworthy pre-image and an unchanged post-image. A failed
+read must never be interpreted as proof that a file did not exist.
+
+Provider credentials are not transferred into the browser or another agent.
+Claude's existing subscription isolation applies to SDK sessions as well as
+one-shot work. The other installed CLIs retain their own login state.
+
+New-session creation does not accept a repository, branch or filesystem path
+from the browser. Workspace files live under the ignored `.poise-chat/`
+directory inside Poise. Its private Git repository has no remote and never
+uses the enclosing source checkout for checkpoints. Symlinked storage roots
+and unowned non-empty workspace directories are refused. Existing sessions
+retain their original boundaries; no histories or documents are relocated.
+
+The workspace Manager's authority is cooperative. Only the Manager among chats
+can steer, answer and stop chats it did not create, and only the person's
+browser can stop, close, fork, hand off, rename or delete a chat through REST;
+the budgets (120 control actions and 20 new chats per hour) and the audit bind
+the control path only. They do not isolate agents running as the same
+operating-system user. A same-user agent can still read another chat's
+connection file and act as that chat, forge an `Origin` header and act as the
+person on any route, send origin-less commands over loopback `/ws/chat` that
+are recorded as the person, create unattributed chats through
+`POST /api/chat/sessions`, and change Settings and behaviors or drain and
+resume Poise through the loopback APIs. Ordinary chats keep no new limits,
+including on messages to the Manager. These are residual risks under the
+trusted-workspace model.
+
+### Chat file previews
+
+Clicking a local Markdown link requests a bounded, read-only text preview.
+The existing loopback/origin checks and runtime session ownership apply.
+Paths must resolve inside that session's checkout or a tracked Poise source
+checkout. The latter is the running installation or the configured checkout
+for the repository in Poise's own package metadata, with its origin verified;
+a link cannot name a different repository to authorize. Hidden/private paths,
+credential-like files, symlink escapes and non-regular files are not served.
+Reads use a no-follow file descriptor, a 512 KiB byte ceiling and a 5,000-line
+presentation limit. Contents render as text, never active HTML. Previews do
+not launch an agent or switch checkouts; they describe the current file only.
+
+## Review New Issues
+
+Issue reviewers are unattended coding agents with full access: each runs its
+provider's own CLI without tool restrictions or a sandbox, as the local user,
+in a fresh checkout of the issue's repository. Unlike a Chat session, the text
+steering them was written by whoever opened the issue, its sub-issues and
+their comments. The behavior is off until a repository is ticked, and only
+issues opened by the trusted authors listed beside it are reviewed; keep that
+list to accounts you trust. Sub-issues and comments by others remain part of
+what a reviewer reads.
+
+The checkout is a disposable clone outside `~/dev`, made from a local mirror
+with the token passed per git command and stored in neither repository; it
+is not a filesystem boundary. From a reviewer's shell every same-user
+credential is reachable — `gh`'s accounts, SSH keys, provider logins.
+Reviewers are told not to post; Caller posts their comments through
+github-interface as your agent account and only on the issue and its
+sub-issues, but "comments only" is an instruction to the agent, not a limit
+it cannot break. When a reviewer exits, its process group is killed, and so
+is any process still running in its checkout — including one that detached
+into its own session; a process that also left the checkout is not found.
+
+## Poise self-improvement releases
+
+Self-improvement authority is limited to a user-authored Poise change request.
+The independently installed controller fixes the repository to the one
+`package.json` names (`autonomio/poise`), a field a change cannot alter; model
+output cannot select a different repository or grant merge authority. A
+protected change to release/rollback, validation or authorization machinery,
+credentials, destructive migrations, or another package's release
+configuration requires separate review.
+
+The controller holds the release credential; it is not forwarded to native
+agents, candidate builds, or the browser. Exact revision checks and CI precede
+automatic merge. Retained complete releases, an atomic active pointer and a
+separate recovery service make software restoration independent of models,
+GitHub and rebuilds. A rollback hold prevents automatic re-promotion of the
+rejected release. Current/previous identities refer to the served artifact,
+not merely a checkout revision.
+
+These are local, same-user processes. Environment isolation and scoped tool
+permissions are not an operating-system sandbox: native tools, dependencies
+and candidate code must still be treated as code running as the local user.
+The workflow does not promise to undo arbitrary data loss, external side
+effects, or stolen credentials by reverting source code. Persistent data and
+Caller remain outside the replaceable Poise artifact and retain their existing
+locations and permissions. Deployment handover waits for admitted work;
+shutdown of a browser connection is not proof that its file operation ended.
+
+## Explicit session Auto-merge delegation
+
+The user can separately enable Auto-merge in a Chat session for requested work
+across repositories. The server validates a boolean command, session ownership
+and durable replay receipts; agent output cannot toggle the setting. Merge
+delegation is independent of tool permissions. Safe mode controls whether
+native risk approvals are shown; Auto-merge cannot override Safe mode. In
+unrestricted mode, once-only native approvals are recorded as `unrestricted`,
+not forged manual clicks. Questions still require real answers. The shared
+instructions require normal repository checks/protections and verified merges;
+those are not replaced by a new general-purpose server merge gate. The
+Poise-only release controller and its credential scope remain unchanged.
+See [Chat controls](docs/Chat-controls.md) for policy application timing.
+
+## Deferred Chat messages
+
+Queue commands keep the existing session ownership and request replay checks.
+Enqueue and its transcript receipt commit together; claiming an item and
+reserving its open turn are also atomic. Only a recorded, successful turn with
+settled worker/file operations can advance the tail. Crash recovery never
+re-executes a claimed uncertain task. Browser reloads do not dispatch tasks.
+Queued attachments use validated server records and checked content hashes;
+cross-agent handoffs retain the workspace boundary. An isolated Poise change
+keeps its checkout exclusive to the release controller until that release
+settles, then allows queued follow-ups. Queueing neither broadens credentials
+nor changes the session's explicit Auto-merge delegation.
+
+## Shared Chat memories
+
+Memories are user-authored context stored in Poise's private SQLite metadata,
+not a repository file or an agent-managed native memory store. The same-origin
+GET/PUT endpoint uses transactional revision checks to prevent silent stale-tab
+overwrites. Text is preserved verbatim with a 64 KiB UTF-8 limit. Browser drafts
+are retained on save failures; message dispatch waits for outstanding edits.
+
+Only the runtime supplies the memory appendix, after parsing the original
+request and validating attachments. Memories do not toggle Auto-merge, select
+repositories, or independently authorize a self-release. All four native
+adapters place them after other human-message content. As prompt content they
+are sent to the selected provider and may remain in its native conversation;
+clearing memories affects future messages, not historical provider context.
+
+## Reply-review context
+
+`/review` resolves its target from the server's own session transcript before
+starting a direct review, or at dispatch for a queued review. Browsers cannot
+substitute a different session's reply or archive. A model-prefixed task is
+reserved once through the existing command-receipt path; model selection does
+not grant merge authority or change Safe mode.
+
+The reviewing agent intentionally receives access to the full preceding
+conversation, including tool outputs. Generated reply and paginated-history
+files are private local staging under ignored `.poise-chat/reviews/`, created
+with restrictive permissions and checked paths while the checkout lease is
+held. The visible transcript records the person's original command, not a
+second copy of the generated archive. Session deletion removes its review
+staging. These are same-user filesystem files, not a separate OS sandbox;
+review instructions identify quoted history as evidence rather than new
+execution instructions. Credentials retain the existing provider isolation.

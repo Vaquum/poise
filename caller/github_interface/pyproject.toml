@@ -1,0 +1,17 @@
+[project]
+name = "github-interface"
+version = "0.2.0"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "httpx>=0.27.0",
+  "uvicorn>=0.30.0",
+]
+
+[project.scripts]
+github-interface = "github_interface.cli:main"
+github-interface-api = "github_interface.api:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
