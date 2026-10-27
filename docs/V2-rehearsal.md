@@ -106,7 +106,7 @@ publishing an alternate browser entry or enabling a live task trial.
 | New PR and configured review panel | Existing head-pinned panel, claims and Caller | Same review obligation and head; paired fixture checks all three panel widths and duplicate suppression |
 | CI running | Independent v1 new-PR review may run already | Deliberately wait before review; repair failed/stuck CI first; waiting launches nothing |
 | Grey CI eligible | Existing direct rerun behavior / durable intent | Propose that existing operation, retaining uncertain receipts |
-| Review changes / unresolved threads | Existing work monitor and resolution behavior | Propose fixes, then resolution; unknown coverage cannot mean clear |
+| Review changes / unresolved threads | Existing work monitor and resolution behavior | Propose fixes, current-head review and approval, then strong conversation resolution; the existing resolver requires that approval, and unknown coverage cannot mean clear |
 | Behind / conflicts | Existing branch-update and monitor paths | Repair conflicts; preserve native merge-queue policy instead of updating queue-enabled branches |
 | Current-head approval and readiness | Existing native merge behavior | Propose merge only with both; queued is waiting, closed alone is unverified, observed merge SHA is completion |
 | Stop, permission, question, timer and draft | Existing interactive Chat controls | Identical controls/assertions with and without the rehearsal table; headless requires no Manager |
@@ -154,3 +154,7 @@ retained limitations are not reintroduced as an execution hold.
 
 Steps 4–5, production execution, live admissions, migration, default flips and
 v1 removal are outside this proof and require the next discussion.
+
+The subsequent [local sandbox validation](V2-sandbox-validation.md) exercised
+real GitHub CI, reviews and native queue merges using scripted workers in an
+excluded organization. It records its approval-order fix and remaining limits.
