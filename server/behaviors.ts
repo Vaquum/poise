@@ -1718,6 +1718,20 @@ function failedBehaviorLaunches(behavior: string): BehaviorLaunchClaim[] {
     .filter((claim): claim is BehaviorLaunchClaim => claim !== null && organizationOwns(claim.launchRepo))
 }
 
+// Retained failed launches for one pull request, whether or not their
+// incidents already retired: superseding an incident settles its firing,
+// but the retained launch keeps fencing its input against blind relaunch.
+function retainedFailedLaunchesForPr(behavior: string, repo: string, pr: number): BehaviorLaunchClaim[] {
+  const rows = db.prepare(`
+    SELECT target FROM behavior_seen AS launch
+    WHERE key = ? AND claim_id = '' AND launch_call_id IS NOT NULL
+      AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
+      AND launch_repo = ? AND launch_pr = ?
+  `).all(behavior, repo, pr) as Array<{ target: string }>
+  return rows.map(({ target }) => getFailedBehaviorLaunch(behavior, target))
+    .filter((claim): claim is BehaviorLaunchClaim => claim !== null && organizationOwns(claim.launchRepo))
+}
+
 function quarantinedIssueReviews(): BehaviorLaunchClaim[] {
   const active = listBehaviorLaunchClaims(ISSUES_KEY).filter((claim) => claim.launchQuarantine)
   return [...active, ...failedBehaviorLaunches(ISSUES_KEY).filter((claim) => claim.launchQuarantine)]
@@ -3704,8 +3718,8 @@ async function readReviewActivityBatch(
 }
 
 async function dismissedApprovalHeld(pr: DatastorePr, head: string, model: string): Promise<boolean> {
-  const failed = failedBehaviorLaunches('approve-prs').filter((claim) =>
-    claim.launchRepo === pr.repo && claim.launchPr === pr.number && claim.launchExpectedHead === head)
+  const failed = retainedFailedLaunchesForPr('approve-prs', pr.repo, pr.number).filter((claim) =>
+    claim.launchExpectedHead === head)
   if (!failed.length) return false
   const snapshot = await readBehaviorLogSnapshot()
   return failed.some((claim) => {
