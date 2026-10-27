@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest'
-import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, arrangeCli, fixture } from './behaviors-runtime-fixture'
+import { describe, expect, it, vi } from 'vitest'
+import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
+import type { LedgerResult } from '../server/behavior-ledger-contract'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, arrangeCli, fixture } from './behaviors-runtime-fixture'
 
 const CHECK_17 = `${pr.repo}#17:check`
 const SECONDARY_LIMIT_BODY = '{"message": "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}'
@@ -9,13 +11,14 @@ function secondaryLimitError(marked: boolean): Error {
   return Object.assign(new Error('Command failed (1): github-interface'), { stdout: '', stderr })
 }
 
-type ResolveScript = (pullNumber: number) => 'delegate' | { stdout: string } | { error: unknown }
+type ResolveScriptResult = 'delegate' | { stdout: string } | { error: unknown }
+type ResolveScript = (pullNumber: number) => ResolveScriptResult | Promise<ResolveScriptResult>
 
 function scriptResolve(handler: ResolveScript): void {
   const base = mocks.runFile.getMockImplementation()!
   mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
     if (command === 'github-interface' && args[0] === '--resolve-nonblocking-conversations-if-ready') {
-      const outcome = handler(Number(String(args[1]).replace(/^#/, '')))
+      const outcome = await handler(Number(String(args[1]).replace(/^#/, '')))
       if (outcome === 'delegate') return base(command, args, options)
       if ('error' in outcome) throw outcome.error
       return { stdout: outcome.stdout, stderr: '' }
@@ -42,6 +45,9 @@ function expireBackoff(db: { getMeta(key: string): string | null, setMeta(key: s
   const key = `behavior_resolve_unblocking_failure:${target}`
   const stored = JSON.parse(db.getMeta(key)!) as Record<string, unknown>
   db.setMeta(key, JSON.stringify({ ...stored, nextRetryAtMs: 1 }))
+  const recoveryKey = `behavior_resolve_unblocking_recovery:${target}`
+  const recovery = db.getMeta(recoveryKey)
+  if (recovery) db.setMeta(recoveryKey, JSON.stringify({ ...JSON.parse(recovery), nextRetryAtMs: 1 }))
 }
 
 function admissionsFor(pullNumber: number): Array<{ nativeId: string }> {
@@ -49,7 +55,7 @@ function admissionsFor(pullNumber: number): Array<{ nativeId: string }> {
     .filter((admission) => admission.behavior === 'resolve-unblocking' && admission.number === pullNumber)
 }
 
-function outcomesFor(nativeId: string): Array<Record<string, unknown>> {
+function outcomesFor(nativeId: string): Array<Omit<LedgerResult, 'type'>> {
   return mocks.captureOutcome.mock.calls.map(([outcome]) => outcome)
     .filter((outcome) => outcome.nativeId === nativeId)
 }
@@ -64,6 +70,202 @@ async function startResolveRuntime() {
 }
 
 describe('resolve-unblocking rate-limit recovery', () => {
+  it('bounds retained uncertainty before admitting another mutation without dropping evidence', async () => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    const { db, runtime } = await startResolveRuntime()
+    const entries = Array.from({ length: 32 }, (_, index) => ({ nativeId: `retained-${index}`, code: 'unknown',
+      nextRetryAtMs: 1, sideEffects: 'uncertain', head: HEAD_SHA, unresolvedBefore: 1, at: new Date().toISOString() }))
+    const latest = entries.pop()!
+    const receipt = { ...latest, previous: entries }
+    db.setMeta(`behavior_resolve_unblocking_recovery:${CHECK_17}`, JSON.stringify(receipt))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(resolveCalls().map(([, args]) => args[1])).not.toContain('#17')
+    expect(admissionsFor(17)).toEqual([])
+    expect(recoveryRow(db, CHECK_17)).toEqual(receipt)
+    expect(failureRow(db, CHECK_17)).toMatchObject({ error: expect.stringContaining('needs reconciliation') })
+  })
+
+  it.each(['newer-attempt', 'settled'] as const)('fences a late failure after %s takes ownership', async (replacement) => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    const { db, runtime } = await startResolveRuntime()
+    const newerId = 'e'.repeat(32)
+    scriptResolve((number) => {
+      if (number !== 17) return 'delegate'
+      const pending = recoveryRow(db, CHECK_17)!
+      if (replacement === 'newer-attempt') {
+        db.setMeta(`behavior_resolve_unblocking_recovery:${CHECK_17}`, JSON.stringify({ ...pending,
+          nativeId: newerId, code: 'newer-attempt', nextRetryAtMs: Date.now() + 777_000, previous: [pending] }))
+      } else {
+        db.db.prepare('UPDATE behavior_runs SET note = ? WHERE id = ?')
+          .run(JSON.stringify({ ...pending, disposition: 'superseded', observedHead: HEAD_SHA }), pending.nativeId)
+        db.setMeta(`behavior_resolve_unblocking_recovery:${CHECK_17}`, '')
+        mocks.captureOutcome({ nativeId: pending.nativeId, state: 'superseded', activity: 'unknown', stateSource: 'native', outcome: 'superseded' })
+      }
+      return { error: new Error('late response lost') }
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const [original] = admissionsFor(17)
+    if (replacement === 'newer-attempt') {
+      expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: newerId, code: 'newer-attempt',
+        previous: [expect.objectContaining({ nativeId: original!.nativeId, code: 'unknown' })] })
+      expect(failureRow(db, CHECK_17)).toBeNull()
+    } else {
+      expect(recoveryRow(db, CHECK_17)).toBeNull()
+      expect(outcomesFor(original!.nativeId)).toEqual([expect.objectContaining({ state: 'superseded', activity: 'unknown' })])
+      const run = db.db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(original!.nativeId) as { note: string }
+      expect(JSON.parse(run.note)).toMatchObject({ disposition: 'superseded', lateFailure: { error: 'late response lost' } })
+    }
+  })
+
+  it.each(['disabled', 'access'] as const)('retains an admitted invocation when %s prevents a target failure row', async (mode) => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    const { db, runtime } = await startResolveRuntime()
+    scriptResolve((number) => {
+      if (number !== 17) return 'delegate'
+      if (mode === 'disabled') db.setMeta('behavior_resolve_unblocking_enabled', '0')
+      return { error: new Error(mode === 'access' ? 'GitHub 404: Not Found' : 'response lost') }
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const [admission] = admissionsFor(17)
+    expect(admission).toBeDefined()
+    expect(failureRow(db, CHECK_17)).toBeNull()
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId, sideEffects: 'uncertain', actor: 'review-bot' })
+    expect(outcomesFor(admission!.nativeId)).toEqual([expect.objectContaining({ state: 'held', activity: 'unknown' })])
+    const recovered = await restartModules()
+    expect(recoveryRow(recovered.database, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId, sideEffects: 'uncertain' })
+  })
+
+  it.each(['shutdown', 'deadline'] as const)('persists an admitted receipt before Caller and retains it through %s', async (mode) => {
+    if (mode === 'deadline') vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    const { db, runtime } = await startResolveRuntime()
+    let stopping: Promise<void> | undefined
+    let observedAdmission = false
+    scriptResolve(async (number) => {
+      if (number !== 17) return 'delegate'
+      const [admission] = admissionsFor(17)
+      expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId, code: 'admitted',
+        actor: 'review-bot', head: HEAD_SHA, sideEffects: 'uncertain' })
+      const row = db.db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(admission!.nativeId) as { note: string }
+      expect(JSON.parse(row.note)).toMatchObject({ nativeId: admission!.nativeId, actor: 'review-bot', head: HEAD_SHA })
+      observedAdmission = true
+      if (mode === 'shutdown') stopping = runtime.stopBehaviorsRuntime()
+      else await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS + 1)
+      return { error: new Error(`Caller interrupted by ${mode}`) }
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    await stopping
+    if (mode === 'deadline') vi.useRealTimers()
+    expect(observedAdmission).toBe(true)
+    const [admission] = admissionsFor(17)
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId, sideEffects: 'uncertain' })
+    const ledger = new BehaviorLedgerStore(':memory:')
+    try {
+      const native = mocks.captureAdmission.mock.calls.map(([value]) => value).find((value) => value.nativeId === admission!.nativeId)
+      ledger.capture({ type: 'admit', ...native })
+      for (const result of outcomesFor(admission!.nativeId)) ledger.capture({ type: 'result', ...result })
+      expect(ledger.read({ operation: 'list' }).body.records![0]).toMatchObject({ state: 'held', activity: 'unknown', completedAt: null })
+    } finally { ledger.close() }
+    const restarted = await restartModules()
+    expect(recoveryRow(restarted.database, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId })
+  })
+
+  it('keeps partial-write uncertainty when same-head thread churn leaves the count unchanged', async () => {
+    const threads = new Set(['A', 'B'])
+    arrangeCli(false, false, { unresolvedConversationCount: 2, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    scriptResolve((number) => {
+      if (number !== 17) return 'delegate'
+      threads.delete('A')
+      threads.add('C')
+      return { error: new Error('response lost after applying thread A') }
+    })
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    expect([...threads]).toEqual(['B', 'C'])
+    const [admission] = admissionsFor(17)
+    expireBackoff(db, CHECK_17)
+    arrangeCli(false, false, { unresolvedConversationCount: threads.size, reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA, activeChangeRequestAuthors: ['octocat'] })
+    mocks.runFile.mockClear()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(resolveCalls()).toHaveLength(0)
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId, sideEffects: 'uncertain' })
+    expect(outcomesFor(admission!.nativeId)).toEqual([expect.objectContaining({ state: 'held', activity: 'unknown' })])
+    expect(failureRow(db, CHECK_17)).toMatchObject({ kind: 'worker' })
+  })
+
+  it.each(['OPEN', 'MERGED'] as const)('requires positive closure evidence for an absent target (%s)', async (state) => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    scriptResolve((number) => number === 17 ? { error: new Error('response lost') } : 'delegate')
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const [admission] = admissionsFor(17)
+    fixture.listedPrs = [fixture.listedPrs[1]!]
+    arrangeCli(false, false, { state, unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    mocks.runFile.mockClear()
+    await runtime.runEnabledBehaviorsOnce()
+    if (state === 'OPEN') {
+      expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId })
+      expect(failureRow(db, CHECK_17)).not.toBeNull()
+      expect(outcomesFor(admission!.nativeId)).toHaveLength(1)
+    } else {
+      expect(recoveryRow(db, CHECK_17)).toBeNull()
+      expect(outcomesFor(admission!.nativeId)).toEqual([expect.objectContaining({ state: 'held' }),
+        expect.objectContaining({ state: 'superseded', activity: 'unknown' })])
+      const run = db.db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(admission!.nativeId) as { note: string }
+      expect(JSON.parse(run.note)).toMatchObject({ nativeId: admission!.nativeId, disposition: 'superseded', code: 'unknown' })
+    }
+  })
+
+  it('preserves an earlier uncertain write when a newer invocation fails before mutation', async () => {
+    arrangeCli(false, false, { unresolvedConversationCount: 2, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    scriptResolve((number) => number === 17 ? { error: new Error('response lost after partial resolution') } : 'delegate')
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const [original] = admissionsFor(17)
+    expireBackoff(db, CHECK_17)
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    scriptResolve((number) => number === 17 ? { error: secondaryLimitError(true) } : 'delegate')
+    await runtime.runEnabledBehaviorsOnce()
+    const admissions = admissionsFor(17)
+    expect(admissions).toHaveLength(2)
+    expect(outcomesFor(original!.nativeId)).toEqual([expect.objectContaining({ state: 'held', activity: 'unknown' })])
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: admissions[1]!.nativeId, sideEffects: 'none',
+      previous: [expect.objectContaining({ nativeId: original!.nativeId, sideEffects: 'uncertain' })] })
+  })
+
+  it('does not treat draft status as recovered while threads remain', async () => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    scriptResolve((number) => number === 17 ? { error: new Error('response lost') } : 'delegate')
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const [admission] = admissionsFor(17)
+    expireBackoff(db, CHECK_17)
+    arrangeCli(false, false, { draft: true, unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId })
+    expect(outcomesFor(admission!.nativeId)).toHaveLength(1)
+    expect(failureRow(db, CHECK_17)).toMatchObject({ kind: 'worker', error: expect.stringContaining('draft') })
+  })
+
+  it('persists the stated five-minute retry deadline across restart', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-27T09:00:00Z'))
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    scriptResolve((number) => number === 17 ? { error: secondaryLimitError(true) } : 'delegate')
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(failureRow(db, CHECK_17)).toMatchObject({ nextRetryAtMs: Date.parse('2026-10-27T09:05:00Z') })
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nextRetryAtMs: Date.parse('2026-10-27T09:05:00Z') })
+    const restarted = await restartModules()
+    expect(recoveryRow(restarted.database, CHECK_17)).toMatchObject({ nextRetryAtMs: Date.parse('2026-10-27T09:05:00Z') })
+    vi.setSystemTime(new Date('2026-10-27T09:01:01Z'))
+    mocks.runFile.mockClear()
+    restarted.behaviors.startBehaviorsRuntime()
+    await restarted.behaviors.runEnabledBehaviorsOnce()
+    expect(resolveCalls().map(([, args]) => args[1])).not.toContain('#17')
+  })
+
   it('settles a secondary limit before any mutation while another target resolves', async () => {
     arrangeCli(false, false, {
       unresolvedConversationCount: 1,
@@ -88,6 +290,7 @@ describe('resolve-unblocking rate-limit recovery', () => {
     expect(recovery).toMatchObject({ code: 'rate_limit', nextRetryAtMs: failure.nextRetryAtMs, sideEffects: 'none', head: HEAD_SHA, unresolvedBefore: 1 })
     const [admission] = admissionsFor(17)
     expect(recovery.nativeId).toBe(admission!.nativeId)
+    expect(failure.correlationId).toBe(admission!.nativeId)
     const [run] = db.db.prepare('SELECT behavior, status, note FROM behavior_runs WHERE note LIKE ?').all(`%${CHECK_17}%`) as Array<{ behavior: string, status: string, note: string }>
     expect(run).toMatchObject({ behavior: 'resolve-unblocking', status: 'failed' })
     expect(run!.note).toContain(`target=${CHECK_17}`)
@@ -163,7 +366,7 @@ describe('resolve-unblocking rate-limit recovery', () => {
     expect(recoveryRow(db, CHECK_17)).toBeNull()
   })
 
-  it('holds an uncertain target that needs a person until a reconciled retry supersedes it', async () => {
+  it('retains earlier uncertainty when a later invocation still leaves unresolved work', async () => {
     arrangeCli(false, false, {
       unresolvedConversationCount: 1,
       reviewerLatestState: 'APPROVED',
@@ -201,8 +404,7 @@ describe('resolve-unblocking rate-limit recovery', () => {
     expect(recoveryRow(db, CHECK_17)).toMatchObject({ sideEffects: 'uncertain', nativeId: admission!.nativeId })
     expect(outcomesFor(admission!.nativeId)).toHaveLength(1)
 
-    // Once eligible again, a reconciled retry runs and its authoritative result
-    // settles the retained firing as superseded.
+    // A later invocation with unresolved work cannot settle the older write.
     expireBackoff(db, CHECK_17)
     arrangeCli(false, false, {
       unresolvedConversationCount: 1,
@@ -217,13 +419,10 @@ describe('resolve-unblocking rate-limit recovery', () => {
     await runtime.runEnabledBehaviorsOnce()
 
     expect(resolveCalls().map(([, args]) => args[1])).toContain('#17')
-    expect(outcomesFor(admission!.nativeId)).toEqual([
-      expect.objectContaining({ state: 'held', activity: 'unknown' }),
-      expect.objectContaining({ state: 'superseded', activity: 'settled', completedAt: expect.any(String) }),
-    ])
+    expect(outcomesFor(admission!.nativeId)).toEqual([expect.objectContaining({ state: 'held', activity: 'unknown' })])
     expect(admissionsFor(17)).toHaveLength(2)
-    expect(failureRow(db, CHECK_17)).toBeNull()
-    expect(recoveryRow(db, CHECK_17)).toBeNull()
+    expect(failureRow(db, CHECK_17)).toMatchObject({ kind: 'worker' })
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: admission!.nativeId, sideEffects: 'uncertain' })
   })
 
   it('treats a secondary limit without the no-action marker as uncertain', async () => {
