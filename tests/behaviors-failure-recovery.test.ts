@@ -283,6 +283,93 @@ describe('worker failure classification and recovery', () => {
     })])
   })
 
+  it('supersedes a held approval firing once its request is replaced, linking the replacement', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'))
+    const launched = await launchApprovalBeforeCrash()
+    const args: string[] = mocks.spawnDetached.mock.calls[0][1]
+    const error = 'codex review produced no submitted verdict: cannot validate since-diff positions: p must look like p2'
+    const failedCall = agentLog({
+      id: 'e'.repeat(32),
+      behavior: 'pr_approve',
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'failed',
+      action: 'not_started',
+      outcome: 'preflight_failed',
+      error,
+      error_code: 'review_contract_violation',
+      review_policy: 'bounded-v1',
+      model: args[args.indexOf('--model') + 1],
+      expected_head: launched.expectedHead,
+      actor: launched.actor,
+      source: launched.source,
+      correlation_id: launched.correlationId,
+    })
+    fixture.agentLogs = [failedCall]
+    await resetLogCache()
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+
+    // The malformed verdict dead-letters the firing and holds its ledger record.
+    expect(db.listBehaviorDeadLetters()).toEqual([
+      expect.objectContaining({ behavior: 'approve-prs', target: launched.target, callId: failedCall.id, error }),
+    ])
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ nativeId: launched.correlationId, state: 'held' }))
+
+    // The head moves; a replacement approval request launches for the new head.
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA }, {
+      commits_after_request: 0,
+      author_commits_after_request: 0,
+      author_pr_comments_after_request: 1,
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(mocks.spawnDetached.mock.calls[1][1]).toEqual(expect.arrayContaining(['--expected-head', NEXT_HEAD_SHA]))
+    const replacement = db.listBehaviorLaunchClaims('approve-prs').find((claim) => claim.target !== launched.target)!
+    expect(replacement.launchExpectedHead).toBe(NEXT_HEAD_SHA)
+
+    // The replacement runs; an hour later the reconcile pass settles the obsolete firing.
+    fixture.agentLogs = [failedCall, agentLog({
+      id: 'f'.repeat(32),
+      behavior: 'pr_approve',
+      status: 'running',
+      model: args[args.indexOf('--model') + 1],
+      expected_head: NEXT_HEAD_SHA,
+      actor: replacement.launchActor,
+      source: 'poise:approve-prs',
+      correlation_id: replacement.launchCorrelationId,
+      started_at: new Date(Date.parse(replacement.launchRequestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(replacement.launchRequestedAt) + 1_001).toISOString(),
+    })]
+    await resetLogCache()
+    vi.setSystemTime(new Date(Date.now() + 61 * 60_000))
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(db.listBehaviorDeadLetters()).toEqual([])
+    const row = db.db.prepare(
+      'SELECT resolution, resolution_evidence, error FROM behavior_dead_letters',
+    ).get() as { resolution: string, resolution_evidence: string, error: string }
+    expect(row.resolution).toBe('superseded')
+    expect(row.error).toBe(error)
+    expect(JSON.parse(row.resolution_evidence).replacedBy).toMatchObject({
+      correlationId: replacement.launchCorrelationId,
+      expectedHead: NEXT_HEAD_SHA,
+    })
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: launched.correlationId, state: 'superseded', activity: 'unknown', outcome: 'superseded',
+      refs: expect.arrayContaining([
+        expect.objectContaining({ kind: 'correlation', identity: replacement.launchCorrelationId }),
+      ]),
+    }))
+    // The obsolete input stays fenced: its failed launch is retained, and
+    // nothing relaunches the old head.
+    expect(db.getFailedBehaviorLaunch('approve-prs', launched.target)?.launchCallId).toBe(failedCall.id)
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+  })
+
   it.each([{ receipts: null }, { receipts: [] }])('classifies the first issue-review timeout from its recorded posting state: %j', async ({ receipts }) => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
