@@ -214,8 +214,10 @@ recovery. The target's empty-thread read can settle same-head failed work;
 positive closed/merged lifecycle evidence supersedes obsolete work while
 retaining unknown effects. Absence from the open inventory is insufficient.
 Native disposition receipts remain on their direct runs, with legacy unmatched
-identities retained separately rather than inventing correlation. A late failure
-cannot replace a newer attempt or a settled receipt. At 32 unreconciled
+identities retained separately rather than inventing correlation. Late callbacks
+cannot replace a newer attempt or a settled receipt; a late no-op preserves its
+receipt before its idle run is discarded. Missing-target lifecycle reads respect
+the retained attempt's retry deadline too. At 32 unreconciled
 invocations the target requires reconciliation before another admission; no
 uncertain evidence is dropped. One missing target is read at the end of each
 existing resolver pass, using its reader, deadline and access holds; no timer or

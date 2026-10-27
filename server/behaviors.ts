@@ -4485,7 +4485,7 @@ async function retireClosedResolveRecoveries(open: ReadonlySet<string>): Promise
     const match = /^([^#]+)#([1-9][0-9]*):check$/.exec(target)
     if (!match || open.has(`${match[1]}#${match[2]}`) || behaviorAborted()) continue
     const pending = readResolveRecovery(target)
-    if (!pending) continue
+    if (!pending || pending.nextRetryAtMs > Date.now()) continue
     try {
       const actor = pending.actor ?? agentAccount()
       if (!actor || readRepoAccessHold(match[1]!, actor)) continue
@@ -4561,10 +4561,21 @@ function settleResolveRecoveryEndState(checkTarget: string, headSha: string): vo
 function retireResolveRecoveryAttempt(checkTarget: string, nativeId: string): void {
   const pending = readResolveRecovery(checkTarget)
   if (!pending) return
-  const remaining = resolveRecoveryAttempts(pending).filter((attempt) => attempt.nativeId !== nativeId && attempt.sideEffects === 'uncertain')
+  const remaining = resolveRecoveryAttempts(pending).filter((attempt) => attempt.nativeId !== nativeId)
   const latest = remaining.pop()
   if (latest) setMeta(resolveRecoveryKey(checkTarget), JSON.stringify({ ...latest, ...(remaining.length ? { previous: remaining } : {}) }))
   else clearResolveRecovery(checkTarget)
+}
+
+function discardResolveRun(runId: string, checkTarget: string): void {
+  const row = db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(runId) as { note: string | null } | undefined
+  if (row?.note?.startsWith('{')) {
+    const receipt = objectValue(parseJson(row.note, 'resolution run receipt'), 'resolution run receipt')
+    if (receipt.nativeId === runId && ['completed', 'superseded', 'failed'].includes(String(receipt.disposition))) {
+      setMeta(`${resolveRecoveryKey(checkTarget)}:receipt:${runId}`, row.note)
+    }
+  }
+  discardDirectBehaviorRun(runId)
 }
 
 // A retained uncertain record turns an ineligible read into a user-action
@@ -4825,14 +4836,17 @@ async function tickResolveUnblocking(): Promise<void> {
           // Idle polls stay out of the run ledger; their firing keeps the
           // no-op disposition. Retained rows are actual resolutions.
           if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true, 'resolved')
-          else discardDirectBehaviorRun(runId)
+          else discardResolveRun(runId, checkTarget)
           runId = null
-          // A newer result only proves its own invocation. Earlier uncertain
-          // writes remain retained unless the target has no unresolved work.
-          retireResolveRecoveryAttempt(checkTarget, detail.nativeId!)
-          if (!result.superseded && result.unresolved_count === 0) settleResolveRecoveryEndState(checkTarget, result.headSha)
-          checked = readResolveRecovery(checkTarget) === null
-          if (!checked) retainResolveRecoveryUserAction(checkTarget, 'earlier resolution remains unverified after the current invocation')
+          // A late result only proves its own invocation. Check ownership
+          // and settle older receipts atomically with the current pointer.
+          db.transaction(() => {
+            const current = readResolveRecovery(checkTarget)?.nativeId === detail.nativeId
+            retireResolveRecoveryAttempt(checkTarget, detail.nativeId!)
+            if (current && !result.superseded && result.unresolved_count === 0) settleResolveRecoveryEndState(checkTarget, result.headSha)
+            checked = current && readResolveRecovery(checkTarget) === null
+            if (current && !checked) retainResolveRecoveryUserAction(checkTarget, 'earlier resolution remains unverified after the current invocation')
+          })()
           if (result.superseded) {
             console.log(`[behaviors] resolve-unblocking superseded on ${pr.repo}#${pr.number} by head ${result.headSha}`)
           } else if (result.resolved_count > 0) {

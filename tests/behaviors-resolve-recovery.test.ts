@@ -70,6 +70,67 @@ async function startResolveRuntime() {
 }
 
 describe('resolve-unblocking rate-limit recovery', () => {
+  it.each([1, 0])('preserves a settled receipt when a late successful result resolves %s threads', async (resolved) => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA,
+      resolveResolvedCount: resolved, resolveUnresolvedCount: 0 })
+    const { db, runtime } = await startResolveRuntime()
+    scriptResolve((number) => {
+      if (number !== 17) return 'delegate'
+      const receipt = recoveryRow(db, CHECK_17)!
+      db.db.prepare('UPDATE behavior_runs SET note = ? WHERE id = ?')
+        .run(JSON.stringify({ target: CHECK_17, ...receipt, disposition: 'superseded' }), receipt.nativeId)
+      db.setMeta(`behavior_resolve_unblocking_recovery:${CHECK_17}`, '')
+      return 'delegate'
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const [original] = admissionsFor(17)
+    if (resolved) {
+      const run = db.db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(original!.nativeId) as { note: string }
+      expect(JSON.parse(run.note)).toMatchObject({ nativeId: original!.nativeId, disposition: 'superseded' })
+    } else {
+      expect(db.db.prepare('SELECT id FROM behavior_runs WHERE id = ?').get(original!.nativeId)).toBeUndefined()
+      const receipt = db.getMeta(`behavior_resolve_unblocking_recovery:${CHECK_17}:receipt:${original!.nativeId}`)
+      expect(JSON.parse(receipt!)).toMatchObject({ nativeId: original!.nativeId, disposition: 'superseded' })
+    }
+  })
+
+  it.each(['uncertain', 'none'])('does not settle a newer %s owner from an older successful response', async (sideEffects) => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA, resolveResolvedCount: 1 })
+    const { db, runtime } = await startResolveRuntime()
+    const newerId = 'e'.repeat(32)
+    scriptResolve((number) => {
+      if (number !== 17) return 'delegate'
+      const pending = recoveryRow(db, CHECK_17)!
+      db.setMeta(`behavior_resolve_unblocking_recovery:${CHECK_17}`, JSON.stringify({ ...pending,
+        nativeId: newerId, code: 'newer-attempt', sideEffects, previous: [pending] }))
+      return 'delegate'
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: newerId, code: 'newer-attempt' })
+    expect(outcomesFor(newerId)).toEqual([])
+  })
+
+  it('defers an absent-target lifecycle read until its persisted secondary-limit deadline', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-27T09:00:00Z'))
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    scriptResolve((number) => number === 17 ? { error: secondaryLimitError(true) } : 'delegate')
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    fixture.listedPrs = [fixture.listedPrs[1]!]
+    arrangeCli(false, false, { state: 'MERGED', unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    vi.setSystemTime(new Date('2026-10-27T09:01:01Z'))
+    mocks.runFile.mockClear()
+    await runtime.runEnabledBehaviorsOnce()
+    const lifecycle = () => mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--review-activity-since' && args[1] === '#17')
+    expect(lifecycle()).toEqual([])
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nextRetryAtMs: Date.parse('2026-10-27T09:05:00Z') })
+    vi.setSystemTime(new Date('2026-10-27T09:05:01Z'))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(lifecycle()).toHaveLength(1)
+    expect(recoveryRow(db, CHECK_17)).toBeNull()
+  })
+
   it('bounds retained uncertainty before admitting another mutation without dropping evidence', async () => {
     arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
     const { db, runtime } = await startResolveRuntime()
@@ -200,6 +261,7 @@ describe('resolve-unblocking rate-limit recovery', () => {
     const { db, runtime } = await startResolveRuntime()
     await runtime.runEnabledBehaviorsOnce()
     const [admission] = admissionsFor(17)
+    expireBackoff(db, CHECK_17)
     fixture.listedPrs = [fixture.listedPrs[1]!]
     arrangeCli(false, false, { state, unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
     mocks.runFile.mockClear()
