@@ -24,7 +24,7 @@ function scriptResolve(handler: ResolveScript): void {
   })
 }
 
-function resolveCalls(): unknown[][] {
+function resolveCalls(): any[][] {
   return mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--resolve-nonblocking-conversations-if-ready')
 }
 
