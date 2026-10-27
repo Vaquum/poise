@@ -4493,11 +4493,10 @@ async function tickResolveUnblocking(): Promise<void> {
           runId = startDirectBehaviorRun('resolve-unblocking')
           const result = await resolveNonblockingIfReady(pr, headSha, reviewer, runId)
           if (!result) { discardDirectBehaviorRun(runId); runId = null; continue }
-          // Every admitted poll is retained with the same disposition the
-          // firing carries, so no-op polls stay distinguishable from capture
-          // loss after the firing leaves bounded ledger retention.
-          finishDirectBehaviorRun(runId, true, result.superseded ? 'superseded'
-            : result.resolved_count > 0 ? 'resolved' : result.unresolved_count > 0 ? 'waiting' : 'no_op')
+          // Idle polls stay out of the run ledger; their firing keeps the
+          // no-op disposition. Retained rows are actual resolutions.
+          if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true, 'resolved')
+          else discardDirectBehaviorRun(runId)
           runId = null
           checked = true
           if (result.superseded) {
