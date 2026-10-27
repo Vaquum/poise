@@ -23,11 +23,11 @@ export function startDirectBehaviorRun(behavior: DirectBehavior): string {
   return id
 }
 
-export function finishDirectBehaviorRun(id: string, success: boolean): void {
+export function finishDirectBehaviorRun(id: string, success: boolean, note?: string): void {
   const at = new Date().toISOString()
   const row = db.prepare('SELECT behavior, started_at FROM behavior_runs WHERE id = ?').get(id) as { behavior: string, started_at: string } | undefined
-  db.prepare('UPDATE behavior_runs SET completed_at = ?, status = ? WHERE id = ?')
-    .run(at, success ? 'completed' : 'failed', id)
+  db.prepare('UPDATE behavior_runs SET completed_at = ?, status = ?, note = ? WHERE id = ?')
+    .run(at, success ? 'completed' : 'failed', note ?? null, id)
   activeDirectRuns.delete(id)
   if (row) {
     recordHandling({ kind: 'behavior-firing', source: row.behavior, title: row.behavior,

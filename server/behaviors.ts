@@ -2350,6 +2350,7 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
   reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
   retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
   retireClosedQueueAdmissions(seen)
+  retireClosedResolveRecoveries(seen)
   return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(getMeta('me') || '', `${pr.repo}#${pr.number}`, pr))
 }
 
@@ -4306,10 +4307,170 @@ export function getResolveUnblockingLastFired(): { at: string, target: string } 
   return null
 }
 
+// github-interface appends this marker to resolve failures that happened
+// before any conversation mutation. Only that explicit marker proves no
+// side effects: every other post-admission failure (an unmarked rate limit,
+// a timeout, a malformed response) leaves the resolved state uncertain and
+// must reconcile from live thread evidence before retrying.
+const RESOLVE_NO_ACTION_MARKER = '(no conversation was resolved before this failure)'
+type ResolveSideEffects = 'none' | 'uncertain'
+
+// Reads the full CLI evidence, not the bounded failure summary: cause
+// selection keeps the rate-limit facts but may drop the trailing marker.
+function resolveFailureSideEffects(error: unknown): ResolveSideEffects {
+  const message = error instanceof Error ? error.message : String(error)
+  const stderr = (error as { stderr?: unknown } | null)?.stderr
+  const text = `${message}\n${typeof stderr === 'string' ? stderr : ''}`
+  return text.includes(RESOLVE_NO_ACTION_MARKER) ? 'none' : 'uncertain'
+}
+
+// What an admitted resolve attempt reports back to the tick. Empty when the
+// attempt never reached admission: only an admitted invocation owns a firing
+// that later evidence must settle.
+interface ResolveAttemptDetail {
+  nativeId?: string
+  sideEffects?: ResolveSideEffects
+}
+
+// The retained recovery for a failed admitted resolve attempt, keyed by its
+// check target: the firing to settle, the typed failure and backoff the
+// scheduler already recorded, the side-effect certainty, and the thread
+// baseline the next authoritative read reconciles against.
+interface ResolveRecovery {
+  nativeId: string
+  code: string
+  nextRetryAtMs: number
+  sideEffects: ResolveSideEffects
+  head: string
+  unresolvedBefore: number
+  at: string
+}
+const RESOLVE_RECOVERY_PREFIX = `${META_PREFIX}resolve_unblocking_recovery:`
+
+function resolveRecoveryKey(checkTarget: string): string {
+  return `${RESOLVE_RECOVERY_PREFIX}${checkTarget}`
+}
+
+function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
+  const raw = getMeta(resolveRecoveryKey(checkTarget))
+  if (!raw) return null
+  try {
+    const value = objectValue(parseJson(raw, 'resolve recovery'), 'resolve recovery')
+    if (typeof value.nativeId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.nativeId)
+      || typeof value.code !== 'string' || !value.code
+      || !Number.isFinite(value.nextRetryAtMs) || Number(value.nextRetryAtMs) < 0
+      || Number(value.nextRetryAtMs) > 8.64e15
+      || (value.sideEffects !== 'none' && value.sideEffects !== 'uncertain')
+      || typeof value.head !== 'string' || !SHA_PATTERN.test(value.head)
+      || !Number.isSafeInteger(value.unresolvedBefore) || Number(value.unresolvedBefore) < 0
+      || typeof value.at !== 'string' || !Number.isFinite(Date.parse(value.at))) return null
+    return {
+      nativeId: value.nativeId,
+      code: value.code,
+      nextRetryAtMs: Number(value.nextRetryAtMs),
+      sideEffects: value.sideEffects,
+      head: value.head,
+      unresolvedBefore: Number(value.unresolvedBefore),
+      at: value.at,
+    }
+  } catch {
+    return null
+  }
+}
+
+function clearResolveRecovery(checkTarget: string): void {
+  setMeta(resolveRecoveryKey(checkTarget), '')
+}
+
+function retireClosedResolveRecoveries(open: ReadonlySet<string>): void {
+  const prefix = scopedMetaKey(RESOLVE_RECOVERY_PREFIX)
+  const rows = db.prepare(
+    "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
+  ).all(prefix.length, prefix) as Array<{ key: string }>
+  for (const row of rows) {
+    const target = row.key.slice(prefix.length)
+    const ref = target.match(/^[^#]+#\d+/)?.[0]
+    if (ref && !open.has(ref)) clearResolveRecovery(target)
+  }
+}
+
+// An admitted invocation failed: settle its firing (terminal when Caller
+// proves nothing was resolved, held while the resolved state is uncertain)
+// and persist the recovery a later read reconciles. Returns the direct-run
+// note, or null when nothing was admitted.
+function retainResolveRecoveryFailure(checkTarget: string, detail: ResolveAttemptDetail, headSha: string,
+  unresolvedBefore: number, recordedAtMs: number): string | null {
+  if (!detail.nativeId || !detail.sideEffects) return null
+  const at = new Date().toISOString()
+  // A newer attempt replaces the retained record: its uncertainty is moot
+  // once fresher evidence exists.
+  supersedeRetainedResolveRecovery(checkTarget)
+  if (detail.sideEffects === 'none') {
+    captureBehaviorOutcome({ nativeId: detail.nativeId, state: 'failed', activity: 'settled',
+      stateSource: 'native', completedAt: at })
+  } else {
+    captureBehaviorOutcome({ nativeId: detail.nativeId, state: 'held', activity: 'unknown', stateSource: 'native' })
+  }
+  const failure = readBehaviorFailure('resolve-unblocking', checkTarget)
+  // recordBehaviorFailure records nothing while disabled; never persist a
+  // previous failure's clock as this attempt's backoff.
+  if (!failure || failure.lastFailureAtMs < recordedAtMs) return null
+  const code = failure.diagnostic?.code ?? 'unknown'
+  setMeta(resolveRecoveryKey(checkTarget), JSON.stringify({
+    nativeId: detail.nativeId,
+    code,
+    nextRetryAtMs: failure.nextRetryAtMs,
+    sideEffects: detail.sideEffects,
+    head: headSha,
+    unresolvedBefore,
+    at,
+  } satisfies ResolveRecovery))
+  return `target=${checkTarget} code=${code} retry=${new Date(failure.nextRetryAtMs).toISOString()} side_effects=${detail.sideEffects}`
+}
+
+// Authoritative evidence proves nothing remains to resolve: settle a
+// retained uncertain firing as recovered without invoking the mutation.
+function settleResolveRecoveryEndState(checkTarget: string, headSha: string): void {
+  const pending = readResolveRecovery(checkTarget)
+  if (!pending) return
+  if (pending.sideEffects === 'uncertain') {
+    captureBehaviorOutcome({ nativeId: pending.nativeId, state: 'completed', activity: 'settled',
+      stateSource: 'native', outcome: 'no_op', head: headSha, completedAt: new Date().toISOString() })
+  }
+  clearResolveRecovery(checkTarget)
+}
+
+// A newer attempt's authoritative result replaces the retained record: its
+// uncertainty is moot once fresher evidence exists.
+function supersedeRetainedResolveRecovery(checkTarget: string): void {
+  const pending = readResolveRecovery(checkTarget)
+  if (!pending) return
+  if (pending.sideEffects === 'uncertain') {
+    captureBehaviorOutcome({ nativeId: pending.nativeId, state: 'superseded', activity: 'settled',
+      stateSource: 'native', completedAt: new Date().toISOString() })
+  }
+  clearResolveRecovery(checkTarget)
+}
+
+// A retained uncertain record turns an ineligible read into a user-action
+// disposition instead of a silent clear: the earlier failure's side effects
+// are still unknown, so the target keeps a visible held row (and its
+// recovery) until a person acts. Returns false when no uncertain record
+// stands and the caller should handle the target normally.
+function retainResolveRecoveryUserAction(checkTarget: string, reason: string): boolean {
+  const pending = readResolveRecovery(checkTarget)
+  if (!pending) return false
+  if (pending.sideEffects !== 'uncertain') { clearResolveRecovery(checkTarget); return false }
+  recordBehaviorFailure('resolve-unblocking', 'worker',
+    `${reason}; earlier ${pending.code} failure left conversation state uncertain`,
+    checkTarget, { held: true })
+  return true
+}
+
 // The expected head comes from the pre-check's observed activity, not a
 // separate lookup: the primitive revalidates it against a fresh read at
 // execution time and reports superseded when the head already moved.
-async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, reviewer: string): Promise<ResolveResult | null> {
+async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, reviewer: string, detail: ResolveAttemptDetail = {}): Promise<ResolveResult | null> {
   const { repo, number } = pr
   const accounts = prAccounts()
   const [owner, name] = repo.split('/', 2)
@@ -4323,6 +4484,7 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
   // above must still hold this resolve.
   if (!isRunnable('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
   const nativeId = randomUUID()
+  detail.nativeId = nativeId
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
     source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,
     actor: reviewer, repository: repo, number, head: expectedHead, startedAt: new Date().toISOString() })
@@ -4408,7 +4570,9 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
     superseded: false,
   }
   } catch (error) {
-    captureBehaviorOutcome({ nativeId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+    // The tick settles the firing once it records the failure: a proven
+    // no-action failure closes it, an uncertain one retains recovery.
+    detail.sideEffects = resolveFailureSideEffects(error)
     throw error
   }
 }
@@ -4443,7 +4607,7 @@ async function tickResolveUnblocking(): Promise<void> {
         }
         continue
       }
-      const actionable: { pr: DatastorePr, headSha: string }[] = []
+      const actionable: { pr: DatastorePr, headSha: string, unresolvedBefore: number }[] = []
       for (const { pr, result, error } of records) {
         const key = `${pr.repo}#${pr.number}`
         const checkTarget = `${key}:check`
@@ -4455,8 +4619,21 @@ async function tickResolveUnblocking(): Promise<void> {
         }
         const activity = result!
         if (activity.state !== 'OPEN' || activity.draft || activity.unresolvedConversationCount === 0) {
+          // Fresh evidence settles a retained firing by reading alone: the
+          // mutation never runs merely to clear the diagnostic.
+          settleResolveRecoveryEndState(checkTarget, activity.headSha)
           if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           continue
+        }
+        // Same head with nothing resolved since: the retained attempt provably
+        // resolved nothing. Settle it and handle the target normally below.
+        const pendingRecovery = readResolveRecovery(checkTarget)
+        if (pendingRecovery?.sideEffects === 'uncertain'
+          && activity.headSha === pendingRecovery.head
+          && activity.unresolvedConversationCount >= pendingRecovery.unresolvedBefore) {
+          captureBehaviorOutcome({ nativeId: pendingRecovery.nativeId, state: 'failed', activity: 'settled',
+            stateSource: 'native', completedAt: new Date().toISOString() })
+          clearResolveRecovery(checkTarget)
         }
         // The resolve CLI re-verifies this gate itself and costs 3 core
         // REST calls plus a head lookup per run: skip the doomed call when
@@ -4464,14 +4641,23 @@ async function tickResolveUnblocking(): Promise<void> {
         if (activity.reviewerLatestState !== 'APPROVED'
           || activity.reviewerLatestCommit !== activity.headSha
           || activity.activeChangeRequestAuthors.length > 0) {
-          if (!behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
+          const reason = activity.activeChangeRequestAuthors.length > 0
+            ? `changes requested by ${activity.activeChangeRequestAuthors.join(', ')} must be addressed before automatic resolution`
+            : 'reviewer has not approved the current head'
+          if (!retainResolveRecoveryUserAction(checkTarget, reason)
+            && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           continue
         }
         try { await requireOwnedHumanReviews(pr, reviewer, activity) }
-        catch (error) { recordBehaviorFailure('resolve-unblocking', 'operation', error, checkTarget, { actingAccount: reviewer }); continue }
-        actionable.push({ pr, headSha: activity.headSha })
+        catch (error) {
+          if (!retainResolveRecoveryUserAction(checkTarget, error instanceof Error ? error.message : String(error))) {
+            recordBehaviorFailure('resolve-unblocking', 'operation', error, checkTarget, { actingAccount: reviewer })
+          }
+          continue
+        }
+        actionable.push({ pr, headSha: activity.headSha, unresolvedBefore: activity.unresolvedConversationCount })
       }
-      for (const { pr, headSha } of actionable) {
+      for (const { pr, headSha, unresolvedBefore } of actionable) {
         if (!isEnabled('resolve-unblocking') || behaviorAborted()) return
         const key = `${pr.repo}#${pr.number}`
         // Reads finish before mutations start; resume beyond the last actual
@@ -4481,6 +4667,8 @@ async function tickResolveUnblocking(): Promise<void> {
         let checked = false
         let operationId: string | null = null
         let runId: string | null = null
+        let runNote: string | null = null
+        const detail: ResolveAttemptDetail = {}
         try {
           operationId = claimPrOperationOwned(key, PR_OPERATION_EVALUATION_LEASE_MS)
           if (!operationId) continue
@@ -4490,12 +4678,15 @@ async function tickResolveUnblocking(): Promise<void> {
           // starting another resolve.
           if (!isRunnable('resolve-unblocking') || !stillEligible('resolve-unblocking', pr, reviewer)) continue
           runId = startDirectBehaviorRun('resolve-unblocking')
-          const result = await resolveNonblockingIfReady(pr, headSha, reviewer)
+          const result = await resolveNonblockingIfReady(pr, headSha, reviewer, detail)
           if (!result) { discardDirectBehaviorRun(runId); runId = null; continue }
           if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true)
           else discardDirectBehaviorRun(runId)
           runId = null
           checked = true
+          // This authoritative result replaces any retained record: a
+          // reconciled retry settles the uncertain firing it reconciled.
+          supersedeRetainedResolveRecovery(checkTarget)
           if (result.superseded) {
             console.log(`[behaviors] resolve-unblocking superseded on ${pr.repo}#${pr.number} by head ${result.headSha}`)
           } else if (result.resolved_count > 0) {
@@ -4518,9 +4709,11 @@ async function tickResolveUnblocking(): Promise<void> {
           checked = false
           if (behaviorAborted()) return
           console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
+          const recordedAtMs = Date.now()
           recordBehaviorFailure('resolve-unblocking', 'operation', err, checkTarget, { actingAccount: reviewer })
+          runNote = retainResolveRecoveryFailure(checkTarget, detail, headSha, unresolvedBefore, recordedAtMs)
         } finally {
-          if (runId) finishDirectBehaviorRun(runId, false)
+          if (runId) finishDirectBehaviorRun(runId, false, runNote ?? undefined)
           if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)
           if (operationId) releasePrOperationOwned(operationId)
         }

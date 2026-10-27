@@ -16,6 +16,19 @@ from github_interface.context import repository, token_user
 
 REQUIRE_TOKEN_USER = True
 
+# Phase markers appended to resolution failures. The first proves the failure
+# happened before any conversation mutation, so Poise can retry on backoff;
+# any other failure leaves the resolved state uncertain and must reconcile
+# from live thread evidence before retrying.
+NO_ACTION_SUFFIX = "(no conversation was resolved before this failure)"
+
+
+def _uncertain_suffix(resolved_count: int) -> str:
+    return (
+        f"({resolved_count} review conversation(s) resolved before this failure; "
+        "remaining resolved state is uncertain)"
+    )
+
 
 class HeadChanged(RuntimeError):
     def __init__(self, expected: str, actual: str, phase: str) -> None:
@@ -55,29 +68,61 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             "head_sha": required_head,
             "current_head_sha": error.actual,
         }
-    threads = await list_review_threads(client, owner, repo, pull_number)
+    except Exception as error:
+        raise RuntimeError(f"{error} {NO_ACTION_SUFFIX}") from error
 
-    unresolved = [thread for thread in threads if not thread["is_resolved"]]
-    if not gate["ready"]:
-        return _result(
-            owner,
-            repo,
-            pull_number,
-            required_head,
-            False,
-            0,
-            len(unresolved),
-            gate["approval"],
-            gate["statuses_green"],
-            gate["checks_green"],
-            gate["checks_present"],
-            gate["blockers"],
-            [],
-        )
+    resolved: list[dict[str, Any]] = []
+    mutation_attempted = False
+    try:
+        threads = await list_review_threads(client, owner, repo, pull_number)
 
-    resolved = []
-    for thread in unresolved:
-        current_gate = await _read_gate(
+        unresolved = [thread for thread in threads if not thread["is_resolved"]]
+        if not gate["ready"]:
+            return _result(
+                owner,
+                repo,
+                pull_number,
+                required_head,
+                False,
+                0,
+                len(unresolved),
+                gate["approval"],
+                gate["statuses_green"],
+                gate["checks_green"],
+                gate["checks_present"],
+                gate["blockers"],
+                [],
+            )
+
+        for thread in unresolved:
+            current_gate = await _read_gate(
+                client,
+                owner,
+                repo,
+                pull_number,
+                required_head,
+                username,
+            )
+            if not current_gate["ready"]:
+                raise RuntimeError(
+                    f"pull request stopped being ready before resolving thread {thread['id']}"
+                )
+            current_threads = await list_review_threads(client, owner, repo, pull_number)
+            current_thread = next(
+                (candidate for candidate in current_threads if candidate["id"] == thread["id"]),
+                None,
+            )
+            if current_thread is None:
+                raise RuntimeError(f"review thread disappeared before resolution: {thread['id']}")
+            if current_thread["is_resolved"]:
+                continue
+            mutation_attempted = True
+            result = await resolve_conversation(client, thread["id"])
+            if result.get("id") != thread["id"] or result.get("isResolved") is not True:
+                raise RuntimeError(f"GitHub did not resolve review thread {thread['id']}")
+            resolved.append(result)
+
+        final_gate = await _read_gate(
             client,
             owner,
             repo,
@@ -85,55 +130,33 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             required_head,
             username,
         )
-        if not current_gate["ready"]:
+        if not final_gate["ready"]:
+            raise RuntimeError("pull request stopped being ready after conversation resolution")
+        final_threads = await list_review_threads(client, owner, repo, pull_number)
+        final_unresolved = [thread for thread in final_threads if not thread["is_resolved"]]
+        if final_unresolved:
             raise RuntimeError(
-                f"pull request stopped being ready before resolving thread {thread['id']}"
+                f"{len(final_unresolved)} unresolved review conversation(s) remain after resolution"
             )
-        current_threads = await list_review_threads(client, owner, repo, pull_number)
-        current_thread = next(
-            (candidate for candidate in current_threads if candidate["id"] == thread["id"]),
-            None,
+        return _result(
+            owner,
+            repo,
+            pull_number,
+            required_head,
+            True,
+            len(resolved),
+            0,
+            final_gate["approval"],
+            final_gate["statuses_green"],
+            final_gate["checks_green"],
+            final_gate["checks_present"],
+            final_gate["blockers"],
+            resolved,
         )
-        if current_thread is None:
-            raise RuntimeError(f"review thread disappeared before resolution: {thread['id']}")
-        if current_thread["is_resolved"]:
-            continue
-        result = await resolve_conversation(client, thread["id"])
-        if result.get("id") != thread["id"] or result.get("isResolved") is not True:
-            raise RuntimeError(f"GitHub did not resolve review thread {thread['id']}")
-        resolved.append(result)
-
-    final_gate = await _read_gate(
-        client,
-        owner,
-        repo,
-        pull_number,
-        required_head,
-        username,
-    )
-    if not final_gate["ready"]:
-        raise RuntimeError("pull request stopped being ready after conversation resolution")
-    final_threads = await list_review_threads(client, owner, repo, pull_number)
-    final_unresolved = [thread for thread in final_threads if not thread["is_resolved"]]
-    if final_unresolved:
-        raise RuntimeError(
-            f"{len(final_unresolved)} unresolved review conversation(s) remain after resolution"
-        )
-    return _result(
-        owner,
-        repo,
-        pull_number,
-        required_head,
-        True,
-        len(resolved),
-        0,
-        final_gate["approval"],
-        final_gate["statuses_green"],
-        final_gate["checks_green"],
-        final_gate["checks_present"],
-        final_gate["blockers"],
-        resolved,
-    )
+    except Exception as error:
+        if mutation_attempted:
+            raise RuntimeError(f"{error} {_uncertain_suffix(len(resolved))}") from error
+        raise RuntimeError(f"{error} {NO_ACTION_SUFFIX}") from error
 
 
 async def _read_gate(

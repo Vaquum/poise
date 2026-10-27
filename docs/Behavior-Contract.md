@@ -203,7 +203,12 @@ as before, and the row's Skip list and pause/disable guards apply to capped
 runs like any other launch.
 `resolve-unblocking` uses the upstream strong
 resolution primitive, which revalidates the complete gate before every thread
-mutation.
+mutation. A failed admitted resolution retains its firing, typed failure,
+backoff and side-effect certainty: Caller proves failures before any mutation,
+and every other failure reconciles from live thread evidence after the retry
+deadline — settling recovered targets, holding targets that need a person, or
+retrying only while threads provably remain. The mutation never runs merely to
+clear the diagnostic.
 
 Load timeouts — an expired sweep deadline, a slow CLI, lock contention — retry
 on a short clock of a few minutes, not the hour-long backoff of hard failures.
