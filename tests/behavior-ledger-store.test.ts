@@ -199,6 +199,44 @@ describe('behavior firing ledger store', () => {
     expect(records(db)[0].state).toBe('pending')
   })
 
+  it('creates no lineage for results without a known correlation', () => {
+    const db = store()
+    db.capture({ type: 'result', nativeId: 'never-admitted', state: 'completed', activity: 'settled',
+      outcome: 'clean', completedAt: stamp() })
+    expect(records(db)).toEqual([])
+    expect(db.health()).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
+  })
+
+  it('retains a failed attempt underneath a recovered firing with the final completion', () => {
+    const db = store()
+    db.capture(admission('attempt-1'))
+    db.capture({ type: 'result', nativeId: 'attempt-1', state: 'failed', activity: 'settled', completedAt: stamp() })
+    clock += 60_000
+    db.capture(admission('attempt-2'))
+    complete(db, 'attempt-2')
+    const root = records(db).find((record) => record.kind === 'firing')!
+    expect(root).toMatchObject({ state: 'completed', activity: 'settled', outcome: 'clean', completedAt: stamp() })
+    const attempts = db.read({ operation: 'list', parent: root.id }).body.records!
+    expect(attempts.map((attempt) => [attempt.state, attempt.outcome])).toEqual([['failed', null], ['completed', 'clean']])
+    expect(attempts[1]!.completedAt).toBe(stamp())
+  })
+
+  it('withholds the panel boundary while an earlier attempt stays unsettled, keeping the child timestamp', () => {
+    const db = store()
+    db.capture(admission('attempt-1'))
+    db.capture({ type: 'result', nativeId: 'attempt-1', state: 'unknown', activity: 'unknown' })
+    clock += 60_000
+    db.capture(admission('attempt-2'))
+    complete(db, 'attempt-2')
+    const root = records(db).find((record) => record.kind === 'firing')!
+    // The firing reads completed from its final successful child, but the
+    // boundary stays null: deriving it from the child needs disclosure.
+    expect(root).toMatchObject({ state: 'completed', activity: 'unknown', completedAt: null })
+    const attempts = db.read({ operation: 'list', parent: root.id }).body.records!
+    expect(attempts).toHaveLength(2)
+    expect(attempts[1]).toMatchObject({ state: 'completed', completedAt: stamp() })
+  })
+
   it('selects retained roots and attempts by GitHub target without scanning unrelated work', () => {
     const db = store()
     db.capture(admission('target-1', { admissionKey: 'target-1', repository: 'acme/project', number: 7 }))

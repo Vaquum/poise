@@ -133,7 +133,7 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
   const overlay = () => getComputedStyle(el).position === 'absolute'
   function bounds() {
     const total = layoutEl.clientWidth
-    const occupied = [view.querySelector<HTMLElement>('.chat-sidebar'), view.querySelector<HTMLElement>('.chat-memories-pane')]
+    const occupied = [view.querySelector<HTMLElement>('.chat-sidebar'), view.querySelector<HTMLElement>('.chat-memories-pane'), view.querySelector<HTMLElement>('.work-rehearsal-table')]
       .reduce((sum, pane) => pane && getComputedStyle(pane).position !== 'absolute' ? sum + pane.getBoundingClientRect().width : sum, 0)
     const max = Math.max(MIN_WIDTH, total - occupied - CHAT_MIN_WIDTH)
     return { total, min: Math.min(MIN_WIDTH, max), max }

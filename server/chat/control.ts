@@ -22,6 +22,7 @@ import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, Pois
 import { findEvent } from './storage'
 import { pushedBranches, writeFileAtomic } from './git'
 import { ChatError, type ChatRuntime } from './runtime'
+import type { CiObservation } from './work-observations'
 import { GREY_CI_INTENT_KEY, getEnabledMap, getBehaviorsRuntimeHealth, isEnabled, pullRequestPolicy, pullRequestRefusal, withBehaviorOrganization } from '../behaviors'
 import * as store from './control-store'
 import { isSwitchboardSession } from './switchboard-store'
@@ -67,13 +68,7 @@ const APIS = {
   '/api/logging': 'Structured workspace diagnostics: GET; GET /api/logging/health for collection health.',
 }
 
-export interface CiObservation {
-  head: string, pending?: boolean, failing: Array<{ name: string, state: string, conclusion?: string | null, url?: string | null }>,
-  /** Merge state from the same get_pull response: null while GitHub is still computing it. Absent from older Caller output. */
-  mergeable?: boolean | null, mergeableState?: string | null, author?: string, draft?: boolean, base?: string,
-  /** Pull state from the same get_pull response. Absent from older Caller output. */
-  state?: string, merged?: boolean,
-}
+export type { CiObservation } from './work-observations'
 /** One existing Caller primitive; no job-log reads or new GitHub client. */
 export async function readWorkCi(target: store.WorkTarget): Promise<CiObservation> {
   const { stdout } = await runFile('github-interface', ['--list-failing-ci', String(target.number), '--repository', target.repo, '--token-user', requireAgentAccount()], {

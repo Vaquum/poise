@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -57,31 +58,66 @@ async function failedLaunch(
   return { claimId, callId, id }
 }
 
+// Mirror deadLetterClaim: the failed attempt keeps its error on a completed
+// claim while its dead letter stays open for reconcile.
+function completeFailedClaim(store: Store, key: string, target: string, claimId: string, error: string) {
+  expect(store.setBehaviorLaunchErrorOwned(key, target, claimId, error)).toBe(true)
+  expect(store.completeSeenOwned(key, target, claimId)).toBe(true)
+}
+
+// A newer approval request for the same pull request: a different target,
+// because the request or the head was replaced. Optionally completed.
+function replacementApproval(
+  store: Store,
+  target: string,
+  repo: string,
+  pr: number,
+  expectedHead: string,
+  requestedAt: string,
+  callId = 'd'.repeat(32),
+) {
+  const claimId = store.claimSeenOwned('approve-prs', target)!
+  expect(store.markBehaviorLaunchIntentOwned({
+    key: 'approve-prs', target, claimId, launchBehavior: 'pr_approve',
+    repo, pr, requestedAt, expectedHead, actor: 'bit-mis',
+    source: 'poise:approve-prs', correlationId: claimId,
+  })).toBe(true)
+  expect(store.linkBehaviorLaunchCallOwned('approve-prs', target, claimId, callId)).toBe(true)
+  return { claimId, callId }
+}
+
+function deadLetterRow(store: Store) {
+  return store.db.prepare(
+    'SELECT resolution, resolution_evidence, resolved_at, retired_at, error FROM behavior_dead_letters',
+  ).get() as { resolution: string, resolution_evidence: string, resolved_at: string, retired_at: string, error: string }
+}
+
 describe('dead-letter reconcile pass', () => {
-  it('resolves rows a later completion settled, citing the completion', async () => {
+  it('resolves a row its own request settled, citing the completion', async () => {
     const store = await loadStore()
-    await failedLaunch(store, 'approve-prs', 'Vaquum/repo#12@head=old', 'Vaquum/repo', 12,
-      'Grok Build usage balance exhausted', '2026-10-17T10:00:00Z', 'pr_approve')
-    // A later approval on the same pull request settles the old failure.
-    const claimId = store.claimSeenOwned('approve-prs', 'Vaquum/repo#12@head=new')!
-    store.markBehaviorLaunchIntentOwned({
-      key: 'approve-prs', target: 'Vaquum/repo#12@head=new', claimId, launchBehavior: 'pr_approve',
+    const error = 'Grok Build usage balance exhausted'
+    const { claimId, callId } = await failedLaunch(store, 'approve-prs', 'Vaquum/repo#12@head=old', 'Vaquum/repo', 12,
+      error, '2026-10-17T10:00:00Z', 'pr_approve')
+    completeFailedClaim(store, 'approve-prs', 'Vaquum/repo#12@head=old', claimId, error)
+    // The same request retried on the same head and approved: this request settled.
+    const retryId = randomUUID()
+    expect(store.markBehaviorLaunchIntentOwned({
+      key: 'approve-prs', target: 'Vaquum/repo#12@head=old', claimId: retryId, launchBehavior: 'pr_approve',
       repo: 'Vaquum/repo', pr: 12, requestedAt: '2026-10-19T10:00:00Z',
-      expectedHead: 'b'.repeat(40), actor: 'bit-mis', source: 'poise:approve-prs', correlationId: claimId,
-    })
-    store.linkBehaviorLaunchCallOwned('approve-prs', 'Vaquum/repo#12@head=new', claimId, 'd'.repeat(32))
+      expectedHead: 'a'.repeat(40), actor: 'bit-mis', source: 'poise:approve-prs', correlationId: retryId,
+      replacesFailedCallId: callId,
+    })).toBe(true)
+    store.linkBehaviorLaunchCallOwned('approve-prs', 'Vaquum/repo#12@head=old', retryId, 'd'.repeat(32))
     expect(store.completeBehaviorLaunchOwned({
-      key: 'approve-prs', target: 'Vaquum/repo#12@head=new', claimId,
-      outcome: 'approved', action: 'approved', completedAt: '2026-10-19T10:05:00Z', headSha: 'b'.repeat(40),
+      key: 'approve-prs', target: 'Vaquum/repo#12@head=old', claimId: retryId,
+      outcome: 'approved', action: 'approved', completedAt: '2026-10-19T10:05:00Z', headSha: 'a'.repeat(40),
     })).toBe(true)
 
     const [result] = store.reconcileBehaviorDeadLetters(new Set(['Vaquum/repo#12']))
     expect(result).toMatchObject({ behavior: 'approve-prs', disposition: 'resolved' })
     expect(result.reason).toContain('2026-10-19T10:05:00Z')
     expect(store.listBehaviorDeadLetters()).toEqual([])
-    expect(store.db.prepare(
-      'SELECT resolution, resolution_evidence, resolved_at, retired_at FROM behavior_dead_letters',
-    ).get()).toMatchObject({
+    expect(deadLetterRow(store)).toMatchObject({
       resolution: 'resolved',
       resolution_evidence: expect.stringContaining('2026-10-19T10:05:00Z'),
       resolved_at: expect.any(String),
@@ -89,6 +125,94 @@ describe('dead-letter reconcile pass', () => {
     })
     // Resolving retires; it never deletes the audit row.
     expect(store.db.prepare('SELECT count(*) FROM behavior_dead_letters').pluck().get()).toBe(1)
+  })
+
+  it('supersedes an approval a replacement request settled instead of marking it approved', async () => {
+    const store = await loadStore()
+    const error = 'codex review produced no submitted verdict: cannot validate since-diff positions: p must look like p2'
+    const { claimId } = await failedLaunch(store, 'approve-prs', 'Vaquum/repo#12@head=old', 'Vaquum/repo', 12,
+      error, '2026-10-26T19:16:00Z', 'pr_approve')
+    completeFailedClaim(store, 'approve-prs', 'Vaquum/repo#12@head=old', claimId, error)
+    // A replacement request on a new head approved later: the old request was
+    // replaced, never approved.
+    const { claimId: replacementId, callId: replacementCallId } = replacementApproval(
+      store, 'Vaquum/repo#12@head=new', 'Vaquum/repo', 12, 'b'.repeat(40), '2026-10-26T20:00:00Z')
+    expect(store.completeBehaviorLaunchOwned({
+      key: 'approve-prs', target: 'Vaquum/repo#12@head=new', claimId: replacementId,
+      outcome: 'approved', action: 'approved', completedAt: '2026-10-26T20:05:00Z', headSha: 'b'.repeat(40),
+    })).toBe(true)
+
+    const [result] = store.reconcileBehaviorDeadLetters(new Set(['Vaquum/repo#12']))
+    expect(result).toMatchObject({ behavior: 'approve-prs', disposition: 'superseded' })
+    expect(result.reason).toContain(replacementId)
+    expect(result.correlationId).toBe(claimId)
+    expect(result.replacement).toMatchObject({
+      correlationId: replacementId,
+      target: 'Vaquum/repo#12@head=new',
+      expectedHead: 'b'.repeat(40),
+      requestedAt: '2026-10-26T20:00:00Z',
+      callId: replacementCallId,
+      outcome: 'approved',
+      completedAt: '2026-10-26T20:05:00Z',
+    })
+    expect(store.listBehaviorDeadLetters()).toEqual([])
+    const row = deadLetterRow(store)
+    expect(row.resolution).toBe('superseded')
+    // The malformed-verdict diagnostic survives the settlement.
+    expect(row.error).toBe(error)
+    expect(JSON.parse(row.resolution_evidence).replacedBy).toMatchObject({
+      correlationId: replacementId,
+      expectedHead: 'b'.repeat(40),
+      outcome: 'approved',
+    })
+    expect(store.db.prepare('SELECT count(*) FROM behavior_dead_letters').pluck().get()).toBe(1)
+  })
+
+  it('supersedes a failed no-action preflight once a replacement request is confirmed', async () => {
+    const store = await loadStore()
+    const error = 'codex review produced no submitted verdict: cannot validate since-diff positions: p must look like p2'
+    const { claimId, callId } = await failedLaunch(store, 'approve-prs', 'Vaquum/repo#40@head=old', 'Vaquum/repo', 40,
+      error, '2026-10-26T19:16:00Z', 'pr_approve')
+    completeFailedClaim(store, 'approve-prs', 'Vaquum/repo#40@head=old', claimId, error)
+    // The head moved and a replacement request launched; it has not completed.
+    const { claimId: replacementId } = replacementApproval(
+      store, 'Vaquum/repo#40@head=new', 'Vaquum/repo', 40, 'b'.repeat(40), '2026-10-26T20:00:00Z')
+
+    const [result] = store.reconcileBehaviorDeadLetters(new Set(['Vaquum/repo#40']))
+    expect(result).toMatchObject({ behavior: 'approve-prs', disposition: 'superseded' })
+    expect(result.reason).toContain(replacementId)
+    expect(result.replacement).toMatchObject({ correlationId: replacementId, outcome: null, completedAt: null })
+    expect(store.listBehaviorDeadLetters()).toEqual([])
+    const row = deadLetterRow(store)
+    expect(row.resolution).toBe('superseded')
+    expect(row.error).toBe(error)
+    // Settling the incident releases nothing: the failed launch stays fenced
+    // behind the normal recovery rules instead of relaunching blind.
+    expect(store.getFailedBehaviorLaunch('approve-prs', 'Vaquum/repo#40@head=old')).toMatchObject({
+      launchCallId: callId, launchError: error,
+    })
+  })
+
+  it('supersedes an uncertain approval publication without releasing it for blind retry', async () => {
+    const store = await loadStore()
+    const error = 'review failed: could not prove a safe recovery; a verdict may have been submitted'
+    const { claimId, callId } = await failedLaunch(store, 'approve-prs', 'Vaquum/repo#41@head=old', 'Vaquum/repo', 41,
+      error, '2026-10-26T19:16:00Z', 'pr_approve')
+    completeFailedClaim(store, 'approve-prs', 'Vaquum/repo#41@head=old', claimId, error)
+    const { claimId: replacementId } = replacementApproval(
+      store, 'Vaquum/repo#41@head=new', 'Vaquum/repo', 41, 'b'.repeat(40), '2026-10-26T20:00:00Z')
+
+    const [result] = store.reconcileBehaviorDeadLetters(new Set(['Vaquum/repo#41']))
+    expect(result).toMatchObject({ behavior: 'approve-prs', disposition: 'superseded' })
+    expect(JSON.parse(deadLetterRow(store).resolution_evidence).replacedBy).toMatchObject({
+      correlationId: replacementId,
+    })
+    // Uncertainty survives: the failed launch keeps its error and its call,
+    // so no path can retry the obsolete input without fresh proof.
+    expect(store.getFailedBehaviorLaunch('approve-prs', 'Vaquum/repo#41@head=old')).toMatchObject({
+      launchCallId: callId, launchError: error,
+    })
+    expect(deadLetterRow(store).error).toBe(error)
   })
 
   it('supersedes closed targets and holds unreadable ones instead of guessing', async () => {

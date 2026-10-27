@@ -122,6 +122,35 @@ describe('behavior run metrics', () => {
     expect(readBehaviorMetrics([], { ...selected, since: selected.until, until: null }, null).behaviors['merge-prs']?.totalRuns).toBe(0)
   })
 
+  it('records the firing disposition on direct runs for lineage after ledger eviction', () => {
+    const id = startDirectBehaviorRun('merge-prs')
+    finishDirectBehaviorRun(id, true, 'not_ready')
+    expect(db.prepare('SELECT status, outcome, completed_at FROM behavior_runs WHERE id = ?').get(id))
+      .toEqual({ status: 'completed', outcome: 'not_ready', completed_at: expect.any(String) })
+    // Rows finished before dispositions existed keep a null outcome and
+    // their legacy status-only classification.
+    const legacy = startDirectBehaviorRun('merge-prs')
+    finishDirectBehaviorRun(legacy, true)
+    expect(db.prepare('SELECT status, outcome FROM behavior_runs WHERE id = ?').get(legacy))
+      .toEqual({ status: 'completed', outcome: null })
+  })
+
+  it('counts change-request verdicts as successful deliveries and supersession as a non-failure', () => {
+    const report = readBehaviorMetrics([
+      log({ outcome: 'changes_requested', action: 'requested_changes' }),
+      log({ id: 'b'.repeat(32), status: 'superseded', outcome: 'superseded', action: null }),
+    ], window, null)
+    expect(report.behaviors['review-new-prs']).toEqual({ totalRuns: 2, durationMinutes: 4, successRate: 100 })
+  })
+
+  it('leaves the run ledger untouched while reporting metrics', () => {
+    const id = startDirectBehaviorRun('merge-prs')
+    finishDirectBehaviorRun(id, true, 'merged')
+    const revision = (db.prepare('SELECT revision FROM behavior_runs_revision WHERE id = 1').get() as { revision: number }).revision
+    readBehaviorMetrics([], { since: null, until: null }, null)
+    expect((db.prepare('SELECT revision FROM behavior_runs_revision WHERE id = 1').get() as { revision: number }).revision).toBe(revision)
+  })
+
   it('reuses unchanged aggregates, updates live duration and invalidates every ledger mutation', () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-10-17T10:00:00Z'))
