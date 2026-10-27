@@ -4309,7 +4309,7 @@ export function getResolveUnblockingLastFired(): { at: string, target: string } 
 // The expected head comes from the pre-check's observed activity, not a
 // separate lookup: the primitive revalidates it against a fresh read at
 // execution time and reports superseded when the head already moved.
-async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, reviewer: string): Promise<ResolveResult | null> {
+async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, reviewer: string, nativeId: string): Promise<ResolveResult | null> {
   const { repo, number } = pr
   const accounts = prAccounts()
   const [owner, name] = repo.split('/', 2)
@@ -4322,7 +4322,8 @@ async function resolveNonblockingIfReady(pr: DatastorePr, expectedHead: string, 
   // Final admission before the mutation: a pause landing during the awaits
   // above must still hold this resolve.
   if (!isRunnable('resolve-unblocking') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('resolve-unblocking', pr, reviewer)) return null
-  const nativeId = randomUUID()
+  // The caller passes the behavior_runs row id, so the durable run and the
+  // ledger firing share one stable correlation key like the other directs.
   captureBehaviorAdmission({ admissionKey: nativeId, nativeId, behavior: 'resolve-unblocking',
     source: 'poise:resolve-unblocking', owner: currentOrganization()?.login ?? null,
     actor: reviewer, repository: repo, number, head: expectedHead, startedAt: new Date().toISOString() })
@@ -4490,10 +4491,13 @@ async function tickResolveUnblocking(): Promise<void> {
           // starting another resolve.
           if (!isRunnable('resolve-unblocking') || !stillEligible('resolve-unblocking', pr, reviewer)) continue
           runId = startDirectBehaviorRun('resolve-unblocking')
-          const result = await resolveNonblockingIfReady(pr, headSha, reviewer)
+          const result = await resolveNonblockingIfReady(pr, headSha, reviewer, runId)
           if (!result) { discardDirectBehaviorRun(runId); runId = null; continue }
-          if (result.resolved_count > 0) finishDirectBehaviorRun(runId, true)
-          else discardDirectBehaviorRun(runId)
+          // Every admitted poll is retained with the same disposition the
+          // firing carries, so no-op polls stay distinguishable from capture
+          // loss after the firing leaves bounded ledger retention.
+          finishDirectBehaviorRun(runId, true, result.superseded ? 'superseded'
+            : result.resolved_count > 0 ? 'resolved' : result.unresolved_count > 0 ? 'waiting' : 'no_op')
           runId = null
           checked = true
           if (result.superseded) {
@@ -4757,14 +4761,15 @@ async function tickMergePrs(): Promise<void> {
           || (result.outcome === 'merged' && (typeof result.merge_sha !== 'string' || !SHA_PATTERN.test(result.merge_sha)))) {
           throw new Error('github-interface --merge-if-ready returned malformed state')
         }
+        const disposition = result.outcome === 'enqueued' ? 'enqueued'
+          : result.outcome === 'in_queue' ? 'waiting'
+            : result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded'
         captureBehaviorOutcome({ nativeId: runId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
-          activity: 'settled', stateSource: 'native', outcome: result.outcome === 'enqueued' ? 'enqueued'
-            : result.outcome === 'in_queue' ? 'waiting'
-            : result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded',
+          activity: 'settled', stateSource: 'native', outcome: disposition,
           ...(result.outcome === 'enqueued'
             ? { refs: [{ kind: 'queue' as const, identity: String(result.queue_entry_id), availability: 'available' as const }] } : {}),
           head: expectedHead, completedAt: new Date().toISOString() })
-        finishDirectBehaviorRun(runId, true)
+        finishDirectBehaviorRun(runId, true, disposition)
         runId = null
         if (result.outcome === 'enqueued' || result.outcome === 'in_queue') {
           storeQueueAdmission(target, { entryId: String(result.queue_entry_id), head: expectedHead, at: new Date().toISOString() })
@@ -4824,10 +4829,11 @@ async function tickMergePrs(): Promise<void> {
       || !['updated', 'not_ready', 'superseded'].includes(String(result.outcome))) {
       throw new Error('github-interface --update-branch-if-behind returned malformed state')
     }
+    const updateDisposition = result.outcome as 'updated' | 'not_ready' | 'superseded'
     captureBehaviorOutcome({ nativeId: updateRunId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
-      activity: 'settled', stateSource: 'native', outcome: result.outcome as 'updated' | 'not_ready' | 'superseded',
+      activity: 'settled', stateSource: 'native', outcome: updateDisposition,
       head: expectedHead, completedAt: new Date().toISOString() })
-    finishDirectBehaviorRun(updateRunId, true)
+    finishDirectBehaviorRun(updateRunId, true, updateDisposition)
     updateRunId = null
     if (result.outcome === 'updated') {
       console.log(`[behaviors] merge-prs updated ${updateTarget}`)
@@ -5014,11 +5020,12 @@ async function tickRerunGreyCi(): Promise<void> {
             || result.head_sha !== row.head_sha || result.run_id !== runId || result.run_attempt !== attempt
             || !['rerun_requested', 'not_ready', 'superseded', 'read_failed'].includes(String(result.outcome))
             || (result.outcome === 'read_failed' && (typeof result.error !== 'string' || !result.error))) throw new Error('malformed grey CI rerun receipt')
+          const rerunDisposition = result.outcome as 'rerun_requested' | 'not_ready' | 'superseded' | 'read_failed'
           captureBehaviorOutcome({ nativeId: metricRunId,
             state: result.outcome === 'superseded' ? 'superseded' : result.outcome === 'read_failed' ? 'failed' : 'completed',
-            activity: 'settled', stateSource: 'native', outcome: result.outcome as 'rerun_requested' | 'not_ready' | 'superseded' | 'read_failed',
+            activity: 'settled', stateSource: 'native', outcome: rerunDisposition,
             completedAt: new Date().toISOString(), refs: [{ kind: 'intent', identity: claimId, availability: 'available' }] })
-          finishDirectBehaviorRun(metricRunId, result.outcome !== 'read_failed')
+          finishDirectBehaviorRun(metricRunId, rerunDisposition !== 'read_failed', rerunDisposition)
           metricRunId = null
           if (result.outcome === 'rerun_requested') {
             if (!completeSeenOwned(claimKey, claimTarget, claimId)) throw new Error('grey CI intent ownership changed before receipt')
