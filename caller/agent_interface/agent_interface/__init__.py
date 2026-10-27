@@ -1518,10 +1518,12 @@ def _closed_target_evidence(before: dict, facts: dict, receipt: dict | None, cal
     broken inventory reads as unknown, never as proof of no action.
     """
     try:
-        after = _review_items(facts) or []
-        earlier = _review_items(before) or []
+        after = _review_items(facts)
+        earlier = _review_items(before)
     except RuntimeError:
         return "review inventory malformed; publication state unknown"
+    if after is None or earlier is None:
+        return f"review inventory unavailable; publication state unknown; receipt={receipt!r}"[:1000]
     seen = {item["id"] for item in earlier}
     fresh = [(item["id"], item.get("state")) for item in after if item["id"] not in seen]
     try:
@@ -1650,6 +1652,8 @@ def behavior_outcome(
             if not closed or str(unattributed).startswith("github-interface review outcome returned "):
                 raise
             return settled(str(unattributed))
+    if closed:
+        return settled("legacy counters cannot attribute publication to this run")
     # Without per-review ids a moved head cannot be attributed to a posted
     # review, so the legacy counter path keeps its supersede-first rule.
     if stale:

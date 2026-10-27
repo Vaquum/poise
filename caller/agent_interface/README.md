@@ -110,6 +110,8 @@ the obsolete round settles `superseded` under `review_target_closed`, never
 clean. The original failure, the run's receipt state and the unclaimed and
 sibling-claimed review inventory stay on the row; the settle claims no unknown
 worker stopped and authorizes no replay.
+Counter-only legacy facts use the same typed closure; missing per-review
+inventories remain explicitly unknown publication evidence.
 
 An outer GitHub 403 submission error qualifies only when its validated quota
 headers identify `core` with string remaining `0`; authorization/validation

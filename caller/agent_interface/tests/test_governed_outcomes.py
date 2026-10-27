@@ -79,9 +79,26 @@ class TestGovernedOutcomes(TestCase):
             )
 
         self.assertEqual(
-            result,
+            {key: result[key] for key in ("action", "outcome", "head_sha")},
             {"action": None, "outcome": "superseded", "head_sha": "a" * 40},
         )
+        self.assertEqual(result["error_code"], "review_target_closed")
+        self.assertIn("publication state unknown", result["diagnostic"]["message"])
+
+    def test_legacy_counter_closure_retains_failure_and_unknown_publication(self) -> None:
+        for state in ("CLOSED", "MERGED"):
+            for behavior in ("pr_review", "pr_approve"):
+                with self.subTest(state=state, behavior=behavior):
+                    before = self._facts()
+                    after = self._facts(state=state, reviewer_approvals_since=1)
+                    result = agent_interface.behavior_outcome(
+                        object(), behavior, "68", "/tmp", "bit-mis", "a" * 40,
+                        before, facts=after, prior_error="review submission timed out",
+                    )
+                    self.assertEqual(result["outcome"], "superseded")
+                    self.assertEqual(result["error_code"], "review_target_closed")
+                    self.assertIn("review submission timed out", result["error"])
+                    self.assertIn("publication state unknown", result["diagnostic"]["message"])
 
     def test_review_is_superseded_when_head_changes_during_run(self) -> None:
         before = self._facts()
@@ -606,7 +623,7 @@ class TestClosedTargetSettle(TestCase):
         missing = self._facts()
         del missing["reviewer_reviews_since_items"]
         self.assertIn(
-            "new_unclaimed=[]",
+            "publication state unknown",
             agent_interface._closed_target_evidence(missing, missing, None, None))
 
     @staticmethod
