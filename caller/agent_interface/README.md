@@ -104,6 +104,15 @@ uncertain and reconciled the same way before any retry. Claude's pinned
 inspection root is also carried in its explicit settings so shell tools retain
 repository access.
 
+When live GitHub state confirms the pull request closed or merged — at
+preparation, after provider execution, or during publication reconciliation —
+the obsolete round settles `superseded` under `review_target_closed`, never
+clean. The original failure, the run's receipt state and the unclaimed and
+sibling-claimed review inventory stay on the row; the settle claims no unknown
+worker stopped and authorizes no replay.
+Counter-only legacy facts use the same typed closure; missing per-review
+inventories remain explicitly unknown publication evidence.
+
 An outer GitHub 403 submission error qualifies only when its validated quota
 headers identify `core` with string remaining `0`; authorization/validation
 errors cannot inherit a transient status from response-body text. Quota failure

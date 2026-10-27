@@ -1157,7 +1157,9 @@ bounded worker/store captures existing behavior events and Caller snapshots;
 no new Caller reads, gateway scope, public machine credential or proxy delivery
 is introduced. It shares the current workspace owner/operator boundary and
 cannot influence execution. Concrete pilot deployment remains outside this
-package contract.
+package contract. A native `review_target_closed` outcome distinguishes target
+closure from a head-change retry; panel activity still reflects every started
+worker, including running or uncertain siblings. It adds no execution authority.
 Existing ledger responses may include fixed, bounded `Server-Timing` headers
 for handler, queue and completed worker phases. They add no JSON fields,
 authority, persistence or collection; absent responses establish no timing.

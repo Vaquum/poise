@@ -129,7 +129,17 @@ approval or one atomic change request. An unresolved finding whose location beca
 outdated can be reaffirmed without another inline comment when the reviewer
 confirms it still blocks the supplied head. A terminal review contract violation
 is held on unchanged input and model instead of repeatedly launching the same
-worker. A clean review becomes approval-eligible on the next scheduler scan.
+worker. When live GitHub state confirms the pull request already closed or
+merged, the obsolete firing settles natively superseded instead of holding:
+Caller records `review_target_closed` with the original failure and the
+unclaimed-publication evidence, never a clean review, and the settle proves no
+unknown worker stopped and authorizes no replay. Native reconciliation accepts
+that typed terminal closure even with a retained review receipt, preserves the
+launch's error and seen marker, and does not release an account-access hold.
+The firing ledger distinguishes `review_target_closed` from a head-change
+supersession: closure ends unstarted panel slots, while any running or uncertain
+started sibling retains its actual activity. A later admission cannot inherit
+an earlier closure. A clean review becomes approval-eligible on the next scheduler scan.
 After a dismissal and a head change, a completed change-request review by the
 configured reviewer can admit a fresh head-pinned approval evaluation through
 the same activity and ownership guards. Dismissal never counts as approval.
