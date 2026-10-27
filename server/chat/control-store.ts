@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { db, getMeta, setMeta } from '../db'
 import { HttpError } from '../http'
 import type { ChatActor, ChatHold, PersonActor, TimerSummary, TimerView } from './protocol'
+import type { WorkTarget } from './work-observations'
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS chat_control_children (
@@ -83,7 +84,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS chat_control_inbox_turn ON chat_control_inbox(turn_id);
 `)
 
-export interface WorkTarget { url: string, repo: string, kind: 'issues' | 'pull', number: number }
+export type { WorkTarget } from './work-observations'
 export function workTarget(value: string): WorkTarget {
   if (Buffer.byteLength(value) > 1024) throw new HttpError(400, 'a GitHub work target may contain at most 1024 UTF-8 bytes')
   const match = /^https:\/\/github\.com\/([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)\/(issues|pull)\/([1-9][0-9]*)\/?$/.exec(value)
