@@ -97,7 +97,8 @@ db.exec(`
     started_at TEXT NOT NULL,
     completed_at TEXT,
     status TEXT NOT NULL DEFAULT 'running',
-    note TEXT
+    note TEXT,
+    outcome TEXT
   );
   CREATE INDEX IF NOT EXISTS behavior_runs_started
     ON behavior_runs(unixepoch(started_at, 'subsec'));
@@ -304,6 +305,10 @@ const migrateSchema = db.transaction(() => {
   ensureColumn('behavior_dead_letters', 'resolution_evidence', 'resolution_evidence TEXT')
   ensureColumn('behavior_dead_letters', 'resolved_at', 'resolved_at TEXT')
   ensureColumn('behavior_runs', 'note', 'note TEXT')
+  // The ledger-aligned disposition (merged, not_ready, resolved, ...), so a
+  // run stays classifiable after its firing leaves bounded ledger retention.
+  // Observation only: nothing reads it to decide, retry or replay work.
+  ensureColumn('behavior_runs', 'outcome', 'outcome TEXT')
   // What a notice in the page needs on top of an alert (server/alerts/notices.ts):
   // where it opens, and when the person dismissed or silenced it.
   ensureColumn('alerts', 'target', 'target TEXT')
