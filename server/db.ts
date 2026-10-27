@@ -1222,22 +1222,36 @@ export function retireBehaviorDeadLettersForClosedPrs(
   }, 0))()
 }
 
+export interface DeadLetterReplacement {
+  correlationId: string | null
+  target: string
+  expectedHead: string | null
+  requestedAt: string | null
+  callId: string | null
+  outcome: string | null
+  completedAt: string | null
+  headSha: string | null
+}
+
 export interface DeadLetterReconcileResult {
   id: string
   behavior: string
   target: string
+  correlationId: string | null
   disposition: DeadLetterDisposition
   reason: string
+  replacement?: DeadLetterReplacement
 }
 
 // One reconcile pass over the raw dead-letter inventory. Each open row is
-// resolved (a later completion settled its target), superseded (its pull
-// request or issue closed), or explicitly held with the reason recorded.
-// Nothing is deleted: resolved and superseded rows retire with their
-// evidence, held rows stay open. Unseen rows first, then least-recently
-// rechecked, in bounded batches, so a capped pass resumes where the
-// previous one stopped and re-expired holds cannot starve newer rows; a
-// hold is re-recorded at most hourly so repeats stay quiet.
+// resolved (a later completion settled its own request), superseded (its
+// pull request or issue closed, or a replacement request took over), or
+// explicitly held with the reason recorded. Nothing is deleted: resolved
+// and superseded rows retire with their evidence, held rows stay open.
+// Unseen rows first, then least-recently rechecked, in bounded batches, so
+// a capped pass resumes where the previous one stopped and re-expired holds
+// cannot starve newer rows; a hold is re-recorded at most hourly so repeats
+// stay quiet.
 export function reconcileBehaviorDeadLetters(
   openTargets: ReadonlySet<string>,
   behaviors: readonly string[] = ['review-new-prs', 'approve-prs'],
@@ -1255,7 +1269,7 @@ export function reconcileBehaviorDeadLetters(
   // The behavior scope is part of the query: filtering after LIMIT would
   // let old rows for other behaviors starve this pass forever.
   const rows = db.prepare(`
-    SELECT id, behavior, target, repo, pr, call_id, error, created_at
+    SELECT id, behavior, target, repo, pr, correlation_id, call_id, error, created_at
     FROM behavior_dead_letters AS dead
     WHERE dead.retired_at IS NULL
       AND (? IS NULL OR lower(substr(COALESCE(dead.repo, dead.target), 1, instr(COALESCE(dead.repo, dead.target), '/') - 1)) = ?)
@@ -1266,7 +1280,7 @@ export function reconcileBehaviorDeadLetters(
     LIMIT ?
   `).all(organization ?? null, organization?.toLowerCase() ?? null, ...behaviors, holdCutoff, limit) as Array<{
     id: string, behavior: string, target: string, repo: string | null, pr: number | null,
-    call_id: string | null, error: string, created_at: string,
+    correlation_id: string | null, call_id: string | null, error: string, created_at: string,
   }>
   const quarantined = db.prepare(`
     SELECT 1 FROM behavior_seen AS held
@@ -1286,6 +1300,38 @@ export function reconcileBehaviorDeadLetters(
     ORDER BY recovered.launch_completed_at DESC
     LIMIT 1
   `)
+  // Approval targets carry their request, so only the same request's own
+  // completion resolves the row: another head's approval proves the request
+  // was replaced, never that it succeeded.
+  const recoveredSameRequest = db.prepare(`
+    SELECT launch_completed_at, launch_call_id
+    FROM behavior_seen AS recovered
+    WHERE recovered.key = ? AND recovered.target = ?
+      AND recovered.launch_outcome IS NOT NULL
+      AND julianday(recovered.launch_completed_at) > julianday(?)
+    ORDER BY recovered.launch_completed_at DESC
+    LIMIT 1
+  `)
+  // A confirmed replacement: a newer approval request for the same pull
+  // request on a different target. The obsolete firing can never complete
+  // — its input is gone — so the replacement settles it as superseded,
+  // whether or not the replacement itself has finished.
+  const replacementRequest = db.prepare(`
+    SELECT target, launch_correlation_id, launch_expected_head, launch_requested_at,
+      launch_call_id, launch_outcome, launch_completed_at, launch_head_sha
+    FROM behavior_seen AS replacement
+    WHERE replacement.key = ? AND replacement.launch_repo = ? AND replacement.launch_pr = ?
+      AND replacement.target <> ?
+      AND replacement.launch_requested_at IS NOT NULL
+      AND julianday(replacement.launch_requested_at) > julianday(?)
+    ORDER BY replacement.launch_requested_at DESC, replacement.target ASC
+    LIMIT 1
+  `)
+  const obsoleteRequestedAt = db.prepare(`
+    SELECT launch_requested_at FROM behavior_seen
+    WHERE key = ? AND target = ? AND claim_id = ''
+      AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
+  `)
   const retire = db.prepare(`
     UPDATE behavior_dead_letters
     SET retired_at = ?, resolution = ?, resolution_evidence = ?, resolved_at = ?
@@ -1297,21 +1343,55 @@ export function reconcileBehaviorDeadLetters(
     WHERE id = ? AND retired_at IS NULL
   `)
   return db.transaction(() => rows.map((row): DeadLetterReconcileResult => {
-    const settle = (disposition: DeadLetterDisposition, reason: string, evidence: Record<string, unknown>) => {
+    const settle = (disposition: DeadLetterDisposition, reason: string, evidence: Record<string, unknown>,
+      replacement?: DeadLetterReplacement) => {
       const encoded = JSON.stringify({ ...evidence, checkedAt: now })
       if (disposition === 'held') hold.run(encoded, now, row.id)
       else retire.run(now, disposition, encoded, now, row.id)
-      return { id: row.id, behavior: row.behavior, target: row.target, disposition, reason }
+      return { id: row.id, behavior: row.behavior, target: row.target, correlationId: row.correlation_id,
+        disposition, reason, ...(replacement ? { replacement } : {}) }
     }
     if (quarantined.get(row.behavior, row.target)) {
       return settle('held', 'quarantined claim outstanding', { callId: row.call_id })
     }
     if (row.repo !== null && row.pr !== null) {
-      const completion = recovered.get(row.behavior, row.repo, row.pr, row.created_at, row.behavior, row.target) as
-        { launch_completed_at: string, launch_call_id: string | null } | undefined
-      if (completion) {
-        return settle('resolved', `later completion at ${completion.launch_completed_at}`,
-          { completedAt: completion.launch_completed_at, callId: completion.launch_call_id })
+      if (row.behavior === 'approve-prs') {
+        const own = recoveredSameRequest.get(row.behavior, row.target, row.created_at) as
+          { launch_completed_at: string, launch_call_id: string | null } | undefined
+        if (own) {
+          return settle('resolved', `later completion at ${own.launch_completed_at}`,
+            { completedAt: own.launch_completed_at, callId: own.launch_call_id })
+        }
+        // The replacement must postdate the obsolete request; when its row
+        // is gone (released or retried in place), the recorded failure stands
+        // in, so only a strictly newer request settles the row.
+        const obsolete = obsoleteRequestedAt.get(row.behavior, row.target) as
+          { launch_requested_at: string } | undefined
+        const next = replacementRequest.get(row.behavior, row.repo, row.pr, row.target,
+          obsolete?.launch_requested_at ?? row.created_at) as {
+          target: string, launch_correlation_id: string | null, launch_expected_head: string | null,
+          launch_requested_at: string | null, launch_call_id: string | null, launch_outcome: string | null,
+          launch_completed_at: string | null, launch_head_sha: string | null,
+        } | undefined
+        if (next) {
+          const link: DeadLetterReplacement = {
+            correlationId: next.launch_correlation_id, target: next.target, expectedHead: next.launch_expected_head,
+            requestedAt: next.launch_requested_at, callId: next.launch_call_id, outcome: next.launch_outcome,
+            completedAt: next.launch_completed_at, headSha: next.launch_head_sha,
+          }
+          const open = unreadRepositories?.has(row.repo) ? null : openTargets.has(`${row.repo}#${row.pr}`)
+          return settle('superseded',
+            `replaced by request ${next.launch_correlation_id ?? next.target}`
+            + ` on head ${next.launch_expected_head ?? 'unknown'} at ${next.launch_requested_at}`,
+            { callId: row.call_id, open, replacedBy: link }, link)
+        }
+      } else {
+        const completion = recovered.get(row.behavior, row.repo, row.pr, row.created_at, row.behavior, row.target) as
+          { launch_completed_at: string, launch_call_id: string | null } | undefined
+        if (completion) {
+          return settle('resolved', `later completion at ${completion.launch_completed_at}`,
+            { completedAt: completion.launch_completed_at, callId: completion.launch_call_id })
+        }
       }
       if (!unreadRepositories?.has(row.repo) && !openTargets.has(`${row.repo}#${row.pr}`)) {
         return settle('superseded', `${row.repo}#${row.pr} is no longer open`, { open: false })

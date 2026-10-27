@@ -1,5 +1,6 @@
 import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
+import type { LedgerReference } from './behavior-ledger-contract'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
 import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun, reapAbandonedDirectBehaviorRuns } from './behavior-metrics'
@@ -75,6 +76,7 @@ import {
   type BehaviorAgentLaunch,
   type BehaviorLaunchClaim,
   type CompletedApprovalBasisLaunch,
+  type DeadLetterReconcileResult,
 } from './db'
 import { HttpError } from './http'
 import { eventLoopDelayStats, type EventLoopDelayStats } from './event-loop-delay'
@@ -1414,6 +1416,28 @@ function deadLetterClaim(claim: BehaviorLaunchClaim, error: string, observe = tr
   return completed
 }
 
+// A replacement approval request settles the obsolete firing it replaced.
+// The dead letter already retired as superseded with the replacement link;
+// the ledger firing follows so it cannot stay held past its input. Activity
+// stays unknown: the replacement proves the input is obsolete, never what
+// the obsolete run published.
+function settleSupersededApprovalFirings(results: DeadLetterReconcileResult[]): void {
+  for (const result of results) {
+    if (result.behavior !== 'approve-prs' || result.disposition !== 'superseded' || !result.replacement) continue
+    const nativeId = result.correlationId
+    const replacementId = result.replacement.correlationId
+    if (!nativeId || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(nativeId)) continue
+    if (!replacementId || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(replacementId)) continue
+    const refs: LedgerReference[] = [{ kind: 'correlation', identity: replacementId, availability: 'available' }]
+    const replacementCallId = result.replacement.callId
+    if (replacementCallId && /^[0-9a-f]{32}$/.test(replacementCallId)) {
+      refs.push({ kind: 'caller', identity: replacementCallId, availability: 'available' })
+    }
+    captureBehaviorOutcome({ nativeId, state: 'superseded', activity: 'unknown', stateSource: 'native',
+      outcome: 'superseded', refs })
+  }
+}
+
 function recordQuarantineIncident(claim: BehaviorLaunchClaim, error: string, callId: string | null): void {
   if (claim.launchQuarantine === 'invalid_result') return
   const updated = db.prepare(`
@@ -1690,6 +1714,20 @@ function failedBehaviorLaunches(behavior: string): BehaviorLaunchClaim[] {
           AND (incident.call_id IS NULL OR incident.call_id = launch.launch_call_id)
       ))
   `).all(behavior) as Array<{ target: string }>
+  return rows.map(({ target }) => getFailedBehaviorLaunch(behavior, target))
+    .filter((claim): claim is BehaviorLaunchClaim => claim !== null && organizationOwns(claim.launchRepo))
+}
+
+// Retained failed launches for one pull request, whether or not their
+// incidents already retired: superseding an incident settles its firing,
+// but the retained launch keeps fencing its input against blind relaunch.
+function retainedFailedLaunchesForPr(behavior: string, repo: string, pr: number): BehaviorLaunchClaim[] {
+  const rows = db.prepare(`
+    SELECT target FROM behavior_seen AS launch
+    WHERE key = ? AND claim_id = '' AND launch_call_id IS NOT NULL
+      AND launch_requested_at IS NOT NULL AND launch_error IS NOT NULL AND launch_outcome IS NULL
+      AND launch_repo = ? AND launch_pr = ?
+  `).all(behavior, repo, pr) as Array<{ target: string }>
   return rows.map(({ target }) => getFailedBehaviorLaunch(behavior, target))
     .filter((claim): claim is BehaviorLaunchClaim => claim !== null && organizationOwns(claim.launchRepo))
 }
@@ -2347,7 +2385,7 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
     seen.add(key)
     return pr
   })
-  reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
+  settleSupersededApprovalFirings(reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login))
   retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
   retireClosedQueueAdmissions(seen)
   return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(getMeta('me') || '', `${pr.repo}#${pr.number}`, pr))
@@ -3680,8 +3718,8 @@ async function readReviewActivityBatch(
 }
 
 async function dismissedApprovalHeld(pr: DatastorePr, head: string, model: string): Promise<boolean> {
-  const failed = failedBehaviorLaunches('approve-prs').filter((claim) =>
-    claim.launchRepo === pr.repo && claim.launchPr === pr.number && claim.launchExpectedHead === head)
+  const failed = retainedFailedLaunchesForPr('approve-prs', pr.repo, pr.number).filter((claim) =>
+    claim.launchExpectedHead === head)
   if (!failed.length) return false
   const snapshot = await readBehaviorLogSnapshot()
   return failed.some((claim) => {
