@@ -1,5 +1,9 @@
 # Local v2 sandbox validation — 27 October 2026
 
+The subsequent [ten real-worker cycles](V2-real-cycle-validation.md) provide
+the actual model-driven issue-to-merge evidence. The scripted workers in this
+earlier run are excluded from that count.
+
 Three fixture tasks completed through real GitHub issues, reviews, CI and native
 merge-queue merges. The production instance kept running. Its configured
 organizations and identities were unchanged, and its retained metadata recorded
