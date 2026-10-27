@@ -313,6 +313,333 @@ class TestGovernedOutcomes(TestCase):
         facts.update(updates)
         return facts
 
+class TestClosedTargetSettle(TestCase):
+    def test_preparation_settles_when_target_already_closed(self) -> None:
+        import io
+        import json
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        from agent_interface import pr_review
+
+        before = self._facts(state="MERGED", reviewer_reviews_since_items=[])
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(agent_interface, 'DB', Path(directory) / 'calls.sqlite3'), \
+                patch.object(agent_interface, 'RESPONSES', Path(directory) / 'responses'), \
+                patch.object(agent_interface, 'review_facts', return_value=before), \
+                patch.object(pr_review, 'run') as provider:
+            agent_interface.init_db()
+            output = io.StringIO()
+            with redirect_stdout(output):
+                agent_interface.run_governed_behavior(
+                    pr_review, 'pr_review', 'https://github.com/o/r/pull/68',
+                    actor='bit-mis', expected_head='a' * 40,
+                    source='poise:review-new-prs', correlation_id='test-closed-prep', pwd=directory,
+                )
+            provider.assert_not_called()
+            row = agent_interface.logs()[0]
+            self.assertEqual(row['status'], 'superseded')
+            self.assertEqual(row['outcome'], 'superseded')
+            self.assertIsNone(row['action'])
+            self.assertEqual(row['head_sha'], 'a' * 40)
+            self.assertEqual(row['error_code'], 'review_target_closed')
+            self.assertIn('MERGED', row['error'])
+            self.assertIn('provider never ran', row['error'])
+            self.assertIsNone(row['review_id'])
+            printed = json.loads(output.getvalue())
+            self.assertEqual(printed['outcome'], 'superseded')
+            self.assertEqual(printed['error_code'], 'review_target_closed')
+            diagnostic = row['diagnostic']
+            self.assertEqual(
+                (diagnostic['operation'], diagnostic['phase'], diagnostic['outcome']),
+                ('review.verify', 'preparing', 'target_closed'))
+            self.assertEqual(
+                (diagnostic['repository'], diagnostic['pr'], diagnostic['reviewer'],
+                 diagnostic['behavior'], diagnostic['expected_head']),
+                ('o/r', '68', 'bit-mis', 'pr_review', 'a' * 40))
+
+    def test_failed_provider_run_settles_when_target_closed(self) -> None:
+        import subprocess as process
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from agent_interface import pr_review
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            state="MERGED",
+            reviewer_reviews_since_items=[self._item(77, state="APPROVED", commit="a" * 40)],
+        )
+        spec = SimpleNamespace(identity="model-a", provider="codex")
+        recovery = SimpleNamespace(identity="model-b", provider="codex")
+
+        def expired(*args, **kwargs):
+            raise process.TimeoutExpired("codex", 60)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(agent_interface, 'DB', Path(directory) / 'calls.sqlite3'), \
+                patch.object(agent_interface, 'sleep'), \
+                patch.object(pr_review, "run", side_effect=expired), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            agent_interface.init_db()
+            response, result = agent_interface._run_review_with_recovery(
+                pr_review, "pr_review", "68", "/tmp", "bit-mis", "a" * 40,
+                "", 60, None, spec, recovery, before, "call-1",
+            )
+
+        self.assertIn("time limit", response)
+        self.assertEqual(result["outcome"], "superseded")
+        self.assertIsNone(result["action"])
+        self.assertEqual(result["error_code"], "review_target_closed")
+        self.assertIn("time limit", result["error"])
+        self.assertIn("target MERGED", result["error"])
+        self.assertIn("unexpected approval", result["error"])
+        self.assertIn("77/APPROVED", result["error"])
+        self.assertIn("receipt=none", result["error"])
+
+    def test_reconciliation_settles_unattributable_reviews_on_a_closed_target(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            state="CLOSED",
+            reviewer_reviews_since_items=[self._item(78, state="APPROVED", commit="a" * 40)],
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(agent_interface, 'DB', Path(directory) / 'calls.sqlite3'), \
+                patch.object(agent_interface, 'sleep'), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            agent_interface.init_db()
+            review_receipt._current.set(None)
+            try:
+                result = agent_interface.behavior_outcome(
+                    object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40, before
+                )
+            finally:
+                review_receipt._current.set(None)
+
+        self.assertEqual(result["outcome"], "superseded")
+        self.assertEqual(result["error_code"], "review_target_closed")
+        self.assertIn("target CLOSED", result["error"])
+        self.assertIn("78/APPROVED", result["error"])
+        self.assertEqual(result["diagnostic"]["outcome"], "target_closed")
+
+    def test_reconciliation_settles_duplicate_reviews_on_a_closed_target(self) -> None:
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from time import time
+
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            state="MERGED",
+            reviewer_reviews_since_items=[
+                self._item(91, state="COMMENTED", commit="a" * 40),
+                self._item(92, state="APPROVED", commit="a" * 40),
+            ],
+        )
+        receipt = {"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(agent_interface, 'DB', Path(directory) / 'calls.sqlite3'), \
+                patch.object(agent_interface, 'sleep'), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            agent_interface.init_db()
+            with sqlite3.connect(Path(directory) / 'calls.sqlite3', timeout=30) as conn:
+                conn.execute(
+                    "insert into calls(id, started_at, actor, repo, pr_id, behavior, status)"
+                    " values (?,?,?,?,?,?,?)",
+                    ("call-1", time(), "bit-mis", "o/r", "68", "pr_review", "running"))
+            review_receipt._current.set(None)
+            try:
+                result = agent_interface.behavior_outcome(
+                    object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40,
+                    before, receipt=receipt, call_id="call-1",
+                )
+            finally:
+                review_receipt._current.set(None)
+
+        self.assertEqual(result["outcome"], "superseded")
+        self.assertEqual(result["error_code"], "review_target_closed")
+        self.assertIn("duplicate", result["error"])
+        self.assertIn("92/APPROVED", result["error"])
+
+    def test_closed_settle_lists_sibling_claims_beside_unclaimed_reviews(self) -> None:
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            state="MERGED",
+            reviewer_reviews_since_items=[
+                self._item(55, state="APPROVED", commit="a" * 40),
+                self._item(77, state="APPROVED", commit="a" * 40),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(agent_interface, 'DB', Path(directory) / 'calls.sqlite3'), \
+                patch.object(agent_interface, 'sleep'), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            agent_interface.init_db()
+            database = Path(directory) / 'calls.sqlite3'
+            with sqlite3.connect(database, timeout=30) as conn:
+                conn.execute(
+                    "insert into calls(id, repo, pr_id, review_id, status) values (?,?,?,?,?)",
+                    ("sibling-1", "o/r", "68", "55", "completed"))
+            review_receipt._current.set(None)
+            try:
+                result = agent_interface.behavior_outcome(
+                    object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40,
+                    before, call_id="call-1",
+                )
+            finally:
+                review_receipt._current.set(None)
+
+        self.assertEqual(result["outcome"], "superseded")
+        self.assertIn("new_unclaimed=[77/APPROVED]", result["error"])
+        self.assertIn("sibling_claimed=[55]", result["error"])
+
+    def test_closed_target_with_no_new_reviews_settles_with_evidence(self) -> None:
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(state="MERGED", reviewer_reviews_since_items=[])
+
+        with patch.object(agent_interface, "review_facts", return_value=after):
+            result = agent_interface.behavior_outcome(
+                object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40, before
+            )
+
+        self.assertEqual(
+            (result["action"], result["outcome"], result["head_sha"]),
+            (None, "superseded", "a" * 40))
+        self.assertEqual(result["error_code"], "review_target_closed")
+        self.assertIn("no review attributable", result["error"])
+
+    def test_posted_review_still_wins_on_a_closed_target(self) -> None:
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            state="MERGED",
+            reviewer_reviews_since_items=[self._item(91, state="COMMENTED", commit="a" * 40)],
+        )
+        receipt = {"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40}
+
+        with patch.object(agent_interface, "review_facts", return_value=after):
+            result = agent_interface.behavior_outcome(
+                object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40,
+                before, receipt=receipt, call_id="call-1",
+            )
+
+        self.assertEqual(result, {
+            "action": "reviewed_clean",
+            "outcome": "clean",
+            "head_sha": "a" * 40,
+        })
+
+    def test_open_target_still_holds_an_unexpected_approval(self) -> None:
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            reviewer_reviews_since_items=[self._item(77, state="APPROVED", commit="a" * 40)],
+        )
+        with patch.object(agent_interface, "sleep"), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            review_receipt._current.set(None)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "unexpected approval"):
+                    agent_interface.behavior_outcome(
+                        object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40, before
+                    )
+            finally:
+                review_receipt._current.set(None)
+
+    def test_open_target_still_holds_duplicate_reviews(self) -> None:
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from time import time
+
+        from agent_interface import review_budget, review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            reviewer_reviews_since_items=[
+                self._item(91, state="COMMENTED", commit="a" * 40),
+                self._item(92, state="APPROVED", commit="a" * 40),
+            ],
+        )
+        receipt = {"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(agent_interface, 'DB', Path(directory) / 'calls.sqlite3'), \
+                patch.object(agent_interface, 'sleep'), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            agent_interface.init_db()
+            with sqlite3.connect(Path(directory) / 'calls.sqlite3', timeout=30) as conn:
+                conn.execute(
+                    "insert into calls(id, started_at, actor, repo, pr_id, behavior, status)"
+                    " values (?,?,?,?,?,?,?)",
+                    ("call-1", time(), "bit-mis", "o/r", "68", "pr_review", "running"))
+            review_receipt._current.set(None)
+            try:
+                with self.assertRaises(review_budget.ReviewLimitError) as raised:
+                    agent_interface.behavior_outcome(
+                        object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40,
+                        before, receipt=receipt, call_id="call-1",
+                    )
+            finally:
+                review_receipt._current.set(None)
+        self.assertEqual(raised.exception.code, "review_contract_violation")
+
+    def test_evidence_inventory_degrades_to_unknown_instead_of_raising(self) -> None:
+        malformed = self._facts(reviewer_reviews_since_items=[{"id": "not-an-int"}])
+        self.assertIn(
+            "unknown",
+            agent_interface._closed_target_evidence(malformed, malformed, None, "call-1"))
+        missing = self._facts()
+        del missing["reviewer_reviews_since_items"]
+        self.assertIn(
+            "new_unclaimed=[]",
+            agent_interface._closed_target_evidence(missing, missing, None, None))
+
+    @staticmethod
+    def _item(review_id: int, state: str, commit: str) -> dict:
+        return {
+            "id": review_id,
+            "node_id": f"node-{review_id}",
+            "state": state,
+            "commit": commit,
+            "submitted_at": "2026-10-25T13:51:24Z",
+        }
+
+    @staticmethod
+    def _facts(**updates):
+        facts = {
+            "repository": "o/r",
+            "pull_number": 68,
+            "state": "OPEN",
+            "draft": False,
+            "head_sha": "a" * 40,
+            "reviewer_change_requests_since": 0,
+            "reviewer_approvals_since": 0,
+            "reviewer_comments_since": 0,
+            "reviewer_reviews_since": 0,
+            "reviewer_pending_reviews": 0,
+            "reviewer_latest_review_id": None,
+            "reviewer_latest_any_review_id": None,
+            "reviewer_reviews_since_items": [],
+        }
+        facts.update(updates)
+        return facts
+
+
 class TestPreflightLogContract(TestCase):
     def test_failure_code_survives_database_and_logs_with_no_action_proof(self):
         import io

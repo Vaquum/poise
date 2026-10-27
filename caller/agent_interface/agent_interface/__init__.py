@@ -1162,6 +1162,42 @@ def run_governed_behavior(
                 "error": str(e),
             }, indent=2))
             raise SystemExit(1)
+        if before.get("state") in CLOSED_TARGET_STATES:
+            # The target already closed before the provider ran: the round is
+            # obsolete, not failed. Settle without spending the review budget.
+            closed = _closed_target_result(
+                facts=before,
+                evidence=_closed_target_evidence(before, before, None, id_),
+                attribution="target already closed at preparation; provider never ran",
+                phase="preparing",
+            )
+            closed["diagnostic"] = _caller_context(
+                closed["diagnostic"], id_, correlation_id, repo, mod.pr_number(pr),
+                actor, behavior, expected_head)
+            ended_at = finish(
+                id_,
+                "superseded",
+                response=closed["error"],
+                error=closed["error"],
+                outcome=closed["outcome"],
+                head_sha=closed["head_sha"],
+                action=closed["action"],
+                error_code=closed["error_code"],
+                diagnostic=closed["diagnostic"],
+            )
+            print(json.dumps({
+                "id": id_,
+                "model": name,
+                "behavior": behavior,
+                "actor": actor,
+                "source": source,
+                "correlation_id": correlation_id,
+                "response": closed["error"],
+                "completed_at": utc_stamp(ended_at),
+                "budget": review_budget.usage(),
+                **closed,
+            }, indent=2))
+            return
         try:
             try:
                 response, recovered_result = _run_review_with_recovery(mod, behavior, review_pr, pwd, actor, expected_head, note, timeout_s, p, spec, recovery, before, id_,
@@ -1176,7 +1212,7 @@ def run_governed_behavior(
                     # verify the posted review instead of retracting it.
                     progress.stage("verifying", "Verifying GitHub outcome after cancellation")
                     result = behavior_outcome(mod, behavior, pr, pwd, actor, expected_head, before,
-                                              receipt=cancelled_receipt, call_id=id_)
+                                              receipt=cancelled_receipt, call_id=id_, prior_error=response)
             else:
                 progress.stage("verifying", "Verifying GitHub outcome")
                 result = recovered_result or behavior_outcome(
@@ -1191,13 +1227,23 @@ def run_governed_behavior(
                     call_id=id_,
                 )
             status = "superseded" if result["outcome"] == "superseded" else "completed"
+            if "diagnostic" in result:
+                # A close-settled round keeps its original failure and its
+                # publication evidence on the row; Poise releases the
+                # superseded claim while the audit trail stays complete.
+                result = {**result, "diagnostic": _caller_context(
+                    result["diagnostic"], id_, correlation_id, repo, mod.pr_number(pr),
+                    actor, behavior, expected_head)}
             ended_at = finish(
                 id_,
                 status,
                 response=response,
+                error=result.get("error") or "",
                 outcome=result["outcome"],
                 head_sha=result["head_sha"],
                 action=result["action"],
+                error_code=result.get("error_code"),
+                diagnostic=result.get("diagnostic"),
             )
             print(json.dumps({
                 "id": id_,
@@ -1309,15 +1355,17 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             receipt = review_receipt.get()
             # A completed or superseded action wins over a later CLI failure.
             if facts["head_sha"] != head or facts["state"] != "OPEN" or facts["draft"]:
-                return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts, receipt=receipt, call_id=call_id)
+                return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
+                                                       receipt=receipt, call_id=call_id, prior_error=str(failure))
             own = own_reviews(before, facts, receipt, call_id)
             if own is None:
                 counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
                 if any(_count(facts, key) != _count(before, key) for key in counts):
                     return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
-                                                          receipt=receipt, call_id=call_id)
+                                                          receipt=receipt, call_id=call_id, prior_error=str(failure))
             elif receipt is not None or own:
-                return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts, receipt=receipt, call_id=call_id)
+                return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
+                                                       receipt=receipt, call_id=call_id, prior_error=str(failure))
             # Require positive no-action proof, including pending reviews.
             if _count(facts, "reviewer_pending_reviews") != 0:
                 raise RuntimeError("a pending GitHub review requires reconciliation")
@@ -1371,6 +1419,10 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
 # taken for this run's own.
 SIBLING_GRACE_SECONDS = 2.0
 RECEIPT_STATES = {"requested_changes": "CHANGES_REQUESTED", "reviewed_clean": "COMMENTED", "approved_pr": "APPROVED"}
+# A pull request in either state is gone for review purposes: the round the
+# run prepared is obsolete, whatever the provider did or did not submit.
+CLOSED_TARGET_STATES = {"CLOSED", "MERGED"}
+REVIEW_TARGET_CLOSED_CODE = "review_target_closed"
 
 
 def _review_items(facts: dict) -> list[dict] | None:
@@ -1457,6 +1509,78 @@ def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: di
     raise RuntimeError("latest review state does not match the terminal behavior action")
 
 
+def _closed_target_evidence(before: dict, facts: dict, receipt: dict | None, call_id: str | None) -> str:
+    """Who may have published what, for a close-settled round.
+
+    The shared reviewer identity alone never attributes a review: the run's
+    own receipt, its siblings' claimed ids and the remaining unclaimed
+    reviews are listed side by side instead. Bounded, and never raises — a
+    broken inventory reads as unknown, never as proof of no action.
+    """
+    try:
+        after = _review_items(facts) or []
+        earlier = _review_items(before) or []
+    except RuntimeError:
+        return "review inventory malformed; publication state unknown"
+    seen = {item["id"] for item in earlier}
+    fresh = [(item["id"], item.get("state")) for item in after if item["id"] not in seen]
+    try:
+        siblings = review_receipt.sibling_ids(
+            DB, call_id, str(facts.get("repository") or ""), str(facts.get("pull_number") or "")) if call_id else set()
+    except Exception:
+        siblings = None
+    receipted = receipt.get("review_id") if receipt else None
+
+    def listed(entries: list[str]) -> str:
+        shown = ",".join(entries[:10])
+        return shown + (f",+{len(entries) - 10} more" if len(entries) > 10 else "")
+
+    unclaimed = [f"{review_id}/{state}" for review_id, state in fresh
+                 if review_id != receipted and (siblings is None or review_id not in siblings)]
+    own = "none" if receipt is None else f"id={receipted} action={receipt.get('action')}"
+    claimed = "unknown" if siblings is None else f"[{listed(sorted(str(i) for i in siblings))}]"
+    return f"receipt={own}; new_unclaimed=[{listed(unclaimed)}]; sibling_claimed={claimed}"[:1000]
+
+
+def _closed_target_result(*, facts: dict, evidence: str, attribution: str,
+                          prior_error: str | None = None, phase: str = "verifying") -> dict:
+    """The terminal disposition for work a closed target made obsolete.
+
+    Superseded, never clean: the round cannot complete on a closed pull
+    request. The original failure, the attribution gap and the ownership
+    inventory stay on the row, so the settle neither hides what went wrong
+    nor claims an unknown worker stopped; a superseded outcome authorizes
+    no replay.
+    """
+    state = facts["state"]
+    actual = str(facts["head_sha"]).lower()
+    note = "; ".join(part for part in (
+        (prior_error or "")[:500],
+        f"target {state}",
+        attribution[:500],
+        evidence[:500],
+    ) if part)
+    return {
+        "action": None,
+        "outcome": "superseded",
+        "head_sha": actual,
+        "error": note,
+        "error_code": REVIEW_TARGET_CLOSED_CODE,
+        "diagnostic": diagnostic_envelope(
+            operation="review.verify", phase=phase, outcome="target_closed",
+            stderr=note[:500], message=evidence[:1000], observed_head=actual),
+    }
+
+
+def _caller_context(envelope: dict, call_id: str, correlation_id: str, repo: str, pr_number: str,
+                    reviewer: str, behavior: str, expected_head: str) -> dict:
+    """The durable launch identity a close-settled diagnostic carries, the
+    same context the failure paths attach."""
+    return {**envelope, "call_id": call_id, "correlation_id": correlation_id,
+            "repository": repo, "pr": pr_number, "reviewer": reviewer,
+            "behavior": behavior, "expected_head": expected_head}
+
+
 def behavior_outcome(
     mod,
     behavior: str,
@@ -1468,36 +1592,64 @@ def behavior_outcome(
     facts: dict | None = None,
     receipt: dict | None = None,
     call_id: str | None = None,
-) -> dict[str, str | None]:
+    prior_error: str | None = None,
+) -> dict:
     if facts is None:
         facts = review_facts(mod, pr, pwd, actor, expected_head, 0)
     if behavior not in {"pr_review", "pr_approve"}:
         raise RuntimeError(f"unsupported governed behavior: {behavior}")
     actual_head = str(facts["head_sha"]).lower()
     stale = facts["state"] != "OPEN" or facts["draft"] is True or actual_head != expected_head
-    own = own_reviews(before, facts, receipt, call_id)
+    closed = facts["state"] in CLOSED_TARGET_STATES
+
+    def settled(attribution: str) -> dict:
+        return _closed_target_result(
+            facts=facts,
+            evidence=_closed_target_evidence(before, facts, receipt, call_id),
+            attribution=attribution,
+            prior_error=prior_error,
+        )
+
+    try:
+        own = own_reviews(before, facts, receipt, call_id)
+    except review_budget.ReviewLimitError as duplicates:
+        # Two reviews under the shared identity with no attributable owner.
+        # On an open target that ambiguity holds; on a confirmed-closed one
+        # the round is over and the evidence settles with it.
+        if not closed:
+            raise
+        return settled(str(duplicates))
     if own is not None:
-        if len(own) == 1:
-            if (receipt is not None and receipt.get("action") == "approved_pr"
-                    and own[0].get("state") == "DISMISSED" and stale):
-                # GitHub dismissed the posted approval as stale after the
-                # target moved: no approval authority, but the current head
-                # needs a fresh evaluation, not a hold. Poise releases this
-                # typed failure like a supersede.
-                raise review_budget.ReviewLimitError(
-                    "submitted approval was dismissed as stale after the target moved",
-                    "approval_dismissed_stale")
-            # A posted review wins over a target that went stale after the
-            # submission: the round completed on the expected head.
+        try:
+            if len(own) == 1:
+                if (receipt is not None and receipt.get("action") == "approved_pr"
+                        and own[0].get("state") == "DISMISSED" and stale):
+                    # GitHub dismissed the posted approval as stale after the
+                    # target moved: no approval authority, but the current head
+                    # needs a fresh evaluation, not a hold. Poise releases this
+                    # typed failure like a supersede.
+                    raise review_budget.ReviewLimitError(
+                        "submitted approval was dismissed as stale after the target moved",
+                        "approval_dismissed_stale")
+                # A posted review wins over a target that went stale after the
+                # submission: the round completed on the expected head.
+                return _own_outcome(behavior, own, expected_head, receipt)
+            if stale and not own and receipt is None:
+                if closed:
+                    # Nothing posted and the target closed: the round is
+                    # obsolete, with its no-action evidence retained.
+                    return settled("no review attributable to this run was posted")
+                # Nothing posted and the target moved on: a clean supersede.
+                return {
+                    "action": None,
+                    "outcome": "superseded",
+                    "head_sha": actual_head,
+                }
             return _own_outcome(behavior, own, expected_head, receipt)
-        if stale and not own and receipt is None:
-            # Nothing posted and the target moved on: a clean supersede.
-            return {
-                "action": None,
-                "outcome": "superseded",
-                "head_sha": actual_head,
-            }
-        return _own_outcome(behavior, own, expected_head, receipt)
+        except (review_budget.ReviewLimitError, RuntimeError) as unattributed:
+            if not closed or str(unattributed).startswith("github-interface review outcome returned "):
+                raise
+            return settled(str(unattributed))
     # Without per-review ids a moved head cannot be attributed to a posted
     # review, so the legacy counter path keeps its supersede-first rule.
     if stale:
