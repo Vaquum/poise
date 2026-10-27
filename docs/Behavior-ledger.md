@@ -6,6 +6,13 @@ has a permanent 64-character hexadecimal hash. The ledger observes work; its
 state never controls eligibility, claims, retries, locks, metrics or launches.
 Capture does not wait for storage and adds no Caller reads.
 
+A native `review_target_closed` outcome supersedes an obsolete review panel,
+including configured slots that never started. It does not claim publication
+success or worker termination: started siblings keep their running or unknown
+activity, and Caller retains its original failure and receipt evidence. An
+ordinary head-change supersession still leaves the panel pending for its next
+head; a later admission cannot inherit an earlier target-closure observation.
+
 ## Read interface
 
 Use the current workspace owner/loopback authority. There is no new public

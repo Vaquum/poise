@@ -1960,6 +1960,22 @@ async function reconcileBehaviorLaunchClaims(
       || String(call.outcome || '') === 'superseded'
       || call.error === SUPERSEDED_AGENT_ERROR
     if (superseded) {
+      if (status === 'superseded' && call.outcome === 'superseded'
+        && call.error_code === 'review_target_closed'
+        && SHA_PATTERN.test(call.head_sha || '')
+        && Number.isFinite(Date.parse(call.completed_at || ''))
+        && unambiguousAgentCall(snapshot, call)) {
+        // Caller proved target closure, not a no-publication outcome. Keep
+        // the terminal launch and Caller receipt evidence; do not release
+        // its seen marker or infer that a conflicting worker stopped.
+        if (completeClaimSafely(claim, call.error || 'review target closed')) {
+          captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
+            state: 'superseded', activity: 'settled', stateSource: 'native',
+            outcome: 'review_target_closed', head: call.head_sha, completedAt: call.completed_at })
+          clearBehaviorFailureKeepHold(behavior, claim.target)
+        }
+        continue
+      }
       if (call.review_id != null || call.receipts != null) {
         // A run that posted must never be silently released: a superseded
         // result always carries the observed current head, which proves

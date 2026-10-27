@@ -217,6 +217,35 @@ describe('review outcome evidence and registration', () => {
     }))
   })
 
+  it.each([null, 91])('settles a closed-target review with retained publication evidence (%s)', async (reviewId) => {
+    const launched = await launchReviewBeforeCrash()
+    const completedAt = new Date(Date.parse(launched.requestedAt) + 2_000).toISOString()
+    fixture.agentLogs = [agentLog({ id: 'd'.repeat(32),
+      started_at: new Date(Date.parse(launched.requestedAt) + 1_000).toISOString(),
+      started_at_precise: new Date(Date.parse(launched.requestedAt) + 1_001).toISOString(),
+      status: 'superseded', outcome: 'superseded', action: null, head_sha: HEAD_SHA,
+      completed_at: completedAt, review_id: reviewId,
+      error_code: 'review_target_closed', error: 'target MERGED; receipt state remains uncertain',
+      expected_head: launched.expectedHead, actor: launched.actor,
+      source: launched.source, correlation_id: launched.correlationId })]
+    await resetLogCache()
+    const { database: db, behaviors: runtime } = await restartModules()
+    runtime.startBehaviorsRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(db.hasSeen('review-new-prs', launched.target)).toBe(true)
+    expect(db.listBehaviorLaunchClaims('review-new-prs')).toEqual([])
+    expect(db.listBehaviorDeadLetters()).toEqual([])
+    expect(db.countReviewRounds(pr.repo, pr.number)).toBe(0)
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: launched.correlationId, callId: 'd'.repeat(32), state: 'superseded',
+      activity: 'settled', outcome: 'review_target_closed', completedAt,
+    }))
+    expect(db.db.prepare('SELECT launch_call_id, launch_error FROM behavior_seen WHERE target = ?').get(launched.target))
+      .toEqual({ launch_call_id: 'd'.repeat(32), launch_error: 'target MERGED; receipt state remains uncertain' })
+  })
+
   it('quarantines a superseded review that posted instead of releasing it', async () => {
     const launched = await launchReviewBeforeCrash()
     fixture.agentLogs = [agentLog({

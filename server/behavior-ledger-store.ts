@@ -21,7 +21,7 @@ const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,1
 const SHA = /^[a-f0-9]{40}$/
 const SLOTS: readonly LedgerSlot[] = ['primary', 'secondary', 'tertiary']
 const PRECEDENCE: readonly LedgerState[] = ['running', 'held', 'unknown', 'pending', 'failed', 'superseded', 'completed']
-const OUTCOMES = new Set(['clean', 'changes_requested', 'approved', 'commented', 'preflight_failed', 'resolved', 'waiting', 'no_op', 'merged', 'already_merged', 'updated', 'not_ready', 'superseded', 'rerun_requested', 'read_failed', 'spawn_failed', 'adopted', 'enqueued'])
+const OUTCOMES = new Set(['clean', 'changes_requested', 'approved', 'commented', 'preflight_failed', 'resolved', 'waiting', 'no_op', 'merged', 'already_merged', 'updated', 'not_ready', 'superseded', 'rerun_requested', 'read_failed', 'spawn_failed', 'adopted', 'enqueued', 'review_target_closed'])
 const TERMINAL = new Set<LedgerState>(['completed', 'failed', 'superseded'])
 const DIRECT = new Set(['resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
 const cliBehavior = { 'review-new-prs': 'pr_review', 'approve-prs': 'pr_approve', 'review-new-issues': 'issue_review' } as const
@@ -395,17 +395,25 @@ export class BehaviorLedgerStore {
     const root = recordOf(row)
     const children = this.rows('SELECT * FROM ledger_instances WHERE parent_id=? ORDER BY creation_seq DESC', id).map(recordOf)
     const selected = root.plannedSlots.length ? root.plannedSlots.map((slot) => children.find((child) => child.slot === slot)) : [children[0]]
+    const latest = children[0]
+    // Closure ends the target's panel, including slots never admitted. A
+    // later admission or a delayed observation of an older closure cannot
+    // supersede work started after the target reopened.
+    const closed = children.find((child) => child.outcome === 'review_target_closed'
+      && child.state === 'superseded' && child.completedAt !== null
+      && (child === latest || (latest?.startedAt !== null && latest?.startedAt !== undefined
+        && Date.parse(child.completedAt) > Date.parse(latest.startedAt))))
     const states = selected.map((child) => child?.state === 'superseded' && root.behavior === 'review-new-prs' && root.source === 'poise:review-new-prs' ? 'pending' : child?.state ?? 'pending')
-    const state = PRECEDENCE.find((candidate) => states.includes(candidate)) ?? 'pending'
+    const state = closed ? 'superseded' : PRECEDENCE.find((candidate) => states.includes(candidate)) ?? 'pending'
     // Older uncertain attempts still count as caused work; a retry cannot prove they stopped.
     const activity: LedgerActivity = children.some((child) => child.activity === 'running') ? 'running'
-      : selected.some((child) => !child) || children.some((child) => child.activity !== 'settled') ? 'unknown' : 'settled'
-    const latest = children[0]
-    const completions = selected.flatMap((child) => child?.completedAt ? [child.completedAt] : [])
-    const completedAt = completions.length === selected.length
+      : (!closed && selected.some((child) => !child)) || children.some((child) => child.activity !== 'settled') ? 'unknown' : 'settled'
+    const required = closed ? children : selected
+    const completions = required.flatMap((child) => child?.completedAt ? [child.completedAt] : [])
+    const completedAt = completions.length === required.length
       ? completions.sort((a, b) => Date.parse(b) - Date.parse(a))[0] ?? null : null
     this.put({ ...root, state, activity, stateSource: latest?.stateSource ?? root.stateSource,
-      outcome: selected.length === 1 ? selected[0]?.outcome ?? null : null,
+      outcome: closed ? 'review_target_closed' : selected.length === 1 ? selected[0]?.outcome ?? null : null,
       completedAt: TERMINAL.has(state) && activity === 'settled' ? completedAt : null,
       observedAt: this.time(), head: root.plannedSlots.length > 1 ? null : latest?.head ?? root.head }, row)
   }

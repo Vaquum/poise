@@ -207,6 +207,54 @@ describe('behavior firing ledger store', () => {
     expect(db.health()).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
   })
 
+  it.each([{ plannedSlots: ['primary'] }, { plannedSlots: ['primary', 'secondary', 'tertiary'] }] as const)('settles a closed-target panel without inventing its unstarted slots ($plannedSlots)', ({ plannedSlots }) => {
+    let db = store()
+    db.capture(admission('closed-1', { plannedSlots: [...plannedSlots] }))
+    clock += 1_000
+    db.capture({ type: 'result', nativeId: 'closed-1', state: 'superseded', activity: 'settled',
+      outcome: 'review_target_closed', completedAt: stamp() })
+    expect(records(db)[0]).toMatchObject({ state: 'superseded', activity: 'settled',
+      outcome: 'review_target_closed', completedAt: stamp(), plannedSlots: [...plannedSlots] })
+    expect(records(db)).toHaveLength(2)
+    const path = db.path
+    db.close()
+    db = store({}, path)
+    expect(records(db)[0]).toMatchObject({ state: 'superseded', activity: 'settled', completedAt: stamp() })
+    expect(db.pending()).toEqual([])
+  })
+
+  it.each(['settled', 'running', 'unknown'] as const)('retains the actual activity of a %s sibling when closure ends its target', (activity) => {
+    const db = store()
+    db.capture(admission('sibling-1', { plannedSlots: ['primary', 'secondary', 'tertiary'] }))
+    if (activity === 'settled') complete(db, 'sibling-1')
+    else db.capture({ type: 'result', nativeId: 'sibling-1', state: activity === 'running' ? 'running' : 'held', activity })
+    clock += 1_000
+    db.capture(admission('closed-1', { slot: 'secondary', plannedSlots: ['primary', 'secondary', 'tertiary'] }))
+    clock += 1_000
+    db.capture({ type: 'result', nativeId: 'closed-1', state: 'superseded', activity: 'settled',
+      outcome: 'review_target_closed', completedAt: stamp() })
+    expect(records(db)[0]).toMatchObject({ state: 'superseded', activity,
+      completedAt: activity === 'settled' ? stamp() : null })
+    expect(records(db).find((record) => record.kind === 'attempt' && record.slot === 'primary'))
+      .toMatchObject({ activity, state: activity === 'settled' ? 'completed' : activity === 'running' ? 'running' : 'held' })
+  })
+
+  it('does not carry an old or delayed closure into a later admission after reopening', () => {
+    const db = store()
+    db.capture(admission('closed-1'))
+    clock += 1_000
+    const closedAt = stamp()
+    const closed = { type: 'result', nativeId: 'closed-1', state: 'superseded', activity: 'settled',
+      outcome: 'review_target_closed', completedAt: closedAt } as const
+    db.capture(closed)
+    clock += 1_000
+    db.capture(admission('reopened-1', { slot: 'secondary', plannedSlots: ['primary', 'secondary'] }))
+    expect(records(db)[0]).toMatchObject({ state: 'pending', activity: 'unknown', completedAt: null })
+    clock += 1_000
+    db.capture(closed)
+    expect(records(db)[0]).toMatchObject({ state: 'pending', activity: 'unknown', completedAt: null })
+  })
+
   it('retains a failed attempt underneath a recovered firing with the final completion', () => {
     const db = store()
     db.capture(admission('attempt-1'))
