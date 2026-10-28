@@ -193,6 +193,22 @@ describe('native admission and recovery', () => {
       launch: async () => true, perform: async () => ({}), wake: () => {}, ...overrides }
   }
 
+  it('reconciles and advances admitted work while intake failure remains visible', async () => {
+    const { journal, chain } = setup(); const obs = observation()
+    const pending = invocation('existing-review', 'review-issue', chainBasis(['issue', obs.issue.revision]))
+    record(journal, chain, { type: 'invocation.admitted', invocation: pending })
+    const call = { id: 'a'.repeat(32), correlation_id: pending.id, source: 'poise:behavior-chain', actor: 'reviewer',
+      repo: 'Example/Repo', behavior: 'issue_review', status: 'completed', outcome: 'commented', action: 'commented',
+      issue_revision: obs.issue.revision, resources_settled_at: new Date(NOW).toISOString(),
+      receipts: [{ issue: 'Example/Repo#7', comment_id: 17, author: 'reviewer' }] } as LogEntry
+    const runtime = new BehaviorChainRuntime(journal, operations({ discover: async () => { throw new Error('intake is stale') },
+      readInvocations: async () => ({ entries: [call], quarantined: [] }) }))
+    await expect(runtime.run()).rejects.toThrow('intake is stale')
+    const current = journal.read(chain.id)!
+    expect(current.invocations[0]).toMatchObject({ state: 'settled', callId: call.id, outcome: 'commented' })
+    expect(current.invocations[1]).toMatchObject({ behavior: 'implement-issue', state: 'started' })
+  })
+
   it.each(['review-pr', 'approve-pr'] as const)('recovers a relative %s target against the original chain without a checkout or a new admission', async (behavior) => {
     const { journal, chain } = setup()
     const pending = invocation('original-correlation', behavior, 'head')

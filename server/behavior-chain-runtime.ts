@@ -86,20 +86,26 @@ export class BehaviorChainRuntime {
   async run(): Promise<void> {
     if (this.running) return
     this.running = true
-    const began = Date.now()
     try {
-      if (this.operations.enabled()) {
-        const accounts = this.operations.accounts()
-        for (const seed of await this.operations.discover()) {
-          const id = chainIdentity(seed.repository, seed.number)
-          if (this.journal.read(id)) continue
-          this.journal.append(id, `admit:${id}`, 0, { type: 'chain.admitted', repository: seed.repository, issue: seed.number,
-            branch: `poise/issue-${seed.number}-${chainBasis(id).slice(0, 12)}`, ...accounts })
+      let intakeError: Error | null = null
+      try {
+        if (this.operations.enabled()) {
+          const accounts = this.operations.accounts()
+          for (const seed of await this.operations.discover()) {
+            const id = chainIdentity(seed.repository, seed.number)
+            if (this.journal.read(id)) continue
+            this.journal.append(id, `admit:${id}`, 0, { type: 'chain.admitted', repository: seed.repository, issue: seed.number,
+              branch: `poise/issue-${seed.number}-${chainBasis(id).slice(0, 12)}`, ...accounts })
+          }
         }
+      } catch (error) {
+        intakeError = error instanceof Error ? error : new Error(String(error))
+        console.error('[behavior-chain] intake failed; admitted chains continue', intakeError)
       }
+      const began = Date.now()
       let page = this.journal.active(this.cursor)
       if (!page.length && this.cursor) { this.cursor = ''; page = this.journal.active() }
-      if (!page.length) { this.cursor = ''; return }
+      if (!page.length) { this.cursor = ''; if (intakeError) throw intakeError; return }
       const pending = page.flatMap((chain) => chain.invocations.filter((invocation) => invocation.state !== 'settled' && invocation.model !== null))
       const snapshot = pending.length ? await this.operations.readInvocations(pending.map((invocation) => invocation.id)) : { entries: [], quarantined: [] }
       for (let chain of page) {
@@ -159,6 +165,7 @@ export class BehaviorChainRuntime {
           if (reason !== chain.waiting) this.append(chain, { type: 'chain.waiting', reason })
         }
       }
+      if (intakeError) throw intakeError
     } finally {
       this.running = false
     }
