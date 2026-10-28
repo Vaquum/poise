@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { computeBehaviorMetrics, discardDirectBehaviorRun, finishDirectBehaviorRun, readBehaviorMetrics, reapAbandonedDirectBehaviorRuns, startDirectBehaviorRun } from '../server/behavior-metrics'
 import { db } from '../server/db'
 import type { LogEntry } from '../server/agent'
+import type { QuarantinedAgentLog } from '../server/agent-log-parse'
 
 const window = { since: '2026-10-17T00:00:00Z', until: '2026-10-18T00:00:00Z' }
 const run = (status: string, startedAt = '2026-10-17T10:00:00Z', completedAt: string | null = '2026-10-17T10:02:00Z') =>
@@ -12,6 +13,11 @@ const log = (extra: Partial<LogEntry> = {}): LogEntry => ({
   started_at: '2026-10-17T10:00:00Z', completed_at: '2026-10-17T10:02:00Z',
   time_elapsed: '2m', status: 'completed', outcome: 'clean', head_sha: null,
   expected_head: null, correlation_id: null, action: 'reviewed_clean', response: null, error: '', ...extra,
+})
+const quarantine = (extra: Partial<QuarantinedAgentLog> = {}): QuarantinedAgentLog => ({
+  index: 0, id: 'e'.repeat(32), correlationId: 'bad-call', repo: 'acme/api', prId: '2',
+  behavior: 'pr_review', sessionId: null, source: 'poise:review-new-prs', startedAt: '2026-10-17T11:00:00Z',
+  error: 'Unreadable diagnostic', ...extra,
 })
 
 describe('behavior run metrics', () => {
@@ -54,6 +60,43 @@ describe('behavior run metrics', () => {
     expect(report.error).toBe('Logs unavailable')
     expect(report.behaviors['review-new-prs']).toBeNull()
     expect(report.behaviors['merge-prs']).toMatchObject({ totalRuns: 2, successRate: 50 })
+  })
+
+  it('contains unreadable history to the behavior whose metrics could include it', () => {
+    const report = readBehaviorMetrics([log(), log({ behavior: 'pr_approve', source: 'poise:approve-prs' })],
+      window, null, [quarantine()])
+    expect(report.behaviors['review-new-prs']).toBeNull()
+    expect(report.behaviors['approve-prs']).toEqual({ totalRuns: 1, durationMinutes: 2, successRate: 100 })
+    expect(report.behaviors['review-new-issues']?.totalRuns).toBe(0)
+    expect(report.error).toContain('unreadable')
+  })
+
+  it.each([
+    { startedAt: '2026-10-16T23:59:59Z' }, { startedAt: window.until }, { source: 'manual' }, { behavior: 'chat' },
+  ])('does not withhold metrics for an excluded quarantine %j', (extra) => {
+    const report = readBehaviorMetrics([log()], window, null, [quarantine(extra)])
+    expect(report.behaviors['review-new-prs']).toEqual({ totalRuns: 1, durationMinutes: 2, successRate: 100 })
+  })
+
+  it('keeps unknown provenance conservative and refuses contradictory duplicate identities', () => {
+    const unknown = quarantine({ source: undefined, behavior: null, startedAt: undefined })
+    const report = readBehaviorMetrics([log()], window, null, [unknown])
+    expect(report.behaviors['review-new-prs']).toBeNull()
+    expect(report.behaviors['approve-prs']).toBeNull()
+    for (const duplicate of [{ id: log().id }, { correlationId: 'same-call' }]) {
+      const conflict = quarantine({ ...duplicate, source: 'manual', behavior: 'chat', startedAt: '2026-10-01T00:00:00Z' })
+      expect(readBehaviorMetrics([log({ correlation_id: 'same-call' })], window, null, [conflict])
+        .behaviors['review-new-prs']).toBeNull()
+    }
+  })
+
+  it('retains valid metrics through a large unrelated fault feed', () => {
+    const logs = Array.from({ length: 3000 }, (_, i) => log({ id: i.toString(16).padStart(32, '0') }))
+    const faults = Array.from({ length: 1500 }, (_, i) => quarantine({
+      id: (10000 + i).toString(16).padStart(32, '0'), source: 'manual',
+    }))
+    expect(readBehaviorMetrics(logs, window, null, faults).behaviors['review-new-prs'])
+      .toEqual({ totalRuns: 3000, durationMinutes: 6000, successRate: 100 })
   })
 
   it('keeps interrupted direct attempts unknown instead of extending their duration forever', () => {

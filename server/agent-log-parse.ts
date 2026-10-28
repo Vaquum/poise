@@ -81,6 +81,8 @@ export interface QuarantinedAgentLog {
   // A readable lifecycle hint can retain running capacity; it never proves
   // the rejected result's action or outcome.
   status?: string | null
+  source?: string | null
+  startedAt?: string | null
   index: number
   error: string
   id: string | null
@@ -115,9 +117,12 @@ function quarantineLogEntry(value: unknown, index: number, error: unknown): Quar
     const result = lowercase ? raw.toLowerCase() : raw
     return !pattern || pattern.test(result) ? result : null
   }
+  const started = row.started_at_precise ?? row.started_at
   return {
     index,
     status: text('status', LOG_STATUS, true),
+    source: text('source', /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/),
+    startedAt: typeof started === 'string' && Number.isFinite(Date.parse(started)) ? started : null,
     error: error instanceof Error ? error.message : String(error),
     id: text('id', LOG_CALL_ID, true),
     correlationId: text('correlation_id', LOG_CORRELATION_ID),

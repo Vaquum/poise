@@ -4,7 +4,8 @@ import { BEHAVIORS } from '../../src/behaviors'
 
 async function workspace(page: Page, longSettings = false) {
   const reads: URL[] = []
-  const state = { fail: false, reads, filteredRuns: 4, heldToday: null as Promise<void> | null }
+  const state = { fail: false, reads, filteredRuns: 4, durationMinutes: 240.5 as number | null,
+    unreadableReview: false, heldToday: null as Promise<void> | null }
   await page.clock.setFixedTime(new Date('2026-10-17T12:00:00Z'))
   await page.addInitScript(() => {
     localStorage.clear()
@@ -20,8 +21,10 @@ async function workspace(page: Page, longSettings = false) {
       const filtered = url.searchParams.has('since')
       const totalRuns = filtered ? state.filteredRuns : 120
       if (url.searchParams.get('since') === '2026-10-16T18:30:00.000Z' && state.heldToday) await state.heldToday
-      return route.fulfill({ json: { error: null, behaviors: Object.fromEntries(BEHAVIORS.map(({ key }) => [key,
-        { totalRuns, durationMinutes: filtered ? 8.5 : 240.5, successRate: filtered ? 75 : 95 },
+      return route.fulfill({ json: { error: state.unreadableReview ? 'Affected metrics are unreadable' : null,
+        behaviors: Object.fromEntries(BEHAVIORS.map(({ key }) => [key,
+        state.unreadableReview && key === 'review-new-prs' ? null
+          : { totalRuns, durationMinutes: filtered ? 8.5 : state.durationMinutes, successRate: filtered ? 75 : 95 },
       ])) } })
     }
     if (url.pathname === '/api/behaviors') return route.fulfill({ json: Object.fromEntries(BEHAVIORS.map(({ key }) => [key,
@@ -43,7 +46,7 @@ test('filters the entire metrics section in the configured timezone without chan
   const state = await workspace(page)
   await page.goto('/')
   const row = page.locator('tr[data-behavior="review-new-prs"]')
-  await expect(row.locator('.behavior-metric')).toHaveText(['120', '240.5', '95%'])
+  await expect(row.locator('.behavior-metric')).toHaveText(['120', '4h', '95%'])
   await expect(row.locator('td').first().locator('input')).toBeChecked()
   await expect(page.locator('#behaviors-table th').first()).toHaveText('')
   await expect(page.locator('#behaviors-table th').nth(2)).toHaveText('Status')
@@ -54,19 +57,43 @@ test('filters the entire metrics section in the configured timezone without chan
     ['week', '2026-10-11T18:30:00.000Z', null],
   ]) {
     await page.locator(`#behaviors-time-picker [data-time="${range}"]`).click()
-    await expect(row.locator('.behavior-metric')).toHaveText(['4', '8.5', '75%'])
+    await expect(row.locator('.behavior-metric')).toHaveText(['4', '8m 30s', '75%'])
     expect(state.reads.at(-1)?.searchParams.get('since')).toBe(since)
     expect(state.reads.at(-1)?.searchParams.get('until')).toBe(until)
     await expect(row.locator('input')).toBeChecked()
     await expect(page.locator(`#behaviors-time-picker [data-time="${range}"]`)).toHaveAttribute('aria-pressed', 'true')
   }
   await page.locator('#behaviors-time-picker [data-time="all"]').click()
-  await expect(row.locator('.behavior-metric')).toHaveText(['120', '240.5', '95%'])
+  await expect(row.locator('.behavior-metric')).toHaveText(['120', '4h', '95%'])
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem('poise-current-filters') || '{}').time)).toBe('week')
   state.fail = true
   await page.locator('#behaviors-time-picker [data-time="today"]').click()
   await expect(row.locator('.behavior-metric')).toHaveText(['—', '—', '—'])
   await expect(await feedback(page)).toContainText('Run history unavailable')
+})
+
+test('shows explicit duration units and distinguishes zero from unknown', async ({ page }) => {
+  const state = await workspace(page)
+  state.durationMinutes = 0.1
+  await page.goto('/')
+  const metrics = page.locator('tr[data-behavior="review-new-prs"] .behavior-metric')
+  await expect(metrics).toHaveText(['120', '6s', '95%'])
+  for (const [minutes, text] of [[0, '0s'], [null, '—']] as const) {
+    state.durationMinutes = minutes
+    await page.locator('#behaviors-time-picker [data-time="today"]').click()
+    await expect(metrics).toHaveText(['4', '8m 30s', '75%'])
+    await page.locator('#behaviors-time-picker [data-time="all"]').click()
+    await expect(metrics).toHaveText(['120', text, '95%'])
+  }
+})
+
+test('keeps readable behavior metrics visible beside an unreadable behavior', async ({ page }) => {
+  const state = await workspace(page)
+  state.unreadableReview = true
+  await page.goto('/')
+  await expect(page.locator('tr[data-behavior="review-new-prs"] .behavior-metric')).toHaveText(['—', '—', '—'])
+  await expect(page.locator('tr[data-behavior="approve-prs"] .behavior-metric')).toHaveText(['120', '4h', '95%'])
+  await expect(await feedback(page)).toContainText('Affected metrics are unreadable')
 })
 
 test('keeps the selected period when an earlier metrics read finishes later', async ({ page }) => {
@@ -75,18 +102,18 @@ test('keeps the selected period when an earlier metrics read finishes later', as
   state.heldToday = new Promise<void>((resolve) => { release = resolve })
   await page.goto('/')
   const metrics = page.locator('#behaviors-tbody tr').first().locator('.behavior-metric')
-  await expect(metrics).toHaveText(['120', '240.5', '95%'])
+  await expect(metrics).toHaveText(['120', '4h', '95%'])
   try {
     await page.locator('#behaviors-time-picker [data-time="today"]').click()
     await expect.poll(() => state.reads.at(-1)?.searchParams.get('since')).toBe('2026-10-16T18:30:00.000Z')
     state.filteredRuns = 8
     await page.locator('#behaviors-time-picker [data-time="yesterday"]').click()
-    await expect(metrics).toHaveText(['8', '8.5', '75%'])
+    await expect(metrics).toHaveText(['8', '8m 30s', '75%'])
     const answered = page.waitForResponse((response) => new URL(response.url()).searchParams.get('since') === '2026-10-16T18:30:00.000Z')
     release()
     await (await answered).finished()
     await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
-    await expect(metrics).toHaveText(['8', '8.5', '75%'])
+    await expect(metrics).toHaveText(['8', '8m 30s', '75%'])
   } finally { release() }
 })
 
@@ -94,7 +121,7 @@ test('keeps columns spaced and single-line across desktop and narrow viewports i
   await workspace(page, true)
   await page.goto('/')
   await expect(page.locator('#behaviors-tbody tr')).toHaveCount(6)
-  await expect(page.locator('#behaviors-tbody tr').first().locator('.behavior-metric')).toHaveText(['120', '240.5', '95%'])
+  await expect(page.locator('#behaviors-tbody tr').first().locator('.behavior-metric')).toHaveText(['120', '4h', '95%'])
   for (const width of [1920, 1600, 1280, 768, 390]) {
     await page.setViewportSize({ width, height: 900 })
     const geometry = await page.locator('#view-behaviors main').evaluate((main) => {

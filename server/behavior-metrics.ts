@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { BEHAVIOR_KEYS, type BehaviorKey } from '../src/behavior-types'
 import type { BehaviorMetrics, BehaviorMetricsReport } from '../src/behavior-metrics'
 import type { LogEntry } from './agent'
+import type { QuarantinedAgentLog } from './agent-log-parse'
 import type { LedgerOutcome } from './behavior-ledger-contract'
 import { recordHandling } from './alerts/handling'
 import type { AnalyticsWindow } from './analytics'
@@ -168,18 +169,40 @@ export function computeBehaviorMetrics(runs: Run[], window: AnalyticsWindow, now
   }
 }
 
-export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, error: string | null): BehaviorMetricsReport {
+function inWindow(startedAt: string, window: AnalyticsWindow): boolean {
+  const at = Date.parse(startedAt)
+  return Number.isFinite(at) && (!window.since || at >= Date.parse(window.since))
+    && (!window.until || at < Date.parse(window.until))
+}
+
+function quarantineMayAffect(row: QuarantinedAgentLog, identities: ReadonlySet<string>, key: string, behavior: string, window: AnalyticsWindow): boolean {
+  // A duplicate's contradictory provenance cannot hide a corrupt in-window row.
+  if (row.id && identities.has(`call:${row.id}`) || row.correlationId && identities.has(`correlation:${row.correlationId}`)) return true
+  if (row.behavior && row.behavior !== behavior || row.source && row.source !== `poise:${key}`) return false
+  return !row.startedAt || inWindow(row.startedAt, window)
+}
+
+export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, error: string | null,
+  quarantined: readonly QuarantinedAgentLog[] = []): BehaviorMetricsReport {
   const direct = readDirectMetrics(window)
+  let unreadable = false
   const behaviors = Object.fromEntries(BEHAVIOR_KEYS.map((key) => {
     if (key in AGENT_BEHAVIORS) {
       if (error) return [key, null]
       const behavior = AGENT_BEHAVIORS[key as keyof typeof AGENT_BEHAVIORS]
-      const runs = logs.filter((log) => log.behavior === behavior && log.source === `poise:${key}`)
+      const selected = logs.filter((log) => log.behavior === behavior && log.source === `poise:${key}`)
+      const identities = new Set(selected.filter((log) => inWindow(log.started_at_precise || log.started_at, window))
+        .flatMap((log) => [`call:${log.id}`, ...(log.correlation_id ? [`correlation:${log.correlation_id}`] : [])]))
+      if (quarantined.some((row) => quarantineMayAffect(row, identities, key, behavior, window))) {
+        unreadable = true
+        return [key, null]
+      }
+      const runs = selected
         .map((log) => ({ behavior: key, startedAt: log.started_at_precise || log.started_at,
           completedAt: log.completed_at ?? null, status: log.status }))
       return [key, computeBehaviorMetrics(runs, window)]
     }
     return [key, direct.get(key) ?? { totalRuns: 0, durationMinutes: 0, successRate: null }]
   })) as BehaviorMetricsReport['behaviors']
-  return { behaviors, error }
+  return { behaviors, error: error || (unreadable ? 'Some worker logs are unreadable; affected behavior metrics are unavailable.' : null) }
 }

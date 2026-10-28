@@ -44,3 +44,19 @@ it('keeps historical absence readable and refuses unsupported or malformed diagn
     expect(() => parseProcessDiagnostic(value)).toThrow('diagnostic')
   }
 })
+
+it('keeps missing historical v1 evidence unknown, including uncertain submission', () => {
+  const event = parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error',
+    operation: 'provider.review', phase: 'submitting', submission: 'uncertain' })
+  expect(event).toMatchObject({ outcome: null, stderr: null, stderr_truncated: null,
+    context: { submission: 'uncertain' } })
+  expect(parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error', operation: 'provider.review',
+    phase: 'provider_execution', stderr: 'codex exited 1', exit_code: 1, submission: 'none' }))
+    .toMatchObject({ outcome: null, stderr: 'codex exited 1', stderr_truncated: null,
+      context: { exit_code: 1, submission: 'none' } })
+})
+
+it.each([{ outcome: 7 }, { stderr: [] }, { stderr_truncated: 'false' }])('rejects malformed present diagnostic evidence %j', (extra) => {
+  expect(() => parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error',
+    operation: 'provider.review', phase: 'submitting', ...extra })).toThrow('diagnostic')
+})
