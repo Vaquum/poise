@@ -192,6 +192,40 @@ describe('native admission and recovery', () => {
       launch: async () => true, perform: async () => ({}), wake: () => {}, ...overrides }
   }
 
+  it.each(['review-pr', 'approve-pr'] as const)('recovers a relative %s target against the original chain without a checkout or a new admission', async (behavior) => {
+    const { journal, chain } = setup()
+    const pending = invocation('original-correlation', behavior, 'head')
+    pending.admittedAt = Date.now() - 60_000
+    pending.request = { command: 'agent-interface', cwd: '/interface', argv: [behavior === 'review-pr' ? '--pr-review' : '--pr-approve', '#37', '--pwd', '/empty/interface/directory'] }
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: pending })
+    current = record(journal, current, { type: 'invocation.started', invocationId: pending.id })
+    const launched: ChainInvocation[] = []
+    await new BehaviorChainRuntime(journal, operations({ launch: async (request) => { launched.push(request); return true } })).run()
+    expect(launched).toHaveLength(1)
+    expect(launched[0].id).toBe(pending.id)
+    expect(launched[0].request.argv).toEqual([pending.request.argv[0], 'https://github.com/Example/Repo/pull/37', '--pwd', '/empty/interface/directory'])
+    const recovered = journal.read(chain.id)!
+    expect(recovered.invocations).toHaveLength(1)
+    expect(recovered.invocations[0].request).toEqual(pending.request)
+    expect(recovered.invocations[0].state).toBe('started')
+  })
+
+  it('retains native exit evidence and refuses to relaunch an exited process with no Call receipt', async () => {
+    const { journal, chain } = setup()
+    const pending = invocation('exited-before-track', 'review-issue', 'revision')
+    pending.admittedAt = Date.now() - 60_000
+    record(journal, chain, { type: 'invocation.admitted', invocation: pending })
+    let launches = 0
+    const runtime = new BehaviorChainRuntime(journal, operations({ launch: async (_request, onExit) => {
+      launches++; onExit({ code: 1, signal: null }); return true
+    } }))
+    await runtime.run()
+    await runtime.run()
+    expect(launches).toBe(1)
+    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'uncertain',
+      outcome: expect.stringContaining('without a durable Call receipt'), evidence: { nativeExit: { code: 1, signal: null, error: null } } })
+  })
+
   it('advances on the completion wake without an empty cursor pass or polling GitHub during a running invocation', async () => {
     const { journal } = setup()
     const obs = observation()

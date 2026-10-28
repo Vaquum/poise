@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
+import type { DetachedProcessExit } from './process'
 import { decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 
@@ -16,7 +17,7 @@ export interface ChainRuntimeOperations {
   capacity(): number
   permitted(chain: BehaviorChain, decision: Extract<ChainDecision, { kind: 'invoke' }>): boolean
   request(chain: BehaviorChain, observation: ChainObservation, decision: Extract<ChainDecision, { kind: 'invoke' }>, id: string): Promise<ChainInvocation['request'] | null>
-  launch(invocation: ChainInvocation, onExit: () => void, allowed: () => boolean): Promise<boolean>
+  launch(invocation: ChainInvocation, onExit: (result?: DetachedProcessExit) => void, allowed: () => boolean): Promise<boolean>
   perform(invocation: ChainInvocation): Promise<Record<string, unknown>>
   wake(): void
 }
@@ -58,6 +59,28 @@ export class BehaviorChainRuntime {
     return !current.held && this.operations.enabled() && accounts.author.toLowerCase() === current.author.toLowerCase() && accounts.reviewer.toLowerCase() === current.reviewer.toLowerCase()
       && this.operations.permitted(current, { kind: 'invoke', behavior: invocation.behavior, actor: invocation.actor,
         basis: invocation.basis, reviewer: null, reason: 'start the previously admitted native invocation' })
+  }
+
+  private nativeInvocation(chain: BehaviorChain, invocation: ChainInvocation): ChainInvocation {
+    const argv = invocation.request.argv
+    if (!['--pr-review', '--pr-approve'].includes(argv[0])) return invocation
+    const relative = /^#?([1-9][0-9]*)$/.exec(argv[1])
+    const absolute = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]*)$/.exec(argv[1])
+    if ((!relative && !absolute) || (absolute && absolute[1].toLowerCase() !== chain.repository.toLowerCase())) throw new Error('native PR invocation target differs from its behavior chain')
+    // Older admissions used a relative PR reference, but the interface's
+    // directory is deliberately not a git checkout. Resolve that reference
+    // against its immutable chain identity, retaining the same correlation.
+    return { ...invocation, request: { ...invocation.request, argv: [argv[0],
+      `https://github.com/${chain.repository}/pull/${relative?.[1] ?? absolute![2]}`, ...argv.slice(2)] } }
+  }
+
+  private exited(chain: BehaviorChain, invocation: ChainInvocation, result?: DetachedProcessExit): void {
+    const current = this.current(chain)
+    if (result && current.invocations.some((candidate) => candidate.id === invocation.id && candidate.state !== 'settled')) {
+      this.append(current, { type: 'invocation.reconciled', invocationId: invocation.id,
+        evidence: { nativeExit: { code: result.code, signal: result.signal, error: result.error?.message ?? null } } })
+    }
+    this.operations.wake()
   }
 
   async run(): Promise<void> {
@@ -176,7 +199,7 @@ export class BehaviorChainRuntime {
     chain = this.append(chain, { type: 'invocation.started', invocationId: invocation.id })
     if (invocation.request.command === 'agent-interface') {
       try {
-        const started = await this.operations.launch(invocation, () => this.operations.wake(), () => this.allowed(chain, invocation))
+        const started = await this.operations.launch(this.nativeInvocation(chain, invocation), (result) => this.exited(chain, invocation, result), () => this.allowed(chain, invocation))
         if (!started) this.append(this.current(chain), { type: 'invocation.settled', invocationId: invocation.id, callId: null, outcome: 'launch_deferred',
           evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: Date.now() } })
       } catch (error) {
@@ -249,13 +272,18 @@ export class BehaviorChainRuntime {
         reviewer: null, reason: 'recover the original admitted invocation' })) return
     if (snapshot.entries.some((call) => call.correlation_id === invocation.id)
       || snapshot.quarantined.length || Date.now() - invocation.admittedAt < 10_000) return
+    if (invocation.evidence?.nativeExit) {
+      this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
+        reason: 'native process exited without a durable Call receipt; its exit evidence must be reconciled before another effect' })
+      return
+    }
     // Caller has a UNIQUE correlation index, reserved by track() before any
     // checkout/provider/write. Resuming this SAME native identity cannot start
     // a second behavior even if the first CLI is still preparing to track it.
     if (invocation.state === 'admitted') await this.start(chain, invocation)
     else {
       this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id, evidence: { nativeCallAbsent: true, retryUsesSameCorrelation: true } })
-      const started = await this.operations.launch(invocation, () => this.operations.wake(), () => this.allowed(chain, invocation))
+      const started = await this.operations.launch(this.nativeInvocation(chain, invocation), (result) => this.exited(chain, invocation, result), () => this.allowed(chain, invocation))
       if (!started) this.append(this.current(chain), { type: 'invocation.reconciled', invocationId: invocation.id,
         evidence: { repeatLaunchDeferred: true } })
     }

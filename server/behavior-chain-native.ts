@@ -247,7 +247,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           ...common, '--model', selected.model, '--branch', chain.branch, '--expected-issue-revision', observation.issue.revision,
           ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head, ...(pull.conflict || pull.behind || pull.queueRemoval ? ['--merge-base'] : [])] : []), '--note', note] }
         if (!pull) throw new Error('PR behavior requires its actual pull request')
-        return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `#${pull.number}`,
+        return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `https://github.com/${chain.repository}/pull/${pull.number}`,
           ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior), '--note', note] }
       }
       if (decision.behavior === 'publish-issue') {
@@ -277,7 +277,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         const env = await hooks.prepare(identities)
         if (!allowed()) { release(); return false }
         await spawnDetached('agent-interface', invocation.request.argv, { cwd: invocation.request.cwd, env,
-          onExit: () => { release(); onExit() } })
+          onExit: (result) => { release(); onExit(result) } })
         return true
       } catch (error) { release(); throw error }
     },
