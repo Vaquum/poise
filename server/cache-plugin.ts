@@ -905,11 +905,14 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             ['pr_review', 'poise:review-new-prs'],
             ['pr_approve', 'poise:approve-prs'],
             ['issue_review', 'poise:review-new-issues'],
+            ['pr_review', 'poise:behavior-chain'],
+            ['pr_approve', 'poise:behavior-chain'],
+            ['issue_review', 'poise:behavior-chain'],
           ]
           const triggered = (entry: { behavior: string | null, source: string | null, repo: string | null, pr_id: string | null },
             cliBehavior: string, source: string) =>
             entry.behavior === cliBehavior
-            && entry.source === source
+            && (entry.source === source || entry.source === 'poise:behavior-chain')
             && !!entry.repo
             && accounts.some((account) => repoBelongsTo(entry.repo!, account.login))
             && !!entry.pr_id
