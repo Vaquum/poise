@@ -110,6 +110,12 @@ export class CheckSemaphore {
     return () => { this.releaseListeners.delete(listener) }
   }
 
+  /** Lane ceiling for durable admissions that outlive this process. */
+  laneCapacity(lane: CheckLane): number {
+    const cap = this.liveCap()
+    return lane === 'person' ? cap : lane === 'behavior' ? this.backgroundLimit(cap) : this.chatTurnLimit(cap)
+  }
+
   /** True when the lane could take a slot now, after earlier waiters. */
   available(lane: CheckLane): boolean {
     this.grant()

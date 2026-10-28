@@ -33,6 +33,7 @@ export interface AppSettings {
   chat?: { branchPrefix: string, idleTimeoutMinutes: number, maxConcurrentLocalTurns: number, updateTurnBoundMinutes: number }
   // The notifications at the top of the page; on unless turned off.
   notifications?: { enabled: boolean }
+  behaviorChain?: { enabled: boolean, seedMode: 'label' | 'all', label: string }
 }
 
 let current: AppSettings = { org: '', me: '', timezone: '' }

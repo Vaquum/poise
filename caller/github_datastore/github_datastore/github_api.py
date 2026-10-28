@@ -241,6 +241,7 @@ ITEM_GRAPH_BATCH_SIZE = 20
 
 ISSUE_GRAPH_FIELDS = f"""
       {ISSUE_ITEM_FIELDS}
+      labels(first: 100) {{ totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ id name }} }}
       blockedBy(first: 100) {{
         pageInfo {{ hasNextPage }}
         nodes {{
@@ -1070,9 +1071,33 @@ class GitHubOrgReader:
         timeline.extend(
             self._page_timeline(owner, name, number, False, issue["timelineItems"]["pageInfo"], len(timeline))
         )
+        issue = dict(issue)
+        labels = issue.get("labels")
+        if not isinstance(labels, dict):
+            raise GitHubApiError(f"issue label evidence is missing: {owner}/{name}#{number}")
+        total = required_total_count(labels, owner, name, "issue labels")
+        nodes = list(labels["nodes"])
+        cursor = None
+        while labels["pageInfo"]["hasNextPage"]:
+            cursor = required_next_cursor(labels["pageInfo"], cursor, owner, name, "issue labels")
+            data = self.client.graphql("""query($owner:String!,$name:String!,$number:Int!,$cursor:String){
+              repository(owner:$owner,name:$name){issue(number:$number){labels(first:100,after:$cursor){
+                totalCount pageInfo{hasNextPage endCursor} nodes{id name}
+              }}}}
+            """, {"owner": owner, "name": name, "number": number, "cursor": cursor})
+            labels = data["repository"]["issue"]["labels"]
+            if required_total_count(labels, owner, name, "issue labels") != total:
+                raise GitHubEnumerationDriftError("issue label count changed during pagination")
+            nodes.extend(labels["nodes"])
+        if len(nodes) != total or any(not isinstance(label, dict) or not isinstance(label.get("id"), str)
+                                     or not isinstance(label.get("name"), str) for label in nodes) or len({label["id"] for label in nodes}) != total:
+            raise GitHubApiError(f"incomplete or duplicate issue labels: {owner}/{name}#{number}")
+        issue["labels"] = {"totalCount": total, "pageInfo": labels["pageInfo"], "nodes": nodes}
+        row = graphql_issue_to_row(issue)
+        row["labels"] = [{"node_id": label["id"], "name": label["name"]} for label in nodes]
         return {
             "repo": repo,
-            "issue": graphql_issue_to_row(issue),
+            "issue": row,
             "is_pr": False,
             "pull": None,
             "comments": comments,

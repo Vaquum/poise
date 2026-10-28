@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { db, getMeta, setMeta } from '../db'
+import { behaviorChainOwner, type ChainPullIdentity } from '../behavior-chain-journal'
 import { HttpError } from '../http'
 import type { ChatActor, ChatHold, PersonActor, TimerSummary, TimerView } from './protocol'
 import type { WorkTarget } from './work-observations'
@@ -120,8 +121,11 @@ function resetTargetObservations(instance: string, url: string): void {
   db.prepare('DELETE FROM chat_control_observations WHERE instance = ? AND substr(target, 1, length(?)) = ?')
     .run(instance, seenPrefix, seenPrefix)
 }
-export const bindWork = db.transaction((instance: string, session: string, target: string): Binding => {
+export const bindWork = db.transaction((instance: string, session: string, target: string, identity?: ChainPullIdentity): Binding => {
   const canonical = workTarget(target).url
+  const parsed = workTarget(target)
+  const chain = behaviorChainOwner(parsed.repo, parsed.number, parsed.kind, identity)
+  if (chain) throw new HttpError(409, `${canonical} is owned by behavior chain ${chain}; a chat cannot take it over`)
   const existing = db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND target = ?').get(instance, canonical) as Binding | undefined
   if (existing && existing.session !== session) throw new HttpError(409, `${canonical} is owned by chat ${existing.session}; its owner must release it first`)
   if (existing) return existing
@@ -134,8 +138,10 @@ export const bindWork = db.transaction((instance: string, session: string, targe
 /** Claim a target for a chat without ever taking another chat's binding:
  *  null when another chat holds it or the chat released it before. One
  *  transaction, so a sweep and an explicit bind cannot interleave. */
-export const bindWorkAuto = db.transaction((instance: string, session: string, target: string): Binding | null => {
+export const bindWorkAuto = db.transaction((instance: string, session: string, target: string, identity?: ChainPullIdentity): Binding | null => {
   const canonical = workTarget(target).url
+  const parsed = workTarget(target)
+  if (behaviorChainOwner(parsed.repo, parsed.number, parsed.kind, identity)) return null
   const existing = db.prepare('SELECT target, session, created_at FROM chat_work_bindings WHERE instance = ? AND target = ?').get(instance, canonical) as Binding | undefined
   if (existing) return existing.session === session ? existing : null
   if (bindingReleased(instance, session, canonical)) return null

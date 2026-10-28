@@ -78,6 +78,15 @@ describe.each(['headless', 'interactive'] as const)('%s work decisions', mode =>
     }
   })
 
+  it('obtains current-head approval before invoking the strong conversation resolver', () => {
+    const work = pull({ unresolved: 2, approvedHead: null })
+    expect(advanceWork({ ...work, mode }, null, NOW)).toMatchObject({ kind: 'propose', action: 'approve', head: HEAD })
+    expect(advanceWork({ ...pull({ unresolved: 2 }), mode }, null, NOW))
+      .toMatchObject({ kind: 'propose', action: 'resolve-threads', head: HEAD })
+    expect(advanceWork({ ...pull({ unresolved: 2, approvedHead: null, review: 'changes' }), mode }, null, NOW))
+      .toMatchObject({ kind: 'propose', action: 'fix-review' })
+  })
+
   it('does not convert missing evidence, closed state, or a finished turn into completion', () => {
     for (const work of [pull({ ci: null }), pull({ ci: { ...running, head: NEXT_HEAD } }),
       pull({ ci: { ...running, state: 'closed', merged: false } }), pull({ unresolved: null }),

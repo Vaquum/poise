@@ -504,8 +504,8 @@ function repoCell(e: LogEntry): string {
     const repoHtml = !name ? ''
       : owner ? githubLink('agent-repo', githubUrl(owner, name), name, `${owner}/${name}`)
         : `<span class="agent-repo" title="${escapeHtml(name)}">${escapeHtml(name)}</span>`
-    // An issue review's target is an issue; GitHub serves it under /issues.
-    const kind = e.behavior === 'issue_review' ? 'issues' : 'pull'
+    // Seed review and implementation target the issue; repairs target the PR.
+    const kind = e.behavior === 'issue_review' || e.behavior === 'implement_issue' ? 'issues' : 'pull'
     const prHtml = !pr ? ''
       : owner ? githubLink('agent-pr', githubUrl(owner, name, kind, pr), `#${pr}`, `${owner}/${name}#${pr}`)
         : `<span class="agent-pr">#${escapeHtml(pr)}</span>`

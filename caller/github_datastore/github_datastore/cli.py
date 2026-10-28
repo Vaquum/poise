@@ -100,6 +100,7 @@ def main(argv: list[str] | None = None) -> None:
     view_parser.add_argument("--page-size", type=int)
     view_parser.add_argument("--after-number", type=int)
     view_parser.add_argument("--after-repo")
+    view_parser.add_argument("--label")
 
     args = parser.parse_args(argv)
     db_path = Path(args.db)
@@ -173,7 +174,7 @@ def run_view(db_path: Path, args: argparse.Namespace) -> str:
     if args.name == "pr":
         return views.pr(**common)
     if args.name == "issue":
-        return views.issue(**common)
+        return views.issue(**common, label=args.label, after_repo=args.after_repo, after_number=args.after_number)
     if args.name == "user":
         return views.user(username=args.username, item_type=args.item_type, **common)
     if args.name == "pr-reviews":

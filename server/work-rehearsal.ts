@@ -103,8 +103,8 @@ export function advanceWork(work: WorkObservation, receipt: WorkActionReceipt | 
   if (stage.review === 'unread' || stage.unresolved === null) return { kind: 'inspect', reason: 'review coverage is incomplete' }
   if (stage.review === 'changes') return propose('fix-review')
   if (stage.review === 'needed' || stage.reviewedHead !== stage.head) return propose('review-pr')
-  if (stage.unresolved > 0) return propose('resolve-threads')
   if (stage.approvedHead !== stage.head) return propose('approve')
+  if (stage.unresolved > 0) return propose('resolve-threads')
   if (stage.ready !== true) return { kind: 'inspect', reason: 'native merge readiness is not confirmed' }
   return propose('merge')
 }

@@ -237,14 +237,15 @@ check_browsers() {
   browsers=$(docker exec "$workspace" printenv PLAYWRIGHT_BROWSERS_PATH) \
     || fail "PLAYWRIGHT_BROWSERS_PATH is not set"
   [ "$browsers" = /opt/playwright-browsers ] || fail "PLAYWRIGHT_BROWSERS_PATH is $browsers"
-  chrome=$(docker exec "$workspace" sh -c 'ls /opt/playwright-browsers/chromium-*/chrome-linux64/chrome') \
+  chrome=$(docker exec "$workspace" sh -c 'ls /opt/playwright-browsers/chromium-*/chrome-linux*/chrome') \
     || fail "no shared Chromium under $browsers"
-  shell=$(docker exec "$workspace" sh -c 'ls /opt/playwright-browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell') \
+  # The pinned x64 and arm64 archives use different headless binary names.
+  shell=$(docker exec "$workspace" sh -c 'find /opt/playwright-browsers/chromium_headless_shell-* -maxdepth 2 -type f \( -name chrome-headless-shell -o -name headless_shell \)') \
     || fail "no shared headless shell under $browsers"
   ffmpeg=$(docker exec "$workspace" sh -c 'ls /opt/playwright-browsers/ffmpeg-*/ffmpeg-linux') \
     || fail "no shared ffmpeg under $browsers"
   for binary in "$chrome" "$shell" "$ffmpeg"; do
-    [ "$(printf '%s\n' "$binary" | wc -l)" = 1 ] || fail "several shared browsers match: $binary"
+    [ "$(printf '%s\n' "$binary" | wc -l | tr -d '[:space:]')" = 1 ] || fail "several shared browsers match: $binary"
     docker exec "$workspace" test ! -w "$binary" || fail "$binary is writable"
   done
   docker exec "$workspace" test ! -w "$browsers" || fail "$browsers is writable"

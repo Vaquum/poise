@@ -28,6 +28,8 @@ def graph(number=1, kind='issue'):
     if kind == 'pr':
         node.update(mergedAt=None, mergedBy=None, isDraft=False, additions=3, deletions=1,
                     reviewRequests=page(), reviews=page(), reviewThreads=page(), commits=page())
+    else:
+        node['labels'] = {**page(), 'totalCount': 0}
     return node
 
 
@@ -37,6 +39,24 @@ def stub(node):
 
 
 class ItemGraphBatchTest(unittest.TestCase):
+    def test_issue_labels_are_captured_completely_before_intake_can_use_them(self):
+        issue = graph(2)
+        issue['labels'] = {'totalCount': 2, **page([{'id': 'L1', 'name': 'other'}], 'next-label')}
+        client = ScriptedClient([{'repository': {'item_0': issue}}, {'repository': {'issue': {'labels': {
+            'totalCount': 2, **page([{'id': 'L2', 'name': 'poise'}])}}}}])
+        expanded = list(iter_expanded(GitHubOrgReader(client), repo_row(), [stub(issue)], 1))[0]
+        self.assertEqual(expanded['issue']['labels'], [{'node_id': 'L1', 'name': 'other'}, {'node_id': 'L2', 'name': 'poise'}])
+        self.assertIn('labels(first: 100)', client.calls[0][0])
+        self.assertEqual(client.calls[1][1]['cursor'], 'next-label')
+        client.assert_exhausted()
+
+    def test_missing_label_evidence_is_a_failure_not_an_empty_label_set(self):
+        issue = graph(2)
+        del issue['labels']
+        client = ScriptedClient([{'repository': {'item_0': issue}}])
+        with self.assertRaisesRegex(GitHubApiError, 'label evidence is missing'):
+            list(iter_expanded(GitHubOrgReader(client), repo_row(), [stub(issue)], 1))
+
     def test_mixed_graphs_keep_every_item_and_reject_unexpected_network_reads(self):
         nodes = [graph(n, 'pr' if n % 2 else 'issue') for n in range(1, 21)]
         client = ScriptedClient([{'repository': {f'item_{i}': n for i, n in enumerate(nodes)}}])

@@ -12,6 +12,38 @@ from tests.test_store import base_expanded
 
 
 class ViewsTest(unittest.TestCase):
+    def test_label_intake_refuses_legacy_missing_observations_instead_of_silently_omitting_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / 'db.sqlite'
+            conn = connect(db_path); init_db(conn)
+            issue = base_expanded('', [])
+            del issue['issue']['labels']
+            with conn:
+                upsert_repo(conn, issue['repo'])
+            store_expanded(conn, issue); conn.close()
+            with self.assertRaisesRegex(RuntimeError, 'label evidence is incomplete'):
+                views.issue(db_path=db_path, label='poise')
+
+    def test_label_intake_includes_old_issues_and_drains_stable_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            original = base_expanded("@mikkokotila", [])
+            with conn:
+                upsert_repo(conn, original["repo"])
+            for number in range(1, 6):
+                issue = base_expanded("@mikkokotila", [])
+                issue["issue"] = dict(issue["issue"], id=100 + number, node_id=f"I_{number}", number=number,
+                                      labels=[{"name": "Poise"}] if number != 3 else [])
+                store_expanded(conn, issue)
+            conn.close()
+            first = json.loads(views.issue(db_path=db_path, label="poise", after_repo="", after_number=0, limit=2))
+            self.assertEqual([row["number"] for row in first], [1, 2])
+            second = json.loads(views.issue(db_path=db_path, label="poise", after_repo=first[-1]["repo"], after_number=2, limit=2))
+            self.assertEqual([row["number"] for row in second], [4, 5])
+            self.assertEqual(len(json.loads(views.issue(db_path=db_path, label="poise"))), 4)
+
     def test_pr_issue_and_user_views_return_json_or_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "db.sqlite"
@@ -590,6 +622,33 @@ def pr_with_reviewers(number: int, item_id: int, reviewers: list[dict] | None) -
     pr["pull"] = pull
     pr["issue"]["pull_request"] = {"node_id": f"I_{item_id}"}
     return pr
+
+
+class PrBranchIdentityTest(unittest.TestCase):
+    def test_version_4_views_gain_actual_head_identity_without_inventing_missing_legacy_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            current = pr_with_reviewers(2, 101, [])
+            current["pull"]["graphql"].update({"headRefName": "poise/issue-7", "headRepository": {"nameWithOwner": "mikkokotila/Poise"}})
+            legacy = pr_with_reviewers(3, 102, [])
+            with conn:
+                upsert_repo(conn, current["repo"])
+            store_expanded(conn, current)
+            store_expanded(conn, legacy)
+            conn.execute("DROP VIEW prs")
+            conn.execute("CREATE VIEW prs AS SELECT item_id AS pr_ref FROM items WHERE item_type = 'pr'")
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+            init_db(conn)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], VIEW_SCHEMA_VERSION)
+            conn.close()
+            rows = {row["number"]: row for row in json.loads(views.pr(db_path=db_path))}
+            self.assertEqual(rows[2]["head_ref"], "poise/issue-7")
+            self.assertEqual(rows[2]["head_repo"], "mikkokotila/Poise")
+            self.assertIsNone(rows[3]["head_ref"])
+            self.assertIsNone(rows[3]["head_repo"])
 
 
 class RequestedReviewersTest(unittest.TestCase):

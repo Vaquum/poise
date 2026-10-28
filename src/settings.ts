@@ -23,6 +23,7 @@ import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protoc
 import { googleAccountsSection } from './views/google-accounts'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
 import { publishingSection, type PublishingSection } from './views/publishing-settings'
+import { behaviorChainSettings } from './views/behavior-chain-settings'
 import { sendLatest } from './notices'
 import './views/connected-accounts.css'
 import type { TerminalPanel } from './views/terminal-panel'
@@ -83,6 +84,7 @@ let catalogStatusEl: HTMLElement | null = null
 let productionEl: HTMLElement | null = null
 let refreshBtn: HTMLButtonElement | null = null
 let notificationsPicker: HTMLElement | null = null
+let chainSettings: ReturnType<typeof behaviorChainSettings> | null = null
 let notificationsStatusEl: HTMLElement | null = null
 // A model select someone has changed keeps its value across background
 // reloads until Save, exactly like the text fields keep typed text.
@@ -177,6 +179,7 @@ function syncFieldsFromCache() {
     readValues.set('updateTurnBoundMinutes', value)
   }
   showNotificationsChoice(s.notifications?.enabled !== false)
+  chainSettings?.update(s)
 }
 
 function showNotificationsChoice(enabled: boolean): void {
@@ -1517,6 +1520,8 @@ function buildPanel(): HTMLElement {
           <div class="st-help st-help-info st-org-status" role="status"></div>
         </div>
 
+        <div class="st-behavior-chain-slot"></div>
+
         <div class="tp-group-label">Time</div>
 
         <div class="tp-section">
@@ -1681,6 +1686,8 @@ function buildPanel(): HTMLElement {
   panel.querySelector('.st-storage-dry-run')!.addEventListener('click', () => { void runStorageMaintenance(true) })
   panel.querySelector('.st-storage-retry')!.addEventListener('click', () => { void loadStorage(true) })
   notificationsPicker = panel.querySelector('.st-notifications-picker')
+  chainSettings = behaviorChainSettings()
+  panel.querySelector('.st-behavior-chain-slot')!.append(chainSettings.element)
   notificationsStatusEl = panel.querySelector('.st-notifications-status')
   notificationsPicker!.addEventListener('click', (event) => {
     const choice = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-notifications]')?.dataset.notifications

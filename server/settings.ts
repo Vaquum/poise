@@ -39,6 +39,26 @@ export interface Settings {
   chat: ChatSettings
   notifications: NotificationSettings
   manager: ManagerSettings
+  behaviorChain: BehaviorChainSettings
+}
+
+export interface BehaviorChainSettings { enabled: boolean, seedMode: 'label' | 'all', label: string }
+export const DEFAULT_BEHAVIOR_CHAIN_SETTINGS: BehaviorChainSettings = { enabled: false, seedMode: 'label', label: 'poise' }
+
+function validateBehaviorChainSettings(value: unknown): BehaviorChainSettings {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('behavior chain settings must be an object')
+  const input = value as Record<string, unknown>
+  if (typeof input.enabled !== 'boolean' || !['label', 'all'].includes(String(input.seedMode))
+    || typeof input.label !== 'string' || !input.label.trim() || [...input.label.trim()].length > 50
+    || /[\u0000-\u001f\u007f]/.test(input.label)) throw new Error('behavior chain needs enabled, seedMode (label or all) and a label of 1 to 50 characters')
+  return { enabled: input.enabled, seedMode: input.seedMode as BehaviorChainSettings['seedMode'], label: input.label.trim() }
+}
+
+export function getBehaviorChainSettings(): BehaviorChainSettings {
+  const raw = getMeta('behavior_chain_settings')
+  if (raw === undefined || raw === null || raw === '') return { ...DEFAULT_BEHAVIOR_CHAIN_SETTINGS }
+  // Corrupt authority cannot silently select broader intake or enable execution.
+  return validateBehaviorChainSettings(JSON.parse(raw))
 }
 
 // Chat v1 (server/chat): the prefix of branches new sessions cut from the
@@ -262,6 +282,7 @@ export function getSettings(): Settings {
     chat: getChatSettings(),
     notifications: getNotificationSettings(),
     manager: getManagerSettings(),
+    behaviorChain: getBehaviorChainSettings(),
   }
 }
 
@@ -347,6 +368,7 @@ const saveSettings = db.transaction((partial: Partial<Settings>, catalog: Catalo
   if ('chat' in partial && partial.chat !== undefined) chat = validateChatSettings(partial.chat)
   let notifications: NotificationSettings | undefined
   if ('notifications' in partial && partial.notifications !== undefined) notifications = validateNotificationSettings(partial.notifications)
+  const behaviorChain = 'behaviorChain' in partial ? validateBehaviorChainSettings(partial.behaviorChain) : undefined
   const mergedManager = 'manager' in partial && partial.manager !== undefined ? validateManagerSettings(partial.manager) : current.manager
   const manager: ManagerSettings = { ...mergedManager, version: current.manager.version + 1 }
   const orgChanged = typeof next.org === 'string' && next.org !== (getMeta('org') || '')
@@ -357,6 +379,7 @@ const saveSettings = db.transaction((partial: Partial<Settings>, catalog: Catalo
   if (models) setMeta('models', JSON.stringify(models))
   if (chat) setMeta('chat_settings', JSON.stringify(chat))
   if (notifications) setMeta('notification_settings', JSON.stringify(notifications))
+  if (behaviorChain) setMeta('behavior_chain_settings', JSON.stringify(behaviorChain))
   setMeta('manager_settings', JSON.stringify(manager))
   return { settings: getSettings(), orgChanged }
 })

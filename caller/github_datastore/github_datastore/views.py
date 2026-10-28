@@ -57,6 +57,9 @@ def issue(
     created_since_datetime: str | None = None,
     created_at_datetime: str | None = None,
     limit: int | None = None,
+    label: str | None = None,
+    after_repo: str | None = None,
+    after_number: int | None = None,
 ) -> str:
     return _select(
         db_path,
@@ -70,6 +73,9 @@ def issue(
             "updated_since_datetime": updated_since_datetime,
             "created_since_datetime": _created_since(created_since_datetime, created_at_datetime),
             "limit": limit,
+            "label": label,
+            "after_repo": after_repo,
+            "after_number": after_number,
         },
     )
 
@@ -193,7 +199,7 @@ def _pr_reviews_page(
     # even when a single thread has arbitrarily many comments; repeated thread
     # summaries across pages are deduplicated by the consumer's identity state.
     comments = conn.execute(
-        """SELECT comment_id, node_id, body, COALESCE(thread_node_id, node_id) AS identity
+        """SELECT comment_id, node_id, author_login, body, COALESCE(thread_node_id, node_id) AS identity
            FROM review_comments WHERE item_id = ? AND comment_id > ?
            ORDER BY comment_id LIMIT ?""", (item_id, comment_after, page_size + 1),
     ).fetchall()
@@ -218,7 +224,7 @@ def _pr_reviews_page(
             "next_review_after": reviews[page_size - 1]["review_id"] if more_reviews else 0,
             "next_comment_after": comments[page_size - 1]["comment_id"] if more_comments else 0,
         },
-        "comments": [{"id": row["node_id"], "thread": row["identity"],
+        "comments": [{"id": row["node_id"], "author": row["author_login"], "thread": row["identity"],
                       "resolved": _flag(latest_by_identity[row["identity"]]["thread_resolved"]),
                       "revision": hashlib.sha256((row["body"] or "").encode()).hexdigest()}
                      for row in comments[:page_size]],
@@ -587,10 +593,25 @@ def _select(db_path: str | Path, view_name: str, output: Output, filters: dict[s
         raise ValueError(f"unknown view: {view_name}")
     limit = filters.pop("limit")
     where, params = _where(filters)
+    after_repo, after_number = filters.get("after_repo"), filters.get("after_number")
+    if after_repo is not None or after_number is not None:
+        if view_name != "issues" or not isinstance(after_repo, str) or not isinstance(after_number, int) or after_number < 0:
+            raise ValueError("issue pagination needs after_repo and a nonnegative after_number")
+        where.append("(repo > ? OR (repo = ? AND number > ?))")
+        params.extend([after_repo, after_repo, after_number])
+    label = filters.get("label")
+    if label is not None:
+        if view_name != "issues" or not isinstance(label, str) or not label.strip():
+            raise ValueError("issue label must be a nonempty string")
+        where.append("""EXISTS (SELECT 1 FROM items chain_issue,
+          json_each(chain_issue.expanded_json, '$.issue.labels') chain_label
+          WHERE chain_issue.item_id = issues.payload_ref
+            AND json_extract(chain_label.value, '$.name') = ? COLLATE NOCASE)""")
+        params.append(label)
     sql = f"SELECT * FROM {view_name}"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY updated_at DESC, repo ASC, number ASC"
+    sql += " ORDER BY repo ASC, number ASC" if after_repo is not None else " ORDER BY updated_at DESC, repo ASC, number ASC"
     if limit is not None:
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -599,6 +620,9 @@ def _select(db_path: str | Path, view_name: str, output: Output, filters: dict[s
 
     conn = _read_connect(db_path)
     try:
+        if label is not None and conn.execute("SELECT 1 FROM items WHERE item_type='issue' AND state='open' "
+                                             "AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array' LIMIT 1").fetchone():
+            raise RuntimeError('issue label evidence is incomplete; ordinary datastore synchronization must refresh the old snapshots')
         rows = conn.execute(sql, params).fetchall()
         columns = [column[0] for column in conn.execute(f"SELECT * FROM {view_name} LIMIT 0").description]
         return _render(rows, columns, output)

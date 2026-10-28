@@ -1,6 +1,10 @@
 import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
+import { behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
+import { BehaviorChainRuntime } from './behavior-chain-runtime'
+import { nativeChainOperations } from './behavior-chain-native'
+import { chainBasis, type ChainBehavior } from './behavior-chain-store'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
 import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun, reapAbandonedDirectBehaviorRuns } from './behavior-metrics'
@@ -29,7 +33,7 @@ import { MessageChannel } from 'node:worker_threads'
 import { ISSUE_REVIEW_BEHAVIOR, fetchAgentLogSnapshot, quarantinedLogMayMatch, type LogEntry } from './agent'
 import { claudeAuth } from './claude-auth'
 import { REVIEW_POLICY, needsClaude, reviewChoice, reviewPanel, type ReviewPanel, type ReviewPlace } from './review-model'
-import { type Catalog, type ReviewerSlot, MODEL_SLOTS, REVIEWER_SLOTS, isPlaceModel, loadCatalog, recoveryModel, resolveSlots } from './models'
+import { type Catalog, type ReviewerSlot, MODEL_SLOTS, REVIEWER_SLOTS, isPlaceModel, loadCatalog, recoveryModel, resolveSlots, resolvePlace } from './models'
 import {
   db,
   claimPrOperationOwned,
@@ -88,7 +92,7 @@ import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDet
 import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type CheckSlotStats } from './check-semaphore'
 import { withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
-import { agentAccount, getModelSettings, requireAgentAccount } from './settings'
+import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { behaviorHeld } from './alerts/producers'
@@ -981,6 +985,7 @@ async function retireStaleReviewerTrips(): Promise<void> {
     // running on a later slot trips that model, and a review tick must not
     // retire the trip while the backoff still holds it.
     for (const slot of MODEL_SLOTS) configured.add(resolveSlots(approval.catalog, getModelSettings().slots)[slot])
+    for (const place of ['issue_implement', 'pr_repair'] as const) configured.add(resolvePlace(approval.catalog, place, getModelSettings()).model)
   } catch {
     return
   }
@@ -1142,7 +1147,7 @@ export function pullRequestPolicy(behavior: SkippableBehavior): PullRequestPolic
 }
 
 // Open, not a draft and yours: what every PR behavior and the baseline require.
-function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | null, agent = agentAccount()): string | null {
+function ownPullRequestRefusal(me: string, ref: string, pr: Pick<PullRequestFacts, 'author' | 'status' | 'draft'> | null, agent = agentAccount()): string | null {
   if (pr?.status !== 'open') return `${ref} is not an open pull request`
   if (pr.draft) return `${ref} is a draft`
   if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → General`
@@ -1155,7 +1160,7 @@ function ownPullRequestRefusal(me: string, ref: string, pr: PullRequestFacts | n
 // The one check a pull request passes before a PR behavior acts on it, applied
 // by the scheduler and by a replay from Swarm alike. It names what failed;
 // `pr` is null when the datastore does not have the pull request.
-export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, number: number, pr: PullRequestFacts | null): string | null {
+export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, number: number, pr: Pick<PullRequestFacts, 'author' | 'status' | 'draft'> | null): string | null {
   return ownPullRequestRefusal(policy.me, `${repo}#${number}`, pr, policy.agentAccount)
     ?? (policy.skipped.has(repo.toLowerCase()) ? `${repo} is in the Skip repositories list of ${SKIPPABLE_LABELS[policy.behavior]}` : null)
     ?? (pr ? repoHoldRefusal(repo, prReviewer(pr.author)) : null)
@@ -1697,6 +1702,7 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
     WHERE key = ? AND target = ? AND claim_id = '' AND launch_quarantine = 'unreadable'
       AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
   `).run(claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
+  if (call.outcome === 'published' || call.outcome === 'no_changes') throw new Error('atomic publication cannot settle a legacy review claim')
   captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
     state: 'completed', activity: 'settled', stateSource: 'native', outcome: call.outcome,
     head: call.head_sha, completedAt: call.completed_at })
@@ -2140,6 +2146,8 @@ async function reconcileBehaviorLaunchClaims(
 
 interface DatastorePr extends PullRequestFacts {
   url: string
+  headRef: string | null
+  headRepo: string | null
 }
 
 interface DatastoreFreshness {
@@ -2356,16 +2364,20 @@ function datastorePr(row: unknown, index: number): DatastorePr {
   const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
   const status = String(value.status || '')
   const updatedAt = String(value.updated_at || '')
+  const headRef = value.head_ref ?? null
+  const headRepo = value.head_repo ?? null
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
     || number < 1
     || draft > 1
     || !['open', 'closed', 'merged'].includes(status)
     || !author
     || !Number.isFinite(Date.parse(updatedAt))
-    || url !== `https://github.com/${repo}/pull/${number}`) {
+    || url !== `https://github.com/${repo}/pull/${number}`
+    || (headRef !== null && (typeof headRef !== 'string' || !headRef))
+    || (headRepo !== null && (typeof headRepo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(headRepo)))) {
     throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
   }
-  return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt }
+  return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt, headRef: headRef as string | null, headRepo: headRepo as string | null }
 }
 
 async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
@@ -2413,13 +2425,18 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
 async function listEligiblePrs(behavior: SkippableBehavior, author: string): Promise<DatastorePr[]> {
   const prs = await listOpenPrsByAuthor(author)
   const policy = pullRequestPolicy(behavior)
-  return prs.filter((pr) => !pullRequestRefusal(policy, pr.repo, pr.number, pr))
+  return prs.filter((pr) => !chainOwnsPr(pr) && !pullRequestRefusal(policy, pr.repo, pr.number, pr))
+}
+
+function chainOwnsPr(pr: DatastorePr): boolean {
+  if (behaviorChainOwnsRepository(pr.repo) && (!pr.headRef || !pr.headRepo)) throw new Error(`PR ${pr.repo}#${pr.number} lacks complete branch ownership evidence while behavior chains own work in its repository`)
+  return behaviorChainOwner(pr.repo, pr.number, 'pull', pr) !== null
 }
 
 // Read just before a launch: a skip saved, or your account changed, while the
 // launch was being prepared stops it.
 function stillEligible(behavior: SkippableBehavior, pr: DatastorePr, actor?: string): boolean {
-  return !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
+  return !chainOwnsPr(pr) && !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
     && (actor === undefined || configuredReviewer(pr.author).toLowerCase() === actor.toLowerCase())
 }
 
@@ -6108,6 +6125,7 @@ async function tickReviewNewIssues(): Promise<void> {
       continue
     }
     for (const issue of issues) {
+      if (behaviorChainOwner(issue.repo, issue.number, 'issues')) continue
       const key = `${issue.repo}#${issue.number}`
       open.add(key)
       const created = Date.parse(issue.createdAt)
@@ -6716,6 +6734,137 @@ export interface RunEnabledBehaviorsOptions {
   stagger?: boolean
 }
 
+const behaviorChains = new Map<string, BehaviorChainRuntime>()
+const behaviorChainHealth = new Map<string, { lastSweepAt: number, error: string | null }>()
+export function getBehaviorChainRuntimeHealth() {
+  return [...behaviorChainHealth].map(([organization, health]) => ({ organization, ...health }))
+}
+function chainBehaviorKey(behavior: ChainBehavior): BehaviorKey | null {
+  return ({ 'review-issue': 'review-new-issues', 'review-pr': 'review-new-prs', 'approve-pr': 'approve-prs',
+    'resolve-threads': 'resolve-unblocking', 'merge-pr': 'merge-prs', 'rerun-grey-ci': 'rerun-grey-ci' } as Partial<Record<ChainBehavior, BehaviorKey>>)[behavior] ?? null
+}
+
+async function runBehaviorChains(): Promise<void> {
+  const configured = databaseGetMeta('behavior_chain_settings')
+  if (!configured && (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()
+    || !db.prepare('SELECT 1 FROM behavior_chain_current WHERE merged = 0 LIMIT 1').get())) return
+  const org = currentOrganization()
+  if (!org) return
+  let runtime = behaviorChains.get(org.login.toLowerCase())
+  if (!runtime) {
+    const roster = async () => {
+      const [issues, prs, approval, catalog] = await Promise.all([reviewPanel(getReviewers(ISSUES_KEY), 'issue_review'), reviewPanel(getReviewers('review-new-prs')), reviewChoice('pr_approve'), loadCatalog()])
+      if (issues.reviewers.length !== getReviewers(ISSUES_KEY) || prs.reviewers.length !== getReviewers('review-new-prs')) throw new Error('behavior chain reviewer count exceeds configured model slots')
+      const model = (place: 'issue_implement' | 'pr_repair') => { const resolved = resolvePlace(catalog, place, getModelSettings()); return { ...resolved, recovery: resolved.model } }
+      return { issueReviewers: issues.reviewers, prReviewers: prs.reviewers, implementer: model('issue_implement'), repairer: model('pr_repair'),
+        approver: { slot: approval.slot, model: approval.model, recovery: approval.recovery } }
+    }
+    runtime = new BehaviorChainRuntime(behaviorChainJournal(), nativeChainOperations(org, {
+      roster,
+      async resolve(decision) {
+        if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
+          const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), decision.behavior === 'review-issue' ? 'issue_review' : 'pr_review')
+          const reviewer = panel.reviewers.find((entry) => entry.slot === decision.reviewer?.slot)
+          if (!reviewer || !claimReviewerTripProbe(reviewer.model)) return null
+          return reviewer
+        }
+        if (decision.behavior === 'approve-pr') {
+          const approval = await approvalSlot()
+          if (!approval || !claimReviewerTripProbe(approval.model)) return null
+          return approval
+        }
+        const models = await roster()
+        const selected = decision.behavior === 'repair-pr' ? models.repairer : models.implementer
+        const place = decision.behavior === 'repair-pr' ? 'pr_repair' : 'issue_implement'
+        const catalog = await loadCatalog()
+        const slots = resolveSlots(catalog, getModelSettings().slots)
+        const candidates = [selected.model, ...MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(selected.slot)).map((slot) => slots[slot])]
+        const model = candidates.find((identity) => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
+        if (!model || !claimReviewerTripProbe(model)) return null
+        return { slot: selected.slot, model, recovery: model }
+      },
+      async prepare(identities) {
+        const catalog = await loadCatalog()
+        if (identities.some((identity) => needsClaude(catalog, identity))) await claudeAuth.requireReady()
+        return { ...claudeSubscriptionEnvironment(), ...await prepareBehaviorModelClis(catalog, identities) }
+      },
+      borrow() {
+        return behaviorCheckSlots.tryAcquire('behavior')
+      },
+      available: () => { const available = behaviorCheckSlots.available('behavior'); if (!available) checkSlotRetryPending = true; return available },
+      capacity: () => behaviorCheckSlots.laneCapacity('behavior'),
+      permitted(chain, decision) {
+        if (!tickerStarted || behaviorAbortController?.signal.aborted || !getBehaviorChainSettings().enabled || releaseBackgroundPaused()) return false
+        const key = chainBehaviorKey(decision.behavior)
+        if (key && !isRunnable(key)) return false
+        const pull = chain.observation?.pull as { number?: number, state: string, draft: boolean } | null | undefined
+        if (key && key !== ISSUES_KEY && pull?.number && pullRequestRefusal(pullRequestPolicy(key as SkippableBehavior), chain.repository, pull.number,
+          { author: chain.author, status: pull.state, draft: pull.draft })) return false
+        return true
+      },
+      note: (behavior) => { const key = chainBehaviorKey(behavior); return key ? noteArgs(key)[1] ?? '' : '' },
+      severity: (behavior) => getSetting(behavior === 'approve-pr' ? 'approve-prs' : 'review-new-prs'),
+      received(invocation, call) {
+        const identity = call.recovery_model || call.model
+        if (call.status === 'completed') clearReviewerTrip(identity)
+        else {
+          const kind = reviewerTripKind(call)
+          if (kind) tripReviewer(invocation.behavior === 'review-pr' || invocation.behavior === 'approve-pr' ? 'review-new-prs' : ISSUES_KEY, identity, kind, call.id)
+        }
+      },
+      async reviews(repository, number) {
+        const { readWorkReviews } = await import('./chat/control')
+        const target = { repo: repository, number, kind: 'pull' as const, url: `https://github.com/${repository}/pull/${number}` }
+        let cursor = { reviewAfter: 0, commentAfter: 0 }
+        const revisions = new Map<string, unknown>()
+        for (;;) {
+          const page = await readWorkReviews(target, cursor)
+          if (!page) throw new Error('behavior chain cannot read existing review observations')
+          if (!page.found) return chainBasis(['datastore-not-yet-indexed', repository, number])
+          for (const review of page.reviews) revisions.set(`review:${review.id}`, [review.state, review.revision])
+          for (const comment of page.comments ?? []) if (comment.author?.toLowerCase() !== getSettings().me.toLowerCase()) {
+            revisions.set(`comment:${comment.id}`, [comment.thread, comment.resolved, comment.revision])
+          }
+          if (!page.truncated) break
+          if (!page.page || (page.page.reviewAfter === cursor.reviewAfter && page.page.commentAfter === cursor.commentAfter)) throw new Error('behavior chain review pagination did not advance')
+          cursor = page.page
+        }
+        return chainBasis([...revisions].sort(([a], [b]) => a.localeCompare(b)))
+      },
+      async existing(seeds) {
+        const existing = new Set<string>()
+        if (!seeds.length) return existing
+        const wanted = new Set(seeds.map((seed) => `${seed.repository.toLowerCase()}#${seed.number}`))
+        if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'chat_work_bindings'").get()) {
+          for (const row of db.prepare('SELECT target FROM chat_work_bindings').iterate() as Iterable<{ target: string }>) {
+            const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/([1-9][0-9]*)$/.exec(row.target)
+            if (match) existing.add(`${match[1].toLowerCase()}#${match[2]}`)
+          }
+        }
+        const { readOpenPrClosingRefs } = await import('./chat/control')
+        let cursor: { repo: string, number: number } | undefined
+        for (;;) {
+          const page = await readOpenPrClosingRefs(org, cursor)
+          if (!page || (page.truncated && !page.more) || page.prs.some((pr) => pr.closingTruncated)) throw new Error('existing issue-to-PR ownership cannot be established from complete observations')
+          for (const pr of page.prs) for (const ref of pr.closing) { const key = `${ref.repo.toLowerCase()}#${ref.number}`; if (wanted.has(key)) existing.add(key) }
+          if (!page.more) break
+          const last = page.prs.at(-1)
+          if (!last || (cursor?.repo === last.repo && cursor?.number === last.number)) throw new Error('existing PR ownership pagination did not advance')
+          cursor = { repo: last.repo, number: last.number }
+        }
+        return existing
+      },
+      wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
+    }))
+    behaviorChains.set(org.login.toLowerCase(), runtime)
+  }
+  const directory = dirname(behaviorProcessLockPath(ISSUES_KEY))
+  await withProcessLock({ path: join(directory, `.poise-${org.login.toLowerCase()}-behavior-chain-runtime-lock.sqlite3`), timeoutMs: 1000 }, async () => {
+    const release = trackReleaseBackground()
+    try { await runtime!.run() } finally { release() }
+  })
+}
+
 async function runBehaviorCycle(
   key: BehaviorKey,
   operation: () => Promise<boolean>,
@@ -6770,6 +6919,14 @@ export async function runEnabledBehaviorsOnce(
   // This tick's PR behaviors share one open-PR listing, dropped when the
   // tick ends.
   return sharedPrListing.run({ promise: null, author: '' }, async () => {
+    try {
+      await runBehaviorChains()
+      behaviorChainHealth.set(org.login.toLowerCase(), { lastSweepAt: Date.now(), error: null })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      behaviorChainHealth.set(org.login.toLowerCase(), { lastSweepAt: Date.now(), error: message })
+      console.error(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
+    }
     const operations: Promise<void>[] = []
     if (isEnabled('review-new-prs')
       && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-prs')))) {
@@ -7001,16 +7158,18 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     error: identityError,
   }
   const datastoreUnavailable = anyEnabled && datastoreFreshness().status === 'unavailable'
+  const chainError = behaviorChainHealth.get(currentOrganization()?.login.toLowerCase() || '')?.error
   return {
     runtimeError: !tickerStarted ? 'The behavior scheduler has stopped.'
       : heartbeatStale ? 'The behavior scheduler is no longer responding.'
-        : operationStale ? 'A behavior operation exceeded its execution deadline.' : null,
+        : operationStale ? 'A behavior operation exceeded its execution deadline.' : chainError || null,
     status: tickerStarted
       && !heartbeatStale
       && !operationStale
       && !failures.some((failure) => !failure.target)
       && (!anyEnabled || identityValid)
       && !datastoreUnavailable
+      && !chainError
       ? 'ok'
       : 'degraded',
     running: tickerStarted,

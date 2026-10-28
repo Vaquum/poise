@@ -365,6 +365,12 @@ def sync_once(
                 raise RuntimeError("initialization is incomplete; run init-org --resume first")
         with conn:
             initialize_full_build_markers(conn)
+            # Existing snapshots predate label capture. Reuse the normal
+            # full-enumeration/checkpoint path to refresh old open issues,
+            # even when their GitHub updatedAt has not changed.
+            for row in conn.execute("SELECT DISTINCT repo_id FROM items WHERE item_type='issue' AND state='open' "
+                                    "AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array'"):
+                clear_full_build_marker(conn, int(row["repo_id"]))
         since = get_state(conn, "org", "last_sync_at")
         repos = reader.list_org_repos(org)
         repos = apply_sync_repo_filter(conn, repos, include_repos, exclude_repos)
@@ -521,7 +527,7 @@ def items_requiring_full_refresh(
         int(row["item_id"]): row
         for row in conn.execute(
             """
-            SELECT item_id, repo_full_name, number, item_type, updated_at
+            SELECT item_id, repo_full_name, number, item_type, state, updated_at, expanded_json
             FROM items
             WHERE repo_id = ?
             """,
@@ -550,6 +556,7 @@ def items_requiring_full_refresh(
             or int(row["number"]) != int(item["number"])
             or str(row["item_type"]) != item["item_kind"]
             or str(row["repo_full_name"]) != repo_full_name
+            or (row["item_type"] == "issue" and row["state"] == 'open' and not isinstance(json.loads(row["expanded_json"])["issue"].get("labels"), list))
         ):
             refresh.append(item)
     return refresh

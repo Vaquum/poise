@@ -193,6 +193,22 @@ export const MODEL_PLACES = [
     reviewers: true,
     seed: 'pr_review',
   },
+  {
+    key: 'issue_implement',
+    label: 'Issue implementation',
+    why: 'One fresh behavior invocation implements the reviewed seed issue and publishes its pull request. No Chat session remains running.',
+    review: false,
+    reviewers: false,
+    seed: 'author_content',
+  },
+  {
+    key: 'pr_repair',
+    label: 'PR repair',
+    why: 'One fresh behavior invocation addresses actual review findings, failing CI, conflicts or queue rejection, then releases its resources.',
+    review: false,
+    reviewers: false,
+    seed: 'author_content',
+  },
 ] as const
 
 export type ModelSlot = 'primary' | 'secondary' | 'tertiary'

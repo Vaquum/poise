@@ -5,6 +5,37 @@ import { mocks, pr, HEAD_SHA, loadModules, arrangeCli, agentLog, fixture } from 
 
 describe('launch ownership and resolution', () => {
 
+  it('keeps a newly listed chain branch out of legacy review before publication is observed', async () => {
+    arrangeCli(false)
+    const inherited = mocks.runFile.getMockImplementation()
+    if (!inherited) throw new Error('CLI fixture is not arranged')
+    mocks.runFile.mockImplementation((command, args, options) => {
+      if (command === 'github-interface') {
+        if (args[0] === '--read-issue') return Promise.resolve({ stdout: JSON.stringify({ issue: { title: 'Seed', body: '', state: 'open', labels: ['poise'] } }), stderr: '' })
+        if (args[0] === '--issue-comments') return Promise.resolve({ stdout: JSON.stringify({ comments: [] }), stderr: '' })
+        // The chain's read preceded publication. The later PR listing below
+        // already includes the branch: this was the live duplicate-review race.
+        if (args[0] === '--issue-work') return Promise.resolve({ stdout: JSON.stringify({ existing_pulls: [], pull_number: null,
+          head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }), stderr: '' })
+      }
+      return inherited(command, args, options)
+    })
+    const { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user')
+    const { behaviorChainJournal } = await import('../server/behavior-chain-journal')
+    const chain = behaviorChainJournal().append('vaquum/poise-test#7', 'seed', 0, { type: 'chain.admitted', repository: pr.repo,
+      issue: 7, branch: 'poise/issue-7', author: 'poise-user', reviewer: 'review-bot' })
+    fixture.listedPrs = [{ ...pr, head_ref: chain.branch, head_repo: pr.repo }]
+    runtime.startBehaviorsRuntime()
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+    await runtime.runEnabledBehaviorsOnce()
+    expect(behaviorChainJournal().read(chain.id)?.observation?.publication).toMatchObject({ pull_number: null })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(db.listBehaviorLaunchClaims('review-new-prs')).toHaveLength(0)
+  })
+
   it('never overlaps initial review and approval for the same PR', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-07-15T11:40:00.000Z'))

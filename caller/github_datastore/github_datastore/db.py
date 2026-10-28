@@ -17,7 +17,7 @@ def default_db() -> str:
 
 
 DEFAULT_DB = default_db()
-VIEW_SCHEMA_VERSION = 4
+VIEW_SCHEMA_VERSION = 5
 VIEW_NAMES = frozenset({"user_associations", "prs", "issues", "user_items"})
 
 
@@ -245,7 +245,9 @@ SELECT
     ELSE (SELECT json_group_array(json_extract(value, '$.login'))
           FROM json_each(i.expanded_json, '$.pull.requested_reviewers')
           WHERE json_extract(value, '$.login') IS NOT NULL)
-    END AS requested_reviewers
+    END AS requested_reviewers,
+    nullif(json_extract(i.expanded_json, '$.pull.graphql.headRefName'), '') AS head_ref,
+    nullif(json_extract(i.expanded_json, '$.pull.graphql.headRepository.nameWithOwner'), '') AS head_repo
 FROM items i
 WHERE i.item_type = 'pr';
 

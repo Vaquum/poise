@@ -36,6 +36,22 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     result = {"action": "rerun_grey_ci_if_ready", "repository": f"{owner}/{repo}",
               "pull_number": number, "head_sha": head, "run_id": run_id, "run_attempt": attempt,
               "outcome": "not_ready"}
+    if payload.get("inspect"):
+        try:
+            pull = await get_pull(client, owner, repo, number)
+            if (pull.get("head") or {}).get("sha") != head:
+                return {**result, "outcome": "superseded"}
+            if str((pull.get("user") or {}).get("login") or "").lower() != author.lower():
+                raise RuntimeError("workflow recovery pull author differs from the admitted action")
+            workflow = await client.get(f"/repos/{owner}/{repo}/actions/runs/{run_id}")
+            observed = workflow.get("run_attempt")
+            if workflow.get("id") != run_id or workflow.get("head_sha") != head \
+                    or type(observed) is not int or observed < attempt:
+                raise RuntimeError("workflow recovery evidence conflicts with the admitted run/head/attempt")
+            return {**result, "outcome": "rerun_observed" if observed > attempt else "unconfirmed",
+                    "observed_run_attempt": observed, "workflow_status": workflow.get("status"), "conclusion": workflow.get("conclusion")}
+        except (RuntimeError, httpx.HTTPError, KeyError, TypeError, ValueError) as error:
+            return {**result, "outcome": "read_failed", "error": str(error)}
     try:
         readiness = await preflight(client, owner, repo, number, head, author, run_id, attempt)
     except (RuntimeError, httpx.HTTPError, KeyError, TypeError, ValueError) as error:

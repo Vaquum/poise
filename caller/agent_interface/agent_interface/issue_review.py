@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import hashlib
 from pathlib import Path
 from threading import current_thread, main_thread
 from time import monotonic, sleep, time
@@ -82,7 +83,12 @@ def ref(repo: str, number: int) -> str:
     return f"{repo}#{number}"
 
 
-def interface(*args: str, seconds: float = 120) -> dict:
+def revision(issue: dict) -> str:
+    return hashlib.sha256(json.dumps([issue.get("title") or "", issue.get("body") or ""],
+                                    ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def interface(*args: str, seconds: float = 120, cwd: Path | None = None) -> dict:
     # Its own process group: a timeout or a stop must also end the git it
     # started, which would otherwise keep working on a shared mirror.
     # Check the budget before spawning so an exhausted budget never starts
@@ -90,7 +96,7 @@ def interface(*args: str, seconds: float = 120) -> dict:
     limit = review_budget.timeout(seconds)
     process = subprocess.Popen(
         [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), *args],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, cwd=cwd,
     )
     try:
         stdout, stderr = process.communicate(timeout=limit)
@@ -245,7 +251,7 @@ def artifact_status(path: Path) -> dict:
     return status
 
 
-def command(model: Model, text: str, checkout: Path, work: Path, seconds: float) -> tuple[list[str], str, dict]:
+def command(model: Model, text: str, checkout: Path, work: Path, seconds: float, unattended: str = UNATTENDED) -> tuple[list[str], str, dict]:
     """The provider's own CLI with full access — no allowlist, no sandbox."""
     env = os.environ.copy()
     scratch = work.resolve() / "tmp"
@@ -261,7 +267,7 @@ def command(model: Model, text: str, checkout: Path, work: Path, seconds: float)
             "--dangerously-skip-permissions", "--setting-sources", "", "--no-session-persistence",
             "--add-dir", str(work), "--settings", settings,
             # Last, so Poise's subscription wrapper reads the prompt from stdin.
-            "--append-system-prompt", UNATTENDED,
+            "--append-system-prompt", unattended,
         ], text, env
     if model.provider == "codex":
         for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
@@ -638,6 +644,11 @@ def _reconcile_post(repo: str, number: int, actor: str, call_id: str, seen: set[
     return None
 
 
+def comment_body(item: dict, model: str, call_id: str) -> str:
+    return (f"{item['body']}\n\n---\n<sub>Issue review · `{model}`</sub>\n"
+            f"<!-- agent-interface issue-review call={call_id} -->")
+
+
 def post(posts: list[dict], actor: str, call_id: str, model: str, record) -> list[dict]:
     """Post each comment as the actor. `record` is called with the receipts
     before the first comment and after every one, so a run that dies while
@@ -648,8 +659,7 @@ def post(posts: list[dict], actor: str, call_id: str, model: str, record) -> lis
     record(receipts)
     for item in posts:
         repo, number = parse(item["issue"])
-        body = (f"{item['body']}\n\n---\n<sub>Issue review · `{model}`</sub>\n"
-                f"<!-- agent-interface issue-review call={call_id} -->")
+        body = comment_body(item, model, call_id)
         try:
             reply = interface("--comment-issue", f"#{number}", "--repository", repo, "--token-user", actor, f"--body={body}")
         except (subprocess.TimeoutExpired, review_budget.ReviewLimitError) as error:

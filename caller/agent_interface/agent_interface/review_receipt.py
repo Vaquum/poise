@@ -12,6 +12,8 @@ import ast
 import json
 import re
 import sqlite3
+import os
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -21,6 +23,98 @@ _call: ContextVar[tuple[Path, str] | None] = ContextVar("review_receipt_call", d
 _failure: ContextVar[str | None] = ContextVar("review_submission_failure", default=None)
 _QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-remaining",
                   "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
+
+
+@contextmanager
+def invocation_environment(database: Path, call_id: str, managed: bool, *, initialize: bool = True):
+    keys = {"AGENT_INTERFACE_RECEIPT_DB": str(database), "AGENT_INTERFACE_RECEIPT_CALL": call_id}
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        for key, value in keys.items():
+            if managed:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+        if managed and initialize:
+            with sqlite3.connect(database, timeout=30) as conn:
+                conn.execute("update calls set artifact=? where id=? and status='running'", (json.dumps({"phase": "reviewing"}), call_id))
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def begin_submission(body: str, head: str) -> str:
+    """Cross-process native receipt: reserve the one review write before POST.
+    An unacknowledged request retains its identity in GitHub's review body."""
+    database = os.environ.get("AGENT_INTERFACE_RECEIPT_DB")
+    call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database and not call_id:
+        return body
+    if not database or not call_id or not re.fullmatch(r"[0-9a-f]{32}", call_id):
+        raise RuntimeError("managed review submission lacks its native receipt binding")
+    with sqlite3.connect(database, timeout=30) as conn:
+        changed = conn.execute("update calls set artifact=json_patch(artifact,?) where id=? and status='running' and source='poise:behavior-chain' "
+                               "and coalesce(error_code,'') not in ('stopping','stopped') and json_extract(artifact,'$.phase')='reviewing'",
+                               (json.dumps({"phase": "submitting_review", "expected_head": head}), call_id)).rowcount
+        if changed != 1:
+            raise RuntimeError("managed review does not own an unsubmitted native action receipt")
+    return f"{body}\n\n<!-- poise-invocation {call_id} -->".strip()
+
+
+def work_publication(head: str, *, start_replies: bool = False) -> None:
+    """Checkpoint a pushed head, then reserve its planned replies before POST.
+
+    Only a recorded unattempted reply batch can resume after worker settlement.
+    A lost POST remains uncertain instead of authorizing another write.
+    """
+    database, call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_DB"), os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database and not call_id:
+        return
+    if not database or not call_id or not re.fullmatch(r"[0-9a-f]{32}", call_id) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise RuntimeError("managed work publication lacks its native receipt binding")
+    with sqlite3.connect(database, timeout=30) as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select artifact,status,resources_settled_at from calls where id=? and source='poise:behavior-chain' "
+                           "and behavior in ('implement_issue','repair_pr') and action_plan is not null "
+                           "and coalesce(error_code,'') not in ('stopping','stopped')", (call_id,)).fetchone()
+        artifact = json.loads(row[0]) if row and row[0] else {}
+        if not row or artifact.get("phase") != "publishing" or not artifact.get("plan_sha"):
+            raise RuntimeError("work publication lacks its original native action plan")
+        if start_replies:
+            if row[1] not in {"running", "failed"} or (row[1] == "failed" and row[2] is None) \
+                    or artifact.get("publication_head") != head or artifact.get("replies_started") is not False:
+                raise RuntimeError("planned replies are already attempted or lack settled native ownership")
+            artifact["replies_started"] = True
+        else:
+            if row[1] != "running" or ("publication_head" in artifact and artifact["publication_head"] != head):
+                raise RuntimeError("work publication head conflicts with its original native receipt")
+            artifact.setdefault("publication_head", head)
+            artifact.setdefault("replies_started", False)
+        conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), call_id))
+
+
+@contextmanager
+def managed_resources(root: Path):
+    """Managed handoffs require resource settlement as well as a verdict."""
+    database, call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_DB"), os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database or not call_id:
+        yield
+        return
+    from . import issue_review
+    with sqlite3.connect(database, timeout=30) as conn:
+        conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.resource_root',?) where id=?", (str(root), call_id))
+    try:
+        yield
+    finally:
+        issue_review.stop_leftovers(root)
+        if issue_review._cwd_pids(root, require_complete=True) != []:
+            with sqlite3.connect(database, timeout=30) as conn:
+                conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.resource_error','resources_unknown') where id=?", (call_id,))
+            raise RuntimeError("managed behavior resources could not be proven released")
 
 
 class SubmissionError(RuntimeError):
@@ -119,6 +213,9 @@ def record(text: str) -> dict | None:
         with sqlite3.connect(database, timeout=30) as conn:
             conn.execute("update calls set review_id=?, review_comments=? where id=?",
                          (str(receipt["review_id"]), _comments(text), call_id))
+            if os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") == call_id:
+                conn.execute("update calls set artifact=json_patch(artifact,?) where id=? and status='running'",
+                             (json.dumps({"phase": "review_submitted", **receipt}), call_id))
     return receipt
 
 

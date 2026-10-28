@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
 import { db, getMeta, setMeta } from '../db'
+import { behaviorChainOwner, behaviorChainOwnsRepository, type ChainPullIdentity } from '../behavior-chain-journal'
 import { HttpError, httpStatus, readJson } from '../http'
 import { runFile } from '../process'
 import { requireAgentAccount } from '../settings'
@@ -58,6 +59,7 @@ const APIS = {
   '/api/gh': 'Cached GitHub work: POST with operation=list and record_type=pull_request|issue.',
   '/api/agent-logs': 'Swarm and running agent calls: GET.',
   '/api/behaviors': 'Behavior configuration, health and diagnostics: GET; POST /api/behaviors/<key> to configure.',
+  '/api/behavior-chains': 'Durable behavior chains: GET with optional id and event cursor; POST id, sequence and operation hold|resume. Resume never bypasses an uncertain native receipt.',
   '/api/chat/sessions': 'Chat sessions: GET. Session detail and transcript: /api/chat/sessions/<id>.',
   '/api/editor/docs': 'Editor documents: GET, POST; /api/editor/doc/<slug> reads and writes a document.',
   '/api/snippets': 'Snippets and switches.',
@@ -286,7 +288,7 @@ export async function readWorkTargetStatus(target: store.WorkTarget): Promise<Wo
 export interface ReviewsCursor { reviewAfter: number, commentAfter: number }
 export interface ReviewsObservation {
   page?: ReviewsCursor, hasUnresolved?: boolean,
-  comments?: Array<{ id: string, thread: string, resolved: boolean | null, revision: string }>,
+  comments?: Array<{ id: string, author?: string | null, thread: string, resolved: boolean | null, revision: string }>,
   found: boolean, truncated: boolean,
   reviews: Array<{ id: string, author: string | null, state: string, revision?: string }>,
   threads: Array<{ thread: string | null, resolved: boolean | null, outdated: boolean | null,
@@ -349,7 +351,9 @@ export async function readWorkReviews(target: store.WorkTarget, cursor: ReviewsC
           || !('thread' in comment) || typeof comment.thread !== 'string'
           || !('revision' in comment) || typeof comment.revision !== 'string'
           || !('resolved' in comment) || (comment.resolved !== null && typeof comment.resolved !== 'boolean')) return null
-        comments.push({ id: comment.id, thread: comment.thread, resolved: comment.resolved, revision: comment.revision })
+        if ('author' in comment && comment.author !== null && typeof comment.author !== 'string') return null
+        comments.push({ id: comment.id, author: 'author' in comment ? comment.author as string | null : null,
+          thread: comment.thread, resolved: comment.resolved, revision: comment.revision })
       }
     }
     return { found: value.found, truncated: 'truncated' in value && value.truncated === true, reviews, threads,
@@ -1064,7 +1068,29 @@ export class ChatControl {
       }
       return { answered: true, sessionId: target }
     }
-    if (operation === 'bind') return store.bindWork(instance, id, text(command.target, 'target'))
+    if (operation === 'bind') {
+      const target = store.workTarget(text(command.target, 'target'))
+      const knownOwner = behaviorChainOwner(target.repo, target.number, target.kind)
+      if (knownOwner) throw new HttpError(409, `${target.url} is owned by behavior chain ${knownOwner}; a chat cannot take it over`)
+      let identity: ChainPullIdentity | undefined
+      if (target.kind === 'pull' && behaviorChainOwnsRepository(target.repo)) {
+        const org = organizationForRepository(target.repo)
+        if (!org) throw new HttpError(409, 'PR ownership cannot be verified outside a followed organization')
+        let after: { repo: string, number: number } | undefined
+        for (;;) {
+          const page = await (this.options.closingRefs ?? readOpenPrClosingRefs)(org, after)
+          if (!page) throw new HttpError(409, 'PR ownership observations are unavailable')
+          const pr = page.prs.find((pr) => pr.repo.toLowerCase() === target.repo.toLowerCase() && pr.number === target.number)
+          if (pr) { identity = pr; break }
+          if (!page.more) break
+          const last = page.prs.at(-1)
+          if (!last || (after?.repo === last.repo && after.number === last.number)) throw new HttpError(409, 'PR ownership observations did not advance')
+          after = { repo: last.repo, number: last.number }
+        }
+        if (!identity?.headRef || !identity.headRepo) throw new HttpError(409, 'PR branch ownership has not been observed; refresh before binding it')
+      }
+      return store.bindWork(instance, id, target.url, identity)
+    }
     if (operation === 'unbind') { store.unbindWork(instance, id, text(command.target, 'target')); return { released: true } }
     if (operation === 'supervise') {
       if (!Array.isArray(command.sessionIds) || !command.sessionIds.every(s => typeof s === 'string')) throw new HttpError(400, 'sessionIds must be an array of chat IDs')
@@ -1373,7 +1399,7 @@ export class ChatControl {
             continue
           }
           const [session] = union
-          if (session && store.bindWorkAuto(instance, session, url)) bound.add(url)
+          if (session && store.bindWorkAuto(instance, session, url, pr)) bound.add(url)
         }
         const last = listed.prs.at(-1)
         // The (repository, number) cursor always moves; a page that makes
