@@ -19,6 +19,7 @@ import type { ItemGroup } from '../notification-items'
 import { TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
 import type { BehaviorMetricsReport } from '../behavior-metrics'
 import { formatShortDuration } from '../analytics-format'
+import { getPausedUntil, setPaused } from '../behaviors'
 
 let viewEl: HTMLElement
 let initialized = false
@@ -122,6 +123,7 @@ function ownerCell(username: string | null): string {
 // checkbox — dropping the guard that stops a second click while the first is
 // still travelling. Rendering consults this so the guard survives a repaint.
 const togglesInFlight = new Set<BehaviorKey>()
+const pausesInFlight = new Set<BehaviorKey>()
 
 function stateUnknown(): boolean {
   return !isBehaviorStateLoaded()
@@ -530,7 +532,7 @@ function buildTriggersPanel(): HTMLElement {
       <select id="bt-ceiling" class="behavior-setting bt-ceiling-select">${ceilings}</select>
     </div>
     <div class="bt-section bt-review-cap" hidden>
-      <label class="bt-label" for="bt-review-cap">Review cap</label>
+      <label class="bt-label" for="bt-review-cap">Review cap (legacy only)</label>
       <select id="bt-review-cap" class="behavior-setting bt-review-cap-select" title="From this round on, Approve files the round's findings as one follow-up issue and approves instead of requesting changes. Off disables the cap.">${caps}</select>
     </div>
     <div class="bt-section">
@@ -1068,7 +1070,7 @@ function renderRow(meta: typeof BEHAVIORS[number]): HTMLTableRowElement {
   tr.innerHTML = `
     <td class="behavior-active-cell">${toggleCell(meta.key)}</td>
     <td class="title-cell" title="${escapeHtml(meta.label)}"><span class="behavior-name">${escapeHtml(meta.label)}</span></td>
-    <td class="behavior-status-cell"><span class="behavior-notifications">${notificationChips(meta.key)}</span></td>
+    <td class="behavior-status-cell"><span class="behavior-notifications">${notificationChips(meta.key)}</span>${meta.key === 'implement-issues' || meta.key === 'repair-prs' ? `<button type="button" class="st-clear" data-behavior-pause="${meta.key}" title="Pause future invocations; a running worker continues"${stateUnknown() || pausesInFlight.has(meta.key) ? ' disabled' : ''}>${getPausedUntil(meta.key) ? 'Resume' : 'Pause 15 min'}</button>` : ''}</td>
     <td class="behavior-owner-cell">${ownerCell(owner)}</td>
     <td class="behavior-setting-cell">${settingCell(meta)}</td>
     <td class="behavior-reviewers-cell">${reviewersCell(meta)}</td>
@@ -1124,6 +1126,17 @@ function renderRows() {
 }
 
 function attachHandlers() {
+  viewEl.addEventListener('click', (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-behavior-pause]')
+    if (!button) return
+    const key = button.dataset.behaviorPause as BehaviorKey
+    if (pausesInFlight.has(key)) return
+    pausesInFlight.add(key)
+    button.disabled = true
+    void setPaused(key, getPausedUntil(key) ? null : new Date(Date.now() + 15 * 60_000).toISOString())
+      .catch((error: unknown) => { button.disabled = false; viewFeedback(`behavior-pause:${key}`, 'Behavior pause failed', String(error)) })
+      .finally(() => { pausesInFlight.delete(key); renderRows() })
+  })
   viewEl.querySelector('#behaviors-time-picker')!.addEventListener('click', (event) => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-time]')
     if (!button || !isTimeRange(button.dataset.time) || button.dataset.time === metricsRange) return
@@ -1237,6 +1250,8 @@ async function tickRefresh() {
     }
     const toggle = tr.querySelector<HTMLInputElement>('input[type="checkbox"][data-behavior]')
     if (toggle) repaintToggle(meta.key, toggle)
+    const pause = tr.querySelector<HTMLButtonElement>('[data-behavior-pause]')
+    if (pause) { pause.textContent = getPausedUntil(meta.key) ? 'Resume' : 'Pause 15 min'; pause.disabled = stateUnknown() || pausesInFlight.has(meta.key) }
     const reviewers = tr.querySelector<HTMLSelectElement>('select.behavior-reviewers[data-behavior]')
     if (reviewers) reviewers.disabled = stateUnknown() || reviewersInFlight.has(meta.key)
     if (reviewers && !reviewersInFlight.has(meta.key)) reviewers.value = String(getReviewers(meta.key))

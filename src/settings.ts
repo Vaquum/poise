@@ -1478,7 +1478,7 @@ function selectSection(panel: HTMLElement, tab: SettingsSection) {
   if (panel.classList.contains('open')) {
     if (tab === 'accounts') void loadAccounts()
     if (tab === 'publishing') void publishing?.refresh()
-    if (tab === 'general') void loadStorage()
+    if (tab === 'general') { void loadStorage(); void chainSettings?.refresh() }
   }
   window.dispatchEvent(new CustomEvent('poise:settings-section-changed', { detail: { section: tab } }))
 }
@@ -1775,6 +1775,7 @@ export function initSettings() {
   // Closed Settings releases its rapid timer; the app's regular refresh clock
   // still reconciles pending activation so filters catch up without reopening.
   window.addEventListener('poise:refresh-tick', () => {
+    if (panelEl?.classList.contains('open') && panelEl.dataset.section === 'general') void chainSettings?.refresh()
     if (!panelEl?.classList.contains('open') && getOrganizations().some((org) => org.status === 'initializing')) void pollOrganizations()
   })
   // Elsewhere in Poise (the Claude sign-in banner in service mode) asks for a
@@ -1800,6 +1801,7 @@ export function openSettingsPanel() {
   panelEl.removeAttribute('inert')
   panelEl.removeAttribute('aria-hidden')
   panelEl.classList.add('open')
+  if (panelEl.dataset.section === 'general') void chainSettings?.refresh()
   document.addEventListener('keydown', onSettingsKeydown)
   void refreshStatus()
   if (panelEl.dataset.section === 'models') void loadModels()

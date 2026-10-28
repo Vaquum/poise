@@ -15,6 +15,16 @@ afterEach(async () => {
 })
 
 describe('Caller calls still running', () => {
+  it('isolates scheduled behaviors for cutover while preserving the service-wide count and unknown provenance', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'poise-caller-calls-'))
+    const db = new Database(join(dir, 'calls.sqlite3'))
+    db.exec('create table calls (id text, status text, pid integer, runner text, source text)')
+    const insert = db.prepare('insert into calls values (?, ?, ?, ?, ?)')
+    for (const source of ['poise:behavior-chain', 'poise:review-new-prs', 'poise:chat', 'manual', null]) insert.run(String(source), 'running', process.pid, null, source)
+    db.close()
+    expect(liveCallerCalls(dir)).toBe(5)
+    expect(liveCallerCalls(dir, true)).toBe(3)
+  })
   it('counts running calls whose process lives, and no Chat turn Poise runs itself', async () => {
     dir = await mkdtemp(join(tmpdir(), 'poise-caller-calls-'))
     const gone = spawnSync('true').pid

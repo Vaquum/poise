@@ -103,7 +103,7 @@ test('chain intake and individual holds use explicit settings and current journa
       held = 'New invocations held by the person'
       return route.fulfill({ json: {} })
     }
-    return route.fulfill({ json: { chains: [{ id: 'acme/repo#7', repository: 'acme/repo', issue: 7, sequence: held ? 12 : 11,
+    return route.fulfill({ json: { cutover: { sequence: 0, mode: 'v1', requestedAt: null, legacyPulls: [], blockers: [] }, chains: [{ id: 'acme/repo#7', repository: 'acme/repo', issue: 7, sequence: held ? 12 : 11,
       held, waiting: 'exact-head CI is still running', mergeSha: null, pullNumber: 9, invocations: [] }], next: null, runtime: [] } })
   })
   await page.goto('/')

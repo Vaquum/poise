@@ -900,6 +900,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           // absence: a never-run kind cannot cause a whole-history walk.
           const accounts = getOrganizations()
           const triggers: Array<[string, string]> = [
+            ['implement_issue', 'poise:behavior-chain'],
+            ['repair_pr', 'poise:behavior-chain'],
             ['pr_review', 'poise:review-new-prs'],
             ['pr_approve', 'poise:approve-prs'],
             ['issue_review', 'poise:review-new-issues'],
@@ -939,6 +941,11 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const evidence = await behaviorEvidence({ failures: runtime.failures, deadLetters: getBehaviorDiagnosticIncidents(snapshot) })
           const owner = [getSettings().me, agentAccount()].filter(Boolean).join(' / ') || null
           return json(res, 200, {
+            ...Object.fromEntries((['implement-issues', 'repair-prs'] as const).map((key) => [key, {
+              ...pauseState(key), owner: getSettings().me || null, enabled: enabled[key],
+              setting: null, reviewers: null, scratchpad: scratch[key],
+              lastTriggered: lastFor(key === 'implement-issues' ? 'implement_issue' : 'repair_pr', 'poise:behavior-chain'),
+            }])),
             'review-new-prs': {
               ...pauseState('review-new-prs'),
               owner,
