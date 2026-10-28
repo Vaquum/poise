@@ -171,13 +171,15 @@ async def run(client: GitHubClient, payload: dict) -> dict:
     if mode == "complete":
         call_id = str(payload.get("invocation_id") or "")
         title, body = str(payload.get("title") or ""), str(payload.get("body") or "")
-        if not expected or not invocation or invocation.group(1) != call_id or not COMMIT.fullmatch(title) or not body.strip():
-            raise ValueError("publication recovery requires the original invocation, exact pushed head and durable metadata")
+        if not expected or not invocation or invocation.group(1) != call_id:
+            raise ValueError("publication recovery requires the original invocation and exact pushed head")
         publication_body(body, target, issue_number)
         if pull is not None:
             pull = await confirmed_pull(client, owner, repo, pull, expected)
             posted = await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=True, head=expected)
             return {**result, "outcome": "published", "reply_receipts": posted}
+        if not COMMIT.fullmatch(title) or any(char in title for char in "\r\n") or not body.strip():
+            raise ValueError("PR creation recovery requires its original Conventional Commit title and body")
         pull = await client.post(f"/repos/{target}/pulls", json={"title": title, "body": f"{body}\n\nCloses #{issue_number}\n\n{marker}",
                                                                  "head": branch, "base": default_branch, "draft": False})
         return {**result, "outcome": "published", "pull_number": pull["number"], "url": pull["html_url"]}

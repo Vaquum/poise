@@ -41,7 +41,7 @@ class ReviewReplyReceipts(IsolatedAsyncioTestCase):
         self.assertEqual(read.await_count, 5)
         client.post.assert_not_awaited()
 
-    async def test_existing_pr_completion_posts_only_the_original_head_and_planned_reply(self):
+    async def test_existing_pr_completion_posts_the_original_reply_without_using_the_unused_repair_title(self):
         client = AsyncMock()
         head = "b" * 40
         pull = {"number": 3, "state": "open", "head": {"ref": "poise/issue-7", "sha": head, "repo": {"full_name": "example/repo"}},
@@ -53,7 +53,7 @@ class ReviewReplyReceipts(IsolatedAsyncioTestCase):
         client.post.return_value = {"id": 18}
         with patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
             result = await run(client, {"repository": "example/repo", "token_user": "author", "issue": 7, "branch": "poise/issue-7",
-                "mode": "complete", "expected_head": head, "invocation_id": CALL, "title": "fix: repair", "body": "Actual repair",
+                "mode": "complete", "expected_head": head, "invocation_id": CALL, "title": "Repair outcomes", "body": "Actual repair",
                 "replies_json": '[{"commentId":17,"body":"Fixed the actual finding."}]'})
         checkpoint.assert_called_once_with(head, start_replies=True)
         self.assertEqual(result["reply_receipts"][0]["comment_id"], 18)
