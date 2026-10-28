@@ -132,6 +132,21 @@ class TestGreyRerun(IsolatedAsyncioTestCase):
         self.assertEqual(self.client.get.await_count, 3)
         self.client.get.assert_any_await('/repos/acme/app/actions/runs/100/attempts/2/jobs', params={'per_page': 100, 'page': 1})
 
+    async def test_uncertain_rerun_inspection_requires_a_later_attempt_and_never_writes(self):
+        for status in ('queued', 'in_progress', 'completed'):
+            with self.subTest(status=status):
+                self.workflow = {**deepcopy(WORKFLOW), 'run_attempt': 3, 'status': status}
+                result = await rerun_grey_ci_if_ready.run(self.client, {**PAYLOAD, 'inspect': True})
+                self.assertEqual((result['outcome'], result['observed_run_attempt']), ('rerun_observed', 3))
+                self.assertEqual(result['workflow_status'], status)
+        self.workflow = deepcopy(WORKFLOW)
+        self.assertEqual((await rerun_grey_ci_if_ready.run(self.client, {**PAYLOAD, 'inspect': True}))['outcome'], 'unconfirmed')
+        for changed in ({'head_sha': 'b' * 40}, {'id': 99}, {'run_attempt': 1}):
+            with self.subTest(changed=changed):
+                self.workflow = {**deepcopy(WORKFLOW), **changed}
+                self.assertEqual((await rerun_grey_ci_if_ready.run(self.client, {**PAYLOAD, 'inspect': True}))['outcome'], 'read_failed')
+        self.client.post.assert_not_awaited()
+
     async def test_failed_green_active_and_skipped_runs_never_rerun(self):
         for fields in [{'conclusion': 'failure'}, {'conclusion': 'success'},
                        {'conclusion': 'skipped'}, {'conclusion': 'neutral'}, {'status': 'in_progress'},

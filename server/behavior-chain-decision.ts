@@ -13,7 +13,8 @@ export interface ChainObservation extends Record<string, unknown> {
   reviewPublication?: { callId: string, complete: boolean, issueRevision: string,
     receipts: Array<{ issue: string, comment_id: number, author: string, url: string | null }> }
   existingPulls: string[]
-  workPublication?: { callId: string, repliesComplete: boolean }
+  workPublication?: { callId: string, repliesComplete: boolean, resumable?: boolean, planSha?: string }
+  greyRecovery?: { invocationId: string, receipt: Record<string, unknown> }
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,
     queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null },

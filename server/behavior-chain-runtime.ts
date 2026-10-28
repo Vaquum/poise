@@ -19,6 +19,7 @@ export interface ChainRuntimeOperations {
   request(chain: BehaviorChain, observation: ChainObservation, decision: Extract<ChainDecision, { kind: 'invoke' }>, id: string): Promise<ChainInvocation['request'] | null>
   launch(invocation: ChainInvocation, onExit: (result?: DetachedProcessExit) => void, allowed: () => boolean): Promise<boolean>
   perform(invocation: ChainInvocation): Promise<Record<string, unknown>>
+  resumePublication(invocation: ChainInvocation, head: string): Promise<Record<string, unknown>>
   wake(): void
 }
 
@@ -191,7 +192,10 @@ export class BehaviorChainRuntime {
         reason: 'native invocation ended without proof that its worker resources were released' })
     }
     if (call.status === 'failed' && call.action !== 'not_started' && ['implement-issue', 'repair-pr', 'review-issue', 'review-pr', 'approve-pr'].includes(invocation.behavior)) {
-      if (invocation.state === 'uncertain' && invocation.evidence?.callId === call.id) return chain
+      if (invocation.state === 'uncertain' && invocation.evidence?.callId === call.id) {
+        return chainBasis(invocation.evidence.artifact ?? null) === chainBasis(call.artifact ?? null) ? chain
+          : this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id, evidence: { artifact: call.artifact ?? null } })
+      }
       this.operations.received(invocation, call)
       if (['stopped', 'stopping'].includes(call.error_code || '') && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: `behavior invocation ${invocation.id} was stopped by the person` })
       chain = this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id, evidence: { ...receipt(call), callId: call.id } })
@@ -257,6 +261,24 @@ export class BehaviorChainRuntime {
       }
     }
     if (resourcesSettled && invocation.state === 'uncertain' && typeof nativeId === 'string'
+      && invocation.behavior === 'repair-pr' && observation.workPublication?.callId === nativeId
+      && !observation.workPublication.repliesComplete && observation.workPublication.resumable
+      && nativeId === observation.publication.head_invocation && observation.publication.head_sha
+      && this.allowed(chain, invocation)) {
+      const current = this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id,
+        evidence: { publicationResume: { callId: nativeId, head: observation.publication.head_sha, plan: observation.workPublication.planSha } } })
+      try {
+        await this.operations.resumePublication(current.invocations.find((item) => item.id === invocation.id)!, observation.publication.head_sha)
+        this.operations.wake()
+      } catch (error) {
+        this.append(this.current(chain), { type: 'invocation.reconciled', invocationId: invocation.id,
+          evidence: { publicationResumeError: String(error) } })
+      }
+      // A subsequent read verifies every actual reply, including when this
+      // completion response was lost. It never admits a replacement worker.
+      return
+    }
+    if (resourcesSettled && invocation.state === 'uncertain' && typeof nativeId === 'string'
       && (invocation.behavior !== 'repair-pr' || (observation.workPublication?.callId === nativeId && observation.workPublication.repliesComplete))
       && nativeId === observation.publication.head_invocation && observation.publication.head_sha) {
       const outcome = observation.publication.pull_number ? 'published' : 'publication_incomplete'
@@ -269,6 +291,11 @@ export class BehaviorChainRuntime {
     if (invocation.request.command === 'github-interface') {
       const pull = observation.pull
       let evidence: Record<string, unknown> | null = null
+      if (invocation.behavior === 'rerun-grey-ci' && observation.greyRecovery?.invocationId === invocation.id
+        && ['rerun_observed', 'superseded'].includes(String(observation.greyRecovery.receipt.outcome))) {
+        evidence = { ...observation.greyRecovery.receipt,
+          status: observation.greyRecovery.receipt.outcome === 'superseded' ? 'deferred' : 'completed' }
+      }
       if (invocation.behavior === 'publish-issue' && observation.publication.pull_number) evidence = { outcome: 'published', ...observation.publication }
       if (invocation.behavior === 'merge-pr' && pull?.merged && pull.mergeSha) evidence = { outcome: 'merged', merged: true, merge_sha: pull.mergeSha, head_sha: pull.head }
       if (invocation.behavior === 'merge-pr' && pull?.queueEntry) evidence = { outcome: 'in_queue', queue_entry_id: pull.queueEntry, head_sha: pull.head }

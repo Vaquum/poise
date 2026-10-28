@@ -25,6 +25,13 @@ are runnable, with each package's version from its `pyproject.toml`. The
 production server does not start without it, and `npm run install:production`
 builds the same virtualenv in the production checkout.
 
+The [behavior chain](../docs/Behavior-chain.md) drives atomic implementation
+and repair through `agent-interface --atomic-work`, with publication through
+`github-interface --issue-work`. Its internal `--complete-atomic-publication
+CALL_ID PLAN_SHA HEAD_SHA` continuation accepts only an original failed repair
+whose immutable plan, pushed head, unattempted replies and released worker
+resources are proven. It starts no model and cannot replace that plan.
+
 ## Accounts
 
 No GitHub account is fixed in Caller. Each `github-interface` behavior acts as
@@ -173,6 +180,11 @@ A failure, timeout, active or unknown job refuses recovery. Outcomes are
 `rerun_requested`, `not_ready`, `superseded` and `read_failed`; the successful outcome means
 GitHub accepted a request, not that CI passed. Writes are never blindly retried.
 Poise owns the persistent once-per-workflow/head/event intent and ambiguity hold.
+The same command with `--inspect` is read-only: an actual later attempt of the
+original workflow on the original head returns `rerun_observed`. An unchanged
+attempt is `unconfirmed`; neither absence nor a different workflow settles a
+lost response. This inspection lets managed chains recover an accepted rerun
+without posting another one.
 
 Grey CI recovery intents are shared by repository, workflow, event and head,
 independent of PR number or changes to the acting account. Intent is persisted

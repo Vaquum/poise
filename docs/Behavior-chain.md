@@ -30,9 +30,29 @@ The chain intentionally does not use the legacy approval-round escape that files
 
 Native Call rows and immutable action plans record effect intent before controlled publication. They provide execution evidence to the journal, not a second phase controller. Unique native correlations prevent duplicate processes from executing the same admission. Worker resource settlement is required before a handoff; a terminal model result is insufficient. A restart or interrupted process is reconciled against the original invocation, pushed branch, posted comments and exact-head review receipts.
 
+The publication primitive validates the checkout and model-written metadata in
+read-only mode before Caller records its write intent. Invalid commit subjects,
+PR titles, issue-closing references or reply targets fail as unstarted work,
+rather than becoming ambiguous writes that never occurred.
+
 Durable model admissions use the existing semaphore's behavior-lane ceiling, including its interactive reserve. A fresh server process cannot fill that reserve with another background invocation merely because surviving workers hold no slots in its new in-memory semaphore. Existing work above a lowered ceiling finishes normally while new admissions wait. The journal's capacity check also precedes provider preparation, so waiting work cannot consume a provider recovery probe without launching; admission still rechecks capacity transactionally afterward.
 
 Known failures before publication retry with bounded backoff and existing provider fallback. Ambiguous writes retain ownership. Confirmed actual artifacts can settle a lost response; missing receipts cannot justify another write. Partially published review/reply plans that cannot be fully reconciled remain uncertain and visible. They are not silently retried or reported successful. This limitation must be exercised and resolved if encountered in the real validation runs.
+
+A repair push checkpoints its exact native head before bounded PR-head
+confirmation. If GitHub's PR projection still trails the push, the existing
+reconciliation pass can complete the original immutable reply plan once the
+head is confirmed and worker resources have settled. The canonical journal
+records this continuation before Caller acts; no replacement model starts.
+Caller reserves the reply batch before its first POST. A lost or partial
+reply POST remains uncertain unless every original reply is found on GitHub;
+absence never authorizes another POST. Older receipts without an explicit
+unattempted checkpoint do not acquire this recovery authority.
+
+An uncertain grey-CI rerun is inspected through the existing native command in
+read-only mode. A later attempt of that exact workflow/head settles its original
+admission; an unchanged attempt remains uncertain. A confirmed preflight read
+failure is a failed, unstarted action and retries with the existing backoff.
 
 ## Acceptance boundary
 

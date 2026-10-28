@@ -172,12 +172,28 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         if (!Array.isArray(replies)) throw new Error('repair publication plan contains invalid replies')
         const inspected = await github(chain.repository, ['--issue-work', issueRef, '--mode', 'inspect', '--branch', chain.branch,
           '--invocation-id', String(interruptedWork.evidence!.callId), '--replies-json', JSON.stringify(replies), ...actor])
-        observation.workPublication = { callId: String(interruptedWork.evidence!.callId), repliesComplete: !replies.length || inspected.replies_complete === true }
+        observation.workPublication = { callId: String(interruptedWork.evidence!.callId), repliesComplete: !replies.length || inspected.replies_complete === true,
+          resumable: artifact.replies_started === false && artifact.publication_head === observation.publication.head_sha,
+          planSha: String(artifact.plan_sha) }
       }
       const reviewer = ['--token-user', chain.reviewer]
       const state = await github(chain.repository, ['--pull-action-state', String(number), '--queue-evidence', ...reviewer])
       if (state.pull_number !== number || !['open', 'closed'].includes(String(state.state))) throw new Error('native pull state is incomplete')
       const head = sha(state.head_sha, 'pull state')
+      const uncertainGrey = chain.invocations.find((invocation) => invocation.behavior === 'rerun-grey-ci' && invocation.state === 'uncertain')
+      if (uncertainGrey) {
+        const argv = uncertainGrey.request.argv
+        const runId = positive(Number(argv[argv.indexOf('--run-id') + 1]), 'admitted grey workflow')
+        const attempt = positive(Number(argv[argv.indexOf('--run-attempt') + 1]), 'admitted grey attempt')
+        const expected = sha(argv[argv.indexOf('--expected-head') + 1], 'admitted grey head')
+        const receipt = await github(chain.repository, ['--rerun-grey-ci-if-ready', String(number), '--inspect',
+          '--run-id', String(runId), '--run-attempt', String(attempt), '--expected-head', expected, '--author', chain.author,
+          '--token-user', chain.reviewer])
+        if (receipt.pull_number !== number || receipt.head_sha !== expected || receipt.run_id !== runId || receipt.run_attempt !== attempt
+          || !['rerun_observed', 'superseded', 'unconfirmed'].includes(String(receipt.outcome))) throw new Error(`grey CI recovery evidence is invalid: ${String(receipt.error || receipt.outcome)}`)
+        if (receipt.outcome === 'rerun_observed' && positive(receipt.observed_run_attempt, 'observed grey attempt') <= attempt) throw new Error('grey CI recovery did not advance its actual attempt')
+        observation.greyRecovery = { invocationId: uncertainGrey.id, receipt }
+      }
       const prior = chain.observation as ChainObservation | null
       const headSince = prior?.pull?.head === head ? prior.pull.headSince : Date.now()
       if (state.merged === true) {
@@ -287,9 +303,18 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     async perform(invocation) {
       const { stdout } = await runFile('github-interface', invocation.request.argv, { cwd: invocation.request.cwd, timeoutMs: 30_000, maxOutputBytes: 256 * 1024 })
       const evidence = object(JSON.parse(stdout), 'native behavior action')
+      if (evidence.outcome === 'read_failed') return { ...evidence, status: 'failed', action: 'not_started', completedAt: Date.now() }
       const deferred = ['not_ready', 'superseded'].includes(String(evidence.outcome))
         || (invocation.behavior === 'resolve-threads' && evidence.ready_except_conversations !== true)
       return deferred ? { ...evidence, status: 'deferred', action: 'not_started', completedAt: Date.now() } : evidence
+    },
+    async resumePublication(invocation, head) {
+      const callId = invocation.evidence?.callId
+      const artifact = object(invocation.evidence?.artifact, 'repair publication receipt')
+      if (typeof callId !== 'string' || !/^[0-9a-f]{32}$/.test(callId) || typeof artifact.plan_sha !== 'string') throw new Error('repair lacks its original native publication identity')
+      const { stdout } = await runFile('agent-interface', ['--complete-atomic-publication', callId, artifact.plan_sha, head],
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 256 * 1024 })
+      return object(JSON.parse(stdout), 'native repair publication completion')
     },
   }
 }

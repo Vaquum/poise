@@ -190,7 +190,7 @@ describe('native admission and recovery', () => {
       ownsRepository: () => true, observe: async () => ({ ...observation(), checkedAt: Date.now() }),
       readInvocations: async () => ({ entries: [], quarantined: [] }), received: () => {}, available: () => true, capacity: () => 2,
       permitted: () => true, request: async () => ({ command: 'agent-interface', argv: ['--model', 'fixture-model'], cwd: '/fixture' }),
-      launch: async () => true, perform: async () => ({}), wake: () => {}, ...overrides }
+      launch: async () => true, perform: async () => ({}), resumePublication: async () => { throw new Error('unexpected publication resume') }, wake: () => {}, ...overrides }
   }
 
   it('reconciles and advances admitted work while intake failure remains visible', async () => {
@@ -314,6 +314,60 @@ describe('native admission and recovery', () => {
     await runtime.run()
     expect(launches).toBe(0)
     expect(journal.read(chain.id)!.invocations[0].state).toBe('uncertain')
+  })
+
+  it('settles a lost grey-CI response from its later native attempt without issuing another rerun', async () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    const pending = invocation('uncertain-grey', 'rerun-grey-ci', 'attempt-2', null)
+    pending.model = null
+    pending.request = { command: 'github-interface', cwd: '/interface', argv: ['--rerun-grey-ci-if-ready', '21',
+      '--run-id', '100', '--run-attempt', '2', '--expected-head', HEAD] }
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: pending })
+    current = record(journal, current, { type: 'invocation.uncertain', invocationId: pending.id, reason: 'HTTP response lost' })
+    let writes = 0
+    const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => ({ ...obs, checkedAt: Date.now() }),
+      perform: async () => { writes++; return {} } }))
+    obs.greyRecovery = { invocationId: pending.id, receipt: { outcome: 'unconfirmed' } }
+    await runtime.run()
+    expect(journal.read(chain.id)!.invocations[0].state).toBe('uncertain')
+    obs.greyRecovery.receipt = { outcome: 'rerun_observed', run_id: 100, run_attempt: 2, observed_run_attempt: 3, head_sha: HEAD }
+    await runtime.run()
+    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'settled', outcome: 'rerun_observed' })
+    expect(writes).toBe(0)
+  })
+
+  it('resumes only provably unattempted repair replies under the original admission and verifies their actual outcome', async () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    const pending = invocation('original-repair', 'repair-pr', 'findings')
+    record(journal, chain, { type: 'invocation.admitted', invocation: pending })
+    const callId = 'a'.repeat(32)
+    const call: LogEntry = { id: callId, correlation_id: pending.id, source: 'poise:behavior-chain', actor: 'author', repo: 'Example/Repo', behavior: 'repair_pr',
+      status: 'failed', action: null, outcome: null, resources_settled_at: new Date(NOW).toISOString(),
+      pr_id: '21', model: 'fixture-model', session_id: null, prompt: '', started_at: new Date(NOW).toISOString(), time_elapsed: '1s',
+      head_sha: null, expected_head: HEAD, response: null, error: 'PR head confirmation timed out',
+      artifact: { phase: 'publishing', plan_sha: 'b'.repeat(64) } }
+    obs.publication.head_invocation = callId
+    obs.workPublication = { callId, repliesComplete: false, resumable: true, planSha: 'b'.repeat(64) }
+    let resumed = 0
+    const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => ({ ...obs, checkedAt: Date.now() }),
+      readInvocations: async () => ({ entries: [call], quarantined: [] }), resumePublication: async (original, head) => {
+        expect(original.id).toBe(pending.id)
+        expect(head).toBe(HEAD)
+        expect(journal.read(chain.id)!.invocations[0].evidence).toMatchObject({ publicationResume: { callId, head: HEAD } })
+        resumed++; throw new Error('completion response lost')
+      }, launch: async () => { throw new Error('must not launch a replacement worker') } }))
+    await runtime.run()
+    expect(resumed).toBe(1)
+    expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+    expect(journal.read(chain.id)!.invocations[0].state).toBe('uncertain')
+    obs.workPublication.resumable = false
+    call.artifact = { ...call.artifact, replies_started: true }
+    await runtime.run()
+    expect(resumed).toBe(1)
+    expect(journal.read(chain.id)!.invocations[0].evidence?.artifact).toMatchObject({ replies_started: true })
+    obs.workPublication.repliesComplete = true
+    await runtime.run()
+    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'settled', callId, outcome: 'published' })
   })
 
   it('bounds active model admissions transactionally and excludes completed history', () => {

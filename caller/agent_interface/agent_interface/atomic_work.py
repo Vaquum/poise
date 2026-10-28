@@ -94,12 +94,18 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             lease.acquire(checkout_lock.ACQUIRE_WAIT_SECONDS)
             if expected_issue_revision and issue_review.revision(issue_review._issue(repo, number, actor)) != expected_issue_revision:
                 raise ValueError("seed issue changed during implementation/repair; no publication attempted")
+            publication_args = ["--issue-work", *common, "--path", str(checkout),
+                                "--starting-head", prepared["checkout_head"], "--message", publication["commitMessage"],
+                                "--title", publication["title"], "--body", publication["body"], "--replies-json", json.dumps(replies)]
+            validated = issue_review.interface(*publication_args, "--mode", "validate", seconds=120)
+            if validated.get("outcome") == "superseded":
+                return validated
+            if validated.get("outcome") != "validated":
+                raise ValueError("publication validation returned no confirmation; no publication attempted")
             receipt = {"phase": "publishing", "prepared": prepared, "publication": publication}
             record(receipt)
             progress.stage("publishing", "Publishing the verified checkout through github-interface")
-            published = issue_review.interface("--issue-work", *common, "--mode", "publish", "--path", str(checkout),
-                                               "--starting-head", prepared["checkout_head"], "--message", publication["commitMessage"],
-                                               "--title", publication["title"], "--body", publication["body"], "--replies-json", json.dumps(replies), seconds=120)
+            published = issue_review.interface(*publication_args, "--mode", "publish", seconds=120)
             record({**receipt, "phase": "published", "result": published})
             return published
         finally:

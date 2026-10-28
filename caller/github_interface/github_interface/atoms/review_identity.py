@@ -12,6 +12,13 @@ def invocation_body(body: str, head: str) -> str:
     return begin_submission(body, head)
 
 
+def work_publication(head: str, *, start_replies: bool = False) -> None:
+    if not os.environ.get("AGENT_INTERFACE_RECEIPT_DB") and not os.environ.get("AGENT_INTERFACE_RECEIPT_CALL"):
+        return
+    from agent_interface.review_receipt import work_publication as checkpoint
+    checkpoint(head, start_replies=start_replies)
+
+
 def require_other_author(pull: dict, actor: str) -> None:
     author = str((pull.get("user") or {}).get("login") or "")
     if not author:

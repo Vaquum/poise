@@ -20,7 +20,7 @@ behaviors:
   --read-failing-ci-log LOG_ID
   --checkout-pr-head PR
   --commit-work PR --message MESSAGE
-  --issue-work ISSUE --mode prepare|publish|inspect --branch BRANCH --token-user USER [--repository OWNER/REPO]
+  --issue-work ISSUE --mode prepare|validate|publish|complete|inspect --branch BRANCH --token-user USER [--repository OWNER/REPO]
   --list-test-files
   --read-file PATH
   --write-file PATH --content CONTENT
@@ -185,7 +185,7 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
 def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--issue-work":
         parser = argparse.ArgumentParser(prog="github-interface --issue-work ISSUE")
-        parser.add_argument("--mode", required=True, choices=("prepare", "publish", "inspect", "complete"))
+        parser.add_argument("--mode", required=True, choices=("prepare", "validate", "publish", "inspect", "complete"))
         parser.add_argument("--branch", required=True)
         parser.add_argument("--path")
         parser.add_argument("--pull-number", type=int)
@@ -278,6 +278,8 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior == "--rerun-grey-ci-if-ready":
         parser = argparse.ArgumentParser(prog="github-interface --rerun-grey-ci-if-ready PR")
+        parser.add_argument("--inspect", action="store_true", default=argparse.SUPPRESS,
+                            help="read a later attempt as the receipt for an uncertain rerun; never write")
         parser.add_argument("--run-id", type=int, required=True)
         parser.add_argument("--run-attempt", type=int, required=True)
         parser.add_argument("--author", required=True)

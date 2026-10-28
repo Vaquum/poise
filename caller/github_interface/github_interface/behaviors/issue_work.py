@@ -3,6 +3,7 @@
 The branch is the durable artifact identity. Lost responses are inspected,
 never retried by creating a second branch or pull request.
 """
+import asyncio
 import base64
 import json
 import re
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from github_interface.atoms.local import _run, checkout_repo
 from github_interface.atoms.pulls import get_pull
+from github_interface.atoms.review_identity import work_publication
 from github_interface.client import GitHubClient
 from github_interface.context import repository, token_user
 
@@ -26,14 +28,36 @@ def publication_body(body: str, target: str, number: int) -> None:
             raise ValueError("behavior chain publication may close only its seed issue")
 
 
-async def review_replies(client: GitHubClient, target: str, pull: int, actor: str, call_id: str, replies: list, *, publish: bool) -> list:
+def publication_metadata(payload: dict, target: str, number: int, *, creating: bool) -> tuple[str, str, str]:
+    message, title, body = (str(payload.get(key) or "") for key in ("message", "title", "body"))
+    if not COMMIT.fullmatch(message) or any(char in message for char in "\r\n") \
+            or (creating and (not COMMIT.fullmatch(title) or any(char in title for char in "\r\n") or not body.strip())):
+        raise ValueError("publication requires Conventional Commit metadata and a nonempty PR body")
+    publication_body(body, target, number)
+    return message, title, body
+
+
+async def confirmed_pull(client: GitHubClient, owner: str, repo: str, pull: dict, head: str) -> dict:
+    # GitHub's PR projection can trail the just-pushed branch. This bounded
+    # publication confirmation is not another background reader.
+    for delay in (0, .2, .4, .8, 1.6):
+        if (pull.get("head") or {}).get("sha") == head:
+            return pull
+        await asyncio.sleep(delay)
+        pull = await get_pull(client, owner, repo, int(pull["number"]))
+    if (pull.get("head") or {}).get("sha") != head:
+        raise RuntimeError("published branch and pull-request heads disagree; reconcile before retry")
+    return pull
+
+
+async def review_replies(client: GitHubClient, target: str, pull: int, actor: str, call_id: str, replies: list, *, publish: bool, head: str = "") -> list:
     if not replies:
         return []
     if len(replies) > 100 or not re.fullmatch(r"[0-9a-f]{32}", call_id):
         raise ValueError("review replies require a bounded original native publication plan")
     comments = await client.paginate(f"/repos/{target}/pulls/{pull}/comments")
     by_id = {comment["id"]: comment for comment in comments}
-    receipts, used = [], set()
+    receipts, used, reserved = [], set(), False
     for reply in replies:
         if not isinstance(reply, dict) or type(reply.get("commentId")) is not int or not isinstance(reply.get("body"), str) or not reply["body"].strip():
             raise ValueError("review reply requires an actual comment id and a model-written answer")
@@ -49,6 +73,9 @@ async def review_replies(client: GitHubClient, target: str, pull: int, actor: st
         if matching:
             posted = matching[0]
         elif publish:
+            if not reserved:
+                work_publication(head, start_replies=True)
+                reserved = True
             posted = await client.post(f"/repos/{target}/pulls/{pull}/comments/{parent}/replies", json={"body": body})
         else:
             continue
@@ -142,13 +169,15 @@ async def run(client: GitHubClient, payload: dict) -> dict:
     if pull is not None and (pull.get("state") != "open" or pull.get("merged_at")):
         raise ValueError("behavior chain pull request is no longer open")
     if mode == "complete":
-        if pull is not None:
-            return {**result, "outcome": "published"}
         call_id = str(payload.get("invocation_id") or "")
         title, body = str(payload.get("title") or ""), str(payload.get("body") or "")
         if not expected or not invocation or invocation.group(1) != call_id or not COMMIT.fullmatch(title) or not body.strip():
             raise ValueError("publication recovery requires the original invocation, exact pushed head and durable metadata")
         publication_body(body, target, issue_number)
+        if pull is not None:
+            pull = await confirmed_pull(client, owner, repo, pull, expected)
+            posted = await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=True, head=expected)
+            return {**result, "outcome": "published", "reply_receipts": posted}
         pull = await client.post(f"/repos/{target}/pulls", json={"title": title, "body": f"{body}\n\nCloses #{issue_number}\n\n{marker}",
                                                                  "head": branch, "base": default_branch, "draft": False})
         return {**result, "outcome": "published", "pull_number": pull["number"], "url": pull["html_url"]}
@@ -174,17 +203,12 @@ async def run(client: GitHubClient, payload: dict) -> dict:
         return {**result, "outcome": "prepared", "path": str(path),
                 "base_merge_conflicts": conflicts,
                 "checkout_head": _run(["git", "-C", str(path), "rev-parse", "HEAD"], client.token)}
-    if mode != "publish":
-        raise ValueError("issue-work mode must be prepare, publish or inspect")
+    if mode not in {"publish", "validate"}:
+        raise ValueError("issue-work mode must be prepare, validate, publish, complete or inspect")
     if _run(["git", "-C", str(path), "branch", "--show-current"], client.token) != branch \
             or _run(["git", "-C", str(path), "remote", "get-url", "origin"], client.token) != f"https://github.com/{target}.git":
         raise ValueError("publication checkout does not match the behavior chain")
-    message = str(payload.get("message") or "")
-    title = str(payload.get("title") or "")
-    body = str(payload.get("body") or "")
-    if not COMMIT.fullmatch(message) or "\n" in message or (pull is None and (not COMMIT.fullmatch(title) or not body.strip())):
-        raise ValueError("publication requires Conventional Commit metadata and a nonempty PR body")
-    publication_body(body, target, issue_number)
+    message, title, body = publication_metadata(payload, target, issue_number, creating=pull is None)
     starting_head = str(payload.get("starting_head") or "")
     if not SHA.fullmatch(starting_head) or (remote_head is not None and starting_head.lower() != str(remote_head).lower()):
         return {**result, "outcome": "superseded"}
@@ -192,26 +216,29 @@ async def run(client: GitHubClient, payload: dict) -> dict:
     if current_head.lower() != starting_head.lower():
         raise ValueError("worker changed HEAD outside the publication primitive")
     dirty = _run(["git", "-C", str(path), "status", "--porcelain"], client.token)
-    if not dirty:
-        if replies and pull is not None:
-            posted = await review_replies(client, target, int(pull["number"]), actor, str(payload.get("invocation_id") or ""), replies, publish=True)
-            return {**result, "outcome": "no_changes", "reply_receipts": posted}
-        return {**result, "outcome": "no_changes"}
-    _run(["git", "-C", str(path), "add", "-A"], client.token)
     call_id = str(payload.get("invocation_id") or "")
     if not re.fullmatch(r"[0-9a-f]{32}", call_id):
         raise ValueError("publication requires the native invocation id")
+    if mode == "validate":
+        if replies and pull is not None:
+            await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=False)
+        return {**result, "outcome": "validated"}
+    if not dirty:
+        if replies and pull is not None:
+            work_publication(current_head)
+            posted = await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=True, head=current_head)
+            return {**result, "outcome": "no_changes", "reply_receipts": posted}
+        return {**result, "outcome": "no_changes"}
+    _run(["git", "-C", str(path), "add", "-A"], client.token)
     _run(["git", "-C", str(path), "commit", "-m", f"{message}\n\nPoise-Invocation: {call_id}"], client.token)
     head = _run(["git", "-C", str(path), "rev-parse", "HEAD"], client.token)
+    work_publication(head)
     basic = base64.b64encode(f"x-access-token:{client.token}".encode()).decode()
     _run(["git", "-C", str(path), "-c", f"http.extraHeader=Authorization: Basic {basic}",
           "push", "origin", f"HEAD:refs/heads/{branch}"], client.token, basic)
     if pull is None:
         pull = await client.post(f"/repos/{target}/pulls", json={"title": title, "body": f"{body}\n\nCloses #{issue_number}\n\n{marker}",
                                                                  "head": branch, "base": default_branch, "draft": False})
-    if (pull.get("head") or {}).get("sha") != head:
-        pull = await get_pull(client, owner, repo, int(pull["number"]))
-    if (pull.get("head") or {}).get("sha") != head:
-        raise RuntimeError("published branch and pull-request heads disagree; reconcile before retry")
-    posted = await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=True)
+    pull = await confirmed_pull(client, owner, repo, pull, head)
+    posted = await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=True, head=head)
     return {**result, "outcome": "published", "head_sha": head, "head_invocation": call_id, "pull_number": pull["number"], "url": pull["html_url"], "reply_receipts": posted}

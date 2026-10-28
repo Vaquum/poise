@@ -1046,6 +1046,32 @@ def read_action_plan(call_id: str) -> dict:
     return {"id": call_id, "sha": hashlib.sha256(encoded.encode()).hexdigest(), "plan": json.loads(encoded)}
 
 
+def complete_atomic_publication(call_id: str, digest: str, head: str) -> dict:
+    """Finish only the original repair's provably unattempted reply batch."""
+    plan = read_action_plan(call_id)
+    with db() as conn:
+        row = conn.execute("select * from calls where id=?", (call_id,)).fetchone()
+    artifact = json.loads(row["artifact"] or "{}") if row else {}
+    prepared = artifact.get("prepared") or {}
+    if not row or row["source"] != "poise:behavior-chain" or row["behavior"] != "repair_pr" \
+            or row["status"] != "failed" or row["error_code"] in {"stopping", "stopped"} \
+            or row["resources_settled_at"] is None or artifact.get("resource_error") \
+            or plan["sha"] != digest or artifact.get("plan_sha") != digest or plan["plan"].get("kind") != "atomic_work" \
+            or artifact.get("phase") != "publishing" or artifact.get("publication_head") != head \
+            or artifact.get("replies_started") is not False or not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise ValueError("repair publication lacks its original unattempted, resource-settled receipt")
+    if prepared.get("repository") != row["repo"] or str(prepared.get("pull_number")) != row["pr_id"] \
+            or prepared.get("actor") != row["actor"]:
+        raise ValueError("repair publication target differs from its original native Call")
+    publication = plan["plan"]["publication"]
+    with review_receipt.invocation_environment(DB, call_id, True, initialize=False):
+        return issue_review.interface("--issue-work", str(prepared["issue_number"]), "--repository", row["repo"],
+                                      "--mode", "complete", "--branch", prepared["branch"], "--pull-number", str(prepared["pull_number"]),
+                                      "--expected-head", head, "--invocation-id", call_id, "--token-user", row["actor"],
+                                      "--title", publication["title"], "--body", publication["body"],
+                                      "--replies-json", json.dumps(publication.get("replies", [])), seconds=25)
+
+
 def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
     # These durable phases precede the controlled GitHub publication path.
     # An admitted/submitting request is deliberately excluded even when its
@@ -2014,6 +2040,7 @@ behaviors:
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--note TEXT]
   --atomic-work OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID --branch BRANCH [--pull-number N --expected-head SHA] [--merge-base] [--expected-issue-revision SHA256] [--note TEXT]
   --read-action-plan CALL_ID
+  --complete-atomic-publication CALL_ID PLAN_SHA HEAD_SHA
   --author-content TOPIC [--session-id ID] [--pwd DIR] [--voice-guide PATH]
   --debate TOPIC [--rounds N]
   --record-turn start --model MODEL --session ID --source SOURCE [--repo OWNER/NAME --pr N] [--correlation-id ID]
@@ -2134,6 +2161,9 @@ def _main():
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--read-action-plan":
         print(json.dumps(read_action_plan(sys.argv[2]), ensure_ascii=False))
+        return
+    if len(sys.argv) == 5 and sys.argv[1] == "--complete-atomic-publication":
+        print(json.dumps(complete_atomic_publication(*sys.argv[2:]), ensure_ascii=False))
         return
     if len(sys.argv) == 3 and sys.argv[1] == "--stop":
         call_id = sys.argv[2]
