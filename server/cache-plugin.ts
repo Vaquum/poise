@@ -875,8 +875,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const window = parseWindow(query.get('since'), query.get('until'))
           try {
             const snapshot = await fetchAgentLogSnapshot()
-            const error = snapshot.quarantined.length ? 'Some worker logs are unreadable; agent metrics are unavailable.' : null
-            return json(res, 200, readBehaviorMetrics(snapshot.entries, window, error))
+            return json(res, 200, readBehaviorMetrics(snapshot.entries, window, null, snapshot.quarantined))
           } catch (error) {
             return json(res, 200, readBehaviorMetrics([], window, error instanceof Error ? error.message : String(error)))
           }

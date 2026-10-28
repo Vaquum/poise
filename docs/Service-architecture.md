@@ -826,6 +826,11 @@ Poise Link while it is unfinished.
 
 ## Behaviors
 
+Behavior run metrics reuse the existing Caller snapshot and direct-run ledger.
+Optional quarantine source/start hints limit reporting uncertainty; they never
+change execution or replay authority. [Run analytics](Behavior-Contract.md#run-analytics)
+defines historical diagnostic compatibility and scoped metric availability.
+
 The notification rail lists Behaviors' diagnostics: red Poise faults, amber
 conditions that need the person and folded grey automatic recovery, with grouped
 target/cause details ([Notifications](Notifications.md)).
