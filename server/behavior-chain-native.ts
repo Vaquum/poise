@@ -194,6 +194,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         || !Array.isArray(state.my_reviews) || typeof readiness.draft !== 'boolean' || typeof readiness.reviewer_approved_current_head !== 'boolean'
         || !Number.isSafeInteger(readiness.unresolved_live_conversation_count) || Number(readiness.unresolved_live_conversation_count) < 0
         || typeof readiness.green !== 'boolean' || typeof state.merged !== 'boolean'
+        || !Array.isArray(readiness.blockers) || readiness.blockers.some((blocker) => typeof blocker !== 'string')
         || (state.queue_entry_id !== null && (typeof state.queue_entry_id !== 'string' || !state.queue_entry_id))
         || !Array.isArray(state.queue_removals)) throw new Error('native PR observations changed head or are incomplete')
       const checks = ci.failing.map((item) => object(item, 'CI check'))
@@ -227,7 +228,9 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         reviewReceipts: reviews.filter((review) => review.state !== 'PENDING').map((review) => ({ id: positive(review.id, 'review'),
           head: sha(review.commit_id, 'review commit'), state: String(review.state), invocation: typeof review.invocation_id === 'string' ? review.invocation_id : null })),
         reviewRevision, greyRuns, pending, failing: failures.map((check) => `${check.name}:${check.conclusion || check.state}`).sort(),
-        conflict: ci.mergeable === false, behind: ci.mergeable_state === 'behind' }
+        // The existing readiness primitive already applies the repository's
+        // queue policy: BEHIND needs a base update only without a merge queue.
+        conflict: ci.mergeable === false, behind: ci.mergeable_state === 'behind' && readiness.blockers.includes('merge_state_not_clean') }
       return observation
     },
     async request(chain, observation, decision, id) {
