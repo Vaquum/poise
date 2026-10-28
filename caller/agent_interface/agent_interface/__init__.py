@@ -1064,7 +1064,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
     repo, number = issue_review.parse(issue)
     actor, source, correlation_id = atoms.actor(actor), atoms.source(source), atoms.correlation_id(correlation_id)
     behavior = "repair_pr" if pull is not None else "implement_issue"
-    id_ = track(spec.identity, note, str(number), repo, actor, behavior,
+    id_ = track(spec.identity, note, str(pull if pull is not None else number), repo, actor, behavior,
                 expected_head=expected_head, source=source, correlation_id=correlation_id)
     run_dir = issue_review.WORK_ROOT.parent / "atomic-work" / id_
     artifact = {"phase": "preparing"}
@@ -2082,6 +2082,8 @@ def main():
                 if behavior:
                     if behavior in {"issue_review", "implement_issue", "repair_pr"}:
                         repository, number = issue_review.parse(sys.argv[2])
+                        if behavior == 'repair_pr':
+                            number = int(required_flag('--pull-number'))
                     else:
                         repository, number = atoms.repo_name(sys.argv[2], flag_value("--pwd")), int(atoms.pr_number(sys.argv[2]))
                     id_ = track(required_flag("--model"), "", str(number), repository, atoms.actor(required_flag("--actor")), behavior,
