@@ -1087,9 +1087,12 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
 
     previous_sigterm = signal.signal(signal.SIGTERM, review_watch_interrupted)
     try:
-        with review_budget.ReviewBudget(issue_review.TIMEOUT_SECONDS), progress.Progress(DB, id_, "preparing_issue", "Preparing an atomic behavior"):
+        with review_budget.ReviewBudget(issue_review.TIMEOUT_SECONDS, cap=issue_review.TIMEOUT_SECONDS), \
+                progress.Progress(DB, id_, "preparing_issue", "Preparing an atomic behavior"), \
+                review_receipt.invocation_environment(DB, id_, source == 'poise:behavior-chain'):
             record(artifact)
-            result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
+            with review_receipt.managed_resources(run_dir):
+                result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
             outcome = result.get("outcome")
             if outcome not in {"published", "no_changes", "superseded"}:
                 raise RuntimeError("atomic behavior returned no publication outcome")
@@ -1106,7 +1109,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
         no_publication = artifact.get("phase") in {"preparing", "prepared", "executing"}
         finish(id_, "failed", error="Stopped by user" if stopped else str(error)[:2000] or INTERRUPTED_ERROR,
-               error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else "atomic_work_failed",
+               error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
                action="not_started" if no_publication else None,
                outcome="preflight_failed" if no_publication else None)
         raise

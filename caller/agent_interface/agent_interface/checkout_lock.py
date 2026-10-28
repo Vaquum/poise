@@ -23,6 +23,9 @@ from threading import Event, Thread, current_thread, main_thread
 from time import monotonic, sleep, time
 from uuid import uuid4
 
+from .provider_progress import ProviderStream
+from .review_watch import RateLimitAbort
+
 LEASE_MS = 90_000
 HEARTBEAT_MS = 20_000
 POLL_SECONDS = 1.0
@@ -373,7 +376,7 @@ def _interrupted(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, timeout: float, input: str = "") -> subprocess.CompletedProcess:
+def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, timeout: float, input: str = "", provider: str | None = None) -> subprocess.CompletedProcess:
     """Run the native writer under the lease. A gate leads a fresh process
     group and starts the agent only after it is registered in the lease and
     told GO over a pipe only we hold; it reports `STARTED` on a second pipe,
@@ -388,6 +391,8 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                  "--status-fd", str(status_w), "--", *args]
     process: subprocess.Popen | None = None
     result: subprocess.CompletedProcess | None = None
+    events = ProviderStream(provider)
+    limited = RateLimitAbort() if provider else None
     with TemporaryFile(mode="w+t") as stdin, TemporaryFile(mode="w+t") as stdout, TemporaryFile(mode="w+t") as stderr:
         stdin.write(input)
         stdin.seek(0)
@@ -407,6 +412,10 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
             lease.start_heartbeat()
             deadline = monotonic() + timeout
             while process.poll() is None:
+                events.read(stdout)
+                if limited:
+                    limited.scan(stdout, stderr)
+                    limited.check(provider, process)
                 if lease.lost.is_set():
                     _stop_group(process)
                     raise LeaseLost(f"checkout lease for {lease.checkout} was taken over; fix-failing-ci agent stopped")
@@ -418,6 +427,7 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                     process.wait(timeout=min(POLL_SECONDS, remaining))
                 except subprocess.TimeoutExpired:
                     continue
+            events.read(stdout, final=True)
             if not _gate_started(status_r):
                 raise RuntimeError("fix-failing-ci worker gate exited before the agent started")
             stdout.seek(0)

@@ -12,7 +12,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import agent_interface
-from agent_interface import checkout_lock, fix_failing_ci
+from agent_interface import checkout_lock, fix_failing_ci, review_budget, review_watch
 from agent_interface.checkout_lock import Lease, LeaseLost, LockBusy, WorkerOrphaned, pgid_alive, pid_alive
 from agent_interface.model_catalog import CATALOG
 
@@ -326,6 +326,19 @@ class TestGate(LockCase):
 
 
 class TestRunGated(LockCase):
+    def test_provider_quota_supervision_stops_the_registered_writer_and_releases_its_lease(self):
+        lease = self.lease().acquire(1)
+        writer = 'print(\'{"type":"error","message":"Reconnecting... 429 Too Many Requests"}\', flush=True)\n' + WRITER
+        with patch.object(review_watch, "RATE_LIMIT_ABORT_SECONDS", 0), \
+                patch("agent_interface.provider_progress.progress.provider_event") as activity, \
+                self.assertRaises(review_budget.ReviewLimitError) as failure:
+            checkout_lock.run_gated(lease, [sys.executable, "-c", writer], cwd=self.checkout, env=None, timeout=30, provider="codex")
+        self.assertEqual(failure.exception.code, "review_provider_error")
+        self.assertTrue(activity.called)
+        self.assertFalse(pgid_alive(self.meta()[1]))
+        self.assertFalse(lease.held)
+        self.assertEqual(self.rows(), [])
+
     def test_registers_the_gate_before_go_and_releases_after_the_group_is_gone(self):
         os.environ["WRITER_TICKS"] = "2"
         lease = self.lease().acquire(1)

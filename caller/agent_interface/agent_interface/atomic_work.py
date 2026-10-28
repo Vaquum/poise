@@ -64,7 +64,8 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         lease.acquire(checkout_lock.ACQUIRE_WAIT_SECONDS)
         try:
             record({"phase": "executing", "prepared": prepared})
-            done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env)
+            progress.stage("waiting_provider", "Waiting for atomic behavior provider", timeout=seconds)
+            done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
             record({"phase": "resources_unknown", "prepared": prepared})
             issue_review.stop_leftovers(work)
             if issue_review._cwd_pids(work, require_complete=True) != []:
