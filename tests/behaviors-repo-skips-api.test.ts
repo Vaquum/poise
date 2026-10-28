@@ -54,6 +54,7 @@ let base = ''
 let database: typeof import('../server/db') | undefined
 let cache: typeof import('../server/cache-plugin') | undefined
 let pulls: Array<Record<string, unknown>> = []
+let agentRows: Array<Record<string, unknown>> = []
 let healthFailure: Error | null = null
 const envKeys = ['POISE_DB', 'POISE_EDITOR_DIR', 'POISE_CHAT_ATTACHMENTS_DIR', 'POISE_LOCK_DIR', 'AGENT_INTERFACE_ROOT', 'POISE_ESPANSO_MATCH_DIR', 'POISE_DATASTORE_DB']
 const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]]))
@@ -62,7 +63,7 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
   const json = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' })
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
   if (command === 'agent-interface' && args[0] === '--logs' && args.includes('--limit')) return json({ rows: [], nextCursor: null, total: 0 })
-  if (command === 'agent-interface' && args[0] === '--logs') return json([])
+  if (command === 'agent-interface' && args[0] === '--logs') return json(agentRows)
   if (command === 'github-datastore' && args[0] === 'health') {
     if (healthFailure) throw healthFailure
     const now = new Date().toISOString()
@@ -118,6 +119,7 @@ beforeEach(async () => {
   delete process.env.POISE_DATASTORE_DB
   pulls = [{ repo: REPO, number: 1, url: `https://github.com/${REPO}/pull/1`, status: 'open', author: 'octocat', draft: 0, updated_at: '2026-07-15T12:00:00Z' }]
   healthFailure = null
+  agentRows = []
   mocks.runFile.mockReset().mockImplementation(cli)
   mocks.spawnDetached.mockReset().mockResolvedValue(undefined)
   vi.resetModules()
@@ -232,6 +234,39 @@ describe('Skip repositories API', () => {
     for (const query of ['since=invalid', 'since=2026-10-17T00:00:00', 'since=2026-10-18T00:00:00Z&until=2026-10-17T00:00:00Z']) {
       expect((await fetch(`${base}/api/behavior-metrics?${query}`)).status).toBe(400)
     }
+  })
+
+  it.each(['provider_execution', 'submitting'])('keeps failed historical %s diagnostics readable through the metrics API', async (phase) => {
+    const pairs = [['review-new-prs', 'pr_review'], ['approve-prs', 'pr_approve'], ['review-new-issues', 'issue_review']] as const
+    agentRows = pairs.map(([key, behavior], index) => ({
+      id: String(index + 1).repeat(32), repo: REPO, pr_id: '1', actor: 'review-bot', model: 'model',
+      behavior, source: `poise:${key}`, session_id: null, prompt: '',
+      started_at: '2026-10-17T10:00:00Z', completed_at: '2026-10-17T10:01:00Z', time_elapsed: '1m',
+      status: 'failed', outcome: null, action: null, head_sha: null, expected_head: HEAD,
+      correlation_id: `original-${index}`, error: 'Review failed',
+      diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase,
+        submission: phase === 'submitting' ? 'uncertain' : 'none',
+        ...(phase === 'provider_execution' ? { stderr: 'codex exited 1' } : {}) },
+    }))
+    const response = await fetch(`${base}/api/behavior-metrics`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ error: null, behaviors: Object.fromEntries(pairs.map(([key]) => [key,
+      { totalRuns: 1, durationMinutes: 1, successRate: 0 }])) })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
+  it('contains unsupported diagnostics to their behavior and period through the metrics API', async () => {
+    agentRows = [{ id: 'a'.repeat(32), repo: REPO, pr_id: '1', actor: 'review-bot', model: 'model',
+      behavior: 'pr_review', source: 'poise:review-new-prs', prompt: '',
+      started_at: '2026-10-17T10:00:00Z', completed_at: '2026-10-17T10:01:00Z', time_elapsed: '1m',
+      status: 'failed', expected_head: HEAD, correlation_id: 'unreadable-call', error: 'Review failed', diagnostic: { version: 2 } }]
+    const all = await fetch(`${base}/api/behavior-metrics`)
+    expect(await all.json()).toMatchObject({ error: expect.stringContaining('unreadable'), behaviors: {
+      'review-new-prs': null, 'approve-prs': { totalRuns: 0 }, 'review-new-issues': { totalRuns: 0 },
+    } })
+    const later = await fetch(`${base}/api/behavior-metrics?since=2026-10-18T00:00:00Z`)
+    expect(await later.json()).toMatchObject({ error: null, behaviors: { 'review-new-prs': { totalRuns: 0 } } })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
 
   it.each(['[broken', JSON.stringify({ at: 'invalid', target: 7 })])('keeps behavior controls readable when merge history is corrupt: %s', async (value) => {

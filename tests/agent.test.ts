@@ -162,6 +162,20 @@ describe('agent log compatibility', () => {
       context: { call_id: 'a'.repeat(32), correlation_id: 'run', exit_code: 128 } })
   })
 
+  it.each(['provider_execution', 'submitting'])('reads a failed run with a historical v1 %s diagnostic', async (phase) => {
+    const diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase,
+      submission: phase === 'submitting' ? 'uncertain' : 'none',
+      ...(phase === 'provider_execution' ? { stderr: 'codex exited 1', exit_code: 1 } : {}) }
+    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow({ status: 'failed', error: 'Review failed',
+      source: 'poise:review-new-prs', expected_head: 'b'.repeat(40), correlation_id: 'original-call', diagnostic })]), stderr: '' })
+    const snapshot = await fetchAgentLogSnapshot()
+    expect(snapshot.quarantined).toEqual([])
+    expect(snapshot.entries).toMatchObject([{ status: 'failed', outcome: null, action: null,
+      diagnostic: { outcome: null, stderr_truncated: null, context: { submission: diagnostic.submission } } }])
+    expect(mocks.runFile).toHaveBeenCalledTimes(1)
+    expect(mocks.runFile.mock.calls[0][1]).toEqual(['--logs'])
+  })
+
   it('keeps a historical unqualified repository row readable', async () => {
     mocks.runFile.mockResolvedValue({
       stdout: JSON.stringify([logRow({ repo: 'legacy-repo' })]),
@@ -246,6 +260,8 @@ describe('agent log quarantine', () => {
       index: 1,
       status: 'completed',
       error: 'agent-interface log row 1 has invalid actor',
+      source: null,
+      startedAt: '2026-07-17T09:00:00.000Z',
       id: 'b'.repeat(32),
       correlationId: 'claim-1',
       repo: 'owner/repo',

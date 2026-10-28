@@ -487,7 +487,7 @@ failure retries with backoff. Errors after the write begins remain held.
 
 Behaviors uses the full table width. Its leading, unlabeled toggle controls
 activation; notification counts occupy the Status column after Behavior.
-The shaded numeric columns show total runs, total elapsed minutes, and the
+The shaded numeric columns show total runs, total elapsed duration, and the
 percentage of finished runs that did not fail. Any time, Today, Yesterday,
 and This week filter all three metrics by run start, using the timezone in
 Settings, independently of Current. These filters do not change settings,
@@ -495,14 +495,23 @@ notifications, or Last triggered. Live runs contribute elapsed time but are
 excluded from success rate; no finished runs shows a dash.
 
 Agent metrics use only automatic runs with the matching behavior and Poise
-source. Missing or quarantined logs show unavailable metrics, never zero.
+source. A failed log read withholds agent metrics; a quarantined row withholds
+only the behavior and start-time window it could affect. Missing provenance
+stays conservative, and conflicting duplicate identities cannot escape through
+contradictory scope hints. Unavailable metrics remain unknown, never zero.
+Historical Caller v1 diagnostics may omit outcome, stderr or truncation facts;
+these read as null, retaining submission uncertainty and the failed lifecycle.
+Present malformed fields and unsupported versions remain quarantined. Diagnostic
+reading grants no new execution or replay authority.
 Resolution, merge, and grey-CI metrics count direct mutation attempts recorded
 in the local run ledger since tracking was introduced; earlier history is
 unavailable. Eligibility checks and resolution polls that change no conversations
 are excluded. Safe no-write merge/rerun receipts count as successful executions;
 errors count as failures. A direct run whose owner died without finishing
 closes as interrupted with its completion unknown: it stays out of the
-success rate and its duration stays unknown. Unknown durations show a dash. The ledger uses indexed
+success rate and its duration stays unknown. Durations use explicit units, such
+as `6s`, `8m 30s` or `4h`; a known zero is `0s`, and an unknown duration shows a
+dash. The ledger uses indexed
 time windows and cached database aggregates; unchanged refreshes do not scan its
 history. Narrow windows scroll the table without compressing its controls.
 

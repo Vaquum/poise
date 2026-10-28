@@ -18,6 +18,7 @@ import { notificationCountsFor, onNotificationItems, openNotifications } from '.
 import type { ItemGroup } from '../notification-items'
 import { TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
 import type { BehaviorMetricsReport } from '../behavior-metrics'
+import { formatShortDuration } from '../analytics-format'
 
 let viewEl: HTMLElement
 let initialized = false
@@ -34,8 +35,10 @@ function metricCells(key: BehaviorKey): string {
     : 'Automatic runs started in the selected period. Live runs contribute elapsed time; success rate excludes unfinished runs.')
   const format = (value: number | null | undefined, decimals = 0) => value == null ? '—'
     : value.toLocaleString(undefined, { maximumFractionDigits: decimals })
+  const minutes = metrics?.durationMinutes
+  const duration = minutes === 0 ? '0s' : formatShortDuration(minutes == null ? null : minutes * 60_000)
   return `<td class="behavior-metric behavior-metrics-start" title="${escapeHtml(note)}">${format(metrics?.totalRuns)}</td>
-    <td class="behavior-metric" title="${escapeHtml(note)}">${format(metrics?.durationMinutes, 1)}</td>
+    <td class="behavior-metric" title="${escapeHtml(note)}">${duration}</td>
     <td class="behavior-metric" title="${escapeHtml(note)}">${metrics?.successRate == null ? '—' : `${format(metrics.successRate, 1)}%`}</td>`
 }
 
@@ -1048,7 +1051,7 @@ function renderShell(): string {
             <th class="col-memory">Memory</th>
             <th class="col-last">Last triggered</th>
             <th class="col-runs behavior-metric behavior-metrics-start" title="Runs started in the selected period">Total runs</th>
-            <th class="col-duration behavior-metric" title="Total elapsed run duration in minutes">Duration <span class="behavior-unit">(mins)</span></th>
+            <th class="col-duration behavior-metric" title="Total elapsed run duration">Duration</th>
             <th class="col-success behavior-metric" title="Completed runs that did not fail; unfinished runs are excluded">Success <span class="behavior-unit">(%)</span></th>
           </tr>
         </thead>
