@@ -192,6 +192,33 @@ describe('native admission and recovery', () => {
       launch: async () => true, perform: async () => ({}), wake: () => {}, ...overrides }
   }
 
+  it('advances on the completion wake without an empty cursor pass or polling GitHub during a running invocation', async () => {
+    const { journal } = setup()
+    const obs = observation()
+    let running: ChainInvocation | null = null
+    let completed = false
+    let observations = 0
+    const launched: string[] = []
+    const runtime = new BehaviorChainRuntime(journal, operations({
+      observe: async () => { observations++; return { ...obs, checkedAt: Date.now() } },
+      launch: async (invocation) => { launched.push(invocation.behavior); running = invocation; return true },
+      readInvocations: async () => ({ quarantined: [], entries: running ? [{ id: 'a'.repeat(32), correlation_id: running.id,
+        source: 'poise:behavior-chain', repo: 'Example/Repo', actor: 'reviewer', behavior: 'issue_review',
+        status: completed ? 'completed' : 'running', action: completed ? 'commented' : null, outcome: completed ? 'commented' : null,
+        issue_revision: obs.issue.revision, receipts: [{ issue: 'Example/Repo#7', comment_id: 17, author: 'reviewer' }],
+        resources_settled_at: completed ? new Date().toISOString() : null,
+      } as LogEntry] : [] }),
+    }))
+    await runtime.run()
+    expect(launched).toEqual(['review-issue'])
+    await runtime.run()
+    expect(observations).toBe(1)
+    completed = true
+    await runtime.run()
+    expect(launched).toEqual(['review-issue', 'implement-issue'])
+    expect(observations).toBe(2)
+  })
+
   it('commits authority before launch, coalesces duplicate ticks and rechecks controls after preparation', async () => {
     const { journal, chain } = setup()
     let launches = 0
