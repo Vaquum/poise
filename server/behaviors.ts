@@ -6792,7 +6792,7 @@ async function runBehaviorChains(): Promise<void> {
         return behaviorCheckSlots.tryAcquire('behavior')
       },
       available: () => { const available = behaviorCheckSlots.available('behavior'); if (!available) checkSlotRetryPending = true; return available },
-      capacity: () => behaviorCheckSlots.stats().cap,
+      capacity: () => behaviorCheckSlots.laneCapacity('behavior'),
       permitted(chain, decision) {
         if (!tickerStarted || behaviorAbortController?.signal.aborted || !getBehaviorChainSettings().enabled || releaseBackgroundPaused()) return false
         const key = chainBehaviorKey(decision.behavior)

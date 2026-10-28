@@ -75,6 +75,8 @@ describe('shared check slots', () => {
 
   it('drops the reservation at a cap of one so background work cannot deadlock', () => {
     const sem = new CheckSemaphore(() => 1)
+    expect(sem.laneCapacity('behavior')).toBe(1)
+    expect(sem.laneCapacity('background')).toBe(1)
     expect(sem.available('background')).toBe(true)
     const hold = sem.tryAcquire('background')
     expect(hold).not.toBeNull()
@@ -85,11 +87,14 @@ describe('shared check slots', () => {
   it('starts waiters when the cap rises and converges when it falls', async () => {
     let cap = 1
     const sem = new CheckSemaphore(() => cap)
+    expect(sem.laneCapacity('person')).toBe(1)
     const hold = await sem.acquire('person')
     let granted = false
     const waiter = sem.acquire('person').then((release) => { granted = true; return release })
     expect(sem.stats().queued).toBe(1)
     cap = 2
+    expect(sem.laneCapacity('person')).toBe(2)
+    expect(sem.laneCapacity('behavior')).toBe(1)
     sem.grant()
     const release = await waiter
     expect(granted).toBe(true)

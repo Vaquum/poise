@@ -4,6 +4,7 @@ import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, ty
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import type { LogEntry } from '../server/agent-log-parse'
+import { CheckSemaphore } from '../server/check-semaphore'
 
 const NOW = 1_800_000_000_000
 const HEAD = '1'.repeat(40)
@@ -311,5 +312,26 @@ describe('native admission and recovery', () => {
       evidence: { repository: 'Example/Repo', pull_number: 21, merged: true, merge_sha: MERGE } })
     expect(journal.page('', 100, true).map(item => item.id)).toEqual([current.id])
     expect(journal.admitInvocation(other, 'admit-second', invocation('two', 'review-issue', 'revision'), 1)).not.toBeNull()
+  })
+
+  it('preserves the interactive reserve when an empty process adopts three durable behavior invocations', () => {
+    const { db, journal, chain } = setup()
+    const slots = new CheckSemaphore(() => 4)
+    expect(slots.laneCapacity('behavior')).toBe(3)
+    for (const number of [7, 8, 9]) {
+      const current = number === 7 ? chain : journal.append(`example/repo#${number}`, `seed-${number}`, 0,
+        { type: 'chain.admitted', repository: 'Example/Repo', issue: number, branch: `poise/issue-${number}`, author: 'author', reviewer: 'reviewer' }, NOW)
+      expect(journal.admitInvocation(current, `admit-${number}`, invocation(`work-${number}`, 'review-issue', 'revision'), slots.laneCapacity('behavior'))).not.toBeNull()
+    }
+    const restarted = new BehaviorChainJournal(db); restarted.rebuild()
+    const freshSlots = new CheckSemaphore(() => 4)
+    expect(freshSlots.stats().running).toBe(0)
+    const fourth = restarted.append('example/repo#10', 'seed-10', 0,
+      { type: 'chain.admitted', repository: 'Example/Repo', issue: 10, branch: 'poise/issue-10', author: 'author', reviewer: 'reviewer' }, NOW)
+    expect(restarted.admitInvocation(fourth, 'admit-10', invocation('work-10', 'review-issue', 'revision'), freshSlots.laneCapacity('behavior'))).toBeNull()
+    expect(freshSlots.tryAcquire('person')).not.toBeNull()
+    record(restarted, restarted.read(chain.id)!, { type: 'invocation.settled', invocationId: 'work-7', callId: 'native',
+      outcome: 'commented', evidence: { status: 'completed', resources_settled_at: new Date(NOW).toISOString() } })
+    expect(restarted.admitInvocation(fourth, 'admit-10', invocation('work-10', 'review-issue', 'revision'), freshSlots.laneCapacity('behavior'))).not.toBeNull()
   })
 })
