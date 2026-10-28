@@ -72,7 +72,7 @@ const pr = {
 }
 const HEAD_SHA = 'a'.repeat(40)
 const NEXT_HEAD_SHA = 'd'.repeat(40)
-let listedPrs = [pr]
+let listedPrs: Array<typeof pr & { head_ref?: string | null, head_repo?: string | null }> = [pr]
 
 let tempRoot = ''
 let database: typeof import('../server/db') | null = null

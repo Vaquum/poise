@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setImmediate } from 'node:timers/promises'
 import { db, getMeta, setMeta } from '../db'
+import { behaviorChainOwner, behaviorChainOwnsRepository, type ChainPullIdentity } from '../behavior-chain-journal'
 import { HttpError, httpStatus, readJson } from '../http'
 import { runFile } from '../process'
 import { requireAgentAccount } from '../settings'
@@ -1067,7 +1068,29 @@ export class ChatControl {
       }
       return { answered: true, sessionId: target }
     }
-    if (operation === 'bind') return store.bindWork(instance, id, text(command.target, 'target'))
+    if (operation === 'bind') {
+      const target = store.workTarget(text(command.target, 'target'))
+      const knownOwner = behaviorChainOwner(target.repo, target.number, target.kind)
+      if (knownOwner) throw new HttpError(409, `${target.url} is owned by behavior chain ${knownOwner}; a chat cannot take it over`)
+      let identity: ChainPullIdentity | undefined
+      if (target.kind === 'pull' && behaviorChainOwnsRepository(target.repo)) {
+        const org = organizationForRepository(target.repo)
+        if (!org) throw new HttpError(409, 'PR ownership cannot be verified outside a followed organization')
+        let after: { repo: string, number: number } | undefined
+        for (;;) {
+          const page = await (this.options.closingRefs ?? readOpenPrClosingRefs)(org, after)
+          if (!page) throw new HttpError(409, 'PR ownership observations are unavailable')
+          const pr = page.prs.find((pr) => pr.repo.toLowerCase() === target.repo.toLowerCase() && pr.number === target.number)
+          if (pr) { identity = pr; break }
+          if (!page.more) break
+          const last = page.prs.at(-1)
+          if (!last || (after?.repo === last.repo && after.number === last.number)) throw new HttpError(409, 'PR ownership observations did not advance')
+          after = { repo: last.repo, number: last.number }
+        }
+        if (!identity?.headRef || !identity.headRepo) throw new HttpError(409, 'PR branch ownership has not been observed; refresh before binding it')
+      }
+      return store.bindWork(instance, id, target.url, identity)
+    }
     if (operation === 'unbind') { store.unbindWork(instance, id, text(command.target, 'target')); return { released: true } }
     if (operation === 'supervise') {
       if (!Array.isArray(command.sessionIds) || !command.sessionIds.every(s => typeof s === 'string')) throw new HttpError(400, 'sessionIds must be an array of chat IDs')
@@ -1376,7 +1399,7 @@ export class ChatControl {
             continue
           }
           const [session] = union
-          if (session && store.bindWorkAuto(instance, session, url)) bound.add(url)
+          if (session && store.bindWorkAuto(instance, session, url, pr)) bound.add(url)
         }
         const last = listed.prs.at(-1)
         // The (repository, number) cursor always moves; a page that makes

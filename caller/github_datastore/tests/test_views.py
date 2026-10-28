@@ -624,6 +624,33 @@ def pr_with_reviewers(number: int, item_id: int, reviewers: list[dict] | None) -
     return pr
 
 
+class PrBranchIdentityTest(unittest.TestCase):
+    def test_version_4_views_gain_actual_head_identity_without_inventing_missing_legacy_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            current = pr_with_reviewers(2, 101, [])
+            current["pull"]["graphql"].update({"headRefName": "poise/issue-7", "headRepository": {"nameWithOwner": "mikkokotila/Poise"}})
+            legacy = pr_with_reviewers(3, 102, [])
+            with conn:
+                upsert_repo(conn, current["repo"])
+            store_expanded(conn, current)
+            store_expanded(conn, legacy)
+            conn.execute("DROP VIEW prs")
+            conn.execute("CREATE VIEW prs AS SELECT item_id AS pr_ref FROM items WHERE item_type = 'pr'")
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+            init_db(conn)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], VIEW_SCHEMA_VERSION)
+            conn.close()
+            rows = {row["number"]: row for row in json.loads(views.pr(db_path=db_path))}
+            self.assertEqual(rows[2]["head_ref"], "poise/issue-7")
+            self.assertEqual(rows[2]["head_repo"], "mikkokotila/Poise")
+            self.assertIsNone(rows[3]["head_ref"])
+            self.assertIsNone(rows[3]["head_repo"])
+
+
 class RequestedReviewersTest(unittest.TestCase):
     def test_prs_view_returns_the_current_requested_reviewers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,7 +1,7 @@
 import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
-import { behaviorChainJournal, behaviorChainOwner } from './behavior-chain-journal'
+import { behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
@@ -2146,6 +2146,8 @@ async function reconcileBehaviorLaunchClaims(
 
 interface DatastorePr extends PullRequestFacts {
   url: string
+  headRef: string | null
+  headRepo: string | null
 }
 
 interface DatastoreFreshness {
@@ -2362,16 +2364,20 @@ function datastorePr(row: unknown, index: number): DatastorePr {
   const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
   const status = String(value.status || '')
   const updatedAt = String(value.updated_at || '')
+  const headRef = value.head_ref ?? null
+  const headRepo = value.head_repo ?? null
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
     || number < 1
     || draft > 1
     || !['open', 'closed', 'merged'].includes(status)
     || !author
     || !Number.isFinite(Date.parse(updatedAt))
-    || url !== `https://github.com/${repo}/pull/${number}`) {
+    || url !== `https://github.com/${repo}/pull/${number}`
+    || (headRef !== null && (typeof headRef !== 'string' || !headRef))
+    || (headRepo !== null && (typeof headRepo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(headRepo)))) {
     throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
   }
-  return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt }
+  return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt, headRef: headRef as string | null, headRepo: headRepo as string | null }
 }
 
 async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
@@ -2419,13 +2425,18 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
 async function listEligiblePrs(behavior: SkippableBehavior, author: string): Promise<DatastorePr[]> {
   const prs = await listOpenPrsByAuthor(author)
   const policy = pullRequestPolicy(behavior)
-  return prs.filter((pr) => !behaviorChainOwner(pr.repo, pr.number, 'pull') && !pullRequestRefusal(policy, pr.repo, pr.number, pr))
+  return prs.filter((pr) => !chainOwnsPr(pr) && !pullRequestRefusal(policy, pr.repo, pr.number, pr))
+}
+
+function chainOwnsPr(pr: DatastorePr): boolean {
+  if (behaviorChainOwnsRepository(pr.repo) && (!pr.headRef || !pr.headRepo)) throw new Error(`PR ${pr.repo}#${pr.number} lacks complete branch ownership evidence while behavior chains own work in its repository`)
+  return behaviorChainOwner(pr.repo, pr.number, 'pull', pr) !== null
 }
 
 // Read just before a launch: a skip saved, or your account changed, while the
 // launch was being prepared stops it.
 function stillEligible(behavior: SkippableBehavior, pr: DatastorePr, actor?: string): boolean {
-  return !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
+  return !chainOwnsPr(pr) && !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
     && (actor === undefined || configuredReviewer(pr.author).toLowerCase() === actor.toLowerCase())
 }
 
