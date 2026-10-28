@@ -245,7 +245,7 @@ check_browsers() {
   ffmpeg=$(docker exec "$workspace" sh -c 'ls /opt/playwright-browsers/ffmpeg-*/ffmpeg-linux') \
     || fail "no shared ffmpeg under $browsers"
   for binary in "$chrome" "$shell" "$ffmpeg"; do
-    [ "$(printf '%s\n' "$binary" | wc -l)" = 1 ] || fail "several shared browsers match: $binary"
+    [ "$(printf '%s\n' "$binary" | wc -l | tr -d '[:space:]')" = 1 ] || fail "several shared browsers match: $binary"
     docker exec "$workspace" test ! -w "$binary" || fail "$binary is writable"
   done
   docker exec "$workspace" test ! -w "$browsers" || fail "$browsers is writable"
