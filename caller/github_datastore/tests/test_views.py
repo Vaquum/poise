@@ -12,6 +12,18 @@ from tests.test_store import base_expanded
 
 
 class ViewsTest(unittest.TestCase):
+    def test_label_intake_refuses_legacy_missing_observations_instead_of_silently_omitting_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / 'db.sqlite'
+            conn = connect(db_path); init_db(conn)
+            issue = base_expanded('', [])
+            del issue['issue']['labels']
+            with conn:
+                upsert_repo(conn, issue['repo'])
+            store_expanded(conn, issue); conn.close()
+            with self.assertRaisesRegex(RuntimeError, 'label evidence is incomplete'):
+                views.issue(db_path=db_path, label='poise')
+
     def test_label_intake_includes_old_issues_and_drains_stable_pages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "db.sqlite"
