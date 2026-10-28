@@ -128,6 +128,11 @@ export class BehaviorChainRuntime {
             pull_number: observation.pull!.number, merged: true, merge_sha: decision.mergeSha } })
         } else if (decision.kind === 'hold') this.append(chain, { type: 'chain.held', reason: decision.reason })
         else if (decision.kind === 'invoke' && this.operations.enabled() && (!decision.reviewer || this.operations.available()) && this.operations.permitted(chain, decision)) {
+          if (decision.reviewer && !this.journal.modelCapacityAvailable(this.operations.capacity())) {
+            const reason = 'shared native invocation capacity is occupied'
+            if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+            continue
+          }
           const accounts = this.operations.accounts()
           if (accounts.author.toLowerCase() !== chain.author.toLowerCase() || accounts.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()) {
             this.append(chain, { type: 'chain.held', reason: 'configured accounts changed; existing chain ownership needs a decision' })

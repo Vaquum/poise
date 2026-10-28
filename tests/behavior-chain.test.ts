@@ -314,7 +314,7 @@ describe('native admission and recovery', () => {
     expect(journal.admitInvocation(other, 'admit-second', invocation('two', 'review-issue', 'revision'), 1)).not.toBeNull()
   })
 
-  it('preserves the interactive reserve when an empty process adopts three durable behavior invocations', () => {
+  it('preserves the interactive reserve and provider probes when an empty process adopts three durable behavior invocations', async () => {
     const { db, journal, chain } = setup()
     const slots = new CheckSemaphore(() => 4)
     expect(slots.laneCapacity('behavior')).toBe(3)
@@ -330,8 +330,16 @@ describe('native admission and recovery', () => {
       { type: 'chain.admitted', repository: 'Example/Repo', issue: 10, branch: 'poise/issue-10', author: 'author', reviewer: 'reviewer' }, NOW)
     expect(restarted.admitInvocation(fourth, 'admit-10', invocation('work-10', 'review-issue', 'revision'), freshSlots.laneCapacity('behavior'))).toBeNull()
     expect(freshSlots.tryAcquire('person')).not.toBeNull()
+    let prepared = 0
+    const entries = [7, 8, 9].map((number) => ({ id: String(number).repeat(32), correlation_id: `work-${number}`,
+      source: 'poise:behavior-chain', actor: 'reviewer', repo: 'Example/Repo', behavior: 'issue_review', status: 'running' }) as LogEntry)
+    await new BehaviorChainRuntime(restarted, operations({ capacity: () => freshSlots.laneCapacity('behavior'),
+      available: () => freshSlots.available('behavior'), readInvocations: async () => ({ entries, quarantined: [] }),
+      request: async () => { prepared++; return { command: 'agent-interface', argv: ['--model', 'fixture-model'], cwd: '/fixture' } },
+    })).run()
+    expect(prepared).toBe(0)
     record(restarted, restarted.read(chain.id)!, { type: 'invocation.settled', invocationId: 'work-7', callId: 'native',
       outcome: 'commented', evidence: { status: 'completed', resources_settled_at: new Date(NOW).toISOString() } })
-    expect(restarted.admitInvocation(fourth, 'admit-10', invocation('work-10', 'review-issue', 'revision'), freshSlots.laneCapacity('behavior'))).not.toBeNull()
+    expect(restarted.admitInvocation(restarted.read(fourth.id)!, 'admit-10', invocation('work-10', 'review-issue', 'revision'), freshSlots.laneCapacity('behavior'))).not.toBeNull()
   })
 })

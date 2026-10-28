@@ -206,12 +206,17 @@ export class BehaviorChainJournal {
     this.durable()
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('native invocation capacity must be positive')
     return this.db.transaction(() => {
-      const row = this.db.prepare(`SELECT count(*) AS count FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
-        WHERE c.merged = 0 AND json_extract(i.value, '$.state') != 'settled'
-          AND json_type(i.value, '$.model') != 'null' AND json_extract(i.value, '$.evidence.resources_settled_at') IS NULL`).get() as { count: number }
-      if (invocation.model !== null && row.count >= capacity) return null
+      if (invocation.model !== null && !this.modelCapacityAvailable(capacity)) return null
       return this.append(chain.id, eventId, chain.sequence, { type: 'invocation.admitted', invocation })
     }).immediate()
+  }
+
+  modelCapacityAvailable(capacity: number): boolean {
+    if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('native invocation capacity must be positive')
+    const row = this.db.prepare(`SELECT count(*) AS count FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+      WHERE c.merged = 0 AND json_extract(i.value, '$.state') != 'settled'
+        AND json_type(i.value, '$.model') != 'null' AND json_extract(i.value, '$.evidence.resources_settled_at') IS NULL`).get() as { count: number }
+    return row.count < capacity
   }
 
   history(id: string, after = 0, limit = 100): StoredEvent[] {
