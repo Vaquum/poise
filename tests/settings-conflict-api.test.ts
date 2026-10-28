@@ -98,6 +98,18 @@ afterEach(async () => {
 })
 
 describe('a settings save that overwrites another tab', () => {
+  it('keeps chain intake disabled by default and requires an explicit conflict-checked scope', async () => {
+    const initial = await call('GET', '/api/settings')
+    const defaults = { enabled: false, seedMode: 'label', label: 'poise' }
+    expect(initial.body.behaviorChain).toEqual(defaults)
+    const labelMode = { enabled: false, seedMode: 'label', label: 'ready-for-poise' }
+    expect((await call('POST', '/api/settings', { behaviorChain: labelMode, expect: { behaviorChain: defaults } })).status).toBe(200)
+    expect((await call('POST', '/api/settings', { behaviorChain: { ...labelMode, seedMode: 'all' }, expect: { behaviorChain: defaults } })).status).toBe(409)
+    expect((await call('GET', '/api/settings')).body.behaviorChain).toEqual(labelMode)
+    expect((await call('POST', '/api/settings', { behaviorChain: { enabled: true, seedMode: 'all' } })).status).toBeGreaterThanOrEqual(400)
+    expect((await call('GET', '/api/settings')).body.behaviorChain).toEqual(labelMode)
+  })
+
   it('is refused with 409 and the current values, changing nothing', async () => {
     const first = await call('POST', '/api/settings', { timezone: 'Europe/Helsinki' })
     expect(first.status).toBe(200)

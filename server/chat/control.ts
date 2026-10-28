@@ -58,6 +58,7 @@ const APIS = {
   '/api/gh': 'Cached GitHub work: POST with operation=list and record_type=pull_request|issue.',
   '/api/agent-logs': 'Swarm and running agent calls: GET.',
   '/api/behaviors': 'Behavior configuration, health and diagnostics: GET; POST /api/behaviors/<key> to configure.',
+  '/api/behavior-chains': 'Durable behavior chains: GET with optional id and event cursor; POST id, sequence and operation hold|resume. Resume never bypasses an uncertain native receipt.',
   '/api/chat/sessions': 'Chat sessions: GET. Session detail and transcript: /api/chat/sessions/<id>.',
   '/api/editor/docs': 'Editor documents: GET, POST; /api/editor/doc/<slug> reads and writes a document.',
   '/api/snippets': 'Snippets and switches.',
@@ -286,7 +287,7 @@ export async function readWorkTargetStatus(target: store.WorkTarget): Promise<Wo
 export interface ReviewsCursor { reviewAfter: number, commentAfter: number }
 export interface ReviewsObservation {
   page?: ReviewsCursor, hasUnresolved?: boolean,
-  comments?: Array<{ id: string, thread: string, resolved: boolean | null, revision: string }>,
+  comments?: Array<{ id: string, author?: string | null, thread: string, resolved: boolean | null, revision: string }>,
   found: boolean, truncated: boolean,
   reviews: Array<{ id: string, author: string | null, state: string, revision?: string }>,
   threads: Array<{ thread: string | null, resolved: boolean | null, outdated: boolean | null,
@@ -349,7 +350,9 @@ export async function readWorkReviews(target: store.WorkTarget, cursor: ReviewsC
           || !('thread' in comment) || typeof comment.thread !== 'string'
           || !('revision' in comment) || typeof comment.revision !== 'string'
           || !('resolved' in comment) || (comment.resolved !== null && typeof comment.resolved !== 'boolean')) return null
-        comments.push({ id: comment.id, thread: comment.thread, resolved: comment.resolved, revision: comment.revision })
+        if ('author' in comment && comment.author !== null && typeof comment.author !== 'string') return null
+        comments.push({ id: comment.id, author: 'author' in comment ? comment.author as string | null : null,
+          thread: comment.thread, resolved: comment.resolved, revision: comment.revision })
       }
     }
     return { found: value.found, truncated: 'truncated' in value && value.truncated === true, reviews, threads,

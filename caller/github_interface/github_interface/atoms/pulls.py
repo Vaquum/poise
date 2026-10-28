@@ -1,6 +1,7 @@
 from typing import Any
 
 from github_interface.client import GitHubClient
+from github_interface.atoms.review_identity import invocation_body
 
 
 async def get_pull(client: GitHubClient, owner: str, repo: str, pull_number: int) -> dict[str, Any]:
@@ -141,7 +142,7 @@ async def request_changes(
 ) -> dict[str, Any]:
     review: dict[str, Any] = {
         "event": "REQUEST_CHANGES",
-        "body": body,
+        "body": invocation_body(body, commit_id),
         "commit_id": commit_id,
     }
     if comments:
@@ -162,7 +163,7 @@ async def comment_review(
 ) -> dict[str, Any]:
     return await client.post(
         f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
-        json={"event": "COMMENT", "body": body, "commit_id": commit_id},
+        json={"event": "COMMENT", "body": invocation_body(body, commit_id), "commit_id": commit_id},
     )
 
 
@@ -412,9 +413,13 @@ async def approve_pr(
     pull_number: int,
     commit_id: str,
 ) -> dict[str, Any]:
+    body = invocation_body("", commit_id)
+    payload = {"event": "APPROVE", "commit_id": commit_id}
+    if body:
+        payload["body"] = body
     return await client.post(
         f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
-        json={"event": "APPROVE", "commit_id": commit_id},
+        json=payload,
     )
 
 

@@ -10,6 +10,10 @@ class UnknownBehavior(ValueError):
     pass
 
 
+async def issue_work(payload: dict) -> dict:
+    return await run_behavior("issue_work", payload)
+
+
 async def run_behavior(name: str, payload: dict[str, Any]) -> Any:
     if not name.isidentifier() or name.startswith("_"):
         raise UnknownBehavior(name)

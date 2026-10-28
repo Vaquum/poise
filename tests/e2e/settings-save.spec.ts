@@ -90,6 +90,37 @@ test.beforeEach(async ({ page }) => {
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com)\//, (route) => route.abort())
 })
 
+test('chain intake and individual holds use explicit settings and current journal sequences', async ({ page }) => {
+  const defaults = { enabled: false, seedMode: 'label', label: 'poise' }
+  const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: 'reviewer', timezone: 'UTC',
+    chat: { ...CHAT }, models: {}, behaviorChain: defaults })
+  await setupModels(page, state)
+  const controls: unknown[] = []
+  let held: string | null = null
+  await page.route('**/api/behavior-chains', async (route) => {
+    if (route.request().method() === 'POST') {
+      controls.push(route.request().postDataJSON())
+      held = 'New invocations held by the person'
+      return route.fulfill({ json: {} })
+    }
+    return route.fulfill({ json: { chains: [{ id: 'acme/repo#7', repository: 'acme/repo', issue: 7, sequence: held ? 12 : 11,
+      held, waiting: 'exact-head CI is still running', mergeSha: null, pullNumber: 9, invocations: [] }], next: null, runtime: [] } })
+  })
+  await page.goto('/')
+  await openSection(page, 'general')
+  const chain = page.getByRole('region', { name: 'Behavior chain settings' })
+  await expect(chain.getByLabel('Run the issue-to-merge chain')).not.toBeChecked()
+  await expect(chain.getByLabel('Issue label', { exact: true })).toHaveValue('poise')
+  await chain.getByLabel('Seed issues').selectOption('all')
+  await expect(chain.getByLabel('Issue label', { exact: true })).toBeDisabled()
+  await chain.getByRole('button', { name: 'Save chain settings' }).click()
+  await expect.poll(() => state.posts.at(-1)).toEqual({ behaviorChain: { ...defaults, seedMode: 'all' }, expect: { behaviorChain: defaults } })
+  await chain.getByRole('button', { name: 'Refresh chains' }).click()
+  await chain.getByRole('button', { name: 'Hold new invocations' }).click()
+  await expect.poll(() => controls).toEqual([{ id: 'acme/repo#7', sequence: 11, operation: 'hold' }])
+  await expect(chain.getByRole('button', { name: 'Resume', exact: true })).toBeVisible()
+})
+
 test('a models save sends only the edited place and leaves general drafts alone', async ({ page }) => {
   const state = await setupSettings(page, { org: 'acme', me: 'octocat', agentAccount: '', timezone: 'UTC', chat: { ...CHAT }, models: {} })
   await setupModels(page, state)

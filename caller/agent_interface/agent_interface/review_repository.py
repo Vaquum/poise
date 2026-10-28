@@ -112,7 +112,9 @@ def prepare(pwd: str, pr: str, actor: str, head: str, packet: str):
                     if "exceeds its file or byte limit" in message or "guidance exceeds its byte limit" in message else None)
             diagnostic = command_failure(error, "checkout", pwd, limit) if isinstance(error, (OSError, subprocess.TimeoutExpired)) else None
             raise atoms.AgentPreflightError(f"cannot inspect review checkout: {error}", code, diagnostic) from error
-        yield Repository(root, info)
+        from .review_receipt import managed_resources
+        with managed_resources(Path(work)):
+            yield Repository(root, info)
 
 
 @contextmanager

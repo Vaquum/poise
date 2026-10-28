@@ -1,6 +1,8 @@
-# Ten real-worker cycles — 27 October 2026
+# Archived externally dispatched cycles — 27 October 2026
 
-All ten new issues completed through actual issue-review comments, model-written implementations and tests, separate PR review/approval calls, GitHub Actions, the native merge queue and confirmed merges. The complete paginated open-PR list is empty. The final merged test-repository main is `f377b3f9c8779b21d4d45cbc6dcaadf42ed130fd`.
+**Excluded from acceptance.** These runs used an external Python dispatcher, native Chat sessions, phase-control changes and operator interventions. They did not demonstrate a production replica autonomously running a durable chain of atomic behaviors. The earlier validation claim is withdrawn. None of these ten counts toward the ten unattended native-runtime cycles requested by the user.
+
+The historical issues reached actual issue-review comments, model-written implementations and tests, separate PR review/approval calls, GitHub Actions, the native merge queue and confirmed merges under that external orchestration. The paginated open-PR list was empty at the archived observation. The final merged test-repository main was `f377b3f9c8779b21d4d45cbc6dcaadf42ed130fd`.
 
 The final checkout passed **621 tests, zero failures and zero skips**. Independent functional assertions passed for all ten capabilities. These assertions check returned values, errors, ordering, cancellation and input preservation. GitHub queue CI also passed on every actual merge commit below.
 

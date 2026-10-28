@@ -218,10 +218,11 @@ class Lease:
     """Caller's hold on one checkout: acquire with a deadline, register the
     gate, heartbeat from a thread, release only when the worker has settled."""
 
-    def __init__(self, checkout: str, owner_id: str, owner_label: str, branch: str | None = None):
+    def __init__(self, checkout: str, owner_id: str, owner_label: str, branch: str | None = None, *, owner_kind: str = OWNER_KIND):
         self.checkout = canonical(checkout)
         self.owner_id = owner_id
         self.owner_label = owner_label
+        self.owner_kind = owner_kind
         self.branch = branch
         self.token = uuid4().hex
         self.instance = f"caller:{os.getpid()}"
@@ -247,7 +248,7 @@ class Lease:
         conn = connect(self.path)
         try:
             while True:
-                state, row = try_acquire(conn, self.checkout, self.token, OWNER_KIND, self.owner_id,
+                state, row = try_acquire(conn, self.checkout, self.token, self.owner_kind, self.owner_id,
                                          self.owner_label, self.instance, self.branch)
                 if state == "acquired":
                     self.held = True
@@ -372,7 +373,7 @@ def _interrupted(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, timeout: float) -> subprocess.CompletedProcess:
+def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, timeout: float, input: str = "") -> subprocess.CompletedProcess:
     """Run the native writer under the lease. A gate leads a fresh process
     group and starts the agent only after it is registered in the lease and
     told GO over a pipe only we hold; it reports `STARTED` on a second pipe,
@@ -387,10 +388,12 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                  "--status-fd", str(status_w), "--", *args]
     process: subprocess.Popen | None = None
     result: subprocess.CompletedProcess | None = None
-    with TemporaryFile(mode="w+t") as stdout, TemporaryFile(mode="w+t") as stderr:
+    with TemporaryFile(mode="w+t") as stdin, TemporaryFile(mode="w+t") as stdout, TemporaryFile(mode="w+t") as stderr:
+        stdin.write(input)
+        stdin.seek(0)
         try:
             process = subprocess.Popen(
-                gate_args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
+                gate_args, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
                 start_new_session=True, pass_fds=(control_r, status_w),
             )
             os.close(control_r)

@@ -1,4 +1,5 @@
 from typing import Any
+import re
 
 from github_interface.atoms.pulls import get_pr_readiness_state, get_pull, list_reviews
 from github_interface.client import GitHubClient
@@ -42,6 +43,9 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             if login is not None and login.lower() == actor.lower():
                 mine.append({"id": review.get("id"), "state": review.get("state"),
                              "commit_id": review.get("commit_id"), "submitted_at": review.get("submitted_at")})
+                if payload.get("queue_evidence"):
+                    marker = re.search(r"<!-- poise-invocation ([0-9a-f]{32}) -->\s*\Z", review.get("body") or "")
+                    mine[-1]["invocation_id"] = marker.group(1) if marker else None
 
         queue_entry_id = None
         steady = True
@@ -63,6 +67,23 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         if steady:
             break
 
+    queue_evidence = {}
+    if payload.get("queue_evidence") and pull.get("state") == "open":
+        data = await client.graphql("""query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){
+          pullRequest(number:$number){headRefOid timelineItems(last:5,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){
+            nodes{... on RemovedFromMergeQueueEvent{id createdAt reason actor{login} beforeCommit{oid statusCheckRollup{
+              state contexts(first:100){pageInfo{hasNextPage} nodes{__typename
+                ... on CheckRun{name status conclusion detailsUrl}
+                ... on StatusContext{context state targetUrl}
+              }}
+            }}}}
+          }}
+        }}""", {"owner": owner, "repo": repo, "number": number})
+        observed = data["repository"]["pullRequest"]
+        if observed["headRefOid"] != (pull.get("head") or {}).get("sha"):
+            raise RuntimeError("pull-request head changed while reading queue removal evidence")
+        queue_evidence = {"queue_removals": observed["timelineItems"]["nodes"]}
+
     return {
         "action": "pull_action_state",
         "repository": f"{owner}/{repo}",
@@ -75,4 +96,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "merge_sha": pull.get("merge_commit_sha"),
         "queue_entry_id": queue_entry_id,
         "my_reviews": mine,
+        **queue_evidence,
     }

@@ -22,12 +22,12 @@ export interface LogEntry {
   time_elapsed: string
   status: string
   progress?: ModelProgress | null
-  outcome: 'clean' | 'changes_requested' | 'approved' | 'superseded' | 'preflight_failed' | 'commented' | null
+  outcome: 'clean' | 'changes_requested' | 'approved' | 'superseded' | 'preflight_failed' | 'commented' | 'published' | 'no_changes' | null
   head_sha: string | null
   expected_head: string | null
   source: string | null
   correlation_id: string | null
-  action: 'reviewed_clean' | 'requested_changes' | 'approved' | 'not_started' | 'commented' | null
+  action: 'reviewed_clean' | 'requested_changes' | 'approved' | 'not_started' | 'commented' | 'published' | 'no_changes' | null
   response: string | null // upstream 8-char availability marker; read by full `id`
   error: string
   review_policy?: string | null
@@ -43,6 +43,9 @@ export interface LogEntry {
   // comments it knows it posted. A failed run with receipts must never be
   // relaunched on its own — it may already have commented.
   receipts?: IssueCommentReceipt[] | null
+  artifact?: Record<string, unknown> | null
+  resources_settled_at?: string | null
+  issue_revision?: string | null
   // `external` for a Chat turn Poise recorded through `--record-turn`: no
   // Caller process ran, so `--stop` refuses it and Poise routes it to its
   // own runtime.
@@ -201,6 +204,11 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     && outcome === 'preflight_failed'
     && headSha === null
   const issueReview = behavior === ISSUE_REVIEW_BEHAVIOR
+  const atomicWork = behavior === 'implement_issue' || behavior === 'repair_pr'
+  const artifact = row.artifact === null || row.artifact === undefined ? null : row.artifact
+  const managedReview = source === 'poise:behavior-chain' && (behavior === 'pr_review' || behavior === 'pr_approve' || issueReview)
+  if (artifact !== null && ((!atomicWork && !managedReview) || typeof artifact !== 'object' || Array.isArray(artifact)
+    || Buffer.byteLength(JSON.stringify(artifact)) > 128 * 1024)) throw new Error(`agent-interface log row ${index} has an invalid atomic artifact`)
   if (!LOG_CALL_ID.test(id)
     || (prId !== null && !LOG_PR_ID.test(prId))
     || (repo !== null && !LOG_REPO.test(repo))
@@ -209,10 +217,11 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     || !Number.isFinite(Date.parse(startedAt))
     || (startedAtPrecise !== null && !Number.isFinite(Date.parse(startedAtPrecise)))
     || (completedAt !== null && !Number.isFinite(Date.parse(completedAt)))
-    || !['clean', 'changes_requested', 'approved', 'superseded', 'preflight_failed', 'commented', null].includes(outcome)
+    || !['clean', 'changes_requested', 'approved', 'superseded', 'preflight_failed', 'commented', 'published', 'no_changes', null].includes(outcome)
     || (headSha !== null && !/^[0-9a-f]{40}$/.test(headSha))
     || (expectedHead !== null && !/^[0-9a-f]{40}$/.test(expectedHead))
-    || !['reviewed_clean', 'requested_changes', 'approved', 'not_started', 'commented', null].includes(action)
+    || !['reviewed_clean', 'requested_changes', 'approved', 'not_started', 'commented', 'published', 'no_changes', null].includes(action)
+    || ((action === 'published' || action === 'no_changes' || outcome === 'published' || outcome === 'no_changes') && !atomicWork)
     || ((action === 'commented' || outcome === 'commented') && !issueReview)
     || ((action === 'not_started' || outcome === 'preflight_failed') && !preflightFailed)
     || (source !== null && !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(source))
@@ -238,11 +247,11 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     throw new Error(`agent-interface log row ${index} is externally recorded but not a chat turn`)
   }
   if (source?.startsWith('poise:') && !externalChatTurn) {
-    if (!actor || (!expectedHead && !issueReview) || !correlationId || !behavior
+    if (!actor || (!expectedHead && !issueReview && behavior !== 'implement_issue') || !correlationId || !behavior
       || !repo || !/^[^/\s]+\/[^/\s]+$/.test(repo) || !prId) {
       throw new Error(`agent-interface log row ${index} has incomplete Poise provenance`)
     }
-    if (status === 'completed' && (!completedAt || !action || !outcome || (!headSha && !issueReview))) {
+    if (status === 'completed' && (!completedAt || !action || !outcome || (!headSha && !issueReview && !(atomicWork && outcome === 'no_changes')))) {
       throw new Error(`agent-interface log row ${index} has incomplete terminal outcome`)
     }
     if (status === 'failed' && !error) {
@@ -283,6 +292,9 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     review_id: Number.isSafeInteger(row.review_id) && Number(row.review_id) > 0 ? Number(row.review_id) : null,
     review_comments: Number.isSafeInteger(row.review_comments) && Number(row.review_comments) >= 0 ? Number(row.review_comments) : null,
     receipts: parseReceipts(row.receipts),
+    ...(artifact === null ? {} : { artifact: artifact as Record<string, unknown> }),
+    ...(row.resources_settled_at === null || row.resources_settled_at === undefined ? {} : { resources_settled_at: optionalString('resources_settled_at') }),
+    ...(row.issue_revision === null || row.issue_revision === undefined ? {} : { issue_revision: optionalString('issue_revision') }),
     runner: runner as LogEntry['runner'],
   }
 }

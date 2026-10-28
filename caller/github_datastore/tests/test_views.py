@@ -12,6 +12,26 @@ from tests.test_store import base_expanded
 
 
 class ViewsTest(unittest.TestCase):
+    def test_label_intake_includes_old_issues_and_drains_stable_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "db.sqlite"
+            conn = connect(db_path)
+            init_db(conn)
+            original = base_expanded("@mikkokotila", [])
+            with conn:
+                upsert_repo(conn, original["repo"])
+            for number in range(1, 6):
+                issue = base_expanded("@mikkokotila", [])
+                issue["issue"] = dict(issue["issue"], id=100 + number, node_id=f"I_{number}", number=number,
+                                      labels=[{"name": "Poise"}] if number != 3 else [])
+                store_expanded(conn, issue)
+            conn.close()
+            first = json.loads(views.issue(db_path=db_path, label="poise", after_repo="", after_number=0, limit=2))
+            self.assertEqual([row["number"] for row in first], [1, 2])
+            second = json.loads(views.issue(db_path=db_path, label="poise", after_repo=first[-1]["repo"], after_number=2, limit=2))
+            self.assertEqual([row["number"] for row in second], [4, 5])
+            self.assertEqual(len(json.loads(views.issue(db_path=db_path, label="poise"))), 4)
+
     def test_pr_issue_and_user_views_return_json_or_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "db.sqlite"

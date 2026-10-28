@@ -7,6 +7,7 @@ import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
 import { agentAccount, callerAccounts, getModelSettings, getSettings, seedAgentAccount, setSettings, SettingsConflictError } from './settings'
+import { handleBehaviorChains } from './behavior-chain-api'
 import { MODEL_PLACES, canaryClaudeModel, loadCatalog, placeProviders, readCatalogReport, resolvePlace, resolveSlots } from './models'
 import { refreshModelCatalog } from './models-refresh'
 import { deleteModelPreset, listModelPresets, saveModelPreset } from './model-presets'
@@ -412,6 +413,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         if (await handleJevApi(req, res, url)) return
+        if (path === '/api/behavior-chains') return handleBehaviorChains(req, res, url)
 
         if (url === '/api/health' && req.method === 'GET') {
           const scheduler = getBehaviorsRuntimeHealth()
