@@ -2,7 +2,7 @@ import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-cont
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
 import { behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
-import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers, legacyBehaviorOwns } from './behavior-cutover'
+import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
@@ -2534,7 +2534,7 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
 async function listEligiblePrs(behavior: SkippableBehavior, author: string): Promise<DatastorePr[]> {
   const prs = await listOpenPrsByAuthor(author)
   const policy = pullRequestPolicy(behavior)
-  return prs.filter((pr) => legacyBehaviorOwns(pr.repo, pr.number) && !chainOwnsPr(pr) && !pullRequestRefusal(policy, pr.repo, pr.number, pr))
+  return prs.filter((pr) => !behaviorAdmissionDraining() && !chainOwnsPr(pr) && !pullRequestRefusal(policy, pr.repo, pr.number, pr))
 }
 
 function chainOwnsPr(pr: DatastorePr): boolean {
@@ -2545,7 +2545,7 @@ function chainOwnsPr(pr: DatastorePr): boolean {
 // Read just before a launch: a skip saved, or your account changed, while the
 // launch was being prepared stops it.
 function stillEligible(behavior: SkippableBehavior, pr: DatastorePr, actor?: string): boolean {
-  return legacyBehaviorOwns(pr.repo, pr.number) && !chainOwnsPr(pr) && !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
+  return !behaviorAdmissionDraining() && !chainOwnsPr(pr) && !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
     && (actor === undefined || configuredReviewer(pr.author).toLowerCase() === actor.toLowerCase())
 }
 
@@ -7102,7 +7102,7 @@ async function runBehaviorChains(): Promise<void> {
       return { issueReviewers: issues.reviewers, prReviewers: prs.reviewers, implementer: model('issue_implement'), repairer: model('pr_repair'),
         approver: { slot: approval.slot, model: approval.model, recovery: approval.recovery } }
     }
-    runtime = new BehaviorChainRuntime(behaviorChainJournal(), nativeChainOperations(org, {
+    const operations = nativeChainOperations(org, {
       roster,
       async resolve(decision, chainKey) {
         if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
@@ -7202,7 +7202,9 @@ async function runBehaviorChains(): Promise<void> {
         return existing
       },
       wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
-    }))
+    })
+    runtime = new BehaviorChainRuntime(behaviorChainJournal(), { ...operations,
+      enabled: () => behaviorChainJournal().cutover().mode === 'v2' && operations.enabled() })
     behaviorChains.set(org.login.toLowerCase(), runtime)
   }
   const directory = dirname(behaviorProcessLockPath(ISSUES_KEY))
@@ -7505,7 +7507,9 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
       }] : []
     })
   })
-  const anyEnabled = BEHAVIOR_KEYS.some(isEnabled)
+  const enabledForRuntime = (key: BehaviorKey) => isEnabled(key)
+    && (key !== 'implement-issues' && key !== 'repair-prs' || getBehaviorChainSettings().enabled)
+  const anyEnabled = BEHAVIOR_KEYS.some(enabledForRuntime)
   let reviewer: string | null = null
   let reviewerError: string | null = null
   try {
@@ -7525,7 +7529,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   // the production monitor alerts on that field.
   const author = getMeta('me') || ''
   // Review New Issues is scoped by repository and author list, not by `me`.
-  const needsMe = BEHAVIOR_KEYS.some((key) => key !== 'review-new-issues' && isEnabled(key))
+  const needsMe = BEHAVIOR_KEYS.some((key) => key !== 'review-new-issues' && enabledForRuntime(key))
   let pairError: string | null = null
   if (needsMe) {
     try { prAccounts() } catch (error) { pairError = behaviorErrorMessage(error) }

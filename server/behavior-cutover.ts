@@ -6,18 +6,6 @@ import { db } from './db'
 
 export function behaviorAdmissionDraining(): boolean { return behaviorChainJournal().cutover().mode === 'draining' }
 
-export function legacyBehaviorOwns(repository: string, number: number): boolean {
-  const state = behaviorChainJournal().cutover()
-  if (state.mode === 'v1') return true
-  if (state.mode !== 'v2') return false
-  if (state.legacyPulls.includes(`${repository}#${number}`.toLowerCase())) return true
-  // A Chat may publish its PR after the boundary. Its existing ownership is
-  // authoritative; cutting over behavior intake must not strand that work.
-  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'chat_work_bindings'").get()
-    && !!db.prepare('SELECT 1 FROM chat_work_bindings WHERE lower(target) = lower(?) LIMIT 1')
-      .get(`https://github.com/${repository}/pull/${number}`)
-}
-
 export function behaviorCutoverBlockers(): string[] {
   const calls = runningCallerCalls(true)
   const blockers: string[] = []

@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { arrangeCli, deferred, loadModules, mocks, pr } from './behaviors-runtime-fixture'
 import type { NativeChainHooks } from '../server/behavior-chain-native'
 
+vi.mock('../server/chat/control', () => ({ readOpenPrClosingRefs: vi.fn() }))
+
 describe('cutover launch boundary', () => {
   it('routes implementation/repair switches and notes into the actual native admission hooks', async () => {
     arrangeCli()
@@ -14,6 +16,7 @@ describe('cutover launch boundary', () => {
       return { ...original(org, passed), enabled: () => false }
     })
     runtime.startBehaviorsRuntime()
+    expect(runtime.getBehaviorsRuntimeHealth().status).toBe('ok')
     db.setMeta('me', 'poise-user')
     db.setMeta('behavior_chain_settings', JSON.stringify({ enabled: true, seedMode: 'label', label: 'poise' }))
     await runtime.runEnabledBehaviorsOnce()
@@ -31,6 +34,36 @@ describe('cutover launch boundary', () => {
     expect(captured.permitted(chain, decision('repair-pr'))).toBe(false)
     runtime.setScratchpad('repair-prs', 'Preserve all CI gates.')
     expect(captured.note('repair-pr')).toBe('Preserve all CI gates.')
+  })
+
+  it('uses the existing tick and paginated reader to complete cutover before native intake can run', async () => {
+    arrangeCli()
+    const { database: db, behaviors: runtime } = await loadModules()
+    const native = await import('../server/behavior-chain-native')
+    const discover = vi.fn(async () => [])
+    const original = native.nativeChainOperations
+    vi.spyOn(native, 'nativeChainOperations').mockImplementation((org, hooks) => ({ ...original(org, hooks), discover }))
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_chain_settings', JSON.stringify({ enabled: true, seedMode: 'label', label: 'poise' }))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(discover).not.toHaveBeenCalled()
+    const journal = (await import('../server/behavior-chain-journal')).behaviorChainJournal()
+    journal.changeAdmission(0, 'draining')
+    const reader = await import('../server/chat/control')
+    const page = (number: number, more: boolean) => ({ prs: [{ repo: pr.repo, number, url: `https://github.com/${pr.repo}/pull/${number}`,
+      closing: [], closesVia: 'closing-references' as const, closingTruncated: false, headRef: `work-${number}`, headRepo: pr.repo }], truncated: more, more })
+    const read = vi.spyOn(reader, 'readOpenPrClosingRefs').mockResolvedValueOnce(page(17, true)).mockResolvedValueOnce(page(18, false))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(read.mock.calls[1][1]).toEqual({ repo: pr.repo, number: 17 })
+    expect(journal.cutover()).toMatchObject({ mode: 'v2', legacyPulls: [`${pr.repo}#17`.toLowerCase(), `${pr.repo}#18`.toLowerCase()] })
+    expect(JSON.parse(db.getMeta('behavior_chain_settings')!).enabled).toBe(true)
+    expect(journal.page()).toEqual([])
+    expect(discover).not.toHaveBeenCalled()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(discover).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
   it('fences an already preparing legacy review without cancelling it or starting its worker', async () => {
     arrangeCli()
@@ -57,20 +90,22 @@ describe('cutover launch boundary', () => {
     expect(runtime.isRunnable('review-new-prs')).toBe(true)
   })
 
-  it('preserves only the recorded legacy PR boundary and keeps new behavior controls independent', async () => {
+  it('preserves standalone PR handling after cutover and keeps new behavior controls independent', async () => {
+    arrangeCli()
     const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
     const journal = (await import('../server/behavior-chain-journal')).behaviorChainJournal()
-    const { legacyBehaviorOwns } = await import('../server/behavior-cutover')
-    expect(legacyBehaviorOwns(pr.repo, pr.number)).toBe(true)
     journal.changeAdmission(0, 'draining')
-    expect(legacyBehaviorOwns(pr.repo, pr.number)).toBe(false)
-    journal.changeAdmission(journal.cutover().sequence, 'v2', [`${pr.repo}#${pr.number}`])
-    expect(legacyBehaviorOwns(pr.repo.toUpperCase(), pr.number)).toBe(true)
-    expect(legacyBehaviorOwns(pr.repo, pr.number + 1)).toBe(false)
-    const { bindWork } = await import('../server/chat/control-store')
-    bindWork('fixture', 'existing-chat', `https://github.com/${pr.repo}/pull/${pr.number + 1}`)
-    expect(legacyBehaviorOwns(pr.repo, pr.number + 1)).toBe(true)
-    const lease = db.claimPrOperationOwned(`${pr.repo}#${pr.number}`, 60_000)
+    expect(runtime.isRunnable('review-new-prs')).toBe(false)
+    journal.changeAdmission(journal.cutover().sequence, 'v2', [])
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalled()
+    expect(mocks.spawnDetached.mock.calls[0][1]).toContain('--pr-review')
+    const lease = db.claimPrOperationOwned(`${pr.repo}#${pr.number + 1}`, 60_000)
     expect(lease).toBeTruthy()
     const { behaviorCutoverBlockers } = await import('../server/behavior-cutover')
     expect(behaviorCutoverBlockers().join(';')).toContain('reserved PR operation')
