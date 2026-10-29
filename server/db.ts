@@ -1475,18 +1475,19 @@ export function requestIssueReviewRevision(
   pr: number,
   revision: string,
   correlationId: string,
-): { correlationId: string, created: boolean } {
+): { correlationId: string, created: boolean, requestedAt: string } {
   const key = repo.toLowerCase()
+  const now = new Date().toISOString()
   const info = db.prepare(`
     INSERT OR IGNORE INTO issue_review_requests(repo, pr, revision, correlation_id, requested_at)
     VALUES(?, ?, ?, ?, ?)
-  `).run(key, pr, revision, correlationId, new Date().toISOString())
-  if (info.changes === 1) return { correlationId, created: true }
+  `).run(key, pr, revision, correlationId, now)
+  if (info.changes === 1) return { correlationId, created: true, requestedAt: now }
   const row = db.prepare(`
-    SELECT correlation_id AS correlationId FROM issue_review_requests
+    SELECT correlation_id AS correlationId, requested_at AS requestedAt FROM issue_review_requests
     WHERE repo = ? AND pr = ? AND revision = ?
-  `).get(key, pr, revision) as { correlationId: string }
-  return { correlationId: row.correlationId, created: false }
+  `).get(key, pr, revision) as { correlationId: string, requestedAt: string }
+  return { correlationId: row.correlationId, created: false, requestedAt: row.requestedAt }
 }
 
 // Release a request whose run could not be started. The exact predicate

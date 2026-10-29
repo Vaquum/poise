@@ -768,6 +768,21 @@ async function readIssueForReview(repo: string, issue: number, actor: string): P
   return { title: entry.title, body: entry.body }
 }
 
+// How long a recorded request without a registered run still counts as
+// alive: its worker may be starting. Past this the recording outlived its
+// spawn. Same length as the scheduler's launch registration grace.
+const ISSUE_REVIEW_REQUEST_GRACE_MS = 5 * 60_000
+
+// Whether a recorded request already has its run: any registered call, any
+// quarantined evidence that may be its run, or still inside the grace where
+// registration may land. Only past-grace silence is dead.
+async function issueReviewRequestActive(correlationId: string, requestedAt: string): Promise<boolean> {
+  const snapshot = await fetchAgentLogSnapshot()
+  if (snapshot.entries.some((entry) => entry.correlation_id === correlationId)) return true
+  if (snapshot.quarantined.some((row) => row.correlationId === correlationId)) return true
+  return Date.now() - Date.parse(requestedAt) < ISSUE_REVIEW_REQUEST_GRACE_MS
+}
+
 // A replayed issue review is one fresh full-access run by the Issue review
 // default, commenting again as the agent account. It needs no head and no
 // local checkout: Caller prepares its own. The run is bound to the exact
@@ -792,8 +807,18 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
   const current = await readIssueForReview(repo, number, actor)
   const revision = issueReviewRevision(current.title, current.body)
   const request = requestIssueReviewRevision(repo, number, revision, correlationId)
-  if (!request.created) return { ok: true, source, correlationId: request.correlationId, revision, deduped: true }
-  captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
+  let effectiveCorrelation: string = correlationId
+  let created = request.created
+  if (!created && !await issueReviewRequestActive(request.correlationId, request.requestedAt)) {
+    // The recording outlived its spawn (a crash between the two): take it
+    // over under the recorded correlation, so a late original registrant
+    // still arbitrates through Caller's unique correlation instead of
+    // running beside this one.
+    effectiveCorrelation = request.correlationId
+    created = true
+  }
+  if (!created) return { ok: true, source, correlationId: request.correlationId, revision, deduped: true }
+  captureBehaviorAdmission({ admissionKey: effectiveCorrelation, nativeId: effectiveCorrelation,
     behavior: 'review-new-issues', source, owner: repo.split('/')[0], actor,
     repository: repo, number, head: null, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
   try { await spawnDetached(CLI, [
@@ -808,7 +833,7 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
     '--source',
     source,
     '--correlation-id',
-    correlationId,
+    effectiveCorrelation,
     '--expected-issue-revision',
     revision,
   ], {
@@ -816,11 +841,12 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
   }) } catch (error) {
-    // Nothing started, so nothing owns the recorded request: a repeat may
-    // create a new obligation instead of reusing this dead one.
-    releaseIssueReviewRevision(repo, number, revision, correlationId)
-    captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
+    // Nothing started. A row this call created is released, so a repeat
+    // creates a new obligation at once; a taken-over row stays, so a repeat
+    // takes it over again instead of forking the obligation.
+    if (effectiveCorrelation === correlationId) releaseIssueReviewRevision(repo, number, revision, correlationId)
+    captureBehaviorOutcome({ nativeId: effectiveCorrelation, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
     throw error
   }
-  return { ok: true, source, correlationId, revision }
+  return { ok: true, source, correlationId: effectiveCorrelation, revision }
 }

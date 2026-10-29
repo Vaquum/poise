@@ -983,8 +983,10 @@ describe('issue re-review requests', () => {
       places: { issue_review: { slot: 'primary' } },
     }
     mocks.agentAccount = 'bit-mis'
+    const agentLog: Array<Record<string, unknown>> = []
     mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'agent-interface') return { stdout: catalog, stderr: '' }
+      if (command === 'agent-interface' && args[0] === '--models') return { stdout: catalog, stderr: '' }
+      if (command === 'agent-interface' && args[0] === '--logs') return { stdout: JSON.stringify(agentLog), stderr: '' }
       if (command === 'github-interface' && args[0] === '--read-issue') {
         if (args[args.indexOf('--token-user') + 1] !== 'bit-mis') throw new Error(`read-issue without the agent account: ${args.join(' ')}`)
         const repository = args[args.indexOf('--repository') + 1]
@@ -1000,7 +1002,16 @@ describe('issue re-review requests', () => {
     invalidateCatalog()
     const { spawnDetached } = await import('../server/process')
     vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
-    return { spawnDetached: vi.mocked(spawnDetached), ...(await import('../server/agent')) }
+    return { spawnDetached: vi.mocked(spawnDetached), agentLog, ...(await import('../server/agent')) }
+  }
+
+  async function backdateRequest(repo: string, pr: number, correlationId: string, agoMs: number): Promise<void> {
+    const { db } = await import('../server/db')
+    const info = db.prepare(`
+      UPDATE issue_review_requests SET requested_at = ?
+      WHERE repo = ? AND pr = ? AND correlation_id = ?
+    `).run(new Date(Date.now() - agoMs).toISOString(), repo.toLowerCase(), pr, correlationId)
+    expect(info.changes).toBe(1)
   }
 
   it('hashes the exact title and body, the bytes Caller hashes', async () => {
@@ -1058,6 +1069,49 @@ describe('issue re-review requests', () => {
     const retry = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '459' }, mocks.admit)
     expect(retry.deduped).toBeUndefined()
     expect(spawnDetached).toHaveBeenCalledTimes(2)
+  })
+
+  it('takes over a recording that outlived its spawn under the same correlation', async () => {
+    const { replayAgentJob, spawnDetached } = await arrange({ 460: { title: 'PRD', body: 'Body.' } })
+    const first = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '460' }, mocks.admit)
+    // The spawn happened but no run ever registered: the recording is dead.
+    await backdateRequest('Vaquum/Origo', 460, first.correlationId!, 10 * 60_000)
+    const retry = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '460' }, mocks.admit)
+    expect(retry.deduped).toBeUndefined()
+    expect(retry.correlationId).toBe(first.correlationId)
+    expect(retry.revision).toBe(first.revision)
+    expect(spawnDetached).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(spawnDetached).mock.calls[1][1]).toEqual(expect.arrayContaining(
+      ['--correlation-id', first.correlationId, '--expected-issue-revision', first.revision]))
+  })
+
+  it('reuses a recorded request while its run may still register, runs, or is uncertain', async () => {
+    const { replayAgentJob, spawnDetached, agentLog, resetAgentLogCache } = await arrange({
+      461: { title: 'PRD', body: 'Registering.' },
+      463: { title: 'PRD', body: 'Running.' },
+      464: { title: 'PRD', body: 'Uncertain.' },
+    })
+    // Registering: no call yet, but inside the grace.
+    const registering = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '461' }, mocks.admit)
+    const again = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '461' }, mocks.admit)
+    expect(again).toMatchObject({ correlationId: registering.correlationId, deduped: true })
+    // Running: a registered call settles the request however old it is.
+    const running = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '463' }, mocks.admit)
+    await backdateRequest('Vaquum/Origo', 463, running.correlationId!, 60 * 60_000)
+    agentLog.push(logRow({ id: 'd'.repeat(32), behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '463',
+      status: 'running', completed_at: null, correlation_id: running.correlationId }))
+    resetAgentLogCache()
+    const stale = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '463' }, mocks.admit)
+    expect(stale).toMatchObject({ correlationId: running.correlationId, deduped: true })
+    // Uncertain: quarantined evidence may be its run, so no take-over.
+    const uncertain = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '464' }, mocks.admit)
+    await backdateRequest('Vaquum/Origo', 464, uncertain.correlationId!, 60 * 60_000)
+    agentLog.length = 0
+    agentLog.push(logRow({ id: 'not-an-id', correlation_id: uncertain.correlationId, actor: 42 }))
+    resetAgentLogCache()
+    const held = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '464' }, mocks.admit)
+    expect(held).toMatchObject({ correlationId: uncertain.correlationId, deduped: true })
+    expect(spawnDetached).toHaveBeenCalledTimes(3)
   })
 
   it('refuses a closed issue and launches nothing on an unreadable one', async () => {
