@@ -294,7 +294,7 @@ describe('model slots and place slots', () => {
     const cases: Array<[unknown, RegExp]> = [
       [{ slots: { primary: 'opus' } }, /from the catalog/],
       [{ slots: { primary: 'opus-5-max', secondary: 'opus-5-max' } }, /different models/],
-      [{ places: { chat: { slot: 'default' } } }, /must be primary, secondary or tertiary/],
+      [{ places: { chat: { slot: 'default' } } }, /must be primary, secondary, tertiary or random/],
       [{ places: { content: { slot: 'primary' } } }, /unknown model place/],
       [{ chat: { default: 'opus-5-max', fallback: 'opus-5-xhigh' } }, /unknown models section/],
       [[], /object with slots and places/],
