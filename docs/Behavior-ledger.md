@@ -87,6 +87,51 @@ second deadline and 512 KiB response bound. Exit 0 means a successful reply with
 complete health; 1 means HTTP/transport failure or incomplete/stale coverage;
 2 means invalid arguments. The command emits server JSON unchanged.
 
+## Per-PR status projection
+
+`GET /api/behavior-ledger/pr-status?limit=50` answers "why isn't PR N merged
+yet" with one row per open pull request from the configured account pair,
+each linking to the ledger target lookup for drill-down:
+
+```sh
+node dist/behavior-ledger.js pr-status --limit 50
+```
+
+Same guards, GET-only method, 512 KiB bound, and CLI exit codes as the
+ledger routes. `limit` is an integer from 1 to 100, default 50; the reply
+carries `totalOpen` and `truncated` when the limit cuts rows. Flagged rows
+sort first, then oldest opened first. Each row shows open age since
+datastore `created_at` (GitHub exposes no first-push time), completed
+review rounds from the same counter the cap uses plus cap and next round,
+the latest verdict with its head and whether it is on the current head, CI
+state on the current head, merge-queue state, and a one-line current
+blocker. A row is flagged past 60 minutes of age, or when its blocker
+identity stays unchanged for more than 15 minutes.
+
+The blocker is a closed vocabulary, first match wins: `not_eligible`,
+`held` (dead letter or quarantine, with diagnostic cause and next retry),
+`review_running`, `awaiting_author`, `awaiting_review`, `ci_pending` /
+`ci_failing`, `unresolved_threads`, `conflicting`, `behind`, `blocked`,
+`approved_not_enqueued` (with sub-reason), `in_queue`, and `unknown`
+naming the missing input. Other active reasons stay in `details`. Approvals
+need proof of currency; a change request stands until a new head or verdict
+disproves it. Queue membership short-circuits the merge gates: head-CI
+churn during integration never masquerades as the blocker. A vanished queue
+entry reads as a removal without inventing its cause. Flags are display
+only and never raise alerts or influence execution.
+
+Collection is read-only: one cached datastore listing per minute at most,
+pure launch-ledger and dead-letter reads, and the merge-candidate reading
+the existing merge-prs tick already fetched (rollup state, review decision,
+merge state, thread counts, and queue support ride the same GraphQL
+fields at zero added cost). No Caller invocation, no GitHub request, and no
+claim, retry, incident, queue-admission, or launch change. Blocker-since is
+observed at read time and kept in memory only; it resets on restart
+(`sinceRestart`) and restarts on every A→B→A transition. Unreadable or
+initializing datastores appear as explicit per-organization coverage, never
+as an empty success; stale or unavailable inputs render `unknown` with the
+source named.
+
 ## Health split
 
 `/api/health` carries the ledger twice: `dependencies.ledger` for whether

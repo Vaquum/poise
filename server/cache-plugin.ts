@@ -3,6 +3,7 @@ import { addDiagnosticSecrets, startLogging, stopLogging } from './logging'
 import { localLogging, stopLoggingApi } from './logging-api'
 import { startBehaviorLedger, stopBehaviorLedger } from './behavior-ledger'
 import { handleBehaviorLedger } from './behavior-ledger-http'
+import { handleBehaviorPrStatus } from './behavior-pr-status'
 import { handleJevApi, stopJev } from './jev/api'
 import type { Plugin, Connect } from 'vite'
 import type { ServerResponse } from 'node:http'
@@ -28,6 +29,7 @@ import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
+import { startAgentCollaboratorRuntime, stopAgentCollaboratorRuntime } from './agent-collaborator'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
 import { readBehaviorEstimates } from './behavior-estimates'
@@ -207,6 +209,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   recordRunningRelease()
   setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
+  startAgentCollaboratorRuntime()
   startBehaviorsRuntime()
   startNoticesRuntime()
   startPublicationReviewsRuntime()
@@ -309,7 +312,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopPublicationReviewsRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopAgentCollaboratorRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopPublicationReviewsRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
   await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
@@ -359,6 +362,9 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           authority = enforceApiRequest(req, { allowedHosts: opts.allowedHosts, service })
         } catch (err) {
           return json(res, httpStatus(err, 403), { error: (err as Error).message })
+        }
+        if (path === '/api/behavior-ledger/pr-status') {
+          return handleBehaviorPrStatus(req, res, url)
         }
         if (path === '/api/behavior-ledger' || path.startsWith('/api/behavior-ledger/')) {
           return handleBehaviorLedger(req, res, url)

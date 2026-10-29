@@ -36,6 +36,9 @@ export const CATALOG = {
   review_providers: ['antigravity', 'claude', 'codex', 'grok', 'muse'],
   // Every provider runs an issue review with full access (Caller's --issue-review).
   issue_review_providers: ['antigravity', 'claude', 'codex', 'grok', 'muse'],
+  // Revision-bound issue reviews: --expected-issue-revision, recorded
+  // issue_revision, and a revision marker on published comments.
+  issue_review_revisions: true,
   policy: 'bounded-v1',
 }
 

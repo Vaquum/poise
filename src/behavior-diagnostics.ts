@@ -16,6 +16,8 @@ export interface DiagnosticEntry extends EvidenceAttachment {
   /** When the next check runs, for a failing behavior with one scheduled. */
   next: string | null
   detail: string
+  /** Where the person acts on it, when the entry names one. */
+  link?: { label: string, url: string }
 }
 
 export interface BehaviorDiagnosticGroup extends DiagnosticClassification {
@@ -28,6 +30,22 @@ export interface BehaviorDiagnosticGroup extends DiagnosticClassification {
 // The PR behaviors a repository hold gates, in Behaviors-view row order.
 // (src/behaviors.ts imports this module, so the list cannot come from there.)
 const HELD_PR_BEHAVIORS = ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'rerun-grey-ci', 'merge-prs']
+
+// A held name worth linking: owner/name as GitHub spells it. The server
+// holds the same shape; anything else links nowhere rather than wrongly.
+const HELD_REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/
+
+/** A held repository's access settings, where the person invites the acting
+ *  account or resends its pending invitation. GitHub answers the same
+ *  unreadable repository in both cases, so one link names both next actions. */
+function accessSettingsLink(actor: string, repo: string): { label: string, url: string } | undefined {
+  if (!HELD_REPOSITORY.test(repo)) return undefined
+  const who = actor || 'the agent account'
+  return {
+    label: `Invite ${who} or resend its pending invitation`,
+    url: `https://github.com/${repo}/settings/access`,
+  }
+}
 
 export function targetRef(target: string): string {
   return target.match(/^[^#]+#\d+/)?.[0] ?? target
@@ -97,9 +115,10 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
     const cause = failureCause(hold.error)
     const message = `${hold.actor || 'agent account'} has no access to ${hold.repo}`
     const detail = `${hold.org ? `${hold.org}: ` : ''}PR behaviors held for ${hold.repo} — ${cause}`
+    const link = accessSettingsLink(hold.actor || '', hold.repo)
     for (const behavior of HELD_PR_BEHAVIORS) {
       add({ severity: 'warning', code: 'github_access' }, hold.repo, message, detail,
-        { behavior, target: null, at: hold.heldAt || null, next: hold.nextRecheckAt || null })
+        { behavior, target: null, at: hold.heldAt || null, next: hold.nextRecheckAt || null, ...(link ? { link } : {}) })
     }
   }
   for (const letter of diagnostics.deadLetters) {

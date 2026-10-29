@@ -4,7 +4,7 @@ import { LEDGER_RESPONSE_BYTES, type LedgerRead } from './behavior-ledger-contra
 const PREFIX = '/api/behavior-ledger'
 const ID = /^[a-f0-9]{64}$/
 const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,100}$/
-const USAGE = 'Usage: behavior-ledger list [--limit N] [--cursor CURSOR] [--parent ID] [--repository OWNER/REPO --number N] | get ID | changes CURSOR [--limit N] | health; each accepts --base-url ORIGIN'
+const USAGE = 'Usage: behavior-ledger list [--limit N] [--cursor CURSOR] [--parent ID] [--repository OWNER/REPO --number N] | get ID | changes CURSOR [--limit N] | health | pr-status [--limit N]; each accepts --base-url ORIGIN'
 
 class UsageError extends Error {}
 
@@ -20,11 +20,11 @@ function loopbackOrigin(value: string): URL {
 
 export function parseBehaviorLedgerArguments(args: string[], env: NodeJS.ProcessEnv = process.env): URL {
   const [operation, ...rest] = args
-  if (!['list', 'get', 'changes', 'health'].includes(operation ?? '')) throw new UsageError(USAGE)
+  if (!['list', 'get', 'changes', 'health', 'pr-status'].includes(operation ?? '')) throw new UsageError(USAGE)
   const flags = new Map<string, string>()
   const positional: string[] = []
   const permitted = operation === 'list' ? ['--base-url', '--limit', '--cursor', '--parent', '--repository', '--number']
-    : operation === 'changes' ? ['--base-url', '--limit'] : ['--base-url']
+    : operation === 'changes' || operation === 'pr-status' ? ['--base-url', '--limit'] : ['--base-url']
   for (let index = 0; index < rest.length; index++) {
     const arg = rest[index]
     if (!arg.startsWith('--')) { positional.push(arg); continue }
@@ -50,10 +50,14 @@ export function parseBehaviorLedgerArguments(args: string[], env: NodeJS.Process
     throw new UsageError('number must be a positive integer')
   }
   const base = loopbackOrigin(flags.get('--base-url') ?? `http://127.0.0.1:${env.POISE_PORT ?? '5555'}`)
-  const request: LedgerRead = operation === 'get' ? { operation, id: positional[0] }
-    : operation === 'changes' ? { operation, cursor: positional[0] }
-      : operation === 'health' ? { operation } : { operation: 'list' }
-  base.pathname = request.operation === 'get' ? `${PREFIX}/${request.id}` : request.operation === 'list' ? PREFIX : `${PREFIX}/${request.operation}`
+  if (operation === 'pr-status') {
+    base.pathname = `${PREFIX}/pr-status`
+  } else {
+    const request: LedgerRead = operation === 'get' ? { operation, id: positional[0] }
+      : operation === 'changes' ? { operation, cursor: positional[0] }
+        : operation === 'health' ? { operation } : { operation: 'list' }
+    base.pathname = request.operation === 'get' ? `${PREFIX}/${request.id}` : request.operation === 'list' ? PREFIX : `${PREFIX}/${request.operation}`
+  }
   if (limit !== undefined) base.searchParams.set('limit', limit)
   if (cursor !== undefined) base.searchParams.set('cursor', cursor)
   if (parent !== undefined) base.searchParams.set('parent', parent)

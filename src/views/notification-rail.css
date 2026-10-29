@@ -298,6 +298,7 @@ body.notifications-docked:not(.editor-writer-mode) .self-update-banner { right: 
 .nr-history li { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; }
 .nr-history li > span { grid-column: 2; }
 .nr-history time { color: var(--text-tertiary); }
+.nr-link { color: var(--a1); text-decoration: underline; text-underline-offset: 2px; }
 .nr-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .nr-btn {
   display: inline-flex;

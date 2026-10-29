@@ -153,10 +153,16 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
             if (!Array.isArray(response.comments)) throw new Error('issue review reconciliation has no complete comment list')
             commentsByIssue.set(ref, response.comments)
           }
-          const body = `${post.body}\n\n---\n<sub>Issue review · \`${plan.model}\`</sub>\n<!-- agent-interface issue-review call=${pendingReview.evidence.callId} -->`
+          const body = `${post.body}\n\n---\n<sub>Issue review · \`${plan.model}\` · rev \`${plan.issue_revision.slice(0, 8)}\`</sub>\n<!-- agent-interface issue-review call=${pendingReview.evidence.callId} -->`
+          // A comment an older Caller posted before revision markers has the
+          // same terminal call marker without the rev stamp: still this run's
+          // receipt, so an upgrade mid-chain does not block on work GitHub
+          // already shows.
+          const legacy = `${post.body}\n\n---\n<sub>Issue review · \`${plan.model}\`</sub>\n<!-- agent-interface issue-review call=${pendingReview.evidence.callId} -->`
           const found = commentsByIssue.get(ref)!.map((comment) => object(comment, 'published issue review comment')).find((comment) =>
             typeof comment.id === 'number' && !used.has(comment.id) && typeof comment.author === 'string'
-              && comment.author.toLowerCase() === chain.reviewer.toLowerCase() && comment.body === body)
+              && comment.author.toLowerCase() === chain.reviewer.toLowerCase()
+              && (comment.body === body || comment.body === legacy))
           if (found) { const id = positive(found.id, 'published issue comment'); used.add(id);
             receipts.push({ issue: String(post.issue), comment_id: id, author: String(found.author), url: typeof found.url === 'string' ? found.url : null }) }
         }

@@ -456,6 +456,33 @@ function readBehaviorFailure(key: BehaviorKey, target?: string): PersistedBehavi
   }
 }
 
+export interface BehaviorFailureState {
+  kind: 'operation' | 'worker'
+  consecutiveFailures: number
+  lastFailureAt: string
+  nextRetryAt: string
+  error?: string
+  diagnostic?: DiagnosticClassification
+  callId?: string
+  correlationId?: string
+}
+
+/** Persisted failure for one behavior target, read-only for the per-PR status projection. */
+export function getBehaviorFailureState(key: BehaviorKey, target: string): BehaviorFailureState | null {
+  const failure = readBehaviorFailure(key, target)
+  if (!failure) return null
+  return {
+    kind: failure.kind,
+    consecutiveFailures: failure.consecutiveFailures,
+    lastFailureAt: new Date(failure.lastFailureAtMs).toISOString(),
+    nextRetryAt: new Date(failure.nextRetryAtMs).toISOString(),
+    ...(failure.error ? { error: failure.error } : {}),
+    ...(failure.diagnostic ? { diagnostic: failure.diagnostic } : {}),
+    ...(failure.callId ? { callId: failure.callId } : {}),
+    ...(failure.correlationId ? { correlationId: failure.correlationId } : {}),
+  }
+}
+
 function recordBehaviorFailure(key: BehaviorKey, kind: 'worker', cause: unknown, target: string, options?: DiagnosticOptions & { callId?: string }): void
 function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string, hold?: boolean, noBackoff?: boolean, actingAccount?: string }): void
 function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string, hold?: boolean, noBackoff?: boolean, actingAccount?: string } = {}): void {
@@ -1158,6 +1185,8 @@ export interface PullRequestFacts {
   draft: boolean
   author: string
   updated_at: string
+  /** Opened time as the datastore reports it; null when the row predates it. */
+  created_at: string | null
 }
 
 // Whose pull requests a PR behavior acts on and where it is skipped, read once
@@ -1179,7 +1208,7 @@ export function pullRequestPolicy(behavior: SkippableBehavior): PullRequestPolic
 }
 
 // Open, not a draft and yours: what every PR behavior and the baseline require.
-function ownPullRequestRefusal(me: string, ref: string, pr: Pick<PullRequestFacts, 'author' | 'status' | 'draft'> | null, agent = agentAccount()): string | null {
+export function ownPullRequestRefusal(me: string, ref: string, pr: Pick<PullRequestFacts, 'author' | 'status' | 'draft'> | null, agent = agentAccount()): string | null {
   if (pr?.status !== 'open') return `${ref} is not an open pull request`
   if (pr.draft) return `${ref} is a draft`
   if (!me) return `${ref} cannot be matched to your GitHub account: none is set in Settings → General`
@@ -1203,6 +1232,11 @@ export function pullRequestRefusal(policy: PullRequestPolicy, repo: string, numb
 function repoHoldRefusal(repo: string, actor = agentAccount()): string | null {
   const hold = readRepoAccessHold(repo, actor)
   return hold ? `${actor.toLowerCase() === agentAccount().toLowerCase() ? 'agent account' : actor} has no access to ${hold.repo}; PR behaviors are held for this repository` : null
+}
+
+/** Repository-access hold refusal for one repo, read-only for the per-PR status projection. */
+export function getRepoHoldRefusal(repo: string): string | null {
+  return repoHoldRefusal(repo)
 }
 
 // Last-fired info is intentionally NOT persisted here — agent-interface
@@ -2176,7 +2210,7 @@ async function reconcileBehaviorLaunchClaims(
 
 // ── review-new-prs implementation ───────────────────────────────────────
 
-interface DatastorePr extends PullRequestFacts {
+export interface DatastorePr extends PullRequestFacts {
   url: string
   headRef: string | null
   headRepo: string | null
@@ -2387,7 +2421,7 @@ async function requireFreshDatastore(): Promise<void> {
   }
 }
 
-function datastorePr(row: unknown, index: number): DatastorePr {
+export function datastorePr(row: unknown, index: number): DatastorePr {
   const value = objectValue(row, `github-datastore PR row ${index}`)
   const repo = String(value.repo || '')
   const number = safeInteger(value.number, `github-datastore PR row ${index} number`)
@@ -2396,6 +2430,7 @@ function datastorePr(row: unknown, index: number): DatastorePr {
   const draft = safeInteger(value.draft, `github-datastore PR row ${index} draft`)
   const status = String(value.status || '')
   const updatedAt = String(value.updated_at || '')
+  const createdAt = value.created_at ?? null
   const headRef = value.head_ref ?? null
   const headRepo = value.head_repo ?? null
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)
@@ -2404,12 +2439,15 @@ function datastorePr(row: unknown, index: number): DatastorePr {
     || !['open', 'closed', 'merged'].includes(status)
     || !author
     || !Number.isFinite(Date.parse(updatedAt))
+    || (createdAt !== null && (typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))))
     || url !== `https://github.com/${repo}/pull/${number}`
     || (headRef !== null && (typeof headRef !== 'string' || !headRef))
     || (headRepo !== null && (typeof headRepo !== 'string' || !/^[^/\s]+\/[^/\s]+$/.test(headRepo)))) {
     throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
   }
-  return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt, headRef: headRef as string | null, headRepo: headRepo as string | null }
+  return { repo, number, url, draft: draft === 1, author, status, updated_at: updatedAt,
+    created_at: createdAt as string | null,
+    headRef: headRef as string | null, headRepo: headRepo as string | null }
 }
 
 async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
@@ -2428,8 +2466,11 @@ async function listOpenPrsByAuthor(author: string): Promise<DatastorePr[]> {
   return readOpenPrsByAuthor(author)
 }
 
-async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
-  await requireFreshDatastore()
+// Pure datastore read: every open pull request row, without the freshness
+// gate, dead-letter reconciliation, failure/queue retirement, or eligibility
+// filtering the tick applies. Read-only callers (the per-PR status
+// projection) use this so a GET never mutates execution state.
+export async function fetchOpenPrRows(): Promise<DatastorePr[]> {
   const { stdout } = await runFile(
     DATASTORE,
     datastoreArgs(['view', 'pr', '--status', 'open', '--format', 'json']),
@@ -2438,7 +2479,7 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
   const parsed = parseJson(stdout, 'github-datastore view pr')
   if (!Array.isArray(parsed)) throw new Error('github-datastore view pr returned a non-array')
   const seen = new Set<string>()
-  const prs = parsed.map((row, index) => {
+  return parsed.map((row, index) => {
     const pr = datastorePr(row, index)
     if (pr.status !== 'open') throw new Error(`github-datastore PR row ${index} violates the candidate contract`)
     const key = `${pr.repo}#${pr.number}`
@@ -2446,6 +2487,12 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
     seen.add(key)
     return pr
   })
+}
+
+async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
+  await requireFreshDatastore()
+  const prs = await fetchOpenPrRows()
+  const seen = new Set(prs.map((pr) => `${pr.repo}#${pr.number}`))
   settleSupersededApprovalFirings(reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login))
   retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
   retireClosedQueueAdmissions(seen)
@@ -5007,6 +5054,62 @@ interface MergeCandidate {
   approvedAt: string | null
   queueEntryId: string | null
   error: string | null
+  rollupState: string | null
+  reviewDecision: string | null
+  mergeStateStatus: string | null
+  unresolvedThreads: number | null
+  threadsComplete: boolean | null
+  queueEnabled: boolean | null
+}
+
+// Last merge-candidate reading per pull request, cached by the existing
+// merge-prs tick for the per-PR status projection: no new GitHub read.
+// Best-effort and bounded; a missing or stale entry reads as unknown.
+export interface CachedMergeCandidate {
+  head: string | null
+  ready: boolean
+  behind: boolean
+  author: string | null
+  approvedAt: string | null
+  queueEntryId: string | null
+  rollupState: string | null
+  reviewDecision: string | null
+  mergeStateStatus: string | null
+  unresolvedThreads: number | null
+  threadsComplete: boolean | null
+  queueEnabled: boolean | null
+  error: string | null
+  /** When this process read it, ISO. */
+  at: string
+}
+
+const mergeCandidateCache = new Map<string, CachedMergeCandidate>()
+const MERGE_CANDIDATE_CACHE_MAX = 2000
+/** A reading older than this no longer describes the pull request. */
+export const MERGE_CANDIDATE_CACHE_STALE_MS = 5 * 60_000
+
+function cacheMergeCandidate(repo: string, number: number, candidate: Omit<CachedMergeCandidate, 'at'>): void {
+  if (mergeCandidateCache.size >= MERGE_CANDIDATE_CACHE_MAX) {
+    const oldest = mergeCandidateCache.keys().next()
+    if (!oldest.done) mergeCandidateCache.delete(oldest.value)
+  }
+  mergeCandidateCache.set(`${repo.toLowerCase()}#${number}`, { ...candidate, at: new Date().toISOString() })
+}
+
+export function getCachedMergeCandidate(repo: string, number: number): CachedMergeCandidate | null {
+  return mergeCandidateCache.get(`${repo.toLowerCase()}#${number}`) ?? null
+}
+
+/** Test-only: drop cached merge-candidate readings. */
+export function resetMergeCandidateCache(): void {
+  mergeCandidateCache.clear()
+}
+
+/** Test-only: seed one cached merge-candidate reading. */
+export function seedMergeCandidateCache(repo: string, number: number,
+  candidate: Omit<CachedMergeCandidate, 'at'> & { at?: string }): void {
+  mergeCandidateCache.set(`${repo.toLowerCase()}#${number}`,
+    { ...candidate, at: candidate.at ?? new Date().toISOString() })
 }
 
 async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<MergeCandidate[]> {
@@ -5024,6 +5127,14 @@ async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<M
   return result.records.map((row: unknown, index: number) => {
     const record = objectValue(row, 'merge candidate')
     const pr = prs[index]!
+    // The status-projection fields are absent from older Callers; absent
+    // reads as unknown, never as a malformed batch.
+    const rollupState = record.rollup_state ?? null
+    const reviewDecision = record.review_decision ?? null
+    const mergeStateStatus = record.merge_state_status ?? null
+    const unresolvedThreads = record.unresolved_threads ?? null
+    const threadsComplete = record.threads_complete ?? null
+    const queueEnabled = record.queue_enabled ?? null
     if (record.repository !== pr.repo || record.number !== pr.number || typeof record.ready !== 'boolean'
       || typeof record.behind !== 'boolean'
       || !(record.head_sha === null || (typeof record.head_sha === 'string' && SHA_PATTERN.test(record.head_sha)))
@@ -5031,13 +5142,26 @@ async function readMergeCandidates(prs: DatastorePr[], actor: string): Promise<M
       || !(record.approved_at === null || (typeof record.approved_at === 'string' && Number.isFinite(Date.parse(record.approved_at))))
       || !(record.queue_entry_id === null || (typeof record.queue_entry_id === 'string' && record.queue_entry_id.length > 0))
       || !(record.error === null || (typeof record.error === 'string' && record.error.length > 0))
+      || !(rollupState === null || typeof rollupState === 'string')
+      || !(reviewDecision === null || typeof reviewDecision === 'string')
+      || !(mergeStateStatus === null || typeof mergeStateStatus === 'string')
+      || !(unresolvedThreads === null || (Number.isSafeInteger(unresolvedThreads) && (unresolvedThreads as number) >= 0))
+      || !(threadsComplete === null || typeof threadsComplete === 'boolean')
+      || !(queueEnabled === null || typeof queueEnabled === 'boolean')
       || (record.ready && (record.head_sha === null || !record.author || record.error !== null))
       || (record.behind && (record.ready || record.head_sha === null || !record.author || record.error !== null))) {
       throw new Error('github-interface --merge-candidates returned malformed candidate evidence')
     }
-    return { pr, actor, ready: record.ready, behind: record.behind, head: record.head_sha as string | null,
+    const candidate = { pr, actor, ready: record.ready, behind: record.behind, head: record.head_sha as string | null,
       author: record.author as string | null, approvedAt: record.approved_at as string | null,
-      queueEntryId: record.queue_entry_id as string | null, error: record.error as string | null }
+      queueEntryId: record.queue_entry_id as string | null, error: record.error as string | null,
+      rollupState: rollupState as string | null, reviewDecision: reviewDecision as string | null,
+      mergeStateStatus: mergeStateStatus as string | null,
+      unresolvedThreads: unresolvedThreads as number | null, threadsComplete: threadsComplete as boolean | null,
+      queueEnabled: queueEnabled as boolean | null }
+    const { pr: _pr, actor: _actor, ...cached } = candidate
+    cacheMergeCandidate(pr.repo, pr.number, cached)
+    return candidate
   })
 }
 
@@ -5055,7 +5179,7 @@ function compareBehindCandidates(a: MergeCandidate, b: MergeCandidate): number {
 // green checks, so a vanished entry must read as a rejection to retain, not
 // as a fresh PR to resubmit. A new head, a manual requeue, or the merge
 // itself releases the admission.
-interface MergeQueueAdmission { entryId: string, head: string, at: string }
+export interface MergeQueueAdmission { entryId: string, head: string, at: string }
 const MERGE_QUEUE_ADMISSION_PREFIX = `${META_PREFIX}merge_prs_queue:`
 
 function mergeQueueAdmissionKey(target: string): string {
@@ -5082,6 +5206,11 @@ function storeQueueAdmission(target: string, admission: MergeQueueAdmission): vo
 
 function clearQueueAdmission(target: string): void {
   setMeta(mergeQueueAdmissionKey(target), '')
+}
+
+/** Merge-queue admission for one PR target, read-only for the per-PR status projection. */
+export function getMergeQueueAdmission(target: string): MergeQueueAdmission | null {
+  return readQueueAdmission(target)
 }
 
 function retireClosedQueueAdmissions(open: ReadonlySet<string>): void {
