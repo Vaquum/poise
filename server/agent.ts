@@ -12,7 +12,7 @@ import { captureBehaviorAdmission, captureBehaviorOutcome, observeAgentSnapshot 
 // Everything is hash-routed now — Poise never touches the filesystem
 // the agent-interface project owns.
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
+import { requestIssueReviewRevision } from './db'
 import { getHeadSha, getPrAuthor } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
@@ -40,6 +41,7 @@ export type {
 } from './agent-log-parse'
 
 const CLI = 'agent-interface'
+const GH_INTERFACE = 'github-interface'
 
 // agent-interface's DB stores some response_paths as relative
 // (`data/responses/<id>.txt`) and `--read-response` reads them without
@@ -653,7 +655,7 @@ export async function replayAgentJob(input: {
   behavior?: string,
   repo?: string,
   pr_id?: string | number,
-}, admit: ReplayAdmission): Promise<{ ok: true, source: string, correlationId: string }> {
+}, admit: ReplayAdmission): Promise<{ ok: true, source: string, correlationId: string, revision?: string, deduped?: true }> {
   const behavior = String(input.behavior || '')
   const repo = String(input.repo || '')
   const prId = String(input.pr_id || '')
@@ -727,12 +729,58 @@ export async function replayAgentJob(input: {
   return { ok: true, source, correlationId }
 }
 
+// The document revision an issue review reads: SHA-256 over the exact title
+// and body, the same bytes Caller's issue_review.revision hashes —
+// JSON([title, body]) with missing text as "". Comments and child documents
+// are context, never identity: identical content is the same revision.
+export function issueReviewRevision(title: unknown, body: unknown): string {
+  const text = (value: unknown): string => typeof value === 'string' ? value : ''
+  return createHash('sha256').update(JSON.stringify([text(title), text(body)]), 'utf8').digest('hex')
+}
+
+// The issue as it stands now, read as the agent account through the same
+// primitive Caller reads: the authoritative body a revision-bound request
+// pins. A closed issue is refused; an unreadable one throws, and launches
+// nothing.
+async function readIssueForReview(repo: string, issue: number, actor: string): Promise<{ title: unknown, body: unknown }> {
+  let data: unknown
+  try {
+    const { stdout } = await runFile(GH_INTERFACE, [
+      '--read-issue', `#${issue}`, '--repository', repo, '--token-user', actor,
+    ], { timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024 })
+    data = JSON.parse(stdout)
+  } catch (error) {
+    throw new HttpError(502, `Replay could not read ${repo}#${issue}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const result = data && typeof data === 'object' ? data as Record<string, unknown> : null
+  const entry = result && typeof result.issue === 'object' && result.issue !== null
+    ? result.issue as Record<string, unknown> : null
+  if (!result || result.action !== 'read_issue'
+    || typeof result.repository !== 'string' || result.repository.toLowerCase() !== repo.toLowerCase()
+    || result.issue_number !== issue || !entry
+    || (typeof entry.title !== 'string' && entry.title !== null && entry.title !== undefined)
+    || (typeof entry.body !== 'string' && entry.body !== null && entry.body !== undefined)) {
+    throw new HttpError(502, `Replay could not read ${repo}#${issue}: unexpected answer`)
+  }
+  if (typeof entry.state !== 'string' || entry.state.toLowerCase() !== 'open') {
+    throw new HttpError(409, `Replay refused: ${repo}#${issue} is not an open issue.`)
+  }
+  return { title: entry.title, body: entry.body }
+}
+
 // A replayed issue review is one fresh full-access run by the Issue review
 // default, commenting again as the agent account. It needs no head and no
-// local checkout: Caller prepares its own.
-async function replayIssueReview(repo: string, issue: string): Promise<{ ok: true, source: string, correlationId: string }> {
+// local checkout: Caller prepares its own. The run is bound to the exact
+// document revision read above: Caller verifies it before reading and
+// before posting, and fails loud instead of reviewing another body.
+// Repeated requests for the same revision reuse the recorded obligation
+// and spawn nothing, even after the run finished, failed or is held.
+async function replayIssueReview(repo: string, issue: string): Promise<{ ok: true, source: string, correlationId: string, revision: string, deduped?: true }> {
   const actor = requireAgentAccount()
   const { model, recovery, catalog } = await reviewChoice('issue_review')
+  // An older Caller silently ignores the expected revision and would run
+  // unpinned: prove support before anything is read or launched.
+  if (catalog.issue_review_revisions !== true) throw new Error('Update Caller: issue re-review is unavailable')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
@@ -740,9 +788,14 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
   if ((await reviewChoice('issue_review')).model !== model) throw new Error('Review model changed; retry the request')
+  const number = Number(issue)
+  const current = await readIssueForReview(repo, number, actor)
+  const revision = issueReviewRevision(current.title, current.body)
+  const request = requestIssueReviewRevision(repo, number, revision, correlationId)
+  if (!request.created) return { ok: true, source, correlationId: request.correlationId, revision, deduped: true }
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: 'review-new-issues', source, owner: repo.split('/')[0], actor,
-    repository: repo, number: Number(issue), head: null, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+    repository: repo, number, head: null, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
   try { await spawnDetached(CLI, [
     '--issue-review',
     `${repo}#${issue}`,
@@ -756,6 +809,8 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
     source,
     '--correlation-id',
     correlationId,
+    '--expected-issue-revision',
+    revision,
   ], {
     cwd: agentCwd(),
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
@@ -764,5 +819,5 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
     captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
     throw error
   }
-  return { ok: true, source, correlationId }
+  return { ok: true, source, correlationId, revision }
 }

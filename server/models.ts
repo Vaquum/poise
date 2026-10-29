@@ -30,6 +30,9 @@ export interface Catalog {
   // Providers Caller can run with full access for an issue review; absent
   // from a Caller that has no issue review.
   issue_review_providers?: string[]
+  // True when Caller honors --expected-issue-revision, records the observed
+  // issue_revision and stamps it on published comments; absent from older Callers.
+  issue_review_revisions?: boolean
   policy: string
 }
 

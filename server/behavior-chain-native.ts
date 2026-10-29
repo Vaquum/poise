@@ -150,7 +150,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
             if (!Array.isArray(response.comments)) throw new Error('issue review reconciliation has no complete comment list')
             commentsByIssue.set(ref, response.comments)
           }
-          const body = `${post.body}\n\n---\n<sub>Issue review · \`${plan.model}\`</sub>\n<!-- agent-interface issue-review call=${pendingReview.evidence.callId} -->`
+          const body = `${post.body}\n\n---\n<sub>Issue review · \`${plan.model}\` · rev \`${plan.issue_revision.slice(0, 8)}\`</sub>\n<!-- agent-interface issue-review call=${pendingReview.evidence.callId} -->`
           const found = commentsByIssue.get(ref)!.map((comment) => object(comment, 'published issue review comment')).find((comment) =>
             typeof comment.id === 'number' && !used.has(comment.id) && typeof comment.author === 'string'
               && comment.author.toLowerCase() === chain.reviewer.toLowerCase() && comment.body === body)

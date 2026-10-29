@@ -644,22 +644,28 @@ def _reconcile_post(repo: str, number: int, actor: str, call_id: str, seen: set[
     return None
 
 
-def comment_body(item: dict, model: str, call_id: str) -> str:
-    return (f"{item['body']}\n\n---\n<sub>Issue review · `{model}`</sub>\n"
+def comment_body(item: dict, model: str, call_id: str, revision: str | None = None) -> str:
+    # The revision marker names the exact document revision this comment
+    # reviewed, so a later revision's review is distinguishable from a stale
+    # one. The terminal call marker stays byte-identical: existing parsers and
+    # mark_reviewed match on it, not on the human-readable line above.
+    marker = f" · rev `{revision[:8]}`" if revision else ""
+    return (f"{item['body']}\n\n---\n<sub>Issue review · `{model}`{marker}</sub>\n"
             f"<!-- agent-interface issue-review call={call_id} -->")
 
 
-def post(posts: list[dict], actor: str, call_id: str, model: str, record) -> list[dict]:
+def post(posts: list[dict], actor: str, call_id: str, model: str, record, revision: str | None = None) -> list[dict]:
     """Post each comment as the actor. `record` is called with the receipts
     before the first comment and after every one, so a run that dies while
-    posting is never mistaken for one that posted nothing."""
+    posting is never mistaken for one that posted nothing. `revision` is the
+    observed document revision each comment reviewed, stamped visibly."""
     progress.stage("posting", f"Posting {len(posts)} comment(s) as {actor}")
     receipts: list[dict] = []
     failures: list[str] = []
     record(receipts)
     for item in posts:
         repo, number = parse(item["issue"])
-        body = comment_body(item, model, call_id)
+        body = comment_body(item, model, call_id, revision)
         try:
             reply = interface("--comment-issue", f"#{number}", "--repository", repo, "--token-user", actor, f"--body={body}")
         except (subprocess.TimeoutExpired, review_budget.ReviewLimitError) as error:

@@ -897,6 +897,13 @@ def run_issue_review(
                     "review_budget_exhausted"), "review_budget_exhausted")
             except Exception as e:
                 fail(e)
+            # A revision-bound request promises the author a readback of the
+            # requested document: child-only output cannot fulfill it.
+            if expected_issue_revision and not any(isinstance(post, dict)
+                    and str(post.get("issue") or "").lower() == issue_review.ref(repo, number).lower()
+                    for post in posts):
+                fail(issue_review.InvalidReview("the review has no comment for the requested issue"),
+                     issue_review.InvalidReview.code)
             try:
                 if expected_issue_revision and issue_review.revision(issue_review._issue(repo, number, actor)) != observed_revision:
                     fail(ValueError("seed issue changed during review; no comments posted"), "issue_revision_changed", preflight=True)
@@ -905,7 +912,7 @@ def run_issue_review(
                     with db() as conn:
                         conn.execute("update calls set artifact=? where id=? and status='running'",
                                      (json.dumps({"phase": "posting_issue_reviews", "plan_sha": digest}), id_))
-                receipts = issue_review.post(posts, actor, id_, name, record)
+                receipts = issue_review.post(posts, actor, id_, name, record, observed_revision)
             except subprocess.TimeoutExpired as e:
                 fail(review_budget.ReviewLimitError(
                     "Issue review posting reached its time limit; uncertain publication, reconcile before retry",
@@ -2037,7 +2044,7 @@ behaviors:
   --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N]
   --fix-failing-ci PR [--pwd DIR]
   --issue-simplify ISSUE [--pwd DIR]
-  --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--note TEXT]
+  --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--expected-issue-revision SHA256] [--note TEXT]
   --atomic-work OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID --branch BRANCH [--pull-number N --expected-head SHA] [--merge-base] [--expected-issue-revision SHA256] [--note TEXT]
   --read-action-plan CALL_ID
   --complete-atomic-publication CALL_ID PLAN_SHA HEAD_SHA

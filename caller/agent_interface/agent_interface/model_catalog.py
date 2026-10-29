@@ -106,6 +106,10 @@ class ModelCatalog:
             "debate_participants": list(self.debate_participants),
             "review_providers": sorted(REVIEW_PROVIDERS),
             "issue_review_providers": sorted(ISSUE_REVIEW_PROVIDERS),
+            # Revision-bound issue reviews: --expected-issue-revision is
+            # honored, the observed issue_revision is recorded, and every
+            # published comment carries its revision marker.
+            "issue_review_revisions": True,
         }
 
 

@@ -63,6 +63,21 @@ include it. Edits, new comments and your agent account's own comments never
 start another review; Replay in Swarm runs one by hand. At most three
 reviewers run at once across all issues; the rest wait for a free slot.
 
+## Asking for another review
+
+When you revise the issue and want it reviewed again, Replay on its review
+row requests a fresh review of the exact revision the issue holds at that
+moment: Poise reads the current title and body, binds the run to their
+SHA-256, and Caller verifies that revision before reading and again before
+posting, failing loud instead of reviewing another body. A repeated request
+for the same revision reuses the recorded request and starts nothing new,
+even after the run finished, failed or is held; editing the issue creates a
+new revision that can be requested on its own. The request needs the same
+standing as a first review — an opted-in repository, an open issue, a
+trusted author — but it is not bound by the automatic discovery rules above
+(it works for older issues and while the behavior is off), and it runs one
+reviewer: the current Issue review default.
+
 ## Sub-issues
 
 "Directly linked" means the issue makes the other issue its sub-issue, one
@@ -116,12 +131,17 @@ is deleted when the reviewer finishes. The reviewer does not post. It writes its
 comments to a file; Caller posts them through github-interface as your agent
 account — one comment per issue per reviewer (in parts when it is longer than
 GitHub takes in one), only on the issue and its readable sub-issues, each
-signed with the reviewer's model:
+signed with the reviewer's model and the short revision it reviewed:
 
 ```
 ---
-Issue review · `opus-5.5-max`
+Issue review · `opus-5.5-max` · rev `d9da577c`
 ```
+
+A comment covers only its marked revision: a later edit makes it historical
+without starting another review, and a completed run never satisfies a
+request for a different revision. Reviews from before revision markers have
+an unknown revision and never count as a review of the current body.
 
 Reviewers work independently, so the same finding can appear twice, as with
 the PR review panel. When a reviewer finishes, anything still running in its
@@ -180,13 +200,21 @@ from your working copies; it is not a sandbox. See SECURITY.md.
 ## Caller contract
 
 - `agent-interface --issue-review OWNER/REPO#N --model M [--recovery-model R]
-  --actor USER --source SOURCE --correlation-id ID [--note TEXT]`
+  --actor USER --source SOURCE --correlation-id ID [--expected-issue-revision
+  SHA256] [--note TEXT]`. With the expected revision, Caller fails with
+  `issue_revision_changed` and posts nothing when the title or body moved
+  before reading or before posting; a revision-bound run with no comment for
+  the requested issue fails instead of completing.
 - `agent-interface --models` lists `issue_review_providers`; without it Poise
   reports *Update Caller: issue review is unavailable* and launches nothing.
+  Revision-bound replays additionally need `issue_review_revisions`, else
+  *Update Caller: issue re-review is unavailable*.
 - Log rows: `behavior: issue_review`, the issue number in `pr_id`, no
-  `expected_head` or `head_sha`, `action`/`outcome` `commented` when done, and
-  `receipts` — `null` until posting begins, then the comments posted
-  (`issue`, `comment_id`, `url`, `author`).
+  `expected_head` or `head_sha`, `action`/`outcome` `commented` when done,
+  `issue_revision` — the SHA-256 of the exact title and body reviewed
+  (`null` on runs from before revision markers) — and `receipts` — `null`
+  until posting begins, then the comments posted (`issue`, `comment_id`,
+  `url`, `author`).
 - github-interface primitives: `--read-issue`, `--issue-comments`,
   `--sub-issues` and `--comment-issue`, each with `--repository OWNER/REPO`,
   and `--checkout-repo OWNER/REPO --path DIR`, every one with

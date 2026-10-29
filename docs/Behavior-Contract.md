@@ -470,7 +470,13 @@ spawn are ahead. Launch claims fence live reservations atomically, so a
 scheduler tick in that window skips instead of starting a duplicate
 worker; a refused replay releases its reservation. An
 `issue_review` replay stays a deliberate fresh run that comments again: it
-takes no publication check.
+takes no publication check. It is bound to the exact document revision read
+when the request is accepted — the SHA-256 of the current title and body —
+and Caller verifies that revision before reading and before posting. One
+revision is requested once: a repeated request reuses the recorded
+obligation and starts nothing new, however the run ended. Each published
+comment carries the short revision it reviewed, so a stale result stays
+distinguishable from a review of the current body.
 
 A repository outside every ready account is refused the same way. When the
 facts cannot be read, the replay answers 502 and launches nothing.
