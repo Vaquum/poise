@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({
   runFile: vi.fn(),
   meta: new Map<string, string>(),
   orgs: [] as Array<{ login: string }>,
-  repos: {} as Record<string, Array<{ full_name: string, archived?: boolean, disabled?: boolean, owner?: { login: string } }>>,
+  repos: {} as Record<string, Array<{ full_name: string, id: number, archived?: boolean, disabled?: boolean, owner?: { login: string } }>>,
   collaboratorStatus: 201,
   invitations: [] as unknown[],
   acceptStatus: 204,
@@ -44,7 +44,7 @@ beforeEach(() => {
   mocks.meta.set('me', 'octocat')
   mocks.meta.set('agentAccount', 'agent-x')
   mocks.orgs = [{ login: 'acme' }]
-  mocks.repos = { acme: [{ full_name: 'acme/site', owner: { login: 'acme' } }] }
+  mocks.repos = { acme: [{ full_name: 'acme/site', id: 101, owner: { login: 'acme' } }] }
   mocks.collaboratorStatus = 201
   mocks.invitations = []
   mocks.acceptStatus = 204
@@ -79,7 +79,7 @@ describe('reconcileAgentCollaborators', () => {
     expect(invites).toEqual([['api', 'repos/acme/site/collaborators/agent-x', '--method', 'PUT', '--include', '--field', 'permission=push']])
     const inviteCall = mocks.runFile.mock.calls.find(([, args]) => args[1]?.includes('/collaborators/'))
     expect(inviteCall?.[2].env).toMatchObject({ GH_HOST: 'github.com', GH_TOKEN: 'octocat-token' })
-    expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme')!)).toEqual(['acme/site'])
+    expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme:agent-x')!)).toEqual([[101, 'acme/site']])
   })
 
   it('treats an existing collaborator as confirmed without a second write', async () => {
@@ -94,19 +94,38 @@ describe('reconcileAgentCollaborators', () => {
 
   it('skips archived and disabled repositories and prunes stale confirmations', async () => {
     mocks.repos = { acme: [
-      { full_name: 'acme/site', owner: { login: 'acme' } },
-      { full_name: 'acme/old', archived: true, owner: { login: 'acme' } },
-      { full_name: 'acme/off', disabled: true, owner: { login: 'acme' } },
+      { full_name: 'acme/site', id: 101, owner: { login: 'acme' } },
+      { full_name: 'acme/old', id: 104, archived: true, owner: { login: 'acme' } },
+      { full_name: 'acme/off', id: 105, disabled: true, owner: { login: 'acme' } },
     ] }
-    mocks.meta.set('agent_collaborator_confirmed:acme', JSON.stringify(['acme/site', 'acme/renamed-away']))
+    mocks.meta.set('agent_collaborator_confirmed:acme:agent-x', JSON.stringify([[101, 'acme/site'], [106, 'acme/renamed-away']]))
     const result = await reconcileAgentCollaborators()
     expect(result.invited).toEqual([])
     expect(calls('gh').filter((args) => args[1]?.includes('/collaborators/'))).toEqual([])
-    expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme')!)).toEqual(['acme/site'])
+    expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme:agent-x')!)).toEqual([[101, 'acme/site']])
+  })
+
+  it('re-invites every repository after the agent account changes', async () => {
+    mocks.meta.set('agent_collaborator_confirmed:acme:agent-x', JSON.stringify([[101, 'acme/site']]))
+    mocks.meta.set('agentAccount', 'agent-y')
+    const result = await reconcileAgentCollaborators()
+    expect(result.invited).toEqual(['acme/site'])
+    expect(calls('gh').filter((args) => args[1]?.includes('/collaborators/'))).toEqual([
+      ['api', 'repos/acme/site/collaborators/agent-y', '--method', 'PUT', '--include', '--field', 'permission=push'],
+    ])
+    expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme:agent-y')!)).toEqual([[101, 'acme/site']])
+  })
+
+  it('re-invites a same-name repository recreated with a new id', async () => {
+    mocks.meta.set('agent_collaborator_confirmed:acme:agent-x', JSON.stringify([[101, 'acme/site']]))
+    mocks.repos = { acme: [{ full_name: 'acme/site', id: 202, owner: { login: 'acme' } }] }
+    const result = await reconcileAgentCollaborators()
+    expect(result.invited).toEqual(['acme/site'])
+    expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme:agent-x')!)).toEqual([[202, 'acme/site']])
   })
 
   it('accepts only the person’s invitations under covered accounts and tolerates a vanished one', async () => {
-    mocks.meta.set('agent_collaborator_confirmed:acme', JSON.stringify(['acme/site']))
+    mocks.meta.set('agent_collaborator_confirmed:acme:agent-x', JSON.stringify([[101, 'acme/site']]))
     mocks.invitations = [
       invitation(11, 'acme', 'octocat'),
       invitation(12, 'acme', 'stranger'),
@@ -151,8 +170,8 @@ describe('reconcileAgentCollaborators', () => {
 
   it('backs a failing invite off, keeps reconciling the rest, and retries after reset', async () => {
     mocks.repos = { acme: [
-      { full_name: 'acme/denied', owner: { login: 'acme' } },
-      { full_name: 'acme/site', owner: { login: 'acme' } },
+      { full_name: 'acme/denied', id: 103, owner: { login: 'acme' } },
+      { full_name: 'acme/site', id: 101, owner: { login: 'acme' } },
     ] }
     mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
       if (command === 'gh' && args[0] === 'auth') return { stdout: `${args[args.length - 1]}-token`, stderr: '' }
@@ -184,7 +203,7 @@ describe('reconcileAgentCollaborators', () => {
 
   it('continues past an unreadable listing or invitation read', async () => {
     mocks.orgs = [{ login: 'acme' }, { login: 'beta' }]
-    mocks.repos = { beta: [{ full_name: 'beta/site', owner: { login: 'beta' } }] }
+    mocks.repos = { beta: [{ full_name: 'beta/site', id: 102, owner: { login: 'beta' } }] }
     mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
       if (command === 'gh' && args[0] === 'auth') return { stdout: `${args[args.length - 1]}-token`, stderr: '' }
       if (command === 'github-interface' && String(args[1]).toLowerCase() === 'acme') throw new Error('no network')
@@ -201,10 +220,10 @@ describe('reconcileAgentCollaborators', () => {
   })
 
   it('re-verifies every repository when the confirmed set is unreadable', async () => {
-    mocks.meta.set('agent_collaborator_confirmed:acme', 'not json')
+    mocks.meta.set('agent_collaborator_confirmed:acme:agent-x', 'not json')
     const result = await reconcileAgentCollaborators()
     expect(result.invited).toEqual(['acme/site'])
-    expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme')!)).toEqual(['acme/site'])
+    expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme:agent-x')!)).toEqual([[101, 'acme/site']])
   })
 
   it('waits for sign-in when a token is unavailable instead of failing', async () => {
@@ -215,11 +234,11 @@ describe('reconcileAgentCollaborators', () => {
     })
     const result = await reconcileAgentCollaborators()
     expect(result).toEqual({ repos: 1, invited: [], accepted: [] })
-    expect(mocks.meta.get('agent_collaborator_confirmed:acme')).toBe(JSON.stringify([]))
+    expect(mocks.meta.get('agent_collaborator_confirmed:acme:agent-x')).toBe(JSON.stringify([]))
   })
 
   it('rejects a listing that names repositories outside the account', async () => {
-    mocks.repos = { acme: [{ full_name: 'elsewhere/site', owner: { login: 'elsewhere' } }] }
+    mocks.repos = { acme: [{ full_name: 'elsewhere/site', id: 109, owner: { login: 'elsewhere' } }] }
     const result = await reconcileAgentCollaborators()
     expect(result).toEqual({ repos: 0, invited: [], accepted: [] })
     expect(calls('gh').filter((args) => args[1]?.includes('/collaborators/'))).toEqual([])

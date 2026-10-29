@@ -31,6 +31,7 @@ export interface ReconcileResult {
 
 interface ListedRepo {
   fullName: string
+  id: number
   archived: boolean
 }
 
@@ -61,20 +62,33 @@ function warnOnce(key: string, now: number, message: string): void {
   console.warn(`[agent-collaborator] ${message}`)
 }
 
-function confirmedKey(login: string): string {
-  return `agent_collaborator_confirmed:${login.toLowerCase()}`
+// Confirmations are scoped to the agent account they were granted to: a
+// Settings change re-verifies every repository for the new agent instead of
+// inheriting the previous agent's access. Entries bind the repository id, so
+// a deleted and recreated same-name repository re-verifies instead of
+// inheriting the deleted repository's confirmation.
+function confirmedKey(login: string, agent: string): string {
+  return `agent_collaborator_confirmed:${login.toLowerCase()}:${agent.toLowerCase()}`
 }
 
-function readConfirmed(login: string): Set<string> {
-  const raw = getMeta(confirmedKey(login))
-  if (!raw) return new Set()
+function readConfirmed(login: string, agent: string): Map<string, number> {
+  const empty = new Map<string, number>()
+  const raw = getMeta(confirmedKey(login, agent))
+  if (!raw) return empty
   try {
     const parsed: unknown = JSON.parse(raw)
-    if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== 'string')) throw new Error('not a string array')
-    return new Set(parsed as string[])
+    if (!Array.isArray(parsed)) throw new Error('not an array')
+    const confirmed = new Map<string, number>()
+    for (const entry of parsed) {
+      if (!Array.isArray(entry) || entry.length !== 2 || !Number.isInteger(entry[0]) || typeof entry[1] !== 'string') {
+        throw new Error('not an id/name pair')
+      }
+      confirmed.set(entry[1].toLowerCase(), entry[0])
+    }
+    return confirmed
   } catch {
     console.warn(`[agent-collaborator] confirmed repositories for ${login} are unreadable; re-verifying all of them`)
-    return new Set()
+    return empty
   }
 }
 
@@ -147,14 +161,17 @@ async function discoverRepos(login: string, me: string): Promise<ListedRepo[]> {
   const entries = (data as { repos?: unknown }).repos
   if (!Array.isArray(entries)) throw new Error(`repository discovery for ${login} returned no repository list`)
   return entries.map((entry) => {
-    const record = entry as { full_name?: unknown, archived?: unknown, disabled?: unknown, owner?: unknown }
+    const record = entry as { full_name?: unknown, id?: unknown, archived?: unknown, disabled?: unknown, owner?: unknown }
     const fullName = typeof record.full_name === 'string' ? record.full_name : ''
     const owner = (record.owner as { login?: unknown } | undefined)?.login
     if (!REPOSITORY.test(fullName) || fullName.split('/')[0].toLowerCase() !== login.toLowerCase()
       || (owner !== undefined && String(owner).toLowerCase() !== login.toLowerCase())) {
       throw new Error(`repository discovery for ${login} returned an unexpected repository: ${fullName || '(unnamed)'}`)
     }
-    return { fullName, archived: record.archived === true || record.disabled === true }
+    if (!Number.isInteger(record.id)) {
+      throw new Error(`repository discovery for ${login} returned a repository without an id: ${fullName}`)
+    }
+    return { fullName, id: record.id as number, archived: record.archived === true || record.disabled === true }
   })
 }
 
@@ -191,15 +208,17 @@ async function inviteMissing(
     console.warn(`[agent-collaborator] ${redact(error instanceof Error ? error.message : String(error), secrets)}`)
     return { repos: 0, invited: [] }
   }
-  const confirmed = readConfirmed(login)
-  const current = new Set(listed.map((repo) => repo.fullName.toLowerCase()))
-  const kept = [...confirmed].filter((repo) => current.has(repo))
-  const next = new Set(kept)
+  const stored = readConfirmed(login, agent)
+  const next = new Map<string, number>()
   const invited: string[] = []
   let token: string | null | undefined
   for (const repo of listed) {
-    if (repo.archived || next.has(repo.fullName.toLowerCase())) continue
     const key = repo.fullName.toLowerCase()
+    if (repo.archived) continue
+    if (stored.get(key) === repo.id) {
+      next.set(key, repo.id)
+      continue
+    }
     if (backedOff(key, now)) continue
     token ??= await getMeToken()
     if (!token) {
@@ -211,7 +230,7 @@ async function inviteMissing(
       // an existing collaborator (204), and a pending invitation restated.
       const { status, body } = await ghApi(token, 'PUT', `repos/${repo.fullName}/collaborators/${agent}`, ['--field', 'permission=push'])
       if (status < 200 || status >= 300) throw new Error(failureMessage(repo.fullName, status, body, [token, ...secrets]))
-      next.add(key)
+      next.set(key, repo.id)
       recentFailures.delete(key)
       invited.push(repo.fullName)
     } catch (error) {
@@ -219,7 +238,8 @@ async function inviteMissing(
       console.warn(`[agent-collaborator] ${redact(error instanceof Error ? error.message : String(error), token ? [token, ...secrets] : [...secrets])}`)
     }
   }
-  setMeta(confirmedKey(login), JSON.stringify([...next].sort()))
+  const ordered = [...next.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([name, id]) => [id, name])
+  setMeta(confirmedKey(login, agent), JSON.stringify(ordered))
   return { repos: listed.length, invited }
 }
 
