@@ -95,7 +95,7 @@ beforeEach(() => {
 })
 
 describe('agent log compatibility', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
 
   it('projects an existing validated snapshot without another Caller read', async () => {
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
@@ -243,7 +243,7 @@ describe('agent log compatibility', () => {
 })
 
 describe('agent log quarantine', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
 
   it('returns valid rows newest first while retaining malformed row attribution', async () => {
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([
@@ -843,7 +843,7 @@ describe('progress data does not determine review status', () => {
 
 
 describe('stopping a run', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
   it('asks Caller to stop the call and passes its answer through', async () => {
     const { stopAgentJob } = await import('../server/agent')
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify({ id: 'a'.repeat(32), stopped: true, status: 'failed', error_code: 'stopped' }), stderr: '' })
@@ -860,7 +860,7 @@ describe('stopping a run', () => {
 })
 
 describe('provider reasoning reads', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
   it('reads only a full call id and bounds the CLI output', async () => {
     mocks.runFile.mockResolvedValue({ stdout: 'exposed reasoning' })
     await expect(fetchAgentReasoning('A'.repeat(32))).resolves.toMatchObject({ body: 'exposed reasoning' })
@@ -890,7 +890,7 @@ describe('review policy compatibility', () => {
 // shape, one such row rejected the whole log — Swarm blank, reconciliation
 // stalled for every behavior.
 describe('issue review rows', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
 
   function issueRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return logRow({
@@ -962,7 +962,8 @@ describe('issue review rows', () => {
     const result = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '452' }, mocks.admit)
     expect(result.source).toBe('poise:replay')
     const revision = issueReviewRevision('PRD', 'Revision 2.')
-    expect(result).toMatchObject({ revision, deduped: undefined })
+    expect(result.revision).toBe(revision)
+    expect(result.deduped).toBeUndefined()
     const [command, args] = vi.mocked(spawnDetached).mock.calls[0]
     expect(command).toBe('agent-interface')
     expect(args).toEqual(['--issue-review', 'Vaquum/Origo#452', '--model', 'gpt-6-astra-ultra', '--recovery-model', 'opus-5-xhigh',
@@ -999,7 +1000,7 @@ describe('issue re-review requests', () => {
     invalidateCatalog()
     const { spawnDetached } = await import('../server/process')
     vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
-    return { spawnDetached: vi.mocked(spawnDetached), ...(await import('../server/agent'))) }
+    return { spawnDetached: vi.mocked(spawnDetached), ...(await import('../server/agent')) }
   }
 
   it('hashes the exact title and body, the bytes Caller hashes', async () => {
