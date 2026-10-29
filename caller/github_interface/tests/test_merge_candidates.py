@@ -60,7 +60,33 @@ class TestMergeCandidates(IsolatedAsyncioTestCase):
         result = await self.read()
         self.assertEqual(result['records'][0], {'repository': 'acme/app', 'number': 1,
                          'ready': True, 'behind': False, 'head_sha': HEAD, 'author': 'octocat',
-                         'approved_at': APPROVED_AT, 'queue_entry_id': None, 'error': None})
+                         'approved_at': APPROVED_AT, 'queue_entry_id': None, 'error': None,
+                         'rollup_state': 'SUCCESS', 'review_decision': None, 'merge_state_status': 'CLEAN',
+                         'unresolved_threads': 0, 'threads_complete': True, 'queue_enabled': False})
+
+    async def test_status_projection_fields_come_from_the_same_read(self):
+        self.client.request.return_value = response(fields={
+            'reviewDecision': 'CHANGES_REQUESTED',
+            'mergeQueue': {'id': 'Q1'},
+            'reviewThreads': {'pageInfo': {'hasNextPage': False}, 'nodes': [
+                {'isResolved': False, 'isOutdated': False},
+                {'isResolved': False, 'isOutdated': True},
+                {'isResolved': True, 'isOutdated': False}]},
+            'commits': {'nodes': [{'commit': {'statusCheckRollup': {'state': 'PENDING'}}}]}})
+        record = (await self.read())['records'][0]
+        self.assertEqual((record['rollup_state'], record['review_decision'], record['merge_state_status'],
+                          record['unresolved_threads'], record['threads_complete'], record['queue_enabled']),
+                         ('PENDING', 'CHANGES_REQUESTED', 'CLEAN', 1, True, True))
+        self.client.request.assert_awaited_once()
+        self.client.get.assert_not_awaited()
+
+    async def test_status_projection_fields_stay_empty_on_malformed_evidence(self):
+        self.client.request.return_value = response(fields={'mergeQueueEntry': {'id': ''}})
+        record = (await self.read())['records'][0]
+        self.assertEqual((record['rollup_state'], record['review_decision'], record['merge_state_status'],
+                          record['unresolved_threads'], record['threads_complete'], record['queue_enabled']),
+                         (None, None, None, None, None, None))
+        self.assertIn('malformed', record['error'])
 
     async def test_queued_packets_carry_the_current_queue_entry_id(self):
         self.client.request.return_value = response(fields={'mergeQueueEntry': {'id': 'MQE_1'}})

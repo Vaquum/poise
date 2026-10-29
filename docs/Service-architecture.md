@@ -1168,6 +1168,12 @@ worker, including running or uncertain siblings. It adds no execution authority.
 Existing ledger responses may include fixed, bounded `Server-Timing` headers
 for handler, queue and completed worker phases. They add no JSON fields,
 authority, persistence or collection; absent responses establish no timing.
+A per-PR status projection is served beside the ledger at guarded, read-only
+`GET /api/behavior-ledger/pr-status` with a `pr-status` loopback CLI
+subcommand. It projects one row per open pull request from already-held
+state (datastore listing, launch ledger, incidents, queue admissions, and
+the merge-prs tick's cached candidate reading) with no new Caller or GitHub
+read and no execution influence. See [Behavior ledger](Behavior-ledger.md).
 
 ## Google document publishing
 
