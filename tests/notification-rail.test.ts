@@ -55,6 +55,27 @@ describe('an entry', () => {
     expect(html).toContain('is-auto')
   })
 
+  it('links a held repository once to its access settings, escaping what it says', () => {
+    const [held] = notificationItems([], {
+      status: 'ok', agentLogsError: null,
+      datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+      identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [],
+      holds: [{ actor: 'review-bot', repo: 'org/repo', error: 'GitHub 404: Not Found', heldAt: '', nextRecheckAt: '' }],
+    }, T0)
+    const html = itemHtml(held, true, T0)
+    expect(html).toContain('<a class="nr-link" href="https://github.com/org/repo/settings/access" target="_blank" rel="noopener noreferrer">Invite review-bot or resend its pending invitation</a>')
+    expect(html.match(/<a class="nr-link"/g)).toHaveLength(1)
+    const [hostile] = notificationItems([], {
+      status: 'ok', agentLogsError: null,
+      datastore: { status: 'healthy', checkedAt: '', ageSeconds: 1, lastSuccessAt: '', error: null },
+      identity: { status: 'valid', actor: 'bit-mis', error: null }, failures: [], deadLetters: [],
+      holds: [{ actor: '<img src=x onerror=alert(1)>', repo: 'org/repo', error: 'GitHub 404: Not Found', heldAt: '', nextRecheckAt: '' }],
+    }, T0)
+    const escaped = itemHtml(hostile, true, T0)
+    expect(escaped).not.toContain('<img src=x')
+    expect(escaped).toContain('Invite &lt;img src=x onerror=alert(1)&gt; or resend its pending invitation')
+  })
+
   it('says whether it is expanded, and hides its details until it is', () => {
     const closed = itemHtml(item(notice('a')), false, T0)
     expect(closed).toContain('aria-expanded="false"')

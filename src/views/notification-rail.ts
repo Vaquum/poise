@@ -116,6 +116,20 @@ function nextCheck(entry: DiagnosticEntry, now: number): string {
   return entry.next && Number.isFinite(Date.parse(entry.next)) ? `; next check ${clock(entry.next, now)}` : ''
 }
 
+// An entry's link, once per card however many entries carry it, and only to
+// https: escaping alone cannot stop a javascript: href.
+function entryLink(entry: DiagnosticEntry, linked: Set<string>): string {
+  const link = entry.link
+  if (!link || linked.has(link.url)) return ''
+  try {
+    if (new URL(link.url).protocol !== 'https:') return ''
+  } catch {
+    return ''
+  }
+  linked.add(link.url)
+  return ` <a class="nr-link" href="${escapeHtml(link.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.label)}</a>`
+}
+
 // A stable element id for an item id, which may hold any character.
 function slug(id: string): string {
   let hash = 2166136261
@@ -131,8 +145,9 @@ export function itemHtml(item: NotificationItem, opened: boolean, now: number): 
   // A Poise-wide condition's scope can repeat its source: "Behaviors · Behaviors".
   const meta = [item.source, item.scope === item.source ? null : item.scope, item.meta].filter(Boolean).map((part) => escapeHtml(part!)).join(' · ')
   const when = item.when && Number.isFinite(Date.parse(item.when)) ? `<time datetime="${escapeHtml(item.when)}">${ago(item.when, now)}</time>` : ''
+  const linked = new Set<string>()
   const history = item.details.length
-    ? `<ol class="nr-history">${item.details.map((entry) => `<li>${entry.at && Number.isFinite(Date.parse(entry.at)) ? `<time datetime="${escapeHtml(entry.at)}">${clock(entry.at, now)}</time>` : ''}<span>${escapeHtml(entry.detail)}${nextCheck(entry, now)}</span></li>`).join('')}</ol>`
+    ? `<ol class="nr-history">${item.details.map((entry) => `<li>${entry.at && Number.isFinite(Date.parse(entry.at)) ? `<time datetime="${escapeHtml(entry.at)}">${clock(entry.at, now)}</time>` : ''}<span>${escapeHtml(entry.detail)}${nextCheck(entry, now)}${entryLink(entry, linked)}</span></li>`).join('')}</ol>`
     : ''
   const notice = item.notice
   const label = notice?.target ? openLabel(notice.target) : null

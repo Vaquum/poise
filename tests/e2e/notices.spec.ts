@@ -666,6 +666,23 @@ test('shows a quota-exhausted check as automatic with its reset, not a repositor
   await expect(entry.locator('.nr-history')).toContainText('1800000000')
 })
 
+test('links a held repository to its access settings, naming the agent and the pending invitation', async ({ page }) => {
+  await workspace(page, [], { diagnostics: diagnostics({ holds: [{ actor: 'octo-agent', repo: 'acme/api',
+    error: 'GitHub 404: Not Found', heldAt: iso(0), nextRecheckAt: iso(60) }] }) })
+  await page.goto('/')
+  await openRail(page)
+  const needs = rail(page).getByRole('region', { name: 'Needs you' })
+  const entry = needs.locator('.nr-card').filter({ hasText: 'octo-agent has no access to acme/api' }).first()
+  await expect(entry).toBeVisible()
+  await entry.locator('.nr-card-head').click()
+  await expect(entry.locator('.nr-card-head')).toHaveAttribute('aria-expanded', 'true')
+  const link = entry.locator('.nr-history a.nr-link')
+  await expect(link).toHaveCount(1)
+  await expect(link).toHaveText('Invite octo-agent or resend its pending invitation')
+  await expect(link).toHaveAttribute('href', 'https://github.com/acme/api/settings/access')
+  await expect(link).toHaveAttribute('target', '_blank')
+})
+
 test('counts Behaviors’ diagnostics on the bell once the page has settled, with one read and the rail closed', async ({ page }) => {
   await workspace(page, [WAITING], { diagnostics: diagnostics({ agentLogsError: 'agent-interface --logs exited with status 1' }) })
   let reads = 0

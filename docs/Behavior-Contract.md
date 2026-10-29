@@ -243,7 +243,10 @@ for the repository instead of a per-target failure, and the pull-request
 behaviors skip the repository until access comes back. One recheck an hour
 later either clears the hold or renews it; a successful check against the
 repository clears it sooner. A batch failure shared by several repositories
-is unattributable and never holds any of them.
+is unattributable and never holds any of them. The rail's held-repository
+entry names the acting account and links the repository's access settings,
+where the person invites the account or resends its pending invitation;
+grants stay the person's explicit action.
 A `review-new-prs` sweep cut short by its deadline still claims and launches
 the reviews it managed to prepare, and an `approve-prs` sweep still fires the
 approvals it managed to prepare; the next sweep prepares the rest. Git
