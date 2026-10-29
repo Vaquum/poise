@@ -603,14 +603,15 @@ export async function triggerPrReview(
   const correlationId = randomUUID()
 
   if (claude) await claudeAuth.requireReady()
+  // The final lookup runs first: the checks below catch anything that changed
+  // while it was out, including account swaps during the lookup itself. A
+  // Random draw varies per read, so it revalidates membership in the current
+  // runnable slots instead of identity with a fresh draw.
+  const stored = getModelSettings().places?.['pr_review']?.slot ?? 'primary'
+  const selectedModel = stored === 'random' ? null : (await reviewChoice('pr_review')).model
+  const drawValid = stored === 'random' ? await randomDrawStillValid('pr_review', model) : selectedModel === model
   if (!prAccountsMatch(accounts) || prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
-  if (getModelSettings().places?.['pr_review']?.slot === 'random') {
-    // Draws vary per read by design; revalidate membership instead so a
-    // settings change cannot launch a model no slot holds anymore.
-    if (!(await randomDrawStillValid('pr_review', model))) throw new Error('Review model changed; retry the request')
-  } else if ((await reviewChoice('pr_review')).model !== model) {
-    throw new Error('Review model changed; retry the request')
-  }
+  if (!drawValid) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: 'review-new-prs', source, owner, actor, repository: repoFullName,
     number: Number(num), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
@@ -692,14 +693,15 @@ export async function replayAgentJob(input: {
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
+  // The final lookup runs first: the checks below catch anything that changed
+  // while it was out, including account swaps during the lookup itself. A
+  // Random draw varies per read, so it revalidates membership in the current
+  // runnable slots instead of identity with a fresh draw.
+  const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
+  const selectedModel = stored === 'random' ? null : (await reviewChoice(place)).model
+  const drawValid = stored === 'random' ? await randomDrawStillValid(place, model) : selectedModel === model
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
-  if (getModelSettings().places?.[place]?.slot === 'random') {
-    // Draws vary per read by design; revalidate membership instead so a
-    // settings change cannot launch a model no slot holds anymore.
-    if (!(await randomDrawStillValid(place, model))) throw new Error('Review model changed; retry the request')
-  } else if ((await reviewChoice(place)).model !== model) {
-    throw new Error('Review model changed; retry the request')
-  }
+  if (!drawValid) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
     repository: repo, number: Number(prId), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
@@ -812,13 +814,13 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
-  if (getModelSettings().places?.['issue_review']?.slot === 'random') {
-    // Draws vary per read by design; revalidate membership instead so a
-    // settings change cannot launch a model no slot holds anymore.
-    if (!(await randomDrawStillValid('issue_review', model))) throw new Error('Review model changed; retry the request')
-  } else if ((await reviewChoice('issue_review')).model !== model) {
-    throw new Error('Review model changed; retry the request')
-  }
+  // A Random draw varies per read, so it revalidates membership in the
+  // current runnable slots instead of identity with a fresh draw.
+  const stored = getModelSettings().places?.['issue_review']?.slot ?? 'primary'
+  const drawValid = stored === 'random'
+    ? await randomDrawStillValid('issue_review', model)
+    : (await reviewChoice('issue_review')).model === model
+  if (!drawValid) throw new Error('Review model changed; retry the request')
   const number = Number(issue)
   const current = await readIssueForReview(repo, number, actor)
   const revision = issueReviewRevision(current.title, current.body)

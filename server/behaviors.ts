@@ -2989,8 +2989,13 @@ async function tickReviewNewPrs(): Promise<void> {
     await retireStaleReviewerTrips()
     // Admission remembers the configured panel; only launches slide past
     // tripped reviewers, so a recovered reviewer still owns its waiting slot.
-    // The guard draws the full set, which is stable regardless of shuffle.
-    const guard = availableReviewSlots(await launchReviewPanel(REVIEWER_SLOTS.length, 'pr_review', 'guard:pr_review'))
+    // A fixed panel guards on its configured count, so a blocked reviewer
+    // holds the scan before any external work; a Random panel guards on the
+    // full set, since different targets draw different slots.
+    const stored = getModelSettings().places?.['pr_review']?.slot ?? 'primary'
+    const guard = stored === 'random'
+      ? availableReviewSlots(await launchReviewPanel(REVIEWER_SLOTS.length, 'pr_review', 'guard:pr_review'))
+      : availableReviewSlots(await launchReviewPanel(reviewerCount, 'pr_review'))
     if (guard.length === 0) return
     const prs = await listEligiblePrs('review-new-prs', author)
     await recoverSnapshotReviews(prs)
@@ -3924,12 +3929,15 @@ async function fireApprove(
   attachCheckSlotToClaim(claimId, checkSlot)
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
   const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor, accounts)
+  // The final lookup runs first: the gates below catch anything that changed
+  // while it was out, including role swaps during the lookup itself. A Random
+  // draw varies per read, so it revalidates membership in the current runnable
+  // slots instead of identity with a fresh draw.
+  const stored = getModelSettings().places?.['pr_approve']?.slot ?? 'primary'
+  const selectedModel = stored === 'random' ? null : (await approvalSlot())?.model
+  const drawValid = stored === 'random' ? await randomDrawStillValid('pr_approve', model) : selectedModel === model
   if (!isRunnable('approve-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('approve-prs', pr, actor)) return false
-  if (getModelSettings().places?.['pr_approve']?.slot === 'random') {
-    // Draws vary per read by design; revalidate membership instead so a
-    // settings change cannot launch a model no slot holds anymore.
-    if (!(await randomDrawStillValid('pr_approve', model))) return false
-  } else if ((await approvalSlot())?.model !== model) return false
+  if (!drawValid) return false
   if (admittedReviewer && configuredReviewer(pr.author).toLowerCase() !== admittedReviewer.toLowerCase()) return false
   if (replacesFailedCallId && !renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
     throw new Error(`approval PR operation ownership was lost for ${pr.repo}#${pr.number}`)
@@ -6277,10 +6285,14 @@ async function tickReviewNewIssues(): Promise<void> {
   await retireStaleReviewerTrips()
   // Planned slots remember the configured panel; only launches slide past
   // tripped reviewers, so a recovered reviewer still owns its waiting slot.
-  // The guard draws the full set, which is stable regardless of shuffle; each
-  // issue below draws its own seeded panel so a Random target keeps exactly
-  // its N reviewers across ticks.
-  const guard = availableReviewSlots(await launchReviewPanel(REVIEWER_SLOTS.length, 'issue_review', 'guard:issue_review'))
+  // A fixed panel guards on its configured count, so a blocked reviewer holds
+  // the scan before any external work; a Random panel guards on the full set,
+  // since different targets draw different slots. Each issue below draws its
+  // own seeded panel so a Random target keeps exactly its N reviewers.
+  const stored = getModelSettings().places?.['issue_review']?.slot ?? 'primary'
+  const guard = stored === 'random'
+    ? availableReviewSlots(await launchReviewPanel(REVIEWER_SLOTS.length, 'issue_review', 'guard:issue_review'))
+    : availableReviewSlots(await launchReviewPanel(reviewerCount, 'issue_review'))
   if (guard.length === 0) return
   const slotSince = getIssueSlotSince()
   await requireFreshDatastore()
