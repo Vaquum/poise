@@ -95,7 +95,7 @@ beforeEach(() => {
 })
 
 describe('agent log compatibility', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
 
   it('projects an existing validated snapshot without another Caller read', async () => {
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([logRow()]), stderr: '' })
@@ -243,7 +243,7 @@ describe('agent log compatibility', () => {
 })
 
 describe('agent log quarantine', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
 
   it('returns valid rows newest first while retaining malformed row attribution', async () => {
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([
@@ -843,7 +843,7 @@ describe('progress data does not determine review status', () => {
 
 
 describe('stopping a run', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
   it('asks Caller to stop the call and passes its answer through', async () => {
     const { stopAgentJob } = await import('../server/agent')
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify({ id: 'a'.repeat(32), stopped: true, status: 'failed', error_code: 'stopped' }), stderr: '' })
@@ -860,7 +860,7 @@ describe('stopping a run', () => {
 })
 
 describe('provider reasoning reads', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
   it('reads only a full call id and bounds the CLI output', async () => {
     mocks.runFile.mockResolvedValue({ stdout: 'exposed reasoning' })
     await expect(fetchAgentReasoning('A'.repeat(32))).resolves.toMatchObject({ body: 'exposed reasoning' })
@@ -890,7 +890,7 @@ describe('review policy compatibility', () => {
 // shape, one such row rejected the whole log — Swarm blank, reconciliation
 // stalled for every behavior.
 describe('issue review rows', () => {
-  beforeEach(() => mocks.runFile.mockReset())
+  beforeEach(() => { mocks.runFile.mockReset() })
 
   function issueRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return logRow({
@@ -943,22 +943,192 @@ describe('issue review rows', () => {
       slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' },
       places: { issue_review: { slot: 'primary' } },
     }
-    mocks.runFile.mockResolvedValue({ stdout: CATALOG_STDOUT, stderr: '' })
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'agent-interface') return { stdout: CATALOG_STDOUT, stderr: '' }
+      if (command === 'github-interface' && args[0] === '--read-issue') {
+        if (args[args.indexOf('--token-user') + 1] !== 'bit-mis') throw new Error(`read-issue without the agent account: ${args.join(' ')}`)
+        return { stdout: JSON.stringify({ action: 'read_issue', repository: 'Vaquum/Origo', issue_number: 452,
+          issue: { title: 'PRD', body: 'Revision 2.', state: 'open' } }), stderr: '' }
+      }
+      throw new Error(`unexpected CLI call: ${command} ${args.join(' ')}`)
+    })
     const { invalidateCatalog } = await import('../server/models')
     invalidateCatalog()
     const gh = await import('../server/gh')
     mocks.agentAccount = 'bit-mis'
     const { spawnDetached } = await import('../server/process')
     vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
-    const { replayAgentJob } = await import('../server/agent')
+    const { replayAgentJob, issueReviewRevision } = await import('../server/agent')
     const result = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '452' }, mocks.admit)
     expect(result.source).toBe('poise:replay')
+    const revision = issueReviewRevision('PRD', 'Revision 2.')
+    expect(result.revision).toBe(revision)
+    expect(result.deduped).toBeUndefined()
     const [command, args] = vi.mocked(spawnDetached).mock.calls[0]
     expect(command).toBe('agent-interface')
     expect(args).toEqual(['--issue-review', 'Vaquum/Origo#452', '--model', 'gpt-6-astra-ultra', '--recovery-model', 'opus-5-xhigh',
-      '--actor', 'bit-mis', '--source', 'poise:replay', '--correlation-id', result.correlationId])
+      '--actor', 'bit-mis', '--source', 'poise:replay', '--correlation-id', result.correlationId,
+      '--expected-issue-revision', revision])
     expect(gh.getHeadSha).not.toHaveBeenCalled()
     expect(gh.localCheckoutPath).not.toHaveBeenCalled()
+  })
+})
+
+describe('issue re-review requests', () => {
+  // Each test replays its own issue number: the request ledger is the
+  // process-wide isolated database, shared by every test in this file.
+  async function arrange(issues: Record<number, { title: unknown, body: unknown, state?: string }>, catalog = CATALOG_STDOUT) {
+    mocks.models = {
+      slots: { primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh' },
+      places: { issue_review: { slot: 'primary' } },
+    }
+    mocks.agentAccount = 'bit-mis'
+    const agentLog: Array<Record<string, unknown>> = []
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'agent-interface' && args[0] === '--models') return { stdout: catalog, stderr: '' }
+      if (command === 'agent-interface' && args[0] === '--logs') return { stdout: JSON.stringify(agentLog), stderr: '' }
+      if (command === 'github-interface' && args[0] === '--read-issue') {
+        if (args[args.indexOf('--token-user') + 1] !== 'bit-mis') throw new Error(`read-issue without the agent account: ${args.join(' ')}`)
+        const repository = args[args.indexOf('--repository') + 1]
+        const number = Number(args[1].replace('#', ''))
+        const entry = issues[number]
+        if (!entry) throw new Error(`no such issue: ${repository}#${number}`)
+        return { stdout: JSON.stringify({ action: 'read_issue', repository, issue_number: number,
+          issue: { title: entry.title, body: entry.body, state: entry.state ?? 'open' } }), stderr: '' }
+      }
+      throw new Error(`unexpected CLI call: ${command} ${args.join(' ')}`)
+    })
+    const { invalidateCatalog } = await import('../server/models')
+    invalidateCatalog()
+    const { spawnDetached } = await import('../server/process')
+    vi.mocked(spawnDetached).mockReset().mockResolvedValue(undefined)
+    return { spawnDetached: vi.mocked(spawnDetached), agentLog, ...(await import('../server/agent')) }
+  }
+
+  async function backdateRequest(repo: string, pr: number, correlationId: string, agoMs: number): Promise<void> {
+    const { db } = await import('../server/db')
+    const info = db.prepare(`
+      UPDATE issue_review_requests SET requested_at = ?
+      WHERE repo = ? AND pr = ? AND correlation_id = ?
+    `).run(new Date(Date.now() - agoMs).toISOString(), repo.toLowerCase(), pr, correlationId)
+    expect(info.changes).toBe(1)
+  }
+
+  it('hashes the exact title and body, the bytes Caller hashes', async () => {
+    const { issueReviewRevision } = await import('../server/agent')
+    // Shared vector with Caller's test_issue_review: changing either side's
+    // digest computation breaks the revision binding.
+    expect(issueReviewRevision('PRD: fresh review — revision 2',
+      '## Goal\nLet an author request re-review.\n\nUnicode: äöü ✓.'))
+      .toBe('d9da577c24c4867413f3f566f135d6e72c01fee79855a9984be9a1d8a70ac2f1')
+    expect(issueReviewRevision(null, null)).toBe(issueReviewRevision('', ''))
+  })
+
+  it('dedupes a repeated request for the same revision and spawns once', async () => {
+    const { replayAgentJob, issueReviewRevision, spawnDetached } = await arrange({ 453: { title: 'PRD', body: 'Same body.' } })
+    const first = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '453' }, mocks.admit)
+    const second = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '453' }, mocks.admit)
+    expect(first).toMatchObject({ source: 'poise:replay', revision: issueReviewRevision('PRD', 'Same body.') })
+    expect(first.deduped).toBeUndefined()
+    expect(second).toEqual({ ok: true, source: 'poise:replay', correlationId: first.correlationId, revision: first.revision, deduped: true })
+    expect(spawnDetached).toHaveBeenCalledTimes(1)
+  })
+
+  it('requests a new review when the body changed to a new revision', async () => {
+    const bodies: Record<number, { title: unknown, body: unknown }> = { 454: { title: 'PRD', body: 'Revision B.' } }
+    const { replayAgentJob, spawnDetached } = await arrange(bodies)
+    const first = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '454' }, mocks.admit)
+    bodies[454] = { title: 'PRD', body: 'Revision C.' }
+    const second = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '454' }, mocks.admit)
+    expect(second.correlationId).not.toBe(first.correlationId)
+    expect(second.revision).not.toBe(first.revision)
+    expect(second.deduped).toBeUndefined()
+    expect(spawnDetached).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(spawnDetached).mock.calls[1][1]).toEqual(expect.arrayContaining(['--expected-issue-revision', second.revision]))
+  })
+
+  it('launches nothing against a Caller without revision binding', async () => {
+    const { replayAgentJob, spawnDetached } = await arrange(
+      { 456: { title: 'PRD', body: 'Body.' } },
+      JSON.stringify({ ...JSON.parse(CATALOG_STDOUT), issue_review_revisions: undefined }),
+    )
+    await expect(replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '456' }, mocks.admit))
+      .rejects.toThrow('Update Caller: issue re-review is unavailable')
+    expect(spawnDetached).not.toHaveBeenCalled()
+    // Refused before the issue is read, so nothing is recorded either.
+    expect(mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')).toHaveLength(0)
+  })
+
+  it('releases the recorded request when the run cannot start', async () => {
+    const { replayAgentJob, spawnDetached } = await arrange({ 459: { title: 'PRD', body: 'Body.' } })
+    const failure = new Error('spawn rejected')
+    vi.mocked(spawnDetached).mockRejectedValueOnce(failure)
+    await expect(replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '459' }, mocks.admit)).rejects.toBe(failure)
+    // Nothing started, so the repeat creates a new obligation instead of
+    // reusing the dead one.
+    const retry = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '459' }, mocks.admit)
+    expect(retry.deduped).toBeUndefined()
+    expect(spawnDetached).toHaveBeenCalledTimes(2)
+  })
+
+  it('takes over a recording that outlived its spawn under the same correlation', async () => {
+    const { replayAgentJob, spawnDetached } = await arrange({ 460: { title: 'PRD', body: 'Body.' } })
+    const first = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '460' }, mocks.admit)
+    // The spawn happened but no run ever registered: the recording is dead.
+    await backdateRequest('Vaquum/Origo', 460, first.correlationId!, 10 * 60_000)
+    const retry = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '460' }, mocks.admit)
+    expect(retry.deduped).toBeUndefined()
+    expect(retry.correlationId).toBe(first.correlationId)
+    expect(retry.revision).toBe(first.revision)
+    expect(spawnDetached).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(spawnDetached).mock.calls[1][1]).toEqual(expect.arrayContaining(
+      ['--correlation-id', first.correlationId, '--expected-issue-revision', first.revision]))
+  })
+
+  it('reuses a recorded request while its run may still register, runs, or is uncertain', async () => {
+    const { replayAgentJob, spawnDetached, agentLog, resetAgentLogCache } = await arrange({
+      461: { title: 'PRD', body: 'Registering.' },
+      463: { title: 'PRD', body: 'Running.' },
+      464: { title: 'PRD', body: 'Uncertain.' },
+    })
+    // Registering: no call yet, but inside the grace.
+    const registering = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '461' }, mocks.admit)
+    const again = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '461' }, mocks.admit)
+    expect(again).toMatchObject({ correlationId: registering.correlationId, deduped: true })
+    // Running: a registered call settles the request however old it is.
+    const running = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '463' }, mocks.admit)
+    await backdateRequest('Vaquum/Origo', 463, running.correlationId!, 60 * 60_000)
+    agentLog.push(logRow({ id: 'd'.repeat(32), behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '463',
+      status: 'running', completed_at: null, correlation_id: running.correlationId }))
+    resetAgentLogCache()
+    const stale = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '463' }, mocks.admit)
+    expect(stale).toMatchObject({ correlationId: running.correlationId, deduped: true })
+    // Uncertain: quarantined evidence may be its run, so no take-over.
+    const uncertain = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '464' }, mocks.admit)
+    await backdateRequest('Vaquum/Origo', 464, uncertain.correlationId!, 60 * 60_000)
+    agentLog.length = 0
+    agentLog.push(logRow({ id: 'not-an-id', correlation_id: uncertain.correlationId, actor: 42 }))
+    resetAgentLogCache()
+    const held = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '464' }, mocks.admit)
+    expect(held).toMatchObject({ correlationId: uncertain.correlationId, deduped: true })
+    expect(spawnDetached).toHaveBeenCalledTimes(3)
+  })
+
+  it('refuses a closed issue and launches nothing on an unreadable one', async () => {
+    const { replayAgentJob, spawnDetached } = await arrange({
+      457: { title: 'PRD', body: 'Body.', state: 'closed' },
+    })
+    const closed = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '457' }, mocks.admit)
+      .then(() => null, (error: Error) => error)
+    expect(closed).toMatchObject({ statusCode: 409 })
+    expect(String((closed as Error).message)).toContain('is not an open issue')
+    mocks.runFile.mockImplementation(async (command: string) => {
+      if (command === 'agent-interface') return { stdout: CATALOG_STDOUT, stderr: '' }
+      throw new Error('github-interface exploded')
+    })
+    await expect(replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '458' }, mocks.admit))
+      .rejects.toThrow('Replay could not read Vaquum/Origo#458')
+    expect(spawnDetached).not.toHaveBeenCalled()
   })
 })
 

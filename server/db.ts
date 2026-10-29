@@ -150,6 +150,20 @@ db.exec(`
     PRIMARY KEY (repo, pr, behavior)
   );
 
+  -- Explicit issue re-review requests, one row per requested document
+  -- revision: repeated requests for the same revision reuse the recorded
+  -- obligation instead of spawning another run, across restarts and after
+  -- the run completes, fails or is held. The repository is lowercase;
+  -- revision is the SHA-256 of the exact title and body Caller reviews.
+  CREATE TABLE IF NOT EXISTS issue_review_requests (
+    repo TEXT NOT NULL,
+    pr INTEGER NOT NULL,
+    revision TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    PRIMARY KEY (repo, pr, revision)
+  );
+
   CREATE TABLE IF NOT EXISTS content_jobs (
     call_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -1536,6 +1550,40 @@ export function releaseBehaviorReplay(
     DELETE FROM behavior_replay_reservations
     WHERE repo = ? AND pr = ? AND behavior = ? AND created_at = ?
   `).run(repo, pr, behavior, createdAt)
+}
+
+// Record an explicit request for a review of one document revision, or reuse
+// the recorded obligation: INSERT OR IGNORE plus read-back, so concurrent
+// requests for the same revision cannot both spawn. Only a created row may
+// launch; a reused row must never reset attempts or erase held state.
+export function requestIssueReviewRevision(
+  repo: string,
+  pr: number,
+  revision: string,
+  correlationId: string,
+): { correlationId: string, created: boolean, requestedAt: string } {
+  const key = repo.toLowerCase()
+  const now = new Date().toISOString()
+  const info = db.prepare(`
+    INSERT OR IGNORE INTO issue_review_requests(repo, pr, revision, correlation_id, requested_at)
+    VALUES(?, ?, ?, ?, ?)
+  `).run(key, pr, revision, correlationId, now)
+  if (info.changes === 1) return { correlationId, created: true, requestedAt: now }
+  const row = db.prepare(`
+    SELECT correlation_id AS correlationId, requested_at AS requestedAt FROM issue_review_requests
+    WHERE repo = ? AND pr = ? AND revision = ?
+  `).get(key, pr, revision) as { correlationId: string, requestedAt: string }
+  return { correlationId: row.correlationId, created: false, requestedAt: row.requestedAt }
+}
+
+// Release a request whose run could not be started. The exact predicate
+// keeps one failed spawn from clearing another request; a run that started
+// is never released, however it ended.
+export function releaseIssueReviewRevision(repo: string, pr: number, revision: string, correlationId: string): void {
+  db.prepare(`
+    DELETE FROM issue_review_requests
+    WHERE repo = ? AND pr = ? AND revision = ? AND correlation_id = ?
+  `).run(repo.toLowerCase(), pr, revision, correlationId)
 }
 
 export function listBehaviorDeadLetters(limit = 50, organization?: string): BehaviorDeadLetter[] {

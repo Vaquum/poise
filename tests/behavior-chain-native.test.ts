@@ -1,5 +1,5 @@
 import { expect, it, vi } from 'vitest'
-import type { BehaviorChain } from '../server/behavior-chain-store'
+import { chainBasis, type BehaviorChain } from '../server/behavior-chain-store'
 import type { Organization } from '../server/organizations'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
@@ -43,4 +43,46 @@ it.each([
   })
   const observation = await operations.observe(chain)
   expect(decideBehaviorChain(chain, observation, Date.now())).toMatchObject({ kind: 'invoke', behavior: expected })
+})
+
+it('reconciles planned review comments with and without the revision marker', async () => {
+  const callId = 'c'.repeat(32)
+  // A review interrupted after posting: one comment carries the revision
+  // marker, one was posted by an older Caller without it. Both are this
+  // run's receipts, so the chain completes instead of blocking.
+  const plan = { kind: 'issue_review', posts: [
+    { issue: 'example/repo#7', body: 'Marked.' },
+    { issue: 'example/repo#7', body: 'Legacy.' },
+  ], model: 'fixture', issue_revision: 'd'.repeat(64) }
+  const digest = chainBasis(plan)
+  const marked = `Marked.\n\n---\n<sub>Issue review · \`fixture\` · rev \`dddddddd\`</sub>\n<!-- agent-interface issue-review call=${callId} -->`
+  const legacy = `Legacy.\n\n---\n<sub>Issue review · \`fixture\`</sub>\n<!-- agent-interface issue-review call=${callId} -->`
+  mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
+    const evidence: Record<string, unknown> = {
+      '--read-issue': { issue: { title: 'Seed', body: '', state: 'open', labels: [] } },
+      '--issue-comments': { comments: [
+        { id: 7, author: 'reviewer', body: marked, url: 'https://example.test/marked' },
+        { id: 8, author: 'reviewer', body: legacy, url: null },
+      ] },
+      '--issue-work': { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null },
+      '--read-action-plan': { id: callId, sha: digest, plan },
+    }
+    if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
+    return { stdout: JSON.stringify(evidence[argv[0]]) }
+  })
+  const operations = nativeChainOperations({ login: 'example' } as Organization, {
+    roster: async () => ({ issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
+    resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
+    capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
+    reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
+  })
+  const uncertain: BehaviorChain = { ...chain, invocations: [{ id: 'inv-1', behavior: 'review-issue', basis: 'basis',
+    actor: 'reviewer', model: 'fixture', slot: 'primary', admittedAt: Date.now(), admissionSequence: 1,
+    request: { command: 'agent-interface', argv: [], cwd: '/interface' }, state: 'uncertain', callId,
+    outcome: null, evidence: { callId, artifact: { plan_sha: digest } } }] }
+  const observation = await operations.observe(uncertain)
+  expect(observation.reviewPublication).toEqual({ callId, complete: true, issueRevision: 'd'.repeat(64), receipts: [
+    { issue: 'example/repo#7', comment_id: 7, author: 'reviewer', url: 'https://example.test/marked' },
+    { issue: 'example/repo#7', comment_id: 8, author: 'reviewer', url: null },
+  ] })
 })

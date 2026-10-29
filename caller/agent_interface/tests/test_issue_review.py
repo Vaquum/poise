@@ -118,16 +118,18 @@ class IssueReviewCase(TestCase):
             self.addCleanup(target.stop)
         agent_interface.init_db()
 
-    def run_review(self, github, supervise, model="opus-5-max", recovery=None, expect_exit=False):
+    def run_review(self, github, supervise, model="opus-5-max", recovery=None, expect_exit=False, expected=None):
         with patch.object(issue_review, "interface", github), patch.object(issue_review, "supervise", supervise), \
                 redirect_stdout(io.StringIO()) as output:
             if expect_exit:
                 with self.assertRaises(SystemExit):
                     agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", "claim-1",
-                                                     model, recovery, note="Remember the charts.")
+                                                     model, recovery, note="Remember the charts.",
+                                                     expected_issue_revision=expected)
             else:
                 agent_interface.run_issue_review(f"{REPO}#452", "bit-mis", "poise:review-new-issues", "claim-1",
-                                                 model, recovery, note="Remember the charts.")
+                                                 model, recovery, note="Remember the charts.",
+                                                 expected_issue_revision=expected)
         with agent_interface.db() as conn:
             row = conn.execute("select * from calls where correlation_id='claim-1'").fetchone()
         return row, json.loads(output.getvalue())
@@ -306,6 +308,67 @@ class TestIssueReviewRun(IssueReviewCase):
         with patch.object(issue_review, "review", side_effect=review):
             row, _ = self.run_review(FakeGitHub(), agent_writes(None), recovery="gpt-6-astra-ultra", expect_exit=True)
         self.assertEqual((row["status"], row["error_code"], row["recovery_model"]), ("failed", "review_budget_exhausted", None))
+
+
+class TestRevisionBoundReview(IssueReviewCase):
+    def test_revision_is_the_exact_title_and_body(self):
+        # Shared vector with Poise's agent.test: changing either side's
+        # digest computation breaks the revision binding.
+        self.assertEqual(
+            issue_review.revision({"title": "PRD: fresh review — revision 2",
+                                   "body": "## Goal\nLet an author request re-review.\n\nUnicode: äöü ✓."}),
+            "d9da577c24c4867413f3f566f135d6e72c01fee79855a9984be9a1d8a70ac2f1")
+        self.assertEqual(issue_review.revision({"title": None, "body": None}),
+                         issue_review.revision({"title": "", "body": ""}))
+
+    def test_published_comments_carry_the_reviewed_revision(self):
+        github = FakeGitHub()
+        supervise = agent_writes({"comments": [{"issue": "#452", "body": "One."}, {"issue": "#453", "body": "Two."}]})
+        row, _ = self.run_review(github, supervise)
+        digest = issue_review.revision({"title": "Issue 452", "body": "Body 452"})
+        self.assertEqual(row["issue_revision"], digest)
+        self.assertEqual(self.exported(row)["issue_revision"], digest)
+        posted = [call for call in github.calls if call[0] == "--comment-issue"]
+        self.assertEqual(len(posted), 2)
+        for call in posted:
+            self.assertIn(f"rev `{digest[:8]}`", call[6])
+            self.assertTrue(issue_review.MARKER_RE.search(call[6].removeprefix("--body=")),
+                            "the terminal call marker still parses with a revision stamp")
+
+    def test_a_changed_body_fails_before_any_comment_is_posted(self):
+        github = FakeGitHub()
+
+        def supervise(args, **kwargs):
+            github.issues[452]["body"] = "Revised while the provider worked."
+            return agent_writes({"comments": [{"issue": "#452", "body": "One."}]})(args, **kwargs)
+
+        expected = issue_review.revision({"title": "Issue 452", "body": "Body 452"})
+        row, _ = self.run_review(github, supervise, expect_exit=True, expected=expected)
+        self.assertEqual((row["status"], row["error_code"]), ("failed", "issue_revision_changed"))
+        self.assertIsNone(self.exported(row)["receipts"])
+        self.assertFalse([call for call in github.calls if call[0] == "--comment-issue"])
+
+    def test_a_wrong_expected_revision_fails_without_reading_further(self):
+        github = FakeGitHub()
+        row, _ = self.run_review(github, agent_writes({"comments": [{"issue": "#452", "body": "One."}]}),
+                                 expect_exit=True, expected="0" * 64)
+        self.assertEqual((row["status"], row["error_code"]), ("failed", "issue_revision_changed"))
+        self.assertFalse([call for call in github.calls if call[0] == "--comment-issue"])
+
+    def test_child_only_output_cannot_fulfill_a_revision_bound_request(self):
+        expected = issue_review.revision({"title": "Issue 452", "body": "Body 452"})
+        github = FakeGitHub()
+        supervise = agent_writes({"comments": [{"issue": "#453", "body": "Only the child."}]})
+        row, _ = self.run_review(github, supervise, expect_exit=True, expected=expected)
+        self.assertEqual((row["status"], row["error_code"]), ("failed", "invalid_review_output"))
+        self.assertIn("no comment for the requested issue", row["error"])
+        self.assertFalse([call for call in github.calls if call[0] == "--comment-issue"])
+        # Without a bound revision the legacy rule stands: a comment for any
+        # allowed issue completes the run.
+        with agent_interface.db() as conn:
+            conn.execute("delete from calls")
+        row, _ = self.run_review(FakeGitHub(), agent_writes({"comments": [{"issue": "#453", "body": "Only the child."}]}))
+        self.assertEqual(row["status"], "completed")
 
 
 class TestPacket(IssueReviewCase):
@@ -509,6 +572,7 @@ class TestInterface(TestCase):
         with self.assertRaises(ModelCatalogError):
             CATALOG.issue_review_model("opus")
         self.assertEqual(CATALOG.export()["issue_review_providers"], ["antigravity", "claude", "codex", "grok", "muse"])
+        self.assertTrue(CATALOG.export()["issue_review_revisions"])
 
 
 class TestProcessesAndErrors(TestCase):
