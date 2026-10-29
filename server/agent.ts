@@ -20,7 +20,7 @@ import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
-import { requestIssueReviewRevision } from './db'
+import { releaseIssueReviewRevision, requestIssueReviewRevision } from './db'
 import { getHeadSha, getPrAuthor } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
@@ -816,6 +816,9 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
     env: { ...claudeSubscriptionEnvironment(), ...modelCliEnv },
     onExit: (result) => { if (claude) claudeAuth.observeProcessFailure(result) },
   }) } catch (error) {
+    // Nothing started, so nothing owns the recorded request: a repeat may
+    // create a new obligation instead of reusing this dead one.
+    releaseIssueReviewRevision(repo, number, revision, correlationId)
     captureBehaviorOutcome({ nativeId: correlationId, state: 'failed', activity: 'settled', stateSource: 'native', outcome: 'spawn_failed' })
     throw error
   }

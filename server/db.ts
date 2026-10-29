@@ -1489,6 +1489,16 @@ export function requestIssueReviewRevision(
   return { correlationId: row.correlationId, created: false }
 }
 
+// Release a request whose run could not be started. The exact predicate
+// keeps one failed spawn from clearing another request; a run that started
+// is never released, however it ended.
+export function releaseIssueReviewRevision(repo: string, pr: number, revision: string, correlationId: string): void {
+  db.prepare(`
+    DELETE FROM issue_review_requests
+    WHERE repo = ? AND pr = ? AND revision = ? AND correlation_id = ?
+  `).run(repo.toLowerCase(), pr, revision, correlationId)
+}
+
 export function listBehaviorDeadLetters(limit = 50, organization?: string): BehaviorDeadLetter[] {
   return readBehaviorDeadLetters(limit, false, organization)
 }

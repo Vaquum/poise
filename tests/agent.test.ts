@@ -1048,6 +1048,18 @@ describe('issue re-review requests', () => {
     expect(mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')).toHaveLength(0)
   })
 
+  it('releases the recorded request when the run cannot start', async () => {
+    const { replayAgentJob, spawnDetached } = await arrange({ 459: { title: 'PRD', body: 'Body.' } })
+    const failure = new Error('spawn rejected')
+    vi.mocked(spawnDetached).mockRejectedValueOnce(failure)
+    await expect(replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '459' }, mocks.admit)).rejects.toBe(failure)
+    // Nothing started, so the repeat creates a new obligation instead of
+    // reusing the dead one.
+    const retry = await replayAgentJob({ behavior: 'issue_review', repo: 'Vaquum/Origo', pr_id: '459' }, mocks.admit)
+    expect(retry.deduped).toBeUndefined()
+    expect(spawnDetached).toHaveBeenCalledTimes(2)
+  })
+
   it('refuses a closed issue and launches nothing on an unreadable one', async () => {
     const { replayAgentJob, spawnDetached } = await arrange({
       457: { title: 'PRD', body: 'Body.', state: 'closed' },
