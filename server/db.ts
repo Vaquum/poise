@@ -1070,6 +1070,93 @@ export function countReviewRounds(repo: string, pr: number): number {
   return row.n
 }
 
+// Latest review/approve launch state per pull request, for the per-PR status
+// projection: one scan over the two review keys, grouped by the caller. Live
+// claims (claim_id set) ride the same rows so the projection needs no second
+// read. Read-only.
+export interface PrReviewState {
+  key: string
+  target: string
+  repo: string
+  pr: number
+  action: string | null
+  outcome: string | null
+  headSha: string | null
+  expectedHead: string | null
+  requestedAt: string | null
+  completedAt: string | null
+  actor: string | null
+  source: string | null
+  callId: string | null
+  claimId: string
+  leaseUntil: number | null
+  quarantine: string | null
+}
+
+export function listPrReviewStates(): PrReviewState[] {
+  return db.prepare(`
+    SELECT key, target, launch_repo AS repo, launch_pr AS pr, launch_action AS action,
+      launch_outcome AS outcome, launch_head_sha AS headSha, launch_expected_head AS expectedHead,
+      launch_requested_at AS requestedAt, launch_completed_at AS completedAt,
+      launch_actor AS actor, launch_source AS source, launch_call_id AS callId,
+      claim_id AS claimId, lease_until AS leaseUntil, launch_quarantine AS quarantine
+    FROM behavior_seen
+    WHERE key IN ('review-new-prs', 'approve-prs')
+      AND launch_repo IS NOT NULL AND launch_pr IS NOT NULL
+  `).all() as PrReviewState[]
+}
+
+// Live review claims, including pre-launch ones whose launch row is not
+// recorded yet: the repository and number then come from the target prefix
+// (`owner/repo#number`, before any slot or round suffix). Read-only.
+export interface PrReviewClaim {
+  key: string
+  target: string
+  repo: string
+  pr: number
+  expectedHead: string | null
+  requestedAt: string | null
+  actor: string | null
+  leaseUntil: number | null
+}
+
+export function listLiveReviewClaims(): PrReviewClaim[] {
+  const rows = db.prepare(`
+    SELECT key, target, launch_repo AS repo, launch_pr AS pr,
+      launch_expected_head AS expectedHead, launch_requested_at AS requestedAt,
+      launch_actor AS actor, lease_until AS leaseUntil
+    FROM behavior_seen
+    WHERE key IN ('review-new-prs', 'approve-prs') AND claim_id <> ''
+  `).all() as Array<{ key: string, target: string, repo: string | null, pr: number | null,
+    expectedHead: string | null, requestedAt: string | null, actor: string | null, leaseUntil: number | null }>
+  const claims: PrReviewClaim[] = []
+  for (const row of rows) {
+    if (row.repo && Number.isSafeInteger(row.pr) && Number(row.pr) > 0) {
+      claims.push({ key: row.key, target: row.target, repo: row.repo, pr: Number(row.pr),
+        expectedHead: row.expectedHead, requestedAt: row.requestedAt, actor: row.actor, leaseUntil: row.leaseUntil })
+      continue
+    }
+    const ref = /^([^#]+)#(\d+)/.exec(row.target)
+    if (ref && /^[^/\s]+\/[^/\s]+$/.test(ref[1]) && Number.isSafeInteger(Number(ref[2])) && Number(ref[2]) > 0) {
+      claims.push({ key: row.key, target: row.target, repo: ref[1], pr: Number(ref[2]),
+        expectedHead: row.expectedHead, requestedAt: row.requestedAt, actor: row.actor, leaseUntil: row.leaseUntil })
+    }
+  }
+  return claims
+}
+
+// Heads with an unconfirmed grey-CI rerun intent, as `repo:head` with the
+// repository lowercased the way the grey-ci tick stores it. Read-only.
+export function listGreyCiPendingHeads(): Set<string> {
+  const rows = db.prepare(`
+    SELECT DISTINCT launch_repo AS repo, launch_expected_head AS head
+    FROM behavior_seen
+    WHERE key = 'grey-ci-recovery' AND claim_id <> ''
+      AND launch_repo IS NOT NULL AND launch_expected_head IS NOT NULL
+  `).all() as Array<{ repo: string, head: string }>
+  return new Set(rows.map((row) => `${row.repo}:${row.head}`))
+}
+
 // An issue review ends in comments rather than a review on a head.
 export function completeIssueReviewLaunchOwned(input: {
   key: string
