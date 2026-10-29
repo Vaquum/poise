@@ -107,6 +107,12 @@ describe('computePrBlocker', () => {
     expect(computed.details).toContain('review decision: REVIEW_REQUIRED')
   })
 
+  it('ignores a null review decision on bases requiring no reviews', () => {
+    const computed = computePrBlocker(baseInput({ reviewDecision: null }))
+    expect(computed.id).toBe('approved_not_enqueued')
+    expect(computed.details).not.toContain('review decision: null')
+  })
+
   it('names a reached cap and an off cap', () => {
     const reached = computePrBlocker(baseInput({ verdict: null, onCurrentHead: null, roundsCompleted: 5 }))
     expect(reached.line).toBe(`awaiting review of ${SHORT} · cap 5/5 · cap reached`)
@@ -413,6 +419,41 @@ describe('readPrStatus', () => {
     expect(reply.identity.status).toBe('invalid')
     expect(reply.health.status).toBe('unavailable')
     expect(reply.rows).toEqual([])
+  })
+
+  it('merges past a null review decision with a current approval', async () => {
+    const { db, runtime, status } = await setup()
+    recordApproval(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-10-29T09:00:00Z/r=1/head=${HEAD}`,
+      headSha: HEAD, callId: 'e'.repeat(32), completedAt: '2026-10-29T10:00:00Z',
+    })
+    const now = Date.parse('2026-10-29T10:30:00Z')
+    seedCache(runtime, new Date(now).toISOString(), { reviewDecision: null })
+    const reply = await status.readPrStatus(50, now)
+    expect(reply.rows[0].blocker.id).toBe('approved_not_enqueued')
+  })
+
+  it('reads a fresh admission as queued, a vanished entry as ejected', async () => {
+    const { db, runtime, status } = await setup()
+    recordApproval(db, {
+      target: `${pr.repo}#${pr.number}@req=2026-10-29T09:00:00Z/r=1/head=${HEAD}`,
+      headSha: HEAD, callId: 'e'.repeat(32), completedAt: '2026-10-29T10:00:00Z',
+    })
+    const cacheAt = '2026-10-29T10:30:00Z'
+    seedCache(runtime, cacheAt)
+    const target = `${pr.repo}#${pr.number}`
+    // The enqueue landed after the cached reading: queued, not ejected.
+    db.setMeta(`behavior_merge_prs_queue:${target}`,
+      JSON.stringify({ entryId: 'MQE_1', head: HEAD, at: '2026-10-29T10:31:00Z' }))
+    const queued = await status.readPrStatus(50, Date.parse('2026-10-29T10:32:00Z'))
+    expect(queued.rows[0].queue.state).toBe('queued')
+    expect(queued.rows[0].blocker.id).toBe('in_queue')
+    // A newer entry-less reading proves the entry is gone.
+    status.resetPrStatusCaches()
+    seedCache(runtime, '2026-10-29T10:33:00Z')
+    const ejected = await status.readPrStatus(50, Date.parse('2026-10-29T10:34:00Z'))
+    expect(ejected.rows[0].queue.state).toBe('ejected')
+    expect(ejected.rows[0].blocker.line).toBe('approved, not enqueued: queue entry gone, cause unrecorded')
   })
 
   it('holds repositories with their refusal reason', async () => {

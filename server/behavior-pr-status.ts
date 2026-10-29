@@ -159,7 +159,9 @@ export function computePrBlocker(input: BlockerInput): ComputedBlocker {
   }
 
   const verdictCurrent = verdict && input.onCurrentHead === true ? verdict : null
-  const decisionBlocks = input.evidenceFresh && input.reviewDecision !== 'APPROVED'
+  // A null decision means GitHub requires no reviews on this base; only a
+  // concrete non-approved decision blocks.
+  const decisionBlocks = input.evidenceFresh && input.reviewDecision !== null && input.reviewDecision !== 'APPROVED'
   const needsReview = !verdictCurrent
     || (verdictCurrent.outcome !== 'approved' && verdictCurrent.outcome !== 'clean')
     || decisionBlocks
@@ -461,8 +463,13 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
       ? admission : null
     const mergeFailure = scoped(() => getBehaviorFailureState('merge-prs', target))
     const ejectionRecorded = !!mergeFailure?.error?.includes('removed from the merge queue')
+    // A cache reading older than the admission cannot disprove it: right
+    // after an enqueue it still carries no entry while the admission is
+    // already live. Only a newer entry-less reading proves removal.
+    const admissionNewerThanCache = !!admissionLive && cacheUsable
+      && Date.parse(cached.at) <= Date.parse(admissionLive.at)
     const ejected = !!admissionLive && (ejectionRecorded
-      || (cacheUsable && !cached.queueEntryId))
+      || (cacheUsable && !cached.queueEntryId && !admissionNewerThanCache))
     const ejectionAt = ejected
       ? (ejectionRecorded ? mergeFailure?.lastFailureAt ?? null : null) ?? admissionLive?.at ?? null
       : null
@@ -474,6 +481,9 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
     } else if (cacheUsable && cached.queueEntryId) {
       queueState = 'queued'
       queueSince = admissionLive?.at ?? cached.at
+    } else if (admissionLive && admissionNewerThanCache) {
+      queueState = 'queued'
+      queueSince = admissionLive.at
     } else if (!cacheUsable) {
       queueState = 'unknown'
     } else if (cached.queueEnabled === false) {
