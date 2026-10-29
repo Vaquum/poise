@@ -22,6 +22,13 @@ vi.mock('../server/storage-maintenance', async (original) => ({
   startStorageMaintenanceRuntime: vi.fn(),
   stopStorageMaintenanceRuntime: vi.fn(async () => undefined),
 }))
+// Collaborator reconciliation is background maintenance too: its listing
+// passes own their coverage in tests/agent-collaborator.test.ts and must not
+// count as request-side reads here.
+vi.mock('../server/agent-collaborator', () => ({
+  startAgentCollaboratorRuntime: vi.fn(),
+  stopAgentCollaboratorRuntime: vi.fn(async () => undefined),
+}))
 vi.mock('../server/content-jobs', async (original) => ({
   ...(await original<typeof import('../server/content-jobs')>()),
   startContentFinalizer: vi.fn(),

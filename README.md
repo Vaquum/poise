@@ -163,6 +163,14 @@ the first start without one saved; after that Settings is the only source,
 including when you clear it. Review New Issues trusts the authors you list;
 until you save a list, that is your account and the agent account.
 
+Once both accounts are saved and signed in to `gh`, Poise keeps the agent
+account's repository access current on its own: about every minute it invites
+the agent account with write permission to repositories under ready accounts
+where that access is not confirmed, and accepts those invitations on the agent
+side. Archived and disabled repositories are skipped, and only invitations
+from your account for repositories under ready accounts are ever accepted
+automatically.
+
 ### Multiple GitHub accounts
 
 Settings → General → GitHub accounts → Add starts datastore activation immediately.
