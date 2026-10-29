@@ -1,6 +1,6 @@
 from typing import Any
 
-from github_interface.behaviors.mergeable import readiness_behind, readiness_status
+from github_interface.behaviors.mergeable import queue_enabled, readiness_behind, readiness_status
 from github_interface.client import GitHubClient
 from github_interface.atoms.pr_batch import read_pull_batch
 
@@ -75,6 +75,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         record["merge_state_status"] = None
         record["unresolved_threads"] = None
         record["threads_complete"] = None
+        record["queue_enabled"] = None
         if pull is not None:
             try:
                 record["ready"] = bool(record["author"]) and readiness_status(pull) == "green"
@@ -89,6 +90,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                 unresolved, complete = unresolved_thread_count(pull)
                 record["unresolved_threads"] = unresolved
                 record["threads_complete"] = complete
+                record["queue_enabled"] = queue_enabled(pull)
             except (KeyError, TypeError, AttributeError) as error:
                 # A failed target carries no positive claims: ready/behind
                 # alongside an error would fail the server's batch validation
@@ -102,5 +104,6 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                 record["merge_state_status"] = None
                 record["unresolved_threads"] = None
                 record["threads_complete"] = None
+                record["queue_enabled"] = None
                 record["error"] = f"GitHub returned malformed pull request readiness evidence: {error}"
     return result
