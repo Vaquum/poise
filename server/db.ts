@@ -1071,9 +1071,8 @@ export function countReviewRounds(repo: string, pr: number): number {
 }
 
 // Latest review/approve launch state per pull request, for the per-PR status
-// projection: one scan over the two review keys, grouped by the caller. Live
-// claims (claim_id set) ride the same rows so the projection needs no second
-// read. Read-only.
+// projection: one scan over the two review keys, grouped by the caller.
+// Read-only.
 export interface PrReviewState {
   key: string
   target: string
