@@ -32,8 +32,8 @@ import { mkdir } from 'node:fs/promises'
 import { MessageChannel } from 'node:worker_threads'
 import { ISSUE_REVIEW_BEHAVIOR, fetchAgentLogSnapshot, quarantinedLogMayMatch, type LogEntry } from './agent'
 import { claudeAuth } from './claude-auth'
-import { REVIEW_POLICY, needsClaude, reviewChoice, reviewPanel, type ReviewPanel, type ReviewPlace } from './review-model'
-import { type Catalog, type ReviewerSlot, MODEL_SLOTS, REVIEWER_SLOTS, isPlaceModel, loadCatalog, recoveryModel, resolveSlots, resolvePlace } from './models'
+import { REVIEW_POLICY, needsClaude, randomDrawStillValid, reviewChoice, reviewPanel, type ReviewPanel, type ReviewPlace } from './review-model'
+import { type Catalog, type ReviewerSlot, MODEL_SLOTS, REVIEWER_SLOTS, isPlaceModel, loadCatalog, recoveryModel, resolveSlots, resolvePlace, seededRandom } from './models'
 import {
   db,
   claimPrOperationOwned,
@@ -977,14 +977,21 @@ function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, 
 // The reviewers that launch now: the admitted slots as targets, each running
 // the next untripped model — the substitute verdict lands on the waiting
 // slot instead of stranding its ledger aggregate.
-async function launchReviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review'): Promise<ReviewPanel> {
-  const full = await reviewPanel(REVIEWER_SLOTS.length, place)
+async function launchReviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review', seedKey?: string): Promise<ReviewPanel> {
+  const full = await reviewPanel(REVIEWER_SLOTS.length, place, seedKey === undefined ? Math.random : seededRandom(seedKey))
   const targets = full.reviewers.slice(0, count)
   const models = full.reviewers.filter(({ model }) => !reviewerTripped(model)).slice(0, count)
   const reviewers = targets.slice(0, models.length).map((target, index) => ({
     slot: target.slot, model: models[index].model, recovery: models[index].recovery,
   }))
   return { ...full, reviewers }
+}
+
+// One target's panel seed: the same target draws the same Random panel on
+// every call, so a target configured for N reviewers keeps exactly those N
+// across ticks while different targets spread across the slots.
+function panelSeedKey(repo: string, number: number, place: 'pr_review' | 'issue_review'): string {
+  return `${repo}#${number}:${place}:panel`
 }
 
 // A trip for a reviewer neither place configures anymore says nothing: retire
@@ -1001,18 +1008,27 @@ async function retireStaleReviewerTrips(): Promise<void> {
   const configured = new Set<string>()
   for (const place of ['pr_review', 'issue_review'] as const) {
     try {
-      for (const { model } of (await reviewPanel(REVIEWER_SLOTS.length, place)).reviewers) configured.add(model)
+      // Complete sets; the fixed seed keeps the hygiene read deterministic.
+      for (const { model } of (await reviewPanel(REVIEWER_SLOTS.length, place, seededRandom(`stale-trips:${place}`))).reviewers) configured.add(model)
     } catch {
       return
     }
   }
   try {
     const approval = await reviewChoice('pr_approve')
+    const catalog = approval.catalog
     // Every slot model, not just the approval's current one: a fallback
     // running on a later slot trips that model, and a review tick must not
     // retire the trip while the backoff still holds it.
-    for (const slot of MODEL_SLOTS) configured.add(resolveSlots(approval.catalog, getModelSettings().slots)[slot])
-    for (const place of ['issue_implement', 'pr_repair'] as const) configured.add(resolvePlace(approval.catalog, place, getModelSettings()).model)
+    for (const slot of MODEL_SLOTS) configured.add(resolveSlots(catalog, getModelSettings().slots)[slot])
+    for (const place of ['issue_implement', 'pr_repair'] as const) {
+      // A Random place may run any slot model; keep every trip a chain run
+      // could still be holding instead of retiring the undrawn ones.
+      if ((getModelSettings().places?.[place]?.slot ?? 'primary') === 'random') {
+        const slots = resolveSlots(catalog, getModelSettings().slots)
+        for (const slot of MODEL_SLOTS) if (isPlaceModel(catalog, place, slots[slot])) configured.add(slots[slot])
+      } else configured.add(resolvePlace(catalog, place, getModelSettings()).model)
+    }
   } catch {
     return
   }
@@ -1023,15 +1039,31 @@ async function retireStaleReviewerTrips(): Promise<void> {
 
 // The approval slot that launches now: the PR approval place's slot unless
 // tripped, else the next slot the place can run; null when every runnable
-// slot is tripped. When no slot runs there at all, the catalog seed still
-// approves. A peek: the probe claim happens beside the spawn, like a panel.
+// slot is tripped. A Random place draws from every runnable slot instead of
+// from its draw onward, so a tripped draw moves to an untried model. When no
+// slot runs there at all, the catalog seed still approves. A peek: the probe
+// claim happens beside the spawn, like a panel.
 async function approvalSlot(): Promise<{ slot: ReviewerSlot, model: string, recovery: string, catalog: Catalog } | null> {
   const choice = await reviewChoice('pr_approve')
   const slots = resolveSlots(choice.catalog, getModelSettings().slots)
-  const runnable = MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(choice.slot))
+  const stored = getModelSettings().places?.['pr_approve']?.slot ?? 'primary'
+  const runnable = (stored === 'random' ? [...MODEL_SLOTS] : MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(choice.slot)))
     .filter((slot) => isPlaceModel(choice.catalog, 'pr_approve', slots[slot]))
   if (runnable.length === 0) {
     return { slot: choice.slot, model: choice.model, recovery: recoveryModel(choice.catalog, 'pr_approve', slots, choice.slot), catalog: choice.catalog }
+  }
+  if (stored === 'random' && !reviewerTripped(choice.model) && runnable.includes(choice.slot)) {
+    return { slot: choice.slot, model: choice.model, recovery: choice.recovery, catalog: choice.catalog }
+  }
+  const untripped = runnable.filter((slot) => !reviewerTripped(slots[slot]))
+  if (untripped.length === 0) return null
+  if (stored === 'random') {
+    const slot = untripped[Math.floor(Math.random() * untripped.length) % untripped.length]
+    const remaining = untripped.filter((candidate) => candidate !== slot)
+    const recovery = remaining.length > 0
+      ? slots[remaining[Math.floor(Math.random() * remaining.length) % remaining.length]]
+      : recoveryModel(choice.catalog, 'pr_approve', slots, slot)
+    return { slot, model: slots[slot], recovery, catalog: choice.catalog }
   }
   for (const slot of runnable) {
     const model = slots[slot]
@@ -2628,8 +2660,8 @@ function settleClaimAfterExit(
 
 // The model a reviewer slot launches right now, or null when the panel no
 // longer has that slot — the count was lowered while this tick was waiting.
-async function slotModel(slot: ReviewerSlot): Promise<{ model: string, recovery: string, catalog: Catalog } | null> {
-  const panel = await launchReviewPanel(getReviewers('review-new-prs'))
+async function slotModel(slot: ReviewerSlot, seedKey?: string): Promise<{ model: string, recovery: string, catalog: Catalog } | null> {
+  const panel = await launchReviewPanel(getReviewers('review-new-prs'), 'pr_review', seedKey)
   const reviewer = panel.reviewers.find((entry) => entry.slot === slot)
   return reviewer ? { model: reviewer.model, recovery: reviewer.recovery, catalog: panel.catalog } : null
 }
@@ -2691,7 +2723,7 @@ async function prepareReviewTarget(
       const m = pr.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/)
       if (!m) throw new Error('not a github PR url: ' + pr.url)
       const [, owner, repo, num] = m
-      const resolved = await waitForBehavior(slotModel(slot))
+      const resolved = await waitForBehavior(slotModel(slot, panelSeedKey(pr.repo, pr.number, 'pr_review')))
       if (!resolved || !isEnabled('review-new-prs') || behaviorAborted()) return null
       const { model, recovery, catalog } = resolved
       const claude = needsClaude(catalog, model)
@@ -2953,16 +2985,33 @@ async function tickReviewNewPrs(): Promise<void> {
 
   if (await initializeReviewBaseline()) return
   try {
-    const panel = await reviewPanel(getReviewers('review-new-prs'))
+    const reviewerCount = getReviewers('review-new-prs')
     await retireStaleReviewerTrips()
     // Admission remembers the configured panel; only launches slide past
     // tripped reviewers, so a recovered reviewer still owns its waiting slot.
-    const slots = availableReviewSlots(await launchReviewPanel(getReviewers('review-new-prs')))
-    if (slots.length === 0) return
+    // A fixed panel guards on its configured count, so a blocked reviewer
+    // holds the scan before any external work; a Random panel guards on the
+    // full set, since different targets draw different slots.
+    const stored = getModelSettings().places?.['pr_review']?.slot ?? 'primary'
+    const guard = stored === 'random'
+      ? availableReviewSlots(await launchReviewPanel(REVIEWER_SLOTS.length, 'pr_review', 'guard:pr_review'))
+      : availableReviewSlots(await launchReviewPanel(reviewerCount, 'pr_review'))
+    if (guard.length === 0) return
     const prs = await listEligiblePrs('review-new-prs', author)
     await recoverSnapshotReviews(prs)
     let failure: unknown
-    const candidates = orderByCursor(prs, 'behavior_review_new_prs_prepare_cursor').flatMap((pr) => {
+    const ordered = orderByCursor(prs, 'behavior_review_new_prs_prepare_cursor')
+    // Each PR draws its own seeded panel, so a Random target keeps exactly
+    // its N reviewers across ticks while different PRs spread across slots.
+    const panels = new Map<string, { intended: ReviewerSlot[], runnable: ReviewerSlot[] }>()
+    for (const pr of ordered) {
+      const key = `${pr.repo}#${pr.number}`
+      const seedKey = panelSeedKey(pr.repo, pr.number, 'pr_review')
+      const intended = (await reviewPanel(reviewerCount, 'pr_review', seededRandom(seedKey))).reviewers.map(({ slot }) => slot)
+      const runnable = availableReviewSlots(await launchReviewPanel(reviewerCount, 'pr_review', seedKey))
+      panels.set(key, { intended, runnable })
+    }
+    const candidates = ordered.flatMap((pr) => {
       const key = `${pr.repo}#${pr.number}`
       // Advisory only: the claim phase re-derives admission from fresh
       // reads. A fresh primary admits the current panel; already handled
@@ -2973,8 +3022,9 @@ async function tickReviewNewPrs(): Promise<void> {
       // the panel later must not add reviewers to historical PRs.
       const panelKey = `${META_PREFIX}review_new_prs_panel:${key}`
       const admitted = parseJsonMeta(panelKey)
+      const { intended, runnable: slots } = panels.get(key)!
       const admittedSlots = new Set(
-        (Array.isArray(admitted) ? admitted : primaryFresh ? panel.reviewers.map(({ slot }) => slot) : []) as ReviewerSlot[],
+        (Array.isArray(admitted) ? admitted : primaryFresh ? intended : []) as ReviewerSlot[],
       )
       return slots.filter((slot) => {
         const target = reviewSlotTarget(key, slot)
@@ -3027,7 +3077,6 @@ async function tickReviewNewPrs(): Promise<void> {
     }
     try {
       await underLifecycleSignal(() => withBehaviorProcessLock('review-new-prs', async () => {
-        const fresh = await reviewPanel(getReviewers('review-new-prs'))
         // Read the ceiling here, closest to the spawn: narrowing it in the
         // view must take effect on launches already being prepared.
         const setting = getSetting('review-new-prs')
@@ -3049,8 +3098,10 @@ async function tickReviewNewPrs(): Promise<void> {
             if (!prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) { releaseLeases(null); continue }
             const primaryFresh = !hasSeen('review-new-prs', key) || !!getFailedBehaviorLaunch('review-new-prs', key)
             const panelKey = `${META_PREFIX}review_new_prs_panel:${key}`
+            const seedKey = panelSeedKey(pr.repo, pr.number, 'pr_review')
             let admitted = parseJsonMeta(panelKey)
             if (!Array.isArray(admitted)) {
+              const fresh = await reviewPanel(getReviewers('review-new-prs'), 'pr_review', seededRandom(seedKey))
               admitted = primaryFresh ? fresh.reviewers.map(({ slot: admittedSlot }) => admittedSlot) : []
               if (primaryFresh) setMeta(panelKey, JSON.stringify(admitted))
             }
@@ -3063,7 +3114,7 @@ async function tickReviewNewPrs(): Promise<void> {
             // the prepared CLI environment belongs to the prepared model.
             // Resolved per target: claiming a probe re-trips its reviewer,
             // so targets behind it in this tick see the substitute.
-            const launchModels = new Map((await launchReviewPanel(getReviewers('review-new-prs')))
+            const launchModels = new Map((await launchReviewPanel(getReviewers('review-new-prs'), 'pr_review', seedKey))
               .reviewers.map((entry) => [entry.slot, entry.model]))
             if (launchModels.get(slot) !== bundle.model) { releaseLeases(null); continue }
             // A full shared budget stops here, before the probe and the
@@ -3528,7 +3579,7 @@ async function releaseFailedBehaviorIfNoAction(
   // restarts; a different head or an explicit model change can be reconsidered.
   const configuredModel = launchBehavior === 'pr_approve'
     ? (await approvalSlot())?.model
-    : (await slotModel(reviewSlotOfTarget(target)))?.model
+    : (await slotModel(reviewSlotOfTarget(target), panelSeedKey(repo, number, 'pr_review')))?.model
   // An explicit replay is a separate Caller run. Reconcile its verified
   // receipt into the held launch so approval sees the recovered decision.
   if (boundedReviewFailure(call) && call.model === configuredModel
@@ -3878,9 +3929,15 @@ async function fireApprove(
   attachCheckSlotToClaim(claimId, checkSlot)
   const pwd = await localCheckoutPath(owner, repo, pr.number, expectedHead, actor)
   const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor, accounts)
-  const selectedModel = (await approvalSlot())?.model
+  // The final lookup runs first: the gates below catch anything that changed
+  // while it was out, including role swaps during the lookup itself. A Random
+  // draw varies per read, so it revalidates membership in the current runnable
+  // slots instead of identity with a fresh draw.
+  const stored = getModelSettings().places?.['pr_approve']?.slot ?? 'primary'
+  const selectedModel = stored === 'random' ? null : (await approvalSlot())?.model
+  const drawValid = stored === 'random' ? await randomDrawStillValid('pr_approve', model) : selectedModel === model
   if (!isRunnable('approve-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('approve-prs', pr, actor)) return false
-  if (selectedModel !== model) return false
+  if (!drawValid) return false
   if (admittedReviewer && configuredReviewer(pr.author).toLowerCase() !== admittedReviewer.toLowerCase()) return false
   if (replacesFailedCallId && !renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
     throw new Error(`approval PR operation ownership was lost for ${pr.repo}#${pr.number}`)
@@ -6051,8 +6108,8 @@ async function planIssueReviews(
   return plan
 }
 
-async function issueSlotModel(slot: ReviewerSlot): Promise<{ model: string, recovery: string, catalog: Catalog } | null> {
-  const panel = await launchReviewPanel(getReviewers(ISSUES_KEY), 'issue_review')
+async function issueSlotModel(slot: ReviewerSlot, seedKey?: string): Promise<{ model: string, recovery: string, catalog: Catalog } | null> {
+  const panel = await launchReviewPanel(getReviewers(ISSUES_KEY), 'issue_review', seedKey)
   const reviewer = panel.reviewers.find((entry) => entry.slot === slot)
   return reviewer ? { model: reviewer.model, recovery: reviewer.recovery, catalog: panel.catalog } : null
 }
@@ -6068,7 +6125,8 @@ async function fireIssueReview(
 ): Promise<boolean> {
   return withNoticeDiagnosticIdentity({ correlationId: claimId, behavior: 'review-new-issues', repository: issue.repo, target: `${issue.repo}#${issue.number}`, account: agentAccount() || null }, async () => {
   if (!isEnabled(ISSUES_KEY)) return false
-  const resolved = await waitForBehavior(issueSlotModel(slot))
+  const seedKey = panelSeedKey(issue.repo, issue.number, 'issue_review')
+  const resolved = await waitForBehavior(issueSlotModel(slot, seedKey))
   if (!resolved) return false
   const { model, recovery, catalog } = resolved
   const claude = needsClaude(catalog, model)
@@ -6079,7 +6137,7 @@ async function fireIssueReview(
   // behavior off, deselecting the repository, untrusting the author or
   // changing the panel meanwhile must stop this launch, so these are the last
   // checks before it.
-  if ((await waitForBehavior(issueSlotModel(slot)))?.model !== model) return false
+  if ((await waitForBehavior(issueSlotModel(slot, seedKey)))?.model !== model) return false
   if (!isRunnable(ISSUES_KEY) || behaviorAborted()) return false
   if (issueReviewRefusal(issueReviewPolicy(), issue.repo, issue.number, issue)) return false
   // Shed load before claiming a recovery probe: a launch past the shared
@@ -6223,12 +6281,19 @@ async function tickReviewNewIssues(): Promise<void> {
   // launches below, and the ledger keeps them for the resume.
   if (isPaused(ISSUES_KEY)) return
   const policy = issueReviewPolicy()
-  const panel = await reviewPanel(getReviewers(ISSUES_KEY), 'issue_review')
+  const reviewerCount = getReviewers(ISSUES_KEY)
   await retireStaleReviewerTrips()
   // Planned slots remember the configured panel; only launches slide past
   // tripped reviewers, so a recovered reviewer still owns its waiting slot.
-  const slots = availableReviewSlots(await launchReviewPanel(getReviewers(ISSUES_KEY), 'issue_review'))
-  if (slots.length === 0) return
+  // A fixed panel guards on its configured count, so a blocked reviewer holds
+  // the scan before any external work; a Random panel guards on the full set,
+  // since different targets draw different slots. Each issue below draws its
+  // own seeded panel so a Random target keeps exactly its N reviewers.
+  const stored = getModelSettings().places?.['issue_review']?.slot ?? 'primary'
+  const guard = stored === 'random'
+    ? availableReviewSlots(await launchReviewPanel(REVIEWER_SLOTS.length, 'issue_review', 'guard:issue_review'))
+    : availableReviewSlots(await launchReviewPanel(reviewerCount, 'issue_review'))
+  if (guard.length === 0) return
   const slotSince = getIssueSlotSince()
   await requireFreshDatastore()
   const open = new Set<string>()
@@ -6260,9 +6325,12 @@ async function tickReviewNewIssues(): Promise<void> {
       const created = Date.parse(issue.createdAt)
       if (issueReviewRefusal(policy, issue.repo, issue.number, issue) || created < Date.parse(since)) continue
       const targets: string[] = []
+      const seedKey = panelSeedKey(issue.repo, issue.number, 'issue_review')
+      const panel = await reviewPanel(reviewerCount, 'issue_review', seededRandom(seedKey))
       const plannedSlots = panel.reviewers.map(({ slot }) => slot).filter((slot) =>
         slot === 'primary' || !slotSince[slot] || created >= Date.parse(slotSince[slot]!))
       const admissionKey = JSON.stringify([ISSUES_KEY, currentOrganization()?.login ?? null, repo, since, issue.number])
+      const slots = availableReviewSlots(await launchReviewPanel(reviewerCount, 'issue_review', seedKey))
       slots.forEach((slot, index) => {
         const joined = slot === 'primary' ? undefined : slotSince[slot]
         if (joined && created < Date.parse(joined)) return
@@ -6881,18 +6949,27 @@ async function runBehaviorChains(): Promise<void> {
   if (!org) return
   let runtime = behaviorChains.get(org.login.toLowerCase())
   if (!runtime) {
-    const roster = async () => {
-      const [issues, prs, approval, catalog] = await Promise.all([reviewPanel(getReviewers(ISSUES_KEY), 'issue_review'), reviewPanel(getReviewers('review-new-prs')), reviewChoice('pr_approve'), loadCatalog()])
+    const roster = async (chainKey: string) => {
+      // One chain draws one roster: every observation refresh re-reads the
+      // same seeded draws, so a Random chain keeps exactly its N reviewers —
+      // and one implementer — instead of admitting a new slot per refresh.
+      const [issues, prs, approval, catalog] = await Promise.all([
+        reviewPanel(getReviewers(ISSUES_KEY), 'issue_review', seededRandom(`${chainKey}:issue_review:panel`)),
+        reviewPanel(getReviewers('review-new-prs'), 'pr_review', seededRandom(`${chainKey}:pr_review:panel`)),
+        reviewChoice('pr_approve', seededRandom(`${chainKey}:pr_approve`)),
+        loadCatalog(),
+      ])
       if (issues.reviewers.length !== getReviewers(ISSUES_KEY) || prs.reviewers.length !== getReviewers('review-new-prs')) throw new Error('behavior chain reviewer count exceeds configured model slots')
-      const model = (place: 'issue_implement' | 'pr_repair') => { const resolved = resolvePlace(catalog, place, getModelSettings()); return { ...resolved, recovery: resolved.model } }
+      const model = (place: 'issue_implement' | 'pr_repair') => { const resolved = resolvePlace(catalog, place, getModelSettings(), seededRandom(`${chainKey}:${place}`)); return { ...resolved, recovery: resolved.model } }
       return { issueReviewers: issues.reviewers, prReviewers: prs.reviewers, implementer: model('issue_implement'), repairer: model('pr_repair'),
         approver: { slot: approval.slot, model: approval.model, recovery: approval.recovery } }
     }
     runtime = new BehaviorChainRuntime(behaviorChainJournal(), nativeChainOperations(org, {
       roster,
-      async resolve(decision) {
+      async resolve(decision, chainKey) {
         if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
-          const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), decision.behavior === 'review-issue' ? 'issue_review' : 'pr_review')
+          const place = decision.behavior === 'review-issue' ? 'issue_review' : 'pr_review'
+          const panel = await launchReviewPanel(getReviewers(decision.behavior === 'review-issue' ? ISSUES_KEY : 'review-new-prs'), place, `${chainKey}:${place}:panel`)
           const reviewer = panel.reviewers.find((entry) => entry.slot === decision.reviewer?.slot)
           if (!reviewer || !claimReviewerTripProbe(reviewer.model)) return null
           return reviewer
@@ -6902,15 +6979,18 @@ async function runBehaviorChains(): Promise<void> {
           if (!approval || !claimReviewerTripProbe(approval.model)) return null
           return approval
         }
-        const models = await roster()
+        const models = await roster(chainKey)
         const selected = decision.behavior === 'repair-pr' ? models.repairer : models.implementer
         const place = decision.behavior === 'repair-pr' ? 'pr_repair' : 'issue_implement'
         const catalog = await loadCatalog()
         const slots = resolveSlots(catalog, getModelSettings().slots)
-        const candidates = [selected.model, ...MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(selected.slot)).map((slot) => slots[slot])]
+        const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
+        const ordered = stored === 'random' ? [...MODEL_SLOTS] : MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(selected.slot))
+        const candidates = [selected.model, ...ordered.map((slot) => slots[slot])]
         const model = candidates.find((identity) => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
         if (!model || !claimReviewerTripProbe(model)) return null
-        return { slot: selected.slot, model, recovery: model }
+        const slot = stored === 'random' ? (MODEL_SLOTS.find((candidate) => slots[candidate] === model) ?? selected.slot) : selected.slot
+        return { slot, model, recovery: model }
       },
       async prepare(identities) {
         const catalog = await loadCatalog()
@@ -7458,8 +7538,17 @@ export function getScratchpadMap(): Record<BehaviorKey, string> {
 // sign-in and that sign-in is not there; a fallback on another provider runs.
 async function reviewHeldByClaudeAuth(place: ReviewPlace): Promise<boolean> {
   try {
+    if (claudeAuth.snapshot().status === 'authenticated') return false
+    // A Random draw varies per read, so hold only while every runnable slot
+    // needs the sign-in; otherwise a fresh draw can proceed without it.
+    if ((getModelSettings().places?.[place]?.slot ?? 'primary') === 'random') {
+      const catalog = await loadCatalog()
+      const slots = resolveSlots(catalog, getModelSettings().slots)
+      const runnable = MODEL_SLOTS.filter((slot) => isPlaceModel(catalog, place, slots[slot]))
+      return runnable.length > 0 && runnable.every((slot) => needsClaude(catalog, slots[slot]))
+    }
     const { model, catalog } = await reviewChoice(place)
-    return needsClaude(catalog, model) && claudeAuth.snapshot().status !== 'authenticated'
+    return needsClaude(catalog, model)
   } catch {
     // An unavailable catalog is reported by the tick itself.
     return false

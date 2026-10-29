@@ -99,7 +99,7 @@ export interface ModelsDraft { slots?: ModelSlotDraft, places?: Record<string, {
 
 // Only the drafted half is validated, like the general fields above: the
 // three slot models must be different models. Place slots need no check;
-// their pickers only offer the three slots.
+// their pickers only offer the three slots and Random.
 export function validateModelChoices(draft: ModelsDraft): string | null {
   const slots = draft.slots
   if (slots) {

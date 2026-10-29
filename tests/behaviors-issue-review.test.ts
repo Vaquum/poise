@@ -1602,4 +1602,38 @@ describe('Review New Issues reviewer account trips', () => {
     expect(failures.some((failure) => failure.target?.startsWith('reviewer:'))).toBe(false)
     expect(launches()).toHaveLength(1)
   })
+
+  it('keeps one Random reviewer per issue across ticks: a 429 relaunches the same target with an untried model', async () => {
+    // Seeded draws never touch Math.random; any unseeded draw fails the spy.
+    const spy = vi.spyOn(Math, 'random')
+    try {
+      const { behaviors, database } = await start({ reviewers: 1 })
+      database.setMeta('models', JSON.stringify({
+        slots: { primary: 'opus-5-xhigh', secondary: 'grok-4.6-xhigh', tertiary: 'gpt-6-astra-ultra' },
+        places: { issue_review: { slot: 'random' } },
+      }))
+      issues = [issue(452)]
+      await behaviors.runEnabledBehaviorsOnce()
+      expect(launches()).toHaveLength(1)
+      const firstModel = flag(launches()[0], '--model')
+      const target = database.listBehaviorLaunchClaims(KEY)[0].target
+      expect(spy).not.toHaveBeenCalled()
+
+      agentLogs = [finished(target, {
+        status: 'failed', model: firstModel,
+        error: 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)',
+        error_code: 'review_provider_error',
+      })]
+      await resetLogCache()
+      await behaviors.runEnabledBehaviorsOnce()
+
+      expect(launches()).toHaveLength(2)
+      expect(flag(launches()[1], '--model')).not.toBe(firstModel)
+      expect(database.listBehaviorLaunchClaims(KEY).map((claim) => claim.target)).toEqual([target])
+      expect(database.listBehaviorDeadLetters()).toEqual([])
+      expect(spy).not.toHaveBeenCalled()
+    } finally {
+      spy.mockRestore()
+    }
+  })
 })

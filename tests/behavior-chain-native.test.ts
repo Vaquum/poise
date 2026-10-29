@@ -86,3 +86,27 @@ it('reconciles planned review comments with and without the revision marker', as
     { issue: 'example/repo#7', comment_id: 8, author: 'reviewer', url: null },
   ] })
 })
+
+it('seeds roster draws and resolutions by the chain seed issue', async () => {
+  mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
+    const evidence: Record<string, unknown> = {
+      '--read-issue': { issue: { title: 'Seed', body: '', state: 'open', labels: [] } },
+      '--issue-comments': { comments: [] },
+      '--issue-work': { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    }
+    if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
+    return { stdout: JSON.stringify(evidence[argv[0]]) }
+  })
+  const roster = vi.fn(async () => ({ issueReviewers: [reviewer], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }))
+  const resolve = vi.fn(async () => reviewer)
+  const operations = nativeChainOperations({ login: 'example' } as Organization, {
+    roster, resolve, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
+    capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
+    reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
+  })
+  const observation = await operations.observe(chain)
+  expect(roster).toHaveBeenCalledWith('example/repo#7')
+  const decision = { kind: 'invoke', behavior: 'review-issue', basis: '', actor: 'reviewer', reviewer, reason: '' } as const
+  await operations.request(chain, observation, decision, 'test-id')
+  expect(resolve).toHaveBeenCalledWith(decision, 'example/repo#7')
+})

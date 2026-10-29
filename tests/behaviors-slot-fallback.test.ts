@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { LogEntry } from '../server/agent'
 import type { ReviewerTripKind } from '../server/behaviors'
 import { mocks, pr, loadModules, resetLogCache, arrangeCli, agentLog, fixture } from './behaviors-runtime-fixture'
@@ -209,5 +209,80 @@ describe('approval fallback through the slots', () => {
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
     expect(db.listBehaviorLaunchClaims('approve-prs')).toEqual([])
+  })
+
+  it('moves a Random approval to an untried model on a 429 and records each draw in the ledger', async () => {
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+    try {
+      arrangeCli(true, false, { headSha: 'b'.repeat(40) }, {
+        commits_after_request: 0,
+        author_commits_after_request: 0,
+        author_pr_comments_after_request: 1,
+      })
+      mocks.spawnDetached.mockResolvedValue(undefined)
+      const { database: db, behaviors: runtime } = await loadModules()
+      runtime.startBehaviorsRuntime()
+      db.setMeta('me', 'poise-user')
+      db.setMeta('behavior_approve_prs_enabled', '1')
+      db.setMeta('models', JSON.stringify({ slots, places: { pr_approve: { slot: 'random' } } }))
+
+      await runtime.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+      const first = modelOf(mocks.spawnDetached.mock.calls[0])
+      expect(Object.values(slots)).toContain(first)
+
+      fixture.agentLogs = [failedApproveLog(db, first, {
+        error: RATE_LIMIT_ERROR, error_code: 'review_provider_error', action: 'not_started', outcome: 'preflight_failed',
+      })]
+      await resetLogCache()
+      await runtime.runEnabledBehaviorsOnce()
+
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      const second = modelOf(mocks.spawnDetached.mock.calls[1])
+      expect(Object.values(slots)).toContain(second)
+      expect(second).not.toBe(first)
+      expect(db.listBehaviorDeadLetters()).toEqual([])
+      const admissions = mocks.captureAdmission.mock.calls.map(([admission]) => admission)
+      expect(admissions).toHaveLength(2)
+      expect(admissions[0].slot).not.toBe(admissions[1].slot)
+    } finally {
+      random.mockRestore()
+    }
+  })
+
+  it('holds a Random approval whose prepared model left every slot mid-flight', async () => {
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+    try {
+      arrangeCli(true, false, { headSha: 'b'.repeat(40) }, {
+        commits_after_request: 0,
+        author_commits_after_request: 0,
+        author_pr_comments_after_request: 1,
+      })
+      mocks.spawnDetached.mockResolvedValue(undefined)
+      const { database: db, behaviors: runtime } = await loadModules()
+      runtime.startBehaviorsRuntime()
+      db.setMeta('me', 'poise-user')
+      db.setMeta('behavior_approve_prs_enabled', '1')
+      db.setMeta('models', JSON.stringify({
+        slots: { primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh' },
+        places: { pr_approve: { slot: 'random' } },
+      }))
+      // The draw prepares opus-5-xhigh; a settings change swaps every slot
+      // model before the pre-launch check runs.
+      mocks.requireAuth.mockImplementationOnce(async () => {
+        db.setMeta('models', JSON.stringify({
+          slots: { primary: 'grok-4.6-high', secondary: 'gemini-3.8-flash-high', tertiary: 'muse-spark-1.3-contributor-max' },
+          places: { pr_approve: { slot: 'random' } },
+        }))
+      })
+
+      await runtime.runEnabledBehaviorsOnce()
+
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+      expect(db.listBehaviorLaunchClaims('approve-prs')).toEqual([])
+      expect(mocks.captureAdmission).not.toHaveBeenCalled()
+    } finally {
+      random.mockRestore()
+    }
   })
 })

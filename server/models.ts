@@ -225,6 +225,34 @@ export function isModelSlot(value: unknown): value is ModelSlot {
   return value === 'primary' || value === 'secondary' || value === 'tertiary'
 }
 
+// What a place stores: a fixed slot, or Random to draw per run from the three.
+export type ModelPlaceSlot = ModelSlot | 'random'
+
+export function isPlaceSlot(value: unknown): value is ModelPlaceSlot {
+  return isModelSlot(value) || value === 'random'
+}
+
+// A deterministic random stream for one target's draws: the same key draws
+// the same panel on every call, in every process, while different targets
+// spread across the slots. Scheduled panels seed by target so a target
+// configured for N reviewers keeps exactly those N across ticks; single
+// draws stay on Math.random. FNV-1a into mulberry32; pure integer math.
+export function seededRandom(key: string): () => number {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < key.length; i++) {
+    hash ^= key.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  let state = hash >>> 0
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let sample = state
+    sample = Math.imul(sample ^ (sample >>> 15), sample | 1)
+    sample ^= sample + Math.imul(sample ^ (sample >>> 7), sample | 61)
+    return ((sample ^ (sample >>> 14)) >>> 0) / 4294967296
+  }
+}
+
 export type ModelPlace = typeof MODEL_PLACES[number]['key']
 export const MODEL_PLACE_KEYS = MODEL_PLACES.map((p) => p.key) as ModelPlace[]
 
@@ -237,7 +265,7 @@ export interface ModelSlotChoices {
 }
 
 export interface ModelPlaceChoice {
-  slot: ModelSlot
+  slot: ModelPlaceSlot
 }
 
 export interface ModelSettings {
@@ -325,11 +353,30 @@ export interface ResolvedPlace {
 
 // What a place launches: its slot's model when the place can run it, else the
 // first following slot's model it can run, else the place's Caller seed —
-// every read resolves to something launchable, and says what moved.
-export function resolvePlace(catalog: Catalog, place: ModelPlace, settings: ModelSettings): ResolvedPlace {
+// every read resolves to something launchable, and says what moved. A Random
+// place draws one runnable slot per call; callers that compare two reads must
+// compare the stored choice, not the draw.
+export function resolvePlace(
+  catalog: Catalog,
+  place: ModelPlace,
+  settings: ModelSettings,
+  random: () => number = Math.random,
+): ResolvedPlace {
   const spec = MODEL_PLACES.find((p) => p.key === place)!
   const slots = resolveSlots(catalog, settings.slots)
   const chosen = settings.places?.[place]?.slot ?? 'primary'
+  const runnable = MODEL_SLOTS.filter((slot) => isPlaceModel(catalog, place, slots[slot]))
+  if (chosen === 'random') {
+    if (placeProviders(catalog, place)?.length === 0) {
+      return { slot: 'primary', model: slots.primary, notes: [...slots.notes, `Update Caller: ${spec.label} is unavailable.`] }
+    }
+    if (runnable.length > 0) {
+      const slot = runnable[Math.floor(random() * runnable.length) % runnable.length]
+      return { slot, model: slots[slot], notes: [...slots.notes] }
+    }
+    const seed = catalog.behaviors[spec.seed]
+    return { slot: 'primary', model: seed, notes: [...slots.notes, `${spec.label} cannot run its models; using ${seed}.`] }
+  }
   // A Caller without the place's capability can launch none of its models;
   // keep what was chosen for when it can, and say why nothing runs meanwhile.
   if (placeProviders(catalog, place)?.length === 0) {
@@ -346,6 +393,26 @@ export function resolvePlace(catalog: Catalog, place: ModelPlace, settings: Mode
   return { slot: chosen, model: seed, notes: [...slots.notes, `${spec.label} cannot run ${slots[chosen]}; using ${seed}.`] }
 }
 
+// Whether a prepared model is still what its Random place would draw. A
+// Random draw varies per read by design, so revalidation checks membership
+// in the current runnable slot models instead of identity with a fresh draw;
+// a settings change that removed the model fails the run before it launches
+// something no slot holds anymore.
+export function randomDrawStillValid(
+  catalog: Catalog,
+  place: ModelPlace,
+  settings: ModelSettings,
+  model: string,
+): boolean {
+  if ((settings.places?.[place]?.slot ?? 'primary') !== 'random') return false
+  const slots = resolveSlots(catalog, settings.slots)
+  const runnable = MODEL_SLOTS.filter((slot) => isPlaceModel(catalog, place, slots[slot]))
+  if (runnable.length === 0) {
+    return model === catalog.behaviors[MODEL_PLACES.find((entry) => entry.key === place)!.seed]
+  }
+  return runnable.some((slot) => slots[slot] === model)
+}
+
 // The reviewers of a new pull request or issue: the place's slot first, then
 // the following slots it can run, as many as Behaviors asks for. A panel
 // starting past Primary runs fewer than asked when the slots run out; it
@@ -360,6 +427,26 @@ export function slotPanel(
   return MODEL_SLOTS
     .slice(MODEL_SLOTS.indexOf(start))
     .filter((slot) => isPlaceModel(catalog, place, slots[slot]))
+    .slice(0, Math.max(1, Math.min(MODEL_SLOTS.length, count)))
+    .map((slot) => ({ slot, model: slots[slot], recovery: recoveryModel(catalog, place, slots, slot) }))
+}
+
+// A Random panel: N distinct runnable slots in shuffled order per call. Three
+// needed takes all three; it never repeats a model and never launches what
+// the place cannot run.
+export function randomPanel(
+  catalog: Catalog,
+  place: ModelPlace,
+  slots: { primary: string, secondary: string, tertiary: string },
+  count: number,
+  random: () => number = Math.random,
+): Array<{ slot: ModelSlot, model: string, recovery: string }> {
+  const runnable = MODEL_SLOTS.filter((slot) => isPlaceModel(catalog, place, slots[slot]))
+  for (let i = runnable.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1)) % (i + 1)
+    ;[runnable[i], runnable[j]] = [runnable[j], runnable[i]]
+  }
+  return runnable
     .slice(0, Math.max(1, Math.min(MODEL_SLOTS.length, count)))
     .map((slot) => ({ slot, model: slots[slot], recovery: recoveryModel(catalog, place, slots, slot) }))
 }
@@ -422,7 +509,7 @@ export function validateModelSettings(catalog: Catalog, models: unknown): ModelS
       if (!isModelPlace(place)) throw new Error(`unknown model place ${place}`)
       const spec = MODEL_PLACES.find((p) => p.key === place)!
       const slot = (value as { slot?: unknown } | null)?.slot
-      if (!isModelSlot(slot)) throw new Error(`${spec.label} slot must be primary, secondary or tertiary`)
+      if (!isPlaceSlot(slot)) throw new Error(`${spec.label} slot must be primary, secondary, tertiary or random`)
       places[place] = { slot }
     }
     if (Object.keys(places).length > 0) next.places = places

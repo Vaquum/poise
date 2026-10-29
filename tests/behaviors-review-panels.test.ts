@@ -2,6 +2,29 @@ import { describe, expect, it, vi } from 'vitest'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { mocks, pr, HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, launchReviewBeforeCrash, launchApprovalBeforeCrash, fixture } from './behaviors-runtime-fixture'
 
+const RATE_LIMIT_ERROR = 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)'
+
+function failedPrLog(
+  db: { listBehaviorLaunchClaims: (behavior: string) => Array<{ target: string, launchRequestedAt: string, launchExpectedHead: string, launchActor: string, launchSource: string, launchCorrelationId: string }> },
+  target: string,
+  model: string,
+  overrides: Record<string, unknown>,
+): Record<string, unknown> {
+  const claim = db.listBehaviorLaunchClaims('review-new-prs').find((row) => row.target === target)!
+  return agentLog({
+    id: '1'.repeat(32),
+    model,
+    started_at: claim.launchRequestedAt,
+    started_at_precise: claim.launchRequestedAt,
+    status: 'failed',
+    expected_head: claim.launchExpectedHead,
+    actor: claim.launchActor,
+    source: claim.launchSource,
+    correlation_id: claim.launchCorrelationId,
+    ...overrides,
+  })
+}
+
 describe('review panel scheduling and recovery', () => {
 
   it('reviews a new pull request with every reviewer Behaviors asks for, at once', async () => {
@@ -37,6 +60,74 @@ describe('review panel scheduling and recovery', () => {
     // a pull request the primary already handled.
     await runtime.runEnabledBehaviorsOnce()
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+  })
+
+  it('reviews with all three models exactly once when the place draws at Random', async () => {
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.setMeta('behavior_review_new_prs_reviewers', '3')
+    db.setMeta('models', JSON.stringify({
+      slots: { primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh' },
+      places: { pr_review: { slot: 'random' } },
+    }))
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    const launches = mocks.spawnDetached.mock.calls.map((call) => call[1] as string[])
+    expect(launches.map((args) => args[args.indexOf('--model') + 1]).sort())
+      .toEqual(['gpt-6-astra-ultra', 'grok-4.6-xhigh', 'opus-5-xhigh'])
+    const admissions = mocks.captureAdmission.mock.calls.map(([admission]) => admission)
+    expect(admissions).toHaveLength(3)
+    expect(new Set(admissions.map(({ slot }) => slot)).size).toBe(3)
+  })
+
+  it('keeps one Random reviewer per PR across ticks: a 429 relaunches the same target with an untried model', async () => {
+    // Seeded draws never touch Math.random; any unseeded draw fails the spy.
+    const spy = vi.spyOn(Math, 'random')
+    try {
+      arrangeCli(false)
+      mocks.spawnDetached.mockResolvedValue(undefined)
+      const { database: db, behaviors: runtime } = await loadModules()
+      runtime.startBehaviorsRuntime()
+      db.setMeta('me', 'poise-user')
+      db.setMeta('behavior_review_new_prs_keyver', '3')
+      db.setMeta('behavior_review_new_prs_enabled', '1')
+      db.setMeta('behavior_review_new_prs_reviewers', '1')
+      db.setMeta('models', JSON.stringify({
+        slots: { primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh' },
+        places: { pr_review: { slot: 'random' } },
+      }))
+      db.recordSeen('review-new-prs', '__snapshot_v3__')
+
+      await runtime.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+      const firstArgs = mocks.spawnDetached.mock.calls[0][1] as string[]
+      const firstModel = firstArgs[firstArgs.indexOf('--model') + 1]
+      const target = db.listBehaviorLaunchClaims('review-new-prs')[0].target
+      expect(spy).not.toHaveBeenCalled()
+
+      fixture.agentLogs = [failedPrLog(db, target, firstModel, {
+        error: RATE_LIMIT_ERROR, error_code: 'review_provider_error', action: 'not_started', outcome: 'preflight_failed',
+      })]
+      await resetLogCache()
+      await runtime.runEnabledBehaviorsOnce()
+
+      expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+      const secondArgs = mocks.spawnDetached.mock.calls[1][1] as string[]
+      expect(secondArgs[secondArgs.indexOf('--model') + 1]).not.toBe(firstModel)
+      expect(db.listBehaviorLaunchClaims('review-new-prs').map((claim) => claim.target)).toEqual([target])
+      expect(db.listBehaviorDeadLetters()).toEqual([])
+      expect(spy).not.toHaveBeenCalled()
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   it.each(['review-new-prs', 'approve-prs'] as const)('isolates a %s max-turns failure while fresh work runs in the same cycle', async (behavior) => {

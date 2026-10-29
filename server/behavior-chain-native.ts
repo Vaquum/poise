@@ -13,8 +13,8 @@ import { runFile, spawnDetached } from './process'
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
 export interface NativeChainHooks {
-  roster(): Promise<Roster>
-  resolve(decision: Invoke): Promise<ChainReviewer | null>
+  roster(chainKey: string): Promise<Roster>
+  resolve(decision: Invoke, chainKey: string): Promise<ChainReviewer | null>
   prepare(identities: string[]): Promise<NodeJS.ProcessEnv>
   borrow(): (() => void) | null
   available(): boolean
@@ -113,11 +113,14 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       if (!ownsRepository(chain.repository)) throw new Error('behavior chain organization is no longer followed')
       const actor = ['--token-user', chain.author]
       const issueRef = `#${chain.issue}`
+      // The chain's draws seed by its seed issue, so every observation
+      // refresh re-reads the same roster instead of admitting new slots.
+      const chainKey = `${chain.repository}#${chain.issue}`
       const [rawIssue, rawComments, publication, roster] = await Promise.all([
         github(chain.repository, ['--read-issue', issueRef, ...actor]),
         github(chain.repository, ['--issue-comments', issueRef, ...actor]),
         github(chain.repository, ['--issue-work', issueRef, '--mode', 'inspect', '--branch', chain.branch, ...actor]),
-        hooks.roster(),
+        hooks.roster(chainKey),
       ])
       const issue = object(rawIssue.issue, 'seed issue')
       if (!Array.isArray(rawComments.comments) || !Array.isArray(issue.labels) || typeof issue.title !== 'string'
@@ -261,7 +264,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const common = ['--source', 'poise:behavior-chain', '--correlation-id', id, '--actor', decision.actor]
       const note = [hooks.note(decision.behavior), decision.reason].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
-        const selected = await hooks.resolve(decision)
+        const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`)
         if (!selected) return null
         const model = ['--model', selected.model, '--recovery-model', selected.recovery]
         if (decision.behavior === 'review-issue') return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: ['--issue-review', `${chain.repository}#${chain.issue}`,

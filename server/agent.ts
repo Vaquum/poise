@@ -24,11 +24,11 @@ import { releaseIssueReviewRevision, requestIssueReviewRevision } from './db'
 import { getHeadSha, getPrAuthor } from './gh'
 import { claudeAuth } from './claude-auth'
 import { HttpError } from './http'
-import { needsClaude, reviewChoice } from './review-model'
+import { needsClaude, randomDrawStillValid, reviewChoice } from './review-model'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic } from './logging'
-import { requireAgentAccount } from './settings'
+import { getModelSettings, requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { resolveReviewCheckout } from './review-checkout'
 import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogPage, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
@@ -593,7 +593,7 @@ export async function triggerPrReview(
   const author = await getPrAuthor(repoFullName, Number(num), accounts.agent)
     .catch(() => getPrAuthor(repoFullName, Number(num), accounts.me))
   const actor = prReviewer(author, true)
-  const { model, recovery, catalog } = await reviewChoice('pr_review')
+  const { model, recovery, slot, catalog } = await reviewChoice('pr_review')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
@@ -603,12 +603,18 @@ export async function triggerPrReview(
   const correlationId = randomUUID()
 
   if (claude) await claudeAuth.requireReady()
-  const selectedModel = (await reviewChoice('pr_review')).model
+  // The final lookup runs first: the checks below catch anything that changed
+  // while it was out, including account swaps during the lookup itself. A
+  // Random draw varies per read, so it revalidates membership in the current
+  // runnable slots instead of identity with a fresh draw.
+  const stored = getModelSettings().places?.['pr_review']?.slot ?? 'primary'
+  const selectedModel = stored === 'random' ? null : (await reviewChoice('pr_review')).model
+  const drawValid = stored === 'random' ? await randomDrawStillValid('pr_review', model) : selectedModel === model
   if (!prAccountsMatch(accounts) || prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
-  if (selectedModel !== model) throw new Error('Review model changed; retry the request')
+  if (!drawValid) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: 'review-new-prs', source, owner, actor, repository: repoFullName,
-    number: Number(num), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+    number: Number(num), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
   try { await spawnDetached(CLI, [
     '--pr-review',
     `#${num}`,
@@ -677,7 +683,7 @@ export async function replayAgentJob(input: {
   const actor = admission.actor
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
-  const { model, recovery, catalog } = await reviewChoice(place)
+  const { model, recovery, slot, catalog } = await reviewChoice(place)
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const [owner, repoName] = repo.split('/', 2)
@@ -687,12 +693,18 @@ export async function replayAgentJob(input: {
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
-  const selectedModel = (await reviewChoice(place)).model
+  // The final lookup runs first: the checks below catch anything that changed
+  // while it was out, including account swaps during the lookup itself. A
+  // Random draw varies per read, so it revalidates membership in the current
+  // runnable slots instead of identity with a fresh draw.
+  const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
+  const selectedModel = stored === 'random' ? null : (await reviewChoice(place)).model
+  const drawValid = stored === 'random' ? await randomDrawStillValid(place, model) : selectedModel === model
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
-  if (selectedModel !== model) throw new Error('Review model changed; retry the request')
+  if (!drawValid) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
-    repository: repo, number: Number(prId), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+    repository: repo, number: Number(prId), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
   // An approval replay runs under the same effective cap as a scheduled
   // approve-prs launch: at or past the capped round it files (or reuses)
   // the follow-up issue and approves instead of requesting changes again.
@@ -792,7 +804,7 @@ async function issueReviewRequestActive(correlationId: string, requestedAt: stri
 // and spawn nothing, even after the run finished, failed or is held.
 async function replayIssueReview(repo: string, issue: string): Promise<{ ok: true, source: string, correlationId: string, revision: string, deduped?: true }> {
   const actor = requireAgentAccount()
-  const { model, recovery, catalog } = await reviewChoice('issue_review')
+  const { model, recovery, slot, catalog } = await reviewChoice('issue_review')
   // An older Caller silently ignores the expected revision and would run
   // unpinned: prove support before anything is read or launched.
   if (catalog.issue_review_revisions !== true) throw new Error('Update Caller: issue re-review is unavailable')
@@ -802,7 +814,13 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
-  if ((await reviewChoice('issue_review')).model !== model) throw new Error('Review model changed; retry the request')
+  // A Random draw varies per read, so it revalidates membership in the
+  // current runnable slots instead of identity with a fresh draw.
+  const stored = getModelSettings().places?.['issue_review']?.slot ?? 'primary'
+  const drawValid = stored === 'random'
+    ? await randomDrawStillValid('issue_review', model)
+    : (await reviewChoice('issue_review')).model === model
+  if (!drawValid) throw new Error('Review model changed; retry the request')
   const number = Number(issue)
   const current = await readIssueForReview(repo, number, actor)
   const revision = issueReviewRevision(current.title, current.body)
@@ -820,7 +838,7 @@ async function replayIssueReview(repo: string, issue: string): Promise<{ ok: tru
   if (!created) return { ok: true, source, correlationId: request.correlationId, revision, deduped: true }
   captureBehaviorAdmission({ admissionKey: effectiveCorrelation, nativeId: effectiveCorrelation,
     behavior: 'review-new-issues', source, owner: repo.split('/')[0], actor,
-    repository: repo, number, head: null, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+    repository: repo, number, head: null, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
   try { await spawnDetached(CLI, [
     '--issue-review',
     `${repo}#${issue}`,
