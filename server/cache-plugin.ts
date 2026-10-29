@@ -28,6 +28,7 @@ import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
 import { handlePullRequestApprove, handlePullRequestMerge } from './pull-requests'
 import { getOrganizations, readyOrganizations, addOrganization, retryOrganization, removeOrganization, startOrganizationsRuntime, stopOrganizationsRuntime } from './organizations'
+import { startAgentCollaboratorRuntime, stopAgentCollaboratorRuntime } from './agent-collaborator'
 import { fetchAgentLogs, fetchAgentLogSnapshot, fetchAgentResponse, fetchAgentReasoning, fetchSelectedAgentLogSnapshot, fetchRunningAgentLogSnapshot, fetchAgentLogPage, fetchAgentLogById, triggerPrReview, replayAgentJob, stopAgentJob } from './agent'
 import { readBehaviorMetrics } from './behavior-metrics'
 import { readBehaviorEstimates } from './behavior-estimates'
@@ -207,6 +208,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   recordRunningRelease()
   setCallerAccounts(callerAccounts)
   startOrganizationsRuntime()
+  startAgentCollaboratorRuntime()
   startBehaviorsRuntime()
   startNoticesRuntime()
   startPublicationReviewsRuntime()
@@ -309,7 +311,7 @@ export async function stopPoiseRuntime(): Promise<void> {
   serviceControl = null
   dailyModelRefresh = null
   linkApi = null
-  await Promise.all([stopOrganizationsRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopPublicationReviewsRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
+  await Promise.all([stopOrganizationsRuntime(), stopAgentCollaboratorRuntime(), stopBehaviorsRuntime(), stopNoticesRuntime(), stopPublicationReviewsRuntime(), stopGithubQuotaRuntime(), stopLedgerHealthRuntime(), stopTemporaryStorageRuntime(), stopReviewCheckoutPruning(), stopStorageMaintenanceRuntime(), stopContentFinalizer(), stopJev(), controlStop, switchboardStop, chatStop, socketStop, terminalStop, ...authStops])
   await stopBehaviorLedger()
   await stopLoggingApi()
   await stopLogging()
