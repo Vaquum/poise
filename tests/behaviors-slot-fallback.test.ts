@@ -249,4 +249,40 @@ describe('approval fallback through the slots', () => {
       random.mockRestore()
     }
   })
+
+  it('holds a Random approval whose prepared model left every slot mid-flight', async () => {
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+    try {
+      arrangeCli(true, false, { headSha: 'b'.repeat(40) }, {
+        commits_after_request: 0,
+        author_commits_after_request: 0,
+        author_pr_comments_after_request: 1,
+      })
+      mocks.spawnDetached.mockResolvedValue(undefined)
+      const { database: db, behaviors: runtime } = await loadModules()
+      runtime.startBehaviorsRuntime()
+      db.setMeta('me', 'poise-user')
+      db.setMeta('behavior_approve_prs_enabled', '1')
+      db.setMeta('models', JSON.stringify({
+        slots: { primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh' },
+        places: { pr_approve: { slot: 'random' } },
+      }))
+      // The draw prepares opus-5-xhigh; a settings change swaps every slot
+      // model before the pre-launch check runs.
+      mocks.requireAuth.mockImplementationOnce(async () => {
+        db.setMeta('models', JSON.stringify({
+          slots: { primary: 'grok-4.6-high', secondary: 'gemini-3.8-flash-high', tertiary: 'muse-spark-1.3-contributor-max' },
+          places: { pr_approve: { slot: 'random' } },
+        }))
+      })
+
+      await runtime.runEnabledBehaviorsOnce()
+
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+      expect(db.listBehaviorLaunchClaims('approve-prs')).toEqual([])
+      expect(mocks.captureAdmission).not.toHaveBeenCalled()
+    } finally {
+      random.mockRestore()
+    }
+  })
 })

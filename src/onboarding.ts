@@ -676,13 +676,16 @@ interface ModelPlace {
   key: string
   label: string
   why: string
-  slot: Slot
-  stored: { slot: Slot } | null
+  slot: PlaceSlot
+  stored: { slot: PlaceSlot } | null
 }
 interface ModelsAnswer { catalog: { models: CatalogModel[], review_providers: string[] }, slots: ModelSlots, places: ModelPlace[] }
 type Slot = 'primary' | 'secondary' | 'tertiary'
 const MODEL_SLOTS: readonly Slot[] = ['primary', 'secondary', 'tertiary']
 const SLOT_LABELS: Record<Slot, string> = { primary: 'Primary', secondary: 'Secondary', tertiary: 'Tertiary' }
+type PlaceSlot = Slot | 'random'
+const PLACE_SLOTS: readonly PlaceSlot[] = ['primary', 'secondary', 'tertiary', 'random']
+const PLACE_SLOT_LABELS: Record<PlaceSlot, string> = { primary: 'Primary', secondary: 'Secondary', tertiary: 'Tertiary', random: 'Random' }
 
 /** For each of the three slots, the resolved model when its provider is
  *  signed in, otherwise the first signed-in model no earlier slot took. */
@@ -732,11 +735,11 @@ function modelsStep(ctx: StepContext): StepView {
           + (off.length ? `<optgroup label="Not signed in">${off.map((model) => option(model, true)).join('')}</optgroup>` : '')
       }
       const provider = (identity: string) => eligible.find((model) => model.identity === identity)?.provider ?? ''
-      const slotOptions = (selected: string) => MODEL_SLOTS.map((slot) => `<option value="${slot}"${slot === selected ? ' selected' : ''}>${SLOT_LABELS[slot]}</option>`).join('')
+      const slotOptions = (selected: string) => PLACE_SLOTS.map((slot) => `<option value="${slot}"${slot === selected ? ' selected' : ''}>${PLACE_SLOT_LABELS[slot]}</option>`).join('')
       placesEl.innerHTML = `
           <div class="ob-place" data-slots>
             <div class="ob-place-head"><span class="ob-place-name">Models</span></div>
-            <div class="st-help st-help-info ob-place-why">The three models, chosen once. Every place below runs one of these slots.</div>
+            <div class="st-help st-help-info ob-place-why">The three models, chosen once. Every place below runs one of these slots or draws at Random per run.</div>
             <div class="ob-place-grid">${MODEL_SLOTS.map((slot) => {
               const off = !!choice[slot] && !usable.has(provider(choice[slot]))
               return `

@@ -112,7 +112,15 @@ export async function setupWorkspace(page: Page, initial: Partial<SetupState> = 
         const recorded = { ...account, signInRecordedAt: state.logins[account.id] }
         return hasRecordedSignIn(recorded) ? recorded : account
       }) } })
-      case '/api/models': return route.fulfill({ json: { catalog: CATALOG, slots: SLOTS, places: PLACES, fixed: [], refresh: null } })
+      case '/api/models': {
+        // Saved place choices come back as stored, so running setup again
+        // shows what Settings holds — including Random.
+        const places = PLACES.map((place) => {
+          const slot = state.models.places?.[place.key]?.slot
+          return slot ? { ...place, slot, stored: { slot } } : place
+        })
+        return route.fulfill({ json: { catalog: CATALOG, slots: SLOTS, places, fixed: [], refresh: null } })
+      }
       case '/api/claude-auth': return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
       case '/api/current': return route.fulfill({ json: { cards: [] } })
       case '/_poise/api/account':

@@ -232,6 +232,20 @@ test('opens at pairing when Poise Link sends the person to /link during setup', 
   await expect(page).toHaveURL(/\/$/)
 })
 
+test('running setup again keeps saved Random places instead of replacing them with Primary', async ({ page }) => {
+  const state = await setupWorkspace(page, { step: 'models', me: 'octocat',
+    models: {
+      slots: { primary: 'opus-5-max', secondary: 'opus-5-high', tertiary: 'grok-5-heavy' },
+      places: { chat: { slot: 'random' }, pr_review: { slot: 'random' } },
+    } })
+  await page.goto('/')
+  await expect(page.locator('.ob-title')).toHaveText('Choose your models')
+  await expect(page.locator('.ob-place[data-place="chat"] select')).toHaveValue('random')
+  await expect(page.locator('.ob-place[data-place="pr_review"] select')).toHaveValue('random')
+  await next(page).click()
+  expect(state.models.places).toEqual({ chat: { slot: 'random' }, pr_review: { slot: 'random' } })
+})
+
 test('never opens setup in a workspace that is already set up, and offers to run it again', async ({ page }) => {
   await setupWorkspace(page, { status: 'done', step: 'finish', me: 'octocat', organizations: [organization('acme', 'ready')] })
   await page.goto('/')

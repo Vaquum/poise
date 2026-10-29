@@ -229,6 +229,27 @@ export function isPlaceSlot(value: unknown): value is ModelPlaceSlot {
   return isModelSlot(value) || value === 'random'
 }
 
+// A deterministic random stream for one target's draws: the same key draws
+// the same panel on every call, in every process, while different targets
+// spread across the slots. Scheduled panels seed by target so a target
+// configured for N reviewers keeps exactly those N across ticks; single
+// draws stay on Math.random. FNV-1a into mulberry32; pure integer math.
+export function seededRandom(key: string): () => number {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < key.length; i++) {
+    hash ^= key.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  let state = hash >>> 0
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0
+    let sample = state
+    sample = Math.imul(sample ^ (sample >>> 15), sample | 1)
+    sample ^= sample + Math.imul(sample ^ (sample >>> 7), sample | 61)
+    return ((sample ^ (sample >>> 14)) >>> 0) / 4294967296
+  }
+}
+
 export type ModelPlace = typeof MODEL_PLACES[number]['key']
 export const MODEL_PLACE_KEYS = MODEL_PLACES.map((p) => p.key) as ModelPlace[]
 
@@ -367,6 +388,26 @@ export function resolvePlace(
   }
   const seed = catalog.behaviors[spec.seed]
   return { slot: chosen, model: seed, notes: [...slots.notes, `${spec.label} cannot run ${slots[chosen]}; using ${seed}.`] }
+}
+
+// Whether a prepared model is still what its Random place would draw. A
+// Random draw varies per read by design, so revalidation checks membership
+// in the current runnable slot models instead of identity with a fresh draw;
+// a settings change that removed the model fails the run before it launches
+// something no slot holds anymore.
+export function randomDrawStillValid(
+  catalog: Catalog,
+  place: ModelPlace,
+  settings: ModelSettings,
+  model: string,
+): boolean {
+  if ((settings.places?.[place]?.slot ?? 'primary') !== 'random') return false
+  const slots = resolveSlots(catalog, settings.slots)
+  const runnable = MODEL_SLOTS.filter((slot) => isPlaceModel(catalog, place, slots[slot]))
+  if (runnable.length === 0) {
+    return model === catalog.behaviors[MODEL_PLACES.find((entry) => entry.key === place)!.seed]
+  }
+  return runnable.some((slot) => slots[slot] === model)
 }
 
 // The reviewers of a new pull request or issue: the place's slot first, then

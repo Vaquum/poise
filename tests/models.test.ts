@@ -305,4 +305,39 @@ describe('a Random place', () => {
     const panel = models.randomPanel(narrow, 'pr_review', slots, 3, () => 0.1)
     expect(panel.map((r) => r.model)).not.toContain('grok-4.6-xhigh')
   })
+
+  it('draws the same panel for the same seed key on every call', () => {
+    const first = models.randomPanel(catalog, 'pr_review', slots, 2, models.seededRandom('Vaquum/poise-test#17:pr_review:panel'))
+    const second = models.randomPanel(catalog, 'pr_review', slots, 2, models.seededRandom('Vaquum/poise-test#17:pr_review:panel'))
+    expect(second).toEqual(first)
+    const streams = [models.seededRandom('k'), models.seededRandom('k')].map((random) => [random(), random(), random()])
+    expect(streams[0]).toEqual(streams[1])
+    expect(streams[0].every((value) => value >= 0 && value < 1)).toBe(true)
+  })
+
+  it('spreads seeded draws across the slots while keeping three complete', () => {
+    const drawn = new Set<string>()
+    for (let number = 1; number <= 30; number++) {
+      const picked = models.resolvePlace(catalog, 'pr_review',
+        { slots, places: { pr_review: { slot: 'random' } } } as never,
+        models.seededRandom(`Vaquum/poise-test#${number}:pr_review:panel`))
+      drawn.add(picked.slot)
+    }
+    expect([...drawn].sort()).toEqual(['primary', 'secondary', 'tertiary'])
+    for (const number of [1, 2, 3]) {
+      const panel = models.randomPanel(catalog, 'pr_review', slots, 3, models.seededRandom(`Vaquum/poise-test#${number}:pr_review:panel`))
+      expect(panel.map((r) => r.slot).sort()).toEqual(['primary', 'secondary', 'tertiary'])
+    }
+  })
+
+  it('revalidates a prepared draw against the current slots, not a fresh draw', () => {
+    const settings = { slots, places: { pr_approve: { slot: 'random' } } } as never
+    expect(models.randomDrawStillValid(catalog, 'pr_approve', settings, 'opus-5-max')).toBe(true)
+    expect(models.randomDrawStillValid(catalog, 'pr_approve', settings, 'fable-5.1-max')).toBe(false)
+    // Every slot model changed underneath the prepared run.
+    const moved = { slots: { primary: 'fable-5.1-max', secondary: 'grok-4.6-high', tertiary: 'gemini-3.8-flash-high' }, places: { pr_approve: { slot: 'random' } } } as never
+    expect(models.randomDrawStillValid(catalog, 'pr_approve', moved, 'opus-5-max')).toBe(false)
+    // No longer a Random place at all.
+    expect(models.randomDrawStillValid(catalog, 'pr_approve', { slots, places: { pr_approve: { slot: 'primary' } } } as never, 'opus-5-max')).toBe(false)
+  })
 })

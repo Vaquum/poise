@@ -1,5 +1,5 @@
 import { claudeAuth } from './claude-auth'
-import { MODEL_SLOTS, REVIEW_POLICY, type Catalog, type ModelSlot, type ResolvedSlots, isClaudeModel, isPlaceModel, loadCatalog, placeProviders, randomPanel, recoveryModel, resolvePlace, resolveSlots, slotPanel } from './models'
+import { MODEL_SLOTS, REVIEW_POLICY, type Catalog, type ModelSlot, type ResolvedSlots, isClaudeModel, isPlaceModel, loadCatalog, placeProviders, randomDrawStillValid as drawStillValid, randomPanel, recoveryModel, resolvePlace, resolveSlots, slotPanel } from './models'
 import { getModelSettings } from './settings'
 
 export { REVIEW_POLICY }
@@ -76,6 +76,15 @@ export async function reviewPanel(
 // Whether launching this identity needs the Claude.ai sign-in Poise monitors.
 export function needsClaude(catalog: Catalog | null, identity: string): boolean {
   return isClaudeModel(catalog, identity)
+}
+
+// Revalidation for a prepared Random draw against the live configuration:
+// true while the place still draws at random and the prepared model is still
+// one of its runnable slot models. Callers use this instead of comparing two
+// draws, which vary by design.
+export async function randomDrawStillValid(place: ReviewPlace, model: string): Promise<boolean> {
+  const catalog = await loadCatalog()
+  return drawStillValid(catalog, place, getModelSettings(), model)
 }
 
 // Fallback for non-review places: when the wanted model is a Claude model and
