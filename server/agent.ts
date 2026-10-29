@@ -27,7 +27,7 @@ import { needsClaude, reviewChoice } from './review-model'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
 import { diagnostic } from './logging'
-import { requireAgentAccount } from './settings'
+import { getModelSettings, requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { resolveReviewCheckout } from './review-checkout'
 import { ISSUE_REVIEW_BEHAVIOR, freezeAgentLogSnapshot, parseAgentLogPage, parseAgentLogStdout, scopedAgentLogs } from './agent-log-parse'
@@ -591,7 +591,7 @@ export async function triggerPrReview(
   const author = await getPrAuthor(repoFullName, Number(num), accounts.agent)
     .catch(() => getPrAuthor(repoFullName, Number(num), accounts.me))
   const actor = prReviewer(author, true)
-  const { model, recovery, catalog } = await reviewChoice('pr_review')
+  const { model, recovery, slot, catalog } = await reviewChoice('pr_review')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
@@ -603,10 +603,10 @@ export async function triggerPrReview(
   if (claude) await claudeAuth.requireReady()
   const selectedModel = (await reviewChoice('pr_review')).model
   if (!prAccountsMatch(accounts) || prReviewer(author, true) !== actor) throw new Error('GitHub accounts changed; retry the review')
-  if (selectedModel !== model) throw new Error('Review model changed; retry the request')
+  if (getModelSettings().places?.['pr_review']?.slot !== 'random' && selectedModel !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: 'review-new-prs', source, owner, actor, repository: repoFullName,
-    number: Number(num), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+    number: Number(num), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
   try { await spawnDetached(CLI, [
     '--pr-review',
     `#${num}`,
@@ -675,7 +675,7 @@ export async function replayAgentJob(input: {
   const actor = admission.actor
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
   const place = behavior === 'pr_review' ? 'pr_review' : 'pr_approve'
-  const { model, recovery, catalog } = await reviewChoice(place)
+  const { model, recovery, slot, catalog } = await reviewChoice(place)
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const [owner, repoName] = repo.split('/', 2)
@@ -687,10 +687,10 @@ export async function replayAgentJob(input: {
   if (claude) await claudeAuth.requireReady()
   const selectedModel = (await reviewChoice(place)).model
   if (!prAccountsMatch(admission.accounts) || prReviewer(admission.author) !== actor) throw new Error('GitHub accounts changed; retry the replay')
-  if (selectedModel !== model) throw new Error('Review model changed; retry the request')
+  if (getModelSettings().places?.[place]?.slot !== 'random' && selectedModel !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: behavior === 'pr_review' ? 'review-new-prs' : 'approve-prs', source, owner, actor,
-    repository: repo, number: Number(prId), head: expectedHead, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+    repository: repo, number: Number(prId), head: expectedHead, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
   // An approval replay runs under the same effective cap as a scheduled
   // approve-prs launch: at or past the capped round it files (or reuses)
   // the follow-up issue and approves instead of requesting changes again.
@@ -732,17 +732,17 @@ export async function replayAgentJob(input: {
 // local checkout: Caller prepares its own.
 async function replayIssueReview(repo: string, issue: string): Promise<{ ok: true, source: string, correlationId: string }> {
   const actor = requireAgentAccount()
-  const { model, recovery, catalog } = await reviewChoice('issue_review')
+  const { model, recovery, slot, catalog } = await reviewChoice('issue_review')
   const claude = needsClaude(catalog, model)
   if (claude) await claudeAuth.requireReady()
   const modelCliEnv = await prepareModelClis(catalog, [model, recovery])
   const source = 'poise:replay'
   const correlationId = randomUUID()
   if (claude) await claudeAuth.requireReady()
-  if ((await reviewChoice('issue_review')).model !== model) throw new Error('Review model changed; retry the request')
+  if (getModelSettings().places?.['issue_review']?.slot !== 'random' && (await reviewChoice('issue_review')).model !== model) throw new Error('Review model changed; retry the request')
   captureBehaviorAdmission({ admissionKey: correlationId, nativeId: correlationId,
     behavior: 'review-new-issues', source, owner: repo.split('/')[0], actor,
-    repository: repo, number: Number(issue), head: null, slot: 'primary', plannedSlots: ['primary'], startedAt: new Date().toISOString() })
+    repository: repo, number: Number(issue), head: null, slot, plannedSlots: [slot], startedAt: new Date().toISOString() })
   try { await spawnDetached(CLI, [
     '--issue-review',
     `${repo}#${issue}`,

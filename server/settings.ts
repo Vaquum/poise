@@ -1,7 +1,7 @@
 import { db, getMeta, setMeta } from './db'
 import { invalidateRepoListCache } from './gh'
 import { HttpError } from './http'
-import { type Catalog, type ModelPlace, type ModelPlaceChoice, type ModelSettings, type ModelSlotChoices, assertSlotsDistinct, isModelPlace, isModelSlot, migrateLegacyModelSettings, validateModelSettings } from './models'
+import { type Catalog, type ModelPlace, type ModelPlaceChoice, type ModelSettings, type ModelSlotChoices, assertSlotsDistinct, isModelPlace, isModelSlot, isPlaceSlot, migrateLegacyModelSettings, validateModelSettings } from './models'
 
 // GitHub logins and organization names: 1–39 characters, alphanumerics and
 // hyphens, not leading or trailing; your account and the agent account
@@ -252,7 +252,7 @@ function readModelSettings(record: Record<string, unknown>): ModelSettings {
     const picked: Partial<Record<ModelPlace, ModelPlaceChoice>> = {}
     for (const [place, value] of Object.entries(places as Record<string, unknown>)) {
       const slot = (value as { slot?: unknown } | null)?.slot
-      if (isModelPlace(place) && isModelSlot(slot)) picked[place] = { slot }
+      if (isModelPlace(place) && isPlaceSlot(slot)) picked[place] = { slot }
     }
     if (Object.keys(picked).length > 0) settings.places = picked
   }

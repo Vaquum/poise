@@ -194,7 +194,7 @@ describe('validating what the settings pane saves', () => {
     [{ slots: { primary: 'opus' } }, /model slot primary must be a model from the catalog/],
     [{ slots: { fourth: 'opus-5-max' } }, /unknown model slot fourth/],
     [{ slots: 'opus-5-max' }, /must be an object of primary, secondary and tertiary/],
-    [{ places: { chat: { slot: 'default' } } }, /Chat slot must be primary, secondary or tertiary/],
+    [{ places: { chat: { slot: 'default' } } }, /Chat slot must be primary, secondary, tertiary or random/],
     [{ places: { canary: { slot: 'primary' } } }, /unknown model place canary/],
     [{ places: 'primary' }, /model places must be an object of places/],
     [{ chat: { default: 'opus-5-max', fallback: 'opus-5-xhigh' } }, /unknown models section chat/],
@@ -270,4 +270,39 @@ it('does not reuse an in-flight old catalogue after discovery invalidates it', a
   release({ stdout: CATALOG_STDOUT, stderr: '' })
   await old
   expect(await models.loadCatalog()).toEqual(next)
+})
+
+describe('a Random place', () => {
+  const slots = { primary: 'opus-5-max', secondary: 'grok-4.6-xhigh', tertiary: 'gpt-6-astra-ultra' }
+  const randomSettings = { slots, places: { pr_approve: { slot: 'random' } } } as never
+
+  it('saves Random as a place slot', () => {
+    expect(models.validateModelSettings(catalog, { places: { chat: { slot: 'random' } } }))
+      .toEqual({ places: { chat: { slot: 'random' } } })
+  })
+
+  it('picks one runnable slot at random per run', () => {
+    expect(models.resolvePlace(catalog, 'pr_approve', randomSettings, () => 0))
+      .toMatchObject({ slot: 'primary', model: 'opus-5-max' })
+    expect(models.resolvePlace(catalog, 'pr_approve', randomSettings, () => 0.5))
+      .toMatchObject({ slot: 'secondary', model: 'grok-4.6-xhigh' })
+    expect(models.resolvePlace(catalog, 'pr_approve', randomSettings, () => 0.99))
+      .toMatchObject({ slot: 'tertiary', model: 'gpt-6-astra-ultra' })
+  })
+
+  it('draws N distinct runnable models, all three when three are needed', () => {
+    const one = models.randomPanel(catalog, 'pr_review', slots, 1, () => 0.99)
+    expect(one).toHaveLength(1)
+    const three = models.randomPanel(catalog, 'pr_review', slots, 3, () => 0.1)
+    expect(three.map((r) => r.slot).sort()).toEqual(['primary', 'secondary', 'tertiary'])
+    expect(new Set(three.map((r) => r.model)).size).toBe(3)
+  })
+
+  it('never draws what the place cannot run', () => {
+    // Grok cannot review on the narrow catalog; Random skips it.
+    const picked = models.resolvePlace(narrow, 'pr_approve', randomSettings, () => 0.5)
+    expect(['opus-5-max', 'gpt-6-astra-ultra']).toContain(picked.model)
+    const panel = models.randomPanel(narrow, 'pr_review', slots, 3, () => 0.1)
+    expect(panel.map((r) => r.model)).not.toContain('grok-4.6-xhigh')
+  })
 })

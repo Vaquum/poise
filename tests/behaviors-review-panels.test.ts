@@ -39,6 +39,32 @@ describe('review panel scheduling and recovery', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
   })
 
+  it('reviews with all three models exactly once when the place draws at Random', async () => {
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.setMeta('behavior_review_new_prs_reviewers', '3')
+    db.setMeta('models', JSON.stringify({
+      slots: { primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh' },
+      places: { pr_review: { slot: 'random' } },
+    }))
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    const launches = mocks.spawnDetached.mock.calls.map((call) => call[1] as string[])
+    expect(launches.map((args) => args[args.indexOf('--model') + 1]).sort())
+      .toEqual(['gpt-6-astra-ultra', 'grok-4.6-xhigh', 'opus-5-xhigh'])
+    const admissions = mocks.captureAdmission.mock.calls.map(([admission]) => admission)
+    expect(admissions).toHaveLength(3)
+    expect(new Set(admissions.map(({ slot }) => slot)).size).toBe(3)
+  })
+
   it.each(['review-new-prs', 'approve-prs'] as const)('isolates a %s max-turns failure while fresh work runs in the same cycle', async (behavior) => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-10-02T06:00:00.000Z'))

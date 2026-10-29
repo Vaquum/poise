@@ -996,15 +996,31 @@ async function retireStaleReviewerTrips(): Promise<void> {
 
 // The approval slot that launches now: the PR approval place's slot unless
 // tripped, else the next slot the place can run; null when every runnable
-// slot is tripped. When no slot runs there at all, the catalog seed still
-// approves. A peek: the probe claim happens beside the spawn, like a panel.
+// slot is tripped. A Random place draws from every runnable slot instead of
+// from its draw onward, so a tripped draw moves to an untried model. When no
+// slot runs there at all, the catalog seed still approves. A peek: the probe
+// claim happens beside the spawn, like a panel.
 async function approvalSlot(): Promise<{ slot: ReviewerSlot, model: string, recovery: string, catalog: Catalog } | null> {
   const choice = await reviewChoice('pr_approve')
   const slots = resolveSlots(choice.catalog, getModelSettings().slots)
-  const runnable = MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(choice.slot))
+  const stored = getModelSettings().places?.['pr_approve']?.slot ?? 'primary'
+  const runnable = (stored === 'random' ? [...MODEL_SLOTS] : MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(choice.slot)))
     .filter((slot) => isPlaceModel(choice.catalog, 'pr_approve', slots[slot]))
   if (runnable.length === 0) {
     return { slot: choice.slot, model: choice.model, recovery: recoveryModel(choice.catalog, 'pr_approve', slots, choice.slot), catalog: choice.catalog }
+  }
+  if (stored === 'random' && !reviewerTripped(choice.model) && runnable.includes(choice.slot)) {
+    return { slot: choice.slot, model: choice.model, recovery: choice.recovery, catalog: choice.catalog }
+  }
+  const untripped = runnable.filter((slot) => !reviewerTripped(slots[slot]))
+  if (untripped.length === 0) return null
+  if (stored === 'random') {
+    const slot = untripped[Math.floor(Math.random() * untripped.length) % untripped.length]
+    const remaining = untripped.filter((candidate) => candidate !== slot)
+    const recovery = remaining.length > 0
+      ? slots[remaining[Math.floor(Math.random() * remaining.length) % remaining.length]]
+      : recoveryModel(choice.catalog, 'pr_approve', slots, slot)
+    return { slot, model: slots[slot], recovery, catalog: choice.catalog }
   }
   for (const slot of runnable) {
     const model = slots[slot]
@@ -3833,7 +3849,8 @@ async function fireApprove(
   const reviewEnvironment = await automatedReviewEnvironment(pr.repo, pr.number, actor, accounts)
   const selectedModel = (await approvalSlot())?.model
   if (!isRunnable('approve-prs') || behaviorAborted() || !prAccountsMatch(accounts) || !stillEligible('approve-prs', pr, actor)) return false
-  if (selectedModel !== model) return false
+  // A Random draw varies per read by design; the prepared model stands.
+  if (getModelSettings().places?.['pr_approve']?.slot !== 'random' && selectedModel !== model) return false
   if (admittedReviewer && configuredReviewer(pr.author).toLowerCase() !== admittedReviewer.toLowerCase()) return false
   if (replacesFailedCallId && !renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)) {
     throw new Error(`approval PR operation ownership was lost for ${pr.repo}#${pr.number}`)
@@ -6778,10 +6795,13 @@ async function runBehaviorChains(): Promise<void> {
         const place = decision.behavior === 'repair-pr' ? 'pr_repair' : 'issue_implement'
         const catalog = await loadCatalog()
         const slots = resolveSlots(catalog, getModelSettings().slots)
-        const candidates = [selected.model, ...MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(selected.slot)).map((slot) => slots[slot])]
+        const stored = getModelSettings().places?.[place]?.slot ?? 'primary'
+        const ordered = stored === 'random' ? [...MODEL_SLOTS] : MODEL_SLOTS.slice(MODEL_SLOTS.indexOf(selected.slot))
+        const candidates = [selected.model, ...ordered.map((slot) => slots[slot])]
         const model = candidates.find((identity) => isPlaceModel(catalog, place, identity) && !reviewerTripped(identity))
         if (!model || !claimReviewerTripProbe(model)) return null
-        return { slot: selected.slot, model, recovery: model }
+        const slot = stored === 'random' ? (MODEL_SLOTS.find((candidate) => slots[candidate] === model) ?? selected.slot) : selected.slot
+        return { slot, model, recovery: model }
       },
       async prepare(identities) {
         const catalog = await loadCatalog()

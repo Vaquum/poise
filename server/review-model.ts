@@ -1,5 +1,5 @@
 import { claudeAuth } from './claude-auth'
-import { MODEL_SLOTS, REVIEW_POLICY, type Catalog, type ModelSlot, type ResolvedSlots, isClaudeModel, loadCatalog, placeProviders, recoveryModel, resolvePlace, resolveSlots, slotPanel } from './models'
+import { MODEL_SLOTS, REVIEW_POLICY, type Catalog, type ModelSlot, type ResolvedSlots, isClaudeModel, isPlaceModel, loadCatalog, placeProviders, randomPanel, recoveryModel, resolvePlace, resolveSlots, slotPanel } from './models'
 import { getModelSettings } from './settings'
 
 export { REVIEW_POLICY }
@@ -27,11 +27,20 @@ async function supportedCatalog(place: ReviewPlace): Promise<Catalog> {
   return catalog
 }
 
-export async function reviewChoice(place: ReviewPlace): Promise<ReviewChoice> {
+export async function reviewChoice(place: ReviewPlace, random: () => number = Math.random): Promise<ReviewChoice> {
   const catalog = await supportedCatalog(place)
   const settings = getModelSettings()
-  const resolved = resolvePlace(catalog, place, settings)
+  const stored = settings.places?.[place]?.slot ?? 'primary'
+  const resolved = resolvePlace(catalog, place, settings, random)
   const slots = resolveSlots(catalog, settings.slots)
+  if (stored === 'random') {
+    // Recovery is another runnable the run has not tried, drawn at random.
+    const remaining = MODEL_SLOTS.filter((slot) => slot !== resolved.slot && isPlaceModel(catalog, place, slots[slot]))
+    const recovery = remaining.length > 0
+      ? slots[remaining[Math.floor(random() * remaining.length) % remaining.length]]
+      : recoveryModel(catalog, place, slots, resolved.slot)
+    return { model: resolved.model, recovery, slot: resolved.slot, catalog }
+  }
   return { model: resolved.model, recovery: recoveryModel(catalog, place, slots, resolved.slot), slot: resolved.slot, catalog }
 }
 
@@ -42,14 +51,22 @@ export interface ReviewPanel {
 
 // The reviewers of a new pull request or issue, the place's slot first: as
 // many of the following slots as Behaviors asks for, each with the recovery
-// model after its own slot. When no slot model can run there, the one
+// model after its own slot. A Random place draws N distinct runnable slots in
+// shuffled order instead. When no slot model can run there, the one
 // launchable resolution still reviews.
-export async function reviewPanel(count: number, place: 'pr_review' | 'issue_review' = 'pr_review'): Promise<ReviewPanel> {
+export async function reviewPanel(
+  count: number,
+  place: 'pr_review' | 'issue_review' = 'pr_review',
+  random: () => number = Math.random,
+): Promise<ReviewPanel> {
   const catalog = await supportedCatalog(place)
   const settings = getModelSettings()
-  const start = resolvePlace(catalog, place, settings)
+  const stored = settings.places?.[place]?.slot ?? 'primary'
+  const start = resolvePlace(catalog, place, settings, random)
   const slots = resolveSlots(catalog, settings.slots)
-  const reviewers = slotPanel(catalog, place, slots, start.slot, count)
+  const reviewers = stored === 'random'
+    ? randomPanel(catalog, place, slots, count, random)
+    : slotPanel(catalog, place, slots, start.slot, count)
   if (reviewers.length === 0) {
     reviewers.push({ slot: start.slot, model: start.model, recovery: recoveryModel(catalog, place, slots, start.slot) })
   }

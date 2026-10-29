@@ -32,6 +32,9 @@ interface CatalogModel { identity: string, provider: string, selector: string, e
 type ModelSlot = 'primary' | 'secondary' | 'tertiary'
 const MODEL_SLOTS: readonly ModelSlot[] = ['primary', 'secondary', 'tertiary']
 const SLOT_LABELS: Record<ModelSlot, string> = { primary: 'Primary', secondary: 'Secondary', tertiary: 'Tertiary' }
+type ModelPlaceSlot = ModelSlot | 'random'
+const PLACE_SLOTS: readonly ModelPlaceSlot[] = ['primary', 'secondary', 'tertiary', 'random']
+const PLACE_SLOT_LABELS: Record<ModelPlaceSlot, string> = { primary: 'Primary', secondary: 'Secondary', tertiary: 'Tertiary', random: 'Random' }
 interface ModelSlots {
   primary: string
   secondary: string
@@ -48,10 +51,10 @@ interface ModelPlace {
   providers?: string[] | null
   reviewers: boolean
   // The slot this place runs, and the model that resolves to.
-  slot: ModelSlot
+  slot: ModelPlaceSlot
   model: string
   notes: string[]
-  stored: { slot: ModelSlot } | null
+  stored: { slot: ModelPlaceSlot } | null
 }
 interface FixedPlace { key: string, label: string, model: string, why: string }
 interface ModelsResponse {
@@ -706,8 +709,8 @@ function modelOptions(models: CatalogModel[], selected: string): string {
 }
 
 function slotOptions(selected: string): string {
-  return MODEL_SLOTS
-    .map((slot) => `<option value="${slot}"${slot === selected ? ' selected' : ''}>${SLOT_LABELS[slot]}</option>`)
+  return PLACE_SLOTS
+    .map((slot) => `<option value="${slot}"${slot === selected ? ' selected' : ''}>${PLACE_SLOT_LABELS[slot]}</option>`)
     .join('')
 }
 
@@ -753,7 +756,7 @@ function renderPlaces(data: ModelsResponse) {
   const slotsNotes = slots.notes.map((n) => `<div class="st-help st-help-warn">${escapeHtml(n)}</div>`).join('')
   patchContent(modelsEl, `
       <div class="tp-section st-slots" data-slots>
-        <label class="tp-label" ${helpAttributes('The three models, chosen once. Every place below runs one of these slots; changing a slot changes it everywhere. When a chosen model fails before a verdict, the run moves to the next slot.')}>Models</label>
+        <label class="tp-label" ${helpAttributes('The three models, chosen once. Every place below runs one of these slots or draws at Random per run; changing a slot changes it everywhere. When a chosen model fails before a verdict, the run moves to a slot it has not tried yet.')}>Models</label>
         ${MODEL_SLOTS.map((slot) => `
         <label class="st-sublabel">${SLOT_LABELS[slot]}</label>
         <select class="st-select st-slot-${slot}" aria-label="${SLOT_LABELS[slot]} model">${modelOptions(data.catalog.models, currentSlots[slot] || '')}</select>`).join('')}
@@ -939,7 +942,7 @@ async function usePreset(): Promise<void> {
         const choice = preset.models.places?.[place.key]
         // Stored too, mirroring the server's merge: a draft made after this
         // Use reads its baseline from it.
-        if (choice) { place.slot = choice.slot as ModelSlot; place.stored = { slot: place.slot } }
+        if (choice) { place.slot = choice.slot as ModelPlaceSlot; place.stored = { slot: place.slot } }
       }
       renderPlaces(lastModels)
     }
@@ -1245,7 +1248,7 @@ async function saveModels(): Promise<void> {
       if (changes.slots) lastModels.slots.stored = { ...lastModels.slots.stored, ...changes.slots }
       for (const [key, sent] of Object.entries(places)) {
         const place = lastModels.places.find((entry) => entry.key === key)
-        if (place) place.stored = { slot: sent.slot as ModelSlot }
+        if (place) place.stored = { slot: sent.slot as ModelPlaceSlot }
       }
     }
     setLocalSettings(data)
@@ -1395,8 +1398,8 @@ function updateStoredChoice(key: string, choice: unknown): void {
   }
   if (typeof choice.slot !== 'string') return
   const place = lastModels.places.find((entry) => entry.key === key)
-  if (!place || !MODEL_SLOTS.includes(choice.slot as ModelSlot)) return
-  place.slot = choice.slot as ModelSlot
+  if (!place || !PLACE_SLOTS.includes(choice.slot as ModelPlaceSlot)) return
+  place.slot = choice.slot as ModelPlaceSlot
   place.stored = { slot: place.slot }
 }
 

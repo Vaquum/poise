@@ -665,11 +665,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             const slots = { ...resolveSlots(catalog, stored.slots), stored: stored.slots || null }
             const places = MODEL_PLACES.map((place) => {
               const resolved = resolvePlace(catalog, place.key, stored)
+              const random = stored.places?.[place.key]?.slot === 'random'
               return {
                 ...place,
-                slot: resolved.slot,
+                slot: random ? 'random' : resolved.slot,
                 model: resolved.model,
-                notes: resolved.notes,
+                notes: random ? [...resolved.notes, 'Drawn at random per run from the three models.'] : resolved.notes,
                 stored: stored.places?.[place.key] || null,
                 // Which providers this place may launch; null means all of them.
                 providers: placeProviders(catalog, place.key),
