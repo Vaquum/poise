@@ -31,8 +31,8 @@ function invitation(id: number, owner: string, inviter: string) {
 
 function calls(command: string, prefix?: string): string[][] {
   return mocks.runFile.mock.calls
-    .filter(([name, args]: [string, string[]]) => name === command && (!prefix || args[1] === prefix || args[0] === prefix))
-    .map(([, args]: [string, string[]]) => args)
+    .filter(([name, args]) => name === command && (!prefix || args[1] === prefix || args[0] === prefix))
+    .map(([, args]) => args)
 }
 
 beforeEach(() => {
@@ -77,7 +77,7 @@ describe('reconcileAgentCollaborators', () => {
     expect(result).toEqual({ repos: 1, invited: ['acme/site'], accepted: [] })
     const invites = calls('gh').filter((args) => args[1].includes('/collaborators/'))
     expect(invites).toEqual([['api', 'repos/acme/site/collaborators/agent-x', '--method', 'PUT', '--include', '--field', 'permission=push']])
-    const inviteCall = mocks.runFile.mock.calls.find(([, args]: [string, string[]]) => args[1]?.includes('/collaborators/'))
+    const inviteCall = mocks.runFile.mock.calls.find(([, args]) => args[1]?.includes('/collaborators/'))
     expect(inviteCall?.[2].env).toMatchObject({ GH_HOST: 'github.com', GH_TOKEN: 'octocat-token' })
     expect(JSON.parse(mocks.meta.get('agent_collaborator_confirmed:acme')!)).toEqual(['acme/site'])
   })
@@ -128,7 +128,7 @@ describe('reconcileAgentCollaborators', () => {
     expect(result.accepted).toEqual([11])
     const accepts = calls('gh').filter((args) => args[1]?.startsWith('user/repository_invitations/') && !args[1].includes('?'))
     expect(accepts.map((args) => args[1])).toEqual(['user/repository_invitations/11', 'user/repository_invitations/14'])
-    const listCall = mocks.runFile.mock.calls.find(([, args]: [string, string[]]) => args[1]?.startsWith('user/repository_invitations?'))
+    const listCall = mocks.runFile.mock.calls.find(([, args]) => args[1]?.startsWith('user/repository_invitations?'))
     expect(listCall?.[2].env).toMatchObject({ GH_TOKEN: 'agent-x-token' })
   })
 
