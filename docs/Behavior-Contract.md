@@ -3,6 +3,9 @@
 Poise is a trigger and orchestration layer. It does not read GitHub source,
 construct reviews, or mutate review threads itself.
 
+The shared error-state vocabulary lives in [Error-state handling contract](Error-State-Contract.md);
+per-message paragraphs below are examples of that table.
+
 ## PR accounts
 
 PR behaviors accept either configured GitHub account as author, case-insensitively.
