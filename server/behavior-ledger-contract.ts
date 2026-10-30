@@ -68,7 +68,7 @@ export interface LedgerCaller {
 }
 export type LedgerObservation = LedgerAdmission | LedgerResult | LedgerCaller
   | { type: 'heartbeat' }
-  | { type: 'loss'; count: number }
+  | { type: 'loss'; count: number; since?: string }
 export interface LedgerRecord {
   id: string
   kind: 'firing' | 'attempt'
@@ -105,6 +105,8 @@ export interface LedgerHealth {
   pending: number
   dropped: number
   gaps: LedgerGap[]
+  /** Exact gap detail below or at this time was compacted; uncertainty there is coarse. Null keeps full detail. */
+  detailFloor: string | null
   generation: string | null
   retainedFrom: string | null
   changeLowerBound: number | null

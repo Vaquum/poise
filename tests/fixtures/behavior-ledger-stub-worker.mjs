@@ -14,6 +14,7 @@ const health = {
   pending: 0,
   dropped: 0,
   gaps: [],
+  detailFloor: null,
   generation: 'stub',
   retainedFrom: null,
   changeLowerBound: null,
