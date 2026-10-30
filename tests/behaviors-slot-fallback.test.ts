@@ -11,7 +11,7 @@ function modelOf(call: unknown[]): string {
 }
 
 describe('reviewer trip classification', () => {
-  const trips: Array<{ name: string, error: string, code?: string, expected: ReviewerTripKind }> = [
+  const trips: Array<{ name: string, error: string, code?: string, diagnostic?: { operation: string, phase: string }, expected: ReviewerTripKind }> = [
     { name: 'codex 429 reconnect loop', error: RATE_LIMIT_ERROR, expected: 'rate_limit' },
     { name: 'status 429', error: 'API error (status 429 Too Many Requests)', expected: 'rate_limit' },
     { name: 'http_status 429', error: '{"http_status": 429}', expected: 'rate_limit' },
@@ -20,10 +20,11 @@ describe('reviewer trip classification', () => {
     { name: 'provider error code', error: 'codex review failed: turn errored', code: 'review_provider_error', expected: 'provider' },
     { name: 'provider exit code', error: 'codex review failed: provider exited', code: 'review_provider_exit', expected: 'provider' },
     { name: 'budget exhausted code', error: 'Review reached its total time limit; needs attention', code: 'review_budget_exhausted', expected: 'budget' },
+    { name: 'provider-execution budget with diagnostic', error: 'Issue review reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'provider.review', phase: 'provider_execution' }, expected: 'budget' },
     { name: '402 stays an account trip', error: 'API error (status 402 Payment Required)', expected: 'balance' },
   ]
 
-  const holds: Array<{ name: string, error: string, code?: string }> = [
+  const holds: Array<{ name: string, error: string, code?: string, diagnostic?: { operation: string, phase: string } }> = [
     { name: 'GitHub 429', error: 'error: GitHub 429: rate limit exceeded for resource' },
     { name: 'GitHub 403 rate-limit', error: 'error: GitHub 403 rate-limit: {headers}' },
     { name: 'line 429', error: 'verdict failed at line 429' },
@@ -34,16 +35,18 @@ describe('reviewer trip classification', () => {
     { name: 'empty', error: '' },
     { name: 'inspection prompt exhaustion', error: 'Repository inspection exceeds the review prompt limit; needs attention', code: 'review_budget_exhausted' },
     { name: 'inspection round exhaustion', error: 'Repository inspection limit reached; needs attention', code: 'review_budget_exhausted' },
+    { name: 'issue checkout budget', error: 'Issue review checkout reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'issue.checkout', phase: 'checking_out' } },
+    { name: 'issue preparation budget', error: 'Issue review preparation reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'issue.prepare', phase: 'preparing_issue' } },
   ]
 
-  it.each(trips)('trips on $name', async ({ error, code, expected }) => {
+  it.each(trips)('trips on $name', async ({ error, code, diagnostic, expected }) => {
     const { behaviors } = await loadModules()
-    expect(behaviors.reviewerTripKind({ error, error_code: code } as LogEntry)).toBe(expected)
+    expect(behaviors.reviewerTripKind({ error, error_code: code, diagnostic } as LogEntry)).toBe(expected)
   })
 
-  it.each(holds)('does not trip on $name', async ({ error, code }) => {
+  it.each(holds)('does not trip on $name', async ({ error, code, diagnostic }) => {
     const { behaviors } = await loadModules()
-    expect(behaviors.reviewerTripKind({ error, error_code: code } as LogEntry)).toBeNull()
+    expect(behaviors.reviewerTripKind({ error, error_code: code, diagnostic } as LogEntry)).toBeNull()
   })
 })
 

@@ -873,11 +873,16 @@ def run_issue_review(
                     conn.execute("update calls set issue_revision=? where id=? and ended_at is null", (observed_revision, id_))
                 issue_review.mark_reviewed(data, actor, _issue_review_targets, _running_issue_reviews(id_))
             except review_budget.ReviewLimitError as e:
+                if e.diagnostic is None:
+                    e.diagnostic = diagnostic_envelope(operation="issue.prepare", phase="preparing_issue",
+                                                       outcome="timed_out")
                 fail(e, e.code)
             except subprocess.TimeoutExpired as e:
                 fail(review_budget.ReviewLimitError(
                     "Issue review preparation reached its time limit; needs attention",
-                    "review_budget_exhausted"), "review_budget_exhausted")
+                    "review_budget_exhausted",
+                    diagnostic_envelope(operation="issue.prepare", phase="preparing_issue",
+                                        outcome="timed_out")), "review_budget_exhausted")
             except Exception as e:
                 fail(e, getattr(e, "code", None), preflight=True)
             try:

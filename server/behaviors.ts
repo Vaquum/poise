@@ -870,6 +870,18 @@ export function isDeterministicReviewExhaustion(call: LogEntry): boolean {
     || /repository inspection limit reached/i.test(error)
 }
 
+// A time limit reached before the provider started is a preparation failure,
+// not a provider failure: the model never ran, so tripping it would penalize
+// a healthy reviewer and relaunch the same expensive preparation under
+// another model. These hold their target with the Caller's precise reason.
+function isPreparationBudgetExhaustion(call: LogEntry): boolean {
+  if (call.error_code !== 'review_budget_exhausted') return false
+  const operation = call.diagnostic?.operation
+  const phase = call.diagnostic?.phase
+  return operation === 'issue.checkout' || phase === 'checking_out'
+    || operation === 'issue.prepare' || phase === 'preparing_issue'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -894,7 +906,8 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // A provider CLI that died outright trips like one that errored: before a
   // verdict, the next slot is strictly more useful than the same dead run.
   if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit') return 'provider'
-  if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)) return 'budget'
+  if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)
+    && !isPreparationBudgetExhaustion(call)) return 'budget'
   return null
 }
 
@@ -6671,7 +6684,15 @@ async function reconcileIssueReviewClaims(): Promise<void> {
     }
     if (FAILED_AGENT_STATUSES.has(status)) {
       const message = call.error || `agent call terminated with status ${status}`
-      if (releaseTrippedCall(ISSUES_KEY, claim, call)) continue
+      if (releaseTrippedCall(ISSUES_KEY, claim, call)) {
+        // A time-limit trip still relaunches the review once with the next
+        // reviewer — but the attempt counts toward the retry bound, so
+        // repeated time-limits hold instead of relaunching without end.
+        // Account and rate-limit trips substitute reviewers on backoff and
+        // stay uncounted, as documented.
+        if (call.error_code === 'review_budget_exhausted') recordBehaviorDeadLetter(claim, message, call.id)
+        continue
+      }
       if (deadLetterClaim(claim, message)) {
         const posted = call.receipts !== null && call.receipts !== undefined
         if (call.error_code !== 'stopped' && (posted || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))) {
