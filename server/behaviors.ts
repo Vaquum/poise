@@ -5311,6 +5311,7 @@ async function tickMergePrs(): Promise<void> {
       const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
       if (!operationId) continue
       let runId: string | null = null
+      let runNote: string | null = null
       try {
         const expectedHead = candidate.head!
         const [owner, name] = pr.repo.split('/', 2)
@@ -5343,7 +5344,10 @@ async function tickMergePrs(): Promise<void> {
           ...(result.outcome === 'enqueued'
             ? { refs: [{ kind: 'queue' as const, identity: String(result.queue_entry_id), availability: 'available' as const }] } : {}),
           head: expectedHead, completedAt: new Date().toISOString() })
-        finishDirectBehaviorRun(runId, true, disposition)
+        const receipt = result.outcome === 'merged' ? ` merge_sha=${result.merge_sha}`
+          : ['enqueued', 'in_queue'].includes(String(result.outcome)) ? ` queue_entry=${String(result.queue_entry_id).slice(0, 120)}` : ''
+        runNote = `target=${target} native=${runId} actor=${actor} head=${expectedHead} op=merge-if-ready outcome=${result.outcome}${receipt}`
+        finishDirectBehaviorRun(runId, true, disposition, runNote)
         runId = null
         if (result.outcome === 'enqueued' || result.outcome === 'in_queue') {
           storeQueueAdmission(target, { entryId: String(result.queue_entry_id), head: expectedHead, at: new Date().toISOString() })
@@ -5360,12 +5364,15 @@ async function tickMergePrs(): Promise<void> {
         }
         clearBehaviorFailure('merge-prs', target, actor)
       } catch (error) {
-        if (runId) captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+        if (runId) {
+          captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+          runNote = `target=${target} native=${runId} actor=${actor} head=${candidate.head ?? 'unknown'} op=merge-if-ready error=${behaviorErrorMessage(error)}`
+        }
         if (behaviorAborted()) return
         recordBehaviorFailure('merge-prs', 'operation', error, target, { actingAccount: actor })
         console.error(`[behaviors] merge-prs failed for ${target}:`, error)
       } finally {
-        if (runId) finishDirectBehaviorRun(runId, false)
+        if (runId) finishDirectBehaviorRun(runId, false, null, runNote ?? undefined)
         releasePrOperationOwned(operationId)
       }
     }
@@ -5382,6 +5389,7 @@ async function tickMergePrs(): Promise<void> {
   const updateOperationId = claimPrOperationOwned(updateTarget, PR_OPERATION_EVALUATION_LEASE_MS)
   if (!updateOperationId) return
   let updateRunId: string | null = null
+  let updateRunNote: string | null = null
   try {
     const expectedHead = update.head!
     const [owner, name] = updatePr.repo.split('/', 2)
@@ -5407,19 +5415,23 @@ async function tickMergePrs(): Promise<void> {
     captureBehaviorOutcome({ nativeId: updateRunId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
       activity: 'settled', stateSource: 'native', outcome: updateDisposition,
       head: expectedHead, completedAt: new Date().toISOString() })
-    finishDirectBehaviorRun(updateRunId, true, updateDisposition)
+    updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${expectedHead} op=update-branch-if-behind outcome=${result.outcome}`
+    finishDirectBehaviorRun(updateRunId, true, updateDisposition, updateRunNote)
     updateRunId = null
     if (result.outcome === 'updated') {
       console.log(`[behaviors] merge-prs updated ${updateTarget}`)
     }
     clearBehaviorFailure('merge-prs', updateTarget, actor)
   } catch (error) {
-    if (updateRunId) captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+    if (updateRunId) {
+      captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+      updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${update.head ?? 'unknown'} op=update-branch-if-behind error=${behaviorErrorMessage(error)}`
+    }
     if (behaviorAborted()) return
     recordBehaviorFailure('merge-prs', 'operation', error, updateTarget, { actingAccount: actor })
     console.error(`[behaviors] merge-prs failed for ${updateTarget}:`, error)
   } finally {
-    if (updateRunId) finishDirectBehaviorRun(updateRunId, false)
+    if (updateRunId) finishDirectBehaviorRun(updateRunId, false, null, updateRunNote ?? undefined)
     releasePrOperationOwned(updateOperationId)
   }
 }

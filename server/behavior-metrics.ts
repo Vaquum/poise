@@ -25,16 +25,25 @@ export function startDirectBehaviorRun(behavior: DirectBehavior): string {
   return id
 }
 
+export const MAX_DIRECT_RUN_NOTE = 1000
+
 export function finishDirectBehaviorRun(id: string, success: boolean, outcome: LedgerOutcome | null = null, note?: string): void {
   const at = new Date().toISOString()
-  const row = db.prepare('SELECT behavior, started_at FROM behavior_runs WHERE id = ?').get(id) as { behavior: string, started_at: string } | undefined
-  db.prepare('UPDATE behavior_runs SET completed_at = ?, status = ?, outcome = ?, note = COALESCE(?, note) WHERE id = ?')
-    .run(at, success ? 'completed' : 'failed', outcome, note ?? null, id)
+  const row = db.prepare('SELECT behavior, started_at, status FROM behavior_runs WHERE id = ?').get(id) as { behavior: string, started_at: string, status: string } | undefined
   activeDirectRuns.delete(id)
-  if (row) {
+  if (!row || row.status !== 'running') return
+  const bounded = note === undefined ? null
+    : note.length > MAX_DIRECT_RUN_NOTE ? `${note.slice(0, MAX_DIRECT_RUN_NOTE - 1).trimEnd()}…` : note
+  const settled = db.prepare(`UPDATE behavior_runs SET completed_at = ?, status = ?, outcome = ?, note = COALESCE(?, note)
+    WHERE id = ? AND status = 'running'`)
+    .run(at, success ? 'completed' : 'failed', outcome, bounded, id)
+  if (settled.changes === 0) return
+  try {
     recordHandling({ kind: 'behavior-firing', source: row.behavior, title: row.behavior,
       startedAt: row.started_at, finishedAt: at, outcome: success ? 'completed' : 'failed',
       actor: 'behaviors', ref: `direct-run:${id}` }, at)
+  } catch (error) {
+    console.error('[behaviors] direct-run handling unavailable; canonical run retained:', error)
   }
 }
 
