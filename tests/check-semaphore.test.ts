@@ -222,6 +222,27 @@ describe('shared check slots', () => {
     behavior!()
   })
 
+  it('refuses a slot to an already-aborted signal on the fast path', async () => {
+    const sem = new CheckSemaphore(() => 2)
+    const controller = new AbortController()
+    controller.abort()
+    expect(() => sem.acquire('person', { signal: controller.signal })).toThrow()
+    expect(sem.stats()).toMatchObject({ running: 0, queued: 0 })
+  })
+
+  it('never parks an already-aborted signal when the budget is full', async () => {
+    const sem = new CheckSemaphore(() => 1)
+    const hold = await sem.acquire('person')
+    const controller = new AbortController()
+    controller.abort()
+    expect(() => sem.acquire('person', {
+      signal: controller.signal,
+      onQueued: () => { throw new Error('aborted waiter parked') },
+    })).toThrow()
+    expect(sem.stats()).toMatchObject({ running: 1, queued: 0 })
+    hold()
+  })
+
   it('notifies release listeners once per holding', () => {
     const sem = new CheckSemaphore(() => 1)
     let calls = 0
