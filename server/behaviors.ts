@@ -859,6 +859,17 @@ export function reviewAccountFailure(call: LogEntry): ReviewAccountFailureKind |
 
 export type ReviewerTripKind = ReviewAccountFailureKind | 'rate_limit' | 'provider' | 'budget'
 
+// Deterministic input exhaustion, not a provider outage: the review input
+// itself exceeds the prompt or inspection budget on this head. Retrying with
+// another model cannot fix it, and tripping the provider globally would stall
+// unrelated PRs. These hold their target with the Caller's precise reason.
+export function isDeterministicReviewExhaustion(call: LogEntry): boolean {
+  if (call.error_code !== 'review_budget_exhausted') return false
+  const error = String(call.error || '')
+  return /repository inspection exceeds the review prompt limit/i.test(error)
+    || /repository inspection limit reached/i.test(error)
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -880,7 +891,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   // A provider CLI that died outright trips like one that errored: before a
   // verdict, the next slot is strictly more useful than the same dead run.
   if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit') return 'provider'
-  if (call.error_code === 'review_budget_exhausted') return 'budget'
+  if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)) return 'budget'
   return null
 }
 
@@ -3457,10 +3468,12 @@ function boundedReviewFailure(call: LogEntry): boolean {
 // failure, not an ambiguous side effect: Caller verifies against live
 // GitHub before failing this way, and says so when it cannot. It retries
 // the same head on backoff once the provider answers again; only an
-// uncertain submission holds.
+// uncertain submission holds — as does deterministic input exhaustion,
+// which no other model can fix on this head.
 function budgetExhaustedProvenNoAction(call: LogEntry): boolean {
   return call.review_policy === REVIEW_POLICY
     && call.error_code === 'review_budget_exhausted'
+    && !isDeterministicReviewExhaustion(call)
     && postedNothing(call)
     && call.review_comments == null
     && !/could not prove a safe recovery/.test(call.error || '')

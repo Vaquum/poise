@@ -316,10 +316,12 @@ async def review_diff(
         raw = await git("diff", "--raw", "--no-abbrev", "--no-renames", "-z", merge_base, head, "--", limit=4_000_000)
         files = _changes(raw)
         sizes = await _blob_sizes(client, owner, repo, files)
-        # Keep ordinary PRs unchanged. When full blob inputs already exceed
-        # the budget, exclude bulk data before Git can download those blobs.
-        input_bytes = sum(sizes.get(f[key], 0) for f in files for key in ("old_oid", "new_oid"))
-        passes = (None, False, True) if input_bytes <= MAX_DIFF_BYTES else (False, True)
+        # Exclude bulk data upfront, even when the total input fits: a packet
+        # that fits locally can still carry an artifact diff entry GitHub
+        # rejects inline comments on (422 "diff is too large"), stranding the
+        # firing after the model already ran. Small fixtures and source stay
+        # retained; only large bulk/opaque payloads are excluded here.
+        passes = (False, True)
         for compact in passes:
             excluded = []
             retained = []
