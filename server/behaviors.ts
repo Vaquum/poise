@@ -3189,11 +3189,48 @@ async function tickReviewNewPrs(): Promise<void> {
       releasePhase2Leases()
       throw err
     }
-    // Phase 3 — provision the checkout and spawn every claimed target without
-    // the behavior lock: the atomic claim plus launch intent is the
+    // Phase 3a — re-verify every claimed head through the same bounded
+    // pool as preparation: the preparation's head read is stale by now
+    // whenever the pull request moved during the claim phase, and launching
+    // anyway spawns a worker Caller's head check is already doomed to
+    // refuse. A stale preparation ends here as a retained no-op before it
+    // provisions or spawns, so a fast-moving pull request costs one head
+    // read per tick instead of one preflight failure per backoff window.
+    // The next tick prepares fresh on the new head; Caller's exact-head
+    // checks still backstop the remaining race.
+    const verified: { prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting }[] = []
+    await underLifecycleSignal(() => forEachPool(claimed, REVIEW_PREPARE_CONCURRENCY, async ({ prepared: bundle, claimId, setting }) => {
+      const { pr, slot, target } = bundle
+      try {
+        const currentHead = await currentHeadSha(pr.repo, pr.number, bundle.actor)
+        if (currentHead !== bundle.expectedHead) {
+          releaseOwnedClaim('review-new-prs', target, claimId)
+          releasePrOperationOwned(bundle.operationId)
+          captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
+            outcome: 'no_op', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+          console.log(`[behaviors] review-new-prs deferred for ${pr.repo}#${pr.number} — head moved during preparation`)
+          return
+        }
+        verified.push({ prepared: bundle, claimId, setting })
+      } catch (err) {
+        releaseOwnedClaim('review-new-prs', target, claimId)
+        releasePrOperationOwned(bundle.operationId)
+        if (behaviorAborted()) return
+        // The head read itself failed before anything provisioned: no
+        // worker stands behind the launch intent, so the ledger records
+        // the preflight end like a checkout failure.
+        captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
+          outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+        console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+        if (err instanceof BehaviorLogFeedError) failure ??= err
+        else recordBehaviorFailure('review-new-prs', 'operation', err, `${target}:check`, { actingAccount: bundle.actor })
+      }
+    }))
+    // Phase 3b — provision the checkout and spawn every verified target
+    // without the behavior lock: the atomic claim plus launch intent is the
     // ownership. The checkout runs here, under the lifecycle signal, so a
     // cold clone can't consume the sweep deadline.
-    await underLifecycleSignal(() => Promise.all(claimed.map(async ({ prepared: bundle, claimId, setting }) => {
+    await underLifecycleSignal(() => Promise.all(verified.map(async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target, checkTarget } = bundle
       let checkoutReady = false
       try {
