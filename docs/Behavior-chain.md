@@ -134,3 +134,161 @@ results do not authorize production activation or migration of active v1 work.
 Raw journal events, native receipts, GitHub artifacts and gate logs are retained
 privately under `test-results/behavior-chain-20261028/` in the validation
 worktree; historical externally dispatched runs remain excluded.
+
+## Native parallel-execution evaluation — 30 October 2026
+
+The supported native options were evaluated against the checked-in Codex
+protocol surface and the current official documentation. The comparative
+workload leg is blocked: #729 (teardown), #730 (memory bounds) and #731
+(admission) are all still open, so no candidate can run under the required
+controls yet. Decision: retain the current isolated workers. No adapter
+change. The empirical method below is recorded so the blocked leg can run
+unchanged once those controls land.
+
+### Options and verdicts
+
+The only checked-in version marker is the Chat protocol types generated
+from codex-cli 0.154.0 (`server/chat/adapters/codex.ts`). There is no
+behavior-runtime Codex pin: provider preparation checks npm
+`@openai/codex@latest` on every launch
+(`scripts/provider-cli-updates.mjs`) and the workspace image installs
+`@openai/codex@latest` (`deploy/runtime/install-clis.sh`). CLI execution,
+app-server threads and agent APIs have distinct contracts and were
+evaluated separately.
+
+| Topology | Verdict |
+| --- | --- |
+| Current: one CLI exec process per behavior invocation (`codex exec --ephemeral`, `issue_review.command`), owned process group (`start_new_session`), group kill plus checkout process-scan reclamation (`checkout_lock._stop_group`, `issue_review.stop_leftovers`) and settlement before handoff | Retained |
+| One app-server process per behavior | Rejected: keeps the process boundary but adds a persistent server, on-disk thread state and an unsubscribe/delete/kill teardown per behavior with no demonstrated benefit over direct exec |
+| Shared app-server multiplexing independent behaviors | Ineligible: fails the ownership, unload and reservation gates below |
+| In-behavior native delegation (subagents) | Out of scope: irreconcilable with the review delegation contract below |
+
+### Ownership and selective termination
+
+Each current invocation owns one OS process group, registered through the
+writer gate (`checkout_lock.register_worker`); timeout or lease loss kills
+exactly that group, and the checkout scan reclaims what the agent left
+behind. A shared server breaks this boundary: its process, allocations
+and process-group kill are shared across behaviors. Stopping or timing
+out behavior A while B is live must not stop B, free B's reservation or
+publish A's unfinished output, and shared-server death plus Poise
+replacement with both active must reconcile each uncertain action
+individually. No durable mapping from canonical invocation/Call ID to
+native root, logical descendants and checkout exists, and the checkout
+process scan cannot see logical threads in a server outside the checkout,
+so an empty scan cannot prove unload. A PID-only child counter, killing
+the whole shared server, or a lost `thread/start` / `turn/start` reply
+authorizing duplicate work are all insufficient. The exact evaluated
+version exposes no primitive that supplies the missing mapping, so the
+shared topology is rejected without adding another scheduler.
+
+### Observed unload
+
+Per the current app-server documentation, `thread/unsubscribe` keeps the
+thread loaded through a 30-minute no-subscriber/no-activity grace period
+before unload and `thread/closed`; archiving moves the JSONL log into the
+archived directory and retains its history; ephemeral root threads cannot
+use `thread/delete`. A successful RPC, `turn/completed`, or absence from
+the ordinary history list therefore cannot establish zero resident agents
+or disk reclamation. The checked-in history-list contract defaults to
+interactive sources and excludes archived threads
+(`server/chat/generated/codex/v2/ThreadListParams.ts`), so an unfiltered
+first page misses the `exec` and subagent histories under evaluation.
+Eligibility requires separate observations against the loaded-thread
+inventory (`thread/loaded/list`), OS descendants, disk/history removal
+and retained required receipts. Even Chat's own adapter tears a session
+down by ending RPC and killing its one app-server process
+(`server/chat/adapters/codex.ts` `close`), never by per-thread
+unsubscribe/delete — with a shared server that per-behavior kill is
+unavailable.
+
+### Delegation contract
+
+Structured Codex PR review disables `multi_agent` (and shell, exec and
+related tools), owns one fresh native conversation per review, resumes
+only that exact conversation for fragment/inspection continuation, and
+rejects execution/delegation events and foreign conversations
+(`structured_review.ask_codex`). Implementation and repair instruct the
+model not to start other agents and leave all publication to Caller
+(`atomic_work`). Enabling native delegation merely to obtain a sample
+would change the review's evidence and authority. Any permitted internal
+delegation must stay inside one admitted behavior, retain the governed
+inspection/packet and output checks, keep publication with Caller, start
+each reviewer independently rather than fork the implementer's analysis,
+and keep exact-conversation continuation until that behavior's outcome is
+durable with a fresh context for the next behavior. No evaluated option
+demonstrates this, so delegation stays disabled.
+
+### Advance reservation
+
+Expected-result accounting requires the measured maximum envelope to be
+reserved through behavior admission before native execution; observing a
+child-creation event afterward cannot prevent overcommit. The documented
+`agents.max_concurrent_threads_per_session` caps concurrently open
+spawned-agent threads per session excluding the primary: it is neither a
+workspace-wide limit nor a cap on arbitrary client-created app-server
+threads, so a child-limit setting alone cannot establish compliance.
+Unbounded or unmeasurable fan-out is ineligible rather than zero-cost,
+and a shared server's base/context memory plus build/test descendants
+would need explicit attribution with stated shared-page treatment.
+
+### Blocked empirical leg
+
+Run only under #729 teardown, #730 measured bounds and #731 admission,
+once available, reusing the existing local service replica, readers and
+diagnostics. Preserve the #728 pre-change measurements
+(`77976fd92963cc7e2ad238f90b5ef3f8788ee0c0`), then capture an
+isolated-worker baseline after those controls with identical
+prerequisites, configuration and budgets; record both revisions and
+compare the candidate against the controlled baseline, never #728 alone.
+Freeze versions with verified immutable launch paths for both lanes and
+retain bounded, redacted executable/version/config/schema evidence per
+attempt, including actual child model/effort, auth/provider route and
+fallback use; a version or model change separates that pair, and fallback
+to existing workers is not a native sample. This needs no production
+updater change.
+
+Define concurrency as achieved simultaneous behaviors. The unchanged
+semaphore keeps a person reserve and a behavior reserve of one each
+(`server/check-semaphore.ts`), so total caps 1/2/3 admit only 1/1/2
+behaviors and cap 4 admits 3; record achieved 1/2/3 levels and admission
+blocks under the same budgets, separately from native context counts.
+Predeclare matched seed/base revisions, packet and build/test sizes,
+cache conditions, repetitions and run ordering. Already reviewed,
+repaired or merged targets cannot be replayed as unchanged inputs.
+
+Derive counts from canonical admissions, settled native receipts and
+verified artifacts, deduplicated by invocation and outcome; a child turn
+is not another completed behavior. The UI behavior-metrics summary is
+excluded: it covers only the six legacy behavior keys and classifies
+`superseded` as success (`server/behavior-metrics.ts`). Report phase
+throughput separately from issue-to-confirmed-merge throughput, splitting
+admission delay, execution, external CI/queue wait and verified
+reclamation. Measure full-process-tree peak memory with stated
+shared-page treatment, disk retained after completion,
+termination/reclamation latency and idle agent counts; include parent and
+child token/context usage where observable, every failed attempt and
+retry, and provider throttling. Observe reclamation through the
+loaded-thread inventory as well as OS descendants, disk/history removal
+and retained receipts, against #729's deadlines. Predeclare the
+improvement/uncertainty rule; if no benefit is demonstrated, or the
+native option is infeasible, report retain-current or inconclusive
+explicitly. Evidence analysis stays bounded and read-only; no new
+telemetry.
+
+Seed issues are created manually in dedicated test
+repositories/accounts; real product behaviors perform every review,
+implementation, repair and strict merge/queue action. Excluded: Poise
+Chat performance, a persistent agent coordinating multiple behaviors,
+production operations, v2 activation/admissions/default changes and
+active-work migration.
+
+Evidence for this record: audited baseline #728 at
+`77976fd92963cc7e2ad238f90b5ef3f8788ee0c0`, evaluated main at
+`e5484ab50bc73ceb1d5119057688e33ab881e950`, official app-server and
+subagent documentation as published on 30 October 2026, and the
+checked-in generated v2 protocol types. The `codex-cli 0.166.0` binary
+visible in this documentation environment is not evidence of any
+replica version. No provider workload was run, so this record
+establishes the options analysis and the retain-current decision, not a
+performance winner.
