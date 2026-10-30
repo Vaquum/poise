@@ -671,6 +671,31 @@ class TestSincePositions(TestCase):
         self.assertIn('"review_id": 91', result)
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
+    def test_new_finding_colliding_with_a_thread_line_is_remapped(self):
+        shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                             "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                "body": "brand new defect here"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False,
+                                  "bodies": ["unrelated old thread"]}]
+        _, calls, _ = self._run(json.dumps(node), verdict, self._full(shifted))
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(5, "LEFT")])
+
+    def test_identical_reaffirmation_inside_the_since_diff_keeps_its_location(self):
+        shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                             "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "still blocks"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False, "bodies": ["still blocks"]}]
+        _, calls, _ = self._run(json.dumps(node), verdict, self._full(shifted))
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
     def test_outdated_reaffirmation_uses_thread_coordinates(self):
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 999, "side": "RIGHT", "body": "y is wrong"}]}

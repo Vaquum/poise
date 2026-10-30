@@ -173,6 +173,17 @@ class TestSplit(TestCase):
         stages = review_stages.split(json.dumps(node))
         self.assertEqual(len(stages), 1)
 
+    def test_quoted_rename_to_prefers_the_decoded_destination(self):
+        # A quoted "rename to" value decodes to the rename destination
+        # even when the raw quoted value is another retained file's
+        # literal name.
+        diff = "\n".join(['diff --git "a/o\\"ld.py" "b/n\\"ew.py"',
+                          "similarity index 100%",
+                          'rename from "o\\"ld.py"',
+                          'rename to "n\\"ew.py"'])
+        sets = review_stages.diff_line_sets(diff, ['o"ld.py', 'n"ew.py', '"n\\"ew.py"'])
+        self.assertIn('n"ew.py', sets)
+
     def test_section_for_an_unretained_file_fails_loud(self):
         node = json.loads(packet(["kept.py"]))
         node["diff"] += "\n" + section("dropped.py")

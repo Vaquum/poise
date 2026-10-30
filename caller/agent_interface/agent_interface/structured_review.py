@@ -224,12 +224,15 @@ def _stage_texts(text: str, packet: str) -> list[str]:
     return [text.replace(packet, stage, 1) for stage in stages]
 
 
-def _reaffirming_thread(comment: dict, threads: list[dict]) -> dict | None:
+def _reaffirming_thread(comment: dict, threads: list[dict], *, in_since_diff: bool) -> dict | None:
     """The unresolved thread this comment reaffirms, if any.
 
-    A comment at a current thread's location reaffirms it whatever its
-    body says, matching the downstream duplicate check; an outdated
-    thread matches by body alone, since its location is stale.
+    A location match with the same body reaffirms a current thread, and
+    a body match alone reaffirms an outdated one, whose location is
+    stale. A bare location match reaffirms only outside the since diff:
+    inside it, the line may be a new finding's previous-head line that
+    collides with an unrelated thread's base line, and remapping must
+    win so the finding is not discarded as a duplicate.
     """
     body = " ".join(comment["body"].lower().split())
     for thread in threads:
@@ -239,7 +242,9 @@ def _reaffirming_thread(comment: dict, threads: list[dict]) -> dict | None:
             if any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
                 return thread
         elif thread.get("line") == comment["line"] and thread.get("side") == comment["side"]:
-            return thread
+            if not in_since_diff or \
+                    any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
+                return thread
     return None
 
 
@@ -284,7 +289,10 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
             by_content.setdefault((path, content), []).append((number, full_spans[path][number]))
     kept, dropped = [], []
     for comment in verdict["comments"]:
-        thread = _reaffirming_thread(comment, node.get("review_threads", []))
+        anchor = since_left.get(comment["path"], {}).get(comment["line"]) \
+            if comment["side"] == "LEFT" else None
+        thread = _reaffirming_thread(comment, node.get("review_threads", []),
+                                     in_since_diff=anchor is not None)
         if thread is not None:
             if thread.get("is_outdated"):
                 # The model's coordinates for a stale thread are unchecked;
@@ -300,7 +308,6 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
             else:
                 dropped.append({key: comment[key] for key in ("path", "line", "side")})
             continue
-        anchor = since_left.get(comment["path"], {}).get(comment["line"])
         if anchor is None:
             raise InvalidVerdict(
                 f"comment on {comment['path']}:{comment['line']} (LEFT) is outside the reviewed since diff")

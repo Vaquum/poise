@@ -132,9 +132,10 @@ def _primary(section: list[str], retained: list[str]) -> str:
     # split matches and a retained suffix never shadows the true path.
     for line in section:
         if line.startswith("rename to "):
-            path = line.removeprefix("rename to ").removesuffix("\t")
+            raw = line.removeprefix("rename to ").removesuffix("\t")
+            path = _unquote(raw)
             if path not in retained:
-                path = _unquote(path)
+                path = raw
             if path not in retained:
                 raise StageError(f"diff section for {path!r} names no retained file")
             return path
