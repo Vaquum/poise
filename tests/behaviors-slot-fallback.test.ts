@@ -30,6 +30,8 @@ describe('reviewer trip classification', () => {
     { name: 'ordinary failure', error: 'max turns reached' },
     { name: 'model at capacity', error: 'Selected model is at capacity. Please try a different model.', code: 'provider_capacity' },
     { name: 'empty', error: '' },
+    { name: 'inspection prompt exhaustion', error: 'Repository inspection exceeds the review prompt limit; needs attention', code: 'review_budget_exhausted' },
+    { name: 'inspection round exhaustion', error: 'Repository inspection limit reached; needs attention', code: 'review_budget_exhausted' },
   ]
 
   it.each(trips)('trips on $name', async ({ error, code, expected }) => {
@@ -123,6 +125,27 @@ describe('slot fallback on provider failure', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
     expect(db.listBehaviorDeadLetters()).toHaveLength(1)
     expect(runtime.getBehaviorsRuntimeHealth().failures.map((failure) => failure.target)).not.toContain('reviewer:grok-4.6-xhigh')
+  })
+
+  it.each([
+    { name: 'inspection prompt exhaustion', error: 'Repository inspection exceeds the review prompt limit; needs attention' },
+    { name: 'inspection round exhaustion', error: 'Repository inspection limit reached; needs attention' },
+  ])('holds its target on deterministic $name, without tripping the provider', async ({ error }) => {
+    const { db, runtime } = await startPrReviews({
+      primary: 'grok-4.6-xhigh', secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const key = `${pr.repo}#${pr.number}`
+    fixture.agentLogs = [failedPrLog(db, key, 'grok-4.6-xhigh', {
+      error, error_code: 'review_budget_exhausted', review_policy: 'bounded-v1',
+    })]
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+
+    // Held, not fallen through: no second launch, no global trip, one dead letter.
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+    expect(db.listBehaviorDeadLetters()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 })
 

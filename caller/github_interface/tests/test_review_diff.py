@@ -143,6 +143,37 @@ class TestPacketBudget(IsolatedAsyncioTestCase):
         self.assertNotIn(':(literal)data.csv', diff_calls[-1])
         self.assertEqual(len(packet['diff']), 1000)
 
+    async def test_large_artifact_excluded_even_when_total_input_fits(self):
+        # A packet that fits locally can still carry an artifact diff entry
+        # GitHub rejects inline comments on (422 "diff is too large"). Bulk
+        # data is excluded upfront so the model never targets it.
+        base, head = 'a' * 40, 'b' * 40
+        code, data = 'c' * 40, 'd' * 40
+        raw = (f':000000 100644 {"0" * 40} {code} A\0code.py\0'
+               f':000000 100644 {"0" * 40} {data} A\0input-artefacts/RUN-abc.json\0').encode()
+        diff_calls = []
+
+        def git_result(cwd, env, *args, limit):
+            if '--raw' in args:
+                return raw
+            if '--find-renames' in args:
+                diff_calls.append(args)
+                self.assertNotIn(':(literal)input-artefacts/RUN-abc.json', args)
+                return b'diff --git a/code.py b/code.py\n+pass\n'
+            return b''
+
+        client = AsyncMock()
+        client.token = 'test-token'
+        client.get.return_value = {'merge_base_commit': {'sha': base}}
+        # Total input (~100KB) fits well under the 1.35MB diff budget.
+        with patch.object(rd, '_git', side_effect=git_result), \
+                patch.object(rd, '_blob_sizes', AsyncMock(return_value={code: 100, data: 100_000})):
+            packet = await rd.review_diff(client, 'o', 'r', {'base': {'sha': base}, 'head': {'sha': head}})
+        self.assertEqual([f['path'] for f in packet['excluded_files']], ['input-artefacts/RUN-abc.json'])
+        self.assertEqual([f['filename'] for f in packet['files']], ['code.py'])
+        self.assertIn('code.py', packet['diff'])
+        self.assertNotIn('omitted_files', packet)
+
 
 class TestBoundedCoverage(IsolatedAsyncioTestCase):
     async def _packet(self, names, per_file, diff_limit, packet_limit=None, context=None):
