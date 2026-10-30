@@ -345,6 +345,14 @@ export class BehaviorLedgerStore {
       const index = refs.findIndex((current) => current.kind === ref.kind && current.identity === ref.identity)
       if (index < 0) refs.push(ref); else refs[index] = ref
     }
+    if (row.native_override === 1 && TERMINAL.has(record.state) && record.activity === 'settled'
+      && (input.state !== record.state || input.activity !== record.activity
+        || (input.outcome !== undefined && input.outcome !== record.outcome)
+        || (input.head !== undefined && input.head !== record.head)
+        || (input.completedAt !== undefined && input.completedAt !== record.completedAt))) {
+      this.put({ ...record, refs, observedAt: this.time() }, row, false, row.native_override, this.time())
+      return
+    }
     this.put({ ...record, state: input.state, stateSource: input.stateSource ?? 'native', activity: input.activity,
       outcome: input.outcome === undefined ? record.outcome : input.outcome, head: input.head === undefined ? record.head : input.head,
       completedAt: input.completedAt === undefined ? record.completedAt : input.completedAt, refs, observedAt: this.time() }, row, false,

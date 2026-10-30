@@ -169,7 +169,10 @@ references. A panel root has no single head; its children can have different
 heads. Root state follows the latest attempt in each planned slot, with
 running, held, unknown, pending, failed, superseded, completed precedence.
 A superseded PR-review attempt leaves its panel pending for native relaunch.
-Native settlement overrides passive Caller observations. `activity` separately
+Native settlement overrides passive Caller observations. A native-settled
+terminal firing never downgrades: a delayed unknown or conflicting observation
+merges new references without touching its proven state, outcome, head or
+completion time. `activity` separately
 reports running, settled or unknown: held/failed never by itself proves idle.
 Missing, duplicate, quarantined or stale evidence remains uncertain.
 

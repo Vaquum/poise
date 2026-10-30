@@ -235,6 +235,13 @@ invocations the target requires reconciliation before another admission; no
 uncertain evidence is dropped. One missing target is read at the end of each
 existing resolver pass, using its reader, deadline and access holds; no timer or
 new polling loop is added. The mutation never runs merely to clear a diagnostic.
+Each `merge-prs` merge or branch-update invocation retains a bounded native
+receipt on its direct run: target, native identity, acting account, expected
+head, operation (`merge-if-ready` vs `update-branch-if-behind`), outcome, and
+the validated `merge_sha` or queue entry id on writes, or the redacted failure
+cause. Direct runs settle once; a delayed failure or unknown callback never
+overwrites a proven completion, and an unavailable handling view never erases
+the canonical run.
 
 Load timeouts — an expired sweep deadline, a slow CLI, lock contention — retry
 on a short clock of a few minutes, not the hour-long backoff of hard failures.

@@ -91,8 +91,10 @@ mutation after successful head checks, platform approval and complete
 conversation checks, and reports `enqueued` or `in_queue` with the confirmed
 queue entry id; neither is a completed merge. The queue admission contract is
 in `docs/Behavior-Contract.md`.
-API errors fail visibly; a lost merge response can be reconciled by the next
-read without merging twice. This operation requires an explicit acting account.
+`already_merged` and `in_queue` report observed target state, not proof that
+this request performed the mutation. API errors fail visibly; a lost merge
+response can be reconciled by the next read without merging twice. This
+operation requires an explicit acting account.
 
 `github-interface --update-branch-if-behind '#7' --expected-head SHA --author
 USER --token-user AGENT` updates only the named author's open, non-draft head
