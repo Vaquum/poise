@@ -212,4 +212,31 @@ describe('behavior run metrics', () => {
     discardDirectBehaviorRun(id)
     expect(read()).toEqual({ totalRuns: 0, durationMinutes: 0, successRate: null })
   })
+
+  it('settles a direct run once and never downgrades a proven result', () => {
+    const id = startDirectBehaviorRun('merge-prs')
+    finishDirectBehaviorRun(id, true, 'merged', 'target=acme/app#7 head=a outcome=merged merge_sha=b')
+    const settled = db.prepare('SELECT status, outcome, completed_at, note FROM behavior_runs WHERE id = ?').get(id)
+    expect(settled).toMatchObject({ status: 'completed', outcome: 'merged' })
+    // A delayed failure callback must not overwrite the proven settlement.
+    finishDirectBehaviorRun(id, false)
+    expect(db.prepare('SELECT status, outcome, completed_at, note FROM behavior_runs WHERE id = ?').get(id)).toEqual(settled)
+    // Handling records the firing once; the downgrade attempt adds no duplicate.
+    const handled = db.prepare("SELECT count(*) AS n FROM handling_log WHERE ref = ?").get(`direct-run:${id}`) as { n: number }
+    expect(handled.n).toBe(1)
+  })
+
+  it('keeps the canonical run when its handling view is unavailable', () => {
+    db.exec(`CREATE TRIGGER fail_completed_handling BEFORE INSERT ON handling_log
+      WHEN NEW.kind = 'behavior-firing' AND NEW.outcome = 'completed'
+      BEGIN SELECT RAISE(ABORT, 'handling log unavailable'); END;`)
+    try {
+      const id = startDirectBehaviorRun('merge-prs')
+      expect(() => finishDirectBehaviorRun(id, true, 'merged', 'target=acme/app#7')).not.toThrow()
+      expect(db.prepare('SELECT status, outcome FROM behavior_runs WHERE id = ?').get(id))
+        .toEqual({ status: 'completed', outcome: 'merged' })
+    } finally {
+      db.exec('DROP TRIGGER fail_completed_handling')
+    }
+  })
 })
