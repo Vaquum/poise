@@ -35,7 +35,7 @@ function snapshot(over: Partial<BehaviorLedgerSnapshot> = {}, health: Record<str
     ready: true, failed: false, stopping: false, queueAgeMs: null, pending: 0, unreportedLoss: 0, stallBudgetMs: 10_000,
     health: {
       status: 'ok', unavailableReason: null, coverageStart: null, observedAt: null, callerObservedAt: null,
-      pending: 0, dropped: 0, gaps: [], generation: 'generation-a', retainedFrom: null,
+      pending: 0, dropped: 0, gaps: [], detailFloor: null, generation: 'generation-a', retainedFrom: null,
       changeLowerBound: null, lastSequence: null, instances: null, changes: null, ...health,
     },
     ...over,

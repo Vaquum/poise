@@ -20,7 +20,7 @@ const T0 = Date.parse('2026-10-24T08:00:00Z')
 function ledgerHealth(over: Partial<LedgerHealth> = {}): LedgerHealth {
   return {
     status: 'ok', unavailableReason: null, coverageStart: null, observedAt: null, callerObservedAt: null,
-    pending: 0, dropped: 0, gaps: [], generation: 'test-generation', retainedFrom: null,
+    pending: 0, dropped: 0, gaps: [], detailFloor: null, generation: 'test-generation', retainedFrom: null,
     changeLowerBound: null, lastSequence: null, instances: null, changes: null, ...over,
   }
 }
@@ -231,7 +231,7 @@ describe('readiness', () => {
 
 describe('ledger history', () => {
   it('passes cumulative completeness through, zeros before start', () => {
-    expect(health.ledgerHistory(null)).toEqual({ dropped: 0, gaps: [], coverageStart: null, retainedFrom: null, generation: null, observedAt: null, callerObservedAt: null })
+    expect(health.ledgerHistory(null)).toEqual({ dropped: 0, gaps: [], detailFloor: null, coverageStart: null, retainedFrom: null, generation: null, observedAt: null, callerObservedAt: null })
     const gaps = [{ since: new Date(T0).toISOString(), until: null, reason: 'capture_loss' as const }]
     expect(health.ledgerHistory(snapshot({ health: ledgerHealth({ dropped: 4, gaps, coverageStart: '2026-10-01T00:00:00Z', retainedFrom: '2026-10-20T00:00:00Z' }) })))
       .toMatchObject({ dropped: 4, gaps, coverageStart: '2026-10-01T00:00:00Z', retainedFrom: '2026-10-20T00:00:00Z', generation: 'test-generation' })

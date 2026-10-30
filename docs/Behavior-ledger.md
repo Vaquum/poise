@@ -184,13 +184,33 @@ stdout, stderr, credentials and diagnostic prose are never stored here.
 
 ## Coverage and bounds
 
-`health.status: ok` with zero pending/dropped captures and no gaps means complete
-capture since `coverageStart`, within retained coverage. A fresh capture
-heartbeat does not prove fresh Caller evidence. Relevant source evidence older
-than 125 seconds becomes unknown/stale; no additional poll is performed.
+`health.status: ok` with zero pending/dropped captures, no gaps and no detail
+floor means complete capture since `coverageStart`, within retained coverage.
+A fresh capture heartbeat does not prove fresh Caller evidence. Relevant source
+evidence older than 125 seconds becomes unknown/stale; no additional poll is
+performed.
 The open/closed worker epoch and a separate bounded health journal preserve
 unclean-restart and capture-loss gaps. Restarted direct work with no observed
 native settlement remains unknown. The ledger has no historical backfill.
+
+A gap episode opens on loss, restart, eviction or journal failure, and a
+successful observation seals the last episode: only a later gap of the same
+reason without an observed recovery in between extends it. Event order decides,
+so a capture landing on the old endpoint still starts a new episode. A restart
+gap spans the last persisted proof the worker was alive to the reopening, and
+stays open (`until: null`, uncertainty not yet recovered) until the store
+demonstrably opens or a capture commits; failed opens and failed captures
+establish no recovery. A loss marker spans the first unreported loss to its
+commit, so pump delay widens the interval instead of shifting it.
+
+Half-open reporting windows own their start instant: a zero-duration gap
+exactly at a cutoff belongs to the window starting there, never to both
+neighbors and never to neither. `detailFloor` marks compacted history: gaps at
+or below it are coarse summaries of uncertainty that existed, not exact
+episodes; only time after the floor with no overlapping gap reads complete.
+Journals written before the floor keep their old envelopes coarse from the
+migration cutover. A rejected journal (oversized, malformed or unknown version)
+starts fresh with an `unavailable` gap: its history is not trusted.
 
 A separate worker owns `behavior-ledger.db` beside `POISE_DB` (by default
 `~/.poise`); it never migrates the behavior cache. `POISE_DB=:memory:` also makes

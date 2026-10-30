@@ -72,6 +72,7 @@ function complete(value: unknown): boolean {
   return !!health && typeof health === 'object' && 'status' in health && health.status === 'ok'
     && 'pending' in health && health.pending === 0 && 'dropped' in health && health.dropped === 0
     && 'gaps' in health && Array.isArray(health.gaps) && health.gaps.length === 0
+    && (!('detailFloor' in health) || health.detailFloor === null || health.detailFloor === undefined)
 }
 
 export async function runBehaviorLedgerCli(args: string[], write = (text: string) => { process.stdout.write(text) },
