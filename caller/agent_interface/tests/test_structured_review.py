@@ -423,7 +423,7 @@ class TestSincePositions(TestCase):
 
     def _packet(self, since, diff=None, paths=("src/gone.py",)):
         node = json.loads(staged_packet(list(paths)))
-        node["p"] = 2
+        node["p"] = "p2"
         node["since_head_sha"] = since
         if diff is not None:
             node["diff"] = diff
@@ -641,6 +641,73 @@ class TestSincePositions(TestCase):
         result, _, fetch = self._run(self._packet(None), verdict, "unused")
         self.assertIn('"review_id": 91', result)
         fetch.assert_not_called()
+
+    def test_production_priorities_pass_through_unchanged(self):
+        for priority in ("p0", "p1", "p2", "p12"):
+            with self.subTest(priority=priority):
+                node = json.loads(self._packet("c" * 40, self.REMOVAL))
+                node["p"] = priority
+                verdict = {"action": "request_changes",
+                           "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+                result, _, fetch = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
+                self.assertIn('"review_id": 91', result)
+                fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
+                                              "a" * 40, priority, since_head=None)
+
+    def test_missing_priority_fails_closed_without_fetch_or_submit(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        for missing in ("absent", None, "", "   "):
+            with self.subTest(missing=missing):
+                node = json.loads(self._packet("c" * 40, self.REMOVAL))
+                if missing == "absent":
+                    del node["p"]
+                else:
+                    node["p"] = missing
+                packet = json.dumps(node)
+                calls = []
+
+                def process(args, **kwargs):
+                    calls.append((args, kwargs))
+                    if args[0] == "github-interface":
+                        return SimpleNamespace(returncode=0, stdout=json.dumps(
+                            {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}), stderr="")
+                    Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+                with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                        patch.object(ReviewWatch, "run", side_effect=process), \
+                        patch.object(structured_review, "fetch_packet") as fetch:
+                    with self.assertRaises(atoms.AgentPreflightError) as failure:
+                        structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                              "pr_approve", "https://github.com/o/r/pull/12", "bit-mis",
+                                              "a" * 40, 60, packet=packet)
+                self.assertEqual(failure.exception.code, "review_contract_violation")
+                self.assertIn("missing its priority", str(failure.exception))
+                fetch.assert_not_called()
+                self.assertEqual(len(calls), 1)
+                self.assertNotEqual(calls[0][0][0], "github-interface")
+
+    def test_malformed_and_integer_priorities_fail_closed_via_adapter(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        full = self._full(self.REMOVAL)
+
+        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None):
+            atoms._priority(p)
+            return full
+
+        for bad in ("pp2", "px", "p", "2", 2, 0, True):
+            with self.subTest(p=bad):
+                node = json.loads(self._packet("c" * 40, self.REMOVAL))
+                node["p"] = bad
+                with patch.object(structured_review, "fetch_packet", side_effect=validating_fetch):
+                    with self.assertRaises(structured_review.InvalidVerdict) as failure:
+                        structured_review._validate_since_positions(
+                            "/repo", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40,
+                            json.dumps(node), dict(verdict))
+                self.assertIn("cannot validate since-diff positions", str(failure.exception))
 
 
 class TestOtherProviderVerdicts(TestCase):
