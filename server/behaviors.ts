@@ -880,14 +880,17 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   const error = String(call.error || '')
   // A bare 429 matches line counts like a bare 402 does, so only HTTP-status
   // readings and rate-limit words trip — plus Caller's own early handoff,
-  // which says rate-limited outright. GitHub's own limits ("GitHub 429:",
-  // "GitHub 403 rate-limit:") never trip the model: switching slots cannot
-  // fix GitHub, and every slot would trip in turn.
+  // which says rate-limited outright. A bare retry loop ("exceeded retry
+  // limit" without quota evidence) is a transport stall, not a 429: it
+  // trips as a provider failure via the error code below instead.
+  // GitHub's own limits ("GitHub 429:", "GitHub 403 rate-limit:") never
+  // trip the model: switching slots cannot fix GitHub, and every slot
+  // would trip in turn.
   const githubLimit = /github\s+\d{3}/i.test(error)
   if (!githubLimit
     && (/status\s+429\b/i.test(error) || /\b429\s+too\s+many\b/i.test(error)
     || /http_status\D{0,8}429\b/i.test(error) || /too\s+many\s+requests/i.test(error)
-    || /rate[\s_-]*limit/i.test(error) || /exceeded\s+retry\s+limit/i.test(error))) return 'rate_limit'
+    || /rate[\s_-]*limit/i.test(error))) return 'rate_limit'
   // A provider CLI that died outright trips like one that errored: before a
   // verdict, the next slot is strictly more useful than the same dead run.
   if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit') return 'provider'
