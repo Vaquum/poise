@@ -158,6 +158,21 @@ class TestSplit(TestCase):
         self.assertEqual(len(stages), 1)
         self.assertEqual(json.loads(stages[0])["diff"].count("new mode"), 2)
 
+    def test_pure_rename_prefers_its_rename_to_path(self):
+        # A pure rename "q b/y" -> "z" next to a retained "y b/z": the
+        # header "diff --git a/q b/y b/z" must resolve to the rename
+        # target "z", not the retained suffix "y b/z".
+        node = json.loads(packet([]))
+        node["diff"] = "\n".join(["diff --git a/q b/y b/z", "similarity index 90%",
+                                  "rename from q b/y", "rename to z",
+                                  section("y b/z")])
+        node["files"] = [{"filename": name, "status": status,
+                          "old_mode": "100644", "new_mode": "100644"}
+                         for name, status in (("q b/y", "removed"), ("z", "added"),
+                                              ("y b/z", "modified"))]
+        stages = review_stages.split(json.dumps(node))
+        self.assertEqual(len(stages), 1)
+
     def test_section_for_an_unretained_file_fails_loud(self):
         node = json.loads(packet(["kept.py"]))
         node["diff"] += "\n" + section("dropped.py")

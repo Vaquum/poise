@@ -292,9 +292,10 @@ pull request diff before the single submission. An unfetchable last head, or
 a base that moved since the last review, widens the round to the full diff
 instead. Any finding without a verified position fails the review before
 submission, including a capped round's follow-up issue and approval.
-Removed lines are mapped by their content and current-head position; ambiguous
-matches fail visibly. Reaffirmed unresolved findings keep their original thread
-coordinates, including outdated findings absent from the current diff.
+Removed lines are mapped by their content within the current-head span of their
+change block; ambiguous matches fail visibly. Reaffirmed unresolved findings
+keep their original thread coordinates, including outdated findings absent
+from the current diff.
 Every run reports its budget usage
 (`used_seconds` of `total_seconds`) in its terminal progress snapshot and in
 the completion result, so a near-miss is visible before it fails.
