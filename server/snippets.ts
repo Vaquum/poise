@@ -1,0 +1,420 @@
+// Snippets — espanso text-expansion pairs, managed from Poise.
+//
+// Poise owns exactly ONE espanso match file: <match>/poise.yml. espanso
+// loads every .yml in its match directory and hot-reloads on change, so
+// rewriting this file is all it takes for a `;trigger` expansion to go
+// live system-wide. Advanced espanso matches (forms, vars, per-app
+// rules) belong in the user's OTHER match files — Poise reads and
+// rewrites poise.yml exclusively and never touches the rest.
+//
+// The file itself is the source of truth — no DB row, no sidecar. Same
+// philosophy as server/editor.ts: a plain file in a standard location
+// the user can also edit, version, or sync by hand.
+
+import { mkdir, open, writeFile, unlink, rename } from 'node:fs/promises'
+import { existsSync, openSync, fstatSync, readSync, closeSync } from 'node:fs'
+import { join, dirname, delimiter } from 'node:path'
+import { homedir } from 'node:os'
+import { createHash } from 'node:crypto'
+import { parse as parseYaml, parseDocument, stringify as stringifyYaml, isMap, isSeq } from 'yaml'
+import { withProcessLock } from './process-lock'
+import { isServiceMode, serviceStatePath } from './service/config'
+
+// espanso's macOS config root holds config/ and match/. Override the
+// match dir via POISE_ESPANSO_MATCH_DIR (mirrors POISE_EDITOR_DIR) for
+// non-default installs or tests. In service mode no Espanso runs beside the
+// server: the file lives in the home volume and Poise Link carries it to the
+// person's desktop.
+const SERVICE_MODE = isServiceMode()
+const MATCH_DIR = process.env.POISE_ESPANSO_MATCH_DIR
+  || (SERVICE_MODE ? serviceStatePath('snippets') : join(homedir(), 'Library', 'Application Support', 'espanso', 'match'))
+export const MATCH_FILE = join(MATCH_DIR, 'poise.yml')
+const LOCK_FILE = join(MATCH_DIR, '.poise-snippets-lock.sqlite3')
+export const MAX_SNIPPETS_BYTES = 1 * 1024 * 1024
+
+export interface Snippet {
+  trigger: string
+  replace: string
+}
+
+export interface SnippetState {
+  snippets: Snippet[]
+  version: string
+}
+
+function versionFor(raw: string): string {
+  return createHash('sha256').update(raw, 'utf8').digest('hex')
+}
+
+// Absence is a distinct readable state. A user manually creating even an
+// empty poise.yml after a GET must invalidate that client's pending PUT.
+const MISSING_SNIPPETS_VERSION = versionFor('poise:snippets:missing-file:v1')
+
+export class SnippetConflictError extends Error {
+  readonly code = 'SNIPPET_CONFLICT'
+  readonly statusCode = 409
+
+  constructor(readonly currentVersion: string) {
+    super('snippets changed since they were loaded')
+    this.name = 'SnippetConflictError'
+  }
+}
+
+let mutationTail: Promise<void> = Promise.resolve()
+
+async function serializeMutation<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = mutationTail
+  let release!: () => void
+  mutationTail = new Promise<void>((resolve) => { release = resolve })
+  await previous
+  try {
+    return await operation()
+  } finally {
+    release()
+  }
+}
+
+async function readSnippetSource(): Promise<string> {
+  const handle = await open(MATCH_FILE, 'r')
+  try {
+    const fileStat = await handle.stat()
+    if (!fileStat.isFile()) throw new Error('poise.yml is not a regular file')
+    if (fileStat.size > MAX_SNIPPETS_BYTES) {
+      throw new Error(`poise.yml exceeds ${MAX_SNIPPETS_BYTES} bytes`)
+    }
+    const buffer = Buffer.alloc(MAX_SNIPPETS_BYTES + 1)
+    let offset = 0
+    while (offset < buffer.byteLength) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.byteLength - offset, offset)
+      if (bytesRead === 0) break
+      offset += bytesRead
+    }
+    if (offset > MAX_SNIPPETS_BYTES) {
+      throw new Error(`poise.yml exceeds ${MAX_SNIPPETS_BYTES} bytes`)
+    }
+    return buffer.subarray(0, offset).toString('utf8')
+  } finally {
+    await handle.close()
+  }
+}
+
+// Read both the parsed pairs and a hash of the exact source bytes. Hashing the
+// raw YAML (rather than its parsed pairs) means comments, formatting, and
+// other manual edits also invalidate a stale full-set replacement.
+export async function readSnippetState(): Promise<SnippetState> {
+  let raw: string | null
+  try {
+    raw = await readSnippetSource()
+  } catch (err: any) {
+    if (err.code === 'ENOENT') raw = null
+    else throw err
+  }
+  return parseSnippetSource(raw)
+}
+
+/** How every Espanso match file Poise reads is parsed. */
+export const MATCH_FILE_YAML_OPTIONS = {
+  maxAliasCount: 20,
+  merge: false,
+  schema: 'core',
+  strict: true,
+  stringKeys: true,
+  uniqueKeys: true,
+} as const
+
+export function parseSnippetSource(raw: string | null): SnippetState {
+  if (raw === null) {
+    return { snippets: [], version: MISSING_SNIPPETS_VERSION }
+  }
+
+  // Anything that isn't a simple trigger/replace pair is ignored. Poise only
+  // models simple snippets, while the raw version still protects all content.
+  const doc = parseYaml(raw, MATCH_FILE_YAML_OPTIONS) as { matches?: unknown } | null
+  const matches = doc && Array.isArray(doc.matches) ? doc.matches : []
+  const snippets: Snippet[] = []
+  const seenTriggers = new Set<string>()
+  for (const m of matches) {
+    if (isSimpleMatch(m)) {
+      // A file can carry the same trigger twice — a hand edit, a dotfiles
+      // merge, a sync that concatenated two versions. Read it, but keep only
+      // the first: the write path rejects duplicates, so surfacing them all
+      // made the file readable and unwritable at once, and every save (and
+      // every "save selection as snippet") failed with `duplicate trigger`
+      // until the user found and fixed the file by hand.
+      if (seenTriggers.has(m.trigger)) continue
+      seenTriggers.add(m.trigger)
+      snippets.push({ trigger: m.trigger, replace: m.replace })
+    }
+  }
+  return { snippets, version: versionFor(raw) }
+}
+
+/** Synchronous snapshot for the runtime's atomic prompt-admission path.
+ * Writes are atomic renames, and this handle reads one bounded file generation. */
+export function readSnippetSnapshotSync(): { raw: string | null, state: SnippetState } {
+  let raw: string | null = null
+  let fd: number | undefined
+  try {
+    fd = openSync(MATCH_FILE, 'r')
+    const stat = fstatSync(fd)
+    if (!stat.isFile()) throw new Error('poise.yml is not a regular file')
+    if (stat.size > MAX_SNIPPETS_BYTES) throw new Error(`poise.yml exceeds ${MAX_SNIPPETS_BYTES} bytes`)
+    const buffer = Buffer.alloc(MAX_SNIPPETS_BYTES + 1)
+    let offset = 0
+    while (offset < buffer.length) {
+      const bytes = readSync(fd, buffer, offset, buffer.length - offset, offset)
+      if (!bytes) break
+      offset += bytes
+    }
+    if (offset > MAX_SNIPPETS_BYTES) throw new Error(`poise.yml exceeds ${MAX_SNIPPETS_BYTES} bytes`)
+    raw = buffer.subarray(0, offset).toString('utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  } finally { if (fd !== undefined) closeSync(fd) }
+  return { raw, state: parseSnippetSource(raw) }
+}
+
+/** An entry the library shows as a snippet: a text trigger and a text
+ *  replacement, whatever else it carries. */
+export function isSimpleMatch(m: unknown): m is Snippet {
+  return !!m && typeof m === 'object'
+    && typeof (m as { trigger?: unknown }).trigger === 'string'
+    && typeof (m as { replace?: unknown }).replace === 'string'
+}
+
+// Everything in poise.yml that Poise does not model: other top-level keys
+// (global_vars, imports, a `label`), and matches that are more than a plain
+// trigger/replace pair (regex, form, vars, word, propagate_case).
+//
+// Poise used to rewrite the file as nothing but its own pairs, so a user who
+// hand-added an espanso feature to this file lost it on the next save with no
+// warning. Poise still owns the simple pairs — it just carries the rest
+// through untouched.
+// Rewrite poise.yml so it carries Poise's simple pairs while leaving
+// everything else in the file exactly as the user wrote it — other top-level
+// keys (global_vars, imports), matches that are more than a plain
+// trigger/replace pair (regex, form, vars), and their comments.
+//
+// Poise used to emit `{ matches: [...] }` from scratch, so a user who
+// hand-added an espanso feature to this file lost it on the next save from
+// the UI, with no warning. Editing the parsed document instead of rebuilding
+// it keeps comments and formatting that a parse/stringify round-trip drops.
+async function renderSnippetFile(snippets: Snippet[]): Promise<string> {
+  let raw: string | null = null
+  try {
+    raw = await readSnippetSource()
+  } catch (err: any) {
+    if (err.code !== 'ENOENT') throw err
+  }
+  if (raw === null || raw.trim() === '') {
+    return stringifyYaml({ matches: snippets })
+  }
+
+  let doc
+  try {
+    doc = parseDocument(raw, { merge: false, schema: 'core', strict: true, uniqueKeys: true })
+    if (doc.errors.length) throw new Error(doc.errors[0].message)
+  } catch {
+    // An unparseable file never reaches a write — readSnippetState throws
+    // first. If it somehow does, do not try to salvage it.
+    return stringifyYaml({ matches: snippets })
+  }
+
+  const contents = doc.contents
+  if (!isMap(contents)) return stringifyYaml({ matches: snippets })
+
+  const seq = doc.get('matches', true)
+  if (!isSeq(seq)) {
+    doc.set('matches', snippets)
+    return String(doc)
+  }
+  // Poise owns the trigger/replace pair. It does NOT own the other espanso
+  // options a person may have added to that same entry — `vars` for a date or
+  // clipboard expansion, `word`, `propagate_case`, `label`. Those used to be
+  // destroyed on the next save from the UI: the owned entries were filtered
+  // out wholesale and re-emitted as fresh two-key nodes, so `;date` survived
+  // in the list while quietly losing the `vars` block that made it expand to
+  // anything. Silent, unbacked (the file is replaced by rename) and invisible
+  // until the expansion came out as literal `{{mydate}}`.
+  //
+  // Keep each entry's own node and set `replace` on it, so everything else it
+  // carries comes through untouched. Only a trigger the person actually
+  // removed loses its node.
+  const ownedByTrigger = new Map<string, unknown>()
+  seq.items = seq.items.filter((item) => {
+    const plain = doc.createNode(item).toJSON()
+    if (!isSimpleMatch(plain)) return true
+    if (!ownedByTrigger.has(plain.trigger)) ownedByTrigger.set(plain.trigger, item)
+    return false
+  })
+  for (const snip of snippets) {
+    const existing = ownedByTrigger.get(snip.trigger)
+    if (existing !== undefined && isMap(existing)) {
+      existing.set('replace', snip.replace)
+      seq.items.push(existing)
+    } else {
+      seq.items.push(doc.createNode(snip))
+    }
+  }
+  return String(doc)
+}
+
+export async function listSnippets(): Promise<Snippet[]> {
+  return (await readSnippetState()).snippets
+}
+
+// Validate + normalize an incoming list. Throws on the first problem with
+// a user-facing message: triggers must be non-empty and unique, bodies
+// non-empty. Returns the trimmed-trigger list ready to persist.
+export function validateSnippets(input: unknown): Snippet[] {
+  if (!Array.isArray(input)) throw new Error('snippets must be an array')
+  const seen = new Set<string>()
+  const out: Snippet[] = []
+  for (const s of input) {
+    const trigger = String((s as any)?.trigger ?? '').trim()
+    const replace = String((s as any)?.replace ?? '')
+    if (!trigger) throw new Error('every snippet needs a trigger')
+    if (!replace.trim()) throw new Error(`snippet "${trigger}" needs a body`)
+    if (seen.has(trigger)) throw new Error(`duplicate trigger: ${trigger}`)
+    seen.add(trigger)
+    out.push({ trigger, replace })
+  }
+  return out
+}
+
+// espanso refuses to start if its config root exists but has no config/
+// directory — it panics with "missing config directory" instead of
+// scaffolding defaults (it only scaffolds when the root is wholly
+// absent). Because writing poise.yml creates <root>/match/, a user who
+// adds a snippet BEFORE ever launching espanso would otherwise be left
+// with an unstartable, half-initialized config root. So whenever we
+// write into espanso's real default location, make sure a minimal
+// config/default.yml exists too. Never overwrites an existing config.
+const DEFAULT_ESPANSO_CONFIG = `# espanso configuration file
+#
+# espanso loads all match files from the sibling "match/" directory
+# (including Poise's poise.yml), so nothing is required here. This file
+# was created by Poise so espanso can start even when a snippet was added
+# before espanso's first launch. Edit freely — https://espanso.org/docs/
+`
+
+async function ensureEspansoConfigDir(): Promise<void> {
+  // With a custom POISE_ESPANSO_MATCH_DIR the caller owns the layout, so
+  // don't assume an espanso config root sits beside it; in service mode
+  // there is no Espanso root at all.
+  if (process.env.POISE_ESPANSO_MATCH_DIR || SERVICE_MODE) return
+  const defaultYml = join(dirname(MATCH_DIR), 'config', 'default.yml')
+  if (existsSync(defaultYml)) return
+  await mkdir(dirname(defaultYml), { recursive: true })
+  if (!existsSync(defaultYml)) await writeFile(defaultYml, DEFAULT_ESPANSO_CONFIG, 'utf-8')
+}
+
+// Serialize to espanso's match schema and write atomically (tmp +
+// rename, same as server/editor.ts) so espanso's file watcher never sees
+// a half-written file. Creates the match dir (and a minimal config/ so
+// espanso stays startable) if espanso hasn't been initialized yet.
+let tmpCounter = 0
+
+async function writeSnippets(snippets: Snippet[], expectedVersion: string, libraryHeader?: string): Promise<string> {
+  await mkdir(MATCH_DIR, { recursive: true })
+  await ensureEspansoConfigDir()
+  // espanso schema: { matches: [{ trigger, replace }] }. yaml.stringify
+  // owns the quoting/escaping and emits block scalars for multi-line
+  // bodies — no manual escaping here.
+  let body = await renderSnippetFile(snippets)
+  if (libraryHeader !== undefined) {
+    body = body.replace(/^# poise-chat-library-v1 [^\r\n]*(?:\r?\n|$)/gm, '')
+    body = `${libraryHeader}\n${body}`
+  }
+  if (Buffer.byteLength(body, 'utf8') > MAX_SNIPPETS_BYTES) {
+    throw new Error(`serialized snippets exceed ${MAX_SNIPPETS_BYTES} bytes`)
+  }
+  const tmp = `${MATCH_FILE}.tmp.${process.pid}.${Date.now()}.${++tmpCounter}`
+  let handle: Awaited<ReturnType<typeof open>> | null = null
+  try {
+    handle = await open(tmp, 'wx', 0o600)
+    await handle.writeFile(body, 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = null
+
+    // A manual editor does not participate in Poise's process lock. Recheck
+    // after preparing the durable temp file so an edit during serialization
+    // still turns into a conflict instead of being overwritten.
+    const current = await readSnippetState()
+    if (current.version !== expectedVersion) {
+      throw new SnippetConflictError(current.version)
+    }
+    await rename(tmp, MATCH_FILE)
+    const directory = await open(MATCH_DIR, 'r')
+    try { await directory.sync() } finally { await directory.close() }
+    return versionFor(body)
+  } catch (err) {
+    if (handle) await handle.close().catch(() => undefined)
+    try { await unlink(tmp) } catch { /* best-effort */ }
+    throw err
+  }
+}
+
+export async function saveSnippets(input: unknown, baseVersion: unknown): Promise<SnippetState> {
+  if (typeof baseVersion !== 'string' || !/^[a-f0-9]{64}$/.test(baseVersion)) {
+    throw new Error('base_version must be a SHA-256 version')
+  }
+  return serializeMutation(() => withProcessLock({ path: LOCK_FILE }, async () => {
+      const current = await readSnippetState()
+      if (current.version !== baseVersion) {
+        throw new SnippetConflictError(current.version)
+      }
+      const snippets = validateSnippets(input)
+      const version = await writeSnippets(snippets, current.version)
+      return { snippets, version }
+    }))
+}
+
+// Append one snippet to the latest set and persist. The whole set is
+// validated under the same rules as a full PUT, so a duplicate or empty
+// trigger is rejected. Returns the added pair and resulting source version.
+// Used by the editor's "save selection as snippet" action.
+export async function addSnippet(input: unknown): Promise<{ snippet: Snippet, version: string }> {
+  const trigger = String((input as any)?.trigger ?? '').trim()
+  const replace = String((input as any)?.replace ?? '')
+  return serializeMutation(() => withProcessLock({ path: LOCK_FILE }, async () => {
+      const current = await readSnippetState()
+      const next = validateSnippets([...current.snippets, { trigger, replace }])
+      const version = await writeSnippets(next, current.version)
+      return { snippet: next[next.length - 1], version }
+    }))
+}
+
+/** A shared-library mutation uses the exact same process lock and durable
+ * compare-and-swap as Snippets and the Editor. Metadata is a YAML comment,
+ * atomically committed with the bodies; Espanso still sees ordinary matches. */
+export async function mutateSnippetLibrary(operation: (snapshot: { raw: string | null, state: SnippetState }) => { snippets: Snippet[], header: string } | null): Promise<SnippetState> {
+  return serializeMutation(() => withProcessLock({ path: LOCK_FILE }, async () => {
+    const snapshot = readSnippetSnapshotSync()
+    const next = operation(snapshot)
+    if (!next) return snapshot.state
+    const snippets = validateSnippets(next.snippets)
+    const version = await writeSnippets(snippets, snapshot.state.version, next.header)
+    return { snippets, version }
+  }))
+}
+
+// Best-effort "is espanso installed?" — drives a UI hint only. We look
+// for the `espanso` binary on PATH rather than for a directory: espanso
+// is commonly installed before its config dir exists (in that state
+// `espanso path` itself panics with "missing config directory"), so a
+// dir check gives false negatives. A custom POISE_ESPANSO_MATCH_DIR
+// means the user knows their setup, so assume yes.
+export function espansoDetected(): boolean {
+  if (process.env.POISE_ESPANSO_MATCH_DIR) return true
+  const dirs = (process.env.PATH || '').split(delimiter)
+  return dirs.some((p) => p !== '' && existsSync(join(p, 'espanso')))
+}
+
+/** How snippets reach the desktop, for the Snippets view: through Espanso on
+ *  this computer, or through Poise Link in service mode, where looking for
+ *  Espanso on the server would say nothing about the person's desktop. */
+export function snippetDelivery(): { espansoDetected: boolean } | { desktop: 'poise-link' } {
+  return SERVICE_MODE ? { desktop: 'poise-link' } : { espansoDetected: espansoDetected() }
+}

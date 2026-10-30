@@ -1,0 +1,37 @@
+/* Spatial motion composes with native transforms, including full-bleed layout. */
+/* Per-actor offsets must not invalidate every descendant on each frame. */
+@property --flow-layout-x { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-layout-y { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-enter-x { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-enter-y { syntax: "<length>"; inherits: false; initial-value: 0px; }
+[data-flow-enter], [data-flow-layout] {
+  --flow-layout-x: 0px;
+  --flow-layout-y: 0px;
+  --flow-enter-x: 0px;
+  --flow-enter-y: 0px;
+  translate: calc(var(--flow-layout-x, 0px) + var(--flow-enter-x, 0px)) calc(var(--flow-layout-y, 0px) + var(--flow-enter-y, 0px));
+}
+[data-flow-retained][hidden], [data-flow-panel-retained] { display: var(--flow-display, block) !important; pointer-events: none; }
+[data-flow-retiring] { animation: none !important; transition: none !important; }
+[data-motion-running] { animation: none !important; transition: none !important; }
+details[data-flow-details] > [data-flow-disclosure] { display: var(--flow-display, block) !important; }
+/* Native modal focus/cancel semantics occur before these optional visuals. */
+@supports (transition-behavior: allow-discrete) {
+  dialog {
+    opacity: 0;
+    translate: 0 20px;
+    transition: opacity var(--flow-settle) var(--flow-spring), translate var(--flow-settle) var(--flow-spring), display var(--flow-settle) allow-discrete, overlay var(--flow-settle) allow-discrete;
+  }
+  dialog[open] { opacity: 1; translate: 0 0; }
+  @starting-style { dialog[open] { opacity: 0; translate: 0 20px; } }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+@media print {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

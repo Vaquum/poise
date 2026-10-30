@@ -1,0 +1,456 @@
+import { retainDiagnosticEvidence } from './behavior-diagnostics'
+import type { EvidenceAttachment } from '../gateway/src/diagnostics/evidence-contract'
+// Thin client for the Behaviors view.
+//
+// All polling, snapshotting, and triggering live SERVER-SIDE in
+// server/behaviors.ts — that's the only place a behavior can run
+// reliably (browser tabs close, reload, get backgrounded). This
+// module is just labels + an HTTP client for the toggle.
+
+import { classifyBehaviorDiagnostic, type DiagnosticClassification } from './behavior-failure-cause'
+
+import type { BehaviorKey } from './behavior-types'
+export type { BehaviorKey } from './behavior-types'
+
+export interface BehaviorMeta {
+  key: BehaviorKey
+  label: string
+  // Whether this behavior exposes a priority-ceiling setting (p0..p4).
+  // The Behaviors view renders an em dash in the Setting cell when
+  // this is false.
+  hasSetting: boolean
+  // Whether this behavior caps review rounds: from the capped round on,
+  // the run files its findings as one follow-up issue and approves.
+  hasReviewCap: boolean
+  // Whether this behavior chooses how many reviewers act on each pull
+  // request (the slots from the PR review place's slot on, in parallel).
+  // Only the initial review does; the others show a dash.
+  hasReviewers: boolean
+  // Whether this behavior has a memory scratchpad — true only for the
+  // agent-backed behaviors whose prompt the note can be injected into.
+  // resolve-unblocking calls github-interface directly with no agent,
+  // so it has nothing to receive a note; the Memory cell shows a dash.
+  hasMemory: boolean
+  // Whether the Setting cell chooses which repositories trigger it and whose
+  // issues count — Review New Issues is opt-in per repository.
+  hasTriggers: boolean
+  // Whether the Setting dropdown lists repositories to skip: the PR behaviors
+  // act everywhere except the repositories ticked there.
+  hasSkips: boolean
+  // What one review is of, for the Reviewers tooltip.
+  reviews?: { place: string, item: string }
+}
+
+// Pull-request review, approval, conversation resolution and optional merging,
+// then the issue review that stands apart from them. Rows use this order.
+export const BEHAVIORS: BehaviorMeta[] = [
+  { key: 'review-new-prs',     label: 'Review New Pull Requests',      hasSetting: true,  hasReviewCap: false, hasReviewers: true,  hasMemory: true,  hasTriggers: false, hasSkips: true,  reviews: { place: 'PR review', item: 'pull request' } },
+  { key: 'approve-prs',        label: 'Approve Pull Requests',         hasSetting: false, hasReviewCap: true,  hasReviewers: false, hasMemory: true,  hasTriggers: false, hasSkips: true },
+  { key: 'resolve-unblocking', label: 'Resolve Unblocking Conversations', hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'rerun-grey-ci',      label: 'Rerun Grey CI',                hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'merge-prs',          label: 'Merge Pull Requests',           hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
+  { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewCap: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  hasSkips: false, reviews: { place: 'Issue review', item: 'issue' } },
+]
+
+export type BehaviorSetting = 'p0' | 'p1' | 'p2' | 'p3' | 'p4'
+export type ReviewerCount = 1 | 2 | 3
+export interface LastTriggered { at: string; target: string; url?: string }
+export interface BehaviorDiagnostics {
+  status: 'ok' | 'degraded' | 'unknown'
+  runtimeError?: string | null
+  agentLogsError: string | null
+  apiError?: DiagnosticClassification & { message: string }
+  datastore: {
+    status: 'unchecked' | 'healthy' | 'unavailable'
+    checkedAt: string
+    ageSeconds: number | null
+    lastSuccessAt: string | null
+    error: string | null
+  }
+  identity: {
+    status: 'valid' | 'invalid' | 'unknown'
+    actor: string | null
+    error: string | null
+  }
+  failures: Array<EvidenceAttachment & {
+    org?: string
+    behavior: BehaviorKey
+    target?: string
+    kind: string
+    consecutiveFailures: number
+    lastFailureAt: string
+    nextRetryAt: string
+    error?: string
+    diagnostic?: DiagnosticClassification
+    callId?: string
+    correlationId?: string
+    recovered?: boolean
+  }>
+  deadLetters: Array<EvidenceAttachment & {
+    id: string
+    behavior: string
+    target: string
+    error: string
+    createdAt: string
+    attemptCount?: number
+    correlationId?: string | null
+    callId?: string | null
+    diagnostic?: DiagnosticClassification
+    nextRetryAt?: string
+  }>
+  holds: Array<{
+    org?: string
+    repo: string
+    actor?: string
+    error: string
+    heldAt: string
+    nextRecheckAt: string
+  }>
+}
+
+// A 409 from the memory precondition carries the value that is actually
+// stored, so the caller can offer it rather than just reporting a number.
+export class BehaviorConflictError extends Error {
+  constructor(message: string, readonly current: string) { super(message) }
+}
+
+export function isReviewerCount(value: unknown): value is ReviewerCount {
+  return value === 1 || value === 2 || value === 3
+}
+
+// In-memory mirror of the server's state, kept in sync via
+// /api/behaviors GET on view init and every successful POST.
+const enabledByKey: Partial<Record<BehaviorKey, boolean>> = {}
+const settingByKey: Partial<Record<BehaviorKey, BehaviorSetting>> = {}
+const reviewersByKey: Partial<Record<BehaviorKey, ReviewerCount>> = {}
+const lastByKey: Partial<Record<BehaviorKey, LastTriggered | null>> = {}
+const lastSucceededByKey: Partial<Record<BehaviorKey, { at: string } | null>> = {}
+const scratchpadByKey: Partial<Record<BehaviorKey, string>> = {}
+// Review New Issues: the repositories that trigger it and the trusted authors.
+const reposByKey: Partial<Record<BehaviorKey, string[]>> = {}
+const authorsByKey: Partial<Record<BehaviorKey, string[]>> = {}
+// The PR behaviors: the repositories each one leaves alone.
+const skipReposByKey: Partial<Record<BehaviorKey, string[]>> = {}
+let diagnostics: BehaviorDiagnostics | null = null
+
+export function isEnabled(key: BehaviorKey): boolean {
+  return !!enabledByKey[key]
+}
+
+export function getSetting(key: BehaviorKey): BehaviorSetting {
+  return settingByKey[key] || 'p2'
+}
+
+export function getReviewers(key: BehaviorKey): ReviewerCount {
+  return reviewersByKey[key] || 1
+}
+
+// The review-round cap for Approve Pull Requests: null is off, otherwise the
+// round from which a run files its findings as one follow-up issue and
+// approves. Only the server's approve-prs row carries it.
+const reviewCapByKey: Partial<Record<BehaviorKey, number | null>> = {}
+
+export function getReviewCap(key: BehaviorKey): number | null {
+  return reviewCapByKey[key] ?? null
+}
+
+export function isReviewCap(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 2 && value <= 10
+}
+
+
+export function getLastTriggered(key: BehaviorKey): LastTriggered | null {
+  return lastByKey[key] || null
+}
+
+export function getLastSucceeded(key: BehaviorKey): { at: string } | null {
+  const last = lastSucceededByKey[key]
+  return last && typeof last.at === 'string' && Number.isFinite(Date.parse(last.at)) ? last : null
+}
+
+export function getScratchpad(key: BehaviorKey): string {
+  return scratchpadByKey[key] || ''
+}
+
+export function getRepos(key: BehaviorKey): string[] {
+  return reposByKey[key] ?? []
+}
+
+export function getAuthors(key: BehaviorKey): string[] {
+  return authorsByKey[key] ?? []
+}
+
+export function getSkipRepos(key: BehaviorKey): string[] {
+  return skipReposByKey[key] ?? []
+}
+
+function stringList(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : null
+}
+
+export function getBehaviorDiagnostics(): BehaviorDiagnostics | null {
+  return diagnostics
+}
+
+async function postBehavior(key: BehaviorKey, body: { enabled?: boolean, reviewers?: ReviewerCount, scratchpad?: string, scratchpadPrevious?: string } & SettingFields) {
+  const res = await fetch(`/api/behaviors/${encodeURIComponent(key)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok && res.status !== 409) {
+    // The server says why a change was refused (an unknown repository, a
+    // malformed username); that is the message worth showing.
+    const data = await res.json().catch(() => ({}))
+    throw new Error(typeof data?.error === 'string' ? data.error : `HTTP ${res.status}`)
+  }
+  if (res.status === 409) {
+    const data = await res.json().catch(() => ({}))
+    throw new BehaviorConflictError(
+      data?.error || 'the memory changed since it was loaded',
+      typeof data?.scratchpad === 'string' ? data.scratchpad : '',
+    )
+  }
+  return res.json()
+}
+
+// Writes have to invalidate reads that were already on the wire. Ordering the
+// reads against each other is not enough: GET /api/behaviors blocks on an
+// `agent-interface --logs` subprocess for as long as 30 seconds, so a tick's
+// GET is routinely still unanswered when a click's POST completes. That GET
+// carries a snapshot taken before the change and is still the newest read when
+// it lands, so it overwrote the mirror with the pre-click value — the toggle
+// repainted OFF on a behaviour that is running, and a just-saved memory
+// reverted to its pre-save text, both for a full refresh interval.
+//
+// Each key counts the writes started against it. A read records the count
+// before it asks, and applies a key's user-writable fields only if no write
+// began, and none was already in flight, while it was out.
+const writesStarted: Partial<Record<BehaviorKey, number>> = {}
+const writesInFlight: Partial<Record<BehaviorKey, number>> = {}
+
+function beginWrite(key: BehaviorKey): void {
+  writesStarted[key] = (writesStarted[key] ?? 0) + 1
+  writesInFlight[key] = (writesInFlight[key] ?? 0) + 1
+}
+
+function endWrite(key: BehaviorKey): void {
+  writesInFlight[key] = Math.max(0, (writesInFlight[key] ?? 1) - 1)
+}
+
+function readIsCurrentFor(key: BehaviorKey, startedAt: number, wasBusy: boolean): boolean {
+  return !wasBusy && (writesStarted[key] ?? 0) === startedAt && (writesInFlight[key] ?? 0) === 0
+}
+
+export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<void> {
+  // Optimistic local update so the toggle UI doesn't flicker; the
+  // server is authoritative and a re-fetch on next view-mount will
+  // correct any drift.
+  enabledByKey[key] = enabled
+  beginWrite(key)
+  try {
+    const data = await postBehavior(key, { enabled })
+    enabledByKey[key] = !!data.enabled
+  } catch (err) {
+    enabledByKey[key] = !enabled
+    throw err
+  } finally {
+    endWrite(key)
+  }
+  window.dispatchEvent(new CustomEvent('poise:behaviors-changed', { detail: { key, enabled: enabledByKey[key] } }))
+}
+
+// The reviewer count is serialized the same way as the Setting dropdown, for
+// the same reason: the last request to arrive is what the server keeps.
+const reviewersWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
+
+export function setReviewers(key: BehaviorKey, reviewers: ReviewerCount): Promise<void> {
+  const run = async () => {
+    const previous = reviewersByKey[key] ?? 1
+    reviewersByKey[key] = reviewers
+    beginWrite(key)
+    try {
+      const data = await postBehavior(key, { reviewers })
+      if (isReviewerCount(data.reviewers)) reviewersByKey[key] = data.reviewers
+    } catch (err) {
+      reviewersByKey[key] = previous
+      throw err
+    } finally {
+      endWrite(key)
+    }
+  }
+  const chained = (reviewersWriteChain[key] ?? Promise.resolve()).then(run, run)
+  reviewersWriteChain[key] = chained.catch(() => {})
+  return chained
+}
+
+// What the Setting dropdown saves: Review New Pull Requests' ceiling, Review
+// New Issues' repositories and trusted authors, and the repositories a PR
+// behavior skips. The changed fields travel in one request, so the server
+// applies all of them or none.
+export interface SettingFields {
+  setting?: BehaviorSetting
+  reviewCap?: number | null
+  repos?: string[]
+  authors?: string[]
+  skipRepos?: string[]
+}
+
+// Writes are serialized per behaviour. The server stores whichever request
+// arrives last, so two in flight at once could leave a setting on a value the
+// person had already moved past — and these decide where the automations act.
+const settingFieldsWriteChain: Partial<Record<BehaviorKey, Promise<void>>> = {}
+
+export function setSettingFields(key: BehaviorKey, fields: SettingFields): Promise<void> {
+  const run = async () => {
+    const previous = { setting: settingByKey[key], reviewCap: reviewCapByKey[key], repos: reposByKey[key], authors: authorsByKey[key], skipRepos: skipReposByKey[key] }
+    if (fields.setting) settingByKey[key] = fields.setting
+    if ('reviewCap' in fields) reviewCapByKey[key] = fields.reviewCap ?? null
+    if (fields.repos) reposByKey[key] = [...fields.repos]
+    if (fields.authors) authorsByKey[key] = [...fields.authors]
+    if (fields.skipRepos) skipReposByKey[key] = [...fields.skipRepos]
+    beginWrite(key)
+    try {
+      const data = await postBehavior(key, fields)
+      if (fields.setting && data.setting) settingByKey[key] = data.setting
+      if ('reviewCap' in fields && (data.reviewCap === null || isReviewCap(data.reviewCap))) {
+        reviewCapByKey[key] = data.reviewCap
+      }
+      reposByKey[key] = stringList(data.repos) ?? reposByKey[key]
+      authorsByKey[key] = stringList(data.authors) ?? authorsByKey[key]
+      skipReposByKey[key] = stringList(data.skipRepos) ?? skipReposByKey[key]
+    } catch (err) {
+      settingByKey[key] = previous.setting
+      reviewCapByKey[key] = previous.reviewCap
+      reposByKey[key] = previous.repos
+      authorsByKey[key] = previous.authors
+      skipReposByKey[key] = previous.skipRepos
+      throw err
+    } finally {
+      endWrite(key)
+    }
+  }
+  const chained = (settingFieldsWriteChain[key] ?? Promise.resolve()).then(run, run)
+  // The chain only orders the requests; a rejection belongs to its own caller
+  // and must not be reported twice or left unhandled here.
+  settingFieldsWriteChain[key] = chained.catch(() => {})
+  return chained
+}
+
+// `loaded` is what the caller believed was stored when it began editing. The
+// server refuses the write if that no longer matches, so a second window
+// cannot silently overwrite the first one's memory.
+export async function setScratchpad(key: BehaviorKey, text: string, loaded?: string): Promise<void> {
+  const previous = scratchpadByKey[key] ?? ''
+  scratchpadByKey[key] = text
+  beginWrite(key)
+  try {
+    const data = await postBehavior(key, {
+      scratchpad: text,
+      ...(typeof loaded === 'string' ? { scratchpadPrevious: loaded } : {}),
+    })
+    if (typeof data.scratchpad === 'string') scratchpadByKey[key] = data.scratchpad
+  } catch (err) {
+    // On a conflict the server told us what is really stored; keep the mirror
+    // truthful rather than restoring a value we now know is stale.
+    scratchpadByKey[key] = err instanceof BehaviorConflictError ? err.current : previous
+    throw err
+  } finally {
+    endWrite(key)
+  }
+}
+
+// Called by the view on init to load the current state from the server.
+// Whether the last read of server state succeeded. The toggles drive agents
+// that write to real pull requests, so the view needs to know when what it is
+// showing is a guess rather than the server's answer.
+let stateLoadOk = false
+export function isBehaviorStateLoaded(): boolean { return stateLoadOk }
+
+// Owner of each behaviour, from the same payload as everything else.
+const ownerByKey: Partial<Record<BehaviorKey, string | null>> = {}
+export function getBehaviorOwner(key: BehaviorKey): string | null {
+  return ownerByKey[key] ?? null
+}
+
+// Ordering guard for concurrent reads. Two refreshes can be in flight at once
+// — the tick fires while a view entry is still loading, or a slow response is
+// still on the wire when a newer one returns. Without a sequence the older
+// answer could land last and overwrite newer state: a toggle the user had just
+// switched repainted itself from a snapshot taken before the change, and a
+// just-saved memory reverted to its pre-save text.
+let refreshSequence = 0
+
+export async function refreshState(): Promise<void> {
+  let requestFailure: DiagnosticClassification | undefined
+  const mine = ++refreshSequence
+  const keys = BEHAVIORS.map((behavior) => behavior.key)
+  // Snapshot the write counters before asking, so the answer can be checked
+  // against what the person did while it was on the wire.
+  const before = new Map(keys.map((k) => [k, {
+    started: writesStarted[k] ?? 0,
+    busy: (writesInFlight[k] ?? 0) > 0,
+  }]))
+  try {
+    const res = await fetch('/api/behaviors').catch((cause: unknown) => {
+      requestFailure = classifyBehaviorDiagnostic(cause instanceof Error ? cause.message : String(cause))
+      throw cause
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    // A newer refresh already answered; this one is history.
+    if (mine !== refreshSequence) return
+    for (const k of keys) {
+      const seen = before.get(k)!
+      // Server-owned columns are safe either way — nothing the person does
+      // here writes them, so a slightly old value is just a slightly old value.
+      lastByKey[k] = data[k]?.lastTriggered ?? null
+      lastSucceededByKey[k] = data[k]?.lastSucceeded ?? null
+      // These three the person can change from this view. If they did so while
+      // this read was out, the read predates the change and must not undo it.
+      if (!readIsCurrentFor(k, seen.started, seen.busy)) continue
+      enabledByKey[k] = !!data[k]?.enabled
+      if (data[k]?.setting) settingByKey[k] = data[k].setting
+      if (data[k]?.reviewCap === null || isReviewCap(data[k]?.reviewCap)) reviewCapByKey[k] = data[k].reviewCap
+      if (isReviewerCount(data[k]?.reviewers)) reviewersByKey[k] = data[k].reviewers
+      const repos = stringList(data[k]?.repos)
+      if (repos) reposByKey[k] = repos
+      const authors = stringList(data[k]?.authors)
+      if (authors) authorsByKey[k] = authors
+      const skipRepos = stringList(data[k]?.skipRepos)
+      if (skipRepos) skipReposByKey[k] = skipRepos
+      scratchpadByKey[k] = typeof data[k]?.scratchpad === 'string' ? data[k].scratchpad : ''
+    }
+    for (const k of keys) {
+      ownerByKey[k] = typeof data[k]?.owner === 'string' ? data[k].owner : null
+    }
+    diagnostics = data.diagnostics ? retainDiagnosticEvidence(data.diagnostics, diagnostics) : null
+    stateLoadOk = true
+  } catch (error) {
+    if (mine !== refreshSequence) return
+    stateLoadOk = false
+    diagnostics = {
+      ...(diagnostics ?? {
+        status: 'unknown',
+        agentLogsError: null,
+        datastore: {
+          status: 'unchecked',
+          checkedAt: new Date().toISOString(),
+          ageSeconds: null,
+          lastSuccessAt: null,
+          error: null,
+        },
+        identity: { status: 'unknown', actor: null, error: null },
+        failures: [],
+        deadLetters: [],
+        holds: [],
+      }),
+      apiError: {
+        ...(requestFailure ?? classifyBehaviorDiagnostic(error instanceof Error ? error.message : String(error))),
+        message: error instanceof Error ? error.message : String(error),
+      },
+    }
+  }
+  // The notification rail lists these diagnostics, from whichever view read them.
+  window.dispatchEvent(new CustomEvent('poise:behavior-diagnostics'))
+}

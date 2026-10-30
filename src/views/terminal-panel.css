@@ -1,0 +1,54 @@
+/* The terminal in Settings → Connected accounts: a framed screen in the
+   panel's idiom. xterm.js paints the screen itself from the same tokens
+   (terminal-panel.ts), so both themes follow. */
+
+.st-terminal {
+  margin-bottom: var(--sp-4);
+  border: var(--b-base);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.st-terminal-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 6px var(--sp-2) 6px var(--sp-3);
+  background: var(--surface);
+  border-bottom: var(--b-hair);
+}
+
+.st-terminal-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+}
+
+.st-terminal-head .st-clear {
+  padding: 4px 10px;
+}
+
+.st-terminal-screen {
+  height: 320px;
+  padding: var(--sp-2);
+}
+
+/* xterm opens in this unpadded box: the fit addon sizes the terminal to the
+   box it opens in, padding included, so on the padded screen the fitted rows
+   would run past its bottom edge. */
+.st-terminal-fit {
+  height: 100%;
+}
+
+.st-terminal-status {
+  margin: 0;
+  padding: 6px var(--sp-3);
+  border-top: var(--b-hair);
+  background: var(--surface);
+}

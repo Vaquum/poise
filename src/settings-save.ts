@@ -1,0 +1,260 @@
+// The Settings save round trip, without the panel: which drafts changed, the
+// smallest partial update that carries them, and what to say when another
+// tab got there first. DOM-free so the unit suite covers it; src/settings.ts
+// wires it to the panel and the baselines a save carries.
+import type { AppSettings } from './config'
+
+// What the server applies when nothing is stored; shown so an empty field
+// never reads as "no prefix" or "never times out".
+export const CHAT_DEFAULTS = { branchPrefix: 'chat/', idleTimeoutMinutes: 120, maxConcurrentLocalTurns: 4, updateTurnBoundMinutes: 15 }
+
+// GitHub logins and organization names are 1–39 characters of alphanumerics
+// and single hyphens, not starting or ending with one. Both fields were stored
+// with nothing but .trim(), so a pasted URL or a typo saved cleanly and every
+// downstream query silently returned nothing.
+export const GITHUB_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/
+
+export type GeneralField = 'me' | 'agentAccount' | 'timezone' | 'branchPrefix' | 'idleTimeoutMinutes' | 'maxConcurrentLocalTurns' | 'updateTurnBoundMinutes'
+
+export interface GeneralDraft {
+  me: string
+  agentAccount: string
+  timezone: string
+  branchPrefix: string
+  idleTimeoutMinutes: number
+  maxConcurrentLocalTurns: number
+  updateTurnBoundMinutes: number
+}
+
+export interface DraftProblem { message: string, field: GeneralField }
+
+// Only drafts are validated: an untouched field cannot block the save, even
+// when what it shows would not validate today.
+export function validateGeneralDraft(draft: GeneralDraft, stored: { me: string, agentAccount: string }, dirty: ReadonlySet<GeneralField>): DraftProblem | null {
+  if (dirty.has('me')) {
+    if (!draft.me) return { message: 'Your GitHub account is required.', field: 'me' }
+    // A value identical to the stored one is grandfathered past the
+    // consecutive-hyphen check, mirroring the server: refusing a stored value
+    // would refuse every save on installs that stored one while permissive.
+    if (!GITHUB_NAME.test(draft.me) || (draft.me.includes('--') && draft.me !== stored.me)) {
+      return { message: 'Your GitHub account must be a GitHub login, not a URL or email.', field: 'me' }
+    }
+  }
+  if (dirty.has('agentAccount') && draft.agentAccount && (!GITHUB_NAME.test(draft.agentAccount) || (draft.agentAccount.includes('--') && draft.agentAccount !== stored.agentAccount))) {
+    return { message: 'The agent account must be a GitHub login, not a URL or email.', field: 'agentAccount' }
+  }
+  // A branch prefix is a git ref fragment: no spaces, no `..`, no leading
+  // slash. A bad one would make every new session fail at branch creation.
+  if (dirty.has('branchPrefix') && (!/^[A-Za-z0-9._\/-]+$/.test(draft.branchPrefix) || draft.branchPrefix.startsWith('/') || draft.branchPrefix.includes('..'))) {
+    return { message: 'Branch prefix must be a valid git ref fragment, like chat/.', field: 'branchPrefix' }
+  }
+  // The backend and the runtime take 0 as no idle expiry
+  // (validateChatSettings, armIdleTimer); the panel used to require at least
+  // 1, so a stored 0 blocked every save.
+  if (dirty.has('idleTimeoutMinutes') && (!Number.isInteger(draft.idleTimeoutMinutes) || draft.idleTimeoutMinutes < 0 || draft.idleTimeoutMinutes > 10080)) {
+    return { message: 'Idle timeout must be a whole number of minutes between 0 and 10080.', field: 'idleTimeoutMinutes' }
+  }
+  if (dirty.has('maxConcurrentLocalTurns') && (!Number.isInteger(draft.maxConcurrentLocalTurns) || draft.maxConcurrentLocalTurns < 1 || draft.maxConcurrentLocalTurns > 64)) {
+    return { message: 'Concurrent local turns must be a whole number between 1 and 64.', field: 'maxConcurrentLocalTurns' }
+  }
+  if (dirty.has('updateTurnBoundMinutes') && (!Number.isInteger(draft.updateTurnBoundMinutes) || draft.updateTurnBoundMinutes < 1 || draft.updateTurnBoundMinutes > 10080)) {
+    return { message: 'Update turn bound must be a whole number of minutes between 1 and 10080.', field: 'updateTurnBoundMinutes' }
+  }
+  return null
+}
+
+export interface GeneralPayload { body: Record<string, unknown>, expect: Record<string, unknown>, fields: GeneralField[] }
+
+// The smallest supported partial update: only drafted fields, with the values
+// this tab read for the fields it sends, so a stale draft is refused instead
+// of overwriting another tab's save.
+export function generalPayload(draft: GeneralDraft, dirty: ReadonlySet<GeneralField>, basis: ReadonlyMap<string, unknown>, freshChat: Record<string, unknown>): GeneralPayload | null {
+  const body: Record<string, unknown> = {}
+  const expect: Record<string, unknown> = {}
+  const fields: GeneralField[] = []
+  for (const key of ['me', 'agentAccount', 'timezone'] as const) {
+    if (!dirty.has(key)) continue
+    body[key] = draft[key]
+    fields.push(key)
+    if (basis.has(key)) expect[key] = basis.get(key)
+  }
+  const chat: Record<string, unknown> = {}
+  const chatLeaves = new Set<string>()
+  for (const key of ['branchPrefix', 'idleTimeoutMinutes', 'maxConcurrentLocalTurns', 'updateTurnBoundMinutes'] as const) {
+    if (dirty.has(key)) {
+      chat[key] = draft[key]
+      chatLeaves.add(key)
+      fields.push(key)
+    }
+  }
+  if (Object.keys(chat).length > 0) {
+    body.chat = chat
+    expect.chat = wholeExpect(chatLeaves, basis, freshChat)
+  }
+  return fields.length > 0 ? { body, expect, fields } : null
+}
+
+export interface ModelSlotDraft { primary?: string, secondary?: string, tertiary?: string }
+export interface ModelsDraft { slots?: ModelSlotDraft, places?: Record<string, { slot: string }> }
+
+// Only the drafted half is validated, like the general fields above: the
+// three slot models must be different models. Place slots need no check;
+// their pickers only offer the three slots and Random.
+export function validateModelChoices(draft: ModelsDraft): string | null {
+  const slots = draft.slots
+  if (slots) {
+    const seen = new Map<string, string>()
+    for (const slot of ['primary', 'secondary', 'tertiary'] as const) {
+      const identity = slots[slot]
+      if (!identity) continue
+      const clash = seen.get(identity)
+      if (clash) return `Model slots ${clash} and ${slot} must be different models.`
+      seen.set(identity, slot)
+    }
+  }
+  return null
+}
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+// The whole object the server compares for a partially written field: fresh
+// values for clean leaves, each draft's own read basis for drafted ones. A
+// single whole baseline cannot represent drafts written against different
+// reads, so the expectation is built per leaf instead. A null basis — drafted
+// while nothing was stored — is left out here; modelsExpect decides it below.
+export function wholeExpect(dirty: ReadonlySet<string>, basis: ReadonlyMap<string, unknown>, fresh: Record<string, unknown>): Record<string, unknown> {
+  const expect: Record<string, unknown> = { ...fresh }
+  for (const leaf of dirty) {
+    if (basis.has(leaf) && basis.get(leaf) !== null) expect[leaf] = basis.get(leaf)
+  }
+  return expect
+}
+
+// The whole models object the server compares for a partially written save:
+// fresh values for clean leaves, each draft's own read basis for drafted
+// ones. The leaves are the slots as one and each place as its own. A draft
+// written while nothing was stored adopts the still-empty fresh read — but if
+// the leaf has since gained a stored value, the expectation carries null,
+// which matches nothing, so the save is refused with the current values
+// instead of silently overwriting an unseen change.
+export function modelsExpect(
+  dirty: ReadonlySet<string>,
+  basis: ReadonlyMap<string, unknown>,
+  fresh: { slots?: unknown, places?: Record<string, unknown> },
+): Record<string, unknown> {
+  const expect: Record<string, unknown> = {}
+  if (dirty.has('slots') || fresh.slots !== undefined) {
+    if (dirty.has('slots') && basis.has('slots') && basis.get('slots') !== null) expect.slots = basis.get('slots')
+    else if (dirty.has('slots') && basis.get('slots') === null && fresh.slots !== undefined) expect.slots = null
+    else if (fresh.slots !== undefined) expect.slots = fresh.slots
+  }
+  const places: Record<string, unknown> = { ...(fresh.places ?? {}) }
+  for (const leaf of dirty) {
+    if (leaf === 'slots') continue
+    if (basis.has(leaf) && basis.get(leaf) !== null) places[leaf] = basis.get(leaf)
+    else if (basis.get(leaf) === null && fresh.places && leaf in fresh.places) places[leaf] = null
+  }
+  if (fresh.places !== undefined || Object.keys(places).length > 0) expect.places = places
+  return expect
+}
+
+export function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((value, index) => deepEqual(value, b[index]))
+  }
+  if (!isRecord(a) || !isRecord(b)) return false
+  const keys = Object.keys(a)
+  return keys.length === Object.keys(b).length && keys.every((key) => deepEqual(a[key], b[key]))
+}
+
+export interface ConflictLeaf { field: string, leaf: string | null, current: unknown }
+
+// The moved halves of a refused models save: the slots as one leaf, each
+// place as its own.
+export function modelsConflictLeaves(current: Record<string, unknown>, baseline: Record<string, unknown>): ConflictLeaf[] {
+  const leaves: ConflictLeaf[] = []
+  if (!deepEqual(current.slots, baseline.slots)) leaves.push({ field: 'models', leaf: 'slots', current: current.slots ?? null })
+  const places = isRecord(current.places) ? current.places : {}
+  const base = isRecord(baseline.places) ? baseline.places : {}
+  for (const place of [...new Set([...Object.keys(places), ...Object.keys(base)])].sort()) {
+    if (!deepEqual(places[place], base[place])) leaves.push({ field: 'models', leaf: place, current: places[place] ?? null })
+  }
+  return leaves
+}
+
+// The refused save's `current`, narrowed to the drafted leaves that actually
+// moved, so the message and Read again name what changed, not the section.
+export function conflictLeaves(current: Record<string, unknown>, baselines: ReadonlyMap<string, unknown>): ConflictLeaf[] {
+  const leaves: ConflictLeaf[] = []
+  for (const [field, value] of Object.entries(current)) {
+    const baseline = baselines.get(field)
+    if (field === 'models' && isRecord(value) && isRecord(baseline)) {
+      leaves.push(...modelsConflictLeaves(value, baseline))
+    } else if (isRecord(value) && isRecord(baseline)) {
+      let moved = false
+      for (const [sub, subValue] of Object.entries(value)) {
+        if (!deepEqual(subValue, baseline[sub])) {
+          leaves.push({ field, leaf: sub, current: subValue })
+          moved = true
+        }
+      }
+      // Shapes differ without a moved leaf (a removed key): name the field.
+      if (!moved) leaves.push({ field, leaf: null, current: value })
+    } else {
+      leaves.push({ field, leaf: null, current: value })
+    }
+  }
+  return leaves
+}
+
+const FIELD_LABELS: Record<string, string> = { me: 'Your GitHub account', agentAccount: 'GitHub automation account', timezone: 'Time zone' }
+const CHAT_LABELS: Record<string, string> = { branchPrefix: 'Branch prefix', idleTimeoutMinutes: 'Idle timeout', maxConcurrentLocalTurns: 'Concurrent local turns', updateTurnBoundMinutes: 'Update turn bound' }
+
+function formatScalar(value: unknown): string {
+  if (typeof value === 'string') return value ? `"${value}"` : '(empty)'
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return JSON.stringify(value) ?? String(value)
+}
+
+function formatChoice(value: unknown): string {
+  if (isRecord(value) && typeof value.slot === 'string') return `slot ${formatScalar(value.slot)}`
+  if (isRecord(value)) {
+    const parts = ['primary', 'secondary', 'tertiary']
+      .filter((slot) => typeof value[slot] === 'string')
+      .map((slot) => `${slot} ${formatScalar(value[slot])}`)
+    if (parts.length > 0) return parts.join(', ')
+  }
+  return formatScalar(value)
+}
+
+// Read again shows the freshest known server value for a reverted leaf: the
+// conflict refresh when it landed (it ran after the 409), else the 409's own
+// snapshot. Showing the older snapshot while the cache holds newer would base
+// the next draft on an unseen value.
+export function rereadValue(field: string, leaf: string | null, snapshot: unknown, cached: AppSettings, fresh: boolean): unknown {
+  if (!fresh) return snapshot
+  if (leaf === null) {
+    if (field === 'me') return cached.me
+    if (field === 'agentAccount') return cached.agentAccount ?? ''
+    if (field === 'timezone') return cached.timezone
+    if (field === 'chat' && cached.chat) return { ...cached.chat }
+    return snapshot
+  }
+  const chat = cached.chat as Record<string, unknown> | undefined
+  if (field === 'chat' && chat && leaf in chat) return chat[leaf]
+  return snapshot
+}
+
+export function conflictMessage(leaves: ConflictLeaf[]): string {
+  const parts = leaves.map((entry) => {
+    if (entry.field === 'chat' && entry.leaf) return `${CHAT_LABELS[entry.leaf] ?? entry.leaf} is now ${formatScalar(entry.current)}`
+    if (entry.field === 'models' && entry.leaf) return `Models "${entry.leaf}" is now ${formatChoice(entry.current)}`
+    if (entry.leaf) return `${entry.field}.${entry.leaf} is now ${formatScalar(entry.current)}`
+    return `${FIELD_LABELS[entry.field] ?? entry.field} is now ${formatScalar(entry.current)}`
+  })
+  const changed = parts.length > 0 ? parts.join('; ') : 'Settings changed on the server'
+  return `${changed}. Your edits are kept — Save again to overwrite, or Read again for the saved values.`
+}

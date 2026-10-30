@@ -1,0 +1,628 @@
+// SQLite mirror for Chat v1: the session table, the per-session event log
+// that the browser renders history from, the unanswered requests that must
+// survive a reload, and the worker gates this server spawned (for startup
+// cleanup). Lives in Poise's own database (server/db.ts); sessions are
+// separated by the `instance` column, and dev and production normally use
+// separate `POISE_DB` files. The checkout lock is what they share. Every
+// write is one short transaction; nothing here talks to an agent.
+
+import { db } from '../db'
+import { claimQueuedMessage, delegateQueue, deleteMessageQueue, pauseQueue, settleQueuedTurn, queueOwner, readQueue } from './message-queue'
+import type { ChatEnvelope, ChatEvent, SessionRecord, SessionStatus, MessageQueue, SubjectSurface } from './protocol'
+import type { AttachmentRecord } from './attachments'
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY,
+    record TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    checkout TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL,
+    native_session_id TEXT,
+    instance TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_seq INTEGER NOT NULL DEFAULT 0,
+    open_turn_id TEXT,
+    open_call_id TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_chat_sessions_instance ON chat_sessions(instance, updated_at DESC);
+  CREATE UNIQUE INDEX IF NOT EXISTS chat_sessions_subject ON chat_sessions(
+    instance, json_extract(record, '$.subject.surface'), json_extract(record, '$.subject.key')
+  ) WHERE json_extract(record, '$.subject.key') IS NOT NULL;
+
+  CREATE TABLE IF NOT EXISTS chat_events (
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    at TEXT NOT NULL,
+    event TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq)
+  );
+  -- One turn's finish, looked up by finalizeTurn on every turn end: without
+  -- it the dedup read scans the whole transcript. Partial, so only the
+  -- ~one-per-turn finish rows are indexed, and read INDEXED BY so the
+  -- planner needs no table statistics to use it.
+  CREATE INDEX IF NOT EXISTS idx_chat_events_turn_finished ON chat_events(session_id, json_extract(event, '$.turnId'))
+    WHERE json_extract(event, '$.type') = 'turn.finished';
+
+  CREATE TABLE IF NOT EXISTS chat_pending (
+    request_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('permission', 'question')),
+    seq INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_chat_pending_session ON chat_pending(session_id);
+
+  CREATE TABLE IF NOT EXISTS chat_request_revision (
+    instance TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS chat_attachments (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_chat_attachments_session ON chat_attachments(session_id);
+
+  CREATE TABLE IF NOT EXISTS chat_finish_outbox (
+    call_id TEXT PRIMARY KEY,
+    instance TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'cancelled', 'failed')),
+    error TEXT,
+    queued_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_chat_finish_outbox_instance ON chat_finish_outbox(instance);
+
+  CREATE TABLE IF NOT EXISTS chat_workers (
+    session_id TEXT PRIMARY KEY,
+    gate_pid INTEGER NOT NULL,
+    gate_pgid INTEGER NOT NULL,
+    ident TEXT NOT NULL,
+    checkout TEXT NOT NULL,
+    lease_token TEXT,
+    command TEXT NOT NULL,
+    started_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS chat_relays (
+    session_id TEXT PRIMARY KEY,
+    relay_pid INTEGER NOT NULL,
+    relay_ident TEXT NOT NULL,
+    socket TEXT NOT NULL,
+    dir TEXT NOT NULL,
+    started_at TEXT NOT NULL
+  );
+`)
+
+// The Manager's role column and singleton index. The shape duplicates
+// server/db.ts: an immediate transaction serializes a second process
+// starting at the same moment. If it still meets a duplicate column, the
+// column is treated as present; any other error stops startup.
+try {
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(chat_sessions)').all() as Array<{ name: string }>
+    if (!cols.some((c) => c.name === 'role')) {
+      db.exec('ALTER TABLE chat_sessions ADD COLUMN role TEXT')
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS chat_sessions_one_manager ON chat_sessions(instance) WHERE role = 'manager'`)
+  }).immediate()
+} catch (error) {
+  if (error instanceof Error && error.message.includes('duplicate column name: role')) {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS chat_sessions_one_manager ON chat_sessions(instance) WHERE role = 'manager'`)
+  } else {
+    throw error
+  }
+}
+
+const EVENT_MAX_BYTES = 4 * 1024 * 1024
+
+export function insertSession(record: SessionRecord): void {
+  db.prepare(`
+    INSERT INTO chat_sessions (id, record, agent, repo, checkout, branch, status, title, native_session_id, instance, created_at, updated_at, last_seq, role)
+    VALUES (@id, @record, @agent, @repo, @checkout, @branch, @status, @title, @native, @instance, @created, @updated, 0, @role)
+  `).run({
+    id: record.id,
+    record: JSON.stringify({ ...record, queue: undefined, timers: undefined }),
+    agent: record.agent,
+    repo: record.repo,
+    checkout: record.checkout,
+    branch: record.branch.name,
+    status: record.status,
+    title: record.title,
+    native: record.nativeSessionId ?? null,
+    instance: record.instance,
+    created: record.createdAt,
+    updated: record.updatedAt,
+    role: record.role ?? null,
+  })
+}
+
+/** The instance's Manager, read from the role column, or null. */
+export function managerSession(instance: string): SessionRecord | null {
+  const row = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? AND role = \'manager\' LIMIT 1')
+    .get(instance) as { record: string, last_seq: number, status: string, role: string | null } | undefined
+  return row ? parseRecord(row) : null
+}
+
+export function saveSession(record: SessionRecord): void {
+  db.prepare(`
+    UPDATE chat_sessions
+    SET record = @record, agent = @agent, repo = @repo, checkout = @checkout, branch = @branch,
+        status = @status, title = @title, native_session_id = @native, updated_at = @updated
+    WHERE id = @id
+  `).run({
+    id: record.id,
+    record: JSON.stringify({ ...record, queue: undefined, timers: undefined }),
+    agent: record.agent,
+    repo: record.repo,
+    checkout: record.checkout,
+    branch: record.branch.name,
+    status: record.status,
+    title: record.title,
+    native: record.nativeSessionId ?? null,
+    updated: record.updatedAt,
+  })
+}
+
+function parseRecord(row: { record: string, last_seq: number, status: string, role?: string | null }): SessionRecord {
+  const record = JSON.parse(row.record) as SessionRecord
+  record.lastSeq = row.last_seq
+  record.status = row.status as SessionStatus
+  // The column is the role's only source; any role in the record JSON is ignored.
+  if (row.role === 'manager' || row.role === 'worker') record.role = row.role
+  else delete record.role
+  record.pendingRequests = listPendingRequests(record.id).map((p) => p.requestId)
+  return record
+}
+
+export function getSession(id: string): SessionRecord | null {
+  const row = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE id = ?').get(id) as { record: string, last_seq: number, status: string, role: string | null } | undefined
+  return row ? parseRecord(row) : null
+}
+
+/** Which server owns the session, without parsing the record. */
+export function sessionInstance(id: string): string | null {
+  const row = db.prepare('SELECT instance FROM chat_sessions WHERE id = ?').get(id) as { instance: string } | undefined
+  return row?.instance ?? null
+}
+
+export interface CheckoutSession {
+  id: string
+  status: SessionStatus
+  updatedAt: string
+}
+
+/** Every session row claiming a checkout, across instances: a workspace
+ *  another server's session uses is claimed, never unclaimed. */
+export function sessionsForCheckout(checkout: string): CheckoutSession[] {
+  const rows = db.prepare('SELECT id, status, updated_at FROM chat_sessions WHERE checkout = ?')
+    .all(checkout) as Array<{ id: string, status: SessionStatus, updated_at: string }>
+  return rows.map((row) => ({ id: row.id, status: row.status, updatedAt: row.updated_at }))
+}
+
+export function listSessions(instance: string): SessionRecord[] {
+  const rows = db.prepare('SELECT record, last_seq, status, role FROM chat_sessions WHERE instance = ? ORDER BY updated_at DESC, created_at DESC')
+    .all(instance) as Array<{ record: string, last_seq: number, status: string, role: string | null }>
+  return rows.map(parseRecord)
+}
+
+/** The subject's session id, in any state, or null. Keys compare exactly. */
+export function sessionForSubject(instance: string, surface: SubjectSurface, key: string): string | null {
+  const row = db.prepare(`SELECT id FROM chat_sessions WHERE instance = ?
+    AND json_extract(record, '$.subject.surface') = ? AND json_extract(record, '$.subject.key') = ? LIMIT 1`)
+    .get(instance, surface, key) as { id: string } | undefined
+  return row?.id ?? null
+}
+
+/** Move the subject from one record to another in one transaction. A
+ *  source without a subject leaves both records as they are. */
+export const moveSubject: (from: SessionRecord, to: SessionRecord) => void = db.transaction((from: SessionRecord, to: SessionRecord): void => {
+  if (!from.subject) return
+  const subject = from.subject
+  const source = { ...from }
+  delete source.subject
+  saveSession(source)
+  saveSession({ ...to, subject })
+})
+
+export function deleteSession(id: string): void {
+  db.transaction(() => {
+    const session = db.prepare('SELECT instance FROM chat_sessions WHERE id = ?').get(id) as { instance: string } | undefined
+    deleteMessageQueue(id)
+    db.prepare('DELETE FROM chat_events WHERE session_id = ?').run(id)
+    const pending = db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(id)
+    db.prepare('DELETE FROM chat_workers WHERE session_id = ?').run(id)
+    db.prepare('DELETE FROM chat_relays WHERE session_id = ?').run(id)
+    db.prepare('DELETE FROM chat_attachments WHERE session_id = ?').run(id)
+    db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(id)
+    if (session && pending.changes) bumpRequestRevision(session.instance)
+  })()
+}
+
+export function setSessionStatus(id: string, status: SessionStatus): void {
+  db.prepare('UPDATE chat_sessions SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), id)
+}
+
+export function setOpenTurn(id: string, turnId: string | null, callId: string | null): void {
+  db.prepare('UPDATE chat_sessions SET open_turn_id = ?, open_call_id = ? WHERE id = ?').run(turnId, callId, id)
+}
+
+export function getOpenTurn(id: string): { turnId: string, callId: string | null } | null {
+  const row = db.prepare('SELECT open_turn_id, open_call_id FROM chat_sessions WHERE id = ?').get(id) as { open_turn_id: string | null, open_call_id: string | null } | undefined
+  return row?.open_turn_id ? { turnId: row.open_turn_id, callId: row.open_call_id } : null
+}
+
+/** A queue mutation and its transcript receipt either both persist or neither does. */
+export const commitQueueMutation = db.transaction((sessionId: string, mutate: () => MessageQueue): ChatEnvelope => {
+  const queue = mutate()
+  return appendEvent(sessionId, { type: 'queue.updated', queue })
+})
+
+/** Queue claim and open-turn reservation cannot be separated by a crash. */
+export const reserveQueueTurn = db.transaction((sessionId: string, turnId: string, itemId?: string, internal?: { seq: number, at: number }): void => {
+  if (getOpenTurn(sessionId)) throw new Error('A turn is already recorded for this session')
+  if (internal !== undefined) {
+    if (!Number.isSafeInteger(internal.seq) || internal.seq <= 0) throw new Error('Invalid internal message sequence')
+    const admitted = db.prepare(`UPDATE chat_control_inbox SET state = 'admitted', turn_id = ?, admitted_at = ?
+      WHERE seq = ? AND recipient = ? AND instance = (SELECT instance FROM chat_sessions WHERE id = ?) AND state = 'pending'`)
+      .run(turnId, internal.at, internal.seq, sessionId, sessionId)
+    if (admitted.changes !== 1) throw new Error('The internal message is no longer pending for this session')
+  }
+  const owner = queueOwner(sessionId)
+  if (itemId) claimQueuedMessage(owner, itemId, turnId)
+  else {
+    const queue = readQueue(owner)
+    // A new manual activity can take the idle queue back from a completed
+    // delegated change. Never take it away from an executing queued turn.
+    if (queue.executorSessionId && queue.executorSessionId !== sessionId
+      && !getOpenTurn(queue.executorSessionId) && !queue.items.some(item => item.state === 'running')) {
+      delegateQueue(owner, sessionId)
+    }
+    pauseQueue(owner)
+  }
+  setOpenTurn(sessionId, turnId, null)
+})
+
+/** Sessions of this instance that had a turn open — a crash cut them. */
+export function listOpenTurns(instance: string): Array<{ sessionId: string, turnId: string, callId: string | null }> {
+  return (db.prepare('SELECT id, open_turn_id, open_call_id FROM chat_sessions WHERE instance = ? AND open_turn_id IS NOT NULL')
+    .all(instance) as Array<{ id: string, open_turn_id: string, open_call_id: string | null }>)
+    .map((row) => ({ sessionId: row.id, turnId: row.open_turn_id, callId: row.open_call_id }))
+}
+
+/** Append one event; returns its envelope. Sequence numbers are allocated
+ *  inside the same transaction as the insert, so two writers cannot collide. */
+export const appendEvent = db.transaction((sessionId: string, event: ChatEvent, at: string = new Date().toISOString()): ChatEnvelope => {
+  const encoded = JSON.stringify(event)
+  if (Buffer.byteLength(encoded, 'utf8') > EVENT_MAX_BYTES) {
+    throw new Error(`chat event exceeds ${EVENT_MAX_BYTES} bytes`)
+  }
+  const row = db.prepare('SELECT last_seq, instance FROM chat_sessions WHERE id = ?').get(sessionId) as { last_seq: number, instance: string } | undefined
+  if (!row) throw new Error(`unknown chat session ${sessionId}`)
+  const seq = row.last_seq + 1
+  db.prepare('INSERT INTO chat_events (session_id, seq, at, event) VALUES (?, ?, ?, ?)').run(sessionId, seq, at, encoded)
+  db.prepare('UPDATE chat_sessions SET last_seq = ?, updated_at = ? WHERE id = ?').run(seq, at, sessionId)
+  if (event.type === 'permission.requested') {
+    db.prepare('INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(event.id, sessionId, 'permission', seq, at)
+    bumpRequestRevision(row.instance)
+  } else if (event.type === 'question.asked') {
+    db.prepare('INSERT OR REPLACE INTO chat_pending (request_id, session_id, kind, seq, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(event.id, sessionId, 'question', seq, at)
+    bumpRequestRevision(row.instance)
+  } else if (event.type === 'permission.resolved' || event.type === 'question.answered') {
+    const removed = db.prepare('DELETE FROM chat_pending WHERE request_id = ? AND session_id = ?').run(event.id, sessionId)
+    if (removed.changes) bumpRequestRevision(row.instance)
+  }
+  return { seq, sessionId, at, event }
+})
+
+export const EVENT_PAGE_LIMIT = 5_000
+
+export function listEvents(sessionId: string, afterSeq: number, limit: number = EVENT_PAGE_LIMIT): { events: ChatEnvelope[], truncated: boolean } {
+  const bounded = Math.max(1, Math.min(limit, EVENT_PAGE_LIMIT))
+  const rows = db.prepare('SELECT seq, at, event FROM chat_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?')
+    .all(sessionId, afterSeq, bounded + 1) as Array<{ seq: number, at: string, event: string }>
+  const truncated = rows.length > bounded
+  return {
+    events: rows.slice(0, bounded).map((row) => ({ seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent })),
+    truncated,
+  }
+}
+
+export function lastEvent(sessionId: string): ChatEnvelope | null {
+  const row = db.prepare('SELECT seq, at, event FROM chat_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1').get(sessionId) as { seq: number, at: string, event: string } | undefined
+  return row ? { seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent } : null
+}
+
+export function findEvent(sessionId: string, predicate: (event: ChatEvent) => boolean): ChatEnvelope | null {
+  const rows = db.prepare('SELECT seq, at, event FROM chat_events WHERE session_id = ? ORDER BY seq DESC').iterate(sessionId) as Iterable<{ seq: number, at: string, event: string }>
+  for (const row of rows) {
+    const event = JSON.parse(row.event) as ChatEvent
+    if (predicate(event)) return { seq: row.seq, sessionId, at: row.at, event }
+  }
+  return null
+}
+
+/** One turn's committed finish, newest first like findEvent: the dedup read
+ *  for finalizeTurn, answered from the partial finish index instead of a
+ *  whole-transcript scan with a JSON parse per row. */
+export function findTurnFinished(sessionId: string, turnId: string): ChatEnvelope | null {
+  const row = db.prepare(`SELECT seq, at, event FROM chat_events INDEXED BY idx_chat_events_turn_finished
+    WHERE session_id = ? AND json_extract(event, '$.type') = 'turn.finished' AND json_extract(event, '$.turnId') = ?
+    ORDER BY seq DESC LIMIT 1`).get(sessionId, turnId) as { seq: number, at: string, event: string } | undefined
+  return row ? { seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent } : null
+}
+
+export interface PendingRequest { requestId: string, sessionId: string, kind: 'permission' | 'question', seq: number }
+
+/** One open request with its stored title and ask time, for the handling
+ *  log. Read before the answering event deletes the pending row. */
+export function pendingRequestDetail(sessionId: string, requestId: string): { kind: 'permission' | 'question', title: string, createdAt: string } | null {
+  const row = db.prepare(`
+    SELECT p.kind AS kind, p.created_at AS createdAt, e.event AS event
+    FROM chat_pending p JOIN chat_events e ON e.session_id = p.session_id AND e.seq = p.seq
+    WHERE p.session_id = ? AND p.request_id = ?
+  `).get(sessionId, requestId) as { kind: 'permission' | 'question', createdAt: string, event: string } | undefined
+  if (!row) return null
+  try {
+    const event = JSON.parse(row.event) as ChatEvent
+    if (event.type === 'permission.requested' && row.kind === 'permission' && event.id === requestId) {
+      return { kind: row.kind, title: event.title, createdAt: row.createdAt }
+    }
+    if (event.type === 'question.asked' && row.kind === 'question' && event.id === requestId) {
+      return { kind: row.kind, title: event.questions[0]?.question ?? 'A question', createdAt: row.createdAt }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+export function listPendingRequests(sessionId: string): PendingRequest[] {
+  return (db.prepare('SELECT request_id, session_id, kind, seq FROM chat_pending WHERE session_id = ? ORDER BY seq').all(sessionId) as Array<{ request_id: string, session_id: string, kind: 'permission' | 'question', seq: number }>)
+    .map((row) => ({ requestId: row.request_id, sessionId: row.session_id, kind: row.kind, seq: row.seq }))
+}
+
+// The open-request revision: every change the Overview must see bumps it,
+// inside the same transaction as the pending rows, so the counter and the
+// rows never disagree. The row is never deleted, so the revision only ever
+// grows, across restarts. Callers outside a transaction bump through this;
+// appendEvent, resetConversation and deleteSession bump inside their own.
+export function requestRevision(instance: string): number {
+  db.prepare('INSERT OR IGNORE INTO chat_request_revision(instance) VALUES(?)').run(instance)
+  return (db.prepare('SELECT revision FROM chat_request_revision WHERE instance = ?').get(instance) as { revision: number }).revision
+}
+
+export function bumpRequestRevision(instance: string): number {
+  requestRevision(instance)
+  return (db.prepare('UPDATE chat_request_revision SET revision = revision + 1 WHERE instance = ? RETURNING revision').get(instance) as { revision: number }).revision
+}
+
+export const OPEN_CHAT_REQUEST_LIMIT = 200
+
+export interface OpenChatRequest {
+  id: string
+  kind: 'permission' | 'question'
+  sessionId: string
+  sessionTitle: string
+  createdAt: string
+  content: unknown
+  /** The escalation reason, once the Manager escalates requests. */
+  escalation: string | null
+}
+
+/** Every open request of this instance with its stored content: one
+ *  consistent snapshot carrying its revision, newest first. Each pending
+ *  row joins by seq to its exact stored request event, never a transcript
+ *  scan. Foreign instances' rows stay out. */
+export const listOpenChatRequests = db.transaction((instance: string): { revision: number, complete: boolean, requests: OpenChatRequest[] } => {
+  const revision = requestRevision(instance)
+  const rows = db.prepare(`
+    SELECT p.request_id AS requestId, p.session_id AS sessionId, p.kind AS kind, p.created_at AS createdAt,
+      e.event AS event, s.title AS sessionTitle
+    FROM chat_pending p
+    JOIN chat_events e ON e.session_id = p.session_id AND e.seq = p.seq
+    JOIN chat_sessions s ON s.id = p.session_id
+    WHERE s.instance = ?
+    ORDER BY p.created_at DESC, p.request_id DESC
+    LIMIT ?
+  `).all(instance, OPEN_CHAT_REQUEST_LIMIT + 1) as Array<{ requestId: string, sessionId: string, kind: 'permission' | 'question', createdAt: string, event: string, sessionTitle: string }>
+  const requests: OpenChatRequest[] = []
+  for (const row of rows.slice(0, OPEN_CHAT_REQUEST_LIMIT)) {
+    let content: unknown = null
+    try {
+      const event = JSON.parse(row.event) as ChatEvent
+      if (event.type === 'permission.requested' && row.kind === 'permission' && event.id === row.requestId) {
+        content = { title: event.title, description: event.description ?? null, input: event.input ?? null, options: event.options }
+      } else if (event.type === 'question.asked' && row.kind === 'question' && event.id === row.requestId) {
+        content = { questions: event.questions }
+      } else {
+        continue
+      }
+    } catch {
+      continue
+    }
+    requests.push({ id: row.requestId, kind: row.kind, sessionId: row.sessionId,
+      sessionTitle: row.sessionTitle, createdAt: row.createdAt, content, escalation: null })
+  }
+  return { revision, complete: rows.length <= OPEN_CHAT_REQUEST_LIMIT, requests }
+})
+
+export interface WorkerRow {
+  sessionId: string
+  gatePid: number
+  gatePgid: number
+  ident: string
+  checkout: string
+  leaseToken: string | null
+  command: string
+  startedAt: string
+}
+
+export function recordWorker(row: WorkerRow): void {
+  db.prepare(`
+    INSERT OR REPLACE INTO chat_workers (session_id, gate_pid, gate_pgid, ident, checkout, lease_token, command, started_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(row.sessionId, row.gatePid, row.gatePgid, row.ident, row.checkout, row.leaseToken, row.command, row.startedAt)
+}
+
+export function setWorkerLeaseToken(sessionId: string, token: string | null): void {
+  db.prepare('UPDATE chat_workers SET lease_token = ? WHERE session_id = ?').run(token, sessionId)
+}
+
+export function getWorker(sessionId: string): WorkerRow | null {
+  const row = db.prepare('SELECT * FROM chat_workers WHERE session_id = ?').get(sessionId) as {
+    session_id: string, gate_pid: number, gate_pgid: number, ident: string, checkout: string, lease_token: string | null, command: string, started_at: string
+  } | undefined
+  return row ? { sessionId: row.session_id, gatePid: row.gate_pid, gatePgid: row.gate_pgid, ident: row.ident, checkout: row.checkout, leaseToken: row.lease_token, command: row.command, startedAt: row.started_at } : null
+}
+
+export function forgetWorker(sessionId: string): void {
+  db.prepare('DELETE FROM chat_workers WHERE session_id = ?').run(sessionId)
+}
+
+export interface RelayRow {
+  sessionId: string
+  relayPid: number
+  relayIdent: string
+  socket: string
+  dir: string
+  startedAt: string
+}
+
+export function recordRelay(row: RelayRow): void {
+  db.prepare(`
+    INSERT OR REPLACE INTO chat_relays (session_id, relay_pid, relay_ident, socket, dir, started_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(row.sessionId, row.relayPid, row.relayIdent, row.socket, row.dir, row.startedAt)
+}
+
+export function getRelay(sessionId: string): RelayRow | null {
+  const row = db.prepare('SELECT * FROM chat_relays WHERE session_id = ?').get(sessionId) as {
+    session_id: string, relay_pid: number, relay_ident: string, socket: string, dir: string, started_at: string
+  } | undefined
+  return row ? { sessionId: row.session_id, relayPid: row.relay_pid, relayIdent: row.relay_ident, socket: row.socket, dir: row.dir, startedAt: row.started_at } : null
+}
+
+export function forgetRelay(sessionId: string): void {
+  db.prepare('DELETE FROM chat_relays WHERE session_id = ?').run(sessionId)
+}
+
+export function listWorkers(): WorkerRow[] {
+  return (db.prepare('SELECT * FROM chat_workers').all() as Array<{
+    session_id: string, gate_pid: number, gate_pgid: number, ident: string, checkout: string, lease_token: string | null, command: string, started_at: string
+  }>).map((row) => ({
+    sessionId: row.session_id,
+    gatePid: row.gate_pid,
+    gatePgid: row.gate_pgid,
+    ident: row.ident,
+    checkout: row.checkout,
+    leaseToken: row.lease_token,
+    command: row.command,
+    startedAt: row.started_at,
+  }))
+}
+
+export function insertAttachment(row: AttachmentRecord): void {
+  db.prepare('INSERT INTO chat_attachments (id, session_id, name, path, size, sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(row.id, row.sessionId, row.name, row.path, row.size, row.sha256, row.createdAt)
+}
+
+export function getAttachment(id: string): AttachmentRecord | null {
+  const row = db.prepare('SELECT * FROM chat_attachments WHERE id = ?').get(id) as
+    { id: string, session_id: string, name: string, path: string, size: number, sha256: string, created_at: string } | undefined
+  return row ? { id: row.id, sessionId: row.session_id, name: row.name, path: row.path, size: row.size, sha256: row.sha256, createdAt: row.created_at } : null
+}
+
+// The Caller finish outbox: a turn's terminal outcome is written here before
+// Caller is asked to record it and removed only once Caller did. It outlives
+// later turns and the session itself, so a Caller that was unavailable is
+// told the actual outcome later, never a made-up one.
+export interface FinishOutboxRow {
+  callId: string
+  instance: string
+  sessionId: string
+  status: 'completed' | 'cancelled' | 'failed'
+  error: string | null
+  queuedAt: string
+}
+
+export function queueFinish(row: Omit<FinishOutboxRow, 'queuedAt'>): void {
+  db.prepare('INSERT INTO chat_finish_outbox (call_id, instance, session_id, status, error, queued_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(call_id) DO NOTHING')
+    .run(row.callId, row.instance, row.sessionId, row.status, row.error, new Date().toISOString())
+}
+
+export function finishDelivered(callId: string): void {
+  db.prepare('DELETE FROM chat_finish_outbox WHERE call_id = ?').run(callId)
+}
+
+export function listFinishOutbox(instance: string): FinishOutboxRow[] {
+  return (db.prepare('SELECT * FROM chat_finish_outbox WHERE instance = ? ORDER BY queued_at').all(instance) as Array<{
+    call_id: string, instance: string, session_id: string, status: FinishOutboxRow['status'], error: string | null, queued_at: string
+  }>).map((row) => ({ callId: row.call_id, instance: row.instance, sessionId: row.session_id, status: row.status, error: row.error, queuedAt: row.queued_at }))
+}
+
+/** The first terminal outcome is immutable. Commit its transcript event,
+ * Caller delivery record and open-turn clearing together: a crash cannot
+ * leave a completed turn looking open, or lose a pending Caller finish. */
+export const finalizeTurn = db.transaction((
+  sessionId: string,
+  event: Extract<ChatEvent, { type: 'turn.finished' }>,
+  ledger?: { callId: string, instance: string },
+  canAdvanceQueue = true,
+): ChatEnvelope => {
+  const previous = findTurnFinished(sessionId, event.turnId)
+  const envelope = previous ?? appendEvent(sessionId, event)
+  const terminal = envelope.event as Extract<ChatEvent, { type: 'turn.finished' }>
+  if (ledger) {
+    const status = terminal.stopReason === 'cancelled' ? 'cancelled'
+      : terminal.stopReason === 'error' || terminal.stopReason === 'interrupted' ? 'failed' : 'completed'
+    queueFinish({ callId: ledger.callId, instance: ledger.instance, sessionId, status,
+      error: terminal.stopReason === 'interrupted' ? 'Interrupted by Poise restart' : terminal.error ?? null })
+  }
+  const owner = queueOwner(sessionId)
+  const executor = readQueue(owner).executorSessionId
+  if (!previous && (!executor || executor === sessionId)) settleQueuedTurn(owner, terminal.turnId, canAdvanceQueue && terminal.stopReason === 'end_turn', terminal.error || (terminal.stopReason === 'cancelled' ? 'Stopped. This message was not retried.' : undefined))
+  // Never clear another turn reserved after this one; callers publish the
+  // completion only after this transaction is durable.
+  db.prepare('UPDATE chat_sessions SET open_turn_id = NULL, open_call_id = NULL WHERE id = ? AND open_turn_id = ?')
+    .run(sessionId, event.turnId)
+  return envelope
+})
+
+/** Select one full immutable record without materializing the whole history. */
+export function getDiffEvent(sessionId: string, diffId: string): Extract<ChatEvent, { type: 'diff' }> | null {
+  const row = db.prepare(`SELECT event FROM chat_events WHERE session_id = ?
+    AND json_extract(event, '$.type') = 'diff' AND json_extract(event, '$.diffId') = ? LIMIT 1`)
+    .get(sessionId, diffId) as { event: string } | undefined
+  return row ? JSON.parse(row.event) as Extract<ChatEvent, { type: 'diff' }> : null
+}
+
+/** Replace this chat's history atomically without reusing sequence numbers.
+ * Receipts, queued future work, files and Caller outcomes remain independent. */
+export const resetConversation = db.transaction((current: SessionRecord): { session: SessionRecord, envelope: ChatEnvelope } => {
+  const row = db.prepare('SELECT last_seq FROM chat_sessions WHERE id = ?').get(current.id) as { last_seq: number } | undefined
+  if (!row) throw new Error('unknown chat session')
+  const session: SessionRecord = { ...current, status: 'idle', contextResetting: false, contextCompacting: false,
+    contextResetSeq: row.last_seq + 1, lastSeq: row.last_seq + 1, pendingRequests: [],
+    nativeSessionId: undefined, context: undefined, queuedHandoff: undefined,
+    forkedFrom: undefined, staged: undefined, interruptedTurnId: undefined,
+    orphanNotice: undefined, safeModePending: false, queuedBehind: undefined }
+  db.prepare('DELETE FROM chat_events WHERE session_id = ?').run(session.id)
+  const pending = db.prepare('DELETE FROM chat_pending WHERE session_id = ?').run(session.id)
+  if (pending.changes) bumpRequestRevision(current.instance)
+  const envelope = appendEvent(session.id, { type: 'session.reset', session })
+  saveSession(session)
+  return { session, envelope }
+})

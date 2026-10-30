@@ -1,0 +1,318 @@
+import http, { STATUS_CODES, type IncomingHttpHeaders, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from 'node:http'
+import type { Duplex } from 'node:stream'
+import { header } from './http.js'
+import type { Upstream } from './orchestrator.js'
+
+// RFC 9110 section 7.6.1 hop-by-hop fields, plus Expect, which only governs the client's own hop.
+const HOP_BY_HOP = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'expect',
+])
+
+// Errors that mean nothing is listening at the workspace's address yet, as opposed to a broken exchange.
+const UNREACHABLE = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH'])
+
+export function isUnreachable(error: NodeJS.ErrnoException): boolean {
+  return UNREACHABLE.has(error.code ?? '')
+}
+
+/** The workspace answered with something the gateway will not relay. */
+export class UpstreamResponseError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'UpstreamResponseError'
+  }
+}
+
+/**
+ * The largest request body relayed to a workspace. Poise's largest accepted body is an editor document's
+ * 30 MiB envelope; anything bigger is refused before it costs the shared gateway more.
+ */
+export const MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
+
+/** A declined WebSocket upgrade is a short refusal; a workspace sending more is not relayed. */
+export const MAX_DECLINED_UPGRADE_BYTES = 64 * 1024
+
+/** The client sent a body larger than the gateway relays. */
+export class RequestTooLargeError extends Error {
+  readonly code = 'E_REQUEST_TOO_LARGE'
+  constructor(readonly limit: number) {
+    super(`the request body is larger than ${limit} bytes`)
+    this.name = 'RequestTooLargeError'
+  }
+}
+
+/** A status Node can send on: an owner-controlled workspace may answer with anything, e.g. `HTTP/1.1 099`. */
+function relayableStatus(status: number | undefined): number {
+  if (status === undefined || !Number.isInteger(status) || status < 100 || status > 599) {
+    throw new UpstreamResponseError(`the workspace answered with status ${String(status)}`)
+  }
+  return status
+}
+
+export interface ForwardOptions {
+  assertion: string
+  proto: 'http' | 'https'
+  /** The Authorization header carried a device token the gateway has consumed. */
+  dropAuthorization: boolean
+}
+
+function connectionTokens(headers: IncomingHttpHeaders): Set<string> {
+  const value = headers.connection
+  const list = Array.isArray(value) ? value.join(',') : value ?? ''
+  return new Set(list.split(',').map((token) => token.trim().toLowerCase()).filter(Boolean))
+}
+
+function clientAddress(req: IncomingMessage): string {
+  return (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '')
+}
+
+/**
+ * The request headers a workspace receives: the client's, minus anything identity-bearing the gateway owns
+ * and every cookie. A workspace needs none, and a cookie a parent domain shares with every host below it,
+ * such as another service's login, must not reach the agents.
+ */
+export function forwardHeaders(req: IncomingMessage, options: ForwardOptions): OutgoingHttpHeaders {
+  const listed = connectionTokens(req.headers)
+  const out: OutgoingHttpHeaders = {}
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value === undefined || HOP_BY_HOP.has(name) || listed.has(name)) continue
+    if (name === 'x-poise-identity' || name === 'forwarded' || name.startsWith('x-forwarded-') || name === 'cookie') continue
+    if (name === 'authorization' && options.dropAuthorization) continue
+    out[name] = value
+  }
+  // A chunked body is re-framed as chunked on the way in: Node would otherwise send it unframed for some
+  // methods, and the workspace would read the body as a second request.
+  if (req.headers['transfer-encoding'] !== undefined) out['transfer-encoding'] = 'chunked'
+  const priorFor = header(req, 'x-forwarded-for')
+  out['x-forwarded-for'] = priorFor ? `${priorFor}, ${clientAddress(req)}` : clientAddress(req)
+  out['x-forwarded-proto'] = options.proto
+  out['x-forwarded-host'] = header(req, 'host')
+  out['x-poise-identity'] = options.assertion
+  return out
+}
+
+/** Response headers worth relaying: no hop-by-hop fields and no cookies, which a workspace may never set. */
+function relayedHeaders(headers: IncomingHttpHeaders): OutgoingHttpHeaders {
+  const listed = connectionTokens(headers)
+  const out: OutgoingHttpHeaders = {}
+  for (const [name, value] of Object.entries(headers)) {
+    if (value !== undefined && !HOP_BY_HOP.has(name) && !listed.has(name) && name !== 'set-cookie') out[name] = value
+  }
+  return out
+}
+
+function responseHead(status: number, rawHeaders: readonly string[]): string {
+  let head = `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? ''}\r\n`
+  for (let index = 0; index < rawHeaders.length; index += 2) head += `${rawHeaders[index]}: ${rawHeaders[index + 1]}\r\n`
+  return `${head}\r\n`
+}
+
+function withoutRawHeaders(rawHeaders: readonly string[], drop: (name: string) => boolean): string[] {
+  const kept: string[] = []
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    if (!drop(rawHeaders[index].toLowerCase())) kept.push(rawHeaders[index], rawHeaders[index + 1])
+  }
+  return kept
+}
+
+/**
+ * Streams a request to the workspace and its answer back, in both directions without buffering.
+ * `onError` runs only while the client can still be answered, and must not throw. `onTruncated`
+ * observes an upstream failure after the answer started: the client keeps its partial answer and
+ * the failure is recorded, never answered twice. Neither runs when the client went first.
+ */
+export function proxyRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  target: Upstream,
+  headers: OutgoingHttpHeaders,
+  agent: http.Agent,
+  onError: (error: NodeJS.ErrnoException) => void,
+  onTruncated?: (error: NodeJS.ErrnoException, bytesSent: number) => void,
+  maxBodyBytes = MAX_REQUEST_BODY_BYTES,
+): void {
+  let clientGone = false
+  // The first failure decides the answer: destroying the upstream to stop a body raises errors of its own.
+  let failed = false
+  // Body bytes relayed before the upstream failed mid-answer; a truncation without them sent none.
+  let bytesSent = 0
+  let responseDone = false
+  const upstream = http.request({ host: target.host, port: target.port, method: req.method, path: req.url, headers, agent })
+  const truncated = (error: NodeJS.ErrnoException) => {
+    if (clientGone || failed || responseDone) return
+    failed = true
+    res.destroy()
+    onTruncated?.(error, bytesSent)
+  }
+  const fail = (error: NodeJS.ErrnoException) => {
+    if (clientGone || failed) return
+    failed = true
+    if (res.headersSent) {
+      res.destroy()
+      onTruncated?.(error, bytesSent)
+      return
+    }
+    req.unpipe(upstream)
+    req.resume()
+    onError(error)
+  }
+  upstream.on('response', (upstreamRes) => {
+    // Anything thrown in this listener would escape every handler and take the whole gateway down.
+    try {
+      res.writeHead(relayableStatus(upstreamRes.statusCode), relayedHeaders(upstreamRes.headers))
+      // Long polls and event streams must not wait for a first body chunk to deliver their headers.
+      res.flushHeaders()
+      upstreamRes.on('data', (chunk: Buffer) => {
+        bytesSent += chunk.length
+      })
+      upstreamRes.on('error', truncated)
+      // A hang-up is not always an error event: without an end the answer was cut either way.
+      upstreamRes.on('close', () => {
+        if (!responseDone) truncated(Object.assign(new Error('the workspace closed the answer before it ended'), { code: 'ECONNRESET' }))
+      })
+      upstreamRes.on('end', () => {
+        responseDone = true
+      })
+      upstreamRes.pipe(res)
+    } catch (error) {
+      upstreamRes.destroy()
+      upstream.destroy()
+      fail(error as NodeJS.ErrnoException)
+    }
+  })
+  upstream.on('error', fail)
+  res.on('close', () => {
+    if (res.writableFinished) return
+    clientGone = true
+    upstream.destroy()
+  })
+  // Node already holds a Content-Length body to its declared size; a chunked body is counted as it streams.
+  let received = 0
+  req.on('data', (chunk: Buffer) => {
+    received += chunk.length
+    if (failed || received <= maxBodyBytes) return
+    req.unpipe(upstream)
+    upstream.destroy()
+    fail(new RequestTooLargeError(maxBodyBytes))
+  })
+  req.pipe(upstream)
+}
+
+/** Answers a WebSocket upgrade with a plain HTTP error and closes the connection. */
+export function rejectUpgrade(socket: Duplex, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  if (!socket.writable) {
+    socket.destroy()
+    return
+  }
+  const payload = JSON.stringify(body)
+  const raw = [
+    'content-type', 'application/json; charset=utf-8',
+    'content-length', String(Buffer.byteLength(payload)),
+    'connection', 'close',
+    ...Object.entries(headers).flat(),
+  ]
+  socket.end(responseHead(status, raw) + payload)
+}
+
+/**
+ * Relays a WebSocket upgrade to the workspace and then pipes the two sockets together.
+ * `onError` runs only while the client can still be answered, and must not throw.
+ * `onTruncated` observes the upstream end failing once the switch is done, when the client
+ * can no longer be answered; a clean close on either end, or the client going first, stays silent.
+ */
+export function proxyUpgrade(
+  req: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  target: Upstream,
+  headers: OutgoingHttpHeaders,
+  onError: (error: NodeJS.ErrnoException) => void,
+  onTruncated?: (error: NodeJS.ErrnoException) => void,
+): void {
+  let clientGone = false
+  const upstream = http.request({
+    host: target.host,
+    port: target.port,
+    method: req.method,
+    path: req.url,
+    headers: { ...headers, connection: 'Upgrade', upgrade: header(req, 'upgrade') },
+    agent: false,
+  })
+  const abandon = () => {
+    clientGone = true
+    upstream.destroy()
+  }
+  // Destroying the upstream after a refusal raises errors of its own; only the first failure is reported.
+  let reported = false
+  const report = (error: NodeJS.ErrnoException) => {
+    if (clientGone || reported) return
+    reported = true
+    onError(error)
+  }
+  socket.once('close', abandon)
+  upstream.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    try {
+      socket.off('close', abandon)
+      // Past the switch a client close still goes first: destroying the upstream then must not report.
+      socket.on('error', () => {
+        clientGone = true
+        upstreamSocket.destroy()
+      })
+      socket.on('close', () => {
+        clientGone = true
+        upstreamSocket.destroy()
+      })
+      upstreamSocket.on('error', (error: unknown) => {
+        socket.destroy()
+        if (!clientGone && !reported) {
+          reported = true
+          onTruncated?.(error as NodeJS.ErrnoException)
+        }
+      })
+      upstreamSocket.on('close', () => socket.destroy())
+      socket.write(responseHead(101, withoutRawHeaders(upstreamRes.rawHeaders, (name) => name === 'set-cookie')))
+      if (upstreamHead.length > 0) socket.write(upstreamHead)
+      if (head.length > 0) upstreamSocket.write(head)
+      upstreamSocket.pipe(socket).pipe(upstreamSocket)
+    } catch (error) {
+      // Nothing can be answered on a half-switched connection: close both ends, then report it.
+      upstreamSocket.destroy()
+      socket.destroy()
+      onError(error as NodeJS.ErrnoException)
+    }
+  })
+  upstream.on('response', (upstreamRes) => {
+    // The workspace declined the upgrade: relay its answer as a complete response and close.
+    let status: number
+    try {
+      status = relayableStatus(upstreamRes.statusCode)
+    } catch (error) {
+      upstreamRes.destroy()
+      upstream.destroy()
+      report(error as NodeJS.ErrnoException)
+      return
+    }
+    const chunks: Buffer[] = []
+    let size = 0
+    upstreamRes.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > MAX_DECLINED_UPGRADE_BYTES) {
+        upstreamRes.destroy()
+        upstream.destroy()
+        report(new UpstreamResponseError(`the workspace declined the upgrade with more than ${MAX_DECLINED_UPGRADE_BYTES} bytes`))
+        return
+      }
+      chunks.push(chunk)
+    })
+    upstreamRes.on('error', () => socket.destroy())
+    upstreamRes.on('end', () => {
+      const body = Buffer.concat(chunks)
+      const raw = withoutRawHeaders(upstreamRes.rawHeaders, (name) => HOP_BY_HOP.has(name) || name === 'content-length' || name === 'set-cookie')
+      raw.push('content-length', String(body.length), 'connection', 'close')
+      socket.end(Buffer.concat([Buffer.from(responseHead(status, raw)), body]))
+    })
+  })
+  upstream.on('error', report)
+  upstream.end()
+}

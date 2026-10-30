@@ -1,0 +1,57 @@
+# Poise repository specifics
+
+Status: repository-only details for `autonomio/poise`.
+Scope: narrows [AUTONOMIO_PR_GUIDELINE.md](AUTONOMIO_PR_GUIDELINE.md) for this repository.
+
+## What this repository is
+
+Poise as a self-hosted service. The application started as the single-user Poise from `mikkokotila/Poise` (history preserved up to #101). This repository adds what running it for several people needs: Caller in-tree, a login gateway, a per-person workspace image, and the Poise Link desktop companion. [docs/Service-architecture.md](docs/Service-architecture.md) is the contract between those parts.
+
+Poise must keep working outside service mode too: `npm run dev` on a developer's machine is still how the application is built and tested.
+
+## Layout
+
+| Path | Surface |
+| --- | --- |
+| `src/`, `server/`, `scripts/`, `tests/`, `index.html`, `vite.config.ts` | Poise application |
+| `caller/` | Caller: `agent_interface`, `github_interface` and `github_datastore`, the Python CLIs Poise drives ([caller/README.md](caller/README.md)) |
+| `deploy/runtime/`, `.dockerignore` | The workspace image: Dockerfile, entrypoint, provider CLI bootstrap and smoke tests ([deploy/runtime/README.md](deploy/runtime/README.md)) |
+| `deploy/` (outside `deploy/runtime/`) | The deployment bundle: Compose file, Caddyfile, environment template, the install, upgrade, backup and restore scripts, and their end-to-end test in `deploy/ci/` ([docs/Operating.md](docs/Operating.md)) |
+| `docs/` | Documentation; `docs/Service-architecture.md` is the interface contract |
+| `gateway/` | Login, routing and workspace orchestration service (Node 22, TypeScript, its own `package.json`) |
+| `.github/workflows/` | CI |
+| `link/` | Poise Link, the desktop companion (Tauri 2: Rust in `link/src-tauri`, the window in `link/ui`); see [docs/Poise-Link.md](docs/Poise-Link.md) |
+
+## Toolchain
+
+- Node 22 is the runtime line (the workspace image pins it). On a developer Mac put it first on `PATH`: `export PATH=/opt/homebrew/opt/node@22/bin:$PATH`. The default Homebrew `node` (23) cannot load the `better-sqlite3` build and fails hundreds of tests for that reason alone.
+- Python 3.13 for Caller. `npm run caller:setup` builds `caller/.venv`, which Poise runs Caller's CLIs from.
+- Docker Engine 24 or newer for the workspace image and the deployment bundle.
+- Rust for Poise Link: the toolchain pinned in `link/rust-toolchain.toml` (rustup installs it on first use). On Linux, Tauri's system libraries too; [docs/Poise-Link.md](docs/Poise-Link.md) lists them.
+
+## Gates
+
+| Touched surface | Required local gate |
+| --- | --- |
+| Poise application | `npm run check` (lint, unit and integration tests, production build) |
+| Poise browser UI | `npm run check` and `npm run test:e2e` |
+| Gateway | In `gateway/`: `npm ci`, `npm run typecheck` and `npm test`; where Docker is available, also `docker build gateway/` and `POISE_GATEWAY_DOCKER_TESTS=1 npx vitest run tests/docker.integration.test.ts` |
+| Caller | `npm ci` and `npm run caller:setup`, then `PATH="$PWD/caller/.venv/bin:$PATH" caller/.venv/bin/python -m pytest caller/agent_interface/tests caller/github_interface/tests caller/github_datastore/tests`. Some tests run Caller's own CLIs from `PATH`, as Poise does and as CI's `pip install` provides |
+| Workspace image | `shellcheck deploy/runtime/*.sh deploy/runtime/test/*.sh`; where Docker is available, `docker build -f deploy/runtime/Dockerfile -t poise-runtime .` then `deploy/runtime/test/smoke.sh contract poise-runtime` and `deploy/runtime/test/smoke.sh offline poise-runtime`; CI otherwise |
+| Deployment bundle | `shellcheck -x deploy/*.sh deploy/ci/*.sh` and `python3 -m unittest discover --start-directory deploy/ci --pattern 'test_*.py'`; on a Linux host with Docker whose `/etc/hosts` resolves `poise.test` and its subdomains `alice`, `bob`, `nobody` and `admin` to 127.0.0.1, `npm ci --prefix deploy/ci` then `deploy/ci/e2e.sh run` in a throwaway clone, because it writes `deploy/.env` and commits to a branch of the checkout; CI otherwise |
+| Documentation only | Links and examples checked by hand against the code |
+| CI workflows and `.github/workflows/ci.mjs` | `actionlint .github/workflows/ci.yml .github/workflows/caller.yml`, `npx eslint --no-ignore .github/workflows/ci.mjs` and `npx vitest run tests/ci-selection.test.mjs tests/ci-audit-gate.test.ts tests/self-update-github.test.mjs tests/self-update-policy.test.mjs`; complete candidate gates in CI |
+| Poise Link (`link/`) | In `link/src-tauri`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`; for the installer, `shellcheck link/install.sh` and `python3 -m unittest discover --start-directory link/tests --pattern 'test_*.py'`. The real installs run in CI |
+
+CI runs the complete Poise gates on Node 22 for merge-queue candidates: independent static and build jobs, two unit/integration shards and four Chromium shards, all required by the stable `Verify (Node 22)` aggregate. PR updates select affected tests conservatively; main pushes reuse successful queue evidence only for the exact same commit and otherwise run the complete gates. [Testing](docs/Testing.md) defines selection, evidence reuse, browser images, concurrency, profiling and fixture isolation. The gateway workflow runs its gates and builds its image on Node 22 when `gateway/` changes. The Caller workflow runs Caller's tests on Python 3.13 for affected pull requests and all merge-queue candidates, reusing exact-commit queue evidence on main pushes where available. The Poise Link workflow runs its gates on Ubuntu, builds the macOS, Windows and Linux installers and runs `link/install.sh` with them on fresh macOS (Apple silicon and Intel), Ubuntu and Debian machines for pull requests and `main` pushes that touch `link/` and when run by hand; for a `link-v*` tag it does the same and then publishes the release (see [docs/Poise-Link.md](docs/Poise-Link.md#releases)). The Runtime image workflow builds the workspace image and runs its smoke tests whenever the image or what it ships (Poise, Caller) changes; it installs the provider CLIs for real only when `deploy/runtime/` changes. The Deployment workflow runs the deployment bundle end to end (install, sign-in through a fake GitHub, a workspace, Chat's WebSocket, TLS, backup and restore, upgrade) when `deploy/` or `gateway/` changes, and when run by hand.
+
+## Proof obligations
+
+- A change to an interface in `docs/Service-architecture.md` updates the document and the tests on both sides of the interface.
+- Service-mode behavior is tested with `POISE_MODE=service` and an isolated `HOME`; nothing in a test may read or write the developer's real `~/.poise`, `~/.claude`, `~/.codex`, gh configuration or Espanso folder.
+- No test reaches a real agent CLI or its login.
+  - **Isolation.** Every vitest process (`tests/home-isolation.ts`) and the end-to-end server (`playwright.config.ts`) run with a temporary `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GH_CONFIG_DIR`, `GROK_HOME` and XDG folders. Replacing `HOME` alone is not enough: Claude Code keeps its macOS Keychain login under `CLAUDE_CONFIG_DIR`. Every vitest process, and the end-to-end runner with the server and workers it starts, also start without the variables whose values the diagnostics redact as credentials (`environmentSecrets` in `gateway/src/diagnostics/redaction.mjs`), and without `GIT_CONFIG_COUNT`, which git refuses once the `GIT_CONFIG_KEY_<n>` among them are gone (`removeCredentialVariables` in `tests/fixtures/cli-isolation.ts`). The gateway's own suite does the same through its setup file `gateway/tests/credential-isolation.ts`, a copy that imports nothing outside `gateway/` so its tests still run alone in the gateway's Docker test image. So the developer's tokens never reach a test, and a flag merely named like one, such as Claude Code's `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH=1`, cannot turn every `1` in a test's diagnostics into `[redacted]`. A test that needs such a variable stubs it.
+  - **Stand-ins.** Stand-ins come first on `PATH` for `claude`, `codex`, `gh`, `grok`, `muse` and `agy`.
+  - **Tests that run a CLI** use the fakes in `tests/fixtures/accounts/fake-clis.ts`, placed ahead of the stand-ins.
+  - **Tests that open a Connect terminal** pass `fakePresetCommand`, which refuses a preset whose CLI is not its fake before anything starts.
+- Security-relevant paths (identity assertions, sessions, device tokens, the terminal, replay checks) carry negative tests: forged, expired, wrong-audience, wrong-scope and missing credentials are each rejected.

@@ -1,0 +1,1049 @@
+# Operating Poise
+
+Open Menu → Logging to investigate retained diagnostics; Export NDJSON downloads
+a fresh bounded snapshot of the applied filters. Diagnostic HTTP reads are for
+the owner's same-origin workspace page. Typing or
+bookmarking an export endpoint is refused by the existing browser guards; an
+operator without that page uses the operator command documented in Logging.
+The page's authenticated `/_poise/api/logging/export` request returns bounded
+NDJSON with `truncated` and `resumeCursor` in its metadata line. Continuing an
+export requires the same filters and that opaque cursor. `scope=instance` is
+an explicit administrator choice. Local installations use `/api/logging/export`
+under the local loopback rules; no browser session token is needed there.
+See [Logging](Logging.md) for access, retention, filters and query budgets.
+For an external Caddy proxy, install the optional
+[bounded diagnostic reader](../deploy/ingress/README.md) on its operator-owned
+Docker host to connect the external ingress source with expiring health.
+
+## Bounded CPU capture
+
+The direct service-mode production server accepts at most one operator-requested
+15-second CPU capture during its lifetime. It opens no debugger listener and
+does not enable SIGUSR1 inspection. There is no HTTP trigger or environment
+override for duration, output or commands. This is an optional diagnostic,
+not a responsiveness fix or an unlimited-load acceptance test.
+Environment-supplied service mode installs the handler before dotenv loading;
+mode supplied by a secured `.env` installs it immediately after validation,
+before logging/runtime startup. Neither path is ready for an operator signal
+until its process-specific availability record exists.
+
+Before sending any signal, complete this preflight in the workspace's PID
+namespace:
+
+1. Identify the **Node application PID**, its `/proc/<pid>/stat` start ticks,
+   executable, supervisor parent and running command. Never signal PID 1,
+   `tini`, a launcher/supervisor, a process group or an older release. Never use
+   `docker kill --signal=USR2`: that targets the container's init and can stop
+   the workspace and its agents.
+2. Read normal authenticated service health. Bind its compiled `version` and
+   active `release` to the running bundle containing this handler; require no
+   pending release switch. A checkout HEAD, installed/desired release, image
+   label or successful Deploy job alone does not establish the running code.
+3. Find that process's startup `CPU capture availability` record. Require
+   `available:true` and matching PID, start ticks, build SHA and release.
+   Independently check the effective Node arguments and inherited
+   `NODE_OPTIONS` for native diagnostic signal flags without exporting the
+   environment. Capture refuses signal-report/heap options, including
+   ambiguous or overridden spellings, and `process.report.reportOnSignal`.
+   The supported server does not mutate that report setting after startup;
+   if the effective configuration cannot be established, stop. A JS refusal
+   **cannot prevent** an already-enabled native report or heap handler from
+   writing sensitive data when SIGUSR2 arrives.
+4. Require the caught-signal bit `SigCgt & 0x800` in `/proc/<pid>/status` and
+   no existing `~/.poise/diagnostics/cpu-profile.json`. Preserve any prior
+   artifact before a separately authorized later process/attempt. Recheck
+   PID/start identity and active release immediately before delivering
+   **SIGUSR2 only to that application PID**. An old server without this
+   handler can terminate on SIGUSR2.
+
+Choose a naturally busy Chat or Caller phase with contemporaneous loop-delay
+evidence; do not create production agent load for a capture. Separately retain
+native host CPU/I/O pressure, cgroup limits/counters, actual workload phases
+and client vantage for the same window. The artifact reads only fixed
+namespace-local `cpu.stat` and `cpu.pressure` paths; unavailable sources are
+explicit, and these are not necessarily host-wide measurements. A failed,
+interrupted, oversized or uninformative attempt does not re-arm the process
+or authorize a retry. Duplicate signals produce only one refusal log and the
+handler remains installed after completion, failure and shutdown.
+
+The fixed output is `~/.poise/diagnostics/cpu-profile.json`: an envelope with
+`metadata` and `profile`. Directory mode is 0700 and file mode 0600. These
+exclude other UIDs, not agent processes sharing the server's UID. Do not post
+profile frames, environment/argument dumps or the artifact in GitHub. Extract
+the `profile` member privately as JSON to a `.cpuprofile` file for a CPU-profile
+viewer; an oversize envelope has `profile:null` and cannot be opened as one.
+
+Publication uses exclusive staging, file sync, an atomic non-replacing link
+and directory sync. Existing output is preserved. The persisted UTF-8 cap is
+64 MiB, including metadata; this is not a peak serialization-memory cap.
+Oversize captures publish valid metadata only. Disk/write/sync failures name
+the failure and clean owned staging files; a full disk cannot guarantee a
+fallback artifact. A directory-sync failure after the atomic commit retains
+the complete artifact but does not promise durability. Cancellation before
+commit prevents publication; an already committed artifact is retained.
+
+Capture-only metadata records UTC/monotonic phase timestamps, actual duration,
+start/stop wait and serialization costs, V8 profile times in microseconds,
+sample count/mean interval and gaps over 100 ms. **Gaps are unattributed**:
+weighting one by an adjacent frame does not prove CPU self-time or distinguish
+scheduler pressure from a synchronous wait. Dedicated loop statistics report
+their sample count and coverage; zero samples means insufficient coverage.
+CPU/resource deltas include worker threads; ELU measures the main isolate.
+`persistenceStarted` precedes output I/O; the bounded completion log
+records publication completion time. Start/stop/setup/persistence overhead is
+separate from workload evidence. A quiet or incomplete capture cannot explain
+an earlier stall. Shutdown promptly abandons diagnostics, preserves normal
+exit codes and never holds the quiet release gate for the remaining 15 seconds.
+
+This guide runs Poise as a service on one Linux server, for yourself and a
+few colleagues. Each person signs in with GitHub at one address and gets
+their own workspace: their own Poise, agent CLIs, GitHub accounts and data,
+in a container of their own. [Service architecture](Service-architecture.md)
+describes how the parts fit together.
+
+Setting up takes four steps: point DNS at the server, create a GitHub OAuth
+App, fill in `deploy/.env`, and run `deploy/install.sh`. Upgrading is
+`deploy/upgrade.sh`. On a server whose web server already holds ports 80 and
+443, Poise runs behind it instead (see
+[Behind your own proxy](#behind-your-own-proxy)). A fork of this repository
+can do the installing and upgrading itself from GitHub Actions (see
+[Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
+
+## What runs
+
+`deploy/compose.yaml` runs two containers with Docker Compose:
+
+- **`poise-caddy`** ([Caddy](https://caddyserver.com/)) listens on ports 80
+  and 443, holds the TLS certificates and passes every request to the
+  gateway.
+- **`poise-gateway`** signs people in, routes each workspace host to its
+  owner's workspace, and creates, starts and upgrades the workspace
+  containers itself through the Docker socket.
+
+Behind a proxy the server already runs, the gateway runs alone and that
+proxy does Caddy's part.
+
+Each person's workspace is a container named `poise-ws-<handle>`, where the
+handle is their GitHub login in lower case. Their home folder is the volume
+`poise-home-<handle>`, so their data and signed-in CLIs outlive the
+container. The gateway keeps its own state (people, sessions, devices, its
+signing key) in the volume `poise-gateway-data`.
+
+## The server
+
+- 64-bit Linux with Docker Engine 24 or newer and its Compose plugin
+  ([install Docker](https://docs.docker.com/engine/install/)), and `git`.
+  The deployment is tested on Ubuntu on x86-64.
+- Ports 80 and 443 reachable from the internet, and nothing else listening on
+  them, or a proxy already on them that will front Poise too
+  ([Behind your own proxy](#behind-your-own-proxy)).
+- A domain whose DNS you control.
+
+Size it for what agents do: they check out repositories, build them and run
+their test suites, often for several people at once. Each workspace may use
+up to 8 GB of memory and 4 CPUs by default (`POISE_WORKSPACE_MEMORY`,
+`POISE_WORKSPACE_CPUS`); those are limits, not reservations. For three to
+five people, start with:
+
+- **CPU**: 8 cores. Builds and test suites are CPU-bound, and two people's
+  agents often run at the same time.
+- **Memory**: 16 GB, 32 GB if agents work on large codebases. An agent CLI
+  and a test run each take several hundred megabytes to a few gigabytes.
+- **Disk**: 150 GB of SSD. Each home volume holds about 1 GB of provider
+  CLIs plus the repositories its agents check out; review checkouts are
+  removed a day after their last use. The workspace image is about 1 GB; each
+  upgrade keeps the previous one and at most 5 GB of build cache, and removes
+  the rest ([Upgrades](#upgrades)).
+
+Run the scripts as a user who owns the checkout and may use Docker (root, or
+a member of the `docker` group).
+
+## 1. DNS
+
+Point two records at the server's public address: the apex you choose and a
+wildcard below it. Use A records for IPv4 and AAAA records for IPv6, and add
+AAAA records only if the server is reachable over IPv6.
+
+| Name | Type | Value |
+| --- | --- | --- |
+| `poise.example.com` | A / AAAA | the server's address |
+| `*.poise.example.com` | A / AAAA | the server's address |
+
+People sign in at `https://poise.example.com/`. Alice, whose GitHub login is
+`Alice`, works at `https://alice.poise.example.com/`. Caddy obtains the
+apex's certificate from Let's Encrypt as soon as the name reaches the server,
+and each workspace host's certificate on its first visit, after the gateway
+confirms that the host belongs to someone who has signed in. Names that
+belong to nobody never get a certificate.
+
+## 2. The GitHub OAuth App
+
+People sign in through a GitHub OAuth App that you own. Create it under your
+account (GitHub → Settings → Developer settings → OAuth Apps → New OAuth App)
+or under an organization's settings:
+
+| Field | Value |
+| --- | --- |
+| Application name | Anything people will recognise, such as `Poise` |
+| Homepage URL | `https://poise.example.com` |
+| Authorization callback URL | `https://poise.example.com/auth/callback`, exactly |
+| Enable Device Flow | Off |
+
+Register it, choose **Generate a new client secret**, and keep the client ID
+and the secret for the next step.
+
+At sign-in the gateway asks GitHub for the `read:user` scope, and also for
+`read:org` when `POISE_ALLOWED_ORGS` is set. It reads the person's login and,
+for organisation access, their membership, and then discards the GitHub
+token; it never stores one. An organisation that restricts OAuth App access
+must approve the app before its members can sign in through
+`POISE_ALLOWED_ORGS`; until then the sign-in page says GitHub did not share
+the membership.
+
+## 3. Settings
+
+Clone the repository onto the server, for example to `/srv/poise`, with
+credentials that can read it (a deploy key or a token), and create the
+settings file from its template:
+
+```bash
+git clone https://github.com/autonomio/poise.git /srv/poise
+cd /srv/poise
+cp deploy/.env.example deploy/.env
+chmod 600 deploy/.env
+```
+
+Fill in `deploy/.env`. [`deploy/.env.example`](../deploy/.env.example)
+describes every setting with an example. These are required:
+
+| Setting | Value |
+| --- | --- |
+| `POISE_DOMAIN` | The apex, for example `poise.example.com` |
+| `POISE_GITHUB_CLIENT_ID` | The OAuth App's client ID |
+| `POISE_GITHUB_CLIENT_SECRET` | The OAuth App's client secret |
+| `POISE_GOOGLE_CLIENT_ID`, `POISE_GOOGLE_CLIENT_SECRET` | Optional Google client pair, configured once; [Google connections](Google-connections.md#operator-configuration) |
+| `POISE_ADMINS` | GitHub logins that administer this Poise, separated by commas |
+| `POISE_ACME_EMAIL` | The address Let's Encrypt writes to about certificates; not needed behind your own proxy |
+
+`POISE_ALLOWED_USERS` and `POISE_ALLOWED_ORGS` decide who else may sign in
+(see [People](#people)). The workspace limits, the drain timeout and the
+optional gVisor runtime are described in the template and under
+[Security](#security).
+
+The file holds the OAuth App's client secret: keep it readable by its owner
+only. The scripts refuse to run otherwise.
+
+## 4. Install
+
+```bash
+deploy/install.sh
+```
+
+It checks Docker, the ports and `deploy/.env`, and stops with a message that
+names the problem if something is missing. Then it builds the workspace image
+`poise-runtime:latest` (several minutes the first time), starts Caddy and the
+gateway, waits for the gateway to answer, and prints what is left to do: the
+DNS records, the OAuth App's callback URL, the admin sign-in and Poise Link.
+
+The image is also tagged with the commit it was built from, such as
+`poise-runtime:0fcf84e…`, and each workspace reports that commit as `version`
+at `/api/service/health`. A checkout with uncommitted changes builds a
+development image, which reports no version; the script says so.
+
+Run `deploy/install.sh` again after any change to `deploy/.env`: Compose
+recreates the gateway with the new settings.
+
+## 5. The first sign-in
+
+Open `https://poise.example.com/` and sign in with GitHub as one of the
+`POISE_ADMINS`. GitHub asks once whether to authorize the OAuth App. The home
+page then opens your workspace, where first-run setup takes you step by step
+through the theme, your GitHub account, the agent account, organizations, time,
+the AI accounts, models and pairing this computer with Poise Link (see
+[First-run setup](Service-architecture.md#first-run-setup)). In the workspace,
+Settings → Admin lists
+everyone who has signed in, how they got access, and their workspace's state
+and image, and lets you start, stop or restart a workspace, disable or enable a
+person, and change who may sign in. The same controls stay at
+`https://poise.example.com/admin` for when your own workspace cannot open; its
+starting page links there when a start failed.
+
+## Behind your own proxy
+
+For repeatable public deployment descriptions and OAuth policy pages, use the
+gateway's [operator-approved public pages](Public-pages.md). They use the current
+deployment domain and persisted operator content, including behind an external proxy.
+
+When the server already runs a web server or reverse proxy on ports 80 and
+443, such as a Caddy or nginx serving other sites, Poise runs behind it
+instead of with a Caddy of its own. Set `POISE_PROXY_LISTEN` in
+`deploy/.env` to the address that proxy will reach the gateway at, and run
+`deploy/install.sh`:
+
+```bash
+POISE_PROXY_LISTEN=127.0.0.1:8080
+```
+
+The installation then runs the gateway alone, removes a Caddy it ran before,
+and publishes the gateway, over plain http, on that one address. Choose one
+only the proxy can reach: `127.0.0.1` when the proxy runs on the same host,
+or the private address it reaches this server at, such as a virtual
+machine's address on its host's internal network. `0.0.0.0` and `[::]` are
+refused, because they would publish the gateway on every address.
+`POISE_ACME_EMAIL` is not needed: the proxy holds the certificates.
+
+Your proxy must:
+
+- send every request for `poise.example.com` and `*.poise.example.com`, and
+  for no other name, to `http://<POISE_PROXY_LISTEN>`, with the browser's
+  `Host` header;
+- pass WebSockets through, put no time limit on a response, and accept
+  request bodies of up to 32 MiB: event streams, Chat's WebSocket and
+  terminals stay open for as long as people use them;
+- retry a connection failure (no listener while the gateway is replaced) for
+  30 seconds before it answers 502, so a replacement reads as a brief delay;
+- set `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` from what
+  it saw itself, never from what the client sent; Caddy does unless told to
+  trust another proxy;
+- serve a certificate for the apex and one for each workspace host: either a
+  wildcard certificate for `*.poise.example.com`, or each host's on demand.
+  For on-demand certificates it asks the gateway first,
+  `GET http://<POISE_PROXY_LISTEN>/_gateway/tls-ask?domain=<host>`, which
+  answers 200 only for the apex and the hosts of people who have signed in.
+  The gateway answers that question only for requests addressed to
+  `POISE_PROXY_LISTEN`, which is why the proxy must never pass that name on.
+
+A proxy that signs people in itself, as a portal does, should keep that
+sign-in alive while it is used. Once the sign-in has ended, it should answer
+an open page's requests, those that are not page navigations, with 401 rather
+than a redirect to its login page. Poise notices either: it says "Your
+sign-in has ended" and offers Sign in again, which reloads the page through
+the proxy's login.
+
+With Caddy, for a gateway on `127.0.0.1:8080`:
+
+```caddyfile
+{
+	on_demand_tls {
+		ask http://127.0.0.1:8080/_gateway/tls-ask
+	}
+}
+
+poise.example.com {
+	reverse_proxy 127.0.0.1:8080 {
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
+}
+
+*.poise.example.com {
+	tls {
+		on_demand
+	}
+	reverse_proxy 127.0.0.1:8080 {
+		lb_try_duration 30s
+		lb_try_interval 100ms
+	}
+}
+```
+
+Point the DNS records at the proxy. The OAuth App and everything after it
+are the same as above.
+
+**A sign-in of the proxy's own.** A proxy may ask for a sign-in of its own
+before it passes a request on, as a company portal does. Poise Link cannot
+answer one, so let these requests through without it; the gateway checks
+each against the device's token itself:
+
+- `POST /link/device/code` and `POST /link/device/token` on the apex;
+- every path under `/api/link/` on the workspace hosts.
+
+**A parent domain shared with other services.** When `POISE_DOMAIN` is under
+a domain other services use, such as `poise.example.com` beside a portal at
+`portal.example.com`, the browser also sends the gateway every cookie set
+for the whole of `example.com`, the portal's login among them. The gateway
+forwards no cookie to a workspace, so none of them reaches a workspace or
+its agents. A page in a workspace still counts as the same site as those
+services, so they must refuse cross-origin requests, for example by checking
+`Origin` or `Sec-Fetch-Site`, as they should in any case.
+
+To switch back, remove `POISE_PROXY_LISTEN`, set `POISE_ACME_EMAIL`, free
+ports 80 and 443 and run `deploy/install.sh`. When you run Compose yourself
+in `deploy/`, name both files as the scripts do, for example
+`COMPOSE_FILE=compose.yaml:compose.proxy.yaml docker compose ps`.
+
+## Run your own Poise from a fork
+
+This repository is meant to be forked. A fork deploys itself to its own
+server from GitHub Actions, and can take this repository's changes as they
+land.
+
+1. **Fork** autonomio/poise into your account or organisation. GitHub turns
+   workflows off in a new fork: enable them on the fork's **Actions** tab.
+2. **Prepare the server** as for any installation: [the server](#the-server),
+   [DNS](#1-dns) and [the OAuth App](#2-the-github-oauth-app). Then give the
+   workflow an account on it:
+   - a user that may use Docker, such as `poise` in the `docker` group, with
+     `git` installed;
+   - an empty directory for the checkout, owned by that user: `/srv/poise`,
+     unless you set `POISE_DEPLOY_PATH`;
+   - a key pair of the workflow's own, its public key in that user's
+     `~/.ssh/authorized_keys`.
+3. **Set the fork's variables and secrets** under Settings → Secrets and
+   variables → Actions (below).
+4. **Start CI with a push, then run the Deploy workflow** on the fork's
+   **Actions** tab. The fork deploys only a commit whose CI and Caller runs
+   both passed on that exact commit, so a new fork with no runs yet deploys
+   nothing until its first push has gone green; an empty commit suffices.
+   Once green, the workflow signs in to the server, brings the checkout to
+   the commit, cloning it the first time, writes `deploy/.env`, and runs
+   `deploy/install.sh` the first time and `deploy/upgrade.sh --no-pull`
+   after that. Every push to the fork's main deploys the same way once its
+   CI passes, about ten to twenty minutes later, and a deployment that
+   fails fails the run. A commit CI never tested, or one whose CI failed,
+   is refused: re-run the failed jobs and the deploy follows their success.
+   Every completion re-checks the current tip, so a re-run for an older
+   commit deploys the green tip instead of losing its deploy.
+
+The workflow reaches the server with these:
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `POISE_DEPLOY_HOST` | variable | The server's address or host name. Without it the workflow does nothing, which is why autonomio/poise itself deploys nowhere |
+| `POISE_DEPLOY_USER` | variable | The account it deploys as |
+| `POISE_DEPLOY_KNOWN_HOSTS` | variable | The server's host keys, and the jump host's, as `ssh-keyscan` prints them. The workflow connects to no other key |
+| `POISE_DEPLOY_SSH_KEY` | secret | The workflow's private key |
+| `POISE_DEPLOY_PORT` | variable | The server's SSH port, when not 22 |
+| `POISE_DEPLOY_JUMP` | variable | `user@host` of a jump host to reach the server through, when it has no address of its own on the internet |
+| `POISE_DEPLOY_PATH` | variable | The checkout, when not `/srv/poise` |
+
+Every other `POISE_` variable becomes a line of `deploy/.env`, so the
+settings [`deploy/.env.example`](../deploy/.env.example) describes are
+variables of the fork: `POISE_DOMAIN`, `POISE_GITHUB_CLIENT_ID`,
+`POISE_ADMINS`, `POISE_ACME_EMAIL` or `POISE_PROXY_LISTEN`, and whichever
+others you need. The OAuth App's client secret is the secret
+`POISE_GITHUB_CLIENT_SECRET`. The workflow writes `deploy/.env` anew at every
+deployment, so change settings in the fork, not on the server, and run the
+workflow to apply them. A run started by hand checks the same gate, so
+applying settings needs green CI on the tip too. Of what a run brings, only `deploy/.env` stays on the
+server: the checkout fetches with the run's own token, which expires with the
+run, and the settings reach the server over SSH alone, never on a command
+line.
+
+**Google OAuth client settings.** To supply an optional Google client through
+Actions, add
+`POISE_GOOGLE_CLIENT_ID` as an Actions repository **variable** and
+`POISE_GOOGLE_CLIENT_SECRET` as an Actions repository **secret**. Set both
+together; leaving both unset omits Google client credentials from the generated
+deployment environment. The Deploy workflow
+rejects an incomplete pair or a Google secret stored as a variable before
+contacting the server. It rewrites both values into the protected `deploy/.env`
+on each deployment, so configure them in Actions rather than editing that file.
+
+**Serving the fork's own releases.** Set `POISE_RELEASE_REPO` to the fork,
+as an Actions variable like the settings above. The gateway then serves the
+fork's Poise Link installer links to every workspace's Settings, and each
+workspace attributes its release to the fork once its container is recreated.
+Tag `link-v*` in the fork to publish its own Poise Link builds; until then
+the links point at releases that do not exist yet.
+
+**Keeping up with autonomio/poise.** For the fork to update itself, it needs
+both of these:
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `POISE_UPSTREAM_SYNC` | variable | `true` |
+| `POISE_SYNC_TOKEN` | secret | A fine-grained personal access token for the fork, made as below |
+
+The Sync workflow then merges autonomio/poise's main into the fork's main
+every five minutes, as the **Sync fork** button on the fork's page does, and
+what that brought in deploys once its CI passes, so a merged change reaches
+the server about ten to twenty-five minutes later. GitHub may start a
+scheduled run some minutes late when it is busy.
+A change to Poise alone then reaches the running workspaces within five more
+minutes. A change to the system under `deploy/runtime/` first waits for their
+running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
+
+The token is required because GitHub never lets a workflow's own token change
+a workflow file, anything under `.github/workflows/`. autonomio/poise changes
+its workflows from time to time. Without the token, the first such change
+stops the sync, and the fork stays on the commit before it until someone
+presses **Sync fork**. The workflow uses the token for its merges only.
+Without the token the scheduled sync's merges also start no CI — a push
+the workflow token makes starts no workflow — so the deploy gate refuses
+them. Set the token and the next merged change deploys once its CI passes.
+
+To make the token, open GitHub → Settings → Developer settings → Personal
+access tokens → **Fine-grained tokens** → **Generate new token**, or this
+link, which fills in all but the repository (replace `<owner>` with the fork's
+owner):
+`https://github.com/settings/personal-access-tokens/new?name=Poise+fork+sync&target_name=<owner>&expires_in=366&contents=write&workflows=write`
+
+- **Resource owner:** the fork's owner.
+- **Repository access:** **Only select repositories**, and the fork.
+- **Permissions**, under Repositories: **Contents**: Write, and
+  **Workflows**: Write. GitHub adds **Metadata**: Read by itself.
+- **Expiration:** at most a year. When it expires the sync stops, until a new
+  token replaces it.
+
+Save it in the fork as a repository secret named `POISE_SYNC_TOKEN`: the
+fork's Settings → Secrets and variables → **Actions** → **New repository
+secret**. A secret saved under Dependabot or Codespaces does not reach the
+workflow. An organization secret does only when its repository access
+includes the fork; one limited to private repositories never reaches a public
+fork. To check, run the Sync workflow by hand: its log shows
+`WORKFLOW_TOKEN_ONLY: false` once it has the token.
+
+A fork with commits of its own can conflict with autonomio/poise; the sync
+then fails and leaves the merge to you.
+
+## In a virtual machine on a shared server
+
+The gateway drives the Docker Engine of the machine it runs on, which amounts
+to root there (see [Security](#security)). On a server that runs other
+services too, give Poise a virtual machine of its own, so that neither the
+gateway nor an agent in a workspace can reach those services. Vaquum's
+deployment runs this way, with libvirt on an Ubuntu host:
+
+1. **A network of its own.** A libvirt NAT network, such as
+   `192.168.150.0/24` with the host at `.1` and the VM fixed at `.10` by its
+   MAC address, gives the VM the internet, and nothing outside the host can
+   open a connection into it.
+2. **A traffic filter.** A libvirt network filter on the VM's interface drops
+   what the VM sends to every private range and to the host's own public
+   addresses, so it reaches none of the host's services, containers or other
+   VMs. It lets through DNS and DHCP to the host, and the answers to the
+   host's connections to the VM's SSH and to the gateway:
+
+   ```xml
+   <filter name='poise-isolation' chain='root'>
+     <filterref filter='clean-traffic'/>
+     <rule action='accept' direction='out' priority='-905'>
+       <tcp dstipaddr='192.168.150.1' srcportstart='22' state='ESTABLISHED'/>
+     </rule>
+     <rule action='accept' direction='out' priority='-904'>
+       <tcp dstipaddr='192.168.150.1' srcportstart='8080' state='ESTABLISHED'/>
+     </rule>
+     <rule action='accept' direction='out' priority='-900'>
+       <udp dstipaddr='192.168.150.1' dstportstart='53'/>
+     </rule>
+     <rule action='accept' direction='out' priority='-899'>
+       <tcp dstipaddr='192.168.150.1' dstportstart='53'/>
+     </rule>
+     <rule action='accept' direction='out' priority='-898'>
+       <udp srcportstart='68' dstportstart='67'/>
+     </rule>
+     <rule action='drop' direction='out' priority='-850'><all dstipaddr='10.0.0.0' dstipmask='8'/></rule>
+     <rule action='drop' direction='out' priority='-849'><all dstipaddr='172.16.0.0' dstipmask='12'/></rule>
+     <rule action='drop' direction='out' priority='-848'><all dstipaddr='192.168.0.0' dstipmask='16'/></rule>
+     <rule action='drop' direction='out' priority='-847'><all dstipaddr='169.254.0.0' dstipmask='16'/></rule>
+     <rule action='drop' direction='out' priority='-846'><all dstipaddr='100.64.0.0' dstipmask='10'/></rule>
+     <rule action='drop' direction='out' priority='-845'><all dstipaddr='203.0.113.10'/></rule>
+     <rule action='drop' direction='inout' priority='-844'><ipv6/></rule>
+   </filter>
+   ```
+
+   Write one rule like the one for `203.0.113.10` for each public address of
+   the host. From inside the VM, check that the internet answers and the
+   host does not.
+3. **The VM.** Ubuntu 24.04 from Ubuntu's cloud image, checked against its
+   signed checksums, sized as the server would be ([The server](#the-server)).
+   Install Docker Engine and its Compose plugin from Docker's repository, and
+   gVisor from gVisor's, and set `POISE_WORKSPACE_RUNTIME=runsc` and
+   `POISE_WORKSPACE_DNS` ([Security](#security)).
+4. **The host's proxy in front.** Set `POISE_PROXY_LISTEN` to the VM's
+   address, `192.168.150.10:8080`, and have the host's proxy send Poise's
+   names there ([Behind your own proxy](#behind-your-own-proxy)). The filter
+   above lets the answers through.
+5. **Deploying from a fork** reaches the VM through the host. Give the
+   workflow an account on the host that can do nothing but forward a
+   connection to the VM's SSH, and set `POISE_DEPLOY_JUMP` to it and
+   `POISE_DEPLOY_HOST` to the VM's address. Create the account without a
+   shell (`/usr/sbin/nologin`) and put the workflow's public key in its
+   `~/.ssh/authorized_keys` with these restrictions:
+
+   ```text
+   restrict,port-forwarding,permitopen="192.168.150.10:22" ssh-ed25519 AAAA… poise-deploy
+   ```
+
+   `permitopen` limits only the connections the key opens through the host;
+   `port-forwarding` would also let it listen on the host (`ssh -R`). Allow
+   the account local forwarding alone in the host's SSH server, in a file of
+   its own such as `/etc/ssh/sshd_config.d/poise-deploy.conf`, check it with
+   `sudo sshd -t`, and reload SSH:
+
+   ```text
+   Match User poise-deploy
+   	AllowTcpForwarding local
+   	PermitOpen 192.168.150.10:22
+   	PermitListen none
+   	PermitTTY no
+   	X11Forwarding no
+   	AllowAgentForwarding no
+   	AllowStreamLocalForwarding no
+   ```
+
+## People
+
+A GitHub login may sign in when it is an admin, on the allow list, or an
+active member of an organisation in `POISE_ALLOWED_ORGS`.
+
+- **Add someone** on the admin page under the allow list, or list their login
+  in `POISE_ALLOWED_USERS` and run `deploy/install.sh`. For a whole
+  organisation, add it to `POISE_ALLOWED_ORGS`; membership is checked at every
+  sign-in.
+- **Remove someone** from the allow list on the admin page. A login that comes
+  from `POISE_ALLOWED_USERS` can only be removed there, followed by
+  `deploy/install.sh`. Removal takes effect on their next request; their
+  workspace keeps running until you stop it.
+- **Disable someone** on the admin page to cut them off at once, however they
+  got access: their sessions end, their Poise Link devices are revoked,
+  sign-in is refused and their workspace stops. Enabling them lets them sign
+  in and pair again. Disabling is also how to cut off an organisation member
+  before their next sign-in.
+
+A person's data stays in their home volume after they are removed or
+disabled. To delete it for good, stop their workspace, then remove the
+container and the volume: `docker rm poise-ws-<handle>` and
+`docker volume rm poise-home-<handle>`. This cannot be undone.
+
+### What each person does first
+
+1. Sign in at `https://poise.example.com/` and choose **Open your
+   workspace**. It lives at `https://<your login>.poise.example.com/`. Its
+   first start takes about a minute, behind a page that reloads by itself,
+   and the provider CLIs install in the background over the next few
+   minutes.
+2. In **Settings → Accounts**, under **Connected accounts**, choose
+   **Connect** for each agent CLI you use (Claude, Codex, Grok, Muse,
+   Antigravity) and for **GitHub**. Each opens a terminal in the panel running
+   that CLI's own login. Connect GitHub twice: sign in once as your own GitHub
+   account and once as your agent account.
+3. In **Settings → General → GitHub**, set **Your GitHub account** and
+   **GitHub automation account**. Both must be signed in to `gh` in the workspace. Poise
+   acts on GitHub only as these two accounts, and every automation that posts
+   reviews or comments fails, saying so, until the agent account is set.
+   There is no server-wide default: `REVIEW_AGENT_USERNAME` only seeds the
+   agent account on a personal computer. Then add the organisations and
+   accounts to work with under **GitHub accounts**.
+4. In **Behaviors**, choose where your automations act before you turn them
+   on. The pull-request behaviors act in every repository of your accounts
+   except those ticked under **Skip repositories** in their Setting; Review
+   New Issues reviews only the repositories you opt in. Colleagues can
+   automate the same repositories: each person's automations act only as
+   their own agent account.
+5. Install [Poise Link](Poise-Link.md) on your computer and pair it with
+   `poise.example.com`. It keeps Espanso's snippets in sync and shows Poise's
+   alerts while the browser is closed. On macOS or on Debian and Ubuntu, one
+   command installs it, with Espanso when that is missing; Settings →
+   Accounts → Poise Link shows it too, and is where you approve the code
+   Poise Link shows:
+
+   ```bash
+   curl -fsSL https://github.com/autonomio/poise/releases/latest/download/install.sh | sh
+   ```
+
+## Upgrades
+
+```bash
+deploy/upgrade.sh
+```
+
+It pulls the newest commit of the branch the checkout follows (fast-forward
+only), rebuilds the workspace image, lets Compose recreate Caddy or the
+gateway if they changed, and lists the workspaces that run an older image.
+A fork that deploys itself does this once CI passes on what a push to its
+main brought ([Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
+
+It then proves the deploy landed: for up to ten minutes it waits for every
+workspace to serve the new commit — a running one through its health check,
+a stopped one by its new image — and only then reports success. Past that it
+reports which workspaces are still pending, with the release each runs, the
+one it waits for and how long it has waited, and fails: a deploy run is
+green only once the workspaces run what it deployed. `deploy/install.sh`
+proves the same after it starts the gateway.
+Both scripts capture workspace handles before building or retagging the image,
+then retain that inventory and add any workspaces observed during verification.
+A removed container stays pending until its replacement is verified; another
+healthy workspace cannot hide a missing one.
+Each poll retains the workspace labels from its container listing before
+inspection. If a listed container vanishes before inspection, verification
+still requires that workspace across later polls and retries; it waits for
+a complete inventory instead of treating partial results as proof of success.
+The private `deploy/.env.workspace-proof` retains unfinished obligations across
+failed deploys and retries, and is cleared after successful verification.
+It proves handles captured by these scripts; a workspace already absent before
+the first captured inventory cannot be inferred from that inventory.
+
+The gateway upgrades those workspaces by itself, when it starts and every
+five minutes. Most upgrades change Poise but not the system it runs on, and
+those happen in place: the gateway installs the new release into each
+running workspace, and Poise restarts on it alone within seconds, at a moment
+no Chat turn runs. Agents and reviews keep running through it, and the open
+page shows "Updating to the latest version" until it reloads into the new
+version (docs/Service-architecture.md, "Updates in place"). The first line of
+Poise's menu (☰) says which commit a workspace runs, linked to it on
+autonomio/poise, and when the workspace was updated to it, as in
+`46815bf · 9 Oct 21:40`.
+
+An upgrade that changes the system itself, the files under `deploy/runtime/`,
+gets a new container instead. The gateway drains a running workspace first:
+the workspace refuses new Chat turns and agent launches, which then answer
+that Poise is installing an update, and lets running work finish. One Chat
+turn holds the drain at most 30 minutes: past that the workspace stops it
+with a notice in its transcript, naming the update, and the agent keeps its
+context for the next prompt. Once an admitted drain reports the workspace idle
+the gateway recreates the container on the new image with the same home volume;
+past `POISE_DRAIN_TIMEOUT` seconds (90 minutes by default) it recreates a
+workspace that confirmed busy work behind an admitted drain or that it can no
+longer reach, cutting only work that would not settle, and releases one whose
+drain was never admitted or whose answers only timed out or were refused for
+the next pass (`workspace.upgrade.aborted`). After starting the replacement it
+waits for its health before declaring the upgrade finished, within the two-minute
+idle-to-ready bound; past it the miss is recorded (`workspace.upgrade.ready.missed`),
+a late answer still reports its measured `readyAfterMs`, and one that never answers
+is left for the next visit to bring up. A stopped workspace
+is recreated without being started. Follow it all in the gateway's log:
+
+```bash
+docker logs --follow poise-gateway 2>&1 | grep workspace.
+```
+
+When Compose recreates the gateway, the new container is on none of the
+workspace networks the old one had joined. The gateway joins them all as it
+starts, before it answers or upgrades anything, so it reaches each running
+workspace to drain it; `deploy/upgrade.sh` and `deploy/install.sh` check that
+it did, and stop with a message if not. If the gateway cannot join a
+workspace's network, that workspace's upgrade fails with the reason
+(`workspace.upgrade.failed`) and is tried again five minutes later, rather
+than recreating the workspace undrained. The old gateway lets in-flight
+requests finish for up to ten seconds while the front retries dials for
+thirty, so a replacement reads as a brief delay, not 502s.
+
+To roll back, check out the earlier commit and apply it without pulling;
+return to the branch the same way:
+
+```bash
+git checkout <commit>
+deploy/upgrade.sh --no-pull
+git checkout main
+deploy/upgrade.sh
+```
+
+Every upgrade keeps the previous image under its commit tag, for a rollback
+to rebuild from cache. Once Poise is up, `deploy/install.sh` and
+`deploy/upgrade.sh` remove what older builds left: workspace images of
+earlier commits that no container uses, Poise's images that lost their tag
+to a newer build, and Docker's build cache beyond 5 GB (`build_cache_limit`
+in `deploy/lib.sh`; the cache is shared with the server's other builds). List
+what is left with `docker image ls poise-runtime` and `docker system df`.
+
+Settings that shape a workspace container (its limits and runtime) apply to
+containers the gateway creates from then on. To apply them to an existing
+workspace, stop it on the admin page and remove its container with
+`docker rm poise-ws-<handle>`; its home volume stays, and its next visit
+creates it again.
+
+`POISE_DRAIN_TIMEOUT` is different: the gateway passes it to every workspace,
+which lets a drain the gateway stopped renewing lapse by the same value, so
+the two must agree. After you change it and run `deploy/install.sh`, the
+gateway recreates every workspace the way it does for a new image: a running
+one drained first, a stopped one without starting it. It may be at most
+604800 seconds, a week.
+
+## Backups
+
+```bash
+deploy/backup.sh [DIRECTORY]
+```
+
+It backs up the gateway's volume and every home volume into a new directory
+named after the time (UTC), in `DIRECTORY` or `deploy/backups`, while
+everything keeps running. Each volume becomes one gzipped tar beside a
+`SHA256SUMS` file. SQLite databases go in as snapshots taken with SQLite's
+online backup, so each is consistent even while Poise writes to it; their
+`-wal` and `-shm` files stay out. Everything else is archived as it is, with
+owners and permissions.
+
+A backup holds every person's signed-in CLIs and the gateway's signing key,
+so only the user who made it can read it. Copy it off the server; a backup on
+the same disk does not survive the disk. To run it nightly, add a line like
+this to root's crontab (`sudo crontab -e`):
+
+```cron
+0 3 * * * /srv/poise/deploy/backup.sh /var/backups/poise >>/var/log/poise-backup.log 2>&1
+```
+
+Not in a backup: `deploy/.env` (keep a copy somewhere safe; it holds the
+OAuth App's client secret), Caddy's certificates (it obtains new ones) and
+the images (the scripts build them).
+
+A workspace that runs under gVisor (`POISE_WORKSPACE_RUNTIME=runsc`) is
+outside the reach of SQLite's locks from the backup's container, so a busy
+one may be caught mid-write; `deploy/backup.sh` warns about each. Stop such a
+workspace on the admin page before the backup when you need a copy that is
+certainly consistent.
+
+## Restore
+
+```bash
+deploy/restore.sh BACKUP
+```
+
+`BACKUP` is one of the directories `deploy/backup.sh` writes. The script
+checks the archives against `SHA256SUMS`, then creates each volume anew and
+fills it, keeping owners and permissions. It never overwrites a volume: if
+one already exists it stops before touching anything, and if it fails it
+removes the volumes it created.
+A successful restore also clears any unfinished host deployment proof: restored
+home volumes intentionally wait for their owner's next visit to create a container.
+
+**On a new server**, for example after losing the old one:
+
+1. Install Docker, clone the repository and write `deploy/.env` with the same
+   `POISE_DOMAIN` as before (see [Settings](#3-settings)).
+2. Copy the backup directory to the server and run
+   `deploy/restore.sh <backup directory>`.
+3. Run `deploy/install.sh`, then point DNS at the new server.
+
+Everyone's sessions, devices and workspaces come back as they were; each
+workspace container is created again on its owner's next visit.
+
+**On the same server**, to go back to a backup, remove what it replaces
+first. This deletes the current data of the gateway and of every workspace:
+
+```bash
+cd deploy
+docker compose down
+docker rm --force $(docker ps --all --quiet --filter label=poise.managed=true)
+docker volume rm poise-gateway-data $(docker volume ls --quiet --filter name=poise-home-)
+./restore.sh <backup directory>
+./install.sh
+```
+
+## Disk
+
+The gateway measures every workspace's home volume and the free space of the
+disk its data lives on when it starts and every hour. Settings → Admin and
+the admin page show both. The gateway logs `disk.workspace.over_budget` when
+a workspace grows past `POISE_WORKSPACE_DISK_BUDGET` (50 GB by default), and
+`disk.low` when less than a tenth of the disk is free. Each is logged once,
+until it clears. Both Admin views show these capacity warnings in amber;
+failed operations, such as a workspace that could not start, remain red.
+
+What grows in a home volume is each person's own: their provider CLIs, Chat
+history, the GitHub indexes Poise reads, and the repositories agents check
+out. Review checkouts are removed a day after their last use. Old images and
+build cache are removed after each deploy ([Upgrades](#upgrades)).
+
+### Storage maintenance
+
+Each workspace also cleans itself: every 6 hours, whenever its own disk
+passes 80% used, and on demand from Settings → Storage, which shows the
+storage breakdown and the last run. A run removes a closed session's scratch
+workspace after 24 hours when its tree is clean and nothing is unpushed,
+requiring a remote-tracking ref to contain every local branch tip and any
+detached HEAD; remote-less committed work stays held. Open idle sessions keep
+their artifacts: directory names and Git ignore rules do not prove that an
+entry can be regenerated. Artifact pruning requires recorded generator
+provenance, which existing workspaces do not have. Any legacy prune marker
+still restores dependencies on the next turn. Maintenance takes the checkout
+lease and rechecks turn claims before tidying its Git data. It expires
+incident snapshots after 30 days unless pinned with a
+`KEEP` file, and caps the pip, uv, npm and GitHub-mirror caches with
+least-recently-used eviction. Workspace content with uncommitted or unpushed
+work stays held, and a running or queued turn blocks all workspace maintenance;
+everything kept is listed
+as held with the reason, and every run is logged with the bytes it reclaimed.
+GitHub mirrors are evicted through Caller's local `--prune-mirrors` behavior,
+which shares checkout's per-repository lock and keeps owner directories and
+lock files. A recent descendant write, a busy lock or uncertain bare-mirror
+identity holds the mirror; symlinks are never followed for deletion.
+Resuming a removed managed workspace creates only its empty private path
+before constructing the canonical lease. Ownership/Git initialization and
+the post-wait existence check run under that same held lease. Foreign
+markers are refused; an unsettled initializer worker keeps its lease.
+
+Settings → General reads a cached storage summary: one scan answers
+concurrent requests, and its observation answers Settings opens for 60
+seconds. Each read walks at most 100,000 entries or 5 seconds across every
+category; a category past either bound reports partial (a measured prefix)
+or unavailable, while a missing directory still reads as zero. When a
+refresh fails, the panel keeps the last update, marked stale with its age
+and the refresh error; a failed first read, and a read that never answers
+within 15 seconds, show an error instead. Partial, stale and failed reads
+offer Retry, which re-measures at once (`GET /api/storage?fresh=1`). A
+completed maintenance run drops the cached summary, so the next open
+measures the reclaimed space.
+
+### Giving space back on a VM host
+
+When Poise runs [in a virtual machine](#in-a-virtual-machine-on-a-shared-server),
+freed guest blocks only return to the host if the disk passes discards
+through. Without that, the image keeps growing while the guest reports free
+space. On the libvirt host, set `discard='unmap'` on the VM's disk (with the
+VM shut down, `virsh edit` the domain and find the `<driver>` line of its
+disk):
+
+```xml
+<driver name='qemu' type='qcow2' discard='unmap'/>
+```
+
+Then start the VM and compare the guest's `df` against the host's
+`virsh domblkinfo` allocation: after the guest trims, the two agree again.
+The guest side needs nothing from the operator: each maintenance run issues
+`fstrim` on the home volume when the tool is available.
+
+## Logs
+
+From `deploy/`:
+
+- `docker compose logs --follow gateway`: one JSON object per line, each with
+  an `event`, such as `auth.signed_in`, `workspace.container.started`,
+  `workspace.upgrade.finished`, and every refusal and error.
+- `docker compose logs --follow caddy`: certificates and Caddy's errors.
+
+A workspace logs to `docker logs --follow poise-ws-<handle>`. The provider
+CLI installation logs inside it:
+`docker exec poise-ws-<handle> cat /home/poise/.poise/logs/cli-bootstrap.log`.
+
+Docker keeps container logs without a size limit unless told otherwise.
+Poise's own containers need nothing: Caddy and the gateway (in
+`deploy/compose.yaml`) and every workspace (set by the gateway) keep at most
+five log files of 20 MB each. A workspace created before this limit gets it
+when it is next recreated. For other containers on the server, set a default
+in `/etc/docker/daemon.json` and restart Docker:
+
+```json
+{ "log-driver": "json-file", "log-opts": { "max-size": "20m", "max-file": "5" } }
+```
+
+## Health
+
+Each workspace answers three levels of health:
+
+- `GET /api/health/live` is liveness: 200 whenever the process answers. It
+  performs no I/O, so no dependency can slow it down.
+- `GET /api/health` adds readiness: `readiness` says whether interactive
+  work can trust its dependencies, `dependencies` names each one (ledger,
+  datastore per organization, GitHub quota per account, local collection),
+  and `history` keeps cumulative ledger loss. These fields are additive:
+  the response's status code and `status` keep the meaning existing
+  monitors read.
+- `GET /api/service/health` is the gateway's contract: startup readiness,
+  release switching and drain polling. The container health check probes it.
+
+A degraded dependency never changes a status code. Alert on
+`readiness.status` and the `dependencies` entries rather than on the
+process existing. Ledger queue stalls, worker failures and capture loss
+also alert through Poise Link and the page's notices.
+
+A responsive health endpoint does not prove that PR automation is making
+progress. During a service-mode drain, `/api/health` can still report
+`scheduler.status: ok` and `selfUpdate.draining: false`. Read the workspace's
+actual drain state from its loopback service endpoint:
+
+```bash
+docker exec poise-ws-<handle> curl -fsS http://127.0.0.1:5555/api/service/health
+```
+
+`draining: true` pauses new PR reviews and approvals while running work
+settles. The gateway reports a recreate drain in `workspace.drain.waiting`,
+including its blockers and `remainingSeconds`; an in-place release switch
+uses `workspace.update.waiting`. `switching` alone does not pause behaviors.
+Missing gateway events do not disprove a drain: when renewals stop, the drain
+lasts until its lapse timeout ([Upgrades](#upgrades)).
+
+Provider failures appear in `/api/health` under `scheduler.failures`, with
+`diagnostic.code` and `lastFailureAt`. Old failures remain visible during a
+drain, so compare their timestamps with the admission pause. Check recent
+outcomes for the PR in the [behavior ledger](Behavior-ledger.md#read-interface);
+an empty or stale result does not prove no work is running—check its `health`.
+
+## Troubleshooting
+
+- **`install.sh` says a port is in use.** Another web server holds port 80
+  or 443; stop it, or run Poise behind it
+  ([Behind your own proxy](#behind-your-own-proxy)).
+  `sudo ss -ltnp 'sport = :443'` names it.
+- **The gateway keeps restarting.** `docker compose logs gateway` lists every
+  setting it refused, each with the reason.
+- **The browser warns about the certificate.** For the apex, check the DNS
+  records and that ports 80 and 443 are open to the internet;
+  `docker compose logs caddy` shows each attempt. Let's Encrypt limits how
+  often it issues for one name, so fix the cause before retrying with
+  `docker compose restart caddy`. A workspace host gets its certificate only
+  after its owner has signed in at the apex once.
+- **GitHub shows "The redirect_uri is not associated with this
+  application".** The OAuth App's callback URL must be exactly
+  `https://<POISE_DOMAIN>/auth/callback`.
+- **Sign-in ends with "GitHub refused the sign-in code".** The client ID or
+  secret in `deploy/.env` does not belong to the OAuth App; correct it and run
+  `deploy/install.sh`.
+- **Sign-in says the login is not allowed.** Add it on the admin page, or
+  check `POISE_ALLOWED_ORGS` and the organisation's OAuth App approval.
+- **A workspace stays on "Starting your workspace".** The page shows the last
+  start error, and the gateway logs `workspace.start.failed` with the reason.
+  If the workspace image is missing, run `deploy/install.sh`.
+- **A workspace still runs the old image after an upgrade.** The gateway
+  waits up to `POISE_DRAIN_TIMEOUT` for a busy workspace. Look for
+  `workspace.drain.waiting` (what it waits on and the time left),
+  `workspace.drain.unconfirmed` (the drain was never admitted),
+  `workspace.upgrade.aborted` and `workspace.drain.released` (a slow workspace
+  freed for the next pass), `workspace.update.waiting` and
+  `workspace.update.stuck` (an in-place switch waiting or stuck), and
+  `workspace.upgrade` and `workspace.network` events in its log.
+  `readyAfterMs` on `workspace.upgrade.finished` says how long the replacement
+  took to answer health; past the two-minute idle-to-ready bound the miss is
+  recorded as `workspace.upgrade.ready.missed` alongside it, and a replacement
+  that never answers is left for the next visit to bring up.
+- **`install.sh` or `upgrade.sh` says the gateway is not on a workspace's
+  network.** The gateway joins every workspace's network as it starts, and
+  `docker logs poise-gateway 2>&1 | grep workspace.network` says why it could
+  not. Fix that, then run `docker compose restart gateway` from `deploy/`.
+- **The disk fills up.** Remove old images and build cache (see
+  [Upgrades](#upgrades)); `docker system df` shows where the space goes.
+
+## Security
+
+- **The gateway is root on the server.** It manages workspaces through the
+  Docker socket, which gives full control of the host to whoever controls
+  the gateway. Keep the server for Poise alone, keep the checkout up to date,
+  and limit who can log in to it. Whoever is root on the server can read
+  every person's data and signed-in CLIs, so people must trust its operator.
+- **Workspaces are isolated containers.** Each runs as an unprivileged user
+  with every Linux capability dropped, `no-new-privileges`, and memory, CPU
+  and process limits. Its network is shared with the gateway only, so no
+  workspace can reach another, and it publishes no ports. Agents inside a
+  workspace run with full access and no sandbox: anything an agent does can
+  touch everything in that person's workspace, and it can reach the
+  internet.
+- **gVisor** adds a second boundary. Workspaces share the host's kernel; with
+  [gVisor](https://gvisor.dev/docs/user_guide/install/) each one runs on its
+  own application kernel instead. Install `runsc`, register it with Docker
+  (`sudo runsc install`, then `sudo systemctl reload docker`), set
+  `POISE_WORKSPACE_RUNTIME=runsc` in `deploy/.env` and run
+  `deploy/install.sh`. It applies to workspace containers created from then
+  on (see [Upgrades](#upgrades)). Set `POISE_WORKSPACE_DNS` with it, to
+  resolvers such as `1.1.1.1,8.8.8.8`. gVisor cannot reach the DNS server
+  Docker gives containers on their own networks, so without it a workspace
+  resolves no host: it installs no provider CLI and cannot reach GitHub. The
+  gateway mounts a file naming those resolvers over each workspace's
+  `/etc/resolv.conf`, and recreates a workspace whose resolvers differ.
+- **Sign-in and sessions.** Caddy, or your own proxy, serves everything over
+  TLS. Session cookies are `Secure`, `HttpOnly` and `SameSite=Lax`, and no
+  cookie the browser sends ever reaches a workspace. A workspace host
+  serves its owner only; an admin gets no access to it either. The gateway
+  stores no GitHub token, and keeps only hashes of session ids, tickets and
+  device tokens.
+- **Secrets on disk**: the OAuth App's client secret in `deploy/.env`, the
+  gateway's signing key in `poise-gateway-data`, and each person's CLI
+  credentials in their home volume. Backups hold the last two.
+
+### Diagnostic history
+
+[Logging](Logging.md#collection-and-operation) defines independent local and
+central stores, retention limits, source coverage, the operator CLI and external
+proxy delivery. `poise-gateway-data` backups include the central SQLite history;
+workspace replacement/removal does not remove that history. Missing host
+journals or incompatible workspace versions are visible collection gaps.

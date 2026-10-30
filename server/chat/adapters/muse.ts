@@ -1,0 +1,1657 @@
+import { compactionWaiter } from './compaction'
+import { appendMemories } from '../memory-content'
+// Muse adapter: one `muse serve` process per session, speaking the Muse
+// Session Protocol (MSP v1, Muse 1.3.0; types in server/chat/generated/muse/
+// msp.d.ts — regenerate with `muse schema generate-ts`).
+// `turn/foregroundCompleted` (Muse 1.4.x) is outside the generated union,
+// so it is subscribed by raw name like session/started.
+//
+// Shape of a session:
+//   initialize → initialized → model/list → session/start | session/resume |
+//   session/fork, then one `turn/start` per prompt. Every command carries a
+//   client-minted UUIDv7 `commandId` (Muse's idempotency handle; the turn id
+//   of a fresh turn is that same command id). The turn streams as view
+//   notifications keyed by item id and ends with `turn/completed`.
+//
+// Approvals arrive as an `approval/requested` notification and — for clients
+// that announce dialog support — also as an `approval/request` server request;
+// the same is true of `userInput/request(ed)`. Both forms are honoured and
+// de-duplicated by their id, since answering twice is a wire error (-32056 in
+// the recorded trace). The decision goes back through `approval/decide`.
+//
+// Muse offers "always allow in this workspace" choices that would write to the
+// user's own Muse config (`localPersistent`). Poise keeps session-scoped grants
+// itself, so a user's "allow always" is sent to Muse as the once-only choice
+// and never as a persistent policy amendment.
+
+import { randomBytes } from 'node:crypto'
+import { basename, resolve, sep } from 'node:path'
+import type {
+  ApprovalChoice,
+  ApprovalDecideParams,
+  ApprovalDecideResult,
+  ApprovalRequestParams,
+  ApprovalUpdatedParams,
+  ApprovalResolvedParams,
+  ApprovalListPendingParams,
+  ApprovalListPendingResult,
+  InitializeParams,
+  InitializeResult,
+  Item,
+  ItemCompletedParams,
+  ItemDeltaParams,
+  ItemStartedParams,
+  ItemUpdatedParams,
+  ModelListParams,
+  ModelListResult,
+  MspMethod,
+  MspNotification,
+  MspServerRequest,
+  ReasoningEffort,
+  SessionCompactParams,
+  SessionCompactResult,
+  SessionForkParams,
+  SessionForkResult,
+  SessionModelChangedParams,
+  SessionReasoningEffortChangedParams,
+  SessionResumeParams,
+  SessionResumeResult,
+  SessionSetApprovalModeParams,
+  SessionSetApprovalModeResult,
+  SessionSetModelParams,
+  SessionSetModelResult,
+  SessionSetReasoningEffortParams,
+  SessionSetReasoningEffortResult,
+  SessionStartParams,
+  SessionStartResult,
+  SessionStatusChangedParams,
+  SessionTokenUsageParams,
+  TurnCompletedParams,
+  TurnInputPart,
+  TurnInterruptParams,
+  TurnInterruptResult,
+  TurnStartParams,
+  TurnStartResult,
+  TurnStartedParams,
+  TurnSteerParams,
+  TurnSteerResult,
+  TurnUnqueueParams,
+  TurnUnqueueResult,
+  TurnUnqueuedParams,
+  UserInputAnswer,
+  UserInputAnswerParams,
+  UserInputAnswerResult,
+  UserInputCancelParams,
+  UserInputCancelResult,
+  UserInputRequestParams,
+  ViewSubscribeParams,
+  ViewSubscribeResult,
+} from '../generated/muse/msp'
+import { CHAT_LIMITS } from '../protocol'
+import type { ChatEvent, ContentBlock, PermissionOption, PermissionOptionKind, PromptInput, Question, ToolKind, ToolLocation, ToolStatus, TurnUsage } from '../protocol'
+import { StdioRpc, outboundRequests } from '../rpc'
+import { AdapterError } from './types'
+import type { Adapter, AdapterHost, AdapterStartOptions, AdapterStartResult, AgentProcess, ReplayInit, TurnResult } from './types'
+import { forMuse, type Skipped } from '../../extensions/types'
+import { assertMuseContributor } from '../../models'
+import pkg from '../../../package.json'
+
+const AGENT = 'muse' as const
+const LABEL = 'Muse'
+
+const CAPABILITIES = {
+  steer: true,
+  fork: true,
+  thought: true,
+  plan: false,
+  commands: false,
+  modes: false,
+  permissions: true,
+  questions: true,
+  resume: true,
+  images: false,
+} as const
+
+/** MSP fixes the effort vocabulary in the schema rather than per model. */
+const EFFORTS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+
+const EXIT_GRACE_MS = 3_000
+/** How long a steered message may take to start its native turn (observed
+ *  ~0.1 s on 1.3.0; the bound only catches a message that never runs). */
+const STEER_SETTLE_MS = 30_000
+const OUTPUT_FLUSH_MS = 150
+const TRUNCATION_MARKER = '\n… [output truncated by Poise]'
+/** `turn/foregroundCompleted` firings one native turn of a worker session
+ *  may see before Poise ends it: the first is the model ending its work
+ *  (reminders may still nudge it once — verify-reminder catching an
+ *  unverified "done" is the useful case); the second proves a blocking
+ *  reminder is holding a finished turn open, so the Poise turn ends as
+ *  end_turn and the native turn is interrupted. 1.3.x never sends the
+ *  notification; those loops are caught by the runtime's no-op guard. */
+const WORKER_FOREGROUND_COMPLETION_LIMIT = 2
+
+// ── Generated-type pins ─────────────────────────────────────────────────
+// msp.d.ts only lists method names as string unions, so the params/result
+// pairing is declared here and checked against those unions: a Muse release
+// that drops a method or renames a notification fails the typecheck.
+
+interface Methods {
+  'initialize': { params: InitializeParams, result: InitializeResult }
+  'model/list': { params: ModelListParams, result: ModelListResult }
+  'session/start': { params: SessionStartParams, result: SessionStartResult }
+  'session/resume': { params: SessionResumeParams, result: SessionResumeResult }
+  'session/fork': { params: SessionForkParams, result: SessionForkResult }
+  'session/compact': { params: SessionCompactParams, result: SessionCompactResult }
+  'session/setApprovalMode': { params: SessionSetApprovalModeParams, result: SessionSetApprovalModeResult }
+  'session/setModel': { params: SessionSetModelParams, result: SessionSetModelResult }
+  'session/setReasoningEffort': { params: SessionSetReasoningEffortParams, result: SessionSetReasoningEffortResult }
+  'view/subscribe': { params: ViewSubscribeParams, result: ViewSubscribeResult }
+  'turn/start': { params: TurnStartParams, result: TurnStartResult }
+  'turn/steer': { params: TurnSteerParams, result: TurnSteerResult }
+  'turn/interrupt': { params: TurnInterruptParams, result: TurnInterruptResult }
+  'turn/unqueue': { params: TurnUnqueueParams, result: TurnUnqueueResult }
+  'approval/decide': { params: ApprovalDecideParams, result: ApprovalDecideResult }
+  'approval/listPending': { params: ApprovalListPendingParams, result: ApprovalListPendingResult }
+  'userInput/answer': { params: UserInputAnswerParams, result: UserInputAnswerResult }
+  'userInput/cancel': { params: UserInputCancelParams, result: UserInputCancelResult }
+}
+type Method = keyof Methods & MspMethod
+
+interface Notifications {
+  'turn/started': TurnStartedParams
+  'turn/completed': TurnCompletedParams
+  'turn/unqueued': TurnUnqueuedParams
+  'item/started': ItemStartedParams
+  'item/updated': ItemUpdatedParams
+  'item/delta': ItemDeltaParams
+  'item/completed': ItemCompletedParams
+  'approval/requested': ApprovalRequestParams
+  'approval/updated': ApprovalUpdatedParams
+  'approval/resolved': ApprovalResolvedParams
+  'userInput/requested': UserInputRequestParams
+  'session/statusChanged': SessionStatusChangedParams
+  'session/modelChanged': SessionModelChangedParams
+  'session/reasoningEffortChanged': SessionReasoningEffortChangedParams
+  'session/tokenUsage': SessionTokenUsageParams
+}
+type Notification = keyof Notifications & MspNotification
+
+interface ServerRequests {
+  'approval/request': ApprovalRequestParams
+  'userInput/request': UserInputRequestParams
+}
+type ServerRequest = keyof ServerRequests & MspServerRequest
+
+const INITIALIZED: MspNotification = 'initialized'
+
+/** View notifications Muse sends that the transcript does not need; each is
+ *  logged once so a new Muse build stays visible in the server log. */
+const IGNORED_NOTIFICATIONS: readonly MspNotification[] = [
+
+  'userInput/settled',
+  'session/branchChanged',
+  'session/contextUsage',
+  'session/approvalModeChanged',
+  'session/goalChanged',
+  'session/todoListChanged',
+  'session/nameChanged',
+  'session/viewHealthChanged',
+  'session/listChanged',
+  'session/modelRouteUnserved',
+  'turn/retracted',
+  'turn/retryScheduled',
+  'skill/changed',
+  'usage/changed',
+  'view/gap',
+]
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+/** UUIDv7 (RFC 9562): 48-bit unix-ms timestamp, version nibble, 12 random
+ *  bits, RFC variant, 62 random bits. Muse requires v7 for `commandId`. */
+export function uuidv7(now = Date.now()): string {
+  const bytes = randomBytes(16)
+  const ms = BigInt(now)
+  for (let index = 0; index < 6; index++) bytes[index] = Number((ms >> BigInt(8 * (5 - index))) & 0xffn)
+  bytes[6] = (bytes[6] & 0x0f) | 0x70
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = bytes.toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+class OutputBuffer {
+  text = ''
+  bytes = 0
+  truncated = false
+
+  append(delta: string): void {
+    if (this.truncated) return
+    const size = Buffer.byteLength(delta)
+    if (this.bytes + size <= CHAT_LIMITS.toolOutputBytes) {
+      this.text += delta
+      this.bytes += size
+      return
+    }
+    const room = Math.max(0, CHAT_LIMITS.toolOutputBytes - this.bytes)
+    this.text += Buffer.from(delta).subarray(0, room).toString('utf8') + TRUNCATION_MARKER
+    this.bytes = CHAT_LIMITS.toolOutputBytes
+    this.truncated = true
+  }
+}
+
+interface OpenTool {
+  id: string
+  kind: ToolKind
+  tool: string
+  args: unknown
+  startedAt: number
+  output: OutputBuffer
+  lastFlush: number
+  flushTimer: ReturnType<typeof setTimeout> | null
+  /** Pre-images of the files an edit-family tool targets, keyed by path,
+   *  taken while the tool waited for its approval — the one moment the
+   *  edit provably has not run yet. Without an approval round-trip there
+   *  is no such moment, and no pre-image is claimed. */
+  snapshots?: Map<string, Promise<Snapshot>>
+}
+
+/** What a file looked like at one moment, or why that could not be read. */
+type Snapshot = { ok: true, exists: boolean, text: string } | { ok: false, reason: string }
+
+function isMissingFile(error: unknown): boolean {
+  if ((error as { code?: unknown } | null)?.code === 'ENOENT') return true
+  return /ENOENT|no such file/i.test(error instanceof Error ? error.message : String(error))
+}
+
+interface ActiveTurn {
+  id: string
+  nativeId: string | null
+  done: boolean
+  interruptRequested: boolean
+  tools: Map<string, OpenTool>
+  /** Item ids whose text streamed as deltas. */
+  streamed: Set<string>
+  /** Native reminder housekeeping, never conversation content. */
+  internalItems: Set<string>
+  usage?: TurnUsage
+  /** Item completions still reading file snapshots; the turn settles after them. */
+  pending: Set<Promise<void>>
+  finishing: boolean
+  /** Accepted steers by command id, each with the runtime's correlation id
+   *  (if any): Muse either absorbs the steer into the running turn — seen
+   *  as a userMessage carrying the steer's command id — or completes the
+   *  running turn and starts a new native turn under the steer's command
+   *  id, so the Poise turn stays open until each of those ran. */
+  steers: Map<string, string | undefined>
+  /** Native turn ids this Poise turn has owned, oldest first. */
+  nativeIds: string[]
+  /** `turn/foregroundCompleted` firings per native turn, with the latest
+   *  firing's blocking agents. */
+  foreground: Map<string, { count: number, agents: string[] }>
+  endedNativeIds: Set<string>
+  cancellationRequests: Map<string, Promise<void>>
+  terminalError?: string
+  /** Muse admitted the turn behind another one; it has not launched. */
+  queued: boolean
+  /** Transcript diffs to replay verbatim instead of re-reading the disk. */
+  recalled: Map<string, { oldText: string, newText: string, oldExists: boolean, newExists: boolean }>
+  resolve: (result: TurnResult) => void
+}
+
+function toolKind(tool: string | undefined): ToolKind {
+  const name = (tool ?? '').toLowerCase()
+  if (!name) return 'other'
+  if (/^(bash|shell|sh|exec|execute|run|command|zsh|powershell)$/.test(name)) return 'execute'
+  if (/^(read|read_file|cat|view|list|ls|list_dir|list_directory|tree)$/.test(name)) return 'read'
+  if (/^(grep|glob|search|find|rg|ripgrep|code_search)$/.test(name)) return 'search'
+  if (/^(write|write_file|edit|edit_file|patch|apply_patch|multi_edit|str_replace|create_file)$/.test(name)) return 'edit'
+  if (/^(fetch|web_fetch|http|web_search|browse|curl)$/.test(name)) return 'fetch'
+  return 'other'
+}
+
+function parseArgs(raw: string | undefined): unknown {
+  if (raw === undefined) return undefined
+  try { return JSON.parse(raw) } catch { return raw }
+}
+
+function argString(args: unknown, ...keys: string[]): string | undefined {
+  if (!args || typeof args !== 'object') return undefined
+  for (const key of keys) {
+    const value = (args as Record<string, unknown>)[key]
+    if (typeof value === 'string' && value) return value
+  }
+  return undefined
+}
+
+function toolTitle(tool: string, kind: ToolKind, args: unknown): string {
+  const command = argString(args, 'command', 'cmd')
+  if (kind === 'execute' && command) return command
+  const path = argString(args, 'path', 'file_path', 'filePath', 'file')
+  if (path) return `${tool} ${basename(path)}`
+  const pattern = argString(args, 'pattern', 'query', 'url')
+  if (pattern) return `${tool} ${pattern}`
+  return tool
+}
+
+function toolLocations(args: unknown): ToolLocation[] | undefined {
+  const path = argString(args, 'path', 'file_path', 'filePath', 'file')
+  return path ? [{ path }] : undefined
+}
+
+function itemToolStatus(status: Item['status']): ToolStatus {
+  switch (status) {
+    case 'completed': return 'completed'
+    case 'failed': case 'timedOut': return 'failed'
+    case 'cancelled': case 'rejected': return 'cancelled'
+    case 'inProgress': return 'running'
+    default: return 'completed'
+  }
+}
+
+/** Muse's bash tool reports a JSON envelope in `visibleOutput`; when it parses
+ *  the terminal card gets the real output and exit code instead of the JSON. */
+function terminalFromVisibleOutput(text: string): { output: string, exitCode: number | null } | null {
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === 'object' && typeof parsed.output === 'string') {
+      return { output: parsed.output, exitCode: typeof parsed.exit_code === 'number' ? parsed.exit_code : null }
+    }
+  } catch { /* plain text */ }
+  return null
+}
+
+function boundedText(value: unknown): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? ''
+  const buffer = new OutputBuffer()
+  buffer.append(text)
+  return buffer.text
+}
+
+function choiceKind(choice: ApprovalChoice): PermissionOptionKind {
+  switch (choice.decision) {
+    case 'approved':
+      return choice.scope === 'once' ? 'allow_once' : 'allow_always'
+    case 'approvedForSession':
+    case 'approvedPolicyAmendment':
+      return 'allow_always'
+    case 'deniedPolicyAmendment':
+      return 'reject_always'
+    default:
+      return 'reject_once'
+  }
+}
+
+function withTimeout(promise: Promise<void>, ms: number): Promise<boolean> {
+  return new Promise((resolveWait) => {
+    const timer = setTimeout(() => resolveWait(false), ms)
+    void promise.then(() => { clearTimeout(timer); resolveWait(true) })
+  })
+}
+
+/** A turn that died on subscription quota ran on the account login: an API
+ *  key has no subscription quota. Say so, with where to switch. */
+function turnError(message: string): string {
+  if (!message.includes('Subscription quota exhausted')) return `${LABEL}: ${message}`
+  return `${LABEL}: ${message} Muse is running on the account login, not an API key. Switch it in Settings → Accounts → Muse → Use an API key.`
+}
+
+/** "Muse exited (code): last stderr lines" once the process is gone; the
+ *  link's own reason when it is still running (a framing failure). */
+async function exitMessage(process: AgentProcess, link: StdioRpc, fallback: Error): Promise<string> {
+  if (process.exitCode === null && process.signalCode === null) {
+    const exited = new Promise<void>((resolveExit) => process.once('exit', () => resolveExit()))
+    if (!(await withTimeout(exited, EXIT_GRACE_MS))) return fallback.message
+  }
+  const tail = link.stderr.trim().split('\n').filter(Boolean).slice(-3).join(' | ')
+  return `${LABEL} exited (${process.exitCode ?? process.signalCode ?? 'unknown'})${tail ? `: ${tail}` : ''}`
+}
+
+// ── Adapter ─────────────────────────────────────────────────────────────
+
+export function createMuseAdapter(host: AdapterHost, options: { steerSettleMs?: number, compactTimeoutMs?: number } = {}): Adapter {
+  const steerSettleMs = options.steerSettleMs ?? STEER_SETTLE_MS
+  let child: AgentProcess | null = null
+  let rpc: StdioRpc | null = null
+  let sessionId: string | undefined
+  let modelId = ''
+  let effort = ''
+  let compaction: { commandId: string, wait: ReturnType<typeof compactionWaiter>, itemId?: string } | null = null
+  const seenCompactions = new Set<string>()
+  let active: ActiveTurn | null = null
+  let lastFinishedNativeId: string | null = null
+  let closing = false
+  /** A worker chat owns no conversation: Poise wakes its turns, and
+   *  Muse-side blocking continuation is bounded instead of open-ended. */
+  let workerSession = false
+  const exitListeners: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = []
+  const loggedOnce = new Set<string>()
+  /** Approvals and questions already being answered, by their id. */
+  const pendingApprovals = new Set<string>()
+  const approvalControllers = new Map<string, AbortController>()
+  const decidedApprovalStages = new Set<string>()
+  const approvalRequests = new Map<string, ApprovalRequestParams>()
+  const resolvedApprovals = new Set<string>()
+  /** Pre-images taken for an approval whose tool item had not started yet. */
+  const preApproved = new Map<string, Map<string, Promise<Snapshot>>>()
+  const pendingUserInputs = new Set<string>()
+  /** Decisions replayed but not yet confirmed sent, confirmed at live. */
+  const pendingDecisions: Array<
+    | { kind: 'approval', approvalId: string, sourceIndex: number, choiceId: string, requirementId: ApprovalRequestParams['currentRequirementId'] }
+    | { kind: 'userInput', userInputId: string, answers: UserInputAnswer[] | null }
+  > = []
+  /** Decision receipts keyed `approval:<id>:<sourceIndex>` / `userInput:<id>`. */
+  const decisionReceipts = new Map<string, any>()
+  let replayOutbound: Buffer | null = null
+
+  function logOnce(key: string, message: string): void {
+    if (loggedOnce.has(key)) return
+    loggedOnce.add(key)
+    host.log(message)
+  }
+
+  function link(): StdioRpc {
+    if (!rpc || rpc.isClosed) throw new AdapterError(AGENT, `${LABEL} is not running`, 'exited')
+    return rpc
+  }
+
+  function call<M extends Method>(method: M, params: Methods[M]['params'], options?: { timeoutMs?: number }): Promise<Methods[M]['result']> {
+    return link().request<Methods[M]['result']>(method, params, options)
+  }
+
+  function on<M extends Notification>(method: M, handler: (params: Notifications[M]) => void): void {
+    rpc!.onNotification(method, (params) => {
+      const view = params as Notifications[M]
+      // A forked session stays subscribed on this connection; only this
+      // session's view is ours.
+      if (view.sessionId !== sessionId) return
+      handler(view)
+    })
+  }
+
+  function serve<M extends ServerRequest>(method: M, handler: (params: ServerRequests[M]) => void): void {
+    rpc!.onRequest(method, (params) => {
+      const request = params as ServerRequests[M]
+      if (request.sessionId === sessionId) handler(request)
+      // The request form is acknowledged with `{}`; the decision travels as
+      // its own command, exactly like the notification form.
+      return {}
+    }, { replayCompleted: true })
+  }
+
+  function session(): string {
+    if (!sessionId) throw new AdapterError(AGENT, `${LABEL} adapter has no session; call start() first`, 'protocol')
+    return sessionId
+  }
+
+  function turnFor(nativeTurnId: string | null | undefined): ActiveTurn | null {
+    const turn = active
+    if (!turn || turn.done || !nativeTurnId) return null
+    if (turn.nativeId === null) {
+      if (nativeTurnId === lastFinishedNativeId) return null
+      turn.nativeId = nativeTurnId
+      turn.nativeIds.push(nativeTurnId)
+    }
+    if (turn.nativeId === nativeTurnId || turn.nativeIds.includes(nativeTurnId)) return turn
+    if (turn.steers.has(nativeTurnId)) {
+      // The steer's own native turn: it belongs to this Poise turn.
+      // A queued user-message item can precede turn/started. Associate it
+      // with this turn without prematurely treating the queue as consumed.
+      turn.nativeId = nativeTurnId
+      if (!turn.nativeIds.includes(nativeTurnId)) turn.nativeIds.push(nativeTurnId)
+      return turn
+    }
+    return null
+  }
+
+  // A completed native turn with steers still to run is not the end of the
+  // Poise turn; once nothing else is still running, steers that never
+  // started are reported back, so the runtime queues them as the next
+  // prompt instead of failing a turn whose work already finished. The
+  // process is kept: nothing observed is still running on it.
+  let steerSettleTimer: ReturnType<typeof setTimeout> | null = null
+  function clearSteerSettle() {
+    if (steerSettleTimer) { clearTimeout(steerSettleTimer); steerSettleTimer = null }
+  }
+  function armSteerSettle(turn: ActiveTurn) {
+    clearSteerSettle()
+    steerSettleTimer = setTimeout(() => {
+      steerSettleTimer = null
+      if (active !== turn || turn.done) return
+      deferUnsettled(turn)
+    }, steerSettleMs)
+    steerSettleTimer.unref()
+  }
+  function deferUnsettled(turn: ActiveTurn) {
+    // A successor that launched (it left the steer set at turn/started)
+    // may still be running the turn's work: look again once it lands
+    // instead of cutting its transcript off. An id still in the steer
+    // set never launched, even if its queued input was shown.
+    if (turn.nativeIds.some(id => !turn.endedNativeIds.has(id) && !turn.steers.has(id))) { armSteerSettle(turn); return }
+    const unrun = [...turn.steers.values()].filter((id): id is string => !!id)
+    turn.steers.clear()
+    if (turn.terminalError || turn.interruptRequested) {
+      // A failed or stopped turn drops its unrun steers and reports its
+      // real outcome; only a normally finished turn defers them.
+      host.log(`${LABEL}: a steered message never ran and the turn did not finish normally, so the steer was dropped`)
+      finish(turn, turn.terminalError ? { stopReason: 'error', error: turn.terminalError } : { stopReason: 'cancelled' })
+      return
+    }
+    host.log(`${LABEL}: a steered message did not run within the settle window; the turn completes and the steer is queued as the next prompt`)
+    finish(turn, { stopReason: 'end_turn', ...(unrun.length ? { unrunSteers: unrun } : {}) })
+  }
+
+  function emit(event: ChatEvent): void {
+    host.emit(event)
+  }
+
+  function openTool(turn: ActiveTurn, item: Item): OpenTool {
+    const name = item.tool ?? item.kind
+    const kind = item.kind === 'toolCall' ? toolKind(item.tool) : 'other'
+    const args = parseArgs(item.args)
+    const title = item.kind === 'toolCall'
+      ? toolTitle(name, kind, args)
+      : item.fallbackText ?? item.objective ?? `${item.kind}${item.reminderAgentId ? ` ${item.reminderAgentId}` : ''}`
+    const tool: OpenTool = { id: item.itemId, kind, tool: name, args, startedAt: Date.now(), output: new OutputBuffer(), lastFlush: 0, flushTimer: null }
+    const early = preApproved.get(item.itemId)
+    if (early) { tool.snapshots = early; preApproved.delete(item.itemId) }
+    turn.tools.set(item.itemId, tool)
+    const locations = toolLocations(args)
+    emit({ type: 'tool.started', turnId: turn.id, id: item.itemId, kind, title, ...(locations ? { locations } : {}), ...(args !== undefined ? { input: args } : {}) })
+    return tool
+  }
+
+  function closeTool(turn: ActiveTurn, id: string, status: ToolStatus, content?: ContentBlock[], durationMs?: number): void {
+    const tool = turn.tools.get(id)
+    if (!tool) return
+    turn.tools.delete(id)
+    if (tool.flushTimer) clearTimeout(tool.flushTimer)
+    emit({ type: 'tool.finished', turnId: turn.id, id, status, ...(content?.length ? { content } : {}), durationMs: durationMs ?? Date.now() - tool.startedAt })
+  }
+
+  function outputBlock(tool: OpenTool): ContentBlock {
+    if (tool.kind === 'execute') return { type: 'terminal', text: tool.output.text, exitCode: null, ...(tool.output.truncated ? { truncated: true } : {}) }
+    return { type: 'text', text: tool.output.text }
+  }
+
+  function flushOutput(turn: ActiveTurn, tool: OpenTool): void {
+    const now = Date.now()
+    const send = () => {
+      tool.flushTimer = null
+      tool.lastFlush = Date.now()
+      if (turn.done || !turn.tools.has(tool.id)) return
+      emit({ type: 'tool.updated', turnId: turn.id, id: tool.id, status: 'running', content: [outputBlock(tool)] })
+    }
+    if (now - tool.lastFlush >= OUTPUT_FLUSH_MS) { send(); return }
+    if (!tool.flushTimer) tool.flushTimer = setTimeout(send, OUTPUT_FLUSH_MS - (now - tool.lastFlush))
+  }
+
+  /** A file's contents through the host, scoped to the checkout. A missing
+   *  file is a legitimate answer (created or deleted file); any other failure
+   *  is kept so the completion can say why no diff was recorded. */
+  function snapshot(path: string): Promise<Snapshot> {
+    return host.readTextFile(path).then(
+      (text) => ({ ok: true, exists: true, text }),
+      (error: unknown) => isMissingFile(error)
+        ? { ok: true, exists: false, text: '' }
+        : { ok: false, reason: error instanceof Error ? error.message : String(error) },
+    )
+  }
+
+  function track(turn: ActiveTurn, task: Promise<void>): void {
+    turn.pending.add(task)
+    void task.catch((error) => host.log(`${LABEL}: item completion failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => turn.pending.delete(task))
+  }
+
+  // Turn completion waits for item completions that are still reading file
+  // snapshots, so every diff lands before prompt() resolves.
+  function finish(turn: ActiveTurn, result: TurnResult): void {
+    if (turn.done || turn.finishing) return
+    turn.finishing = true
+    const settle = async () => { while (turn.pending.size) await Promise.allSettled([...turn.pending]) }
+    void settle().then(() => complete(turn, result))
+  }
+
+  function complete(turn: ActiveTurn, result: TurnResult): void {
+    if (turn.done) return
+    turn.done = true
+    clearSteerSettle()
+    if (turn.nativeId) lastFinishedNativeId = turn.nativeId
+    const straggler: ToolStatus = result.stopReason === 'end_turn' ? 'completed' : 'cancelled'
+    for (const id of [...turn.tools.keys()]) closeTool(turn, id, straggler)
+    if (active === turn) active = null
+    turn.resolve({ ...result, ...(turn.usage ? { usage: turn.usage } : {}) })
+  }
+
+  function finishIfQuiescent(turn: ActiveTurn): void {
+    if (turn.done || turn.steers.size || turn.nativeIds.some(id => !turn.endedNativeIds.has(id))) return
+    finish(turn, turn.terminalError ? { stopReason: 'error', error: turn.terminalError }
+      : { stopReason: turn.interruptRequested ? 'cancelled' : 'end_turn' })
+  }
+
+  // ── Items ───────────────────────────────────────────────────────────
+
+  function completeTool(turn: ActiveTurn, item: Item): void {
+    const tool = turn.tools.get(item.itemId) ?? openTool(turn, item)
+    const content: ContentBlock[] = []
+    const visible = item.visibleOutput ?? tool.output.text
+    if (tool.kind === 'execute') {
+      const parsed = item.visibleOutput ? terminalFromVisibleOutput(item.visibleOutput) : null
+      const buffer = new OutputBuffer()
+      buffer.append(parsed ? parsed.output : visible)
+      const exitCode = parsed?.exitCode ?? item.exitCode ?? null
+      if (buffer.text || exitCode !== null) {
+        content.push({ type: 'terminal', text: buffer.text, exitCode, ...(buffer.truncated || item.truncated ? { truncated: true } : {}) })
+      }
+    } else if (visible) {
+      content.push({ type: 'text', text: boundedText(visible) })
+    }
+    if (item.failureReason) content.push({ type: 'text', text: boundedText(item.failureReason) })
+    if (item.result?.summary) content.push({ type: 'text', text: boundedText(item.result.text ?? item.result.summary) })
+    if (item.patchSummary) {
+      content.push({ type: 'text', text: `${item.patchSummary.files} file(s) changed, +${item.patchSummary.added} −${item.patchSummary.removed}` })
+    }
+    if (tool.snapshots) {
+      track(turn, recordFileChanges(turn, tool, item, content))
+      return
+    }
+    if (tool.kind === 'edit' && item.status === 'completed') {
+      host.log(`${LABEL}: no reversible diff recorded for ${toolLocations(tool.args)?.map((l) => l.path).join(', ') || item.itemId}: the edit ran without an approval round-trip, so no moment before the write could be captured`)
+    }
+    closeTool(turn, item.itemId, itemToolStatus(item.status), content, item.durationMs)
+  }
+
+  // One diff per path with the full before/after contents, so Revert can put
+  // the exact pre-image back and detect a conflicting later edit. Muse only
+  // ships a patch summary and an opaque `patchRef` for edits (its structured
+  // patch body has no verified format here), so the pre-image comes from the
+  // approval-time read; when that could not be read (a file over the host's
+  // limit, or outside the checkout) there is nothing reversible to record:
+  // the card keeps the summary and the reason is logged.
+  async function recordFileChanges(turn: ActiveTurn, tool: OpenTool, item: Item, content: ContentBlock[]): Promise<void> {
+    for (const [path, pending] of tool.snapshots ?? []) {
+      const recalled = turn.recalled.get(`${item.itemId}\0${path}`)
+      if (recalled) {
+        // Replayed from the transcript: the disk moved on since this diff
+        // was recorded, so re-deriving it could only disagree.
+        emit({
+          type: 'diff', turnId: turn.id, toolId: item.itemId, diffId: uuidv7(), path,
+          oldText: recalled.oldText, newText: recalled.newText, oldExists: recalled.oldExists, newExists: recalled.newExists,
+        })
+        continue
+      }
+      const before = await pending
+      const after = before.ok ? await snapshot(path) : before
+      if (!before.ok || !after.ok) {
+        const reason = before.ok ? (after as { reason: string }).reason : before.reason
+        host.log(`${LABEL}: no reversible diff recorded for ${path}, its contents could not be read: ${reason}`)
+        continue
+      }
+      if (before.exists === after.exists && before.text === after.text) continue // rejected or a no-op
+      emit({
+        type: 'diff', turnId: turn.id, toolId: item.itemId, diffId: uuidv7(), path,
+        oldText: before.text, newText: after.text, oldExists: before.exists, newExists: after.exists,
+      })
+    }
+    closeTool(turn, item.itemId, itemToolStatus(item.status), content, item.durationMs)
+  }
+
+  // A steer absorbed into the running turn (1.4.x) never gets its own
+  // turn/started: its userMessage carries the steer's command id while
+  // belonging to the running turn. That steer ran. An item whose turn is
+  // the steer id itself is the successor turn's own input; the
+  // turn/started path below attaches that turn instead.
+  function observeSteeredItem(turn: ActiveTurn, item: Item): void {
+    if (item.kind !== 'userMessage' || !item.commandId || item.commandId === item.turnId) return
+    if (!turn.steers.delete(item.commandId)) return
+    if (!turn.steers.size) clearSteerSettle()
+    finishIfQuiescent(turn)
+  }
+
+  function handleItemStarted(turn: ActiveTurn, item: Item): void {
+    observeSteeredItem(turn, item)
+    if (item.kind === 'reminderChild') { turn.internalItems.add(item.itemId); return }
+    switch (item.kind) {
+      case 'toolCall':
+      case 'subagent':
+      case 'workflow':
+      case 'userShell':
+        if (!turn.tools.has(item.itemId)) openTool(turn, item)
+        return
+      default:
+        return
+    }
+  }
+
+  function handleItemCompleted(turn: ActiveTurn, item: Item): void {
+    observeSteeredItem(turn, item)
+    if (item.kind === 'reminderChild') { turn.internalItems.add(item.itemId); return }
+    switch (item.kind) {
+      case 'agentMessage':
+        if (!turn.streamed.has(item.itemId) && item.text) emit({ type: 'text.delta', turnId: turn.id, messageId: item.itemId, delta: item.text })
+        return
+      case 'reasoning': {
+        if (turn.streamed.has(item.itemId)) return
+        const text = [...(item.summary ?? []), item.text ?? ''].filter(Boolean).join('\n\n')
+        if (text) emit({ type: 'thought.delta', turnId: turn.id, messageId: item.itemId, delta: text })
+        return
+      }
+      case 'toolCall':
+      case 'subagent':
+      case 'workflow':
+      case 'userShell':
+        completeTool(turn, item)
+        return
+      default:
+        return
+    }
+  }
+
+  function observeCompaction(item: Item): void {
+    if (item.kind !== 'compaction') return
+    const current = compaction
+    if (current && (!item.commandId || item.commandId === current.commandId)
+      && item.trigger === 'manual' && (!seenCompactions.has(item.itemId) || current.itemId === item.itemId)) {
+      if (item.status === 'inProgress' || item.commandId === current.commandId) current.itemId ??= item.itemId
+      if (current.itemId === item.itemId && item.status !== 'inProgress') {
+        const ok = item.outcome === 'compacted' || item.outcome === 'noop'
+        current.wait.finish(ok ? { stopReason: 'end_turn', compaction: { changed: item.outcome === 'compacted', ...(item.reason ? { detail: item.reason } : {}) } }
+          : { stopReason: item.outcome === 'cancelled' ? 'cancelled' : 'error', error: `Muse compaction: ${item.reason || item.outcome || item.status}` })
+      }
+    }
+    seenCompactions.add(item.itemId)
+  }
+
+  function registerNotifications(): void {
+    on('turn/started', ({ turnId }) => {
+      const turn = turnFor(turnId)
+      if (!turn) return
+      turn.queued = false
+      turn.steers.delete(turnId)
+      clearSteerSettle()
+      if (turn.interruptRequested) void interrupt(turn)
+    })
+
+    on('turn/unqueued', ({ turnId }) => {
+      const turn = active
+      if (!turn || !(turn.steers.has(turnId) || turn.nativeIds.includes(turnId) || turn.nativeId === turnId)) return
+      // Reclaiming one queued steer does not stop another native turn.
+      turn.steers.delete(turnId)
+      turn.endedNativeIds.add(turnId)
+      if (!turn.nativeIds.includes(turnId)) turn.nativeIds.push(turnId)
+      finishIfQuiescent(turn)
+    })
+
+    on('item/started', ({ item }) => {
+      observeCompaction(item)
+      const turn = turnFor(item.turnId)
+      if (turn) handleItemStarted(turn, item)
+    })
+
+    on('item/updated', ({ item }) => {
+      observeCompaction(item)
+      const turn = turnFor(item.turnId)
+      if (!turn) return
+      observeSteeredItem(turn, item)
+      if (item.kind === 'reminderChild') { turn.internalItems.add(item.itemId); return }
+      if (item.status !== 'inProgress' && turn.tools.has(item.itemId)) {
+        completeTool(turn, item)
+        return
+      }
+      if (turn.tools.has(item.itemId)) {
+        emit({ type: 'tool.updated', turnId: turn.id, id: item.itemId, status: 'running', ...(item.fallbackText ? { title: item.fallbackText } : {}) })
+      }
+    })
+
+    on('item/completed', ({ item }) => {
+      observeCompaction(item)
+      const turn = turnFor(item.turnId)
+      if (turn) handleItemCompleted(turn, item)
+    })
+
+    on('item/delta', ({ itemId, field, delta }) => {
+      const turn = active
+      if (!turn || turn.done || turn.internalItems.has(itemId)) return
+      const tool = turn.tools.get(itemId)
+      if (tool) {
+        if (field === 'output' || field === undefined) {
+          tool.output.append(delta)
+          flushOutput(turn, tool)
+        }
+        return
+      }
+      if (field === undefined || field === 'text') {
+        turn.streamed.add(itemId)
+        emit({ type: 'text.delta', turnId: turn.id, messageId: itemId, delta })
+        return
+      }
+      if (field.startsWith('summary')) {
+        turn.streamed.add(itemId)
+        emit({ type: 'thought.delta', turnId: turn.id, messageId: itemId, delta })
+      }
+    })
+
+    on('turn/completed', (params) => {
+      const turn = turnFor(params.turnId)
+      if (!turn) return
+      turn.steers.delete(params.turnId)
+      turn.endedNativeIds.add(params.turnId)
+      if (params.terminal === 'cancelled') turn.interruptRequested = true
+      else if (params.terminal !== 'completed') {
+        turn.terminalError = turnError(params.error?.message ?? params.reason ?? `turn ended with ${params.terminal}`)
+        turn.interruptRequested = true
+      }
+      if (turn.steers.size > 0) {
+        // Keep the checkout until every accepted send has either run to a
+        // terminal event or been reclaimed by the native queue protocol.
+        armSteerSettle(turn)
+        if (turn.interruptRequested) void interrupt(turn)
+      }
+      finishIfQuiescent(turn)
+    })
+
+    on('session/tokenUsage', (params) => {
+      const turn = turnFor(params.turnId)
+      if (turn) turn.usage = { inputTokens: params.promptTokens, outputTokens: params.usage.outputTokens, totalTokens: params.totalTokens }
+    })
+
+    on('approval/requested', receiveApproval)
+    on('approval/updated', params => {
+      const previous = approvalRequests.get(params.approvalId)
+      if (previous) receiveApproval({ ...previous, ...params })
+    })
+    on('approval/resolved', params => {
+      resolvedApprovals.add(params.approvalId)
+      for (const [key, controller] of approvalControllers) if (key.startsWith(`${params.approvalId}:`)) controller.abort()
+    })
+    on('userInput/requested', (params) => { void handleUserInput(params) })
+
+    on('session/modelChanged', (params) => {
+      modelId = params.modelId
+      try { assertMuseContributor(modelId) } catch (error) {
+        child?.kill('SIGKILL')
+        if (active) finish(active, { stopReason: 'error', error: String(error), terminate: true })
+        host.log(String(error))
+        return
+      }
+      emit({ type: 'model.updated', model: modelId, modelId, effort, efforts: [...EFFORTS] })
+    })
+    on('session/reasoningEffortChanged', (params) => {
+      effort = params.reasoningEffort
+      emit({ type: 'model.updated', model: modelId, modelId, effort, efforts: [...EFFORTS] })
+    })
+    // Status is derived by the runtime from turn events; the attention flags
+    // duplicate the approval/userInput notifications handled above.
+    on('session/statusChanged', () => {})
+    // `session/started` and `session/closed` are outside the generated
+    // notification union, so they are subscribed by raw name. A close for
+    // this session while a turn runs unloads the native session: the turn
+    // ends with `terminate` so the runtime restarts the worker group, and
+    // the stale id is dropped so nothing else is addressed to it. While
+    // idle or compacting there is no turn to end, so the id stays and the
+    // next call addresses the session as before. Other sessions' rows
+    // (session/listChanged context) are ignored.
+    rpc!.onNotification('session/started', () => logOnce('ignored:session/started', `${LABEL}: ignoring session/started notifications`))
+    rpc!.onNotification('session/closed', (params) => {
+      const id = closedSessionId(params)
+      if (id && id !== sessionId) return
+      if (!active) {
+        logOnce('session-closed-idle', `${LABEL}: the native session was closed while idle`)
+        return
+      }
+      logOnce('session-closed', `${LABEL}: the native session was closed`)
+      sessionId = undefined
+      finish(active, { stopReason: 'error', error: `${LABEL} closed the session`, terminate: true })
+    })
+    // The model's foreground work is done and named background reminder
+    // checks hold the turn open. Explicitly non-terminal: the turn ends
+    // only at turn/completed / turn/unqueued. In a worker session the
+    // second firing for one native turn ends the Poise turn — a finished
+    // worker turn has nothing to resume for — and the native turn is
+    // interrupted so the next wake starts instead of queueing behind it.
+    rpc!.onNotification('turn/foregroundCompleted', (params) => {
+      if (!params || typeof params !== 'object') return
+      const view = params as { sessionId?: unknown, turnId?: unknown, blockingAgents?: unknown }
+      if (view.sessionId !== sessionId || typeof view.turnId !== 'string') return
+      const turn = turnFor(view.turnId)
+      if (!turn) return
+      const agents = Array.isArray(view.blockingAgents) ? view.blockingAgents.filter((agent): agent is string => typeof agent === 'string') : []
+      const seen = turn.foreground.get(view.turnId) ?? { count: 0, agents: [] as string[] }
+      seen.count += 1
+      seen.agents = agents
+      turn.foreground.set(view.turnId, seen)
+      const held = agents.join(', ') || 'unknown'
+      host.log(workerSession
+        ? `${LABEL}: foreground completed on ${view.turnId}, held open by ${held} (${seen.count}/${WORKER_FOREGROUND_COMPLETION_LIMIT})`
+        : `${LABEL}: foreground completed on ${view.turnId}, held open by ${held}`)
+      if (!workerSession || seen.count < WORKER_FOREGROUND_COMPLETION_LIMIT) return
+      // Steers the interrupt reclaims never run: report them so the
+      // runtime requeues their text instead of losing accepted messages.
+      const unrun = [...turn.steers.values()].filter((id): id is string => !!id)
+      // The interrupt first: its send is deferred, and a finished turn
+      // would skip it as done.
+      void interrupt(turn)
+      // Terminate: the Poise turn ends without waiting for native
+      // completion, so the runtime verifies the worker group dead before
+      // the checkout lease is released.
+      finish(turn, { stopReason: 'end_turn', terminate: true, ...(unrun.length ? { unrunSteers: unrun } : {}),
+        note: `Muse blocking reminders (${held}) resumed the finished turn; Poise ended it after ${seen.count - 1} allowed continuation. The turn resumes on its next wake.` })
+    })
+
+    for (const method of IGNORED_NOTIFICATIONS) {
+      rpc!.onNotification(method, () => logOnce(`ignored:${method}`, `${LABEL}: ignoring ${method} notifications`))
+    }
+  }
+
+  function closedSessionId(params: unknown): string | null {
+    if (!params || typeof params !== 'object') return null
+    const record = params as { sessionId?: unknown, session?: { sessionId?: unknown } }
+    if (typeof record.sessionId === 'string') return record.sessionId
+    if (record.session && typeof record.session === 'object' && typeof record.session.sessionId === 'string') return record.session.sessionId
+    return null
+  }
+
+  // ── Approvals and questions ─────────────────────────────────────────
+
+  function approvalTitle(params: ApprovalRequestParams): string {
+    const subject = params.subject
+    if (subject.command) return subject.command
+    if (subject.path) return `${params.toolName} ${subject.path}`
+    if (subject.host) return `${params.toolName} ${subject.host}${subject.port ? `:${subject.port}` : ''}`
+    if (subject.target) return `${params.toolName} ${subject.target}`
+    return params.toolName
+  }
+
+  /** Which choice to put on the wire for the option the user picked. An
+   *  allow-always answer becomes Muse's once-only approval: the runtime holds
+   *  the session grant, and Muse's persistent choices would edit the user's
+   *  workspace policy. */
+  function wireChoice(params: ApprovalRequestParams, optionId: string): ApprovalChoice | undefined {
+    const picked = params.availableChoices.find((choice) => choice.choiceId === optionId)
+    if (!picked) return undefined
+    if (choiceKind(picked) !== 'allow_always') return picked
+    return params.availableChoices.find((choice) => choice.decision === 'approved' && choice.scope === 'once')
+      ?? params.availableChoices.find((choice) => choice.decision === 'approvedForSession')
+      ?? picked
+  }
+
+  function rejectChoice(params: ApprovalRequestParams): ApprovalChoice | undefined {
+    return params.availableChoices.find((choice) => choice.decision === 'abort')
+      ?? params.availableChoices.find((choice) => choice.decision === 'denied')
+      ?? params.availableChoices.find((choice) => choiceKind(choice) === 'reject_once')
+      ?? params.availableChoices.find((choice) => choiceKind(choice) === 'reject_always')
+  }
+
+  function receiveApproval(params: ApprovalRequestParams): void {
+    const previous = approvalRequests.get(params.approvalId)
+    if (previous && previous.currentRequirementId.sourceIndex > params.currentRequirementId.sourceIndex) return
+    if (previous && previous.currentRequirementId.sourceIndex < params.currentRequirementId.sourceIndex) {
+      approvalControllers.get(`${params.approvalId}:${previous.currentRequirementId.sourceIndex}`)?.abort()
+    }
+    approvalRequests.set(params.approvalId, params)
+    void handleApproval(params).catch(error => interactionFailed('approval', error))
+  }
+
+  function interactionFailed(kind: string, error: unknown, origin: ActiveTurn | null = active): void {
+    const message = `${LABEL}: ${kind} delivery failed: ${error instanceof Error ? error.message : String(error)}. The turn has stopped; its work was not replayed.`
+    host.log(message)
+    if (!active || active !== origin || active.done || closing || active.interruptRequested) return
+    host.emit({ type: 'error', message, recoverable: true })
+    // Preserve the decision failure before process-exit reporting can win.
+    finish(origin, { stopReason: 'error', error: message, terminate: true })
+    rpc?.fail(new AdapterError(AGENT, message, 'protocol'))
+  }
+
+  /** Whether the recorded outbound stream carries a decision command for
+   *  this approval stage or question. */
+  function outboundHasDecision(outbound: Buffer, decision: { kind: 'approval', approvalId: string, sourceIndex: number } | { kind: 'userInput', userInputId: string }): boolean {
+    for (const line of outbound.toString('utf8').split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      let message: any = null
+      try { message = JSON.parse(trimmed) } catch { continue }
+      if (!message || typeof message !== 'object' || message.id === undefined) continue
+      if (decision.kind === 'approval') {
+        if (message.method === 'approval/decide' && message.params?.approvalId === decision.approvalId
+          && message.params?.requirementId?.sourceIndex === decision.sourceIndex) return true
+      } else if ((message.method === 'userInput/answer' || message.method === 'userInput/cancel')
+        && message.params?.userInputId === decision.userInputId) return true
+    }
+    return false
+  }
+
+  function alreadySettled(error: unknown, code: number): boolean {
+    if ((error as { code?: unknown })?.code === code) return true
+    return /already (resolved|answered|settled|decided)/i.test(error instanceof Error ? error.message : String(error))
+  }
+
+  function listPendingRecovery(): void {
+    void call('approval/listPending', { sessionId: session() }, { timeoutMs: 30_000 })
+      .then((pending) => { for (const next of pending.approvals) receiveApproval(next) })
+      .catch((error) => interactionFailed('approval', error))
+  }
+
+  function applyApprovalReceipt(approvalId: string, receipt: { terminal?: unknown }): void {
+    if (receipt?.terminal === true) resolvedApprovals.add(approvalId)
+    else listPendingRecovery()
+  }
+
+  /** Confirm every decision replay made: receipts and the recorded outbound
+   *  stream prove what the agent heard; only a decision in neither is sent,
+   *  and the agent's already-settled answer then counts as accepted. */
+  async function confirmDecisions(): Promise<void> {
+    const outbound = replayOutbound
+    replayOutbound = null
+    const outstanding = pendingDecisions.splice(0)
+    const seen = new Set<string>()
+    for (const decision of outstanding) {
+      const dedupe = decision.kind === 'approval' ? `approval:${decision.approvalId}:${decision.sourceIndex}` : `userInput:${decision.userInputId}`
+      if (seen.has(dedupe)) continue
+      seen.add(dedupe)
+      if (decision.kind === 'approval') {
+        const receipt = decisionReceipts.get(`approval:${decision.approvalId}:${decision.sourceIndex}`)
+        if (receipt && receipt.status === 'accepted') { applyApprovalReceipt(decision.approvalId, receipt); continue }
+        if (outbound && outboundHasDecision(outbound, decision)) { listPendingRecovery(); continue }
+        try {
+          const result = await call('approval/decide', { commandId: uuidv7(), sessionId: session(), approvalId: decision.approvalId, choiceId: decision.choiceId, requirementId: decision.requirementId }, { timeoutMs: 30_000 })
+          if (result.status !== 'accepted') throw new Error('Muse did not accept the approval decision')
+          applyApprovalReceipt(decision.approvalId, result)
+        } catch (error) {
+          if (alreadySettled(error, -32054)) { resolvedApprovals.add(decision.approvalId); continue }
+          interactionFailed('approval', error)
+        }
+      } else {
+        if (decisionReceipts.has(`userInput:${decision.userInputId}`)) continue
+        if (outbound && outboundHasDecision(outbound, decision)) continue
+        try {
+          if (decision.answers) await call('userInput/answer', { commandId: uuidv7(), sessionId: session(), userInputId: decision.userInputId, answers: decision.answers }, { timeoutMs: 30_000 })
+          else await call('userInput/cancel', { commandId: uuidv7(), sessionId: session(), userInputId: decision.userInputId, reason: 'turn cancelled' }, { timeoutMs: 30_000 })
+        } catch (error) {
+          if (alreadySettled(error, -32056)) continue
+          interactionFailed(`userInput/${decision.answers ? 'answer' : 'cancel'}`, error)
+        }
+      }
+    }
+  }
+
+  async function handleApproval(params: ApprovalRequestParams): Promise<void> {
+    // A single shell command can ask about several stages under one approval id.
+    // A follow-up often arrives before the previous decide response is read.
+    const key = `${params.approvalId}:${params.currentRequirementId.sourceIndex}`
+    if (resolvedApprovals.has(params.approvalId) || pendingApprovals.has(key) || decidedApprovalStages.has(key)) return
+    pendingApprovals.add(key)
+    const origin = active
+    const controller = new AbortController()
+    approvalControllers.set(key, controller)
+    const options: PermissionOption[] = params.availableChoices.map((choice) => ({ id: choice.choiceId, name: choice.label, kind: choiceKind(choice) }))
+    // An edit that waits for this decision has not touched its files yet:
+    // the pre-images read now (before the decision goes out) are exact.
+    const approvedArgs = parseArgs(params.rawArgs)
+    if (toolKind(params.toolName) === 'edit') {
+      const tool = active?.tools.get(params.itemId)
+      const locations = toolLocations(approvedArgs) ?? (tool ? toolLocations(tool.args) : undefined)
+      if (locations) {
+        const snapshots = new Map(locations.map((location) => [location.path, snapshot(location.path)]))
+        await Promise.all(snapshots.values())
+        if (tool) tool.snapshots = snapshots
+        else preApproved.set(params.itemId, snapshots)
+      }
+    }
+    let choice: ApprovalChoice | undefined
+    try {
+      const optionId = await host.requestPermission({
+        toolId: params.itemId,
+        signal: controller.signal,
+        title: approvalTitle(params),
+        ...(params.subject.kind ? { description: `${params.toolName} (${params.subject.kind})` } : {}),
+        input: { tool: params.toolName, args: approvedArgs, subject: params.subject, protectedWrite: params.protectedWrite },
+        options,
+      })
+      choice = wireChoice(params, optionId) ?? rejectChoice(params)
+    } catch {
+      choice = rejectChoice(params)
+    }
+    if (controller.signal.aborted || resolvedApprovals.has(params.approvalId) || active !== origin) {
+      pendingApprovals.delete(key); approvalControllers.delete(key); return
+    }
+    if (!choice) {
+      interactionFailed('approval', new Error('No usable permission choice was offered'), origin)
+      host.log(`${LABEL}: approval ${params.approvalId} offers no usable choice (${params.availableChoices.map((entry) => entry.choiceId).join(', ')})`)
+      pendingApprovals.delete(key)
+      return
+    }
+    if (choice.scope === 'localPersistent') {
+      // Never reached through wireChoice; guards a future choice set.
+      host.log(`${LABEL}: refusing to send persistent choice ${choice.choiceId}`)
+      choice = rejectChoice(params) ?? choice
+    }
+    try {
+      if (link().isReplaying) {
+        // The agent already has this decision, or the live catch-up sends
+        // it: mark the stage decided now so the dual notification/request
+        // forms cannot ask twice, and confirm at live.
+        decidedApprovalStages.add(key)
+        pendingDecisions.push({ kind: 'approval', approvalId: params.approvalId, sourceIndex: params.currentRequirementId.sourceIndex, choiceId: choice.choiceId, requirementId: params.currentRequirementId })
+        return
+      }
+      const result = await call('approval/decide', {
+        commandId: uuidv7(),
+        sessionId: session(),
+        approvalId: params.approvalId,
+        choiceId: choice.choiceId,
+        requirementId: params.currentRequirementId,
+      }, { timeoutMs: 30_000 })
+      if (result.status !== 'accepted') throw new Error('Muse did not accept the approval decision')
+      decidedApprovalStages.add(key)
+      if (result.terminal) resolvedApprovals.add(params.approvalId)
+      else {
+        // Recover from a lost/reordered notification using its read-only dual.
+        const pending = await call('approval/listPending', { sessionId: session() }, { timeoutMs: 30_000 })
+        for (const next of pending.approvals) receiveApproval(next)
+      }
+    } catch (error) {
+      // A competing decision may advance a stage while our answer is in flight.
+      // Never apply that earlier consent to the new requirement.
+      const latest = approvalRequests.get(params.approvalId)
+      if (!resolvedApprovals.has(params.approvalId) && (!latest || latest.currentRequirementId.sourceIndex <= params.currentRequirementId.sourceIndex)) interactionFailed('approval', error, origin)
+    } finally {
+      pendingApprovals.delete(key)
+      approvalControllers.delete(key)
+    }
+  }
+
+  async function handleUserInput(params: UserInputRequestParams): Promise<void> {
+    const origin = turnFor(params.turnId)
+    if (!origin || pendingUserInputs.has(params.userInputId)) return
+    pendingUserInputs.add(params.userInputId)
+    const questions: Question[] = params.questions.map((question) => ({
+      id: question.id,
+      header: question.header,
+      question: question.question,
+      options: question.options.map((option) => ({ label: option.label, ...(option.description ? { description: option.description } : {}) })),
+      multiSelect: question.selection.mode === 'multiple',
+      freeText: false,
+    }))
+    let answers: UserInputAnswer[] | null = null
+    try {
+      const replies = await host.askQuestion({ toolId: params.itemId, questions })
+      answers = params.questions.map((question) => {
+        const reply = replies[question.id]
+        const labels = new Set(question.options.map((option) => option.label))
+        if (question.selection.mode === 'multiple') {
+          const picked = (Array.isArray(reply) ? reply : reply === undefined ? [] : [reply]).filter((label) => labels.has(label))
+          return { questionId: question.id, selectedLabels: picked }
+        }
+        const single = Array.isArray(reply) ? reply[0] : reply
+        if (single !== undefined && labels.has(single)) return { questionId: question.id, selectedLabel: single }
+        return { questionId: question.id, freeText: (single ?? '').slice(0, 500) }
+      })
+    } catch {
+      answers = null
+    }
+    try {
+      if (active !== origin || origin.done) return
+      if (link().isReplaying) {
+        // Confirmed at live like an approval decision.
+        pendingDecisions.push({ kind: 'userInput', userInputId: params.userInputId, answers })
+        return
+      }
+      if (answers) {
+        await call('userInput/answer', { commandId: uuidv7(), sessionId: session(), userInputId: params.userInputId, answers }, { timeoutMs: 30_000 })
+      } else {
+        await call('userInput/cancel', { commandId: uuidv7(), sessionId: session(), userInputId: params.userInputId, reason: 'turn cancelled' }, { timeoutMs: 30_000 })
+      }
+    } catch (error) {
+      interactionFailed(`userInput/${answers ? 'answer' : 'cancel'}`, error, origin)
+    } finally {
+      pendingUserInputs.delete(params.userInputId)
+    }
+  }
+
+  function registerServerRequests(): void {
+    serve('approval/request', receiveApproval)
+    serve('userInput/request', (params) => { void handleUserInput(params) })
+  }
+
+  // ── Process lifecycle ───────────────────────────────────────────────
+
+  /** Wire a link — a fresh child or a replayed relay peer — to the
+   *  turn handlers. The handshake stays with the caller: replay never
+   *  re-runs it against the running agent. */
+  function attachLink(peer: AgentProcess): void {
+    child = peer
+    const link = new StdioRpc(peer, { label: LABEL, onStderr: (text) => { if (text.trim()) host.log(`${LABEL} stderr: ${text.trimEnd()}`) } })
+    rpc = link
+    link.on('malformed', (frame: string) => logOnce('malformed', `${LABEL} sent a frame that is not JSON-RPC (dropped): ${frame}`))
+    link.on('unhandled-notification', (method: string) => logOnce(`unhandled:${method}`, `${LABEL}: no handler for ${method} notifications`))
+    link.on('unknown-method', (method: string) => logOnce(`unknown:${method}`, `${LABEL} asked for ${method}; answered with -32601`))
+    link.on('orphan-response', (id: unknown) => logOnce(`orphan:${String(id)}`, `${LABEL} answered request ${String(id)} nobody was waiting for`))
+    link.on('handler-error', (error: unknown) => host.log(`${LABEL} handler failed: ${error instanceof Error ? error.message : String(error)}`))
+    // The link fails when Muse exits, closes stdout or breaks framing; the
+    // rpc layer terminates the process, this settles the turn. Stdout EOF
+    // usually lands before `exit`, so the exit code is awaited briefly to
+    // report "Muse exited (2): …" rather than "closed its stdout".
+    link.on('close', (error: Error) => {
+      const turn = active
+      if (!turn) return
+      if (closing) { finish(turn, { stopReason: 'cancelled', terminate: true }); return }
+      void exitMessage(peer, link, error).then((message) => finish(turn, { stopReason: 'error', error: message, terminate: true }))
+    })
+    peer.once('exit', (code, signal) => {
+      for (const listener of exitListeners) {
+        try { listener(code, signal) } catch (error) { host.log(`${LABEL} exit listener failed: ${error instanceof Error ? error.message : String(error)}`) }
+      }
+    })
+    registerNotifications()
+    registerServerRequests()
+  }
+
+  async function launch(selector: string): Promise<void> {
+    attachLink(await host.spawn('muse', ['serve', '--model', selector, '--contributor-mode', 'on', '--disable-sandbox', '--trust-workspace']))
+  }
+
+  async function validateModel(wanted: string): Promise<string> {
+    assertMuseContributor(wanted)
+    const catalog = await call('model/list', {}, { timeoutMs: 30_000 })
+    const match = catalog.models.find((model) => model.modelId === wanted)
+    if (match) return match.modelId
+    throw new AdapterError(AGENT, `${LABEL} does not offer model "${wanted}" (available: ${catalog.models.map((model) => model.modelId).join(', ') || 'none'})`, 'start_failed')
+  }
+
+  async function applyModel(id: string, wanted: string): Promise<void> {
+    assertMuseContributor(wanted)
+    const commandId = uuidv7()
+    const receipt = await call('session/setModel', { commandId, sessionId: id, model: { modelId: wanted } }, { timeoutMs: 30_000 })
+    if (receipt.status !== 'accepted' || receipt.commandId !== commandId) {
+      throw new AdapterError(AGENT, 'Muse did not confirm the contributor model selection', 'start_failed')
+    }
+  }
+
+  function chooseEffort(wanted: string): ReasoningEffort {
+    if ((EFFORTS as readonly string[]).includes(wanted)) return wanted as ReasoningEffort
+    throw new AdapterError(AGENT, `${LABEL} does not support reasoning effort "${wanted}"`, 'unsupported')
+  }
+
+  function insideCheckout(relativePath: string): string | null {
+    const absolute = resolve(host.checkout, relativePath)
+    return absolute === host.checkout || absolute.startsWith(host.checkout + sep) ? absolute : null
+  }
+
+  /** MSP input parts are text, image or skill; mentions and binary
+   *  attachments become paths in the text so the model can read them. */
+  function turnInput(input: PromptInput): TurnInputPart[] {
+    let text = input.text
+    const references: string[] = []
+    for (const attachment of input.attachments) {
+      if (attachment.text !== undefined) {
+        text += `\n\n${attachment.name} (${attachment.path}):\n\`\`\`\n${attachment.text}\n\`\`\``
+        continue
+      }
+      const path = insideCheckout(attachment.path)
+      if (path) references.push(path)
+      else host.log(`${LABEL}: dropping attachment outside the checkout: ${attachment.path}`)
+    }
+    for (const mention of input.mentions) {
+      const path = insideCheckout(mention.path)
+      if (path) references.push(path)
+      else host.log(`${LABEL}: dropping mention outside the checkout: ${mention.path}`)
+    }
+    if (references.length) text += `\n\nReferenced files:\n${references.map((path) => `- ${path}`).join('\n')}`
+    return [{ type: 'text', text: appendMemories(text, input.memories) }]
+  }
+
+  async function interrupt(turn: ActiveTurn): Promise<void> {
+    if (!sessionId || turn.done) return
+    const targets = [...new Set([...turn.steers.keys(), ...turn.nativeIds, ...(turn.nativeId ? [turn.nativeId] : [])])]
+      .filter(id => !turn.endedNativeIds.has(id))
+    await Promise.all(targets.map(nativeId => {
+      const reclaim = turn.steers.has(nativeId) || (turn.queued && nativeId === turn.nativeId)
+      const key = `${reclaim ? 'unqueue' : 'interrupt'}:${nativeId}`
+      const existing = turn.cancellationRequests.get(key)
+      if (existing) return existing
+      const task = Promise.resolve().then(async () => {
+        if (turn.done || turn.endedNativeIds.has(nativeId)) return
+        if (reclaim) {
+          try {
+            const receipt = await call('turn/unqueue', { commandId: uuidv7(), sessionId: sessionId!, turnId: nativeId }, { timeoutMs: 2_000 })
+            // MSP documents accepted unqueue admission as winning the race:
+            // that exact queued turn cannot launch, even if its view event
+            // arrives after this response.
+            if (receipt.status !== 'accepted' || receipt.turnId !== nativeId) throw new Error('queue reclaim was not confirmed')
+            turn.steers.delete(nativeId)
+            turn.endedNativeIds.add(nativeId)
+            if (!turn.nativeIds.includes(nativeId)) turn.nativeIds.push(nativeId)
+            finishIfQuiescent(turn)
+            return
+          } catch (error) {
+            if (!turn.done && !turn.endedNativeIds.has(nativeId)) host.log(`${LABEL}: reclaim did not confirm ${nativeId}; interrupting the exact turn (${error instanceof Error ? error.message : String(error)})`)
+          }
+        }
+        if (turn.done || turn.endedNativeIds.has(nativeId)) return
+        try {
+          await call('turn/interrupt', { commandId: uuidv7(), sessionId: sessionId!, turnId: nativeId }, { timeoutMs: 2_000 })
+        } catch (error) {
+          if (!turn.done && !turn.endedNativeIds.has(nativeId)) host.log(`${LABEL}: turn/interrupt failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }).finally(() => turn.cancellationRequests.delete(key))
+      turn.cancellationRequests.set(key, task)
+      return task
+    }))
+  }
+
+  const adapter: Adapter = {
+    agent: AGENT,
+    capabilities: CAPABILITIES,
+
+    get nativeSessionId() { return sessionId },
+    get alive() { return !!child && child.exitCode === null && child.signalCode === null },
+
+    onExit(listener) { exitListeners.push(listener) },
+
+    async start(options: AdapterStartOptions): Promise<AdapterStartResult> {
+      try { assertMuseContributor(options.modelId) } catch (error) {
+        throw new AdapterError(AGENT, String(error), 'start_failed')
+      }
+      if (child) throw new AdapterError(AGENT, `${LABEL} adapter already started`, 'protocol')
+      workerSession = options.worker === true
+      try {
+        await launch(options.modelId)
+      } catch (error) {
+        throw new AdapterError(AGENT, `${LABEL} could not be launched: ${error instanceof Error ? error.message : String(error)}`, 'start_failed')
+      }
+      const extensions = forMuse(options.mcpServers ?? [])
+      const skipped: Skipped[] = [...extensions.skipped]
+      let mcpPending = false
+      try {
+        const init = await call('initialize', {
+          clientInfo: { name: 'poise', title: 'Poise', version: pkg.version },
+          capabilities: { userInputDialogs: true, requestedCapabilities: ['sessionMcp'] },
+        }, { timeoutMs: 30_000 })
+        link().notify(INITIALIZED)
+        const wanted = Object.keys(extensions.mcpServers)
+        // Without the grant Muse would ignore the servers; say so instead.
+        const config = wanted.length && init.grantedCapabilities?.includes('sessionMcp') ? { config: { mcpServers: extensions.mcpServers } } : {}
+        if (wanted.length && !('config' in config)) {
+          for (const name of wanted) skipped.push({ name: options.mcpServers!.find((server) => server.name === name)!.title, reason: 'this Muse did not grant session MCP servers' })
+        }
+        modelId = await validateModel(options.modelId)
+        effort = chooseEffort(options.effort)
+
+        let id: string
+        if (options.resume) {
+          // session/resume subscribes this connection to the session view.
+          const response = await call('session/resume', { commandId: uuidv7(), sessionId: options.resume, excludeItems: true, ...config }, { timeoutMs: 60_000 })
+          id = response.session.sessionId
+          sessionId = id
+          if (response.session.modelId !== modelId) {
+            await applyModel(id, modelId)
+          }
+        } else if (options.forkFrom) {
+          const response = await call('session/fork', { commandId: uuidv7(), sessionId: options.forkFrom, excludeItems: true }, { timeoutMs: 60_000 })
+          id = response.session.sessionId
+          sessionId = id
+          // session/fork takes no configuration; the runtime resumes the fork with it.
+          mcpPending = 'config' in config
+          // The schema documents auto-subscription for resume only; subscribing
+          // is idempotent, so a fork is attached explicitly.
+          await call('view/subscribe', { sessionId: id }, { timeoutMs: 30_000 })
+          if (response.session.modelId !== modelId) {
+            await applyModel(id, modelId)
+          }
+        } else {
+          const response = await call('session/start', {
+            commandId: uuidv7(),
+            workspaceRoot: host.checkout,
+            approvalMode: options.safeMode === true ? 'onRequest' : 'allowAll',
+            modelId,
+            ...config,
+          }, { timeoutMs: 60_000 })
+          assertMuseContributor(response.session.modelId)
+          id = response.session.sessionId
+          sessionId = id
+        }
+        if (options.resume || options.forkFrom) await adapter.setSafeMode!(options.safeMode === true)
+        await call('session/setReasoningEffort', { commandId: uuidv7(), sessionId: id, reasoningEffort: effort as ReasoningEffort }, { timeoutMs: 30_000 })
+      } catch (error) {
+        if (error instanceof AdapterError) throw error
+        throw new AdapterError(AGENT, `${LABEL} failed to start: ${error instanceof Error ? error.message : String(error)}`, 'start_failed')
+      }
+      return { nativeSessionId: sessionId!, capabilities: CAPABILITIES, modelId, effort, efforts: [...EFFORTS], ...(skipped.length ? { mcpSkipped: skipped } : {}), ...(mcpPending ? { mcpPending } : {}) }
+    },
+
+    async prompt(turnId, input, signal): Promise<TurnResult> {
+      assertMuseContributor(modelId)
+      const id = session()
+      if (active) throw new AdapterError(AGENT, `${LABEL} is already running a turn`, 'protocol')
+      if (signal.aborted) return { stopReason: 'cancelled' }
+      link()
+
+      const turn: ActiveTurn = {
+        id: turnId,
+        nativeId: null,
+        done: false,
+        interruptRequested: false,
+        tools: new Map(),
+        streamed: new Set(),
+        internalItems: new Set(),
+        pending: new Set(),
+        finishing: false,
+        steers: new Map(),
+        nativeIds: [],
+        foreground: new Map(),
+        endedNativeIds: new Set(),
+        cancellationRequests: new Map(),
+        queued: false,
+        recalled: new Map(),
+        resolve: () => {},
+      }
+      const result = new Promise<TurnResult>((resolveTurn) => { turn.resolve = resolveTurn })
+      active = turn
+      const onAbort = () => { void adapter.cancel() }
+      signal.addEventListener('abort', onAbort, { once: true })
+
+      try {
+        const response = await call('turn/start', {
+          commandId: uuidv7(),
+          sessionId: id,
+          input: turnInput(input),
+          reasoningEffort: effort as ReasoningEffort,
+        }, { timeoutMs: 60_000 })
+        if (turn.nativeId === null && response.turnId !== lastFinishedNativeId) {
+          turn.nativeId = response.turnId
+          if (!turn.nativeIds.includes(response.turnId)) turn.nativeIds.push(response.turnId)
+        }
+        if (response.disposition === 'queued') { turn.queued = true; host.log(`${LABEL} queued the turn behind another one`) }
+        if (turn.interruptRequested) void interrupt(turn)
+      } catch (error) {
+        finish(turn, { stopReason: 'error', error: `${LABEL} could not start the turn: ${error instanceof Error ? error.message : String(error)}` })
+      }
+
+      return result.finally(() => signal.removeEventListener('abort', onAbort))
+    },
+
+    async replayTurn(init: ReplayInit): Promise<TurnResult> {
+      if (init.signal.aborted) return { stopReason: 'cancelled', terminate: true }
+      // Without the turn's initiating request the agent never heard it: that
+      // turn must be re-prompted, not replayed.
+      if (init.outboundTruncated) throw new AdapterError(AGENT, 'the relay cannot prove what Muse heard; the turn is interrupted instead', 'protocol')
+      const requests = outboundRequests(init.outbound)
+      const requestId = [...requests].reverse().find(([, request]) => request.method === 'turn/start')?.[0]
+      if (requestId === undefined) throw new AdapterError(AGENT, 'the turn never reached Muse; it is interrupted instead', 'protocol')
+      if (active) throw new AdapterError(AGENT, `${LABEL} is already running a turn`, 'protocol')
+      sessionId = init.session.nativeSessionId
+      modelId = init.session.modelId
+      effort = init.session.effort
+      workerSession = init.session.worker === true
+      replayOutbound = init.outbound
+      attachLink(init.peer)
+      const replayLink = link()
+      replayLink.beginReplay(init.outbound)
+      const turn: ActiveTurn = {
+        id: init.turnId,
+        nativeId: null,
+        done: false,
+        interruptRequested: false,
+        tools: new Map(),
+        streamed: new Set(),
+        internalItems: new Set(),
+        pending: new Set(),
+        finishing: false,
+        steers: new Map(),
+        nativeIds: [],
+        foreground: new Map(),
+        endedNativeIds: new Set(),
+        cancellationRequests: new Map(),
+        queued: false,
+        recalled: init.recalledDiffs,
+        resolve: () => {},
+      }
+      const result = new Promise<TurnResult>((resolveTurn) => { turn.resolve = resolveTurn })
+      active = turn
+      // The spool carries the turn/start answer and every decision receipt;
+      // the link never sent their requests, so each arrives as an orphan.
+      // Terminal receipts apply at once, so a late stage can never reopen a
+      // settled approval; the rest is confirmed at live.
+      const orphan = (id: unknown, message: any) => {
+        if (id === requestId && message?.error) {
+          finish(turn, { stopReason: 'error', error: `Muse could not start the turn: ${String(message.error.message || 'rpc error')}` })
+          return
+        }
+        const request = typeof id === 'string' || typeof id === 'number' ? requests.get(id) : undefined
+        if (message?.error && (request?.method === 'approval/decide' || request?.method === 'userInput/answer' || request?.method === 'userInput/cancel')) {
+          interactionFailed(request.method, new Error(String(message.error.message || 'recorded decision failed')), turn)
+          return
+        }
+        const receipt = message?.result
+        if (!receipt || typeof receipt !== 'object') return
+        if (typeof receipt.approvalId === 'string') {
+          const params = request?.params as Partial<ApprovalDecideParams> | undefined
+          const sourceIndex = params?.requirementId?.sourceIndex
+          if (request?.method === 'approval/decide' && params?.approvalId === receipt.approvalId
+            && typeof sourceIndex === 'number' && Number.isSafeInteger(sourceIndex)) {
+            decisionReceipts.set(`approval:${receipt.approvalId}:${sourceIndex}`, receipt)
+          }
+          if (receipt.terminal === true) resolvedApprovals.add(receipt.approvalId)
+          return
+        }
+        if (typeof receipt.userInputId === 'string') {
+          decisionReceipts.set(`userInput:${receipt.userInputId}`, receipt)
+          return
+        }
+        if (typeof receipt.turnId === 'string') {
+          if (turn.nativeId === null && receipt.turnId !== lastFinishedNativeId) {
+            turn.nativeId = receipt.turnId
+            if (!turn.nativeIds.includes(receipt.turnId)) turn.nativeIds.push(receipt.turnId)
+          }
+          if (receipt.disposition === 'queued') { turn.queued = true; host.log(`${LABEL} queued the turn behind another one`) }
+        }
+      }
+      replayLink.on('orphan-response', orphan)
+      const onAbort = () => { void adapter.cancel() }
+      init.signal.addEventListener('abort', onAbort, { once: true })
+      if (init.signal.aborted) onAbort()
+      void init.live.then(
+        async () => {
+          try {
+            replayLink.endReplay()
+            await confirmDecisions()
+          } catch (error) {
+            replayLink.fail(error instanceof Error ? error : new Error(String(error)))
+          }
+        },
+        (error) => replayLink.fail(error instanceof Error ? error : new Error(String(error))),
+      )
+      return result.finally(() => {
+        replayLink.off('orphan-response', orphan)
+        init.signal.removeEventListener('abort', onAbort)
+      })
+    },
+
+    async compact(_id, _memories, signal) {
+      assertMuseContributor(modelId)
+      if (!child || active || compaction) throw new AdapterError(AGENT, 'Muse is not ready to compact.', 'protocol')
+      const current = { commandId: uuidv7(), wait: compactionWaiter(child, signal, options.compactTimeoutMs) }
+      compaction = current
+      if (!signal.aborted) void call('session/compact', { commandId: current.commandId, sessionId: session() }, { timeoutMs: 60_000 }).then(receipt => {
+        if (receipt.commandId !== current.commandId || !['accepted', 'noop'].includes(receipt.status)) throw new Error('Native compaction admission was not confirmed')
+        if (receipt.status === 'noop') current.wait.finish({ stopReason: 'end_turn', compaction: { changed: false, detail: receipt.reason } })
+      }).catch(error => current.wait.finish({ stopReason: 'error', error: `Muse compaction failed: ${String(error)}`, terminate: true }))
+      return current.wait.result.finally(() => { if (compaction === current) compaction = null })
+    },
+
+    async steer(text, opts) {
+      assertMuseContributor(modelId)
+      const turn = active
+      if (!turn || turn.done || turn.interruptRequested || !turn.nativeId) throw new AdapterError(AGENT, `${LABEL} has no running turn to steer`, 'protocol')
+      const commandId = uuidv7()
+      turn.steers.set(commandId, opts?.correlationId)
+      try {
+        await call('turn/steer', {
+          commandId,
+          sessionId: session(),
+          expectedTurnId: turn.nativeId,
+          input: [{ type: 'text', text }],
+        }, { timeoutMs: 30_000 })
+      } catch (error) {
+        turn.steers.delete(commandId)
+        finishIfQuiescent(turn)
+        throw error
+      }
+    },
+
+    async cancel() {
+      const turn = active
+      if (!turn || turn.done) return
+      turn.interruptRequested = true
+      await interrupt(turn)
+    },
+
+    async setModel(nextModelId, nextEffort) {
+      const id = session()
+      const chosen = chooseEffort(nextEffort)
+      const validated = await validateModel(nextModelId)
+      if (validated !== modelId) {
+        await applyModel(id, validated)
+        modelId = validated
+      }
+      if (chosen !== effort) {
+        await call('session/setReasoningEffort', { commandId: uuidv7(), sessionId: id, reasoningEffort: chosen }, { timeoutMs: 30_000 })
+        effort = chosen
+      }
+      return { modelId, effort, efforts: [...EFFORTS] }
+    },
+
+    async setSafeMode(enabled) {
+      const mode = enabled ? 'onRequest' : 'allowAll'
+      const result = await call('session/setApprovalMode', { commandId: uuidv7(), sessionId: session(), mode }, { timeoutMs: 30_000 })
+      if (result.status !== 'accepted' || result.effectiveMode.mode !== mode) throw new AdapterError(AGENT, `${LABEL} did not apply the requested permission mode`, 'protocol')
+      return 'current_turn'
+    },
+
+    async setMode() {
+      throw new AdapterError(AGENT, `${LABEL} has no modes`, 'unsupported')
+    },
+
+    async fork() {
+      const response = await call('session/fork', { commandId: uuidv7(), sessionId: session(), excludeItems: true }, { timeoutMs: 60_000 })
+      return response.session.sessionId
+    },
+
+    async close() {
+      compaction?.wait.finish({ stopReason: 'cancelled', terminate: true })
+      const process = child
+      if (!process) return
+      closing = true
+      if (process.exitCode !== null || process.signalCode !== null) return
+      const exited = new Promise<void>((resolveExit) => process.once('exit', () => resolveExit()))
+      rpc?.end()
+      if (await withTimeout(exited, EXIT_GRACE_MS)) return
+      process.kill('SIGTERM')
+      if (await withTimeout(exited, EXIT_GRACE_MS)) return
+      process.kill('SIGKILL')
+      await exited
+    },
+  }
+
+  return adapter
+}

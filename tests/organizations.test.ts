@@ -1,0 +1,777 @@
+import Database from 'better-sqlite3'
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { RunFileOptions } from '../server/process'
+
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), diagnosticFailure: vi.fn() }))
+vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
+vi.mock('../server/logging', () => ({ diagnosticFailure: mocks.diagnosticFailure, diagnostic: vi.fn() }))
+
+let tempRoot = ''
+let database: typeof import('../server/db') | undefined
+let organizations: typeof import('../server/organizations') | undefined
+const originalDb = process.env.POISE_DB
+const originalDatastore = process.env.POISE_DATASTORE_DB
+
+function writeIndex(path: string, login: string, complete = true): void {
+  const fixture = new Database(path)
+  try {
+    fixture.exec('CREATE TABLE IF NOT EXISTS sync_state(scope TEXT, key TEXT, value TEXT)')
+    fixture.prepare('INSERT INTO sync_state VALUES (?, ?, ?)').run('org', 'login', login)
+    if (complete) fixture.prepare('INSERT INTO sync_state VALUES (?, ?, ?)').run('org', 'last_full_build_at', new Date().toISOString())
+  } finally { fixture.close() }
+}
+
+async function cli(command: string, args: string[], _options?: RunFileOptions) {
+  if (command === 'gh') return { stdout: 'selected-secret-token\n', stderr: '' }
+  const path = args[1]!
+  const operation = args[2]
+  if (operation === 'init-org') writeIndex(path, args[3]!)
+  if (operation === 'health') return {
+    stdout: JSON.stringify({ action: 'health', status: 'healthy', healthy: true, database: path }), stderr: '',
+  }
+  if (args.includes('--reconcile')) return { stdout: JSON.stringify({ reconcile_complete: true }), stderr: '' }
+  return { stdout: '', stderr: '' }
+}
+
+function operations(operation: string) {
+  return mocks.runFile.mock.calls.filter(([command, args]) => command === 'github-datastore' && args[2] === operation)
+}
+
+async function load() {
+  database = await import('../server/db')
+  organizations = await import('../server/organizations')
+  return organizations
+}
+
+async function ready(login: string) {
+  await vi.waitFor(() => {
+    expect(organizations!.getOrganizations().find((org) => org.login === login)?.status).toBe('ready')
+  })
+}
+
+beforeEach(async () => {
+  tempRoot = await mkdtemp(join(tmpdir(), 'poise-organizations-test-'))
+  process.env.POISE_DB = join(tempRoot, 'cache.db')
+  delete process.env.POISE_DATASTORE_DB
+  vi.resetModules()
+  mocks.diagnosticFailure.mockReset()
+  mocks.runFile.mockReset().mockImplementation(cli)
+  await load()
+  database!.setMeta('me', 'octocat')
+})
+
+afterEach(async () => {
+  await organizations?.stopOrganizationsRuntime()
+  if (database?.db.open) database.closeDatabase()
+  database = undefined
+  organizations = undefined
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+  if (originalDb === undefined) delete process.env.POISE_DB
+  else process.env.POISE_DB = originalDb
+  if (originalDatastore === undefined) delete process.env.POISE_DATASTORE_DB
+  else process.env.POISE_DATASTORE_DB = originalDatastore
+  vi.resetModules()
+  await rm(tempRoot, { recursive: true, force: true })
+})
+
+describe('organization activation', () => {
+  it('preserves legacy routing and automation history without reinitializing its datastore', async () => {
+    database!.setMeta('org', 'Vaquum')
+    process.env.POISE_DATASTORE_DB = join(tempRoot, 'existing.sqlite')
+    database!.recordSeen('review-new-prs', 'Vaquum/repo#4')
+    expect(organizations!.getOrganizations()).toEqual([{
+      login: 'Vaquum', datastorePath: process.env.POISE_DATASTORE_DB,
+      managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null, retryAt: null,
+    }])
+    expect(organizations!.addOrganization('VAQUUM').managed).toBe(false)
+    organizations!.addOrganization('second')
+    await ready('second')
+    expect(operations('init-org').map((call) => call[1][3])).toEqual(['second'])
+    expect(database!.hasSeen('review-new-prs', 'Vaquum/repo#4')).toBe(true)
+    expect(organizations!.organizationArgs(organizations!.getOrganizations()[0]!, ['view', 'pr'])).toEqual([
+      '--db', process.env.POISE_DATASTORE_DB, 'view', 'pr',
+    ])
+  })
+
+  it('validates and deduplicates organizations case-insensitively before spawning', async () => {
+    for (const value of ['', '../repo', '-flag', 'abc--def', 'org/repo', 'a'.repeat(40)]) {
+      expect(() => organizations!.addOrganization(value)).toThrow('GitHub organization name')
+    }
+    const first = organizations!.addOrganization(' Acme ')
+    const second = organizations!.addOrganization('ACME')
+    expect(first.status).toBe('initializing')
+    expect(second.login).toBe('acme')
+    expect(organizations!.readyOrganizations()).toEqual([])
+    await ready('acme')
+    expect(operations('init-org')).toHaveLength(1)
+    expect(organizations!.getOrganizations()).toHaveLength(1)
+    expect(existsSync(first.datastorePath!)).toBe(true)
+    expect(statSync(dirname(first.datastorePath!)).mode & 0o777).toBe(0o700)
+    expect(existsSync(`${first.datastorePath}.initializing`)).toBe(false)
+  })
+
+  it('pins the selected GitHub identity and keeps credentials out of persisted state', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    expect(mocks.runFile.mock.calls[0]).toMatchObject([
+      'gh', ['auth', 'token', '--hostname', 'github.com', '--user', 'octocat'],
+      { env: { GH_TOKEN: undefined, GH_HOST: undefined, GITHUB_TOKEN: undefined } },
+    ])
+    for (const call of operations('init-org')) {
+      expect(call[2].env).toMatchObject({ GH_TOKEN: 'selected-secret-token', GH_HOST: 'github.com' })
+      expect(call[1].join(' ')).not.toContain('selected-secret-token')
+    }
+    expect(JSON.stringify(database!.db.prepare('SELECT * FROM organizations').all())).not.toContain('secret-token')
+    expect(operations('build-user')[0]?.[1][3]).toBe('octocat')
+  })
+
+  it('isolates activation failures and retries only the unfinished organization', async () => {
+    let failing = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org' && args[3] === 'broken' && failing) {
+        writeIndex(args[1], 'broken', false)
+        throw Object.assign(new Error('init failed'), { stderr: 'denied selected-secret-token github_pat_mocksecret' })
+      }
+      return cli(command, args, options)
+    })
+    const failed = organizations!.addOrganization('broken')
+    organizations!.addOrganization('working')
+    await ready('working')
+    await vi.waitFor(() => expect(organizations!.getOrganizations().find((org) => org.login === 'broken')?.status).toBe('error'))
+    expect(organizations!.getOrganizations().find((org) => org.login === 'broken')?.error).toContain('[redacted]')
+    expect(JSON.stringify(organizations!.getOrganizations())).not.toContain('selected-secret-token')
+    expect(existsSync(failed.datastorePath!)).toBe(false)
+    failing = false
+    organizations!.retryOrganization('BROKEN')
+    await ready('broken')
+    expect(operations('init-org').map((call) => call[1][3]).sort()).toEqual(['broken', 'broken', 'working'])
+    expect(operations('init-org').at(-1)?.[1][3]).toBe('broken')
+    expect(organizations!.readyOrganizations()).toHaveLength(2)
+  })
+
+  it.each(['wrong-owner', 'complete-without-owner', 'corrupt'] as const)('preserves %s staging and refuses to restart it', async (kind) => {
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org') {
+        if (kind === 'corrupt') writeFileSync(args[1], 'not a SQLite database')
+        else {
+          writeIndex(args[1], kind === 'wrong-owner' ? 'another-account' : 'acme', kind === 'complete-without-owner')
+          if (kind === 'complete-without-owner') {
+            const fixture = new Database(args[1])
+            try { fixture.exec("DELETE FROM sync_state WHERE key = 'login'") } finally { fixture.close() }
+          }
+        }
+        throw new Error('interrupted initialization')
+      }
+      return cli(command, args, options)
+    })
+    const account = organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
+    const staging = `${account.datastorePath}.initializing`
+    const before = readFileSync(staging)
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
+    expect(organizations!.getOrganizations()[0]!.error).toContain('contents were preserved')
+    expect(operations('init-org')).toHaveLength(1)
+    expect(readFileSync(staging)).toEqual(before)
+    expect(existsSync(account.datastorePath!)).toBe(false)
+  })
+
+  it('refreshes retained empty staging on retry before rebuilding the user projection', async () => {
+    let remoteIssueExists = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      const result = await cli(command, args, options)
+      if (command !== 'github-datastore') return result
+      const fixture = new Database(args[1])
+      try {
+        fixture.exec('CREATE TABLE IF NOT EXISTS items (item_id INTEGER PRIMARY KEY)')
+        if (args[2] === 'sync' && remoteIssueExists) {
+          fixture.prepare('INSERT OR IGNORE INTO items(item_id) VALUES (1)').run()
+        }
+        if (args[2] === 'build-user' && !fixture.prepare('SELECT item_id FROM items LIMIT 1').get()) {
+          throw new Error('no indexed items; run init-org first')
+        }
+      } finally { fixture.close() }
+      return result
+    })
+    const org = organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
+    expect(organizations!.getOrganizations()[0]!.error).toContain('no indexed items')
+    expect(existsSync(org.datastorePath!)).toBe(false)
+    expect(existsSync(`${org.datastorePath}.initializing`)).toBe(true)
+    remoteIssueExists = true
+    organizations!.retryOrganization('acme')
+    await ready('acme')
+    expect(operations('init-org')).toHaveLength(1)
+    const fixture = new Database(org.datastorePath!, { readonly: true })
+    try {
+      expect(fixture.prepare('SELECT item_id FROM items').all()).toEqual([{ item_id: 1 }])
+    } finally { fixture.close() }
+  })
+
+  it('resumes completed staging work after shutdown without initializing twice', async () => {
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'build-user') {
+        return new Promise((_resolve, reject) => options!.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true }))
+      }
+      return cli(command, args, options)
+    })
+    organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(operations('build-user')).toHaveLength(1))
+    await organizations!.stopOrganizationsRuntime()
+    expect(organizations!.getOrganizations()[0]!.status).toBe('initializing')
+    database!.closeDatabase()
+    vi.resetModules()
+    mocks.runFile.mockImplementation(cli)
+    await load()
+    organizations!.startOrganizationsRuntime()
+    await ready('acme')
+    expect(operations('init-org')).toHaveLength(1)
+    expect(operations('build-user')).toHaveLength(2)
+  })
+
+  it('adopts a published completed index on restart and rejects an unexpected owner', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    database!.db.prepare("UPDATE organizations SET status = 'initializing', last_sync_at = 0 WHERE login = 'acme'").run()
+    organizations!.startOrganizationsRuntime()
+    await ready('acme')
+    expect(operations('init-org')).toHaveLength(1)
+    const path = organizations!.getOrganizations()[0]!.datastorePath!
+    const fixture = new Database(path)
+    fixture.prepare("UPDATE sync_state SET value = 'other' WHERE key = 'login'").run()
+    fixture.close()
+    database!.db.prepare("UPDATE organizations SET status = 'initializing', activated_at = NULL WHERE login = 'acme'").run()
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
+    expect(organizations!.getOrganizations()[0]!.error).toContain('this account')
+    expect(operations('init-org')).toHaveLength(1)
+  })
+
+  it('keeps initialization failures durable until the user retries', async () => {
+    mocks.runFile.mockRejectedValue(new Error('credential unavailable'))
+    organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
+    await organizations!.stopOrganizationsRuntime()
+    database!.closeDatabase()
+    vi.resetModules()
+    mocks.runFile.mockClear()
+    await load()
+    organizations!.startOrganizationsRuntime()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(organizations!.getOrganizations()[0]!.error).toContain('authentication is unavailable for octocat')
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when health does not verify the newly created database', async () => {
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'health') return {
+        stdout: JSON.stringify({ healthy: true, status: 'healthy', action: 'health', database: '/different.sqlite' }), stderr: '',
+      }
+      return cli(command, args, options)
+    })
+    const org = organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
+    expect(organizations!.readyOrganizations()).toEqual([])
+    expect(existsSync(org.datastorePath!)).toBe(false)
+  })
+})
+
+describe('managed organization synchronization', () => {
+  it('repairs legacy full-build retry markers in bounded chunks before requesting a delta sync', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    const path = organizations!.getOrganizations()[0]!.datastorePath!
+    const index = new Database(path)
+    index.prepare('INSERT INTO sync_state VALUES (?, ?, ?)').run('repo:10', 'full_build_retry_required', '1')
+    index.close()
+    mocks.runFile.mockClear()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = 0, sync_failures = 8').run()
+    let complete = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args.includes('--reconcile')) {
+        if (complete) {
+          const fixture = new Database(path)
+          fixture.prepare("DELETE FROM sync_state WHERE key = 'full_build_retry_required'").run()
+          fixture.close()
+        }
+        return { stdout: JSON.stringify({ reconcile_complete: complete }), stderr: '' }
+      }
+      return cli(command, args, options)
+    })
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(operations('sync')).toHaveLength(1))
+    await vi.waitFor(() => expect(database!.db.prepare('SELECT next_sync_at FROM organizations').get()).toEqual({ next_sync_at: 0 }))
+    expect(operations('sync')[0]![1].slice(2)).toEqual(['sync', '--reconcile', '--reconcile-max-seconds', '20'])
+    expect(operations('health')).toHaveLength(0)
+    expect(database!.db.prepare('SELECT last_sync_at, last_reconcile_at, sync_failures FROM organizations').get()).toEqual({ last_sync_at: 0, last_reconcile_at: 0, sync_failures: 8 })
+    complete = true
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(1))
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]).toMatchObject({ stage: 'ready', error: null }))
+    expect(operations('sync').map((call) => call[1].slice(2))).toEqual([
+      ['sync', '--reconcile', '--reconcile-max-seconds', '20'],
+      ['sync', '--reconcile', '--reconcile-max-seconds', '20'], ['sync'],
+    ])
+    expect(database!.db.prepare('SELECT sync_failures FROM organizations').get()).toEqual({ sync_failures: 0 })
+  })
+
+  it('refreshes between bounded reconciliation chunks and records daily completion only at the end', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    mocks.runFile.mockClear()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = 0').run()
+    let complete = false
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args.includes('--reconcile')) {
+        return { stdout: JSON.stringify({ reconcile_complete: complete }), stderr: '' }
+      }
+      return cli(command, args, options)
+    })
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(1))
+    await vi.waitFor(() => expect(database!.db.prepare('SELECT last_sync_at FROM organizations').get()).toEqual({ last_sync_at: expect.any(Number) }))
+    expect(database!.db.prepare('SELECT last_reconcile_at, sync_failures FROM organizations').get()).toEqual({ last_reconcile_at: 0, sync_failures: 0 })
+    expect(operations('sync').map((call) => call[1].slice(2))).toEqual([
+      ['sync'], ['sync', '--reconcile', '--reconcile-max-seconds', '20'], ['sync'],
+    ])
+    expect(organizations!.getOrganizations()[0]).toMatchObject({ stage: 'ready', error: null })
+    complete = true
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(2))
+    await vi.waitFor(() => expect((database!.db.prepare('SELECT last_reconcile_at FROM organizations').get() as { last_reconcile_at: number }).last_reconcile_at).toBeGreaterThan(0))
+    expect(operations('sync').map((call) => call[1].slice(2))).toEqual([
+      ['sync'], ['sync', '--reconcile', '--reconcile-max-seconds', '20'], ['sync'],
+      ['sync'], ['sync', '--reconcile', '--reconcile-max-seconds', '20'], ['sync'],
+    ])
+  })
+
+  it('rejects malformed reconciliation completion instead of claiming the daily scan succeeded', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = 0').run()
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args.includes('--reconcile')) return { stdout: '{}', stderr: '' }
+      return cli(command, args, options)
+    })
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]).toMatchObject({
+      stage: 'sync-error', error: 'Datastore reconciliation did not report completion status.',
+    }))
+    expect(database!.db.prepare('SELECT last_reconcile_at FROM organizations').get()).toEqual({ last_reconcile_at: 0 })
+  })
+
+  it('pauses new work during a release drain and tracks activation already in progress', async () => {
+    const background = await import('../server/release-background')
+    background.pauseReleaseBackground()
+    organizations!.addOrganization('acme')
+    expect(background.releaseBackgroundBusy()).toBe(0)
+    expect(mocks.runFile).not.toHaveBeenCalled()
+    background.resumeReleaseBackground()
+    let finish!: () => void
+    const waiting = new Promise<void>((resolve) => { finish = resolve })
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org') {
+        await Promise.race([waiting, new Promise<void>((_resolve, reject) => {
+          options!.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })])
+      }
+      return cli(command, args, options)
+    })
+    try {
+      organizations!.startOrganizationsRuntime()
+      await vi.waitFor(() => expect(operations('init-org')).toHaveLength(1))
+      expect(background.releaseBackgroundBusy()).toBe(1)
+      background.pauseReleaseBackground()
+      finish()
+      await ready('acme')
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+    } finally {
+      finish()
+      background.resumeReleaseBackground()
+    }
+  })
+
+  it('syncs each managed org independently and periodically reconciles repository removals', async () => {
+    database!.setMeta('org', 'legacy')
+    organizations!.addOrganization('acme')
+    organizations!.addOrganization('beta')
+    await ready('acme')
+    await ready('beta')
+    mocks.runFile.mockClear()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = 0 WHERE managed = 1').run()
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(2))
+    expect(operations('sync').filter((call) => call[1].includes('--reconcile'))).toHaveLength(2)
+    expect(operations('sync').every((call) => call[1][1].includes('/datastores/'))).toBe(true)
+    expect(operations('init-org')).toHaveLength(0)
+  })
+
+  it('rebuilds user projections after the selected identity changes before returning ready', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    database!.setMeta('me', 'new-user')
+    expect(organizations!.readyOrganizations()).toEqual([])
+    organizations!.startOrganizationsRuntime()
+    await ready('acme')
+    expect(operations('build-user').map((call) => call[1][3])).toEqual(['octocat', 'new-user'])
+    expect(mocks.runFile.mock.calls.filter(([command]) => command === 'gh').at(-1)?.[1]).toContain('new-user')
+  })
+
+  it('persists failed-sync backoff across ticks and restarts while another org continues', async () => {
+    organizations!.addOrganization('acme')
+    organizations!.addOrganization('beta')
+    await ready('acme')
+    await ready('beta')
+    let failing = true
+    let releaseSync!: () => void
+    let heldSync: Promise<void> | undefined
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'sync' && args[1].includes('/acme/')) {
+        if (failing) throw new Error('network unavailable')
+        if (heldSync) await Promise.race([
+          heldSync,
+          new Promise<void>((_resolve, reject) => options!.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true })),
+        ])
+      }
+      return cli(command, args, options)
+    })
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations().find((org) => org.login === 'acme')!.stage).toBe('sync-error'))
+    const state = database!.db.prepare("SELECT next_sync_at, sync_failures FROM organizations WHERE login = 'acme'").get() as { next_sync_at: number, sync_failures: number }
+    expect(state.next_sync_at - Date.now()).toBeGreaterThan(50_000)
+    expect(state.sync_failures).toBe(1)
+    expect(mocks.diagnosticFailure).toHaveBeenCalledWith('datastore.sync', expect.any(Error), expect.objectContaining({ retryCount: 1, nextRetryAt: state.next_sync_at }), expect.any(Object))
+    await organizations!.stopOrganizationsRuntime()
+    database!.closeDatabase()
+    vi.resetModules()
+    await load()
+    database!.db.prepare("UPDATE organizations SET last_sync_at = 0 WHERE login = 'beta'").run()
+    mocks.runFile.mockClear()
+    const intervals = vi.spyOn(globalThis, 'setInterval')
+    try {
+      organizations!.startOrganizationsRuntime()
+      await vi.waitFor(() => expect(operations('health')).toHaveLength(1))
+      const tick = intervals.mock.calls.at(-1)![0]
+      for (let index = 0; index < 3; index += 1) {
+        if (typeof tick === 'function') tick()
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(operations('sync').map((call) => call[1][1])).toEqual([join(tempRoot, 'datastores/beta/github.sqlite')])
+      expect(organizations!.getOrganizations().find((org) => org.login === 'acme')!.error).toContain('network unavailable')
+      failing = false
+      heldSync = new Promise<void>((resolve) => { releaseSync = resolve })
+      organizations!.retryOrganization('acme')
+      await vi.waitFor(() => expect(operations('sync')).toHaveLength(2))
+      expect(organizations!.getOrganizations().find((org) => org.login === 'acme')!.error).toContain('network unavailable')
+      releaseSync()
+      await vi.waitFor(() => expect(organizations!.getOrganizations().find((org) => org.login === 'acme')!.error).toBeNull())
+      expect(database!.db.prepare("SELECT next_sync_at, sync_failures FROM organizations WHERE login = 'acme'").get())
+        .toEqual({ next_sync_at: 0, sync_failures: 0 })
+    } finally {
+      releaseSync?.()
+      intervals.mockRestore()
+    }
+  })
+
+  it('exposes sync failures without dropping the org and recovers on the next sync', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    let failing = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (failing && command === 'github-datastore' && args[2] === 'sync') throw new Error('network unavailable')
+      return cli(command, args, options)
+    })
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.stage).toBe('sync-error'))
+    expect(organizations!.readyOrganizations()).toHaveLength(1)
+    failing = false
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.error).toBeNull())
+    await ready('acme')
+  })
+
+  it('alerts once syncs have been failing for 15 minutes, until one succeeds', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    const alerts = () => database!.db.prepare('SELECT kind, dedupe_key AS key, resolved_at AS resolved FROM alerts ORDER BY id').all()
+    const streak = () => database!.db.prepare("SELECT sync_failures AS failures, sync_failing_since AS since FROM organizations WHERE login = 'acme'").get() as { failures: number, since: number }
+    let failing = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (failing && command === 'github-datastore' && args[2] === 'sync') throw new Error('network unavailable')
+      return cli(command, args, options)
+    })
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(streak().failures).toBe(1))
+    expect(streak().since).toBeGreaterThan(0)
+    expect(alerts()).toEqual([])
+
+    // The run of failures began 15 minutes ago: the next failure alerts, and
+    // the run keeps its start.
+    const since = Date.now() - 15 * 60_000
+    database!.db.prepare("UPDATE organizations SET sync_failing_since = ? WHERE login = 'acme'").run(since)
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(streak().failures).toBe(2))
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(streak().failures).toBe(3))
+    expect(streak().since).toBe(since)
+    expect(alerts()).toEqual([{ kind: 'datastore_sync_failing', key: 'datastore-sync:acme', resolved: null }])
+
+    failing = false
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.error).toBeNull())
+    expect(streak()).toEqual({ failures: 0, since: 0 })
+    expect(alerts()).toEqual([{ kind: 'datastore_sync_failing', key: 'datastore-sync:acme', resolved: expect.any(String) }])
+  })
+})
+
+
+describe('GitHub quota recovery', () => {
+  function quotaError(reset: number) {
+    return Object.assign(new Error('GitHub primary API quota exhausted'), {
+      stderr: `GitHub rate limit exceeded\nGITHUB_RATE_LIMIT_RESET=${reset}`,
+    })
+  }
+
+  it('shares cooldown across accounts, manual retry and restart, then resumes the retained incomplete index', async () => {
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    let limited = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org' && args[3] === 'acme') {
+        if (limited) {
+          writeIndex(args[1], 'acme', false)
+          const fixture = new Database(args[1])
+          try { fixture.exec("CREATE TABLE saved_progress(repo TEXT); INSERT INTO saved_progress VALUES ('acme/completed')") } finally { fixture.close() }
+          throw quotaError(reset)
+        }
+        expect(args).toContain('--resume')
+        const fixture = new Database(args[1], { readonly: true })
+        try { expect(fixture.prepare('SELECT repo FROM saved_progress').all()).toEqual([{ repo: 'acme/completed' }]) } finally { fixture.close() }
+      }
+      return cli(command, args, options)
+    })
+    const account = organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.stage).toBe('rate-limited'))
+    expect(organizations!.getOrganizations()[0]).toMatchObject({
+      status: 'initializing', retryAt: new Date(reset * 1000).toISOString(), error: expect.stringContaining('automatically'),
+    })
+    expect(existsSync(account.datastorePath!)).toBe(false)
+    const callsAtLimit = mocks.runFile.mock.calls.length
+    expect(organizations!.addOrganization('beta').stage).toBe('rate-limited')
+    expect(organizations!.retryOrganization('acme').retryAt).toBe(new Date(reset * 1000).toISOString())
+    await organizations!.stopOrganizationsRuntime()
+    database!.closeDatabase()
+    vi.resetModules()
+    await load()
+    const intervals = vi.spyOn(globalThis, 'setInterval')
+    organizations!.startOrganizationsRuntime()
+    const tick = intervals.mock.calls.at(-1)![0]
+    if (typeof tick === 'function') tick()
+    organizations!.retryOrganization('beta')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(mocks.runFile).toHaveBeenCalledTimes(callsAtLimit)
+    expect(organizations!.getOrganizations().every((org) => org.retryAt === new Date(reset * 1000).toISOString())).toBe(true)
+    limited = false
+    vi.spyOn(Date, 'now').mockReturnValue(reset * 1000 + 1)
+    if (typeof tick === 'function') tick()
+    await ready('acme')
+    await ready('beta')
+    expect(operations('init-org').map((call) => call[1][3]).sort()).toEqual(['acme', 'acme', 'beta'])
+    expect(organizations!.getOrganizations().every((org) => org.retryAt === null && org.error === null)).toBe(true)
+    expect(existsSync(account.datastorePath!)).toBe(true)
+    expect(existsSync(`${account.datastorePath}.initializing`)).toBe(false)
+  })
+
+  it('resumes an empty unidentified index after quota fails during first repository discovery', async () => {
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    let limited = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org') {
+        if (limited) {
+          const fixture = new Database(args[1])
+          try { fixture.exec('CREATE TABLE sync_state(scope TEXT, key TEXT, value TEXT)') } finally { fixture.close() }
+          throw quotaError(reset)
+        }
+        expect(args).toContain('--resume')
+        expect(existsSync(args[1])).toBe(true)
+      }
+      return cli(command, args, options)
+    })
+    const account = organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.stage).toBe('rate-limited'))
+    expect(existsSync(account.datastorePath!)).toBe(false)
+    limited = false
+    vi.spyOn(Date, 'now').mockReturnValue(reset * 1000 + 1)
+    organizations!.startOrganizationsRuntime()
+    await ready('acme')
+    expect(operations('init-org')).toHaveLength(2)
+  })
+
+  it('automatically retries a valid quota response whose reset elapsed before it arrived', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const background = await import('../server/release-background')
+    const reset = Math.floor(Date.now() / 1000) - 1
+    let limited = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (limited && command === 'github-datastore' && args[2] === 'init-org') {
+        limited = false
+        throw quotaError(reset)
+      }
+      return cli(command, args, options)
+    })
+    organizations!.startOrganizationsRuntime()
+    organizations!.addOrganization('acme')
+    // Observe the settled failure, not the row update before the job's finally
+    // handler releases ownership. Then exercise the automatic scheduled retry.
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+    expect(organizations!.getOrganizations()[0]).toMatchObject({
+      status: 'initializing', stage: 'rate-limited', retryAt: null,
+    })
+    expect(operations('init-org')).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(5000)
+    await ready('acme')
+    expect(operations('init-org')).toHaveLength(2)
+  })
+
+  it.each(['0', '-1', 'invalid', '999999999999999999'])('keeps malformed quota reset %s as an explicit activation error', async (reset) => {
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org') {
+        throw Object.assign(new Error('GitHub quota failure'), { stderr: `GITHUB_RATE_LIMIT_RESET=${reset}` })
+      }
+      return cli(command, args, options)
+    })
+    organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.status).toBe('error'))
+    expect(organizations!.getOrganizations()[0]!.retryAt).toBeNull()
+  })
+
+  it('merges concurrent quota reset times without shortening the shared cooldown', async () => {
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    let failAcme!: () => void
+    let failBeta!: () => void
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org') {
+        await new Promise<void>((_resolve, reject) => {
+          const fail = () => reject(quotaError(args[3] === 'acme' ? reset + 600 : reset))
+          if (args[3] === 'acme') failAcme = fail
+          else failBeta = fail
+          options!.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+      }
+      return cli(command, args, options)
+    })
+    organizations!.addOrganization('acme')
+    organizations!.addOrganization('beta')
+    await vi.waitFor(() => expect(operations('init-org')).toHaveLength(2))
+    failAcme()
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.stage).toBe('rate-limited'))
+    failBeta()
+    await vi.waitFor(() => expect(database!.db.prepare("SELECT stage FROM organizations WHERE login = 'beta'").get()).toEqual({ stage: 'rate-limited' }))
+    expect(organizations!.getOrganizations().map((org) => org.retryAt)).toEqual([
+      new Date((reset + 600) * 1000).toISOString(), new Date((reset + 600) * 1000).toISOString(),
+    ])
+    expect(database!.getMeta('github_rate_limit:octocat:reset_at')).toBe(String((reset + 600) * 1000))
+  })
+
+  it('holds the next subprocess of an already-running account after another account exhausts quota', async () => {
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    let finishBeta!: () => void
+    let failAcme!: () => void
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'init-org') {
+        await new Promise<void>((resolve, reject) => {
+          if (args[3] === 'acme') failAcme = () => reject(quotaError(reset))
+          else finishBeta = resolve
+          options!.signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+      }
+      return cli(command, args, options)
+    })
+    organizations!.addOrganization('acme')
+    const beta = organizations!.addOrganization('beta')
+    await vi.waitFor(() => expect(operations('init-org')).toHaveLength(2))
+    failAcme()
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.retryAt).not.toBeNull())
+    finishBeta()
+    await vi.waitFor(() => expect(database!.db.prepare("SELECT stage FROM organizations WHERE login = 'beta'").get()).toEqual({ stage: 'rate-limited' }))
+    expect(operations('build-user')).toHaveLength(0)
+    expect(operations('sync')).toHaveLength(0)
+    expect(existsSync(beta.datastorePath!)).toBe(false)
+    expect(existsSync(`${beta.datastorePath}.initializing`)).toBe(true)
+  })
+
+  it('attributes a quota failure to the identity used for the request despite a settings change', async () => {
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    let limited = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (limited && command === 'github-datastore' && args[2] === 'init-org') {
+        limited = false
+        database!.setMeta('me', 'other-user')
+        throw quotaError(reset)
+      }
+      return cli(command, args, options)
+    })
+    organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(database!.getMeta('github_rate_limit:octocat:reset_at')).toBe(String(reset * 1000)))
+    expect(database!.getMeta('github_rate_limit:other-user:reset_at')).toBeNull()
+    organizations!.addOrganization('beta')
+    await ready('beta')
+    expect(organizations!.getOrganizations().find((org) => org.login === 'beta')!.retryAt).toBeNull()
+    expect(mocks.runFile.mock.calls.filter(([command]) => command === 'gh').at(-1)?.[1]).toContain('other-user')
+    database!.setMeta('me', 'OCTOCAT')
+    expect(organizations!.getOrganizations().find((org) => org.login === 'beta')!.retryAt).toBe(new Date(reset * 1000).toISOString())
+  })
+
+  it('retains activated accounts during cooldown and resumes synchronization after reset', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    const activatedAt = organizations!.getOrganizations()[0]!.activatedAt
+    const reset = Math.floor(Date.now() / 1000) + 3600
+    let limited = true
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (limited && command === 'github-datastore' && args[2] === 'sync') throw quotaError(reset)
+      return cli(command, args, options)
+    })
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.stage).toBe('rate-limited'))
+    expect(organizations!.getOrganizations()[0]).toMatchObject({ status: 'ready', activatedAt, retryAt: new Date(reset * 1000).toISOString() })
+    const calls = mocks.runFile.mock.calls.length
+    organizations!.retryOrganization('acme')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(mocks.runFile).toHaveBeenCalledTimes(calls)
+    limited = false
+    vi.spyOn(Date, 'now').mockReturnValue(reset * 1000 + 1)
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.error).toBeNull())
+    expect(organizations!.getOrganizations()[0]).toMatchObject({ status: 'ready', stage: 'ready', retryAt: null, activatedAt })
+    expect(operations('init-org')).toHaveLength(1)
+  })
+
+  it('reconciles daily while keeping ordinary failed-sync backoff capped at one hour', async () => {
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    mocks.runFile.mockClear()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = ?').run(Date.now() - 2 * 60 * 60_000)
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(1))
+    expect(operations('sync').some((call) => call[1].includes('--reconcile'))).toBe(false)
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = ?').run(Date.now() - 24 * 60 * 60_000)
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(operations('health')).toHaveLength(2))
+    expect(operations('sync').filter((call) => call[1].includes('--reconcile'))).toHaveLength(1)
+    database!.db.prepare('UPDATE organizations SET sync_failures = 10').run()
+    mocks.runFile.mockImplementation(async (command, args, options) => {
+      if (command === 'github-datastore' && args[2] === 'sync') throw new Error('network unavailable')
+      return cli(command, args, options)
+    })
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.stage).toBe('sync-error'))
+    const { next_sync_at } = database!.db.prepare('SELECT next_sync_at FROM organizations').get() as { next_sync_at: number }
+    expect(next_sync_at - Date.now()).toBeGreaterThan(59 * 60_000)
+    expect(next_sync_at - Date.now()).toBeLessThanOrEqual(60 * 60_000)
+  })
+})
