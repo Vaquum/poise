@@ -257,10 +257,16 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
         return
     if not isinstance(node, dict) or not node.get("since_head_sha"):
         return
+    level = node.get("p")
+    if level is None or (isinstance(level, str) and not level.strip()):
+        raise InvalidVerdict(
+            "cannot validate since-diff positions: review packet is missing its priority")
+    # The packet carries the wire value (e.g. "p2"); pass it through unchanged
+    # so the full-diff re-fetch uses the same priority scope. atoms._priority
+    # validates the format strictly; non-string values fail there.
+    priority = level if isinstance(level, str) else str(level)
     try:
-        level = node.get("p")
-        full = json.loads(fetch_packet(pwd, pr, actor_name, head,
-                                       f"p{level}" if level is not None else None, since_head=None))
+        full = json.loads(fetch_packet(pwd, pr, actor_name, head, priority, since_head=None))
         retained = [entry["filename"] for entry in full["files"]]
         sets = review_stages.diff_line_sets(full["diff"], retained)
         since_files = [entry["filename"] for entry in node.get("files", [])]
