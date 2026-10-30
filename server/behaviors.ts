@@ -3216,6 +3216,23 @@ async function tickReviewNewPrs(): Promise<void> {
         if (!renewPrOperationOwned(claimId, PR_OPERATION_EVALUATION_LEASE_MS)) {
           throw new Error(`review PR operation ownership was lost for ${pr.repo}#${pr.number}`)
         }
+        // The preparation's head read is stale by now whenever the pull
+        // request moved during the claim phase or while another target
+        // provisioned: launching anyway spawns a worker Caller's head check
+        // is already doomed to refuse. Abort the stale preparation before
+        // it provisions or spawns, so a fast-moving pull request costs one
+        // head read per tick instead of one preflight failure per backoff
+        // window. The next tick prepares fresh on the new head; Caller's
+        // exact-head checks still backstop the remaining race.
+        const currentHead = await currentHeadSha(pr.repo, pr.number, bundle.actor)
+        if (currentHead !== bundle.expectedHead) {
+          releaseOwnedClaim('review-new-prs', target, claimId)
+          releasePrOperationOwned(bundle.operationId)
+          captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
+            outcome: 'no_op', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+          console.log(`[behaviors] review-new-prs deferred for ${pr.repo}#${pr.number} — head moved during preparation`)
+          return
+        }
         const pwd = await localCheckoutPath(bundle.owner, bundle.repo, pr.number, bundle.expectedHead, bundle.actor)
         if (behaviorAborted() || !isRunnable('review-new-prs') || !prAccountsMatch(bundle.accounts) || !stillEligible('review-new-prs', pr, bundle.actor)) {
           releaseOwnedClaim('review-new-prs', target, claimId)
