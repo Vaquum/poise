@@ -4530,7 +4530,10 @@ interface ResolveAttemptDetail {
 
 // Persisted before each admitted resolve. Earlier uncertain attempts stay
 // linked until positive target evidence settles them; a later failure is
-// never proof of their effects.
+// never proof of their effects. `cause` is the bounded actionable failure
+// message (behaviorErrorMessage); absent only for a freshly admitted firing
+// that has not failed yet. It survives through `previous` and every archived
+// receipt so a later supersession never replaces the original evidence.
 interface ResolveRecovery {
   nativeId: string
   code: string
@@ -4540,6 +4543,7 @@ interface ResolveRecovery {
   unresolvedBefore: number
   at: string
   actor?: string
+  cause?: string
   previous?: ResolveRecovery[]
 }
 const RESOLVE_RECOVERY_PREFIX = `${META_PREFIX}resolve_unblocking_recovery:`
@@ -4551,6 +4555,8 @@ function resolveRecoveryKey(checkTarget: string): string {
 function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
   const raw = getMeta(resolveRecoveryKey(checkTarget))
   if (!raw) return null
+  const validCause = (cause: unknown): cause is string =>
+    typeof cause === 'string' && cause.length >= 1 && cause.length <= 300
   try {
     const value = objectValue(parseJson(raw, 'resolve recovery'), 'resolve recovery')
     if (typeof value.nativeId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.nativeId)
@@ -4562,6 +4568,7 @@ function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
       || !Number.isSafeInteger(value.unresolvedBefore) || Number(value.unresolvedBefore) < 0
       || typeof value.at !== 'string' || !Number.isFinite(Date.parse(value.at))
       || (value.actor !== undefined && (typeof value.actor !== 'string' || !GITHUB_USERNAME_PATTERN.test(value.actor)))
+      || (value.cause !== undefined && !validCause(value.cause))
       || (value.previous !== undefined && (!Array.isArray(value.previous) || value.previous.length > 31))) return null
     const previous: ResolveRecovery[] = []
     if (Array.isArray(value.previous)) {
@@ -4573,10 +4580,12 @@ function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
           || item.sideEffects !== 'uncertain' || typeof item.head !== 'string' || !SHA_PATTERN.test(item.head)
           || !Number.isSafeInteger(item.unresolvedBefore) || Number(item.unresolvedBefore) < 0
           || typeof item.at !== 'string' || !Number.isFinite(Date.parse(item.at))
-          || (item.actor !== undefined && (typeof item.actor !== 'string' || !GITHUB_USERNAME_PATTERN.test(item.actor)))) return null
+          || (item.actor !== undefined && (typeof item.actor !== 'string' || !GITHUB_USERNAME_PATTERN.test(item.actor)))
+          || (item.cause !== undefined && !validCause(item.cause))) return null
         previous.push({ nativeId: item.nativeId, code: item.code, nextRetryAtMs: Number(item.nextRetryAtMs),
           sideEffects: 'uncertain', head: item.head, unresolvedBefore: Number(item.unresolvedBefore), at: item.at,
-          ...(typeof item.actor === 'string' ? { actor: item.actor } : {}) })
+          ...(typeof item.actor === 'string' ? { actor: item.actor } : {}),
+          ...(typeof item.cause === 'string' ? { cause: item.cause } : {}) })
       }
     }
     return {
@@ -4588,6 +4597,7 @@ function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
       unresolvedBefore: Number(value.unresolvedBefore),
       at: value.at,
       ...(typeof value.actor === 'string' ? { actor: value.actor } : {}),
+      ...(typeof value.cause === 'string' ? { cause: value.cause } : {}),
       ...(previous.length ? { previous } : {}),
     }
   } catch {
@@ -4618,6 +4628,26 @@ function archiveResolveRecovery(checkTarget: string, pending: ResolveRecovery, d
     state: disposition, activity: disposition === 'completed' ? 'settled' : 'unknown', stateSource: 'native',
     outcome: disposition === 'completed' ? 'no_op' : 'superseded', head,
     ...(disposition === 'completed' ? { completedAt: at } : {}) })
+}
+
+// A direct CLI supersession settles its own firing inside
+// resolveNonblockingIfReady, which already captured the superseded outcome.
+// Persist the receipt only: the original head/actor/correlation (and any
+// failure cause) must survive alongside the observed head, without a second
+// ledger outcome and without authorizing a replay from the changed head.
+// The attempt is the single firing being settled, never the whole chain.
+function retainResolveSupersededReceipt(checkTarget: string, attempt: ResolveRecovery, observedHead: string): void {
+  const single: ResolveRecovery = { nativeId: attempt.nativeId, code: attempt.code,
+    nextRetryAtMs: attempt.nextRetryAtMs, sideEffects: attempt.sideEffects, head: attempt.head,
+    unresolvedBefore: attempt.unresolvedBefore, at: attempt.at,
+    ...(attempt.actor !== undefined ? { actor: attempt.actor } : {}),
+    ...(attempt.cause !== undefined ? { cause: attempt.cause } : {}) }
+  const at = new Date().toISOString()
+  const receipt = { ...single, disposition: 'superseded', targetDisposition: 'superseded' as const,
+    observedHead, observedAt: at }
+  const stored = db.prepare("UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
+    .run(JSON.stringify({ target: checkTarget, ...receipt }), single.nativeId)
+  if (!stored.changes) setMeta(`${resolveRecoveryKey(checkTarget)}:receipt:${single.nativeId}`, JSON.stringify(receipt))
 }
 
 async function retireClosedResolveRecoveries(open: ReadonlySet<string>): Promise<void> {
@@ -4679,13 +4709,14 @@ function retainResolveRecoveryFailure(checkTarget: string, detail: ResolveAttemp
   }
   const failure = readBehaviorFailure('resolve-unblocking', checkTarget)
   const current = admitted?.nativeId === detail.nativeId && failure && failure.lastFailureAtMs >= recordedAtMs ? failure : null
-  const code = current?.diagnostic?.code ?? classifyBehaviorDiagnostic(behaviorErrorMessage(cause)).code
+  const causeMessage = current?.error ?? behaviorErrorMessage(cause)
+  const code = current?.diagnostic?.code ?? classifyBehaviorDiagnostic(causeMessage).code
   const retryAt = current?.nextRetryAtMs ?? Math.min(Math.max(
     rateLimitRetryAtMs(behaviorFailureEvidence(cause), recordedAtMs) ?? recordedAtMs + BEHAVIOR_RETRY_BASE_MS,
     recordedAtMs + BEHAVIOR_RETRY_BASE_MS), recordedAtMs + BEHAVIOR_RETRY_MAX_MS)
   attempts[ownIndex] = {
     nativeId: detail.nativeId, code, nextRetryAtMs: retryAt, sideEffects: detail.sideEffects,
-    head: headSha, unresolvedBefore, at, actor: detail.actor,
+    head: headSha, unresolvedBefore, at, actor: detail.actor, cause: causeMessage,
   }
   const latest = attempts.pop()!
   const previous = attempts.filter((attempt) => attempt.sideEffects === 'uncertain')
@@ -4696,7 +4727,7 @@ function retainResolveRecoveryFailure(checkTarget: string, detail: ResolveAttemp
   } else {
     captureBehaviorOutcome({ nativeId: detail.nativeId, state: 'held', activity: 'unknown', stateSource: 'native' })
   }
-  return `target=${checkTarget} native=${detail.nativeId} actor=${detail.actor} head=${headSha} code=${code} retry=${new Date(retryAt).toISOString()} side_effects=${detail.sideEffects}`
+  return `target=${checkTarget} native=${detail.nativeId} actor=${detail.actor} head=${headSha} code=${code} retry=${new Date(retryAt).toISOString()} side_effects=${detail.sideEffects} cause=${causeMessage}`
 }
 
 // Authoritative evidence proves nothing remains to resolve: settle a
@@ -4994,7 +5025,22 @@ async function tickResolveUnblocking(): Promise<void> {
           // A late result only proves its own invocation. Check ownership
           // and settle older receipts atomically with the current pointer.
           db.transaction(() => {
-            const current = readResolveRecovery(checkTarget)?.nativeId === detail.nativeId
+            const pendingBefore = readResolveRecovery(checkTarget)
+            const current = pendingBefore?.nativeId === detail.nativeId
+            if (result.superseded) {
+              // A late superseded response settles only its own firing, even
+              // when a newer attempt already owns the recovery pointer. Find
+              // its admitted evidence in the chain; when the pointer already
+              // moved on, rebuild the receipt from this invocation's pinned
+              // head/actor/correlation rather than dropping them.
+              const known = pendingBefore
+                ? resolveRecoveryAttempts(pendingBefore).find((attempt) => attempt.nativeId === detail.nativeId)
+                : undefined
+              const attempt: ResolveRecovery = known ?? { nativeId: detail.nativeId!, code: 'admitted',
+                nextRetryAtMs: Date.now() + BEHAVIOR_RETRY_BASE_MS, sideEffects: 'uncertain',
+                head: headSha, unresolvedBefore, at: new Date().toISOString(), actor: reviewer }
+              retainResolveSupersededReceipt(checkTarget, attempt, result.headSha)
+            }
             retireResolveRecoveryAttempt(checkTarget, detail.nativeId!)
             if (current && !result.superseded && result.unresolved_count === 0) settleResolveRecoveryEndState(checkTarget, result.headSha)
             checked = current && readResolveRecovery(checkTarget) === null
