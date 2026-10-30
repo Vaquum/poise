@@ -490,6 +490,29 @@ class TestSincePositions(TestCase):
                                            "a" * 40, 60, packet=packet, **options)
         return result, calls, fetch
 
+    @staticmethod
+    def _real_diffs(base, prev, cur, path="src/f.py"):
+        """(since, full) diffs from three real commits, as git lays them out."""
+        with tempfile.TemporaryDirectory(prefix="since-positions-") as directory:
+            subprocess.run(["git", "-c", "init.defaultBranch=main", "init", "-q"], cwd=directory,
+                           check=True, capture_output=True)
+            shas = []
+            for index, tree in enumerate((base, prev, cur)):
+                target = Path(directory) / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(tree)
+                subprocess.run(["git", "add", path], cwd=directory, check=True, capture_output=True)
+                subprocess.run(["git", "-c", "user.email=since@test", "-c", "user.name=since",
+                                "-c", "commit.gpgsign=false", "commit", "-qm", f"state{index}"],
+                               cwd=directory, check=True, capture_output=True)
+                shas.append(subprocess.run(["git", "rev-parse", "HEAD"], cwd=directory, check=True,
+                                           capture_output=True, text=True).stdout.strip())
+            since = subprocess.run(["git", "diff", shas[1], shas[2], "--", path], cwd=directory,
+                                   check=True, capture_output=True, text=True).stdout
+            full = subprocess.run(["git", "diff", shas[0], shas[2], "--", path], cwd=directory,
+                                  check=True, capture_output=True, text=True).stdout
+            return since, full
+
     def test_removal_finding_inside_the_pr_diff_submits(self):
         verdict = {"action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
@@ -642,6 +665,82 @@ class TestSincePositions(TestCase):
                        self._full(full, paths=("src/dup.py",)))
         self.assertEqual(failure.exception.code, "review_contract_violation")
         self.assertIn("no submitted verdict", str(failure.exception))
+
+    def test_removal_next_to_an_earlier_pr_edit_anchors_using_real_git_diffs(self):
+        base = "def f():\n    a = 1\n    b = 2\n    return a\n"
+        prev = "def f():\n    a = 10\n    b = 2\n    return a\n"
+        cur = "def f():\n    a = 10\n    return a\n"
+        since, full = self._real_diffs(base, prev, cur)
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/f.py", "line": 3, "side": "LEFT", "body": "b is still needed"}]}
+        _, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/f.py",)), verdict,
+                                self._full(full, paths=("src/f.py",)))
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(3, "LEFT")])
+
+    def test_repeated_removal_in_a_separate_hunk_anchors_using_real_git_diffs(self):
+        filler = "".join(f"    step{i} = {i}\n" for i in range(8))
+        base = f"def a():\n    return None\n{filler}def b():\n    return None\n    tail = 1\n"
+        prev = f"def a():\n    return 1\n{filler}def b():\n    return None\n    tail = 1\n"
+        cur = f"def a():\n    return 1\n{filler}def b():\n    tail = 1\n"
+        since, full = self._real_diffs(base, prev, cur)
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/f.py", "line": 12, "side": "LEFT", "body": "second removal"}]}
+        _, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/f.py",)), verdict,
+                                self._full(full, paths=("src/f.py",)))
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(12, "LEFT")])
+
+    def test_reworded_reaffirmation_at_thread_location_submits(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                "body": "Removing `z` still breaks callers."}]}
+        node = json.loads(self._packet("c" * 40, kept, paths=("src/kept.py",)))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False,
+                                  "bodies": ["[p1] removing z breaks callers"]}]
+        result, calls, _ = self._run(json.dumps(node), verdict,
+                                     self._full(self.REMOVAL + "\n" + kept,
+                                              paths=("src/gone.py", "src/kept.py")))
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_new_finding_colliding_with_a_thread_line_is_remapped(self):
+        shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                             "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                "body": "brand new defect here"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False,
+                                  "bodies": ["unrelated old thread"]}]
+        _, calls, _ = self._run(json.dumps(node), verdict, self._full(shifted))
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(5, "LEFT")])
+
+    def test_identical_reaffirmation_inside_the_since_diff_keeps_its_location(self):
+        shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                             "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "still blocks"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False, "bodies": ["still blocks"]}]
+        _, calls, _ = self._run(json.dumps(node), verdict, self._full(shifted))
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_outdated_reaffirmation_uses_thread_coordinates(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 999, "side": "RIGHT", "body": "y is wrong"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": True, "bodies": ["y is wrong"]}]
+        _, calls, _ = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
+        self.assertEqual(json.loads(calls[-1][0][4]),
+                         [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "y is wrong"}])
 
     def test_partially_stale_verdict_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
