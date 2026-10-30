@@ -45,8 +45,8 @@ async function directory(repository: string): Promise<string> {
   await mkdir(path, { recursive: true })
   return path
 }
-async function github(repository: string, argv: string[]): Promise<Record<string, unknown>> {
-  const { stdout } = await runFile('github-interface', argv, { cwd: await directory(repository), timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
+async function github(repository: string, argv: string[], maxOutputBytes = 2 * 1024 * 1024): Promise<Record<string, unknown>> {
+  const { stdout } = await runFile('github-interface', argv, { cwd: await directory(repository), timeoutMs: 30_000, maxOutputBytes })
   const value = object(JSON.parse(stdout), argv[0])
   if (typeof value.repository === 'string' && value.repository.toLowerCase() !== repository.toLowerCase()) throw new Error('native evidence belongs to another repository')
   return value
@@ -116,12 +116,19 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // The chain's draws seed by its seed issue, so every observation
       // refresh re-reads the same roster instead of admitting new slots.
       const chainKey = `${chain.repository}#${chain.issue}`
-      const [rawIssue, rawComments, publication, roster] = await Promise.all([
-        github(chain.repository, ['--read-issue', issueRef, ...actor]),
-        github(chain.repository, ['--issue-comments', issueRef, ...actor]),
-        github(chain.repository, ['--issue-work', issueRef, '--mode', 'inspect', '--branch', chain.branch, ...actor]),
+      // One process reads the seed issue, its comments and the publication
+      // inspection together, reusing their existing projections. The output
+      // cap is the sum of the three previous per-read caps, so no facet
+      // loses budget; any facet failure still fails the whole observation.
+      const [seed, roster] = await Promise.all([
+        github(chain.repository, ['--chain-seed', issueRef, '--branch', chain.branch, ...actor], 3 * 2 * 1024 * 1024),
         hooks.roster(chainKey),
       ])
+      if (seed.issue_number !== chain.issue || seed.branch !== chain.branch
+        || String(seed.actor).toLowerCase() !== chain.author.toLowerCase()) throw new Error('native seed observation belongs to another chain or actor')
+      const rawIssue: Record<string, unknown> = { issue: seed.issue }
+      const rawComments: Record<string, unknown> = { comments: seed.comments }
+      const publication = object(seed.publication, 'native issue-to-PR ownership evidence')
       const issue = object(rawIssue.issue, 'seed issue')
       if (!Array.isArray(rawComments.comments) || !Array.isArray(issue.labels) || typeof issue.title !== 'string'
         || (issue.body !== null && typeof issue.body !== 'string') || !['open', 'closed'].includes(String(issue.state))) throw new Error('seed issue observation is incomplete')

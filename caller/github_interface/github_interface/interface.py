@@ -198,6 +198,10 @@ async def issue_comments(payload: dict[str, Any]) -> Any:
     return await run_behavior("issue_comments", payload)
 
 
+async def chain_seed(payload: dict[str, Any]) -> Any:
+    return await run_behavior("chain_seed", payload)
+
+
 async def checkout_repo(payload: dict[str, Any]) -> Any:
     return await run_behavior("checkout_repo", payload)
 

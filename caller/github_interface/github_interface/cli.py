@@ -8,7 +8,7 @@ from typing import Any
 
 from .interface import issue_work
 
-from .interface import checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, grey_ci_candidates, rerun_grey_ci_if_ready, merge_candidates, merge_if_ready, merge_pr, pull_action_state, update_branch_if_behind, mergeable, post_pr_comment, prune_mirrors, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
+from .interface import chain_seed, checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, grey_ci_candidates, rerun_grey_ci_if_ready, merge_candidates, merge_if_ready, merge_pr, pull_action_state, update_branch_if_behind, mergeable, post_pr_comment, prune_mirrors, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
 
 TOP_HELP = """usage: github-interface BEHAVIOR ...
 
@@ -53,6 +53,7 @@ behaviors:
   --view-repos ORG
   --read-issue ISSUE [--repository OWNER/REPO]
   --issue-comments ISSUE [--repository OWNER/REPO]
+  --chain-seed ISSUE --branch BRANCH --token-user USER [--repository OWNER/REPO]
   --sub-issues ISSUE [--repository OWNER/REPO]
   --assign-issue ISSUE --user USER [--user USER ...]
   --comment-issue ISSUE --body BODY [--repository OWNER/REPO]
@@ -76,7 +77,7 @@ def main() -> None:
     if argv in (["-h"], ["--help"]):
         print(TOP_HELP)
         return
-    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--issue-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--merge-pr", "--pull-action-state", "--update-branch-if-behind", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context", "--prune-mirrors"}:
+    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--issue-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--merge-pr", "--pull-action-state", "--update-branch-if-behind", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context", "--prune-mirrors", "--chain-seed"}:
         print("error: first argument must be a behavior switch\n", file=sys.stderr)
         print(TOP_HELP, file=sys.stderr)
         raise SystemExit(2)
@@ -95,7 +96,7 @@ def main() -> None:
         payload: dict[str, Any] = vars(args)
     else:
         args = _parser(argv[0]).parse_args(argv[2:])
-        key = "root" if argv[0] == "--prune-mirrors" else "path" if argv[0] in {"--read-file", "--write-file"} else "issue" if argv[0] in {"--issue-work", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues"} else "repository" if argv[0] == "--checkout-repo" else "log_id" if argv[0] == "--read-failing-ci-log" else "conversation" if argv[0] == "--resolve-conversation" else "pr"
+        key = "root" if argv[0] == "--prune-mirrors" else "path" if argv[0] in {"--read-file", "--write-file"} else "issue" if argv[0] in {"--issue-work", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--chain-seed"} else "repository" if argv[0] == "--checkout-repo" else "log_id" if argv[0] == "--read-failing-ci-log" else "conversation" if argv[0] == "--resolve-conversation" else "pr"
         payload = {key: argv[1], **vars(args)}
 
     if batch or argv[0] in {"--merge-candidates", "--grey-ci-candidates"}:
@@ -158,6 +159,7 @@ def main() -> None:
         "--checkout-repo": checkout_repo,
         "--checkout-review": checkout_review,
         "--review-context": review_context,
+        "--chain-seed": chain_seed,
     }[argv[0]]
     try:
         result = asyncio.run(behavior(payload))
@@ -357,6 +359,12 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--view-repos":
         parser = argparse.ArgumentParser(prog="github-interface --view-repos ORG")
         parser.add_argument("org")
+        return parser
+
+    if behavior == "--chain-seed":
+        parser = argparse.ArgumentParser(prog="github-interface --chain-seed ISSUE")
+        parser.add_argument("--branch", required=True)
+        _add_repository(parser)
         return parser
 
     if behavior in {"--read-issue", "--assign-issue", "--issue-comments", "--sub-issues"}:

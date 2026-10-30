@@ -24,9 +24,9 @@ it.each([
 ])('uses native readiness policy for behind branches and still repairs actual conflicts: $expected', async ({ blockers, mergeable, expected }) => {
   mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
     const evidence: Record<string, unknown> = {
-      '--read-issue': { issue: { title: 'Seed', body: '', state: 'open', labels: [] } },
-      '--issue-comments': { comments: [] },
-      '--issue-work': { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+      '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
+        issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+        publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
       '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
       '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: false,
         unresolved_live_conversation_count: 0, green: false, blockers: [...blockers, 'reviewer_not_approved_current_head'] },
@@ -59,12 +59,13 @@ it('reconciles planned review comments with and without the revision marker', as
   const legacy = `Legacy.\n\n---\n<sub>Issue review · \`fixture\`</sub>\n<!-- agent-interface issue-review call=${callId} -->`
   mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
     const evidence: Record<string, unknown> = {
-      '--read-issue': { issue: { title: 'Seed', body: '', state: 'open', labels: [] } },
-      '--issue-comments': { comments: [
-        { id: 7, author: 'reviewer', body: marked, url: 'https://example.test/marked' },
-        { id: 8, author: 'reviewer', body: legacy, url: null },
-      ] },
-      '--issue-work': { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null },
+      '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
+        issue: { title: 'Seed', body: '', state: 'open', labels: [] },
+        comments: [
+          { id: 7, author: 'reviewer', body: marked, url: 'https://example.test/marked' },
+          { id: 8, author: 'reviewer', body: legacy, url: null },
+        ],
+        publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } },
       '--read-action-plan': { id: callId, sha: digest, plan },
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
@@ -90,9 +91,9 @@ it('reconciles planned review comments with and without the revision marker', as
 it('seeds roster draws and resolutions by the chain seed issue', async () => {
   mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
     const evidence: Record<string, unknown> = {
-      '--read-issue': { issue: { title: 'Seed', body: '', state: 'open', labels: [] } },
-      '--issue-comments': { comments: [] },
-      '--issue-work': { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+      '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
+        issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+        publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
     return { stdout: JSON.stringify(evidence[argv[0]]) }
@@ -109,4 +110,40 @@ it('seeds roster draws and resolutions by the chain seed issue', async () => {
   const decision = { kind: 'invoke', behavior: 'review-issue', basis: '', actor: 'reviewer', reviewer, reason: '' } as const
   await operations.request(chain, observation, decision, 'test-id')
   expect(resolve).toHaveBeenCalledWith(decision, 'example/repo#7')
+})
+
+it('reads the seed issue, comments and publication inspection in one native process', async () => {
+  mocks.runFile.mockClear()
+  mocks.runFile.mockImplementation(async () => ({ stdout: JSON.stringify({ repository: 'example/repo', issue_number: 7,
+    actor: 'author', branch: 'poise/issue-7', issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+    publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }) }))
+  const operations = nativeChainOperations({ login: 'example' } as Organization, {
+    roster: async () => ({ issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
+    resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
+    capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
+    reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
+  })
+  const observation = await operations.observe(chain)
+  expect(observation.issue.commentIds).toEqual([])
+  const native = mocks.runFile.mock.calls.filter(([command]) => command === 'github-interface')
+  expect(native).toHaveLength(1)
+  expect(native[0][1]).toEqual(['--chain-seed', '#7', '--branch', 'poise/issue-7', '--token-user', 'author'])
+})
+
+it.each([
+  { issue_number: 8 },
+  { branch: 'poise/issue-8' },
+  { actor: 'reviewer' },
+])('rejects seed evidence for another chain or actor: %o', async (override) => {
+  mocks.runFile.mockImplementation(async () => ({ stdout: JSON.stringify({ repository: 'example/repo', issue_number: 7,
+    actor: 'author', branch: 'poise/issue-7', ...override,
+    issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+    publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }) }))
+  const operations = nativeChainOperations({ login: 'example' } as Organization, {
+    roster: async () => ({ issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
+    resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
+    capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
+    reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
+  })
+  await expect(operations.observe(chain)).rejects.toThrow('belongs to another chain or actor')
 })
