@@ -1,9 +1,11 @@
+import gc
 import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 from contextlib import redirect_stdout
 from contextlib import nullcontext
 from pathlib import Path
@@ -374,6 +376,32 @@ class TestStagedReview(TestCase):
         self.assertEqual(len(calls), 3)
         self.assertIn("file group 2 of 2", calls[2])
         self.assertEqual(len(json.loads(submit.call_args.args[0][4])), 2)
+
+
+class TestBoundedStagePrompts(TestCase):
+    def test_stage_prompts_stream_one_at_a_time(self):
+        paths = [f"src/f{i:04d}.py" for i in range(1000)]
+        node = json.loads(staged_packet(paths))
+        node["review_threads"] = [{"path": paths[0], "line": 1, "side": "RIGHT", "bodies": ["c" * 60_000]}
+                                  for _ in range(16)]
+        packet = json.dumps(node)
+        self.assertLess(len(packet.encode()), 1_450_000)
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        self.assertFalse(isinstance(structured_review._stage_texts(text, packet), list),
+                         "stage prompts must stream, not materialize every prompt")
+        gc.collect()
+        tracemalloc.start()
+        try:
+            total, count = 0, 0
+            for prompt in structured_review._stage_texts(text, packet):
+                total += len(prompt.encode())
+                count += 1
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(count, 125)
+        self.assertGreater(total, 100_000_000)
+        self.assertLess(peak, total // 8)
 
 
 class TestApproveSinceHead(TestCase):
