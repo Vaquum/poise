@@ -435,6 +435,60 @@ class TestGovernedOutcomes(TestCase):
             "error_code": "review_contract_violation",
         })
 
+    def test_blocked_marker_settles_an_approval_without_a_review(self) -> None:
+        from agent_interface import review_budget, review_receipt
+
+        line = "error: 1 unresolved review conversation(s) from other reviewers remain"
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(reviewer_reviews_since_items=[])
+        review_receipt._failure.set(None)
+        review_receipt._blocked.set(line)
+        try:
+            with self.assertRaises(review_budget.ReviewLimitError) as raised:
+                agent_interface.behavior_outcome(
+                    object(), "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                    before, facts=after,
+                )
+        finally:
+            review_receipt._blocked.set(None)
+        self.assertEqual(raised.exception.code, "approval_blocked_unresolved_conversations")
+        self.assertIn(line, str(raised.exception))
+
+    def test_uncertain_submission_wins_over_a_blocked_marker(self) -> None:
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(reviewer_reviews_since_items=[])
+        review_receipt._failure.set("httpx.ReadTimeout: timed out")
+        review_receipt._blocked.set("error: 1 unresolved review conversation(s) from other reviewers remain")
+        try:
+            with self.assertRaises(review_receipt.SubmissionError):
+                agent_interface.behavior_outcome(
+                    object(), "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                    before, facts=after,
+                )
+        finally:
+            review_receipt._failure.set(None)
+            review_receipt._blocked.set(None)
+
+    def test_blocked_marker_settles_the_legacy_counter_path(self) -> None:
+        from agent_interface import review_budget, review_receipt
+
+        line = "error: 1 unresolved review conversation(s) from other reviewers remain"
+        before = self._facts()
+        after = self._facts()
+        review_receipt._failure.set(None)
+        review_receipt._blocked.set(line)
+        try:
+            with self.assertRaises(review_budget.ReviewLimitError) as raised:
+                agent_interface.behavior_outcome(
+                    object(), "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                    before, facts=after,
+                )
+        finally:
+            review_receipt._blocked.set(None)
+        self.assertEqual(raised.exception.code, "approval_blocked_unresolved_conversations")
+
     @staticmethod
     def _item(review_id: int, state: str, commit: str) -> dict:
         return {

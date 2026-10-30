@@ -96,7 +96,9 @@ GitHub reviews are `review_contract_violation` and held. An approval the
 unresolved-conversation guard refuses is `approval_blocked_unresolved_conversations`:
 still nothing approved, but a waiting external blocker rather than a failed
 verdict publication; a superseding head keeps that disposition, and another
-request's review never settles the blocked run. A second terminal
+request's review never settles the blocked run. Claude runs persist the refusal
+through the guard's `.blocked` sidecar, since they submit outside the structured
+runner; uncertainty still wins when both markers exist. A second terminal
 submission after an accepted one is blocked at the gate.
 
 A controller-observed transient GitHub submission failure is recorded as
@@ -104,7 +106,9 @@ A controller-observed transient GitHub submission failure is recorded as
 receipts establish what happened. It does not become a permanent model-contract
 hold. A verified accepted review wins over a lost response; Caller never retries
 the write automatically. A submission timeout or a success without a receipt is
-uncertain and reconciled the same way before any retry. Claude's pinned
+uncertain and reconciled the same way before any retry. A transport timeout or
+connection error during submission names no status, so it is uncertain as well —
+never a refused submission. Claude's pinned
 inspection root is also carried in its explicit settings so shell tools retain
 repository access.
 

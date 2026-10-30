@@ -21,6 +21,12 @@ SUBMISSIONS = {"requested_changes", "reviewed_clean", "approved_pr"}
 _current: ContextVar[dict | None] = ContextVar("review_receipt", default=None)
 _call: ContextVar[tuple[Path, str] | None] = ContextVar("review_receipt_call", default=None)
 _failure: ContextVar[str | None] = ContextVar("review_submission_failure", default=None)
+_blocked: ContextVar[str | None] = ContextVar("review_submission_blocked", default=None)
+# A transport error carries no status: the write may have landed before the
+# response was lost, so publication is uncertain, never a refused submission.
+_TRANSPORT_ERRORS = ("TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
+                     "ConnectError", "ReadError", "WriteError", "CloseError",
+                     "RemoteProtocolError", "LocalProtocolError")
 _QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-remaining",
                   "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
 
@@ -152,7 +158,7 @@ def record_failure(text: str) -> str | None:
     # calls this path, and validation/authentication failures remain held.
     observed = re.search(r"(?:^|\n)(?:error: )?GitHub (\d{3})( rate-limit)?:", text)
     if not observed:
-        return None
+        return record_transport_failure(text)
     status = observed[1]
     if status == "403":
         message = _quota_failure(text[observed.end():].rstrip()) if observed[2] else None
@@ -166,14 +172,49 @@ def record_failure(text: str) -> str | None:
     return None
 
 
+def record_transport_failure(text: str) -> str | None:
+    """A controller-observed transport error during the submission command.
+
+    Timeouts and connection errors name no status: the write may already be
+    accepted, so the failure is transient and reconciled from live receipts,
+    never tagged a refused submission.
+    """
+    found = None
+    for match in re.finditer(r"httpx\.(?:_[a-z_]+\.)?(?:" + "|".join(_TRANSPORT_ERRORS) + r")\b", text):
+        found = match
+    if found is None:
+        return None
+    message = text[found.start():].strip()[:4096]
+    _failure.set(message)
+    return message
+
+
 def failure() -> str | None:
     return _failure.get()
+
+
+def blocked_refusal(text: str) -> str | None:
+    """The approval guard's pre-POST refusal line, when the command output holds one.
+
+    Pure evidence for both submission runners: the structured runner raises it
+    directly, and the Claude guard persists it beside the receipt for the run
+    to settle as a blocked approval instead of a failed verdict.
+    """
+    found = re.search(r"(?:error: )?\d+ unresolved review conversation\(s\) from other reviewers remain", text)
+    if found is None:
+        return None
+    return " ".join(found.group(0).split())[:500]
+
+
+def blocked() -> str | None:
+    return _blocked.get()
 
 
 def bind(database: Path, call_id: str) -> None:
     _call.set((database, call_id))
     _current.set(None)
     _failure.set(None)
+    _blocked.set(None)
 
 
 def get() -> dict | None:
@@ -226,6 +267,13 @@ def record_file(path: str | Path) -> dict | None:
         record_failure(Path(str(path) + ".failure").read_text())
     except OSError:
         pass
+    try:
+        refused = blocked_refusal(Path(str(path) + ".blocked").read_text())
+    except OSError:
+        pass
+    else:
+        if refused is not None:
+            _blocked.set(refused)
     try:
         text = Path(path).read_text()
     except OSError:

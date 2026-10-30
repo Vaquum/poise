@@ -384,11 +384,6 @@ def _refused_head(output: str) -> str | None:
     return match[1] if match else None
 
 
-def _blocked_unresolved(output: str) -> bool:
-    """The pre-POST guard refused approval while other reviewers' conversations stay open."""
-    return re.search(r"\d+ unresolved review conversation\(s\) from other reviewers remain", output) is not None
-
-
 def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         pr: str, actor_name: str, head: str, timeout_s: int, *, repository=None,
         packet: str = "", capped: bool = False,
@@ -481,7 +476,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             # is superseded, not a contract violation.
             raise ReviewSuperseded(superseded)
         cause = bounded_cause(output or f"github-interface exited {done.returncode}")
-        if _blocked_unresolved(output):
+        if review_receipt.blocked_refusal(output) is not None:
             # The pre-POST guard refused: other reviewers' conversations are
             # still open, so the approval waits on them. The guard stays
             # strict — nothing is approved — but a blocked approval is not a

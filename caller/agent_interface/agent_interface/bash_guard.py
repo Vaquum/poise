@@ -11,10 +11,10 @@ import sys
 
 if __package__:
     from .review_gate import submission_gate
-    from .review_receipt import record_failure
+    from .review_receipt import blocked_refusal, record_failure
 else:
     from review_gate import submission_gate
-    from review_receipt import record_failure
+    from review_receipt import blocked_refusal, record_failure
 
 
 BAD = {";", "|", "||", "&&", "&", "<", ">", ">>", "<<", "2>", "2>>", "2>&1"}
@@ -72,6 +72,14 @@ def main():
             with open(staged, "w") as handle:
                 handle.write(failure_message)
             os.replace(staged, receipt + ".failure")
+        elif done.returncode and (refused := blocked_refusal(done.stderr or done.stdout)):
+            # The approval guard refused: deterministic, retryable, and never
+            # sealed — the run settles it as a blocked approval, not a failed
+            # verdict. Uncertainty still wins when both markers exist.
+            staged = receipt + ".blocked.tmp"
+            with open(staged, "w") as handle:
+                handle.write(refused)
+            os.replace(staged, receipt + ".blocked")
     # The reply reaches the model unchanged; a submitted review's id is also
     # left for the run, so it can tell its own review from a sibling's.
     sys.stdout.write(done.stdout)

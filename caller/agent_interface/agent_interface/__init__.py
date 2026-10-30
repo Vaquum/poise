@@ -1678,6 +1678,10 @@ def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: di
     if len(own) != 1:
         if not own and receipt is None and review_receipt.failure():
             raise review_receipt.SubmissionError(review_receipt.failure())
+        if not own and receipt is None and behavior == "pr_approve" and review_receipt.blocked():
+            raise review_budget.ReviewLimitError(
+                f"approval blocked by unresolved review conversations: {review_receipt.blocked()}",
+                "approval_blocked_unresolved_conversations")
         kind = "review behavior must produce exactly one atomic clean or change-request review" if behavior == "pr_review" \
             else "approval behavior must produce exactly one atomic approval or change-request review"
         raise review_budget.ReviewLimitError(kind, "review_contract_violation")
@@ -1892,6 +1896,11 @@ def behavior_outcome(
     )
     if not any((change_requests, approvals, comments)) and receipt is None and review_receipt.failure():
         raise review_receipt.SubmissionError(review_receipt.failure())
+    if not any((change_requests, approvals, comments)) and receipt is None and behavior == "pr_approve" \
+            and review_receipt.blocked():
+        raise review_budget.ReviewLimitError(
+            f"approval blocked by unresolved review conversations: {review_receipt.blocked()}",
+            "approval_blocked_unresolved_conversations")
     if change_requests < 0 or approvals < 0 or comments < 0:
         raise RuntimeError("review activity counters moved backwards")
     previous_review_id = str(before.get("reviewer_latest_review_id") or "")

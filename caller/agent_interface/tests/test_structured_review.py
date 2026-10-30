@@ -243,6 +243,26 @@ class TestStructuredVerdict(TestCase):
         self.assertEqual(failure.exception.diagnostic["submission"], "blocked")
         self.assertIsNone(review_receipt.get())
 
+    def test_transport_timeout_at_submit_is_uncertain_not_a_violation(self):
+        from agent_interface import review_receipt as receipt_mod
+
+        def process(args, **kwargs):
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=1, stdout="",
+                                       stderr="Traceback (most recent call last):\n"
+                                              "  File \"client.py\", line 69, in request\n"
+                                              "httpx.ReadTimeout: timed out\n")
+            Path(args[args.index("--output-last-message") + 1]).write_text(
+                json.dumps({"action": "approve", "comments": []}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process):
+            with self.assertRaises(receipt_mod.SubmissionError) as failure:
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertIn("httpx.ReadTimeout", str(failure.exception))
+
     def test_clean_and_approval_are_distinct_terminal_actions(self):
         for behavior, action, flag in (("pr_review", "reviewed_clean", "--reviewed-clean"), ("pr_approve", "approve", "--approve-pr")):
             with self.subTest(behavior=behavior):
