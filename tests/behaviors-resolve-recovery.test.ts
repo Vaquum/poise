@@ -506,4 +506,72 @@ describe('resolve-unblocking rate-limit recovery', () => {
     const [admission] = admissionsFor(17)
     expect(outcomesFor(admission!.nativeId)).toEqual([expect.objectContaining({ state: 'held', activity: 'unknown' })])
   })
+
+  it.each([
+    { name: 'safe no-effect', marked: true, sideEffects: 'none' },
+    { name: 'uncertain mutation', marked: false, sideEffects: 'uncertain' },
+  ])('retains a bounded actionable cause for a $name failure', async ({ marked, sideEffects }) => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    const message = `GitHub 403 rate-limit: quota exhausted for this test ${marked ? '(no conversation was resolved before this failure)' : ''}`
+    scriptResolve((number) => number === 17 ? { error: Object.assign(new Error(message), { stderr: message }) } : 'delegate')
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const recovery = recoveryRow(db, CHECK_17)!
+    expect(recovery).toMatchObject({ sideEffects, head: HEAD_SHA, actor: 'review-bot' })
+    expect(typeof recovery.cause).toBe('string')
+    expect((recovery.cause as string).length).toBeGreaterThan(0)
+    expect((recovery.cause as string).length).toBeLessThanOrEqual(300)
+    expect(recovery.cause).toContain('quota exhausted for this test')
+    const [admission] = admissionsFor(17)
+    expect(recovery.nativeId).toBe(admission!.nativeId)
+    const run = db.db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(admission!.nativeId) as { note: string }
+    expect(run.note).toContain(`side_effects=${sideEffects}`)
+    expect(run.note).toContain('cause=')
+    expect(run.note).toContain('quota exhausted for this test')
+  })
+
+  it('preserves original head, actor and correlation through a direct supersession', async () => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA, resolveSuperseded: true })
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const [admission] = admissionsFor(17)
+    expect(admission).toMatchObject({ head: HEAD_SHA, actor: 'review-bot' })
+    expect(outcomesFor(admission!.nativeId)).toEqual([expect.objectContaining({
+      state: 'superseded', activity: 'settled', outcome: 'superseded', head: NEXT_HEAD_SHA,
+    })])
+    const receiptRaw = db.getMeta(`behavior_resolve_unblocking_recovery:${CHECK_17}:receipt:${admission!.nativeId}`)
+    expect(receiptRaw).toBeTruthy()
+    const receipt = JSON.parse(receiptRaw!)
+    expect(receipt).toMatchObject({ nativeId: admission!.nativeId, head: HEAD_SHA, actor: 'review-bot',
+      disposition: 'superseded', targetDisposition: 'superseded', observedHead: NEXT_HEAD_SHA })
+    expect(receipt.observedHead).not.toBe(receipt.head)
+    expect(recoveryRow(db, CHECK_17)).toBeNull()
+    expect(db.db.prepare('SELECT id FROM behavior_runs WHERE id = ?').get(admission!.nativeId)).toBeUndefined()
+  })
+
+  it('preserves the failure cause through a later merge supersession', async () => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    scriptResolve((number) => number === 17 ? { error: new Error('response lost after partial resolution') } : 'delegate')
+    const { db, runtime } = await startResolveRuntime()
+    await runtime.runEnabledBehaviorsOnce()
+    const [admission] = admissionsFor(17)
+    const before = recoveryRow(db, CHECK_17)!
+    expect(before).toMatchObject({ nativeId: admission!.nativeId, sideEffects: 'uncertain' })
+    expect(before.cause).toContain('response lost after partial resolution')
+    expireBackoff(db, CHECK_17)
+    fixture.listedPrs = [fixture.listedPrs[1]!]
+    arrangeCli(false, false, { state: 'MERGED', unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED',
+      reviewerLatestCommit: HEAD_SHA, headSha: NEXT_HEAD_SHA })
+    mocks.runFile.mockClear()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(recoveryRow(db, CHECK_17)).toBeNull()
+    const run = db.db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(admission!.nativeId) as { note: string }
+    const receipt = JSON.parse(run.note)
+    expect(receipt).toMatchObject({ nativeId: admission!.nativeId, head: HEAD_SHA, actor: 'review-bot',
+      disposition: 'superseded', targetDisposition: 'superseded', observedHead: NEXT_HEAD_SHA,
+      sideEffects: 'uncertain', cause: expect.stringContaining('response lost after partial resolution') })
+    expect(outcomesFor(admission!.nativeId)).toEqual([expect.objectContaining({ state: 'held' }),
+      expect.objectContaining({ state: 'superseded', head: NEXT_HEAD_SHA })])
+  })
 })
