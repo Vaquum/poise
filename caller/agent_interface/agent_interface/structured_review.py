@@ -11,6 +11,7 @@ findings combine into the single submitted verdict.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from hashlib import sha256
 import os
 import re
@@ -213,15 +214,15 @@ def _admit(text: str) -> None:
         )
 
 
-def _stage_texts(text: str, packet: str) -> list[str]:
-    if not packet:
-        return [text]
-    stages = review_stages.split(packet)
-    if len(stages) == 1:
-        return [text]
+def _stage_texts(text: str, packet: str) -> Iterator[str]:
+    """Yield one review prompt per file group, holding one at a time."""
+    if not packet or review_stages.stage_count(packet) == 1:
+        yield text
+        return
     if packet not in text:
         raise review_stages.StageError("staged review packet differs from the review prompt")
-    return [text.replace(packet, stage, 1) for stage in stages]
+    for stage in review_stages.iter_stages(packet):
+        yield text.replace(packet, stage, 1)
 
 
 def _reaffirms_finding(comment: dict, threads: list[dict]) -> bool:
@@ -388,17 +389,17 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     if ask is None:
         raise AgentPreflightError(f"{model.provider} cannot return a structured review verdict")
     try:
-        stage_texts = _stage_texts(text, packet)
-        staged = len(stage_texts) > 1
+        total = review_stages.stage_count(packet) if packet else 1
+        staged = total > 1
         with tempfile.TemporaryDirectory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
             root = Path(work)
             deadline = monotonic() + timeout_s
             prior: list[dict] = []
-            for index, stage_text in enumerate(stage_texts):
+            for index, stage_text in enumerate(_stage_texts(text, packet)):
                 _admit(stage_text)
                 if staged:
-                    progress.stage("reviewing", f"Reviewing file group {index + 1} of {len(stage_texts)}")
+                    progress.stage("reviewing", f"Reviewing file group {index + 1} of {total}")
                     if prior:
                         stage_text += ("\n\nFindings already recorded in earlier file groups "
                                        "(do not repeat them):\n" + json.dumps(prior))

@@ -1,4 +1,6 @@
+import gc
 import json
+import tracemalloc
 from unittest import TestCase
 
 from agent_interface import review_stages
@@ -222,3 +224,53 @@ class TestSplit(TestCase):
             node = json.loads(stage)
             self.assertEqual(node["omitted_files"], [{"path": "src/rest.py", "reason": "omitted"}])
             self.assertIn("not reviewed in any stage", node["review_scope"])
+
+
+def large_packet(files=1000, comment_chars=60_000, comments=16):
+    """A legal-size packet with many stages: ~1 MB of common context shared
+    by every group, so retaining all rendered stages costs ~125 MB."""
+    paths = [f"src/f{i:04d}.py" for i in range(files)]
+    threads = [{"path": paths[0], "line": 1, "side": "RIGHT", "bodies": ["c" * comment_chars]}
+               for _ in range(comments)]
+    return packet(paths, review_threads=threads)
+
+
+class TestBoundedStageRetention(TestCase):
+    def test_stage_count_reports_groups_without_rendering(self):
+        raw = large_packet()
+        self.assertLess(len(raw.encode()), 1_450_000)
+        self.assertEqual(review_stages.stage_count(raw), 125)
+        self.assertEqual(review_stages.stage_count(packet(["a.py"])), 1)
+        self.assertEqual(review_stages.stage_count("not a packet"), 1)
+
+    def test_streamed_stages_cover_every_file_with_full_context(self):
+        raw = large_packet()
+        expected = json.loads(raw)
+        seen, count = [], 0
+        for stage in review_stages.iter_stages(raw):
+            node = json.loads(stage)
+            count += 1
+            self.assertEqual(node["review_threads"], expected["review_threads"])
+            seen.extend(entry["filename"] for entry in node["files"])
+        self.assertEqual(count, 125)
+        self.assertEqual(seen, [entry["filename"] for entry in expected["files"]])
+
+    def test_split_renders_the_same_stages_as_the_stream(self):
+        raw = large_packet()
+        self.assertEqual(review_stages.split(raw), list(review_stages.iter_stages(raw)))
+
+    def test_streaming_one_stage_at_a_time_bounds_live_retention(self):
+        raw = large_packet()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            total, count = 0, 0
+            for stage in review_stages.iter_stages(raw):
+                total += len(stage.encode())
+                count += 1
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(count, 125)
+        self.assertGreater(total, 100_000_000)
+        self.assertLess(peak, total // 8)

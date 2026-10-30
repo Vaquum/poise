@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 
 STAGE_MAX_FILES = 8
 STAGE_MAX_DIFF_BYTES = 200_000
@@ -47,17 +48,18 @@ def _unquote(path: str) -> str:
     return bytes(out).decode("utf-8", "surrogateescape")
 
 
-def split(packet: str) -> list[str]:
-    """One packet per file group, or the untouched packet when it fits."""
+def _plan(packet: str) -> tuple[dict, list[list[tuple[list[str], set[str]]]]] | None:
+    """The parsed packet and its file groups, or None when the input runs
+    unstaged: not a staged packet, or one group that reviews everything."""
     try:
         node = json.loads(packet)
     except ValueError:
-        return [packet]
+        return None
     if not isinstance(node, dict) or not isinstance(node.get("diff"), str) \
             or not isinstance(node.get("files"), list) \
             or not all(isinstance(entry, dict) and isinstance(entry.get("filename"), str)
                        for entry in node["files"]):
-        return [packet]
+        return None
     retained = [entry["filename"] for entry in node["files"]]
     sections = [(section, _covers(section, retained)) for section in _sections(node["diff"])]
     covered = {path for _, paths in sections for path in paths}
@@ -66,9 +68,25 @@ def split(packet: str) -> list[str]:
         raise StageError(f"retained file without a diff section: {missing[0]!r}")
     groups = _pack(sections)
     if len(groups) == 1:
-        return [packet]
+        return None
+    return node, groups
+
+
+def split(packet: str) -> list[str]:
+    """One packet per file group, or the untouched packet when it fits."""
+    return list(iter_stages(packet))
+
+
+def iter_stages(packet: str) -> Iterator[str]:
+    """Yield one rendered stage packet at a time: exactly what split()
+    returns, but holding one stage in memory instead of every stage at
+    once. Each stage still carries the full common review context."""
+    planned = _plan(packet)
+    if planned is None:
+        yield packet
+        return
+    node, groups = planned
     assigned: set[int] = set()
-    rendered = []
     for index, group in enumerate(groups):
         paths = {path for _, group_paths in group for path in group_paths}
         entries = []
@@ -76,9 +94,14 @@ def split(packet: str) -> list[str]:
             if entry["filename"] in paths and number not in assigned:
                 assigned.add(number)
                 entries.append(entry)
-        rendered.append(_render(node, len(groups), index,
-                                ["\n".join(section) for section, _ in group], entries))
-    return rendered
+        yield _render(node, len(groups), index,
+                      ["\n".join(section) for section, _ in group], entries)
+
+
+def stage_count(packet: str) -> int:
+    """The number of file groups, without rendering any stage."""
+    planned = _plan(packet)
+    return 1 if planned is None else len(planned[1])
 
 
 def _sections(diff: str) -> list[list[str]]:
