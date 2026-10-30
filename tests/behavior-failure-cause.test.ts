@@ -79,7 +79,7 @@ describe('deterministic behavior severity', () => {
   it.each(['invalid_agent_result'])('reserves red for the confirmed integration fault %s', (errorCode) => {
     expect(classifyBehaviorDiagnostic('worker failed', { errorCode, held: true })).toEqual({ severity: 'error', code: errorCode })
   })
-  it.each(['review_contract_violation', 'review_recovery_failed', 'review_provider_blocked', 'review_packet_too_large', 'review_budget_exhausted', 'model_output_limit'])('keeps the external worker condition %s yellow', (errorCode) => {
+  it.each(['review_contract_violation', 'review_recovery_failed', 'review_provider_blocked', 'review_packet_too_large', 'review_budget_exhausted', 'model_output_limit', 'approval_blocked_unresolved_conversations'])('keeps the external worker condition %s yellow', (errorCode) => {
     expect(classifyBehaviorDiagnostic('worker failed', { errorCode, held: true })).toEqual({ severity: 'warning', code: errorCode })
   })
   it('does not lose an unknown terminal cause behind an earlier capacity message', () => {

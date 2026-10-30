@@ -493,12 +493,23 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         transient = review_receipt.record_failure(done.stderr or done.stdout)
         if transient is not None:
             raise review_receipt.SubmissionError(transient)
-        superseded = _refused_head((done.stderr or done.stdout).strip())
+        output = (done.stderr or done.stdout).strip()
+        superseded = _refused_head(output)
         if superseded is not None:
             # The pre-POST head check refused: proved no review, so the run
             # is superseded, not a contract violation.
             raise ReviewSuperseded(superseded)
-        cause = bounded_cause((done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}")
+        cause = bounded_cause(output or f"github-interface exited {done.returncode}")
+        if review_receipt.blocked_refusal(output) is not None:
+            # The pre-POST guard refused: other reviewers' conversations are
+            # still open, so the approval waits on them. The guard stays
+            # strict — nothing is approved — but a blocked approval is not a
+            # failed verdict publication.
+            raise review_budget.ReviewLimitError(
+                f"approval blocked by unresolved review conversations: {cause}",
+                "approval_blocked_unresolved_conversations",
+                diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
+                                    stderr=cause, provider=model.provider, submission="blocked"))
         raise review_budget.ReviewLimitError(
             f"review submission rejected: {cause}", "review_contract_violation",
             diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",

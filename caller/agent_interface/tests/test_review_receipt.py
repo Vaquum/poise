@@ -245,6 +245,35 @@ class TestReceiptRecording(TestCase):
                 self.assertEqual(review_receipt.record_failure("warning before error\n" + message), message)
                 self.assertIsNone(review_receipt.get())
 
+    def test_transport_timeout_is_transient_never_a_refused_submission(self):
+        for error in ("httpx.ReadTimeout: timed out",
+                      "httpx.ConnectError: [Errno 111] Connection refused",
+                      "httpx._exceptions.RemoteProtocolError: peer closed connection"):
+            with self.subTest(error=error):
+                review_receipt.bind(api.DB, "run")
+                text = f"Traceback (most recent call last):\n  File \"client.py\", line 69, in request\n{error}\n"
+                message = review_receipt.record_failure(text)
+                self.assertTrue(message.startswith(error.split(":")[0]))
+                self.assertEqual(review_receipt.failure(), message)
+                self.assertIsNone(review_receipt.get())
+
+    def test_guard_refusal_is_not_a_transient_submission_error(self):
+        review_receipt.bind(api.DB, "run")
+        self.assertIsNone(review_receipt.record_failure(
+            "error: 1 unresolved review conversation(s) from other reviewers remain"))
+        self.assertIsNone(review_receipt.failure())
+
+    def test_blocked_refusal_matches_only_the_guard_line(self):
+        line = "error: 1 unresolved review conversation(s) from other reviewers remain"
+        self.assertEqual(review_receipt.blocked_refusal(line), line)
+        self.assertEqual(review_receipt.blocked_refusal(f"Traceback\nRuntimeError: {line}\n"), line)
+        for text in ("error: GitHub 422: invalid review",
+                     "Traceback\nhttpx.ReadTimeout: timed out",
+                     "2 unresolved review conversation(s) remain after resolution",
+                     "the model mentions unresolved review conversations"):
+            with self.subTest(text=text):
+                self.assertIsNone(review_receipt.blocked_refusal(text))
+
     def test_provider_failure_with_exact_quota_prose_is_not_a_submission_failure(self):
         with patch.object(ReviewWatch, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=QUOTA_ERROR)), \
                 patch.object(structured_review.subprocess, "run") as submit:
@@ -297,6 +326,29 @@ class TestReceiptRecording(TestCase):
         review_receipt.bind(api.DB, "run")
         self.assertIsNone(review_receipt.record_file(receipt_path))
         self.assertEqual(review_receipt.failure(), "error: GitHub 503:")
+        self.assertIsNone(self.stored())
+
+    def test_claude_guard_persists_the_guard_refusal_unsealed_for_retry(self):
+        command = f"github-interface --approve-pr #68 --expected-head {HEAD} --token-user bit-mis"
+        receipt_path = Path(self.directory.name) / "receipt.json"
+        gate_path = Path(self.directory.name) / "gate"
+        gate_path.write_text("")
+        line = "error: 2 unresolved review conversation(s) from other reviewers remain"
+        with patch.dict(os.environ, {"AGENT_INTERFACE_BASH_ALLOW": json.dumps([command]),
+                                     "AGENT_INTERFACE_REVIEW_RECEIPT": str(receipt_path),
+                                     "AGENT_INTERFACE_REVIEW_GATE": str(gate_path)}), \
+                patch.object(sys, "argv", ["bash_guard.py", command]), \
+                patch.object(bash_guard.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=line + "\n")), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                bash_guard.main()
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(Path(str(receipt_path) + ".blocked").read_text(), line)
+        self.assertEqual(gate_path.read_text(), "")
+        review_receipt.bind(api.DB, "run")
+        self.assertIsNone(review_receipt.record_file(receipt_path))
+        self.assertEqual(review_receipt.blocked(), line)
+        self.assertIsNone(review_receipt.failure())
         self.assertIsNone(self.stored())
 
 

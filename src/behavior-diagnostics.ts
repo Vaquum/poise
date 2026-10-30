@@ -65,6 +65,7 @@ function diagnosticMessage(code: string, cause: string): string {
     invalid_agent_result: 'Poise could not reconcile the worker result.',
     review_contract_violation: 'The model did not produce a usable review.',
     review_recovery_failed: 'The review needs attention after recovery failed.',
+    approval_blocked_unresolved_conversations: 'Approval is waiting on other reviewers to resolve their conversations. Poise will try again.',
   } as Record<string, string>)[code] ?? cause
 }
 
