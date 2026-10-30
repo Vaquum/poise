@@ -305,6 +305,136 @@ class TestGovernedOutcomes(TestCase):
 
         self.assertEqual(raised.exception.code, "approval_dismissed_stale")
 
+    def test_blocked_approval_never_adopts_another_request_review(self) -> None:
+        from types import SimpleNamespace
+
+        from agent_interface import pr_approve, review_budget
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            reviewer_reviews_since_items=[
+                self._item(92, state="APPROVED", commit="a" * 40)
+            ],
+        )
+        failure = review_budget.ReviewLimitError(
+            "approval blocked by unresolved review conversations: "
+            "error: 1 unresolved review conversation(s) from other reviewers remain",
+            "approval_blocked_unresolved_conversations")
+        spec = SimpleNamespace(identity="model-a", provider="codex")
+        recovery = SimpleNamespace(identity="model-b", provider="codex")
+
+        def blocked(*args, **kwargs):
+            raise failure
+
+        with patch.object(pr_approve, "run", side_effect=blocked), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            review_receipt._current.set(None)
+            try:
+                with self.assertRaises(review_budget.ReviewLimitError) as raised:
+                    agent_interface._run_review_with_recovery(
+                        pr_approve, "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                        "", 60, None, spec, recovery, before, "call-1",
+                    )
+            finally:
+                review_receipt._current.set(None)
+
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(raised.exception.code, "approval_blocked_unresolved_conversations")
+
+    def test_blocked_approval_supersede_keeps_the_original_disposition(self) -> None:
+        from types import SimpleNamespace
+
+        from agent_interface import pr_approve, review_budget
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(head_sha="b" * 40, reviewer_reviews_since_items=[])
+        failure = review_budget.ReviewLimitError(
+            "approval blocked by unresolved review conversations: "
+            "error: 1 unresolved review conversation(s) from other reviewers remain",
+            "approval_blocked_unresolved_conversations")
+        spec = SimpleNamespace(identity="model-a", provider="codex")
+        recovery = SimpleNamespace(identity="model-b", provider="codex")
+
+        def blocked(*args, **kwargs):
+            raise failure
+
+        with patch.object(pr_approve, "run", side_effect=blocked), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            review_receipt._current.set(None)
+            try:
+                response, result = agent_interface._run_review_with_recovery(
+                    pr_approve, "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                    "", 60, None, spec, recovery, before, "call-1",
+                )
+            finally:
+                review_receipt._current.set(None)
+
+        self.assertIn("blocked", response)
+        self.assertEqual(result, {
+            "action": None,
+            "outcome": "superseded",
+            "head_sha": "b" * 40,
+            "error": str(failure),
+            "error_code": "approval_blocked_unresolved_conversations",
+        })
+
+    def test_rejected_submission_never_adopts_another_request_approval(self) -> None:
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from time import time
+        from types import SimpleNamespace
+
+        from agent_interface import pr_approve, review_budget
+        from agent_interface import review_receipt
+
+        before = self._facts(reviewer_reviews_since_items=[])
+        after = self._facts(
+            head_sha="b" * 40,
+            reviewer_reviews_since_items=[
+                self._item(92, state="APPROVED", commit="a" * 40)
+            ],
+        )
+        failure = review_budget.ReviewLimitError(
+            "review submission rejected: error: GitHub 422: line not in diff",
+            "review_contract_violation", {"submission": "rejected"})
+        spec = SimpleNamespace(identity="model-a", provider="codex")
+        recovery = SimpleNamespace(identity="model-b", provider="codex")
+
+        def rejected(*args, **kwargs):
+            raise failure
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(agent_interface, 'DB', Path(directory) / 'calls.sqlite3'), \
+                patch.object(agent_interface, 'sleep'), \
+                patch.object(pr_approve, "run", side_effect=rejected), \
+                patch.object(agent_interface, "review_facts", return_value=after):
+            agent_interface.init_db()
+            with sqlite3.connect(Path(directory) / 'calls.sqlite3', timeout=30) as conn:
+                conn.execute(
+                    "insert into calls(id, started_at, actor, repo, pr_id, behavior, status)"
+                    " values (?,?,?,?,?,?,?)",
+                    ("call-1", time(), "bit-mis", "o/r", "68", "pr_approve", "running"))
+            review_receipt._current.set(None)
+            try:
+                response, result = agent_interface._run_review_with_recovery(
+                    pr_approve, "pr_approve", "68", "/tmp", "bit-mis", "a" * 40,
+                    "", 60, None, spec, recovery, before, "call-1",
+                )
+            finally:
+                review_receipt._current.set(None)
+
+        self.assertIn("line not in diff", response)
+        self.assertEqual(result, {
+            "action": None,
+            "outcome": "superseded",
+            "head_sha": "b" * 40,
+            "error": str(failure),
+            "error_code": "review_contract_violation",
+        })
+
     @staticmethod
     def _item(review_id: int, state: str, commit: str) -> dict:
         return {

@@ -140,6 +140,7 @@ Current `status: 'ok'` does not meet this definition (G4).
 | Caller `review_provider_error`, `review_provider_exit` | Reviewer trip, provider kind, before a verdict with nothing posted. |
 | Caller `review_packet_too_large` | Held on unchanged input and model; oversized packets do not retry blindly. |
 | Caller `review_submission_failed`, `submission: uncertain`, duplicate-verdict and malformed-verdict paths | Uncertain: reconcile from live receipts before any retry; contract violations hold. |
+| Caller `approval_blocked_unresolved_conversations` | Waiting: the approval guard refused while other reviewers' conversations stay open — nothing approved, retried on backoff while the head is unchanged. Proven no-action failures never adopt another request's review; a superseding head keeps the original disposition. |
 | Caller `review_target_closed` | Native terminal closure: settles the obsolete panel without claiming publication or worker termination. |
 | Caller `not_started` / `preflight_failed`, `launch_preflight_failed` | No-action proof candidates under E3; missing, conflicting or quarantined evidence stays under Needs you. |
 | Caller `stopped`, `stopping`, `interrupted`, `atomic_work_failed` | User stop holds like a bounded failure; process loss closes direct runs as `interrupted`, outside the success rate with unknown duration. |

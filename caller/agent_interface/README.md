@@ -86,13 +86,17 @@ lease never touches the row again.
 
 Every attempt ends with one durable terminal state: a validated result with its
 authoritative `review_id` receipt, or a typed failure carrying provider, phase,
-bounded redacted cause and known (`none`, `rejected`, `noop`) or unknown
-submission state. Structured provider exits and signals are `review_provider_exit`,
+bounded redacted cause and known (`none`, `rejected`, `noop`, `blocked`) or
+unknown submission state. Structured provider exits and signals are `review_provider_exit`,
 provider-reported error terminals are `review_provider_error`; both keep
 `not_started` / `preflight_failed` with no receipt, so Poise can safely retry
 after proving no reviewer action. Invalid, missing, duplicate or contradictory
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
-GitHub reviews are `review_contract_violation` and held. A second terminal
+GitHub reviews are `review_contract_violation` and held. An approval the
+unresolved-conversation guard refuses is `approval_blocked_unresolved_conversations`:
+still nothing approved, but a waiting external blocker rather than a failed
+verdict publication; a superseding head keeps that disposition, and another
+request's review never settles the blocked run. A second terminal
 submission after an accepted one is blocked at the gate.
 
 A controller-observed transient GitHub submission failure is recorded as

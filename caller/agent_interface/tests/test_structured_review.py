@@ -221,6 +221,28 @@ class TestStructuredVerdict(TestCase):
                                       "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
         self.assertEqual(raised.exception.head_sha, "b" * 40)
 
+    def test_unresolved_conversation_refusal_is_blocked_not_a_violation(self):
+        from agent_interface import review_receipt
+
+        def process(args, **kwargs):
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=1, stdout="",
+                                       stderr="error: 1 unresolved review conversation(s) from other reviewers remain")
+            Path(args[args.index("--output-last-message") + 1]).write_text(
+                json.dumps({"action": "approve", "comments": []}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process):
+            with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertEqual(failure.exception.code, "approval_blocked_unresolved_conversations")
+        self.assertIn("blocked", str(failure.exception))
+        self.assertIn("1 unresolved review conversation(s) from other reviewers remain", str(failure.exception))
+        self.assertEqual(failure.exception.diagnostic["submission"], "blocked")
+        self.assertIsNone(review_receipt.get())
+
     def test_clean_and_approval_are_distinct_terminal_actions(self):
         for behavior, action, flag in (("pr_review", "reviewed_clean", "--reviewed-clean"), ("pr_approve", "approve", "--approve-pr")):
             with self.subTest(behavior=behavior):

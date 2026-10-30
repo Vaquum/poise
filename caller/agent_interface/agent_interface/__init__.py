@@ -1512,6 +1512,19 @@ def run_governed_behavior(
             raise
 
 
+def _proven_no_action(failure: review_budget.ReviewLimitError) -> bool:
+    """Failures that prove this run posted no review: the approval guard's
+    pre-POST refusal, a refused or no-op submission, or a verdict that never
+    reached submission. Anything found afterward is another request's, never
+    this run's recovery. Output-limit failures keep their recovery path: a
+    different model still re-runs them."""
+    if failure.code == "model_output_limit":
+        return False
+    if failure.code == "approval_blocked_unresolved_conversations":
+        return True
+    return (failure.diagnostic or {}).get("submission") in {"none", "rejected", "noop"}
+
+
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
                               capped=False, review_round=None, review_cap=None):
     # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
@@ -1535,25 +1548,30 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         try:
             facts = review_facts(mod, pr, pwd, actor, head, 0)
             receipt = review_receipt.get()
+            proven = receipt is None and _proven_no_action(failure)
             # A completed or superseded action wins over a later CLI failure.
             if facts["head_sha"] != head or facts["state"] != "OPEN" or facts["draft"]:
                 return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
-                                                       receipt=receipt, call_id=call_id, prior_error=str(failure))
-            own = own_reviews(before, facts, receipt, call_id)
-            if own is None:
-                counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
-                if any(_count(facts, key) != _count(before, key) for key in counts):
+                                                       receipt=receipt, call_id=call_id, prior_error=str(failure),
+                                                       prior_code=failure.code, proven_no_action=proven)
+            if not proven:
+                own = own_reviews(before, facts, receipt, call_id)
+                if own is None:
+                    counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
+                    if any(_count(facts, key) != _count(before, key) for key in counts):
+                        return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
+                                                              receipt=receipt, call_id=call_id, prior_error=str(failure))
+                elif receipt is not None or own:
                     return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
-                                                          receipt=receipt, call_id=call_id, prior_error=str(failure))
-            elif receipt is not None or own:
-                return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
-                                                       receipt=receipt, call_id=call_id, prior_error=str(failure))
-            # Require positive no-action proof, including pending reviews.
-            if _count(facts, "reviewer_pending_reviews") != 0:
-                raise RuntimeError("a pending GitHub review requires reconciliation")
-            if own is None and (_count(facts, "reviewer_reviews_since") != _count(before, "reviewer_reviews_since")
-                    or facts.get("reviewer_latest_any_review_id") != before.get("reviewer_latest_any_review_id")):
-                raise RuntimeError("review activity changed without matching counters")
+                                                           receipt=receipt, call_id=call_id, prior_error=str(failure))
+                # Require positive no-action proof, including pending reviews.
+                if _count(facts, "reviewer_pending_reviews") != 0:
+                    raise RuntimeError("a pending GitHub review requires reconciliation")
+                if own is None and (_count(facts, "reviewer_reviews_since") != _count(before, "reviewer_reviews_since")
+                        or facts.get("reviewer_latest_any_review_id") != before.get("reviewer_latest_any_review_id")):
+                    raise RuntimeError("review activity changed without matching counters")
+            # A proven no-action run posted nothing: a later review is another
+            # request's, never this run's recovery. The failure stands verbatim.
         except review_budget.ReviewLimitError as typed:
             if typed.code == "approval_dismissed_stale":
                 # A stale-dismissed approval reconciles as a typed release
@@ -1756,6 +1774,21 @@ def _closed_target_result(*, facts: dict, evidence: str, attribution: str,
     }
 
 
+def _moved_target_result(actual_head: str, prior_error: str | None, prior_code: str | None) -> dict:
+    """The terminal disposition for work a moved target made obsolete.
+
+    Nothing was posted and the head moved on: a clean supersede. When a
+    failure preceded it, the original disposition stays on the row instead
+    of a bare supersede losing what the run was waiting on or hit.
+    """
+    result: dict = {"action": None, "outcome": "superseded", "head_sha": actual_head}
+    if prior_error is not None:
+        result["error"] = prior_error
+        if prior_code is not None:
+            result["error_code"] = prior_code
+    return result
+
+
 def _caller_context(envelope: dict, call_id: str, correlation_id: str, repo: str, pr_number: str,
                     reviewer: str, behavior: str, expected_head: str) -> dict:
     """The durable launch identity a close-settled diagnostic carries, the
@@ -1777,6 +1810,8 @@ def behavior_outcome(
     receipt: dict | None = None,
     call_id: str | None = None,
     prior_error: str | None = None,
+    prior_code: str | None = None,
+    proven_no_action: bool = False,
 ) -> dict:
     if facts is None:
         facts = review_facts(mod, pr, pwd, actor, expected_head, 0)
@@ -1803,6 +1838,12 @@ def behavior_outcome(
         if not closed:
             raise
         return settled(str(duplicates))
+    if proven_no_action and receipt is None and own is not None:
+        # Proven no-action without a receipt: no new review can be this
+        # run's, so attribution stays empty. A later review is another
+        # request's — settlement keeps this run's own disposition instead
+        # of adopting it.
+        own = []
     if own is not None:
         try:
             if len(own) == 1:
@@ -1823,12 +1864,9 @@ def behavior_outcome(
                     # Nothing posted and the target closed: the round is
                     # obsolete, with its no-action evidence retained.
                     return settled("no review attributable to this run was posted")
-                # Nothing posted and the target moved on: a clean supersede.
-                return {
-                    "action": None,
-                    "outcome": "superseded",
-                    "head_sha": actual_head,
-                }
+                # Nothing posted and the target moved on: a clean supersede
+                # that keeps the preceding failure's disposition, if any.
+                return _moved_target_result(actual_head, prior_error, prior_code)
             return _own_outcome(behavior, own, expected_head, receipt)
         except (review_budget.ReviewLimitError, RuntimeError) as unattributed:
             if not closed or str(unattributed).startswith("github-interface review outcome returned "):
@@ -1839,11 +1877,7 @@ def behavior_outcome(
     # Without per-review ids a moved head cannot be attributed to a posted
     # review, so the legacy counter path keeps its supersede-first rule.
     if stale:
-        return {
-            "action": None,
-            "outcome": "superseded",
-            "head_sha": actual_head,
-        }
+        return _moved_target_result(actual_head, prior_error, prior_code)
     change_requests = _count(facts, "reviewer_change_requests_since") - _count(
         before,
         "reviewer_change_requests_since",
