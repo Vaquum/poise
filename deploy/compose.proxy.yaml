@@ -1,0 +1,12 @@
+# Added to compose.yaml by the scripts beside it when deploy/.env sets
+# POISE_PROXY_LISTEN (docs/Operating.md, "Behind your own proxy"): a proxy
+# the server already runs holds ports 80 and 443 and the certificates, so
+# this installation runs no Caddy, removes one it ran before, and publishes
+# the gateway on that one address for the proxy to reach.
+services:
+  caddy:
+    scale: 0
+
+  gateway:
+    ports:
+      - "${POISE_PROXY_LISTEN:?set POISE_PROXY_LISTEN in deploy/.env}:8080"

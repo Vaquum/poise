@@ -1,0 +1,457 @@
+import { spawn } from 'node:child_process'
+import { constants } from 'node:fs'
+import {
+  access,
+  chmod,
+  mkdir,
+  realpath,
+  rename,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { config as loadDotenv } from 'dotenv'
+import { callerPython, setupCaller } from './caller-setup.mjs'
+import { installStopGate, stopGateManifest } from './stop-gate-runtime.mjs'
+import { servicePath } from './production-path.mjs'
+import { requireProductionDotenv } from './production-env.mjs'
+import { legacyDatastoreServices, resolveLegacyDatastore, resolveLegacySyncUser } from './legacy-datastore.mjs'
+import { prepareInstalledBundle } from './start-production.mjs'
+import { selectNodeRuntime } from './self-update/node-runtime.mjs'
+
+import { selfUpdateEnabled } from './self-update-bridge.mjs'
+
+// Do not overwrite the trusted launcher or frozen Caller environment.
+if (await selfUpdateEnabled()) {
+  throw new Error('Production is managed by the self-update controller. Use its manual maintenance workflow instead of install:production.')
+}
+
+const projectRoot = await realpath(fileURLToPath(new URL('..', import.meta.url)))
+// The service runs the Caller this checkout carries, from the virtualenv
+// `npm run caller:setup` builds.
+const callerRoot = join(projectRoot, 'caller')
+const binRoot = join(callerRoot, '.venv', 'bin')
+const agentRoot = join(callerRoot, 'agent_interface')
+const home = homedir()
+const stateRoot = join(home, '.poise')
+const launchAgents = join(home, 'Library', 'LaunchAgents')
+const serviceLabel = 'com.vaquum.poise'
+const monitorLabel = 'com.vaquum.poise.health'
+const updaterLabel = 'com.vaquum.poise.caller-update'
+const servicePlist = join(launchAgents, `${serviceLabel}.plist`)
+const monitorPlist = join(launchAgents, `${monitorLabel}.plist`)
+const updaterPlist = join(launchAgents, `${updaterLabel}.plist`)
+const logRoot = join(stateRoot, 'logs')
+const domain = `gui/${process.getuid()}`
+const dotenvPath = join(projectRoot, '.env')
+
+function run(command, args, options = {}) {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env || process.env,
+      stdio: options.capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.setEncoding('utf8')
+    child.stderr?.setEncoding('utf8')
+    child.stdout?.on('data', (chunk) => { stdout += chunk })
+    child.stderr?.on('data', (chunk) => { stderr += chunk })
+    child.once('error', rejectRun)
+    child.once('close', (code, signal) => {
+      if (code === 0) return resolveRun({ stdout, stderr })
+      const reason = signal ? `signal ${signal}` : `exit ${code}`
+      rejectRun(new Error(`${command} failed (${reason})${stderr ? `: ${stderr.trim()}` : ''}`))
+    })
+  })
+}
+
+async function executable(path) {
+  try {
+    await access(path, constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function commandOutput(command, args) {
+  return (await run(command, args, { capture: true })).stdout.trim()
+}
+
+function supportedNode() {
+  return selectNodeRuntime({
+    isExecutable: executable,
+    readVersion: (candidate) => commandOutput(candidate, ['--version']),
+  })
+}
+
+function xml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;')
+}
+
+function shell(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`
+}
+
+function array(values) {
+  return `<array>${values.map((value) => `<string>${xml(value)}</string>`).join('')}</array>`
+}
+
+function dictionary(values) {
+  return `<dict>${Object.entries(values)
+    .map(([key, value]) => `<key>${xml(key)}</key><string>${xml(value)}</string>`)
+    .join('')}</dict>`
+}
+
+function plist(entries) {
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0"><dict>',
+    entries.join(''),
+    '</dict></plist>',
+    '',
+  ].join('\n')
+}
+
+function key(name, value) {
+  return `<key>${xml(name)}</key>${value}`
+}
+
+async function atomicWrite(path, content) {
+  const temporary = `${path}.${process.pid}.${Date.now()}.tmp`
+  await writeFile(temporary, content, { mode: 0o600 })
+  await rename(temporary, path)
+  await chmod(path, 0o600)
+}
+
+async function bootout(label) {
+  try {
+    await run('/bin/launchctl', ['bootout', `${domain}/${label}`], { capture: true })
+  } catch {
+    // A first install has nothing to unload.
+  }
+}
+
+// launchd normally starts a RunAtLoad job as it is bootstrapped. A session
+// left in on-demand-only mode — a logout that is started and then cancelled
+// leaves it there — records that start as pending and never makes it, so a
+// reinstall unloaded the running service and left it down. Ask for the start
+// explicitly: kickstart is honoured in that mode, and does nothing to a job
+// that is already running.
+async function start(label) {
+  try {
+    await run('/bin/launchctl', ['kickstart', `${domain}/${label}`], { capture: true })
+  } catch (error) {
+    console.warn(`Could not start ${label}: ${error.message}`)
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms))
+}
+
+async function bootstrap(path) {
+  let lastError
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    try {
+      await run('/bin/launchctl', ['bootstrap', domain, path], { capture: true })
+      return
+    } catch (error) {
+      // bootout returns before launchd has always finished tearing down the
+      // old job. Only bootstrap's own success is authoritative: `print` can
+      // briefly expose that stale, unloading registration.
+      lastError = error
+      if (attempt < 15) await delay(Math.min(250 * (2 ** attempt), 2_000))
+    }
+  }
+  throw lastError
+}
+
+// Two different outcomes were treated as one. /api/health answers 503 with
+// `status: 'degraded'` for ordinary, fixable reasons — a Claude subscription
+// that needs signing in, a Caller that needs setting up — and the service
+// answering at all means it started. Aborting there left the service
+// bootstrapped and running while telling the operator the install had failed,
+// and the monitor and updater jobs that come after were never bootstrapped.
+//
+// A service that never answers is a genuine install failure. A service that
+// answers degraded is installed, and the operator needs to know what to fix.
+async function waitForHealthyProduction() {
+  const url = `http://127.0.0.1:${process.env.POISE_PORT || '5555'}/api/health`
+  let lastError = 'service did not respond'
+  let lastBody = null
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) })
+      const body = await response.json()
+      if (response.ok && body?.status === 'ok') return { healthy: true }
+      lastBody = body
+      lastError = `health returned HTTP ${response.status}`
+    } catch (error) {
+      lastBody = null
+      lastError = error instanceof Error ? error.message : String(error)
+    }
+    if (attempt < 29) await delay(1_000)
+  }
+  if (!lastBody) throw new Error(`Production service did not start: ${lastError}`)
+  return { healthy: false, body: lastBody }
+}
+
+function describeDegraded(body) {
+  const reasons = []
+  if (body?.scheduler?.status && body.scheduler.status !== 'ok') {
+    reasons.push(`behaviour runtime: ${body.scheduler.status}`)
+    if (body.scheduler.identity?.error) reasons.push(`  ${body.scheduler.identity.error}`)
+    if (body.scheduler.datastore?.error) reasons.push(`  ${body.scheduler.datastore.error}`)
+  }
+  if (body?.claudeAuth?.status && body.claudeAuth.status !== 'authenticated') {
+    reasons.push(`Claude subscription: ${body.claudeAuth.status}`)
+  }
+  if (body?.callerRelease?.status && body.callerRelease.status !== 'ready') {
+    reasons.push(`Caller: ${body.callerRelease.error || body.callerRelease.status}`)
+  }
+  return reasons.length ? reasons.join('\n  ') : 'no specific reason reported'
+}
+
+async function main() {
+  if (process.platform !== 'darwin') {
+    throw new Error('The supervised production installer currently supports macOS launchd')
+  }
+  await requireProductionDotenv(dotenvPath)
+  loadDotenv({ path: dotenvPath, quiet: true })
+
+  const datastoreDb = await resolveLegacyDatastore({ home, configuredPath: process.env.POISE_DATASTORE_DB })
+  const datastoreServices = legacyDatastoreServices(datastoreDb, launchAgents)
+  // The sync jobs authenticate as your saved GitHub account; a never-saved
+  // one migrates once from POISE_GITHUB_USER, explicitly.
+  const legacyUser = datastoreDb ? await resolveLegacySyncUser({ home, run, environment: process.env }) : null
+  if (legacyUser?.migrated) console.log(`Saved ${legacyUser.user} from POISE_GITHUB_USER as Your GitHub account in Settings.`)
+  const githubUser = legacyUser?.user ?? null
+
+  const [node, python] = await Promise.all([supportedNode(), callerPython()])
+  const commit = await commandOutput('git', ['-C', projectRoot, 'rev-parse', 'HEAD'])
+  // Before the slow Caller build: the hooks fix the saved agent account, and
+  // a missing one fails here naming the setting instead of after it.
+  const manifest = await stopGateManifest({ callerRoot, commit })
+  await installStopGate({
+    home,
+    manifest,
+    python,
+    run,
+  })
+  await setupCaller({ root: callerRoot, python, run })
+  const nodeEnvironment = {
+    ...process.env,
+    PATH: `${dirname(node)}:${process.env.PATH || '/usr/bin:/bin'}`,
+  }
+  await run('npm', ['ci'], {
+    cwd: projectRoot,
+    env: nodeEnvironment,
+  })
+  await prepareInstalledBundle({
+    root: projectRoot,
+    build: () => run('npm', ['run', 'build'], {
+      cwd: projectRoot,
+      env: nodeEnvironment,
+    }),
+  })
+
+  const legacyData = join(home, 'dev', 'caller', 'agent_interface', 'data')
+  let agentData = process.env.AGENT_INTERFACE_DATA_DIR || join(stateRoot, 'agent-interface')
+  try {
+    if (!process.env.AGENT_INTERFACE_DATA_DIR && (await stat(legacyData)).isDirectory()) {
+      agentData = legacyData
+    }
+  } catch {
+    // A new installation uses the state directory.
+  }
+  await Promise.all([
+    mkdir(launchAgents, { recursive: true, mode: 0o700 }),
+    mkdir(logRoot, { recursive: true, mode: 0o700 }),
+    mkdir(agentData, { recursive: true, mode: 0o700 }),
+  ])
+  const path = servicePath(home, binRoot)
+  const environment = {
+    AGENT_INTERFACE_DATA_DIR: agentData,
+    AGENT_INTERFACE_ROOT: agentRoot,
+    CALLER_BIN_ROOT: binRoot,
+    HOME: home,
+    LANG: process.env.LANG || 'en_US.UTF-8',
+    NODE_ENV: 'production',
+    PATH: path,
+    ...(datastoreDb ? { POISE_DATASTORE_DB: datastoreDb } : {}),
+    ...(process.env.POISE_DB ? { POISE_DB: process.env.POISE_DB } : {}),
+    TMPDIR: process.env.TMPDIR || '/tmp',
+  }
+  const service = plist([
+    key('Label', `<string>${serviceLabel}</string>`),
+    // start-production.mjs rebuilds dist/ when the checkout has moved and
+    // then starts the server in-process, so a relaunch can never serve a
+    // bundle that no longer matches the source on disk.
+    key('ProgramArguments', array([node, join(projectRoot, 'scripts', 'start-production.mjs')])),
+    key('WorkingDirectory', `<string>${xml(projectRoot)}</string>`),
+    // The timed jobs the server keeps alive when launchd stops firing their
+    // timers (server/launchd-watchdog.ts). Interval jobs only: the calendar
+    // jobs still fire in on-demand-only mode.
+    key('EnvironmentVariables', dictionary({
+      ...environment,
+      POISE_LAUNCHD_WATCHDOG: [
+        updaterLabel,
+        monitorLabel,
+        ...datastoreServices.filter((job) => job.kind !== 'reconcile').map((job) => job.label),
+      ].join(','),
+    })),
+    key('RunAtLoad', '<true/>'),
+    key('KeepAlive', '<true/>'),
+    key('ProcessType', '<string>Interactive</string>'),
+    key('ThrottleInterval', '<integer>10</integer>'),
+    key('StandardOutPath', `<string>${xml(join(logRoot, 'production.out.log'))}</string>`),
+    key('StandardErrorPath', `<string>${xml(join(logRoot, 'production.err.log'))}</string>`),
+  ])
+  const monitor = plist([
+    key('Label', `<string>${monitorLabel}</string>`),
+    key('ProgramArguments', array([node, join(projectRoot, 'scripts', 'monitor-production.mjs')])),
+    key('WorkingDirectory', `<string>${xml(projectRoot)}</string>`),
+    key('EnvironmentVariables', dictionary({
+      HOME: home,
+      LANG: process.env.LANG || 'en_US.UTF-8',
+      PATH: path,
+      POISE_HEALTH_URL: `http://127.0.0.1:${process.env.POISE_PORT || '5555'}/api/health`,
+      TMPDIR: process.env.TMPDIR || '/tmp',
+    })),
+    key('RunAtLoad', '<true/>'),
+    key('StartInterval', '<integer>60</integer>'),
+    key('StandardOutPath', `<string>${xml(join(logRoot, 'health.out.log'))}</string>`),
+    key('StandardErrorPath', `<string>${xml(join(logRoot, 'health.err.log'))}</string>`),
+  ])
+  const updater = plist([
+    key('Label', `<string>${updaterLabel}</string>`),
+    key('ProgramArguments', array([node, join(projectRoot, 'scripts', 'update-caller.mjs')])),
+    key('WorkingDirectory', `<string>${xml(projectRoot)}</string>`),
+    key('EnvironmentVariables', dictionary({
+      HOME: home,
+      LANG: process.env.LANG || 'en_US.UTF-8',
+      PATH: path,
+      POISE_HEALTH_URL: `http://127.0.0.1:${process.env.POISE_PORT || '5555'}/api/health`,
+      ...(process.env.POISE_DB ? { POISE_DB: process.env.POISE_DB } : {}),
+      TMPDIR: process.env.TMPDIR || '/tmp',
+    })),
+    key('RunAtLoad', '<true/>'),
+    key('StartInterval', '<integer>60</integer>'),
+    key('StandardOutPath', `<string>${xml(join(logRoot, 'caller-update.out.log'))}</string>`),
+    key('StandardErrorPath', `<string>${xml(join(logRoot, 'caller-update.err.log'))}</string>`),
+  ])
+  // No calendar job for the model catalog: the production server runs the
+  // daily check itself at 07:00 in the timezone saved in Settings, so a
+  // timezone change takes effect without reinstalling. The running server
+  // retires the legacy job at startup (server/launchd-watchdog.ts) — the
+  // only retirer, so its stand-down decision can never race a concurrent
+  // unload. That also covers managed installs, which never run this script.
+  // The empty plan on a clean install must not write, unload, or start any
+  // pre-existing datastore launchd job owned outside this Poise installation.
+  if (datastoreDb) {
+    const datastoreCommand = (args) => [
+      'set -euo pipefail',
+      `export PATH=${shell(path)}`,
+      `GH_TOKEN="$(gh auth token --user ${shell(githubUser)})"`,
+      '[[ -n "$GH_TOKEN" ]]',
+      'export GH_TOKEN',
+      `exec ${shell(join(binRoot, 'github-datastore'))} --db ${shell(datastoreDb)} ${args.map(shell).join(' ')}`,
+    ].join('; ')
+    const datastoreSync = plist([
+      key('Label', `<string>com.vaquum.github-datastore.sync</string>`),
+      key('ProgramArguments', array([
+        '/bin/zsh', '-lc', datastoreCommand(['sync', '--loop', '--interval', '60', '--workers', '12']),
+      ])),
+      key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
+      key('RunAtLoad', '<true/>'),
+      key('KeepAlive', '<true/>'),
+      key('ThrottleInterval', '<integer>60</integer>'),
+      key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-sync.out.log'))}</string>`),
+      key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-sync.err.log'))}</string>`),
+    ])
+    const datastoreReconcile = plist([
+      key('Label', `<string>com.vaquum.github-datastore.reconcile</string>`),
+      key('ProgramArguments', array([
+        '/bin/zsh', '-lc', datastoreCommand([
+          'sync', '--workers', '1', '--reconcile', '--reconcile-sleep', '17',
+        ]),
+      ])),
+      key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
+      key('StartCalendarInterval', '<dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>'),
+      key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-reconcile.out.log'))}</string>`),
+      key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-reconcile.err.log'))}</string>`),
+    ])
+    const datastoreHealth = plist([
+      key('Label', `<string>com.vaquum.github-datastore.health</string>`),
+      key('ProgramArguments', array([
+        join(binRoot, 'github-datastore'),
+        '--db', datastoreDb,
+        'health', '--max-age-seconds', '120',
+      ])),
+      key('WorkingDirectory', `<string>${xml(dirname(datastoreDb))}</string>`),
+      key('EnvironmentVariables', dictionary({ HOME: home, PATH: path })),
+      key('RunAtLoad', '<true/>'),
+      key('StartInterval', '<integer>60</integer>'),
+      key('StandardOutPath', `<string>${xml(join(logRoot, 'datastore-health.out.log'))}</string>`),
+      key('StandardErrorPath', `<string>${xml(join(logRoot, 'datastore-health.err.log'))}</string>`),
+    ])
+    const contents = { sync: datastoreSync, reconcile: datastoreReconcile, health: datastoreHealth }
+    for (const job of datastoreServices) job.content = contents[job.kind]
+  }
+  await Promise.all([
+    atomicWrite(servicePlist, service),
+    atomicWrite(monitorPlist, monitor),
+    atomicWrite(updaterPlist, updater),
+    ...datastoreServices.map((job) => atomicWrite(job.path, job.content)),
+  ])
+  const selfUpdating = process.env.POISE_RUNTIME_RECONCILER === '1'
+    || process.env.POISE_CALLER_UPDATER === '1'
+  if (!selfUpdating) await bootout(updaterLabel)
+  await bootout(monitorLabel)
+  await bootout(serviceLabel)
+  for (const job of datastoreServices) await bootout(job.label)
+  await run('/bin/launchctl', ['enable', `${domain}/${serviceLabel}`])
+  await run('/bin/launchctl', ['enable', `${domain}/${monitorLabel}`])
+  await run('/bin/launchctl', ['enable', `${domain}/${updaterLabel}`])
+  for (const job of datastoreServices) await run('/bin/launchctl', ['enable', `${domain}/${job.label}`])
+  for (const job of datastoreServices.filter((job) => job.kind === 'sync')) {
+    await bootstrap(job.path)
+    await start(job.label)
+  }
+  for (const job of datastoreServices.filter((job) => job.kind !== 'sync')) {
+    await bootstrap(job.path)
+    if (job.kind !== 'reconcile') await start(job.label)
+  }
+  await bootstrap(servicePlist)
+  await start(serviceLabel)
+  const health = await waitForHealthyProduction()
+  // The service is up either way at this point, so the monitor and the updater
+  // are bootstrapped regardless — leaving them out was what made a degraded
+  // install a half-install.
+  await bootstrap(monitorPlist)
+  await start(monitorLabel)
+  if (!selfUpdating) {
+    await bootstrap(updaterPlist)
+    await start(updaterLabel)
+  }
+  console.log(`Installed ${serviceLabel} at ${commit} with its Caller (${Object.entries(manifest.packages).map(([name, version]) => `${name} ${version}`).join(', ')})`)
+  if (!datastoreDb) console.log('Add your first GitHub organization in Settings to initialize its datastore.')
+  if (!health.healthy) {
+    console.warn('\nThe service is installed and running, but reports degraded:')
+    console.warn(`  ${describeDegraded(health.body)}`)
+    console.warn('\nFix the above and it will clear on its own — no reinstall needed.')
+  }
+}
+
+await main()

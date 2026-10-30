@@ -1,0 +1,127 @@
+// Settings → Connected accounts: one row per agent CLI with what its own
+// status command says (GET /api/accounts), and the button that opens its
+// login in a terminal.
+
+import { MUSE_API_KEY_LOGIN, hasRecordedSignIn, type AccountId, type ConnectedAccount } from '../../server/accounts/types'
+
+const ACCOUNT_NAMES: Record<AccountId, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  gh: 'GitHub',
+  grok: 'Grok',
+  muse: 'Muse',
+  antigravity: 'Antigravity',
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+}
+
+export async function fetchAccounts(id?: AccountId): Promise<ConnectedAccount[]> {
+  const res = await fetch(id ? `/api/accounts?id=${id}` : '/api/accounts', { cache: 'no-store' })
+  let data: { accounts?: unknown, error?: unknown } | null = null
+  try { data = await res.json() } catch { /* reported below */ }
+  if (!res.ok) throw new Error(typeof data?.error === 'string' ? data.error : `HTTP ${res.status}`)
+  if (!Array.isArray(data?.accounts)) throw new Error('the answer is unreadable')
+  return data.accounts as ConnectedAccount[]
+}
+
+function state(account: ConnectedAccount): { text: string, tone: 'on' | 'off' | 'unknown' } {
+  if (!account.installed) return { text: 'Not installed', tone: 'unknown' }
+  if (account.signedIn === true) return { text: account.identity ? `Signed in as ${account.identity}` : 'Signed in', tone: 'on' }
+  if (account.signedIn === false) return { text: 'Not signed in', tone: 'off' }
+  if (hasRecordedSignIn(account)) return { text: 'Signed in here', tone: 'on' }
+  return { text: 'Sign-in not reported', tone: 'unknown' }
+}
+
+/** The two GitHub accounts Settings → General names (`me` and `agentAccount`). */
+export interface GitHubIdentities {
+  me: string
+  agentAccount: string
+}
+
+// GitHub logins are case-insensitive.
+function sameLogin(a: string, b: string): boolean {
+  return !!b && a.toLowerCase() === b.toLowerCase()
+}
+
+/** Every account gh holds, which is active and which are yours, and a line for
+ *  each of your two accounts gh cannot use. Nothing is said about them while
+ *  gh's own status is unknown. */
+function ghAccounts(account: ConnectedAccount, identities: GitHubIdentities): string {
+  if (!account.accounts) return ''
+  const held = account.accounts
+  const list = held.length ? `<ul class="st-gh-accounts" aria-label="GitHub accounts gh holds">${held.map((gh) => {
+    const notes = [
+      gh.active ? 'active' : '',
+      sameLogin(gh.login, identities.me) ? 'your GitHub account' : '',
+      sameLogin(gh.login, identities.agentAccount) ? 'automation account' : '',
+    ].filter(Boolean)
+    return `<li class="st-gh-account st-account-state-${gh.signedIn ? 'on' : 'off'}" data-login="${escapeHtml(gh.login)}">
+      <span class="st-gh-login">${escapeHtml(gh.login)}</span>${notes.length ? `<span class="st-gh-notes">${notes.join(' · ')}</span>` : ''}
+      ${gh.detail ? `<span class="st-gh-problem">${escapeHtml(gh.detail)}</span>` : ''}
+    </li>`
+  }).join('')}</ul>` : ''
+  const usable = (login: string) => held.some((gh) => gh.signedIn && sameLogin(gh.login, login))
+  const missing = [
+    identities.me && !usable(identities.me) ? `Your GitHub account ${identities.me} is not signed in.` : '',
+    identities.agentAccount && !usable(identities.agentAccount) ? `Your GitHub automation account ${identities.agentAccount} is not signed in.` : '',
+  ].filter(Boolean)
+  return list + missing.map((text) => `<div class="st-help st-help-warn st-gh-missing">${escapeHtml(text)}</div>`).join('')
+}
+
+const MUSE_LOGIN_WARNING = 'switches Muse to the account login and its subscription quota'
+
+/** Which credential Muse's auth file holds, when it names one. */
+function museCredential(account: ConnectedAccount): string {
+  if (account.id !== 'muse' || !account.credential) return ''
+  const text = account.credential === 'api-key' ? 'Credential: API key.' : 'Credential: Account login (device code).'
+  return `<div class="st-help st-help-info st-account-credential">${escapeHtml(text)}</div>`
+}
+
+/** Connect on an API-key Muse would silently move it to subscription quota. */
+function museLoginWarning(account: ConnectedAccount): string {
+  if (account.id !== 'muse' || account.credential !== 'api-key') return ''
+  return `<div class="st-help st-help-warn st-account-warning">${escapeHtml(`Connect ${MUSE_LOGIN_WARNING}.`)}</div>`
+}
+
+/** The Muse row also stores an API key, pasted into its own terminal. */
+function museApiKeyButton(account: ConnectedAccount, disabled: boolean): string {
+  if (account.id !== 'muse') return ''
+  const label = MUSE_API_KEY_LOGIN.join(' ')
+  return `<button type="button" class="st-clear st-account-connect" data-connect="muse-api-key" data-help="Opens a terminal: ${escapeHtml(label)}. Paste the key there; Poise never sees or stores it." aria-label="Use an API key for Muse"${disabled ? ' disabled' : ''}>Use an API key</button>`
+}
+
+/** The rows. `busy` while a terminal runs: one login at a time. */
+export function accountsHtml(accounts: ConnectedAccount[], identities: GitHubIdentities, busy: boolean): string {
+  const rows = (entries: ConnectedAccount[]) => entries.map((account) => {
+    const name = ACCOUNT_NAMES[account.id]
+    const { text, tone } = state(account)
+    const action = tone === 'on' ? 'Reconnect' : 'Connect'
+    const disabled = busy || !account.installed
+    const detail = hasRecordedSignIn(account) ? 'Sign-in completed or confirmed in Poise. The CLI cannot verify its current status.' : account.detail
+    const help = account.id === 'muse' ? `Opens a sign-in terminal: ${account.login.label}. Warning: this ${MUSE_LOGIN_WARNING}.` : `Opens a sign-in terminal: ${account.login.label}`
+    return `
+    <div class="st-account" data-account="${account.id}">
+      <div class="st-account-head">
+        <span class="st-account-name">${escapeHtml(name)}</span>
+        ${account.version ? `<span class="st-account-version" data-help="${escapeHtml(name)} version ${escapeHtml(account.version)}" tabindex="0">${escapeHtml(account.version)}</span>` : ''}
+        <button type="button" class="st-clear st-account-connect" data-connect="${account.id}" data-help="${escapeHtml(help)}" aria-label="${action} ${escapeHtml(name)}"${disabled ? ' disabled' : ''}>${action}</button>
+        ${museApiKeyButton(account, disabled)}
+      </div>
+      <div class="st-account-state st-account-state-${tone}">${escapeHtml(text)}</div>
+      ${museCredential(account)}
+      ${museLoginWarning(account)}
+      ${detail ? `<div class="st-help st-help-info st-account-detail">${escapeHtml(detail)}</div>` : ''}
+      ${ghAccounts(account, identities)}
+    </div>`
+  }).join('')
+  return [
+    { key: 'ai', label: 'AI accounts', entries: accounts.filter((account) => account.id !== 'gh') },
+    { key: 'github', label: 'GitHub accounts', entries: accounts.filter((account) => account.id === 'gh') },
+  ].filter((group) => group.entries.length).map((group) => `
+    <section class="st-account-group" data-key="accounts-${group.key}" aria-label="${group.label}">
+      <h3 class="tp-group-label">${group.label}</h3>
+      ${rows(group.entries)}
+    </section>`).join('')
+}

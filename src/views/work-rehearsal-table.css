@@ -1,0 +1,11 @@
+.work-rehearsal-table { flex: 0 0 auto; min-width: 180px; min-height: 0; display: flex; flex-direction: column; overflow: hidden; border-left: var(--b-hair); background: var(--n1); font-size: .75rem; }
+.work-rehearsal-table > header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--sp-2); padding: var(--sp-2); }
+.work-rehearsal-table label { display: flex; gap: var(--sp-1); align-items: center; }
+.work-rehearsal-table input { width: 72px; }
+.work-rehearsal-table p { padding: var(--sp-2); overflow-wrap: anywhere; }
+.work-table-scroll { overflow: auto; min-height: 0; flex: 1; }
+.work-table-scroll table { border-collapse: collapse; min-width: 1000px; }
+.work-table-scroll th, .work-table-scroll td { padding: var(--sp-2); border-bottom: var(--b-hair); text-align: left; vertical-align: top; }
+.work-table-scroll th { position: sticky; top: 0; background: var(--n1); }
+.work-table-scroll ol { margin: 0; padding-left: var(--sp-4); min-width: 240px; }
+.work-table-scroll time { color: var(--text-tertiary); }

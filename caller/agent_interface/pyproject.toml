@@ -1,0 +1,12 @@
+[project]
+name = "agent-interface"
+version = "0.3.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+agent-interface = "agent_interface:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

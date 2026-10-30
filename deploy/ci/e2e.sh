@@ -1,0 +1,683 @@
+#!/bin/bash
+# The deployment bundle end to end, on a Linux host with Docker, as
+# .github/workflows/deploy-e2e.yml runs it:
+#
+#   deploy/ci/e2e.sh run    install, sign in, use a workspace and Poise Link, check TLS, back up and restore, recreate the gateway, upgrade, run behind another proxy
+#   deploy/ci/e2e.sh logs   print what the stack and the workspaces logged
+#
+# It drives the real stack, deploy/compose.yaml, through deploy/install.sh,
+# backup.sh, restore.sh and upgrade.sh, with deploy/ci/compose.yaml on top:
+# plain http (POISE_INSECURE_HTTP=1) on poise.test, a fake GitHub beside the
+# gateway, and workspaces without provider CLIs. It writes deploy/.env and
+# commits to a branch of this checkout. poise.test and its subdomains alice,
+# bob, nobody and admin must resolve to 127.0.0.1.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+deploy=$(cd "$here/.." && pwd)
+root=$(cd "$deploy/.." && pwd)
+export COMPOSE_FILE=compose.yaml:ci/compose.yaml
+domain=poise.test
+apex=http://$domain
+github=http://127.0.0.1:9999
+work=$(mktemp -d)
+alice=$work/alice.cookies
+bob=$work/bob.cookies
+nobody=$work/nobody.cookies
+navigate=(--header 'Accept: text/html' --header 'Sec-Fetch-Mode: navigate')
+# Commits rows to a database in WAL mode and keeps it open, with automatic
+# checkpoints off, so the commits stay in its -wal file.
+live_writer="
+import os, sqlite3, time
+os.makedirs('/home/poise/e2e', exist_ok=True)
+db = sqlite3.connect('/home/poise/e2e/live.db', isolation_level=None)
+db.execute('PRAGMA journal_mode=WAL')
+db.execute('PRAGMA wal_autocheckpoint=0')
+db.execute('CREATE TABLE notes (body TEXT)')
+for n in range(100):
+    db.execute('INSERT INTO notes VALUES (?)', (f'note {n}',))
+open('/home/poise/e2e/ready', 'w').close()
+time.sleep(86400)
+"
+
+pass() { echo "ok - $*"; }
+fail() {
+  echo "FAIL - $*" >&2
+  exit 1
+}
+compose() { (cd "$deploy" && docker compose "$@"); }
+uri() { jq --raw-output --null-input --arg value "$1" '$value | @uri'; }
+in_workspace() { docker exec poise-ws-alice "$@"; }
+
+# One request with cookie jar JAR, which must answer WANT. The body is left
+# in $work/body and the redirect target in $location.
+expect() {
+  local want=$1 what=$2 jar=$3 url=$4 answer status
+  shift 4
+  answer=$(curl --silent --show-error --max-time 30 --cookie "$jar" --cookie-jar "$jar" \
+    --output "$work/body" --write-out '%{http_code} %{redirect_url}' "$@" "$url") || fail "$what: $url could not be reached"
+  status=${answer%% *}
+  location=${answer#* }
+  [ "$status" = "$want" ] || fail "$what: $url answered $status, not $want: $(head -c 800 "$work/body")"
+  pass "$what ($status)"
+}
+
+# A command that must fail and say SAYS.
+refused() {
+  local what=$1 says=$2 output
+  shift 2
+  if output=$("$@" 2>&1); then fail "$what: $* succeeded: $output"; fi
+  grep --quiet --fixed-strings -- "$says" <<<"$output" || fail "$what: $* did not say \"$says\": $output"
+  pass "$what is refused: $says"
+}
+
+# Whether JAR holds cookie NAME for DOMAIN, as a domain cookie (TRUE) or for that host only (FALSE).
+has_cookie() {
+  local jar=$1 domain=$2 scope=$3 name=$4
+  awk -F '\t' -v domain="$domain" -v scope="$scope" -v name="$name" \
+    '{ sub(/^#HttpOnly_/, "", $1) } $1 == domain && $2 == scope && $6 == name { found = 1 } END { exit !found }' "$jar" \
+    || fail "no $name cookie for $domain ($scope) in $jar"
+  pass "$name is set for $domain ($scope)"
+}
+
+cookie() {
+  awk -F '\t' -v domain="$2" -v name="$3" '{ sub(/^#HttpOnly_/, "", $1) } $1 == domain && $6 == name { print $7 }' "$1"
+}
+
+# Signs LOGIN in through the fake GitHub into JAR, asking to continue to NEXT.
+sign_in() {
+  local login=$1 jar=$2 next=$3
+  : >"$jar"
+  expect 302 "$login starts to sign in" "$jar" "$apex/auth/login?next=$(uri "$next")"
+  [[ $location == "$github/login/oauth/authorize?"* ]] || fail "sign-in went to $location, not to the GitHub in POISE_GITHUB_URL"
+  [[ $location == *"redirect_uri=$(uri "$apex/auth/callback")&"* ]] || fail "the gateway's callback is not $apex/auth/callback: $location"
+  [[ $location == *"&scope=read%3Auser&"* ]] || fail "the gateway asks GitHub for more than read:user: $location"
+  expect 302 "GitHub signs $login in" "$jar" "$location&login=$login"
+  [[ $location == "$apex/auth/callback?"* ]] || fail "GitHub sent $login to $location"
+  expect 302 "the gateway lets $login in" "$jar" "$location"
+}
+
+# Waits until the workspace behind HANDLE's host serves Poise to JAR.
+wait_for_poise() {
+  local jar=$1 handle=$2 status
+  for _ in $(seq 1 120); do
+    status=$(curl --silent --max-time 30 --cookie "$jar" --output "$work/body" --write-out '%{http_code}' \
+      "${navigate[@]}" "http://$handle.$domain/") || status=000
+    if [ "$status" = 200 ]; then break; fi
+    if [ "$status" != 503 ]; then fail "$handle's workspace host answered $status while it started: $(head -c 800 "$work/body")"; fi
+    sleep 2
+  done
+  [ "$status" = 200 ] || fail "$handle's workspace did not start within four minutes: $(head -c 800 "$work/body")"
+  grep --quiet '<title>Poise</title>' "$work/body" || fail "$handle's workspace host did not serve Poise: $(head -c 800 "$work/body")"
+  pass "$handle's workspace host serves Poise"
+}
+
+workspace_version() {
+  in_workspace curl --fail --silent --show-error http://127.0.0.1:5555/api/service/health | jq --raw-output .version
+}
+
+install() {
+  : >"$deploy/.env"
+  chmod 644 "$deploy/.env"
+  refused "install.sh with a deploy/.env others can read" "chmod 600" "$deploy/install.sh"
+  chmod 600 "$deploy/.env"
+  refused "install.sh with no settings" \
+    "sets no POISE_DOMAIN POISE_GITHUB_CLIENT_ID POISE_GITHUB_CLIENT_SECRET POISE_ADMINS POISE_ACME_EMAIL" "$deploy/install.sh"
+  cat >"$deploy/.env" <<EOF
+POISE_DOMAIN=$domain
+POISE_GITHUB_CLIENT_ID=e2e-client
+POISE_GITHUB_CLIENT_SECRET=e2e-secret
+POISE_ADMINS=alice
+POISE_ALLOWED_USERS=bob
+POISE_ACME_EMAIL=e2e@poise.test
+POISE_WORKSPACE_MEMORY=3g
+POISE_WORKSPACE_CPUS=2
+POISE_INSECURE_HTTP=1
+POISE_GITHUB_URL=$github
+POISE_GITHUB_API_URL=$github
+POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP=1
+EOF
+  "$deploy/install.sh" | tee "$work/install.log"
+  grep --quiet --fixed-strings "$apex/auth/callback" "$work/install.log" || fail "install.sh did not print the OAuth App's callback URL"
+  pass "install.sh installed the stack"
+}
+
+sign_in_alice() {
+  local ticket
+  sign_in alice "$alice" "http://alice.$domain/"
+  ticket=$location
+  [[ $ticket == "http://alice.$domain/_poise/session?ticket="* ]] || fail "alice was sent to $ticket, not to her workspace host"
+  has_cookie "$alice" "$domain" FALSE poise_gw
+  has_cookie "$alice" ".$domain" TRUE poise_bind
+  : >"$nobody"
+  expect 403 "her ticket, redeemed by a browser without her poise_bind" "$nobody" "$ticket"
+  expect 302 "alice asks for her workspace again" "$alice" "$apex/auth/login?next=$(uri "http://alice.$domain/")"
+  [[ $location == "http://alice.$domain/_poise/session?ticket="* ]] || fail "alice was sent to $location"
+  expect 302 "alice redeems the new ticket on her workspace host, with her poise_bind" "$alice" "$location"
+  [ "$location" = "http://alice.$domain/" ] || fail "the ticket sent alice on to $location"
+  has_cookie "$alice" "alice.$domain" FALSE poise_ws
+}
+
+open_workspace() {
+  local script
+  expect 503 "alice's first visit starts her workspace" "$alice" "http://alice.$domain/" "${navigate[@]}"
+  grep --quiet 'Starting your workspace' "$work/body" || fail "no starting page: $(head -c 800 "$work/body")"
+  wait_for_poise "$alice" alice
+  script=$(grep --only-matching 'src="/assets/[^"]*\.js"' "$work/body" | head -n 1 | cut -d '"' -f 2)
+  [ -n "$script" ] || fail "Poise's page names no script"
+  expect 200 "Poise's script, through alice's workspace host" "$alice" "http://alice.$domain$script"
+  [ "$(workspace_version)" = "$(git -C "$root" rev-parse HEAD)" ] || fail "the workspace reports version $(workspace_version), not the commit it was built from"
+  pass "the workspace reports the commit it was built from"
+  expect 200 "the admin page, for alice" "$alice" "$apex/admin"
+}
+
+# Exercise the maintained publication command against real Compose, not a fake CLI.
+check_public_pages() {
+  local before
+  before=$(docker inspect --format '{{.Id}}' poise-ws-alice)
+  expect 404 "policy pages are absent before operator publication" "$nobody" "$apex/privacy"
+  jq '.appName = "Reviewed CI deployment" | .description = "Reviewed deployment description at {{origin}}." | .privacy = ["Reviewed privacy content at {{origin}}."] | .terms = ["Reviewed service terms at {{domain}}."]' \
+    "$deploy/public-pages.example.json" >"$work/reviewed-public-pages.json"
+  "$deploy/public-pages.sh" validate "$work/reviewed-public-pages.json"
+  expect 404 "validation does not publish" "$nobody" "$apex/privacy"
+  "$deploy/public-pages.sh" publish "$work/reviewed-public-pages.json"
+  compose exec -T gateway cat /data/public-pages.json >"$work/approved-public-pages.json"
+  echo '{"invalid":"replacement"}' >"$work/refused-public-pages.json"
+  refused "invalid policy replacement" "Invalid public-pages.json" "$deploy/public-pages.sh" publish "$work/refused-public-pages.json"
+  [ "$(docker inspect --format '{{.Id}}' poise-ws-alice)" = "$before" ] || fail "publishing recreated alice's workspace"
+  check_persisted_public_pages
+  expect 405 "public policies reject mutation" "$nobody" "$apex/privacy" --request POST
+  expect 200 "alice's workspace survives policy publication" "$alice" "http://alice.$domain/" "${navigate[@]}"
+}
+
+check_persisted_public_pages() {
+  local path
+  compose exec -T gateway cat /data/public-pages.json >"$work/current-public-pages.json"
+  cmp "$work/approved-public-pages.json" "$work/current-public-pages.json" || fail "approved policy bytes changed"
+  for path in / /privacy /terms; do
+    expect 200 "anonymous operator page $path" "$nobody" "$apex$path"
+    grep --quiet 'mailto:operator%40example.com' "$work/body" || fail "missing operator content on $path"
+    expect 200 "anonymous HEAD $path" "$nobody" "$apex$path" --head
+  done
+}
+
+# The gateway's service endpoints and its certificate question stay inside.
+check_inside_only() {
+  : >"$nobody"
+  expect 403 "/api/service/health, for alice's own browser" "$alice" "http://alice.$domain/api/service/health"
+  expect 403 "a drain, from alice's own browser" "$alice" "http://alice.$domain/api/service/drain" \
+    --request POST --header "Origin: http://alice.$domain"
+  expect 401 "/api/service/health, without a session" "$nobody" "http://alice.$domain/api/service/health"
+  expect 404 "/api/service/health on the apex" "$nobody" "$apex/api/service/health"
+  expect 404 "the certificate question, through the apex" "$nobody" "$apex/_gateway/tls-ask?domain=$domain"
+  [ -z "$(curl --silent --max-time 10 --header 'Host: gateway:8080' "http://127.0.0.1/_gateway/tls-ask?domain=$domain")" ] \
+    || fail "Caddy passed a request for Host gateway:8080 to the gateway"
+  pass "Caddy answers Host gateway:8080 itself and never passes it on"
+  expect 401 "a forged X-Poise-Identity, without a session" "$nobody" "http://alice.$domain/api/health" \
+    --header 'X-Poise-Identity: e30.e30.forged'
+}
+
+second_user() {
+  local session
+  sign_in bob "$bob" "http://bob.$domain/"
+  [[ $location == "http://bob.$domain/_poise/session?ticket="* ]] || fail "bob was sent to $location"
+  expect 302 "bob redeems his ticket on his own host" "$bob" "$location"
+  session=$(cookie "$bob" "bob.$domain" poise_ws)
+  [ -n "$session" ] || fail "bob got no workspace session"
+  expect 403 "bob asking the apex for alice's workspace" "$bob" "$apex/auth/login?next=$(uri "http://alice.$domain/")"
+  expect 302 "bob opening alice's workspace host" "$bob" "http://alice.$domain/" "${navigate[@]}"
+  [[ $location == "$apex/auth/login?"* ]] || fail "bob was sent to $location, not to sign in"
+  : >"$nobody"
+  expect 403 "bob's workspace session on alice's host" "$nobody" "http://alice.$domain/" "${navigate[@]}" \
+    --header "Cookie: poise_ws=$session"
+  expect 403 "bob's session on alice's host, with forwarding headers naming his own" "$nobody" "http://alice.$domain/api/health" \
+    --header "Cookie: poise_ws=$session" --header "X-Forwarded-Host: bob.$domain" --header "Forwarded: host=bob.$domain"
+  socket_refused 403 "bob's session" "poise_ws=$session"
+  socket_refused 401 "no session" ""
+}
+
+socket_refused() {
+  local want=$1 what=$2 cookie=$3 output
+  output=$(node "$here/chat-socket.mjs" "ws://alice.$domain/ws/chat" "http://alice.$domain" "$cookie" 0) && fail "Chat's WebSocket with $what connected"
+  [ "$output" = "refused $want" ] || fail "Chat's WebSocket with $what: $output"
+  pass "Chat's WebSocket on alice's host, with $what: $output"
+}
+
+# Poise Link's path through Caddy and the gateway: a device code, alice's
+# approval in her workspace's Settings, the token, and the Link API on her workspace host,
+# its event stream left open while the other checks run.
+pair_link() {
+  local code user
+  code=$(curl --silent --show-error --fail --max-time 30 --request POST --user-agent 'Poise Link e2e' "$apex/link/device/code") \
+    || fail "POST /link/device/code failed"
+  user=$(jq --raw-output .user_code <<<"$code")
+  [ "$(jq --raw-output .verification_uri <<<"$code")" = "$apex/link" ] || fail "the device code sends people elsewhere: $code"
+  pass "Poise Link gets the device code $user"
+  expect 302 "/link sends alice to her workspace's Settings" "$alice" "$apex/link"
+  [ "$location" = "http://alice.$domain/?settings=link" ] || fail "/link sent alice to $location, not to her workspace's Settings"
+  expect 200 "alice approves $user in Settings" "$alice" "http://alice.$domain/_poise/api/devices/pair" \
+    --header "Origin: http://alice.$domain" --header 'Content-Type: application/json' \
+    --data "{\"userCode\":\"$user\",\"decision\":\"approve\"}"
+  [ "$(jq --raw-output .decision "$work/body")" = approve ] || fail "the approval was not confirmed: $(head -c 800 "$work/body")"
+  curl --silent --show-error --fail --max-time 30 --header 'Content-Type: application/json' \
+    --data "{\"device_code\":\"$(jq --raw-output .device_code <<<"$code")\"}" "$apex/link/device/token" >"$work/token" \
+    || fail "POST /link/device/token failed: $(cat "$work/token")"
+  [ "$(jq --raw-output '.endpoint + " " + .login' "$work/token")" = "http://alice.$domain alice" ] \
+    || fail "the token is not for alice's workspace: $(jq --compact-output 'del(.access_token)' "$work/token")"
+  link_token=$(jq --raw-output .access_token "$work/token")
+  pass "Poise Link gets a token for alice's workspace"
+
+  curl --silent --no-buffer --max-time 25 --header "Authorization: Bearer $link_token" \
+    "http://alice.$domain/api/link/events" >"$work/events" 2>&1 &
+  events=$!
+
+  expect 200 "/api/link/hello with the device token" "$nobody" "http://alice.$domain/api/link/hello" \
+    --header "Authorization: Bearer $link_token"
+  [ "$(jq --raw-output '.login + " " + .version' "$work/body")" = "alice $(git -C "$root" rev-parse HEAD)" ] \
+    || fail "/api/link/hello answered $(cat "$work/body")"
+  expect 200 "/api/link/snippets with the device token" "$nobody" "http://alice.$domain/api/link/snippets" \
+    --header "Authorization: Bearer $link_token" --dump-header "$work/headers"
+  snippets_version=$(jq --raw-output .version "$work/body")
+  [ "$(jq --raw-output .yaml "$work/body" | head -n 1)" = '# Managed by Poise Link. Edit snippets in Poise; changes made here are overwritten.' ] \
+    || fail "the snippets lack Poise Link's header: $(cat "$work/body")"
+  [ "$(jq --join-output .yaml "$work/body" | sha256sum | cut -d ' ' -f 1)" = "$snippets_version" ] \
+    || fail "the snippets' version is not the SHA-256 of their YAML"
+  grep --quiet --ignore-case "^etag: \"$snippets_version\"" "$work/headers" || fail "the snippets carry no ETag of their version"
+  pass "the snippets carry Poise Link's header, and their version is the YAML's SHA-256"
+  expect 401 "the device token outside /api/link/" "$nobody" "http://alice.$domain/api/health" \
+    --header "Authorization: Bearer $link_token"
+}
+
+# The event stream must still be open after 25 seconds, having sent the
+# snippets version at once and a ping since. Then alice revokes the device.
+revoke_link() {
+  local status=0 device
+  wait "$events" || status=$?
+  [ "$status" = 28 ] || fail "the event stream ended before 25 seconds (curl $status): $(cat "$work/events")"
+  if ! grep --quiet --line-regexp 'event: snippets' "$work/events" \
+    || ! grep --quiet --fixed-strings "{\"version\":\"$snippets_version\"}" "$work/events"; then
+    fail "the event stream sent no snippets version: $(cat "$work/events")"
+  fi
+  grep --quiet --line-regexp 'event: ping' "$work/events" || fail "the event stream sent no ping: $(cat "$work/events")"
+  pass "the event stream stays open through Caddy and the gateway, with the snippets version and pings"
+  expect 200 "alice lists her paired devices in Settings" "$alice" "http://alice.$domain/_poise/api/devices"
+  device=$(jq --raw-output '.devices[] | select(.state == "active") | .id' "$work/body" | head -n 1)
+  [ -n "$device" ] || fail "Settings lists no paired device: $(head -c 800 "$work/body")"
+  expect 200 "alice revokes the device" "$alice" "http://alice.$domain/_poise/api/devices/revoke" \
+    --header "Origin: http://alice.$domain" --header 'Content-Type: application/json' --data "{\"id\":\"$device\"}"
+  expect 401 "/api/link/hello with the revoked device's token" "$nobody" "http://alice.$domain/api/link/hello" \
+    --header "Authorization: Bearer $link_token" --dump-header "$work/headers"
+  [ "$(jq --raw-output .error "$work/body")" = device_revoked ] || fail "the refusal does not say device_revoked: $(cat "$work/body")"
+  grep --quiet --ignore-case '^www-authenticate: Bearer error="invalid_token"' "$work/headers" || fail "the refusal lacks WWW-Authenticate"
+  pass "a revoked device gets 401 device_revoked"
+}
+
+# deploy/Caddyfile itself, with Caddy's own certificate authority in place of
+# Let's Encrypt: the apex gets a certificate, and a workspace host gets one on
+# demand only when the gateway knows its owner.
+check_tls() {
+  local caddyfile=$work/Caddyfile host
+  awk '{ print } !done && $0 == "{" { print "\tlocal_certs\n\tskip_install_trust"; done = 1 }' "$deploy/Caddyfile" >"$caddyfile"
+  grep --quiet --line-regexp $'\tlocal_certs' "$caddyfile" || fail "could not give deploy/Caddyfile local certificates"
+  docker run --detach --name poise-e2e-tls --network poise-edge --publish 127.0.0.1:8443:443 \
+    --env POISE_DOMAIN=$domain --env POISE_ACME_EMAIL=e2e@poise.test \
+    --mount "type=bind,source=$caddyfile,target=/etc/caddy/Caddyfile,readonly" caddy:2 >/dev/null
+  for _ in $(seq 1 30); do
+    if docker exec poise-e2e-tls cat /data/caddy/pki/authorities/local/root.crt >"$work/root.crt" 2>/dev/null \
+      && curl --silent --max-time 10 --cacert "$work/root.crt" --output /dev/null "https://$domain:8443/"; then
+      break
+    fi
+    sleep 1
+  done
+  for host in "$domain" "alice.$domain" "bob.$domain"; do
+    curl --silent --show-error --max-time 30 --cacert "$work/root.crt" --output /dev/null "https://$host:8443/" \
+      || fail "deploy/Caddyfile has no valid certificate for $host"
+    pass "deploy/Caddyfile serves $host with a valid certificate"
+  done
+  for host in "nobody.$domain" "admin.$domain"; do
+    if curl --silent --max-time 30 --cacert "$work/root.crt" --output /dev/null "https://$host:8443/"; then
+      fail "deploy/Caddyfile served $host, whose owner the gateway does not know"
+    fi
+    pass "deploy/Caddyfile gets no certificate for $host"
+  done
+  docker rm --force poise-e2e-tls >/dev/null
+}
+
+# Chat's WebSocket, opened through Caddy and the gateway and left silent for
+# 75 seconds, longer than the 60 seconds a proxy commonly allows, while the
+# other checks run.
+open_chat_socket() {
+  node "$here/chat-socket.mjs" "ws://alice.$domain/ws/chat" "http://alice.$domain" \
+    "poise_ws=$(cookie "$alice" "alice.$domain" poise_ws)" 75 >"$work/socket" 2>&1 &
+  socket=$!
+}
+
+check_chat_socket() {
+  wait "$socket" || fail "Chat's WebSocket through Caddy and the gateway: $(cat "$work/socket")"
+  [ "$(cat "$work/socket")" = $'connected\nanswered' ] || fail "Chat's WebSocket through Caddy and the gateway: $(cat "$work/socket")"
+  pass "Chat's WebSocket connects through Caddy and the gateway and still answers after 75 silent seconds"
+}
+
+check_data() {
+  local marker=$1 rows owners
+  [ "$(in_workspace cat /home/poise/e2e/marker)" = "$marker" ] || fail "alice's file did not survive"
+  rows=$(in_workspace python3 -c "import sqlite3; print(sqlite3.connect('file:/home/poise/e2e/live.db?mode=ro', uri=True).execute('SELECT count(*) FROM notes').fetchone()[0])")
+  [ "$rows" = 100 ] || fail "alice's database has $rows of its 100 rows"
+  owners=$(in_workspace stat -c '%u:%g' /home/poise /home/poise/.poise /home/poise/e2e/marker /home/poise/e2e/live.db | sort -u)
+  [ "$owners" = 10001:10001 ] || fail "alice's home is not owned by the workspace user: $owners"
+  pass "alice's file and database are intact, owned by the workspace user"
+}
+
+diagnostic_owner_count() {
+  docker exec poise-gateway node --input-type=module --eval "const {DiagnosticStore}=await import('/app/dist/diagnostics/store.js'); const db=new DiagnosticStore('/data/logging.db',undefined,Date.now,true); console.log(db.query({workspace:'alice',operator:false},{search:'poise-e2e-diagnostic-fixture'}).total); db.close()"
+}
+
+check_diagnostic_history() {
+  local count
+  count=$(diagnostic_owner_count)
+  [ "$count" -ge 1 ] || fail "the owner's retained diagnostic disappeared"
+  docker exec poise-gateway node dist/diagnostics/cli.js query '{"search":"poise-e2e-diagnostic-fixture"}' \
+    | jq --exit-status '.total == 0' >/dev/null || fail "operator access widened into another owner's private diagnostic"
+  docker exec poise-gateway node dist/diagnostics/cli.js query '{"search":"poise-e2e-ingress-fixture"}' \
+    | jq --exit-status '.total == 1 and .events[0].severity == "error"' >/dev/null || fail "Poise-owned ingress evidence is unavailable"
+}
+
+seed_diagnostic_history() {
+  local status=0 count=0
+  in_workspace node /opt/poise/dist/runtime-diagnostic.js /missing/poise-e2e-diagnostic-fixture || status=$?
+  [ "$status" = 127 ] || fail "the fake failed installer changed its outcome to $status"
+  printf '%s' '{"level":"error","msg":"poise-e2e-ingress-fixture","request":{"host":"poise.test"},"request_id":"poise-ci-ingress-proof"}' \
+    | docker exec --interactive poise-gateway node dist/diagnostics/cli.js ingress \
+    | jq --exit-status '.accepted and (.eventId | startswith("evt_"))' >/dev/null || fail "Poise-owned external ingress integration refused its fixture"
+  for _ in $(seq 1 30); do
+    count=$(diagnostic_owner_count)
+    if [ "$count" -ge 1 ]; then break; fi
+    sleep 2
+  done
+  check_diagnostic_history
+  pass "owned producer -> durable authenticated collection -> scoped query works without another application"
+}
+
+backup_and_restore() {
+  local marker backup key
+  seed_diagnostic_history
+  marker="e2e $(date +%s)"
+  in_workspace sh -c "mkdir -p /home/poise/e2e && printf '%s' '$marker' >/home/poise/e2e/marker"
+  docker exec --detach poise-ws-alice python3 -c "$live_writer"
+  for _ in $(seq 1 30); do
+    if in_workspace test -f /home/poise/e2e/ready; then break; fi
+    sleep 1
+  done
+  [ "$(in_workspace stat -c %s /home/poise/e2e/live.db-wal)" -gt 0 ] || fail "the database's commits are not in its -wal file"
+  key=$(docker exec poise-gateway sha256sum /data/identity-ed25519.pem)
+
+  "$deploy/backup.sh" "$work/backups" | tee "$work/backup.log"
+  backup=$(find "$work/backups" -mindepth 1 -maxdepth 1 -type d)
+  [ "$(find "$backup" -type f -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')" = "SHA256SUMS poise-gateway-data.tar.gz poise-home-alice.tar.gz " ] \
+    || fail "the backup holds $(ls "$backup")"
+  tar --list --gzip --file "$backup/poise-home-alice.tar.gz" >"$work/listing"
+  grep --quiet --line-regexp 'e2e/live.db' "$work/listing" || fail "the backup lacks alice's database"
+  if grep --quiet 'e2e/live.db-' "$work/listing"; then fail "the backup holds the database's -wal or -shm file"; fi
+  pass "backup.sh archived both volumes, the database without its -wal and -shm"
+
+  refused "restore.sh over volumes that exist" "exist already" "$deploy/restore.sh" "$backup"
+
+  # A new server: nothing of the old installation is left.
+  compose down
+  docker rm --force poise-ws-alice >/dev/null
+  docker volume rm poise-gateway-data poise-home-alice >/dev/null
+  docker network rm poise-net-alice >/dev/null
+  "$deploy/restore.sh" "$backup"
+  "$deploy/install.sh"
+  [ "$(docker exec poise-gateway sha256sum /data/identity-ed25519.pem)" = "$key" ] || fail "the gateway's signing key was not restored"
+  pass "the gateway's signing key is restored"
+  check_diagnostic_history
+  pass "private and ingress diagnostic history survived complete source removal and restore"
+
+  # alice's browser session lives in the restored gateway database.
+  expect 503 "alice's visit after the restore starts her workspace" "$alice" "http://alice.$domain/" "${navigate[@]}"
+  wait_for_poise "$alice" alice
+  check_data "$marker"
+  echo "$marker" >"$work/marker"
+}
+
+# A new commit on the branch this checkout follows, as a merge to main makes one.
+next_commit() {
+  local upstream=$work/upstream.git next=$work/next
+  git init --quiet --bare "$upstream"
+  git -C "$root" checkout --quiet -B e2e
+  git -C "$root" push --quiet "$upstream" e2e
+  git -C "$root" remote add e2e "$upstream"
+  git -C "$root" fetch --quiet e2e
+  git -C "$root" branch --quiet --set-upstream-to=e2e/e2e
+  git clone --quiet --branch e2e "$upstream" "$next"
+  git -C "$next" -c user.name=e2e -c user.email=e2e@poise.test commit --quiet --allow-empty --message 'test: the next commit'
+  git -C "$next" push --quiet origin e2e
+  git -C "$next" rev-parse HEAD
+}
+
+# The new commit leaves the workspace image's base as it was, so the gateway
+# updates alice's workspace in place: it installs the new release in it and
+# Poise restarts on it alone, in the same container, while a process Poise
+# does not wait for, as it does not wait for a detached agent call, runs on.
+check_upgrade() {
+  local sha before version=''
+  before=$(docker inspect --format '{{.Id}}' poise-ws-alice)
+  docker exec --detach poise-ws-alice setsid sleep 3600
+  sha=$(next_commit)
+  "$deploy/upgrade.sh" | tee "$work/upgrade.log"
+  [ "$(git -C "$root" rev-parse HEAD)" = "$sha" ] || fail "upgrade.sh did not pull $sha"
+  grep --quiet 'alice: running. The gateway installs the new release in it' "$work/upgrade.log" \
+    || fail "upgrade.sh did not say it will update alice's workspace in place"
+  docker image inspect "poise-runtime:$sha" >/dev/null || fail "upgrade.sh did not tag the image with the commit"
+  # The gateway looks for outdated workspaces when it starts and every five minutes.
+  for _ in $(seq 1 90); do
+    version=$(workspace_version 2>/dev/null || true)
+    [ "$version" = "$sha" ] && break
+    sleep 5
+  done
+  [ "$version" = "$sha" ] || fail "alice's workspace did not come back on $sha within 7.5 minutes; it reports '$version'"
+  [ "$(docker inspect --format '{{.Id}}' poise-ws-alice)" = "$before" ] || fail "the gateway replaced alice's container instead of updating it in place"
+  in_workspace pgrep -f 'sleep 3600' >/dev/null || fail "a process running in alice's workspace did not survive the update"
+  docker logs poise-gateway 2>&1 | grep '"handle":"alice"' | grep --quiet '"event":"workspace.update.requested"' \
+    || fail "the gateway did not log the switch it asked for"
+  pass "the gateway updated alice's workspace in place: Poise runs $sha in the same container, and its other processes kept running"
+  check_data "$(cat "$work/marker")"
+  wait_for_poise "$alice" alice
+}
+
+# A gateway container Compose recreates is on Compose's network alone; the
+# gateway joins the workspace networks again itself as it starts, before it
+# answers, so alice's running workspace answers at once rather than after a
+# start, and the upgrade after this drains it through the new container.
+# Traffic runs through Caddy while the container is replaced: Caddy retries
+# dials and the old gateway exits 0, so every answer is 200, never a 502.
+check_gateway_recreated() {
+  local before after traffic=$work/gateway-traffic.log loop code
+  before=$(docker inspect --format '{{.Id}}' poise-gateway)
+  : >"$traffic"
+  (
+    while :; do
+      code=$(curl --silent --max-time 60 --cookie "$alice" --output /dev/null --write-out '%{http_code}' "${navigate[@]}" "http://alice.$domain/" 2>/dev/null) || code="curl:$?"
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$code" >>"$traffic"
+      sleep 0.2
+    done
+  ) &
+  loop=$!
+  compose stop gateway
+  code=$(docker inspect --format '{{.State.ExitCode}}' poise-gateway)
+  if [ "$code" != 0 ]; then kill $loop 2>/dev/null || true; fail "the replaced gateway exited $code, not 0"; fi
+  compose up --detach --force-recreate gateway
+  "$deploy/install.sh" >"$work/gateway-recreate-install.log"
+  kill $loop 2>/dev/null || true
+  wait $loop 2>/dev/null || true
+  after=$(docker inspect --format '{{.Id}}' poise-gateway)
+  [ "$before" != "$after" ] || fail "the gateway container did not change"
+  grep --quiet ' 200$' "$traffic" || fail "no traffic reached the workspace during replacement: $(cat "$traffic")"
+  if grep --quiet -v ' 200$' "$traffic"; then fail "traffic during replacement saw non-200: $(grep -v ' 200$' "$traffic" | head -n 5)"; fi
+  pass "traffic during gateway replacement saw zero 502s and zero connection failures ($(wc -l <"$traffic") requests)"
+  docker logs poise-gateway 2>&1 | awk '
+    /"event":"workspace.network.connected"/ && /"handle":"alice"/ { joined = NR }
+    /"event":"gateway.listening"/ { listening = NR }
+    END { exit !(joined && listening && joined < listening) }' \
+    || fail "the recreated gateway did not join alice's network before it answered"
+  pass "the recreated gateway joined alice's network before it answered"
+  expect 200 "alice's workspace, right after the gateway was recreated" "$alice" "http://alice.$domain/" "${navigate[@]}"
+}
+
+# The installation behind a proxy the server already runs (POISE_PROXY_LISTEN):
+# install.sh removes the bundled Caddy and publishes the gateway on that one
+# address, and a second Caddy on the host's network, in front of it the way a
+# server's existing proxy would be (deploy/ci/proxy.Caddyfile), serves alice's
+# workspace and gets certificates on demand. Then install.sh switches back.
+check_proxy_mode() {
+  local first=127.0.0.2:8080 listen=127.0.0.1:8080 published host path
+  sed -i '/^POISE_ACME_EMAIL=/d' "$deploy/.env"
+  echo 'POISE_PROXY_LISTEN=0.0.0.0:8080' >>"$deploy/.env"
+  refused "install.sh with POISE_PROXY_LISTEN on every address" "must be the one IP address and port" "$deploy/install.sh"
+  sed -i "s/^POISE_PROXY_LISTEN=.*/POISE_PROXY_LISTEN=$first/" "$deploy/.env"
+  "$deploy/install.sh" >"$work/proxy-first-install.log"
+  published=$(docker port poise-gateway 8080/tcp 2>&1 || true)
+  [ "$published" = "$first" ] || fail "the gateway is published on $published, not on $first"
+  # Another address on the same port: the gateway's own port is no obstacle. And
+  # deploy/.env alone decides, whatever the shell exports.
+  sed -i "s/^POISE_PROXY_LISTEN=.*/POISE_PROXY_LISTEN=$listen/" "$deploy/.env"
+  POISE_PROXY_LISTEN=0.0.0.0:8080 "$deploy/install.sh" | tee "$work/proxy-install.log"
+  grep --quiet --fixed-strings "ask http://$listen/_gateway/tls-ask" "$work/proxy-install.log" \
+    || fail "install.sh did not say what the proxy must ask the gateway"
+  if docker container inspect poise-caddy >/dev/null 2>&1; then fail "install.sh left the bundled Caddy in place"; fi
+  published=$(docker port poise-gateway 8080/tcp 2>&1 || true)
+  [ "$published" = "$listen" ] || fail "the gateway is published on $published, not on $listen alone"
+  pass "install.sh needs no POISE_ACME_EMAIL, removes the bundled Caddy, moves the gateway from $first and publishes it on $listen alone, as deploy/.env says"
+
+  [ "$(curl --silent --max-time 10 "http://$listen/_gateway/tls-ask?domain=alice.$domain")" = ok ] \
+    || fail "the gateway does not answer the certificate question at $listen"
+  [ "$(curl --silent --max-time 10 --output /dev/null --write-out '%{http_code}' "http://$listen/_gateway/tls-ask?domain=nobody.$domain")" = 404 ] \
+    || fail "the gateway would let the proxy get a certificate for nobody.$domain"
+  pass "the gateway answers the certificate question at $listen"
+
+  docker run --detach --name poise-e2e-proxy --network host --env POISE_DOMAIN=$domain --env POISE_PROXY_LISTEN=$listen \
+    --mount "type=bind,source=$here/proxy.Caddyfile,target=/etc/caddy/Caddyfile,readonly" caddy:2 >/dev/null
+  for _ in $(seq 1 30); do
+    if docker exec poise-e2e-proxy cat /data/caddy/pki/authorities/local/root.crt >"$work/proxy-root.crt" 2>/dev/null \
+      && curl --silent --max-time 10 --cacert "$work/proxy-root.crt" --output /dev/null "https://$domain:8443/"; then
+      break
+    fi
+    sleep 1
+  done
+  wait_for_poise "$alice" alice
+  expect 200 "the admin page, through the server's own proxy" "$alice" "$apex/admin"
+  expect 404 "the certificate question, through the server's own proxy" "$nobody" "$apex/_gateway/tls-ask?domain=$domain"
+  [ -z "$(curl --silent --max-time 10 --header "Host: $listen" "http://127.0.0.1/_gateway/tls-ask?domain=$domain")" ] \
+    || fail "the server's own proxy passed a request for Host $listen to the gateway"
+  pass "the server's own proxy never passes Host $listen on"
+  for host in "$domain" "alice.$domain" "bob.$domain"; do
+    curl --silent --show-error --max-time 30 --cacert "$work/proxy-root.crt" --output /dev/null "https://$host:8443/" \
+      || fail "the server's own proxy has no valid certificate for $host"
+    pass "the server's own proxy serves $host with a valid certificate"
+  done
+  for host in "nobody.$domain" "admin.$domain"; do
+    if curl --silent --max-time 30 --cacert "$work/proxy-root.crt" --output /dev/null "https://$host:8443/"; then
+      fail "the server's own proxy served $host, whose owner the gateway does not know"
+    fi
+    pass "the server's own proxy gets no certificate for $host"
+  done
+  check_persisted_public_pages
+  for path in / /privacy /terms; do
+    expect 200 "exact apex public exception $path" "$nobody" "http://127.0.0.1:8081$path" --header "Host: $domain"
+    grep --quiet 'Reviewed' "$work/body" || fail "external proxy did not serve reviewed policy content"
+    expect 200 "exact apex public HEAD $path" "$nobody" "http://127.0.0.1:8081$path" --head --header "Host: $domain"
+  done
+  for path in /privacy/ /privacy.json /x/../privacy /%2e/privacy /admin /auth/login; do
+    expect 401 "external proxy retains login on $path" "$nobody" "http://127.0.0.1:8081$path" --path-as-is --header "Host: $domain"
+  done
+  expect 401 "external proxy policy exception excludes POST" "$nobody" "http://127.0.0.1:8081/privacy" --request POST --header "Host: $domain"
+  expect 401 "external proxy policy exception excludes workspace hosts" "$nobody" "http://127.0.0.1:8081/privacy" --header "Host: alice.$domain"
+  # The production topology: traffic through the server's own proxy while the published gateway is
+  # replaced. The proxy retries dials, so every answer is 200, never a 502 for a refused connection.
+  local traffic=$work/proxy-traffic.log loop code before after
+  # install.sh's file set: the run's own two files omit compose.proxy.yaml, which publishes
+  # the gateway on $listen, so recreating with them would drop the published port.
+  local proxy_files=compose.yaml:ci/compose.yaml:compose.proxy.yaml
+  before=$(docker inspect --format '{{.Id}}' poise-gateway)
+  : >"$traffic"
+  (
+    while :; do
+      code=$(curl --silent --max-time 60 --cookie "$alice" --output /dev/null --write-out '%{http_code}' "${navigate[@]}" "http://alice.$domain/" 2>/dev/null) || code="curl:$?"
+      printf '%s %s\n' "$(date -u +%FT%TZ)" "$code" >>"$traffic"
+      sleep 0.2
+    done
+  ) &
+  loop=$!
+  COMPOSE_FILE="$proxy_files" compose stop gateway
+  code=$(docker inspect --format '{{.State.ExitCode}}' poise-gateway)
+  if [ "$code" != 0 ]; then kill $loop 2>/dev/null || true; fail "the replaced gateway exited $code, not 0"; fi
+  COMPOSE_FILE="$proxy_files" compose up --detach --force-recreate gateway
+  for _ in $(seq 1 60); do
+    if [ "$(curl --silent --max-time 5 "http://$listen/_gateway/tls-ask?domain=alice.$domain" 2>/dev/null)" = ok ]; then break; fi
+    sleep 2
+  done
+  [ "$(curl --silent --max-time 10 "http://$listen/_gateway/tls-ask?domain=alice.$domain")" = ok ] \
+    || { kill $loop 2>/dev/null || true; fail "the recreated gateway does not answer at $listen"; }
+  kill $loop 2>/dev/null || true
+  wait $loop 2>/dev/null || true
+  after=$(docker inspect --format '{{.Id}}' poise-gateway)
+  [ "$before" != "$after" ] || fail "the gateway container did not change"
+  grep --quiet ' 200$' "$traffic" || fail "no traffic reached the workspace during replacement: $(cat "$traffic")"
+  if grep --quiet -v ' 200$' "$traffic"; then fail "traffic through the server's own proxy saw non-200: $(grep -v ' 200$' "$traffic" | head -n 5)"; fi
+  pass "traffic through the server's own proxy saw zero 502s and zero connection failures ($(wc -l <"$traffic") requests)"
+  docker rm --force poise-e2e-proxy >/dev/null
+
+  sed -i '/^POISE_PROXY_LISTEN=/d' "$deploy/.env"
+  echo 'POISE_ACME_EMAIL=e2e@poise.test' >>"$deploy/.env"
+  "$deploy/install.sh"
+  [ "$(docker inspect --format '{{.State.Running}}' poise-caddy)" = true ] || fail "install.sh did not bring the bundled Caddy back"
+  published=$(docker port poise-gateway 8080/tcp 2>/dev/null || true)
+  [ -z "$published" ] || fail "the gateway is still published on $published"
+  wait_for_poise "$alice" alice
+  pass "install.sh switches back to the bundled Caddy"
+}
+
+run() {
+  install
+  sign_in_alice
+  open_workspace
+  open_chat_socket
+  pair_link
+  check_inside_only
+  second_user
+  check_tls
+  check_chat_socket
+  check_public_pages
+  revoke_link
+  backup_and_restore
+  check_persisted_public_pages
+  check_gateway_recreated
+  check_persisted_public_pages
+  check_upgrade
+  check_persisted_public_pages
+  check_proxy_mode
+  echo "The deployment works end to end."
+}
+
+logs() {
+  local container
+  compose ps --all || echo "(docker compose ps failed)"
+  compose logs --no-color --timestamps --tail 400 || echo "(docker compose logs failed)"
+  for container in $(docker ps --all --filter label=poise.managed=true --format '{{.Names}}') poise-e2e-tls poise-e2e-proxy; do
+    if ! docker container inspect "$container" >/dev/null 2>&1; then continue; fi
+    echo "::group::$container"
+    docker inspect --format '{{.State.Status}} (exit {{.State.ExitCode}}, restarts {{.RestartCount}}) health: {{json .State.Health}}' "$container"
+    docker logs --timestamps --tail 400 "$container" 2>&1
+    echo "::endgroup::"
+  done
+}
+
+case ${1:-} in
+  run) run ;;
+  logs) logs ;;
+  *)
+    sed -n '5,6p' "$0" >&2
+    exit 2
+    ;;
+esac

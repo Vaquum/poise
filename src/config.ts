@@ -1,0 +1,264 @@
+// Client-side cache of server settings (org, me, agent account, timezone).
+// Loaded once at startup from /api/settings, refreshed whenever the user saves
+// in the Settings panel.
+
+export interface ModelSettings {
+  slots?: { primary?: string, secondary?: string, tertiary?: string }
+  places?: Partial<Record<string, { slot: string }>>
+}
+
+export interface Organization {
+  login: string
+  managed: boolean
+  status: 'initializing' | 'ready' | 'error'
+  stage: string
+  error: string | null
+  activatedAt: string | null
+  retryAt?: string | null
+}
+
+export interface AppSettings {
+  org: string
+  organizations?: Organization[]
+  me: string
+  // The GitHub user reviews and comments are posted as.
+  agentAccount?: string
+  timezone: string
+  // The three slot models chosen once, and the slot each place that launches
+  // a model runs. Absent = Caller default.
+  models?: ModelSettings
+  // Chat view: the prefix for branches new sessions cut, how long an idle
+  // session keeps its agent process alive, how many Poise-local turns may
+  // run concurrently, and how long running turns may hold up a Poise update.
+  chat?: { branchPrefix: string, idleTimeoutMinutes: number, maxConcurrentLocalTurns: number, updateTurnBoundMinutes: number }
+  // The notifications at the top of the page; on unless turned off.
+  notifications?: { enabled: boolean }
+  behaviorChain?: { enabled: boolean, seedMode: 'label' | 'all', label: string }
+}
+
+let current: AppSettings = { org: '', me: '', timezone: '' }
+let loaded = false
+let savedRevision = 0
+let pendingSettings: { revision: number, promise: Promise<AppSettings> } | null = null
+
+// Whether the last read actually reached the server. A failed read used to be
+// indistinguishable from an empty one: `current` kept its blank defaults,
+// isFullyConfigured saw no org and no me, and a fully configured install was
+// told it was unconfigured and had the settings panel forced open over it — on
+// top of whatever the person was doing.
+let loadOk = false
+export function settingsLoadOk(): boolean { return loadOk }
+
+export function loadSettings(options: { fresh?: boolean } = {}): Promise<AppSettings> {
+  // Post-write reads supersede any snapshot captured before that write.
+  if (options.fresh) savedRevision++
+  const revision = savedRevision
+  if (pendingSettings?.revision === revision) return pendingSettings.promise
+  const promise = readSettings(revision)
+  const pending = { revision, promise }
+  pendingSettings = pending
+  const clear = () => { if (pendingSettings === pending) pendingSettings = null }
+  void promise.then(clear, clear)
+  return promise
+}
+
+async function readSettings(revision: number): Promise<AppSettings> {
+  try {
+    const res = await fetch('/api/settings')
+    if (res.ok) {
+      const settings = await res.json()
+      // A refresh started before Save must not restore the previous model.
+      if (revision === savedRevision) {
+        current = settings
+        loadOk = true
+      }
+    } else if (revision === savedRevision) {
+      loadOk = false
+    }
+  } catch {
+    if (revision === savedRevision) loadOk = false
+  }
+  loaded = true
+  return current
+}
+
+export function getSettings(): AppSettings {
+  return current
+}
+
+export function settingsLoaded(): boolean {
+  return loaded
+}
+
+export function settingsReady(): boolean {
+  return !!(getOrganizations().some((org) => org.status === 'ready') && current.me)
+}
+
+export function setLocalSettings(s: AppSettings) {
+  savedRevision += 1
+  loadOk = true
+  current = s
+}
+
+export function getOrganizations(): Organization[] {
+  if (Array.isArray(current.organizations)) return current.organizations
+  return current.org ? [{ login: current.org, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }] : []
+}
+
+export function setOrganizations(organizations: Organization[]): void {
+  const before = getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login).join(',')
+  setLocalSettings({ ...current, organizations })
+  window.dispatchEvent(new CustomEvent('poise:organizations-changed'))
+  const after = organizations.filter((org) => org.status === 'ready').map((org) => org.login).join(',')
+  if (before !== after) window.dispatchEvent(new CustomEvent('poise:synced'))
+}
+
+// Views ask on every render, and building a formatter is the costly part.
+const knownZones = new Map<string, boolean>()
+function knownTimezone(name: string): boolean {
+  let known = knownZones.get(name)
+  if (known === undefined) {
+    try { new Intl.DateTimeFormat('en-US', { timeZone: name }); known = true } catch { known = false }
+    knownZones.set(name, known)
+  }
+  return known
+}
+
+/** The saved time zone when this browser does not know it, else null.
+ *  Settings refuses such a zone, so it can only be older or hand-written;
+ *  main.ts names it in a notice. */
+export function unknownSavedTimezone(): string | null {
+  return current.timezone && !knownTimezone(current.timezone) ? current.timezone : null
+}
+
+// The saved zone, or the browser's while none is saved or while the saved one
+// is unknown to this browser (which unknownSavedTimezone reports).
+export function effectiveTimezone(): string {
+  if (current.timezone && knownTimezone(current.timezone)) return current.timezone
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone } catch { return 'UTC' }
+}
+
+// ── Theme ─────────────────────────────────────────────────────────────
+// Light or dark, persisted client-side. Applied via `data-theme="dark"`
+// on <html> so [data-theme="dark"] CSS overrides take effect. The page
+// listens for `poise:theme-changed` to react in JS where needed.
+
+const THEME_KEY = 'poise-theme'
+export type Theme = 'light' | 'dark'
+
+export function getTheme(): Theme {
+  try {
+    const v = localStorage.getItem(THEME_KEY)
+    if (v === 'light' || v === 'dark') return v
+  } catch { /* ignore */ }
+  return 'light'
+}
+
+export function applyTheme(theme: Theme) {
+  document.documentElement.setAttribute('data-theme', theme)
+  // Clear any inline-style overrides of the alias variables that older
+  // typo-panel runs may have written. Those have inline-specificity
+  // (1,0,0,0) and would shadow the theme cascade if left in place.
+  const root = document.documentElement
+  for (const v of ['--bg', '--text', '--text-secondary', '--text-tertiary', '--border', '--hover', '--hairline', '--surface', '--accent']) {
+    if (root.style.getPropertyValue(v)) root.style.removeProperty(v)
+  }
+}
+
+export function setTheme(theme: Theme) {
+  if (theme !== 'light' && theme !== 'dark') return
+  if (getTheme() === theme) return
+  try { localStorage.setItem(THEME_KEY, theme) } catch { /* ignore */ }
+  applyTheme(theme)
+  window.dispatchEvent(new CustomEvent('poise:theme-changed', { detail: { theme } }))
+}
+
+// ── Refresh rate ──────────────────────────────────────────────────────
+// How often the live views (Current, Swarm, Archive) re-fetch their data.
+// Two presets only — "1m" or "5m" — picked from the Settings panel.
+// Stored client-side; views listen for `poise:refresh-rate-changed` and
+// restart their timers.
+
+const REFRESH_KEY = 'poise-refresh-rate'
+export type RefreshRate = '1m' | '5m'
+
+export function getRefreshRate(): RefreshRate {
+  try {
+    const v = localStorage.getItem(REFRESH_KEY)
+    if (v === '1m' || v === '5m') return v
+  } catch { /* ignore */ }
+  return '1m'
+}
+
+export function getRefreshRateMs(): number {
+  return getRefreshRate() === '5m' ? 5 * 60_000 : 60_000
+}
+
+export function setRefreshRate(rate: RefreshRate) {
+  if (rate !== '1m' && rate !== '5m') return
+  if (getRefreshRate() === rate) return
+  try { localStorage.setItem(REFRESH_KEY, rate) } catch { /* ignore */ }
+  window.dispatchEvent(new CustomEvent('poise:refresh-rate-changed', { detail: { rate } }))
+}
+
+// Shared wall-clock-aligned ticker. Every view listens for
+// `poise:refresh-tick` and refreshes on it. Anchoring to interval-
+// boundaries (Math.ceil(now / interval) * interval) means that
+// switching views mid-cycle never causes the new view to refresh
+// shortly after the one you just left — they all share one clock.
+let tickTimer: ReturnType<typeof setTimeout> | null = null
+let tickerStarted = false
+
+function scheduleNextTick() {
+  if (tickTimer) clearTimeout(tickTimer)
+  const intervalMs = getRefreshRateMs()
+  const now = Date.now()
+  // +1 to push past the current boundary if we just landed on it
+  const nextBoundary = Math.ceil((now + 1) / intervalMs) * intervalMs
+  tickTimer = setTimeout(() => {
+    window.dispatchEvent(new CustomEvent('poise:refresh-tick'))
+    scheduleNextTick()
+  }, Math.max(0, nextBoundary - now))
+}
+
+export function startRefreshTicker() {
+  if (tickerStarted) return
+  tickerStarted = true
+  scheduleNextTick()
+}
+
+if (typeof window !== 'undefined') window.addEventListener('poise:refresh-rate-changed', () => {
+  if (tickerStarted) scheduleNextTick()
+})
+
+// The first instant of "today + dayOffset" in the configured zone. A date
+// can start at 01:00 when DST skips midnight, or repeat midnight on rollback.
+export function midnightInZone(dayOffset: number = 0, anchor = new Date()): Date {
+  const calendar = new Intl.DateTimeFormat('en-CA', {
+    timeZone: effectiveTimezone(), year: 'numeric', month: '2-digit', day: '2-digit',
+  })
+  const localDate = (instant: number): number => {
+    const parts = calendar.formatToParts(instant)
+    const part = (name: string) => Number(parts.find((item) => item.type === name)!.value)
+    return Date.UTC(part('year'), part('month') - 1, part('day'))
+  }
+  const target = localDate(anchor.getTime()) + dayOffset * 86_400_000
+  // All IANA offsets fit inside this bracket. Searching dates instead of
+  // offsets finds the first valid instant even when midnight does not exist.
+  let before = target - 36 * 3_600_000
+  let after = target + 36 * 3_600_000
+  while (after - before > 1) {
+    const middle = Math.floor((before + after) / 2)
+    if (localDate(middle) < target) before = middle
+    else after = middle
+  }
+  return new Date(after)
+}
+
+// Most recent Monday 00:00 in the configured zone (today if today is Monday).
+export function startOfWeekInZone(): Date {
+  const tz = effectiveTimezone()
+  const dow = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).format(new Date())
+  const map: Record<string, number> = { Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4, Sat: 5, Sun: 6 }
+  return midnightInZone(-(map[dow] ?? 0))
+}

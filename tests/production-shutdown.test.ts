@@ -1,0 +1,113 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mocks = vi.hoisted(() => ({
+  stopPoiseRuntime: vi.fn<() => Promise<void>>(),
+  closeDatabase: vi.fn<() => void>(),
+  createPoiseMiddleware: vi.fn(() => (
+    _req: unknown,
+    _res: unknown,
+    next: () => void,
+  ) => next()),
+  // The Chat WebSocket attaches to the production server's upgrade event;
+  // shutdown ordering is what this file checks, so it is a no-op here.
+  attachChatSockets: vi.fn<() => void>(),
+  stopDailyModelRefresh: vi.fn<() => void>(),
+  abandonCapture: vi.fn<() => void>(),
+  installCapture: vi.fn<() => void>(),
+}))
+
+vi.mock('../server/production-cpu-profile', () => ({
+  abandonProductionCpuCapture: mocks.abandonCapture,
+  installProductionCpuCapture: mocks.installCapture,
+}))
+
+vi.mock('../server/cache-plugin', () => ({
+  createPoiseMiddleware: mocks.createPoiseMiddleware,
+  stopPoiseRuntime: mocks.stopPoiseRuntime,
+  attachChatSockets: mocks.attachChatSockets,
+  stopDailyModelRefresh: mocks.stopDailyModelRefresh,
+}))
+
+vi.mock('../server/db', () => ({
+  closeDatabase: mocks.closeDatabase,
+}))
+
+beforeEach(() => {
+  vi.resetModules()
+  mocks.stopPoiseRuntime.mockReset()
+  mocks.closeDatabase.mockReset()
+  mocks.createPoiseMiddleware.mockClear()
+  mocks.abandonCapture.mockClear()
+  mocks.installCapture.mockClear()
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
+describe('production shutdown', () => {
+  it('is idempotent and closes the database only after runtime shutdown', async () => {
+    let releaseRuntime!: () => void
+    mocks.stopPoiseRuntime.mockReturnValue(new Promise<void>((resolve) => {
+      releaseRuntime = resolve
+    }))
+    const production = await import('../server/production')
+    expect(mocks.installCapture).not.toHaveBeenCalled()
+    const server = production.createProductionServer()
+
+    const first = production.shutdownProductionServer(server)
+    const second = production.shutdownProductionServer(server)
+    expect(second).toBe(first)
+    expect(mocks.abandonCapture).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(mocks.stopPoiseRuntime).toHaveBeenCalledTimes(1))
+    expect(mocks.closeDatabase).not.toHaveBeenCalled()
+    expect(mocks.abandonCapture.mock.invocationCallOrder[0]).toBeLessThan(mocks.stopPoiseRuntime.mock.invocationCallOrder[0])
+
+    releaseRuntime()
+    await first
+    expect(mocks.stopPoiseRuntime).toHaveBeenCalledTimes(1)
+    expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
+  })
+
+  it('exits with the code a release switch asks for once it has shut down', async () => {
+    mocks.stopPoiseRuntime.mockResolvedValue(undefined)
+    const production = await import('../server/production')
+    const server = production.createProductionServer()
+    const exits: number[] = []
+    const shutdown = production.createProductionShutdown(server, (code) => { exits.push(code) })
+    shutdown(75)
+    await vi.waitFor(() => expect(exits).toEqual([75]))
+    expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
+  })
+
+  it('forces shutdown once after the ten-second deadline', async () => {
+    vi.useFakeTimers()
+    let releaseRuntime!: () => void
+    mocks.stopPoiseRuntime.mockReturnValue(new Promise<void>((resolve) => {
+      releaseRuntime = resolve
+    }))
+    const production = await import('../server/production')
+    const server = production.createProductionServer()
+    const exits: number[] = []
+    const shutdown = production.createProductionShutdown(server, (code) => { exits.push(code) })
+
+    shutdown()
+    shutdown()
+    await Promise.resolve()
+    expect(mocks.stopPoiseRuntime).toHaveBeenCalledTimes(1)
+    expect(production.PRODUCTION_SHUTDOWN_TIMEOUT_MS).toBe(10_000)
+    expect(mocks.closeDatabase).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(9_999)
+    expect(exits).toEqual([])
+    await vi.advanceTimersByTimeAsync(1)
+    expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
+    expect(exits).toEqual([1])
+
+    releaseRuntime()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
+    expect(exits).toEqual([1])
+  })
+})

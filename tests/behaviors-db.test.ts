@@ -1,0 +1,545 @@
+import Database from 'better-sqlite3'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+let tempRoot = ''
+let loaded: typeof import('../server/db') | null = null
+
+async function loadIsolatedDb(path: string): Promise<typeof import('../server/db')> {
+  process.env.POISE_DB = path
+  vi.resetModules()
+  loaded = await import('../server/db')
+  return loaded
+}
+
+afterEach(async () => {
+  vi.useRealTimers()
+  if (loaded?.db.open) loaded.closeDatabase()
+  loaded = null
+  delete process.env.POISE_DB
+  vi.resetModules()
+  if (tempRoot) await rm(tempRoot, { recursive: true, force: true })
+  tempRoot = ''
+})
+
+describe('behavior database lifecycle', () => {
+  it('migrates legacy cards once, preserves content, and purges retired credentials', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const path = join(tempRoot, 'cache.db')
+    const legacy = new Database(path)
+    legacy.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO meta(key, value) VALUES ('github_token', 'preserve-me');
+      CREATE TABLE pipe_cards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        lane TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO pipe_cards(id, text, lane, position, created_at, updated_at)
+      VALUES (7, 'legacy card', 'idea', 0, '2026-01-01', '2026-01-01');
+      CREATE TABLE prs (id INTEGER PRIMARY KEY, payload TEXT);
+      INSERT INTO prs(id, payload) VALUES (1, 'preserve-me');
+      CREATE TABLE behavior_seen (
+        key TEXT NOT NULL,
+        target TEXT NOT NULL,
+        seen_at TEXT NOT NULL,
+        claim_id TEXT NOT NULL DEFAULT '',
+        lease_until INTEGER,
+        PRIMARY KEY (key, target)
+      );
+      INSERT INTO behavior_seen(key, target, seen_at, claim_id, lease_until)
+      VALUES ('review-new-prs', 'owner/repo#9@legacy', '2026-01-01', 'legacy-owner', 1);
+    `)
+    legacy.close()
+
+    const first = await loadIsolatedDb(path)
+    const { db, getMeta } = first
+    expect(db.prepare('SELECT text FROM current_cards WHERE id = 7').pluck().get())
+      .toBe('legacy card')
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='pipe_cards'").pluck().get())
+      .toBe('pipe_cards')
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='prs'").pluck().get())
+      .toBe('prs')
+    expect(getMeta('github_token')).toBeNull()
+    expect(getMeta('schema_secure_delete_rebuild_v1')).toBe('complete')
+    expect(db.prepare(`
+      SELECT claim_id, lease_until, launch_error, launch_quarantine FROM behavior_seen
+      WHERE key = 'review-new-prs' AND target = 'owner/repo#9@legacy'
+    `).get()).toEqual({
+      claim_id: '',
+      lease_until: null,
+      launch_error: 'legacy in-flight claim retained to prevent duplicate launch',
+      launch_quarantine: null,
+    })
+    expect(db.pragma('secure_delete', { simple: true })).toBe(1)
+    expect((await stat(path)).mode & 0o777).toBe(0o600)
+
+    // User deletion after migration is authoritative: a restart must not
+    // resurrect the row from the deliberately preserved recovery table.
+    db.prepare('DELETE FROM current_cards WHERE id = 7').run()
+
+    first.closeDatabase()
+    const reopened = await loadIsolatedDb(path)
+    expect(reopened.db.prepare('SELECT count(*) FROM current_cards WHERE id = 7').pluck().get())
+      .toBe(0)
+    expect(reopened.db.prepare('SELECT count(*) FROM pipe_cards WHERE id = 7').pluck().get())
+      .toBe(1)
+  })
+
+  it('releases only the failed target claim and closes idempotently', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const path = join(tempRoot, 'cache.db')
+    const {
+      claimSeen,
+      claimSeenOwned,
+      claimSeenOwnedAs,
+      claimPrOperationOwned,
+      closeDatabase,
+      completeSeenOwned,
+      linkBehaviorLaunchCallOwned,
+      listBehaviorLaunchClaims,
+      markBehaviorLaunchIntentOwned,
+      releaseSeen,
+      releaseSeenOwned,
+      releasePrOperationOwned,
+      renewSeenOwned,
+      renewPrOperationOwned,
+      db,
+    } = await loadIsolatedDb(path)
+
+    const prOperation = claimPrOperationOwned('owner/repo#7', 60_000)
+    expect(prOperation).toEqual(expect.any(String))
+    expect(claimPrOperationOwned('owner/repo#7', 60_000)).toBeNull()
+    expect(claimSeenOwnedAs(
+      'approve-prs',
+      'owner/repo#7@generation',
+      prOperation!,
+    )).toBe(prOperation)
+    expect(renewPrOperationOwned(prOperation!, 120_000)).toBe(true)
+    expect(releasePrOperationOwned(prOperation!)).toBe(true)
+    const nextPrOperation = claimPrOperationOwned('owner/repo#7', 60_000)
+    expect(nextPrOperation).toEqual(expect.any(String))
+    expect(nextPrOperation).not.toBe(prOperation)
+    expect(releasePrOperationOwned(nextPrOperation!)).toBe(true)
+    expect(releaseSeenOwned(
+      'approve-prs',
+      'owner/repo#7@generation',
+      prOperation!,
+    )).toBe(true)
+
+    expect(claimSeen('review-new-prs', 'repo#1@abc')).toBe(true)
+    expect(claimSeen('review-new-prs', 'repo#1@abc')).toBe(false)
+    releaseSeen('review-new-prs', 'repo#2@def')
+    expect(claimSeen('review-new-prs', 'repo#1@abc')).toBe(false)
+    releaseSeen('review-new-prs', 'repo#1@abc')
+    expect(claimSeen('review-new-prs', 'repo#1@abc')).toBe(true)
+
+    releaseSeen('review-new-prs', 'repo#1@abc')
+    const owner = claimSeenOwned('review-new-prs', 'repo#1@abc')
+    expect(owner).toEqual(expect.any(String))
+    expect(releaseSeenOwned('review-new-prs', 'repo#1@abc', 'superseded-owner')).toBe(false)
+    expect(claimSeen('review-new-prs', 'repo#1@abc')).toBe(false)
+    expect(releaseSeenOwned('review-new-prs', 'repo#1@abc', owner!)).toBe(true)
+    expect(claimSeen('review-new-prs', 'repo#1@abc')).toBe(true)
+
+    releaseSeen('review-new-prs', 'repo#1@abc')
+    const expiredOwner = claimSeenOwned('review-new-prs', 'repo#1@abc', 60_000)
+    db.prepare('UPDATE behavior_seen SET lease_until = ? WHERE key = ? AND target = ?')
+      .run(Date.now() - 1, 'review-new-prs', 'repo#1@abc')
+    const recoveredOwner = claimSeenOwned('review-new-prs', 'repo#1@abc')
+    expect(recoveredOwner).toEqual(expect.any(String))
+    expect(recoveredOwner).not.toBe(expiredOwner)
+    expect(completeSeenOwned('review-new-prs', 'repo#1@abc', expiredOwner!)).toBe(false)
+    expect(completeSeenOwned('review-new-prs', 'repo#1@abc', recoveredOwner!)).toBe(true)
+    expect(claimSeenOwned('review-new-prs', 'repo#1@abc')).toBeNull()
+
+    const launchedTarget = 'owner/repo#2@def'
+    const launchedOwner = claimSeenOwned('review-new-prs', launchedTarget, 60_000)
+    expect(launchedOwner).toEqual(expect.any(String))
+    const requestedAt = new Date().toISOString()
+    const expectedHead = 'b'.repeat(40)
+    expect(markBehaviorLaunchIntentOwned({
+      key: 'review-new-prs',
+      target: launchedTarget,
+      claimId: launchedOwner!,
+      launchBehavior: 'pr_review',
+      repo: 'owner/repo',
+      pr: 2,
+      requestedAt,
+      expectedHead,
+      actor: 'bit-mis',
+      source: 'poise:review-new-prs',
+      correlationId: launchedOwner!,
+    })).toBe(true)
+    db.prepare('UPDATE behavior_seen SET lease_until = ? WHERE key = ? AND target = ?')
+      .run(Date.now() - 1, 'review-new-prs', launchedTarget)
+    expect(claimSeenOwned('review-new-prs', launchedTarget)).toBeNull()
+    expect(listBehaviorLaunchClaims('review-new-prs')).toEqual([
+      expect.objectContaining({
+        target: launchedTarget,
+        claimId: launchedOwner,
+        launchBehavior: 'pr_review',
+        launchRepo: 'owner/repo',
+        launchPr: 2,
+        launchRequestedAt: requestedAt,
+        launchCallId: null,
+        launchExpectedHead: expectedHead,
+        launchActor: 'bit-mis',
+        launchSource: 'poise:review-new-prs',
+        launchCorrelationId: launchedOwner,
+      }),
+    ])
+    expect(linkBehaviorLaunchCallOwned(
+      'review-new-prs', launchedTarget, 'wrong-owner', 'a'.repeat(32),
+    )).toBe(false)
+    expect(linkBehaviorLaunchCallOwned(
+      'review-new-prs', launchedTarget, launchedOwner!, 'A'.repeat(32),
+    )).toBe(true)
+    expect(renewSeenOwned('review-new-prs', launchedTarget, launchedOwner!, 60_000)).toBe(true)
+    expect(claimSeenOwned('review-new-prs', launchedTarget)).toBeNull()
+    expect(releaseSeenOwned('review-new-prs', launchedTarget, launchedOwner!)).toBe(true)
+
+    closeDatabase()
+    expect(db.open).toBe(false)
+    expect(() => closeDatabase()).not.toThrow()
+  })
+
+  it('retires a dead letter after a later successful run for the same PR', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-07-29T06:56:00.000Z'))
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const {
+      claimSeenOwnedAs,
+      completeBehaviorLaunchOwned,
+      completeSeenOwned,
+      linkBehaviorLaunchCallOwned,
+      listBehaviorDeadLetters,
+      listBehaviorLaunchClaims,
+      markBehaviorLaunchIntentOwned,
+      recordBehaviorDeadLetter,
+      db,
+    } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const failedTarget = 'Vaquum/repo#127@head=old'
+    const failedClaim = 'a'.repeat(32)
+    expect(claimSeenOwnedAs('approve-prs', failedTarget, failedClaim)).toBe(failedClaim)
+    expect(markBehaviorLaunchIntentOwned({
+      key: 'approve-prs',
+      target: failedTarget,
+      claimId: failedClaim,
+      launchBehavior: 'pr_approve',
+      repo: 'Vaquum/repo',
+      pr: 127,
+      requestedAt: '2026-07-29T06:54:10.000Z',
+      expectedHead: '1'.repeat(40),
+      actor: 'bit-mis',
+      source: 'poise:approve-prs',
+      correlationId: failedClaim,
+    })).toBe(true)
+    const claim = listBehaviorLaunchClaims('approve-prs')[0]
+    recordBehaviorDeadLetter(claim, 'atomic review missing')
+    expect(completeSeenOwned('approve-prs', failedTarget, failedClaim)).toBe(true)
+    expect(listBehaviorDeadLetters()).toHaveLength(1)
+
+    vi.setSystemTime(new Date('2026-07-29T06:59:18.000Z'))
+    const recoveredTarget = 'Vaquum/repo#127@head=new'
+    const recoveredClaim = 'b'.repeat(32)
+    expect(claimSeenOwnedAs(
+      'approve-prs', recoveredTarget, recoveredClaim,
+    )).toBe(recoveredClaim)
+    expect(markBehaviorLaunchIntentOwned({
+      key: 'approve-prs',
+      target: recoveredTarget,
+      claimId: recoveredClaim,
+      launchBehavior: 'pr_approve',
+      repo: 'Vaquum/repo',
+      pr: 127,
+      requestedAt: '2026-07-29T06:58:11.000Z',
+      expectedHead: '2'.repeat(40),
+      actor: 'bit-mis',
+      source: 'poise:approve-prs',
+      correlationId: recoveredClaim,
+    })).toBe(true)
+    expect(linkBehaviorLaunchCallOwned(
+      'approve-prs', recoveredTarget, recoveredClaim, 'c'.repeat(32),
+    )).toBe(true)
+    expect(completeBehaviorLaunchOwned({
+      key: 'approve-prs',
+      target: recoveredTarget,
+      claimId: recoveredClaim,
+      outcome: 'approved',
+      action: 'approved',
+      completedAt: '2026-07-29T06:59:18.000Z',
+      headSha: '2'.repeat(40),
+    })).toBe(true)
+
+    expect(listBehaviorDeadLetters()).toEqual([])
+    expect(db.prepare('SELECT count(*) FROM behavior_dead_letters').pluck().get())
+      .toBe(1)
+  })
+
+  it('groups repeated failures before limiting diagnostics and preserves audit rows', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const store = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const insert = store.db.prepare(`
+      INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, error, created_at)
+      VALUES (?, 'review-new-prs', ?, 'Vaquum/repo', ?, ?, ?)
+    `)
+    insert.run('older', 'Vaquum/repo#2', 2, 'other failure', '2026-01-01T00:00:00Z')
+    for (let n = 0; n < 55; n++) {
+      insert.run(`repeated-${n}`, `Vaquum/repo#1@attempt=${n}`, 1, `timeout ${n}`, `2026-01-02T00:00:${String(n).padStart(2, '0')}Z`)
+    }
+    expect(store.listBehaviorIncidents(2)).toEqual([
+      expect.objectContaining({ target: 'Vaquum/repo#1', attemptCount: 55, error: 'timeout 54' }),
+      expect.objectContaining({ target: 'Vaquum/repo#2', attemptCount: 1, error: 'other failure' }),
+    ])
+    expect(store.listBehaviorDeadLetters(500)).toHaveLength(56)
+    expect(store.getBehaviorIncident('review-new-prs', 'Vaquum/repo#1'))
+      .toMatchObject({ target: 'Vaquum/repo#1', attemptCount: 55, error: 'timeout 54' })
+    expect(store.getBehaviorIncident('approve-prs', 'Vaquum/repo#1')).toBeNull()
+    store.retireBehaviorDeadLetter('older')
+    expect(store.getBehaviorIncident('review-new-prs', 'Vaquum/repo#2')).toBeNull()
+    expect(store.listBehaviorIncidents()).toHaveLength(1)
+    expect(store.db.prepare('SELECT count(*) FROM behavior_dead_letters').pluck().get()).toBe(56)
+  })
+
+  it('retires closed-PR dead letters without deleting their audit rows', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const {
+      claimSeenOwnedAs,
+      completeSeenOwned,
+      listBehaviorDeadLetters,
+      listBehaviorLaunchClaims,
+      markBehaviorLaunchIntentOwned,
+      recordBehaviorDeadLetter,
+      retireBehaviorDeadLettersForClosedPrs,
+      db,
+    } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const claimId = 'd'.repeat(32)
+    expect(claimSeenOwnedAs('approve-prs', 'Vaquum/repo#12@head=old', claimId))
+      .toBe(claimId)
+    expect(markBehaviorLaunchIntentOwned({
+      key: 'approve-prs',
+      target: 'Vaquum/repo#12@head=old',
+      claimId,
+      launchBehavior: 'pr_approve',
+      repo: 'Vaquum/repo',
+      pr: 12,
+      requestedAt: '2026-08-01T12:00:00.000Z',
+      expectedHead: '1'.repeat(40),
+      actor: 'bit-mis',
+      source: 'poise:approve-prs',
+      correlationId: claimId,
+    })).toBe(true)
+    recordBehaviorDeadLetter(listBehaviorLaunchClaims('approve-prs')[0], 'old failure')
+    expect(completeSeenOwned('approve-prs', 'Vaquum/repo#12@head=old', claimId)).toBe(true)
+
+    expect(retireBehaviorDeadLettersForClosedPrs(new Set())).toBe(1)
+    expect(listBehaviorDeadLetters()).toEqual([])
+    expect(db.prepare(`
+      SELECT count(*) FROM behavior_dead_letters WHERE retired_at IS NOT NULL
+    `).pluck().get()).toBe(1)
+  })
+
+  it('persists quarantine occupancy independently of the invalid result and never loses running uncertainty', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const path = join(tempRoot, 'cache.db')
+    let store = await loadIsolatedDb(path)
+    const target = 'Vaquum/Origo#500'
+    const claimId = store.claimSeenOwned('review-new-issues', target)!
+    store.markBehaviorLaunchIntentOwned({
+      key: 'review-new-issues', target, claimId, launchBehavior: 'issue_review',
+      repo: 'Vaquum/Origo', pr: 500, requestedAt: new Date().toISOString(),
+      expectedHead: '', actor: 'bit-mis', source: 'poise:review-new-issues', correlationId: claimId,
+    })
+    store.linkBehaviorLaunchCallOwned('review-new-issues', target, claimId, 'a'.repeat(32))
+    store.quarantineBehaviorLaunchOwned('review-new-issues', target, claimId, 'invalid_result', 'bad terminal outcome', false)
+    expect(store.clearUnreadableBehaviorLaunchOwned('review-new-issues', target, claimId, 'a'.repeat(32))).toBe(false)
+    expect(store.listBehaviorLaunchClaims('review-new-issues')[0].launchQuarantineMayRun).toBe(false)
+    store.quarantineBehaviorLaunchOwned('review-new-issues', target, claimId, 'unreadable', 'conflicting running row', true)
+    store.quarantineBehaviorLaunchOwned('review-new-issues', target, claimId, 'invalid_result', 'rewritten terminal row', false)
+    const claim = store.listBehaviorLaunchClaims('review-new-issues')[0]
+    const incident = store.recordBehaviorDeadLetter(claim, 'feed unreadable')
+    store.retireBehaviorDeadLetter(incident)
+    store.recordBehaviorDeadLetter(claim, 'worker failed')
+    expect(store.countBehaviorDeadLetters('review-new-issues', target)).toBe(1)
+    store.closeDatabase()
+    store = await loadIsolatedDb(path)
+    expect(store.listBehaviorLaunchClaims('review-new-issues')[0]).toMatchObject({
+      launchQuarantine: 'invalid_result', launchQuarantineMayRun: true, launchError: 'bad terminal outcome',
+    })
+  })
+
+  it.each(['invalid_result', 'unreadable'] as const)('keeps a closed parent incident visible while %s evidence still holds its children', async (kind) => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const store = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const target = 'Vaquum/Origo#500'
+    const claimId = store.claimSeenOwned('review-new-issues', target)!
+    store.markBehaviorLaunchIntentOwned({
+      key: 'review-new-issues', target, claimId, launchBehavior: 'issue_review',
+      repo: 'Vaquum/Origo', pr: 500, requestedAt: new Date().toISOString(),
+      expectedHead: '', actor: 'bit-mis', source: 'poise:review-new-issues',
+      correlationId: claimId, covers: ['Vaquum/Origo#501'],
+    })
+    store.linkBehaviorLaunchCallOwned('review-new-issues', target, claimId, 'a'.repeat(32))
+    store.quarantineBehaviorLaunchOwned('review-new-issues', target, claimId, kind, 'uncertain comments')
+    expect(store.clearUnreadableBehaviorLaunchOwned('review-new-issues', target, 'another-owner', 'a'.repeat(32))).toBe(false)
+    expect(store.clearUnreadableBehaviorLaunchOwned('review-new-issues', target, claimId, 'b'.repeat(32))).toBe(false)
+    store.recordBehaviorDeadLetter(store.listBehaviorLaunchClaims('review-new-issues')[0], 'uncertain comments')
+    expect(store.retireBehaviorDeadLettersForClosedPrs(new Set(['Vaquum/Origo#501']), ['review-new-issues'])).toBe(0)
+    expect(store.listBehaviorIncidents()).toMatchObject([{ target, error: 'uncertain comments' }])
+    const completed = store.completeIssueReviewLaunchOwned({
+      key: 'review-new-issues', target, claimId, completedAt: new Date().toISOString(),
+    })
+    expect(completed).toBe(kind === 'unreadable')
+    if (completed) expect(store.retireBehaviorDeadLettersForClosedPrs(new Set(), ['review-new-issues'])).toBe(1)
+  })
+
+  // An issue review's dead letter names an issue. A pull-request scan lists
+  // only open pull requests, so without the scope the next scan retired every
+  // issue-review incident — gone from diagnostics before anyone saw it.
+  it('retires a behavior\'s dead letters only against what that behavior lists', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const {
+      claimSeenOwned,
+      listBehaviorDeadLetters,
+      listBehaviorLaunchClaims,
+      markBehaviorLaunchIntentOwned,
+      recordBehaviorDeadLetter,
+      retireBehaviorDeadLettersForClosedPrs,
+      countBehaviorDeadLetters,
+    } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const claimId = claimSeenOwned('review-new-issues', 'Vaquum/Origo#452')!
+    expect(markBehaviorLaunchIntentOwned({
+      key: 'review-new-issues',
+      target: 'Vaquum/Origo#452',
+      claimId,
+      launchBehavior: 'issue_review',
+      repo: 'Vaquum/Origo',
+      pr: 452,
+      requestedAt: '2026-09-24T07:00:00.000Z',
+      expectedHead: '',
+      actor: 'bit-mis',
+      source: 'poise:review-new-issues',
+      correlationId: claimId,
+    })).toBe(true)
+    recordBehaviorDeadLetter(listBehaviorLaunchClaims('review-new-issues')[0], 'provider exited 1')
+    expect(countBehaviorDeadLetters('review-new-issues', 'Vaquum/Origo#452')).toBe(1)
+
+    expect(retireBehaviorDeadLettersForClosedPrs(new Set())).toBe(0)
+    expect(listBehaviorDeadLetters().map((letter) => letter.behavior)).toEqual(['review-new-issues'])
+    expect(retireBehaviorDeadLettersForClosedPrs(new Set(['Vaquum/Origo#452']), ['review-new-issues'])).toBe(0)
+    expect(retireBehaviorDeadLettersForClosedPrs(new Set(), ['review-new-issues'])).toBe(1)
+    expect(listBehaviorDeadLetters()).toEqual([])
+    // Retiring keeps the count a relaunch decision is made from.
+    expect(countBehaviorDeadLetters('review-new-issues', 'Vaquum/Origo#452')).toBe(1)
+  })
+
+  it('keeps a held issue reviewer listed when another reviewer of the issue finishes', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const db = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const launch = (target: string) => {
+      const claimId = db.claimSeenOwned('review-new-issues', target)!
+      db.markBehaviorLaunchIntentOwned({
+        key: 'review-new-issues', target, claimId, launchBehavior: 'issue_review', repo: 'Vaquum/Origo', pr: 452,
+        requestedAt: new Date(Date.now() - 60_000).toISOString(), expectedHead: '', actor: 'bit-mis',
+        source: 'poise:review-new-issues', correlationId: claimId,
+      })
+      return claimId
+    }
+    launch('Vaquum/Origo#452:secondary')
+    db.recordBehaviorDeadLetter(db.listBehaviorLaunchClaims('review-new-issues')[0], 'posted 1 of 2 comment(s)')
+    const primary = launch('Vaquum/Origo#452')
+    expect(db.completeIssueReviewLaunchOwned({ key: 'review-new-issues', target: 'Vaquum/Origo#452', claimId: primary, completedAt: new Date().toISOString() })).toBe(true)
+    expect(db.listBehaviorIncidents().map((letter) => letter.target)).toEqual(['Vaquum/Origo#452'])
+    expect(db.listBehaviorDeadLetters().map((letter) => letter.target)).toEqual(['Vaquum/Origo#452:secondary'])
+  })
+
+  it('records an issue review launch without a head and completes it as commented', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const {
+      claimSeenOwned,
+      completeIssueReviewLaunchOwned,
+      hasSeen,
+      listBehaviorLaunchClaims,
+      markBehaviorLaunchIntentOwned,
+      db,
+    } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const claimId = claimSeenOwned('review-new-issues', 'Vaquum/Origo#452:secondary')!
+    const intent = {
+      key: 'review-new-issues',
+      target: 'Vaquum/Origo#452:secondary',
+      claimId,
+      launchBehavior: 'issue_review' as const,
+      repo: 'Vaquum/Origo',
+      pr: 452,
+      requestedAt: '2026-09-24T07:00:00.000Z',
+      expectedHead: '',
+      actor: 'bit-mis',
+      source: 'poise:review-new-issues',
+      correlationId: claimId,
+    }
+    // A pull-request launch needs its head; an issue review must not carry one.
+    expect(() => markBehaviorLaunchIntentOwned({ ...intent, expectedHead: 'a'.repeat(40) })).toThrow(/expected head/)
+    expect(() => markBehaviorLaunchIntentOwned({ ...intent, launchBehavior: 'pr_review' })).toThrow(/expected head/)
+    expect(markBehaviorLaunchIntentOwned(intent)).toBe(true)
+    expect(listBehaviorLaunchClaims('review-new-issues')[0]).toMatchObject({ launchBehavior: 'issue_review', launchExpectedHead: '' })
+
+    expect(completeIssueReviewLaunchOwned({ key: 'review-new-issues', target: 'Vaquum/Origo#452:secondary', claimId: 'someone-else', completedAt: '2026-09-24T07:30:00.000Z' })).toBe(false)
+    expect(completeIssueReviewLaunchOwned({ key: 'review-new-issues', target: 'Vaquum/Origo#452:secondary', claimId, completedAt: '2026-09-24T07:30:00.000Z' })).toBe(true)
+    expect(listBehaviorLaunchClaims('review-new-issues')).toEqual([])
+    expect(hasSeen('review-new-issues', 'Vaquum/Origo#452:secondary')).toBe(true)
+    expect(db.prepare(`SELECT launch_outcome, launch_action, launch_head_sha FROM behavior_seen WHERE key = 'review-new-issues'`).get())
+      .toEqual({ launch_outcome: 'commented', launch_action: 'commented', launch_head_sha: null })
+  })
+
+  it('records the sub-issues an issue review covers, through failure too', async () => {
+    tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
+    const {
+      claimSeenOwned,
+      completeSeenOwned,
+      getFailedBehaviorLaunch,
+      linkBehaviorLaunchCallOwned,
+      listBehaviorLaunchClaims,
+      markBehaviorLaunchIntentOwned,
+      setBehaviorLaunchErrorOwned,
+    } = await loadIsolatedDb(join(tempRoot, 'cache.db'))
+    const target = 'Vaquum/Origo#500'
+    const claimId = claimSeenOwned('review-new-issues', target)!
+    const intent = {
+      key: 'review-new-issues',
+      target,
+      claimId,
+      launchBehavior: 'issue_review' as const,
+      repo: 'Vaquum/Origo',
+      pr: 500,
+      requestedAt: '2026-09-24T07:00:00.000Z',
+      expectedHead: '',
+      actor: 'bit-mis',
+      source: 'poise:review-new-issues',
+      correlationId: claimId,
+    }
+    expect(() => markBehaviorLaunchIntentOwned({
+      ...intent, launchBehavior: 'pr_review', expectedHead: 'a'.repeat(40), covers: ['Vaquum/Origo#501'],
+    })).toThrow(/only an issue review/)
+    // What a launch covers only holds others back: a bad entry is dropped, not fatal.
+    expect(markBehaviorLaunchIntentOwned({
+      ...intent, covers: ['Vaquum/Origo#501', 'not an issue', 'Vaquum/Origo#0', 'Vaquum/Limen#7', 'Vaquum/Origo#501'],
+    })).toBe(true)
+    expect(listBehaviorLaunchClaims('review-new-issues')[0].launchCovers).toEqual(['Vaquum/Origo#501', 'Vaquum/Limen#7'])
+
+    expect(linkBehaviorLaunchCallOwned('review-new-issues', target, claimId, 'b'.repeat(32))).toBe(true)
+    expect(setBehaviorLaunchErrorOwned('review-new-issues', target, claimId, 'provider exited 1')).toBe(true)
+    expect(completeSeenOwned('review-new-issues', target, claimId)).toBe(true)
+    expect(getFailedBehaviorLaunch('review-new-issues', target)?.launchCovers).toEqual(['Vaquum/Origo#501', 'Vaquum/Limen#7'])
+
+    // Any other launch covers nothing.
+    const other = claimSeenOwned('review-new-issues', 'Vaquum/Origo#502')!
+    expect(markBehaviorLaunchIntentOwned({ ...intent, target: 'Vaquum/Origo#502', claimId: other, pr: 502, correlationId: other })).toBe(true)
+    expect(listBehaviorLaunchClaims('review-new-issues').find((claim) => claim.target === 'Vaquum/Origo#502')!.launchCovers).toEqual([])
+  })
+})

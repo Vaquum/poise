@@ -1,0 +1,355 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { behaviorDiagnosticGroups } from '../src/behavior-diagnostics'
+
+// src/behaviors.ts is the browser-side mirror of the behaviour state. It has
+// no imports, so it loads under the node environment with `fetch` and
+// `window.dispatchEvent` stubbed. Each case gets a fresh module so the
+// module-level mirror and write counters start clean.
+type BehaviorsModule = typeof import('../src/behaviors')
+
+let behaviors: BehaviorsModule
+let deferredGets: Array<{ resolve: (body: unknown) => void }>
+
+const KEYS = ['review-new-prs', 'approve-prs', 'resolve-unblocking'] as const
+
+function payload(over: Record<string, unknown> = {}): Record<string, unknown> {
+  const base: Record<string, unknown> = { diagnostics: null }
+  for (const key of KEYS) {
+    base[key] = { enabled: false, setting: 'p2', scratchpad: '', lastTriggered: null, owner: null }
+  }
+  for (const [key, value] of Object.entries(over)) {
+    base[key] = { ...(base[key] as object), ...(value as object) }
+  }
+  return base
+}
+
+// A GET that does not answer until the test says so — the whole point is what
+// happens to a write while a read is still on the wire.
+function deferGet(): Promise<unknown> {
+  return new Promise((resolve) => { deferredGets.push({ resolve }) })
+}
+
+beforeEach(async () => {
+  deferredGets = []
+  vi.stubGlobal('window', { dispatchEvent: () => true, CustomEvent })
+  vi.resetModules()
+  behaviors = await import('../src/behaviors')
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe('Behaviors availability diagnostics', () => {
+  it('reports one 502 warning without inventing agent-log, datastore or identity failures', async () => {
+    vi.stubGlobal('fetch', async () => ({ ok: false, status: 502 }))
+    await behaviors.refreshState()
+    expect(behaviors.getBehaviorDiagnostics()).toMatchObject({
+      status: 'unknown',
+      apiError: { severity: 'info', code: 'upstream_unavailable', message: 'HTTP 502' },
+      agentLogsError: null, datastore: { status: 'unchecked', error: null }, identity: { status: 'unknown', error: null },
+    })
+    expect(behaviorDiagnosticGroups(behaviors.getBehaviorDiagnostics()!).map((group) => group.code)).toEqual(['upstream_unavailable'])
+    expect(behaviors.isBehaviorStateLoaded()).toBe(false)
+  })
+  it('preserves a generic fetch exception without fabricating a reset cause', async () => {
+    vi.stubGlobal('fetch', async () => { throw new TypeError('Failed to fetch') })
+    await behaviors.refreshState()
+    expect(behaviors.getBehaviorDiagnostics()?.apiError).toEqual({ severity: 'warning', code: 'unknown', message: 'Failed to fetch' })
+    expect(JSON.stringify(behaviors.getBehaviorDiagnostics())).not.toContain('ECONNRESET')
+  })
+  it('keeps a known degraded runtime visible through a 502 until a healthy read', async () => {
+    const snapshot = { status: 'degraded', runtimeError: 'Behavior runtime is degraded.', agentLogsError: null,
+      datastore: { status: 'healthy', error: null }, identity: { status: 'valid', actor: 'reviewer', error: null },
+      failures: [], deadLetters: [], holds: [] }
+    let outage = false
+    vi.stubGlobal('fetch', async () => outage ? { ok: false, status: 502 }
+      : { ok: true, json: async () => ({ ...payload(), diagnostics: snapshot }) })
+    await behaviors.refreshState()
+    const before = behaviorDiagnosticGroups(behaviors.getBehaviorDiagnostics()!)
+    expect(before.map((group) => group.code)).toEqual(['runtime_unhealthy'])
+    outage = true
+    await behaviors.refreshState()
+    const during = behaviorDiagnosticGroups(behaviors.getBehaviorDiagnostics()!)
+    expect(during[0]).toEqual(before[0])
+    expect(during.map((group) => group.code)).toEqual(['runtime_unhealthy', 'upstream_unavailable'])
+    outage = false
+    snapshot.status = 'ok'
+    snapshot.runtimeError = ''
+    await behaviors.refreshState()
+    expect(behaviorDiagnosticGroups(behaviors.getBehaviorDiagnostics()!)).toEqual([])
+  })
+  it('preserves real last-known errors during an outage and clears availability after recovery', async () => {
+    const snapshot = { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', error: null },
+      identity: { status: 'valid', actor: 'reviewer', error: null },
+      failures: [{ behavior: 'approve-prs', error: 'GitHub 404: Not Found' }], deadLetters: [], holds: [] }
+    let outage = false
+    vi.stubGlobal('fetch', async () => outage ? { ok: false, status: 502 }
+      : { ok: true, json: async () => ({ ...payload(), diagnostics: snapshot }) })
+    await behaviors.refreshState()
+    outage = true
+    await behaviors.refreshState()
+    expect(behaviors.getBehaviorDiagnostics()?.failures).toEqual(snapshot.failures)
+    expect(behaviors.getBehaviorDiagnostics()?.identity.actor).toBe('reviewer')
+    outage = false
+    await behaviors.refreshState()
+    expect(behaviors.getBehaviorDiagnostics()?.apiError).toBeUndefined()
+  })
+  it('keeps malformed successful responses as errors rather than network warnings', async () => {
+    vi.stubGlobal('fetch', async () => ({ ok: true, json: async () => null }))
+    await behaviors.refreshState()
+    expect(behaviors.getBehaviorDiagnostics()?.apiError?.severity).toBe('warning')
+  })
+})
+
+function respond(body: unknown): void {
+  const next = deferredGets.shift()
+  if (!next) throw new Error('no deferred GET outstanding')
+  next.resolve(body)
+}
+
+// GET /api/behaviors walks recent Caller-log pages behind a 30-second
+// subprocess timeout, so a refresh started before a click is routinely still
+// unanswered when that click's POST has completed. Ordering reads against
+// other reads does not help: the slow read is the *newest* read, and it
+// carries a snapshot from before the change.
+describe('a read already on the wire cannot undo a write that completed', () => {
+  it('keeps the toggled value when the pre-toggle refresh finally answers', async () => {
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, enabled: true }) })
+      }
+      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+    })
+
+    // A refresh goes out and blocks.
+    const refresh = behaviors.refreshState()
+    // The person switches the behaviour on; the cheap POST lands first.
+    await behaviors.setEnabled('review-new-prs', true)
+    expect(behaviors.isEnabled('review-new-prs')).toBe(true)
+
+    // The refresh now answers, carrying the pre-toggle snapshot.
+    respond(payload({ 'review-new-prs': { enabled: false } }))
+    await refresh
+
+    expect(behaviors.isEnabled('review-new-prs')).toBe(true)
+  })
+
+  it('keeps a just-saved memory when the pre-save refresh finally answers', async () => {
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, scratchpad: 'new note' }) })
+      }
+      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+    })
+
+    const refresh = behaviors.refreshState()
+    await behaviors.setScratchpad('review-new-prs', 'new note', '')
+    respond(payload({ 'review-new-prs': { scratchpad: 'old note' } }))
+    await refresh
+
+    // Reopening the panel reads this mirror; the pre-save text coming back
+    // here is what made a saved memory look unsaved.
+    expect(behaviors.getScratchpad('review-new-prs')).toBe('new note')
+  })
+
+  it('still applies the read to behaviours the write did not touch', async () => {
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, enabled: true }) })
+      }
+      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+    })
+
+    const refresh = behaviors.refreshState()
+    await behaviors.setEnabled('review-new-prs', true)
+    respond(payload({
+      'review-new-prs': { enabled: false },
+      'approve-prs': { enabled: true },
+    }))
+    await refresh
+
+    expect(behaviors.isEnabled('review-new-prs')).toBe(true)
+    // Discarding the whole response would have thrown this away with it.
+    expect(behaviors.isEnabled('approve-prs')).toBe(true)
+    expect(behaviors.isBehaviorStateLoaded()).toBe(true)
+  })
+
+  it('accepts a read that started after the write settled', async () => {
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, enabled: true }) })
+      }
+      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+    })
+
+    await behaviors.setEnabled('review-new-prs', true)
+    const refresh = behaviors.refreshState()
+    // The server is authoritative: something else turned it off.
+    respond(payload({ 'review-new-prs': { enabled: false } }))
+    await refresh
+
+    expect(behaviors.isEnabled('review-new-prs')).toBe(false)
+  })
+})
+
+// The server stores whichever request arrives last, and a ceiling decides
+// which pull requests the automation acts on — so two in flight at once could
+// leave it on a value the person had already moved past.
+describe('setting writes are serialized per behaviour', () => {
+  it('never leaves the ceiling on a superseded value', async () => {
+    const arrivals: string[] = []
+    let inFlight = 0
+    let maxConcurrent = 0
+    vi.stubGlobal('fetch', async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body))
+      inFlight++
+      maxConcurrent = Math.max(maxConcurrent, inFlight)
+      // The first request is slow, so without serialization the second would
+      // arrive at the server first and the first would win by landing last.
+      await new Promise((resolve) => setTimeout(resolve, arrivals.length === 0 ? 40 : 0))
+      arrivals.push(body.setting)
+      inFlight--
+      return { ok: true, status: 200, json: async () => ({ ok: true, setting: body.setting }) }
+    })
+
+    const first = behaviors.setSettingFields('review-new-prs', { setting: 'p1' })
+    const second = behaviors.setSettingFields('review-new-prs', { setting: 'p4' })
+    await Promise.all([first, second])
+
+    expect(maxConcurrent).toBe(1)
+    expect(arrivals).toEqual(['p1', 'p4'])
+    expect(behaviors.getSetting('review-new-prs')).toBe('p4')
+  })
+
+  it('lets a later write through after an earlier one fails', async () => {
+    let calls = 0
+    vi.stubGlobal('fetch', async () => {
+      calls++
+      if (calls === 1) return { ok: false, status: 500, json: async () => ({}) }
+      return { ok: true, status: 200, json: async () => ({ ok: true, setting: 'p4' }) }
+    })
+
+    await expect(behaviors.setSettingFields('review-new-prs', { setting: 'p1' })).rejects.toThrow()
+    await behaviors.setSettingFields('review-new-prs', { setting: 'p4' })
+    expect(behaviors.getSetting('review-new-prs')).toBe('p4')
+  })
+})
+
+describe('Review New Issues triggers', () => {
+  it('mirrors the repositories and authors and keeps a saved change over an older read', async () => {
+    const posted: unknown[] = []
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        posted.push(JSON.parse(String(init.body)))
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, repos: ['Vaquum/Origo'], authors: ['mikkokotila'] }) })
+      }
+      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+    })
+    const first = behaviors.refreshState()
+    respond(payload({ 'review-new-issues': { enabled: true, repos: ['Vaquum/Limen'], authors: ['zero-bang'], reviewers: 2 } }))
+    await first
+    expect(behaviors.getRepos('review-new-issues')).toEqual(['Vaquum/Limen'])
+    expect(behaviors.getAuthors('review-new-issues')).toEqual(['zero-bang'])
+    expect(behaviors.getReviewers('review-new-issues')).toBe(2)
+
+    const stale = behaviors.refreshState()
+    await behaviors.setSettingFields('review-new-issues', { repos: ['Vaquum/Origo'], authors: ['mikkokotila'] })
+    expect(posted).toEqual([{ repos: ['Vaquum/Origo'], authors: ['mikkokotila'] }])
+    respond(payload({ 'review-new-issues': { repos: ['Vaquum/Limen'], authors: ['zero-bang'] } }))
+    await stale
+    expect(behaviors.getRepos('review-new-issues')).toEqual(['Vaquum/Origo'])
+    expect(behaviors.getAuthors('review-new-issues')).toEqual(['mikkokotila'])
+  })
+
+  it('restores the previous choice and passes the server\'s reason on when a save is refused', async () => {
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve({ ok: false, status: 400, json: async () => ({ error: 'not a repository of the account: Vaquum/Nope' }) })
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => payload({ 'review-new-issues': { repos: ['Vaquum/Origo'], authors: ['mikkokotila'] } }) })
+    })
+    await behaviors.refreshState()
+    await expect(behaviors.setSettingFields('review-new-issues', { repos: ['Vaquum/Nope'] }))
+      .rejects.toThrow('not a repository of the account: Vaquum/Nope')
+    expect(behaviors.getRepos('review-new-issues')).toEqual(['Vaquum/Origo'])
+  })
+})
+
+
+describe('Skip repositories', () => {
+  it('mirrors each PR behavior\'s list and keeps a saved change over an older read', async () => {
+    const posted: unknown[] = []
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        posted.push(JSON.parse(String(init.body)))
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, setting: 'p3', skipRepos: ['acme/api', 'acme/web'] }) })
+      }
+      return deferGet().then((body) => ({ ok: true, status: 200, json: async () => body }))
+    })
+    const first = behaviors.refreshState()
+    respond(payload({ 'review-new-prs': { skipRepos: ['acme/web'] }, 'approve-prs': { skipRepos: ['acme/api'] } }))
+    await first
+    expect(behaviors.getSkipRepos('review-new-prs')).toEqual(['acme/web'])
+    expect(behaviors.getSkipRepos('approve-prs')).toEqual(['acme/api'])
+    expect(behaviors.getSkipRepos('resolve-unblocking')).toEqual([])
+
+    // The ceiling and the list travel in one request: all of it or none.
+    const stale = behaviors.refreshState()
+    await behaviors.setSettingFields('review-new-prs', { setting: 'p3', skipRepos: ['acme/api', 'acme/web'] })
+    expect(posted).toEqual([{ setting: 'p3', skipRepos: ['acme/api', 'acme/web'] }])
+    respond(payload({ 'review-new-prs': { setting: 'p2', skipRepos: ['acme/web'] } }))
+    await stale
+    expect(behaviors.getSkipRepos('review-new-prs')).toEqual(['acme/api', 'acme/web'])
+    expect(behaviors.getSetting('review-new-prs')).toBe('p3')
+  })
+
+  it('restores the ceiling and the list together when a save is refused', async () => {
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        return Promise.resolve({ ok: false, status: 400, json: async () => ({ error: 'not a repository of a ready GitHub account: stranger/app' }) })
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => payload({ 'review-new-prs': { setting: 'p1', skipRepos: ['acme/web'] } }) })
+    })
+    await behaviors.refreshState()
+    await expect(behaviors.setSettingFields('review-new-prs', { setting: 'p4', skipRepos: ['stranger/app'] }))
+      .rejects.toThrow('not a repository of a ready GitHub account: stranger/app')
+    expect(behaviors.getSkipRepos('review-new-prs')).toEqual(['acme/web'])
+    expect(behaviors.getSetting('review-new-prs')).toBe('p1')
+  })
+})
+
+
+describe('global behavior configuration', () => {
+  it('saves repository choices across accounts through the same unscoped endpoint', async () => {
+    const calls: string[] = []
+    const selected = ['acme/project', 'mikkokotila/project']
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      calls.push(url)
+      if (init?.method === 'POST') return { ok: true, status: 200, json: async () => JSON.parse(String(init.body)) }
+      return { ok: true, status: 200, json: async () => payload({ 'review-new-issues': { repos: selected, authors: ['octocat'] } }) }
+    })
+    await behaviors.setSettingFields('review-new-issues', { repos: selected, authors: ['octocat'] })
+    await behaviors.refreshState()
+    expect(behaviors.getRepos('review-new-issues')).toEqual(selected)
+    expect(calls).toEqual(['/api/behaviors/review-new-issues', '/api/behaviors'])
+  })
+
+  it('serializes settings into one shared configuration', async () => {
+    const writes: Array<{ url: string, setting: string }> = []
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body))
+      writes.push({ url, setting: body.setting })
+      return { ok: true, status: 200, json: async () => body }
+    })
+    await Promise.all([
+      behaviors.setSettingFields('review-new-prs', { setting: 'p1' }),
+      behaviors.setSettingFields('review-new-prs', { setting: 'p3' }),
+    ])
+    expect(writes).toEqual([
+      { url: '/api/behaviors/review-new-prs', setting: 'p1' },
+      { url: '/api/behaviors/review-new-prs', setting: 'p3' },
+    ])
+    expect(behaviors.getSetting('review-new-prs')).toBe('p3')
+  })
+})

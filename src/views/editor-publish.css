@@ -1,0 +1,201 @@
+/* The Editor's Publish panel: the document menu's surface, under the bar's
+   Publish icon. Sites, then title, description and date, then each site's
+   own fields, then one button. Every colour is a token. */
+
+.ep-panel {
+  position: fixed;
+  z-index: 60;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  box-shadow: var(--e-2);
+  padding: var(--sp-3);
+  font-size: 0.75rem;
+  color: var(--text);
+}
+
+.ep-body,
+.ep-form {
+  display: grid;
+  gap: var(--sp-3);
+}
+
+.ep-form {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.ep-sites {
+  display: grid;
+  gap: 2px;
+}
+
+.ep-site {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 6px var(--sp-2);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: background var(--flow-feedback) ease-out;
+}
+
+.ep-site:hover { background: var(--hover); }
+.ep-site input { accent-color: var(--n5); margin: 0; }
+
+.ep-site-name {
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ep-site-section {
+  font-weight: 400;
+  color: var(--text-tertiary);
+}
+
+.ep-pr {
+  margin-left: auto;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.625rem;
+  color: var(--text-tertiary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.ep-pr:hover { color: var(--text); }
+.ep-pr-open { color: var(--a2); }
+.ep-pr-merged { color: var(--a7); }
+
+.ep-fields,
+.ep-dest {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.ep-dest {
+  border-top: var(--b-hair);
+  padding-top: var(--sp-3);
+}
+
+.ep-dest-name {
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+}
+
+.ep-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ep-label {
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+}
+
+.ep-input {
+  width: 100%;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  padding: 6px 8px;
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text);
+  outline: none;
+  transition: border-color var(--flow-feedback) ease-out;
+}
+
+.ep-input:focus { border-color: var(--text); }
+.ep-input[readonly] { color: var(--text-tertiary); }
+textarea.ep-input { resize: vertical; min-height: 2.8em; }
+.ep-title { font-weight: 600; }
+
+.ep-mono {
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.75rem;
+}
+
+.ep-list {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ep-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ep-chip {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: transparent;
+  padding: 1px 8px;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.625rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color var(--flow-feedback) ease-out, background var(--flow-feedback) ease-out, border-color var(--flow-feedback) ease-out;
+}
+
+.ep-chip:hover { color: var(--text); border-color: var(--text-tertiary); }
+.ep-chip.is-on { background: var(--n5); border-color: var(--n5); color: var(--n0); }
+
+.ep-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ep-result {
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.ep-result-ok { color: var(--text-secondary); }
+.ep-result-ok a { color: var(--a1); }
+.ep-result-error { color: var(--red); }
+
+.ep-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.ep-message {
+  font-size: 0.6875rem;
+  color: var(--red);
+  overflow-wrap: anywhere;
+}
+
+.ep-note {
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+}
+
+.ep-note-error { color: var(--red); }
+
+.ep-link {
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--a1);
+  cursor: pointer;
+  text-align: left;
+}
