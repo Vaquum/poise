@@ -843,6 +843,48 @@ class TestVerifiedResultsOrExplicitFailures(IssueReviewCase):
         self.assertEqual(diagnostic["operation"], "issue.prepare")
         self.assertEqual(diagnostic["phase"], "preparing_issue")
 
+    def test_checkout_budget_exhaustion_is_tagged_checkout(self):
+        real_timeout = review_budget.timeout
+
+        def flaky_timeout(cap, *, reserve=0):
+            if cap == 1800:
+                raise review_budget.ReviewLimitError("Review reached its total time limit; needs attention",
+                                                     "review_budget_exhausted")
+            return real_timeout(cap, reserve=reserve)
+
+        writes = agent_writes(None)
+        with patch.object(review_budget, "timeout", side_effect=flaky_timeout):
+            row, _ = self.run_review(FakeGitHub(), writes, expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["error_code"], "review_budget_exhausted")
+        diagnostic = exported["diagnostic"]
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(diagnostic["operation"], "issue.checkout")
+        self.assertEqual(diagnostic["phase"], "checking_out")
+        self.assertIsNone(exported["receipts"])
+        self.assertEqual(writes.runs, [])
+
+    def test_pre_provider_reserve_exhaustion_is_tagged_preparation(self):
+        real_timeout = review_budget.timeout
+
+        def flaky_timeout(cap, *, reserve=0):
+            if reserve:
+                raise review_budget.ReviewLimitError("Review reached its total time limit; needs attention",
+                                                     "review_budget_exhausted")
+            return real_timeout(cap, reserve=reserve)
+
+        writes = agent_writes(None)
+        with patch.object(review_budget, "timeout", side_effect=flaky_timeout):
+            row, _ = self.run_review(FakeGitHub(), writes, expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["error_code"], "review_budget_exhausted")
+        diagnostic = exported["diagnostic"]
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(diagnostic["operation"], "issue.prepare")
+        self.assertEqual(diagnostic["phase"], "preparing_issue")
+        self.assertIsNone(exported["receipts"])
+        self.assertEqual(writes.runs, [])
+
     def test_checkout_timeout_keeps_a_checkout_diagnostic(self):
         github = FakeGitHub()
 
