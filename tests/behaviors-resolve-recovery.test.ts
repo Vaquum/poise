@@ -550,6 +550,32 @@ describe('resolve-unblocking rate-limit recovery', () => {
     expect(db.db.prepare('SELECT id FROM behavior_runs WHERE id = ?').get(admission!.nativeId)).toBeUndefined()
   })
 
+  it('preserves a late superseded receipt without disturbing its newer owner', async () => {
+    arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
+    const { db, runtime } = await startResolveRuntime()
+    const newerId = 'e'.repeat(32)
+    scriptResolve((number) => {
+      if (number !== 17) return 'delegate'
+      const pending = recoveryRow(db, CHECK_17)!
+      db.setMeta(`behavior_resolve_unblocking_recovery:${CHECK_17}`, JSON.stringify({ ...pending,
+        nativeId: newerId, code: 'newer-attempt', previous: [pending] }))
+      return { stdout: JSON.stringify({ action: 'resolved_nonblocking_conversations_if_ready',
+        repository: pr.repo, pull_number: 17, outcome: 'superseded',
+        head_sha: HEAD_SHA, current_head_sha: NEXT_HEAD_SHA }) }
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const [original] = admissionsFor(17)
+    expect(recoveryRow(db, CHECK_17)).toMatchObject({ nativeId: newerId, code: 'newer-attempt' })
+    expect(outcomesFor(newerId)).toEqual([])
+    expect(outcomesFor(original!.nativeId)).toEqual([expect.objectContaining({
+      state: 'superseded', activity: 'settled', outcome: 'superseded', head: NEXT_HEAD_SHA,
+    })])
+    const receipt = JSON.parse(db.getMeta(
+      `behavior_resolve_unblocking_recovery:${CHECK_17}:receipt:${original!.nativeId}`)!)
+    expect(receipt).toMatchObject({ nativeId: original!.nativeId, head: HEAD_SHA, actor: 'review-bot',
+      disposition: 'superseded', targetDisposition: 'superseded', observedHead: NEXT_HEAD_SHA })
+  })
+
   it('preserves the failure cause through a later merge supersession', async () => {
     arrangeCli(false, false, { unresolvedConversationCount: 1, reviewerLatestState: 'APPROVED', reviewerLatestCommit: HEAD_SHA })
     scriptResolve((number) => number === 17 ? { error: new Error('response lost after partial resolution') } : 'delegate')

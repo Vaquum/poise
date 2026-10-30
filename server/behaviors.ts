@@ -4632,14 +4632,19 @@ function archiveResolveRecovery(checkTarget: string, pending: ResolveRecovery, d
 // Persist the receipt only: the original head/actor/correlation (and any
 // failure cause) must survive alongside the observed head, without a second
 // ledger outcome and without authorizing a replay from the changed head.
-function retainResolveSupersededReceipt(checkTarget: string, pending: ResolveRecovery, observedHead: string): void {
-  const attempt = resolveRecoveryAttempts(pending).pop()!
+// The attempt is the single firing being settled, never the whole chain.
+function retainResolveSupersededReceipt(checkTarget: string, attempt: ResolveRecovery, observedHead: string): void {
+  const single: ResolveRecovery = { nativeId: attempt.nativeId, code: attempt.code,
+    nextRetryAtMs: attempt.nextRetryAtMs, sideEffects: attempt.sideEffects, head: attempt.head,
+    unresolvedBefore: attempt.unresolvedBefore, at: attempt.at,
+    ...(attempt.actor !== undefined ? { actor: attempt.actor } : {}),
+    ...(attempt.cause !== undefined ? { cause: attempt.cause } : {}) }
   const at = new Date().toISOString()
-  const receipt = { ...attempt, disposition: 'superseded', targetDisposition: 'superseded' as const,
+  const receipt = { ...single, disposition: 'superseded', targetDisposition: 'superseded' as const,
     observedHead, observedAt: at }
   const stored = db.prepare("UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
-    .run(JSON.stringify({ target: checkTarget, ...receipt }), attempt.nativeId)
-  if (!stored.changes) setMeta(`${resolveRecoveryKey(checkTarget)}:receipt:${attempt.nativeId}`, JSON.stringify(receipt))
+    .run(JSON.stringify({ target: checkTarget, ...receipt }), single.nativeId)
+  if (!stored.changes) setMeta(`${resolveRecoveryKey(checkTarget)}:receipt:${single.nativeId}`, JSON.stringify(receipt))
 }
 
 async function retireClosedResolveRecoveries(open: ReadonlySet<string>): Promise<void> {
@@ -5019,8 +5024,19 @@ async function tickResolveUnblocking(): Promise<void> {
           db.transaction(() => {
             const pendingBefore = readResolveRecovery(checkTarget)
             const current = pendingBefore?.nativeId === detail.nativeId
-            if (current && result.superseded && pendingBefore) {
-              retainResolveSupersededReceipt(checkTarget, pendingBefore, result.headSha)
+            if (result.superseded) {
+              // A late superseded response settles only its own firing, even
+              // when a newer attempt already owns the recovery pointer. Find
+              // its admitted evidence in the chain; when the pointer already
+              // moved on, rebuild the receipt from this invocation's pinned
+              // head/actor/correlation rather than dropping them.
+              const known = pendingBefore
+                ? resolveRecoveryAttempts(pendingBefore).find((attempt) => attempt.nativeId === detail.nativeId)
+                : undefined
+              const attempt: ResolveRecovery = known ?? { nativeId: detail.nativeId!, code: 'admitted',
+                nextRetryAtMs: Date.now() + BEHAVIOR_RETRY_BASE_MS, sideEffects: 'uncertain',
+                head: headSha, unresolvedBefore, at: new Date().toISOString(), actor: reviewer }
+              retainResolveSupersededReceipt(checkTarget, attempt, result.headSha)
             }
             retireResolveRecoveryAttempt(checkTarget, detail.nativeId!)
             if (current && !result.superseded && result.unresolved_count === 0) settleResolveRecoveryEndState(checkTarget, result.headSha)
