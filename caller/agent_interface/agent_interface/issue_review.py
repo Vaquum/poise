@@ -557,16 +557,28 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
     """One full-power agent run in its own fresh checkout."""
     work.mkdir(parents=True)
     checkout = work / "repo"
-    progress.stage("checking_out", f"Preparing a fresh checkout of {repo}", timeout=review_budget.timeout(1800))
     try:
-        info = interface("--checkout-repo", repo, "--path", str(checkout), "--token-user", actor, seconds=1800)
-    except subprocess.TimeoutExpired as error:
-        raise review_budget.ReviewLimitError(
-            "Issue review checkout reached its time limit; needs attention", "review_budget_exhausted",
-            diagnostic_envelope(operation="issue.checkout", phase="checking_out",
-                                outcome="timed_out", provider=model.provider)) from error
+        progress.stage("checking_out", f"Preparing a fresh checkout of {repo}", timeout=review_budget.timeout(1800))
+        try:
+            info = interface("--checkout-repo", repo, "--path", str(checkout), "--token-user", actor, seconds=1800)
+        except subprocess.TimeoutExpired as error:
+            raise review_budget.ReviewLimitError(
+                "Issue review checkout reached its time limit; needs attention", "review_budget_exhausted",
+                diagnostic_envelope(operation="issue.checkout", phase="checking_out",
+                                    outcome="timed_out", provider=model.provider)) from error
+    except review_budget.ReviewLimitError as error:
+        if error.diagnostic is None:
+            error.diagnostic = diagnostic_envelope(operation="issue.checkout", phase="checking_out",
+                                                   outcome="timed_out", provider=model.provider)
+        raise
     output = work / "review.json"
-    seconds = review_budget.timeout(TIMEOUT_SECONDS, reserve=POST_RESERVE_SECONDS)
+    try:
+        seconds = review_budget.timeout(TIMEOUT_SECONDS, reserve=POST_RESERVE_SECONDS)
+    except review_budget.ReviewLimitError as error:
+        if error.diagnostic is None:
+            error.diagnostic = diagnostic_envelope(operation="issue.prepare", phase="preparing_issue",
+                                                   outcome="timed_out", provider=model.provider)
+        raise
     text = prompt(ref(repo, number), repo, info, data, output, actor, note, seconds)
     args, stdin, env = command(model, text, checkout, work, seconds)
     try:

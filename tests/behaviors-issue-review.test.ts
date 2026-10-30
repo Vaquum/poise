@@ -1637,3 +1637,134 @@ describe('Review New Issues reviewer account trips', () => {
     }
   })
 })
+
+describe('Review New Issues time-limit recovery', () => {
+  const diagnostic = (operation: string, phase: string): Record<string, unknown> => ({
+    version: 1, source: 'caller', severity: 'error', operation, phase,
+    outcome: 'timed_out', stderr: '', stderr_truncated: false,
+  })
+  const CHECKOUT = diagnostic('issue.checkout', 'checking_out')
+  const PREPARING = diagnostic('issue.prepare', 'preparing_issue')
+  const PROVIDER = diagnostic('provider.review', 'provider_execution')
+
+  const BUDGET = 'review_budget_exhausted'
+
+  function useFallbackModels(database: { setMeta: (key: string, value: string) => void }): void {
+    database.setMeta('models', JSON.stringify({ issue_review: {
+      default: 'grok-4.6-xhigh', fallback: 'gpt-6-astra-ultra',
+      secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
+    } }))
+  }
+
+  it.each([
+    { name: 'checkout', error: 'Issue review checkout reached its time limit; needs attention', diagnostic: CHECKOUT },
+    { name: 'packet preparation', error: 'Issue review preparation reached its time limit; needs attention', diagnostic: PREPARING },
+  ])('holds a $name time-limit with its cause instead of tripping a reviewer that never ran', async ({ error, diagnostic }) => {
+    const { behaviors, database } = await start({ reviewers: 1 })
+    issues = [issue(452)]
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(1)
+
+    const target = `${REPO}#452`
+    agentLogs = [finished(target, { status: 'failed', error, error_code: BUDGET, diagnostic })]
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+
+    // Held with its cause: one dead letter, no reviewer trip, no relaunch
+    // under another model.
+    expect(launches()).toHaveLength(1)
+    expect(database.listBehaviorDeadLetters()).toHaveLength(1)
+    expect(database.listBehaviorDeadLetters()[0]).toMatchObject({ target, error })
+    expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
+    expect(database.hasSeen(KEY, target)).toBe(true)
+
+    skipBackoff()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(1)
+  })
+
+  it('retries a provider time-limit once with the next reviewer, then holds across restart', async () => {
+    let modules = await start({ reviewers: 1 })
+    useFallbackModels(modules.database)
+    issues = [issue(452)]
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(flag(launches()[0], '--model')).toBe('grok-4.6-xhigh')
+
+    const target = `${REPO}#452`
+    agentLogs = [finished(target, {
+      status: 'failed', model: 'grok-4.6-xhigh',
+      error: 'Issue review reached its time limit; needs attention', error_code: BUDGET, diagnostic: PROVIDER,
+    })]
+    await resetLogCache()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+
+    // Tripped and relaunched in the same tick with the next reviewer; the
+    // attempt counts toward the retry bound.
+    expect(launches()).toHaveLength(2)
+    expect(flag(launches()[1], '--model')).toBe('opus-5-xhigh')
+    expect(modules.database.listBehaviorDeadLetters()).toHaveLength(1)
+    expect(modules.behaviors.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ target: 'reviewer:grok-4.6-xhigh', kind: 'operation' }),
+    ])
+
+    agentLogs.push(finished(target, {
+      status: 'failed', model: 'opus-5-xhigh',
+      error: 'Issue review reached its time limit; needs attention', error_code: BUDGET, diagnostic: PROVIDER,
+    }))
+    await resetLogCache()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(2)
+    expect(modules.database.listBehaviorDeadLetters()).toHaveLength(2)
+    expect(modules.database.countBehaviorDeadLetters(KEY, target)).toBe(2)
+
+    // Past every backoff and across a restart, the exhausted target stays held.
+    skipBackoff()
+    vi.setSystemTime(Date.now() + 2 * 60 * MINUTE)
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(2)
+    await modules.behaviors.stopBehaviorsRuntime()
+    modules.database.closeDatabase()
+    modules = await start()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(2)
+    expect(modules.database.countBehaviorDeadLetters(KEY, target)).toBe(2)
+  })
+
+  it('completes a provider time-limit with a same-firing retry that posts once', async () => {
+    const { behaviors, database } = await start({ reviewers: 1 })
+    useFallbackModels(database)
+    issues = [issue(452)]
+    await behaviors.runEnabledBehaviorsOnce()
+
+    const target = `${REPO}#452`
+    agentLogs = [finished(target, {
+      status: 'failed', model: 'grok-4.6-xhigh',
+      error: 'Issue review reached its time limit; needs attention', error_code: BUDGET, diagnostic: PROVIDER,
+    })]
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(2)
+
+    agentLogs.push(finished(target, {
+      status: 'completed', model: 'opus-5-xhigh', action: 'commented', outcome: 'commented',
+      receipts: [{ issue: target, comment_id: 7, url: `https://github.com/${target}`, author: 'bit-mis' }],
+    }))
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(2)
+
+    // Two Caller identities under one firing: the failed child is kept, the
+    // retry posted exactly once, and the firing completed.
+    expect(agentLogs.map((row) => row.correlation_id)).toHaveLength(2)
+    expect(agentLogs[0].correlation_id).not.toBe(agentLogs[1].correlation_id)
+    expect(database.listBehaviorLaunchClaims(KEY)).toEqual([])
+    expect(database.hasSeen(KEY, target)).toBe(true)
+    // The failed attempt stays in history; the recovered incident clears.
+    expect(database.countBehaviorDeadLetters(KEY, target)).toBe(1)
+    expect(database.listBehaviorDeadLetters()).toEqual([])
+    expect(mocks.captureOutcome.mock.calls.map(([outcome]) => outcome)).toEqual([
+      expect.objectContaining({ state: 'completed', activity: 'settled', outcome: 'commented' }),
+    ])
+  })
+})
