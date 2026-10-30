@@ -83,14 +83,21 @@ class TestOwnReviews(TestCase):
         with self.assertRaisesRegex(RuntimeError, "exactly one"):
             self.outcome("pr_review", facts([CLEAN]), facts([CLEAN]), receipt=receipt("reviewed_clean", 92))
 
-    def test_without_a_receipt_a_siblings_review_is_not_adopted(self):
+    def test_without_a_receipt_an_unclaimed_review_is_uncertain_not_adopted(self):
         self.row("me")
         self.row("sibling", 91)
-        result = self.outcome("pr_review", facts(), facts([CHANGES, CLEAN]), call_id="me")
-        self.assertEqual(result["outcome"], "clean")
+        with self.assertRaises(budget.ReviewLimitError) as raised:
+            self.outcome("pr_review", facts(), facts([CHANGES, CLEAN]), call_id="me")
+        self.assertEqual(raised.exception.code, api.REVIEW_PUBLICATION_UNCERTAIN_CODE)
+        self.assertIn("[92]", str(raised.exception))
         self.row("other", 92)
         with self.assertRaisesRegex(RuntimeError, "exactly one"):
             self.outcome("pr_review", facts(), facts([CHANGES, CLEAN]), call_id="me")
+
+    def test_without_identity_a_new_review_is_not_adopted(self):
+        self.assertEqual(api.own_reviews(facts(), facts([CLEAN]), None, None), [])
+        with self.assertRaisesRegex(budget.ReviewLimitError, "exactly one"):
+            self.outcome("pr_review", facts(), facts([CLEAN]))
 
     def test_an_unclaimed_review_is_checked_again_after_a_grace(self):
         self.row("me")
@@ -106,13 +113,19 @@ class TestOwnReviews(TestCase):
             self.outcome("pr_review", facts(), facts([CHANGES]), call_id="me")
         self.assertEqual(calls, [1])
 
-    def test_facts_without_ids_fall_back_to_the_counters(self):
+    def test_facts_without_ids_hold_instead_of_adopting_from_counters(self):
         before = {k: v for k, v in facts().items() if k != "reviewer_reviews_since_items"}
         after = {**before, "reviewer_comments_since": 1, "reviewer_latest_any_state": "COMMENTED",
                  "reviewer_latest_any_commit": HEAD, "reviewer_latest_any_review_id": "R_clean",
                  "reviewer_latest_any_submitted_at": "2026-09-17T10:06:00Z"}
         self.assertIsNone(api.own_reviews(before, after, None, "me"))
-        self.assertEqual(self.outcome("pr_review", before, after, receipt=receipt("reviewed_clean", 92))["outcome"], "clean")
+        # Aggregate progress cannot validate an exact publication receipt, and
+        # without per-review ids a sibling's review is indistinguishable too.
+        for kwargs in ({"receipt": receipt("reviewed_clean", 92)}, {"call_id": "me"}, {}):
+            with self.subTest(kwargs=sorted(kwargs)):
+                with self.assertRaises(budget.ReviewLimitError) as raised:
+                    self.outcome("pr_review", before, after, **kwargs)
+                self.assertEqual(raised.exception.code, api.REVIEW_PUBLICATION_UNCERTAIN_CODE)
 
     def test_logs_carry_the_review_id(self):
         self.row("me", 92)
@@ -121,15 +134,18 @@ class TestOwnReviews(TestCase):
     def test_quota_marker_cannot_override_live_review_or_receipt_checks(self):
         review_receipt.bind(api.DB, "me")
         review_receipt.record_failure(QUOTA_ERROR)
+        self.row("me")
         for behavior, review, outcome in (("pr_review", CLEAN, "clean"), ("pr_review", CHANGES, "changes_requested"),
                                           ("pr_approve", APPROVAL, "approved")):
             with self.subTest(outcome=outcome):
-                self.assertEqual(self.outcome(behavior, facts(), facts([review]))["outcome"], outcome)
+                with self.assertRaises(budget.ReviewLimitError) as raised:
+                    self.outcome(behavior, facts(), facts([review]), call_id="me")
+                self.assertEqual(raised.exception.code, api.REVIEW_PUBLICATION_UNCERTAIN_CODE)
         with self.assertRaisesRegex(budget.ReviewLimitError, "exactly one"):
             self.outcome("pr_approve", facts(), facts([CHANGES]), receipt=receipt("approved_pr", 93))
         with self.assertRaisesRegex(RuntimeError, "expected head"):
             self.outcome("pr_approve", facts(), facts([{**APPROVAL, "commit": "b" * 40}]), receipt=receipt("approved_pr", 93))
-        with self.assertRaisesRegex(budget.ReviewLimitError, "exactly one"):
+        with self.assertRaises(review_receipt.SubmissionError):
             self.outcome("pr_review", facts(), facts([CLEAN, CHANGES]))
         self.assertEqual(self.outcome("pr_approve", facts(), facts(head_sha="b" * 40))["outcome"], "superseded")
 
@@ -167,8 +183,28 @@ class TestReceiptRecording(TestCase):
         with sqlite3.connect(api.DB) as conn:
             self.assertEqual(conn.execute("select review_comments from calls where id='run'").fetchone()[0], "3")
         self.assertEqual([entry["review_comments"] for entry in api.logs() if entry["id"] == "run"], [3])
-        review_receipt.record(json.dumps({"action": "reviewed_clean", "review_id": 92, "head_sha": HEAD}))
-        self.assertEqual([entry["review_comments"] for entry in api.logs() if entry["id"] == "run"], [None])
+        review_receipt.record(json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD, "comments": 5}))
+        self.assertEqual([entry["review_comments"] for entry in api.logs() if entry["id"] == "run"], [5])
+
+    def test_a_second_accepted_receipt_is_preserved_as_this_calls_conflict(self):
+        review_receipt.record(json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD, "comments": 3}))
+        kept = review_receipt.record(json.dumps({"action": "reviewed_clean", "review_id": 92, "head_sha": HEAD}))
+        self.assertEqual(kept, {"action": "requested_changes", "review_id": 91, "head_sha": HEAD})
+        self.assertEqual(self.stored(), "91")
+        with sqlite3.connect(api.DB) as conn:
+            self.assertEqual(conn.execute("select review_comments from calls where id='run'").fetchone()[0], "3")
+        pair = review_receipt.conflict()
+        self.assertEqual(pair["first"]["review_id"], 91)
+        self.assertEqual(pair["second"], {"action": "reviewed_clean", "review_id": 92, "head_sha": HEAD})
+
+    def test_a_receipt_without_its_head_is_not_positive_evidence(self):
+        for text in (json.dumps({"action": "reviewed_clean", "review_id": 92}),
+                     json.dumps({"action": "reviewed_clean", "review_id": 92, "head_sha": "not-a-sha"})):
+            with self.subTest(text=text):
+                review_receipt.bind(api.DB, "run")
+                self.assertIsNone(review_receipt.record(text))
+        self.assertIsNone(review_receipt.get())
+        self.assertIsNone(self.stored())
 
     def test_structured_submission_records_its_receipt(self):
         reply = json.dumps({"action": "reviewed_clean", "review_id": 92, "head_sha": HEAD})
@@ -299,6 +335,29 @@ class TestReceiptRecording(TestCase):
         self.assertEqual(review_receipt.failure(), "error: GitHub 503:")
         self.assertIsNone(self.stored())
 
+    def test_claude_guard_blocks_a_second_write_after_an_uncertain_submission(self):
+        command = f"github-interface --reviewed-clean #68 --expected-head {HEAD} --token-user bit-mis"
+        gate_path = Path(self.directory.name) / "gate.lock"
+        gate_path.touch()
+        receipt_path = Path(self.directory.name) / "receipt.json"
+        reply = json.dumps({"action": "reviewed_clean", "review_id": 92, "head_sha": HEAD})
+        env = {"AGENT_INTERFACE_BASH_ALLOW": json.dumps([command]),
+               "AGENT_INTERFACE_REVIEW_GATE": str(gate_path),
+               "AGENT_INTERFACE_REVIEW_RECEIPT": str(receipt_path)}
+        runs = iter([SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 503:\n"),
+                     SimpleNamespace(returncode=0, stdout=reply, stderr="")])
+        with patch.dict(os.environ, env), patch.object(sys, "argv", ["bash_guard.py", command]), \
+                patch.object(bash_guard.subprocess, "run", side_effect=lambda *a, **k: next(runs)) as run, \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                bash_guard.main()
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertIn("uncertain", gate_path.read_text())
+            with self.assertRaisesRegex(RuntimeError, "uncertain; blocked until reconciled"):
+                bash_guard.main()
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse(receipt_path.exists())
+
 
 class TestRecoveryWithSiblings(TestCase):
     def setUp(self):
@@ -422,24 +481,28 @@ class TestRecoveryWithSiblings(TestCase):
         self.assertIsNone(row["review_id"])
         self.assertEqual(self.mod.run.call_count, 1)
 
-    def test_github_accepted_review_wins_over_lost_claude_submission_response(self):
+    def test_lost_claude_submission_response_holds_without_adopting(self):
         def lost(*args, **kwargs):
             review_receipt.record_failure("error: GitHub 502:")
             return "response lost"
         row = self.execute([lost], [facts(), facts([CLEAN])])
-        self.assertEqual(row["status"], "completed")
-        self.assertEqual(row["outcome"], "clean")
-        self.assertIsNone(row["error_code"])
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["error_code"], api.REVIEW_PUBLICATION_UNCERTAIN_CODE)
+        self.assertIn("uncertain", row["error"])
+        for field in ("action", "outcome", "review_id", "recovery_model"):
+            self.assertIsNone(row[field])
         self.assertEqual(self.mod.run.call_count, 1)
 
-    def test_github_accepted_review_wins_over_lost_structured_submission(self):
+    def test_lost_structured_submission_holds_without_adopting(self):
         def lost(*args, **kwargs):
             raise review_receipt.SubmissionError("error: GitHub 502:")
         row = self.execute([lost], [facts(), facts([CLEAN])])
-        self.assertEqual(row["status"], "completed")
-        self.assertEqual(row["outcome"], "clean")
-        self.assertIsNone(row["error_code"])
-        self.assertIsNone(row["recovery_model"])
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["error_code"], "review_submission_failed")
+        self.assertIn("could not prove a safe recovery", row["error"])
+        self.assertIn("uncertain", row["error"])
+        for field in ("action", "outcome", "review_id", "recovery_model"):
+            self.assertIsNone(row[field])
         self.assertEqual(self.mod.run.call_count, 1)
 
     def test_uncertain_structured_submission_without_a_landed_review_is_never_retried(self):
@@ -495,7 +558,10 @@ class TestRecoveryWithSiblings(TestCase):
 
 
 class TestDuplicatePrevention(TestCase):
-    """#236: a second unclaimed review is a contract violation, never adopted."""
+    """#723: only positive same-call evidence proves a duplicate publication.
+
+    An extra same-account review without that evidence stays unattributed,
+    never blamed on this run by elimination."""
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -509,18 +575,78 @@ class TestDuplicatePrevention(TestCase):
         with sqlite3.connect(api.DB) as conn:
             conn.execute("insert into calls (id, behavior, repo, pr_id, started_at) values ('me', 'pr_review', 'o/r', '1', 0)")
 
-    def test_second_unclaimed_review_with_receipt_is_a_violation(self):
+    def test_second_unclaimed_review_with_receipt_is_unattributed(self):
         after = facts([CHANGES, CLEAN])
-        with self.assertRaisesRegex(budget.ReviewLimitError, "duplicate"):
+        result = api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
+                                      receipt=receipt("reviewed_clean", 92), call_id="me")
+        self.assertEqual(result["outcome"], "clean")
+
+    def test_independent_approval_before_and_during_a_receipted_review(self):
+        earlier = {"id": 90, "node_id": "PRR_90", "state": "APPROVED", "commit": HEAD,
+                   "submitted_at": "2026-09-17T10:04:00Z"}
+        after = facts([earlier, CHANGES, APPROVAL])
+        result = api.behavior_outcome(object(), "pr_approve", "1", "/tmp", "bit-mis", HEAD,
+                                      facts([earlier]), after,
+                                      receipt=receipt("approved_pr", 93), call_id="me")
+        self.assertEqual(result["outcome"], "approved")
+
+    def test_two_accepted_receipts_by_one_call_are_a_duplicate(self):
+        review_receipt.record(json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": HEAD}))
+        review_receipt.record(json.dumps({"action": "reviewed_clean", "review_id": 92, "head_sha": HEAD}))
+        after = facts([CHANGES, CLEAN])
+        with self.assertRaises(budget.ReviewLimitError) as raised:
             api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
                                  receipt=receipt("reviewed_clean", 92), call_id="me")
-        row_code = None
-        try:
+        self.assertEqual(raised.exception.code, "review_contract_violation")
+        self.assertIn("91 and 92", str(raised.exception))
+        # Unrelated work continues: a run without the conflict reconciles.
+        review_receipt.bind(api.DB, "other")
+        result = api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
+                                      receipt=receipt("reviewed_clean", 92), call_id="other")
+        self.assertEqual(result["outcome"], "clean")
+
+    def test_contradictory_receipts_for_one_review_are_a_violation(self):
+        review_receipt.record(json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD}))
+        review_receipt.record(json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": HEAD}))
+        with self.assertRaisesRegex(budget.ReviewLimitError, "contradictory receipts for review 91"):
+            api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), facts([CHANGES]),
+                                 receipt=receipt("requested_changes", 91), call_id="me")
+
+    def test_receipt_claimed_by_a_sibling_is_a_conflict_not_corroboration(self):
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("insert into calls (id, behavior, repo, pr_id, review_id, started_at) values ('sibling', 'pr_review', 'o/r', '1', '92', 0)")
+        with self.assertRaisesRegex(budget.ReviewLimitError, "claimed by another run"):
+            api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), facts([CLEAN]),
+                                 receipt=receipt("reviewed_clean", 92), call_id="me")
+
+    def test_receipt_for_another_head_is_rejected(self):
+        other = receipt("reviewed_clean", 92)
+        other["head_sha"] = "b" * 40
+        with self.assertRaisesRegex(RuntimeError, "receipt does not match the expected head"):
+            api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), facts([CLEAN]),
+                                 receipt=other, call_id="me")
+
+    def test_receipted_extra_with_a_transient_failure_holds_as_uncertain(self):
+        review_receipt.record_failure("error: GitHub 503:")
+        after = facts([CHANGES, CLEAN])
+        with self.assertRaises(budget.ReviewLimitError) as raised:
             api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
                                  receipt=receipt("reviewed_clean", 92), call_id="me")
-        except budget.ReviewLimitError as failure:
-            row_code = failure.code
-        self.assertEqual(row_code, "review_contract_violation")
+        self.assertEqual(raised.exception.code, api.REVIEW_PUBLICATION_UNCERTAIN_CODE)
+        self.assertIn("[91]", str(raised.exception))
+
+    def test_sibling_claim_after_the_grace_cannot_settle_the_wrong_call(self):
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("insert into calls (id, behavior, repo, pr_id, started_at) values ('sibling', 'pr_review', 'o/r', '1', 0)")
+        with self.assertRaises(budget.ReviewLimitError) as raised:
+            api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), facts([CHANGES]),
+                                 call_id="me")
+        self.assertEqual(raised.exception.code, api.REVIEW_PUBLICATION_UNCERTAIN_CODE)
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("update calls set review_id='91' where id='sibling'")
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), facts([CHANGES]),
+                                 call_id="me")
 
     def test_sibling_claimed_extra_review_is_not_a_duplicate(self):
         with sqlite3.connect(api.DB) as conn:
@@ -608,36 +734,20 @@ class TestDuplicatePrevention(TestCase):
                                       receipt=receipt("reviewed_clean", 92), call_id="me")
         self.assertEqual(result["outcome"], "clean")
 
-    def test_another_or_unknown_actor_cannot_shield_a_duplicate(self):
+    def test_extra_review_is_unattributed_whatever_the_sibling_state(self):
         after = facts([CHANGES, CLEAN])
-        for actor in ("other-reviewer", None):
-            for status in ("running", "failed"):
-                with self.subTest(actor=actor, status=status):
-                    with sqlite3.connect(api.DB) as conn:
-                        conn.execute("update calls set actor = 'bit-mis' where id = 'me'")
-                        conn.execute("insert or replace into calls "
-                                     "(id, behavior, repo, pr_id, actor, status, error_code, started_at, ended_at) "
-                                     "values ('sibling', 'pr_review', 'o/r', '1', ?, ?, 'review_submission_failed', 50, 100)",
-                                     (actor, status))
-                    with self.assertRaisesRegex(budget.ReviewLimitError, "duplicate"):
-                        api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
-                                             receipt=receipt("reviewed_clean", 92), call_id="me")
-
-    def test_long_finished_uncertain_sibling_does_not_shield_a_duplicate(self):
-        with sqlite3.connect(api.DB) as conn:
-            conn.execute("update calls set started_at = 2000 where id = 'me'")
-            conn.execute("insert into calls (id, behavior, repo, pr_id, status, error_code, started_at, ended_at)"
-                         " values ('sibling', 'pr_review', 'o/r', '1', 'failed', 'review_submission_failed', 500, 1000)")
-        after = facts([CHANGES, CLEAN])
-        with self.assertRaisesRegex(budget.ReviewLimitError, "duplicate"):
-            api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
-                                 receipt=receipt("reviewed_clean", 92), call_id="me")
-
-    def test_provable_preflight_sibling_does_not_shield_a_duplicate(self):
-        with sqlite3.connect(api.DB) as conn:
-            conn.execute("insert into calls (id, behavior, repo, pr_id, status, outcome, action, started_at, ended_at)"
-                         " values ('sibling', 'pr_review', 'o/r', '1', 'failed', 'preflight_failed', 'not_started', 50, 100)")
-        after = facts([CHANGES, CLEAN])
-        with self.assertRaisesRegex(budget.ReviewLimitError, "duplicate"):
-            api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
-                                 receipt=receipt("reviewed_clean", 92), call_id="me")
+        siblings = [
+            ("other-reviewer", "running"), (None, "failed"),
+            ("bit-mis", "running"), ("bit-mis", "failed"),
+        ]
+        for actor, status in siblings:
+            with self.subTest(actor=actor, status=status):
+                with sqlite3.connect(api.DB) as conn:
+                    conn.execute("update calls set actor = 'bit-mis' where id = 'me'")
+                    conn.execute("insert or replace into calls "
+                                 "(id, behavior, repo, pr_id, actor, status, error_code, started_at, ended_at) "
+                                 "values ('sibling', 'pr_review', 'o/r', '1', ?, ?, 'review_submission_failed', 50, 100)",
+                                 (actor, status))
+                result = api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
+                                              receipt=receipt("reviewed_clean", 92), call_id="me")
+                self.assertEqual(result["outcome"], "clean")
