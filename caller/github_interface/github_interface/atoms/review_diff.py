@@ -19,8 +19,8 @@ from typing import Any
 from github_interface.client import GitHubClient
 from .process_diagnostic import GitProcessError, StderrCapture, failure
 
-MAX_DIFF_BYTES = 1_350_000
-MAX_PACKET_BYTES = 1_450_000  # Leave room for the governed agent policy.
+MAX_DIFF_BYTES = 2_850_000
+MAX_PACKET_BYTES = 2_950_000  # Leave room for the governed agent policy.
 BULK_FILE_BYTES = 32_000
 BULK_SUFFIXES = {".json", ".jsonl", ".ndjson", ".csv", ".tsv"}
 OPAQUE_SUFFIXES = {".gz", ".zip", ".tar", ".bz2", ".xz", ".7z", ".pdf", ".parquet", ".arrow"}
