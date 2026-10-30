@@ -165,13 +165,13 @@ expected head. For PR review these providers can first return `action: "inspect"
 with provisional `comments` and a `requests` array; Caller reads the requested
 source and supplies the result in their next turn. Terminal verdicts require
 `requests: []`. At most 12 inspection rounds fit within the existing total review
-deadline and 1.5 MB prompt limit; exhausting inspection never submits a review.
+deadline and 3 MB prompt limit; exhausting inspection never submits a review.
 Codex messages at or below its 1,048,576-character input limit keep their existing
 single-turn path. Only overflowing messages are sent as consecutive bounded
 fragments through the same native review conversation. Intermediate turns must
 acknowledge the exact fragment number; only the last can return a verdict or
 inspection request. The full input is retained, the existing total deadline and
-1.5 MB limit still apply, and partial staging, mismatched conversation IDs,
+3 MB limit still apply, and partial staging, mismatched conversation IDs,
 failed turns or native tool use submit nothing.
 Each provider process runs in a separate temporary directory with native tools
 disabled, receiving the same explicit guidance and scoped inspection access: Codex
@@ -280,9 +280,17 @@ must submit nothing when filing fails.
 
 ### Staged and follow-up reviews
 
+A governed review admits up to 3,000,000 UTF-8 prompt bytes. Diff generation
+is capped at 2,850,000 bytes and the serialized packet at 2,950,000 bytes,
+leaving room for context and policy. Existing bulk-data compaction rules still
+apply. These byte limits do not guarantee that an input fits a provider's token
+window. Claude receives the whole packet in one call.
+
 A structured review whose packet exceeds one provider call's reliable size
-runs in file-group stages (at most 8 files or 200,000 diff bytes each), all
-under the same head watch and budget. Every stage's findings combine into the
+runs in file-group stages targeting at most 8 files or 200,000 diff bytes each.
+Individual files stay intact and can exceed the byte target. All groups share
+the same head watch and total time budget; retaining more code can increase
+review duration and usage. Every stage's findings combine into the
 single verdict the harness submits; a packet that fits in one group runs
 exactly as before. A follow-up (`--pr-approve`) round reviews the diff since
 the reviewer's last submitted review instead of the whole PR again: new

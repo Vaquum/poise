@@ -11,6 +11,7 @@ findings combine into the single submitted verdict.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from hashlib import sha256
 import os
 import re
@@ -213,15 +214,15 @@ def _admit(text: str) -> None:
         )
 
 
-def _stage_texts(text: str, packet: str) -> list[str]:
-    if not packet:
-        return [text]
-    stages = review_stages.split(packet)
-    if len(stages) == 1:
-        return [text]
+def _stage_texts(text: str, packet: str) -> Iterator[str]:
+    """Yield one review prompt per file group, holding one at a time."""
+    if not packet or review_stages.stage_count(packet) == 1:
+        yield text
+        return
     if packet not in text:
         raise review_stages.StageError("staged review packet differs from the review prompt")
-    return [text.replace(packet, stage, 1) for stage in stages]
+    for stage in review_stages.iter_stages(packet):
+        yield text.replace(packet, stage, 1)
 
 
 def _reaffirms_finding(comment: dict, threads: list[dict]) -> bool:
@@ -257,10 +258,16 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
         return
     if not isinstance(node, dict) or not node.get("since_head_sha"):
         return
+    level = node.get("p")
+    if level is None or (isinstance(level, str) and not level.strip()):
+        raise InvalidVerdict(
+            "cannot validate since-diff positions: review packet is missing its priority")
+    # The packet carries the wire value (e.g. "p2"); pass it through unchanged
+    # so the full-diff re-fetch uses the same priority scope. atoms._priority
+    # validates the format strictly; non-string values fail there.
+    priority = level if isinstance(level, str) else str(level)
     try:
-        level = node.get("p")
-        full = json.loads(fetch_packet(pwd, pr, actor_name, head,
-                                       f"p{level}" if level is not None else None, since_head=None))
+        full = json.loads(fetch_packet(pwd, pr, actor_name, head, priority, since_head=None))
         retained = [entry["filename"] for entry in full["files"]]
         sets = review_stages.diff_line_sets(full["diff"], retained)
         since_files = [entry["filename"] for entry in node.get("files", [])]
@@ -388,17 +395,17 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     if ask is None:
         raise AgentPreflightError(f"{model.provider} cannot return a structured review verdict")
     try:
-        stage_texts = _stage_texts(text, packet)
-        staged = len(stage_texts) > 1
+        total = review_stages.stage_count(packet) if packet else 1
+        staged = total > 1
         with tempfile.TemporaryDirectory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
             root = Path(work)
             deadline = monotonic() + timeout_s
             prior: list[dict] = []
-            for index, stage_text in enumerate(stage_texts):
+            for index, stage_text in enumerate(_stage_texts(text, packet)):
                 _admit(stage_text)
                 if staged:
-                    progress.stage("reviewing", f"Reviewing file group {index + 1} of {len(stage_texts)}")
+                    progress.stage("reviewing", f"Reviewing file group {index + 1} of {total}")
                     if prior:
                         stage_text += ("\n\nFindings already recorded in earlier file groups "
                                        "(do not repeat them):\n" + json.dumps(prior))

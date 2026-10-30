@@ -130,12 +130,26 @@ def _issue(repo: str, number: int, actor: str) -> dict:
     }
 
 
+def _packet_bytes(target: dict, subs: list) -> int:
+    return len(json.dumps({"issue": target, "sub_issues": subs}).encode("utf-8"))
+
+
+def _refuse_oversized(size: int) -> None:
+    raise AgentPreflightError(
+        f"issue packet is {size} bytes, over the {MAX_PACKET_BYTES} a reliable review can take",
+        "review_packet_too_large",
+    )
+
+
 def packet(repo: str, number: int, actor: str) -> dict:
     """The issue, its comments, and every sub-issue with its own comments."""
     progress.stage("preparing_issue", "Reading the issue and its sub-issues", timeout=review_budget.timeout(600))
     target = _issue(repo, number, actor)
     if target.pop("pull_request"):
         raise AgentPreflightError(f"{ref(repo, number)} is a pull request, not an issue")
+    size = _packet_bytes(target, [])
+    if size > MAX_PACKET_BYTES:
+        _refuse_oversized(size)
     subs = []
     for item in interface("--sub-issues", f"#{number}", "--repository", repo, "--token-user", actor)["sub_issues"]:
         linked = ref(item["repository"], item["issue_number"])
@@ -143,17 +157,16 @@ def packet(repo: str, number: int, actor: str) -> dict:
             sub = _issue(item["repository"], item["issue_number"], actor)
         except (RuntimeError, ValueError) as error:
             subs.append({"issue": linked, "via": item["via"], "error": str(error)[:500]})
-            continue
-        if not sub.pop("pull_request"):
-            subs.append({**sub, "via": item["via"]})
-    data = {"issue": target, "sub_issues": subs}
-    size = len(json.dumps(data).encode("utf-8"))
-    if size > MAX_PACKET_BYTES:
-        raise AgentPreflightError(
-            f"issue packet is {size} bytes, over the {MAX_PACKET_BYTES} a reliable review can take",
-            "review_packet_too_large",
-        )
-    return data
+        else:
+            if not sub.pop("pull_request"):
+                subs.append({**sub, "via": item["via"]})
+        # Account for the aggregate as each page arrives, so an oversized
+        # packet is refused before every remaining page is fetched and
+        # retained. Admitted packets are built exactly as before.
+        size = _packet_bytes(target, subs)
+        if size > MAX_PACKET_BYTES:
+            _refuse_oversized(size)
+    return {"issue": target, "sub_issues": subs}
 
 
 def mark_reviewed(data: dict, actor: str, reviews: Callable[[list[str]], dict[str, str]],

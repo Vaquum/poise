@@ -11,7 +11,8 @@ tests and contract documents.
 | `github_datastore/` | `github-datastore` | The per-account SQLite index of issues and pull requests behind Current, Archive and the behaviors |
 
 Each package's own README, AGENTS and (for the datastore) CONSUMER_CONTRACT
-describe its contract.
+describe its contract. Caller terminal states map to the shared contract in
+[Error-state handling contract](../docs/Error-State-Contract.md).
 
 ## How Poise runs them
 

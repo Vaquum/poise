@@ -1,4 +1,6 @@
+import gc
 import json
+import tracemalloc
 from unittest import TestCase
 
 from agent_interface import review_stages
@@ -62,6 +64,18 @@ class TestSplit(TestCase):
     def test_single_huge_file_stays_one_stage(self):
         raw = packet(["big.py"], {"big.py": "@@ -1 +1 @@\n" + "x\n" * 200_000})
         self.assertEqual(review_stages.split(raw), [raw])
+
+    def test_near_three_mb_packet_preserves_every_file_in_small_groups(self):
+        paths = [f"src/f{i:02d}.py" for i in range(16)]
+        body = "@@ -1 +1 @@\n" + "+value = 1\n" * 15_000
+        raw = packet(paths, {path: body for path in paths})
+        self.assertGreater(len(raw.encode()), 1_500_000)
+        self.assertLess(len(raw.encode()), 2_950_000)
+        stages = [json.loads(stage) for stage in review_stages.split(raw)]
+        self.assertEqual([entry["filename"] for stage in stages for entry in stage["files"]], paths)
+        self.assertEqual(sum(stage["diff"].splitlines().count('+value = 1') for stage in stages), 240_000)
+        for stage in stages:
+            self.assertLessEqual(len(stage["diff"].encode()), 200_000)
 
     def test_renamed_old_path_stays_with_its_section(self):
         node = json.loads(packet(["new.py"]))
@@ -222,3 +236,53 @@ class TestSplit(TestCase):
             node = json.loads(stage)
             self.assertEqual(node["omitted_files"], [{"path": "src/rest.py", "reason": "omitted"}])
             self.assertIn("not reviewed in any stage", node["review_scope"])
+
+
+def large_packet(files=1000, comment_chars=60_000, comments=16):
+    """A legal-size packet with many stages: ~1 MB of common context shared
+    by every group, so retaining all rendered stages costs ~125 MB."""
+    paths = [f"src/f{i:04d}.py" for i in range(files)]
+    threads = [{"path": paths[0], "line": 1, "side": "RIGHT", "bodies": ["c" * comment_chars]}
+               for _ in range(comments)]
+    return packet(paths, review_threads=threads)
+
+
+class TestBoundedStageRetention(TestCase):
+    def test_stage_count_reports_groups_without_rendering(self):
+        raw = large_packet()
+        self.assertLess(len(raw.encode()), 1_450_000)
+        self.assertEqual(review_stages.stage_count(raw), 125)
+        self.assertEqual(review_stages.stage_count(packet(["a.py"])), 1)
+        self.assertEqual(review_stages.stage_count("not a packet"), 1)
+
+    def test_streamed_stages_cover_every_file_with_full_context(self):
+        raw = large_packet()
+        expected = json.loads(raw)
+        seen, count = [], 0
+        for stage in review_stages.iter_stages(raw):
+            node = json.loads(stage)
+            count += 1
+            self.assertEqual(node["review_threads"], expected["review_threads"])
+            seen.extend(entry["filename"] for entry in node["files"])
+        self.assertEqual(count, 125)
+        self.assertEqual(seen, [entry["filename"] for entry in expected["files"]])
+
+    def test_split_renders_the_same_stages_as_the_stream(self):
+        raw = large_packet()
+        self.assertEqual(review_stages.split(raw), list(review_stages.iter_stages(raw)))
+
+    def test_streaming_one_stage_at_a_time_bounds_live_retention(self):
+        raw = large_packet()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            total, count = 0, 0
+            for stage in review_stages.iter_stages(raw):
+                total += len(stage.encode())
+                count += 1
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(count, 125)
+        self.assertGreater(total, 100_000_000)
+        self.assertLess(peak, total // 8)

@@ -1,3 +1,4 @@
+import gc
 import io
 import json
 import os
@@ -5,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import TestCase
@@ -394,6 +396,25 @@ class TestPacket(IssueReviewCase):
         with patch.object(issue_review, "interface", github), self.assertRaises(AgentPreflightError) as raised:
             issue_review.packet(REPO, 452, ACTOR)
         self.assertEqual(raised.exception.code, "review_packet_too_large")
+
+    def test_an_oversized_packet_is_refused_without_reading_every_sub_issue(self):
+        numbers = list(range(460, 490))
+        subs = [{"repository": REPO, "issue_number": number, "via": ["work_slices"]} for number in numbers]
+        github = FakeGitHub(subs=subs)
+        github.issues.update({number: issue(number, body="y" * 600_000) for number in numbers})
+        gc.collect()
+        tracemalloc.start()
+        try:
+            with patch.object(issue_review, "interface", github):
+                with self.assertRaises(AgentPreflightError) as refused:
+                    issue_review.packet(REPO, 452, ACTOR)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(refused.exception.code, "review_packet_too_large")
+        reads = [call for call in github.calls if call[0] == "--read-issue"]
+        self.assertLess(len(reads), len(numbers) // 2)
+        self.assertLess(peak, issue_review.MAX_PACKET_BYTES * 4)
 
 
 class TestSubIssuesReviewedOnce(IssueReviewCase):

@@ -139,11 +139,12 @@ export class CheckSemaphore {
   /** Take a slot, parking in lane FIFO order when none fits. */
   acquire(lane: CheckLane, options: CheckSlotAcquireOptions = {}): Promise<() => void> {
     const { signal } = options
+    // A turn stopped before it acquires must never consume a slot or park:
+    // its abort already fired, so the waiter's listener below would never
+    // wake it again, and a grant would hold budget for dead work.
+    signal?.throwIfAborted()
     this.grant()
     if (this.fits(lane, this.liveCap())) return Promise.resolve(this.take(lane))
-    // A turn stopped before it reaches the queue must never park: its abort
-    // already fired, so the waiter's listener below would never wake it again.
-    signal?.throwIfAborted()
     return new Promise<() => void>((resolve, reject) => {
       const waiter: CheckSlotWaiter = {
         lane,
