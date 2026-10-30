@@ -20,14 +20,9 @@ POLL_SECONDS = 30
 HEAD_TIMEOUT_SECONDS = 10
 STOP_GRACE_SECONDS = 2
 # A provider CLI stuck in its own reconnect loop (codex retries a 429 for
-# twenty minutes) hands off after a minute of nothing but rate-limit
-# signals, so Poise can move the run to the next slot on budget instead.
+# twenty minutes) hands off after a minute of nothing but stall signals,
+# so Poise can move the run to the next slot on budget instead.
 RATE_LIMIT_ABORT_SECONDS = 60
-_RATE_LIMIT_MARKERS = (
-    b"reconnecting",
-    b"exceeded retry limit",
-    b"too many requests",
-)
 _RATE_LIMIT_WORDS = (
     b"rate limit",
     b"rate_limit",
@@ -47,6 +42,12 @@ _THROTTLE_COMPANIONS = (
     b"cooldown",
     b"429",
 )
+# A reconnect loop without quota evidence is a transport stall, not proof
+# of a 429: codex prints the same "Reconnecting... n/m" lines for an idle
+# WebSocket timeout. "reconnect" itself cannot be the retry evidence, or
+# every mention of reconnecting would count.
+_TRANSPORT_COMPANIONS = tuple(c for c in _THROTTLE_COMPANIONS if c != b"reconnect")
+_RETRY_COUNTER = re.compile(rb"\d+\s*/\s*\d+")
 _STATUS_429 = re.compile(rb"(?:status|http_status)\D{0,3}429\b")
 _GITHUB_STATUS = re.compile(rb"github\s+\d{3}")
 
@@ -57,24 +58,37 @@ class ReviewSuperseded(RuntimeError):
         super().__init__(f"Review stopped early: PR head changed to {self.head_sha}")
 
 
-def _rate_limited(line: bytes) -> bool:
+def _stall_kind(line: bytes) -> str | None:
+    """Classify one provider output line as quota or transport evidence.
+
+    Returns "quota" for 429/rate-limit evidence, "transport" for a retry
+    loop without quota evidence, and None for anything else — including
+    assistant prose that merely mentions reconnecting.
+    """
     lowered = line.lower()
     if _GITHUB_STATUS.search(lowered):
         # GitHub's own limit: switching models cannot fix it.
-        return False
-    if any(marker in lowered for marker in _RATE_LIMIT_MARKERS) or _STATUS_429.search(lowered):
-        return True
-    return any(word in lowered for word in _RATE_LIMIT_WORDS) \
-        and any(companion in lowered for companion in _THROTTLE_COMPANIONS)
+        return None
+    if (_STATUS_429.search(lowered) or b"too many requests" in lowered
+            or (any(word in lowered for word in _RATE_LIMIT_WORDS)
+                and any(companion in lowered for companion in _THROTTLE_COMPANIONS))):
+        return "quota"
+    if ((b"reconnect" in lowered or b"exceeded retry limit" in lowered)
+            and (_RETRY_COUNTER.search(lowered)
+                 or any(companion in lowered for companion in _TRANSPORT_COMPANIONS))):
+        return "transport"
+    return None
 
 
 class RateLimitAbort:
-    """Kill a provider run stalled on its own rate limit.
+    """Kill a provider run stalled in its own retry loop.
 
-    The first rate-limit signal starts a minute's grace for the provider's
-    own retry; any output line without a signal resets it. Past the minute
+    The first stall signal starts a minute's grace for the provider's own
+    retry; any output line without a signal resets it. Past the minute
     with nothing but signals (or silence), the run is killed so Poise can
     move the review to the next slot instead of waiting out the budget.
+    The handoff keeps the observed cause: quota evidence says rate-limited,
+    a bare reconnect loop says reconnecting.
     """
 
     def __init__(self) -> None:
@@ -83,6 +97,7 @@ class RateLimitAbort:
         self.pending_out = b""
         self.pending_err = b""
         self.since: float | None = None
+        self.quota = False
         self.signal = b""
 
     def scan(self, stdout, stderr) -> None:
@@ -106,12 +121,16 @@ class RateLimitAbort:
     def feed(self, line: bytes) -> None:
         if not line.strip():
             return
-        if _rate_limited(line):
+        kind = _stall_kind(line)
+        if kind is None:
+            self.since = None
+            self.quota = False
+        else:
             if self.since is None:
                 self.since = monotonic()
+            if kind == "quota":
+                self.quota = True
             self.signal = line.strip()[:200]
-        else:
-            self.since = None
 
     def check(self, provider: str | None, process: subprocess.Popen) -> None:
         # Only complete lines judge: a pending fragment may hold half a
@@ -121,9 +140,12 @@ class RateLimitAbort:
             return
         _stop_process_group(process)
         excerpt = self.signal.decode("utf-8", "replace") if self.signal else ""
+        if self.quota:
+            complaint = f"Provider rate-limited this run for over a minute ({provider or 'unknown'})"
+        else:
+            complaint = f"Provider kept reconnecting for over a minute ({provider or 'unknown'})"
         raise review_budget.ReviewLimitError(
-            f"Provider rate-limited this run for over a minute ({provider or 'unknown'}); "
-            f"handing off so the next model can run instead{(': ' + excerpt) if excerpt else ''}",
+            f"{complaint}; handing off so the next model can run instead{(': ' + excerpt) if excerpt else ''}",
             "review_provider_error")
 
 

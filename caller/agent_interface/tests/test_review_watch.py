@@ -387,6 +387,47 @@ class TestRateLimitAbort(TestCase):
         self.assertIn("429 Too Many Requests", str(raised.exception))
         stop.assert_called_once_with(proc)
 
+    def test_transport_stall_without_quota_keeps_the_transport_cause(self):
+        abort = RateLimitAbort()
+        proc = SimpleNamespace(pid=1234)
+        with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
+                patch.object(review_watch, "_stop_process_group") as stop:
+            abort.note(b"Reconnecting... 1/5 (WebSocket idle timeout)\n")
+            abort.note(b"Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for websocket)\n")
+            with self.assertRaises(ReviewLimitError) as raised:
+                abort.check("codex", proc)
+        self.assertEqual(raised.exception.code, "review_provider_error")
+        self.assertTrue(
+            str(raised.exception).startswith("Provider kept reconnecting for over a minute (codex); "),
+            str(raised.exception))
+        self.assertIn("next model", str(raised.exception))
+        self.assertIn("idle timeout waiting for websocket", str(raised.exception))
+        self.assertNotIn("rate-limit", str(raised.exception).lower())
+        stop.assert_called_once_with(proc)
+
+    def test_transport_lines_after_quota_keep_the_quota_handoff(self):
+        abort = RateLimitAbort()
+        with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
+                patch.object(review_watch, "_stop_process_group"):
+            abort.note(b"error: rate limit exceeded, retrying in 30s\n")
+            abort.note(b"Reconnecting... 2/5 (backing off)\n")
+            with self.assertRaises(ReviewLimitError) as raised:
+                abort.check("codex", SimpleNamespace())
+        self.assertEqual(raised.exception.code, "review_provider_error")
+        self.assertIn("rate-limited", str(raised.exception))
+
+    def test_assistant_prose_mentioning_reconnects_never_starts_the_clock(self):
+        abort = RateLimitAbort()
+        abort.note(b'{"type":"assistant","text":"reconnecting the pieces, let me re-read the diff"}\n')
+        abort.note(b"reasoning: reconnecting the helper to its caller now\n")
+        abort.note(b"reconnecting\n")
+        self.assertIsNone(abort.since)
+        proc = SimpleNamespace(pid=1234)
+        with patch.object(review_watch, "monotonic", return_value=1_000_000.0), \
+                patch.object(review_watch, "_stop_process_group") as stop:
+            abort.check("claude", proc)
+        stop.assert_not_called()
+
     def test_silence_after_a_signal_aborts(self):
         abort = RateLimitAbort()
         with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
