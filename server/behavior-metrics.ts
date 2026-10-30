@@ -25,18 +25,17 @@ export function startDirectBehaviorRun(behavior: DirectBehavior): string {
   return id
 }
 
-export const MAX_DIRECT_RUN_NOTE = 1000
-
+// The store never truncates the note: resolve-unblocking settles structured
+// JSON receipts here, and a shared byte bound would leave unparsable JSON.
+// Bounding is each caller's contract (merge notes stay short by construction).
 export function finishDirectBehaviorRun(id: string, success: boolean, outcome: LedgerOutcome | null = null, note?: string): void {
   const at = new Date().toISOString()
   const row = db.prepare('SELECT behavior, started_at, status FROM behavior_runs WHERE id = ?').get(id) as { behavior: string, started_at: string, status: string } | undefined
   activeDirectRuns.delete(id)
   if (!row || row.status !== 'running') return
-  const bounded = note === undefined ? null
-    : note.length > MAX_DIRECT_RUN_NOTE ? `${note.slice(0, MAX_DIRECT_RUN_NOTE - 1).trimEnd()}…` : note
   const settled = db.prepare(`UPDATE behavior_runs SET completed_at = ?, status = ?, outcome = ?, note = COALESCE(?, note)
     WHERE id = ? AND status = 'running'`)
-    .run(at, success ? 'completed' : 'failed', outcome, bounded, id)
+    .run(at, success ? 'completed' : 'failed', outcome, note ?? null, id)
   if (settled.changes === 0) return
   try {
     recordHandling({ kind: 'behavior-firing', source: row.behavior, title: row.behavior,

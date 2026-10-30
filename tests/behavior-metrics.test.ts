@@ -226,6 +226,16 @@ describe('behavior run metrics', () => {
     expect(handled.n).toBe(1)
   })
 
+  it('never truncates a structured settlement receipt', () => {
+    const receipt = JSON.stringify({ nativeId: 'resolve-1', disposition: 'failed',
+      lateFailure: { error: 'x'.repeat(2000), sideEffects: 'uncertain' } })
+    expect(receipt.length).toBeGreaterThan(1000)
+    const id = startDirectBehaviorRun('resolve-unblocking')
+    finishDirectBehaviorRun(id, false, null, receipt)
+    expect(db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(id)).toEqual({ note: receipt })
+    expect(() => JSON.parse((db.prepare('SELECT note FROM behavior_runs WHERE id = ?').get(id) as { note: string }).note)).not.toThrow()
+  })
+
   it('keeps the canonical run when its handling view is unavailable', () => {
     db.exec(`CREATE TRIGGER fail_completed_handling BEFORE INSERT ON handling_log
       WHEN NEW.kind = 'behavior-firing' AND NEW.outcome = 'completed'
