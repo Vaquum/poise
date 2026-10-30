@@ -151,6 +151,38 @@ describe('ledger recovery boundaries', () => {
     ])
   })
 
+  it('journals a failed-startup recovery so a later crash keeps episodes separate', () => {
+    const db = store()
+    db.capture(admission())
+    const checkpoint = stamp()
+    const path = db.path
+    db.close()
+    crash(path)
+    clock = Date.parse('2026-10-19T01:00:00.000Z')
+    rmSync(path)
+    mkdirSync(path)
+    const down = store(path)
+    expect(down.health().gaps.at(-1)).toMatchObject({ reason: 'unclean_restart', until: null })
+    rmdirSync(path)
+    clock = Date.parse('2026-10-19T02:00:00.000Z')
+    const recovery = stamp()
+    expect(down.health()).toMatchObject({ status: 'incomplete', dropped: 0 })
+    // The recovery is journaled without any capture or close.
+    const journal = JSON.parse(readFileSync(path + '.coverage.json', 'utf8')) as { health: LedgerHealth }
+    expect(journal.health.gaps).toEqual([
+      { since: checkpoint, until: recovery, reason: 'unclean_restart' },
+      { since: recovery, until: recovery, reason: 'unavailable' },
+    ])
+    // A later crash starts a new episode instead of absorbing the recovery.
+    clock = Date.parse('2026-10-19T03:00:00.000Z')
+    const second = store(path)
+    expect(second.health().gaps).toEqual([
+      { since: checkpoint, until: recovery, reason: 'unclean_restart' },
+      { since: recovery, until: recovery, reason: 'unavailable' },
+      { since: recovery, until: stamp(), reason: 'unclean_restart' },
+    ])
+  })
+
   it('lets failed captures neither seal episodes nor close uncertainty', () => {
     const db = store()
     db.loss(1)
@@ -425,7 +457,7 @@ const invalidJournals: Array<[string, (health: LedgerHealth) => void]> = [
     health.gaps = [{ since: stamp(), until: stamp(), reason: 'no-such-reason' } as unknown as LedgerHealth['gaps'][number]]
   }],
   ['a non-string gap endpoint', (health) => {
-    health.gaps = [{ since: stamp(), until: 12345, reason: 'capture_loss' } as unknown as LedgerHealth['gaps']]
+    health.gaps = [{ since: stamp(), until: 12345, reason: 'capture_loss' } as unknown as LedgerHealth['gaps'][number]]
   }],
   ['an invalid detail floor', (health) => { health.detailFloor = 'bogus' }],
 ]

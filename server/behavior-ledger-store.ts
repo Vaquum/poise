@@ -145,6 +145,9 @@ export class BehaviorLedgerStore {
         this.prune()
       })()
       this.noteRecovery()
+      // Journal the recovery itself: a crash before the next capture or
+      // close must reload the closed boundary, not the open gap.
+      this.persistJournal(this.currentHealth())
     } catch {
       // No gap: a failed open holds captures for retry instead of losing
       // them, and health names the cause until the store reopens.
