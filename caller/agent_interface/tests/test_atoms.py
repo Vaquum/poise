@@ -11,7 +11,7 @@ from agent_interface.review_watch import ReviewWatch
 
 class TestAtoms(TestCase):
     def test_run_agent_streams_prompt_over_stdin(self) -> None:
-        prompt = "x" * (1024 * 1024)
+        prompt = "é" * 1_500_000  # Exactly 3 MB in UTF-8, not 1.5 MB.
         completed = SimpleNamespace(returncode=0, stdout=json.dumps({"type": "result", "subtype": "success", "result": "ok"}), stderr="")
 
         with patch.object(ReviewWatch, "run", return_value=completed) as run:
@@ -35,13 +35,16 @@ class TestAtoms(TestCase):
         self.assertEqual(run.call_args.kwargs["input"], prompt)
 
     def test_run_agent_rejects_oversized_prompt_before_launch(self) -> None:
-        prompt = "x" * (atoms.MAX_GOVERNED_PROMPT_BYTES + 1)
+        prompt = "é" * 1_500_000 + "x"
 
-        with patch.object(atoms.subprocess, "run") as run:
-            with self.assertRaisesRegex(atoms.AgentPreflightError, "reduce the remaining review input"):
+        with patch.object(ReviewWatch, "run") as run:
+            with self.assertRaisesRegex(atoms.AgentPreflightError, "reduce the remaining review input") as caught:
                 atoms.run_agent("/tmp", "system", prompt, [], "pr_approve")
 
         run.assert_not_called()
+        self.assertEqual(caught.exception.code, "review_packet_too_large")
+        self.assertEqual(caught.exception.diagnostic["context"]["actual_input_bytes"], 3_000_001)
+        self.assertEqual(caught.exception.diagnostic["context"]["input_limit_bytes"], 3_000_000)
 
     def test_packet_timeout_is_proven_before_agent_start(self) -> None:
         with patch.object(atoms.subprocess, "run", side_effect=atoms.subprocess.TimeoutExpired("github-interface", 600)):

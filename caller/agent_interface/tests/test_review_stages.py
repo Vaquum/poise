@@ -65,6 +65,18 @@ class TestSplit(TestCase):
         raw = packet(["big.py"], {"big.py": "@@ -1 +1 @@\n" + "x\n" * 200_000})
         self.assertEqual(review_stages.split(raw), [raw])
 
+    def test_near_three_mb_packet_preserves_every_file_in_small_groups(self):
+        paths = [f"src/f{i:02d}.py" for i in range(16)]
+        body = "@@ -1 +1 @@\n" + "+value = 1\n" * 15_000
+        raw = packet(paths, {path: body for path in paths})
+        self.assertGreater(len(raw.encode()), 1_500_000)
+        self.assertLess(len(raw.encode()), 2_950_000)
+        stages = [json.loads(stage) for stage in review_stages.split(raw)]
+        self.assertEqual([entry["filename"] for stage in stages for entry in stage["files"]], paths)
+        self.assertEqual(sum(stage["diff"].splitlines().count('+value = 1') for stage in stages), 240_000)
+        for stage in stages:
+            self.assertLessEqual(len(stage["diff"].encode()), 200_000)
+
     def test_renamed_old_path_stays_with_its_section(self):
         node = json.loads(packet(["new.py"]))
         node["diff"] = section("new.py", old="old.py")

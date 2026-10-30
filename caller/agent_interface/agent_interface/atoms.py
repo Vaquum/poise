@@ -24,7 +24,7 @@ STRUCTURED_POLICY = (
 )
 
 DEFAULT_P = 2
-MAX_GOVERNED_PROMPT_BYTES = 1_500_000
+MAX_GOVERNED_PROMPT_BYTES = 3_000_000
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 USERNAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?")
 SOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")

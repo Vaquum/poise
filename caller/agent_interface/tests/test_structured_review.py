@@ -49,6 +49,14 @@ def scripted_muse(directory: Path) -> Path:
 
 
 class TestReviewModel(TestCase):
+    def test_structured_prompt_admission_uses_the_three_mb_utf8_boundary(self):
+        prompt = "é" * 1_500_000
+        structured_review._admit(prompt)
+        with self.assertRaises(atoms.AgentPreflightError) as caught:
+            structured_review._admit(prompt + "x")
+        self.assertEqual(caught.exception.code, "review_packet_too_large")
+        self.assertEqual(caught.exception.diagnostic["context"]["actual_input_bytes"], 3_000_001)
+
     def test_default_and_explicit_models_use_the_same_catalog(self):
         for behavior in ("pr_review", "pr_approve"):
             self.assertEqual(CATALOG.review_model(behavior).identity, "opus-5-high")
