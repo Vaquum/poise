@@ -105,6 +105,10 @@ export interface CachePluginOptions {
   selfUpdateBridge?: SelfUpdateBridge | null
   /** Service mode. Omitted: read from the environment; `null`: off. */
   service?: ServiceConfig | null
+  /** Ownership of the daily model schedule. While pending, a due check waits
+   *  instead of running; production resolves it once legacy-job retirement
+   *  settles. */
+  modelRefreshReady?: Promise<boolean>
 }
 
 // Chat v1: one runtime per server process. Sessions are keyed by instance
@@ -273,6 +277,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
         timeZone: () => getSettings().timezone,
         refresh: refreshModelCatalog,
         paused: releaseBackgroundPaused,
+        ready: opts.modelRefreshReady,
       })
       dailyModelRefresh.start()
     }

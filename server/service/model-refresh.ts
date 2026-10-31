@@ -76,6 +76,10 @@ export interface DailyModelRefreshOptions {
   clock?: RefreshClock
   log?: (line: string) => void
   logError?: (line: string) => void
+  /** Ownership of the daily schedule. While pending, a due check waits; it
+   *  runs when the promise resolves true, and is dropped — stopping the
+   *  scheduler — when it resolves false or rejects. */
+  ready?: Promise<boolean>
 }
 
 /** Checks once a minute, so a timezone changed in Settings, a daylight saving
@@ -90,15 +94,35 @@ export class DailyModelRefresh {
   private nextAt: number | null = null
   private zoneNotice = ''
   private running: Promise<void> | null = null
+  private readonly gated: boolean
+  private gatePassed: boolean | null = null
+  private dueWhileGated = false
 
   constructor(private readonly options: DailyModelRefreshOptions) {
     this.clock = options.clock ?? systemClock
     this.log = options.log ?? ((line) => console.log(line))
     this.logError = options.logError ?? ((line) => console.error(line))
+    this.gated = !!options.ready
+    options.ready?.then((own) => this.settleGate(!!own), () => this.settleGate(false))
+  }
+
+  private settleGate(own: boolean): void {
+    this.gatePassed = own
+    if (!own) {
+      if (this.dueWhileGated) {
+        this.dueWhileGated = false
+        this.log('[models] daily model check skipped: the legacy launchd job remains the scheduler')
+      }
+      this.stop()
+    } else if (this.dueWhileGated) {
+      this.dueWhileGated = false
+      if (!this.stopped) this.run()
+    }
   }
 
   start(): void {
     if (!this.stopped) return
+    if (this.gated && this.gatePassed === false) return
     this.stopped = false
     this.check()
   }
@@ -147,7 +171,11 @@ export class DailyModelRefresh {
     }
     if (zone && this.nextAt !== null && now >= this.nextAt) {
       this.nextAt = nextDailyRefresh(now, zone)
-      this.run()
+      if (this.gated && this.gatePassed === null) {
+        this.dueWhileGated = true
+      } else if (!this.gated || this.gatePassed) {
+        this.run()
+      }
     }
     const toMinute = MINUTE_MS - (now % MINUTE_MS)
     const delay = this.nextAt === null ? toMinute : Math.min(toMinute, Math.max(0, this.nextAt - now))
