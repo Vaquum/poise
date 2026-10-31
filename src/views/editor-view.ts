@@ -328,6 +328,7 @@ const ICON_TRASH = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
 // Two-rectangles "duplicate" mark — the same copy glyph used by the
 // card chrome, so the meaning carries over.
 const ICON_COPY  = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><rect x="3" y="3" width="7" height="8" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M5.5 3V2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>'
+const ICON_IMPORT = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 9V2.5M4.5 5L7 2.5 9.5 5M2.5 8.5V11a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V8.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 const ICON_CHECK = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5l3 3 5-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 // Arrows-to-corners pair for the writer-mode toggle: "expand to fill"
 // when entering, "contract back" when exiting. Universal fullscreen
@@ -354,6 +355,8 @@ function renderShell(): string {
       <div class="editor-bar-left">
         <button type="button" class="editor-bar-btn editor-focus-btn"  title="Writer mode" aria-label="Toggle writer mode" aria-pressed="false">${ICON_FOCUS_ENTER}</button>
         <button type="button" class="editor-bar-btn editor-new-btn"    title="New (⌘N)" aria-label="New">${ICON_PLUS}</button>
+        <button type="button" class="editor-bar-btn editor-import-btn" title="Import markdown file" aria-label="Import markdown file">${ICON_IMPORT}</button>
+        <input type="file" class="editor-import-file" accept=".md,.markdown,.txt" hidden />
         <button type="button" class="editor-bar-btn editor-copy-btn"   title="Copy document" aria-label="Copy document">${ICON_COPY}</button>
         <button type="button" class="editor-bar-btn editor-chat-btn"   title="Chat about this document (pane)" aria-label="Open chat">${ICON_CHAT}</button>
         <button type="button" class="editor-bar-btn editor-chat-session-btn" title="Chat about this document" aria-label="Chat about this document">${ICON_CHAT_SESSION}</button>
@@ -2410,6 +2413,58 @@ async function loadDoc(slug: string) {
   }
 }
 
+// An import must fit the same per-document limit the server enforces
+// (server/editor.ts MAX_DOC_BYTES), checked before the file is read
+// into a document so an oversized pick fails fast.
+export const IMPORT_MAX_BYTES = 5 * 1024 * 1024
+
+export function decodeMarkdownImport(buffer: ArrayBuffer): string {
+  if (buffer.byteLength > IMPORT_MAX_BYTES) {
+    throw new Error('Choose a file smaller than 5 MiB.')
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+  } catch {
+    throw new Error('Choose a UTF-8 text file; this one could not be read as text.')
+  }
+}
+
+// Import a markdown file as a new document: decode the picked file as
+// UTF-8, create a blank doc through the same POST newDoc uses, and
+// load the bytes into it verbatim — no format conversion. The
+// existing autosave persists the content.
+async function importDocFile(input: HTMLInputElement): Promise<void> {
+  const file = input.files?.[0]
+  input.value = '' // Choosing the same file again after editing still loads it.
+  if (!file) return
+  let content: string
+  try {
+    content = decodeMarkdownImport(await file.arrayBuffer())
+  } catch (err) {
+    setMeta((err as Error).message)
+    return
+  }
+  if (!(await flushBeforeLeavingDocument('import a file'))) return
+  closePublishPanel()
+  try {
+    const res = await fetch('/api/editor/docs', { method: 'POST' })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    const slug = String(data.slug || '')
+    if (!slug) return
+    void fetchDocs({ fresh: true })
+    await loadDoc(slug)
+    if (currentSlug !== slug || !docEl) return
+    loadIntoEditor(content)
+    resetEditorHistory()
+    setMetaForCurrent()
+    scheduleSave()
+  } catch (err) {
+    console.error('[editor] importDoc failed:', err)
+    setMeta('Could not import file')
+  }
+}
+
 async function newDoc() {
   if (!(await flushBeforeLeavingDocument('start a new document'))) return
   closePublishPanel()
@@ -3949,6 +4004,12 @@ function attachHandlers() {
   })
   viewEl.querySelector<HTMLButtonElement>('.editor-new-btn')!
     .addEventListener('click', () => { void newDoc() })
+  viewEl.querySelector<HTMLButtonElement>('.editor-import-btn')!
+    .addEventListener('click', () => {
+      viewEl.querySelector<HTMLInputElement>('.editor-import-file')!.click()
+    })
+  viewEl.querySelector<HTMLInputElement>('.editor-import-file')!
+    .addEventListener('change', (e) => { void importDocFile(e.target as HTMLInputElement) })
   viewEl.querySelector<HTMLButtonElement>('.editor-delete-btn')!
     .addEventListener('click', () => { void deleteCurrent() })
   const publishBtn = viewEl.querySelector<HTMLButtonElement>('.editor-publish-btn')!
