@@ -294,7 +294,17 @@ class TestRecovery(TestCase):
         self.assertEqual(row['error_code'], 'model_output_limit')
 
     def test_repeat_only_refusal_recovers_once_with_a_different_model(self):
-        row = self.execute([refusal_error(), 'done'], [facts(), facts(), approved()])
+        from agent_interface import review_receipt
+        item = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD,
+                "submitted_at": "2026-09-13T10:00:00Z"}
+        def recovered(*args, **kwargs):
+            review_receipt.record(json.dumps({"action": "approved_pr", "review_id": 93, "head_sha": HEAD}))
+            return 'done'
+        before = facts(reviewer_reviews_since_items=[])
+        mid = facts(reviewer_reviews_since_items=[])
+        after = approved()
+        after["reviewer_reviews_since_items"] = [item]
+        row = self.execute([refusal_error(), recovered], [before, mid, after])
         self.assertEqual([x.kwargs['model'] for x in self.mod.run.call_args_list], ['opus-5-high', 'gpt-6-astra-ultra'])
         self.assertEqual(row['outcome'], 'approved')
         self.assertEqual(row['model'], 'opus-5-high')
@@ -304,7 +314,17 @@ class TestRecovery(TestCase):
         self.assertIn('done', response)
 
     def test_repeat_only_refusal_recovers_for_a_non_claude_primary(self):
-        row = self.execute([refusal_error(), 'done'], [facts(), facts(), approved()], model='grok-4.6-xhigh')
+        from agent_interface import review_receipt
+        item = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD,
+                "submitted_at": "2026-09-13T10:00:00Z"}
+        def recovered(*args, **kwargs):
+            review_receipt.record(json.dumps({"action": "approved_pr", "review_id": 93, "head_sha": HEAD}))
+            return 'done'
+        before = facts(reviewer_reviews_since_items=[])
+        mid = facts(reviewer_reviews_since_items=[])
+        after = approved()
+        after["reviewer_reviews_since_items"] = [item]
+        row = self.execute([refusal_error(), recovered], [before, mid, after], model='grok-4.6-xhigh')
         self.assertEqual([x.kwargs['model'] for x in self.mod.run.call_args_list], ['grok-4.6-xhigh', 'gpt-6-astra-ultra'])
         self.assertEqual(row['outcome'], 'approved')
         self.assertEqual(row['recovery_model'], 'gpt-6-astra-ultra')

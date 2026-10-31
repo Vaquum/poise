@@ -1580,7 +1580,7 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                                                        receipt=receipt, call_id=call_id, prior_error=str(failure),
                                                        prior_code=failure.code, proven_no_action=proven)
             if not proven or repeat_only:
-                own = own_reviews(before, facts, receipt, call_id)
+                own = own_reviews(before, facts, receipt, call_id, proven_no_action=proven)
                 if not proven:
                     if own is None:
                         counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
@@ -1723,7 +1723,8 @@ def _unclaimed_ids(before_new: list[dict], exclude: set[int], repo: str, number:
     return found
 
 
-def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | None) -> list[dict] | None:
+def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | None,
+                proven_no_action: bool = False) -> list[dict] | None:
     """The reviews this run posted, by positive per-call evidence only.
 
     With a receipt, the receipted review: this run's own POST reply named it.
@@ -1732,7 +1733,11 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
     and a sibling delayed past the grace must never settle the wrong run.
     Without a receipt nothing is attributable. None when github-interface
     predates per-review ids; the counters decide then, and they can only
-    supersede or hold, never adopt."""
+    supersede or hold, never adopt. With proven_no_action the caller proved
+    this run posted nothing, so unclaimed reviews are returned as-is instead
+    of raising: they are definitively another request's. Callers must never
+    adopt them — behavior_outcome clears attribution under proof, and the
+    recovery path uses them only for its already-published guard."""
     after = _review_items(facts)
     earlier = _review_items(before)
     if after is None or earlier is None:
@@ -1767,6 +1772,8 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
     repo, number = str(facts.get("repository") or ""), str(facts.get("pull_number") or "")
     unclaimed = _unclaimed_ids(new, set(), repo, number, call_id)
     if unclaimed:
+        if proven_no_action:
+            return unclaimed
         raise _unattributed_error(unclaimed)
     return []
 
@@ -1935,7 +1942,7 @@ def behavior_outcome(
         )
 
     try:
-        own = own_reviews(before, facts, receipt, call_id)
+        own = own_reviews(before, facts, receipt, call_id, proven_no_action=proven_no_action)
     except review_budget.ReviewLimitError as duplicates:
         # Two reviews under the shared identity with no attributable owner.
         # On an open target that ambiguity holds; on a confirmed-closed one
