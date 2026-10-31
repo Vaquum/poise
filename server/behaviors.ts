@@ -2,6 +2,7 @@ import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-cont
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
 import { behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
+import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
@@ -137,7 +138,8 @@ function organizationOwns(repoOrTarget: string): boolean {
 }
 
 function isGlobalPreference(key: string): boolean {
-  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci|review_new_issues)_(?:enabled|setting|reviewers|review_cap|scratchpad)$/.test(key)
+  if (/^behavior_(?:implement_issues|repair_prs)_paused_(?:until|by)$/.test(key)) return true
+  return /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci|review_new_issues|implement_issues|repair_prs)_(?:enabled|setting|reviewers|review_cap|scratchpad)$/.test(key)
     || /^behavior_review_new_issues_(?:repos|authors|slot_since)$/.test(key)
     || /^behavior_(?:review_new_prs|approve_prs|resolve_unblocking|merge_prs|rerun_grey_ci)_skip_repos$/.test(key)
 }
@@ -362,7 +364,8 @@ export function isEnabled(key: BehaviorKey): boolean {
   const org = behaviorOrganization.getStore()
   if (org && !readyOrganizations().some((candidate) => candidate.login.toLowerCase() === org.login.toLowerCase()
     && candidate.datastorePath === org.datastorePath)) return false
-  return getMeta(enabledKey(key)) === '1'
+  const saved = getMeta(enabledKey(key))
+  return saved === '1' || (saved === null && (key === 'implement-issues' || key === 'repair-prs'))
 }
 
 function pausedUntilKey(k: BehaviorKey): string { return META_PREFIX + k.replace(/-/g, '_') + '_paused_until' }
@@ -395,7 +398,7 @@ export function isPaused(key: BehaviorKey): boolean {
 }
 
 export function isRunnable(key: BehaviorKey): boolean {
-  return isEnabled(key) && !isPaused(key)
+  return !behaviorAdmissionDraining() && isEnabled(key) && !isPaused(key)
 }
 
 function setPersistedEnabled(key: BehaviorKey, enabled: boolean) {
@@ -2626,7 +2629,7 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
 async function listEligiblePrs(behavior: SkippableBehavior, author: string): Promise<DatastorePr[]> {
   const prs = await listOpenPrsByAuthor(author)
   const policy = pullRequestPolicy(behavior)
-  return prs.filter((pr) => !chainOwnsPr(pr) && !pullRequestRefusal(policy, pr.repo, pr.number, pr))
+  return prs.filter((pr) => !behaviorAdmissionDraining() && !chainOwnsPr(pr) && !pullRequestRefusal(policy, pr.repo, pr.number, pr))
 }
 
 function chainOwnsPr(pr: DatastorePr): boolean {
@@ -2637,7 +2640,7 @@ function chainOwnsPr(pr: DatastorePr): boolean {
 // Read just before a launch: a skip saved, or your account changed, while the
 // launch was being prepared stops it.
 function stillEligible(behavior: SkippableBehavior, pr: DatastorePr, actor?: string): boolean {
-  return !chainOwnsPr(pr) && !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
+  return !behaviorAdmissionDraining() && !chainOwnsPr(pr) && !pullRequestRefusal(pullRequestPolicy(behavior), pr.repo, pr.number, pr)
     && (actor === undefined || configuredReviewer(pr.author).toLowerCase() === actor.toLowerCase())
 }
 
@@ -6357,7 +6360,7 @@ async function fireIssueReview(
   // changing the panel meanwhile must stop this launch, so these are the last
   // checks before it.
   if ((await waitForBehavior(issueSlotModel(slot, seedKey)))?.model !== model) return false
-  if (!isRunnable(ISSUES_KEY) || behaviorAborted()) return false
+  if (!isRunnable(ISSUES_KEY) || behaviorAborted() || behaviorChainJournal().cutover().mode !== 'v1') return false
   if (issueReviewRefusal(issueReviewPolicy(), issue.repo, issue.number, issue)) return false
   // Shed load before claiming a recovery probe: a launch past the shared
   // budget defers without backoff and retries when a slot frees.
@@ -6493,6 +6496,7 @@ async function launchIssueReview(
 }
 
 async function tickReviewNewIssues(): Promise<void> {
+  if (behaviorChainJournal().cutover().mode !== 'v1') return
   if (!isEnabled(ISSUES_KEY)) return
   const repositories = getIssueRepositories().filter((entry) => organizationOwns(entry.repo))
   if (repositories.length === 0) return
@@ -7119,7 +7123,7 @@ function serializeBehaviorOperation<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
   const scopeKey = operationKey(key)
-  const releaseOperation = trackReleaseBackground()
+  const releaseOperation = trackReleaseBackground('behavior')
   const previous = behaviorOperationTails.get(scopeKey) || Promise.resolve()
   const execute = async () => {
     const startedAt = Date.now()
@@ -7161,10 +7165,12 @@ export interface RunEnabledBehaviorsOptions {
 const behaviorChains = new Map<string, BehaviorChainRuntime>()
 const behaviorChainHealth = new Map<string, { lastSweepAt: number, error: string | null }>()
 export function getBehaviorChainRuntimeHealth() {
-  return [...behaviorChainHealth].map(([organization, health]) => ({ organization, ...health }))
+  return [...behaviorChainHealth].filter(([organization]) => organization !== '@cutover' || behaviorAdmissionDraining())
+    .map(([organization, health]) => ({ organization, ...health }))
 }
 function chainBehaviorKey(behavior: ChainBehavior): BehaviorKey | null {
   return ({ 'review-issue': 'review-new-issues', 'review-pr': 'review-new-prs', 'approve-pr': 'approve-prs',
+    'implement-issue': 'implement-issues', 'repair-pr': 'repair-prs',
     'resolve-threads': 'resolve-unblocking', 'merge-pr': 'merge-prs', 'rerun-grey-ci': 'rerun-grey-ci' } as Partial<Record<ChainBehavior, BehaviorKey>>)[behavior] ?? null
 }
 
@@ -7191,7 +7197,7 @@ async function runBehaviorChains(): Promise<void> {
       return { issueReviewers: issues.reviewers, prReviewers: prs.reviewers, implementer: model('issue_implement'), repairer: model('pr_repair'),
         approver: { slot: approval.slot, model: approval.model, recovery: approval.recovery } }
     }
-    runtime = new BehaviorChainRuntime(behaviorChainJournal(), nativeChainOperations(org, {
+    const operations = nativeChainOperations(org, {
       roster,
       async resolve(decision, chainKey) {
         if (decision.behavior === 'review-issue' || decision.behavior === 'review-pr') {
@@ -7234,7 +7240,7 @@ async function runBehaviorChains(): Promise<void> {
         const key = chainBehaviorKey(decision.behavior)
         if (key && !isRunnable(key)) return false
         const pull = chain.observation?.pull as { number?: number, state: string, draft: boolean } | null | undefined
-        if (key && key !== ISSUES_KEY && pull?.number && pullRequestRefusal(pullRequestPolicy(key as SkippableBehavior), chain.repository, pull.number,
+        if (key && isSkippableBehavior(key) && pull?.number && pullRequestRefusal(pullRequestPolicy(key), chain.repository, pull.number,
           { author: chain.author, status: pull.state, draft: pull.draft })) return false
         return true
       },
@@ -7291,12 +7297,14 @@ async function runBehaviorChains(): Promise<void> {
         return existing
       },
       wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
-    }))
+    })
+    runtime = new BehaviorChainRuntime(behaviorChainJournal(), { ...operations,
+      enabled: () => behaviorChainJournal().cutover().mode === 'v2' && operations.enabled() })
     behaviorChains.set(org.login.toLowerCase(), runtime)
   }
   const directory = dirname(behaviorProcessLockPath(ISSUES_KEY))
   await withProcessLock({ path: join(directory, `.poise-${org.login.toLowerCase()}-behavior-chain-runtime-lock.sqlite3`), timeoutMs: 1000 }, async () => {
-    const release = trackReleaseBackground()
+    const release = trackReleaseBackground('behavior')
     try { await runtime!.run() } finally { release() }
   })
 }
@@ -7329,8 +7337,45 @@ export async function runEnabledBehaviorsOnce(
   options: RunEnabledBehaviorsOptions = {},
 ): Promise<void> {
   if (releaseBackgroundPaused()) return
+  if (behaviorAdmissionDraining() && behaviorOrganization.getStore() !== undefined) return
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
+    if (behaviorAdmissionDraining()) {
+      const configuration = () => JSON.stringify([getSettings().me, getSettings().agentAccount,
+        getOrganizations().map((org) => [org.login.toLowerCase(), org.datastorePath]).sort()])
+      const expectedConfiguration = configuration()
+      try { await advanceBehaviorCutover(behaviorChainJournal(), async () => {
+        const pulls: string[] = []
+        const { readOpenPrClosingRefs } = await import('./chat/control')
+        const organizations = getOrganizations()
+        if (readyOrganizations().length !== organizations.length) throw new Error('Cutover waits for every followed organization to be ready')
+        for (const org of organizations) {
+          await runFile('github-datastore', organizationArgs(org, ['health', '--max-age-seconds', '120']), { timeoutMs: 30_000 })
+          let cursor: { repo: string, number: number } | undefined
+          for (;;) {
+            const page = await readOpenPrClosingRefs(org, cursor)
+            if (!page || (page.truncated && !page.more) || page.prs.some((pr) => pr.closingTruncated)) throw new Error('Cutover cannot establish complete legacy PR ownership')
+            for (const pr of page.prs) {
+              if (pr.repo.split('/')[0].toLowerCase() !== org.login.toLowerCase()) throw new Error('Cutover PR observation escaped its followed organization')
+              if (!behaviorChainOwner(pr.repo, pr.number, 'pull', pr)) pulls.push(`${pr.repo}#${pr.number}`)
+            }
+            if (!page.more) break
+            const last = page.prs.at(-1)
+            if (!last || (cursor?.repo === last.repo && cursor?.number === last.number)) throw new Error('Cutover PR pagination did not advance')
+            cursor = { repo: last.repo, number: last.number }
+          }
+        }
+        return pulls
+      }, behaviorCutoverBlockers, () => {
+        if (configuration() !== expectedConfiguration) throw new Error('Cutover accounts or organizations changed during discovery; waiting for a fresh boundary')
+        databaseSetMeta('behavior_chain_settings', JSON.stringify({ ...getBehaviorChainSettings(), enabled: true }))
+      })
+        behaviorChainHealth.delete('@cutover')
+      } catch (error) {
+        behaviorChainHealth.set('@cutover', { lastSweepAt: Date.now(), error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
     // This sweep is the retry a shed launch waits for; a shed inside it
     // re-arms the wake below. Cleared once for the whole fan-out: a later
     // staggered organization must not erase an earlier one's retry.
@@ -7557,7 +7602,9 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
       }] : []
     })
   })
-  const anyEnabled = BEHAVIOR_KEYS.some(isEnabled)
+  const enabledForRuntime = (key: BehaviorKey) => isEnabled(key)
+    && (key !== 'implement-issues' && key !== 'repair-prs' || getBehaviorChainSettings().enabled)
+  const anyEnabled = BEHAVIOR_KEYS.some(enabledForRuntime)
   let reviewer: string | null = null
   let reviewerError: string | null = null
   try {
@@ -7577,7 +7624,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   // the production monitor alerts on that field.
   const author = getMeta('me') || ''
   // Review New Issues is scoped by repository and author list, not by `me`.
-  const needsMe = BEHAVIOR_KEYS.some((key) => key !== 'review-new-issues' && isEnabled(key))
+  const needsMe = BEHAVIOR_KEYS.some((key) => key !== 'review-new-issues' && enabledForRuntime(key))
   let pairError: string | null = null
   if (needsMe) {
     try { prAccounts() } catch (error) { pairError = behaviorErrorMessage(error) }

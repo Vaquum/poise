@@ -10,7 +10,7 @@
 import Database from 'better-sqlite3'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { runningCallerLaunches } from '../process'
+import { BEHAVIOR_CALL_SOURCES, runningCallerLaunches } from '../process'
 
 let debates = 0
 
@@ -40,14 +40,16 @@ export const CALLER_CALLS_READ_TIMEOUT_MS = 100
 
 /** Caller calls recorded as running whose process is alive, whichever server
  *  started them; null when the records exist but cannot be read. */
-export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR): number | null {
+export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR, behaviorOnly = false): number | null {
   const path = dataDir ? join(dataDir, 'calls.sqlite3') : ''
   if (!path || !existsSync(path)) return 0
   let db: InstanceType<typeof Database> | undefined
   try {
     db = new Database(path, { readonly: true, fileMustExist: true, timeout: CALLER_CALLS_READ_TIMEOUT_MS })
     // A turn Poise runs itself is recorded with an external runner and no process.
-    const rows = db.prepare("select pid from calls where status = 'running' and pid is not null and runner is null").all() as Array<{ pid: unknown }>
+    const rows = db.prepare("select pid from calls where status = 'running' and pid is not null and runner is null"
+      + (behaviorOnly ? ` and (source is null or source in (${BEHAVIOR_CALL_SOURCES.map(() => '?').join(',')}))` : ''))
+      .all(...(behaviorOnly ? BEHAVIOR_CALL_SOURCES : [])) as Array<{ pid: unknown }>
     return rows.filter(({ pid }) => Number.isSafeInteger(Number(pid)) && Number(pid) > 0 && alive(Number(pid))).length
   } catch {
     // Unknown, not none: calls an earlier server started may be running unseen.
@@ -59,7 +61,7 @@ export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR):
 
 /** The Caller calls a restart would cut. `known` is false while Caller's
  *  records cannot be read; `count` then holds this server's own launches. */
-export function runningCallerCalls(): { count: number, known: boolean } {
-  const live = liveCallerCalls()
-  return { count: Math.max(runningCallerLaunches() + debates, live ?? 0), known: live !== null }
+export function runningCallerCalls(behaviorOnly = false): { count: number, known: boolean } {
+  const live = liveCallerCalls(undefined, behaviorOnly)
+  return { count: Math.max(runningCallerLaunches(behaviorOnly) + (behaviorOnly ? 0 : debates), live ?? 0), known: live !== null }
 }

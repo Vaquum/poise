@@ -50,6 +50,8 @@ export const BEHAVIORS: BehaviorMeta[] = [
   { key: 'rerun-grey-ci',      label: 'Rerun Grey CI',                hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
   { key: 'merge-prs',          label: 'Merge Pull Requests',           hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: false, hasTriggers: false, hasSkips: true },
   { key: 'review-new-issues',  label: 'Review New Issues',             hasSetting: false, hasReviewCap: false, hasReviewers: true,  hasMemory: true,  hasTriggers: true,  hasSkips: false, reviews: { place: 'Issue review', item: 'issue' } },
+  { key: 'implement-issues', label: 'Implement Issues', hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: true, hasTriggers: false, hasSkips: false },
+  { key: 'repair-prs', label: 'Repair Pull Requests', hasSetting: false, hasReviewCap: false, hasReviewers: false, hasMemory: true, hasTriggers: false, hasSkips: false },
 ]
 
 export type BehaviorSetting = 'p0' | 'p1' | 'p2' | 'p3' | 'p4'
@@ -126,6 +128,19 @@ const reviewersByKey: Partial<Record<BehaviorKey, ReviewerCount>> = {}
 const lastByKey: Partial<Record<BehaviorKey, LastTriggered | null>> = {}
 const lastSucceededByKey: Partial<Record<BehaviorKey, { at: string } | null>> = {}
 const scratchpadByKey: Partial<Record<BehaviorKey, string>> = {}
+const pausedUntilByKey: Partial<Record<BehaviorKey, string | null>> = {}
+
+export function getPausedUntil(key: BehaviorKey): string | null { return pausedUntilByKey[key] ?? null }
+
+export async function setPaused(key: BehaviorKey, pausedUntil: string | null): Promise<void> {
+  beginWrite(key)
+  try {
+    const response = await fetch(`/api/behaviors/${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pausedUntil }) })
+    const data = await response.json()
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`)
+    pausedUntilByKey[key] = data.pausedUntil ?? null
+  } finally { endWrite(key) }
+}
 // Review New Issues: the repositories that trigger it and the trusted authors.
 const reposByKey: Partial<Record<BehaviorKey, string[]>> = {}
 const authorsByKey: Partial<Record<BehaviorKey, string[]>> = {}
@@ -409,6 +424,7 @@ export async function refreshState(): Promise<void> {
       // These three the person can change from this view. If they did so while
       // this read was out, the read predates the change and must not undo it.
       if (!readIsCurrentFor(k, seen.started, seen.busy)) continue
+      pausedUntilByKey[k] = data[k]?.pausedUntil ?? null
       enabledByKey[k] = !!data[k]?.enabled
       if (data[k]?.setting) settingByKey[k] = data[k].setting
       if (data[k]?.reviewCap === null || isReviewCap(data[k]?.reviewCap)) reviewCapByKey[k] = data[k].reviewCap

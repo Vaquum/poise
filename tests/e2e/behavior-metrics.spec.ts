@@ -120,7 +120,9 @@ test('keeps the selected period when an earlier metrics read finishes later', as
 test('keeps columns spaced and single-line across desktop and narrow viewports in both themes', async ({ page }, info) => {
   await workspace(page, true)
   await page.goto('/')
-  await expect(page.locator('#behaviors-tbody tr')).toHaveCount(6)
+  await expect(page.locator('#behaviors-tbody tr')).toHaveCount(8)
+  await expect(page.locator('tr[data-behavior="implement-issues"]')).toContainText('Implement Issues')
+  await expect(page.locator('tr[data-behavior="repair-prs"]')).toContainText('Repair Pull Requests')
   await expect(page.locator('#behaviors-tbody tr').first().locator('.behavior-metric')).toHaveText(['120', '4h', '95%'])
   for (const width of [1920, 1600, 1280, 768, 390]) {
     await page.setViewportSize({ width, height: 900 })

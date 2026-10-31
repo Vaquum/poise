@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
+import type { BehaviorCutoverState } from '../src/behavior-cutover'
+
+const CUTOVER_ID = '@behavior-admission'
+interface CutoverEvent { type: 'admission.changed', state: BehaviorCutoverState }
 
 export type ChainBehavior = 'review-issue' | 'implement-issue' | 'publish-issue' | 'review-pr' | 'repair-pr' | 'approve-pr' | 'resolve-threads' | 'merge-pr' | 'rerun-grey-ci'
 export interface ChainInvocation {
@@ -141,6 +145,34 @@ export class BehaviorChainJournal {
     }
   }
 
+  cutover(): BehaviorCutoverState {
+    const row = this.db.prepare('SELECT sequence, payload, state_hash FROM behavior_chain_events WHERE chain_id = ? ORDER BY sequence DESC LIMIT 1')
+      .get(CUTOVER_ID) as { sequence: number, payload: string, state_hash: string } | undefined
+    if (!row) return { sequence: 0, mode: 'v1', requestedAt: null, legacyPulls: [] }
+    const event = JSON.parse(row.payload) as CutoverEvent
+    if (event.type !== 'admission.changed' || event.state.sequence !== row.sequence || chainBasis(event.state) !== row.state_hash) throw new Error('behavior cutover journal is corrupt')
+    return event.state
+  }
+
+  changeAdmission(expectedSequence: number, mode: BehaviorCutoverState['mode'], legacyPulls: string[] = [], at = Date.now(), commit?: () => void): BehaviorCutoverState {
+    this.durable()
+    return this.db.transaction(() => {
+      const current = this.cutover()
+      if (current.sequence !== expectedSequence) throw new Error('behavior cutover changed; reload its current state')
+      if (!((current.mode === 'v1' && mode === 'draining') || (current.mode === 'draining' && (mode === 'v1' || mode === 'v2')))) throw new Error('invalid behavior cutover transition')
+      if (!Number.isSafeInteger(at) || at < 0 || legacyPulls.some((target) => !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+#[1-9][0-9]*$/.test(target))) throw new Error('invalid behavior cutover evidence')
+      const sequence = (this.db.prepare('SELECT coalesce(max(sequence), 0) + 1 AS next FROM behavior_chain_events').get() as { next: number }).next
+      const state: BehaviorCutoverState = { sequence, mode, requestedAt: mode === 'v1' ? null : current.requestedAt ?? at,
+        legacyPulls: mode === 'v2' ? [...new Set(legacyPulls.map((target) => target.toLowerCase()))].sort() : [] }
+      const payload = JSON.stringify({ type: 'admission.changed', state } satisfies CutoverEvent)
+      if (Buffer.byteLength(payload) > MAX_EVENT_BYTES) throw new Error('legacy ownership boundary exceeds the journal event limit; cutover remains draining')
+      this.db.prepare('INSERT INTO behavior_chain_events(sequence, chain_id, event_id, at, payload, state_hash) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(sequence, CUTOVER_ID, `admission:${sequence}`, at, payload, chainBasis(state))
+      commit?.()
+      return state
+    }).immediate()
+  }
+
   read(id: string): BehaviorChain | null {
     const row = this.db.prepare(`SELECT c.state, c.sequence, e.state_hash,
       (SELECT max(sequence) FROM behavior_chain_events WHERE chain_id = c.chain_id) AS latest
@@ -168,6 +200,7 @@ export class BehaviorChainJournal {
         return existing
       }
       const current = this.read(id)
+      if (event.type === 'chain.admitted' && this.cutover().mode === 'draining') throw new Error('behavior admissions are draining')
       if ((current?.sequence ?? 0) !== expectedSequence) throw new Error('behavior chain changed before event admission')
       if (event.type === 'chain.admitted' && this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'chat_work_bindings'").get()
         && this.db.prepare('SELECT 1 FROM chat_work_bindings WHERE lower(target) = lower(?) LIMIT 1')
@@ -196,8 +229,9 @@ export class BehaviorChainJournal {
   }
 
   verifyProjection(): void {
+    this.cutover()
     const missing = this.db.prepare(`SELECT 1 FROM behavior_chain_events e LEFT JOIN behavior_chain_current c ON c.chain_id=e.chain_id
-      WHERE c.chain_id IS NULL OR c.sequence < e.sequence LIMIT 1`).get()
+      WHERE e.chain_id != ? AND (c.chain_id IS NULL OR c.sequence < e.sequence) LIMIT 1`).get(CUTOVER_ID)
     if (missing) { this.rebuild(); return }
     for (const row of this.db.prepare('SELECT chain_id FROM behavior_chain_current').iterate() as Iterable<{ chain_id: string }>) this.read(row.chain_id)
   }
@@ -206,6 +240,7 @@ export class BehaviorChainJournal {
     this.durable()
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('native invocation capacity must be positive')
     return this.db.transaction(() => {
+      if (this.cutover().mode === 'draining') return null
       if (invocation.model !== null && !this.modelCapacityAvailable(capacity)) return null
       return this.append(chain.id, eventId, chain.sequence, { type: 'invocation.admitted', invocation })
     }).immediate()
@@ -229,6 +264,11 @@ export class BehaviorChainJournal {
       this.db.prepare('DELETE FROM behavior_chain_current').run()
       const states = new Map<string, BehaviorChain>()
       for (const row of this.db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').iterate() as Iterable<StoredEvent>) {
+        if (row.chain_id === CUTOVER_ID) {
+          const event = JSON.parse(row.payload) as CutoverEvent
+          if (event.type !== 'admission.changed' || event.state.sequence !== row.sequence || chainBasis(event.state) !== (row as StoredEvent & { state_hash: string }).state_hash) throw new Error('behavior cutover journal is corrupt')
+          continue
+        }
         states.set(row.chain_id, reduceChain(states.get(row.chain_id) ?? null, JSON.parse(row.payload) as ChainEvent, row.sequence, row.chain_id))
         if (chainBasis(states.get(row.chain_id)) !== (row as StoredEvent & { state_hash: string }).state_hash) throw new Error('behavior journal state hash is invalid')
       }

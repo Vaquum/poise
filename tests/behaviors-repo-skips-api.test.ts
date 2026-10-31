@@ -172,14 +172,14 @@ afterEach(async () => {
 })
 
 describe('Skip repositories API', () => {
-  it('shares a bounded latest-trigger selection when one kind has never run', async () => {
+  it.each(['poise:review-new-prs', 'poise:behavior-chain'])('shares a bounded latest-trigger selection for %s when one kind has never run', async (source) => {
     let release!: () => void
     let started!: () => void
     const held = new Promise<void>(resolve => { release = resolve })
     const selected = new Promise<void>(resolve => { started = resolve })
     const rows = [{
       id: 'a'.repeat(32), model: 'gpt-6-astra-ultra', prompt: '',
-      behavior: 'pr_review', source: 'poise:review-new-prs', repo: REPO, pr_id: '1',
+      behavior: 'pr_review', source, repo: REPO, pr_id: '1',
       actor: 'review-bot', expected_head: HEAD, head_sha: HEAD, correlation_id: 'selection-fixture',
       started_at: '2026-10-23T12:00:00Z', started_at_precise: '2026-10-23T12:00:00.000Z',
       completed_at: '2026-10-23T12:01:00Z', action: 'reviewed_clean', outcome: 'clean',
@@ -212,6 +212,7 @@ describe('Skip repositories API', () => {
       expect(reads).toHaveLength(1)
       expect(reads[0]![1].slice(0, 2)).toEqual(['--logs', '--select'])
       expect(JSON.parse(reads[0]![1][2]).latest).toContainEqual({ behavior: 'issue_review', source: 'poise:review-new-issues', owner: 'Legacy' })
+      expect(JSON.parse(reads[0]![1][2]).latest).toContainEqual({ behavior: 'pr_review', source: 'poise:behavior-chain', owner: 'Legacy' })
     } finally { release() }
   })
 
