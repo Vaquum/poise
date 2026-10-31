@@ -51,6 +51,7 @@ import { quickSessionRequest, quickSessionModel, consoleModelLabel } from '../ch
 import { attachChatSidebar } from './chat-sidebar'
 import { createFilePreview } from './chat-file-preview'
 import { ICON_FORK, ICON_HANDOFF, ICON_ACTIVITY, ICON_TOOLS, ICON_AUTO_MERGE, ICON_MEMORIES, ICON_SAFE_MODE, ICON_REASONING, ICON_PIN } from './chat-icons'
+import { WAKE_OPTIONS, wakeStatusText, type ManagerWakeView, type WakeMinutes } from '../chat-manager-settings-types'
 import { deriveSessionTitle } from '../chat-title'
 import { applyWorklogOrder, compareWorklog, sessionDot } from '../chat-worklog'
 import { shortElapsed } from '../chat-turn-time'
@@ -94,6 +95,16 @@ let timersOpenFor: string | null = null
 let timersJson = ''
 let timersFetchGeneration = 0
 let timersRefresh: ReturnType<typeof setInterval> | null = null
+// The Manager's wake interval, as its header shows it: the last view, the
+// revision the next save carries, a save in flight, and a status override
+// for transport states. Repair mode is an unreadable setting: the select
+// sits at 60 and any choice replaces it from revision 0.
+let wakeView: ManagerWakeView | null = null
+let wakeRevision = 0
+let wakeSaving = false
+let wakeError: string | null = null
+let wakeRepair = false
+let wakeFetchGeneration = 0
 let mainEl: HTMLElement
 let scrollEl: HTMLElement
 let transcriptEl: HTMLElement
@@ -1218,6 +1229,7 @@ async function selectSession(id: string, restoring = false): Promise<void> {
   composerStateFor(e)
   queueRender()
   if (switching && !viewEl.hidden) scheduleSelfPoll(0)
+  if (switching && e.record.role === 'manager') void fetchManagerWake()
   if (!e.loaded && !e.loading && !e.pending) await loadHistory(e)
   if (activeId === id && !viewEl.hidden && !memories.el.contains(document.activeElement)) composer.focus()
 }
@@ -1279,6 +1291,8 @@ function onEvent(env: ChatEnvelope): void {
   e.record = { ...e.record, lastSeq: Math.max(e.record.lastSeq || 0, env.seq) }
   sortOrder()
   if (env.sessionId === timersOpenFor && (ev.type === 'timer.changed' || ev.type === 'session.updated')) void refreshTimersPane()
+  if (ev.type === 'timer.changed' && ev.timer.system === 'manager-wake') void fetchManagerWake()
+  else if ((ev.type === 'turn.started' || ev.type === 'turn.finished') && e.record.role === 'manager') void fetchManagerWake()
   queueRender()
 }
 
@@ -2188,7 +2202,7 @@ function renderHeader(): void {
   // The live "since" text ticks in place; it must not rebuild the controls.
   // The anchor stays in the memo, so loading history re-anchors the label.
   const memo = html.replace(/(<span class="chat-h-since" data-since="[^"]*">).*?(<\/span>)/, '$1$2')
-  if (memo === lastHeaderHtml) { updateSinceLabel(); return }
+  if (memo === lastHeaderHtml) { updateSinceLabel(); syncWakeStatus(); return }
   lastHeaderHtml = memo
   headerEl.hidden = !html
   const focusMemories = !!document.activeElement?.closest('.chat-h-memories')
@@ -2196,6 +2210,7 @@ function renderHeader(): void {
   const retired = headerEl.querySelector<HTMLElement>('.chat-retired-model')
   if (retired) retired.textContent = `The Manager's model ${retired.dataset.model} was retired. Choose another model to continue.`
   if (focusMemories) headerEl.querySelector<HTMLButtonElement>('.chat-h-memories')?.focus()
+  syncWakeStatus()
 }
 
 function autoMergeButton(enabled: boolean, pending = false): string {
@@ -2395,6 +2410,101 @@ async function refreshTimersPane(): Promise<void> {
   }
 }
 
+// ── Manager wake interval ────────────────────────────────────────────────
+
+/** The Manager's header control: exactly the five intervals, then the
+ *  status line beside it. The status text is set with textContent after the
+ *  render, since it can carry a failure's error. */
+function wakeHtml(): string {
+  const selected = wakeView ? wakeView.everyMinutes : 60
+  const disabled = wakeSaving || (!wakeView && !wakeRepair)
+  const options = WAKE_OPTIONS.map(minutes => `<option value="${minutes}"${minutes === selected ? ' selected' : ''}>${minutes} min</option>`).join('')
+  return `<div class="chat-h-row chat-h-wake"><label class="chat-h-wake-label" for="chat-manager-wake">Wake every</label>`
+    + `<select id="chat-manager-wake" class="chat-h-select" aria-label="Wake the Manager every"${disabled ? ' disabled' : ''}>${options}</select>`
+    + `<span id="chat-manager-wake-status" class="chat-h-wake-status" role="status"></span></div>`
+}
+
+function wakeStatusLine(): string {
+  if (wakeError) return wakeError
+  if (wakeView) return wakeStatusText(wakeView, effectiveTimezone(), Date.now())
+  return ''
+}
+
+function syncWakeStatus(): void {
+  const el = headerEl.querySelector<HTMLElement>('#chat-manager-wake-status')
+  if (el) el.textContent = wakeStatusLine()
+}
+
+async function readWakeView(): Promise<ManagerWakeView> {
+  const res = await fetch('/api/chat/manager/wake')
+  const data = await res.json().catch(() => null) as { error?: string } | null
+  if (!res.ok) throw new ChatHttpError(res.status, data?.error || `HTTP ${res.status}`)
+  return data as ManagerWakeView
+}
+
+/** Fetch the wake view: when the Manager's chat opens, and again after
+ *  each wake timer frame and each Manager turn, so the cost, the next
+ *  wake-up and a failure stay current. A 500 is the unreadable setting,
+ *  which any choice repairs; any other failure keeps the last view. */
+async function fetchManagerWake(): Promise<void> {
+  const generation = ++wakeFetchGeneration
+  try {
+    const view = await readWakeView()
+    if (generation !== wakeFetchGeneration) return
+    wakeView = view
+    wakeRevision = view.revision
+    wakeError = null
+    wakeRepair = false
+  } catch (error) {
+    if (generation !== wakeFetchGeneration) return
+    const status = error instanceof ChatHttpError ? error.status : 0
+    const message = error instanceof Error ? error.message : String(error)
+    if (status === 500) {
+      wakeView = null
+      wakeRevision = 0
+      wakeRepair = true
+      wakeError = message
+    } else {
+      wakeRepair = false
+      wakeError = `Wake interval unavailable: ${message}`
+    }
+  } finally {
+    if (generation === wakeFetchGeneration) renderHeader()
+  }
+}
+
+/** Save the chosen interval at once; there is no Save button. A 409 keeps
+ *  its note while the saved value reloads underneath; a 400 shows the
+ *  message and the select returns to the saved value. */
+async function saveManagerWake(everyMinutes: WakeMinutes): Promise<void> {
+  if (wakeSaving) return
+  wakeSaving = true
+  renderHeader()
+  try {
+    const res = await fetch('/api/chat/manager/wake', { method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ everyMinutes, revision: wakeRevision }) })
+    const data = await res.json().catch(() => null) as { error?: string } | null
+    if (!res.ok) throw new ChatHttpError(res.status, data?.error || `HTTP ${res.status}`)
+    wakeView = data as ManagerWakeView
+    wakeRevision = wakeView.revision
+    wakeError = null
+    wakeRepair = false
+  } catch (error) {
+    const status = error instanceof ChatHttpError ? error.status : 0
+    const message = error instanceof Error ? error.message : String(error)
+    if (status === 409) {
+      await fetchManagerWake()
+      if (!wakeError) wakeError = 'The wake interval changed in another tab.'
+    } else {
+      wakeError = message
+    }
+  } finally {
+    wakeSaving = false
+    renderHeader()
+  }
+}
+
 function headerHtml(): string {
   const e = entry()
   if (!e) return `<div class="chat-h-row chat-h-fresh"><span class="chat-controls-spacer"></span>${reasoningButton()}${autoMergeButton(freshAutoMerge, !!quickSessionPromise || firstPromptPending)}${safeModeButton(freshSafeMode, !!quickSessionPromise || firstPromptPending)}${memoriesButton()}</div>`
@@ -2443,6 +2553,7 @@ function headerHtml(): string {
       ${memoriesButton()}
       ${timersButton(s)}
     </div>
+    ${isManager ? wakeHtml() : ''}
     ${s.safeModePending ? '<div id="chat-safe-mode-status" class="st-help chat-safe-mode-status" role="status">Permission change queued for the next turn; current native permissions are unchanged.</div>' : ''}
     ${s.retiredModel ? `<div class="st-help st-help-error chat-retired-model" role="status" data-model="${escapeHtml(s.retiredModel)}"></div>` : ''}
     ${s.cliWarning ? `<div class="st-help st-help-warn chat-cli-warning" role="status">${escapeHtml(s.cliWarning)}</div>` : ''}
@@ -2473,6 +2584,11 @@ function attachHeader(): void {
     if (t.classList.contains('chat-model-select')) void setModel(t.value, agentFor(s.agent)?.models.find(model => model.identity === t.value)?.effort)
     else if (t.classList.contains('chat-effort-select')) void setModel(s.model, t.value)
     else if (t.classList.contains('chat-mode-select')) void setMode(t.value)
+    else if (t.id === 'chat-manager-wake') {
+      const minutes = Number(t.value)
+      if ((WAKE_OPTIONS as readonly number[]).includes(minutes)) void saveManagerWake(minutes as WakeMinutes)
+      else renderHeader()
+    }
     else if (t.classList.contains('chat-ho-agent')) {
       const a = agentFor(t.value as AgentId)
       const modelSel = headerEl.querySelector<HTMLSelectElement>('.chat-ho-model')
@@ -2715,8 +2831,16 @@ async function openNewSessionDialog(prefill: NewSessionPrefill = {}): Promise<vo
     return
   }
   const existingManager = [...sessions.values()].map(e => e.record).find(r => r.role === 'manager')
+  let wakeChoice: { everyMinutes: WakeMinutes } | 'unavailable' = 'unavailable'
+  try {
+    const view = await readWakeView()
+    if (dialogEl.hidden || generation !== dialogGeneration) return
+    if ((WAKE_OPTIONS as readonly number[]).includes(view.everyMinutes)) wakeChoice = { everyMinutes: view.everyMinutes }
+  } catch {
+    if (dialogEl.hidden || generation !== dialogGeneration) return
+  }
   renderNewSessionDialog(dialogEl, agents, prefill.context, (request, error) => { void createSession(request, error) }, closeDialog, openPrimitiveWorkspace,
-    { existing: existingManager ? { id: existingManager.id, title: existingManager.title } : null, onOpen: (id) => { closeDialog(); void selectSession(id) } })
+    { existing: existingManager ? { id: existingManager.id, title: existingManager.title } : null, onOpen: (id) => { closeDialog(); void selectSession(id) }, wake: wakeChoice })
 }
 
 function closeDialog(): void {

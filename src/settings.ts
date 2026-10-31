@@ -24,6 +24,7 @@ import { googleAccountsSection } from './views/google-accounts'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
 import { publishingSection, type PublishingSection } from './views/publishing-settings'
 import { behaviorChainSettings } from './views/behavior-chain-settings'
+import { WAKE_OPTIONS, wakeStatusText, type ManagerWakeView, type WakeMinutes } from './chat-manager-settings-types'
 import { sendLatest } from './notices'
 import './views/connected-accounts.css'
 import type { TerminalPanel } from './views/terminal-panel'
@@ -120,6 +121,93 @@ let accountsGeneration = 0
 let accountsLoading: Promise<void> | null = null
 let terminal: TerminalPanel | null = null
 let terminalOpening = false
+// The Manager group mirrors the header's wake control on the same routes,
+// outside the General drafts: a choice applies at once, with no Manager.
+let managerWakeView: ManagerWakeView | null = null
+let managerWakeRevision = 0
+let managerWakeSaving = false
+let managerWakeError: string | null = null
+let managerWakeRepair = false
+let managerWakeGeneration = 0
+
+function syncManagerWake(): void {
+  if (!panelEl) return
+  const select = panelEl.querySelector<HTMLSelectElement>('#st-manager-wake')
+  const status = panelEl.querySelector<HTMLElement>('.st-manager-wake-status')
+  if (!select || !status) return
+  select.value = String(managerWakeView ? managerWakeView.everyMinutes : 60)
+  select.disabled = managerWakeSaving || (!managerWakeView && !managerWakeRepair)
+  status.textContent = managerWakeError ?? (managerWakeView ? wakeStatusText(managerWakeView, effectiveTimezone(), Date.now()) : '')
+}
+
+async function loadManagerWake(): Promise<void> {
+  const generation = ++managerWakeGeneration
+  try {
+    const res = await fetch('/api/chat/manager/wake')
+    const data = await res.json().catch(() => null) as (ManagerWakeView & { error?: string }) | null
+    if (generation !== managerWakeGeneration) return
+    if (!res.ok) {
+      const message = data?.error || `HTTP ${res.status}`
+      if (res.status === 500) {
+        managerWakeView = null
+        managerWakeRevision = 0
+        managerWakeRepair = true
+        managerWakeError = message
+      } else {
+        managerWakeRepair = false
+        managerWakeError = `Wake interval unavailable: ${message}`
+      }
+    } else if (data && (WAKE_OPTIONS as readonly number[]).includes(data.everyMinutes)) {
+      managerWakeView = data
+      managerWakeRevision = data.revision
+      managerWakeError = null
+      managerWakeRepair = false
+    } else {
+      managerWakeRepair = false
+      managerWakeError = 'Wake interval unavailable: unexpected response'
+    }
+  } catch (error) {
+    if (generation !== managerWakeGeneration) return
+    managerWakeRepair = false
+    managerWakeError = `Wake interval unavailable: ${(error as Error).message}`
+  } finally {
+    if (generation === managerWakeGeneration) syncManagerWake()
+  }
+}
+
+async function saveManagerWake(everyMinutes: WakeMinutes): Promise<void> {
+  if (managerWakeSaving) return
+  managerWakeSaving = true
+  syncManagerWake()
+  try {
+    const res = await fetch('/api/chat/manager/wake', { method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ everyMinutes, revision: managerWakeRevision }) })
+    const data = await res.json().catch(() => null) as (ManagerWakeView & { error?: string }) | null
+    if (!res.ok) {
+      const failure = new Error(data?.error || `HTTP ${res.status}`) as Error & { status?: number }
+      failure.status = res.status
+      throw failure
+    }
+    if (!data || !(WAKE_OPTIONS as readonly number[]).includes(data.everyMinutes)) throw new Error('unexpected response')
+    managerWakeView = data
+    managerWakeRevision = data.revision
+    managerWakeError = null
+    managerWakeRepair = false
+  } catch (error) {
+    // A 409 keeps its note while the saved value reloads underneath; any
+    // other failure shows the message with the select back on the saved value.
+    if ((error as Error & { status?: number }).status === 409) {
+      await loadManagerWake()
+      if (!managerWakeError) managerWakeError = 'The wake interval changed in another tab.'
+    } else {
+      managerWakeError = (error as Error).message
+    }
+  } finally {
+    managerWakeSaving = false
+    syncManagerWake()
+  }
+}
 
 async function refreshStatus(): Promise<void> {
   const before = getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login).join(',')
@@ -1478,7 +1566,7 @@ function selectSection(panel: HTMLElement, tab: SettingsSection) {
   if (panel.classList.contains('open')) {
     if (tab === 'accounts') void loadAccounts()
     if (tab === 'publishing') void publishing?.refresh()
-    if (tab === 'general') { void loadStorage(); void chainSettings?.refresh() }
+    if (tab === 'general') { void loadStorage(); void chainSettings?.refresh(); void loadManagerWake() }
   }
   window.dispatchEvent(new CustomEvent('poise:settings-section-changed', { detail: { section: tab } }))
 }
@@ -1577,6 +1665,22 @@ function buildPanel(): HTMLElement {
         <div class="tp-section">
           <label class="tp-label" for="st-chat-update-turn-bound" ${helpAttributes("How long running turns may hold up a Poise update. Past the bound they are interrupted and resume after the update.")}>Update turn bound (minutes)</label>
           <input type="number" id="st-chat-update-turn-bound" class="st-input st-input-update-turn-bound" min="1" max="10080" step="1" placeholder="15" />
+
+        </div>
+
+        <div class="tp-group-label">Manager</div>
+
+        <div class="tp-section">
+          <label class="tp-label" for="st-manager-wake" ${helpAttributes("How often Poise wakes the Manager to review the workspace. A change applies at once, before any Manager exists.")}>Wake the Manager every</label>
+          <select id="st-manager-wake" class="st-select" disabled>
+            <option value="60">60 min</option>
+            <option value="30">30 min</option>
+            <option value="15">15 min</option>
+            <option value="10">10 min</option>
+            <option value="5">5 min</option>
+          </select>
+          <div class="st-help st-manager-wake-status" role="status"></div>
+          <div class="st-help">The Manager's standing instructions are the /manager snippet, edited in Snippets.</div>
 
         </div>
 
@@ -1763,6 +1867,15 @@ function buildPanel(): HTMLElement {
     setTheme(theme)
   })
 
+  // The Manager's wake mirror: outside the General drafts, a choice applies
+  // at once on the same routes as the Manager's header.
+  panel.querySelector<HTMLSelectElement>('#st-manager-wake')!.addEventListener('change', (event) => {
+    const minutes = Number((event.target as HTMLSelectElement).value)
+    if ((WAKE_OPTIONS as readonly number[]).includes(minutes)) void saveManagerWake(minutes as WakeMinutes)
+    else syncManagerWake()
+  })
+  void loadManagerWake()
+
   return panel
 }
 
@@ -1807,6 +1920,7 @@ export function openSettingsPanel() {
   if (panelEl.dataset.section === 'models') void loadModels()
   if (panelEl.dataset.section === 'general') void loadProduction()
   if (panelEl.dataset.section === 'general') void loadStorage()
+  if (panelEl.dataset.section === 'general') void loadManagerWake()
   void pollOrganizations()
   if (accountsTabSelected()) void loadAccounts()
   if (panelEl.dataset.section === 'publishing') void publishing?.refresh()

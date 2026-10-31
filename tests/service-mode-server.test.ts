@@ -591,6 +591,18 @@ describe('Poise in service mode', () => {
     }
   })
 
+  it('changes the Manager wake interval only from the owner\'s browser', async () => {
+    const read = await send('GET', '/api/chat/manager/wake', fromGateway())
+    expect(read.status).toBe(200)
+    const revision = read.json.revision as number
+    const everyMinutes = read.json.everyMinutes === 15 ? 30 : 15
+    const saved = await send('PUT', '/api/chat/manager/wake', { ...fromGateway(), origin: PUBLIC_ORIGIN }, { everyMinutes, revision })
+    expect(saved.status).toBe(200)
+    expect(saved.json).toMatchObject({ everyMinutes, revision: revision + 1 })
+    expect(await send('PUT', '/api/chat/manager/wake', {}, { everyMinutes: 30, revision: revision + 1 }))
+      .toMatchObject({ status: 403, json: { error: 'The Manager\'s wake interval is changed in the browser.' } })
+  })
+
   it('never echoes or logs the identity assertion', async () => {
     const lines: string[] = []
     const capture = (...args: unknown[]) => { lines.push(args.map((arg) => arg instanceof Error ? `${arg.message} ${arg.stack}` : typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ')) }

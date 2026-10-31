@@ -9,6 +9,21 @@ export function timersData(overrides: Partial<TimersData> = {}): TimersData {
     scheduler: { running: true, lastTickAt: new Date().toISOString() }, ...overrides }
 }
 
+export interface WakeData {
+  everyMinutes: number
+  revision: number
+  timer: { id: string, state: 'active' | 'held', reason?: string, nextAt: string, waitingFor?: NonNullable<TimerSummary['pending']>['waitingFor'] } | null
+  pendingOn: 'manager' | 'charter' | null
+  lastFailure: { at: string, error: string } | null
+  wakesLast24h: number
+}
+
+export function wakeData(overrides: Partial<WakeData> = {}): WakeData {
+  return { everyMinutes: 60, revision: 1,
+    timer: { id: 'wake-1', state: 'active', nextAt: new Date(Date.now() + 60 * 60_000).toISOString() },
+    pendingOn: null, lastFailure: null, wakesLast24h: 0, ...overrides }
+}
+
 let timerSeq = 0
 export function timerView(overrides: Partial<TimerView> = {}): TimerView {
   timerSeq += 1
@@ -97,6 +112,12 @@ interface ServerState {
   models?: unknown
   /** Answer for GET /api/chat/sessions/<id>/timers, by session. */
   timers?: Record<string, TimersData>
+  /** Answer for GET/PUT /api/chat/manager/wake; a PUT advances the revision. */
+  wake?: WakeData
+  /** While set, GET /api/chat/manager/wake answers this failure instead. */
+  wakeGetFailure?: { status: number, json: unknown }
+  /** The next PUT /api/chat/manager/wake answers this failure once, then clears it. */
+  wakePutFailure?: { status: number, json: unknown }
   /** Failing DELETE /api/chat/sessions/<id> answers, by session. */
   deleteErrors?: Record<string, { status: number, json: unknown }>
   /** Holds a DELETE /api/chat/sessions/<id> answer until released. */
@@ -224,6 +245,23 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     const t = /^\/api\/chat\/sessions\/([^/]+)\/timers$/.exec(path)
     if (t && method === 'GET') {
       await route.fulfill({ json: state.timers?.[decodeURIComponent(t[1])] || timersData() })
+      return
+    }
+    if (path === '/api/chat/manager/wake') {
+      state.wake ??= wakeData()
+      if (method === 'GET' && state.wakeGetFailure) { await route.fulfill(state.wakeGetFailure); return }
+      if (method === 'PUT') {
+        if (state.wakePutFailure) {
+          const failure = state.wakePutFailure
+          state.wakePutFailure = undefined
+          await route.fulfill(failure)
+          return
+        }
+        const req = body as { everyMinutes: number, revision: number }
+        state.wake = { ...state.wake, everyMinutes: req.everyMinutes, revision: state.wake.revision + 1,
+          timer: state.wake.timer ? { ...state.wake.timer, nextAt: new Date(Date.now() + req.everyMinutes * 60_000).toISOString() } : null }
+      }
+      await route.fulfill({ json: state.wake })
       return
     }
     const m = /^\/api\/chat\/sessions\/([^/]+)(?:\/(resume|fork|close|handoff))?$/.exec(path)
