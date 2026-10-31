@@ -94,9 +94,13 @@ export function markWakeArmed(instance: string): void {
   setMeta(ARMED_PREFIX + instance, '1')
 }
 
-// A Manager with a charter that pre-existed this process (an upgrade) arms
-// the wake lifecycle like a fresh creation. Runs once at import, before any
-// caller creates managers, so managers created later never arm it.
+// Upgrade arming, once at import: a Manager with a charter that pre-existed
+// this process arms like a fresh creation. Managers the person creates
+// later arm through POST instead and never need this; anything created any
+// other way (direct runtime.create in tests) stays unarmed in this process.
+// Should such a manager still exist with a charter at a later boot, arming
+// it then is intended — the product has no wakeless-Manager state, and in
+// production every Manager is POST-created and already armed.
 try {
   const managers = db.prepare("SELECT DISTINCT instance FROM chat_sessions WHERE role = 'manager'").all() as Array<{ instance: string }>
   if (managers.length > 0) {
