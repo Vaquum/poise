@@ -292,3 +292,235 @@ visible in this documentation environment is not evidence of any
 replica version. No provider workload was run, so this record
 establishes the options analysis and the retain-current decision, not a
 performance winner.
+
+## Resource-lifecycle acceptance (#733) — frozen protocol and retained baseline
+
+Status: protocol frozen 30 October 2026 by PR #757; unchanged baseline
+retained below. The frozen contract is this PR's merge commit: checking
+out any earlier revision cannot reproduce it, and campaign manifests
+must cite that merge SHA. The real-run campaign is pending #729, #731
+and the measured-budget follow-up to #730. #732 is recorded above
+(retain the current isolated workers; no adapter change) and #730
+closed with bounded review-input memory. No resource-readiness claim
+is made here. Thresholds frozen in this section cannot move after
+observed failures.
+
+### Retained unchanged baseline
+
+The baseline is the audited pre-change candidate `77976fd92963cc7e2ad238f90b5ef3f8788ee0c0`
+(merged #728), on which the ten workflow cycles above ran. The #732
+evaluation above assessed main at `e5484ab50bc73ceb1d5119057688e33ab881e950`;
+that revision predates this protocol and is not its freeze.
+
+| Pinned element | Baseline value |
+| --- | --- |
+| Poise application | `0.1.0` (`package.json`), candidate SHAs above |
+| Node runtime | `^22.13.0` (`engines`), `.node-version` `22`, image `node:22-bookworm` (`deploy/runtime/Dockerfile`) |
+| Caller runtime | Python 3.13 |
+| Provider CLI | Not pinned: the updater queries and installs `@openai/codex@latest` (`scripts/provider-cli-updates.mjs`); the run manifest must record the actual executed binary and version per worker |
+| Service container | uid `10001`, `CapDrop: ALL`, `no-new-privileges` (`gateway/src/orchestrator.ts`) |
+| Replica limits | 4-CPU/8-GiB, own home volume and network, no host ports, production mounts or Docker socket |
+| Test scope | Organization `test1234test1234test` (excluded from production), author `zero-bang`, reviewer `llun-ved` |
+| Storage reader | Logical bytes, potentially partial; missing reads as zero, anything else that stops the walk reports partial or unavailable (`server/storage-maintenance.ts`) |
+| Temporary storage | Warns on downward crossings only; never gates or stops work (`server/temporary-storage.ts`) |
+
+Two concrete retained-data observations calibrate the acceptance
+inventory; #729 owns the implementation and retention decisions:
+
+- 30 Codex session files occupying 7,403,527 bytes after the ten
+  workflow cycles, with both disposable checkout roots empty.
+- Five isolated acquire/release/delete cycles left zero run directories
+  but five checkout lock databases / 40,960 allocated bytes
+  (`caller/agent_interface/agent_interface/checkout_lock.py`).
+
+Idle process, memory and disk measurements are taken in the isolated
+replica on the frozen baseline candidate before the campaign, using the
+idle-observation procedure below. They are not captured in this change.
+
+### Frozen run manifest
+
+Each campaign runs under one immutable manifest: Poise and Caller
+commits, image digest, executed provider binary path and version per
+worker, model/effort and fallback, initial target commit, gates and
+rulesets, review settings and cache state. Paired baseline/candidate
+campaigns use the same workload definitions and a reset procedure over
+dedicated test repositories from the frozen initial target commit.
+Actual packet, output and build sizes and the exercised review
+stages and continuations are recorded per run; requested workload
+class alone does not establish a substantial run. Version, base,
+cache or ruleset drift invalidates the comparison or separates it
+into a new campaign; a corrective source revision starts a new
+candidate campaign while earlier attempts remain failed evidence.
+
+Workload classes are defined by exercised stages: minimal (issue
+reviews, implementation, PR reviews, no repair), moderate (at least
+one repair round), substantial (conflict or multi-round repair with
+full review stages). Each concurrency level's repetitions include at
+least one moderate or substantial run.
+
+### Concurrency proof
+
+Levels 1, 2 and 3 name achieved simultaneous behaviors, not admission
+ceilings or observed overlap alone: the journal permits one
+unsettled invocation per chain (`server/behavior-chain-store.ts`)
+and the semaphore already blocks by count
+(`server/check-semaphore.ts`). With the unchanged person and
+behavior reserves of one each, total caps 1–2 admit one behavior,
+cap 3 admits two and cap 4 admits three, so achieved levels 1, 2
+and 3 run under caps 2, 3 and 4 with the unused reserve
+documented per run. Each level requires a backlog of at least N+1
+admitted unsettled chains and a continuous overlap interval of at
+least 120 seconds with N behavior workers concurrently started
+across distinct chains, verified by a time-aligned invocation,
+process and reservation trace. Admission pressure cases are forced
+separately with a count slot still available: blocked work must
+show zero provider preparation and zero spawn, then become
+eligible only after verified resource release. A run that never
+reaches its intended overlap or pressure case is marked
+unexercised, never passed.
+
+### Predeclared counts, budgets, deadlines and uncertainty
+
+- Merge campaign: at least 3 unattended repetitions per achieved
+  concurrency level (1, 2, 3), hence at least 9 confirmed merges
+  on one frozen candidate. Each fault and breach case is
+  exercised at least once at achieved concurrency 2 or above
+  unless its definition names another level.
+- #730 closed with bounded review-input memory (one rendered
+  stage packet at a time, per-page issue-packet accounting) while
+  measured memory budgets and enforcement remain follow-up work.
+  Numeric memory and disk budgets, permitted breach overshoot
+  and termination delays, and numeric cleanup deadlines are
+  recorded here from #729, #731 and that follow-up before the
+  campaign. Once recorded they cannot move.
+- Clocks start and end on observed events: provider exit (stop
+  signal to last behavior-owned PID gone), cleanup settlement
+  (durable outcome to verified `resources_settled_at`), and
+  restart recovery (process start to reconciled reservations).
+  Restarting or missing a sample never resets elapsed time.
+- Uncertainty follows #730's accounting limits: allocated bytes
+  and inodes plus open-but-unlinked resources from the independent
+  inventory, sampling intervals and coverage gaps published per
+  run. Missing or restart-gap observations are excluded from
+  peaks; they are never counted as zero.
+
+### Fault and breach matrix
+
+Injections gate on observed process, action or cleanup state, never
+on a fixed sleep after launch. Successful-merge runs and
+fault/breach runs form separate cohorts; every attempt is retained
+in its declared cohort.
+
+| Case | Trigger gate | Expected durable state | Terminal |
+| --- | --- | --- | --- |
+| Person Stop / cancellation | Observed stop of a live invocation | Worker tree terminated and settled; chain held even after settlement (`server/behavior-chain-runtime.ts`); no silent resume | Held |
+| Timeout | Budget expiry with worker alive | Tree terminated, settlement verified, ownership retained | Held or failed per cause |
+| Native worker/parent failure | Observed worker or Caller-parent death | Descendants reclaimed; surviving live descendant reconciled against the original invocation | Held |
+| In-container server replacement | New server process with observed surviving workers | Survivors keep no duplicate admissions; capacity reuses the lane ceiling across replacement | Continues or held |
+| Container restart | New container-init epoch with persistent disk and reservations | Caller epoch handling reconciles reservations; cleanup/restart settles exactly once | Continues or held |
+| Interrupted cleanup, before reclamation | Kill between outcome durability and deletion | Failed cleanup durable, visible and retryable; retry repeats no completed external action | Held until recovered |
+| Interrupted cleanup, after deletion before settlement | Kill between deletion and durable settlement | Settlement completes on recovery without re-deleting or duplicating | Settled, then held or continued |
+| Duplicate/overlapping settlement observations | Two observers report one completion | Exactly-once reservation settlement; ledger comparison matches artifacts | Settled once |
+| Uncertain external write | Proof GitHub accepted the real action before the local acknowledgement was lost | Reconcile the original identity; absent receipts never authorize another POST; duplicate counts inspected | Held or settled, never duplicated |
+| Post-admission memory breach | Live growth past the predeclared memory budget (#730 follow-up) under real service security settings, neighbor running | Named durable resource cause; neighbor unaffected; actual external actions preserved and reconciled; reservation retained until cleanup is verified | Held |
+| Post-admission disk breach | Disposable growth past budget under the same conditions | Same guarantees as the memory breach | Held |
+| Unavailable/stale measurement | Probe failure during an admission decision | No admission on unknown state; blocked work wakes through the existing runtime without consuming failure attempts or starting a waiting agent | Waiting, then admitted |
+| Cleanup failure with no other releaser | Failed reclamation while no other worker can emit a release | Blocked work still wakes through the existing runtime under the same guarantees | Waiting, then admitted |
+
+A breach is distinct from a person's Stop, an ordinary provider
+failure and an unexplained SIGKILL. Cases whose correct result is a
+hold end held; an explicitly logged test-control resume is allowed
+only where the case row names it, and never counts as an
+unattended merge. A regression-only path stays explicitly unproven
+in the real run.
+
+### Accumulation and return to idle
+
+Repetitions run as one uninterrupted block on the same candidate,
+HOME, provider profile, state and cache volumes, with no operator
+cleanup between runs. Idle is observed while Poise remains up: ten
+minutes after each phase-handoff settlement and thirty minutes
+after final settlement, requiring zero idle behavior agents (no
+behavior-lane holdings, no behavior-owned processes). Only then is
+the replica stopped, and shutdown cleanup is recorded separately.
+Settlement receipts are verified against an independent
+process and disk inventory covering detached and reparented
+children and paths outside the two disposable checkout roots.
+Unrelated sessions, required retained evidence, shared
+authentication and another behavior's files must remain intact and
+usable; deleting them never counts as reclamation.
+
+### Evidence bundle
+
+Each campaign publishes its manifest and the pass/fail/unexercised
+matrix in this document. The full bundle — frozen protocol and
+manifest, all run IDs and attempts, the complete canonical event
+sequence with hashes, correlated Caller, action-plan and
+publication receipts, raw timestamped resource samples with
+coverage gaps, fault-trigger evidence, and actual GitHub IDs,
+heads, queue checks and merge SHAs — is retained under a
+campaign `test-results/` path in the validation worktree. Database
+exports use a consistent read-only snapshot including WAL files;
+both Poise (`server/db.ts`) and Caller use WAL, so copying main
+files alone can omit the final settlements under proof. The bundle
+is replayed into an empty offline projection and compared against
+the independent artifacts across all invocations and
+reservations; replay starts no workers and performs no external
+actions. The retained bundle is reopened and validated after
+replica cleanup. The chain HTTP reader returns only recent
+summaries (`server/behavior-chain-api.ts`); a scrape of that API
+cannot substitute for the bundle.
+
+### Execution-choice gating
+
+The final campaign runs only on the execution path #732 selected
+and recorded above: the current isolated workers, with no adapter
+change. That path must satisfy #729 and #731, the #730 budget
+follow-up, and its own regression and CI gates before the
+campaign. Any future adapter work becomes an explicitly approved
+implementation dependency first; until then the native
+alternatives stay unproven. This issue performs no adapter
+implementation, and a standalone native benchmark never counts as
+product acceptance.
+
+### Throughput, latency and coverage rules
+
+The measurement interval runs from first seed admission to last
+merge settlement per level, with the declared backlog and arrival
+pattern published. The numerator is unique functionally verified
+merges; retries and failed attempts charge their elapsed time and
+resources to the cohort. The first cycle per level is warm-up:
+excluded from steady-state latency, retained in costs. Admission,
+queue, service and external-CI waits are bounded separately.
+Queue depth and retained invocation history are part of the
+envelope: the capacity query traverses invocation JSON across
+active chains (`server/behavior-chain-store.ts`), so running
+workers alone do not bound admission overhead. Distributions and
+uncertainty are published; the candidate must match or beat
+baseline useful throughput at each level within measurement
+uncertainty with zero lifecycle failures, with equivalent
+workload outputs and unchanged required assertions and
+build/test gates. The coverage table distinguishes pass, fail
+and unexercised per mandatory lifecycle, provider and
+execution-path case with run IDs; an unproven mandatory case
+permits no generic readiness claim.
+
+### Campaign matrix
+
+| Cohort | Level | Runs | Result |
+| --- | --- | --- | --- |
+| Baseline retention (this change) | — | Protocol frozen by PR #757; baseline `77976fd9` retained | Pass |
+| Baseline merge campaign | 1, 2, 3 (achieved) | Pending #729, #731, budget follow-up | Unexercised |
+| Candidate merge campaign | 1, 2, 3 (achieved) | Pending #729, #731, budget follow-up | Unexercised |
+| Fault matrix | ≥2 (achieved) | Pending #729, #731, budget follow-up | Unexercised |
+| Breach matrix | ≥2 (achieved) | Pending #729, #731, budget follow-up | Unexercised |
+
+Required CI remains authoritative for engineering merges. Resource
+readiness cannot be claimed with a missing lifecycle proof or
+changed behavior assertions. The replica is stopped and its
+disposable behavior resources verified and reclaimed after
+evidence capture, preserving the required audit evidence; live
+production is never attached, followed repositories are verified
+absent from production before seeding and after the campaign, and
+production configuration, admissions, defaults and active work
+are untouched.
