@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RunFileOptions } from '../server/process'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
-import { chainBasis } from '../server/behavior-chain-store'
+import { completedReviewCall } from './review-response-fixture'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn(),
   captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn() }))
@@ -38,19 +38,9 @@ let batchGate: { reached: () => void, wait: Promise<void> } | null = null
 let logOverrides: Record<string, unknown> | null = null
 
 function reviewLog(pr: Record<string, unknown>) {
-  const now = Date.now()
-  const id = chainBasis([pr.repo, pr.number]).slice(0, 32)
   const actor = pr.author === 'octocat' ? 'review-bot' : 'octocat'
   const head = heads[Number(pr.number)] ?? HEAD
-  return { id, repo: pr.repo, pr_id: String(pr.number), actor, model: 'fixture', behavior: 'pr_review',
-    session_id: null, prompt: '', started_at: new Date(now - 2000).toISOString(), completed_at: new Date(now).toISOString(),
-    time_elapsed: '2s', status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 91,
-    head_sha: head, expected_head: head, source: 'poise:review-new-prs', correlation_id: `review-${id}`, response: null, error: '',
-    artifact: { review_response: { repository: pr.repo, pull_number: pr.number, reviewer: actor, model: 'fixture',
-      invocation_id: id, head_sha: head, context_sha: 'b'.repeat(64), completed_at: now - 1000,
-      assessment: { verdict: 'The changed validation has no remaining blocking defects.',
-        reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } } },
-    ...logOverrides }
+  return { ...completedReviewCall(String(pr.repo), Number(pr.number), head, actor), ...logOverrides }
 }
 
 function pull(repo = REPO, number = 7, fields: Record<string, unknown> = {}) {

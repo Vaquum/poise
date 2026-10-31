@@ -57,6 +57,7 @@ class TestCodexReviewStaging(TestCase):
                 self.assertIn('"review_id": 91', self.review(text))
                 submit.assert_called_once()
                 self.assertEqual(submit.call_args.args[0], ["github-interface", "--approve-pr", "#12",
+                    "--assessment-json", json.dumps(ASSESSMENT, ensure_ascii=False),
                     "--expected-head", "a" * 40, "--token-user", "bit-mis"])
         return messages, commands, timeouts
 

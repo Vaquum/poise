@@ -162,6 +162,7 @@ class TestReceiptRecording(TestCase):
         review_receipt.bind(api.DB, "run")
         with sqlite3.connect(api.DB) as conn:
             conn.execute("insert into calls (id, started_at, status, actor, behavior) values ('run', 0, 'running', 'bit-mis', 'pr_review')")
+            conn.execute("update calls set artifact=? where id='run'", (json.dumps({'phase': 'reviewing'}),))
         review_receipt.prepare_response(json.dumps({"repository": "o/r", "pull_number": 12, "head_sha": HEAD,
             "pull": {"base": {"sha": "b" * 40}, "title": "Review ordering", "body": "Retain assessment."}}), "fixture")
 

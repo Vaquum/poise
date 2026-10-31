@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
+import { completedReviewCall } from './review-response-fixture'
 
 // Skip lists of the PR behaviors, and the check a Swarm replay shares
 // with the scheduler. Caller is faked at the process boundary: the datastore
@@ -91,7 +92,8 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
   if (command === 'github-datastore' && args[0] === 'view' && args[1] === 'pr') return { stdout: view(pulls, args), stderr: '' }
   if (command === 'github-datastore' && args[0] === 'view' && args[1] === 'issue') return { stdout: view(issues, args), stderr: '' }
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
-  if (command === 'agent-interface' && args[0] === '--logs') return json([])
+  if (command === 'agent-interface' && args[0] === '--logs') return json(database?.getMeta('behavior_merge_prs_enabled') === '1'
+    ? pulls.map(pr => completedReviewCall(String(pr.repo), Number(pr.number), HEAD, AGENT)) : [])
   if (command === 'github-interface') {
     const hold = held[args[0]]
     if (hold) {

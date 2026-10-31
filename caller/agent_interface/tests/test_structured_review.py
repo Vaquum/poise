@@ -398,7 +398,8 @@ class TestStagedReview(TestCase):
         self.assertIn("first group defect", second_kwargs["input"])
         self.assertEqual(mutation[:4], ["github-interface", "--request-changes", "#12", "--comments-json"])
         self.assertEqual(json.loads(mutation[4]), [first, second])
-        self.assertEqual(mutation[5:], ["--expected-head", "a" * 40, "--token-user", "bit-mis"])
+        self.assertEqual(mutation[5:], ["--assessment-json", json.dumps(ASSESSMENT, ensure_ascii=False),
+                                       "--expected-head", "a" * 40, "--token-user", "bit-mis"])
 
     def test_clean_groups_combine_into_one_clean_verdict(self):
         packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
