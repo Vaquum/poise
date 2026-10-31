@@ -92,14 +92,16 @@ provider-reported error terminals are `review_provider_error`; both keep
 `not_started` / `preflight_failed` with no receipt, so Poise can safely retry
 after proving no reviewer action. Invalid, missing, duplicate or contradictory
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
-GitHub reviews are `review_contract_violation` and held. An approval the
-unresolved-conversation guard refuses is `approval_blocked_unresolved_conversations`:
-still nothing approved, but a waiting external blocker rather than a failed
-verdict publication; a superseding head keeps that disposition, and another
-request's review never settles the blocked run. Claude runs persist the refusal
-through the guard's `.blocked` sidecar, since they submit outside the structured
-runner; uncertainty still wins when both markers exist. A second terminal
-submission after an accepted one is blocked at the gate.
+GitHub reviews are `review_contract_violation` and held. A repeat-only
+`no_review` refusal first recovers once with the recovery model; anything
+still failing is held. An approval the unresolved-conversation guard refuses is
+`approval_blocked_unresolved_conversations`: still nothing approved, but a
+waiting external blocker rather than a failed verdict publication; a superseding
+head keeps that disposition, and another request's review never settles the
+blocked run. Claude runs persist the refusal through the guard's `.blocked`
+sidecar, since they submit outside the structured runner; uncertainty still wins
+when both markers exist. A second terminal submission after an accepted one is
+blocked at the gate.
 
 A controller-observed transient GitHub submission failure is recorded as
 `review_submission_failed`, with action and outcome unknown until live review
@@ -130,9 +132,10 @@ when absent; invalid metadata is rejected. Raw response artifacts and unavailabl
 final-inventory handling are unchanged; live receipt and head checks still run
 before the failure marker can determine the outcome.
 
-PR reviews and approvals default to `opus-5-high`; on a Claude output limit they
-recover once with `gpt-6-astra-ultra`. Pass `--model` and `--recovery-model` to
-`--pr-review` or `--pr-approve` with any identity from the catalog.
+PR reviews and approvals default to `opus-5-high`; on a Claude output limit or a
+repeat-only publication refusal they recover once with `gpt-6-astra-ultra`.
+Pass `--model` and `--recovery-model` to `--pr-review` or `--pr-approve` with
+any identity from the catalog.
 
 PR review prepares an independent temporary checkout at the packet's exact head,
 with its merge base available. `github-interface --checkout-review` checks the
@@ -250,11 +253,13 @@ calls measured on 2026-09-13 (1,283.662532 seconds), plus 10%, rounded up. Opus 
 the catalog's review effort and an explicit 64,000-output-token limit in the trusted CLI settings.
 Other behaviors retain their existing model assignments and limits.
 
-On an Opus output-limit error, Caller can recover once with the recovery model using the
-same immutable packet and remaining budget. GitHub must first confirm the same
-open head and no new or pending reviewer action. A verified completed action is
-adopted instead. Ambiguous activity, time exhaustion, or failed recovery leaves a
-typed failure for Poise to retain without automatically repeating unchanged input.
+On an Opus output-limit error or a repeat-only publication refusal, Caller can recover
+once with the recovery model using the same immutable packet and remaining budget.
+GitHub must first confirm the same open head and no new or pending reviewer action.
+A verified completed action is adopted instead. Ambiguous activity, time exhaustion,
+or failed recovery leaves a typed failure for Poise to retain without automatically
+repeating unchanged input. Every recovery exit keeps the refused first attempt beside
+the re-verdict outcome, including a later supersede.
 Logs include `review_policy` and `recovery_model`; capability discovery includes
 `policy: bounded-v1` so Poise can reject an incompatible runtime before launch.
 

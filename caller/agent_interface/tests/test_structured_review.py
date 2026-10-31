@@ -1230,6 +1230,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             run_with_github(SimpleNamespace(returncode=0, stdout=noop, stderr=""))
         self.assertEqual(failure.exception.code, "review_contract_violation")
         self.assertEqual(failure.exception.diagnostic["submission"], "noop")
+        self.assertEqual(failure.exception.diagnostic["refusal"], "duplicate")
 
         with self.assertRaises(receipt_mod.SubmissionError):
             run_with_github(SimpleNamespace(returncode=0, stdout="not json", stderr=""))
@@ -1244,3 +1245,38 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             with self.assertRaises(receipt_mod.SubmissionError):
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
                                       "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+
+    def test_repeat_only_noop_is_typed_for_recovery(self):
+        verdict = {"action": "request_changes", "comments": [FINDING]}
+
+        def run_with_github(reply):
+            def process(args, **kwargs):
+                if args[0] == "github-interface":
+                    return reply
+                Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                    patch.object(ReviewWatch, "run", side_effect=process):
+                return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+
+        skipped = [{"reason": "repeat", "comment": FINDING},
+                   {"reason": "repeat", "comment": FINDING}]
+        noop = json.dumps({"action": "no_review", "skipped": skipped})
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            run_with_github(SimpleNamespace(returncode=0, stdout=noop, stderr=""))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertEqual(failure.exception.diagnostic["submission"], "noop")
+        self.assertEqual(failure.exception.diagnostic["refusal"], "repeat_only")
+
+        mixed = json.dumps({"action": "no_review",
+                            "skipped": [{"reason": "repeat", "comment": FINDING},
+                                        {"reason": "already_commented_or_resolved", "comment": FINDING}]})
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            run_with_github(SimpleNamespace(returncode=0, stdout=mixed, stderr=""))
+        self.assertEqual(failure.exception.diagnostic["refusal"], "duplicate")
+
+        empty = json.dumps({"action": "no_review", "skipped": []})
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            run_with_github(SimpleNamespace(returncode=0, stdout=empty, stderr=""))
+        self.assertEqual(failure.exception.diagnostic["refusal"], "duplicate")
