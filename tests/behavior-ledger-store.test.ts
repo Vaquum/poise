@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -482,6 +482,101 @@ describe('behavior firing ledger store', () => {
         changes: (check.prepare('SELECT count(*) AS n FROM ledger_changes').get() as { n: number }).n,
       })
     } finally { check.close() }
+  })
+
+  it('fails sustained writes fast under a pinned external reader with no WAL or lingering journal', () => {
+    const ceiling = 4 * 1024 * 1024
+    const db = store({ maxPagesBytes: ceiling, maxInstances: 64, maxChanges: 128, maxBytes: 256 * 1024 })
+    for (let i = 0; i < 8; i++) direct(db, 'seed-' + i)
+    // Rollback journaling, not WAL: a pinned reader causes fail-fast capture
+    // loss, never unbounded WAL growth.
+    const mode = new Database(db.path, { readonly: true })
+    try { expect(mode.pragma('journal_mode', { simple: true })).toBe('delete') } finally { mode.close() }
+    expect(existsSync(db.path + '-wal')).toBe(false)
+    // A pinned external reader holds a SHARED lock across sustained writes:
+    // captures fail fast as retryable instead of waiting, leave no partial
+    // rows, and leave no journal or WAL file lingering between attempts.
+    const pinned = new Database(db.path)
+    pinned.pragma('busy_timeout = 0')
+    pinned.exec('BEGIN')
+    pinned.prepare('SELECT * FROM ledger_instances').all()
+    let failed = 0
+    const startedAt = Date.now()
+    try {
+      for (let i = 0; i < 32; i++) {
+        try { direct(db, 'pinned-' + i) } catch { failed++ }
+        expect(existsSync(db.path + '-journal')).toBe(false)
+        expect(existsSync(db.path + '-wal')).toBe(false)
+      }
+    } finally { pinned.exec('ROLLBACK'); pinned.close() }
+    expect(failed).toBe(32)
+    expect(Date.now() - startedAt).toBeLessThan(5000)
+    expect(records(db)).toHaveLength(16)
+    // Release the reader: sustained successful writes prune at the earliest
+    // reached bound, and every commit deletes its transient journal.
+    for (let i = 0; i < 60; i++) {
+      direct(db, 'sustained-' + i)
+      expect(existsSync(db.path + '-journal')).toBe(false)
+    }
+    expect(existsSync(db.path + '-wal')).toBe(false)
+    expect(statSync(db.path).size).toBeLessThanOrEqual(ceiling)
+    expect(db.health()).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
+    expect(db.health().instances).toBeLessThanOrEqual(64)
+    expect(db.health().changes).toBeLessThanOrEqual(128)
+  })
+
+  it('fails closed at the hard page ceiling while the main file stays within it', () => {
+    const ceiling = 128 * 1024
+    const db = store({ maxPagesBytes: ceiling, maxInstances: 100_000, maxChanges: 100_000, maxBytes: 64 * 1024 * 1024 })
+    // Pruning caps stay far away so growth genuinely reaches the page
+    // ceiling; writes then fail closed instead of growing the main file.
+    let fulls = 0
+    for (let i = 0; i < 200 && fulls < 50; i++) {
+      try { direct(db, 'fill-' + i) } catch (error) { expect(String(error)).toMatch(/full/i); fulls++ }
+    }
+    expect(fulls).toBe(50)
+    const check = new Database(db.path, { readonly: true })
+    try {
+      const pages = check.pragma('page_count', { simple: true }) as number
+      const pageSize = check.pragma('page_size', { simple: true }) as number
+      expect(pages * pageSize).toBeLessThanOrEqual(ceiling)
+    } finally { check.close() }
+    expect(statSync(db.path).size).toBeLessThanOrEqual(ceiling)
+    expect(existsSync(db.path + '-journal')).toBe(false)
+    expect(existsSync(db.path + '-wal')).toBe(false)
+    expect(db.health().status).toBe('ok')
+  })
+
+  it('holds no database transaction across the HTTP send window', () => {
+    const db = store()
+    db.capture(admission())
+    complete(db, 'claim-1')
+    // Negative control: the exclusive probe below is sensitive to a
+    // genuinely held read lock (an immediate write lock would coexist).
+    const holder = new Database(db.path)
+    holder.pragma('busy_timeout = 0')
+    try {
+      holder.exec('BEGIN')
+      holder.prepare('SELECT * FROM ledger_instances').all()
+      const probe = new Database(db.path)
+      probe.pragma('busy_timeout = 0')
+      try { expect(() => probe.exec('BEGIN EXCLUSIVE')).toThrow() } finally { probe.close() }
+    } finally { holder.exec('ROLLBACK'); holder.close() }
+    // The HTTP layer serializes the materialized reply only after the
+    // worker's single short read transaction commits, so while the body is
+    // still unsent a slow or disconnected client holds no database lock:
+    // a second connection takes (and releases) the exclusive lock at once.
+    const page = db.read({ operation: 'list', limit: 50 })
+    expect(page.status).toBe(200)
+    const text = JSON.stringify(page.body)
+    expect(text.length).toBeGreaterThan(0)
+    const external = new Database(db.path)
+    external.pragma('busy_timeout = 0')
+    try {
+      external.exec('BEGIN EXCLUSIVE')
+      external.exec('ROLLBACK')
+    } finally { external.close() }
+    expect(page.body.records).toHaveLength(2)
   })
 
   it('retains generation and identifiers on clean restart and exposes an unclean epoch', () => {
