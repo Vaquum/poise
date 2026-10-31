@@ -11,12 +11,12 @@ describe('launch ownership and resolution', () => {
     if (!inherited) throw new Error('CLI fixture is not arranged')
     mocks.runFile.mockImplementation((command, args, options) => {
       if (command === 'github-interface') {
-        if (args[0] === '--read-issue') return Promise.resolve({ stdout: JSON.stringify({ issue: { title: 'Seed', body: '', state: 'open', labels: ['poise'] } }), stderr: '' })
-        if (args[0] === '--issue-comments') return Promise.resolve({ stdout: JSON.stringify({ comments: [] }), stderr: '' })
         // The chain's read preceded publication. The later PR listing below
         // already includes the branch: this was the live duplicate-review race.
-        if (args[0] === '--issue-work') return Promise.resolve({ stdout: JSON.stringify({ existing_pulls: [], pull_number: null,
-          head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }), stderr: '' })
+        if (args[0] === '--chain-seed') return Promise.resolve({ stdout: JSON.stringify({ repository: pr.repo, issue_number: 7,
+          actor: 'poise-user', branch: 'poise/issue-7', issue: { title: 'Seed', body: '', state: 'open', labels: ['poise'] },
+          comments: [], publication: { existing_pulls: [], pull_number: null,
+            head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }), stderr: '' })
       }
       return inherited(command, args, options)
     })
