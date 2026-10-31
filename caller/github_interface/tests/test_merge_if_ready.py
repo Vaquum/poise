@@ -16,6 +16,12 @@ PAYLOAD = {'repository': 'acme/app', 'pr': '#7', 'expected_head': HEAD, 'author'
 
 
 class TestMergeIfReady(IsolatedAsyncioTestCase):
+    async def test_account_approval_without_retained_response_cannot_merge(self):
+        result = await merge_if_ready.run(self.client, PAYLOAD)
+        self.assertEqual(result['outcome'], 'not_ready')
+        self.assertIn('substantive', result['reason'])
+        self.client.request.assert_not_awaited()
+
     async def asyncSetUp(self):
         self.client = AsyncMock()
         self.client.get.return_value = {'allow_squash_merge': True, 'allow_merge_commit': True}

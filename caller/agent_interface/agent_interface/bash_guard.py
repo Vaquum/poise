@@ -55,6 +55,12 @@ def main():
         raise SystemExit(subprocess.run(argv, text=True).returncode)
     receipt = os.environ.get("AGENT_INTERFACE_REVIEW_RECEIPT")
     with submission_gate(os.environ.get("AGENT_INTERFACE_REVIEW_GATE")) as gate:
+        if argv[1] in {"--approve-pr", "--reviewed-clean", "--request-changes"} and "--assessment-json" in argv:
+            if __package__:
+                from .review_receipt import complete_response
+            else:
+                from review_receipt import complete_response
+            complete_response(json.loads(argv[argv.index("--assessment-json") + 1]), argv[argv.index("--expected-head") + 1])
         if not receipt:
             done = subprocess.run(argv, text=True)
             raise SystemExit(done.returncode)

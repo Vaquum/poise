@@ -20,6 +20,9 @@ from agent_interface.review_watch import ReviewWatch
 
 FINDING = {"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "[p1] O'Brien's input crashes."}
 MUSE_SESSION_ERROR = "muse: local session messaging disabled: session logging is required"
+ASSESSMENT = {"verdict": "The changed validation paths have no remaining blocking defects.",
+              "reviewed_context": "Inspected the supplied immutable diff and its affected callers.",
+              "limitations": "Provider fixture; no application test execution."}
 
 
 def scripted_muse(directory: Path) -> Path:
@@ -123,6 +126,16 @@ class TestReviewModel(TestCase):
 
 
 class TestStructuredVerdict(TestCase):
+    def test_terminal_result_requires_substantive_assessment(self):
+        for value in (None, {}, {**ASSESSMENT, "verdict": "Acknowledged"},
+                      {**ASSESSMENT, "verdict": "Reviewed: no blocking findings."},
+                      {**ASSESSMENT, "limitations": ""}, {**ASSESSMENT, "reviewed_context": "x" * 4001}):
+            verdict = {"action": "reviewed_clean", "comments": [], **({"assessment": value} if value is not None else {})}
+            with self.subTest(value=value), self.assertRaises(structured_review.InvalidVerdict):
+                structured_review.validate_verdict(json.dumps(verdict), "pr_review")
+        verdict = {"action": "reviewed_clean", "comments": [], "assessment": ASSESSMENT}
+        self.assertEqual(structured_review.validate_verdict(json.dumps(verdict), "pr_review"), verdict)
+
     def test_codex_resumes_only_its_review_with_new_inspection_evidence(self):
         thread = "01234567-89ab-4cde-8123-456789abcdef"
         with tempfile.TemporaryDirectory() as directory:

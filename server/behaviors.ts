@@ -5,6 +5,7 @@ import { behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository }
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
+import { callReviewResponse } from './review-response'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
@@ -4365,7 +4366,9 @@ async function tickApprovePrs(): Promise<void> {
             parkCheck(pr, `review packet too large for head ${check.headSha.slice(0, 8)}`)
             continue
           }
-          const cleanReview = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number, reviewer)
+          const basis = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number, reviewer)
+          const basisCall = basis ? (await readBehaviorLogSnapshot()).entries.find((call) => call.id === basis.callId) : null
+          const cleanReview = basisCall && callReviewResponse(basisCall, Date.now()) ? basis : null
           let dismissedReview: CompletedApprovalBasisLaunch | null = null
           if (!check.hasChangeRequest && !cleanReview) {
             dismissedReview = check.reviewerLatestState === 'DISMISSED'
@@ -5529,6 +5532,13 @@ async function tickMergePrs(): Promise<void> {
         await mkdir(cwd, { recursive: true })
         if (!isRunnable('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', pr)
           || configuredReviewer(pr.author) !== actor) continue
+        const snapshot = await readBehaviorLogSnapshot()
+        const calls = snapshot.entries.filter((call) => call.repo === pr.repo && call.pr_id === String(pr.number)
+          && call.actor === actor && ['pr_review', 'pr_approve'].includes(call.behavior || '') && call.source?.startsWith('poise:'))
+          .sort((a, b) => Date.parse(b.started_at_precise || b.started_at) - Date.parse(a.started_at_precise || a.started_at))
+        const call = calls[0]
+        const response = call && unambiguousAgentCall(snapshot, call) && call.head_sha === expectedHead ? callReviewResponse(call, Date.now()) : null
+        if (!response) continue
         runId = startDirectBehaviorRun('merge-prs')
         captureBehaviorAdmission({ admissionKey: runId, nativeId: runId, behavior: 'merge-prs',
           source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
@@ -5536,6 +5546,7 @@ async function tickMergePrs(): Promise<void> {
         const { stdout } = await runFile(GH_INTERFACE, [
           '--merge-if-ready', `#${pr.number}`, '--expected-head', expectedHead,
           '--author', pr.author, '--token-user', actor,
+          '--review-response-json', JSON.stringify({ ...response, review_id: call.review_id }),
         ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() })
         const result = objectValue(parseJson(stdout, 'github-interface --merge-if-ready'), 'merge-if-ready')
         if (result.action !== 'merge_if_ready' || result.repository !== pr.repo

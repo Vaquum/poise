@@ -412,11 +412,10 @@ async def approve_pr(
     repo: str,
     pull_number: int,
     commit_id: str,
+    body: str,
 ) -> dict[str, Any]:
-    body = invocation_body("", commit_id)
-    payload = {"event": "APPROVE", "commit_id": commit_id}
-    if body:
-        payload["body"] = body
+    body = invocation_body(body, commit_id)
+    payload = {"event": "APPROVE", "commit_id": commit_id, "body": body}
     return await client.post(
         f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
         json=payload,

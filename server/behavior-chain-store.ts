@@ -33,6 +33,7 @@ export interface BehaviorChain {
   waiting: string | null
   resumedAfterSequence: number
   mergeSha: string | null
+  reviewPending?: boolean
   observation: Record<string, unknown> | null
   invocations: ChainInvocation[]
 }
@@ -80,9 +81,10 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (!SHA.test(event.mergeSha) || event.evidence.merged !== true || event.evidence.merge_sha !== event.mergeSha
       || event.evidence.repository !== next.repository || !Number.isSafeInteger(event.evidence.pull_number)
       || Number(event.evidence.pull_number) < 1) throw new Error('chain completion requires a verified GitHub merge artifact')
-    if (next.invocations.some((invocation) => invocation.state !== 'settled')) throw new Error('cannot complete a chain with an unsettled invocation')
+    if (event.evidence.review_complete !== false && next.invocations.some((invocation) => invocation.state !== 'settled')) throw new Error('cannot complete a chain with an unsettled invocation')
     if (next.mergeSha && next.mergeSha !== event.mergeSha) throw new Error('behavior chain merge evidence conflicts')
     next.mergeSha = event.mergeSha.toLowerCase()
+    if (typeof event.evidence.review_complete === 'boolean') next.reviewPending = !event.evidence.review_complete
   } else if (event.type === 'invocation.admitted') {
     if (next.held || next.mergeSha) throw new Error('behavior chain does not admit invocations')
     const invocation = event.invocation
@@ -211,7 +213,7 @@ export class BehaviorChainJournal {
         .run(sequence, id, eventId, at, payload, chainBasis(next))
       this.db.prepare(`INSERT INTO behavior_chain_current(chain_id, sequence, state, merged) VALUES (?, ?, ?, ?)
         ON CONFLICT(chain_id) DO UPDATE SET sequence=excluded.sequence, state=excluded.state, merged=excluded.merged`)
-        .run(id, next.sequence, JSON.stringify(next), next.mergeSha ? 1 : 0)
+        .run(id, next.sequence, JSON.stringify(next), next.mergeSha && !next.reviewPending ? 1 : 0)
       return next
     }).immediate()
   }
@@ -273,7 +275,7 @@ export class BehaviorChainJournal {
         if (chainBasis(states.get(row.chain_id)) !== (row as StoredEvent & { state_hash: string }).state_hash) throw new Error('behavior journal state hash is invalid')
       }
       const save = this.db.prepare('INSERT INTO behavior_chain_current(chain_id, sequence, state, merged) VALUES (?, ?, ?, ?)')
-      for (const state of states.values()) save.run(state.id, state.sequence, JSON.stringify(state), state.mergeSha ? 1 : 0)
+      for (const state of states.values()) save.run(state.id, state.sequence, JSON.stringify(state), state.mergeSha && !state.reviewPending ? 1 : 0)
     }).immediate()
   }
 }

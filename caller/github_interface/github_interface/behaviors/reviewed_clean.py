@@ -1,6 +1,7 @@
 from typing import Any
 
 from github_interface.atoms.review_identity import require_other_author
+from github_interface.atoms.review_response import response_body, submission_response
 from github_interface.atoms.pulls import comment_review, get_pull
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head, pull_number, repository, token_user
@@ -24,13 +25,14 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             f"pull-request head changed: expected {required_head}, got {actual_head or 'missing'}"
         )
 
+    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor)
     review = await comment_review(
         client,
         owner,
         repo,
         number,
         required_head,
-        REVIEW_BODY,
+        response_body(response),
     )
     review_head = str(review.get("commit_id") or "").lower()
     review_actor = str((review.get("user") or {}).get("login") or "")
@@ -53,4 +55,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "head_sha": required_head,
         "review_id": review.get("id"),
         "submitted_at": review.get("submitted_at"),
+        "review_response": response,
     }

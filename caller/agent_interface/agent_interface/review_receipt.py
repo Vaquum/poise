@@ -13,6 +13,7 @@ import json
 import re
 import sqlite3
 import os
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -24,6 +25,65 @@ _failure: ContextVar[str | None] = ContextVar("review_submission_failure", defau
 _conflict: ContextVar[dict | None] = ContextVar("review_receipt_conflict", default=None)
 _blocked: ContextVar[str | None] = ContextVar("review_submission_blocked", default=None)
 _refused: ContextVar[dict | None] = ContextVar("review_submission_refused", default=None)
+
+
+def prepare_response(packet: str, model: str) -> None:
+    """Pin controller-owned context before invoking the configured reviewer."""
+    from hashlib import sha256
+    bound = _call.get()
+    if bound is None:
+        return
+    value = json.loads(packet)
+    pull = value["pull"]
+    context = sha256(json.dumps([pull["base"]["sha"], pull["title"], pull.get("body") or ""],
+                               ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    database, call_id = bound
+    with sqlite3.connect(database, timeout=30) as conn:
+        conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?)) where id=? and status='running'",
+                     (json.dumps({"repository": value["repository"], "pull_number": value["pull_number"],
+                                  "head_sha": value["head_sha"], "context_sha": context, "model": model}), call_id))
+
+
+def complete_response(assessment: dict, head: str) -> dict | None:
+    """Retain the actual response and time before the terminal command runs."""
+    bound = _call.get()
+    database = os.environ.get("AGENT_INTERFACE_RECEIPT_DB")
+    call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database or not call_id:
+        if bound is None:
+            return None
+        database, call_id = bound
+    with sqlite3.connect(database, timeout=30) as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select artifact,actor,status from calls where id=?", (call_id,)).fetchone()
+        if not row or row[2] != "running":
+            raise RuntimeError("review response lacks its running native invocation")
+        artifact = json.loads(row[0] or "{}")
+        context = artifact.get("review_context")
+        if not context or context["head_sha"] != head:
+            raise RuntimeError("review response lacks its pinned review context")
+        prior = artifact.get("review_response")
+        if prior is not None:
+            if prior["assessment"] != assessment:
+                raise RuntimeError("native reviewer already retained a different response")
+            return prior
+        response = {**context, "reviewer": row[1], "invocation_id": call_id,
+                    "completed_at": int(time.time() * 1000), "assessment": assessment}
+        conn.execute("update calls set artifact=json_set(artifact,'$.review_response',json(?)) where id=?",
+                     (json.dumps(response), call_id))
+        return response
+
+
+def retained_response() -> dict:
+    database, call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_DB"), os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database or not call_id:
+        raise RuntimeError("review response lacks its native invocation")
+    with sqlite3.connect(database, timeout=30) as conn:
+        row = conn.execute("select artifact from calls where id=? and status='running'", (call_id,)).fetchone()
+    response = json.loads(row[0] or "{}").get("review_response") if row else None
+    if not response:
+        raise RuntimeError("reviewer has not retained a substantive response")
+    return response
 # A transport error carries no status: the write may have landed before the
 # response was lost, so publication is uncertain, never a refused submission.
 _TRANSPORT_ERRORS = ("TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
@@ -65,7 +125,7 @@ def begin_submission(body: str, head: str) -> str:
     if not database or not call_id or not re.fullmatch(r"[0-9a-f]{32}", call_id):
         raise RuntimeError("managed review submission lacks its native receipt binding")
     with sqlite3.connect(database, timeout=30) as conn:
-        changed = conn.execute("update calls set artifact=json_patch(artifact,?) where id=? and status='running' and source='poise:behavior-chain' "
+        changed = conn.execute("update calls set artifact=json_patch(artifact,?) where id=? and status='running' and behavior in ('pr_review','pr_approve') "
                                "and coalesce(error_code,'') not in ('stopping','stopped') and json_extract(artifact,'$.phase')='reviewing'",
                                (json.dumps({"phase": "submitting_review", "expected_head": head}), call_id)).rowcount
         if changed != 1:
@@ -267,7 +327,14 @@ def parse(text: str) -> dict | None:
     # expected head later; it is not positive ownership evidence.
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
         return None
-    return {"action": reply["action"], "review_id": review_id, "head_sha": head_sha.lower()}
+    receipt = {"action": reply["action"], "review_id": review_id, "head_sha": head_sha.lower()}
+    if isinstance(reply.get("review_response"), dict):
+        response = reply["review_response"]
+        if response.get("head_sha") != head_sha.lower():
+            return None
+        receipt["review_response"] = response
+        receipt["submitted_at"] = reply.get("submitted_at")
+    return receipt
 
 
 def _comments(text: str) -> str | None:

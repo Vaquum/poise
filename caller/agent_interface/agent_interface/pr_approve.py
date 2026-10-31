@@ -9,7 +9,10 @@ SYSTEM = "Decide whether this PR can be approved. Use only permitted github-inte
 POLICY = (
     "Review the supplied immutable PR packet. Approve only if all requested changes "
     "are addressed and no new blocking issue was introduced. Otherwise call "
-    "request-changes exactly once with every blocking inline finding in one JSON array."
+    "request-changes exactly once with every blocking inline finding in one JSON array. "
+    "Every terminal review command includes --assessment-json with verdict (your substantive "
+    "assessment, 20-4000 characters), reviewed_context (what you inspected, 20-4000 characters), "
+    "and limitations (including unverified tests, 4-4000 characters). Acknowledgements do not qualify."
 )
 SEVERITY = (
     "p0: breaks a common path — data loss, crash, security hole, auth bypass.",
@@ -92,11 +95,11 @@ def allowed(pr: str, actor: str, expected_head: str, capped: bool = False) -> li
         token = f"--token-user {atoms.actor(actor)}"
         return [
             f"Bash(github-interface --create-pr-linked-issue {ref} --title * --body * {token})",
-            f"Bash(github-interface --approve-pr {ref} {fixed})",
+            f"Bash(github-interface --approve-pr {ref} --assessment-json * {fixed})",
         ]
     return [
-        f"Bash(github-interface --request-changes {ref} --comments-json * {fixed})",
-        f"Bash(github-interface --approve-pr {ref} {fixed})",
+        f"Bash(github-interface --request-changes {ref} --comments-json * --assessment-json * {fixed})",
+        f"Bash(github-interface --approve-pr {ref} --assessment-json * {fixed})",
     ]
 
 

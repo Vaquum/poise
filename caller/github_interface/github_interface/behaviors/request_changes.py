@@ -1,6 +1,7 @@
 from typing import Any
 
 from github_interface.atoms.review_identity import require_other_author
+from github_interface.atoms.review_response import response_body, submission_response
 from github_interface.atoms.pulls import (
     get_pull,
     list_inline_comments,
@@ -45,6 +46,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     reaffirmed = not accepted and _has_unresolved_finding(comments, threads)
     if not accepted and not reaffirmed:
         return {"action": "no_review", "repository": f"{owner}/{repo}", "pull_number": pull_number, "skipped": skipped}
+    response = submission_response(payload, pull, f"{owner}/{repo}", pull_number, required_head, actor) if payload.get("assessment") else None
     submitted = await submit_change_request(
         client,
         owner,
@@ -52,7 +54,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         pull_number,
         required_head,
         accepted,
-        REAFFIRM_BODY if reaffirmed else REVIEW_BODY,
+        response_body(response) if response else REAFFIRM_BODY if reaffirmed else REVIEW_BODY,
     )
     submitted_head = str(submitted.get("commit_id") or "").lower()
     submitted_actor = str((submitted.get("user") or {}).get("login") or "")
@@ -78,6 +80,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "skipped": skipped,
         "review_id": submitted.get("id"),
         "submitted_at": submitted.get("submitted_at"),
+        **({"review_response": response} if response else {}),
     }
 
 

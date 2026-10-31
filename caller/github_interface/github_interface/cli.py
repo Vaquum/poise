@@ -105,6 +105,12 @@ def main() -> None:
         except json.JSONDecodeError as error:
             raise SystemExit(f"error: requests-json is invalid JSON: {error}") from error
 
+    for option in ("assessment_json", "review_response_json"):
+        if payload.get(option):
+            try:
+                payload[option.removesuffix("_json")] = json.loads(payload.pop(option))
+            except json.JSONDecodeError as error:
+                raise SystemExit(f"error: {option} is invalid JSON: {error}") from error
     if payload.get("comments_json"):
         try:
             payload["comments"] = json.loads(payload.pop("comments_json"))
@@ -218,6 +224,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior == "--request-changes":
         parser = argparse.ArgumentParser(prog="github-interface --request-changes PR")
+        parser.add_argument("--assessment-json")
         source = parser.add_mutually_exclusive_group(required=True)
         source.add_argument("--comments", help="file containing a JSON array of inline review comments")
         source.add_argument("--comments-json", help="inline JSON array of review comments")
@@ -269,6 +276,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior in {"--approve-pr", "--reviewed-clean"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
+        parser.add_argument("--assessment-json", required=True)
         _add_expected_head(parser)
         _add_repository(parser)
         return parser
@@ -290,6 +298,8 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior in {"--merge-if-ready", "--update-branch-if-behind"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
+        if behavior == "--merge-if-ready":
+            parser.add_argument("--review-response-json")
         parser.add_argument("--author", required=True)
         _add_expected_head(parser)
         return parser

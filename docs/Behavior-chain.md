@@ -1,5 +1,16 @@
 # Native issue-to-merge behavior chain
 
+PR review and approval retain the configured reviewer's substantive verdict,
+reviewed context and limitations before submission. The existing native receipt
+binds that response and its actual completion time to its reviewer, model,
+invocation, repository, PR, head and context (base SHA, title and body). A changed
+head or context requires the existing fresh-review cycle. Approval metadata and
+another process using the same account cannot supply that invocation's response.
+Merge and queue admission revalidate the retained response against the current
+PR and its published review while preserving the normal CI and thread gates.
+A confirmed external merge is recorded separately: without qualifying pre-merge
+review evidence its review obligation remains open through journal recovery.
+
 Status: the native implementation completed the ten real cycles documented below. The admission cutover and GUI changes carry separate local regression proof; those historical cycles do not prove production cutover. Production execution remains disabled by default.
 
 The existing behavior scheduler consumes one durable journal in Poise's existing database. It admits one atomic invocation for a chain, records its native Caller correlation before starting a process, observes the resulting artifacts, and then decides the next behavior. A chain identifies an issue and its eventual PR; it is not a persistent Chat session or worker.
