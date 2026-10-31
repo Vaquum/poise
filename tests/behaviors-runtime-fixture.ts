@@ -352,7 +352,7 @@ function arrangeCli(
 function agentLog(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const behavior = String(overrides.behavior || 'pr_review')
   const completed = overrides.status === 'completed'
-  return {
+  const call: Record<string, unknown> = {
     id: 'f'.repeat(32),
     pr_id: String(pr.number),
     repo: pr.repo,
@@ -376,6 +376,15 @@ function agentLog(overrides: Record<string, unknown> = {}): Record<string, unkno
     error: '',
     ...overrides,
   }
+  if (completed && ['reviewed_clean', 'approved'].includes(String(call.action)) && call.head_sha && call.artifact === undefined) {
+    call.review_id ??= 91
+    call.artifact = { review_response: { repository: call.repo, pull_number: Number(call.pr_id), head_sha: call.head_sha,
+      context_sha: 'e'.repeat(64), reviewer: call.actor, model: call.model, invocation_id: call.id,
+      completed_at: Date.parse(String(call.completed_at)),
+      assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+        reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } } }
+  }
+  return call
 }
 
 function datastoreHealthOutput(): { stdout: string, stderr: string } {
@@ -410,6 +419,7 @@ function recordCompletedInitialReview(
     headSha?: string
     outcome?: 'clean' | 'changes_requested'
     callId?: string
+    response?: boolean
   } = {},
 ): void {
   const pull = options.pull ?? pr
@@ -442,6 +452,18 @@ function recordCompletedInitialReview(
   })
   if (!marked || !linked || !completed) {
     throw new Error('could not arrange completed initial review')
+  }
+  if (options.response !== false) {
+    const ended = Date.parse(options.completedAt ?? new Date(Date.now() - (10 * 60_000) - 1).toISOString())
+    const head = options.headSha ?? HEAD_SHA
+    agentLogs.push(agentLog({ id: callId, repo: pull.repo, pr_id: String(pull.number), correlation_id: claimId,
+      status: 'completed', outcome: options.outcome ?? 'clean', action: options.outcome === 'changes_requested' ? 'requested_changes' : 'reviewed_clean',
+      started_at: new Date(ended - 2000).toISOString(), started_at_precise: new Date(ended - 2000).toISOString(),
+      completed_at: new Date(ended).toISOString(), head_sha: head, expected_head: head, review_id: 91,
+      artifact: { review_response: { repository: pull.repo, pull_number: pull.number, head_sha: head, context_sha: 'e'.repeat(64),
+        reviewer: 'review-bot', model: 'opus-4.7-max', invocation_id: callId, completed_at: ended - 1000,
+        assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+          reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } } } }))
   }
 }
 

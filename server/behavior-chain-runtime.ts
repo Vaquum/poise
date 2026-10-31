@@ -256,7 +256,7 @@ export class BehaviorChainRuntime {
       const review = observation.pull.reviewReceipts.find((receipt) => receipt.invocation === nativeId && receipt.head === expected)
       const action = review?.state === 'APPROVED' ? 'approved' : review?.state === 'CHANGES_REQUESTED' ? 'requested_changes' : review?.state === 'COMMENTED' ? 'reviewed_clean' : null
       if (review && action && chainReviewResponse(chain, { ...invocation, callId: nativeId,
-        evidence: { ...invocation.evidence, review_id: review.id } }, observation, Date.now())) {
+        evidence: { ...invocation.evidence, action, review_id: review.id } }, observation, Date.now())) {
         const outcome = action === 'approved' ? 'approved' : action === 'requested_changes' ? 'changes_requested' : 'clean'
         this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: nativeId, outcome,
           evidence: { ...invocation.evidence, status: 'completed', action, outcome, review_id: review.id, head_sha: review.head,

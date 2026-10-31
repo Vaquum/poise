@@ -14,7 +14,16 @@ it('requires the substantive response from the original invocation and actual fi
   for (const invalid of [null, {}, { ...response, assessment: null }, { ...response, completed_at: NOW + 1 },
     { ...response, completed_at: NOW - 3000 }, { ...response, invocation_id: 'd'.repeat(32) },
     { ...response, context_sha: 'd'.repeat(64) }, { ...response, head_sha: 'd'.repeat(40) },
+    { ...response, model: 'unconfigured-model' },
     { ...response, assessment: { ...response.assessment, verdict: 'Reviewed: no blocking findings.' } }]) {
     expect(validReviewResponse(invalid, target, NOW)).toBe(false)
   }
+})
+
+it('accepts only the configured recovery identity for the same invocation', () => {
+  const recovered = { ...response, model: 'configured-recovery' }
+  expect(validReviewResponse(recovered, target, NOW)).toBe(false)
+  expect(validReviewResponse(recovered, { ...target, recoveryModel: 'configured-recovery' }, NOW)).toBe(true)
+  expect(validReviewResponse({ ...response, assessment: { ...response.assessment, verdict: ' Reviewed: no blocking findings. ' } }, target, NOW)).toBe(false)
+  expect(validReviewResponse({ ...response, assessment: { ...response.assessment, limitations: '😀'.repeat(4000) } }, target, NOW)).toBe(true)
 })

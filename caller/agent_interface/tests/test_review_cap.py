@@ -12,6 +12,7 @@ from agent_interface import review_budget, review_receipt
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 
+ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 HEAD = "c" * 40
 BASE = "b" * 40
 FINDING = {"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "Crashes on empty input."}
@@ -53,8 +54,8 @@ class TestCappedApprovalTools(TestCase):
         self.assertEqual(
             pr_approve.allowed("#12", "bit-mis", HEAD),
             ["Bash(github-interface --request-changes '#12' --comments-json * "
-             f"--expected-head {HEAD} --token-user bit-mis)",
-             f"Bash(github-interface --approve-pr '#12' --expected-head {HEAD} --token-user bit-mis)"])
+             f"--assessment-json * --expected-head {HEAD} --token-user bit-mis)",
+             f"Bash(github-interface --approve-pr '#12' --assessment-json * --expected-head {HEAD} --token-user bit-mis)"])
 
     def test_capped_tools_file_an_issue_and_approve(self):
         tools = pr_approve.allowed("#12", "bit-mis", HEAD, capped=True)
@@ -69,6 +70,8 @@ class TestCappedApprovalTools(TestCase):
 
     def test_capped_prompt_names_the_round_issue_and_approval(self):
         self.assertIn("round 5 of a 5-round cap", pr_approve.capped_policy(5, 5))
+        self.assertIn('--assessment-json with a JSON object', pr_approve.capped_policy(5, 5))
+        self.assertIn('limitations (including unverified tests, 4-4000 characters)', pr_approve.capped_policy(5, 5))
         rules = pr_approve.capped_rules("o/r", "#12", HEAD, 5, 5, "bit-mis")
         text = "\n".join(rules)
         self.assertIn(followup.marker("12", HEAD), text)
@@ -192,7 +195,7 @@ class TestStructuredCappedConversion(TestCase):
             seen.append(args[1])
             return issue_reply() if args[1] == "--create-pr-linked-issue" else approval_reply()
 
-        result, _ = self._run({"action": "request_changes", "comments": [FINDING]}, github)
+        result, _ = self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}, github)
         self.assertEqual(seen, ["--create-pr-linked-issue", "--approve-pr"])
         self.assertIn("issue #8 (https://github.com/o/r/issues/8)", result)
         self.assertIn("round 5 of 5", result)
@@ -209,7 +212,7 @@ class TestStructuredCappedConversion(TestCase):
                 return issue_reply()
             return approval_reply()
 
-        self._run({"action": "request_changes", "comments": [FINDING]}, github)
+        self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}, github)
         self.assertEqual(bodies["title"], "Review follow-up for o/r#12 (round 5)")
         self.assertIn(followup.marker("12", HEAD), bodies["body"])
         self.assertIn("Crashes on empty input.", bodies["body"])
@@ -222,7 +225,7 @@ class TestStructuredCappedConversion(TestCase):
             seen.append(args[1])
             return approval_reply()
 
-        result, _ = self._run({"action": "approve", "comments": []}, github)
+        result, _ = self._run({"assessment": ASSESSMENT, "action": "approve", "comments": []}, github)
         self.assertEqual(seen, ["--approve-pr"])
         self.assertNotIn("round 5 of 5", result)
 
@@ -235,7 +238,7 @@ class TestStructuredCappedConversion(TestCase):
                 return issue_reply()
             return approval_reply()
 
-        self._run({"action": "request_changes", "comments": [REMOVED_FINDING]}, github)
+        self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [REMOVED_FINDING]}, github)
         self.assertIn(f"/blob/{BASE}/src/old.py#L9", bodies["body"])
         self.assertIn("(LEFT,", bodies["body"])
 
@@ -247,7 +250,7 @@ class TestStructuredCappedConversion(TestCase):
             raise AssertionError("no GitHub call may precede the packet check")
 
         with self.assertRaises(review_budget.ReviewLimitError) as failure:
-            self._run({"action": "request_changes", "comments": [FINDING]}, github, packet=packet)
+            self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}, github, packet=packet)
         self.assertEqual(failure.exception.code, "review_contract_violation")
 
     def test_capped_replay_reuses_the_marked_issue(self):
@@ -258,7 +261,7 @@ class TestStructuredCappedConversion(TestCase):
             return approval_reply()
 
         packet = packet_with_issue(f"findings\n\n{followup.marker('12', HEAD)}\n")
-        result, _ = self._run({"action": "request_changes", "comments": [FINDING]}, github, packet=packet)
+        result, _ = self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}, github, packet=packet)
         self.assertEqual(seen, ["--approve-pr"])
         self.assertIn("issue #7 (https://github.com/o/r/issues/7)", result)
 
@@ -272,7 +275,7 @@ class TestStructuredCappedConversion(TestCase):
             return approval_reply()
 
         with self.assertRaises(review_budget.ReviewLimitError) as failure:
-            self._run({"action": "request_changes", "comments": [FINDING]}, github)
+            self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}, github)
         self.assertEqual(failure.exception.code, "review_contract_violation")
         self.assertEqual(seen, ["--create-pr-linked-issue"])
 
@@ -284,6 +287,6 @@ class TestStructuredCappedConversion(TestCase):
             return SimpleNamespace(returncode=0, stdout=json.dumps(
                 {"action": "requested_changes", "review_id": 92, "head_sha": HEAD}), stderr="")
 
-        self._run({"action": "request_changes", "comments": [FINDING]}, github, capped=False,
+        self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}, github, capped=False,
                   review_round=None, review_cap=None)
         self.assertEqual(seen, ["--request-changes"])

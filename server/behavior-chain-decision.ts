@@ -48,15 +48,17 @@ export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvoc
   const evidence = invocation.evidence
   const artifact = evidence?.artifact as Record<string, unknown> | null
   const response = artifact?.review_response
+  const recoveryIndex = invocation.request.argv.indexOf('--recovery-model')
   const review = pull?.reviewReceipts.find((item) => item.id === evidence?.review_id && item.invocation === invocation.callId
-    && item.head === pull.head && item.state !== 'DISMISSED' && item.state !== 'PENDING')
+    && item.head === pull.head && item.state === ({ reviewed_clean: 'COMMENTED', approved: 'APPROVED', requested_changes: 'CHANGES_REQUESTED' } as Record<string, string>)[String(evidence?.action)])
   if (!pull || !evidence || !review || !invocation.callId || !invocation.model || !pull.reviewContext
     || !validReviewResponse(response, { repository: chain.repository, number: pull.number, head: pull.head,
       actor: invocation.actor, callId: invocation.callId, model: invocation.model, context: pull.reviewContext,
+      recoveryModel: recoveryIndex >= 0 ? invocation.request.argv[recoveryIndex + 1] : null,
       startedAt: invocation.admittedAt, completedAt: Number(evidence.completedAt) }, now)
-    || chainBasis(response) !== chainBasis(review.response) || typeof review.submittedAt !== 'number'
+    || chainBasis(response) !== chainBasis(review.response) || typeof review.submittedAt !== 'number' || !Number.isFinite(review.submittedAt)
     || response.completed_at > review.submittedAt + 999 || review.submittedAt > now) return null
-  if (pull.merged && (typeof pull.mergedAt !== 'number' || response.completed_at > pull.mergedAt || review.submittedAt > pull.mergedAt)) return null
+  if (pull.merged && (typeof pull.mergedAt !== 'number' || !Number.isFinite(pull.mergedAt) || response.completed_at > pull.mergedAt || review.submittedAt > pull.mergedAt)) return null
   return response
 }
 
@@ -101,6 +103,7 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   const pending = chain.invocations.find((invocation) => invocation.state !== 'settled')
   if (pending) return { kind: 'wait', reason: `${pending.behavior} is ${pending.state}; its native outcome must settle first` }
   const pull = observation.pull
+  if (!Number.isFinite(observation.checkedAt) || now - observation.checkedAt > 120_000 || observation.checkedAt > now) return { kind: 'wait', reason: 'behavior observations need refreshing' }
   if (pull?.merged && pull.mergeSha && /^[0-9a-f]{40}$/i.test(pull.mergeSha)) {
     const basis = chainBasis(['pr', pull.head, pull.reviewContext])
     if (!observation.prReviewers.length || observation.prReviewers.some((reviewer) =>
@@ -110,7 +113,6 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     return { kind: 'complete', mergeSha: pull.mergeSha }
   }
   if (chain.held) return { kind: 'wait', reason: chain.held }
-  if (now - observation.checkedAt > 120_000 || observation.checkedAt > now) return { kind: 'wait', reason: 'behavior observations need refreshing' }
   if (!observation.issue.open && !pull) return { kind: 'hold', reason: 'seed issue closed without a confirmed merged pull request' }
   if (pull && pull.state !== 'open') return { kind: 'hold', reason: 'pull request closed without a confirmed merge' }
   if (pull?.draft) return { kind: 'wait', reason: 'pull request is a draft' }

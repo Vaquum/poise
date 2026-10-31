@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RunFileOptions } from '../server/process'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
+import { chainBasis } from '../server/behavior-chain-store'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), spawnDetached: vi.fn(),
   captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn() }))
@@ -34,6 +35,23 @@ let behindNumbers = new Set<number>()
 let approvedAts: Record<number, string | null> = {}
 let unreadableNumbers = new Set<number>()
 let batchGate: { reached: () => void, wait: Promise<void> } | null = null
+let logOverrides: Record<string, unknown> | null = null
+
+function reviewLog(pr: Record<string, unknown>) {
+  const now = Date.now()
+  const id = chainBasis([pr.repo, pr.number]).slice(0, 32)
+  const actor = pr.author === 'octocat' ? 'review-bot' : 'octocat'
+  const head = heads[Number(pr.number)] ?? HEAD
+  return { id, repo: pr.repo, pr_id: String(pr.number), actor, model: 'fixture', behavior: 'pr_review',
+    session_id: null, prompt: '', started_at: new Date(now - 2000).toISOString(), completed_at: new Date(now).toISOString(),
+    time_elapsed: '2s', status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 91,
+    head_sha: head, expected_head: head, source: 'poise:review-new-prs', correlation_id: `review-${id}`, response: null, error: '',
+    artifact: { review_response: { repository: pr.repo, pull_number: pr.number, reviewer: actor, model: 'fixture',
+      invocation_id: id, head_sha: head, context_sha: 'b'.repeat(64), completed_at: now - 1000,
+      assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+        reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } } },
+    ...logOverrides }
+}
 
 function pull(repo = REPO, number = 7, fields: Record<string, unknown> = {}) {
   return { repo, number, url: `https://github.com/${repo}/pull/${number}`, status: 'open', draft: 0, author: 'octocat', updated_at: '2026-07-15T12:00:00Z', ...fields }
@@ -47,6 +65,7 @@ function updateCalls() {
 async function cli(command: string, args: string[], options: RunFileOptions) {
   const json = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' })
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
+  if (command === 'agent-interface' && args[0] === '--logs') return json(pulls.map(reviewLog))
   if (command === 'github-datastore' && args.includes('health')) {
     if (healthError) throw healthError
     const now = new Date().toISOString()
@@ -55,7 +74,7 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
       last_sync_at: now, last_success_at: now, checked_at: now })
   }
   if (command === 'github-datastore' && args.includes('view')) return json(pulls)
-  const parts = options.cwd?.split('/') ?? []
+  const parts = options.cwd?.split(/[\\/]/) ?? []
   const repo = `${parts.at(-2)}/${parts.at(-1)}`
   const number = Number(args[1]?.slice(1))
   if (command === 'github-interface' && args[0] === '--merge-candidates') {
@@ -90,7 +109,7 @@ beforeEach(async () => {
   pulls = [pull()]
   outcome = 'merged'; updateOutcome = 'updated'; error = null; healthError = null; response = {}; batchGate = null
   readyNumbers = null; behindNumbers = new Set(); approvedAts = {}; unreadableNumbers = new Set()
-  queuedEntries = {}; heads = {}
+  queuedEntries = {}; heads = {}; logOverrides = null
   mocks.runFile.mockReset().mockImplementation(cli)
   mocks.spawnDetached.mockReset()
   vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -121,6 +140,16 @@ async function heldBatch() {
 }
 
 describe('Merge Pull Requests', () => {
+  it.each([{ artifact: null }, { status: 'running', action: null, outcome: null, head_sha: null, completed_at: null },
+    { expected_head: 'c'.repeat(40) }, { head_sha: 'c'.repeat(40) }])('retains the review obligation without a substantive completed final-head invocation: %j', async (overrides) => {
+    enable(); logOverrides = overrides
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toEqual([])
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(runtime.getMergePrsLastFired()).toBeNull()
+  })
+
   it('starts off and does no external work until enabled', async () => {
     expect(runtime.getEnabledMap()['merge-prs']).toBe(false)
     await runtime.runEnabledBehaviorsOnce()
@@ -131,7 +160,7 @@ describe('Merge Pull Requests', () => {
     await runtime.setEnabled('merge-prs', true)
     await runtime.runEnabledBehaviorsOnce()
     expect(mergeCalls()[0]![1]).toEqual(['--merge-if-ready', '#7', '--expected-head', HEAD,
-      '--author', 'octocat', '--token-user', 'review-bot'])
+      '--review-response-json', expect.any(String), '--author', 'octocat', '--token-user', 'review-bot'])
     expect(runtime.getMergePrsLastFired()).toEqual({ at: expect.any(String), target: `${REPO}#7` })
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
     expect(mocks.spawnDetached).not.toHaveBeenCalled()

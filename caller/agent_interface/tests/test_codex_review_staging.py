@@ -9,6 +9,7 @@ from agent_interface import atoms, structured_review
 from agent_interface.model_catalog import CATALOG
 
 
+ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 THREAD = "01234567-89ab-4cde-8123-456789abcdef"
 LIMIT = 4096
 
@@ -23,7 +24,7 @@ class TestCodexReviewStaging(TestCase):
             timeouts.append(kwargs["timeout"])
             schema = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
             stage = schema["properties"].get("received", {}).get("enum", [None])[0]
-            result = {"received": stage} if stage else {"action": "approve", "comments": []}
+            result = {"received": stage} if stage else {"assessment": ASSESSMENT, "action": "approve", "comments": []}
             thread = THREAD
             events = [{"type": "thread.started", "thread_id": thread}]
             if failure == "wrong_ack" and stage:
@@ -31,7 +32,7 @@ class TestCodexReviewStaging(TestCase):
             if failure == "boolean_ack" and stage:
                 result = {"received": True}
             if failure == "early_verdict" and stage:
-                result = {"action": "approve", "comments": []}
+                result = {"assessment": ASSESSMENT, "action": "approve", "comments": []}
             if failure == "missing_thread" and stage:
                 events = []
             if failure == "changed_thread" and not stage:

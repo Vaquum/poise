@@ -5,19 +5,22 @@ from unittest.mock import AsyncMock, patch
 
 from github_interface import cli, interface
 from github_interface.behaviors import merge_if_ready
+from review_response_fixture import published_review, response
 
 HEAD = 'a' * 40
 PULL = {'state': 'open', 'draft': False, 'mergeable': True, 'mergeable_state': 'clean',
-        'head': {'sha': HEAD}, 'user': {'login': 'octocat'}, 'merged': False}
+        'head': {'sha': HEAD}, 'user': {'login': 'octocat'}, 'merged': False,
+        'base': {'sha': 'b' * 40}, 'title': 'Fix review ordering', 'body': 'Retain final-context review responses.'}
 READY = {'state': 'OPEN', 'isDraft': False, 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN',
          'headRefOid': HEAD, 'commits': {'nodes': [{'commit': {'statusCheckRollup': {'state': 'SUCCESS'}}}]},
          'reviewThreads': {'nodes': [], 'pageInfo': {'hasNextPage': False}}}
 PAYLOAD = {'repository': 'acme/app', 'pr': '#7', 'expected_head': HEAD, 'author': 'octocat', 'token_user': 'review-bot'}
+PAYLOAD['review_response'] = response(PULL)
 
 
 class TestMergeIfReady(IsolatedAsyncioTestCase):
     async def test_account_approval_without_retained_response_cannot_merge(self):
-        result = await merge_if_ready.run(self.client, PAYLOAD)
+        result = await merge_if_ready.run(self.client, {key: value for key, value in PAYLOAD.items() if key != 'review_response'})
         self.assertEqual(result['outcome'], 'not_ready')
         self.assertIn('substantive', result['reason'])
         self.client.request.assert_not_awaited()
@@ -26,6 +29,7 @@ class TestMergeIfReady(IsolatedAsyncioTestCase):
         self.client = AsyncMock()
         self.client.get.return_value = {'allow_squash_merge': True, 'allow_merge_commit': True}
         self.client.request.return_value = {'merged': True, 'sha': 'b' * 40}
+        self.client.paginate.return_value = [published_review(PAYLOAD['review_response'])]
         self.pull = deepcopy(PULL)
         self.ready = deepcopy(READY)
         self.pulls = AsyncMock(side_effect=lambda *_: deepcopy(self.pull))
@@ -45,6 +49,28 @@ class TestMergeIfReady(IsolatedAsyncioTestCase):
                                                     json={'sha': HEAD, 'merge_method': 'squash'})
         self.assertEqual(self.pulls.await_count, 2)
         self.readiness.assert_awaited_once()
+
+    async def test_stale_late_unbound_or_empty_responses_cannot_merge(self):
+        for changes in ({'head_sha': 'd' * 40}, {'context_sha': 'd' * 64}, {'repository': 'other/repo'},
+                        {'pull_number': 8}, {'reviewer': 'other'}, {'invocation_id': None},
+                        {'completed_at': 10 ** 15}, {'assessment': {}}, {'invocation_id': 'd' * 32}):
+            with self.subTest(changes=changes):
+                payload = {**PAYLOAD, 'review_response': {**PAYLOAD['review_response'], **changes}}
+                self.assertEqual((await merge_if_ready.run(self.client, payload))['outcome'], 'not_ready')
+                self.client.request.assert_not_awaited()
+
+    async def test_same_account_empty_or_different_process_review_is_not_adopted(self):
+        review = published_review(PAYLOAD['review_response'])
+        for changed in ({**review, 'body': ''}, {**review, 'body': review['body'].replace('c' * 32, 'd' * 32)},
+                        {**review, 'submitted_at': '2000-01-01T00:00:00Z'}):
+            self.client.paginate.return_value = [changed]
+            self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'not_ready')
+            self.client.request.assert_not_awaited()
+
+    async def test_context_change_at_final_read_invalidates_response(self):
+        self.pulls.side_effect = [PULL, {**PULL, 'base': {'sha': 'd' * 40}}]
+        self.assertEqual((await merge_if_ready.run(self.client, PAYLOAD))['outcome'], 'not_ready')
+        self.client.request.assert_not_awaited()
 
     async def test_selects_only_a_repository_allowed_method(self):
         for config, expected in [({'allow_merge_commit': True}, 'merge'), ({'allow_rebase_merge': True}, 'rebase')]:
@@ -144,4 +170,4 @@ class TestMergeCli(TestCase):
                                 '--author', 'octocat', '--token-user', 'review-bot']), \
                 patch.object(cli, 'merge_if_ready', operation), patch('sys.stdout', StringIO()):
             cli.main()
-        operation.assert_awaited_once_with({k: v for k, v in PAYLOAD.items() if k != 'repository'})
+        operation.assert_awaited_once_with({k: v for k, v in PAYLOAD.items() if k not in {'repository', 'review_response'}})

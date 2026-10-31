@@ -389,7 +389,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             # which has no requests property at all.
             return raw, validate_verdict(raw, behavior)
         if not isinstance(step, dict) or set(step) != {"action", "comments", "assessment", "requests"}:
-            raise InvalidVerdict("review step must contain action, comments, and requests")
+            raise InvalidVerdict("review step must contain action, comments, assessment and requests")
         requests = step["requests"]
         if not isinstance(requests, list):
             raise InvalidVerdict("review requests must be an array")
@@ -440,7 +440,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             root = Path(work)
             deadline = monotonic() + timeout_s
             prior: list[dict] = []
-            assessments: list[dict] = []
+            assessment: dict | None = None
             for index, stage_text in enumerate(_stage_texts(text, packet)):
                 _admit(stage_text)
                 if staged:
@@ -448,16 +448,18 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     if prior:
                         stage_text += ("\n\nFindings already recorded in earlier file groups "
                                        "(do not repeat them):\n" + json.dumps(prior))
+                    if assessment is not None:
+                        stage_text += ("\n\nCumulative assessment from the earlier file groups:\n" + json.dumps(assessment)
+                                       + "\nUpdate this assessment with the current group's evidence. Your terminal assessment "
+                                       "must cover every group reviewed so far and remain within the schema bounds.")
                 raw, verdict = _review_once(root, ask, model, system, stage_text, watch,
                                              timeout_s, deadline, repository, behavior)
                 prior.extend(verdict["comments"])
-                assessments.append(verdict["assessment"])
+                assessment = verdict["assessment"]
             if staged:
                 terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
                 verdict = validate_verdict(json.dumps(
-                    {"action": "request_changes" if prior else terminal, "comments": prior,
-                     "assessment": {key: "\n\n".join(dict.fromkeys(value[key] for value in assessments))
-                                    for key in ("verdict", "reviewed_context", "limitations")}}), behavior)
+                    {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}), behavior)
                 raw = json.dumps(verdict)
             _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
     except review_stages.StageError as error:
@@ -500,7 +502,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     if verdict["action"] == "request_changes":
         args.extend(["--comments-json", json.dumps(verdict["comments"])])
     review_receipt.complete_response(verdict["assessment"], head)
-    args.extend(["--assessment-json", json.dumps(verdict["assessment"])])
+    args.extend(["--assessment-json", json.dumps(verdict["assessment"], ensure_ascii=False)])
     limit = review_budget.timeout(600)
     progress.stage("submitting", "Submitting GitHub review", timeout=limit)
     try:

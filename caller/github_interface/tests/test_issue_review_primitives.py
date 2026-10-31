@@ -13,6 +13,8 @@ from github_interface import cli
 from github_interface.atoms import local
 from github_interface.atoms.local import checkout_repo
 from github_interface.behaviors import issue_comments, sub_issues
+from github_interface.behaviors import reviewed_clean
+from review_response_fixture import ASSESSMENT
 
 PRD = """## Objective
 
@@ -31,6 +33,23 @@ See #455.
 
 #456 is only a risk.
 """
+
+
+class TestSubstantiveCleanReview(IsolatedAsyncioTestCase):
+    async def test_fixed_clean_acknowledgement_is_not_review_evidence(self):
+        client = AsyncMock()
+        client.get.return_value = {'state': 'open', 'draft': False, 'user': {'login': 'author'},
+                                   'head': {'sha': 'a' * 40}, 'base': {'sha': 'b' * 40}, 'title': 'Ordering', 'body': ''}
+        payload = {'repository': 'o/r', 'pr': '7', 'expected_head': 'a' * 40, 'token_user': 'reviewer'}
+        for value in (None, {**ASSESSMENT, 'verdict': reviewed_clean.REVIEW_BODY}):
+            with self.assertRaises(ValueError):
+                await reviewed_clean.run(client, {**payload, 'assessment': value})
+            client.post.assert_not_awaited()
+        client.post.return_value = {'id': 91, 'state': 'COMMENTED', 'commit_id': 'a' * 40,
+                                    'user': {'login': 'reviewer'}, 'submitted_at': '2026-10-31T00:00:00Z'}
+        result = await reviewed_clean.run(client, {**payload, 'assessment': ASSESSMENT})
+        self.assertEqual(result['review_response']['assessment'], ASSESSMENT)
+        self.assertIn(ASSESSMENT['verdict'], client.post.call_args.kwargs['json']['body'])
 
 
 class FakeClient:

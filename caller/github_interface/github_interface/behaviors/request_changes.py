@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 from github_interface.atoms.review_identity import require_other_author
@@ -46,7 +47,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     reaffirmed = not accepted and _has_unresolved_finding(comments, threads)
     if not accepted and not reaffirmed:
         return {"action": "no_review", "repository": f"{owner}/{repo}", "pull_number": pull_number, "skipped": skipped}
-    response = submission_response(payload, pull, f"{owner}/{repo}", pull_number, required_head, actor) if payload.get("assessment") else None
+    response = submission_response(payload, pull, f"{owner}/{repo}", pull_number, required_head, actor) \
+        if payload.get("assessment") or os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") else None
     submitted = await submit_change_request(
         client,
         owner,

@@ -44,6 +44,9 @@ def capped_policy(review_round: int, review_cap: int) -> str:
         f"This is review round {review_round} of a {review_cap}-round cap: the final round. "
         "Review the supplied immutable PR packet as usual. Do NOT request changes: file "
         "every blocking finding as ONE follow-up issue, then approve exactly once."
+        " Pass --assessment-json with a JSON object: verdict (your substantive assessment, "
+        "20-4000 characters), reviewed_context (what you inspected, 20-4000 characters), "
+        "and limitations (including unverified tests, 4-4000 characters)."
     )
 
 

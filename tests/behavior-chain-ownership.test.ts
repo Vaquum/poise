@@ -18,3 +18,14 @@ it('reserves the native branch before publication is observed and refuses Chat t
   expect(bindWorkAuto('fixture', 'chat', 'https://github.com/Example/Repo/pull/37', identity)).toBeNull()
   expect(bindings('fixture')).toHaveLength(0)
 })
+
+it('keeps the seed obligation owned after a confirmed merge without qualifying pre-merge review evidence', () => {
+  const journal = behaviorChainJournal()
+  const chain = journal.append('example/repo#8', 'seed-eight', 0, { type: 'chain.admitted',
+    repository: 'Example/Repo', issue: 8, branch: 'poise/issue-8', author: 'author', reviewer: 'reviewer' })
+  journal.append(chain.id, 'merged-eight', chain.sequence, { type: 'chain.merged', mergeSha: 'a'.repeat(40),
+    evidence: { repository: chain.repository, pull_number: 38, merged: true, merge_sha: 'a'.repeat(40), review_complete: false } })
+  expect(behaviorChainOwner(chain.repository, 8, 'issues')).toBe(chain.id)
+  journal.rebuild()
+  expect(behaviorChainOwner(chain.repository, 8, 'issues')).toBe(chain.id)
+})

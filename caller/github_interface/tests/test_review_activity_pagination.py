@@ -35,7 +35,7 @@ class ScriptedClient:
 
 class TestReviewActivityPagination(IsolatedAsyncioTestCase):
     async def test_each_connection_uses_its_own_continuation_without_refetching_first_pages(self):
-        first = {"state": "OPEN", "isDraft": False, "headRefOid": HEAD,
+        first = {"state": "OPEN", "isDraft": False, "headRefOid": HEAD, "baseRefOid": 'b' * 40, "title": 'Review ordering', "body": '',
                  "updatedAt": "2026-09-17T10:00:00Z",
                  "reviewRequests": page([{"requestedReviewer": {"login": "first"}}], "requests-1"),
                  "reviews": page([{"id": "review-1"}], "reviews-1"),
@@ -49,7 +49,7 @@ class TestReviewActivityPagination(IsolatedAsyncioTestCase):
         ])
         result = await get_review_activity(client, "owner", "repo", 7)
         self.assertEqual(result, {
-            "state": "OPEN", "isDraft": False, "headRefOid": HEAD, "updatedAt": first["updatedAt"],
+            "state": "OPEN", "isDraft": False, "headRefOid": HEAD, "baseRefOid": 'b' * 40, "title": 'Review ordering', "body": '', "updatedAt": first["updatedAt"],
             "reviewRequests": [{"requestedReviewer": {"login": name}} for name in ("first", "second")],
             "reviews": [{"id": f"review-{number}"} for number in (1, 2, 3)],
             "reviewThreads": [
@@ -77,7 +77,7 @@ class TestReviewActivityPagination(IsolatedAsyncioTestCase):
     async def test_missing_pull_and_failed_continuation_fail_visibly(self):
         with self.assertRaisesRegex(ValueError, "pull request not found"):
             await get_review_activity(ScriptedClient([("reviewRequests", None, None)]), "owner", "repo", 7)
-        first = {"state": "OPEN", "isDraft": False, "headRefOid": HEAD, "updatedAt": "now",
+        first = {"state": "OPEN", "isDraft": False, "headRefOid": HEAD, "baseRefOid": 'b' * 40, "title": 'Review ordering', "body": '', "updatedAt": "now",
                  "reviewRequests": page([], "next"), "reviews": page([]), "reviewThreads": page([])}
         client = ScriptedClient([("reviewRequests", None, first),
                                  ("reviewRequests", "next", RuntimeError("rate limited"))])

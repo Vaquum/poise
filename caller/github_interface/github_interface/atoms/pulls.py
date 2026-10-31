@@ -313,6 +313,9 @@ query($owner: String!, $repo: String!, $number: Int!) {{
       state
       isDraft
       headRefOid
+      baseRefOid
+      title
+      body
       updatedAt
       reviewRequests(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
@@ -342,7 +345,7 @@ async def get_review_activity(
         REVIEW_ACTIVITY_QUERY, {"owner": owner, "repo": repo, "number": pull_number},
     )
     first = _required_pull(data, pull_number)
-    pull = {key: first[key] for key in ("state", "isDraft", "headRefOid", "updatedAt")}
+    pull = {key: first[key] for key in ("state", "isDraft", "headRefOid", "baseRefOid", "title", "body", "updatedAt")}
     pull["reviewRequests"] = await _pull_nodes(
         client, owner, repo, pull_number, "reviewRequests", REVIEW_REQUEST_FIELDS, first["reviewRequests"],
     )

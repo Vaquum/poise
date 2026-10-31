@@ -1,7 +1,7 @@
 from typing import Any
 
 from github_interface.atoms.pulls import enqueue_pull_request, get_pr_readiness_state, get_pull, list_reviews
-from github_interface.atoms.review_response import matches_review, qualifying_response
+from github_interface.atoms.review_response import context_sha, matches_review, qualifying_response
 from github_interface.behaviors.mergeable import QUEUE_ADMISSIBLE, queue_enabled, readiness_status, status
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head
@@ -52,7 +52,9 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     response = payload.get("review_response")
     actor = str(payload.get("token_user") or "")
     if not qualifying_response(response, pull, f"{owner}/{repo}", number, head, actor):
-        return {**result, "reason": "completed substantive final-context review response required"}
+        return {**result, "reason": "completed substantive final-context review response required", "review_context": context_sha(pull)}
+    if not any(matches_review(response, review) for review in await list_reviews(client, owner, repo, number)):
+        return {**result, "reason": "final-context review response is unverified", "review_context": context_sha(pull)}
 
     if queued:
         pull = await get_pull(client, owner, repo, number)
@@ -65,9 +67,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         pull_id = readiness.get("id")
         if not isinstance(pull_id, str) or not pull_id:
             raise RuntimeError("GitHub returned no pull request node ID for queue admission")
-        if not qualifying_response(response, pull, f"{owner}/{repo}", number, head, actor) \
-                or not any(matches_review(response, review) for review in await list_reviews(client, owner, repo, number)):
-            return {**result, "reason": "final-context review response is unverified"}
+        if not qualifying_response(response, pull, f"{owner}/{repo}", number, head, actor):
+            return {**result, "reason": "final-context review response is unverified", "review_context": context_sha(pull)}
         entry = await enqueue_pull_request(client, pull_id, head)
         return {**result, "outcome": "enqueued", "queue_entry_id": entry["id"]}
 
@@ -84,9 +85,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         return {**result, "outcome": "superseded"}
     if status(pull, None, 0) != "green" or str((pull.get("user") or {}).get("login") or "").lower() != author.lower():
         return result
-    if not qualifying_response(response, pull, f"{owner}/{repo}", number, head, actor) \
-            or not any(matches_review(response, review) for review in await list_reviews(client, owner, repo, number)):
-        return {**result, "reason": "final-context review response is unverified"}
+    if not qualifying_response(response, pull, f"{owner}/{repo}", number, head, actor):
+        return {**result, "reason": "final-context review response is unverified", "review_context": context_sha(pull)}
     merged = await client.request(
         "PUT", f"/repos/{owner}/{repo}/pulls/{number}/merge",
         json={"sha": head, "merge_method": method},

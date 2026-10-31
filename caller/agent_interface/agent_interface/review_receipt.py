@@ -25,6 +25,13 @@ _failure: ContextVar[str | None] = ContextVar("review_submission_failure", defau
 _conflict: ContextVar[dict | None] = ContextVar("review_receipt_conflict", default=None)
 _blocked: ContextVar[str | None] = ContextVar("review_submission_blocked", default=None)
 _refused: ContextVar[dict | None] = ContextVar("review_submission_refused", default=None)
+# A transport error carries no status: the write may have landed before the
+# response was lost, so publication is uncertain, never a refused submission.
+_TRANSPORT_ERRORS = ("TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
+                     "ConnectError", "ReadError", "WriteError", "CloseError",
+                     "RemoteProtocolError", "LocalProtocolError")
+_QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-remaining",
+                  "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
 
 
 def prepare_response(packet: str, model: str) -> None:
@@ -46,6 +53,13 @@ def prepare_response(packet: str, model: str) -> None:
 
 def complete_response(assessment: dict, head: str) -> dict | None:
     """Retain the actual response and time before the terminal command runs."""
+    if not isinstance(assessment, dict) or set(assessment) != {"verdict", "reviewed_context", "limitations"}:
+        raise ValueError("review response requires a substantive assessment")
+    for key, minimum in (("verdict", 20), ("reviewed_context", 20), ("limitations", 4)):
+        if not isinstance(assessment[key], str) or not minimum <= len(assessment[key].strip()) <= 4000:
+            raise ValueError(f"invalid review assessment {key}")
+    if assessment["verdict"].strip() == "Reviewed: no blocking findings.":
+        raise ValueError("fixed acknowledgement is not a substantive assessment")
     bound = _call.get()
     database = os.environ.get("AGENT_INTERFACE_RECEIPT_DB")
     call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
@@ -64,13 +78,17 @@ def complete_response(assessment: dict, head: str) -> dict | None:
             raise RuntimeError("review response lacks its pinned review context")
         prior = artifact.get("review_response")
         if prior is not None:
-            if prior["assessment"] != assessment:
-                raise RuntimeError("native reviewer already retained a different response")
-            return prior
+            if prior["assessment"] == assessment and all(prior.get(key) == value for key, value in context.items()):
+                return prior
+            if artifact.get("phase") != "reviewing":
+                raise RuntimeError("native reviewer already submitted a different response")
         response = {**context, "reviewer": row[1], "invocation_id": call_id,
                     "completed_at": int(time.time() * 1000), "assessment": assessment}
         conn.execute("update calls set artifact=json_set(artifact,'$.review_response',json(?)) where id=?",
                      (json.dumps(response), call_id))
+        if prior is not None:
+            conn.execute("update calls set artifact=json_set(artifact,'$.previous_review_response',json(?)) where id=?",
+                         (json.dumps(prior), call_id))
         return response
 
 
@@ -84,13 +102,6 @@ def retained_response() -> dict:
     if not response:
         raise RuntimeError("reviewer has not retained a substantive response")
     return response
-# A transport error carries no status: the write may have landed before the
-# response was lost, so publication is uncertain, never a refused submission.
-_TRANSPORT_ERRORS = ("TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
-                     "ConnectError", "ReadError", "WriteError", "CloseError",
-                     "RemoteProtocolError", "LocalProtocolError")
-_QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-remaining",
-                  "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
 
 
 @contextmanager
@@ -126,8 +137,10 @@ def begin_submission(body: str, head: str) -> str:
         raise RuntimeError("managed review submission lacks its native receipt binding")
     with sqlite3.connect(database, timeout=30) as conn:
         changed = conn.execute("update calls set artifact=json_patch(artifact,?) where id=? and status='running' and behavior in ('pr_review','pr_approve') "
-                               "and coalesce(error_code,'') not in ('stopping','stopped') and json_extract(artifact,'$.phase')='reviewing'",
-                               (json.dumps({"phase": "submitting_review", "expected_head": head}), call_id)).rowcount
+                               "and coalesce(error_code,'') not in ('stopping','stopped') and json_extract(artifact,'$.phase')='reviewing' "
+                               "and json_extract(artifact,'$.review_response.head_sha')=? "
+                               "and json_extract(artifact,'$.review_response.completed_at') <= ?",
+                               (json.dumps({"phase": "submitting_review", "expected_head": head}), call_id, head, int(time.time() * 1000))).rowcount
         if changed != 1:
             raise RuntimeError("managed review does not own an unsubmitted native action receipt")
     return f"{body}\n\n<!-- poise-invocation {call_id} -->".strip()

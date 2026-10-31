@@ -10,6 +10,7 @@ const NOW = 1_800_000_000_000
 const HEAD = '1'.repeat(40)
 const NEXT = '2'.repeat(40)
 const MERGE = '3'.repeat(40)
+const CONTEXT = '4'.repeat(64)
 const REVIEWER = { slot: 'primary', model: 'fixture-model', recovery: 'fixture-model' }
 const databases: Database.Database[] = []
 afterEach(() => { for (const db of databases.splice(0)) db.close() })
@@ -36,9 +37,18 @@ function invocation(id: string, behavior: ChainInvocation['behavior'], basis: st
 }
 function finish(journal: BehaviorChainJournal, chain: BehaviorChain, id: string, behavior: ChainInvocation['behavior'], basis: string,
   evidence: Record<string, unknown>, slot: string | null = 'primary'): BehaviorChain {
+  const callId = ['review-pr', 'approve-pr'].includes(behavior) ? chainBasis(id).slice(0, 32) : id
+  if (['review-pr', 'approve-pr'].includes(behavior)) evidence = { ...evidence, completedAt: NOW,
+    artifact: { review_response: reviewResponse(callId, String(evidence.head_sha)) } }
   chain = record(journal, chain, { type: 'invocation.admitted', invocation: invocation(id, behavior, basis, slot) })
   chain = record(journal, chain, { type: 'invocation.started', invocationId: id })
-  return record(journal, chain, { type: 'invocation.settled', invocationId: id, callId: id, outcome: String(evidence.outcome), evidence })
+  return record(journal, chain, { type: 'invocation.settled', invocationId: id, callId, outcome: String(evidence.outcome), evidence })
+}
+function reviewResponse(callId: string, head = HEAD) {
+  return { repository: 'Example/Repo', pull_number: 21, head_sha: head, context_sha: CONTEXT,
+    invocation_id: callId, reviewer: 'reviewer', model: 'fixture-model', completed_at: NOW,
+    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+      reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
 }
 function reviewed(journal: BehaviorChainJournal, chain: BehaviorChain, obs: ChainObservation, slot = 'primary', comment = 17): BehaviorChain {
   return finish(journal, chain, `issue-${slot}`, 'review-issue', chainBasis(['issue', obs.issue.revision]),
@@ -49,7 +59,11 @@ function pull(obs: ChainObservation): void {
   obs.publication = { pull_number: 21, head_sha: HEAD, head_invocation: 'implementation', state: 'open', merged: false, merge_sha: null }
   obs.pull = { number: 21, head: HEAD, headSince: NOW, state: 'open', draft: false, merged: false, mergeSha: null,
     queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
-    reviewIds: [27], reviewReceipts: [], reviewRevision: 'findings-1', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
+    reviewIds: [27], reviewContext: CONTEXT, mergedAt: NOW,
+    reviewReceipts: [['pr-review', 27], ['verify-integration-repair', 28]].map(([id, number]) => ({
+      id: Number(number), head: HEAD, state: number === 28 ? 'APPROVED' : 'COMMENTED', invocation: chainBasis(id).slice(0, 32), submittedAt: NOW,
+      response: reviewResponse(chainBasis(id).slice(0, 32)) })),
+    reviewRevision: 'findings-1', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
 }
 
 describe('authoritative behavior journal', () => {
@@ -101,6 +115,41 @@ describe('authoritative behavior journal', () => {
 })
 
 describe('completion-driven atomic behavior decisions', () => {
+  it('keeps acknowledgements pending and rejects metadata, late and superseded response coverage', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    const first = invocation('pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]))
+    current = record(journal, current, { type: 'invocation.admitted', invocation: first })
+    current = record(journal, current, { type: 'invocation.started', invocationId: first.id })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait' })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: first.id,
+      callId: chainBasis(first.id).slice(0, 32), outcome: 'clean', evidence: { status: 'completed', action: 'reviewed_clean',
+        review_id: 27, head_sha: HEAD, completedAt: NOW } })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'hold' })
+    const valid = structuredClone(current)
+    valid.invocations.at(-1)!.evidence!.artifact = { review_response: reviewResponse(chainBasis(first.id).slice(0, 32)) }
+    expect(decideBehaviorChain(valid, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+    const late = structuredClone(valid)
+    late.invocations.at(-1)!.evidence!.completedAt = NOW + 1
+    expect(decideBehaviorChain(late, obs, NOW)).toMatchObject({ kind: 'hold' })
+    obs.pull!.reviewContext = '5'.repeat(64)
+    expect(decideBehaviorChain(valid, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+    obs.pull!.head = NEXT
+    expect(decideBehaviorChain(valid, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+  })
+
+  it('records an external merge separately and retains its open review obligation through rebuild', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    obs.pull!.merged = true; obs.pull!.mergeSha = MERGE; obs.pull!.state = 'closed'
+    expect(decideBehaviorChain(chain, obs, NOW)).toMatchObject({ kind: 'hold', reason: expect.stringContaining('open review obligation') })
+    const merged = record(journal, chain, { type: 'chain.merged', mergeSha: MERGE,
+      evidence: { repository: chain.repository, pull_number: 21, merged: true, merge_sha: MERGE, review_complete: false } })
+    expect(merged).toMatchObject({ mergeSha: MERGE, reviewPending: true })
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(merged)
+    expect(journal.active().map(item => item.id)).toContain(chain.id)
+  })
+
   it('requires every configured review slot and its actually posted comment before implementation, without a settle delay', () => {
     const { journal, chain } = setup(); const obs = observation()
     obs.issueReviewers = [REVIEWER, { ...REVIEWER, slot: 'secondary' }, { ...REVIEWER, slot: 'tertiary' }]
@@ -120,7 +169,7 @@ describe('completion-driven atomic behavior decisions', () => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
-    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD]),
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
       { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
     obs.pull!.pending = true
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait', reason: 'exact-head CI is still running' })
@@ -135,7 +184,7 @@ describe('completion-driven atomic behavior decisions', () => {
   it('repairs actual blockers with a fresh invocation and diagnoses queue rejection instead of blindly re-enqueuing', () => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
-    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD]),
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
       { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
     for (const flag of ['conflict', 'behind', 'changesRequested'] as const) {
       obs.pull![flag] = true
@@ -158,7 +207,7 @@ describe('completion-driven atomic behavior decisions', () => {
   it('requires a fresh diagnosis and approval before requeueing an unchanged rejected head', () => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
-    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD]),
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
       { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
     current = finish(journal, current, 'queue', 'merge-pr', 'queue-basis', { status: 'completed', outcome: 'enqueued', head_sha: HEAD }, null)
     obs.pull!.approved = true; obs.pull!.ready = true
@@ -192,6 +241,30 @@ describe('native admission and recovery', () => {
       permitted: () => true, request: async () => ({ command: 'agent-interface', argv: ['--model', 'fixture-model'], cwd: '/fixture' }),
       launch: async () => true, perform: async () => ({}), resumePublication: async () => { throw new Error('unexpected publication resume') }, wake: () => {}, ...overrides }
   }
+
+  it('recovers a review only with its retained substantive response and preserves its original completion time', async () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    const now = Date.now(); const nativeId = 'c'.repeat(32)
+    obs.checkedAt = now
+    const pending = invocation('original-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]))
+    pending.admittedAt = now - 3000
+    pending.request.argv = ['--pr-review', '#21', '--expected-head', HEAD]
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: pending })
+    current = record(journal, current, { type: 'invocation.uncertain', invocationId: pending.id, reason: 'submission response lost' })
+    current = record(journal, current, { type: 'invocation.reconciled', invocationId: pending.id,
+      evidence: { callId: nativeId, resources_settled_at: new Date(now).toISOString(), completedAt: now } })
+    obs.pull!.reviewReceipts = [{ id: 91, head: HEAD, state: 'COMMENTED', invocation: nativeId, submittedAt: now - 1000 }]
+    const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => obs, launch: async () => { throw new Error('duplicate review dispatch') } }))
+    await runtime.run()
+    current = journal.read(chain.id)!
+    expect(current.invocations[0].state).toBe('uncertain')
+    const response = { ...reviewResponse(nativeId), completed_at: now - 2000 }
+    obs.pull!.reviewReceipts[0].response = response
+    record(journal, current, { type: 'invocation.reconciled', invocationId: pending.id, evidence: { artifact: { review_response: response } } })
+    await runtime.run()
+    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'settled', callId: nativeId,
+      evidence: { artifact: { review_response: { completed_at: now - 2000 } } } })
+  })
 
   it('reconciles and advances admitted work while intake failure remains visible', async () => {
     const { journal, chain } = setup(); const obs = observation()

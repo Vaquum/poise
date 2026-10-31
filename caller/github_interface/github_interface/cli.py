@@ -224,7 +224,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior == "--request-changes":
         parser = argparse.ArgumentParser(prog="github-interface --request-changes PR")
-        parser.add_argument("--assessment-json")
+        parser.add_argument("--assessment-json", default=argparse.SUPPRESS)
         source = parser.add_mutually_exclusive_group(required=True)
         source.add_argument("--comments", help="file containing a JSON array of inline review comments")
         source.add_argument("--comments-json", help="inline JSON array of review comments")
@@ -276,7 +276,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior in {"--approve-pr", "--reviewed-clean"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
-        parser.add_argument("--assessment-json", required=True)
+        parser.add_argument("--assessment-json", required=behavior == "--reviewed-clean", default=argparse.SUPPRESS)
         _add_expected_head(parser)
         _add_repository(parser)
         return parser
@@ -299,7 +299,7 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior in {"--merge-if-ready", "--update-branch-if-behind"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} PR")
         if behavior == "--merge-if-ready":
-            parser.add_argument("--review-response-json")
+            parser.add_argument("--review-response-json", default=argparse.SUPPRESS)
         parser.add_argument("--author", required=True)
         _add_expected_head(parser)
         return parser

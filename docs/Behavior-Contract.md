@@ -305,7 +305,15 @@ time; unchanged heads are still reevaluated for completed checks and conversatio
 Scoped GraphQL errors hold only their target; identity or unscoped errors hold the
 whole batch visibly. Discovery sends no REST reads or writes. For a ready candidate
 it holds the shared per-PR operation lock, then calls
-`--merge-if-ready PR --expected-head SHA --author PR_AUTHOR --token-user REVIEWER`.
+`--merge-if-ready PR --expected-head SHA --review-response-json RECEIPT --author PR_AUTHOR --token-user REVIEWER`.
+The receipt retains the existing configured reviewer's substantive verdict,
+reviewed context and limitations, with its actual completion time and native
+invocation identity. Both approval and merge validate the final repository,
+PR, head and context (base SHA, title and body). Merge also matches the response
+to the actual submitted review and its invocation marker; account identity or
+an empty approval cannot replace that evidence. Context changes re-arm the
+existing review cycle. The [native chain](Behavior-chain.md) records a confirmed
+external merge separately from any still-open pre-merge review obligation.
 Caller uses the existing green predicate with fresh head-pinned readiness and
 rechecks the pull request before a SHA-pinned merge request. Unknown readiness,
 pending/failed checks, unresolved live conversations, incomplete conversation

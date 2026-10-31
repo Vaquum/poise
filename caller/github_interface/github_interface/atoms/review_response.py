@@ -1,6 +1,7 @@
 """Substantive responses carried by the existing native review receipt."""
 import hashlib
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -52,7 +53,6 @@ def submission_response(payload: dict, pull: dict, repo: str, number: int, head:
     context = context_sha(pull)
     # The governed runner retained the provider's response before entering
     # this command. Standalone submissions cannot acquire native ownership.
-    import os
     if os.environ.get("AGENT_INTERFACE_RECEIPT_CALL"):
         from agent_interface.review_receipt import retained_response
         response = retained_response()
@@ -86,7 +86,10 @@ def matches_review(response: dict, review: dict) -> bool:
     """An account alone never establishes the originating invocation."""
     body = review.get("body") or ""
     try:
-        submitted = datetime.fromisoformat(review["submitted_at"].replace("Z", "+00:00")).timestamp() * 1000
+        stamp = datetime.fromisoformat(review["submitted_at"].replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            return False
+        submitted = stamp.timestamp() * 1000
     except (KeyError, ValueError, TypeError, AttributeError):
         return False
     return (review.get("id") == response.get("review_id") and review.get("state") in {"APPROVED", "COMMENTED"}

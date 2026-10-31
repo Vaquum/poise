@@ -12,6 +12,7 @@ from agent_interface import atoms, pr_review, review_repository as rr, structure
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 
+ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 HEAD, BASE = "a" * 40, "b" * 40
 PR = "https://github.com/o/r/pull/12"
 REQUEST = {"operation": "read", "path": "consumer.py", "query": "", "start_line": 1}
@@ -151,11 +152,11 @@ class TestStructuredInspection(TestCase):
             def ask(*args):
                 rounds.append(args[3])
                 if len(rounds) == 1:
-                    return json.dumps({"action": "inspect", "comments": [],
+                    return json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [],
                         "requests": [{**REQUEST, "path": "figure.jpg"}, REQUEST]})
                 self.assertIn("not UTF-8 text", args[3])
                 self.assertIn("old_contract()", args[3])
-                return json.dumps({"action": "request_changes", "comments": [FINDING], "requests": []})
+                return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING], "requests": []})
 
             with patch.dict(sr.ASK, {"codex": ask}), patch.object(sr.subprocess, "run", side_effect=command):
                 sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR,
@@ -195,9 +196,9 @@ class TestStructuredInspection(TestCase):
             def ask(*args):
                 rounds.append(args[3])
                 if next_requests:
-                    return json.dumps({"action": "inspect", "comments": [], "requests": next_requests.copy()})
+                    return json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": next_requests.copy()})
                 self.assertTrue(all(len(lines) == 100 for lines in received.values()))
-                return json.dumps({"action": "request_changes", "comments": [FINDING], "requests": []})
+                return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING], "requests": []})
 
             with patch.dict(sr.ASK, {"codex": ask}), patch.object(sr.subprocess, "run", side_effect=command):
                 sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR,
@@ -215,9 +216,9 @@ class TestStructuredInspection(TestCase):
                 inputs.append(text)
                 self.assertIn("requests", schema["required"])
                 if len(inputs) == 1:
-                    return json.dumps({"action": "inspect", "comments": [], "requests": [REQUEST]})
+                    return json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST]})
                 self.assertIn("old_contract()", text)
-                return json.dumps({"action": "request_changes", "comments": [FINDING], "requests": []})
+                return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING], "requests": []})
             repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
             result = {"action": "review_context", "head_sha": HEAD,
                       "results": [{"lines": [{"line": 1, "text": "old_contract()"}]}]}
@@ -232,16 +233,16 @@ class TestStructuredInspection(TestCase):
                 self.assertEqual(json.loads(submit.call_args.args[0][4]), [FINDING])
 
     def test_bad_or_unbounded_inspection_never_submits(self):
-        cases = [{"action": "inspect", "comments": [], "requests": []},
-                 {"action": "reviewed_clean", "comments": [], "requests": [REQUEST]},
-                 {"action": "inspect", "comments": [], "requests": [REQUEST], "head": "c" * 40}]
+        cases = [{"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": []},
+                 {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": [], "requests": [REQUEST]},
+                 {"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST], "head": "c" * 40}]
         repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
         for reply in cases:
             with self.subTest(reply=reply), patch.dict(sr.ASK, {"codex": lambda *args: json.dumps(reply)}), \
                     patch.object(sr.subprocess, "run") as submit, self.assertRaises(atoms.AgentPreflightError):
                 sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR, "bot", HEAD, 60, repository=repo)
             submit.assert_not_called()
-        reply = json.dumps({"action": "inspect", "comments": [], "requests": [REQUEST]})
+        reply = json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST]})
         with patch.dict(sr.ASK, {"codex": lambda *args: reply}), patch.object(repo, "inspect", return_value={}), \
                 patch.object(sr.subprocess, "run") as submit, patch.object(sr, "MAX_INSPECTION_ROUNDS", 2), \
                 self.assertRaisesRegex(sr.review_budget.ReviewLimitError, "inspection limit") as failure:
@@ -251,7 +252,7 @@ class TestStructuredInspection(TestCase):
 
     def test_invalid_inspection_contract_has_a_terminal_failure_code(self):
         repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
-        for raw in ('not JSON', json.dumps({"action": "reviewed_clean", "comments": [], "requests": [REQUEST]})):
+        for raw in ('not JSON', json.dumps({"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": [], "requests": [REQUEST]})):
             with patch.dict(sr.ASK, {"codex": lambda *args: raw}), patch.object(sr.subprocess, "run") as submit, \
                     self.assertRaises(atoms.AgentPreflightError) as failure:
                 sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR, "bot", HEAD, 60, repository=repo)
@@ -269,7 +270,7 @@ class TestStructuredInspection(TestCase):
 
     def test_inspection_failure_cannot_become_a_clean_review(self):
         repo = rr.Repository(Path("/tmp/review"), {"head_sha": HEAD})
-        with patch.dict(sr.ASK, {"codex": lambda *args: json.dumps({"action": "inspect", "comments": [], "requests": [REQUEST]})}), \
+        with patch.dict(sr.ASK, {"codex": lambda *args: json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST]})}), \
                 patch.object(repo, "inspect", side_effect=atoms.AgentPreflightError("path escaped")), \
                 patch.object(sr.subprocess, "run") as submit, self.assertRaises(atoms.AgentPreflightError):
             sr.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), "pr_review", PR, "bot", HEAD, 60, repository=repo)
@@ -282,8 +283,8 @@ class TestStructuredInspection(TestCase):
         def ask(*args):
             schemas.append(args[4])
             if len(schemas) == 1:
-                return json.dumps({"action": "inspect", "comments": [], "requests": [REQUEST]})
-            return json.dumps({"action": "request_changes", "comments": [FINDING]})
+                return json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [REQUEST]})
+            return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]})
 
         receipt = json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD})
         with patch.dict(sr.ASK, {"codex": ask}), patch.object(repo, "inspect", return_value={}), \

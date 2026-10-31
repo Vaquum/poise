@@ -2,7 +2,7 @@ import os
 from typing import Any
 
 from github_interface.atoms.review_identity import require_other_author, require_owned_reviews
-from github_interface.atoms.review_response import response_body, submission_response
+from github_interface.atoms.review_response import context_sha, response_body, submission_response
 from github_interface.atoms.pulls import approve_pr, get_pull, list_review_threads, list_reviews
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head, pull_number, repository, token_user
@@ -39,12 +39,14 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
 
     if "GITHUB_INTERFACE_AUTOMATED_REVIEWS" in os.environ:
         require_owned_reviews(await list_reviews(client, owner, repo, number), actor)
-    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor)
+    response = submission_response(payload, pull, f"{owner}/{repo}", number, required_head, actor) \
+        if payload.get("assessment") or os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") else None
     latest = await get_pull(client, owner, repo, number)
-    if latest.get("head") != pull.get("head") or latest.get("base") != pull.get("base") \
-            or latest.get("title") != pull.get("title") or latest.get("body") != pull.get("body"):
+    if (latest.get("head") or {}).get("sha") != required_head \
+            or (response is not None and context_sha(latest) != response["context_sha"]) \
+            or latest.get("state") != "open" or latest.get("draft") is True:
         raise RuntimeError("pull-request review context changed before approval")
-    review = await approve_pr(client, owner, repo, number, required_head, response_body(response))
+    review = await approve_pr(client, owner, repo, number, required_head, response_body(response) if response else "")
     review_head = str(review.get("commit_id") or "").lower()
     review_actor = str((review.get("user") or {}).get("login") or "")
     if review.get("state") != "APPROVED":
@@ -66,5 +68,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "head_sha": required_head,
         "review_id": review.get("id"),
         "submitted_at": review.get("submitted_at"),
-        "review_response": response,
+        **({"review_response": response} if response else {}),
     }
