@@ -537,6 +537,26 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
 
 
 # ── Codex ─────────────────────────────────────────────────────────────
+def codex_environment(root: Path) -> dict:
+    env = os.environ.copy()
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
+        env.pop(key, None)
+    # Each review owns one fresh native conversation history: resume across
+    # input fragments and inspection rounds reads this directory, and deleting
+    # the review directory reclaims it. --ephemeral cannot do this — without
+    # persisted history there is nothing to resume.
+    home = root / "codex-home"
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Preserve sign-in, but do not import personal sessions or configuration.
+    original = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+    auth = original / "auth.json"
+    if original.resolve() != home.resolve() and auth.is_file():
+        shutil.copyfile(auth, home / "auth.json")
+        (home / "auth.json").chmod(0o600)
+    env["CODEX_HOME"] = str(home)
+    return env
+
+
 def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, watch: ReviewWatch, timeout: float) -> str:
     output = root / "verdict.json"
     output.unlink(missing_ok=True)
@@ -565,9 +585,7 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
                     "multi_agent", "browser_use", "computer_use", "image_generation",
                     "code_mode", "code_mode_host", "skill_search"):
         args.extend(["--disable", feature])
-    env = os.environ.copy()
-    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
-        env.pop(key, None)
+    env = codex_environment(root)
     # Each review owns one fresh native conversation. Resume that exact ID
     # with only newly supplied inspection evidence, retaining the provider's
     # prior analysis instead of recomputing the whole packet each round.

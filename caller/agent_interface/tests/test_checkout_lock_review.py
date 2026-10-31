@@ -14,7 +14,7 @@ from unittest import skipUnless
 from unittest.mock import patch
 
 from agent_interface import checkout_lock
-from agent_interface.checkout_lock import Lease, LeaseLost, LockBusy, pgid_alive, pid_alive
+from agent_interface.checkout_lock import Lease, LeaseLost, LockBusy, WorkerOrphaned, pgid_alive, pid_alive
 
 from test_checkout_lock import GATE, WRITER, LockCase, dead_pid
 
@@ -325,6 +325,67 @@ os.execv({shutil.which("ps")!r}, ["ps", *sys.argv[1:]])
         self.assertGreaterEqual(monotonic() - started, 1.2)
         os.close(control)
         os.close(status)
+
+    def test_a_group_that_cannot_be_listed_reports_unsettled_on_the_status_pipe(self):
+        # ps always fails; the gate must give up with exit 70 and an UNSETTLED
+        # receipt after STARTED, so the holder keeps the lease.
+        bin_dir = Path(self.work.name, "bin")
+        bin_dir.mkdir()
+        fake = bin_dir / "ps"
+        fake.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(1)\n")
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}):
+            process, control, status = self.gate(["true"])
+            os.write(control, b"GO\n")
+            self.assertEqual(process.wait(timeout=40), 70)
+            data = b""
+            while True:
+                chunk = os.read(status, 64)
+                if not chunk:
+                    break
+                data += chunk
+            self.assertEqual(data, b"STARTED\nUNSETTLED\n")
+        os.close(control)
+        os.close(status)
+
+    def stub_gate(self, receipt: bytes, code: int) -> Path:
+        """A gate that runs its agent in its own group, reports `receipt`,
+        and exits `code` — the holder's view of a settled or unsettled run."""
+        script = Path(self.work.name, "stub-gate.py")
+        script.write_text(
+            "import os, subprocess, sys\n"
+            "control = int(sys.argv[sys.argv.index('--control-fd') + 1])\n"
+            "status = int(sys.argv[sys.argv.index('--status-fd') + 1])\n"
+            "command = sys.argv[sys.argv.index('--') + 1:]\n"
+            "data = b''\n"
+            "while b'\\n' not in data:\n"
+            "    chunk = os.read(control, 64)\n"
+            "    if not chunk:\n"
+            "        sys.exit(3)\n"
+            "    data += chunk\n"
+            "agent = subprocess.Popen(command, close_fds=True)\n"
+            "agent.wait()\n"
+            f"os.write(status, {receipt!r})\n"
+            f"sys.exit({code})\n"
+        )
+        return script
+
+    def test_an_unsettled_gate_keeps_the_lease_even_when_its_group_is_gone(self):
+        lease = self.lease().acquire(1)
+        with patch.object(checkout_lock, "GATE", self.stub_gate(b"STARTED\nUNSETTLED\n", 70)):
+            with self.assertRaisesRegex(WorkerOrphaned, "unsettled"):
+                checkout_lock.run_gated(lease, ["true"], cwd=self.checkout, env=None, timeout=30)
+        self.assertIn("unsettled", lease.retained)
+        self.assertEqual(len(self.rows()), 1)
+        self.assertFalse(pgid_alive(self.rows()[0]["worker_pgid"]))
+
+    def test_an_agent_exit_70_with_started_only_returns_normally(self):
+        lease = self.lease().acquire(1)
+        with patch.object(checkout_lock, "GATE", self.stub_gate(b"STARTED\n", 70)):
+            done = checkout_lock.run_gated(lease, [sys.executable, "-c", "import sys; sys.exit(70)"],
+                                           cwd=self.checkout, env=None, timeout=30)
+        self.assertEqual(done.returncode, 70)
+        self.assertEqual((lease.retained, self.rows()), (None, []))
 
 
 class TestTokenAcrossHolds(LockCase):

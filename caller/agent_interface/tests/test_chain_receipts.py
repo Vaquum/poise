@@ -177,3 +177,14 @@ class AtomicWorkLimits(TestCase):
                 api.complete_atomic_publication(call, digest, HEAD)
         with api.db() as conn:
             self.assertEqual(conn.execute("select count(*) from calls").fetchone()[0], 1)
+
+    def test_a_failed_cleanup_is_recorded_durably_beside_the_native_receipt(self):
+        call = api.track("fixture-model", "", "7", "example/repo", "author", "implement_issue", source="poise:behavior-chain")
+        with api.db() as conn:
+            conn.execute("update calls set status='completed',artifact=? where id=?",
+                         (json.dumps({"phase": "published", "plan_sha": "d" * 64}), call))
+        api.record_cleanup_failure(call)
+        with api.db() as conn:
+            artifact = json.loads(conn.execute("select artifact from calls where id=?", (call,)).fetchone()[0])
+        self.assertEqual(artifact["resource_error"], "cleanup_failed")
+        self.assertEqual((artifact["phase"], artifact["plan_sha"]), ("published", "d" * 64))

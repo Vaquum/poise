@@ -671,8 +671,60 @@ class TestProcessesAndErrors(TestCase):
         with tempfile.TemporaryDirectory() as work:
             with patch.object(issue_review.shutil, "rmtree", side_effect=OSError("busy")), \
                     self.assertLogs(issue_review.logger, level="WARNING") as captured:
-                issue_review.cleanup(Path(work))
+                removed = issue_review.cleanup(Path(work))
+            self.assertIs(removed, False)
             self.assertIn(f"Could not remove issue-review workspace {work}: busy", captured.output[0])
+
+    def test_cleanup_reports_a_deletion_that_left_the_directory_behind(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work) / "owned"
+            root.mkdir()
+            (root / "artifact").write_text("x")
+            with patch.object(issue_review.shutil, "rmtree", return_value=None), \
+                    self.assertLogs(issue_review.logger, level="WARNING") as captured:
+                self.assertIs(issue_review.cleanup(root), False)
+            self.assertIn("still present after deletion", captured.output[-1])
+            self.assertTrue(root.exists())
+
+    def test_cleanup_reports_a_missing_directory_as_reclaimed(self):
+        with tempfile.TemporaryDirectory() as work:
+            self.assertIs(issue_review.cleanup(Path(work) / "absent"), True)
+
+    def test_sweep_covers_the_atomic_work_sibling_root(self):
+        with tempfile.TemporaryDirectory() as base:
+            reviews, atomic = Path(base) / "issue-review", Path(base) / "atomic-work"
+            reviews.mkdir()
+            atomic.mkdir()
+            stale_review, stale_atomic, fresh_atomic = reviews / ("a" * 32), atomic / ("b" * 32), atomic / ("c" * 32)
+            for directory in (stale_review, stale_atomic, fresh_atomic):
+                directory.mkdir()
+                (directory / "artifact").write_text("keep unless owned and abandoned")
+            old = time.time() - issue_review.STALE_RUN_SECONDS - 60
+            os.utime(stale_review, (old, old))
+            os.utime(stale_atomic, (old, old))
+            with patch.object(issue_review, "WORK_ROOT", reviews):
+                self.assertEqual(issue_review.sweep_roots(), [reviews, atomic])
+                with patch.object(issue_review, "_cwd_pids", return_value=[]):
+                    issue_review.sweep()
+            self.assertFalse(stale_review.exists())
+            self.assertFalse(stale_atomic.exists())
+            self.assertTrue(fresh_atomic.exists())
+
+    def test_a_sweep_that_cannot_remove_retries_on_the_next_sweep(self):
+        with tempfile.TemporaryDirectory() as work, patch.object(issue_review, "WORK_ROOT", Path(work)):
+            stale = Path(work) / ("e" * 32)
+            stale.mkdir()
+            (stale / "artifact").write_text("x")
+            old = time.time() - issue_review.STALE_RUN_SECONDS - 60
+            os.utime(stale, (old, old))
+            with patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                    patch.object(issue_review.shutil, "rmtree", side_effect=OSError("busy")), \
+                    self.assertLogs(issue_review.logger, level="WARNING"):
+                issue_review.sweep()
+            self.assertTrue(stale.exists())
+            with patch.object(issue_review, "_cwd_pids", return_value=[]):
+                issue_review.sweep()
+            self.assertFalse(stale.exists())
 
     def test_read_only_artifacts_are_removed_without_changing_symlink_targets(self):
         with tempfile.TemporaryDirectory() as work:
@@ -688,13 +740,13 @@ class TestProcessesAndErrors(TestCase):
             outside.chmod(0o500)
             (root / "link").symlink_to(outside, target_is_directory=True)
             try:
-                issue_review.cleanup(root)
+                self.assertIs(issue_review.cleanup(root), True)
                 self.assertFalse(root.exists())
                 self.assertEqual((outside / "keep").read_text(), "unrelated")
                 self.assertEqual(outside.stat().st_mode & 0o777, 0o500)
                 root.symlink_to(outside, target_is_directory=True)
                 with self.assertLogs(issue_review.logger, level="WARNING"):
-                    issue_review.cleanup(root)
+                    self.assertIs(issue_review.cleanup(root), False)
                 self.assertTrue(root.is_symlink())
                 self.assertTrue((outside / "keep").exists())
                 self.assertEqual(outside.stat().st_mode & 0o777, 0o500)
