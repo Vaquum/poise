@@ -28,6 +28,19 @@ def approved():
                  reviewer_latest_review_id='R_new', reviewer_latest_any_review_id='R_new',
                  reviewer_latest_submitted_at='2026-09-13T10:00:00Z')
 
+def refusal_error(refusal='repeat_only'):
+    from agent_interface.process_diagnostic import diagnostic_envelope
+    return budget.ReviewLimitError(
+        'review submission was a no-op: [{"reason": "repeat"}]', 'review_contract_violation',
+        diagnostic_envelope(operation='provider.review', phase='submitting', outcome='exit',
+                            stderr='[{"reason": "repeat"}]', provider='claude',
+                            submission='noop', refusal=refusal))
+
+def stored_response(call_id):
+    with api.db() as conn:
+        path = conn.execute('select response_path from calls where id=?', (call_id,)).fetchone()[0]
+    return Path(path).read_text()
+
 class TestReviewBudget(TestCase):
     def test_total_budget_includes_elapsed_time_and_cannot_be_extended(self):
         with patch.object(budget, 'monotonic', return_value=100) as clock, budget.ReviewBudget(3600):
@@ -224,6 +237,83 @@ class TestRecovery(TestCase):
         row = self.execute([budget.ReviewLimitError('output limit')], [facts(), facts()], model='gpt-6-astra-ultra')
         self.assertEqual(self.mod.run.call_count, 1)
         self.assertEqual(row['error_code'], 'model_output_limit')
+
+    def test_repeat_only_refusal_recovers_once_with_a_different_model(self):
+        row = self.execute([refusal_error(), 'done'], [facts(), facts(), approved()])
+        self.assertEqual([x.kwargs['model'] for x in self.mod.run.call_args_list], ['opus-5-high', 'gpt-6-astra-ultra'])
+        self.assertEqual(row['outcome'], 'approved')
+        self.assertEqual(row['model'], 'opus-5-high')
+        self.assertEqual(row['recovery_model'], 'gpt-6-astra-ultra')
+        response = stored_response(row['id'])
+        self.assertIn('review submission was a no-op', response)
+        self.assertIn('done', response)
+
+    def test_repeat_only_refusal_recovers_for_a_non_claude_primary(self):
+        row = self.execute([refusal_error(), 'done'], [facts(), facts(), approved()], model='grok-4.6-xhigh')
+        self.assertEqual([x.kwargs['model'] for x in self.mod.run.call_args_list], ['grok-4.6-xhigh', 'gpt-6-astra-ultra'])
+        self.assertEqual(row['outcome'], 'approved')
+        self.assertEqual(row['recovery_model'], 'gpt-6-astra-ultra')
+
+    def test_repeat_only_refusal_cannot_fallback_to_itself(self):
+        row = self.execute([refusal_error()], [facts(), facts()], model='gpt-6-astra-ultra')
+        self.assertEqual(self.mod.run.call_count, 1)
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertIsNone(row['recovery_model'])
+
+    def test_duplicate_noop_never_recovers(self):
+        row = self.execute([refusal_error('duplicate')], [facts(), facts()])
+        self.assertEqual(self.mod.run.call_count, 1)
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertIsNone(row['recovery_model'])
+
+    def test_repeat_only_predicate_ignores_untyped_failures(self):
+        self.assertFalse(api._repeat_only_refusal(budget.ReviewLimitError('no-op', 'review_contract_violation')))
+        self.assertFalse(api._repeat_only_refusal(atoms.AgentPreflightError('no-op', 'review_contract_violation')))
+        self.assertFalse(api._repeat_only_refusal(budget.ReviewLimitError('output limit')))
+        self.assertTrue(api._repeat_only_refusal(refusal_error()))
+
+    def test_repeat_only_refusal_never_recovers_past_a_pending_review(self):
+        row = self.execute([refusal_error()], [facts(), facts(reviewer_pending_reviews=1)])
+        self.assertEqual(self.mod.run.call_count, 1)
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertIn('could not prove a safe recovery', row['error'])
+        self.assertIsNone(row['recovery_model'])
+
+    def test_repeat_only_refusal_holds_when_another_review_is_published(self):
+        before = facts()
+        before['reviewer_reviews_since_items'] = []
+        after = facts()
+        after['reviewer_reviews_since_items'] = [{'id': 99}]
+        with patch.object(api, 'sleep'):
+            row = self.execute([refusal_error()], [before, after])
+        self.assertEqual(self.mod.run.call_count, 1)
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertIn('another review is already published on this head', row['error'])
+        self.assertIsNone(row['recovery_model'])
+
+    def test_repeat_only_refusal_keeps_prior_failure_when_recovery_fails(self):
+        row = self.execute([refusal_error(), atoms.AgentPreflightError('codex failed')], [facts(), facts(), facts()])
+        self.assertEqual(self.mod.run.call_count, 2)
+        self.assertEqual(row['error_code'], 'review_recovery_failed')
+        self.assertIn('codex failed', row['error'])
+        self.assertIn('prior: review submission was a no-op', row['error'])
+
+    def test_repeat_only_refusal_keeps_prior_failure_when_recovery_supersedes(self):
+        from agent_interface.review_watch import ReviewSuperseded
+        row = self.execute([refusal_error(), ReviewSuperseded('b' * 40)], [facts(), facts()])
+        self.assertEqual(self.mod.run.call_count, 2)
+        self.assertEqual(row['outcome'], 'superseded')
+        response = stored_response(row['id'])
+        self.assertIn('head changed to', response)
+        self.assertIn('prior: review submission was a no-op', response)
+
+    def test_repeat_only_refusal_keeps_prior_disposition_when_head_moves(self):
+        row = self.execute([refusal_error()], [facts(), facts(head_sha='b' * 40)])
+        self.assertEqual(self.mod.run.call_count, 1)
+        self.assertEqual(row['outcome'], 'superseded')
+        self.assertEqual(row['head_sha'], 'b' * 40)
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertIn('review submission was a no-op', row['error'])
 
 class TestMinuteReasoning(TestCase):
     def test_each_minute_reports_new_or_no_reasoning_and_keeps_only_bounded_text(self):

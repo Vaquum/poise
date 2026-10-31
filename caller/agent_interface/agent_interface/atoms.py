@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from . import progress, review_budget
+from . import progress, review_budget, review_receipt
 from .process_diagnostic import command_failure, diagnostic_envelope, diagnostic_from_stderr, diagnostic_message
 from .provider_progress import claude_error, claude_result
 
@@ -332,6 +332,17 @@ def run_agent(
         if "output token maximum" in error or "context window limit" in error:
             raise review_budget.ReviewLimitError(error)
         raise RuntimeError(error)
+    details = review_receipt.refused()
+    if review_receipt.get() is None and details is not None:
+        # github-interface refused the submission as duplicate-only without
+        # posting: type it like the structured runner, so a repeat-only
+        # refusal recovers instead of failing the round unattributed.
+        cause = bounded_cause(json.dumps(details["skipped"]) or "no review submitted")
+        raise review_budget.ReviewLimitError(
+            f"review submission was a no-op: {cause}", "review_contract_violation",
+            diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
+                                stderr=cause, provider=spec.provider, submission="noop",
+                                refusal="repeat_only" if details["repeat_only"] else "duplicate"))
     return result
 
 

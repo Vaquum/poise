@@ -15,7 +15,7 @@ export interface ProcessDiagnostic {
 
 const CONTEXT_FIELDS = ['event_time', 'executable', 'resolved_executable', 'cwd', 'pid', 'exit_code', 'signal', 'timeout_seconds', 'errno',
   'elapsed_ms', 'message', 'workspace', 'container', 'release', 'repository', 'pr', 'expected_head', 'observed_head',
-  'base_sha', 'merge_base_sha', 'call_id', 'correlation_id', 'reviewer', 'behavior', 'submission'] as const
+  'base_sha', 'merge_base_sha', 'call_id', 'correlation_id', 'reviewer', 'behavior', 'submission', 'refusal'] as const
 const FILESYSTEM_FIELDS = ['path', 'free_bytes', 'total_bytes', 'free_inodes', 'total_inodes', 'measured_at', 'measurement_error'] as const
 
 // The canonical redactor, which Logging applies to the same Caller rows: every

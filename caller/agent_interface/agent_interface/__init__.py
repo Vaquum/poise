@@ -1391,6 +1391,9 @@ def run_governed_behavior(
                                                                        capped=capped, review_round=review_round, review_cap=review_cap)
             except ReviewSuperseded as cancelled:
                 response = str(cancelled)
+                prior = getattr(cancelled, "prior_error", None)
+                if prior:
+                    response = f"{response}; prior: {prior}"
                 cancelled_receipt = review_receipt.get()
                 if cancelled_receipt is None:
                     result = {"action": None, "outcome": "superseded", "head_sha": cancelled.head_sha}
@@ -1530,6 +1533,17 @@ def _proven_no_action(failure: review_budget.ReviewLimitError) -> bool:
     return (failure.diagnostic or {}).get("submission") in {"none", "rejected", "noop"}
 
 
+def _repeat_only_refusal(failure: BaseException) -> bool:
+    """A verdict GitHub refused only because every finding restated an
+    already-published body. Proven no-action with nothing delivered, typed
+    on the diagnostic so recovery never reads prose."""
+    diagnostic = getattr(failure, "diagnostic", None)
+    return (isinstance(failure, review_budget.ReviewLimitError)
+            and failure.code == "review_contract_violation"
+            and isinstance(diagnostic, dict)
+            and diagnostic.get("refusal") == "repeat_only")
+
+
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
                               capped=False, review_round=None, review_cap=None):
     # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
@@ -1554,24 +1568,35 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             facts = review_facts(mod, pr, pwd, actor, head, 0)
             receipt = review_receipt.get()
             proven = receipt is None and _proven_no_action(failure)
+            # A repeat-only refusal is proven no-action, but its recovery
+            # submits anew: it still needs the quiet-inventory proof below,
+            # so a pending review cannot turn the re-verdict into a duplicate.
+            # Adoption stays skipped — nothing found can be this run's.
+            repeat_only = _repeat_only_refusal(failure)
             # A completed or superseded action wins over a later CLI failure.
             if facts["head_sha"] != head or facts["state"] != "OPEN" or facts["draft"]:
                 return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
                                                        receipt=receipt, call_id=call_id, prior_error=str(failure),
                                                        prior_code=failure.code, proven_no_action=proven)
-            if not proven:
+            if not proven or repeat_only:
                 own = own_reviews(before, facts, receipt, call_id)
-                if own is None:
-                    counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
-                    if any(_count(facts, key) != _count(before, key) for key in counts):
+                if not proven:
+                    if own is None:
+                        counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
+                        if any(_count(facts, key) != _count(before, key) for key in counts):
+                            return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
+                                                                  receipt=receipt, call_id=call_id, prior_error=str(failure))
+                    elif receipt is not None or own:
                         return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
-                                                              receipt=receipt, call_id=call_id, prior_error=str(failure))
-                elif receipt is not None or own:
-                    return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
-                                                           receipt=receipt, call_id=call_id, prior_error=str(failure))
+                                                               receipt=receipt, call_id=call_id, prior_error=str(failure))
                 # Require positive no-action proof, including pending reviews.
                 if _count(facts, "reviewer_pending_reviews") != 0:
                     raise RuntimeError("a pending GitHub review requires reconciliation")
+                if repeat_only and own:
+                    # Another request's review is already published on this
+                    # head: no re-verdict, so this run cannot publish a second
+                    # review the final verification would reject as duplicate.
+                    raise RuntimeError("another review is already published on this head; no re-verdict was attempted")
                 if own is None and (_count(facts, "reviewer_reviews_since") != _count(before, "reviewer_reviews_since")
                         or facts.get("reviewer_latest_any_review_id") != before.get("reviewer_latest_any_review_id")):
                     raise RuntimeError("review activity changed without matching counters")
@@ -1588,8 +1613,12 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
         except Exception as verification:
             raise review_budget.ReviewLimitError(
                 f"{failure}; could not prove a safe recovery: {verification}", failure.code, failure.diagnostic) from verification
-        # Only a Claude output limit is recoverable, and only by a different model.
-        if failure.code != "model_output_limit" or spec.provider != "claude" or recovery.identity == spec.identity:
+        # A Claude output limit and a repeat-only publication refusal are
+        # recoverable, each once, by a different model. Live GitHub inventory
+        # above proved the failed attempt posted nothing, so the re-verdict is
+        # a new verdict on the same head, never a replay of an uncertain write.
+        output_limit = failure.code == "model_output_limit" and spec.provider == "claude"
+        if (not repeat_only and not output_limit) or recovery.identity == spec.identity:
             raise failure
         review_budget.timeout(seconds, reserve=review_budget.FINAL_CHECK_SECONDS)
         # Durable before launch; a process restart cannot silently repeat it.
@@ -1598,11 +1627,19 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                                    (recovery.identity, call_id)).rowcount
         if changed != 1:
             raise review_budget.ReviewLimitError("Recovery was already attempted; needs attention", "review_recovery_failed")
-        progress.stage("recovering", f"Output limit reached; recovering once with {recovery.identity}")
+        progress.stage("recovering", f"Repeat-only refusal; re-verdicting once with {recovery.identity}"
+                       if repeat_only else f"Output limit reached; recovering once with {recovery.identity}")
         try:
             response = mod.run(pwd, pr, actor, head, note, seconds, p, model=recovery.identity, **cap_kwargs)
+            if repeat_only:
+                # The re-verdict delivered; the response keeps the refused
+                # first attempt beside it, so the refusal is never mistaken
+                # for the delivered verdict.
+                response = f"{failure}\n{response}"
             return response, None
-        except ReviewSuperseded:
+        except ReviewSuperseded as superseded:
+            if repeat_only:
+                superseded.prior_error = str(failure)
             raise
         except Exception as recovery_error:
             # A submission may have succeeded before its response was lost.
@@ -1614,9 +1651,13 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             except Exception:
                 pass
             else:
+                if repeat_only:
+                    return f"{failure}\n{recovery_error}", result
                 return str(recovery_error), result
-            raise review_budget.ReviewLimitError(
-                f"{recovery.identity} recovery failed; needs attention: {recovery_error}", "review_recovery_failed") from recovery_error
+            message = f"{recovery.identity} recovery failed; needs attention: {recovery_error}"
+            if repeat_only:
+                message = f"{message}; prior: {failure}"
+            raise review_budget.ReviewLimitError(message, "review_recovery_failed") from recovery_error
 
 
 # A sibling that submitted a moment ago may not have recorded its review id

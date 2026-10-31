@@ -351,6 +351,60 @@ class TestReceiptRecording(TestCase):
         self.assertIsNone(review_receipt.failure())
         self.assertIsNone(self.stored())
 
+    def test_parse_no_review_types_repeat_only_refusals(self):
+        repeat = {"reason": "repeat", "comment": {"path": "a.py", "line": 1}}
+        skipped = [repeat, dict(repeat)]
+        details = review_receipt.parse_no_review(json.dumps({"action": "no_review", "skipped": skipped}))
+        self.assertEqual(details, {"skipped": skipped, "repeat_only": True})
+        mixed = [repeat, {"reason": "already_commented_or_resolved", "comment": {"path": "a.py", "line": 1}}]
+        self.assertEqual(review_receipt.parse_no_review(
+            json.dumps({"action": "no_review", "skipped": mixed}))["repeat_only"], False)
+        for text in ("not json", json.dumps({"action": "no_review", "skipped": []}),
+                     json.dumps({"action": "no_review"}), json.dumps({"action": "requested_changes", "review_id": 91})):
+            with self.subTest(text=text):
+                details = review_receipt.parse_no_review(text)
+                if text == "not json" or "requested_changes" in text:
+                    self.assertIsNone(details)
+                else:
+                    self.assertEqual(details["repeat_only"], False)
+
+    def test_claude_guard_persists_a_duplicate_only_refusal_unsealed(self):
+        command = f"github-interface --request-changes #68 --expected-head {HEAD} --token-user bit-mis"
+        receipt_path = Path(self.directory.name) / "receipt.json"
+        gate_path = Path(self.directory.name) / "gate"
+        gate_path.write_text("")
+        reply = json.dumps({"action": "no_review",
+                            "skipped": [{"reason": "repeat", "comment": {"path": "a.py", "line": 1}}]})
+        with patch.dict(os.environ, {"AGENT_INTERFACE_BASH_ALLOW": json.dumps([command]),
+                                     "AGENT_INTERFACE_REVIEW_RECEIPT": str(receipt_path),
+                                     "AGENT_INTERFACE_REVIEW_GATE": str(gate_path)}), \
+                patch.object(sys, "argv", ["bash_guard.py", command]), \
+                patch.object(bash_guard.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=reply, stderr="")), \
+                redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(SystemExit) as stopped:
+                bash_guard.main()
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(out.getvalue(), reply)
+        self.assertEqual(json.loads(Path(str(receipt_path) + ".refused").read_text())["action"], "no_review")
+        self.assertEqual(gate_path.read_text(), "")
+        self.assertFalse(receipt_path.exists())
+        review_receipt.bind(api.DB, "run")
+        self.assertIsNone(review_receipt.record_file(receipt_path))
+        self.assertEqual(review_receipt.refused()["repeat_only"], True)
+        self.assertIsNone(review_receipt.failure())
+        self.assertIsNone(review_receipt.blocked())
+        self.assertIsNone(self.stored())
+
+    def test_accepted_submission_wins_over_a_stale_refusal(self):
+        receipt_path = Path(self.directory.name) / "receipt.json"
+        Path(str(receipt_path) + ".refused").write_text(json.dumps(
+            {"action": "no_review", "skipped": [{"reason": "repeat", "comment": {"path": "a.py", "line": 1}}]}))
+        receipt_path.write_text(json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD}))
+        review_receipt.bind(api.DB, "run")
+        self.assertEqual(review_receipt.record_file(receipt_path)["review_id"], 91)
+        self.assertEqual(review_receipt.refused()["repeat_only"], True)
+        self.assertEqual(self.stored(), "91")
+
 
 class TestRecoveryWithSiblings(TestCase):
     def setUp(self):

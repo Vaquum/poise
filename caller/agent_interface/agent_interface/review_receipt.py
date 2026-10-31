@@ -22,6 +22,7 @@ _current: ContextVar[dict | None] = ContextVar("review_receipt", default=None)
 _call: ContextVar[tuple[Path, str] | None] = ContextVar("review_receipt_call", default=None)
 _failure: ContextVar[str | None] = ContextVar("review_submission_failure", default=None)
 _blocked: ContextVar[str | None] = ContextVar("review_submission_blocked", default=None)
+_refused: ContextVar[dict | None] = ContextVar("review_submission_refused", default=None)
 # A transport error carries no status: the write may have landed before the
 # response was lost, so publication is uncertain, never a refused submission.
 _TRANSPORT_ERRORS = ("TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
@@ -210,11 +211,34 @@ def blocked() -> str | None:
     return _blocked.get()
 
 
+def parse_no_review(text: str) -> dict | None:
+    """A duplicate-only publication refusal: the skipped entries and whether
+    every one restated an already-published body. None for anything else,
+    including malformed replies. Shared by both submission runners so the
+    repeat-only rule cannot drift between them."""
+    try:
+        reply = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(reply, dict) or reply.get("action") != "no_review":
+        return None
+    skipped = reply.get("skipped", [])
+    repeat_only = (isinstance(skipped, list) and len(skipped) > 0 and all(
+        isinstance(entry, dict) and entry.get("reason") == "repeat" for entry in skipped))
+    return {"skipped": skipped, "repeat_only": repeat_only}
+
+
+def refused() -> dict | None:
+    """The no_review reply details the guard persisted for this run, if any."""
+    return _refused.get()
+
+
 def bind(database: Path, call_id: str) -> None:
     _call.set((database, call_id))
     _current.set(None)
     _failure.set(None)
     _blocked.set(None)
+    _refused.set(None)
 
 
 def get() -> dict | None:
@@ -274,6 +298,13 @@ def record_file(path: str | Path) -> dict | None:
     else:
         if refused is not None:
             _blocked.set(refused)
+    try:
+        details = parse_no_review(Path(str(path) + ".refused").read_text())
+    except OSError:
+        pass
+    else:
+        if details is not None:
+            _refused.set(details)
     try:
         text = Path(path).read_text()
     except OSError:
