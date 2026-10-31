@@ -40,4 +40,33 @@ describe('behavior resource admission', () => {
     expect(() => measureBehaviorHeadroom({ freeMemory: () => 1, diskFree: () => { throw new Error('gone') } })).toThrow('behavior resource measurement unavailable: disk read of')
     expect(() => measureBehaviorHeadroom({ freeMemory: () => 1, diskFree: () => Number.NaN })).toThrow('behavior resource measurement unavailable: disk read of')
   })
+
+  it('caps host free memory at the workspace cgroup allowance', () => {
+    const cgroup = (files: Record<string, string>) => (name: string) => files[name] ?? null
+    expect(measureBehaviorHeadroom({
+      freeMemory: () => 64_000,
+      diskFree: () => 9,
+      cgroupFile: cgroup({ 'memory.max': '100\n', 'memory.current': '90\n' }),
+    }).freeMemoryBytes).toBe(10)
+    expect(measureBehaviorHeadroom({
+      freeMemory: () => 7,
+      diskFree: () => 9,
+      cgroupFile: cgroup({ 'memory.max': '100\n', 'memory.current': '90\n' }),
+    }).freeMemoryBytes).toBe(7)
+    expect(measureBehaviorHeadroom({
+      freeMemory: () => 7,
+      diskFree: () => 9,
+      cgroupFile: cgroup({ 'memory.max': 'max\n', 'memory.current': '90\n' }),
+    }).freeMemoryBytes).toBe(7)
+    expect(measureBehaviorHeadroom({
+      freeMemory: () => 7,
+      diskFree: () => 9,
+      cgroupFile: cgroup({}),
+    }).freeMemoryBytes).toBe(7)
+    expect(() => measureBehaviorHeadroom({
+      freeMemory: () => 7,
+      diskFree: () => 9,
+      cgroupFile: cgroup({ 'memory.max': 'bogus\n', 'memory.current': '1\n' }),
+    })).toThrow('behavior resource measurement unavailable: cgroup memory read is invalid')
+  })
 })

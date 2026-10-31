@@ -12,7 +12,7 @@
 // Configuration is environment-only, so no Settings surface changes and
 // production defaults are preserved: unset budgets are unbounded and every
 // admission path below behaves exactly as before, running no probes.
-import { statfsSync } from 'node:fs'
+import { readFileSync, statfsSync } from 'node:fs'
 import { freemem, homedir, tmpdir } from 'node:os'
 
 export interface BehaviorResourceBudget { memoryBytes: number | null, diskBytes: number | null }
@@ -50,16 +50,43 @@ export function readBehaviorResourceAdmission(env: NodeJS.ProcessEnv = process.e
   return { budget, reservation }
 }
 
+/** Remaining memory under this process's cgroup v2 limit, or unbounded when
+ *  no limit is set or no cgroup files exist (developer machines). Behaviors
+ *  run inside the memory-limited workspace container, where os.freemem()
+ *  reports host-wide free memory and would overstate the allowance the
+ *  container limit will actually enforce. */
+function cgroupAllowance(read: (name: string) => string | null): number {
+  let maxRaw: string | null
+  let currentRaw: string | null
+  try {
+    maxRaw = read('memory.max')
+    if (maxRaw === null || maxRaw.trim() === 'max') return Number.POSITIVE_INFINITY
+    currentRaw = read('memory.current')
+  } catch (error) {
+    throw new Error(`behavior resource measurement unavailable: cgroup memory read failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const max = Number(maxRaw.trim())
+  const current = Number((currentRaw ?? '').trim())
+  if (!Number.isSafeInteger(max) || max < 0 || !Number.isSafeInteger(current) || current < 0) {
+    throw new Error('behavior resource measurement unavailable: cgroup memory read is invalid')
+  }
+  return Math.max(0, max - current)
+}
+
 /** Synchronous free capacity at one admission boundary. Disposable behavior
  *  roots and provider history live under home while bounded spool uses the
  *  temporary filesystem, so disk headroom is the tighter of the two. Probes
  *  run synchronously at each decision, so a reading is never a stale cache;
  *  any failure reads as unavailable and must block admission explicitly. */
-export function measureBehaviorHeadroom(read: { freeMemory?: () => number, diskFree?: (path: string) => number } = {}): BehaviorResourceHeadroom {
+export function measureBehaviorHeadroom(read: { freeMemory?: () => number, diskFree?: (path: string) => number, cgroupFile?: (name: string) => string | null } = {}): BehaviorResourceHeadroom {
   const freeMemory = read.freeMemory ?? freemem
   const diskFree = read.diskFree ?? ((path: string) => {
     const stats = statfsSync(path)
     return stats.bavail * stats.bsize
+  })
+  const cgroupFile = read.cgroupFile ?? ((name: string) => {
+    try { return readFileSync(`/sys/fs/cgroup/${name}`, 'utf8') }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }
   })
   let freeMemoryBytes: number
   try {
@@ -68,6 +95,7 @@ export function measureBehaviorHeadroom(read: { freeMemory?: () => number, diskF
     throw new Error(`behavior resource measurement unavailable: free memory read failed: ${error instanceof Error ? error.message : String(error)}`)
   }
   if (!Number.isSafeInteger(freeMemoryBytes) || freeMemoryBytes < 0) throw new Error('behavior resource measurement unavailable: free memory read is invalid')
+  freeMemoryBytes = Math.min(freeMemoryBytes, cgroupAllowance(cgroupFile))
   let freeDiskBytes = Number.POSITIVE_INFINITY
   let diskPath = ''
   for (const path of [homedir(), tmpdir()]) {
