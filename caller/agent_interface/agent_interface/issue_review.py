@@ -735,8 +735,16 @@ def summary(posts: list[dict], receipts: list[dict], ignored: list[str]) -> str:
     return "\n".join(lines)
 
 
-def cleanup(path: Path) -> None:
+def cleanup(path: Path) -> bool:
+    """Remove one owned run directory; True only when it is verified gone.
+
+    A deletion failure stays a logged warning — the run's own result must not
+    turn into a cleanup error — but the False return keeps it visible to the
+    caller, which records it durably instead of settling resources."""
+    failed = []
+
     def report(function, failed_path, error):
+        failed.append(failed_path)
         logger.warning("Could not remove issue-review artifact %s: %s", failed_path, error)
 
     def writable(directory: Path) -> None:
@@ -747,7 +755,7 @@ def cleanup(path: Path) -> None:
     try:
         if path.is_symlink():
             logger.warning("Refusing to traverse issue-review workspace symlink %s", path)
-            return
+            return False
         writable(path)
         for root, directories, _ in os.walk(path, followlinks=False, onerror=lambda error: report(None, path, error)):
             for name in directories:
@@ -758,22 +766,38 @@ def cleanup(path: Path) -> None:
                     report(None, directory, error)
         shutil.rmtree(path, onexc=report)
     except FileNotFoundError:
-        return
+        return not path.is_symlink() and not path.exists()
     except OSError as error:
         logger.warning("Could not remove issue-review workspace %s: %s", path, error)
+        return False
+    if failed or path.is_symlink() or path.exists():
+        if not failed:
+            logger.warning("Could not remove issue-review workspace %s: still present after deletion", path)
+        return False
+    return True
+
+
+def sweep_roots() -> list[Path]:
+    """Disposable run roots a killed run could not clean up: issue reviews
+    and their atomic-work siblings."""
+    return [WORK_ROOT, WORK_ROOT.parent / "atomic-work"]
 
 
 def sweep() -> None:
-    """Remove run directories a killed run could not clean up."""
-    if not WORK_ROOT.is_dir():
-        return
-    for path in WORK_ROOT.iterdir():
-        if path.is_symlink() or not re.fullmatch(r"[0-9a-f]{32}", path.name):
+    """Remove stale run directories a killed run could not clean up.
+
+    Only a verified removal counts: a directory that survives stays in place
+    for the next sweep instead of reading as reclaimed."""
+    for root in sweep_roots():
+        if not root.is_dir():
             continue
-        try:
-            if path.is_dir() and time() - path.stat().st_mtime > STALE_RUN_SECONDS:
-                active = _cwd_pids(path, require_complete=True)
-                if active is not None and not active:
-                    cleanup(path)
-        except OSError as error:
-            logger.warning("Could not inspect issue-review workspace %s: %s", path, error)
+        for path in root.iterdir():
+            if path.is_symlink() or not re.fullmatch(r"[0-9a-f]{32}", path.name):
+                continue
+            try:
+                if path.is_dir() and time() - path.stat().st_mtime > STALE_RUN_SECONDS:
+                    active = _cwd_pids(path, require_complete=True)
+                    if active is not None and not active:
+                        cleanup(path)
+            except OSError as error:
+                logger.warning("Could not inspect issue-review workspace %s: %s", path, error)

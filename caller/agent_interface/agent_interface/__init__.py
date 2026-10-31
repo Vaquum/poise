@@ -810,6 +810,18 @@ def run_pr_review(
     )
 
 
+def record_cleanup_failure(call_id: str) -> None:
+    """A run directory that survived deletion keeps its resources unsettled:
+    the failure is durable and visible, and the still-present directory stays
+    retryable by the next sweep without repeating any external action."""
+    try:
+        with db() as conn:
+            conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.resource_error','cleanup_failed') where id=?",
+                         (call_id,))
+    except Exception as error:
+        print(f"call {call_id} cleanup failed and its record could not be updated: {error}", file=sys.stderr)
+
+
 def run_issue_review(
     issue: str,
     actor: str,
@@ -949,7 +961,8 @@ def run_issue_review(
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
-        issue_review.cleanup(run_dir)
+        if not issue_review.cleanup(run_dir):
+            record_cleanup_failure(id_)
 
 
 def _issue_review_targets(call_ids: list[str]) -> dict[str, str]:
@@ -1105,6 +1118,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
     id_ = track(spec.identity, note, str(pull if pull is not None else number), repo, actor, behavior,
                 expected_head=expected_head, source=source, correlation_id=correlation_id)
     run_dir = issue_review.WORK_ROOT.parent / "atomic-work" / id_
+    issue_review.sweep()
     artifact = {"phase": "preparing"}
 
     def record(value: dict) -> None:
@@ -1153,7 +1167,8 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
-        issue_review.cleanup(run_dir)
+        if not issue_review.cleanup(run_dir):
+            record_cleanup_failure(id_)
 
 
 def run_issue_simplify(issue: str, pwd: str | None = None, note: str = "", timeout_s: int = 3600):

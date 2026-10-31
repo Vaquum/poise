@@ -175,6 +175,49 @@ class TestStructuredVerdict(TestCase):
                 with self.assertRaisesRegex(structured_review.InvalidVerdict, "different review conversation"):
                     structured_review.ask_codex(root, model, "system", "packet plus inspection", {}, watch, 60)
 
+    def test_codex_history_isolated_per_review_with_sign_in_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "review"
+            root.mkdir()
+            home = Path(directory) / "home" / ".codex"
+            home.mkdir(parents=True)
+            (home / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+            (home / "config.toml").write_text("personal = true")
+            sessions = home / "sessions"
+            sessions.mkdir()
+            (sessions / "old.jsonl").write_text("personal history")
+            with patch.dict(os.environ, {"CODEX_HOME": str(home), "OPENAI_API_KEY": "test-key"}):
+                env = structured_review.codex_environment(root)
+            isolated = root / "codex-home"
+            self.assertEqual(env["CODEX_HOME"], str(isolated))
+            self.assertEqual(oct(isolated.stat().st_mode & 0o777), "0o700")
+            self.assertEqual((isolated / "auth.json").read_text(), '{"auth_mode": "chatgpt"}')
+            self.assertEqual(oct((isolated / "auth.json").stat().st_mode & 0o777), "0o600")
+            self.assertFalse((isolated / "sessions").exists())
+            self.assertFalse((isolated / "config.toml").exists())
+            self.assertNotIn("OPENAI_API_KEY", env)
+            self.assertEqual((home / "sessions" / "old.jsonl").read_text(), "personal history")
+
+    def test_codex_resume_continuity_survives_history_isolation(self):
+        thread = "01234567-89ab-4cde-8123-456789abcdef"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watch = SimpleNamespace(run=lambda *args, **kwargs: None)
+            def process(args, **kwargs):
+                Path(args[args.index("--output-last-message") + 1]).write_text('{"action":"reviewed_clean","comments":[]}')
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"type":"thread.started","thread_id":thread}), stderr="")
+            with patch.object(watch, "run", side_effect=process) as run:
+                first = "immutable packet\n\nInspection rounds remaining: 12."
+                second = "immutable packet\n\nPrevious review step: inspected consumer\n\nInspection rounds remaining: 11."
+                model = CATALOG.resolve("gpt-6-astra-max")
+                structured_review.ask_codex(root, model, "system", first, {}, watch, 60)
+                structured_review.ask_codex(root, model, "system", second, {}, watch, 60)
+                initial, resumed = run.call_args_list
+                for call in (initial, resumed):
+                    self.assertEqual(call.kwargs["env"]["CODEX_HOME"], str(root / "codex-home"))
+                    self.assertNotIn("--ephemeral", call.args[0])
+                self.assertEqual(resumed.args[0][-3:], ["resume", thread, "-"])
+
     def _run(self, verdict, behavior="pr_review", event=None, code=0):
         def process(args, **kwargs):
             if args[0] == "github-interface":

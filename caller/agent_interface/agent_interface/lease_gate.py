@@ -12,7 +12,8 @@ exit status. EOF after GO, or SIGTERM/SIGINT/SIGHUP, stops the whole group:
 SIGTERM, SIGKILL after five seconds. When the agent exits, lingering
 descendants are settled the same way before the gate exits with the agent's
 status; a group that cannot be listed is never reported settled, and one that
-will not die is reported with exit 70 so the holder keeps the lease.
+will not die is reported with exit 70 and an `UNSETTLED` status line so the
+holder keeps the lease — and tells it from an agent that itself exited 70.
 """
 import os
 import select
@@ -124,6 +125,8 @@ def main(argv: list[str]) -> int:
                 agent.kill()
                 agent.wait()
     if not settle(pgid):
+        if status is not None:
+            os.write(status, b"UNSETTLED\n")
         return UNSETTLED
     if stopping:
         return 128 + signal.SIGTERM

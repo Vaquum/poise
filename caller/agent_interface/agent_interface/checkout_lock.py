@@ -380,10 +380,12 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
     """Run the native writer under the lease. A gate leads a fresh process
     group and starts the agent only after it is registered in the lease and
     told GO over a pipe only we hold; it reports `STARTED` on a second pipe,
-    so "the agent never ran" is a fact, not an exit-code guess. Losing us
+    so "the agent never ran" is a fact, not an exit-code guess, and appends
+    `UNSETTLED` when its group could not be proven empty. Losing us
     (EOF), the lease or the deadline stops the whole group. Returns like
-    subprocess.run(capture_output=True) and settles the lease: released when
-    the group is gone, retained otherwise."""
+    subprocess.run(capture_output=True) and settles the lease: released only
+    when the group is gone and the gate reported it settled, retained
+    otherwise."""
     ident = str(uuid4())
     control_r, control_w = os.pipe()
     status_r, status_w = os.pipe()
@@ -391,6 +393,7 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                  "--status-fd", str(status_w), "--", *args]
     process: subprocess.Popen | None = None
     result: subprocess.CompletedProcess | None = None
+    gate_unsettled = False
     events = ProviderStream(provider)
     limited = RateLimitAbort() if provider else None
     with TemporaryFile(mode="w+t") as stdin, TemporaryFile(mode="w+t") as stdout, TemporaryFile(mode="w+t") as stderr:
@@ -428,7 +431,8 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                 except subprocess.TimeoutExpired:
                     continue
             events.read(stdout, final=True)
-            if not _gate_started(status_r):
+            started, gate_unsettled = _gate_receipt(status_r)
+            if not started:
                 raise RuntimeError("fix-failing-ci worker gate exited before the agent started")
             stdout.seek(0)
             stderr.seek(0)
@@ -441,20 +445,23 @@ def run_gated(lease: Lease, args: list[str], *, cwd: str, env: dict | None, time
                 for fd in (control_r, status_w, control_w, status_r):
                     if fd != -1:
                         os.close(fd)
-                _settle(lease, process.pid if process is not None else None)
+                _settle(lease, process.pid if process is not None else None, gate_unsettled=gate_unsettled)
     if lease.retained:
         raise WorkerOrphaned(lease.retained)
     return result
 
 
-def _gate_started(status_r: int) -> bool:
+def _gate_receipt(status_r: int) -> tuple[bool, bool]:
     """The gate's status pipe is at EOF once the gate (its only writer) has
-    exited; STARTED is on it exactly when the agent was spawned."""
+    exited; STARTED is on it exactly when the agent was spawned, and UNSETTLED
+    exactly when the gate gave up proving its group empty. An agent that
+    itself exited 70 carries STARTED without UNSETTLED, so the exit status
+    alone never decides settlement."""
     data = b""
     while True:
         chunk = os.read(status_r, 64)
         if not chunk:
-            return data.startswith(b"STARTED")
+            return data.startswith(b"STARTED"), b"UNSETTLED" in data.split()
         data += chunk
 
 
@@ -489,9 +496,15 @@ def _exited_unreaped(pid: int) -> bool:
         return False
 
 
-def _settle(lease: Lease, pgid: int | None) -> None:
+def _settle(lease: Lease, pgid: int | None, *, gate_unsettled: bool = False) -> None:
     """Release only once nothing in the worker group can still write. The gate
-    is reaped by now, so a live group means descendants we cannot vouch for."""
+    is reaped by now, so a live group means descendants we cannot vouch for.
+    A gate that reported its group unsettled keeps the lease even when the
+    group id looks dead: the number may have been released while members
+    lived on, or the listing the gate needed may have failed."""
+    if gate_unsettled:
+        lease.retain(f"orphan requiring intervention: worker gate reported group {pgid} ({lease.owner_label}) unsettled; lease retained")
+        return
     if pgid is not None and pgid_alive(pgid):
         lease.retain(f"orphan requiring intervention: worker group {pgid} ({lease.owner_label}) is still alive; lease retained")
         return
