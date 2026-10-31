@@ -13,6 +13,7 @@ import { db } from '../server/db'
 import { createServer as addServer, addEvent, deleteServer, listEvents, listServers, redactSecrets, secretValues, serverView, setDefault, setWorkspace, updateServer, writeSecret } from '../server/extensions/store'
 import { extensionsFor, recordDelivery, scrubEvent } from '../server/extensions/delivery'
 import { FEATURED, directoryEntry, directoryEntryByName, directoryStatus, installSpec, searchDirectory, syncDirectory } from '../server/extensions/registry'
+import { REMOTE_DESKTOP_COMMANDER } from '../server/extensions/builtin'
 import { createExtensionsApi } from '../server/extensions/http'
 import { forAcp, forClaude, forCodex, forMuse, parseImport, reaches, validateSpec, workspaceOf, type ServerSpec } from '../server/extensions/types'
 
@@ -251,14 +252,33 @@ describe('the directory', () => {
     expect(directoryStatus().error).toBeUndefined()
   })
 
-  it('searches its own copy, featured servers first, by kind', async () => {
+  it('searches its own copy, built-in and featured servers first, by kind', async () => {
     await syncDirectory({ force: true })
     const first = searchDirectory('', 'any', 3, 0)
     expect(first.featured).toBe(true)
-    expect(first.entries.slice(0, 2).map((entry) => entry.name)).toEqual(FEATURED.filter((name) => ['app.linear/linear', 'ai.exa/exa'].includes(name)))
+    expect(first.entries.map((entry) => entry.name)).toEqual([REMOTE_DESKTOP_COMMANDER.name, ...FEATURED.filter((name) => ['app.linear/linear', 'ai.exa/exa'].includes(name))])
     expect(searchDirectory('linear', 'any', 10, 0).entries[0].name).toBe('app.linear/linear')
     expect(searchDirectory('', 'local', 50, 0).entries.every((entry) => entry.options.some((option) => option.kind === 'package'))).toBe(true)
     expect(searchDirectory('court directory', 'remote', 10, 0).total).toBe(1)
+  })
+
+  it('builds Remote Desktop Commander in: listed with no crawl, searchable, and installable like a directory server', () => {
+    // No crawl ran here: the mirror is empty, yet the built-in is listed.
+    expect(directoryStatus().count).toBe(0)
+    const builtin = directoryEntryByName(REMOTE_DESKTOP_COMMANDER.name)
+    expect(builtin).toMatchObject({ title: 'Remote Desktop Commander', builtin: true, options: [{ id: 'remote-0', kind: 'remote', transport: 'http', url: 'https://mcp.desktopcommander.app/mcp', inputs: [] }] })
+    expect(searchDirectory('', 'any', 10, 0).entries[0].name).toBe(builtin.name)
+    expect(searchDirectory('remote desktop', 'any', 10, 0).entries[0].name).toBe(builtin.name)
+    expect(searchDirectory('', 'local', 10, 0).entries).toEqual([])
+    const plan = installSpec(builtin, 'remote-0', {}, 'remote-desktop-commander')
+    expect(plan.spec).toMatchObject({ name: 'remote-desktop-commander', source: 'directory', transport: 'http', url: 'https://mcp.desktopcommander.app/mcp', registry: { name: builtin.name, option: 'remote-0' } })
+    expect(plan.secrets).toEqual({})
+  })
+
+  it('prefers the built-in to a mirror row of the same name', () => {
+    db.prepare('INSERT INTO extension_directory (name, entry, generation) VALUES (?, ?, 1)').run(REMOTE_DESKTOP_COMMANDER.name, JSON.stringify({ ...REMOTE_DESKTOP_COMMANDER, title: 'Impostor', builtin: false }))
+    expect(directoryEntryByName(REMOTE_DESKTOP_COMMANDER.name).title).toBe('Remote Desktop Commander')
+    expect(searchDirectory('', 'any', 50, 0).entries.filter((entry) => entry.name === REMOTE_DESKTOP_COMMANDER.name)).toHaveLength(1)
   })
 
   it('marks a package Poise cannot launch on this host', async () => {

@@ -85,6 +85,14 @@ test('lives in the menu, not the top bar', async ({ page }) => {
   await expect(page.locator('#view-extensions .ext-empty')).toContainText('No extensions yet')
 })
 
+test('lists Remote Desktop Commander as a built-in directory server', async ({ page }) => {
+  await open(page)
+  await page.getByRole('tab', { name: 'Directory' }).click()
+  const card = page.locator('.ext-card[data-entry="app.desktopcommander/remote-desktop-commander"]')
+  await expect(card).toBeVisible()
+  await expect(card).toContainText('Built in')
+})
+
 test('adds a custom local server, checks it, keeps its secret out of the page, and switches it off', async ({ page }) => {
   await open(page)
   await removeAll(page)

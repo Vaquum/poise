@@ -32,15 +32,25 @@ retried; a server already removed in another tab is treated as removed.
 ## Directory
 
 The directory is Poise's own copy of the official
-[MCP Registry](https://registry.modelcontextprotocol.io). The registry's
+[MCP Registry](https://registry.modelcontextprotocol.io), plus the servers
+Poise builds in. The registry's
 search takes tens of seconds and single pages often take most of a minute, so
 Poise crawls it in the background (when the view opens and the copy is a day
 old, or on **Refresh**), resumes from the page that failed after an error, and
 keeps the last complete catalog until a new crawl finishes. After a failed
 crawl, opening the view waits ten minutes before trying again; Refresh tries
 at once. Search covers the
-title, the registry name and the description. A few well-known servers come
-first when nothing is searched.
+title, the registry name and the description. The built-in servers come
+first when nothing is searched, then a few well-known servers, then
+everything.
+
+Remote Desktop Commander, the built-in server, is a hosted MCP relay to the
+person's own computers: once it is added and signed in, chats get those
+machines' files, terminal, search and code tools. Pair each machine first —
+on it, run `npx @wonderwhy-er/desktop-commander@latest remote` and confirm
+the code it shows — then Add to Poise and Sign in with the same account. The
+machines are managed and revoked on
+[its dashboard](https://mcp.desktopcommander.app), not in Poise.
 
 Each entry offers its remote endpoint, its package, or both. **Add to Poise**
 asks only for what the entry declares: URL variables, header values (a
