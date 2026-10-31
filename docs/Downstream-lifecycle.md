@@ -43,19 +43,20 @@ Each route below is verified at the recorded revision, with its limit.
 
 ### Standalone PR behaviors (configured-pair authors only)
 
-Every chain phase has a standalone counterpart (chain-to-behavior key map
-in `server/behaviors.ts`):
+Standalone PR scans cover exactly the five `SkippableBehavior` members
+(`server/behaviors.ts`):
 
-| Chain phase | Standalone behavior |
+| Standalone behavior | Chain phase |
 | --- | --- |
-| `review-issue` | `review-new-issues` |
-| `review-pr` | `review-new-prs` |
-| `approve-pr` | `approve-prs` |
-| `implement-issue` | `implement-issues` |
-| `repair-pr` | `repair-prs` |
-| `resolve-threads` | `resolve-unblocking` |
-| `merge-pr` | `merge-prs` |
+| `review-new-prs` | `review-pr` |
+| `approve-prs` | `approve-pr` |
+| `resolve-unblocking` | `resolve-threads` |
+| `merge-prs` | `merge-pr` |
 | `rerun-grey-ci` | `rerun-grey-ci` |
+
+(`review-new-issues` covers seed issues, not PRs. The chain-to-behavior
+key map in `server/behaviors.ts` is partial: the `publish-issue` phase
+has no mapping.)
 
 Admission is per behavior and per scan: open PRs are filtered to the
 configured account pair (`ownPullRequestRefusal` in
@@ -65,6 +66,13 @@ and outside chain ownership (`listEligiblePrs`: `chainOwnsPr` plus
 (`stillEligible`). Chain-owned PRs cannot acquire a second behavior owner
 (`chainOwnsPr` reads `behaviorChainOwner` in
 `server/behavior-chain-journal.ts`).
+
+`implement-issues` and `repair-prs` are chain-only, not standalone
+routes: the runtime treats them as runnable only within an enabled chain
+(`server/behaviors.ts`), and metrics attribute them to source
+`poise:behavior-chain` (`server/behavior-metrics.ts`). There is no
+standalone implement or repair for an already-created PR outside the
+journal; that gap is part of why enrollment is future work.
 
 Limit: a PR authored outside the configured pair (for example a
 workflow-authored maintenance PR) is refused as "outside your configured
