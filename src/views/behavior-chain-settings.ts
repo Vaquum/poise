@@ -128,12 +128,27 @@ export function behaviorChainSettings() {
     if (reading) return
     reading = true; more.disabled = true
     const after = append ? next : null
+    const previousCount = append ? 0 : rows.length
     try {
       const response = await fetch(`/api/behavior-chains${after ? `?after=${encodeURIComponent(after)}` : ''}`)
       const data = await response.json()
       if (!response.ok || !Array.isArray(data.chains)) throw new Error(data.error || `HTTP ${response.status}`)
       if (data.next !== null && (typeof data.next !== 'string' || data.next <= (after ?? ''))) throw new Error('Chain cursor did not advance')
-      next = data.next; rows = append ? [...rows, ...data.chains] : data.chains
+      let chains = data.chains
+      let cursor = data.next
+      // A refresh must not drop pages loaded through More chains: re-read
+      // until the fresh list covers what was shown.
+      while (!append && chains.length < previousCount && cursor) {
+        const page = await fetch(`/api/behavior-chains?after=${encodeURIComponent(cursor)}`)
+        const paged = await page.json()
+        if (!page.ok || !Array.isArray(paged.chains)) throw new Error(paged.error || `HTTP ${page.status}`)
+        if (paged.next !== null && (typeof paged.next !== 'string' || paged.next <= cursor)) throw new Error('Chain cursor did not advance')
+        cursor = paged.next
+        chains = [...chains, ...paged.chains]
+        if (paged.chains.length === 0) break
+      }
+      next = append ? data.next : cursor
+      rows = append ? [...rows, ...data.chains] : chains
       more.hidden = !next
       if (data.settings) update({ ...getSettings(), behaviorChain: data.settings })
       cutover = data.cutover ?? null

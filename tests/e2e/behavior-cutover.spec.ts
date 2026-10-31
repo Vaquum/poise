@@ -74,6 +74,8 @@ test('chain and journal pagination retain prior results and display the actual w
   await expect(controls.locator('[data-chain-list]')).toContainText('exact-head CI is running')
   await controls.getByRole('button', { name: 'More chains' }).click()
   await expect(controls.getByRole('button', { name: 'History', exact: true })).toHaveCount(2)
+  await controls.getByRole('button', { name: 'Refresh chains' }).click()
+  await expect(controls.getByRole('button', { name: 'History', exact: true })).toHaveCount(2)
   await controls.getByRole('button', { name: 'History', exact: true }).first().click()
   const history = controls.getByRole('region', { name: 'Chain journal' })
   await expect(history).toContainText('chain.admitted')
