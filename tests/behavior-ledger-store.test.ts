@@ -484,32 +484,57 @@ describe('behavior firing ledger store', () => {
     } finally { check.close() }
   })
 
-  it('keeps sustained writes within main-file and journal bounds under a pinned external reader', () => {
+  it('fails sustained writes fast under a pinned external reader with no WAL or lingering journal', () => {
     const ceiling = 4 * 1024 * 1024
     const db = store({ maxPagesBytes: ceiling, maxInstances: 64, maxChanges: 128, maxBytes: 256 * 1024 })
     for (let i = 0; i < 8; i++) direct(db, 'seed-' + i)
+    // Rollback journaling, not WAL: a pinned reader causes fail-fast capture
+    // loss, never unbounded WAL growth.
+    const mode = new Database(db.path, { readonly: true })
+    try { expect(mode.pragma('journal_mode', { simple: true })).toBe('delete') } finally { mode.close() }
+    expect(existsSync(db.path + '-wal')).toBe(false)
     // A pinned external reader holds a SHARED lock across sustained writes:
-    // captures fail fast as retryable instead of waiting, and neither the
-    // main file nor the transient rollback journal grows without bound.
+    // captures fail fast as retryable instead of waiting, leave no partial
+    // rows, and leave no journal or WAL file lingering between attempts.
     const pinned = new Database(db.path)
     pinned.pragma('busy_timeout = 0')
     pinned.exec('BEGIN')
     pinned.prepare('SELECT * FROM ledger_instances').all()
     let failed = 0
-    let journalPeak = 0
     const startedAt = Date.now()
     try {
       for (let i = 0; i < 32; i++) {
         try { direct(db, 'pinned-' + i) } catch { failed++ }
-        try { journalPeak = Math.max(journalPeak, statSync(db.path + '-journal').size) } catch { /* absent while writers fail fast */ }
+        expect(existsSync(db.path + '-journal')).toBe(false)
+        expect(existsSync(db.path + '-wal')).toBe(false)
       }
     } finally { pinned.exec('ROLLBACK'); pinned.close() }
     expect(failed).toBe(32)
     expect(Date.now() - startedAt).toBeLessThan(5000)
     expect(records(db)).toHaveLength(16)
     // Release the reader: sustained successful writes prune at the earliest
-    // reached bound while the hard page ceiling backstops the main file.
-    for (let i = 0; i < 60; i++) direct(db, 'sustained-' + i)
+    // reached bound, and every commit deletes its transient journal.
+    for (let i = 0; i < 60; i++) {
+      direct(db, 'sustained-' + i)
+      expect(existsSync(db.path + '-journal')).toBe(false)
+    }
+    expect(existsSync(db.path + '-wal')).toBe(false)
+    expect(statSync(db.path).size).toBeLessThanOrEqual(ceiling)
+    expect(db.health()).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
+    expect(db.health().instances).toBeLessThanOrEqual(64)
+    expect(db.health().changes).toBeLessThanOrEqual(128)
+  })
+
+  it('fails closed at the hard page ceiling while the main file stays within it', () => {
+    const ceiling = 128 * 1024
+    const db = store({ maxPagesBytes: ceiling, maxInstances: 100_000, maxChanges: 100_000, maxBytes: 64 * 1024 * 1024 })
+    // Pruning caps stay far away so growth genuinely reaches the page
+    // ceiling; writes then fail closed instead of growing the main file.
+    let fulls = 0
+    for (let i = 0; i < 200 && fulls < 50; i++) {
+      try { direct(db, 'fill-' + i) } catch (error) { expect(String(error)).toMatch(/full/i); fulls++ }
+    }
+    expect(fulls).toBe(50)
     const check = new Database(db.path, { readonly: true })
     try {
       const pages = check.pragma('page_count', { simple: true }) as number
@@ -517,11 +542,9 @@ describe('behavior firing ledger store', () => {
       expect(pages * pageSize).toBeLessThanOrEqual(ceiling)
     } finally { check.close() }
     expect(statSync(db.path).size).toBeLessThanOrEqual(ceiling)
-    expect(journalPeak).toBeLessThanOrEqual(ceiling)
     expect(existsSync(db.path + '-journal')).toBe(false)
-    expect(db.health()).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
-    expect(db.health().instances).toBeLessThanOrEqual(64)
-    expect(db.health().changes).toBeLessThanOrEqual(128)
+    expect(existsSync(db.path + '-wal')).toBe(false)
+    expect(db.health().status).toBe('ok')
   })
 
   it('holds no database transaction across the HTTP send window', () => {
