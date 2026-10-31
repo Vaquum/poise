@@ -4,7 +4,7 @@ import { evidenceAttachment, evidenceReferences, keepKnownEvidence, type Evidenc
 // to the front, and after the person acts on one. Every tab of the workspace
 // shows the same ones: what one tab puts away, the others drop on their next read.
 
-export const NOTICE_KINDS = ['chat_waiting', 'sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'pr_ready', 'review_requested', 'pr_conflict', 'chat_turn_finished', 'github_quota_warning', 'github_quota_exhausted', 'storage_low', 'ledger_queue_stalled', 'ledger_capture_loss'] as const
+export const NOTICE_KINDS = ['chat_waiting', 'sign_in_needed', 'behavior_held', 'datastore_sync_failing', 'pr_ready', 'review_requested', 'pr_conflict', 'chat_turn_finished', 'github_quota_warning', 'github_quota_exhausted', 'storage_low', 'ledger_queue_stalled', 'ledger_capture_loss', 'worker_idle'] as const
 export const LOCAL_NOTICE_KINDS = ['read_failed', 'action_failed', 'action_needed', 'action_finished'] as const
 export type NoticeKind = typeof NOTICE_KINDS[number] | typeof LOCAL_NOTICE_KINDS[number]
 
