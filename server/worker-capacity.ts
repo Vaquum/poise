@@ -116,32 +116,46 @@ async function readLabelledBacklog(
   bound: ReadonlySet<string>,
 ): Promise<number | null> {
   if (scope !== null && scope.length === 0) return 0
-  const allowed = scope === null ? null : new Set(scope.map((repo) => repo.toLowerCase()))
   const orgs = readyOrganizations()
   if (orgs.length === 0) return null
+  // A scoped backlog reads each scoped repo, not the org page filtered
+  // locally: the org-wide limit applies before the scope filter, so a large
+  // org would hide scoped repos past the limit. Any failed read makes the
+  // total unknown rather than a partial count that could false-alert.
+  const queries: Array<{ org: (typeof orgs)[number], repo: string | null }> = []
+  if (scope === null) {
+    for (const org of orgs) queries.push({ org, repo: null })
+  } else {
+    const byOwner = new Map<string, (typeof orgs)[number]>()
+    for (const org of orgs) byOwner.set(org.login.toLowerCase(), org)
+    for (const repo of scope) {
+      const owner = repo.split('/')[0]?.toLowerCase()
+      const org = owner ? byOwner.get(owner) : undefined
+      if (!org) return null
+      queries.push({ org, repo })
+    }
+  }
   let total = 0
-  let readAny = false
-  for (const org of orgs) {
+  for (const { org, repo } of queries) {
     let rows: unknown
     try {
       const { stdout } = await runFile('github-datastore',
-        organizationArgs(org, ['view', 'issue', '--status', 'open', '--label', WORK_LABEL, '--limit', String(BACKLOG_LIMIT), '--format', 'json']),
+        organizationArgs(org, ['view', 'issue', '--status', 'open', '--label', WORK_LABEL,
+          ...(repo ? ['--repo', repo] : []), '--limit', String(BACKLOG_LIMIT), '--format', 'json']),
         { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
       rows = JSON.parse(stdout)
     } catch {
-      continue
+      return null
     }
-    if (!Array.isArray(rows)) continue
-    readAny = true
+    if (!Array.isArray(rows)) return null
     for (const raw of rows) {
       const row = raw as Partial<DatastoreIssue>
-      if (typeof row.repo !== 'string' || typeof row.number !== 'number' || !Number.isSafeInteger(row.number)) continue
-      if (allowed && !allowed.has(row.repo.toLowerCase())) continue
+      if (typeof row.repo !== 'string' || typeof row.number !== 'number' || !Number.isSafeInteger(row.number)) return null
       if (bound.has(`${row.repo.toLowerCase()}#${row.number}`)) continue
       total += 1
     }
   }
-  return readAny ? total : null
+  return total
 }
 
 function candidateRank(title: string, body: string): number {

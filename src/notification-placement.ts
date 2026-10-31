@@ -14,6 +14,7 @@ export const NOTIFICATION_PLACEMENT = {
   pr_ready: { actor: 'user', logging: 'none', lifecycle: 'ready-two-minute-check-fifteen-minute-reminder' },
   review_requested: { actor: 'user', logging: 'none', lifecycle: 'requested-until-authoritative-removal' },
   pr_conflict: { actor: 'user', logging: 'none', lifecycle: 'conflict-until-resolved-or-closed' },
+  worker_idle: { actor: 'user', logging: 'none', lifecycle: 'idle-two-minute-check-hourly-reminder' },
   action_failed: { actor: 'poise', logging: 'known-source-only', lifecycle: 'tab-dedupe-until-action-recovery' },
   action_needed: { actor: 'user', logging: 'none', lifecycle: 'tab-dedupe-until-action-recovery' },
   action_finished: { actor: 'user', logging: 'none', lifecycle: 'tab-local-until-dismissed-or-cleared' },

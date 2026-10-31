@@ -65,6 +65,7 @@ export const NOTICE_LOOK: Record<NoticeKind, { group: ItemGroup, tone: ItemTone,
   github_quota_exhausted: { group: 'faults', tone: 'red', icon: 'fault', source: 'GitHub API' },
   ledger_queue_stalled: { group: 'faults', tone: 'red', icon: 'fault', source: 'Ledger' },
   ledger_capture_loss: { group: 'faults', tone: 'red', icon: 'fault', source: 'Ledger' },
+  worker_idle: { group: 'needs', tone: 'amber', icon: 'held', source: 'Behaviors' },
 }
 
 // Colour says who can correct a condition (src/behavior-failure-cause.ts):
