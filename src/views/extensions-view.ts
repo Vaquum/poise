@@ -429,7 +429,7 @@ function entryPanelHtml(p: Extract<Panel, { kind: 'entry' }>): string {
   return `<div class="tp-header">${tile(entry.title, true)}<div class="ext-panel-title"><span class="tp-title">${esc(entry.title)}</span><span class="st-help st-help-info">${esc(entry.publisher)} · v${esc(entry.version)}${entry.builtin ? ' · built in' : ''}</span></div>
       <button type="button" class="tp-close" data-close aria-label="Close">&times;</button></div>
     <div class="tp-body"><p class="ext-description">${esc(entry.description || 'No description.')}</p>
-      <div class="ext-facts"><div><span>Registry</span><div><code>${esc(entry.name)}</code></div></div>${entry.websiteUrl ? `<div><span>Website</span><div><a href="${esc(entry.websiteUrl)}" target="_blank" rel="noopener noreferrer">${esc(entry.websiteUrl)}</a></div></div>` : ''}${entry.repositoryUrl ? `<div><span>Source</span><div><a href="${esc(entry.repositoryUrl)}" target="_blank" rel="noopener noreferrer">${esc(entry.repositoryUrl)}</a></div></div>` : ''}</div>
+      <div class="ext-facts"><div><span>${entry.builtin ? 'Built in' : 'Registry'}</span><div><code>${esc(entry.name)}</code></div></div>${entry.websiteUrl ? `<div><span>Website</span><div><a href="${esc(entry.websiteUrl)}" target="_blank" rel="noopener noreferrer">${esc(entry.websiteUrl)}</a></div></div>` : ''}${entry.repositoryUrl ? `<div><span>Source</span><div><a href="${esc(entry.repositoryUrl)}" target="_blank" rel="noopener noreferrer">${esc(entry.repositoryUrl)}</a></div></div>` : ''}</div>
       ${body}</div>`
 }
 
