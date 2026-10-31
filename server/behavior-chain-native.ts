@@ -2,6 +2,7 @@ import { mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { agentInterfaceCwd } from './models'
+import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
 import { chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
@@ -19,6 +20,7 @@ export interface NativeChainHooks {
   borrow(): (() => void) | null
   available(): boolean
   capacity(): number
+  measureHeadroom?: () => BehaviorResourceHeadroom
   permitted(chain: BehaviorChain, decision: Invoke): boolean
   note(behavior: ChainBehavior): string
   severity(behavior: ChainBehavior): string
@@ -78,6 +80,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     ownsRepository,
     available: hooks.available,
     capacity: hooks.capacity,
+    measureHeadroom: hooks.measureHeadroom,
     permitted: hooks.permitted,
     wake: hooks.wake,
     received: hooks.received,
@@ -318,6 +321,18 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         '--review-response-json', JSON.stringify({ ...response, review_id: reviewed.evidence!.review_id }), ...fixed] }
     },
     async launch(invocation, onExit, allowed) {
+      // Provider preparation finished after the durable admission, so
+      // re-verify measured headroom at the last boundary before spawn. A
+      // deferral settles as launch_deferred without consuming an attempt;
+      // the next tick's pre-check records the explicit wait reason.
+      const resources = readBehaviorResourceAdmission()
+      if (resources) {
+        try {
+          if (headroomShortfall((hooks.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)) return false
+        } catch {
+          return false
+        }
+      }
       const release = hooks.borrow()
       if (!release) return false
       try {

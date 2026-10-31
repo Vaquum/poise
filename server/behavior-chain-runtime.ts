@@ -3,6 +3,8 @@ import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import type { DetachedProcessExit } from './process'
 import { chainReviewResponse, decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
+import { budgetShortfall, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
+  type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
 
 export interface ChainSeed { repository: string, number: number }
 export interface ChainRuntimeOperations {
@@ -15,6 +17,9 @@ export interface ChainRuntimeOperations {
   received(invocation: ChainInvocation, call: LogEntry): void
   available(): boolean
   capacity(): number
+  /** Override for the synchronous admission-boundary probe; production and
+   *  local validation measure the actual host. Tests stub this. */
+  measureHeadroom?: () => BehaviorResourceHeadroom
   permitted(chain: BehaviorChain, decision: Extract<ChainDecision, { kind: 'invoke' }>): boolean
   request(chain: BehaviorChain, observation: ChainObservation, decision: Extract<ChainDecision, { kind: 'invoke' }>, id: string): Promise<ChainInvocation['request'] | null>
   launch(invocation: ChainInvocation, onExit: (result?: DetachedProcessExit) => void, allowed: () => boolean): Promise<boolean>
@@ -52,6 +57,14 @@ export class BehaviorChainRuntime {
     const current = this.journal.read(chain.id)
     if (!current) throw new Error('behavior chain disappeared while its invocation was running')
     return current
+  }
+
+  /** Durable-budget wait reason for one more reservation, or null when the
+   *  budget holds it. Unknown ownership never reads as free. */
+  private resourceWaitReason(resources: BehaviorResourceAdmission): string | null {
+    const reserved = this.journal.reservedResources()
+    if (reserved.unaccounted > 0) return `behavior resource accounting is incomplete: ${reserved.unaccounted} live invocation(s) predate reservations`
+    return budgetShortfall(resources.budget, reserved, resources.reservation)
   }
 
   private allowed(chain: BehaviorChain, invocation: ChainInvocation): boolean {
@@ -144,6 +157,28 @@ export class BehaviorChainRuntime {
             if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
             continue
           }
+          // Resource-aware admission precedes provider preparation like the
+          // count check, so blocked work holds no native agent session and
+          // consumes no provider probe. Unset budgets skip every probe.
+          const resources = decision.reviewer ? readBehaviorResourceAdmission() : null
+          if (resources) {
+            const exhausted = this.resourceWaitReason(resources)
+            if (exhausted) {
+              if (chain.waiting !== exhausted) this.append(chain, { type: 'chain.waiting', reason: exhausted })
+              continue
+            }
+            try {
+              const cramped = headroomShortfall((this.operations.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)
+              if (cramped) {
+                if (chain.waiting !== cramped) this.append(chain, { type: 'chain.waiting', reason: cramped })
+                continue
+              }
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error)
+              if (chain.waiting !== reason) this.append(chain, { type: 'chain.waiting', reason })
+              continue
+            }
+          }
           const accounts = this.operations.accounts()
           if (accounts.author.toLowerCase() !== chain.author.toLowerCase() || accounts.reviewer.toLowerCase() !== chain.reviewer.toLowerCase()) {
             this.append(chain, { type: 'chain.held', reason: 'configured accounts changed; existing chain ownership needs a decision' })
@@ -160,8 +195,15 @@ export class BehaviorChainRuntime {
           if (!this.operations.enabled() || !this.operations.permitted(chain, decision)) continue
           const admitted = this.journal.admitInvocation(chain, randomUUID(), { id, behavior: decision.behavior, basis: decision.basis,
             actor: decision.actor, model: request.command === 'agent-interface' ? request.argv[request.argv.indexOf('--model') + 1] : null, slot: decision.reviewer?.slot ?? null,
-            admittedAt: Date.now(), request }, this.operations.capacity())
-          if (!admitted) { this.append(chain, { type: 'chain.waiting', reason: 'shared native invocation capacity is occupied' }); continue }
+            ...(resources ? { reservation: resources.reservation } : {}),
+            admittedAt: Date.now(), request }, this.operations.capacity(), resources?.budget ?? null)
+          if (!admitted) {
+            const reason = !this.journal.modelCapacityAvailable(this.operations.capacity()) ? 'shared native invocation capacity is occupied'
+              : resources ? this.resourceWaitReason(resources) ?? 'shared native invocation capacity is occupied'
+              : 'shared native invocation capacity is occupied'
+            this.append(chain, { type: 'chain.waiting', reason })
+            continue
+          }
           chain = admitted
           await this.start(chain, chain.invocations.at(-1)!)
         } else {

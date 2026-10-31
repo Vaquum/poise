@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
 import type { BehaviorCutoverState } from '../src/behavior-cutover'
+import { budgetShortfall, type BehaviorResourceBudget, type BehaviorResourceReservation } from './behavior-resources'
 
 const CUTOVER_ID = '@behavior-admission'
 interface CutoverEvent { type: 'admission.changed', state: BehaviorCutoverState }
@@ -13,6 +14,10 @@ export interface ChainInvocation {
   actor: string
   model: string | null
   slot: string | null
+  /** Memory/disk allowance held while this invocation is live, including its
+   *  descendants. Null for quick native actions and admissions that predate
+   *  resource budgets; those never count as free against a bounded budget. */
+  reservation: BehaviorResourceReservation | null
   admittedAt: number
   admissionSequence: number
   request: { command: 'agent-interface' | 'github-interface', argv: string[], cwd: string, context?: { head: string, reviewRevision: string, queueRemoval?: string } }
@@ -37,6 +42,9 @@ export interface BehaviorChain {
   observation: Record<string, unknown> | null
   invocations: ChainInvocation[]
 }
+/** Admission payload: the reservation is optional so admissions that predate
+ *  resource budgets and quick native actions without an agent stay valid. */
+export type ChainAdmission = Omit<ChainInvocation, 'state' | 'callId' | 'outcome' | 'evidence' | 'admissionSequence' | 'reservation'> & { reservation?: BehaviorResourceReservation | null }
 export type ChainEvent =
   | { type: 'chain.admitted', repository: string, issue: number, branch: string, author: string, reviewer: string }
   | { type: 'chain.observed', observation: Record<string, unknown> }
@@ -44,7 +52,7 @@ export type ChainEvent =
   | { type: 'chain.waiting', reason: string }
   | { type: 'chain.resumed' }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
-  | { type: 'invocation.admitted', invocation: Omit<ChainInvocation, 'state' | 'callId' | 'outcome' | 'evidence' | 'admissionSequence'> }
+  | { type: 'invocation.admitted', invocation: ChainAdmission }
   | { type: 'invocation.started', invocationId: string }
   | { type: 'invocation.reconciled', invocationId: string, evidence: Record<string, unknown> }
   | { type: 'invocation.uncertain', invocationId: string, reason: string }
@@ -91,7 +99,10 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (!invocation.id || !invocation.basis || !invocation.actor || !Number.isSafeInteger(invocation.admittedAt)
       || invocation.admittedAt < 0 || next.invocations.some((prior) => prior.id === invocation.id)
       || next.invocations.some((prior) => prior.state !== 'settled')) throw new Error('behavior chain already owns an invocation or admission is invalid')
-    next.invocations.push({ ...invocation, admissionSequence: sequence, state: 'admitted', callId: null, outcome: null, evidence: null })
+    const reservation = invocation.reservation ?? null
+    if (reservation !== null && (!Number.isSafeInteger(reservation.memoryBytes) || reservation.memoryBytes < 0
+      || !Number.isSafeInteger(reservation.diskBytes) || reservation.diskBytes < 0)) throw new Error('behavior invocation carries an invalid resource reservation')
+    next.invocations.push({ ...invocation, reservation, admissionSequence: sequence, state: 'admitted', callId: null, outcome: null, evidence: null })
     next.waiting = null
   } else {
     const invocation = next.invocations.find((candidate) => candidate.id === event.invocationId)
@@ -238,12 +249,21 @@ export class BehaviorChainJournal {
     for (const row of this.db.prepare('SELECT chain_id FROM behavior_chain_current').iterate() as Iterable<{ chain_id: string }>) this.read(row.chain_id)
   }
 
-  admitInvocation(chain: BehaviorChain, eventId: string, invocation: Extract<ChainEvent, { type: 'invocation.admitted' }>['invocation'], capacity: number): BehaviorChain | null {
+  admitInvocation(chain: BehaviorChain, eventId: string, invocation: ChainAdmission, capacity: number, budget: BehaviorResourceBudget | null = null): BehaviorChain | null {
     this.durable()
     if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error('native invocation capacity must be positive')
     return this.db.transaction(() => {
       if (this.cutover().mode === 'draining') return null
       if (invocation.model !== null && !this.modelCapacityAvailable(capacity)) return null
+      if (budget && (budget.memoryBytes !== null || budget.diskBytes !== null) && invocation.model !== null) {
+        const reservation = invocation.reservation
+        if (!reservation || !Number.isSafeInteger(reservation.memoryBytes) || reservation.memoryBytes < 0
+          || !Number.isSafeInteger(reservation.diskBytes) || reservation.diskBytes < 0) throw new Error('behavior resource budget is configured but the admission carries no valid reservation')
+        const reserved = this.reservedResources()
+        // Unknown ownership never reads as free: a live invocation that
+        // predates reservations blocks bounded admissions until it settles.
+        if (reserved.unaccounted > 0 || budgetShortfall(budget, reserved, reservation)) return null
+      }
       return this.append(chain.id, eventId, chain.sequence, { type: 'invocation.admitted', invocation })
     }).immediate()
   }
@@ -254,6 +274,24 @@ export class BehaviorChainJournal {
       WHERE c.merged = 0 AND json_extract(i.value, '$.state') != 'settled'
         AND json_type(i.value, '$.model') != 'null' AND json_extract(i.value, '$.evidence.resources_settled_at') IS NULL`).get() as { count: number }
     return row.count < capacity
+  }
+
+  /** Resource allowances held by live native invocations, over the same
+   *  scope as the count check: verified settlement releases a reservation
+   *  exactly once, while cleanup uncertainty retains it. `unaccounted`
+   *  counts live invocations admitted without a reservation. */
+  reservedResources(): BehaviorResourceReservation & { unaccounted: number } {
+    const row = this.db.prepare(`SELECT coalesce(sum(json_extract(i.value, '$.reservation.memoryBytes')), 0) AS memory,
+      coalesce(sum(json_extract(i.value, '$.reservation.diskBytes')), 0) AS disk,
+      coalesce(sum(CASE WHEN json_extract(i.value, '$.reservation.memoryBytes') IS NULL
+        OR json_extract(i.value, '$.reservation.diskBytes') IS NULL THEN 1 ELSE 0 END), 0) AS unaccounted
+      FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+      WHERE c.merged = 0 AND json_extract(i.value, '$.state') != 'settled'
+        AND json_type(i.value, '$.model') != 'null' AND json_extract(i.value, '$.evidence.resources_settled_at') IS NULL`).get() as
+      { memory: number, disk: number, unaccounted: number }
+    if (!Number.isSafeInteger(row.memory) || row.memory < 0 || !Number.isSafeInteger(row.disk) || row.disk < 0
+      || !Number.isSafeInteger(row.unaccounted) || row.unaccounted < 0) throw new Error('behavior resource reservations are corrupt')
+    return { memoryBytes: row.memory, diskBytes: row.disk, unaccounted: row.unaccounted }
   }
 
   history(id: string, after = 0, limit = 100): StoredEvent[] {

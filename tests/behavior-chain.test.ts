@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it } from 'vitest'
-import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
+import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import type { LogEntry } from '../server/agent-log-parse'
@@ -31,7 +31,7 @@ function observation(): ChainObservation {
 function record(journal: BehaviorChainJournal, chain: BehaviorChain, event: ChainEvent): BehaviorChain {
   return journal.append(chain.id, `event-${chain.sequence}`, chain.sequence, event, NOW)
 }
-function invocation(id: string, behavior: ChainInvocation['behavior'], basis: string, slot: string | null = 'primary'): Omit<ChainInvocation, 'state' | 'callId' | 'outcome' | 'evidence' | 'admissionSequence'> {
+function invocation(id: string, behavior: ChainInvocation['behavior'], basis: string, slot: string | null = 'primary'): ChainAdmission {
   return { id, behavior, basis, actor: behavior === 'implement-issue' || behavior === 'repair-pr' ? 'author' : 'reviewer',
     model: 'fixture-model', slot, admittedAt: NOW, request: { command: 'agent-interface', argv: ['--fixture'], cwd: '/fixture' } }
 }
