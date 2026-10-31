@@ -64,6 +64,20 @@ read-only mode. A later attempt of that exact workflow/head settles its original
 admission; an unchanged attempt remains uncertain. A confirmed preflight read
 failure is a failed, unstarted action and retries with the existing backoff.
 
+## Seed observation batch
+
+One observation starts one native process for its seed issue, comments and
+publication inspection, instead of three. The batch reuses the three existing
+read projections on one shared client and returns them as named facets bound
+to the chain's repository, issue, branch and author account. Any facet failure
+fails the whole read; there is no partial envelope and no cached evidence, so
+freshness, validation and uncertain-action recovery are unchanged. The output
+cap is the sum of the three previous per-read caps. Reviewer readiness, CI,
+grey-CI recovery and the review-datastore path still read separately and keep
+their existing budgets. The saving is interpreter startup and auth setup, not
+API reads: the batch issues the same HTTP requests as the three separate
+reads did.
+
 ## Acceptance boundary
 
 Local unit/integration tests use explicit isolated stand-ins to protect contracts. They are not the requested acceptance proof. Historical dispatcher-driven runs in [the archived report](V2-real-cycle-validation.md) are excluded.
