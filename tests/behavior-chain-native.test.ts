@@ -43,7 +43,7 @@ it('preserves actual review identities, responses and times after an external me
   expect(observation.pull).toMatchObject({ merged: true, reviewIds: [91], mergedAt: completedAt + 2000,
     reviewReceipts: [{ id: 91, invocation: response.invocation_id, response, submittedAt: completedAt + 1000 }] })
   const invocation = { id: 'review', behavior: 'review-pr' as const, basis: chainBasis(['pr', HEAD, response.context_sha]),
-    actor: 'reviewer', model: 'fixture', slot: 'primary', admittedAt: completedAt - 1000, admissionSequence: 1,
+    actor: 'reviewer', model: 'fixture', slot: 'primary', reservation: null, admittedAt: completedAt - 1000, admissionSequence: 1,
     request: { command: 'agent-interface' as const, argv: [], cwd: '/fixture' }, state: 'settled' as const,
     callId: response.invocation_id, outcome: 'clean', evidence: { status: 'completed', action: 'reviewed_clean',
       review_id: 91, head_sha: HEAD, completedAt: completedAt + 1000, artifact: { review_response: response } } }
@@ -114,7 +114,7 @@ it('reconciles planned review comments with and without the revision marker', as
     reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
   })
   const uncertain: BehaviorChain = { ...chain, invocations: [{ id: 'inv-1', behavior: 'review-issue', basis: 'basis',
-    actor: 'reviewer', model: 'fixture', slot: 'primary', admittedAt: Date.now(), admissionSequence: 1,
+    actor: 'reviewer', model: 'fixture', slot: 'primary', reservation: null, admittedAt: Date.now(), admissionSequence: 1,
     request: { command: 'agent-interface', argv: [], cwd: '/interface' }, state: 'uncertain', callId,
     outcome: null, evidence: { callId, artifact: { plan_sha: digest } } }] }
   const observation = await operations.observe(uncertain)
