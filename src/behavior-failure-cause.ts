@@ -16,6 +16,7 @@ export const DIAGNOSTIC_PLACEMENT = {
   rate_limit: { rail: 'info', logging: 'warning' }, upstream_unavailable: { rail: 'info', logging: 'warning' }, network_interruption: { rail: 'info', logging: 'warning' },
   held_result: { rail: 'warning', logging: 'source' }, unknown: { rail: 'warning', logging: 'source' },
   review_provider_blocked: { rail: 'warning', logging: 'warning' }, authentication: { rail: 'warning', logging: 'warning' }, github_access: { rail: 'warning', logging: 'warning' },
+  approval_blocked_unresolved_conversations: { rail: 'warning', logging: 'warning' },
   review_packet_too_large: { rail: 'warning', logging: 'error' }, model_output_limit: { rail: 'warning', logging: 'error' },
   review_contract_violation: { rail: 'warning', logging: 'error' }, review_recovery_failed: { rail: 'warning', logging: 'error' }, review_budget_exhausted: { rail: 'warning', logging: 'error' },
   runtime_status_unknown: { rail: 'warning', logging: 'warning' },
@@ -82,7 +83,8 @@ export function isRepoAccessDenied(error: string): boolean {
 
 export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOptions = {}): DiagnosticClassification {
   const blockingCode = ['invalid_agent_result', 'review_provider_blocked', 'review_packet_too_large',
-    'review_contract_violation', 'review_recovery_failed', 'review_budget_exhausted', 'model_output_limit']
+    'review_contract_violation', 'review_recovery_failed', 'review_budget_exhausted', 'model_output_limit',
+    'approval_blocked_unresolved_conversations']
     .includes(options.errorCode ?? '')
   if (options.held || blockingCode) return diagnosticClassification(blockingCode ? options.errorCode! : 'held_result')
   if (options.errorCode === 'authentication_failed') return diagnosticClassification('authentication')

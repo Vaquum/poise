@@ -11,35 +11,42 @@ function modelOf(call: unknown[]): string {
 }
 
 describe('reviewer trip classification', () => {
-  const trips: Array<{ name: string, error: string, code?: string, expected: ReviewerTripKind }> = [
+  const trips: Array<{ name: string, error: string, code?: string, diagnostic?: { operation: string, phase: string }, expected: ReviewerTripKind }> = [
     { name: 'codex 429 reconnect loop', error: RATE_LIMIT_ERROR, expected: 'rate_limit' },
     { name: 'status 429', error: 'API error (status 429 Too Many Requests)', expected: 'rate_limit' },
     { name: 'http_status 429', error: '{"http_status": 429}', expected: 'rate_limit' },
     { name: 'rate-limit words', error: 'Provider rate-limited this run for over a minute', expected: 'rate_limit' },
+    { name: 'transport handoff', error: 'Provider kept reconnecting for over a minute (codex); handing off so the next model can run instead: Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for websocket)', code: 'review_provider_error', expected: 'provider' },
     { name: 'provider error code', error: 'codex review failed: turn errored', code: 'review_provider_error', expected: 'provider' },
     { name: 'provider exit code', error: 'codex review failed: provider exited', code: 'review_provider_exit', expected: 'provider' },
     { name: 'budget exhausted code', error: 'Review reached its total time limit; needs attention', code: 'review_budget_exhausted', expected: 'budget' },
+    { name: 'provider-execution budget with diagnostic', error: 'Issue review reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'provider.review', phase: 'provider_execution' }, expected: 'budget' },
     { name: '402 stays an account trip', error: 'API error (status 402 Payment Required)', expected: 'balance' },
   ]
 
-  const holds: Array<{ name: string, error: string, code?: string }> = [
+  const holds: Array<{ name: string, error: string, code?: string, diagnostic?: { operation: string, phase: string } }> = [
     { name: 'GitHub 429', error: 'error: GitHub 429: rate limit exceeded for resource' },
     { name: 'GitHub 403 rate-limit', error: 'error: GitHub 403 rate-limit: {headers}' },
     { name: 'line 429', error: 'verdict failed at line 429' },
+    { name: 'retry loop without quota evidence', error: 'codex review failed: Reconnecting... 5/5 (exceeded retry limit, stream disconnected)' },
     { name: 'pull number 429', error: 'failed to fetch https://api.github.com/repos/o/r/pulls/429' },
     { name: 'ordinary failure', error: 'max turns reached' },
     { name: 'model at capacity', error: 'Selected model is at capacity. Please try a different model.', code: 'provider_capacity' },
     { name: 'empty', error: '' },
+    { name: 'inspection prompt exhaustion', error: 'Repository inspection exceeds the review prompt limit; needs attention', code: 'review_budget_exhausted' },
+    { name: 'inspection round exhaustion', error: 'Repository inspection limit reached; needs attention', code: 'review_budget_exhausted' },
+    { name: 'issue checkout budget', error: 'Issue review checkout reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'issue.checkout', phase: 'checking_out' } },
+    { name: 'issue preparation budget', error: 'Issue review preparation reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'issue.prepare', phase: 'preparing_issue' } },
   ]
 
-  it.each(trips)('trips on $name', async ({ error, code, expected }) => {
+  it.each(trips)('trips on $name', async ({ error, code, diagnostic, expected }) => {
     const { behaviors } = await loadModules()
-    expect(behaviors.reviewerTripKind({ error, error_code: code } as LogEntry)).toBe(expected)
+    expect(behaviors.reviewerTripKind({ error, error_code: code, diagnostic } as LogEntry)).toBe(expected)
   })
 
-  it.each(holds)('does not trip on $name', async ({ error, code }) => {
+  it.each(holds)('does not trip on $name', async ({ error, code, diagnostic }) => {
     const { behaviors } = await loadModules()
-    expect(behaviors.reviewerTripKind({ error, error_code: code } as LogEntry)).toBeNull()
+    expect(behaviors.reviewerTripKind({ error, error_code: code, diagnostic } as LogEntry)).toBeNull()
   })
 })
 
@@ -123,6 +130,27 @@ describe('slot fallback on provider failure', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
     expect(db.listBehaviorDeadLetters()).toHaveLength(1)
     expect(runtime.getBehaviorsRuntimeHealth().failures.map((failure) => failure.target)).not.toContain('reviewer:grok-4.6-xhigh')
+  })
+
+  it.each([
+    { name: 'inspection prompt exhaustion', error: 'Repository inspection exceeds the review prompt limit; needs attention' },
+    { name: 'inspection round exhaustion', error: 'Repository inspection limit reached; needs attention' },
+  ])('holds its target on deterministic $name, without tripping the provider', async ({ error }) => {
+    const { db, runtime } = await startPrReviews({
+      primary: 'grok-4.6-xhigh', secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const key = `${pr.repo}#${pr.number}`
+    fixture.agentLogs = [failedPrLog(db, key, 'grok-4.6-xhigh', {
+      error, error_code: 'review_budget_exhausted', review_policy: 'bounded-v1',
+    })]
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+
+    // Held, not fallen through: no second launch, no global trip, one dead letter.
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+    expect(db.listBehaviorDeadLetters()).toHaveLength(1)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   })
 })
 

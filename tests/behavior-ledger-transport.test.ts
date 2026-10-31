@@ -12,7 +12,7 @@ import type { LedgerAdmission, LedgerHealth, LedgerRecord } from '../server/beha
 
 const health: LedgerHealth = {
   status: 'ok', unavailableReason: null, coverageStart: '2026-10-19T00:00:00.000Z', observedAt: '2026-10-19T00:00:00.000Z',
-  callerObservedAt: null, pending: 0, dropped: 0, gaps: [], generation: 'fixture', retainedFrom: null,
+  callerObservedAt: null, pending: 0, dropped: 0, gaps: [], detailFloor: null, generation: 'fixture', retainedFrom: null,
   changeLowerBound: 0, lastSequence: 0, instances: 0, changes: 0,
 }
 const admission: LedgerAdmission = { type: 'admit', admissionKey: 'panel', nativeId: 'native',

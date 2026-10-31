@@ -166,6 +166,17 @@ describe('behavior firing ledger store', () => {
     expect(records(db)[0]).toMatchObject({ state: 'running', activity: 'running', stateSource: 'native' })
   })
 
+  it('never downgrades a settled terminal firing with a delayed unknown observation', () => {
+    const db = store()
+    db.capture(admission('direct-1', { admissionKey: 'direct-1', behavior: 'merge-prs', source: 'poise:merge-prs', plannedSlots: [], slot: undefined }))
+    db.capture({ type: 'result', nativeId: 'direct-1', state: 'completed', activity: 'settled', outcome: 'merged', head, completedAt: stamp() })
+    const settled = records(db)[0]
+    expect(settled).toMatchObject({ state: 'completed', activity: 'settled', outcome: 'merged', completedAt: stamp() })
+    clock += 1000
+    db.capture({ type: 'result', nativeId: 'direct-1', state: 'unknown', activity: 'unknown' })
+    expect(records(db)[0]).toMatchObject({ state: 'completed', activity: 'settled', outcome: 'merged', completedAt: settled.completedAt, head })
+  })
+
   it('does not mistake target similarity or conflicting provenance for authoritative completion', () => {
     const db = store()
     db.capture(admission())

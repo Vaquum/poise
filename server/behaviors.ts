@@ -859,6 +859,29 @@ export function reviewAccountFailure(call: LogEntry): ReviewAccountFailureKind |
 
 export type ReviewerTripKind = ReviewAccountFailureKind | 'rate_limit' | 'provider' | 'budget'
 
+// Deterministic input exhaustion, not a provider outage: the review input
+// itself exceeds the prompt or inspection budget on this head. Retrying with
+// another model cannot fix it, and tripping the provider globally would stall
+// unrelated PRs. These hold their target with the Caller's precise reason.
+export function isDeterministicReviewExhaustion(call: LogEntry): boolean {
+  if (call.error_code !== 'review_budget_exhausted') return false
+  const error = String(call.error || '')
+  return /repository inspection exceeds the review prompt limit/i.test(error)
+    || /repository inspection limit reached/i.test(error)
+}
+
+// A time limit reached before the provider started is a preparation failure,
+// not a provider failure: the model never ran, so tripping it would penalize
+// a healthy reviewer and relaunch the same expensive preparation under
+// another model. These hold their target with the Caller's precise reason.
+function isPreparationBudgetExhaustion(call: LogEntry): boolean {
+  if (call.error_code !== 'review_budget_exhausted') return false
+  const operation = call.diagnostic?.operation
+  const phase = call.diagnostic?.phase
+  return operation === 'issue.checkout' || phase === 'checking_out'
+    || operation === 'issue.prepare' || phase === 'preparing_issue'
+}
+
 // Any provider failure before a verdict trips, not just account failures: a
 // rate limit, a provider CLI that died, or a budget that ran out with
 // nothing posted. Callers gate on postedNothing, so a run that submitted
@@ -869,18 +892,22 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
   const error = String(call.error || '')
   // A bare 429 matches line counts like a bare 402 does, so only HTTP-status
   // readings and rate-limit words trip — plus Caller's own early handoff,
-  // which says rate-limited outright. GitHub's own limits ("GitHub 429:",
-  // "GitHub 403 rate-limit:") never trip the model: switching slots cannot
-  // fix GitHub, and every slot would trip in turn.
+  // which says rate-limited outright. A bare retry loop ("exceeded retry
+  // limit" without quota evidence) is a transport stall, not a 429: it
+  // trips as a provider failure via the error code below instead.
+  // GitHub's own limits ("GitHub 429:", "GitHub 403 rate-limit:") never
+  // trip the model: switching slots cannot fix GitHub, and every slot
+  // would trip in turn.
   const githubLimit = /github\s+\d{3}/i.test(error)
   if (!githubLimit
     && (/status\s+429\b/i.test(error) || /\b429\s+too\s+many\b/i.test(error)
     || /http_status\D{0,8}429\b/i.test(error) || /too\s+many\s+requests/i.test(error)
-    || /rate[\s_-]*limit/i.test(error) || /exceeded\s+retry\s+limit/i.test(error))) return 'rate_limit'
+    || /rate[\s_-]*limit/i.test(error))) return 'rate_limit'
   // A provider CLI that died outright trips like one that errored: before a
   // verdict, the next slot is strictly more useful than the same dead run.
   if (call.error_code === 'review_provider_error' || call.error_code === 'review_provider_exit') return 'provider'
-  if (call.error_code === 'review_budget_exhausted') return 'budget'
+  if (call.error_code === 'review_budget_exhausted' && !isDeterministicReviewExhaustion(call)
+    && !isPreparationBudgetExhaustion(call)) return 'budget'
   return null
 }
 
@@ -3259,11 +3286,48 @@ async function tickReviewNewPrs(): Promise<void> {
       releasePhase2Leases()
       throw err
     }
-    // Phase 3 — provision the checkout and spawn every claimed target without
-    // the behavior lock: the atomic claim plus launch intent is the
+    // Phase 3a — re-verify every claimed head through the same bounded
+    // pool as preparation: the preparation's head read is stale by now
+    // whenever the pull request moved during the claim phase, and launching
+    // anyway spawns a worker Caller's head check is already doomed to
+    // refuse. A stale preparation ends here as a retained no-op before it
+    // provisions or spawns, so a fast-moving pull request costs one head
+    // read per tick instead of one preflight failure per backoff window.
+    // The next tick prepares fresh on the new head; Caller's exact-head
+    // checks still backstop the remaining race.
+    const verified: { prepared: PreparedReviewTarget, claimId: string, setting: BehaviorSetting }[] = []
+    await underLifecycleSignal(() => forEachPool(claimed, REVIEW_PREPARE_CONCURRENCY, async ({ prepared: bundle, claimId, setting }) => {
+      const { pr, slot, target } = bundle
+      try {
+        const currentHead = await currentHeadSha(pr.repo, pr.number, bundle.actor)
+        if (currentHead !== bundle.expectedHead) {
+          releaseOwnedClaim('review-new-prs', target, claimId)
+          releasePrOperationOwned(bundle.operationId)
+          captureBehaviorOutcome({ nativeId: claimId, state: 'completed', activity: 'settled', stateSource: 'native',
+            outcome: 'no_op', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+          console.log(`[behaviors] review-new-prs deferred for ${pr.repo}#${pr.number} — head moved during preparation`)
+          return
+        }
+        verified.push({ prepared: bundle, claimId, setting })
+      } catch (err) {
+        releaseOwnedClaim('review-new-prs', target, claimId)
+        releasePrOperationOwned(bundle.operationId)
+        if (behaviorAborted()) return
+        // The head read itself failed before anything provisioned: no
+        // worker stands behind the launch intent, so the ledger records
+        // the preflight end like a checkout failure.
+        captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
+          outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
+        console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+        if (err instanceof BehaviorLogFeedError) failure ??= err
+        else recordBehaviorFailure('review-new-prs', 'operation', err, `${target}:check`, { actingAccount: bundle.actor })
+      }
+    }))
+    // Phase 3b — provision the checkout and spawn every verified target
+    // without the behavior lock: the atomic claim plus launch intent is the
     // ownership. The checkout runs here, under the lifecycle signal, so a
     // cold clone can't consume the sweep deadline.
-    await underLifecycleSignal(() => Promise.all(claimed.map(async ({ prepared: bundle, claimId, setting }) => {
+    await underLifecycleSignal(() => Promise.all(verified.map(async ({ prepared: bundle, claimId, setting }) => {
       const { pr, slot, target, checkTarget } = bundle
       let checkoutReady = false
       try {
@@ -3541,10 +3605,12 @@ function boundedReviewFailure(call: LogEntry): boolean {
 // failure, not an ambiguous side effect: Caller verifies against live
 // GitHub before failing this way, and says so when it cannot. It retries
 // the same head on backoff once the provider answers again; only an
-// uncertain submission holds.
+// uncertain submission holds — as does deterministic input exhaustion,
+// which no other model can fix on this head.
 function budgetExhaustedProvenNoAction(call: LogEntry): boolean {
   return call.review_policy === REVIEW_POLICY
     && call.error_code === 'review_budget_exhausted'
+    && !isDeterministicReviewExhaustion(call)
     && postedNothing(call)
     && call.review_comments == null
     && !/could not prove a safe recovery/.test(call.error || '')
@@ -4598,7 +4664,10 @@ interface ResolveAttemptDetail {
 
 // Persisted before each admitted resolve. Earlier uncertain attempts stay
 // linked until positive target evidence settles them; a later failure is
-// never proof of their effects.
+// never proof of their effects. `cause` is the bounded actionable failure
+// message (behaviorErrorMessage); absent only for a freshly admitted firing
+// that has not failed yet. It survives through `previous` and every archived
+// receipt so a later supersession never replaces the original evidence.
 interface ResolveRecovery {
   nativeId: string
   code: string
@@ -4608,6 +4677,7 @@ interface ResolveRecovery {
   unresolvedBefore: number
   at: string
   actor?: string
+  cause?: string
   previous?: ResolveRecovery[]
 }
 const RESOLVE_RECOVERY_PREFIX = `${META_PREFIX}resolve_unblocking_recovery:`
@@ -4619,6 +4689,8 @@ function resolveRecoveryKey(checkTarget: string): string {
 function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
   const raw = getMeta(resolveRecoveryKey(checkTarget))
   if (!raw) return null
+  const validCause = (cause: unknown): cause is string =>
+    typeof cause === 'string' && cause.length >= 1 && cause.length <= 300
   try {
     const value = objectValue(parseJson(raw, 'resolve recovery'), 'resolve recovery')
     if (typeof value.nativeId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.nativeId)
@@ -4630,6 +4702,7 @@ function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
       || !Number.isSafeInteger(value.unresolvedBefore) || Number(value.unresolvedBefore) < 0
       || typeof value.at !== 'string' || !Number.isFinite(Date.parse(value.at))
       || (value.actor !== undefined && (typeof value.actor !== 'string' || !GITHUB_USERNAME_PATTERN.test(value.actor)))
+      || (value.cause !== undefined && !validCause(value.cause))
       || (value.previous !== undefined && (!Array.isArray(value.previous) || value.previous.length > 31))) return null
     const previous: ResolveRecovery[] = []
     if (Array.isArray(value.previous)) {
@@ -4641,10 +4714,12 @@ function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
           || item.sideEffects !== 'uncertain' || typeof item.head !== 'string' || !SHA_PATTERN.test(item.head)
           || !Number.isSafeInteger(item.unresolvedBefore) || Number(item.unresolvedBefore) < 0
           || typeof item.at !== 'string' || !Number.isFinite(Date.parse(item.at))
-          || (item.actor !== undefined && (typeof item.actor !== 'string' || !GITHUB_USERNAME_PATTERN.test(item.actor)))) return null
+          || (item.actor !== undefined && (typeof item.actor !== 'string' || !GITHUB_USERNAME_PATTERN.test(item.actor)))
+          || (item.cause !== undefined && !validCause(item.cause))) return null
         previous.push({ nativeId: item.nativeId, code: item.code, nextRetryAtMs: Number(item.nextRetryAtMs),
           sideEffects: 'uncertain', head: item.head, unresolvedBefore: Number(item.unresolvedBefore), at: item.at,
-          ...(typeof item.actor === 'string' ? { actor: item.actor } : {}) })
+          ...(typeof item.actor === 'string' ? { actor: item.actor } : {}),
+          ...(typeof item.cause === 'string' ? { cause: item.cause } : {}) })
       }
     }
     return {
@@ -4656,6 +4731,7 @@ function readResolveRecovery(checkTarget: string): ResolveRecovery | null {
       unresolvedBefore: Number(value.unresolvedBefore),
       at: value.at,
       ...(typeof value.actor === 'string' ? { actor: value.actor } : {}),
+      ...(typeof value.cause === 'string' ? { cause: value.cause } : {}),
       ...(previous.length ? { previous } : {}),
     }
   } catch {
@@ -4686,6 +4762,26 @@ function archiveResolveRecovery(checkTarget: string, pending: ResolveRecovery, d
     state: disposition, activity: disposition === 'completed' ? 'settled' : 'unknown', stateSource: 'native',
     outcome: disposition === 'completed' ? 'no_op' : 'superseded', head,
     ...(disposition === 'completed' ? { completedAt: at } : {}) })
+}
+
+// A direct CLI supersession settles its own firing inside
+// resolveNonblockingIfReady, which already captured the superseded outcome.
+// Persist the receipt only: the original head/actor/correlation (and any
+// failure cause) must survive alongside the observed head, without a second
+// ledger outcome and without authorizing a replay from the changed head.
+// The attempt is the single firing being settled, never the whole chain.
+function retainResolveSupersededReceipt(checkTarget: string, attempt: ResolveRecovery, observedHead: string): void {
+  const single: ResolveRecovery = { nativeId: attempt.nativeId, code: attempt.code,
+    nextRetryAtMs: attempt.nextRetryAtMs, sideEffects: attempt.sideEffects, head: attempt.head,
+    unresolvedBefore: attempt.unresolvedBefore, at: attempt.at,
+    ...(attempt.actor !== undefined ? { actor: attempt.actor } : {}),
+    ...(attempt.cause !== undefined ? { cause: attempt.cause } : {}) }
+  const at = new Date().toISOString()
+  const receipt = { ...single, disposition: 'superseded', targetDisposition: 'superseded' as const,
+    observedHead, observedAt: at }
+  const stored = db.prepare("UPDATE behavior_runs SET note = ? WHERE id = ? AND behavior = 'resolve-unblocking'")
+    .run(JSON.stringify({ target: checkTarget, ...receipt }), single.nativeId)
+  if (!stored.changes) setMeta(`${resolveRecoveryKey(checkTarget)}:receipt:${single.nativeId}`, JSON.stringify(receipt))
 }
 
 async function retireClosedResolveRecoveries(open: ReadonlySet<string>): Promise<void> {
@@ -4747,13 +4843,14 @@ function retainResolveRecoveryFailure(checkTarget: string, detail: ResolveAttemp
   }
   const failure = readBehaviorFailure('resolve-unblocking', checkTarget)
   const current = admitted?.nativeId === detail.nativeId && failure && failure.lastFailureAtMs >= recordedAtMs ? failure : null
-  const code = current?.diagnostic?.code ?? classifyBehaviorDiagnostic(behaviorErrorMessage(cause)).code
+  const causeMessage = current?.error ?? behaviorErrorMessage(cause)
+  const code = current?.diagnostic?.code ?? classifyBehaviorDiagnostic(causeMessage).code
   const retryAt = current?.nextRetryAtMs ?? Math.min(Math.max(
     rateLimitRetryAtMs(behaviorFailureEvidence(cause), recordedAtMs) ?? recordedAtMs + BEHAVIOR_RETRY_BASE_MS,
     recordedAtMs + BEHAVIOR_RETRY_BASE_MS), recordedAtMs + BEHAVIOR_RETRY_MAX_MS)
   attempts[ownIndex] = {
     nativeId: detail.nativeId, code, nextRetryAtMs: retryAt, sideEffects: detail.sideEffects,
-    head: headSha, unresolvedBefore, at, actor: detail.actor,
+    head: headSha, unresolvedBefore, at, actor: detail.actor, cause: causeMessage,
   }
   const latest = attempts.pop()!
   const previous = attempts.filter((attempt) => attempt.sideEffects === 'uncertain')
@@ -4764,7 +4861,7 @@ function retainResolveRecoveryFailure(checkTarget: string, detail: ResolveAttemp
   } else {
     captureBehaviorOutcome({ nativeId: detail.nativeId, state: 'held', activity: 'unknown', stateSource: 'native' })
   }
-  return `target=${checkTarget} native=${detail.nativeId} actor=${detail.actor} head=${headSha} code=${code} retry=${new Date(retryAt).toISOString()} side_effects=${detail.sideEffects}`
+  return `target=${checkTarget} native=${detail.nativeId} actor=${detail.actor} head=${headSha} code=${code} retry=${new Date(retryAt).toISOString()} side_effects=${detail.sideEffects} cause=${causeMessage}`
 }
 
 // Authoritative evidence proves nothing remains to resolve: settle a
@@ -5062,7 +5159,22 @@ async function tickResolveUnblocking(): Promise<void> {
           // A late result only proves its own invocation. Check ownership
           // and settle older receipts atomically with the current pointer.
           db.transaction(() => {
-            const current = readResolveRecovery(checkTarget)?.nativeId === detail.nativeId
+            const pendingBefore = readResolveRecovery(checkTarget)
+            const current = pendingBefore?.nativeId === detail.nativeId
+            if (result.superseded) {
+              // A late superseded response settles only its own firing, even
+              // when a newer attempt already owns the recovery pointer. Find
+              // its admitted evidence in the chain; when the pointer already
+              // moved on, rebuild the receipt from this invocation's pinned
+              // head/actor/correlation rather than dropping them.
+              const known = pendingBefore
+                ? resolveRecoveryAttempts(pendingBefore).find((attempt) => attempt.nativeId === detail.nativeId)
+                : undefined
+              const attempt: ResolveRecovery = known ?? { nativeId: detail.nativeId!, code: 'admitted',
+                nextRetryAtMs: Date.now() + BEHAVIOR_RETRY_BASE_MS, sideEffects: 'uncertain',
+                head: headSha, unresolvedBefore, at: new Date().toISOString(), actor: reviewer }
+              retainResolveSupersededReceipt(checkTarget, attempt, result.headSha)
+            }
             retireResolveRecoveryAttempt(checkTarget, detail.nativeId!)
             if (current && !result.superseded && result.unresolved_count === 0) settleResolveRecoveryEndState(checkTarget, result.headSha)
             checked = current && readResolveRecovery(checkTarget) === null
@@ -5395,6 +5507,7 @@ async function tickMergePrs(): Promise<void> {
       const operationId = claimPrOperationOwned(target, PR_OPERATION_EVALUATION_LEASE_MS)
       if (!operationId) continue
       let runId: string | null = null
+      let runNote: string | null = null
       try {
         const expectedHead = candidate.head!
         const [owner, name] = pr.repo.split('/', 2)
@@ -5427,7 +5540,10 @@ async function tickMergePrs(): Promise<void> {
           ...(result.outcome === 'enqueued'
             ? { refs: [{ kind: 'queue' as const, identity: String(result.queue_entry_id), availability: 'available' as const }] } : {}),
           head: expectedHead, completedAt: new Date().toISOString() })
-        finishDirectBehaviorRun(runId, true, disposition)
+        const receipt = result.outcome === 'merged' ? ` merge_sha=${result.merge_sha}`
+          : ['enqueued', 'in_queue'].includes(String(result.outcome)) ? ` queue_entry=${String(result.queue_entry_id).slice(0, 120)}` : ''
+        runNote = `target=${target} native=${runId} actor=${actor} head=${expectedHead} op=merge-if-ready outcome=${result.outcome}${receipt}`
+        finishDirectBehaviorRun(runId, true, disposition, runNote)
         runId = null
         if (result.outcome === 'enqueued' || result.outcome === 'in_queue') {
           storeQueueAdmission(target, { entryId: String(result.queue_entry_id), head: expectedHead, at: new Date().toISOString() })
@@ -5444,12 +5560,15 @@ async function tickMergePrs(): Promise<void> {
         }
         clearBehaviorFailure('merge-prs', target, actor)
       } catch (error) {
-        if (runId) captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+        if (runId) {
+          captureBehaviorOutcome({ nativeId: runId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+          runNote = `target=${target} native=${runId} actor=${actor} head=${candidate.head ?? 'unknown'} op=merge-if-ready error=${behaviorErrorMessage(error)}`
+        }
         if (behaviorAborted()) return
         recordBehaviorFailure('merge-prs', 'operation', error, target, { actingAccount: actor })
         console.error(`[behaviors] merge-prs failed for ${target}:`, error)
       } finally {
-        if (runId) finishDirectBehaviorRun(runId, false)
+        if (runId) finishDirectBehaviorRun(runId, false, null, runNote ?? undefined)
         releasePrOperationOwned(operationId)
       }
     }
@@ -5466,6 +5585,7 @@ async function tickMergePrs(): Promise<void> {
   const updateOperationId = claimPrOperationOwned(updateTarget, PR_OPERATION_EVALUATION_LEASE_MS)
   if (!updateOperationId) return
   let updateRunId: string | null = null
+  let updateRunNote: string | null = null
   try {
     const expectedHead = update.head!
     const [owner, name] = updatePr.repo.split('/', 2)
@@ -5491,19 +5611,23 @@ async function tickMergePrs(): Promise<void> {
     captureBehaviorOutcome({ nativeId: updateRunId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
       activity: 'settled', stateSource: 'native', outcome: updateDisposition,
       head: expectedHead, completedAt: new Date().toISOString() })
-    finishDirectBehaviorRun(updateRunId, true, updateDisposition)
+    updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${expectedHead} op=update-branch-if-behind outcome=${result.outcome}`
+    finishDirectBehaviorRun(updateRunId, true, updateDisposition, updateRunNote)
     updateRunId = null
     if (result.outcome === 'updated') {
       console.log(`[behaviors] merge-prs updated ${updateTarget}`)
     }
     clearBehaviorFailure('merge-prs', updateTarget, actor)
   } catch (error) {
-    if (updateRunId) captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+    if (updateRunId) {
+      captureBehaviorOutcome({ nativeId: updateRunId, state: 'unknown', activity: 'unknown', stateSource: 'native' })
+      updateRunNote = `target=${updateTarget} native=${updateRunId} actor=${actor} head=${update.head ?? 'unknown'} op=update-branch-if-behind error=${behaviorErrorMessage(error)}`
+    }
     if (behaviorAborted()) return
     recordBehaviorFailure('merge-prs', 'operation', error, updateTarget, { actingAccount: actor })
     console.error(`[behaviors] merge-prs failed for ${updateTarget}:`, error)
   } finally {
-    if (updateRunId) finishDirectBehaviorRun(updateRunId, false)
+    if (updateRunId) finishDirectBehaviorRun(updateRunId, false, null, updateRunNote ?? undefined)
     releasePrOperationOwned(updateOperationId)
   }
 }
@@ -6681,7 +6805,15 @@ async function reconcileIssueReviewClaims(): Promise<void> {
     }
     if (FAILED_AGENT_STATUSES.has(status)) {
       const message = call.error || `agent call terminated with status ${status}`
-      if (releaseTrippedCall(ISSUES_KEY, claim, call)) continue
+      if (releaseTrippedCall(ISSUES_KEY, claim, call)) {
+        // A time-limit trip still relaunches the review once with the next
+        // reviewer — but the attempt counts toward the retry bound, so
+        // repeated time-limits hold instead of relaunching without end.
+        // Account and rate-limit trips substitute reviewers on backoff and
+        // stay uncounted, as documented.
+        if (call.error_code === 'review_budget_exhausted') recordBehaviorDeadLetter(claim, message, call.id)
+        continue
+      }
       if (deadLetterClaim(claim, message)) {
         const posted = call.receipts !== null && call.receipts !== undefined
         if (call.error_code !== 'stopped' && (posted || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))) {

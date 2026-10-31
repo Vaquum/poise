@@ -11,6 +11,7 @@ findings combine into the single submitted verdict.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from hashlib import sha256
 import os
 import re
@@ -213,28 +214,39 @@ def _admit(text: str) -> None:
         )
 
 
-def _stage_texts(text: str, packet: str) -> list[str]:
-    if not packet:
-        return [text]
-    stages = review_stages.split(packet)
-    if len(stages) == 1:
-        return [text]
+def _stage_texts(text: str, packet: str) -> Iterator[str]:
+    """Yield one review prompt per file group, holding one at a time."""
+    if not packet or review_stages.stage_count(packet) == 1:
+        yield text
+        return
     if packet not in text:
         raise review_stages.StageError("staged review packet differs from the review prompt")
-    return [text.replace(packet, stage, 1) for stage in stages]
+    for stage in review_stages.iter_stages(packet):
+        yield text.replace(packet, stage, 1)
 
 
-def _reaffirms_finding(comment: dict, threads: list[dict]) -> bool:
+def _reaffirming_thread(comment: dict, threads: list[dict], *, in_since_diff: bool) -> dict | None:
+    """The unresolved thread this comment reaffirms, if any.
+
+    A location match with the same body reaffirms a current thread, and
+    a body match alone reaffirms an outdated one, whose location is
+    stale. A bare location match reaffirms only outside the since diff:
+    inside it, the line may be a new finding's previous-head line that
+    collides with an unrelated thread's base line, and remapping must
+    win so the finding is not discarded as a duplicate.
+    """
     body = " ".join(comment["body"].lower().split())
     for thread in threads:
         if thread.get("is_resolved") or thread.get("path") != comment["path"]:
             continue
-        if not any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
-            continue
-        if thread.get("is_outdated") or (
-                thread.get("line") == comment["line"] and thread.get("side") == comment["side"]):
-            return True
-    return False
+        if thread.get("is_outdated"):
+            if any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
+                return thread
+        elif thread.get("line") == comment["line"] and thread.get("side") == comment["side"]:
+            if not in_since_diff or \
+                    any(body == " ".join(text.lower().split()) for text in thread.get("bodies", [])):
+                return thread
+    return None
 
 
 def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str,
@@ -244,8 +256,9 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
     The model reviewed the diff since the last head: RIGHT numbers already
     name current-head lines, but LEFT numbers name previous-head lines, so
     each new LEFT comment is remapped to base coordinates by matching its
-    content and current-head position. Known unresolved findings retain their
-    original thread coordinates, including outdated findings. A
+    content within the full-diff change block holding its current-head
+    position. Known unresolved findings retain their original thread
+    coordinates, including outdated findings. A
     missing anchor never proves the defect is gone: if any finding cannot be
     anchored, the review fails closed before submitting an incomplete change
     request or filing incomplete findings for a capped approval."""
@@ -257,10 +270,16 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
         return
     if not isinstance(node, dict) or not node.get("since_head_sha"):
         return
+    level = node.get("p")
+    if level is None or (isinstance(level, str) and not level.strip()):
+        raise InvalidVerdict(
+            "cannot validate since-diff positions: review packet is missing its priority")
+    # The packet carries the wire value (e.g. "p2"); pass it through unchanged
+    # so the full-diff re-fetch uses the same priority scope. atoms._priority
+    # validates the format strictly; non-string values fail there.
+    priority = level if isinstance(level, str) else str(level)
     try:
-        level = node.get("p")
-        full = json.loads(fetch_packet(pwd, pr, actor_name, head,
-                                       f"p{level}" if level is not None else None, since_head=None))
+        full = json.loads(fetch_packet(pwd, pr, actor_name, head, priority, since_head=None))
         retained = [entry["filename"] for entry in full["files"]]
         sets = review_stages.diff_line_sets(full["diff"], retained)
         since_files = [entry["filename"] for entry in node.get("files", [])]
@@ -268,15 +287,26 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
         since_left = review_stages.diff_left_anchors(
             since_diff if isinstance(since_diff, str) else "", since_files)
         full_left = review_stages.diff_left_anchors(full["diff"], retained)
+        full_spans = review_stages.diff_left_spans(full["diff"], retained)
     except (ValueError, KeyError, TypeError) as error:
         raise InvalidVerdict(f"cannot validate since-diff positions: {error}") from error
-    by_anchor: dict[tuple[str, int, str], list[int]] = {}
+    by_content: dict[tuple[str, str], list[tuple[int, tuple[int, int]]]] = {}
     for path, lines in full_left.items():
-        for number, (position, content) in lines.items():
-            by_anchor.setdefault((path, position, content), []).append(number)
+        for number, (_position, content) in lines.items():
+            by_content.setdefault((path, content), []).append((number, full_spans[path][number]))
     kept, dropped = [], []
     for comment in verdict["comments"]:
-        if _reaffirms_finding(comment, node.get("review_threads", [])):
+        anchor = since_left.get(comment["path"], {}).get(comment["line"]) \
+            if comment["side"] == "LEFT" else None
+        thread = _reaffirming_thread(comment, node.get("review_threads", []),
+                                     in_since_diff=anchor is not None)
+        if thread is not None:
+            if thread.get("is_outdated"):
+                # The model's coordinates for a stale thread are unchecked;
+                # submit the thread's own coordinates instead.
+                line, side = thread.get("line"), thread.get("side")
+                if type(line) is int and line >= 1 and side in ("LEFT", "RIGHT"):
+                    comment = {**comment, "line": line, "side": side}
             kept.append(comment)
             continue
         if comment["side"] == "RIGHT":
@@ -285,15 +315,16 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
             else:
                 dropped.append({key: comment[key] for key in ("path", "line", "side")})
             continue
-        anchor = since_left.get(comment["path"], {}).get(comment["line"])
         if anchor is None:
             raise InvalidVerdict(
                 f"comment on {comment['path']}:{comment['line']} (LEFT) is outside the reviewed since diff")
-        candidates = by_anchor.get((comment["path"], *anchor), [])
-        if not candidates:
+        position, content = anchor
+        hits = [number for number, (start, end) in by_content.get((comment["path"], content), [])
+                if start <= position <= end]
+        if not hits:
             dropped.append({key: comment[key] for key in ("path", "line", "side")})
-        elif len(candidates) == 1:
-            kept.append({**comment, "line": candidates[0]})
+        elif len(hits) == 1:
+            kept.append({**comment, "line": hits[0]})
         else:
             raise InvalidVerdict(
                 "removed line matches several pull request lines; refusing an unverified anchor")
@@ -388,17 +419,17 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     if ask is None:
         raise AgentPreflightError(f"{model.provider} cannot return a structured review verdict")
     try:
-        stage_texts = _stage_texts(text, packet)
-        staged = len(stage_texts) > 1
+        total = review_stages.stage_count(packet) if packet else 1
+        staged = total > 1
         with tempfile.TemporaryDirectory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
             root = Path(work)
             deadline = monotonic() + timeout_s
             prior: list[dict] = []
-            for index, stage_text in enumerate(stage_texts):
+            for index, stage_text in enumerate(_stage_texts(text, packet)):
                 _admit(stage_text)
                 if staged:
-                    progress.stage("reviewing", f"Reviewing file group {index + 1} of {len(stage_texts)}")
+                    progress.stage("reviewing", f"Reviewing file group {index + 1} of {total}")
                     if prior:
                         stage_text += ("\n\nFindings already recorded in earlier file groups "
                                        "(do not repeat them):\n" + json.dumps(prior))
@@ -462,28 +493,40 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         transient = review_receipt.record_failure(done.stderr or done.stdout)
         if transient is not None:
             raise review_receipt.SubmissionError(transient)
-        superseded = _refused_head((done.stderr or done.stdout).strip())
+        output = (done.stderr or done.stdout).strip()
+        superseded = _refused_head(output)
         if superseded is not None:
             # The pre-POST head check refused: proved no review, so the run
             # is superseded, not a contract violation.
             raise ReviewSuperseded(superseded)
-        cause = bounded_cause((done.stderr or done.stdout).strip() or f"github-interface exited {done.returncode}")
+        cause = bounded_cause(output or f"github-interface exited {done.returncode}")
+        if review_receipt.blocked_refusal(output) is not None:
+            # The pre-POST guard refused: other reviewers' conversations are
+            # still open, so the approval waits on them. The guard stays
+            # strict — nothing is approved — but a blocked approval is not a
+            # failed verdict publication.
+            raise review_budget.ReviewLimitError(
+                f"approval blocked by unresolved review conversations: {cause}",
+                "approval_blocked_unresolved_conversations",
+                diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
+                                    stderr=cause, provider=model.provider, submission="blocked"))
         raise review_budget.ReviewLimitError(
             f"review submission rejected: {cause}", "review_contract_violation",
             diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
                                 stderr=cause, provider=model.provider, submission="rejected"))
     receipt = review_receipt.record(done.stdout)
     if receipt is None:
-        try:
-            reply = json.loads(done.stdout)
-        except ValueError:
-            reply = None
-        if isinstance(reply, dict) and reply.get("action") == "no_review":
-            cause = bounded_cause(json.dumps(reply.get("skipped", [])) or "no review submitted")
+        # A repeat-only refusal restated already-published bodies in every
+        # finding and delivered nothing. Typed so recovery can tell it
+        # from other duplicate refusals without reading prose.
+        details = review_receipt.parse_no_review(done.stdout)
+        if details is not None:
+            cause = bounded_cause(json.dumps(details["skipped"]) or "no review submitted")
             raise review_budget.ReviewLimitError(
                 f"review submission was a no-op: {cause}", "review_contract_violation",
                 diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
-                                    stderr=cause, provider=model.provider, submission="noop"))
+                                    stderr=cause, provider=model.provider, submission="noop",
+                                    refusal="repeat_only" if details["repeat_only"] else "duplicate"))
         raise review_receipt.SubmissionError(
             "review submission returned no receipt; publication uncertain, reconcile before retry")
     # The outer governed behavior reads authoritative review facts afterward:

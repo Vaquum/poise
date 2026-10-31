@@ -46,6 +46,18 @@ describe('behavior diagnostic groups', () => {
     expect(group?.details[0]).toContain('API rate limit exceeded for user ID 42.')
     expect(group?.details[0]).toContain('1800000000')
   })
+  it('names a blocked approval as waiting on other reviewers, not a failed verdict', () => {
+    const diagnostics = snapshot()
+    diagnostics.failures.push({ behavior: 'approve-prs', target: 'acme/api#9', kind: 'worker',
+      consecutiveFailures: 1, lastFailureAt: '', nextRetryAt: '',
+      error: 'approval blocked by unresolved review conversations: error: 1 unresolved review conversation(s) from other reviewers remain',
+      callId: 'b053d806110842fb93a85bdace87bf2a',
+      diagnostic: { severity: 'warning', code: 'approval_blocked_unresolved_conversations' } })
+    expect(behaviorDiagnosticGroups(diagnostics)).toEqual([expect.objectContaining({
+      severity: 'warning', code: 'approval_blocked_unresolved_conversations', scope: 'acme/api#9',
+      message: 'Approval is waiting on other reviewers to resolve their conversations. Poise will try again.',
+    })])
+  })
   it('leaves a legacy brace-only summary unknown instead of inventing its cause', () => {
     const diagnostics = snapshot()
     diagnostics.failures.push({ behavior: 'approve-prs', target: 'acme/api#9:check', kind: 'operation',

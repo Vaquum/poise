@@ -1,3 +1,4 @@
+import gc
 import io
 import json
 import os
@@ -5,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import TestCase
@@ -394,6 +396,25 @@ class TestPacket(IssueReviewCase):
         with patch.object(issue_review, "interface", github), self.assertRaises(AgentPreflightError) as raised:
             issue_review.packet(REPO, 452, ACTOR)
         self.assertEqual(raised.exception.code, "review_packet_too_large")
+
+    def test_an_oversized_packet_is_refused_without_reading_every_sub_issue(self):
+        numbers = list(range(460, 490))
+        subs = [{"repository": REPO, "issue_number": number, "via": ["work_slices"]} for number in numbers]
+        github = FakeGitHub(subs=subs)
+        github.issues.update({number: issue(number, body="y" * 600_000) for number in numbers})
+        gc.collect()
+        tracemalloc.start()
+        try:
+            with patch.object(issue_review, "interface", github):
+                with self.assertRaises(AgentPreflightError) as refused:
+                    issue_review.packet(REPO, 452, ACTOR)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(refused.exception.code, "review_packet_too_large")
+        reads = [call for call in github.calls if call[0] == "--read-issue"]
+        self.assertLess(len(reads), len(numbers) // 2)
+        self.assertLess(peak, issue_review.MAX_PACKET_BYTES * 4)
 
 
 class TestSubIssuesReviewedOnce(IssueReviewCase):
@@ -788,6 +809,100 @@ class TestVerifiedResultsOrExplicitFailures(IssueReviewCase):
         self.assertTrue(diagnostic["artifact"]["readable"])
         self.assertIsNone(exported["receipts"])
         self.assertNotIn("--comment-issue", [call[0] for call in FakeGitHub().calls] if False else [])
+
+    def test_preparation_timeout_keeps_a_preparation_diagnostic(self):
+        github = FakeGitHub()
+
+        def flaky(*args: str, seconds: float = 120):
+            if args[0] == "--read-issue":
+                raise subprocess.TimeoutExpired(list(args), seconds)
+            return github(*args, seconds=seconds)
+
+        writes = agent_writes(None)
+        row, _ = self.run_review(flaky, writes, expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["error_code"], "review_budget_exhausted")
+        self.assertIn("preparation", exported["error"])
+        diagnostic = exported["diagnostic"]
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(diagnostic["operation"], "issue.prepare")
+        self.assertEqual(diagnostic["phase"], "preparing_issue")
+        self.assertEqual(diagnostic["outcome"], "timed_out")
+        self.assertIsNone(exported["receipts"])
+        self.assertEqual(writes.runs, [])
+
+    def test_packet_budget_expiry_is_attributed_to_preparation(self):
+        expired = review_budget.ReviewLimitError("Review reached its total time limit; needs attention",
+                                                 "review_budget_exhausted")
+        with patch.object(issue_review, "packet", side_effect=expired):
+            row, _ = self.run_review(FakeGitHub(), agent_writes(None), expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["error_code"], "review_budget_exhausted")
+        diagnostic = exported["diagnostic"]
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(diagnostic["operation"], "issue.prepare")
+        self.assertEqual(diagnostic["phase"], "preparing_issue")
+
+    def test_checkout_budget_exhaustion_is_tagged_checkout(self):
+        real_timeout = review_budget.timeout
+
+        def flaky_timeout(cap, *, reserve=0):
+            if cap == 1800:
+                raise review_budget.ReviewLimitError("Review reached its total time limit; needs attention",
+                                                     "review_budget_exhausted")
+            return real_timeout(cap, reserve=reserve)
+
+        writes = agent_writes(None)
+        with patch.object(review_budget, "timeout", side_effect=flaky_timeout):
+            row, _ = self.run_review(FakeGitHub(), writes, expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["error_code"], "review_budget_exhausted")
+        diagnostic = exported["diagnostic"]
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(diagnostic["operation"], "issue.checkout")
+        self.assertEqual(diagnostic["phase"], "checking_out")
+        self.assertIsNone(exported["receipts"])
+        self.assertEqual(writes.runs, [])
+
+    def test_pre_provider_reserve_exhaustion_is_tagged_preparation(self):
+        real_timeout = review_budget.timeout
+
+        def flaky_timeout(cap, *, reserve=0):
+            if reserve:
+                raise review_budget.ReviewLimitError("Review reached its total time limit; needs attention",
+                                                     "review_budget_exhausted")
+            return real_timeout(cap, reserve=reserve)
+
+        writes = agent_writes(None)
+        with patch.object(review_budget, "timeout", side_effect=flaky_timeout):
+            row, _ = self.run_review(FakeGitHub(), writes, expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["error_code"], "review_budget_exhausted")
+        diagnostic = exported["diagnostic"]
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(diagnostic["operation"], "issue.prepare")
+        self.assertEqual(diagnostic["phase"], "preparing_issue")
+        self.assertIsNone(exported["receipts"])
+        self.assertEqual(writes.runs, [])
+
+    def test_checkout_timeout_keeps_a_checkout_diagnostic(self):
+        github = FakeGitHub()
+
+        def flaky(*args: str, seconds: float = 120):
+            if args[0] == "--checkout-repo":
+                raise subprocess.TimeoutExpired(list(args), seconds)
+            return github(*args, seconds=seconds)
+
+        writes = agent_writes(None)
+        row, _ = self.run_review(flaky, writes, expect_exit=True)
+        exported = self.exported(row)
+        self.assertEqual(exported["error_code"], "review_budget_exhausted")
+        self.assertIn("checkout", exported["error"])
+        diagnostic = exported["diagnostic"]
+        self.assertEqual(diagnostic["operation"], "issue.checkout")
+        self.assertEqual(diagnostic["phase"], "checking_out")
+        self.assertIsNone(exported["receipts"])
+        self.assertEqual(writes.runs, [])
 
     def test_failed_provider_terminal_with_exit_zero_is_rejected(self):
         review = {"comments": [{"issue": f"{REPO}#452", "body": "looks fine"}]}

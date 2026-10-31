@@ -609,4 +609,53 @@ describe('worker failure classification and recovery', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
     expect(loaded.database.listBehaviorDeadLetters()).toEqual([])
   })
+
+  it('defers a review launch whose head moved during preparation without spawning a doomed worker', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-15T12:00:00Z'))
+    arrangeCli(false)
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    // The pull request moves between the preparation head read and the
+    // launch-phase re-verification: the first --head-sha answers the
+    // prepared head, later ones the pushed head.
+    const inner = mocks.runFile.getMockImplementation()!
+    let headReads = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
+      if (command === 'github-interface' && args[0] === '--head-sha') {
+        headReads += 1
+        if (headReads > 1) {
+          const cwdParts = String(options?.cwd || '').split('/')
+          const repository = `${cwdParts[cwdParts.length - 2]}/${cwdParts[cwdParts.length - 1]}`
+          return { stdout: JSON.stringify({ action: 'head_sha', repository, pull_number: pr.number, head_sha: NEXT_HEAD_SHA }), stderr: '' }
+        }
+      }
+      return inner(command, args, options)
+    })
+    const loaded = await loadModules()
+    loaded.behaviors.startBehaviorsRuntime()
+    loaded.database.setMeta('me', 'poise-user')
+    loaded.database.setMeta('behavior_review_new_prs_keyver', '3')
+    loaded.database.setMeta('behavior_review_new_prs_enabled', '1')
+    loaded.database.recordSeen('review-new-prs', '__snapshot_v3__')
+    await loaded.behaviors.runEnabledBehaviorsOnce()
+
+    const target = `${pr.repo}#${pr.number}`
+    // No worker spawns against the stale head: the preparation ends as a
+    // retained no-op, with no failure and no dead letter behind it.
+    expect(headReads).toBe(2)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'completed', activity: 'settled', outcome: 'no_op', head: HEAD_SHA,
+    }))
+    expect(loaded.database.hasSeen('review-new-prs', target)).toBe(false)
+    expect(loaded.behaviors.getBehaviorFailureState('review-new-prs', target)).toBeNull()
+    expect(loaded.behaviors.getBehaviorFailureState('review-new-prs', `${target}:check`)).toBeNull()
+    expect(loaded.database.listBehaviorDeadLetters()).toEqual([])
+
+    // The next tick prepares fresh on the new head and launches normally.
+    arrangeCli(false, false, { headSha: NEXT_HEAD_SHA })
+    await loaded.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    expect(mocks.spawnDetached.mock.calls[0]?.[1]).toEqual(expect.arrayContaining(['--expected-head', NEXT_HEAD_SHA]))
+  })
 })

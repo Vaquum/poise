@@ -31,7 +31,17 @@ const safeId = (value: number): boolean => Number.isSafeInteger(value) && value 
 const recordOf = (row: Row): LedgerRecord => JSON.parse(row.payload) as LedgerRecord
 const encodedBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value))
 const emptyHealth = (): LedgerHealth => ({ status: 'unavailable', unavailableReason: null, coverageStart: null, observedAt: null, callerObservedAt: null,
-  pending: 0, dropped: 0, gaps: [], generation: null, retainedFrom: null, changeLowerBound: null, lastSequence: null, instances: null, changes: null })
+  pending: 0, dropped: 0, gaps: [], detailFloor: null, generation: null, retainedFrom: null, changeLowerBound: null, lastSequence: null, instances: null, changes: null })
+const GAP_REASONS: ReadonlySet<LedgerGap['reason']> = new Set(['capture_loss', 'unclean_restart', 'eviction', 'unavailable'])
+const validGaps = (gaps: unknown): gaps is LedgerGap[] => Array.isArray(gaps) && gaps.every((gap) => {
+  if (!gap || typeof gap !== 'object') return false
+  const { since, until, reason } = gap as LedgerGap
+  return GAP_REASONS.has(reason) && typeof since === 'string' && iso(since)
+    && (until === null || (typeof until === 'string' && iso(until)))
+    && (until === null || Date.parse(since) <= Date.parse(until))
+})
+const validFloor = (floor: unknown): floor is string | null | undefined =>
+  floor === undefined || floor === null || (typeof floor === 'string' && iso(floor))
 
 /** Synchronous I/O belongs exclusively to the observer worker. */
 export class BehaviorLedgerStore {
@@ -43,6 +53,7 @@ export class BehaviorLedgerStore {
   private journalAvailable = true
   private data = emptyHealth()
   private cursorKey = ''
+  private observedSinceGap = true
   private initialized = false
   private budgetScanTime = 0
   private instanceCount = 0
@@ -133,7 +144,10 @@ export class BehaviorLedgerStore {
         }
         this.prune()
       })()
-      this.data.observedAt = this.time()
+      this.noteRecovery()
+      // Journal the recovery itself: a crash before the next capture or
+      // close must reload the closed boundary, not the open gap.
+      this.persistJournal(this.currentHealth())
     } catch {
       // No gap: a failed open holds captures for retry instead of losing
       // them, and health names the cause until the store reopens.
@@ -152,12 +166,44 @@ export class BehaviorLedgerStore {
   private rows(sql: string, ...args: (string | number | null)[]): Row[] { return this.connection().prepare(sql).all(...args) as Row[] }
   private row(nativeId: string): Row | undefined { return this.connection().prepare('SELECT * FROM ledger_instances WHERE native_id=?').get(nativeId) as Row | undefined }
   private byId(id: string): Row | undefined { return this.connection().prepare('SELECT * FROM ledger_instances WHERE id=?').get(id) as Row | undefined }
-  private gap(reason: LedgerGap['reason'], count = 0): void {
+  private gap(reason: LedgerGap['reason'], count = 0, since: string | null = null): void {
     this.data.dropped += count
+    const now = this.time()
+    const start = since !== null && iso(since) && Date.parse(since) <= Date.parse(now) ? since : now
     const last = this.data.gaps.at(-1)
-    if (!last || last.reason !== reason) this.data.gaps.push({ since: this.time(), until: this.time(), reason })
-    else last.until = this.time()
+    // Episodes merge only across unobserved time: a successful observation
+    // since the last gap seals its episode, so event order — not timestamps —
+    // keeps recovery boundaries. An open restart gap absorbs a later restart
+    // instead, since no recovery was ever observed between them.
+    if (last && last.reason === reason && (last.until === null || !this.observedSinceGap)) {
+      if (last.until !== null) last.until = now
+      if (Date.parse(start) < Date.parse(last.since)) last.since = start
+    } else if (reason === 'unclean_restart') {
+      this.data.gaps.push({ since: start, until: null, reason })
+    } else {
+      this.data.gaps.push({ since: start, until: now, reason })
+    }
+    this.observedSinceGap = false
+    this.compactGaps()
+  }
+  private compactGaps(): void {
+    if (this.data.gaps.length <= 16) return
+    // Overflow keeps a coarse floor, not silence: every dropped interval
+    // stays covered below the newest dropped endpoint.
+    for (const dropped of this.data.gaps.slice(0, -16)) {
+      const end = dropped.until ?? this.time()
+      if (this.data.detailFloor === null || Date.parse(end) > Date.parse(this.data.detailFloor)) this.data.detailFloor = end
+    }
     this.data.gaps = this.data.gaps.slice(-16)
+  }
+  /** Successful observation is the only recovery: it closes open restart
+   *  uncertainty and seals the last episode. Failed opens and failed captures
+   *  never reach here, so they can neither close nor seal anything. */
+  private noteRecovery(): void {
+    const now = this.time()
+    this.data.observedAt = now
+    for (const gap of this.data.gaps) gap.until ??= now
+    this.observedSinceGap = true
   }
   private loadJournal(): void {
     if (!this.journalPath || !existsSync(this.journalPath)) return
@@ -165,10 +211,24 @@ export class BehaviorLedgerStore {
       if (statSync(this.journalPath).size > 8192) throw new Error('Oversized ledger coverage')
       const prior = JSON.parse(readFileSync(this.journalPath, 'utf8')) as Journal
       if (prior.version !== 1 || !prior.health || !Array.isArray(prior.health.gaps) || prior.health.gaps.length > 16
-        || !Number.isSafeInteger(prior.health.dropped) || prior.health.dropped < 0) throw new Error('Invalid ledger coverage')
+        || !Number.isSafeInteger(prior.health.dropped) || prior.health.dropped < 0
+        || !validGaps(prior.health.gaps) || !validFloor(prior.health.detailFloor)) throw new Error('Invalid ledger coverage')
       this.data = { ...emptyHealth(), ...prior.health, pending: 0 }
-      if (!prior.closed) this.gap('unclean_restart')
+      // Journals written before the detail floor carry merged envelopes and
+      // silently dropped episodes: their history stays coarse from this
+      // evidenced cutover, while new episodes remain precise.
+      if (!('detailFloor' in prior.health)) this.data.detailFloor = this.time()
+      if (!prior.closed) this.gap('unclean_restart', 0, this.checkpoint())
     } catch { this.gap('unavailable'); this.journalAvailable = false }
+  }
+  /** The last persisted proof the worker was alive: the final observation or
+   *  gap recording. A restart gap starts here, never earlier than evidence. */
+  private checkpoint(): string {
+    let checkpoint = this.data.observedAt ?? this.data.coverageStart ?? this.time()
+    for (const gap of this.data.gaps) {
+      if (gap.until !== null && Date.parse(gap.until) > Date.parse(checkpoint)) checkpoint = gap.until
+    }
+    return checkpoint
   }
   private persistJournal(health: LedgerHealth): void {
     if (!this.journalPath) return
@@ -182,7 +242,7 @@ export class BehaviorLedgerStore {
       this.journalAvailable = true
     } catch { this.journalAvailable = false }
   }
-  loss(count = 1): void { this.gap('capture_loss', count); this.persistJournal(this.currentHealth()) }
+  loss(count = 1, since: string | null = null): void { this.gap('capture_loss', count, since); this.persistJournal(this.currentHealth()) }
 
   capture(observation: LedgerObservation): void {
     // A failed capture stays unaccounted here: storage failures are held for
@@ -191,7 +251,11 @@ export class BehaviorLedgerStore {
     try {
       if (observation.type === 'loss') {
         if (!Number.isSafeInteger(observation.count) || observation.count < 1) throw new LedgerError(400, 'invalid_observation')
-        this.loss(observation.count); return
+        // An unusable loss timestamp narrows nothing: the marker still counts,
+        // attributed at receipt instead of poisoning the worker protocol.
+        const since = observation.since !== undefined && iso(observation.since)
+          && Date.parse(observation.since) <= Date.parse(this.time()) ? observation.since : null
+        this.loss(observation.count, since); return
       }
       const usage = { instances: this.instanceCount, instanceBytes: this.instanceBytes, changeBytes: this.changeBytes }
       try {
@@ -211,7 +275,7 @@ export class BehaviorLedgerStore {
         this.rebuildPending()
         throw error
       }
-      this.data.observedAt = this.time()
+      this.noteRecovery()
     } finally { this.persistJournal(this.currentHealth()) }
   }
 
@@ -344,6 +408,14 @@ export class BehaviorLedgerStore {
     for (const ref of [...(input.refs ?? []), ...(input.callId ? [{ kind: 'caller' as const, identity: input.callId, availability: 'available' as const }] : [])]) {
       const index = refs.findIndex((current) => current.kind === ref.kind && current.identity === ref.identity)
       if (index < 0) refs.push(ref); else refs[index] = ref
+    }
+    if (row.native_override === 1 && TERMINAL.has(record.state) && record.activity === 'settled'
+      && (input.state !== record.state || input.activity !== record.activity
+        || (input.outcome !== undefined && input.outcome !== record.outcome)
+        || (input.head !== undefined && input.head !== record.head)
+        || (input.completedAt !== undefined && input.completedAt !== record.completedAt))) {
+      this.put({ ...record, refs, observedAt: this.time() }, row, false, row.native_override, this.time())
+      return
     }
     this.put({ ...record, state: input.state, stateSource: input.stateSource ?? 'native', activity: input.activity,
       outcome: input.outcome === undefined ? record.outcome : input.outcome, head: input.head === undefined ? record.head : input.head,
@@ -537,7 +609,7 @@ export class BehaviorLedgerStore {
     }
     const stale = !this.data.observedAt || this.now() - Date.parse(this.data.observedAt) > LEDGER_STALE_MS
     const status: LedgerHealth['status'] = this.closed ? 'stopped' : !this.db || !this.journalAvailable ? 'unavailable'
-      : stale ? 'stale' : this.data.dropped > 0 || this.data.gaps.length > 0 ? 'incomplete' : 'ok'
+      : stale ? 'stale' : this.data.dropped > 0 || this.data.gaps.length > 0 || this.data.detailFloor !== null ? 'incomplete' : 'ok'
     const unavailableReason = this.closed || status !== 'unavailable' ? null
       : !this.db ? 'store_unavailable' : !this.journalAvailable ? 'journal_unavailable' : 'store_unavailable'
     return { ...this.data, status, unavailableReason, gaps: [...this.data.gaps] }

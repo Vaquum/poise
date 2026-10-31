@@ -56,6 +56,17 @@ it('keeps missing historical v1 evidence unknown, including uncertain submission
       context: { exit_code: 1, submission: 'none' } })
 })
 
+it('carries the typed publication refusal beside submission certainty', () => {
+  const event = parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error',
+    operation: 'provider.review', phase: 'submitting', outcome: 'exit',
+    stderr: 'review submission was a no-op', stderr_truncated: false,
+    submission: 'noop', refusal: 'repeat_only' })
+  expect(event).toMatchObject({ context: { submission: 'noop', refusal: 'repeat_only' } })
+  expect(parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error',
+    operation: 'provider.review', phase: 'submitting', submission: 'noop' }))
+    .toMatchObject({ context: { submission: 'noop', refusal: null } })
+})
+
 it.each([{ outcome: 7 }, { stderr: [] }, { stderr_truncated: 'false' }])('rejects malformed present diagnostic evidence %j', (extra) => {
   expect(() => parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error',
     operation: 'provider.review', phase: 'submitting', ...extra })).toThrow('diagnostic')

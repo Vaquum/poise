@@ -388,6 +388,25 @@ describe('Merge Pull Requests', () => {
     expect(mergeCalls()).toHaveLength(1)
     expect(runtime.getMergePrsLastFired()).toBeNull()
   })
+  it('retains a bounded failure receipt on the native merge run', async () => {
+    enable(); error = new Error('GitHub unavailable')
+    await runtime.runEnabledBehaviorsOnce()
+    const runs = db.db.prepare('SELECT status, outcome, note FROM behavior_runs').all() as Array<{ status: string, outcome: string | null, note: string | null }>
+    expect(runs).toHaveLength(1)
+    expect(runs[0]!.status).toBe('failed')
+    expect(runs[0]!.note).toContain(`${REPO}#7`)
+    expect(runs[0]!.note).toContain(HEAD)
+    expect(runs[0]!.note).toContain('GitHub unavailable')
+    expect(runs[0]!.note!.length).toBeLessThanOrEqual(1000)
+  })
+  it('retains the merge SHA receipt on a successful native merge run', async () => {
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    const runs = db.db.prepare('SELECT status, outcome, note FROM behavior_runs').all() as Array<{ status: string, outcome: string | null, note: string | null }>
+    expect(runs).toEqual([{ status: 'completed', outcome: 'merged', note: expect.stringContaining('b'.repeat(40)) }])
+    expect(runs[0]!.note).toContain(`${REPO}#7`)
+    expect(runs[0]!.note).toContain(HEAD)
+  })
   it.each([{ repository: 'other/app' }, { head_sha: 'c'.repeat(40) }, { merge_sha: '' }, { outcome: 'unknown' }])('refuses malformed merge evidence %j', async (fields) => {
     enable(); response = fields
     await runtime.runEnabledBehaviorsOnce()

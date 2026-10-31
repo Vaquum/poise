@@ -19,8 +19,8 @@ from typing import Any
 from github_interface.client import GitHubClient
 from .process_diagnostic import GitProcessError, StderrCapture, failure
 
-MAX_DIFF_BYTES = 1_350_000
-MAX_PACKET_BYTES = 1_450_000  # Leave room for the governed agent policy.
+MAX_DIFF_BYTES = 2_850_000
+MAX_PACKET_BYTES = 2_950_000  # Leave room for the governed agent policy.
 BULK_FILE_BYTES = 32_000
 BULK_SUFFIXES = {".json", ".jsonl", ".ndjson", ".csv", ".tsv"}
 OPAQUE_SUFFIXES = {".gz", ".zip", ".tar", ".bz2", ".xz", ".7z", ".pdf", ".parquet", ".arrow"}
@@ -316,10 +316,12 @@ async def review_diff(
         raw = await git("diff", "--raw", "--no-abbrev", "--no-renames", "-z", merge_base, head, "--", limit=4_000_000)
         files = _changes(raw)
         sizes = await _blob_sizes(client, owner, repo, files)
-        # Keep ordinary PRs unchanged. When full blob inputs already exceed
-        # the budget, exclude bulk data before Git can download those blobs.
-        input_bytes = sum(sizes.get(f[key], 0) for f in files for key in ("old_oid", "new_oid"))
-        passes = (None, False, True) if input_bytes <= MAX_DIFF_BYTES else (False, True)
+        # Exclude bulk data upfront, even when the total input fits: a packet
+        # that fits locally can still carry an artifact diff entry GitHub
+        # rejects inline comments on (422 "diff is too large"), stranding the
+        # firing after the model already ran. Small fixtures and source stay
+        # retained; only large bulk/opaque payloads are excluded here.
+        passes = (False, True)
         for compact in passes:
             excluded = []
             retained = []

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 
 STAGE_MAX_FILES = 8
 STAGE_MAX_DIFF_BYTES = 200_000
@@ -47,17 +48,18 @@ def _unquote(path: str) -> str:
     return bytes(out).decode("utf-8", "surrogateescape")
 
 
-def split(packet: str) -> list[str]:
-    """One packet per file group, or the untouched packet when it fits."""
+def _plan(packet: str) -> tuple[dict, list[list[tuple[list[str], set[str]]]]] | None:
+    """The parsed packet and its file groups, or None when the input runs
+    unstaged: not a staged packet, or one group that reviews everything."""
     try:
         node = json.loads(packet)
     except ValueError:
-        return [packet]
+        return None
     if not isinstance(node, dict) or not isinstance(node.get("diff"), str) \
             or not isinstance(node.get("files"), list) \
             or not all(isinstance(entry, dict) and isinstance(entry.get("filename"), str)
                        for entry in node["files"]):
-        return [packet]
+        return None
     retained = [entry["filename"] for entry in node["files"]]
     sections = [(section, _covers(section, retained)) for section in _sections(node["diff"])]
     covered = {path for _, paths in sections for path in paths}
@@ -66,9 +68,25 @@ def split(packet: str) -> list[str]:
         raise StageError(f"retained file without a diff section: {missing[0]!r}")
     groups = _pack(sections)
     if len(groups) == 1:
-        return [packet]
+        return None
+    return node, groups
+
+
+def split(packet: str) -> list[str]:
+    """One packet per file group, or the untouched packet when it fits."""
+    return list(iter_stages(packet))
+
+
+def iter_stages(packet: str) -> Iterator[str]:
+    """Yield one rendered stage packet at a time: exactly what split()
+    returns, but holding one stage in memory instead of every stage at
+    once. Each stage still carries the full common review context."""
+    planned = _plan(packet)
+    if planned is None:
+        yield packet
+        return
+    node, groups = planned
     assigned: set[int] = set()
-    rendered = []
     for index, group in enumerate(groups):
         paths = {path for _, group_paths in group for path in group_paths}
         entries = []
@@ -76,9 +94,14 @@ def split(packet: str) -> list[str]:
             if entry["filename"] in paths and number not in assigned:
                 assigned.add(number)
                 entries.append(entry)
-        rendered.append(_render(node, len(groups), index,
-                                ["\n".join(section) for section, _ in group], entries))
-    return rendered
+        yield _render(node, len(groups), index,
+                      ["\n".join(section) for section, _ in group], entries)
+
+
+def stage_count(packet: str) -> int:
+    """The number of file groups, without rendering any stage."""
+    planned = _plan(packet)
+    return 1 if planned is None else len(planned[1])
 
 
 def _sections(diff: str) -> list[list[str]]:
@@ -126,29 +149,33 @@ def _primary(section: list[str], retained: list[str]) -> str:
             if path not in retained:
                 raise StageError(f"diff section for {path!r} names no retained file")
             return path
-    # Binary, mode-only and pure-rename sections have no +++ line; the diff
-    # header names both sides. Every b/ split is tried so a path containing
-    # " b/" still matches, and the longest match wins so a retained suffix
-    # never shadows the true path.
+    # Binary, mode-only and pure-rename sections have no +++ line. A rename
+    # names its new path exactly, so it wins over header splits; any other
+    # such header names the same path on both sides, so only the symmetric
+    # split matches and a retained suffix never shadows the true path.
+    for line in section:
+        if line.startswith("rename to "):
+            raw = line.removeprefix("rename to ").removesuffix("\t")
+            path = _unquote(raw)
+            if path not in retained:
+                path = raw
+            if path not in retained:
+                raise StageError(f"diff section for {path!r} names no retained file")
+            return path
     rest = section[0].removeprefix("diff --git ")
-    found = None
     for cut in [match.start() for match in re.finditer(" b/", rest)]:
         candidate = rest[cut + 3:]
-        if candidate in retained and (found is None or len(candidate) > len(found)):
-            found = candidate
-    if found is None:
-        # C-quoted header ("a/old" "b/new"): the b/ split sits inside
-        # quotes, so split on the quote-space-quote pair boundaries instead.
-        start = 0
-        while (boundary := rest.find('" "', start)) != -1:
-            candidate = _unquote(rest[boundary + 2:]).removeprefix("b/")
-            if candidate in retained:
-                found = candidate
-                break
-            start = boundary + 1
-    if found is None:
-        raise StageError(f"diff section without a retained file: {section[0][:80]!r}")
-    return found
+        if candidate in retained and rest == f"a/{candidate} b/{candidate}":
+            return candidate
+    # C-quoted header ("a/old" "b/new"): the b/ split sits inside
+    # quotes, so split on the quote-space-quote pair boundaries instead.
+    start = 0
+    while (boundary := rest.find('" "', start)) != -1:
+        candidate = _unquote(rest[boundary + 2:]).removeprefix("b/")
+        if candidate in retained:
+            return candidate
+        start = boundary + 1
+    raise StageError(f"diff section without a retained file: {section[0][:80]!r}")
 
 
 def _pack(sections: list[tuple[list[str], set[str]]]) -> list[list[tuple[list[str], set[str]]]]:
@@ -213,6 +240,40 @@ def diff_left_anchors(diff: str, retained: list[str]) -> dict[str, dict[int, tup
             if kind in ("context", "removed"):
                 lines[old] = (new, content)
     return contents
+
+
+def diff_left_spans(diff: str, retained: list[str]) -> dict[str, dict[int, tuple[int, int]]]:
+    """The new-side span of the change block holding each LEFT line.
+
+    Both the since diff and the full pull request diff end at the same
+    current head, but they lay out change blocks differently: a
+    follow-up removal next to an earlier pull request edit merges into
+    one block in the full diff. The removed line's since position still
+    falls inside that block's new-side span, while repeats in other
+    blocks sit in disjoint spans. Context lines span only themselves.
+    """
+    spans: dict[str, dict[int, tuple[int, int]]] = {}
+    for section in _sections(diff):
+        lines = spans.setdefault(_primary(section, retained), {})
+        pending: list[int] = []
+        start = end = 0
+        for kind, old, new, _content in _hunk_lines(section):
+            if kind == "removed":
+                if not pending:
+                    start = end = new
+                pending.append(old)
+            elif kind == "added":
+                if pending:
+                    end = new + 1
+            else:
+                if pending:
+                    for number in pending:
+                        lines[number] = (start, new)
+                    pending = []
+                lines[old] = (new, new)
+        for number in pending:
+            lines[number] = (start, end)
+    return spans
 
 
 def _render(node: dict, total: int, index: int, sections: list[str], entries: list[dict]) -> str:

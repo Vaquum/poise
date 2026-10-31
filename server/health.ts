@@ -136,6 +136,7 @@ export function collectorsDependency(snapshot: CollectionSnapshot | null): Colle
 export interface LedgerHistory {
   dropped: number
   gaps: BehaviorLedgerSnapshot['health']['gaps']
+  detailFloor: BehaviorLedgerSnapshot['health']['detailFloor']
   coverageStart: string | null
   retainedFrom: string | null
   generation: string | null
@@ -149,6 +150,7 @@ export function ledgerHistory(snapshot: BehaviorLedgerSnapshot | null): LedgerHi
   return {
     dropped: health?.dropped ?? 0,
     gaps: health?.gaps ?? [],
+    detailFloor: health?.detailFloor ?? null,
     coverageStart: health?.coverageStart ?? null,
     retainedFrom: health?.retainedFrom ?? null,
     generation: health?.generation ?? null,

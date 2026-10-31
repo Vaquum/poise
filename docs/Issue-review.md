@@ -172,12 +172,21 @@ checkout* and *Posting review comments*.
 
 - Failed before posting anything: Poise launches that reviewer once more, then
   holds it.
+- Out of time while the provider ran (one hour of wall-clock time, sleep
+  included, with the one in-Caller recovery): the reviewer is tripped and the
+  review runs once more with the next healthy reviewer, then holds. At most
+  two launches per reviewer: the retry counts toward the same bound. The retry
+  starts fresh — a timed-out run's partial file is diagnostic evidence only,
+  never published or reused.
+- Out of time before the provider started (reading the issue or preparing the
+  checkout): held with the cause. The reviewer is not tripped — switching
+  models cannot repair preparation — and nothing relaunches under another
+  model.
 - Began posting, then failed: held, never relaunched — it may already have
   commented. Caller records every comment the moment it is posted, and records
   that posting began before the first. An issue that refuses a comment (locked,
   deleted) does not stop the others from getting theirs.
-- Stopped, out of time (one hour of wall-clock time, sleep included, with
-  the one recovery), recovery failed, or an issue too large to review: held.
+- Stopped, recovery failed, or an issue too large to review: held.
 - Out of balance (402) or not signed in: the reviewer is tripped, not held —
   the next configured reviewer takes its place, or the review waits when none
   is healthy. The trip retries on the usual backoff and clears when the

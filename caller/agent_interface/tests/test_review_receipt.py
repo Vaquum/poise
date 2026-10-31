@@ -281,22 +281,34 @@ class TestReceiptRecording(TestCase):
                 self.assertEqual(review_receipt.record_failure("warning before error\n" + message), message)
                 self.assertIsNone(review_receipt.get())
 
-    def test_transport_failure_is_a_transient_submission_error(self):
-        for error in ("httpx.ConnectError: [Errno 104] Connection reset by peer",
-                      "httpx.ReadTimeout: timed out", "httpx.RemoteProtocolError: peer closed",
-                      "Traceback (most recent call last):\nhttpx.ConnectError: boom"):
+    def test_transport_timeout_is_transient_never_a_refused_submission(self):
+        for error in ("httpx.ReadTimeout: timed out",
+                      "httpx.ConnectError: [Errno 111] Connection refused",
+                      "httpx._exceptions.RemoteProtocolError: peer closed connection"):
             with self.subTest(error=error):
                 review_receipt.bind(api.DB, "run")
-                self.assertEqual(review_receipt.record_failure(error), error.strip().split("\n")[-1]
-                                 if "\n" in error else error)
-                self.assertIsNotNone(review_receipt.failure())
+                text = f"Traceback (most recent call last):\n  File \"client.py\", line 69, in request\n{error}\n"
+                message = review_receipt.record_failure(text)
+                self.assertTrue(message.startswith(error.split(":")[0]))
+                self.assertEqual(review_receipt.failure(), message)
                 self.assertIsNone(review_receipt.get())
-        for prose in ("The model says httpx.ConnectError failed",
-                      "warning: mind the httpx.ReadTimeout window"):
-            with self.subTest(prose=prose):
-                review_receipt.bind(api.DB, "run")
-                self.assertIsNone(review_receipt.record_failure(prose))
-                self.assertIsNone(review_receipt.failure())
+
+    def test_guard_refusal_is_not_a_transient_submission_error(self):
+        review_receipt.bind(api.DB, "run")
+        self.assertIsNone(review_receipt.record_failure(
+            "error: 1 unresolved review conversation(s) from other reviewers remain"))
+        self.assertIsNone(review_receipt.failure())
+
+    def test_blocked_refusal_matches_only_the_guard_line(self):
+        line = "error: 1 unresolved review conversation(s) from other reviewers remain"
+        self.assertEqual(review_receipt.blocked_refusal(line), line)
+        self.assertEqual(review_receipt.blocked_refusal(f"Traceback\nRuntimeError: {line}\n"), line)
+        for text in ("error: GitHub 422: invalid review",
+                     "Traceback\nhttpx.ReadTimeout: timed out",
+                     "2 unresolved review conversation(s) remain after resolution",
+                     "the model mentions unresolved review conversations"):
+            with self.subTest(text=text):
+                self.assertIsNone(review_receipt.blocked_refusal(text))
 
     def test_provider_failure_with_exact_quota_prose_is_not_a_submission_failure(self):
         with patch.object(ReviewWatch, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=QUOTA_ERROR)), \
@@ -374,6 +386,83 @@ class TestReceiptRecording(TestCase):
                 bash_guard.main()
         self.assertEqual(run.call_count, 1)
         self.assertFalse(receipt_path.exists())
+
+    def test_claude_guard_persists_the_guard_refusal_unsealed_for_retry(self):
+        command = f"github-interface --approve-pr #68 --expected-head {HEAD} --token-user bit-mis"
+        receipt_path = Path(self.directory.name) / "receipt.json"
+        gate_path = Path(self.directory.name) / "gate"
+        gate_path.write_text("")
+        line = "error: 2 unresolved review conversation(s) from other reviewers remain"
+        with patch.dict(os.environ, {"AGENT_INTERFACE_BASH_ALLOW": json.dumps([command]),
+                                     "AGENT_INTERFACE_REVIEW_RECEIPT": str(receipt_path),
+                                     "AGENT_INTERFACE_REVIEW_GATE": str(gate_path)}), \
+                patch.object(sys, "argv", ["bash_guard.py", command]), \
+                patch.object(bash_guard.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=line + "\n")), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as stopped:
+                bash_guard.main()
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(Path(str(receipt_path) + ".blocked").read_text(), line)
+        self.assertEqual(gate_path.read_text(), "")
+        review_receipt.bind(api.DB, "run")
+        self.assertIsNone(review_receipt.record_file(receipt_path))
+        self.assertEqual(review_receipt.blocked(), line)
+        self.assertIsNone(review_receipt.failure())
+        self.assertIsNone(self.stored())
+
+    def test_parse_no_review_types_repeat_only_refusals(self):
+        repeat = {"reason": "repeat", "comment": {"path": "a.py", "line": 1}}
+        skipped = [repeat, dict(repeat)]
+        details = review_receipt.parse_no_review(json.dumps({"action": "no_review", "skipped": skipped}))
+        self.assertEqual(details, {"skipped": skipped, "repeat_only": True})
+        mixed = [repeat, {"reason": "already_commented_or_resolved", "comment": {"path": "a.py", "line": 1}}]
+        self.assertEqual(review_receipt.parse_no_review(
+            json.dumps({"action": "no_review", "skipped": mixed}))["repeat_only"], False)
+        for text in ("not json", json.dumps({"action": "no_review", "skipped": []}),
+                     json.dumps({"action": "no_review"}), json.dumps({"action": "requested_changes", "review_id": 91})):
+            with self.subTest(text=text):
+                details = review_receipt.parse_no_review(text)
+                if text == "not json" or "requested_changes" in text:
+                    self.assertIsNone(details)
+                else:
+                    self.assertEqual(details["repeat_only"], False)
+
+    def test_claude_guard_persists_a_duplicate_only_refusal_unsealed(self):
+        command = f"github-interface --request-changes #68 --expected-head {HEAD} --token-user bit-mis"
+        receipt_path = Path(self.directory.name) / "receipt.json"
+        gate_path = Path(self.directory.name) / "gate"
+        gate_path.write_text("")
+        reply = json.dumps({"action": "no_review",
+                            "skipped": [{"reason": "repeat", "comment": {"path": "a.py", "line": 1}}]})
+        with patch.dict(os.environ, {"AGENT_INTERFACE_BASH_ALLOW": json.dumps([command]),
+                                     "AGENT_INTERFACE_REVIEW_RECEIPT": str(receipt_path),
+                                     "AGENT_INTERFACE_REVIEW_GATE": str(gate_path)}), \
+                patch.object(sys, "argv", ["bash_guard.py", command]), \
+                patch.object(bash_guard.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=reply, stderr="")), \
+                redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(SystemExit) as stopped:
+                bash_guard.main()
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(out.getvalue(), reply)
+        self.assertEqual(json.loads(Path(str(receipt_path) + ".refused").read_text())["action"], "no_review")
+        self.assertEqual(gate_path.read_text(), "")
+        self.assertFalse(receipt_path.exists())
+        review_receipt.bind(api.DB, "run")
+        self.assertIsNone(review_receipt.record_file(receipt_path))
+        self.assertEqual(review_receipt.refused()["repeat_only"], True)
+        self.assertIsNone(review_receipt.failure())
+        self.assertIsNone(review_receipt.blocked())
+        self.assertIsNone(self.stored())
+
+    def test_accepted_submission_wins_over_a_stale_refusal(self):
+        receipt_path = Path(self.directory.name) / "receipt.json"
+        Path(str(receipt_path) + ".refused").write_text(json.dumps(
+            {"action": "no_review", "skipped": [{"reason": "repeat", "comment": {"path": "a.py", "line": 1}}]}))
+        receipt_path.write_text(json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD}))
+        review_receipt.bind(api.DB, "run")
+        self.assertEqual(review_receipt.record_file(receipt_path)["review_id"], 91)
+        self.assertEqual(review_receipt.refused()["repeat_only"], True)
+        self.assertEqual(self.stored(), "91")
 
 
 class TestRecoveryWithSiblings(TestCase):

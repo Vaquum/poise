@@ -86,21 +86,34 @@ lease never touches the row again.
 
 Every attempt ends with one durable terminal state: a validated result with its
 authoritative `review_id` receipt, or a typed failure carrying provider, phase,
-bounded redacted cause and known (`none`, `rejected`, `noop`) or unknown
-submission state. Structured provider exits and signals are `review_provider_exit`,
+bounded redacted cause and known (`none`, `rejected`, `noop`, `blocked`) or
+unknown submission state. Structured provider exits and signals are `review_provider_exit`,
 provider-reported error terminals are `review_provider_error`; both keep
 `not_started` / `preflight_failed` with no receipt, so Poise can safely retry
 after proving no reviewer action. Invalid, missing, duplicate or contradictory
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
-GitHub reviews are `review_contract_violation` and held. A second terminal
-submission after an accepted one is blocked at the gate.
+GitHub reviews are `review_contract_violation` and held. A repeat-only
+`no_review` refusal first recovers once with the recovery model; anything
+still failing is held. Claude runs persist the refusal through the guard's
+`.refused` sidecar, since they submit outside the structured runner; a receipt
+from a later accepted submission wins over the stale marker. An approval the
+unresolved-conversation guard refuses is
+`approval_blocked_unresolved_conversations`: still nothing approved, but a
+waiting external blocker rather than a failed verdict publication; a superseding
+head keeps that disposition, and another request's review never settles the
+blocked run. Claude runs persist the refusal through the guard's `.blocked`
+sidecar, since they submit outside the structured runner; uncertainty still wins
+when both markers exist. A second terminal submission after an accepted one is
+blocked at the gate.
 
 A controller-observed transient GitHub submission failure is recorded as
 `review_submission_failed`, with action and outcome unknown until live review
 receipts establish what happened. It does not become a permanent model-contract
 hold. A verified accepted review wins over a lost response; Caller never retries
 the write automatically. A submission timeout or a success without a receipt is
-uncertain and reconciled the same way before any retry. Claude's pinned
+uncertain and reconciled the same way before any retry. A transport timeout or
+connection error during submission names no status, so it is uncertain as well —
+never a refused submission. Claude's pinned
 inspection root is also carried in its explicit settings so shell tools retain
 repository access.
 
@@ -122,9 +135,10 @@ when absent; invalid metadata is rejected. Raw response artifacts and unavailabl
 final-inventory handling are unchanged; live receipt and head checks still run
 before the failure marker can determine the outcome.
 
-PR reviews and approvals default to `opus-5-high`; on a Claude output limit they
-recover once with `gpt-6-astra-ultra`. Pass `--model` and `--recovery-model` to
-`--pr-review` or `--pr-approve` with any identity from the catalog.
+PR reviews and approvals default to `opus-5-high`; on a Claude output limit or a
+repeat-only publication refusal they recover once with `gpt-6-astra-ultra`.
+Pass `--model` and `--recovery-model` to `--pr-review` or `--pr-approve` with
+any identity from the catalog.
 
 PR review prepares an independent temporary checkout at the packet's exact head,
 with its merge base available. `github-interface --checkout-review` checks the
@@ -165,13 +179,13 @@ expected head. For PR review these providers can first return `action: "inspect"
 with provisional `comments` and a `requests` array; Caller reads the requested
 source and supplies the result in their next turn. Terminal verdicts require
 `requests: []`. At most 12 inspection rounds fit within the existing total review
-deadline and 1.5 MB prompt limit; exhausting inspection never submits a review.
+deadline and 3 MB prompt limit; exhausting inspection never submits a review.
 Codex messages at or below its 1,048,576-character input limit keep their existing
 single-turn path. Only overflowing messages are sent as consecutive bounded
 fragments through the same native review conversation. Intermediate turns must
 acknowledge the exact fragment number; only the last can return a verdict or
 inspection request. The full input is retained, the existing total deadline and
-1.5 MB limit still apply, and partial staging, mismatched conversation IDs,
+3 MB limit still apply, and partial staging, mismatched conversation IDs,
 failed turns or native tool use submit nothing.
 Each provider process runs in a separate temporary directory with native tools
 disabled, receiving the same explicit guidance and scoped inspection access: Codex
@@ -242,11 +256,13 @@ calls measured on 2026-09-13 (1,283.662532 seconds), plus 10%, rounded up. Opus 
 the catalog's review effort and an explicit 64,000-output-token limit in the trusted CLI settings.
 Other behaviors retain their existing model assignments and limits.
 
-On an Opus output-limit error, Caller can recover once with the recovery model using the
-same immutable packet and remaining budget. GitHub must first confirm the same
-open head and no new or pending reviewer action. A verified completed action is
-adopted instead. Ambiguous activity, time exhaustion, or failed recovery leaves a
-typed failure for Poise to retain without automatically repeating unchanged input.
+On an Opus output-limit error or a repeat-only publication refusal, Caller can recover
+once with the recovery model using the same immutable packet and remaining budget.
+GitHub must first confirm the same open head and no new or pending reviewer action.
+A verified completed action is adopted instead. Ambiguous activity, time exhaustion,
+or failed recovery leaves a typed failure for Poise to retain without automatically
+repeating unchanged input. Every recovery exit keeps the refused first attempt beside
+the re-verdict outcome, including a later supersede.
 Logs include `review_policy` and `recovery_model`; capability discovery includes
 `policy: bounded-v1` so Poise can reject an incompatible runtime before launch.
 
@@ -280,9 +296,17 @@ must submit nothing when filing fails.
 
 ### Staged and follow-up reviews
 
+A governed review admits up to 3,000,000 UTF-8 prompt bytes. Diff generation
+is capped at 2,850,000 bytes and the serialized packet at 2,950,000 bytes,
+leaving room for context and policy. Existing bulk-data compaction rules still
+apply. These byte limits do not guarantee that an input fits a provider's token
+window. Claude receives the whole packet in one call.
+
 A structured review whose packet exceeds one provider call's reliable size
-runs in file-group stages (at most 8 files or 200,000 diff bytes each), all
-under the same head watch and budget. Every stage's findings combine into the
+runs in file-group stages targeting at most 8 files or 200,000 diff bytes each.
+Individual files stay intact and can exceed the byte target. All groups share
+the same head watch and total time budget; retaining more code can increase
+review duration and usage. Every stage's findings combine into the
 single verdict the harness submits; a packet that fits in one group runs
 exactly as before. A follow-up (`--pr-approve`) round reviews the diff since
 the reviewer's last submitted review instead of the whole PR again: new
@@ -292,9 +316,10 @@ pull request diff before the single submission. An unfetchable last head, or
 a base that moved since the last review, widens the round to the full diff
 instead. Any finding without a verified position fails the review before
 submission, including a capped round's follow-up issue and approval.
-Removed lines are mapped by their content and current-head position; ambiguous
-matches fail visibly. Reaffirmed unresolved findings keep their original thread
-coordinates, including outdated findings absent from the current diff.
+Removed lines are mapped by their content within the current-head span of their
+change block; ambiguous matches fail visibly. Reaffirmed unresolved findings
+keep their original thread coordinates, including outdated findings absent
+from the current diff.
 Every run reports its budget usage
 (`used_seconds` of `total_seconds`) in its terminal progress snapshot and in
 the completion result, so a near-miss is visible before it fails.

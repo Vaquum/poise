@@ -22,10 +22,15 @@ _current: ContextVar[dict | None] = ContextVar("review_receipt", default=None)
 _call: ContextVar[tuple[Path, str] | None] = ContextVar("review_receipt_call", default=None)
 _failure: ContextVar[str | None] = ContextVar("review_submission_failure", default=None)
 _conflict: ContextVar[dict | None] = ContextVar("review_receipt_conflict", default=None)
+_blocked: ContextVar[str | None] = ContextVar("review_submission_blocked", default=None)
+_refused: ContextVar[dict | None] = ContextVar("review_submission_refused", default=None)
+# A transport error carries no status: the write may have landed before the
+# response was lost, so publication is uncertain, never a refused submission.
+_TRANSPORT_ERRORS = ("TimeoutException", "ReadTimeout", "WriteTimeout", "ConnectTimeout", "PoolTimeout",
+                     "ConnectError", "ReadError", "WriteError", "CloseError",
+                     "RemoteProtocolError", "LocalProtocolError")
 _QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-remaining",
                   "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
-_TRANSPORT_ERRORS = ("TransportError|TimeoutException|ConnectError|ReadError|WriteError|CloseError|"
-                     "ReadTimeout|WriteTimeout|ConnectTimeout|PoolTimeout|RemoteProtocolError|LocalProtocolError")
 
 
 @contextmanager
@@ -155,15 +160,7 @@ def record_failure(text: str) -> str | None:
     # calls this path, and validation/authentication failures remain held.
     observed = re.search(r"(?:^|\n)(?:error: )?GitHub (\d{3})( rate-limit)?:", text)
     if not observed:
-        # A POST accepted before its transport failed leaves no GitHub
-        # status: the traceback names the httpx transport error instead. That
-        # uncertain write fences the gate and holds against extras.
-        transport = re.search(rf"(?:^|\n)(?:error: )?httpx\.(?:{_TRANSPORT_ERRORS})\b", text)
-        if not transport:
-            return None
-        message = text[transport.start():].strip()[:4096]
-        _failure.set(message)
-        return message
+        return record_transport_failure(text)
     status = observed[1]
     if status == "403":
         message = _quota_failure(text[observed.end():].rstrip()) if observed[2] else None
@@ -177,8 +174,64 @@ def record_failure(text: str) -> str | None:
     return None
 
 
+def record_transport_failure(text: str) -> str | None:
+    """A controller-observed transport error during the submission command.
+
+    Timeouts and connection errors name no status: the write may already be
+    accepted, so the failure is transient and reconciled from live receipts,
+    never tagged a refused submission.
+    """
+    found = None
+    for match in re.finditer(r"httpx\.(?:_[a-z_]+\.)?(?:" + "|".join(_TRANSPORT_ERRORS) + r")\b", text):
+        found = match
+    if found is None:
+        return None
+    message = text[found.start():].strip()[:4096]
+    _failure.set(message)
+    return message
+
+
 def failure() -> str | None:
     return _failure.get()
+
+
+def blocked_refusal(text: str) -> str | None:
+    """The approval guard's pre-POST refusal line, when the command output holds one.
+
+    Pure evidence for both submission runners: the structured runner raises it
+    directly, and the Claude guard persists it beside the receipt for the run
+    to settle as a blocked approval instead of a failed verdict.
+    """
+    found = re.search(r"(?:error: )?\d+ unresolved review conversation\(s\) from other reviewers remain", text)
+    if found is None:
+        return None
+    return " ".join(found.group(0).split())[:500]
+
+
+def blocked() -> str | None:
+    return _blocked.get()
+
+
+def parse_no_review(text: str) -> dict | None:
+    """A duplicate-only publication refusal: the skipped entries and whether
+    every one restated an already-published body. None for anything else,
+    including malformed replies. Shared by both submission runners so the
+    repeat-only rule cannot drift between them."""
+    try:
+        reply = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(reply, dict) or reply.get("action") != "no_review":
+        return None
+    skipped = reply.get("skipped", [])
+    repeat_only = (isinstance(skipped, list) and len(skipped) > 0 and all(
+        isinstance(entry, dict) and entry.get("reason") == "repeat" for entry in skipped))
+    return {"skipped": skipped, "repeat_only": repeat_only}
+
+
+def refused() -> dict | None:
+    """The no_review reply details the guard persisted for this run, if any."""
+    return _refused.get()
 
 
 def bind(database: Path, call_id: str) -> None:
@@ -186,6 +239,8 @@ def bind(database: Path, call_id: str) -> None:
     _current.set(None)
     _failure.set(None)
     _conflict.set(None)
+    _blocked.set(None)
+    _refused.set(None)
 
 
 def get() -> dict | None:
@@ -270,6 +325,20 @@ def record_file(path: str | Path) -> dict | None:
         record_failure(Path(str(path) + ".failure").read_text())
     except OSError:
         pass
+    try:
+        refused = blocked_refusal(Path(str(path) + ".blocked").read_text())
+    except OSError:
+        pass
+    else:
+        if refused is not None:
+            _blocked.set(refused)
+    try:
+        details = parse_no_review(Path(str(path) + ".refused").read_text())
+    except OSError:
+        pass
+    else:
+        if details is not None:
+            _refused.set(details)
     try:
         text = Path(path).read_text()
     except OSError:

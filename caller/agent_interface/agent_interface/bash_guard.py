@@ -11,10 +11,10 @@ import sys
 
 if __package__:
     from .review_gate import submission_gate
-    from .review_receipt import record_failure
+    from .review_receipt import blocked_refusal, parse_no_review, record_failure
 else:
     from review_gate import submission_gate
-    from review_receipt import record_failure
+    from review_receipt import blocked_refusal, parse_no_review, record_failure
 
 
 BAD = {";", "|", "||", "&&", "&", "<", ">", ">>", "<<", "2>", "2>>", "2>&1"}
@@ -61,7 +61,14 @@ def main():
         done = subprocess.run(argv, text=True, capture_output=True)
         # Hold the gate across the receipt write: a second terminal command
         # after an accepted submission is blocked instead of overwriting it.
-        if done.returncode == 0 and '"review_id"' in done.stdout:
+        # An exact no_review match goes first: nothing was posted, so the
+        # refusal persists unsealed and a corrected submission can follow.
+        if done.returncode == 0 and parse_no_review(done.stdout) is not None:
+            staged = receipt + ".refused.tmp"
+            with open(staged, "w") as handle:
+                handle.write(done.stdout)
+            os.replace(staged, receipt + ".refused")
+        elif done.returncode == 0 and '"review_id"' in done.stdout:
             staged = receipt + ".tmp"
             with open(staged, "w") as handle:
                 handle.write(done.stdout)
@@ -75,6 +82,14 @@ def main():
             # The POST may have been accepted before its answer failed: no
             # second write until the run reconciles what landed.
             gate.mark_uncertain()
+        elif done.returncode and (refused := blocked_refusal(done.stderr or done.stdout)):
+            # The approval guard refused: deterministic, retryable, and never
+            # sealed — the run settles it as a blocked approval, not a failed
+            # verdict. Uncertainty still wins when both markers exist.
+            staged = receipt + ".blocked.tmp"
+            with open(staged, "w") as handle:
+                handle.write(refused)
+            os.replace(staged, receipt + ".blocked")
     # The reply reaches the model unchanged; a submitted review's id is also
     # left for the run, so it can tell its own review from a sibling's.
     sys.stdout.write(done.stdout)

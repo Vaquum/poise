@@ -1,9 +1,11 @@
+import gc
 import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 from contextlib import redirect_stdout
 from contextlib import nullcontext
 from pathlib import Path
@@ -47,6 +49,14 @@ def scripted_muse(directory: Path) -> Path:
 
 
 class TestReviewModel(TestCase):
+    def test_structured_prompt_admission_uses_the_three_mb_utf8_boundary(self):
+        prompt = "é" * 1_500_000
+        structured_review._admit(prompt)
+        with self.assertRaises(atoms.AgentPreflightError) as caught:
+            structured_review._admit(prompt + "x")
+        self.assertEqual(caught.exception.code, "review_packet_too_large")
+        self.assertEqual(caught.exception.diagnostic["context"]["actual_input_bytes"], 3_000_001)
+
     def test_default_and_explicit_models_use_the_same_catalog(self):
         for behavior in ("pr_review", "pr_approve"):
             self.assertEqual(CATALOG.review_model(behavior).identity, "opus-5-high")
@@ -210,6 +220,48 @@ class TestStructuredVerdict(TestCase):
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
                                       "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
         self.assertEqual(raised.exception.head_sha, "b" * 40)
+
+    def test_unresolved_conversation_refusal_is_blocked_not_a_violation(self):
+        from agent_interface import review_receipt
+
+        def process(args, **kwargs):
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=1, stdout="",
+                                       stderr="error: 1 unresolved review conversation(s) from other reviewers remain")
+            Path(args[args.index("--output-last-message") + 1]).write_text(
+                json.dumps({"action": "approve", "comments": []}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process):
+            with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertEqual(failure.exception.code, "approval_blocked_unresolved_conversations")
+        self.assertIn("blocked", str(failure.exception))
+        self.assertIn("1 unresolved review conversation(s) from other reviewers remain", str(failure.exception))
+        self.assertEqual(failure.exception.diagnostic["submission"], "blocked")
+        self.assertIsNone(review_receipt.get())
+
+    def test_transport_timeout_at_submit_is_uncertain_not_a_violation(self):
+        from agent_interface import review_receipt as receipt_mod
+
+        def process(args, **kwargs):
+            if args[0] == "github-interface":
+                return SimpleNamespace(returncode=1, stdout="",
+                                       stderr="Traceback (most recent call last):\n"
+                                              "  File \"client.py\", line 69, in request\n"
+                                              "httpx.ReadTimeout: timed out\n")
+            Path(args[args.index("--output-last-message") + 1]).write_text(
+                json.dumps({"action": "approve", "comments": []}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                patch.object(ReviewWatch, "run", side_effect=process):
+            with self.assertRaises(receipt_mod.SubmissionError) as failure:
+                structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                      "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+        self.assertIn("httpx.ReadTimeout", str(failure.exception))
 
     def test_clean_and_approval_are_distinct_terminal_actions(self):
         for behavior, action, flag in (("pr_review", "reviewed_clean", "--reviewed-clean"), ("pr_approve", "approve", "--approve-pr")):
@@ -376,6 +428,32 @@ class TestStagedReview(TestCase):
         self.assertEqual(len(json.loads(submit.call_args.args[0][4])), 2)
 
 
+class TestBoundedStagePrompts(TestCase):
+    def test_stage_prompts_stream_one_at_a_time(self):
+        paths = [f"src/f{i:04d}.py" for i in range(1000)]
+        node = json.loads(staged_packet(paths))
+        node["review_threads"] = [{"path": paths[0], "line": 1, "side": "RIGHT", "bodies": ["c" * 60_000]}
+                                  for _ in range(16)]
+        packet = json.dumps(node)
+        self.assertLess(len(packet.encode()), 1_450_000)
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        self.assertFalse(isinstance(structured_review._stage_texts(text, packet), list),
+                         "stage prompts must stream, not materialize every prompt")
+        gc.collect()
+        tracemalloc.start()
+        try:
+            total, count = 0, 0
+            for prompt in structured_review._stage_texts(text, packet):
+                total += len(prompt.encode())
+                count += 1
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(count, 125)
+        self.assertGreater(total, 100_000_000)
+        self.assertLess(peak, total // 8)
+
+
 class TestApproveSinceHead(TestCase):
     def _run(self, since, packets):
         with patch.object(atoms, "last_reviewed_head", return_value=since) as history, \
@@ -423,7 +501,7 @@ class TestSincePositions(TestCase):
 
     def _packet(self, since, diff=None, paths=("src/gone.py",)):
         node = json.loads(staged_packet(list(paths)))
-        node["p"] = 2
+        node["p"] = "p2"
         node["since_head_sha"] = since
         if diff is not None:
             node["diff"] = diff
@@ -453,6 +531,29 @@ class TestSincePositions(TestCase):
                                            "pr_approve", "https://github.com/o/r/pull/12", "bit-mis",
                                            "a" * 40, 60, packet=packet, **options)
         return result, calls, fetch
+
+    @staticmethod
+    def _real_diffs(base, prev, cur, path="src/f.py"):
+        """(since, full) diffs from three real commits, as git lays them out."""
+        with tempfile.TemporaryDirectory(prefix="since-positions-") as directory:
+            subprocess.run(["git", "-c", "init.defaultBranch=main", "init", "-q"], cwd=directory,
+                           check=True, capture_output=True)
+            shas = []
+            for index, tree in enumerate((base, prev, cur)):
+                target = Path(directory) / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(tree)
+                subprocess.run(["git", "add", path], cwd=directory, check=True, capture_output=True)
+                subprocess.run(["git", "-c", "user.email=since@test", "-c", "user.name=since",
+                                "-c", "commit.gpgsign=false", "commit", "-qm", f"state{index}"],
+                               cwd=directory, check=True, capture_output=True)
+                shas.append(subprocess.run(["git", "rev-parse", "HEAD"], cwd=directory, check=True,
+                                           capture_output=True, text=True).stdout.strip())
+            since = subprocess.run(["git", "diff", shas[1], shas[2], "--", path], cwd=directory,
+                                   check=True, capture_output=True, text=True).stdout
+            full = subprocess.run(["git", "diff", shas[0], shas[2], "--", path], cwd=directory,
+                                  check=True, capture_output=True, text=True).stdout
+            return since, full
 
     def test_removal_finding_inside_the_pr_diff_submits(self):
         verdict = {"action": "request_changes",
@@ -607,6 +708,82 @@ class TestSincePositions(TestCase):
         self.assertEqual(failure.exception.code, "review_contract_violation")
         self.assertIn("no submitted verdict", str(failure.exception))
 
+    def test_removal_next_to_an_earlier_pr_edit_anchors_using_real_git_diffs(self):
+        base = "def f():\n    a = 1\n    b = 2\n    return a\n"
+        prev = "def f():\n    a = 10\n    b = 2\n    return a\n"
+        cur = "def f():\n    a = 10\n    return a\n"
+        since, full = self._real_diffs(base, prev, cur)
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/f.py", "line": 3, "side": "LEFT", "body": "b is still needed"}]}
+        _, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/f.py",)), verdict,
+                                self._full(full, paths=("src/f.py",)))
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(3, "LEFT")])
+
+    def test_repeated_removal_in_a_separate_hunk_anchors_using_real_git_diffs(self):
+        filler = "".join(f"    step{i} = {i}\n" for i in range(8))
+        base = f"def a():\n    return None\n{filler}def b():\n    return None\n    tail = 1\n"
+        prev = f"def a():\n    return 1\n{filler}def b():\n    return None\n    tail = 1\n"
+        cur = f"def a():\n    return 1\n{filler}def b():\n    tail = 1\n"
+        since, full = self._real_diffs(base, prev, cur)
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/f.py", "line": 12, "side": "LEFT", "body": "second removal"}]}
+        _, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/f.py",)), verdict,
+                                self._full(full, paths=("src/f.py",)))
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(12, "LEFT")])
+
+    def test_reworded_reaffirmation_at_thread_location_submits(self):
+        kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
+                          "@@ -1,1 +1,2 @@", " same", "+more"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                "body": "Removing `z` still breaks callers."}]}
+        node = json.loads(self._packet("c" * 40, kept, paths=("src/kept.py",)))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False,
+                                  "bodies": ["[p1] removing z breaks callers"]}]
+        result, calls, _ = self._run(json.dumps(node), verdict,
+                                     self._full(self.REMOVAL + "\n" + kept,
+                                              paths=("src/gone.py", "src/kept.py")))
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_new_finding_colliding_with_a_thread_line_is_remapped(self):
+        shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                             "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                "body": "brand new defect here"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False,
+                                  "bodies": ["unrelated old thread"]}]
+        _, calls, _ = self._run(json.dumps(node), verdict, self._full(shifted))
+        submitted = json.loads(calls[-1][0][4])
+        self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(5, "LEFT")])
+
+    def test_identical_reaffirmation_inside_the_since_diff_keeps_its_location(self):
+        shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
+                             "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "still blocks"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": False, "bodies": ["still blocks"]}]
+        _, calls, _ = self._run(json.dumps(node), verdict, self._full(shifted))
+        self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
+
+    def test_outdated_reaffirmation_uses_thread_coordinates(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 999, "side": "RIGHT", "body": "y is wrong"}]}
+        node = json.loads(self._packet("c" * 40, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": True, "bodies": ["y is wrong"]}]
+        _, calls, _ = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
+        self.assertEqual(json.loads(calls[-1][0][4]),
+                         [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "y is wrong"}])
+
     def test_partially_stale_verdict_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
@@ -641,6 +818,73 @@ class TestSincePositions(TestCase):
         result, _, fetch = self._run(self._packet(None), verdict, "unused")
         self.assertIn('"review_id": 91', result)
         fetch.assert_not_called()
+
+    def test_production_priorities_pass_through_unchanged(self):
+        for priority in ("p0", "p1", "p2", "p12"):
+            with self.subTest(priority=priority):
+                node = json.loads(self._packet("c" * 40, self.REMOVAL))
+                node["p"] = priority
+                verdict = {"action": "request_changes",
+                           "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+                result, _, fetch = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
+                self.assertIn('"review_id": 91', result)
+                fetch.assert_called_once_with("/repo", "https://github.com/o/r/pull/12", "bit-mis",
+                                              "a" * 40, priority, since_head=None)
+
+    def test_missing_priority_fails_closed_without_fetch_or_submit(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        for missing in ("absent", None, "", "   "):
+            with self.subTest(missing=missing):
+                node = json.loads(self._packet("c" * 40, self.REMOVAL))
+                if missing == "absent":
+                    del node["p"]
+                else:
+                    node["p"] = missing
+                packet = json.dumps(node)
+                calls = []
+
+                def process(args, **kwargs):
+                    calls.append((args, kwargs))
+                    if args[0] == "github-interface":
+                        return SimpleNamespace(returncode=0, stdout=json.dumps(
+                            {"action": "requested_changes", "review_id": 91, "head_sha": "a" * 40}), stderr="")
+                    Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+                with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                        patch.object(ReviewWatch, "run", side_effect=process), \
+                        patch.object(structured_review, "fetch_packet") as fetch:
+                    with self.assertRaises(atoms.AgentPreflightError) as failure:
+                        structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"),
+                                              "pr_approve", "https://github.com/o/r/pull/12", "bit-mis",
+                                              "a" * 40, 60, packet=packet)
+                self.assertEqual(failure.exception.code, "review_contract_violation")
+                self.assertIn("missing its priority", str(failure.exception))
+                fetch.assert_not_called()
+                self.assertEqual(len(calls), 1)
+                self.assertNotEqual(calls[0][0][0], "github-interface")
+
+    def test_malformed_and_integer_priorities_fail_closed_via_adapter(self):
+        verdict = {"action": "request_changes",
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
+        full = self._full(self.REMOVAL)
+
+        def validating_fetch(pwd, pr, actor_name, head, p, since_head=None):
+            atoms._priority(p)
+            return full
+
+        for bad in ("pp2", "px", "p", "2", 2, 0, True):
+            with self.subTest(p=bad):
+                node = json.loads(self._packet("c" * 40, self.REMOVAL))
+                node["p"] = bad
+                with patch.object(structured_review, "fetch_packet", side_effect=validating_fetch):
+                    with self.assertRaises(structured_review.InvalidVerdict) as failure:
+                        structured_review._validate_since_positions(
+                            "/repo", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40,
+                            json.dumps(node), dict(verdict))
+                self.assertIn("cannot validate since-diff positions", str(failure.exception))
 
 
 class TestOtherProviderVerdicts(TestCase):
@@ -986,6 +1230,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             run_with_github(SimpleNamespace(returncode=0, stdout=noop, stderr=""))
         self.assertEqual(failure.exception.code, "review_contract_violation")
         self.assertEqual(failure.exception.diagnostic["submission"], "noop")
+        self.assertEqual(failure.exception.diagnostic["refusal"], "duplicate")
 
         with self.assertRaises(receipt_mod.SubmissionError):
             run_with_github(SimpleNamespace(returncode=0, stdout="not json", stderr=""))
@@ -1000,3 +1245,38 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
             with self.assertRaises(receipt_mod.SubmissionError):
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
                                       "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+
+    def test_repeat_only_noop_is_typed_for_recovery(self):
+        verdict = {"action": "request_changes", "comments": [FINDING]}
+
+        def run_with_github(reply):
+            def process(args, **kwargs):
+                if args[0] == "github-interface":
+                    return reply
+                Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch.object(structured_review.subprocess, "run", side_effect=process), \
+                    patch.object(ReviewWatch, "run", side_effect=process):
+                return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+
+        skipped = [{"reason": "repeat", "comment": FINDING},
+                   {"reason": "repeat", "comment": FINDING}]
+        noop = json.dumps({"action": "no_review", "skipped": skipped})
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            run_with_github(SimpleNamespace(returncode=0, stdout=noop, stderr=""))
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertEqual(failure.exception.diagnostic["submission"], "noop")
+        self.assertEqual(failure.exception.diagnostic["refusal"], "repeat_only")
+
+        mixed = json.dumps({"action": "no_review",
+                            "skipped": [{"reason": "repeat", "comment": FINDING},
+                                        {"reason": "already_commented_or_resolved", "comment": FINDING}]})
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            run_with_github(SimpleNamespace(returncode=0, stdout=mixed, stderr=""))
+        self.assertEqual(failure.exception.diagnostic["refusal"], "duplicate")
+
+        empty = json.dumps({"action": "no_review", "skipped": []})
+        with self.assertRaises(agent_interface.review_budget.ReviewLimitError) as failure:
+            run_with_github(SimpleNamespace(returncode=0, stdout=empty, stderr=""))
+        self.assertEqual(failure.exception.diagnostic["refusal"], "duplicate")

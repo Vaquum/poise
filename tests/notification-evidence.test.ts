@@ -138,7 +138,7 @@ it('inventories every actual server/client kind and finite diagnostic placement'
     expect([...store.ALERT_KINDS].sort()).toEqual([...NOTICE_KINDS].sort())
     expect(Object.keys(NOTIFICATION_PLACEMENT).sort()).toEqual([...NOTICE_KINDS, 'read_failed', 'action_failed', 'action_needed', 'action_finished'].sort())
     expect(Object.keys(NOTICE_LOOK).sort()).toEqual(Object.keys(NOTIFICATION_PLACEMENT).sort())
-    expect(Object.keys(DIAGNOSTIC_PLACEMENT)).toHaveLength(18)
+    expect(Object.keys(DIAGNOSTIC_PLACEMENT)).toHaveLength(19)
     for (const [code, row] of Object.entries(DIAGNOSTIC_PLACEMENT)) expect(diagnosticClassification(code)).toEqual({ code, severity: row.rail })
     expect(diagnosticClassification('future-source-code')).toEqual({ code: 'future-source-code', severity: 'warning' })
     expect(DIAGNOSTIC_SCOPES).toContain('Behaviors API dynamic code')

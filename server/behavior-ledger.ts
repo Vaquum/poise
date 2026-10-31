@@ -35,7 +35,7 @@ interface Job {
 }
 const emptyHealth = (): LedgerHealth => ({
   status: 'unavailable', unavailableReason: 'worker_unavailable', coverageStart: null, observedAt: null, callerObservedAt: null,
-  pending: 0, dropped: 0, gaps: [], generation: null, retainedFrom: null,
+  pending: 0, dropped: 0, gaps: [], detailFloor: null, generation: null, retainedFrom: null,
   changeLowerBound: null, lastSequence: null, instances: null, changes: null,
 })
 const CAPTURE_RETRY_MS = 250
@@ -74,6 +74,7 @@ export class BehaviorLedgerObserver {
   private captureBytes = 0
   private reads = 0
   private unreportedLoss = 0
+  private unreportedLossSince: number | null = null
   private retryAt = 0
   private retryTimer?: ReturnType<typeof setTimeout>
   private health = emptyHealth()
@@ -209,7 +210,12 @@ export class BehaviorLedgerObserver {
     }
   }
 
-  private lose(count: number): void { this.unreportedLoss += count }
+  private lose(count: number): void {
+    // Memory-only bounds for the pending marker: losses are attributed from
+    // the first unreported one, so pump delay cannot shift them forward.
+    this.unreportedLossSince ??= Date.now()
+    this.unreportedLoss += count
+  }
 
   private projectedHealth(): LedgerHealth {
     const health = { ...this.health, pending: this.captures, dropped: this.health.dropped + this.unreportedLoss }
@@ -311,7 +317,10 @@ export class BehaviorLedgerObserver {
     // A loss marker has a reserved slot; dropping it would hide capture loss.
     if (this.unreportedLoss && !this.queue.some((job) => job.observation?.type === 'loss')) {
       this.queue.unshift({ id: ++this.sequence, operation: 'capture', bytes: 0, enqueuedAt: Date.now(),
-        observation: { type: 'loss', count: this.unreportedLoss } })
+        observation: { type: 'loss', count: this.unreportedLoss, since: new Date(this.unreportedLossSince ?? Date.now()).toISOString() } })
+      // A later loss starts a fresh span: its bounds and count survive the
+      // in-flight marker's acknowledgement instead of stretching it.
+      this.unreportedLossSince = null
       this.captures++
     }
     // Read deadlines include queue wait; permit a turn without starving capture.
@@ -367,7 +376,8 @@ export class BehaviorLedgerObserver {
       // native SQLite. Keep it tracked and close cooperatively.
       worker.ref()
       if (this.unreportedLoss) worker.postMessage({ id: ++this.sequence, operation: 'capture',
-        observation: { type: 'loss', count: this.unreportedLoss } } satisfies LedgerWorkerRequest)
+        observation: { type: 'loss', count: this.unreportedLoss,
+          since: new Date(this.unreportedLossSince ?? Date.now()).toISOString() } } satisfies LedgerWorkerRequest)
       worker.postMessage({ id: ++this.sequence, operation: 'close' } satisfies LedgerWorkerRequest)
     } else this.removeDevelopmentAsset()
   }
@@ -485,6 +495,14 @@ export class BehaviorLedgerObserver {
         this.captures--
         this.captureBytes -= job.bytes
         if (job.observation?.type !== 'loss') this.lose(1)
+        else if (job.observation.since !== undefined) {
+          // The marker's count stays unreported; its span must stay with it,
+          // or a later marker would attribute those losses from this stop.
+          const discarded = Date.parse(job.observation.since)
+          if (Number.isFinite(discarded) && (this.unreportedLossSince === null || discarded < this.unreportedLossSince)) {
+            this.unreportedLossSince = discarded
+          }
+        }
         if (job.observation?.type === 'admit') this.admitted.delete(job.observation.nativeId)
       }
       if (job.operation !== 'read') continue

@@ -28,7 +28,7 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
             (source / 'old.py').rename(source / 'renamed.py')
             (source / 'new.py').write_text('print("é")\n')
             (source / 'new.py').chmod(0o755)
-            (source / 'data.json').write_text('x' * 2_000_000)
+            (source / 'data.json').write_text('x' * 4_000_000)
             (source / 'package.json').write_text('x' * 40_000)
             (source / 'fixtures').mkdir()
             (source / 'fixtures' / 'small.json').write_text('{"ok": true}\n')
@@ -74,6 +74,42 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
             self.assertNotIn(':(literal)data.json', diff_call)
             self.assertIn(':(literal)[literal].py', diff_call)
             client.get.assert_awaited_once_with(f'/repos/o/r/compare/{new_base}...{head}', params={'page': 2, 'per_page': 1})
+
+    async def test_retains_source_diff_above_the_old_packet_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root)
+            git(root, 'init', '--quiet')
+            git(root, 'config', 'user.name', 'Test')
+            git(root, 'config', 'user.email', 'test@example.com')
+            git(root, 'commit', '--quiet', '--allow-empty', '-m', 'base')
+            base = git(root, 'rev-parse', 'HEAD')
+            content = 'value = 1\n' * 120_000
+            for name in ('a.py', 'b.py'):
+                (source / name).write_text(content)
+            git(root, 'add', '.')
+            git(root, 'commit', '--quiet', '-m', 'head')
+            head = git(root, 'rev-parse', 'HEAD')
+            original = rd._git
+
+            def local_git(cwd, env, *args, limit):
+                if args[:2] == ('remote', 'add'):
+                    args = (*args[:-1], source.as_uri())
+                return original(cwd, env, *args, limit=limit)
+
+            async def sizes(client, owner, repo, files):
+                return {file['new_oid']: len(content.encode()) for file in files}
+
+            client = AsyncMock()
+            client.token = 'not-a-token'
+            client.get.return_value = {'merge_base_commit': {'sha': base}}
+            with patch.object(rd, '_git', side_effect=local_git), patch.object(rd, '_blob_sizes', side_effect=sizes):
+                packet = await rd.review_diff(client, 'o', 'r', {'head': {'sha': head}, 'base': {'sha': base}})
+
+            self.assertEqual([entry['filename'] for entry in packet['files']], ['a.py', 'b.py'])
+            self.assertNotIn('omitted_files', packet)
+            self.assertEqual(packet['diff'].count('+value = 1\n'), 240_000)
+            self.assertGreater(len(packet['diff'].encode()), 1_500_000)
+            self.assertLess(len(json.dumps(packet, indent=2).encode()), 2_950_000)
 
     async def test_packet_rejects_head_or_base_change_after_read(self):
         head = 'a' * 40
@@ -142,6 +178,37 @@ class TestPacketBudget(IsolatedAsyncioTestCase):
         self.assertEqual(packet['excluded_files'][0]['path'], 'data.csv')
         self.assertNotIn(':(literal)data.csv', diff_calls[-1])
         self.assertEqual(len(packet['diff']), 1000)
+
+    async def test_large_artifact_excluded_even_when_total_input_fits(self):
+        # A packet that fits locally can still carry an artifact diff entry
+        # GitHub rejects inline comments on (422 "diff is too large"). Bulk
+        # data is excluded upfront so the model never targets it.
+        base, head = 'a' * 40, 'b' * 40
+        code, data = 'c' * 40, 'd' * 40
+        raw = (f':000000 100644 {"0" * 40} {code} A\0code.py\0'
+               f':000000 100644 {"0" * 40} {data} A\0input-artefacts/RUN-abc.json\0').encode()
+        diff_calls = []
+
+        def git_result(cwd, env, *args, limit):
+            if '--raw' in args:
+                return raw
+            if '--find-renames' in args:
+                diff_calls.append(args)
+                self.assertNotIn(':(literal)input-artefacts/RUN-abc.json', args)
+                return b'diff --git a/code.py b/code.py\n+pass\n'
+            return b''
+
+        client = AsyncMock()
+        client.token = 'test-token'
+        client.get.return_value = {'merge_base_commit': {'sha': base}}
+        # Total input (~100KB) fits well under the 1.35MB diff budget.
+        with patch.object(rd, '_git', side_effect=git_result), \
+                patch.object(rd, '_blob_sizes', AsyncMock(return_value={code: 100, data: 100_000})):
+            packet = await rd.review_diff(client, 'o', 'r', {'base': {'sha': base}, 'head': {'sha': head}})
+        self.assertEqual([f['path'] for f in packet['excluded_files']], ['input-artefacts/RUN-abc.json'])
+        self.assertEqual([f['filename'] for f in packet['files']], ['code.py'])
+        self.assertIn('code.py', packet['diff'])
+        self.assertNotIn('omitted_files', packet)
 
 
 class TestBoundedCoverage(IsolatedAsyncioTestCase):
