@@ -139,6 +139,22 @@ In service mode the Claude sign-in banner's button opens Settings → Accounts
 with Claude's login already running, in place of the local-browser sign-in a
 workspace cannot offer.
 
+## SSH keys
+
+Below the CLI accounts, SSH keys inventories `~/.ssh`: each private key file
+by name, with its public key's SHA256 fingerprint when `<name>.pub` exists.
+Poise stats private files and reads `.pub` files only; it never opens a
+private key file, so private material cannot cross the API. A key whose
+permissions are too open for ssh to use says how to fix them (`chmod 600`).
+
+Add an SSH key opens a terminal that asks for a file name and a pasted
+private key (nothing shows while it is pasted). The key lands in `~/.ssh`
+with 0600, `~/.ssh` itself is kept at 0700, and `ssh-keygen -y` derives the
+`.pub`; an existing file is never overwritten, and a key ssh-keygen refuses
+is not kept. The pasted key never leaves that terminal. Keys in `~/.ssh` are
+what ssh — including chats' shell commands — uses when you ask for work on
+your servers.
+
 ## Google accounts
 
 Google connections use the same account rows and compact status text below the

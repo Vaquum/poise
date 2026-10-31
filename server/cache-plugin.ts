@@ -72,6 +72,7 @@ import { DailyModelRefresh } from './service/model-refresh'
 import { CLAUDE_BROWSER_LOGIN_OFF, SELF_UPDATE_OFF, SERVICE_MODE_CODE, productionUpdaterOff } from './service/turned-off'
 import { invalidateAccounts, listAccounts, scheduleAccountsCheck } from './accounts'
 import { accountLogins, recordLogin } from './accounts/logins'
+import { listSshKeys } from './ssh-keys'
 import { connectGitHubAccount, onboardingState, updateOnboarding } from './service/onboarding'
 import { isAccountId, type AccountId, type ConnectedAccount } from './accounts/types'
 import { randomUUID } from 'node:crypto'
@@ -503,6 +504,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           if (id !== null && !isAccountId(id)) return json(res, 400, { error: 'id must name a connected account CLI' })
           try {
             return json(res, 200, { accounts: await checkAccounts(id ?? undefined) })
+          } catch (err: any) {
+            return json(res, 500, { error: err.message || String(err) })
+          }
+        }
+
+        // ── SSH keys: the public inventory of ~/.ssh, never private material ──
+        if (path === '/api/ssh-keys' && req.method === 'GET') {
+          try {
+            return json(res, 200, { keys: listSshKeys() })
           } catch (err: any) {
             return json(res, 500, { error: err.message || String(err) })
           }

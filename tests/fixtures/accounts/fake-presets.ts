@@ -13,7 +13,10 @@ export function fakePresetCommand(bin: string): (preset: TerminalPreset) => Term
   return (preset) => {
     if (preset === 'shell') throw new Error('a test may not open the login shell: it has no fake')
     const command = presetCommand(preset)
-    assertFake(bin, COMMANDS[preset === 'muse-api-key' ? 'muse' : preset], command.env.PATH ?? '')
+    // The SSH import runs on python3, which the fixture links into bin; the
+    // ssh-keygen it derives the public key with comes from the test's own bin
+    // too, or the import says it is missing.
+    assertFake(bin, preset === 'ssh-key' ? 'python3' : COMMANDS[preset === 'muse-api-key' ? 'muse' : preset], command.env.PATH ?? '')
     return command
   }
 }

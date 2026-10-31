@@ -719,6 +719,11 @@ not use the gateway's discarded OAuth token.
     check. A check with no eligible providers reports every provider skipped
     and succeeds neutrally. The server forwards its own observation to the
     refresh script; the standalone job resolves the same rule itself.
+- `GET /api/ssh-keys` returns `{ keys }`, the public inventory of `~/.ssh`:
+  one entry per private key file (name, permission bits, size) and per public
+  key without a private file, with the `.pub` line and its SHA256 fingerprint
+  when readable. Private files are stated, never opened. A missing `~/.ssh`
+  answers empty; anything else unreadable answers 500.
 - Connect opens a terminal in the browser, inside the workspace, running that
   CLI's own login (`login.label`):
 
@@ -731,9 +736,12 @@ not use the gateway's discarded OAuth token.
   | Muse | `muse login`, which warns it switches Muse to the account login and its subscription quota |
   | Muse API key | `muse auth set --api-key-stdin`, pasted into the terminal; Poise never sees or stores the key |
   | Antigravity | `agy`, which has no login subcommand: it opens its sign-in screen when it starts signed out |
+  | SSH key | the SSH import: a pasted private key lands in `~/.ssh` with 0600 and its `.pub` is derived; Poise never sees or stores the key |
 
   Credentials go straight from the CLI to its own files; Poise never reads them,
   except Muse's auth file for its non-secret fields (which credential it holds).
+  SSH private keys go straight from the import terminal to `~/.ssh`; Poise never
+  opens a private key file.
   In local and service mode, a successful Connect exit records a timestamp in
   Poise's existing `account_logins` map, independently of setup progress. Grok
   and Muse can therefore show the completed sign-in immediately and after a
@@ -745,7 +753,7 @@ not use the gateway's discarded OAuth token.
   including indistinguishable older automatic Antigravity entries, are kept.
   Missing CLIs and failed version probes retain history without showing a
   positive sign-in state. Setup's explicit withdrawal removes the record.
-- `/ws/terminal?preset=<id>|shell|muse-api-key` is browser scope only.
+- `/ws/terminal?preset=<id>|shell|muse-api-key|ssh-key` is browser scope only.
   - Client to server: `{type:"input", data}` and `{type:"resize", cols, rows}`,
     with `cols` from 2 to 500, `rows` from 2 to 200 and frames up to 64 KiB.
   - Server to client: `{type:"output", data}` (base64) and `{type:"exit",

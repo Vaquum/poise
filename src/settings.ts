@@ -22,6 +22,8 @@ import { ACCOUNT_IDS, ACCOUNT_LOGINS, CONNECTED_ACCOUNTS_PATH, MUSE_API_KEY_LOGI
 import { isTerminalPreset, type TerminalPreset } from '../server/terminal/protocol'
 import { googleAccountsSection } from './views/google-accounts'
 import { accountsHtml, fetchAccounts } from './views/connected-accounts'
+import { fetchSshKeys, sshKeysHtml } from './views/ssh-keys'
+import type { SshKey } from '../server/ssh-keys'
 import { publishingSection, type PublishingSection } from './views/publishing-settings'
 import { behaviorChainSettings } from './views/behavior-chain-settings'
 import { WAKE_OPTIONS, wakeStatusText, type ManagerWakeView, type WakeMinutes } from './chat-manager-settings-types'
@@ -119,6 +121,11 @@ let shellBtn: HTMLButtonElement | null = null
 let accounts: ConnectedAccount[] | null = null
 let accountsGeneration = 0
 let accountsLoading: Promise<void> | null = null
+let sshEl: HTMLElement | null = null
+let sshKeys: SshKey[] | null = null
+let sshKeysError: string | null = null
+let sshKeysGeneration = 0
+let sshKeysLoading: Promise<void> | null = null
 let terminal: TerminalPanel | null = null
 let terminalOpening = false
 // The Manager group mirrors the header's wake control on the same routes,
@@ -673,6 +680,31 @@ function renderAccounts(): void {
   const settings = getCachedSettings()
   if (accountsEl && accounts) patchInformation(accountsEl, accountsHtml(accounts, { me: settings.me, agentAccount: settings.agentAccount ?? '' }, terminalBusy()))
   if (shellBtn) shellBtn.disabled = terminalBusy()
+  renderSshKeys()
+}
+
+function renderSshKeys(): void {
+  if (sshEl) patchInformation(sshEl, sshKeysHtml(sshKeys, sshKeysError, terminalBusy()))
+}
+
+function loadSshKeys(force = false): Promise<void> {
+  if (!sshEl) return Promise.resolve()
+  if (!force && sshKeysLoading) return sshKeysLoading
+  const generation = ++sshKeysGeneration
+  const loading = fetchSshKeys().then((keys) => {
+    if (generation !== sshKeysGeneration) return
+    sshKeys = keys
+    sshKeysError = null
+  }).catch((error) => {
+    if (generation !== sshKeysGeneration) return
+    sshKeysError = `Could not check SSH keys: ${(error as Error).message}.`
+  }).then(() => {
+    if (generation === sshKeysGeneration) renderSshKeys()
+  }).finally(() => {
+    if (sshKeysLoading === loading) sshKeysLoading = null
+  })
+  sshKeysLoading = loading
+  return loading
 }
 
 function accountsStatus(text: string, failed = false): void {
@@ -727,6 +759,7 @@ function loadAccounts(force = false): Promise<void> {
 function terminalTitle(preset: TerminalPreset): string {
   if (preset === 'shell') return 'Login shell'
   if (preset === 'muse-api-key') return MUSE_API_KEY_LOGIN.join(' ')
+  if (preset === 'ssh-key') return 'Add an SSH key'
   return ACCOUNT_LOGINS[preset].join(' ')
 }
 
@@ -748,8 +781,9 @@ async function connect(preset: TerminalPreset): Promise<void> {
     const opened = openTerminal({
       preset,
       title: terminalTitle(preset),
-      // A login may have changed what the CLI's status says.
-      onEnd: () => { renderAccounts(); void loadAccounts(true) },
+      // A login may have changed what the CLI's status says; an import may
+      // have added an SSH key.
+      onEnd: () => { renderAccounts(); void loadAccounts(true); void loadSshKeys(true) },
       onDispose: () => {
         if (terminal === opened) terminal = null
         panelEl?.classList.remove('st-terminal-open')
@@ -1564,7 +1598,7 @@ function selectSection(panel: HTMLElement, tab: SettingsSection) {
   }
   panel.querySelector<HTMLElement>('.st-footer')!.hidden = tab === 'accounts' || tab === 'publishing' || tab === 'navigation' || tab === 'admin'
   if (panel.classList.contains('open')) {
-    if (tab === 'accounts') void loadAccounts()
+    if (tab === 'accounts') { void loadAccounts(); void loadSshKeys() }
     if (tab === 'publishing') void publishing?.refresh()
     if (tab === 'general') { void loadStorage(); void chainSettings?.refresh(); void loadManagerWake() }
   }
@@ -1752,6 +1786,7 @@ function buildPanel(): HTMLElement {
         <div class="st-terminal-slot"></div>
         <div class="st-accounts" aria-live="polite"></div>
         <section class="st-google-accounts" aria-label="Google accounts"></section>
+        <section class="st-ssh-keys" aria-label="SSH keys"></section>
         <div class="st-help st-help-info st-account-checks-status" role="status"></div>
         <div class="st-help st-help-info st-accounts-status" role="status"></div>
 
@@ -1813,6 +1848,11 @@ function buildPanel(): HTMLElement {
   shellBtn = panel.querySelector('.st-open-shell') as HTMLButtonElement
   shellBtn.addEventListener('click', () => { void connect('shell') })
   accountsEl!.addEventListener('click', (event) => {
+    const preset = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-connect]')?.dataset.connect
+    if (isTerminalPreset(preset)) void connect(preset)
+  })
+  sshEl = panel.querySelector('.st-ssh-keys')
+  sshEl!.addEventListener('click', (event) => {
     const preset = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-connect]')?.dataset.connect
     if (isTerminalPreset(preset)) void connect(preset)
   })
@@ -1922,7 +1962,7 @@ export function openSettingsPanel() {
   if (panelEl.dataset.section === 'general') void loadStorage()
   if (panelEl.dataset.section === 'general') void loadManagerWake()
   void pollOrganizations()
-  if (accountsTabSelected()) void loadAccounts()
+  if (accountsTabSelected()) { void loadAccounts(); void loadSshKeys() }
   if (panelEl.dataset.section === 'publishing') void publishing?.refresh()
 }
 

@@ -120,6 +120,9 @@ This isolation prevents provider-credential fallback, but it cannot disable
 Anthropic account-level Usage Credits. Users requiring a hard spending cap must
 disable Usage Credits under Claude account Settings > Usage.
 
+SSH private keys pasted in the import terminal travel through that terminal
+alone into `~/.ssh`; Poise never reads, returns or stores a private key file.
+
 ## Chat sessions
 
 The Chat WebSocket applies the same loopback host and browser-origin boundary
