@@ -65,6 +65,17 @@ export function setWorkerChatReader(reader: (() => WorkerChatState) | null): voi
   chatReader = reader
 }
 
+/** The chat state, or null when it cannot be read: status surfaces must
+ *  never break their callers (API handlers, control context). */
+function readChatState(): WorkerChatState | null {
+  if (!chatReader) return null
+  try {
+    return chatReader()
+  } catch {
+    return null
+  }
+}
+
 /** For tests: forget the cached backlog and candidates. */
 export function resetWorkerCapacityCache(): void {
   cachedBacklog = undefined
@@ -97,7 +108,7 @@ function boundIssueKeys(boundTargets: readonly string[]): Set<string> {
 /** Synchronous capacity for status surfaces; backlog follows the last refresh. */
 export function getWorkerCapacity(): WorkerCapacity {
   const target = getManagerSettings().rhythm
-  const state = chatReader?.() ?? null
+  const state = readChatState()
   return {
     running: state?.running ?? 0,
     target,
@@ -253,7 +264,7 @@ function scopeOwners(scope: readonly string[] | null, followed: readonly string[
 export async function refreshWorkerCapacity(options: RefreshWorkerCapacityOptions = {}): Promise<WorkerCapacity> {
   const now = options.now ?? Date.now()
   const settings = getManagerSettings()
-  const state = chatReader?.() ?? null
+  const state = readChatState()
   const running = state?.running ?? 0
   const bound = boundIssueKeys(state?.boundTargets ?? [])
   const eligible = state !== null && state.hasManager && !settings.paused
