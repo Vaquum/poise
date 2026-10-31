@@ -275,7 +275,7 @@ describe('the terminal WebSocket', () => {
 
   it('refuses a preset it does not know', async () => {
     await serve({})
-    expect(await open('bash')).toEqual({ status: 400, body: 'preset must be one of claude, codex, gh, grok, muse, antigravity, shell, muse-api-key' })
+    expect(await open('bash')).toEqual({ status: 400, body: 'preset must be one of claude, codex, gh, grok, muse, antigravity, shell, muse-api-key, ssh-key' })
     expect(await open('')).toMatchObject({ status: 400 })
   })
 

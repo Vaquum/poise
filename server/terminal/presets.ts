@@ -7,6 +7,7 @@ import { MUSE_API_KEY_LOGIN } from '../accounts/types'
 import { scrubbedChildEnvironment } from '../process'
 import type { TerminalCommand } from './pty'
 import type { TerminalPreset } from './protocol'
+import { SSH_KEY_HELPER } from './ssh-key-helper'
 
 // The browser draws the terminal with xterm.js.
 const TERMINAL_ENV: NodeJS.ProcessEnv = { TERM: 'xterm-256color', COLORTERM: 'truecolor' }
@@ -20,6 +21,9 @@ export function presetCommand(preset: TerminalPreset): TerminalCommand {
   if (preset === 'muse-api-key') {
     const [command, ...args] = MUSE_API_KEY_LOGIN
     return { command, args, env: scrubbedChildEnvironment(command, TERMINAL_ENV, args), cwd: homedir() }
+  }
+  if (preset === 'ssh-key') {
+    return { command: 'python3', args: ['-I', '-c', SSH_KEY_HELPER], env: scrubbedChildEnvironment('python3', TERMINAL_ENV), cwd: homedir() }
   }
   const { login } = ACCOUNT_CLIS[preset]
   return {
