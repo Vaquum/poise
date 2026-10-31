@@ -1,0 +1,380 @@
+// Snippets and Chat skills share the existing Espanso match file.
+// Its bodies are authoritative; SQLite keeps only a derived revision index.
+// A YAML comment commits stable invocation names and legacy import receipts.
+import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
+import { db, getMeta, setMeta } from './db'
+import { HttpError } from './http'
+import { diagnostic } from './logging'
+import { MATCH_FILE, MAX_SNIPPETS_BYTES, readSnippetSnapshotSync, mutateSnippetLibrary, validateSnippets, SnippetConflictError, type Snippet, type SnippetState } from './snippets'
+import { judgeEntry, parseMatchFile, type MatchFile } from './link/espanso'
+import { MANAGER_SWITCH, WORKER_SWITCH, parseChatSwitches, RESERVED_SWITCHES, switchName, SWITCH_LIMITS, type ChatSwitch, type ChatSwitches } from '../src/chat-switches'
+
+const PREFIX = '# poise-chat-library-v1 '
+const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+const INDEX_KEY = `chat_snippet_index:${hash(MATCH_FILE)}`
+const IMPORT_ID = hash(`chat-snippet-import-v1:${db.name}`)
+const IMPORT_DONE_KEY = `chat_snippet_import:${hash(MATCH_FILE)}:${IMPORT_ID}`
+export const snippetLibraryEvents = new EventEmitter()
+interface Metadata { imports: string[], names: Array<[string, string]> }
+interface Indexed { removed?: boolean, trigger: string, name: string, digest: string, revision: number, updatedAt: string }
+interface Index { revision: number, signature: string, entries: Indexed[] }
+interface Plan { state: SnippetState, metadata: Metadata, imported: boolean }
+export interface SkillSnippetState extends SnippetState { skills: ChatSwitches }
+
+function metadataFrom(raw: string | null): Metadata {
+  const lines = (raw || '').split('\n').filter(line => line.startsWith(PREFIX))
+  if (!lines.length) return { imports: [], names: [] }
+  try {
+    if (lines.length !== 1) throw new Error('duplicate header')
+    const value = JSON.parse(Buffer.from(lines[0].slice(PREFIX.length).trim(), 'base64url').toString('utf8')) as Metadata
+    if (!Array.isArray(value.imports) || !value.imports.every(id => typeof id === 'string' && /^[a-f0-9]{64}$/.test(id)) || !Array.isArray(value.names)) throw new Error('invalid header')
+    const names = new Set<string>(), triggers = new Set<string>()
+    for (const pair of value.names) {
+      if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string' || typeof pair[1] !== 'string' || triggers.has(pair[0])) throw new Error('invalid binding')
+      let name = pair[1]
+      if (RESERVED_SWITCHES.has(name)) {
+        // A stored name that became reserved (a new built-in took it) is
+        // renamed by the existing rule instead of failing the library. The
+        // text-expansion trigger is kept; the new name shows at once and is
+        // saved on the next write.
+        name = uniqueName(candidateName(pair[0]), pair[0], names)
+        pair[1] = name
+      }
+      if (switchName(name) !== name || RESERVED_SWITCHES.has(name) || names.has(name)) throw new Error('invalid binding')
+      names.add(name); triggers.add(pair[0])
+    }
+    return value
+  } catch { throw new HttpError(500, 'The snippet skill-name metadata could not be read. No snippets or skills were replaced.') }
+}
+const header = (metadata: Metadata) => PREFIX + Buffer.from(JSON.stringify(metadata)).toString('base64url')
+
+function candidateName(trigger: string): string {
+  let name = trigger.replace(/^[;:/]+/, '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+  if (!/^[a-z]/.test(name)) name = `snippet-${name || hash(trigger).slice(0, 10)}`
+  name = name.slice(0, 64)
+  if (RESERVED_SWITCHES.has(name)) name = `snippet-${name}`
+  return name
+}
+function uniqueName(candidate: string, trigger: string, used: Set<string>): string {
+  if (!used.has(candidate) && !RESERVED_SWITCHES.has(candidate)) return candidate
+  const suffix = hash(trigger).slice(0, 10)
+  let name = `${candidate.slice(0, 52)}-${suffix}`
+  for (let n = 2; used.has(name) || RESERVED_SWITCHES.has(name); n++) name = `${candidate.slice(0, 46)}-${suffix}-${n}`
+  return name
+}
+/** Rename imported skills whose names became reserved, by the existing
+ *  rule, before the strict shape check. Anything else still rejects. */
+function renameReservedImport(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value
+  const data = value as { switches?: unknown }
+  if (!Array.isArray(data.switches)) return value
+  const used = new Set<string>()
+  for (const item of data.switches) {
+    const name = (item as { name?: unknown } | null)?.name
+    if (typeof name === 'string' && !RESERVED_SWITCHES.has(name)) used.add(name)
+  }
+  let changed = false
+  const switches = data.switches.map((item) => {
+    const name = (item as { name?: unknown } | null)?.name
+    if (typeof name !== 'string' || !RESERVED_SWITCHES.has(name)) return item
+    const renamed = uniqueName(candidateName(`;${name}`), `;${name}`, used)
+    used.add(renamed)
+    changed = true
+    return { ...(item as object), name: renamed }
+  })
+  return changed ? { ...(data as object), switches } : value
+}
+function bind(snippets: Snippet[], metadata: Metadata): Map<string, string> {
+  const names = new Map(metadata.names), used = new Set(names.values())
+  for (const snippet of snippets) {
+    if (names.has(snippet.trigger)) continue
+    const name = uniqueName(candidateName(snippet.trigger), snippet.trigger, used)
+    names.set(snippet.trigger, name); used.add(name)
+  }
+  metadata.names = [...names]
+  return names
+}
+
+/** Import both bodies on a collision; preserve existing Chat invocation names
+ * and leave existing Espanso triggers and their text untouched. */
+function plan(snapshot: ReturnType<typeof readSnippetSnapshotSync>): Plan {
+  const metadata = metadataFrom(snapshot.raw)
+  const snippets = [...snapshot.state.snippets]
+  let imported = false
+  if (!metadata.imports.includes(IMPORT_ID) && getMeta(IMPORT_DONE_KEY) !== 'complete') {
+    const raw = getMeta('chat_custom_switches')
+    if (raw) {
+      let legacy: ChatSwitches | null = null
+      try { legacy = parseChatSwitches(renameReservedImport(JSON.parse(raw))) } catch { /* reject below */ }
+      if (!legacy) throw new HttpError(500, 'Saved switches could not be read. No definitions were replaced.')
+      const used = new Set(metadata.names.map(([, name]) => name))
+      for (const skill of legacy.switches) {
+        let trigger = `;${skill.name}`
+        const existing = snippets.find(snippet => snippet.trigger === trigger)
+        if (existing && existing.replace !== skill.content) {
+          for (let n = 2; snippets.some(snippet => snippet.trigger === trigger); n++) trigger = `;${skill.name}-${n}`
+        }
+        if (!snippets.some(snippet => snippet.trigger === trigger)) snippets.push({ trigger, replace: skill.content })
+        if (!metadata.names.some(([key]) => key === trigger)) {
+          const name = uniqueName(skill.name, trigger, used)
+          metadata.names.push([trigger, name]); used.add(name)
+        }
+      }
+      metadata.imports.push(IMPORT_ID); imported = true
+    }
+  }
+  bind(snippets, metadata)
+  return { state: { ...snapshot.state, snippets }, metadata, imported }
+}
+
+function project(prepared: Plan): ChatSwitches {
+  const names = new Map(prepared.metadata.names)
+  const raw = getMeta(INDEX_KEY)
+  const index: Index = raw ? JSON.parse(raw) : { revision: 0, signature: '', entries: [] }
+  const previous = new Map(index.entries.map(item => [item.trigger, item]))
+  const live = prepared.state.snippets.map(snippet => ({ snippet, name: names.get(snippet.trigger)!, digest: hash(snippet.replace) }))
+  const signature = hash(JSON.stringify(live.map(({ snippet, name, digest }) => [snippet.trigger, name, digest])))
+  if (signature !== index.signature) {
+    if (live.length || index.entries.length) index.revision++
+    const charters = [MANAGER_SWITCH, WORKER_SWITCH].map(name => {
+      const found = live.find(({ name: item }) => item === name)
+      return { name, found, before: found ? previous.get(found.snippet.trigger) : undefined }
+    })
+    for (const { snippet, name, digest } of live) {
+      const old = previous.get(snippet.trigger)
+      if (!old || old.removed || old.digest !== digest || old.name !== name) previous.set(snippet.trigger, {
+        trigger: snippet.trigger, name, digest, revision: (old?.revision ?? 0) + 1, updatedAt: new Date().toISOString(),
+      })
+    }
+    const active = new Set(live.map(({ snippet }) => snippet.trigger))
+    for (const [trigger, entry] of previous) {
+      if (!active.has(trigger) && !entry.removed) previous.set(trigger, { ...entry, removed: true })
+    }
+    index.signature = signature; index.entries = [...previous.values()]
+    setMeta(INDEX_KEY, JSON.stringify(index))
+    for (const { name, found, before } of charters) {
+      if (!found || previous.get(found.snippet.trigger)!.revision === before?.revision) continue
+      const created = !before || before.removed === true
+      const operation = name === MANAGER_SWITCH ? 'chat.manager.charter.changed' : 'chat.worker.charter.changed'
+      // Warning, not info: the diagnostics pipeline drops info and below, so
+      // only warning and above leave the audit record this revision needs.
+      diagnostic({ level: 'warning', operation, message: `The /${name} snippet changed`,
+        context: { revision: previous.get(found.snippet.trigger)!.revision, bytes: Buffer.byteLength(found.snippet.replace, 'utf8'), ...(created ? { created: true } : {}) } })
+    }
+  }
+  return { revision: index.revision, switches: live.map(({ snippet, name }) => {
+    const indexed = previous.get(snippet.trigger)!
+    return { name, content: snippet.replace, revision: indexed.revision, updatedAt: indexed.updatedAt, snippetTrigger: snippet.trigger }
+  }).sort((a, b) => a.name.localeCompare(b.name)) }
+}
+// Read inside the transaction, not before it: an older reader must not publish
+// a newer index revision after another process has seen a newer file generation.
+const snapshotLibrary = db.transaction((): SkillSnippetState => {
+  const prepared = plan(readSnippetSnapshotSync())
+  return { ...prepared.state, skills: project(prepared) }
+})
+export function readSwitches(): ChatSwitches { return snapshotLibrary.immediate().skills }
+
+/** The live switch with that name, or null. Throws when the library cannot be read. */
+export function readSwitch(name: string): ChatSwitch | null {
+  return snapshotLibrary.immediate().skills.switches.find(item => item.name === name) ?? null
+}
+
+function boundMetadata(snapshot: { raw: string | null, state: SnippetState }): Metadata {
+  const metadata = metadataFrom(snapshot.raw)
+  bind(snapshot.state.snippets, metadata)
+  return metadata
+}
+
+function liveBuiltin(snippets: Snippet[], metadata: Metadata, name: string): { trigger: string, content: string } | null {
+  const bindings = new Map(metadata.names)
+  const found = snippets.find(snippet => bindings.get(snippet.trigger) === name)
+  return found ? { trigger: found.trigger, content: found.replace } : null
+}
+
+/** A built-in charter (/manager, /worker) is edited freely but never deleted
+ *  or re-triggered, and only by a request that speaks for the person. A write
+ *  that leaves it unchanged is not affected. */
+function guardBuiltin(before: { trigger: string, content: string } | null, after: { trigger: string, content: string } | null, person: boolean, name: string): void {
+  if (before && !after) throw new HttpError(400, `/${name} is built in. You can edit its text, but not delete it or change its trigger.`)
+  const changed = after && (!before || after.trigger !== before.trigger || after.content !== before.content)
+  if (changed && !person) throw new HttpError(403, `The /${name} snippet is edited in the browser.`)
+  if (changed && Buffer.byteLength(after.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new HttpError(413, `The /${name} snippet holds up to 64 KiB. Nothing was saved.`)
+}
+
+function guardBuiltins(beforeSnippets: Snippet[], beforeMetadata: Metadata, afterSnippets: Snippet[], afterMetadata: Metadata, person: boolean): void {
+  for (const name of [MANAGER_SWITCH, WORKER_SWITCH]) {
+    guardBuiltin(liveBuiltin(beforeSnippets, beforeMetadata, name), liveBuiltin(afterSnippets, afterMetadata, name), person, name)
+  }
+}
+
+async function importLegacy(): Promise<void> {
+  const current = plan(readSnippetSnapshotSync())
+  if (!current.imported) {
+    if (current.metadata.imports.includes(IMPORT_ID) && getMeta(IMPORT_DONE_KEY) !== 'complete') setMeta(IMPORT_DONE_KEY, 'complete')
+    return
+  }
+  await mutateSnippetLibrary(snapshot => {
+    const prepared = plan(snapshot)
+    return prepared.imported ? { snippets: prepared.state.snippets, header: header(prepared.metadata) } : null
+  })
+  setMeta(IMPORT_DONE_KEY, 'complete')
+}
+export async function readSkillSnippets(): Promise<SkillSnippetState> {
+  await importLegacy()
+  return snapshotLibrary.immediate()
+}
+function publish(): SkillSnippetState {
+  const state = snapshotLibrary.immediate()
+  snippetLibraryEvents.emit('changed', state.skills)
+  return state
+}
+export async function saveSkillSnippets(input: unknown, version: unknown, person = true): Promise<SkillSnippetState> {
+  if (typeof version !== 'string' || !/^[a-f0-9]{64}$/.test(version)) throw new HttpError(400, 'base_version must be a SHA-256 version')
+  await importLegacy()
+  await mutateSnippetLibrary(snapshot => {
+    if (snapshot.state.version !== version) throw new SnippetConflictError(snapshot.state.version)
+    const snippets = validateSnippets(input), metadata = metadataFrom(snapshot.raw)
+    const before = boundMetadata(snapshot)
+    bind(snippets, metadata)
+    guardBuiltins(snapshot.state.snippets, before, snippets, metadata, person)
+    return { snippets, header: header(metadata) }
+  })
+  return publish()
+}
+export interface ImportSkip {
+  /** 1-based position in the file's `matches`; null for a top-level key. */
+  entry: number | null
+  trigger: string | null
+  reason: 'duplicate' | 'not_plain' | 'invalid'
+  detail: string
+}
+export interface ImportReport extends SkillSnippetState { added: string[], skipped: ImportSkip[] }
+
+/** Snippets → Import: adds an Espanso match file's plain pairs (what Poise
+ * Link delivers, and nothing else) through the same compare-and-swap as every
+ * other write. A trigger already in the library is never replaced. */
+export async function importEspansoSnippets(raw: unknown, person = true): Promise<ImportReport> {
+  if (typeof raw !== 'string' || !raw.trim()) throw new HttpError(400, 'Paste or choose an Espanso match file to import.')
+  if (Buffer.byteLength(raw, 'utf8') > MAX_SNIPPETS_BYTES) throw new HttpError(413, `The file is larger than ${MAX_SNIPPETS_BYTES} bytes. Nothing was imported.`)
+  let file: MatchFile
+  try { file = parseMatchFile(raw) } catch (error) {
+    throw new HttpError(400, `The file is not valid YAML: ${(error instanceof Error ? error.message : String(error)).split('\n')[0]}`)
+  }
+  const matches = file.matches
+  if (!matches) throw new HttpError(400, 'This is not an Espanso match file: it has no list of matches.')
+  await importLegacy()
+  let added: string[] = [], skipped: ImportSkip[] = []
+  await mutateSnippetLibrary(snapshot => {
+    added = []
+    skipped = file.otherKeys.map(key => ({ entry: null, trigger: null, reason: 'not_plain' as const, detail: `${key.slice(0, 40)} is not a snippet` }))
+    const existing = new Set(snapshot.state.snippets.map(snippet => snippet.trigger.trim())), imported = new Set<string>()
+    const additions: Snippet[] = []
+    matches.forEach((entry, index) => {
+      const verdict = judgeEntry(entry)
+      const skip = (reason: ImportSkip['reason'], detail: string, trigger = verdict.kind === 'plain' ? verdict.snippet.trigger : verdict.trigger) =>
+        skipped.push({ entry: index + 1, trigger, reason, detail })
+      if (verdict.kind !== 'plain') return skip(verdict.kind, verdict.detail)
+      const trigger = verdict.snippet.trigger.trim()
+      if (!trigger) return skip('invalid', 'its trigger is empty')
+      if (!verdict.snippet.replace.trim()) return skip('invalid', 'its replacement is empty')
+      if (existing.has(trigger)) return skip('duplicate', 'a snippet with this trigger already exists', trigger)
+      if (imported.has(trigger)) return skip('duplicate', 'an earlier entry in this file has this trigger', trigger)
+      imported.add(trigger)
+      additions.push({ trigger, replace: verdict.snippet.replace })
+      added.push(trigger)
+    })
+    if (!additions.length) return null
+    const snippets = validateSnippets([...snapshot.state.snippets, ...additions]), metadata = metadataFrom(snapshot.raw)
+    const before = boundMetadata(snapshot)
+    bind(snippets, metadata)
+    guardBuiltins(snapshot.state.snippets, before, snippets, metadata, person)
+    return { snippets, header: header(metadata) }
+  })
+  return { ...(added.length ? publish() : snapshotLibrary.immediate()), added, skipped }
+}
+
+export async function addSkillSnippet(input: unknown, person = true): Promise<{ snippet: Snippet, version: string, skills: ChatSwitches }> {
+  const [snippet] = validateSnippets([input])
+  await importLegacy()
+  await mutateSnippetLibrary(snapshot => {
+    const snippets = validateSnippets([...snapshot.state.snippets, snippet]), metadata = metadataFrom(snapshot.raw)
+    const before = boundMetadata(snapshot)
+    bind(snippets, metadata)
+    guardBuiltins(snapshot.state.snippets, before, snippets, metadata, person)
+    return { snippets, header: header(metadata) }
+  })
+  const state = publish()
+  return { snippet, version: state.version, skills: state.skills }
+}
+
+export async function saveSwitch(input: { name: string, content: string, revision: number }, nativeNames: string[] = []): Promise<ChatSwitches> {
+  if (!input || typeof input.name !== 'string' || typeof input.content !== 'string' || !Number.isSafeInteger(input.revision) || input.revision < 0) throw new HttpError(400, 'A switch requires a name, text and a non-negative revision.')
+  const name = switchName(input.name)
+  if (RESERVED_SWITCHES.has(name) || nativeNames.some(native => native.replace(/^\//, '').toLowerCase() === name)) throw new HttpError(400, `/${name} is already a built-in or native command. Choose another name.`)
+  if (!input.content.trim()) throw new HttpError(400, 'The switch instructions cannot be empty.')
+  if (Buffer.byteLength(input.content, 'utf8') > SWITCH_LIMITS.contentBytes) throw new HttpError(413, 'Switch instructions exceed 64 KiB. Nothing was truncated or saved.')
+  await importLegacy()
+  await mutateSnippetLibrary(snapshot => {
+    const prepared = plan(snapshot)
+    const catalogue = db.transaction(() => project(prepared)).immediate()
+    const existing = catalogue.switches.find(item => item.name === name)
+    if (existing?.content === input.content) return null
+    if (input.revision !== (existing?.revision ?? 0)) throw new HttpError(409, `/${name} changed in Snippets or another tab. Your draft was kept; review it before replacing the saved text.`)
+    const bindings = new Map(prepared.metadata.names)
+    let trigger = existing?.snippetTrigger || [...bindings].find(([, alias]) => alias === name)?.[0] || `;${name}`
+    if (!existing) {
+      for (let n = 2; prepared.state.snippets.some(snippet => snippet.trigger === trigger); n++) trigger = `;${name}-${n}`
+      bindings.set(trigger, name)
+    }
+    const snippets = existing ? prepared.state.snippets.map(snippet => snippet.trigger === trigger ? { ...snippet, replace: input.content } : snippet)
+      : [...prepared.state.snippets, { trigger, replace: input.content }]
+    prepared.metadata.names = [...bindings]
+    return { snippets, header: header(prepared.metadata) }
+  })
+  return publish().skills
+}
+/** Creates the named snippet only when no live snippet has that name; never replaces one.
+ *  Only a library that cannot be read returns 'unreadable'; write failures
+ *  and conflicts throw, as they do for every other library write. */
+export async function ensureSnippetSwitch(name: string, content: string): Promise<'present' | 'created' | 'unreadable'> {
+  try {
+    plan(readSnippetSnapshotSync())
+  } catch {
+    return 'unreadable'
+  }
+  await importLegacy()
+  let created = false
+  await mutateSnippetLibrary(snapshot => {
+    const prepared = plan(snapshot)
+    const bindings = new Map(prepared.metadata.names)
+    if (prepared.state.snippets.some(snippet => bindings.get(snippet.trigger) === name)) return null
+    let trigger = [...bindings].find(([, alias]) => alias === name)?.[0] || `;${name}`
+    for (let n = 2; prepared.state.snippets.some(snippet => snippet.trigger === trigger); n++) trigger = `;${name}-${n}`
+    bindings.set(trigger, name)
+    prepared.metadata.names = [...bindings]
+    created = true
+    return { snippets: [...prepared.state.snippets, { trigger, replace: content }], header: header(prepared.metadata) }
+  })
+  return created ? 'created' : 'present'
+}
+export function savedSwitchNames(): Set<string> {
+  // Retired invocation names remain recognizable. A queued or recalled use of
+  // a deleted skill must fail clearly, never become an ordinary provider command.
+  const index = getMeta(INDEX_KEY)
+  const retired = index ? (JSON.parse(index) as Index).entries.map(item => item.name) : []
+  return new Set([...retired, ...plan(readSnippetSnapshotSync()).metadata.names.map(([, name]) => name)])
+}
+export function expandSwitches(text: string, names: readonly string[] | undefined): string {
+  if (!names?.length) return text
+  const catalogue = readSwitches(), parts = [text]
+  for (const name of new Set(names)) {
+    const item = catalogue.switches.find(item => item.name === name)
+    if (!item) throw new HttpError(400, `Saved switch /${name} is unavailable. Your task was not sent.`)
+    parts.push(`[Saved switch: /${item.name}]\n${item.content}\n[End saved switch: /${item.name}]`)
+  }
+  const expanded = parts.filter(Boolean).join('\n\n')
+  if (Buffer.byteLength(expanded, 'utf8') > 256 * 1024) throw new HttpError(413, 'The message with its saved switches exceeds 256 KiB. Shorten it or use fewer switches; nothing was truncated.')
+  return expanded
+}

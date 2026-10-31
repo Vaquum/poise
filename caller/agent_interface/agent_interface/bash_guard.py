@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import fnmatch
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+
+if __package__:
+    from .review_gate import submission_gate
+    from .review_receipt import blocked_refusal, parse_no_review, record_failure
+else:
+    from review_gate import submission_gate
+    from review_receipt import blocked_refusal, parse_no_review, record_failure
+
+
+BAD = {";", "|", "||", "&&", "&", "<", ">", ">>", "<<", "2>", "2>>", "2>&1"}
+
+
+def allowed(command: str) -> bool:
+    for pattern in json.loads(os.environ.get("AGENT_INTERFACE_BASH_ALLOW", "[]")):
+        if fnmatch.fnmatchcase(command, pattern):
+            return True
+    return False
+
+
+def user_command(raw: str) -> str:
+    parts = shlex.split(raw)
+    if "eval" in parts:
+        i = parts.index("eval")
+        if i + 1 < len(parts):
+            chunk = []
+            for token in parts[i + 1 :]:
+                if token in BAD:
+                    break
+                chunk.append(token)
+            return " ".join(chunk)
+    return raw
+
+
+def main():
+    command = user_command(" ".join(sys.argv[1:]).strip())
+    try:
+        argv = shlex.split(command)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    if not argv or not allowed(command) or any(t in BAD for t in argv):
+        raise SystemExit(f"blocked by agent-interface: {command}")
+    if argv[:2] == ["github-interface", "--review-context"]:
+        # Inspection has no GitHub side effect and must not enter the
+        # submission lock or be mistaken for an ambiguous publication.
+        raise SystemExit(subprocess.run(argv, text=True).returncode)
+    receipt = os.environ.get("AGENT_INTERFACE_REVIEW_RECEIPT")
+    with submission_gate(os.environ.get("AGENT_INTERFACE_REVIEW_GATE")) as gate:
+        if argv[1] in {"--approve-pr", "--reviewed-clean", "--request-changes"} and "--assessment-json" in argv:
+            if __package__:
+                from .review_receipt import complete_response
+            else:
+                from review_receipt import complete_response
+            complete_response(json.loads(argv[argv.index("--assessment-json") + 1]), argv[argv.index("--expected-head") + 1])
+        if not receipt:
+            done = subprocess.run(argv, text=True)
+            raise SystemExit(done.returncode)
+        done = subprocess.run(argv, text=True, capture_output=True)
+        # Hold the gate across the receipt write: a second terminal command
+        # after an accepted submission is blocked instead of overwriting it.
+        # An exact no_review match goes first: nothing was posted, so the
+        # refusal persists unsealed and a corrected submission can follow.
+        if done.returncode == 0 and parse_no_review(done.stdout) is not None:
+            staged = receipt + ".refused.tmp"
+            with open(staged, "w") as handle:
+                handle.write(done.stdout)
+            os.replace(staged, receipt + ".refused")
+        elif done.returncode == 0 and '"review_id"' in done.stdout:
+            staged = receipt + ".tmp"
+            with open(staged, "w") as handle:
+                handle.write(done.stdout)
+            os.replace(staged, receipt)
+            gate.seal()
+        elif done.returncode and (failure_message := record_failure(done.stderr or done.stdout)):
+            staged = receipt + ".failure.tmp"
+            with open(staged, "w") as handle:
+                handle.write(failure_message)
+            os.replace(staged, receipt + ".failure")
+            # The POST may have been accepted before its answer failed: no
+            # second write until the run reconciles what landed.
+            gate.mark_uncertain()
+        elif done.returncode and (refused := blocked_refusal(done.stderr or done.stdout)):
+            # The approval guard refused: deterministic, retryable, and never
+            # sealed — the run settles it as a blocked approval, not a failed
+            # verdict. Uncertainty still wins when both markers exist.
+            staged = receipt + ".blocked.tmp"
+            with open(staged, "w") as handle:
+                handle.write(refused)
+            os.replace(staged, receipt + ".blocked")
+    # The reply reaches the model unchanged; a submitted review's id is also
+    # left for the run, so it can tell its own review from a sibling's.
+    sys.stdout.write(done.stdout)
+    sys.stderr.write(done.stderr)
+    raise SystemExit(done.returncode)
+
+
+if __name__ == "__main__":
+    main()

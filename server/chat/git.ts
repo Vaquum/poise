@@ -1,0 +1,562 @@
+// Git operations on the shared repository checkout a chat session runs in.
+//
+// One checkout, one branch per session. The checkout follows the active
+// session: before a turn the runtime makes sure the session's branch is
+// checked out, committing the previous session's uncommitted work on its own
+// branch first (`wip(poise): checkpoint` — never stashed, never lost) and
+// refusing to touch a dirty checkout on a branch no session owns. Every
+// mutating command runs under a registered worker gate while the caller
+// holds the checkout lease (see checkout-lock.ts), so a crash mid-command
+// cannot leave an unregistered writer behind.
+//
+// Paths handed to revert and to the client file services are validated the
+// same way: resolved inside the checkout, no symlink escape, never inside
+// `.git`.
+
+import { lstat, mkdir, open, readFile, realpath, rename, rm, stat } from 'node:fs/promises'
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { isAbortError, runFile, type ExpectedFailure } from '../process'
+import type { CheckoutLease } from './checkout-lock'
+import { spawnWorker } from './worker'
+
+export const CHECKPOINT_MESSAGE = 'wip(poise): checkpoint'
+const GIT_TIMEOUT_MS = 60_000
+const GUARDED_OUTPUT_BYTES = 4 * 1024 * 1024
+const BRANCH_NAME = /^(?!\/)(?!.*(?:\.\.|\/\/|@\{|\\))[^\s~^:?*[\x00-\x1f\x7f]+(?<!\/|\.lock|\.)$/
+
+export class GitError extends Error {
+  constructor(message: string, readonly code: 'dirty_unowned' | 'branch_drift' | 'invalid' | 'conflict' | 'git' = 'git') {
+    super(message)
+    this.name = 'GitError'
+  }
+}
+
+export interface CheckoutInspection {
+  currentBranch: string
+  /** True while HEAD is detached. */
+  detached: boolean
+  dirty: boolean
+  dirtyFiles: number
+  defaultBranch: string
+  branches: string[]
+  headSha: string
+}
+
+async function git(checkout: string, args: string[], options: { timeoutMs?: number, expected?: ExpectedFailure, env?: NodeJS.ProcessEnv, signal?: AbortSignal } = {}): Promise<string> {
+  try {
+    const { stdout } = await runFile('git', args, { cwd: checkout, timeoutMs: options.timeoutMs ?? GIT_TIMEOUT_MS, ...(options.expected ? { expected: options.expected } : {}), env: { ...options.env, GIT_OPTIONAL_LOCKS: '0' }, ...(options.signal ? { signal: options.signal } : {}) })
+    return stdout
+  } catch (error: any) {
+    if (isAbortError(error)) throw error
+    const detail = String(error?.stderr || error?.message || error).trim()
+    throw new GitError(`git ${args[0]} failed: ${detail}`)
+  }
+}
+
+export function assertBranchName(name: string): string {
+  const value = String(name || '').trim()
+  if (!value || value.length > 200 || !BRANCH_NAME.test(value) || value === 'HEAD' || value.startsWith('-')) {
+    throw new GitError(`invalid branch name: ${JSON.stringify(name)}`, 'invalid')
+  }
+  return value
+}
+
+export async function inspectCheckout(checkout: string, options: { signal?: AbortSignal } = {}): Promise<CheckoutInspection> {
+  const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'], options)
+  const lines = status.split('\n').filter((line) => line.length > 0)
+  const header = lines[0] || ''
+  const detached = header.includes('(no branch)') || header.includes('HEAD (no branch)')
+  const currentBranch = detached ? '' : header.replace(/^## /, '').split('...')[0].split(' ')[0]
+  const dirtyFiles = lines.slice(1).length
+  const branches = (await git(checkout, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'], options))
+    .split('\n').map((line) => line.trim()).filter(Boolean)
+  const headSha = (await git(checkout, ['rev-parse', 'HEAD'], { ...options, expected: { codes: [128], stderr: /unknown revision|Needed a single revision/ } }).catch(() => '')).trim()
+  return {
+    currentBranch,
+    detached,
+    dirty: dirtyFiles > 0,
+    dirtyFiles,
+    defaultBranch: await defaultBranch(checkout, branches, options),
+    branches,
+    headSha,
+  }
+}
+
+export async function defaultBranch(checkout: string, branches?: string[], options: { signal?: AbortSignal } = {}): Promise<string> {
+  const remoteHead = (await git(checkout, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { ...options, expected: { codes: [128], stderr: /is not a symbolic ref/ } }).catch(() => '')).trim()
+  if (remoteHead) return remoteHead.replace(/^origin\//, '')
+  const known = branches ?? (await git(checkout, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'], options)).split('\n').map((line) => line.trim())
+  for (const candidate of ['main', 'master']) if (known.includes(candidate)) return candidate
+  return known[0] || 'main'
+}
+
+export async function branchExists(checkout: string, name: string): Promise<boolean> {
+  try {
+    await git(checkout, ['rev-parse', '--verify', '--quiet', `refs/heads/${assertBranchName(name)}`], { expected: { codes: [1] } })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Commits on `branch` that `base` does not have — zero means a Poise-created
+ *  branch never received a commit and may be deleted with its session. */
+export async function commitsAhead(checkout: string, branch: string, base: string): Promise<number> {
+  const out = await git(checkout, ['rev-list', '--count', `${assertBranchName(base)}..${assertBranchName(branch)}`])
+  return Number(out.trim()) || 0
+}
+
+/** Commits on `branch` no remote-tracking ref contains — what a push would
+ *  send. Read-only: safe without the checkout lease. */
+export async function unpushedCommits(checkout: string, branch: string): Promise<number> {
+  const out = await git(checkout, ['rev-list', '--count', assertBranchName(branch), '--not', '--remotes'])
+  return Number(out.trim()) || 0
+}
+
+/** Leftover work in a worker-owned task repo: the current branch, the
+ *  uncommitted file count, and commits on any local branch — or a
+ *  detached HEAD — that no remote contains. Read-only: safe without the
+ *  checkout lease. */
+export async function inspectTaskRepo(checkout: string): Promise<{ branch: string, dirtyFiles: number, unpushedCommits: number }> {
+  // Confined to this repo: without a ceiling a broken nested `.git` reads
+  // the parent checkpoint repo instead of failing, misattributing its state.
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
+  const status = await git(checkout, ['status', '--porcelain=v1', '--untracked-files=all', '--branch'], { env })
+  const lines = status.split('\n').filter((line) => line.length > 0)
+  const header = lines[0] || ''
+  const detached = header.includes('(no branch)') || header.includes('HEAD (no branch)')
+  const branch = detached ? ''
+    : header.startsWith('## No commits yet on ') ? header.replace('## No commits yet on ', '').split('...')[0]
+    : header.replace(/^## /, '').split('...')[0].split(' ')[0]
+  const dirtyFiles = lines.slice(1).length
+  return { branch, dirtyFiles, unpushedCommits: await unpushedTaskCommits(checkout) }
+}
+
+/** `owner/name` for a GitHub remote URL, lowercased; null for anything
+ *  else. Accepts the https, ssh and scp-like forms, with or without a
+ *  `.git` suffix or embedded credentials. */
+export function githubRepoFromRemoteUrl(url: string): string | null {
+  const match = /^(?:https?:\/\/(?:[^/@\s]+@)?github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/
+    .exec(url.trim())
+  if (!match) return null
+  const repo = match[1].toLowerCase()
+  return /^[^/\s]+\/[^/\s]+$/.test(repo) ? repo : null
+}
+
+/** A branch on a GitHub remote that a local branch tracks: an upstream is
+ *  configured, so the remote branch was pushed there (or fetched from
+ *  there) at some point. The branch is the remote's name for it, which may
+ *  differ from the local one. */
+export interface PushedBranch { branch: string, repo: string }
+
+/** Remote branches with a GitHub remote, each with its remote's
+ *  `owner/name` and the remote's branch name. Branches without an
+ *  upstream, with a local-only or removed upstream remote, or with a
+ *  non-GitHub remote contribute nothing: evidence must positively
+ *  attribute a branch to a repository. Every git failure propagates —
+ *  swallowing one would read as no pushed branches and let discovery bind
+ *  on incomplete evidence. Read-only: safe without the checkout lease.
+ *  Confined like inspectTaskRepo: a broken nested `.git` fails here
+ *  instead of reading the parent checkpoint repo. */
+export async function pushedBranches(checkout: string): Promise<PushedBranch[]> {
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
+  const refs = await git(checkout, ['for-each-ref', '--format=%(refname:short)%00%(upstream:short)%00%(upstream:remotename)', 'refs/heads'], { env })
+  const remotes = new Map<string, string>()
+  let remotesLoaded = false
+  const remoteRepo = async (name: string): Promise<string | null> => {
+    if (!remotesLoaded) {
+      remotesLoaded = true
+      // `git remote` lists nothing and exits zero when no remote exists, so
+      // a missing remote is a fact, never a swallowed failure.
+      const names = (await git(checkout, ['remote'], { env })).split('\n').filter(line => line !== '')
+      for (const remote of names) {
+        const repo = githubRepoFromRemoteUrl(await git(checkout, ['config', '--get', `remote.${remote}.url`], { env }))
+        if (repo) remotes.set(remote, repo)
+      }
+    }
+    return remotes.get(name) ?? null
+  }
+  const found: PushedBranch[] = []
+  for (const line of refs.split('\n')) {
+    if (!line) continue
+    const fields = line.split('\0')
+    if (fields.length !== 3 || !fields[0]) throw new GitError('git for-each-ref returned a malformed branch')
+    const [, upstream, remote] = fields as [string, string, string]
+    if (!remote || remote === '.') continue
+    if (!upstream.startsWith(`${remote}/`)) throw new GitError('git for-each-ref returned a malformed upstream')
+    const branch = upstream.slice(remote.length + 1)
+    if (!branch) throw new GitError('git for-each-ref returned a malformed upstream')
+    const repo = await remoteRepo(remote)
+    if (repo) found.push({ branch, repo })
+  }
+  return found.sort((a, b) => a.repo.localeCompare(b.repo) || a.branch.localeCompare(b.branch))
+}
+
+/** Live linked worktrees registered on a task repo: checkout paths from
+ *  `git worktree list --porcelain`, without prunable entries whose
+ *  checkouts are gone. The main worktree is included; callers dedupe it
+ *  against discovery. NUL-separated output keeps quote, newline and
+ *  unicode paths unambiguous; a git too old for `-z` falls back to
+ *  line-separated output. Confined like inspectTaskRepo. Read-only. */
+export async function linkedWorktrees(checkout: string): Promise<string[]> {
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
+  let out: string
+  let separator = '\0'
+  try {
+    out = await git(checkout, ['worktree', 'list', '--porcelain', '-z'], { env })
+  } catch {
+    out = await git(checkout, ['worktree', 'list', '--porcelain'], { env })
+    separator = '\n'
+  }
+  const paths: string[] = []
+  let current: string | null = null
+  let prunable = false
+  const flush = () => {
+    if (current !== null && !prunable && current.length > 0) paths.push(current)
+    current = null
+    prunable = false
+  }
+  for (const line of out.split(separator)) {
+    if (line.startsWith('worktree ')) { flush(); current = line.slice('worktree '.length) }
+    else if (line.startsWith('prunable')) prunable = true
+  }
+  flush()
+  return paths.map((path) => isAbsolute(path) ? path : resolve(checkout, path))
+}
+
+/** Commits no remote contains: every local branch plus an unborn-proof
+ *  HEAD, so a detached HEAD's commits count but a commit-less repo reads
+ *  zero instead of failing. Confined like its caller: a broken nested
+ *  `.git` must fail here, not read the parent checkpoint repo. */
+async function unpushedTaskCommits(checkout: string): Promise<number> {
+  const env = { GIT_CEILING_DIRECTORIES: dirname(checkout) }
+  try {
+    return Number((await git(checkout, ['rev-list', '--count', '--branches', 'HEAD', '--not', '--remotes'], { env })).trim()) || 0
+  } catch {
+    return Number((await git(checkout, ['rev-list', '--count', '--branches', '--not', '--remotes'], { env })).trim()) || 0
+  }
+}
+
+// ── Guarded (mutating) commands ───────────────────────────────────────────
+
+export interface GuardedResult { stdout: string, stderr: string, code: number | null }
+
+/** A guarded command's worker group survived termination after its signal
+ *  aborted: the lease registration stays, and the caller retains the
+ *  checkout instead of releasing it to the next writer. */
+export class GuardedWorkerStuckError extends Error {
+  constructor(command: string, options?: { cause?: unknown }) {
+    super(`the ${command} worker is still alive after termination; the checkout stays locked`, options)
+    this.name = 'GuardedWorkerStuckError'
+  }
+}
+
+const GUARDED_ABORTED: unique symbol = Symbol('guarded-aborted')
+
+function abortErrorLike(reason: unknown): Error {
+  if (isAbortError(reason)) return reason as Error
+  return Object.assign(new Error('The operation was aborted', { cause: reason }), { name: 'AbortError', code: 'ABORT_ERR' })
+}
+
+/** Run a mutating command under the caller's checkout lease: the gate is
+ *  registered as the lease's worker before it may start, and cleared after
+ *  it exited. The lease must be held. An aborted signal terminates the
+ *  group and settles only once it is verified dead — or with a stuck error
+ *  that keeps the registration when termination cannot be verified. */
+export async function runGuarded(lease: CheckoutLease, command: string, args: readonly string[], options: { cwd: string, timeoutMs?: number, env?: NodeJS.ProcessEnv, signal?: AbortSignal }): Promise<GuardedResult> {
+  if (!lease.held) throw new GitError('checkout lease is not held', 'conflict')
+  options.signal?.throwIfAborted()
+  const worker = spawnWorker(command, args, { cwd: options.cwd, env: options.env })
+  const output = { stdout: [] as Buffer[], stderr: [] as Buffer[], bytes: 0 }
+  const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
+    output.bytes += chunk.byteLength
+    if (output.bytes <= GUARDED_OUTPUT_BYTES) chunks.push(chunk)
+  }
+  worker.child.stdout?.on('data', collect(output.stdout))
+  worker.child.stderr?.on('data', collect(output.stderr))
+  if (!lease.registerWorker({ pid: worker.pid, pgid: worker.pgid, ident: worker.ident })) {
+    await worker.terminate(1_000)
+    throw new GitError('checkout lease was lost before the command could start', 'conflict')
+  }
+  const timeout = setTimeout(() => { worker.terminate(2_000).catch(() => undefined) }, options.timeoutMs ?? GIT_TIMEOUT_MS)
+  const signal = options.signal
+  let settled = false
+  let onAbort: (() => void) | null = null
+  try {
+    worker.go()
+    let exit: { code: number | null } | typeof GUARDED_ABORTED
+    if (signal) {
+      let fire!: () => void
+      const sentry = new Promise<typeof GUARDED_ABORTED>((resolve) => { fire = () => resolve(GUARDED_ABORTED) })
+      onAbort = fire
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+      exit = await Promise.race([worker.exited, sentry])
+    } else {
+      exit = await worker.exited
+    }
+    try {
+      // The gate exits only after its group is empty; a killed gate can still
+      // leave descendants, and those keep the lease's worker registration.
+      if (worker.alive) await worker.terminate(2_000)
+    } catch (error) {
+      if (signal?.aborted) throw new GuardedWorkerStuckError(command, { cause: error })
+      throw error
+    }
+    if (signal?.aborted) {
+      settled = true
+      throw abortErrorLike(signal.reason)
+    }
+    settled = true
+    return {
+      stdout: Buffer.concat(output.stdout).toString('utf8'),
+      stderr: Buffer.concat(output.stderr).toString('utf8'),
+      code: (exit as { code: number | null }).code,
+    }
+  } finally {
+    clearTimeout(timeout)
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort)
+    // Only a settled group may be unregistered: the lease keeps blocking
+    // other writers while anything of this command could still write.
+    if (settled && !worker.alive) lease.clearWorker()
+  }
+}
+
+async function guardedGit(lease: CheckoutLease, checkout: string, args: string[], options: { signal?: AbortSignal } = {}): Promise<string> {
+  const result = await runGuarded(lease, 'git', args, { cwd: checkout, ...(options.signal ? { signal: options.signal } : {}) })
+  if (result.code !== 0) {
+    throw new GitError(`git ${args[0]} failed: ${(result.stderr || result.stdout).trim().slice(0, 2_000)}`)
+  }
+  return result.stdout
+}
+
+/** Commit everything (tracked and untracked, not ignored) on `branch` as a
+ *  checkpoint. Refuses when the checkout is not on `branch` — the caller's
+ *  view of the world has drifted and nothing may be committed blindly. */
+export async function checkpoint(lease: CheckoutLease, checkout: string, branch: string, options: { signal?: AbortSignal } = {}): Promise<{ committed: boolean, sha?: string }> {
+  const state = await inspectCheckout(checkout, options)
+  if (state.currentBranch !== branch) {
+    throw new GitError(`checkout is on ${state.currentBranch || 'a detached HEAD'}, not ${branch}; refusing to checkpoint`, 'branch_drift')
+  }
+  if (!state.dirty) return { committed: false }
+  await guardedGit(lease, checkout, ['add', '--all'], options)
+  // --no-verify: a checkpoint is mechanical, the author squashes before a
+  // PR; a slow or failing pre-commit hook must not block switching sessions.
+  await guardedGit(lease, checkout, ['commit', '--quiet', '--no-verify', '-m', CHECKPOINT_MESSAGE], options)
+  // Read-only and load-bearing: a landed commit must resolve its sha even
+  // when the caller's signal aborted, so the caller retains it on a branch.
+  // The caller still honors the abort right after this returns.
+  const sha = (await git(checkout, ['rev-parse', 'HEAD'])).trim()
+  return { committed: true, sha }
+}
+
+export async function switchBranch(lease: CheckoutLease, checkout: string, branch: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+  const name = assertBranchName(branch)
+  const state = await inspectCheckout(checkout, options)
+  if (state.currentBranch === name) return
+  if (state.dirty) throw new GitError(`checkout on ${state.currentBranch} has ${state.dirtyFiles} uncommitted change(s); refusing to switch`, 'dirty_unowned')
+  await guardedGit(lease, checkout, ['switch', '--quiet', name], options)
+}
+
+/** Create `name` at `from`; returns the commit it starts at, which is what
+ *  "never received a commit" is measured against later (a branch whose
+ *  commits were merged into the default branch still has history). */
+export async function createBranch(lease: CheckoutLease, checkout: string, name: string, from: string): Promise<string> {
+  const branch = assertBranchName(name)
+  if (await branchExists(checkout, branch)) throw new GitError(`branch ${branch} already exists`, 'invalid')
+  await guardedGit(lease, checkout, ['branch', '--quiet', branch, assertBranchName(from)])
+  return (await git(checkout, ['rev-parse', `refs/heads/${branch}`])).trim()
+}
+
+export async function branchTip(checkout: string, name: string): Promise<string> {
+  return (await git(checkout, ['rev-parse', `refs/heads/${assertBranchName(name)}`])).trim()
+}
+
+/** Point `name` at `sha`, creating or moving it. Used to retain a
+ *  checkpoint made on a detached HEAD, which no branch would keep. */
+export async function moveBranch(lease: CheckoutLease, checkout: string, name: string, sha: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+  const branch = assertBranchName(name)
+  if (!/^[0-9a-f]{4,64}$/i.test(sha)) throw new GitError('invalid checkpoint SHA', 'invalid')
+  await guardedGit(lease, checkout, ['branch', '--quiet', '--force', branch, sha], options)
+}
+
+export async function deleteBranch(lease: CheckoutLease, checkout: string, name: string): Promise<void> {
+  const branch = assertBranchName(name)
+  const state = await inspectCheckout(checkout)
+  if (state.currentBranch === branch) {
+    if (state.dirty) throw new GitError(`checkout on ${branch} is dirty; not deleting it`, 'dirty_unowned')
+    await guardedGit(lease, checkout, ['switch', '--quiet', state.defaultBranch])
+  }
+  await guardedGit(lease, checkout, ['branch', '--quiet', '-D', branch])
+}
+
+/** The step fix-failing-ci uses: github-interface fetches the PR head into
+ *  `github-interface-pr-<n>` and checks it out (`checkout -B`). Run once at
+ *  session creation; later switches are plain `git switch`. */
+export async function checkoutPrHead(lease: CheckoutLease, checkout: string, pr: number): Promise<string> {
+  if (!Number.isSafeInteger(pr) || pr <= 0) throw new GitError('invalid pull request number', 'invalid')
+  // `checkout -B` would reset a branch that already exists — and with it any
+  // commit a session made on it. An existing local PR branch is reused as
+  // it is; refreshing it to the PR head is the user's call.
+  const existing = `github-interface-pr-${pr}`
+  if (await branchExists(checkout, existing)) {
+    await switchBranch(lease, checkout, existing)
+    return existing
+  }
+  const state = await inspectCheckout(checkout)
+  if (state.dirty) throw new GitError(`checkout on ${state.currentBranch} has ${state.dirtyFiles} uncommitted change(s); refusing to check out the pull request`, 'dirty_unowned')
+  const result = await runGuarded(lease, 'github-interface', ['--checkout-pr-head', `#${pr}`], { cwd: checkout, timeoutMs: 120_000 })
+  if (result.code !== 0) throw new GitError(`github-interface --checkout-pr-head failed: ${(result.stderr || result.stdout).trim().slice(0, 2_000)}`)
+  let parsed: any
+  try { parsed = JSON.parse(result.stdout) } catch { throw new GitError('github-interface --checkout-pr-head returned no JSON') }
+  const branch = String(parsed?.branch || '')
+  if (parsed?.action !== 'checkout_pr_head' || !branch) throw new GitError('github-interface --checkout-pr-head returned malformed state')
+  return assertBranchName(branch)
+}
+
+// ── Paths ─────────────────────────────────────────────────────────────────
+
+export class PathError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PathError'
+  }
+}
+
+function insideRoot(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate)
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`))
+}
+
+function hasGitComponent(rel: string): boolean {
+  // Exact component match only: `.gitignore` and `.github` are ordinary files.
+  return rel.split(sep).some((part) => part.toLowerCase() === '.git')
+}
+
+/** Resolve `input` (absolute or checkout-relative) to a path inside the
+ *  checkout, refusing traversal, anything under a `.git` directory (in the
+ *  request or in what it resolves to, case-insensitively), and symlinks
+ *  that lead outside. The file itself may not exist yet; every existing
+ *  ancestor is realpath'd and checked again after resolution. */
+export async function resolveInsideCheckout(checkout: string, input: string): Promise<{ absolute: string, relative: string }> {
+  const raw = String(input || '')
+  if (!raw || raw.includes('\0')) throw new PathError('invalid path')
+  const root = await realpath(checkout)
+  // An absolute request is normalized the way the root was (/tmp → /private/tmp
+  // on macOS) before the textual containment check.
+  const candidate = isAbsolute(raw) ? await realpathWithMissingTail(raw) : resolve(root, raw)
+  if (!insideRoot(root, candidate)) throw new PathError(`path is outside the checkout: ${raw}`)
+  const rel = relative(root, candidate)
+  if (hasGitComponent(rel)) throw new PathError('paths inside .git are not served')
+  // Walk from the deepest existing ancestor: a symlink anywhere on the way
+  // may lead out of the checkout — or into its .git — even when the textual
+  // path looks fine. The resolved tail (the part that does not exist yet) is
+  // checked with the same rule as the request.
+  let probe = candidate
+  let missingTail = ''
+  while (true) {
+    try {
+      const real = await realpath(probe)
+      if (!insideRoot(root, real)) throw new PathError(`path resolves outside the checkout: ${raw}`)
+      const resolvedRel = relative(root, missingTail ? resolve(real, missingTail) : real)
+      if (hasGitComponent(resolvedRel)) throw new PathError('paths inside .git are not served')
+      break
+    } catch (error: any) {
+      if (error instanceof PathError) throw error
+      if (error?.code !== 'ENOENT') throw new PathError(`cannot resolve ${raw}: ${error?.message || error}`)
+      const parent = dirname(probe)
+      if (parent === probe) break
+      missingTail = missingTail ? `${basenameOf(probe)}${sep}${missingTail}` : basenameOf(probe)
+      probe = parent
+    }
+  }
+  try {
+    const info = await lstat(candidate)
+    if (info.isSymbolicLink()) throw new PathError(`symbolic links are not served: ${raw}`)
+  } catch (error: any) {
+    if (error instanceof PathError) throw error
+    if (error?.code !== 'ENOENT') throw new PathError(`cannot access ${raw}: ${error?.message || error}`)
+  }
+  return { absolute: candidate, relative: rel }
+}
+
+async function realpathWithMissingTail(path: string): Promise<string> {
+  let probe = resolve(path)
+  let tail = ''
+  while (true) {
+    try {
+      const real = await realpath(probe)
+      return tail ? resolve(real, tail) : real
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') return resolve(path)
+      const parent = dirname(probe)
+      if (parent === probe) return resolve(path)
+      tail = tail ? `${basenameOf(probe)}${sep}${tail}` : basenameOf(probe)
+      probe = parent
+    }
+  }
+}
+
+function basenameOf(path: string): string {
+  return path.slice(dirname(path).length).replace(/^\/+/, '')
+}
+
+/** Write a file atomically inside the checkout: temp file in the same
+ *  directory, fsync, rename — a failure mid-write never truncates the
+ *  target (the Editor's writeAtomic standard). */
+export async function writeFileAtomic(absolute: string, content: string): Promise<void> {
+  const tmp = `${absolute}.poise-tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`
+  let handle
+  try {
+    let mode = 0o600
+    try { mode = (await stat(absolute)).mode & 0o777 } catch (error: any) { if (error?.code !== 'ENOENT') throw error }
+    handle = await open(tmp, 'wx', mode)
+    await handle.writeFile(content, 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await rename(tmp, absolute)
+  } catch (error) {
+    try { await handle?.close() } catch { /* best effort */ }
+    try { await rm(tmp, { force: true }) } catch { /* best effort */ }
+    throw error
+  }
+}
+
+// ── Revert ────────────────────────────────────────────────────────────────
+
+export interface RecordedDiff {
+  path: string
+  oldText: string
+  newText: string
+  oldExists: boolean
+  newExists: boolean
+  unified?: boolean
+}
+
+/** Reverse one recorded change: only when the file still holds exactly what
+ *  the agent left (`newText`, or absence for a deletion). Anything else is a
+ *  conflict — later work is never clobbered. Runs under the caller's lease. */
+export async function revertDiff(lease: CheckoutLease, checkout: string, diff: RecordedDiff): Promise<void> {
+  if (!lease.held) throw new GitError('checkout lease is not held', 'conflict')
+  if (diff.unified) throw new GitError('this change was recorded without the file contents (the agent reported a patch only); it cannot be reverted from the transcript', 'conflict')
+  const { absolute, relative: rel } = await resolveInsideCheckout(checkout, diff.path)
+  let current: string | null = null
+  try {
+    current = await readFile(absolute, 'utf8')
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw new GitError(`cannot read ${rel}: ${error?.message || error}`)
+  }
+  if (diff.newExists) {
+    if (current === null) throw new GitError(`${rel} no longer exists; the agent's change was already reverted or replaced`, 'conflict')
+    if (current !== diff.newText) throw new GitError(`${rel} changed since the agent edited it; not reverting`, 'conflict')
+  } else if (current !== null) {
+    throw new GitError(`${rel} exists again; not reverting the deletion`, 'conflict')
+  }
+  if (diff.oldExists) {
+    await mkdir(dirname(absolute), { recursive: true })
+    await writeFileAtomic(absolute, diff.oldText)
+  } else {
+    await rm(absolute, { force: true })
+  }
+}

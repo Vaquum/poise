@@ -1,0 +1,29 @@
+node_modules/
+dist/
+.DS_Store
+.env
+.env.*
+!.env.example
+.poise-dev/
+
+# Test and browser-runner output
+coverage/
+playwright-report/
+test-results/
+.playwright-mcp/
+
+# Claude-local
+.claude/plans/
+.claude/worktrees/
+
+# Poise-owned Chat workspace and session files
+/.poise-chat/
+
+# In-tree Caller: its virtualenv, agent-interface's default data directory
+# (real prompts and responses) and Python build output
+/caller/.venv/
+/caller/agent_interface/data/
+/caller/*/build/
+/caller/*/*.egg-info/
+__pycache__/
+.pytest_cache/

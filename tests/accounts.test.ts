@@ -1,0 +1,482 @@
+// Connected accounts: each CLI's own status command, run against fakes that
+// print what the real CLIs print. PATH holds only the fakes (and node), so a
+// real CLI can never answer in a test.
+
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { invalidateAccounts, listAccounts, AccountsCache, ACCOUNTS_CACHE_MS, ACCOUNTS_CHECK_MS, scheduleAccountsCheck } from '../server/accounts'
+import { probeAccount, probeAccounts, type RunCommand } from '../server/accounts/status'
+import type { ConnectedAccount } from '../server/accounts/types'
+import { accountLogins, markLogin, recordLogin } from '../server/accounts/logins'
+import { providerEvidence } from '../server/accounts/participation'
+import { setMeta } from '../server/db'
+import { runFile } from '../server/process'
+import { STATUS, fakeCalls, script, writeFakeClis } from './fixtures/accounts/fake-clis'
+
+let root = ''
+let bin = ''
+let home = ''
+
+beforeEach(async () => {
+  setMeta('account_logins', '{}')
+  invalidateAccounts()
+  root = await mkdtemp(join(tmpdir(), 'poise-accounts-'))
+  bin = join(root, 'bin')
+  home = join(root, 'home')
+  vi.stubEnv('PATH', bin)
+  vi.stubEnv('HOME', home)
+})
+
+afterEach(async () => {
+  vi.unstubAllEnvs()
+  await rm(root, { recursive: true, force: true })
+})
+
+const LABELS = {
+  claude: 'claude auth login --claudeai',
+  codex: 'codex login --device-auth',
+  gh: 'gh auth login --hostname github.com --git-protocol https --web',
+  grok: 'grok login --device-auth',
+  muse: 'muse login',
+  antigravity: 'agy',
+}
+
+const UNREPORTED = {
+  grok: 'Grok\'s CLI has no command that reports whether it is signed in.',
+  muse: 'Muse\'s CLI has no command that reports whether it is signed in.',
+  antigravity: 'Antigravity\'s CLI has no command that reports whether it is signed in. It shows its sign-in screen when it starts signed out.',
+}
+
+function byId(accounts: ConnectedAccount[]): Record<string, ConnectedAccount> {
+  return Object.fromEntries(accounts.map((account) => [account.id, account]))
+}
+
+describe('GET /api/accounts', () => {
+  it('reads a fast account independently of a pending provider', async () => {
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const run: RunCommand = vi.fn(async (command, args) => {
+      if (command === 'gh') await held
+      return { stdout: args[0] === '--version' ? '1.2.3' : STATUS.codexChatGpt.stderr ?? '', stderr: 'Logged in using ChatGPT' }
+    })
+    const slow = probeAccount('gh', run)
+    try {
+      const fast = await probeAccount('codex', run)
+      expect(fast).toMatchObject({ id: 'codex', installed: true, signedIn: true })
+      expect(run).toHaveBeenCalledWith('codex', ['--version'], expect.anything())
+    } finally { release(); await slow }
+  })
+
+  it('reports each CLI as its own status command does', async () => {
+    await writeFakeClis(bin, home, {
+      claude: script('claude', STATUS.claudeSubscription),
+      codex: script('codex', STATUS.codexChatGpt),
+      gh: script('gh', STATUS.ghTwoAccounts),
+      grok: script('grok'),
+      muse: script('muse'),
+      antigravity: script('antigravity'),
+    })
+
+    expect(await probeAccounts(runFile)).toEqual([
+      { id: 'claude', installed: true, version: '2.1.288', signedIn: true, identity: 'octocat@example.com', detail: 'Claude Max subscription', login: { label: LABELS.claude } },
+      { id: 'codex', installed: true, version: '0.160.0', signedIn: true, identity: null, detail: 'Signed in with ChatGPT', login: { label: LABELS.codex } },
+      {
+        id: 'gh', installed: true, version: '2.92.0', signedIn: true, identity: 'octocat', detail: null, login: { label: LABELS.gh },
+        accounts: [
+          { login: 'octocat', active: true, signedIn: true, detail: null },
+          { login: 'octo-agent', active: false, signedIn: true, detail: null },
+        ],
+      },
+      { id: 'grok', installed: true, version: '1.0.46', signedIn: null, identity: null, detail: UNREPORTED.grok, login: { label: LABELS.grok } },
+      { id: 'muse', installed: true, version: '1.4.2', signedIn: null, identity: null, detail: UNREPORTED.muse, login: { label: LABELS.muse } },
+      { id: 'antigravity', installed: true, version: '1.2.14', signedIn: null, identity: null, detail: UNREPORTED.antigravity, login: { label: LABELS.antigravity } },
+    ])
+  })
+
+  it('reports signed-out CLIs, which answer and exit non-zero, as signed out', async () => {
+    await writeFakeClis(bin, home, {
+      claude: script('claude', STATUS.claudeSignedOut),
+      codex: script('codex', STATUS.codexSignedOut),
+      gh: script('gh', STATUS.ghSignedOut),
+    })
+
+    const accounts = byId(await probeAccounts(runFile))
+    expect(accounts.claude).toMatchObject({ installed: true, version: '2.1.288', signedIn: false, identity: null, detail: null })
+    expect(accounts.codex).toMatchObject({ installed: true, version: '0.160.0', signedIn: false, identity: null, detail: null })
+    expect(accounts.gh).toMatchObject({ installed: true, version: '2.92.0', signedIn: false, identity: null, detail: null, accounts: [] })
+  })
+
+  it('says which gh account cannot sign in, and that a Claude login without a subscription will not run Claude', async () => {
+    await writeFakeClis(bin, home, {
+      claude: script('claude', STATUS.claudeConsole),
+      codex: script('codex', STATUS.codexApiKey),
+      gh: script('gh', STATUS.ghExpiredAgent),
+    })
+
+    const accounts = byId(await probeAccounts(runFile))
+    expect(accounts.claude).toMatchObject({
+      signedIn: false, identity: null,
+      detail: 'Claude Code is signed in, but not to a Claude subscription. Poise runs Claude only on a subscription; reconnect with your Claude account.',
+    })
+    expect(accounts.codex).toMatchObject({ signedIn: true, identity: null, detail: 'Signed in with an OpenAI API key' })
+    expect(accounts.gh).toMatchObject({
+      signedIn: true, identity: 'octocat',
+      detail: 'gh cannot use octo-agent; reconnect that account.',
+      accounts: [
+        { login: 'octocat', active: true, signedIn: true, detail: null },
+        { login: 'octo-agent', active: false, signedIn: false, detail: 'HTTP 401: Bad credentials (https://api.github.com/)' },
+      ],
+    })
+  })
+
+  it('returns the account name and never a key, an organisation or a credential\'s location', async () => {
+    await writeFakeClis(bin, home, {
+      claude: script('claude', STATUS.claudeSubscription),
+      codex: script('codex', STATUS.codexApiKey),
+      gh: script('gh', STATUS.ghTwoAccounts),
+    })
+
+    const answer = JSON.stringify(await probeAccounts(runFile))
+    for (const secret of ['sk-proj', 'E1234', '7a1c0f2e', 'Organization', 'keyring', 'scopes', '/home/poise']) {
+      expect(answer).not.toContain(secret)
+    }
+  })
+
+  it('reports the Muse credential from its auth file, preferring the oauth mechanism over a stale API key', async () => {
+    await writeFakeClis(bin, home, { muse: script('muse') })
+    const authDir = join(home, 'xdg', 'muse')
+    vi.stubEnv('XDG_CONFIG_HOME', join(home, 'xdg'))
+    await mkdir(authDir, { recursive: true })
+    const authFile = join(authDir, 'auth.json')
+
+    await writeFile(authFile, JSON.stringify({ schema_version: 1, providers: { meta: { api_key: 'LLM_fixture_api_key' } } }))
+    expect(await probeAccount('muse', runFile)).toMatchObject({ credential: 'api-key', signedIn: null })
+
+    // The outage shape: an account login beside a stale key still runs on the login.
+    await writeFile(authFile, JSON.stringify({ schema_version: 1, providers: { meta: {
+      mechanism: 'oauth', obtained_via: 'device_code', subs_active: false,
+      access_token: 'fixture_access_token', api_key: 'stale_fixture_key',
+    } } }))
+    expect(await probeAccount('muse', runFile)).toMatchObject({ credential: 'account-login', signedIn: null })
+
+    await writeFile(authFile, 'not json')
+    expect(await probeAccount('muse', runFile)).not.toHaveProperty('credential')
+    await rm(authFile)
+    expect(await probeAccount('muse', runFile)).not.toHaveProperty('credential')
+  })
+
+  it('reads the Muse auth file from ~/.config when no XDG_CONFIG_HOME is set', async () => {
+    await writeFakeClis(bin, home, { muse: script('muse') })
+    vi.stubEnv('XDG_CONFIG_HOME', '')
+    const authDir = join(home, '.config', 'muse')
+    await mkdir(authDir, { recursive: true })
+    await writeFile(join(authDir, 'auth.json'), JSON.stringify({ schema_version: 1, providers: { meta: { api_key: 'LLM_home_config_key' } } }))
+    expect(await probeAccount('muse', runFile)).toMatchObject({ credential: 'api-key' })
+  })
+
+  it('never lets a Muse secret reach the accounts answer', async () => {
+    await writeFakeClis(bin, home, { muse: script('muse') })
+    vi.stubEnv('XDG_CONFIG_HOME', join(home, 'xdg'))
+    const authDir = join(home, 'xdg', 'muse')
+    await mkdir(authDir, { recursive: true })
+    await writeFile(join(authDir, 'auth.json'), JSON.stringify({ schema_version: 1, providers: { meta: {
+      mechanism: 'oauth', obtained_via: 'device_code', subs_active: false,
+      api_key: 'LLM_muse_secret_key_9f8e', access_token: 'muse_access_secret_7d6c', refresh_token: 'muse_refresh_secret_5b4a',
+    } } }))
+    const answer = JSON.stringify(await probeAccounts(runFile))
+    for (const secret of ['LLM_muse_secret_key_9f8e', 'muse_access_secret_7d6c', 'muse_refresh_secret_5b4a']) {
+      expect(answer).not.toContain(secret)
+    }
+  })
+
+  it('reads Claude through Poise\'s wrapper, gh\'s stored accounts and muse without updating it, and never starts a login', async () => {
+    vi.stubEnv('GH_TOKEN', 'ghp_environment_token_never_used')
+    await writeFakeClis(bin, home, {
+      claude: script('claude', STATUS.claudeSubscription),
+      codex: script('codex', STATUS.codexChatGpt),
+      gh: script('gh', STATUS.ghTwoAccounts),
+      muse: script('muse'),
+    })
+
+    await probeAccounts(runFile)
+    const calls = await fakeCalls(home)
+    expect(calls.find((call) => call.name === 'claude' && call.args.join(' ') === 'auth status --json')).toMatchObject({ settings: true })
+    expect(calls.filter((call) => call.name === 'gh').map((call) => call.ghToken)).toEqual([null, null])
+    expect(calls.find((call) => call.name === 'muse')).toMatchObject({ args: ['--version'], museNoAutoUpdate: '1' })
+    expect(calls.map((call) => `${call.name} ${call.args.join(' ')}`).sort()).toEqual([
+      'claude --version',
+      'claude auth status --json',
+      'codex --version',
+      'codex login status',
+      'gh --version',
+      'gh auth status --json hosts --hostname github.com',
+      'muse --version',
+    ])
+  })
+
+  it('tells a CLI that is not installed apart from one that fails', async () => {
+    await writeFakeClis(bin, home, {
+      claude: script('claude', STATUS.claudeSubscription),
+      codex: { '--version': { stderr: 'Error: cannot read /home/poise/.codex/config.toml\n', code: 2 } },
+      gh: { '--version': { stdout: 'gh version 2.92.0 (2026-04-28)\n' }, 'auth status --json hosts --hostname github.com': { stderr: 'unknown flag: --json\n', code: 1 } },
+    })
+
+    const accounts = byId(await probeAccounts(runFile))
+    for (const id of ['grok', 'muse'] as const) {
+      expect(accounts[id]).toEqual({ id, installed: false, version: null, signedIn: null, identity: null, detail: `${id} is not installed: Poise cannot find it on its PATH.`, login: { label: LABELS[id] } })
+    }
+    expect(accounts.antigravity).toMatchObject({ installed: false, detail: 'agy is not installed: Poise cannot find it on its PATH.' })
+    expect(accounts.codex).toEqual({
+      id: 'codex', installed: true, version: null, signedIn: null, identity: null,
+      detail: '`codex --version` exited with code 2: Error: cannot read /home/poise/.codex/config.toml',
+      login: { label: LABELS.codex },
+    })
+    expect(accounts.gh).toMatchObject({ installed: true, version: '2.92.0', signedIn: null, detail: '`gh auth status` exited with code 1: unknown flag: --json' })
+    expect(accounts.claude).toMatchObject({ signedIn: true })
+  })
+
+  it('says when a status command does not answer in time, and stops it', async () => {
+    await writeFakeClis(bin, home, {})
+    await writeFile(join(bin, 'codex'), `#!/bin/sh\nif [ "$1" = --version ]; then echo 'codex-cli 0.160.0'; exit 0; fi\necho $$ > "$HOME/codex.pid"\nexec /bin/sleep 30\n`)
+    await chmod(join(bin, 'codex'), 0o755)
+    // Only the deliberately hung status probe needs a short deadline;
+    // version discovery keeps its normal startup budget under suite load.
+    const run: RunCommand = (command, args, options) => runFile(command, args, {
+      ...options, ...(args.join(' ') === 'login status' ? { timeoutMs: 500 } : {}),
+    })
+
+    const accounts = byId(await probeAccounts(run))
+    expect(accounts.codex).toMatchObject({ installed: true, version: '0.160.0', signedIn: null, detail: '`codex login status` did not answer within 0.5 seconds' })
+    const pid = Number(await readFile(join(home, 'codex.pid'), 'utf8'))
+    expect(() => process.kill(pid, 0)).toThrow()
+  })
+
+  it('gives no answer it cannot read as an answer', async () => {
+    await writeFakeClis(bin, home, {
+      claude: { '--version': { stdout: '2.1.288 (Claude Code)\n' }, 'auth status --json': { stdout: 'Welcome to Claude Code\n' } },
+      codex: { '--version': { stdout: 'codex-cli 0.160.0\n' }, 'login status': { stderr: 'Logged in somehow\n' } },
+      gh: { '--version': { stdout: 'gh version 2.92.0\n' }, 'auth status --json hosts --hostname github.com': { stdout: '{"hosts":{"github.com":[{"login":"not a login!"}]}}\n' } },
+    })
+
+    const accounts = byId(await probeAccounts(runFile))
+    expect(accounts.claude).toMatchObject({ signedIn: null, detail: '`claude auth status` gave no answer Poise can read.' })
+    expect(accounts.codex).toMatchObject({ signedIn: null, detail: '`codex login status` gave no answer Poise can read.' })
+    expect(accounts.gh).toMatchObject({ signedIn: null, detail: '`gh auth status` gave no answer Poise can read.' })
+  })
+})
+
+describe('the accounts cache', () => {
+  function counting() {
+    let probes = 0
+    let release: (() => void) | null = null
+    let hold = false
+    const probe = async (): Promise<ConnectedAccount[]> => {
+      probes += 1
+      if (hold) await new Promise<void>((resolve) => { release = resolve })
+      return []
+    }
+    return { probe, probes: () => probes, hold: (value: boolean) => { hold = value }, release: () => release?.() }
+  }
+
+  it('answers from the last read for 15 seconds, then reads again', async () => {
+    let now = 1_000
+    const source = counting()
+    const cache = new AccountsCache(source.probe, () => now)
+    await cache.list()
+    await cache.list()
+    now += ACCOUNTS_CACHE_MS - 1
+    await cache.list()
+    expect(source.probes()).toBe(1)
+    now += 1
+    await cache.list()
+    expect(source.probes()).toBe(2)
+  })
+
+  it('shares a read in progress and forgets everything when invalidated', async () => {
+    const source = counting()
+    const cache = new AccountsCache(source.probe, () => 0)
+    source.hold(true)
+    const first = cache.list()
+    const second = cache.list()
+    expect(source.probes()).toBe(1)
+    // A terminal exits while the read runs: the next list must not get it.
+    cache.invalidate()
+    source.hold(false)
+    const third = cache.list()
+    expect(source.probes()).toBe(2)
+    source.release()
+    await Promise.all([first, second, third])
+    await cache.list()
+    expect(source.probes()).toBe(2)
+  })
+
+  it('does not keep a failed read', async () => {
+    let fail = true
+    let probes = 0
+    const cache = new AccountsCache(async () => {
+      probes += 1
+      if (fail) throw new Error('probe failed')
+      return []
+    }, () => 0)
+    await expect(cache.list()).rejects.toThrow('probe failed')
+    fail = false
+    await expect(cache.list()).resolves.toEqual([])
+    expect(probes).toBe(2)
+  })
+})
+
+describe('the scheduled accounts check', () => {
+  it('runs every fifteen minutes, never at once, past a failed check, until stopped', async () => {
+    vi.useFakeTimers()
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      let checks = 0
+      const stop = scheduleAccountsCheck(async () => {
+        checks += 1
+        if (checks === 2) throw new Error('gh did not answer')
+      })
+      expect(ACCOUNTS_CHECK_MS).toBe(15 * 60_000)
+      await vi.advanceTimersByTimeAsync(ACCOUNTS_CHECK_MS - 1)
+      expect(checks).toBe(0)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(checks).toBe(1)
+      await vi.advanceTimersByTimeAsync(ACCOUNTS_CHECK_MS)
+      expect(checks).toBe(2)
+      expect(errors).toHaveBeenCalledWith('[accounts] the scheduled check failed:', expect.objectContaining({ message: 'gh did not answer' }))
+      await vi.advanceTimersByTimeAsync(ACCOUNTS_CHECK_MS)
+      expect(checks).toBe(3)
+      stop()
+      await vi.advanceTimersByTimeAsync(3 * ACCOUNTS_CHECK_MS)
+      expect(checks).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+
+describe('durable login evidence joined to Accounts', () => {
+  it('shares existing confirmations and immediately joins confirm/withdraw after cached probes', async () => {
+    await writeFakeClis(bin, home, { grok: script('grok'), muse: script('muse'), antigravity: script('antigravity') })
+    const at = '2026-10-09T06:00:00Z'
+    setMeta('account_logins', JSON.stringify({ grok: at, muse: at, antigravity: at, codex: at }))
+    for (const id of ['grok', 'muse', 'antigravity'] as const) {
+      expect((await listAccounts(id))[0]).toMatchObject({ signedIn: null, identity: null, signInRecordedAt: at })
+      markLogin(id, false)
+      expect((await listAccounts(id))[0]).not.toHaveProperty('signInRecordedAt')
+      expect((await listAccounts()).find(account => account.id === id)).not.toHaveProperty('signInRecordedAt')
+      markLogin(id, true)
+      expect((await listAccounts(id))[0].signInRecordedAt).toBe(accountLogins()[id])
+    }
+    expect(accountLogins().codex).toBe(at)
+  })
+
+  it('does not carry an old confirmation through a probe pending during withdrawal', async () => {
+    await writeFakeClis(bin, home, { grok: { '--version': { stdout: 'grok 1.0.62' } } })
+    markLogin('grok', true)
+    const pending = listAccounts('grok')
+    markLogin('grok', false)
+    const after = listAccounts('grok')
+    for (const result of await Promise.all([pending, after])) expect(result[0]).not.toHaveProperty('signInRecordedAt')
+  })
+
+  it('keeps negative exits historical, never confirms app/shell exits, and hides history for missing or failing CLIs', async () => {
+    await writeFakeClis(bin, home, { grok: { '--version': { stderr: 'broken installation', code: 1 } } })
+    for (const [id, code] of [['grok', 1], ['muse', 143], ['shell', 0], ['antigravity', 0]] as const) recordLogin(id, code)
+    expect(accountLogins()).toEqual({})
+    recordLogin('grok', 0)
+    recordLogin('muse', 0)
+    markLogin('antigravity', true)
+    const earlier = accountLogins()
+    recordLogin('grok', 1)
+    recordLogin('muse', 143)
+    recordLogin('antigravity', 0)
+    expect(accountLogins()).toEqual(earlier)
+    const accounts = await listAccounts()
+    expect(accounts.find(account => account.id === 'grok')).toMatchObject({ version: null, detail: expect.stringContaining('broken installation') })
+    for (const id of ['grok', 'muse', 'antigravity']) expect(accounts.find(account => account.id === id)).not.toHaveProperty('signInRecordedAt')
+    expect(accountLogins()).toEqual(earlier)
+  })
+
+  it('counts a stored Muse API key as its login', () => {
+    recordLogin('muse-api-key', 1)
+    expect(accountLogins()).toEqual({})
+    recordLogin('muse-api-key', 0)
+    expect(accountLogins().muse).toEqual(expect.any(String))
+  })
+
+  it.each(['true', 'false', 'malformed', 'failed'] as const)('never replaces own-status results (%s) with legacy timestamps', async state => {
+    const at = '2026-10-09T06:00:00Z'
+    setMeta('account_logins', JSON.stringify({ claude: at, codex: at, gh: at }))
+    const status = {
+      claude: state === 'true' ? STATUS.claudeSubscription : state === 'false' ? STATUS.claudeSignedOut : { stdout: 'unreadable', code: state === 'failed' ? 2 : 0 },
+      codex: state === 'true' ? STATUS.codexChatGpt : state === 'false' ? STATUS.codexSignedOut : { stdout: 'unreadable', code: state === 'failed' ? 2 : 0 },
+      gh: state === 'true' ? STATUS.ghTwoAccounts : state === 'false' ? STATUS.ghSignedOut : { stdout: 'unreadable', code: state === 'failed' ? 2 : 0 },
+    }
+    await writeFakeClis(bin, home, { claude: script('claude', status.claude), codex: script('codex', status.codex), gh: script('gh', status.gh) })
+    const probed = await probeAccounts(runFile)
+    const listed = await listAccounts()
+    for (const id of ['claude', 'codex', 'gh']) {
+      expect(listed.find(account => account.id === id)).toEqual(probed.find(account => account.id === id))
+      expect(listed.find(account => account.id === id)?.signedIn).toBe(state === 'true' ? true : state === 'false' ? false : null)
+    }
+  })
+
+  it('never overrides Claude subscription rejection with a successful terminal record', async () => {
+    await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeConsole) })
+    recordLogin('claude', 0)
+    expect((await listAccounts('claude'))[0]).toMatchObject({ signedIn: false, detail: expect.stringContaining('not to a Claude subscription') })
+    expect((await listAccounts('claude'))[0]).not.toHaveProperty('signInRecordedAt')
+  })
+
+  it('remembers a positively observed Claude/Codex sign-in, including one made outside Poise', async () => {
+    await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeSubscription), codex: script('codex', STATUS.codexChatGpt) })
+    expect(accountLogins()).toEqual({})
+    await listAccounts()
+    const observed = accountLogins()
+    expect(observed.claude).toEqual(expect.any(String))
+    expect(observed.codex).toEqual(expect.any(String))
+    await listAccounts()
+    expect(accountLogins()).toEqual(observed)
+  })
+
+  it('records nothing for a signed-out, unknown or unreported sign-in', async () => {
+    await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeSignedOut), codex: script('codex', STATUS.codexSignedOut), grok: script('grok') })
+    await listAccounts()
+    expect(accountLogins()).toEqual({})
+  })
+
+  it('forwards the record with the live sign-in, and a missing CLI as missing', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt), grok: script('grok') })
+    markLogin('grok', true)
+    await expect(providerEvidence()).resolves.toEqual({
+      logins: { codex: expect.any(String), grok: expect.any(String) },
+      live: { claude: 'missing', codex: true },
+    })
+  })
+
+  it('fails evidence closed on a corrupt record while reads still list', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
+    setMeta('account_logins', 'not json')
+    await expect(providerEvidence()).rejects.toThrow(/corrupt/)
+    // Displayed history stays lenient: the read path survives.
+    expect((await listAccounts()).find(account => account.id === 'codex')).toMatchObject({ signedIn: true })
+    expect(accountLogins()).toEqual({})
+  })
+})
+
+
+it('keeps timed-out own-status probes unknown despite legacy sign-in history', async () => {
+  setMeta('account_logins', JSON.stringify({ claude: '2026-10-09T06:00:00Z', codex: '2026-10-09T06:00:00Z', gh: '2026-10-09T06:00:00Z' }))
+  await writeFakeClis(bin, home, {})
+  for (const name of ['claude', 'codex', 'gh']) {
+    await writeFile(join(bin, name), '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.2.3; exit 0; fi\nexec /bin/sleep 30\n')
+    await chmod(join(bin, name), 0o755)
+  }
+  for (const [account] of await Promise.all((['claude', 'codex', 'gh'] as const).map(id => listAccounts(id)))) {
+    expect(account).toMatchObject({ signedIn: null, identity: null, detail: expect.stringContaining('did not answer within 10 seconds') })
+    expect(account).not.toHaveProperty('signInRecordedAt')
+  }
+}, 40_000)

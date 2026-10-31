@@ -1,0 +1,22 @@
+[Unit]
+Description=Poise external proxy diagnostic collector
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/poise-ingress/reporter.py --config /etc/poise-ingress/config.json
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+MemoryMax=128M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

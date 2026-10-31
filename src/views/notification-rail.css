@@ -1,0 +1,421 @@
+/* ── Notification rail (src/views/notification-rail.ts) ──
+   A bell in the control bar's global half, and a full-height rail under the
+   bar that docks beside the page on a wide window. Panels and cards follow
+   the side panels' and Current's grammar: surface panel, hairline cards,
+   e-3 only while it floats over the page. */
+
+[data-tone="blue"]  { --nr-tone: var(--a1); }
+[data-tone="amber"] { --nr-tone: var(--a4); }
+[data-tone="red"]   { --nr-tone: var(--a5); }
+[data-tone="green"] { --nr-tone: var(--a3); }
+[data-tone="teal"]  { --nr-tone: var(--a2); }
+[data-tone="slate"] { --nr-tone: var(--a8); }
+
+/* Docked, the page ends where the rail begins: full-width views size to
+   --page-w instead of the window (style.css). */
+body.notifications-docked:not(.editor-writer-mode) {
+  --rail-w: 440px;
+  --page-w: calc(100vw - var(--scrollbar-w, 0px) - var(--rail-w));
+  padding-right: var(--rail-w);
+}
+body.notifications-docked:not(.editor-writer-mode) #behavior-memory-panel { right: var(--rail-w); }
+body.notifications-docked:not(.editor-writer-mode) #claude-auth-banner { left: calc((100vw - var(--rail-w)) / 2); }
+body.notifications-docked:not(.editor-writer-mode) .self-update-banner { right: calc(var(--rail-w) + var(--sp-4)); }
+
+/* ── Bell ── */
+.nr-bell {
+  position: relative;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: color var(--flow-feedback) ease-out, border-color var(--flow-feedback) ease-out;
+}
+.nr-bell:hover { color: var(--text); border-color: var(--text-tertiary); }
+.nr-bell[aria-expanded="true"] { color: var(--text); border-color: var(--text); }
+.nr-badge {
+  position: absolute;
+  top: -7px;
+  right: -8px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--nr-tone);
+  color: #fff;
+  font-size: 0.625rem;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 2px var(--bg);
+}
+
+/* ── Rail ── */
+.nr-rail {
+  position: fixed;
+  z-index: 125;
+  top: var(--app-bar-h, 96px);
+  right: 0;
+  bottom: 0;
+  width: min(440px, 100vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: var(--e-3);
+}
+.nr-rail:not(.open) { display: none; }
+.nr-rail.is-docked { box-shadow: none; }
+
+.nr-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-4) var(--sp-3) var(--sp-3) 20px;
+}
+.nr-title {
+  margin-right: auto;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.nr-count {
+  margin-left: 6px;
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.nr-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: color var(--flow-feedback) ease-out, background var(--flow-feedback) ease-out;
+}
+.nr-icon:hover,
+.nr-icon[aria-pressed="true"] { color: var(--text); background: var(--hover); }
+
+.nr-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 20px var(--sp-3);
+  border-bottom: 1px solid var(--border);
+}
+.nr-picker button { padding: 3px 10px; font-size: 0.6875rem; }
+.nr-picker button.is-empty:not(.active) { color: var(--text-tertiary); }
+.nr-picker-count {
+  margin-left: 5px;
+  font-weight: 400;
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+}
+.nr-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 24px;
+  padding: 0 var(--sp-1) 0 10px;
+  border-radius: var(--r-pill);
+  background: var(--hover);
+  color: var(--text);
+  font-size: 0.6875rem;
+  font-weight: 600;
+}
+.nr-tag button {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.nr-tag button:hover { color: var(--text); background: var(--border); }
+
+.nr-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 var(--sp-3) var(--sp-7);
+}
+
+.nr-group-label {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 18px var(--sp-2) var(--sp-2);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+}
+.nr-group[data-group="faults"] .nr-group-name { color: var(--red); }
+.nr-group[data-group="needs"] .nr-group-name { color: var(--amber); }
+.nr-group-count { font-variant-numeric: tabular-nums; }
+.nr-group-note {
+  margin-left: auto;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.nr-fold {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.nr-fold:hover { color: var(--text-secondary); }
+.nr-fold .nr-group-note { order: 3; }
+.nr-fold .nr-chev { order: 4; transition: transform var(--flow-settle) var(--flow-spring); }
+.nr-fold[aria-expanded="true"] .nr-chev { transform: rotate(180deg); }
+
+/* ── Entries ── */
+.nr-card {
+  margin-bottom: var(--sp-2);
+  background: var(--bg);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  transition: border-color var(--flow-feedback) ease-out, box-shadow var(--flow-feedback) ease-out;
+}
+.nr-card:hover { border-color: var(--border); }
+.nr-card.is-open { border-color: var(--border); box-shadow: var(--e-1); }
+.nr-card-head {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: var(--sp-3);
+  width: 100%;
+  padding: var(--sp-3);
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.nr-card-head:focus-visible { outline-offset: -2px; }
+.nr-chip {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  color: var(--nr-tone);
+  background: color-mix(in srgb, var(--nr-tone) 13%, transparent);
+}
+[data-theme="dark"] .nr-chip {
+  color: color-mix(in srgb, var(--nr-tone) 55%, #fff);
+  background: color-mix(in srgb, var(--nr-tone) 26%, transparent);
+}
+.nr-chip-solid,
+[data-theme="dark"] .nr-chip-solid { color: #fff; background: var(--nr-tone); }
+.nr-card-text { min-width: 0; }
+.nr-card-title,
+.nr-card-body {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.nr-card-title { font-size: 0.8125rem; font-weight: 600; line-height: 1.4; color: var(--text); }
+.nr-card-body { margin-top: 2px; font-size: 0.75rem; line-height: 1.5; color: var(--text-secondary); }
+.nr-card.is-open .nr-card-title,
+.nr-card.is-open .nr-card-body { -webkit-line-clamp: unset; }
+.nr-card.is-auto .nr-card-title { font-weight: 400; color: var(--text-secondary); }
+.nr-card-meta {
+  display: block;
+  margin-top: 6px;
+  overflow: hidden;
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.nr-card-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--sp-2);
+  padding-top: 1px;
+  font-size: 0.6875rem;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.nr-chev { display: inline-grid; color: var(--text-tertiary); transition: transform var(--flow-settle) var(--flow-spring); }
+.nr-card.is-open .nr-card-side .nr-chev { transform: rotate(180deg); }
+
+.nr-details { padding: 2px var(--sp-3) 14px 48px; }
+/* What happened: mono per DS (timestamps, IDs). The times share one column
+ * per card, as wide as its widest time, so every line's words start even —
+ * including lines with no time, whose words sit in the second column too. */
+.nr-history {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: var(--sp-3);
+  row-gap: 6px;
+  margin: 0 0 var(--sp-3);
+  padding: 0;
+  list-style: none;
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.6875rem;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.nr-history li { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; }
+.nr-history li > span { grid-column: 2; }
+.nr-history time { color: var(--text-tertiary); }
+.nr-link { color: var(--a1); text-decoration: underline; text-underline-offset: 2px; }
+.nr-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.nr-btn {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color var(--flow-feedback) ease-out, background var(--flow-feedback) ease-out, border-color var(--flow-feedback) ease-out;
+}
+.nr-btn:hover { color: var(--text); background: var(--hover); }
+.nr-btn-primary { background: var(--n5); border-color: var(--n5); color: var(--n0); }
+.nr-btn-primary:hover { background: var(--n6); border-color: var(--n6); color: var(--n0); }
+
+@keyframes nr-arrived {
+  from { background-color: color-mix(in srgb, var(--a1) 16%, var(--bg)); }
+  to { background-color: var(--bg); }
+}
+.nr-card.nr-arrived { animation: nr-arrived 1.6s ease-out 1; }
+
+.nr-empty {
+  padding: var(--sp-8) var(--sp-5);
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 0.8125rem;
+}
+.nr-empty-title { margin: 0; font-weight: 600; color: var(--text); }
+.nr-empty-note { margin: var(--sp-2) 0 0; font-size: 0.75rem; line-height: 1.5; }
+
+/* ── Arrivals, while the rail is closed ── */
+.nr-toasts {
+  position: fixed;
+  z-index: 133;
+  top: calc(var(--app-bar-h, 96px) + var(--sp-3));
+  right: 24px;
+  width: min(380px, calc(100vw - 48px));
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  pointer-events: none;
+}
+.nr-toast {
+  pointer-events: auto;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: var(--sp-3);
+  padding: var(--sp-3) 10px var(--sp-3) var(--sp-3);
+  background: var(--surface);
+  border: var(--b-base);
+  border-left: 3px solid var(--nr-tone);
+  border-radius: var(--r-md);
+  box-shadow: var(--e-2);
+}
+.nr-toast-title { margin: 0; font-size: 0.8125rem; font-weight: 600; line-height: 1.4; color: var(--text); overflow-wrap: anywhere; }
+.nr-toast-body {
+  display: -webkit-box;
+  margin: 2px 0 0;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.nr-toast .nr-actions { margin-top: 10px; }
+
+/* Visually hidden, read aloud. */
+.nr-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ── Behaviors: each row's counts, which open the rail on it ── */
+.behavior-notifications { display: flex; flex-wrap: nowrap; align-items: center; gap: var(--sp-1); }
+.behavior-notifications:empty { display: none; }
+.nr-count-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 var(--sp-2);
+  border: 0;
+  border-radius: var(--r-pill);
+  background: color-mix(in srgb, var(--nr-tone) 12%, transparent);
+  color: color-mix(in srgb, var(--nr-tone) 82%, var(--text));
+  font: inherit;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--flow-feedback) ease-out;
+}
+.nr-count-chip:hover { background: color-mix(in srgb, var(--nr-tone) 22%, transparent); }
+.nr-count-chip[data-tone="slate"] { background: var(--surface); color: var(--text-tertiary); }
+.nr-count-chip[data-tone="slate"]:hover { background: var(--hover); color: var(--text-secondary); }
+[data-theme="dark"] .nr-count-chip:not([data-tone="slate"]) {
+  background: color-mix(in srgb, var(--nr-tone) 22%, transparent);
+  color: color-mix(in srgb, var(--nr-tone) 55%, #fff);
+}
+
+/* Writer mode keeps nothing outside the page; the rail waits for its end. */
+body.editor-writer-mode .nr-bell,
+body.editor-writer-mode .nr-rail,
+body.editor-writer-mode .nr-toasts { display: none; }
+@media print {
+  .nr-bell, .nr-rail, .nr-toasts { display: none; }
+}
+
+.nr-evidence-note { margin: 8px 0; color: var(--text-tertiary); font-size: 11px; }

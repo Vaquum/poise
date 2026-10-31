@@ -1,0 +1,1327 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { spawn as spawnProcess } from 'node:child_process'
+import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { delimiter, join } from 'node:path'
+import {
+  AGENT_RIPGREP_CONFIG,
+  CLAUDE_SUBSCRIPTION_CLI,
+  MAX_PROCESS_ARG_BYTES,
+  assertProcessArgSize,
+  claudeSubscriptionEnvironment,
+  runFile,
+  runningCallerLaunches,
+  scrubbedChildEnvironment,
+  setCallerAccounts,
+  spawnDetached,
+  type CallerAccounts,
+} from '../server/process'
+import { spawnWorker } from '../server/chat/worker'
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error: any) {
+    if (error?.code === 'ESRCH') return false
+    throw error
+  }
+}
+
+async function waitForProcessExit(pid: number): Promise<boolean> {
+  const deadline = Date.now() + 2_000
+  while (Date.now() < deadline) {
+    if (!processExists(pid)) return true
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return !processExists(pid)
+}
+
+async function waitForPid(path: string): Promise<number> {
+  const deadline = Date.now() + 2_000
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number(await readFile(path, 'utf8'))
+      if (Number.isSafeInteger(pid) && pid > 0) return pid
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error('grandchild pid was not written')
+}
+
+function forkingParentSource(): string {
+  const grandchild = 'setInterval(() => {}, 1_000)'
+  return [
+    "const { spawn } = require('node:child_process')",
+    "const { writeFileSync } = require('node:fs')",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' })`,
+    'writeFileSync(process.argv[1], String(child.pid))',
+    'setInterval(() => {}, 1_000)',
+  ].join(';')
+}
+
+async function namedNode(root: string, name: string): Promise<string> {
+  const path = join(root, name + (process.platform === 'win32' ? '.exe' : ''))
+  if (process.platform === 'win32') await link(process.execPath, path)
+  else await symlink(process.execPath, path)
+  return path
+}
+
+async function runWithInput(
+  command: string,
+  args: string[],
+  input: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ code: number | null, stdout: string, stderr: string }> {
+  return await new Promise((resolve, reject) => {
+    const child = spawnProcess(command, args, { env })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk })
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk })
+    child.once('error', reject)
+    child.once('close', (code) => resolve({ code, stdout, stderr }))
+    child.stdin.end(input)
+  })
+}
+
+describe('bounded process helpers', () => {
+  it('passes arguments without shell interpretation', async () => {
+    const value = 'literal $(touch should-not-run); `echo nope`'
+    const { stdout } = await runFile(
+      process.execPath,
+      ['-e', 'process.stdout.write(process.argv[1])', value],
+    )
+
+    expect(stdout).toBe(value)
+  })
+
+  it('terminates commands that exceed their deadline', async () => {
+    const started = Date.now()
+
+    await expect(runFile(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1_000)'],
+      { timeoutMs: 50 },
+    )).rejects.toMatchObject({ killed: true })
+    expect(Date.now() - started).toBeLessThan(2_000)
+  })
+
+  it('aborts an active command during graceful shutdown', async () => {
+    const controller = new AbortController()
+    const running = runFile(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1_000)'],
+      { timeoutMs: 30_000, signal: controller.signal },
+    )
+    controller.abort()
+
+    await expect(running).rejects.toMatchObject({ code: 'ABORT_ERR' })
+  })
+
+  it('terminates grandchildren when a command exceeds its deadline', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'poise-process-tree-'))
+    const pidFile = join(root, 'grandchild.pid')
+    let grandchildPid = 0
+    try {
+      await expect(runFile(
+        process.execPath,
+        ['-e', forkingParentSource(), pidFile],
+        { timeoutMs: 500 },
+      )).rejects.toMatchObject({ killed: true })
+      grandchildPid = await waitForPid(pidFile)
+      expect(await waitForProcessExit(grandchildPid)).toBe(true)
+    } finally {
+      if (grandchildPid && processExists(grandchildPid)) {
+        try { process.kill(grandchildPid, 'SIGKILL') } catch { /* already gone */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('terminates grandchildren when an active command is aborted', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'poise-process-tree-'))
+    const pidFile = join(root, 'grandchild.pid')
+    const controller = new AbortController()
+    const running = runFile(
+      process.execPath,
+      ['-e', forkingParentSource(), pidFile],
+      { timeoutMs: 30_000, signal: controller.signal },
+    )
+    let grandchildPid = 0
+    try {
+      grandchildPid = await waitForPid(pidFile)
+      controller.abort()
+      await expect(running).rejects.toMatchObject({ code: 'ABORT_ERR' })
+      expect(await waitForProcessExit(grandchildPid)).toBe(true)
+    } finally {
+      controller.abort()
+      await running.catch(() => undefined)
+      if (grandchildPid && processExists(grandchildPid)) {
+        try { process.kill(grandchildPid, 'SIGKILL') } catch { /* already gone */ }
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects output beyond the configured cap', async () => {
+    await expect(runFile(
+      process.execPath,
+      ['-e', "process.stdout.write('x'.repeat(4_096))"],
+      { maxOutputBytes: 128 },
+    )).rejects.toMatchObject({ code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' })
+  })
+
+  it('preserves stderr on command failures', async () => {
+    const error = await runFile(
+      process.execPath,
+      ['-e', "process.stderr.write('diagnostic'); process.exit(7)"],
+    ).catch((reason: unknown) => reason)
+
+    expect(error).toMatchObject({ code: 7, stderr: 'diagnostic' })
+  })
+
+  it('uses command-scoped credentials, a safe base environment, and explicit overrides', async () => {
+    const values: Record<string, string> = {
+      CONFAB_API_KEY: 'must-not-leak',
+      CONFAB_URL: 'https://user:password@confab.invalid',
+      UNRELATED_DATABASE_PASSWORD: 'also-must-not-leak',
+      INTERNAL_SIGNING_KEY: 'still-must-not-leak',
+      SERVICE_URI: 'postgres://user:password@database.invalid/app',
+      SESSION_JWT: 'header.payload.signature',
+      CUSTOM_AUTH_HEADER: 'Bearer must-not-leak',
+      SAFE_LOOKING_BUT_UNLISTED: 'allowlists-block-this-too',
+      AGENT_INTERFACE_DATA_DIR: '/tmp/poise-agent-data',
+      AGENT_INTERFACE_CLI: '/opt/poise/agent-interface-wrapper',
+      AGENT_INTERFACE_BASH_ALLOW: '["git status"]',
+      CLAUDE_CLI: '/opt/poise/claude-wrapper',
+      CLAUDE_CODE_SHELL_PREFIX: '/opt/poise/bash-guard',
+      CODEX_CLI: '/opt/poise/codex-wrapper',
+      CURSOR_AGENT_CLI: '/opt/poise/cursor-wrapper',
+      GH_TOKEN: 'inherited-gh-token',
+      OPENAI_API_KEY: 'inherited-model-key',
+      HTTPS_PROXY: 'https://proxy-user:proxy-password@proxy.invalid',
+    }
+    const originals = new Map(Object.keys(values).map((key) => [key, process.env[key]]))
+    Object.assign(process.env, values)
+    const root = await mkdtemp(join(tmpdir(), 'poise-env-scope-'))
+    const probe = "process.stdout.write(JSON.stringify({ confab: process.env.CONFAB_API_KEY, confabUrl: process.env.CONFAB_URL, password: process.env.UNRELATED_DATABASE_PASSWORD, signing: process.env.INTERNAL_SIGNING_KEY, uri: process.env.SERVICE_URI, jwt: process.env.SESSION_JWT, auth: process.env.CUSTOM_AUTH_HEADER, unlisted: process.env.SAFE_LOOKING_BUT_UNLISTED, agentData: process.env.AGENT_INTERFACE_DATA_DIR, agentCli: process.env.AGENT_INTERFACE_CLI, bashAllow: process.env.AGENT_INTERFACE_BASH_ALLOW, claudeCli: process.env.CLAUDE_CLI, shellPrefix: process.env.CLAUDE_CODE_SHELL_PREFIX, codexCli: process.env.CODEX_CLI, cursorCli: process.env.CURSOR_AGENT_CLI, gh: process.env.GH_TOKEN, model: process.env.OPENAI_API_KEY, proxy: process.env.HTTPS_PROXY, explicit: process.env.EXPLICIT_PASSWORD, hasPath: !!process.env.PATH }))"
+    try {
+      const unrelated = await runFile(process.execPath, ['-e', probe], {
+        env: { EXPLICIT_PASSWORD: 'deliberate-override' },
+      })
+      expect(JSON.parse(unrelated.stdout)).toEqual({
+        agentData: '/tmp/poise-agent-data',
+        explicit: 'deliberate-override',
+        hasPath: true,
+      })
+
+      const githubCli = await namedNode(root, 'github-interface')
+      const github = await runFile(githubCli, ['-e', probe])
+      expect(JSON.parse(github.stdout)).toEqual({
+        agentData: '/tmp/poise-agent-data',
+        gh: 'inherited-gh-token',
+        proxy: 'https://proxy-user:proxy-password@proxy.invalid',
+        hasPath: true,
+      })
+
+      const agentCli = await namedNode(root, 'agent-interface')
+      const agent = await runFile(agentCli, ['-e', probe])
+      expect(JSON.parse(agent.stdout)).toEqual({
+        agentData: '/tmp/poise-agent-data',
+        agentCli: '/opt/poise/agent-interface-wrapper',
+        bashAllow: '["git status"]',
+        claudeCli: '/opt/poise/claude-wrapper',
+        shellPrefix: '/opt/poise/bash-guard',
+        codexCli: '/opt/poise/codex-wrapper',
+        cursorCli: '/opt/poise/cursor-wrapper',
+        gh: 'inherited-gh-token',
+        model: 'inherited-model-key',
+        proxy: 'https://proxy-user:proxy-password@proxy.invalid',
+        hasPath: true,
+      })
+    } finally {
+      for (const [key, value] of originals) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('defines an explicit Claude subscription-only environment', () => {
+    if (process.platform === 'win32') {
+      expect(() => claudeSubscriptionEnvironment())
+        .toThrow('Claude subscription isolation requires macOS, Linux, or WSL')
+      return
+    }
+    expect(claudeSubscriptionEnvironment()).toEqual({
+      ANTHROPIC_API_KEY: undefined,
+      ANTHROPIC_AUTH_TOKEN: undefined,
+      ANTHROPIC_BASE_URL: undefined,
+      CLAUDE_CODE_OAUTH_TOKEN: undefined,
+      CLAUDE_CLI: CLAUDE_SUBSCRIPTION_CLI,
+    })
+  })
+
+  it('runs direct Claude with local config but without billing credentials or shell interpretation', async () => {
+    if (process.platform === 'win32') return
+    const values: Record<string, string> = {
+      ANTHROPIC_API_KEY: 'metered-api-key',
+      ANTHROPIC_AUTH_TOKEN: 'metered-auth-token',
+      ANTHROPIC_BASE_URL: 'https://metered-provider.invalid',
+      ANTHROPIC_CUSTOM_HEADERS: 'X-Api-Key: metered',
+      CLAUDE_CODE_OAUTH_TOKEN: 'explicit-oauth-token',
+      AWS_ACCESS_KEY_ID: 'cloud-access-key',
+      GOOGLE_APPLICATION_CREDENTIALS: '/tmp/provider-credentials.json',
+      AZURE_CLIENT_SECRET: 'cloud-client-secret',
+      FUTURE_PROVIDER_API_KEY: 'future-provider-key',
+      CLAUDE_CONFIG_DIR: '/tmp/poise-claude-config',
+      CLAUDE_CODE_SHELL_PREFIX: '/opt/poise/bash-guard',
+      HTTPS_PROXY: 'https://proxy-user:proxy-password@proxy.invalid',
+      INTERNAL_SIGNING_KEY: 'must-not-leak',
+    }
+    const originals = new Map(Object.keys(values).map((key) => [key, process.env[key]]))
+    Object.assign(process.env, values)
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-env-'))
+    const literal = 'literal $(touch should-not-run); `echo nope`'
+    const probe = "process.stdout.write(JSON.stringify({ apiKey: process.env.ANTHROPIC_API_KEY, authToken: process.env.ANTHROPIC_AUTH_TOKEN, baseUrl: process.env.ANTHROPIC_BASE_URL, oauth: process.env.CLAUDE_CODE_OAUTH_TOKEN, configDir: process.env.CLAUDE_CONFIG_DIR, shellPrefix: process.env.CLAUDE_CODE_SHELL_PREFIX, proxy: process.env.HTTPS_PROXY, signing: process.env.INTERNAL_SIGNING_KEY, literal: process.argv[1] }))"
+    try {
+      const claudeCli = await namedNode(root, 'claude')
+      const result = await runFile(claudeCli, ['-e', probe, literal], {
+        env: claudeSubscriptionEnvironment(),
+      })
+
+      expect(JSON.parse(result.stdout)).toEqual({
+        configDir: '/tmp/poise-claude-config',
+        shellPrefix: '/opt/poise/bash-guard',
+        proxy: 'https://proxy-user:proxy-password@proxy.invalid',
+        literal,
+      })
+    } finally {
+      for (const [key, value] of originals) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('forces the monitored Claude binary without dropping other model integrations', async () => {
+    if (process.platform === 'win32') return
+    const values: Record<string, string> = {
+      ANTHROPIC_API_KEY: 'metered-api-key',
+      ANTHROPIC_AUTH_TOKEN: 'metered-auth-token',
+      ANTHROPIC_BASE_URL: 'https://metered-provider.invalid',
+      CLAUDE_CODE_OAUTH_TOKEN: 'explicit-oauth-token',
+      CLAUDE_CONFIG_DIR: '/tmp/poise-claude-config',
+      CLAUDE_CLI: '/opt/poise/claude-wrapper',
+      OPENAI_API_KEY: 'other-model-key',
+    }
+    const originals = new Map(Object.keys(values).map((key) => [key, process.env[key]]))
+    Object.assign(process.env, values)
+    const root = await mkdtemp(join(tmpdir(), 'poise-agent-subscription-env-'))
+    const probe = "process.stdout.write(JSON.stringify({ apiKey: process.env.ANTHROPIC_API_KEY, authToken: process.env.ANTHROPIC_AUTH_TOKEN, baseUrl: process.env.ANTHROPIC_BASE_URL, oauth: process.env.CLAUDE_CODE_OAUTH_TOKEN, configDir: process.env.CLAUDE_CONFIG_DIR, claudeCli: process.env.CLAUDE_CLI, openai: process.env.OPENAI_API_KEY }))"
+    try {
+      const agentCli = await namedNode(root, 'agent-interface')
+      const result = await runFile(agentCli, ['-e', probe], {
+        env: claudeSubscriptionEnvironment(),
+      })
+
+      expect(JSON.parse(result.stdout)).toEqual({
+        configDir: '/tmp/poise-claude-config',
+        claudeCli: CLAUDE_SUBSCRIPTION_CLI,
+        openai: 'other-model-key',
+      })
+    } finally {
+      for (const [key, value] of originals) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('neutralizes provider settings and environment overrides in the Claude wrapper', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-wrapper-'))
+    const rawClaude = join(root, 'claude')
+    const callLog = join(root, 'calls')
+    const probe = `#!/usr/bin/env node
+const { appendFileSync, statSync } = require('node:fs')
+const args = process.argv.slice(2)
+const authStatus = args.includes('auth') && args.includes('status')
+appendFileSync(${JSON.stringify(callLog)}, authStatus ? 'status\\n' : 'model\\n')
+const observed = {
+  args,
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+  baseUrl: process.env.ANTHROPIC_BASE_URL,
+  customHeaders: process.env.ANTHROPIC_CUSTOM_HEADERS,
+  anthropicConfigDir: process.env.ANTHROPIC_CONFIG_DIR,
+  anthropicConfigMode: (statSync(process.env.ANTHROPIC_CONFIG_DIR).mode & 0o777).toString(8),
+  claudeConfigDir: process.env.CLAUDE_CONFIG_DIR,
+  profile: process.env.ANTHROPIC_PROFILE,
+  identityToken: process.env.ANTHROPIC_IDENTITY_TOKEN,
+  identityTokenFile: process.env.ANTHROPIC_IDENTITY_TOKEN_FILE,
+  unixSocket: process.env.ANTHROPIC_UNIX_SOCKET,
+  gateway: process.env.CLAUDE_CODE_USE_GATEWAY,
+  ccrTokenFile: process.env.CCR_OAUTH_TOKEN_FILE,
+  aws: process.env.AWS_ACCESS_KEY_ID,
+  google: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+  azure: process.env.AZURE_CLIENT_SECRET,
+  future: process.env.FUTURE_PROVIDER_API_KEY,
+  providerManaged: process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST,
+  maxRetries: process.env.CLAUDE_CODE_MAX_RETRIES,
+  retryWatchdog: process.env.CLAUDE_CODE_RETRY_WATCHDOG,
+  claudeCli: process.env.CLAUDE_CLI,
+  shellPrefix: process.env.CLAUDE_CODE_SHELL_PREFIX,
+  bashAllow: process.env.AGENT_INTERFACE_BASH_ALLOW,
+}
+if (authStatus) Object.assign(observed, {
+  loggedIn: true,
+  authMethod: 'claude.ai',
+  apiProvider: 'firstParty',
+})
+process.stdout.write(JSON.stringify(observed))
+`
+    try {
+      await writeFile(rawClaude, probe, { mode: 0o700 })
+      const options = {
+        env: {
+          PATH: `${root}${delimiter}${process.env.PATH || ''}`,
+          ANTHROPIC_API_KEY: 'metered-api-key',
+          ANTHROPIC_AUTH_TOKEN: 'metered-auth-token',
+          ANTHROPIC_BASE_URL: 'https://metered-provider.invalid',
+          ANTHROPIC_CONFIG_DIR: '/tmp/poisoned-anthropic-profile',
+          ANTHROPIC_CUSTOM_HEADERS: 'X-Api-Key: metered',
+          ANTHROPIC_PROFILE: 'metered-profile',
+          ANTHROPIC_IDENTITY_TOKEN: 'metered-identity-token',
+          ANTHROPIC_IDENTITY_TOKEN_FILE: '/tmp/metered-identity-token',
+          ANTHROPIC_UNIX_SOCKET: '/tmp/metered-provider.sock',
+          CLAUDE_CODE_USE_GATEWAY: '1',
+          CCR_OAUTH_TOKEN_FILE: '/tmp/metered-oauth-token',
+          AWS_ACCESS_KEY_ID: 'cloud-access-key',
+          GOOGLE_APPLICATION_CREDENTIALS: '/tmp/provider-credentials.json',
+          AZURE_CLIENT_SECRET: 'cloud-client-secret',
+          FUTURE_PROVIDER_API_KEY: 'future-provider-key',
+          CLAUDE_CONFIG_DIR: '/tmp/poise-claude-config',
+          CLAUDE_CLI: '/opt/alternate-claude',
+          CLAUDE_CODE_SHELL_PREFIX: '/opt/poise/bash-guard',
+          AGENT_INTERFACE_BASH_ALLOW: '["git status"]',
+        },
+      }
+      const firstSettings = JSON.stringify({
+        hooks: { SessionStart: [] },
+        env: {
+          ANTHROPIC_API_KEY: 'settings-api-key',
+          FORWARDED_SETTING_ONE: 'preserved-one',
+        },
+      })
+      const secondSettings = JSON.stringify({
+        permissions: { allow: ['Bash(git status)'] },
+        env: { FORWARDED_SETTING_TWO: 'preserved-two', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' },
+      })
+      const result = await runFile(
+        CLAUDE_SUBSCRIPTION_CLI,
+        [
+          `--settings=${firstSettings}`,
+          '--settings',
+          secondSettings,
+          '--print',
+          'literal prompt',
+        ],
+        options,
+      )
+      const observed = JSON.parse(result.stdout)
+      const settings = JSON.parse(observed.args[1])
+      expect(settings.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('64000')
+      expect((await readFile(callLog, 'utf8')).trim().split('\n')).toEqual(['status', 'model'])
+      expect(observed).toMatchObject({
+        args: ['--settings', expect.any(String), '--print', '--', 'literal prompt'],
+        anthropicConfigDir: expect.stringContaining('poise-anthropic-profile-'),
+        anthropicConfigMode: '700',
+        claudeConfigDir: '/tmp/poise-claude-config',
+      })
+      expect(observed).not.toHaveProperty('apiKey')
+      expect(observed).not.toHaveProperty('authToken')
+      expect(observed).not.toHaveProperty('baseUrl')
+      expect(observed).not.toHaveProperty('customHeaders')
+      expect(observed).not.toHaveProperty('profile')
+      expect(observed).not.toHaveProperty('identityToken')
+      expect(observed).not.toHaveProperty('identityTokenFile')
+      expect(observed).not.toHaveProperty('unixSocket')
+      expect(observed).not.toHaveProperty('gateway')
+      expect(observed).not.toHaveProperty('ccrTokenFile')
+      expect(observed).not.toHaveProperty('aws')
+      expect(observed).not.toHaveProperty('google')
+      expect(observed).not.toHaveProperty('azure')
+      expect(observed).not.toHaveProperty('future')
+      expect(observed).not.toHaveProperty('providerManaged')
+      expect(observed).toMatchObject({
+        maxRetries: '0',
+        retryWatchdog: '',
+        claudeCli: CLAUDE_SUBSCRIPTION_CLI,
+        shellPrefix: '/opt/poise/bash-guard',
+        bashAllow: '["git status"]',
+      })
+      expect(settings).toMatchObject({
+        hooks: { SessionStart: [] },
+        permissions: { allow: ['Bash(git status)'] },
+        apiKeyHelper: '',
+        awsAuthRefresh: '',
+        awsCredentialExport: '',
+        env: {
+          FORWARDED_SETTING_ONE: 'preserved-one',
+          FORWARDED_SETTING_TWO: 'preserved-two',
+          ANTHROPIC_API_KEY: '',
+          ANTHROPIC_AUTH_TOKEN: '',
+          ANTHROPIC_BASE_URL: '',
+          ANTHROPIC_CONFIG_DIR: observed.anthropicConfigDir,
+          ANTHROPIC_CUSTOM_HEADERS: '',
+          ANTHROPIC_AWS_API_KEY: '',
+          ANTHROPIC_AWS_AUTH: '',
+          ANTHROPIC_FOUNDRY_AUTH_TOKEN: '',
+          ANTHROPIC_FEDERATION_RULE_ID: '',
+          ANTHROPIC_IDENTITY_TOKEN: '',
+          ANTHROPIC_IDENTITY_TOKEN_FILE: '',
+          ANTHROPIC_ORGANIZATION_ID: '',
+          ANTHROPIC_PROFILE: '',
+          ANTHROPIC_UNIX_SOCKET: '',
+          CCR_OAUTH_TOKEN_FILE: '',
+          CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: '',
+          CLAUDE_CODE_HOST_CREDS_FILE: '',
+          CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: '',
+          CLAUDE_CODE_OAUTH_REFRESH_TOKEN: '',
+          CLAUDE_CODE_USE_BEDROCK: '',
+          CLAUDE_CODE_USE_ANTHROPIC_AWS: '',
+          CLAUDE_CODE_USE_GATEWAY: '',
+          CLAUDE_CODE_USE_MANTLE: '',
+          CLAUDE_CODE_USE_VERTEX: '',
+          CLAUDE_CODE_MAX_RETRIES: '0',
+          CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1',
+          CLAUDE_CODE_RETRY_WATCHDOG: '',
+          CLAUDE_CLI: CLAUDE_SUBSCRIPTION_CLI,
+          CLAUDE_CODE_SHELL_PREFIX: '/opt/poise/bash-guard',
+          AGENT_INTERFACE_BASH_ALLOW: '["git status"]',
+        },
+      })
+      expect(observed.args.filter((value: string) => value === '--settings')).toHaveLength(1)
+      await expect(stat(observed.anthropicConfigDir)).rejects.toMatchObject({ code: 'ENOENT' })
+
+      for (const literalPrompt of [
+        '--settings',
+        '--settings={"hooks":{"SessionStart":[{"command":"untrusted"}]}}',
+      ]) {
+        const promptResult = await runFile(
+          CLAUDE_SUBSCRIPTION_CLI,
+          ['--print', literalPrompt],
+          options,
+        )
+        const promptObserved = JSON.parse(promptResult.stdout)
+        const promptSettings = JSON.parse(promptObserved.args[1])
+        expect(promptObserved.args.at(-1)).toBe(literalPrompt)
+        expect(promptObserved.args.at(-2)).toBe('--')
+        expect(promptObserved.args.slice(0, -1)
+          .filter((value: string) => value === '--settings'))
+          .toHaveLength(1)
+        expect(promptSettings).not.toHaveProperty('hooks')
+      }
+
+      const statusResult = await runFile(
+        CLAUDE_SUBSCRIPTION_CLI,
+        ['auth', 'status', '--json'],
+        options,
+      )
+      const statusObserved = JSON.parse(statusResult.stdout)
+      expect(statusObserved).toMatchObject({
+        loggedIn: true,
+        authMethod: 'claude.ai',
+        apiProvider: 'firstParty',
+        anthropicConfigDir: expect.stringContaining('poise-anthropic-profile-'),
+        anthropicConfigMode: '700',
+        claudeConfigDir: '/tmp/poise-claude-config',
+      })
+      expect(statusObserved.anthropicConfigDir).not.toBe(observed.anthropicConfigDir)
+      await expect(stat(statusObserved.anthropicConfigDir)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('passes desktop session coordinates only to the exact Claude.ai login command', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-login-env-'))
+    const rawClaude = join(root, 'claude')
+    const loginEnvironment: Record<string, string> = {
+      DISPLAY: ':0',
+      WAYLAND_DISPLAY: 'wayland-0',
+      XAUTHORITY: '/run/user/1000/xauth',
+      DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
+      XDG_SESSION_TYPE: 'wayland',
+      XDG_CURRENT_DESKTOP: 'GNOME',
+      DESKTOP_SESSION: 'gnome',
+      WSL_DISTRO_NAME: 'Ubuntu',
+      WSL_INTEROP: '/run/WSL/123_interop',
+      BROWSER: 'must-not-be-inherited',
+      SSH_AUTH_SOCK: '/tmp/must-not-be-inherited',
+      SESSION_TOKEN: 'must-not-leak',
+    }
+    const originals = new Map(Object.keys(loginEnvironment)
+      .map((key) => [key, process.env[key]]))
+    const probe = `#!/usr/bin/env node
+const args = process.argv.slice(2)
+const observed = {
+  display: process.env.DISPLAY,
+  waylandDisplay: process.env.WAYLAND_DISPLAY,
+  xauthority: process.env.XAUTHORITY,
+  dbus: process.env.DBUS_SESSION_BUS_ADDRESS,
+  sessionType: process.env.XDG_SESSION_TYPE,
+  desktop: process.env.XDG_CURRENT_DESKTOP,
+  desktopSession: process.env.DESKTOP_SESSION,
+  wslDistro: process.env.WSL_DISTRO_NAME,
+  wslInterop: process.env.WSL_INTEROP,
+  browser: process.env.BROWSER,
+  sshAuthSock: process.env.SSH_AUTH_SOCK,
+  sessionToken: process.env.SESSION_TOKEN,
+}
+if (args.includes('auth') && args.includes('status')) Object.assign(observed, {
+  loggedIn: true,
+  authMethod: 'claude.ai',
+  apiProvider: 'firstParty',
+})
+process.stdout.write(JSON.stringify(observed))
+`
+    try {
+      await writeFile(rawClaude, probe, { mode: 0o700 })
+      Object.assign(process.env, loginEnvironment)
+      const options = { env: { PATH: `${root}${delimiter}${process.env.PATH || ''}` } }
+
+      const login = await runFile(
+        CLAUDE_SUBSCRIPTION_CLI,
+        ['auth', 'login', '--claudeai'],
+        options,
+      )
+      expect(JSON.parse(login.stdout)).toEqual({
+        display: ':0',
+        waylandDisplay: 'wayland-0',
+        xauthority: '/run/user/1000/xauth',
+        dbus: 'unix:path=/run/user/1000/bus',
+        sessionType: 'wayland',
+        desktop: 'GNOME',
+        desktopSession: 'gnome',
+        wslDistro: 'Ubuntu',
+        wslInterop: '/run/WSL/123_interop',
+      })
+
+      const forcedEnvironment = {
+        env: {
+          ...options.env,
+          ...loginEnvironment,
+        },
+      }
+      const status = await runFile(
+        CLAUDE_SUBSCRIPTION_CLI,
+        ['auth', 'status', '--json'],
+        forcedEnvironment,
+      )
+      expect(JSON.parse(status.stdout)).toEqual({
+        loggedIn: true,
+        authMethod: 'claude.ai',
+        apiProvider: 'firstParty',
+      })
+      const worker = await runFile(
+        CLAUDE_SUBSCRIPTION_CLI,
+        ['--print', '--model', 'haiku', 'status probe'],
+        forcedEnvironment,
+      )
+      expect(JSON.parse(worker.stdout)).toEqual({})
+    } finally {
+      for (const [key, value] of originals) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fails closed before a model call and never exposes rejected auth metadata', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-preflight-'))
+    const rawClaude = join(root, 'claude')
+    const modelMarker = join(root, 'model-launched')
+    const profilePath = join(root, 'profile-path')
+    const source = `#!/usr/bin/env node
+const { writeFileSync } = require('node:fs')
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  writeFileSync(${JSON.stringify(profilePath)}, process.env.ANTHROPIC_CONFIG_DIR)
+  process.stdout.write(JSON.stringify({
+    loggedIn: true,
+    authMethod: 'profile',
+    apiProvider: 'firstParty',
+    email: 'private@example.invalid',
+    organization: 'private-organization',
+    token: 'private-token',
+  }))
+  process.exit(0)
+}
+writeFileSync(${JSON.stringify(modelMarker)}, 'launched')
+`
+    try {
+      await writeFile(rawClaude, source, { mode: 0o700 })
+      const failure = await runFile(
+        CLAUDE_SUBSCRIPTION_CLI,
+        ['--model', 'haiku', '--print', 'blocked prompt'],
+        { env: { PATH: `${root}${delimiter}${process.env.PATH || ''}` } },
+      ).catch((error: unknown) => error)
+
+      expect(failure).toMatchObject({
+        code: 77,
+        stdout: '',
+        stderr: expect.stringContaining('subscription preflight failed'),
+      })
+      expect(JSON.stringify(failure)).not.toContain('private@example.invalid')
+      expect(JSON.stringify(failure)).not.toContain('private-organization')
+      expect(JSON.stringify(failure)).not.toContain('private-token')
+      await expect(readFile(modelMarker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+      const isolatedProfilePath = await readFile(profilePath, 'utf8')
+      await expect(stat(isolatedProfilePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('blocks repeated model attempts from one failed worker without another provider call', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-retry-breaker-'))
+    const rawClaude = join(root, 'claude')
+    const attempts = join(root, 'attempts')
+    const failureMarker = join(tmpdir(), `poise-claude-failure-${process.pid}`)
+    const source = `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs')
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(JSON.stringify({
+    loggedIn: true,
+    authMethod: 'claude.ai',
+    apiProvider: 'firstParty',
+  }))
+  process.exit(0)
+}
+appendFileSync(process.argv.at(-1), 'attempt\\n')
+process.stderr.write('Provider Error: 502 Bad Gateway')
+process.exit(1)
+`
+    try {
+      await rm(failureMarker, { force: true })
+      await writeFile(rawClaude, source, { mode: 0o700 })
+      const options = { env: { PATH: `${root}${delimiter}${process.env.PATH || ''}` } }
+      await expect(runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--model', 'opus', '--print', attempts,
+      ], options)).rejects.toMatchObject({ code: 1 })
+      await expect(runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--model', 'opus', '--print', attempts,
+      ], options)).rejects.toMatchObject({
+        code: 75,
+        stderr: expect.stringContaining('Repeated Claude launch blocked'),
+      })
+      expect((await readFile(attempts, 'utf8')).trim().split('\n')).toHaveLength(1)
+    } finally {
+      await rm(failureMarker, { force: true })
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('lets the sign-in canary verify recovery right after a failure', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-canary-breaker-'))
+    const rawClaude = join(root, 'claude')
+    const attempts = join(root, 'attempts')
+    const failureMarker = join(tmpdir(), `poise-claude-failure-${process.pid}`)
+    const source = `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs')
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(JSON.stringify({
+    loggedIn: true,
+    authMethod: 'claude.ai',
+    apiProvider: 'firstParty',
+  }))
+  process.exit(0)
+}
+appendFileSync(process.argv.at(-1), 'attempt\\n')
+if (args.includes('--no-session-persistence')) {
+  process.stdout.write('OK')
+  process.exit(0)
+}
+process.stderr.write('Provider Error: 502 Bad Gateway')
+process.exit(1)
+`
+    try {
+      await rm(failureMarker, { force: true })
+      await writeFile(rawClaude, source, { mode: 0o700 })
+      const options = { env: { PATH: `${root}${delimiter}${process.env.PATH || ''}` } }
+      await expect(runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--model', 'opus', '--print', attempts,
+      ], options)).rejects.toMatchObject({ code: 1 })
+      await expect(runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--model', 'opus', '--print', '--no-session-persistence', attempts,
+      ], { env: { ...options.env, POISE_CLAUDE_CANARY: '1' } })).resolves.toMatchObject({ stdout: 'OK' })
+      expect((await readFile(attempts, 'utf8')).trim().split('\n')).toHaveLength(2)
+    } finally {
+      await rm(failureMarker, { force: true })
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('lets a worker start a session over after Claude reports the resumed one is gone', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-stale-session-'))
+    const rawClaude = join(root, 'claude')
+    const attempts = join(root, 'attempts')
+    const failureMarker = join(tmpdir(), `poise-claude-failure-${process.pid}`)
+    const session = '6889b47a-9cd6-5152-8104-8540f29d2934'
+    const source = `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs')
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(JSON.stringify({
+    loggedIn: true,
+    authMethod: 'claude.ai',
+    apiProvider: 'firstParty',
+  }))
+  process.exit(0)
+}
+if (args.includes('--resume')) {
+  appendFileSync(process.argv.at(-1), 'resume\\n')
+  process.stderr.write('No conversation found with session ID: ${session}\\n')
+  process.exit(1)
+}
+appendFileSync(process.argv.at(-1), 'start\\n')
+process.stdout.write('OK')
+`
+    try {
+      await rm(failureMarker, { force: true })
+      await writeFile(rawClaude, source, { mode: 0o700 })
+      const options = { env: { PATH: `${root}${delimiter}${process.env.PATH || ''}` } }
+      await expect(runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--model', 'opus', '--resume', session, '--print', attempts,
+      ], options)).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining('No conversation found with session ID'),
+      })
+      await expect(stat(failureMarker)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--model', 'opus', '--session-id', session, '--print', attempts,
+      ], options)).resolves.toMatchObject({ stdout: 'OK', stderr: '' })
+      expect((await readFile(attempts, 'utf8')).trim().split('\n')).toEqual(['resume', 'start'])
+    } finally {
+      await rm(failureMarker, { force: true })
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('streams a large print-mode prompt through the subscription wrapper', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-stdin-'))
+    const rawClaude = join(root, 'claude')
+    const source = `#!/usr/bin/env node
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }))
+} else {
+  let input = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk) => { input += chunk })
+  process.stdin.on('end', () => process.stdout.write(JSON.stringify({ args, input })))
+}
+`
+    try {
+      await writeFile(rawClaude, source, { mode: 0o700 })
+      const prompt = 'x'.repeat(2 * 1024 * 1024)
+      const result = await runWithInput(
+        CLAUDE_SUBSCRIPTION_CLI,
+        ['--print', '--model', 'haiku', '--system-prompt', 'system'],
+        prompt,
+        { ...process.env, PATH: `${root}${delimiter}${process.env.PATH || ''}` },
+      )
+      expect(result).toMatchObject({ code: 0, stderr: '' })
+      const observed = JSON.parse(result.stdout)
+      expect(observed.input).toBe(prompt)
+      expect(observed.args.slice(-2)).toEqual(['--system-prompt', 'system'])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // An issue review keeps Claude Code's own system prompt and appends to it,
+  // with its --settings earlier on the line. The wrapper once took the final
+  // value for a typed prompt and blocked every such launch as a missing
+  // settings value.
+  it('streams an issue review prompt through the wrapper with an appended system prompt', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-append-'))
+    const rawClaude = join(root, 'claude')
+    const source = `#!/usr/bin/env node
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }))
+} else {
+  let input = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk) => { input += chunk })
+  process.stdin.on('end', () => process.stdout.write(JSON.stringify({ args, input })))
+}
+`
+    try {
+      await writeFile(rawClaude, source, { mode: 0o700 })
+      const result = await runWithInput(
+        CLAUDE_SUBSCRIPTION_CLI,
+        ['--print', '--output-format', 'stream-json', '--model', 'claude-opus-5', '--effort', 'max',
+          '--dangerously-skip-permissions', '--setting-sources', '', '--no-session-persistence',
+          '--add-dir', root, '--settings', JSON.stringify({ env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: '64000' } }),
+          '--append-system-prompt', 'You run unattended.'],
+        'Provide an adversarial review of o/r#1.',
+        { ...process.env, PATH: `${root}${delimiter}${process.env.PATH || ''}` },
+      )
+      expect(result).toMatchObject({ code: 0, stderr: '' })
+      const observed = JSON.parse(result.stdout)
+      expect(observed.input).toBe('Provide an adversarial review of o/r#1.')
+      expect(observed.args.slice(-2)).toEqual(['--append-system-prompt', 'You run unattended.'])
+      // The caller's settings survive, merged into the wrapper's one overlay.
+      const settings = JSON.parse(observed.args[observed.args.indexOf('--settings') + 1])
+      expect(settings.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('64000')
+      expect(observed.args.filter((arg: string) => arg === '--settings')).toHaveLength(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  // The Claude Agent SDK (Chat sessions) never passes --print: it drives the
+  // CLI with --input-format/--output-format stream-json over stdin/stdout.
+  // The wrapper used to treat that as a non-model invocation and skip the
+  // first-party preflight — the one gate that keeps Poise-owned Claude
+  // processes on the Claude.ai subscription.
+  it('preflights the SDK stream-json invocation and streams stdin through it', async () => {
+    if (process.platform === 'win32') return
+    const root = await mkdtemp(join(tmpdir(), 'poise-claude-sdk-stdin-'))
+    const rawClaude = join(root, 'claude')
+    const statusFile = join(root, 'status.json')
+    const source = `#!/usr/bin/env node
+const { readFileSync } = require('node:fs')
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(readFileSync(${JSON.stringify(statusFile)}, 'utf8'))
+} else {
+  let input = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', (chunk) => { input += chunk })
+  process.stdin.on('end', () => process.stdout.write(JSON.stringify({
+    args,
+    input,
+    apiKey: process.env.ANTHROPIC_API_KEY ?? null,
+    entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT ?? null,
+    settings: JSON.parse(args[args.indexOf('--settings') + 1]).env,
+  })))
+}
+`
+    const sdkArgs = [
+      '--output-format', 'stream-json', '--verbose', '--input-format', 'stream-json',
+      '--model', 'claude-opus-5', '--permission-prompt-tool', 'stdio', '--include-partial-messages',
+    ]
+    const env = {
+      ...process.env,
+      PATH: `${root}${delimiter}${process.env.PATH || ''}`,
+      ANTHROPIC_API_KEY: 'leaked-key-must-not-reach-claude',
+      CLAUDE_CODE_ENTRYPOINT: 'sdk-ts',
+    }
+    try {
+      await writeFile(rawClaude, source, { mode: 0o700 })
+      // Not first-party: the model process must not start.
+      await writeFile(statusFile, JSON.stringify({ loggedIn: true, authMethod: 'console', apiProvider: 'apiKey' }))
+      const blocked = await runWithInput(CLAUDE_SUBSCRIPTION_CLI, sdkArgs, '{"type":"user"}\n', env)
+      expect(blocked).toMatchObject({ code: 77, stdout: '' })
+      expect(blocked.stderr).toContain('subscription preflight failed')
+      // The blocked preflight armed the per-parent retry breaker, as it does
+      // for every model launch; clear it so the next launch is judged on its own.
+      await rm(join(tmpdir(), `poise-claude-failure-${process.pid}`), { force: true })
+
+      // First-party: the stream-json frames reach the CLI's stdin through the
+      // wrapper, with the scrubbed environment and the overlay that blanks
+      // provider credentials.
+      await writeFile(statusFile, JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }))
+      const frames = '{"type":"user","message":{"role":"user","content":"hello"}}\n'.repeat(3)
+      const result = await runWithInput(CLAUDE_SUBSCRIPTION_CLI, sdkArgs, frames, env)
+      expect(result).toMatchObject({ code: 0, stderr: '' })
+      const observed = JSON.parse(result.stdout)
+      expect(observed.input).toBe(frames)
+      expect(observed.args).toEqual(['--settings', expect.any(String), ...sdkArgs])
+      expect(observed.apiKey).toBeNull()
+      expect(observed.entrypoint).toBeNull()
+      expect(observed.settings.ANTHROPIC_API_KEY).toBe('')
+      expect(observed.settings.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST).toBe('1')
+    } finally {
+      await rm(join(tmpdir(), `poise-claude-failure-${process.pid}`), { force: true })
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('caps a single process argument by UTF-8 bytes', () => {
+    expect(MAX_PROCESS_ARG_BYTES).toBe(64 * 1024)
+    expect(() => assertProcessArgSize('x'.repeat(MAX_PROCESS_ARG_BYTES), 'prompt')).not.toThrow()
+    expect(() => assertProcessArgSize('€'.repeat(Math.floor(MAX_PROCESS_ARG_BYTES / 3) + 1), 'prompt'))
+      .toThrow(`prompt too large (max ${MAX_PROCESS_ARG_BYTES} UTF-8 bytes)`)
+  })
+
+  it('enforces the argument cap before run and detached process creation', () => {
+    const oversized = 'x'.repeat(MAX_PROCESS_ARG_BYTES + 1)
+    expect(() => runFile(process.execPath, [oversized]))
+      .toThrow(`argument 1 too large (max ${MAX_PROCESS_ARG_BYTES} UTF-8 bytes)`)
+    expect(() => spawnDetached(process.execPath, [oversized]))
+      .toThrow(`argument 1 too large (max ${MAX_PROCESS_ARG_BYTES} UTF-8 bytes)`)
+  })
+
+  it('reports a missing detached executable without an uncaught error', async () => {
+    await expect(spawnDetached(
+      `poise-missing-binary-${process.pid}-${Date.now()}`,
+      [],
+    )).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('acknowledges a successfully detached launch', async () => {
+    await expect(spawnDetached(process.execPath, ['-e', 'process.exit(0)']))
+      .resolves.toBeUndefined()
+  })
+
+  it('reports a non-zero exit after a detached launch was accepted', async () => {
+    let observeExit!: (result: { code: number | null, signal: NodeJS.Signals | null }) => void
+    const exited = new Promise<{ code: number | null, signal: NodeJS.Signals | null }>((resolve) => {
+      observeExit = resolve
+    })
+
+    await spawnDetached(
+      process.execPath,
+      ['-e', 'setTimeout(() => process.exit(7), 25)'],
+      { onExit: observeExit },
+    )
+
+    await expect(exited).resolves.toMatchObject({ code: 7, signal: null })
+  })
+
+  // Service health reports these as runningCallerCalls: a drain waits on them.
+  it('counts launched Caller processes until each one exits', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'poise-caller-launches-'))
+    try {
+      const caller = join(dir, 'agent-interface')
+      await writeFile(caller, '#!/bin/sh\nwhile [ ! -e "$1" ]; do sleep 0.02; done\n')
+      await chmod(caller, 0o755)
+      const before = runningCallerLaunches()
+      const behaviorBefore = runningCallerLaunches(true)
+      await spawnDetached(caller, [join(dir, 'first'), '--source', 'poise:behavior-chain'])
+      await spawnDetached(caller, [join(dir, 'second')])
+      expect(runningCallerLaunches()).toBe(before + 2)
+      expect(runningCallerLaunches(true)).toBe(behaviorBefore + 1)
+      // Other detached processes and launches that never started are not Caller calls.
+      await spawnDetached(process.execPath, ['-e', 'setTimeout(() => {}, 200)'])
+      await expect(spawnDetached(join(dir, 'missing', 'agent-interface'), [])).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(runningCallerLaunches()).toBe(before + 2)
+      await writeFile(join(dir, 'first'), '')
+      await vi.waitFor(() => expect(runningCallerLaunches()).toBe(before + 1), { timeout: 5_000 })
+      expect(runningCallerLaunches(true)).toBe(behaviorBefore)
+      await writeFile(join(dir, 'second'), '')
+      await vi.waitFor(() => expect(runningCallerLaunches()).toBe(before), { timeout: 5_000 })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('GitHub accounts for Caller', () => {
+  const probe = ['-e', 'process.stdout.write(JSON.stringify({ person: process.env.GITHUB_INTERFACE_USER, agent: process.env.GITHUB_INTERFACE_AGENT_USER }))']
+  let root = ''
+  let commands = new Map<string, string>()
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'poise-caller-accounts-'))
+    commands = new Map()
+    vi.stubEnv('GITHUB_INTERFACE_USER', 'inherited-person')
+    vi.stubEnv('GITHUB_INTERFACE_AGENT_USER', 'inherited-agent')
+  })
+
+  afterEach(async () => {
+    setCallerAccounts(null)
+    vi.unstubAllEnvs()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  async function accountsOf(name: string, env?: NodeJS.ProcessEnv): Promise<unknown> {
+    if (!commands.has(name)) commands.set(name, await namedNode(root, name))
+    return JSON.parse((await runFile(commands.get(name)!, probe, { env })).stdout)
+  }
+
+  it('gives every github-interface and agent-interface process the accounts saved when it starts', async () => {
+    let accounts: CallerAccounts = { GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }
+    setCallerAccounts(() => accounts)
+    expect(await accountsOf('github-interface')).toEqual({ person: 'octocat', agent: 'review-bot' })
+    expect(await accountsOf('agent-interface')).toEqual({ person: 'octocat', agent: 'review-bot' })
+    accounts = { GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'other-bot' }
+    expect(await accountsOf('agent-interface')).toEqual({ person: 'octocat', agent: 'other-bot' })
+    // The chat runtime's worker gate scrubs with the same rules.
+    expect(scrubbedChildEnvironment('github-interface')).toMatchObject({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'other-bot' })
+  })
+
+  // Behavior runs, manual reviews and replays launch agent-interface detached,
+  // the launches a drain counts.
+  it('gives a detached Caller launch the accounts too, and counts it as one', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    const caller = await namedNode(root, 'agent-interface')
+    const out = join(root, 'accounts.json')
+    const before = runningCallerLaunches()
+    let exited!: () => void
+    const done = new Promise<void>((resolve) => { exited = resolve })
+    await spawnDetached(caller, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify({ person: process.env.GITHUB_INTERFACE_USER, agent: process.env.GITHUB_INTERFACE_AGENT_USER }))`], {
+      onExit: () => exited(),
+    })
+    expect(runningCallerLaunches()).toBe(before + 1)
+    await done
+    expect(JSON.parse(await readFile(out, 'utf8'))).toEqual({ person: 'octocat', agent: 'review-bot' })
+    expect(runningCallerLaunches()).toBe(before)
+  })
+
+  it('never lets an inherited account stand in for one that is not set', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat' }))
+    expect(await accountsOf('github-interface')).toEqual({ person: 'octocat' })
+    setCallerAccounts(() => ({}))
+    expect(await accountsOf('agent-interface')).toEqual({})
+  })
+
+  it('keeps the accounts from every other process', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    for (const name of ['github-datastore', 'gh', 'claude', 'node-tool']) {
+      expect(await accountsOf(name), name).toEqual({})
+    }
+  })
+
+  it('passes inherited accounts through when no Poise settings are running', async () => {
+    expect(await accountsOf('github-interface')).toEqual({ person: 'inherited-person', agent: 'inherited-agent' })
+    expect(await accountsOf('gh')).toEqual({})
+  })
+
+  it('still lets a call name an account explicitly', async () => {
+    setCallerAccounts(() => ({ GITHUB_INTERFACE_USER: 'octocat', GITHUB_INTERFACE_AGENT_USER: 'review-bot' }))
+    expect(await accountsOf('agent-interface', { GITHUB_INTERFACE_AGENT_USER: 'named-bot' })).toEqual({ person: 'octocat', agent: 'named-bot' })
+  })
+})
+
+describe('the /content voice guide', () => {
+  afterEach(() => { vi.unstubAllEnvs() })
+
+  it('reaches agent-interface and no other process', () => {
+    vi.stubEnv('AGENT_INTERFACE_VOICE_GUIDE', '/guides/voice.md')
+    expect(scrubbedChildEnvironment('agent-interface').AGENT_INTERFACE_VOICE_GUIDE).toBe('/guides/voice.md')
+    for (const command of ['github-interface', 'github-datastore', 'claude', 'gh']) {
+      expect(scrubbedChildEnvironment(command).AGENT_INTERFACE_VOICE_GUIDE, command).toBeUndefined()
+    }
+  })
+})
+
+describe('Agent tool CPU defaults', () => {
+  let savedGo: string | undefined
+  let savedRg: string | undefined
+
+  beforeEach(() => {
+    savedGo = process.env.GOMAXPROCS
+    savedRg = process.env.RIPGREP_CONFIG_PATH
+    delete process.env.GOMAXPROCS
+    delete process.env.RIPGREP_CONFIG_PATH
+  })
+
+  afterEach(() => {
+    if (savedGo === undefined) delete process.env.GOMAXPROCS
+    else process.env.GOMAXPROCS = savedGo
+    if (savedRg === undefined) delete process.env.RIPGREP_CONFIG_PATH
+    else process.env.RIPGREP_CONFIG_PATH = savedRg
+    vi.unstubAllEnvs()
+  })
+
+  it('gives every child GOMAXPROCS=2 unless one is set', () => {
+    for (const command of ['agent-interface', 'claude', 'codex', 'gh', 'grok', 'muse', 'taskkill.exe']) {
+      expect(scrubbedChildEnvironment(command).GOMAXPROCS, command).toBe('2')
+    }
+  })
+
+  it('keeps an explicitly configured GOMAXPROCS', () => {
+    vi.stubEnv('GOMAXPROCS', '8')
+    expect(scrubbedChildEnvironment('agent-interface').GOMAXPROCS).toBe('8')
+    expect(scrubbedChildEnvironment('agent-interface', { GOMAXPROCS: '4' }).GOMAXPROCS).toBe('4')
+  })
+
+  it('lets a call remove GOMAXPROCS explicitly', () => {
+    expect(scrubbedChildEnvironment('agent-interface', { GOMAXPROCS: undefined }).GOMAXPROCS).toBeUndefined()
+  })
+
+  it('points external ripgrep at the shipped two-thread config unless one is set', () => {
+    for (const command of ['agent-interface', 'claude', 'codex', 'gh']) {
+      expect(scrubbedChildEnvironment(command).RIPGREP_CONFIG_PATH, command).toBe(AGENT_RIPGREP_CONFIG)
+    }
+  })
+
+  it('keeps an explicitly configured ripgrep config', () => {
+    vi.stubEnv('RIPGREP_CONFIG_PATH', '/user/rg.conf')
+    expect(scrubbedChildEnvironment('agent-interface').RIPGREP_CONFIG_PATH).toBe('/user/rg.conf')
+    expect(scrubbedChildEnvironment('agent-interface', { RIPGREP_CONFIG_PATH: '/call/rg.conf' }).RIPGREP_CONFIG_PATH).toBe('/call/rg.conf')
+  })
+
+  it('lets a call remove the ripgrep default explicitly', () => {
+    expect(scrubbedChildEnvironment('agent-interface', { RIPGREP_CONFIG_PATH: undefined }).RIPGREP_CONFIG_PATH).toBeUndefined()
+  })
+
+  // External tools are grandchildren: the agent CLI inherits the worker's
+  // environment and passes it on, as Caller's os.environ.copy() does.
+  it('delivers both defaults to a real child and its own child', async () => {
+    const read = 'process.stdout.write(JSON.stringify({ go: process.env.GOMAXPROCS, rg: process.env.RIPGREP_CONFIG_PATH }))'
+    const probe = ['-e', [
+      "const { execFileSync } = require('node:child_process')",
+      `const child = JSON.parse(execFileSync(process.execPath, ['-e', ${JSON.stringify(read)}]))`,
+      'process.stdout.write(JSON.stringify({ go: process.env.GOMAXPROCS, rg: process.env.RIPGREP_CONFIG_PATH, child }))',
+    ].join(';')]
+    const { stdout } = await runFile(process.execPath, probe)
+    expect(JSON.parse(stdout)).toEqual({
+      go: '2',
+      rg: AGENT_RIPGREP_CONFIG,
+      child: { go: '2', rg: AGENT_RIPGREP_CONFIG },
+    })
+  })
+
+  it('delivers both defaults through the worker gate to the started command', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'poise-worker-env-'))
+    try {
+      const out = join(dir, 'env.json')
+      const worker = spawnWorker(process.execPath, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(out)}, JSON.stringify({ go: process.env.GOMAXPROCS, rg: process.env.RIPGREP_CONFIG_PATH }))`], { cwd: dir })
+      worker.go()
+      await worker.exited
+      expect(JSON.parse(await readFile(out, 'utf8'))).toEqual({ go: '2', rg: AGENT_RIPGREP_CONFIG })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  // The subscription wrapper rebuilds its native child's environment from
+  // its own allowlist: explicitly selected tool settings must survive that
+  // boundary, on the SDK stream-json invocation Chat uses and the --print
+  // invocation Caller uses, while a provider credential in the wrapper's
+  // own environment still reaches neither the native CLI nor its tool
+  // child.
+  it('carries selected tool settings through the subscription wrapper to the native CLI and its tool child', async () => {
+    if (process.platform === 'win32') return
+    const dir = await mkdtemp(join(tmpdir(), 'poise-claude-tool-env-'))
+    try {
+      const overrideConfig = join(dir, 'override.ripgreprc')
+      await writeFile(overrideConfig, '--threads=8\n')
+      const source = `#!/usr/bin/env node
+const { execFileSync } = require('node:child_process')
+const args = process.argv.slice(2)
+if (args.includes('auth') && args.includes('status')) {
+  process.stdout.write(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }))
+  process.exit(0)
+}
+const read = 'process.stdout.write(JSON.stringify({ go: process.env.GOMAXPROCS ?? null, rg: process.env.RIPGREP_CONFIG_PATH ?? null, key: process.env.ANTHROPIC_API_KEY ?? null }))'
+const tool = JSON.parse(execFileSync(process.execPath, ['-e', read]))
+process.stdout.write(JSON.stringify({
+  go: process.env.GOMAXPROCS ?? null,
+  rg: process.env.RIPGREP_CONFIG_PATH ?? null,
+  key: process.env.ANTHROPIC_API_KEY ?? null,
+  tool,
+}))
+`
+      await writeFile(join(dir, 'claude'), source, { mode: 0o700 })
+      const env = {
+        PATH: `${dir}${delimiter}${process.env.PATH || ''}`,
+        GOMAXPROCS: '8',
+        RIPGREP_CONFIG_PATH: overrideConfig,
+        ANTHROPIC_API_KEY: 'credential-sentinel-must-not-pass',
+      }
+      const expected = {
+        go: '8',
+        rg: overrideConfig,
+        key: null,
+        tool: { go: '8', rg: overrideConfig, key: null },
+      }
+      // Chat drives the wrapper through the SDK's stream-json invocation.
+      const chat = await runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--output-format', 'stream-json', '--input-format', 'stream-json', '--model', 'haiku',
+      ], { env })
+      expect(JSON.parse(chat.stdout)).toEqual(expected)
+      // Caller drives it through --print.
+      const caller = await runFile(CLAUDE_SUBSCRIPTION_CLI, [
+        '--print', '--model', 'haiku', 'review this',
+      ], { env })
+      expect(JSON.parse(caller.stdout)).toEqual(expected)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Caller command resolution', () => {
+  let root = ''
+  let bin = ''
+  let decoy = ''
+
+  async function script(directory: string, name: string, body: string): Promise<void> {
+    await writeFile(join(directory, name), `#!/bin/sh\n${body}\n`, { mode: 0o700 })
+  }
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'poise-caller-cli-'))
+    bin = join(root, 'caller-bin')
+    decoy = join(root, 'decoy')
+    await Promise.all([mkdir(bin), mkdir(decoy)])
+    for (const name of ['agent-interface', 'github-interface', 'github-datastore']) {
+      await script(decoy, name, 'printf decoy')
+    }
+    vi.stubEnv('CALLER_BIN_ROOT', bin)
+    vi.stubEnv('PATH', `${decoy}${delimiter}${process.env.PATH || ''}`)
+  })
+
+  afterEach(async () => {
+    vi.unstubAllEnvs()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it.runIf(process.platform !== 'win32')('runs bare Caller commands from the Caller directory, never from PATH', async () => {
+    await script(bin, 'agent-interface', 'printf "caller %s" "$PATH"')
+    const { stdout } = await runFile('agent-interface', ['--logs'])
+    expect(stdout).toBe(`caller ${bin}${delimiter}${decoy}${delimiter}${process.env.PATH!.split(delimiter).slice(1).join(delimiter)}`)
+  })
+
+  it.runIf(process.platform !== 'win32')('fails naming the Caller directory when a CLI is missing instead of using another copy', async () => {
+    await expect(runFile('github-interface', ['--help'])).rejects.toMatchObject({
+      code: 'ENOENT',
+      message: expect.stringContaining(join(bin, 'github-interface')),
+    })
+    await expect(spawnDetached('github-datastore', ['sync'])).rejects.toMatchObject({
+      code: 'ENOENT',
+      message: expect.stringContaining(join(bin, 'github-datastore')),
+    })
+  })
+
+  it('puts the Caller directory first, once, only on the PATH of Caller\'s own processes', async () => {
+    const probe = ['-e', 'process.stdout.write(process.env.PATH || "")']
+    const callerCli = await namedNode(root, 'github-datastore')
+    expect((await runFile(callerCli, probe)).stdout.split(delimiter).slice(0, 2)).toEqual([bin, decoy])
+    expect((await runFile(process.execPath, probe)).stdout).toBe(process.env.PATH)
+    vi.stubEnv('PATH', `${decoy}${delimiter}${bin}`)
+    expect((await runFile(callerCli, probe)).stdout).toBe(`${bin}${delimiter}${decoy}`)
+    // An explicit PATH still wins.
+    expect((await runFile(callerCli, probe, { env: { PATH: decoy } })).stdout).toBe(decoy)
+  })
+
+  it('refuses a relative CALLER_BIN_ROOT instead of resolving it against the working directory', async () => {
+    vi.stubEnv('CALLER_BIN_ROOT', 'caller/.venv/bin')
+    await expect(runFile('agent-interface', ['--logs'])).rejects.toThrow('CALLER_BIN_ROOT must be an absolute path')
+  })
+})

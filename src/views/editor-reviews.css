@@ -1,0 +1,17 @@
+.editor-review-list { max-width: 680px; margin: 0 auto 20px; font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: var(--text); }
+.editor-review-list[hidden] { display: none; }
+.editor-review-list summary { cursor: pointer; color: var(--text-secondary); }
+.editor-review-status, .editor-review-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.editor-review-status span, .editor-review-state, .editor-review-location { color: var(--text-secondary); font-size: 12px; }
+.editor-review-list button, .editor-review-thread button { border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text); padding: 5px 8px; cursor: pointer; font: inherit; }
+.editor-review-list button:hover, .editor-review-thread button:hover { background: var(--surface-hover); }
+.editor-review-list button:disabled, .editor-review-thread button:disabled { opacity: .5; cursor: default; }
+.editor-review-item { display: flex; flex-direction: column; width: 100%; text-align: left; gap: 4px; margin-top: 8px; }
+.editor-review-item span:first-child { font-size: 11px; color: var(--text-secondary); }
+.editor-review-mark { border-bottom-style: dashed; border-bottom-color: var(--a3, #5b8ac4); }
+.editor-review-mark:hover { background: color-mix(in srgb, var(--a3, #5b8ac4) 14%, transparent); }
+.editor-review-thread blockquote { margin: 0; padding: 6px 8px; border-left: 2px solid var(--a3, #5b8ac4); color: var(--text-secondary); white-space: pre-wrap; }
+.editor-review-messages article { border-top: 1px solid var(--border); padding-top: 8px; }
+.editor-review-messages time { display: block; color: var(--text-tertiary); font-size: 11px; }
+.editor-review-messages p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.editor-review-thread [role=alert], .editor-review-list [role=alert] { color: var(--error, #b33); }

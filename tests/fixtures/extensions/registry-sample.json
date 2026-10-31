@@ -1,0 +1,425 @@
+[
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "ai.exa/exa",
+      "description": "Connect AI agents to Exa for web search, content fetching, and multi-step research.",
+      "repository": {
+        "url": "https://github.com/exa-labs/exa-mcp-server",
+        "source": "github"
+      },
+      "version": "3.4.1",
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "https://mcp.exa.ai/mcp"
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-09-23T00:29:56.602357Z",
+        "publishedAt": "2026-09-23T00:29:56.602357Z",
+        "updatedAt": "2026-09-23T00:29:56.602357Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "app.linear/linear",
+      "description": "MCP server for Linear project management and issue tracking",
+      "title": "Linear",
+      "version": "1.0.1",
+      "websiteUrl": "https://linear.app",
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "https://mcp.linear.app/mcp"
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-08-04T09:59:17.029443Z",
+        "publishedAt": "2026-08-04T09:59:17.029443Z",
+        "updatedAt": "2026-08-04T09:59:17.029443Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "academy.apexai/apex-ai-academy",
+      "description": "Co-Learn with your Agent: fact-checked AI lessons with Human and Agent views.",
+      "title": "Apex AI Academy",
+      "repository": {
+        "url": "https://github.com/ApexAI-Academy/sample-agents",
+        "source": "github"
+      },
+      "version": "1.0.2",
+      "websiteUrl": "https://apexai.academy/developers/",
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "https://apexai.academy/mcp",
+          "headers": [
+            {
+              "description": "Optional: Bearer <personal apex_ key> for Premium tools. Public tools need no key.",
+              "isSecret": true,
+              "name": "Authorization"
+            }
+          ]
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-10-17T03:25:05.205722Z",
+        "publishedAt": "2026-10-17T03:25:05.205722Z",
+        "updatedAt": "2026-10-17T03:25:05.205722Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "ai.avaloncompany/web-content-url-tools",
+      "description": "26 tools: web pages to Markdown, metadata, tech stack, SSL, SEO, domains, email auth and SSO checks.",
+      "title": "Web Content & URL Tools",
+      "repository": {
+        "url": "https://github.com/avaloncompany/web-content-mcp-server",
+        "source": "github"
+      },
+      "version": "1.0.0",
+      "websiteUrl": "https://apify.com/avalonai/web-content-url-tools-mcp",
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "https://avalonai--web-content-url-tools-mcp.apify.actor/mcp",
+          "headers": [
+            {
+              "description": "Apify API token as a Bearer token: Bearer <YOUR_APIFY_TOKEN>",
+              "isRequired": true,
+              "value": "Bearer {apify_token}",
+              "isSecret": true,
+              "variables": {
+                "apify_token": {
+                  "description": "Your Apify API token (console.apify.com > Settings > API & Integrations)",
+                  "isRequired": true,
+                  "isSecret": true
+                }
+              },
+              "name": "Authorization"
+            }
+          ]
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-10-03T14:09:40.783985Z",
+        "publishedAt": "2026-10-03T14:09:40.783985Z",
+        "updatedAt": "2026-10-03T14:09:40.783985Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "ai.autorfp/mcp",
+      "description": "Search AutoRFP.ai projects, requirements, content library, and tags for Q&A and analytics.",
+      "title": "AutoRFP.ai",
+      "repository": {
+        "url": "https://github.com/AutoRFP/mcp",
+        "source": "github"
+      },
+      "version": "1.0.0",
+      "websiteUrl": "https://autorfp.ai",
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "https://{api_host}/mcp",
+          "variables": {
+            "api_host": {
+              "description": "AutoRFP.ai API host for your data-residency region.",
+              "isRequired": true,
+              "choices": [
+                "api.autorfp.ai",
+                "api.eu.autorfp.ai",
+                "api.us.autorfp.ai"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-05-18T01:09:10.259215Z",
+        "publishedAt": "2026-05-18T01:09:10.259215Z",
+        "updatedAt": "2026-05-18T01:09:10.259215Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "ai.2kw/mcp-server",
+      "description": "EU-hosted AI platform: OpenAI-compatible LLM gateway, document extraction, transcription, agents.",
+      "title": "2kw.ai",
+      "version": "7.3.2",
+      "websiteUrl": "https://2kw.ai",
+      "packages": [
+        {
+          "registryType": "npm",
+          "registryBaseUrl": "https://registry.npmjs.org",
+          "identifier": "@2kw/ai-mcp-server",
+          "version": "7.3.2",
+          "transport": {
+            "type": "stdio"
+          },
+          "environmentVariables": [
+            {
+              "description": "API key for the 2kw.ai platform",
+              "isRequired": true,
+              "isSecret": true,
+              "name": "AI_2KW_API_KEY"
+            },
+            {
+              "description": "Override the API base URL for self-hosted deployments",
+              "name": "AI_2KW_BASE_URL"
+            },
+            {
+              "description": "true opts agent runs into agent memory (X-Backbone-Memory: enabled)",
+              "name": "AI_2KW_MEMORY"
+            }
+          ]
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-10-19T09:23:26.329508Z",
+        "publishedAt": "2026-10-19T09:23:26.329508Z",
+        "updatedAt": "2026-10-19T09:23:26.329508Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "ai.kaiv/postgres",
+      "description": "Read-only PostgreSQL MCP server. Drop-in replacement for the archived server-postgres.",
+      "title": "Kaiva Postgres MCP",
+      "repository": {
+        "url": "https://github.com/ai-kaiva/postgres-mcp",
+        "source": "github"
+      },
+      "version": "0.1.1",
+      "packages": [
+        {
+          "registryType": "npm",
+          "registryBaseUrl": "https://registry.npmjs.org",
+          "identifier": "@kaiva/postgres-mcp",
+          "version": "0.1.1",
+          "transport": {
+            "type": "stdio"
+          },
+          "packageArguments": [
+            {
+              "description": "PostgreSQL connection URL, for example postgresql://user:password@localhost:5432/mydb",
+              "isRequired": true,
+              "isSecret": true,
+              "type": "positional",
+              "valueHint": "database_url"
+            }
+          ]
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-10-21T00:12:10.848869Z",
+        "publishedAt": "2026-10-21T00:12:10.848869Z",
+        "updatedAt": "2026-10-21T00:12:10.848869Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "ai.anomalyarmor/armor-mcp",
+      "description": "Data observability tools for engineering teams: alerts, freshness, schema drift, lineage, quality.",
+      "title": "AnomalyArmor",
+      "repository": {
+        "url": "https://github.com/anomalyarmor/agents",
+        "source": "github",
+        "subfolder": "armor-mcp"
+      },
+      "version": "0.6.1",
+      "websiteUrl": "https://www.anomalyarmor.ai",
+      "packages": [
+        {
+          "registryType": "pypi",
+          "identifier": "armor-mcp",
+          "version": "0.6.1",
+          "transport": {
+            "type": "stdio"
+          },
+          "environmentVariables": [
+            {
+              "description": "AnomalyArmor API key (aa_live_*). Generate at https://app.anomalyarmor.ai/settings/api-keys.",
+              "isRequired": true,
+              "isSecret": true,
+              "name": "ARMOR_API_KEY"
+            }
+          ]
+        }
+      ],
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "https://mcp.anomalyarmor.ai/mcp"
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-04-18T00:51:37.350253Z",
+        "publishedAt": "2026-04-18T00:51:37.350253Z",
+        "updatedAt": "2026-04-18T00:51:37.350253Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+      "name": "ai.aliengiraffe/spotdb",
+      "description": "Ephemeral data sandbox for AI workflows with guardrails and security",
+      "repository": {
+        "url": "https://github.com/aliengiraffe/spotdb",
+        "source": "github"
+      },
+      "version": "0.1.0",
+      "packages": [
+        {
+          "registryType": "oci",
+          "identifier": "docker.io/aliengiraffe/spotdb:0.1.0",
+          "transport": {
+            "type": "stdio"
+          },
+          "environmentVariables": [
+            {
+              "description": "Optional API key for request authentication",
+              "format": "string",
+              "isSecret": true,
+              "name": "X-API-Key"
+            }
+          ]
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2025-10-09T17:05:17.793149Z",
+        "publishedAt": "2025-10-09T17:05:17.793149Z",
+        "updatedAt": "2025-10-09T17:05:17.793149Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "ai.1court.state/court-directory",
+      "description": "US county court directory: clerk, courthouse address, e-filing, filing fees, and case lookup.",
+      "title": "1Court Directory",
+      "version": "1.0.0",
+      "websiteUrl": "https://state.1court.ai/developers",
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "https://state.1court.ai/api/mcp"
+        },
+        {
+          "type": "sse",
+          "url": "https://state.1court.ai/api/sse"
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "active",
+        "statusChangedAt": "2026-10-21T01:56:14.481942Z",
+        "publishedAt": "2026-10-21T01:56:14.481942Z",
+        "updatedAt": "2026-10-21T01:56:14.481942Z",
+        "isLatest": true
+      }
+    }
+  },
+  {
+    "server": {
+      "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+      "name": "ai.agentplaybooks/agentplaybooks",
+      "description": "Manage portable AI agent playbooks, Agent Skills, MCP configurations, personas, and memory.",
+      "title": "AgentPlaybooks",
+      "repository": {
+        "url": "https://github.com/matebenyovszky/agentplaybooks",
+        "source": "github"
+      },
+      "version": "1.0.0",
+      "websiteUrl": "https://agentplaybooks.ai",
+      "icons": [
+        {
+          "src": "https://agentplaybooks.ai/icon.svg",
+          "mimeType": "image/svg+xml",
+          "sizes": [
+            "any"
+          ]
+        }
+      ],
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "https://agentplaybooks.ai/api/mcp/manage",
+          "headers": [
+            {
+              "description": "Bearer AgentPlaybooks user API key (for example: Bearer apb_live_...)",
+              "isRequired": true,
+              "isSecret": true,
+              "name": "Authorization"
+            }
+          ]
+        }
+      ]
+    },
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "status": "deprecated",
+        "statusChangedAt": "2026-08-01T20:44:36.793656Z",
+        "statusMessage": "Published accidentally as 1.0.0; use 0.2.0 as the early release.",
+        "publishedAt": "2026-08-01T20:24:13.359787Z",
+        "updatedAt": "2026-08-01T20:44:36.793656Z",
+        "isLatest": true
+      }
+    }
+  }
+]

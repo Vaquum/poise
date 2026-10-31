@@ -1,0 +1,1299 @@
+import { isNotificationInteraction, viewDiagnostic, viewFeedback } from '../view-feedback'
+import { patchContent } from '../dom-patch'
+import { layout, watchPanel } from '../motion'
+// Behaviors — a table view listing automations with on/off toggles.
+//
+// Visual contract matches Archive and Swarm exactly: universal `table`,
+// `thead th`, `tbody tr` rules in style.css do all the heavy lifting,
+// and we only declare the column widths and the cells that are
+// genuinely behavior-specific (the owner avatar and the toggle).
+//
+// Each row's "Active" toggle wires to behaviors.ts, which owns the
+// runtime — the view is just a UI for state, not the place where
+// agent automations actually run.
+
+import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewCap, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getLastSucceeded, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../behaviors'
+import { organizationErrors } from '../organizations'
+import { notificationCountsFor, onNotificationItems, openNotifications } from './notification-rail'
+import type { ItemGroup } from '../notification-items'
+import { TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
+import type { BehaviorMetricsReport } from '../behavior-metrics'
+import { formatShortDuration } from '../analytics-format'
+import { getPausedUntil, setPaused } from '../behaviors'
+
+let viewEl: HTMLElement
+let initialized = false
+let metricsRange: TimeRange = 'all'
+let metricsReport: BehaviorMetricsReport | null = null
+let metricsError = ''
+let metricsGeneration = 0
+
+function metricCells(key: BehaviorKey): string {
+  const metrics = metricsReport?.behaviors[key]
+  const direct = key === 'resolve-unblocking' || key === 'merge-prs' || key === 'rerun-grey-ci'
+  const note = metricsError || (!metrics ? metricsReport?.error || 'Reading run history…' : direct
+    ? 'Direct action attempts recorded since run tracking was introduced; earlier history is unavailable.'
+    : 'Automatic runs started in the selected period. Live runs contribute elapsed time; success rate excludes unfinished runs.')
+  const format = (value: number | null | undefined, decimals = 0) => value == null ? '—'
+    : value.toLocaleString(undefined, { maximumFractionDigits: decimals })
+  const minutes = metrics?.durationMinutes
+  const duration = minutes === 0 ? '0s' : formatShortDuration(minutes == null ? null : minutes * 60_000)
+  return `<td class="behavior-metric behavior-metrics-start" title="${escapeHtml(note)}">${format(metrics?.totalRuns)}</td>
+    <td class="behavior-metric" title="${escapeHtml(note)}">${duration}</td>
+    <td class="behavior-metric" title="${escapeHtml(note)}">${metrics?.successRate == null ? '—' : `${format(metrics.successRate, 1)}%`}</td>`
+}
+
+function refreshMetricCells(): void {
+  for (const meta of BEHAVIORS) {
+    const row = viewEl.querySelector<HTMLTableRowElement>(`tr[data-behavior="${meta.key}"]`)
+    if (!row) continue
+    const template = document.createElement('template')
+    template.innerHTML = `<table><tbody><tr>${metricCells(meta.key)}</tr></tbody></table>`
+    const cells = template.content.querySelectorAll('td')
+    row.querySelectorAll('.behavior-metric').forEach((cell, i) => cell.replaceWith(cells[i]))
+  }
+  viewFeedback('behavior-metrics', 'Behavior metrics unavailable', metricsError || metricsReport?.error || '', 'read_failed')
+}
+
+async function refreshMetrics(): Promise<void> {
+  const generation = ++metricsGeneration
+  const query = new URLSearchParams(timeRangeWindow(metricsRange))
+  try {
+    const response = await fetch(`/api/behavior-metrics?${query}`)
+    const data = await response.json() as BehaviorMetricsReport & { error?: string }
+    if (!response.ok || !data.behaviors) throw new Error(data.error || 'Run metrics could not be read.')
+    if (generation !== metricsGeneration) return
+    metricsReport = data
+    metricsError = ''
+  } catch (error) {
+    if (generation !== metricsGeneration) return
+    metricsReport = null
+    metricsError = error instanceof Error ? error.message : String(error)
+  }
+  viewFeedback('behavior-metrics', 'Behavior metrics unavailable', metricsError || metricsReport?.error || '', 'read_failed')
+  if (!viewEl.hidden) refreshMetricCells()
+}
+// Owner per behavior, fetched once from /api/behaviors: the agent account
+// from Settings → GitHub, the GitHub user the automations act as.
+const behaviorOwners: Partial<Record<BehaviorKey, string | null>> = {}
+// Tick listener — installed on view init, removed on view leave by
+// stopBehaviorsRefresh(). Single shared clock, same pattern as the
+// three other views. See startRefreshTicker() in src/config.ts.
+const onTick = () => { void tickRefresh() }
+let tickListening = false
+
+// Attribute-safe HTML escape. textContent → innerHTML only escapes &,
+// <, >; we also need to escape " and ' so attribute interpolations
+// like `title="${escapeHtml(text)}"` don't break on quoted content.
+function escapeHtml(s: string): string {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    c === '&' ? '&amp;' :
+    c === '<' ? '&lt;' :
+    c === '>' ? '&gt;' :
+    c === '"' ? '&quot;' :
+                '&#39;'
+  ))
+}
+
+function humanAvatarFallback(username: string): string {
+  return `https://github.com/${encodeURIComponent(username)}.png?size=48`
+}
+
+function ownerCell(username: string | null): string {
+  if (!username) return '<span class="last-dash">—</span>'
+  if (username.includes(' / ')) return username.split(' / ').map(ownerCell).join(' ')
+  const isBot = /\[bot\]$/i.test(username)
+  const classes = ['last-avatar']
+  if (isBot) classes.push('is-bot')
+  const src = humanAvatarFallback(username)
+  return `
+    <span class="behavior-owner">
+      <img class="${classes.join(' ')}" src="${src}" alt="${escapeHtml(username)}" title="${escapeHtml(username)}" loading="lazy" decoding="async" />
+      <span class="behavior-owner-name">${escapeHtml(username)}</span>
+    </span>
+  `
+}
+
+// True when the last attempt to read server state failed, so the mirror is not
+// to be trusted. The toggles drive agents that write to real pull requests —
+// an unknown state must not be presented as a confident "off".
+// Behaviours whose enable/disable is still in flight. renderRows rebuilds a
+// row from scratch, and a rebuild triggered mid-request (the
+// poise:behaviors-changed listener calls it) produced a fresh, enabled
+// checkbox — dropping the guard that stops a second click while the first is
+// still travelling. Rendering consults this so the guard survives a repaint.
+const togglesInFlight = new Set<BehaviorKey>()
+const pausesInFlight = new Set<BehaviorKey>()
+
+function stateUnknown(): boolean {
+  return !isBehaviorStateLoaded()
+}
+
+// Why a toggle is not clickable decides what to say about it: an unreadable
+// state means the position on screen may be a lie, whereas a write still in
+// flight means it is simply not settled yet. Folding both into one "could not
+// be read" message told people their state was unknown every time they
+// clicked. Both conditions are recomputed on every tick, so a toggle disabled
+// by a failed read comes back to life on its own once the read succeeds.
+function togglePresentation(key: BehaviorKey): { disabled: boolean, unknown: boolean, title: string } {
+  const unknown = stateUnknown()
+  const busy = togglesInFlight.has(key)
+  return {
+    disabled: unknown || busy,
+    unknown,
+    title: unknown
+      ? 'Behaviour state could not be read from the server — this may not reflect what is running.'
+      : busy ? 'Saving…' : `Toggle ${key}`,
+  }
+}
+
+function toggleCell(key: BehaviorKey): string {
+  const on = isEnabled(key)
+  const { disabled, unknown, title } = togglePresentation(key)
+  return `
+    <label class="toggle${unknown ? ' toggle-unknown' : ''}" aria-label="Toggle ${escapeHtml(key)}" title="${escapeHtml(title)}">
+      <input type="checkbox" data-behavior="${escapeHtml(key)}" ${on ? 'checked' : ''}${disabled ? ' disabled' : ''} />
+      <span class="toggle-slider"></span>
+    </label>
+  `
+}
+
+// Bring an already-rendered toggle back in line with what is now known. The
+// tick used to repaint `checked` only, and only on a toggle that was already
+// enabled — so a row drawn while the server was unreachable stayed disabled,
+// unchecked and captioned "could not be read" for as long as the view stayed
+// open, even after the very next read succeeded. Nothing else re-rendered it:
+// the row is rebuilt only on view entry and on a successful toggle, and the
+// toggle was the control that had been switched off.
+function repaintToggle(key: BehaviorKey, toggle: HTMLInputElement): void {
+  const { disabled, unknown, title } = togglePresentation(key)
+  const label = toggle.closest<HTMLElement>('.toggle')
+  if (label) {
+    label.classList.toggle('toggle-unknown', unknown)
+    label.title = title
+  }
+  toggle.disabled = disabled
+  // A write in flight owns the position until it settles; anything else and
+  // the mirror is the truth.
+  if (!togglesInFlight.has(key)) toggle.checked = isEnabled(key)
+}
+
+// Priority ceiling for Review New Pull Requests, chosen in its Setting
+// dropdown. p0 is shown as `==p0` (only p0); the rest as `<=pX` (pX and below).
+const SETTING_OPTIONS: { value: BehaviorSetting, label: string }[] = [
+  { value: 'p0', label: '==p0' },
+  { value: 'p1', label: '<=p1' },
+  { value: 'p2', label: '<=p2' },
+  { value: 'p3', label: '<=p3' },
+  { value: 'p4', label: '<=p4' },
+]
+
+// Relative-time formatter for the Last-triggered column. The value
+// now flows from `agent-interface --logs` straight through the API,
+// which emits naive ISO in local time (datetime.fromtimestamp().isoformat()
+// — see the same parsing fix in swarm-view's startedRel). JavaScript's
+// Date constructor parses naive ISO as local, which is what we want.
+function relTime(iso: string): string {
+  if (!iso) return ''
+  const t = new Date(iso).getTime()
+  if (!isFinite(t)) return ''
+  const secs = Math.max(0, Math.floor((Date.now() - t) / 1000))
+  if (secs < 60) return `${secs}s`
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h`
+  const days = Math.floor(secs / 86400)
+  if (days < 30) return `${days}d`
+  const months = Math.floor(days / 30)
+  if (months < 12) return `${months}mo`
+  return `${Math.floor(months / 12)}y`
+}
+
+// "Last triggered" is read from the agent log. When that read fails the value
+// is simply absent, which used to render as an em dash — indistinguishable
+// from "this has never run". Say the truth instead: unknown, not never.
+function lastTriggeredUnavailable(): boolean {
+  const d = getBehaviorDiagnostics()
+  return stateUnknown() || !!d?.agentLogsError
+}
+
+function lastTriggeredCell(key: BehaviorKey): string {
+  const last = getLastTriggered(key)
+  if (!last && (stateUnknown() || key !== 'merge-prs' && key !== 'rerun-grey-ci' && lastTriggeredUnavailable())) {
+    return '<span class="last-dash" title="The latest history could not be read, so this is unknown — not necessarily never.">?</span>'
+  }
+  if (key === 'rerun-grey-ci') {
+    const succeeded = getLastSucceeded(key)
+    const checked = succeeded ? ` <span class="behavior-last-checked" title="Last completed scan: ${escapeHtml(succeeded.at)}">· checked ${escapeHtml(relTime(succeeded.at))} ago</span>` : ''
+    if (!last) return `<span class="last-dash">—</span>${checked}`
+    if (!last.url || !/^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/actions\/runs\/[1-9]\d*$/.test(last.url)) return `<span class="last-dash">?</span>${checked}`
+    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(last.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>${checked}`
+  }
+  if (!last) return '<span class="last-dash">—</span>'
+  if (key === 'merge-prs') {
+    const match = last.target.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/)
+    if (!match) return '<span class="last-dash">?</span>'
+    const href = `https://github.com/${match[1]}/pull/${match[2]}`
+    return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
+  }
+  return `<a class="behavior-last-link" href="#" data-target="${escapeHtml(last.target)}" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>`
+}
+
+// Every behavior with something to set shows one pill that opens its Setting
+// dropdown; the others render a dash so the column still aligns.
+function settingCell(meta: typeof BEHAVIORS[number]): string {
+  if (meta.hasTriggers || meta.hasSkips) return triggersCell(meta.key)
+  return '<span class="last-dash">—</span>'
+}
+
+// Reviewers cell — how many of the slots from the PR review place's slot on
+// (Settings → Models) review each new pull request, all at the same time.
+// One is the default; the other behaviors show a dash.
+const REVIEWER_OPTIONS: ReviewerCount[] = [1, 2, 3]
+const reviewersInFlight = new Set<BehaviorKey>()
+
+function reviewersCell(meta: typeof BEHAVIORS[number]): string {
+  if (!meta.hasReviewers) return '<span class="last-dash">—</span>'
+  const current = getReviewers(meta.key)
+  const opts = REVIEWER_OPTIONS.map((count) =>
+    `<option value="${count}"${count === current ? ' selected' : ''}>${count}</option>`
+  ).join('')
+  const reviews = meta.reviews ?? { place: 'PR review', item: 'pull request' }
+  const title = `How many of the ${reviews.place} models (Settings → Models) review each new ${reviews.item}, at the same time`
+  return `
+    <select class="behavior-reviewers" data-behavior="${escapeHtml(meta.key)}" aria-label="Reviewers for ${escapeHtml(meta.key)}" title="${escapeHtml(title)}"${stateUnknown() || reviewersInFlight.has(meta.key) ? ' disabled' : ''}>
+      ${opts}
+    </select>
+  `
+}
+
+function writeReviewers(key: BehaviorKey, value: ReviewerCount): void {
+  reviewersInFlight.add(key)
+  void setReviewers(key, value).then(() => viewFeedback(`behavior-reviewers:${key}`, 'Behavior action needs attention', '')).catch((err: unknown) => {
+    viewFeedback(`behavior-reviewers:${key}`, 'Behavior action needs attention', `Could not update the reviewer count: ${(err as Error).message}`)
+  }).then(() => {
+    reviewersInFlight.delete(key)
+    const current = viewEl?.querySelector<HTMLSelectElement>(
+      `select.behavior-reviewers[data-behavior="${key}"]`,
+    )
+    if (current) { current.value = String(getReviewers(key)); current.disabled = stateUnknown() }
+  })
+}
+
+// ── Setting dropdown ────────────────────────────────────────────────────
+// A behavior with something to set has one pill in its Setting cell, which
+// opens a dropdown: a filterable checkbox list of the repositories of all
+// ready accounts, asked for again on every opening.
+// - Review New Issues is opt-in per repository: the ticked repositories
+//   trigger it, and below the list are the trusted authors whose new issues
+//   count.
+// - The PR behaviors skip the ticked repositories. Their list is grouped by
+//   account, with a Select all for each account and one for the whole list;
+//   Review New Pull Requests also chooses its priority ceiling here, and
+//   Approve Pull Requests its review-round cap.
+// Like the memory panel, every way of closing it — Done, Escape, a click
+// outside, leaving the view — saves what changed; a save that fails keeps it
+// open next to the error rather than closing over the choice.
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
+let orgRepos: string[] | null = null
+let orgReposError = ''
+let orgReposLoading: Promise<void> | null = null
+let triggersPanelEl: HTMLElement | null = null
+let triggersKey: BehaviorKey | null = null
+let triggersDraft = new Set<string>()
+let triggersLoaded = { repos: [] as string[], authors: [] as string[], skipRepos: [] as string[], setting: 'p2' as BehaviorSetting, reviewCap: null as number | null }
+let triggersSaving: Promise<boolean> | null = null
+
+function shortRepo(repo: string): string {
+  return repo
+}
+
+function behaviorMeta(key: BehaviorKey): typeof BEHAVIORS[number] {
+  return BEHAVIORS.find((behavior) => behavior.key === key)!
+}
+
+// Repositories are grouped under the account that owns them; GitHub matches
+// account names case-insensitively.
+function ownerKey(repo: string): string {
+  return repo.split('/')[0].toLowerCase()
+}
+
+function settingLabel(setting: BehaviorSetting): string {
+  return SETTING_OPTIONS.find((option) => option.value === setting)?.label ?? setting
+}
+
+function triggersPresentation(key: BehaviorKey) {
+  // What is on screen may not be what is stored; saving from it would replace
+  // the stored list with a guess.
+  const unknown = stateUnknown()
+  const open = triggersKey === key && !!triggersPanelEl?.classList.contains('open')
+  const meta = behaviorMeta(key)
+  if (meta.hasSkips) {
+    const skipped = getSkipRepos(key)
+    const ceiling = meta.hasSetting ? settingLabel(getSetting(key)) : ''
+    const cap = meta.hasReviewCap ? getReviewCap(key) : null
+    const capLabel = cap ? `Cap ${cap}` : ''
+    // The ceiling and the cap never share a row; whichever leads, the
+    // skipped count must stay readable next to it.
+    const lead = ceiling || capLabel
+    return {
+      none: false,
+      unknown,
+      // A whole account skipped runs into hundreds; the count must stay
+      // readable in the cell next to the ceiling.
+      label: lead
+        ? (skipped.length ? `${lead}, skip ${skipped.length}` : lead)
+        : (skipped.length ? `Skip ${skipped.length}` : 'All repos'),
+      title: unknown
+        ? 'The setting could not be read from the server.'
+        : [ceiling ? `Priority ${ceiling}` : '', cap ? `Review cap: round ${cap} files its findings as one follow-up issue and approves` : '', skipped.length ? `Skipped: ${skipped.join(', ')}` : 'Acts in every repository']
+          .filter(Boolean).join(' · '),
+      open,
+    }
+  }
+  const repos = getRepos(key)
+  const authors = getAuthors(key)
+  const none = repos.length === 0
+  return {
+    none,
+    unknown,
+    label: none ? 'No repos' : `${repos.length} repo${repos.length === 1 ? '' : 's'}`,
+    title: unknown
+      ? 'The repositories could not be read from the server.'
+      : none
+        ? 'Choose the repositories whose new issues are reviewed'
+        : `Repositories: ${repos.map(shortRepo).join(', ')} · Authors: ${authors.join(', ') || 'none'}`,
+    open,
+  }
+}
+
+function triggersCell(key: BehaviorKey): string {
+  const { none, unknown, label, title, open } = triggersPresentation(key)
+  return `
+    <button type="button" class="behavior-triggers-btn${none ? ' is-empty' : ''}" data-behavior="${escapeHtml(key)}" aria-haspopup="dialog" aria-expanded="${open}" title="${escapeHtml(title)}"${unknown ? ' disabled' : ''}>
+      <span class="behavior-triggers-label">${escapeHtml(label)}</span>
+    </button>
+  `
+}
+
+// Updated in place: replacing the button every tick took keyboard focus away
+// from it, and could swallow a click that landed during the repaint.
+function refreshTriggersCell(key: BehaviorKey) {
+  const cell = viewEl?.querySelector<HTMLElement>(`tr[data-behavior="${key}"] .behavior-setting-cell`)
+  if (!cell) return
+  const button = cell.querySelector<HTMLButtonElement>('.behavior-triggers-btn')
+  const label = button?.querySelector<HTMLElement>('.behavior-triggers-label')
+  if (!button || !label) {
+    cell.innerHTML = triggersCell(key)
+    return
+  }
+  const view = triggersPresentation(key)
+  label.textContent = view.label
+  button.title = view.title
+  button.classList.toggle('is-empty', view.none)
+  button.setAttribute('aria-expanded', String(view.open))
+  button.disabled = view.unknown
+}
+
+function loadOrgRepos(): Promise<void> {
+  orgReposLoading ??= fetch('/api/repos')
+    .then(async (res) => {
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || !Array.isArray(data.repos)) throw new Error(data?.error || `HTTP ${res.status}`)
+      orgRepos = data.repos.filter((repo: unknown): repo is string => typeof repo === 'string')
+      orgReposError = organizationErrors(data)
+    })
+    .catch((err: unknown) => { orgReposError = (err as Error).message || 'unavailable' })
+    .finally(() => { orgReposLoading = null })
+  return orgReposLoading
+}
+
+function setTriggersStatus(text: string, cls: 'info' | 'error' = 'info') {
+  viewDiagnostic('behavior-triggers', cls === 'info' ? text : '')
+  viewFeedback('behavior-triggers', 'Behavior settings need attention', cls === 'error' ? text : '', 'action_needed')
+}
+
+function renderTriggerRepos() {
+  const list = triggersPanelEl?.querySelector<HTMLElement>('.bt-repos')
+  if (!list) return
+  const filter = (triggersPanelEl!.querySelector<HTMLInputElement>('.bt-filter')?.value || '').trim().toLowerCase()
+  if (!orgRepos && orgReposLoading) {
+    list.replaceChildren()
+    return
+  }
+  // A selected repository an account no longer lists stays visible, so
+  // it can still be turned off.
+  const all = [...new Set([...(orgRepos ?? []), ...triggersDraft])]
+    .sort((a, b) => shortRepo(a).localeCompare(shortRepo(b)))
+  const shown = all.filter((repo) => !filter || repo.toLowerCase().includes(filter))
+  const notes: HTMLElement[] = []
+  viewFeedback('behavior-repositories', 'Behavior repositories unavailable', orgReposError || '', 'read_failed')
+  if (orgReposError) {
+    const retry = document.createElement('button')
+    retry.type = 'button'
+    retry.className = 'bt-retry'
+    retry.textContent = 'Retry'
+    notes.push(retry)
+  }
+  // A row that stays is kept where it is, not rebuilt: the list can grow while
+  // the dropdown is open, and replacing the row under the pointer or the
+  // keyboard focus would swallow the click or drop the focus.
+  const rows = new Map([...list.querySelectorAll<HTMLElement>('.bt-repo')].map((row) => [row.dataset.key, row]))
+  const grouped = triggersPanelEl!.dataset.mode === 'skips'
+  const repoRow = (repo: string) => {
+    const row = rows.get(`repo:${repo}`) ?? triggerRepoRow(repo, grouped)
+    row.querySelector<HTMLInputElement>('input')!.checked = triggersDraft.has(repo)
+    return row
+  }
+  const entries: HTMLElement[] = []
+  if (!grouped) entries.push(...shown.map(repoRow))
+  else if (shown.length) {
+    entries.push(rows.get('all') ?? selectAllRow())
+    const groups = new Map<string, string[]>()
+    for (const repo of shown) groups.set(ownerKey(repo), [...(groups.get(ownerKey(repo)) ?? []), repo])
+    for (const [owner, repos] of groups) {
+      entries.push(rows.get(`group:${owner}`) ?? groupRow(owner, repos[0].split('/')[0]), ...repos.map(repoRow))
+    }
+  }
+  const wanted = [...notes, ...entries]
+  const keep = new Set<Node>(wanted)
+  for (const node of [...list.childNodes]) if (!keep.has(node)) node.remove()
+  let cursor = list.firstChild
+  for (const node of wanted) {
+    if (node === cursor) cursor = cursor.nextSibling
+    else list.insertBefore(node, cursor)
+  }
+  if (grouped) syncSelectAll()
+}
+
+function triggerRepoRow(repo: string, grouped: boolean): HTMLElement {
+  const row = document.createElement('label')
+  row.className = grouped ? 'bt-repo bt-grouped' : 'bt-repo'
+  row.title = repo
+  row.dataset.key = `repo:${repo}`
+  // Under its account a repository shows its own name; the full name stays
+  // its accessible name, as in the flat list.
+  row.innerHTML = grouped
+    ? `<input type="checkbox" value="${escapeHtml(repo)}" data-repo aria-label="${escapeHtml(repo)}" /><span>${escapeHtml(repo.slice(repo.indexOf('/') + 1))}</span>`
+    : `<input type="checkbox" value="${escapeHtml(repo)}" data-repo /><span>${escapeHtml(shortRepo(repo))}</span>`
+  return row
+}
+
+function groupRow(owner: string, name: string): HTMLElement {
+  const row = document.createElement('label')
+  row.className = 'bt-repo bt-group'
+  row.title = `Select all ${name} repositories`
+  row.dataset.key = `group:${owner}`
+  row.innerHTML = `<input type="checkbox" data-group="${escapeHtml(owner)}" aria-label="Select all ${escapeHtml(name)}" /><span>${escapeHtml(name)}</span><span class="bt-select-all">Select all</span>`
+  return row
+}
+
+function selectAllRow(): HTMLElement {
+  const row = document.createElement('label')
+  row.className = 'bt-repo bt-all'
+  row.dataset.key = 'all'
+  row.innerHTML = '<input type="checkbox" data-all aria-label="Select all repositories" /><span>Select all</span>'
+  return row
+}
+
+// The repository rows on screen. A Select all covers these, so a filter
+// narrows what it ticks.
+function repoBoxes(owner?: string): HTMLInputElement[] {
+  return [...(triggersPanelEl?.querySelectorAll<HTMLInputElement>('.bt-repo input[data-repo]') ?? [])]
+    .filter((box) => owner === undefined || ownerKey(box.value) === owner)
+}
+
+// A Select all is ticked when every row it covers is, and mixed when some are.
+function syncSelectAll() {
+  const reflect = (box: HTMLInputElement, covered: HTMLInputElement[]) => {
+    const ticked = covered.filter((repo) => repo.checked).length
+    box.checked = covered.length > 0 && ticked === covered.length
+    box.indeterminate = ticked > 0 && ticked < covered.length
+  }
+  for (const box of triggersPanelEl?.querySelectorAll<HTMLInputElement>('input[data-group]') ?? []) {
+    reflect(box, repoBoxes(box.dataset.group))
+  }
+  const all = triggersPanelEl?.querySelector<HTMLInputElement>('input[data-all]')
+  if (all) reflect(all, repoBoxes())
+}
+
+function buildTriggersPanel(): HTMLElement {
+  const panel = document.createElement('div')
+  panel.id = 'behavior-triggers-panel'
+  panel.setAttribute('role', 'dialog')
+  const ceilings = SETTING_OPTIONS.map((option) => `<option value="${option.value}">${escapeHtml(option.label)}</option>`).join('')
+  const caps = ['<option value="">Off</option>']
+    .concat(Array.from({ length: 9 }, (_, index) => {
+      const rounds = index + 2
+      return `<option value="${rounds}">${rounds} rounds</option>`
+    })).join('')
+  panel.innerHTML = `
+    <div class="bt-section bt-ceiling" hidden>
+      <label class="bt-label" for="bt-ceiling">Priority</label>
+      <select id="bt-ceiling" class="behavior-setting bt-ceiling-select">${ceilings}</select>
+    </div>
+    <div class="bt-section bt-review-cap" hidden>
+      <label class="bt-label" for="bt-review-cap">Review cap (legacy only)</label>
+      <select id="bt-review-cap" class="behavior-setting bt-review-cap-select" title="From this round on, Approve files the round's findings as one follow-up issue and approves instead of requesting changes. Off disables the cap.">${caps}</select>
+    </div>
+    <div class="bt-section">
+      <label class="bt-label bt-repos-label" for="bt-filter">Repositories</label>
+      <input id="bt-filter" class="st-input bt-filter" type="search" placeholder="Filter" autocomplete="off" spellcheck="false" />
+      <div class="bt-repos" role="group" aria-label="Repositories"></div>
+    </div>
+    <div class="bt-section bt-authors-section">
+      <label class="bt-label" for="bt-authors">Trusted authors</label>
+      <input id="bt-authors" class="st-input bt-authors" type="text" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="bt-footer">
+      <button type="button" class="st-save bt-done">Done</button>
+    </div>
+  `
+  const filter = panel.querySelector<HTMLInputElement>('.bt-filter')!
+  filter.addEventListener('input', () => renderTriggerRepos())
+  filter.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowDown') return
+    const first = panel.querySelector<HTMLInputElement>('.bt-repo input')
+    if (first) { e.preventDefault(); first.focus() }
+  })
+  panel.querySelector('.bt-repos')!.addEventListener('change', (e) => {
+    const box = e.target as HTMLInputElement
+    if (!box.matches('input[type="checkbox"]')) return
+    const covered = box.dataset.group !== undefined ? repoBoxes(box.dataset.group)
+      : box.dataset.all !== undefined ? repoBoxes() : [box]
+    for (const repo of covered) {
+      repo.checked = box.checked
+      if (box.checked) triggersDraft.add(repo.value)
+      else triggersDraft.delete(repo.value)
+    }
+    if (panel.dataset.mode === 'skips') syncSelectAll()
+  })
+  panel.querySelector('.bt-repos')!.addEventListener('click', (e) => {
+    if (!(e.target as HTMLElement).closest('.bt-retry')) return
+    void loadOrgRepos().then(() => renderTriggerRepos())
+    renderTriggerRepos()
+  })
+  // Arrow keys walk the visible checkboxes; Up from the first returns to the filter.
+  panel.querySelector('.bt-repos')!.addEventListener('keydown', (e) => {
+    const event = e as KeyboardEvent
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+    const boxes = [...panel.querySelectorAll<HTMLInputElement>('.bt-repo input')]
+    const index = boxes.indexOf(document.activeElement as HTMLInputElement)
+    if (index < 0) return
+    event.preventDefault()
+    const next = index + (event.key === 'ArrowDown' ? 1 : -1)
+    if (next < 0) filter.focus()
+    else boxes[Math.min(next, boxes.length - 1)]?.focus()
+  })
+  panel.querySelector('.bt-done')!.addEventListener('click', () => { void closeTriggersPanel() })
+  return panel
+}
+
+function positionTriggersPanel() {
+  if (!triggersPanelEl || !triggersKey) return
+  const button = viewEl?.querySelector<HTMLElement>(`.behavior-triggers-btn[data-behavior="${triggersKey}"]`)
+  if (!button) return
+  const rect = button.getBoundingClientRect()
+  const width = triggersPanelEl.offsetWidth || 300
+  const ceiling = Math.max(16, viewEl.querySelector<HTMLElement>('.view-header')!.getBoundingClientRect().bottom + 8)
+  const available = Math.max(0, window.innerHeight - ceiling - 16)
+  triggersPanelEl.style.maxHeight = `${available}px`
+  const height = triggersPanelEl.offsetHeight
+  const below = rect.bottom + 6
+  const top = below + height <= window.innerHeight - 16 ? below : rect.top - height - 6
+  triggersPanelEl.style.top = `${Math.round(Math.max(ceiling, Math.min(top, window.innerHeight - height - 16)))}px`
+  triggersPanelEl.style.left = `${Math.round(Math.max(16, Math.min(rect.right - width, window.innerWidth - width - 16)))}px`
+}
+
+function openTriggersPanel(key: BehaviorKey) {
+  if (!triggersPanelEl) {
+    triggersPanelEl = buildTriggersPanel()
+    document.body.appendChild(triggersPanelEl)
+    new ResizeObserver(positionTriggersPanel).observe(triggersPanelEl)
+    watchPanel(triggersPanelEl, () => !!triggersPanelEl?.classList.contains('open'))
+  }
+  const meta = behaviorMeta(key)
+  const mode = meta.hasSkips ? 'skips' : 'triggers'
+  // The two lists are built differently; one cannot reuse the other's rows.
+  if (triggersPanelEl.dataset.mode !== mode) triggersPanelEl.querySelector('.bt-repos')!.replaceChildren()
+  triggersPanelEl.dataset.mode = mode
+  triggersPanelEl.setAttribute('aria-label', meta.hasSkips ? `Setting for ${meta.label}` : 'Repositories and authors that trigger Review New Issues')
+  triggersPanelEl.querySelector<HTMLElement>('.bt-ceiling')!.hidden = !(meta.hasSkips && meta.hasSetting)
+  triggersPanelEl.querySelector<HTMLElement>('.bt-review-cap')!.hidden = !(meta.hasSkips && meta.hasReviewCap)
+  triggersPanelEl.querySelector<HTMLElement>('.bt-authors-section')!.hidden = meta.hasSkips
+  triggersPanelEl.querySelector('.bt-repos-label')!.textContent = meta.hasSkips ? 'Skip repositories' : 'Repositories'
+  triggersPanelEl.querySelector('.bt-repos')!.setAttribute('aria-label', meta.hasSkips ? 'Repositories to skip' : 'Repositories')
+  triggersKey = key
+  triggersLoaded = { repos: getRepos(key), authors: getAuthors(key), skipRepos: getSkipRepos(key), setting: getSetting(key), reviewCap: getReviewCap(key) }
+  triggersDraft = new Set(meta.hasSkips ? triggersLoaded.skipRepos : triggersLoaded.repos)
+  triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value = triggersLoaded.setting
+  triggersPanelEl.querySelector<HTMLSelectElement>('.bt-review-cap-select')!.value = triggersLoaded.reviewCap === null ? '' : String(triggersLoaded.reviewCap)
+  triggersPanelEl.querySelector<HTMLInputElement>('.bt-filter')!.value = ''
+  triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value = triggersLoaded.authors.join(', ')
+  setTriggersStatus('')
+  // Accounts gain repositories while a tab stays open, so every
+  // opening asks again; the list already held shows until the answer lands.
+  void loadOrgRepos().then(() => { if (triggersKey === key) renderTriggerRepos() })
+  renderTriggerRepos()
+  triggersPanelEl.classList.add('open')
+  triggersPanelEl.removeAttribute('inert')
+  refreshTriggersCell(key)
+  positionTriggersPanel()
+  window.addEventListener('resize', positionTriggersPanel)
+  window.addEventListener('scroll', positionTriggersPanel, true)
+  setTimeout(() => {
+    document.addEventListener('mousedown', onTriggersOutside)
+    document.addEventListener('keydown', onTriggersKeydown)
+    // The first control: the ceiling or cap where there is one, otherwise the filter.
+    const first = triggersPanelEl?.querySelector<HTMLElement>('.bt-ceiling:not([hidden]) select, .bt-review-cap:not([hidden]) select')
+      ?? triggersPanelEl?.querySelector<HTMLInputElement>('.bt-filter')
+    first?.focus()
+  }, 0)
+}
+
+function parseAuthors(text: string): string[] {
+  return text.split(/[\s,]+/).map((name) => name.trim().replace(/^@/, '')).filter(Boolean)
+}
+
+// Returns whether the panel is now closed. `force` is for leaving the view:
+// the panel cannot outlive it, so a change that cannot be saved is reported
+// and dropped rather than kept on screen.
+function closeTriggersPanel(force = false): Promise<boolean> {
+  if (triggersSaving) return triggersSaving.then((closed) => closed || closeTriggersPanel(force))
+  if (!triggersPanelEl || !triggersKey || !triggersPanelEl.classList.contains('open')) return Promise.resolve(true)
+  const key = triggersKey
+  const meta = behaviorMeta(key)
+  const draft = [...triggersDraft].sort()
+  const same = (a: string[], b: string[]) => a.length === b.length && a.every((value, index) => value === b[index])
+  const changes: SettingFields = {}
+  let rejectedAuthors = ''
+  const saveStatus = (text: string, cls: 'info' | 'error' = 'info') =>
+    setTriggersStatus([rejectedAuthors, text].filter(Boolean).join(' '), rejectedAuthors ? 'error' : cls)
+  if (meta.hasSkips) {
+    if (!same(draft, [...triggersLoaded.skipRepos].sort())) changes.skipRepos = draft
+    const setting = triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value as BehaviorSetting
+    if (meta.hasSetting && setting !== triggersLoaded.setting) changes.setting = setting
+    const capValue = triggersPanelEl.querySelector<HTMLSelectElement>('.bt-review-cap-select')!.value
+    const reviewCap = capValue === '' ? null : Number(capValue)
+    if (meta.hasReviewCap && reviewCap !== triggersLoaded.reviewCap) changes.reviewCap = reviewCap
+  } else {
+    const authors = parseAuthors(triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value)
+    const invalid = authors.filter((name) => !GITHUB_LOGIN.test(name))
+    if (!same(draft, [...triggersLoaded.repos].sort())) changes.repos = draft
+    if (!same(authors, triggersLoaded.authors)) changes.authors = authors
+    if (invalid.length) {
+      if (!force) {
+        setTriggersStatus(`Not a GitHub username: ${invalid.join(', ')}`, 'error')
+        return Promise.resolve(false)
+      }
+      rejectedAuthors = `The trusted authors were not saved — not a GitHub username: ${invalid.join(', ')}`
+      delete changes.authors
+    }
+  }
+  if (Object.keys(changes).length === 0) {
+    saveStatus('')
+    finishClosingTriggersPanel()
+    return Promise.resolve(true)
+  }
+  if (stateUnknown()) {
+    if (!force) {
+      saveStatus(`Not saved — the current ${meta.hasSkips ? 'setting' : 'repositories'} could not be read from the server.`, 'error')
+      return Promise.resolve(false)
+    }
+    saveStatus(meta.hasSkips
+      ? `The ${meta.label} setting was not saved: the current one could not be read from the server.`
+      : 'The Review New Issues repositories were not saved: the current ones could not be read from the server.', 'error')
+    finishClosingTriggersPanel()
+    return Promise.resolve(true)
+  }
+  saveStatus('')
+  viewDiagnostic('behavior-triggers', 'Saving…')
+  triggersSaving = setSettingFields(key, changes).then(() => {
+    saveStatus('')
+    finishClosingTriggersPanel()
+    return true
+  }, (err: unknown) => {
+    if (force) {
+      saveStatus(`Could not save the ${meta.hasSkips ? `${meta.label} setting` : 'Review New Issues triggers'}: ${(err as Error).message}`, 'error')
+      finishClosingTriggersPanel()
+      return true
+    }
+    saveStatus(`Not saved: ${(err as Error).message}`, 'error')
+    return false
+  }).finally(() => { triggersSaving = null })
+  return triggersSaving
+}
+
+function finishClosingTriggersPanel() {
+  const key = triggersKey
+  const hadFocus = !!triggersPanelEl?.contains(document.activeElement)
+  triggersPanelEl?.classList.remove('open')
+  triggersPanelEl?.setAttribute('inert', '')
+  triggersKey = null
+  document.removeEventListener('mousedown', onTriggersOutside)
+  document.removeEventListener('keydown', onTriggersKeydown)
+  window.removeEventListener('resize', positionTriggersPanel)
+  window.removeEventListener('scroll', positionTriggersPanel, true)
+  // Repaint first: the repaint replaces the pill, so focusing the old one
+  // would drop focus with the element it was on.
+  if (key) refreshTriggersCell(key)
+  if (hadFocus) {
+    const opener = key ? viewEl?.querySelector<HTMLButtonElement>(`.behavior-triggers-btn[data-behavior="${key}"]`) : null
+    if (opener) opener.focus()
+    else (document.activeElement as HTMLElement | null)?.blur()
+  }
+}
+
+function onTriggersKeydown(e: KeyboardEvent) {
+  if (e.defaultPrevented || isNotificationInteraction(e.target)) return
+  if (e.key === 'Escape') { e.preventDefault(); void closeTriggersPanel() }
+}
+
+function onTriggersOutside(e: MouseEvent) {
+  if (isNotificationInteraction(e.target)) return
+  const target = e.target as HTMLElement
+  if (triggersPanelEl?.contains(target) || target.closest('.behavior-triggers-btn')) return
+  void closeTriggersPanel()
+}
+
+// Memory cell — a pill button that opens the per-behavior scratchpad
+// editor. Behaviors that don't run an agent (resolve-unblocking) have
+// no prompt to inject a note into, so they render a dash like the
+// Setting column does. A filled note tints the dot and flips the label
+// from "Add" to "Edit"; the tooltip previews the saved text.
+function memoryCell(meta: typeof BEHAVIORS[number]): string {
+  if (!meta.hasMemory) return '<span class="last-dash">—</span>'
+  const note = getScratchpad(meta.key).trim()
+  const filled = !!note
+  const title = filled ? note.slice(0, 140) : 'Add behavior memory'
+  return `
+    <button type="button" class="behavior-memory-btn${filled ? ' has-note' : ''}" data-behavior="${escapeHtml(meta.key)}" title="${escapeHtml(title)}" aria-label="Edit memory for ${escapeHtml(meta.key)}"${stateUnknown() ? ' disabled' : ''}>
+      <span class="behavior-memory-dot" aria-hidden="true"></span>
+      <span class="behavior-memory-label">${filled ? 'Edit' : 'Add'}</span>
+    </button>
+  `
+}
+
+// ── Memory editor panel ─────────────────────────────────────────────────
+// A right-side slide-in (same grammar as Settings / Typography) holding
+// a textarea for the focused behavior's scratchpad. Built lazily on
+// first open and reused across behaviors — only the title, textarea
+// value, and the key it writes back to change. Closes on its × button,
+// Escape, or a click anywhere outside it (which also covers switching
+// views via the top-nav).
+let memoryPanelEl: HTMLElement | null = null
+let memoryTextarea: HTMLTextAreaElement | null = null
+let memoryTitleEl: HTMLElement | null = null
+let memorySaveBtn: HTMLButtonElement | null = null
+let memoryKey: BehaviorKey | null = null
+// The memory as it stood when the panel opened, so closing can tell whether
+// there is an unsaved change to commit.
+let memoryLoadedValue = ''
+
+function setMemoryStatus(text: string, cls: 'info' | 'ok' | 'error' = 'info') {
+  viewDiagnostic('behavior-memory', cls !== 'error' ? text : '')
+  viewFeedback('behavior-memory', 'Behavior memory needs attention', cls === 'error' ? text : '', 'action_needed')
+}
+
+function buildMemoryPanel(): HTMLElement {
+  const panel = document.createElement('aside')
+  panel.id = 'behavior-memory-panel'
+  panel.innerHTML = `
+    <div class="tp-header">
+      <span class="tp-title">Behavior memory</span>
+      <button type="button" class="tp-close" aria-label="Close">&times;</button>
+    </div>
+    <div class="tp-body">
+      <div class="tp-section">
+        <label class="tp-label behavior-memory-for"></label>
+        <textarea class="st-textarea behavior-memory-textarea" rows="14" maxlength="8000" spellcheck="false" placeholder="e.g. Always confirm the CHANGELOG is updated. This repo uses pnpm, not npm."></textarea>
+      </div>
+      <div class="st-row">
+        <button type="button" class="st-save behavior-memory-save">Save</button>
+        <button type="button" class="st-clear behavior-memory-clear">Clear</button>
+      </div>
+    </div>
+  `
+  memoryTitleEl = panel.querySelector('.behavior-memory-for')
+  memoryTextarea = panel.querySelector('.behavior-memory-textarea')
+  memorySaveBtn = panel.querySelector('.behavior-memory-save')
+
+  // Wrapped, not passed directly: as a listener the click Event would land in
+  // `force` and every close from the X button would discard an unsaved change.
+  panel.querySelector('.tp-close')!.addEventListener('click', () => closeMemoryPanel())
+  memorySaveBtn!.addEventListener('click', () => void saveMemory())
+  panel.querySelector('.behavior-memory-clear')!.addEventListener('click', () => {
+    if (!memoryTextarea) return
+    memoryTextarea.value = ''
+    memoryTextarea.focus()
+  })
+  // Cmd/Ctrl+Enter saves from the textarea. Escape is handled at the
+  // document level (onMemoryKeydown) so it works regardless of focus.
+  memoryTextarea!.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void saveMemory() }
+  })
+  return panel
+}
+
+function openMemoryPanel(key: BehaviorKey) {
+  // Clicking a different behaviour's memory button replaced the textarea in
+  // place, so whatever had been typed for the previous one vanished without
+  // being saved and without a word. Commit it first, exactly as closing does,
+  // and stay put if that commit fails rather than moving on over lost work.
+  if (memoryKey && memoryKey !== key && memoryTextarea
+      && memoryTextarea.value !== memoryLoadedValue) {
+    const previous = memoryTextarea.value
+    void saveMemory().then((saved) => {
+      if (saved) openMemoryPanel(key)
+      else if (memoryTextarea) memoryTextarea.value = previous
+    })
+    return
+  }
+  if (!memoryPanelEl) {
+    memoryPanelEl = buildMemoryPanel()
+    document.body.appendChild(memoryPanelEl)
+    watchPanel(memoryPanelEl, () => !!memoryPanelEl?.classList.contains('open'), 1)
+  }
+  memoryKey = key
+  const meta = BEHAVIORS.find((b) => b.key === key)
+  if (memoryTitleEl) memoryTitleEl.textContent = `Memory for ${meta?.label ?? key}`
+  memoryLoadedValue = getScratchpad(key)
+  const draft = unsavedDrafts.get(key)
+  if (draft !== undefined) unsavedDrafts.delete(key)
+  if (memoryTextarea) memoryTextarea.value = draft ?? memoryLoadedValue
+  setMemoryStatus(
+    draft !== undefined ? 'This is an unsaved draft from earlier — it was never stored. Save to keep it.' : '',
+    draft !== undefined ? 'error' : 'info',
+  )
+  memoryPanelEl.removeAttribute('inert')
+  memoryPanelEl.removeAttribute('aria-hidden')
+  memoryPanelEl.classList.add('open')
+  // Defer listener attach so the click that opened the panel doesn't
+  // immediately count as an outside-click and close it.
+  setTimeout(() => {
+    document.addEventListener('mousedown', onMemoryOutside)
+    document.addEventListener('keydown', onMemoryKeydown)
+    memoryTextarea?.focus()
+  }, 0)
+}
+
+// The memory is edited behind an explicit Save, but every way of leaving the
+// panel — Escape, a click outside, the close button, switching view — used to
+// drop whatever had been typed without saving it and without saying so. The
+// text is a durable instruction the agent runs with, so losing it silently is
+// the wrong default. Closing now commits an unsaved change; if that commit
+// fails the panel stays open with the error, rather than closing over work
+// that was never stored.
+// `force` is for leaving the view entirely. Staying open is the right answer
+// to a failed save while the Behaviors view is still on screen — the panel
+// belongs there and the error is next to the text it refers to. It is the
+// wrong answer when the view is being replaced: the panel lives on
+// document.body, so it stayed floating above whatever came next, still
+// swallowing Escape. Close it either way in that case, and keep the text so
+// reopening the behaviour hands it back instead of losing it.
+function closeMemoryPanel(force = false) {
+  if (!memoryPanelEl) return
+  if (memoryKey && memoryTextarea && memoryTextarea.value !== memoryLoadedValue) {
+    const key = memoryKey
+    const draft = memoryTextarea.value
+    void saveMemory().then((saved) => {
+      if (saved) finishClosingMemoryPanel()
+      else if (force) {
+        unsavedDrafts.set(key, draft)
+        finishClosingMemoryPanel()
+      }
+    })
+    return
+  }
+  finishClosingMemoryPanel()
+}
+
+// Text that could not be stored when the view went away. Held in memory only:
+// it is a draft, and pretending otherwise by persisting it would make it look
+// saved when the server never accepted it.
+const unsavedDrafts = new Map<BehaviorKey, string>()
+
+function finishClosingMemoryPanel() {
+  if (!memoryPanelEl) return
+  // Hiding a subtree that still holds focus is a real problem, not a lint:
+  // the browser refuses the aria-hidden ("Blocked aria-hidden on an element
+  // because its descendant retained focus") and a screen-reader user is left
+  // on a control that visually no longer exists. Hand focus back to the
+  // button that opened the panel, which is also where a keyboard user expects
+  // to land, and fall back to blurring if that row is gone.
+  if (memoryPanelEl.contains(document.activeElement)) {
+    const opener = memoryKey && viewEl
+      ? viewEl.querySelector<HTMLButtonElement>(`.behavior-memory-btn[data-behavior="${memoryKey}"]`)
+      : null
+    if (opener) opener.focus()
+    else (document.activeElement as HTMLElement | null)?.blur()
+  }
+  // Off-screen is not gone: without this the closed panel kept its place in
+  // the tab order, so tabbing landed in a textarea nobody could see and its
+  // Save button did nothing at all (memoryKey is null by then).
+  memoryPanelEl.setAttribute('inert', '')
+  memoryPanelEl.setAttribute('aria-hidden', 'true')
+  memoryPanelEl.classList.remove('open')
+  memoryKey = null
+  memoryLoadedValue = ''
+  document.removeEventListener('mousedown', onMemoryOutside)
+  document.removeEventListener('keydown', onMemoryKeydown)
+}
+
+function onMemoryKeydown(e: KeyboardEvent) {
+  if (e.defaultPrevented || isNotificationInteraction(e.target)) return
+  if (e.key === 'Escape') { e.preventDefault(); closeMemoryPanel() }
+}
+
+function onMemoryOutside(e: MouseEvent) {
+  if (isNotificationInteraction(e.target)) return
+  if (!memoryPanelEl) return
+  const t = e.target as HTMLElement
+  if (memoryPanelEl.contains(t)) return
+  // A click on a memory button is handled by the tbody click handler
+  // (toggle/switch); don't double-handle it here.
+  if (t.closest('.behavior-memory-btn')) return
+  closeMemoryPanel()
+}
+
+// Returns whether the memory is now stored, so the close path can keep the
+// panel open when it is not.
+//
+// Re-entrant callers are the norm here, not an edge case: clicking Save and
+// then pressing Escape before it answers runs this twice, because the close
+// path decides there is an unsaved change from a `memoryLoadedValue` the
+// first save has not updated yet. Both calls then carried the same "what I
+// loaded" baseline, so the server saw the second one as a stale write and
+// refused it — telling the person their memory had been changed elsewhere
+// when the only thing that had changed it was their own click. Wait for the
+// save already running instead of racing it.
+let memorySaveInFlight: Promise<boolean> | null = null
+
+function saveMemory(): Promise<boolean> {
+  if (memorySaveInFlight) {
+    const key = memoryKey
+    return memorySaveInFlight.then((ok) => {
+      // Same panel, and the save that just landed stored exactly what is on
+      // screen: there is nothing left to write.
+      if (ok && memoryKey === key && memoryTextarea?.value === memoryLoadedValue) return true
+      return saveMemory()
+    })
+  }
+  const run = performSave()
+  memorySaveInFlight = run
+  return run.finally(() => { memorySaveInFlight = null })
+}
+
+async function performSave(): Promise<boolean> {
+  if (!memoryKey || !memoryTextarea || !memorySaveBtn) return true
+  // When the state read failed, the textarea was filled from an empty mirror
+  // rather than from the stored note — saving then would replace a real memory
+  // with nothing. Refuse, and say why.
+  if (stateUnknown()) {
+    setMemoryStatus('Not saved — the current memory could not be read from the server.', 'error')
+    return false
+  }
+  const key = memoryKey
+  const text = memoryTextarea.value
+  memorySaveBtn.disabled = true
+  try {
+    await setScratchpad(key, text, memoryLoadedValue)
+    memoryLoadedValue = text
+    setMemoryStatus('Saved.', 'ok')
+    refreshMemoryCell(key)
+    return true
+  } catch (err) {
+    if (err instanceof BehaviorConflictError) {
+      // Someone else wrote this memory while it was open here. Keep what was
+      // typed — it is the only copy — and say plainly what happened, so the
+      // choice to merge or overwrite belongs to the person who typed it.
+      memoryLoadedValue = err.current
+      setMemoryStatus(
+        'Not saved — this memory was changed elsewhere. Save again to overwrite it with what is here.',
+        'error',
+      )
+      return false
+    }
+    setMemoryStatus('Failed to save: ' + (err as Error).message, 'error')
+    return false
+  } finally {
+    memorySaveBtn.disabled = false
+    memorySaveBtn.textContent = 'Save'
+  }
+}
+
+// Repaint a single row's memory cell so the dot/label reflect the
+// just-saved filled/empty state without rebuilding the whole table.
+function refreshMemoryCell(key: BehaviorKey) {
+  const tr = viewEl.querySelector<HTMLTableRowElement>(`tr[data-behavior="${key}"]`)
+  if (!tr) return
+  const cell = tr.querySelector<HTMLElement>('.behavior-memory-cell')
+  const meta = BEHAVIORS.find((b) => b.key === key)
+  if (cell && meta) cell.innerHTML = memoryCell(meta)
+}
+
+function renderShell(): string {
+  return `
+    <header class="view-header">
+      <div class="filter-cluster" id="behaviors-filters">
+        <div class="range-picker" id="behaviors-time-picker" role="group" aria-label="Run metrics period">
+          ${TIME_RANGES.map((range) => `<button type="button" data-time="${range.key}" class="${metricsRange === range.key ? 'active' : ''}" aria-pressed="${metricsRange === range.key}">${range.label}</button>`).join('')}
+        </div>
+      </div>
+    </header>
+    <main>
+      <table id="behaviors-table">
+        <thead>
+          <tr>
+            <th class="col-active" aria-label="Active"></th>
+            <th class="col-title">Behavior</th>
+            <th class="col-notifications">Status</th>
+            <th class="col-owner-wide">Owner</th>
+            <th class="col-setting">Setting</th>
+            <th class="col-reviewers">Reviewers</th>
+            <th class="col-memory">Memory</th>
+            <th class="col-last">Last triggered</th>
+            <th class="col-runs behavior-metric behavior-metrics-start" title="Runs started in the selected period">Total runs</th>
+            <th class="col-duration behavior-metric" title="Total elapsed run duration">Duration</th>
+            <th class="col-success behavior-metric" title="Completed runs that did not fail; unfinished runs are excluded">Success <span class="behavior-unit">(%)</span></th>
+          </tr>
+        </thead>
+        <tbody id="behaviors-tbody"></tbody>
+      </table>
+    </main>
+  `
+}
+
+function renderRow(meta: typeof BEHAVIORS[number]): HTMLTableRowElement {
+  const tr = document.createElement('tr')
+  tr.dataset.behavior = meta.key
+  const owner = behaviorOwners[meta.key] || null
+  tr.innerHTML = `
+    <td class="behavior-active-cell">${toggleCell(meta.key)}</td>
+    <td class="title-cell" title="${escapeHtml(meta.label)}"><span class="behavior-name">${escapeHtml(meta.label)}</span></td>
+    <td class="behavior-status-cell"><span class="behavior-notifications">${notificationChips(meta.key)}</span>${meta.key === 'implement-issues' || meta.key === 'repair-prs' ? `<button type="button" class="st-clear" data-behavior-pause="${meta.key}" title="Pause future invocations; a running worker continues"${stateUnknown() || pausesInFlight.has(meta.key) ? ' disabled' : ''}>${getPausedUntil(meta.key) ? 'Resume' : 'Pause 15 min'}</button>` : ''}</td>
+    <td class="behavior-owner-cell">${ownerCell(owner)}</td>
+    <td class="behavior-setting-cell">${settingCell(meta)}</td>
+    <td class="behavior-reviewers-cell">${reviewersCell(meta)}</td>
+    <td class="behavior-memory-cell">${memoryCell(meta)}</td>
+    <td class="behavior-last-cell">${lastTriggeredCell(meta.key)}</td>
+    ${metricCells(meta.key)}
+  `
+  return tr
+}
+
+// Entering the view used to issue two identical GETs — one here for the owner
+// map and one inside refreshState — and each one costs an `agent-interface
+// --logs` spawn on the server. refreshState reads the same payload, so the
+// owners come from its cached copy and this is a single request.
+//
+// (A non-ok response also used to return early here, skipping refreshState
+// entirely: the mirror stayed at its defaults with every toggle drawn OFF and
+// no diagnostics, while the runtime carried on spawning agents. refreshState
+// records the failure, so it must always run.)
+async function fetchBehaviorOwners() {
+  await refreshState()
+  for (const key of BEHAVIORS.map((behavior) => behavior.key)) {
+    behaviorOwners[key as BehaviorKey] = getBehaviorOwner(key) ?? null
+  }
+}
+
+// What the notification rail lists about a behavior: one count per group,
+// each of which opens the rail on that behavior.
+const CHIP_GROUPS: { group: ItemGroup, tone: string, words: (n: number) => string }[] = [
+  { group: 'faults', tone: 'red', words: (n) => `${n} fault${n === 1 ? '' : 's'}` },
+  { group: 'needs', tone: 'amber', words: (n) => `${n} need${n === 1 ? 's' : ''} you` },
+  { group: 'auto', tone: 'slate', words: (n) => `${n} auto` },
+]
+
+function notificationChips(key: BehaviorKey): string {
+  const counts = notificationCountsFor(key)
+  return CHIP_GROUPS.filter(({ group }) => counts[group] > 0).map(({ group, tone, words }) =>
+    `<button type="button" class="nr-count-chip" data-tone="${tone}" data-notifications-behavior="${escapeHtml(key)}" data-group="${group}" data-opens-notifications title="Show in notifications">${words(counts[group])}</button>`,
+  ).join('')
+}
+
+function refreshNotificationChips() {
+  if (!viewEl) return
+  for (const meta of BEHAVIORS) {
+    const cell = viewEl.querySelector<HTMLElement>(`tr[data-behavior="${meta.key}"] .behavior-notifications`)
+    if (cell) patchContent(cell, notificationChips(meta.key))
+  }
+}
+
+function renderRows() {
+  const tbody = viewEl.querySelector<HTMLTableSectionElement>('#behaviors-tbody')!
+  layout(tbody, () => patchContent(tbody, BEHAVIORS.map(meta => renderRow(meta).outerHTML).join('')))
+}
+
+function attachHandlers() {
+  viewEl.addEventListener('click', (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-behavior-pause]')
+    if (!button) return
+    const key = button.dataset.behaviorPause as BehaviorKey
+    if (pausesInFlight.has(key)) return
+    pausesInFlight.add(key)
+    button.disabled = true
+    void setPaused(key, getPausedUntil(key) ? null : new Date(Date.now() + 15 * 60_000).toISOString())
+      .catch((error: unknown) => { button.disabled = false; viewFeedback(`behavior-pause:${key}`, 'Behavior pause failed', String(error)) })
+      .finally(() => { pausesInFlight.delete(key); renderRows() })
+  })
+  viewEl.querySelector('#behaviors-time-picker')!.addEventListener('click', (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-time]')
+    if (!button || !isTimeRange(button.dataset.time) || button.dataset.time === metricsRange) return
+    metricsRange = button.dataset.time
+    metricsReport = null
+    metricsError = ''
+    viewEl.querySelectorAll<HTMLButtonElement>('#behaviors-time-picker button').forEach((pill) => {
+      const selected = pill.dataset.time === metricsRange
+      pill.classList.toggle('active', selected)
+      pill.setAttribute('aria-pressed', String(selected))
+    })
+    refreshMetricCells()
+    void refreshMetrics()
+  })
+  const tbody = viewEl.querySelector<HTMLTableSectionElement>('#behaviors-tbody')!
+  tbody.addEventListener('change', (e) => {
+    const target = e.target as HTMLElement
+    // Toggle (Active column)
+    if (target.matches('input[type="checkbox"][data-behavior]')) {
+      const cb = target as HTMLInputElement
+      const key = cb.dataset.behavior as BehaviorKey
+      const requested = cb.checked
+      cb.disabled = true
+      togglesInFlight.add(key)
+      void setEnabled(key, requested).then(() => viewFeedback(`behavior-toggle:${key}`, 'Behavior action needs attention', '')).catch((err: unknown) => {
+        viewFeedback(`behavior-toggle:${key}`, 'Behavior action needs attention', `Could not update behavior: ${(err as Error).message}`)
+      }).finally(() => {
+        // On failure setEnabled restores its local mirror. On success the
+        // change event may have rebuilt this row, so repaint whichever input
+        // is currently attached instead of trusting the stale element.
+        togglesInFlight.delete(key)
+        const current = viewEl.querySelector<HTMLInputElement>(
+          `input[type="checkbox"][data-behavior="${key}"]`,
+        )
+        if (current) {
+          current.checked = isEnabled(key)
+          current.disabled = stateUnknown()
+        }
+      })
+      return
+    }
+    // Reviewers dropdown — three values, written as chosen; an intermediate
+    // value only changes how many reviewers the next new pull request gets.
+    if (target.matches('select.behavior-reviewers[data-behavior]')) {
+      const sel = target as HTMLSelectElement
+      const key = sel.dataset.behavior as BehaviorKey
+      const value = Number(sel.value)
+      if (isReviewerCount(value)) writeReviewers(key, value)
+      return
+    }
+  })
+  tbody.addEventListener('click', (e) => {
+    // A behavior's notification count → the notification rail, on that behavior.
+    const counted = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-notifications-behavior]')
+    if (counted) {
+      openNotifications({ behavior: counted.dataset.notificationsBehavior, group: counted.dataset.group as ItemGroup })
+      return
+    }
+    // Setting pill → open or close the behavior's Setting dropdown.
+    const triggersBtn = (e.target as HTMLElement).closest<HTMLButtonElement>('.behavior-triggers-btn')
+    if (triggersBtn) {
+      e.preventDefault()
+      const key = triggersBtn.dataset.behavior as BehaviorKey
+      if (triggersKey === key && triggersPanelEl?.classList.contains('open')) void closeTriggersPanel()
+      else void closeTriggersPanel().then((closed) => { if (closed) openTriggersPanel(key) })
+      return
+    }
+    // Memory button → toggle the per-behavior scratchpad panel.
+    const memBtn = (e.target as HTMLElement).closest<HTMLButtonElement>('.behavior-memory-btn')
+    if (memBtn) {
+      e.preventDefault()
+      const key = memBtn.dataset.behavior as BehaviorKey
+      if (memoryPanelEl?.classList.contains('open') && memoryKey === key) closeMemoryPanel()
+      else openMemoryPanel(key)
+      return
+    }
+    // Last-triggered click → navigate to Swarm and focus the matching row.
+    // The actual view-switch + focus is bridged through main.ts so this
+    // module doesn't need to know about the menu.
+    const link = (e.target as HTMLElement).closest<HTMLAnchorElement>('.behavior-last-link')
+    if (!link || link.hasAttribute('data-merged-pr')) return
+    e.preventDefault()
+    const targetStr = link.dataset.target || ''
+    const m = targetStr.match(/^(.+)#(\d+)$/)
+    if (!m) return
+    const [, repo, num] = m
+    window.dispatchEvent(new CustomEvent('poise:goto-swarm-row', {
+      detail: { repo, pr_id: num },
+    }))
+  })
+}
+
+// In-place cell refresh — pulls fresh state from /api/behaviors and
+// updates cells in place without wiping the table. The server remains
+// authoritative for controls: another tab or a rejected request must be
+// reflected on the next tick instead of leaving a dangerous false state.
+async function tickRefresh() {
+  void refreshMetrics()
+  await refreshState()
+  for (const meta of BEHAVIORS) {
+    const tr = viewEl.querySelector<HTMLTableRowElement>(`tr[data-behavior="${meta.key}"]`)
+    if (!tr) continue
+    const cell = tr.querySelector<HTMLElement>('.behavior-last-cell')
+    if (cell) cell.innerHTML = lastTriggeredCell(meta.key)
+    // The owner is the agent account, which Settings can change meanwhile.
+    const owner = getBehaviorOwner(meta.key) ?? null
+    const ownerCellEl = tr.querySelector<HTMLElement>('.behavior-owner-cell')
+    if (ownerCellEl && owner !== (behaviorOwners[meta.key] ?? null)) {
+      behaviorOwners[meta.key] = owner
+      ownerCellEl.innerHTML = ownerCell(owner)
+    }
+    const toggle = tr.querySelector<HTMLInputElement>('input[type="checkbox"][data-behavior]')
+    if (toggle) repaintToggle(meta.key, toggle)
+    const pause = tr.querySelector<HTMLButtonElement>('[data-behavior-pause]')
+    if (pause) { pause.textContent = getPausedUntil(meta.key) ? 'Resume' : 'Pause 15 min'; pause.disabled = stateUnknown() || pausesInFlight.has(meta.key) }
+    const reviewers = tr.querySelector<HTMLSelectElement>('select.behavior-reviewers[data-behavior]')
+    if (reviewers) reviewers.disabled = stateUnknown() || reviewersInFlight.has(meta.key)
+    if (reviewers && !reviewersInFlight.has(meta.key)) reviewers.value = String(getReviewers(meta.key))
+    const memory = tr.querySelector<HTMLButtonElement>('.behavior-memory-btn')
+    if (memory) memory.disabled = stateUnknown()
+    // An open dropdown holds the person's draft; the pill repaints once it closes.
+    if ((meta.hasTriggers || meta.hasSkips) && triggersKey !== meta.key) refreshTriggersCell(meta.key)
+  }
+}
+
+export function stopBehaviorsRefresh() {
+  metricsGeneration++
+  // The view is going away, so the panel cannot stay open over what replaces it.
+  closeMemoryPanel(true)
+  void closeTriggersPanel(true)
+  if (!tickListening) return
+  window.removeEventListener('poise:refresh-tick', onTick)
+  tickListening = false
+}
+
+export async function initBehaviorsView() {
+  viewEl = document.getElementById('view-behaviors')!
+  if (!initialized) {
+    initialized = true
+    viewEl.innerHTML = renderShell()
+    attachHandlers()
+    // Re-render when behavior state changes from elsewhere (e.g. boot
+    // re-snapshot, programmatic toggle) so the UI never drifts.
+    window.addEventListener('poise:behaviors-changed', () => renderRows())
+    onNotificationItems(refreshNotificationChips)
+  }
+  // Cached rows and explicitly unknown first-load controls do not wait for
+  // the runtime read. Attach cleanup-owned work before the first await.
+  renderRows()
+  void refreshMetrics()
+  // Subscribe to the wall-clock-aligned ticker so the relative-time
+  // strings ("2h", "5m") stay accurate and any newly-fired behavior
+  // shows up without a manual reload.
+  if (!tickListening) {
+    window.addEventListener('poise:refresh-tick', onTick)
+    tickListening = true
+  }
+  await fetchBehaviorOwners()
+  if (!viewEl.hidden) renderRows()
+}

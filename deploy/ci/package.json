@@ -1,0 +1,9 @@
+{
+  "name": "poise-deploy-e2e",
+  "private": true,
+  "description": "The WebSocket client of the deployment's end-to-end test (deploy/ci/e2e.sh).",
+  "type": "module",
+  "dependencies": {
+    "ws": "8.21.3"
+  }
+}
