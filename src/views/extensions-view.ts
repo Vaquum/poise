@@ -236,7 +236,7 @@ function directoryHtml(): string {
     ${status?.error ? `<p class="st-help st-help-warn">The last sync stopped: ${esc(status.error)} It resumes from where it stopped.</p>` : ''}`
   if (!results) return head + '<div class="loader" role="status" aria-label="Loading the directory"><span></span><span></span><span></span></div>'
   if (!results.entries.length) {
-    return head + `<div class="ext-empty"><p>${status?.count ? 'Nothing in the directory matches.' : 'The directory is empty until the first sync finishes.'}</p><div class="st-row"><button type="button" class="st-clear" data-tab="custom">Add it as a custom server</button></div></div>`
+    return head + `<div class="ext-empty"><p>${query || kind !== 'any' || status?.count ? 'Nothing in the directory matches.' : 'The directory is empty until the first sync finishes.'}</p><div class="st-row"><button type="button" class="st-clear" data-tab="custom">Add it as a custom server</button></div></div>`
   }
   const installed = new Set(data?.servers.map((server) => server.registry?.name).filter(Boolean))
   const selected = panel?.kind === 'entry' ? panel.name : ''
@@ -250,7 +250,7 @@ function directoryHtml(): string {
         <div class="ext-card-top">${tile(entry.title, true)}<div><b>${esc(entry.title)}</b><span>${esc(entry.publisher)}</span></div></div>
         <p>${esc(entry.description || 'No description.')}</p>
         <div class="ext-card-foot">
-          ${remote ? '<span class="ext-badge">Remote</span>' : ''}${local ? '<span class="ext-badge">Local</span>' : ''}${keyed ? '<span class="ext-badge">Needs a key</span>' : ''}
+          ${entry.builtin ? '<span class="ext-badge">Built in</span>' : ''}${remote ? '<span class="ext-badge">Remote</span>' : ''}${local ? '<span class="ext-badge">Local</span>' : ''}${keyed ? '<span class="ext-badge">Needs a key</span>' : ''}
           ${installed.has(entry.name) ? '<span class="ext-added">Added</span>' : runnable ? `<button type="button" class="st-clear ext-add" data-add="${esc(entry.name)}">Add</button>` : '<span class="ext-badge ext-badge-quiet">Custom only</span>'}
         </div></article>`
     }).join('')}</div>
@@ -426,10 +426,10 @@ function entryPanelHtml(p: Extract<Panel, { kind: 'entry' }>): string {
         <div class="st-row"><button type="button" class="st-save" data-install ${p.busy ? 'disabled' : ''}>Add ${esc(entry.title)}</button><button type="button" class="st-clear" data-step="about">Back</button></div>`
       : `<div class="ext-options">${entry.options.map(optionHtml).join('')}</div>
         ${entry.options.some((candidate) => !candidate.unsupported) ? '<div class="st-row"><button type="button" class="st-save" data-step="setup">Add to Poise</button></div>' : '<p class="st-help st-help-warn">Poise cannot run this server as listed. Add it as a custom server instead.</p>'}`
-  return `<div class="tp-header">${tile(entry.title, true)}<div class="ext-panel-title"><span class="tp-title">${esc(entry.title)}</span><span class="st-help st-help-info">${esc(entry.publisher)} · v${esc(entry.version)}</span></div>
+  return `<div class="tp-header">${tile(entry.title, true)}<div class="ext-panel-title"><span class="tp-title">${esc(entry.title)}</span><span class="st-help st-help-info">${esc(entry.publisher)} · v${esc(entry.version)}${entry.builtin ? ' · built in' : ''}</span></div>
       <button type="button" class="tp-close" data-close aria-label="Close">&times;</button></div>
     <div class="tp-body"><p class="ext-description">${esc(entry.description || 'No description.')}</p>
-      <div class="ext-facts"><div><span>Registry</span><div><code>${esc(entry.name)}</code></div></div>${entry.websiteUrl ? `<div><span>Website</span><div><a href="${esc(entry.websiteUrl)}" target="_blank" rel="noopener noreferrer">${esc(entry.websiteUrl)}</a></div></div>` : ''}${entry.repositoryUrl ? `<div><span>Source</span><div><a href="${esc(entry.repositoryUrl)}" target="_blank" rel="noopener noreferrer">${esc(entry.repositoryUrl)}</a></div></div>` : ''}</div>
+      <div class="ext-facts"><div><span>${entry.builtin ? 'Built in' : 'Registry'}</span><div><code>${esc(entry.name)}</code></div></div>${entry.websiteUrl ? `<div><span>Website</span><div><a href="${esc(entry.websiteUrl)}" target="_blank" rel="noopener noreferrer">${esc(entry.websiteUrl)}</a></div></div>` : ''}${entry.repositoryUrl ? `<div><span>Source</span><div><a href="${esc(entry.repositoryUrl)}" target="_blank" rel="noopener noreferrer">${esc(entry.repositoryUrl)}</a></div></div>` : ''}</div>
       ${body}</div>`
 }
 

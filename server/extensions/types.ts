@@ -83,6 +83,8 @@ export interface DirectoryEntry {
   websiteUrl?: string
   repositoryUrl?: string
   icon?: string
+  /** Set for servers Poise builds in rather than mirrors from the registry. */
+  builtin?: boolean
   options: InstallOption[]
 }
 

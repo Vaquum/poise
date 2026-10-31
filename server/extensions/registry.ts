@@ -7,6 +7,7 @@
 import { accessSync, constants } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { db, getMeta, setMeta } from '../db'
+import { BUILTIN_ENTRIES } from './builtin'
 import { ExtensionError } from './store'
 import { nameFrom, type DirectoryEntry, type DirectoryInput, type DirectoryStatus, type Field, type InstallOption, type ServerSpec } from './types'
 
@@ -61,6 +62,13 @@ function all(): DirectoryEntry[] {
   const stamp = `${n}:${g}`
   if (entries?.stamp !== stamp) entries = { stamp, list: (db.prepare('SELECT entry FROM extension_directory ORDER BY name').all() as Array<{ entry: string }>).map((row) => JSON.parse(row.entry) as DirectoryEntry) }
   return entries.list
+}
+
+/** The directory as the view sees it: the built-in servers first, then the
+ *  mirror. A built-in shadows a mirror row of the same name. */
+function catalog(): DirectoryEntry[] {
+  const shadowed = new Set(BUILTIN_ENTRIES.map((entry) => entry.name))
+  return [...BUILTIN_ENTRIES, ...all().filter((entry) => !shadowed.has(entry.name))]
 }
 
 export function directoryStatus(): DirectoryStatus {
@@ -269,7 +277,7 @@ function withHost(entry: DirectoryEntry): DirectoryEntry {
 }
 
 export function directoryEntryByName(name: string): DirectoryEntry {
-  const entry = all().find((candidate) => candidate.name === name)
+  const entry = catalog().find((candidate) => candidate.name === name)
   if (!entry) throw new ExtensionError(404, `${name} is not in the directory. Refresh the directory and try again.`)
   return withHost(entry)
 }
@@ -278,13 +286,14 @@ export function searchDirectory(query: string, kind: 'any' | 'remote' | 'local',
   const words = query.toLowerCase().split(/\s+/).filter(Boolean)
   const fits = (entry: DirectoryEntry) => kind === 'any' || entry.options.some((option) => (option.kind === 'remote') === (kind === 'remote'))
   if (!words.length) {
-    const byName = new Map(all().map((entry) => [entry.name, entry]))
-    const featured = FEATURED.map((name) => byName.get(name)).filter((entry): entry is DirectoryEntry => !!entry && fits(entry))
-    const rest = all().filter((entry) => !FEATURED.includes(entry.name) && fits(entry))
-    const ordered = [...featured, ...rest]
-    return { entries: ordered.slice(offset, offset + limit).map(withHost), total: ordered.length, featured: featured.length > 0 }
+    const byName = new Map(catalog().map((entry) => [entry.name, entry]))
+    const builtin = BUILTIN_ENTRIES.filter((entry) => fits(entry))
+    const featured = FEATURED.map((name) => byName.get(name)).filter((entry): entry is DirectoryEntry => !!entry && fits(entry) && !entry.builtin)
+    const rest = catalog().filter((entry) => !entry.builtin && !FEATURED.includes(entry.name) && fits(entry))
+    const ordered = [...builtin, ...featured, ...rest]
+    return { entries: ordered.slice(offset, offset + limit).map(withHost), total: ordered.length, featured: builtin.length + featured.length > 0 }
   }
-  const scored = all().flatMap((entry) => {
+  const scored = catalog().flatMap((entry) => {
     if (!fits(entry)) return []
     const title = entry.title.toLowerCase()
     const haystack = `${title} ${entry.name.toLowerCase()} ${entry.description.toLowerCase()}`
