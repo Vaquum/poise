@@ -30,7 +30,7 @@ class FakeClock implements RefreshClock {
   }
 }
 
-function harness(start: string, zone: string, options: { paused?: () => boolean, refresh?: () => Promise<Record<string, unknown>> } = {}) {
+function harness(start: string, zone: string, options: { paused?: () => boolean, refresh?: () => Promise<Record<string, unknown>>, ready?: Promise<boolean> } = {}) {
   const clock = new FakeClock(t(start))
   const runs: string[] = []
   const logs: string[] = []
@@ -43,6 +43,7 @@ function harness(start: string, zone: string, options: { paused?: () => boolean,
     clock,
     log: (line) => logs.push(line),
     logError: (line) => errors.push(line),
+    ready: options.ready,
   })
   return { clock, runs, logs, errors, state, schedule }
 }
@@ -197,5 +198,51 @@ describe('the daily model check', () => {
     expect(clock.pending).toBe(0)
     await clock.advanceTo(t('2026-06-12T00:00:00Z'))
     expect(runs).toEqual([])
+  })
+
+  it('holds a run due while ownership is pending, then runs it once granted', async () => {
+    let resolveOwnership!: (own: boolean) => void
+    const ready = new Promise<boolean>((resolve) => { resolveOwnership = resolve })
+    const { clock, runs, schedule } = harness('2026-06-10T06:59:58Z', 'UTC', { ready })
+    schedule.start()
+    await clock.advanceTo(t('2026-06-10T07:00:00Z'))
+    expect(runs).toEqual([])
+    resolveOwnership(true)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(runs).toEqual(['2026-06-10T07:00:00.000Z'])
+    await clock.advanceTo(t('2026-06-11T07:00:01Z'))
+    expect(runs).toEqual(['2026-06-10T07:00:00.000Z', '2026-06-11T07:00:00.000Z'])
+    schedule.stop()
+  })
+
+  it('drops a run due while ownership is pending when the legacy job survives', async () => {
+    let resolveOwnership!: (own: boolean) => void
+    const ready = new Promise<boolean>((resolve) => { resolveOwnership = resolve })
+    const { clock, runs, logs, schedule } = harness('2026-06-10T06:59:58Z', 'UTC', { ready })
+    schedule.start()
+    await clock.advanceTo(t('2026-06-10T07:00:00Z'))
+    expect(runs).toEqual([])
+    resolveOwnership(false)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(runs).toEqual([])
+    expect(logs).toContain('[models] daily model check skipped: the legacy launchd job remains the scheduler')
+    expect(clock.pending).toBe(0)
+    await clock.advanceTo(t('2026-06-12T00:00:00Z'))
+    expect(runs).toEqual([])
+  })
+
+  it('stands down when ownership rejects', async () => {
+    let rejectOwnership!: (error: unknown) => void
+    const ready = new Promise<boolean>((_, reject) => { rejectOwnership = reject })
+    const { clock, runs, logs, schedule } = harness('2026-06-10T06:59:58Z', 'UTC', { ready })
+    schedule.start()
+    await clock.advanceTo(t('2026-06-10T07:00:00Z'))
+    expect(runs).toEqual([])
+    rejectOwnership(new Error('retirement failed'))
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(runs).toEqual([])
+    expect(logs).toContain('[models] daily model check skipped: the legacy launchd job remains the scheduler')
+    expect(clock.pending).toBe(0)
+    schedule.stop()
   })
 })

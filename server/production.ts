@@ -78,6 +78,10 @@ export interface ProductionServerOptions {
   terminalCommand?: (preset: TerminalPreset) => TerminalCommand
   /** Service mode. Omitted: read from the environment; `null`: off. */
   service?: ServiceConfig | null
+  /** Ownership of the daily model schedule. While pending, a due check waits
+   *  instead of running; `startProductionServer` resolves it once legacy-job
+   *  retirement settles. Tests gate the scheduler without retirement. */
+  modelRefreshReady?: Promise<boolean>
 }
 
 function isLoopbackHost(host: string): boolean {
@@ -426,6 +430,7 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
     terminalCommand: options.terminalCommand,
     instanceLabel: 'production',
     service,
+    modelRefreshReady: options.modelRefreshReady,
   })
 
   const server = createServer((req, res) => {
@@ -484,9 +489,17 @@ export async function startProductionServer(options: ProductionServerOptions = {
   await assertCallerRelease()
   const staticDir = resolve(options.staticDir || resolve(process.cwd(), 'dist/client'))
   await stat(resolve(staticDir, 'index.html'))
+  // The scheduler arms inside createProductionServer, before the retirement
+  // below settles; gate its first run on the retirement outcome so a startup
+  // spanning 07:00 cannot fire both checks.
+  const retirementEnabled = catalogRetirementEnabled()
+  let resolveOwnership: ((own: boolean) => void) | null = null
+  const modelRefreshReady = retirementEnabled
+    ? new Promise<boolean>((resolve) => { resolveOwnership = resolve })
+    : options.modelRefreshReady
   let server: Server
   try {
-    server = createProductionServer({ ...options, host, port, staticDir, confabUrl, service })
+    server = createProductionServer({ ...options, host, port, staticDir, confabUrl, service, modelRefreshReady })
   } catch (error) {
     await settleRuntimeStop()
     throw error
@@ -514,8 +527,11 @@ export async function startProductionServer(options: ProductionServerOptions = {
   // retires the legacy calendar job it replaces — or stands its own check
   // down when the old job survives, so the two can never both fire. Managed
   // installs never re-run the installer, so this is what retires theirs.
-  if (catalogRetirementEnabled()) {
-    void ensureSingleModelScheduler({ stopScheduler: stopDailyModelRefresh })
+  if (retirementEnabled) {
+    let stoodDown = false
+    void ensureSingleModelScheduler({
+      stopScheduler: () => { stoodDown = true; stopDailyModelRefresh() },
+    }).finally(() => { resolveOwnership?.(!stoodDown) })
   }
   return server
 }
