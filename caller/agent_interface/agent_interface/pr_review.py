@@ -12,7 +12,11 @@ SYSTEM = (
 POLICY = (
     "Review the supplied immutable PR packet. Gather every blocking inline finding, "
     "then finish with exactly one terminal call: request-changes once with one JSON "
-    "array, or reviewed-clean once when there is no blocking finding."
+    "array, or reviewed-clean once when there is no blocking finding. "
+    "Every terminal command includes --assessment-json with an object containing verdict "
+    "(your substantive assessment, 20-4000 characters), reviewed_context (what you inspected, "
+    "20-4000 characters), and limitations (including unverified tests, 4-4000 characters). "
+    "A fixed clean sentence or acknowledgement is insufficient."
 )
 SEVERITY = (
     "p0: breaks a common path — data loss, crash, security hole, auth bypass, etc.",
@@ -45,8 +49,8 @@ def allowed(pr: str, actor: str, expected_head: str) -> list[str]:
     ref = shlex.quote(atoms.pr_ref(pr))
     fixed = atoms.fixed_mutation_args(actor, expected_head)
     return [
-        f"Bash(github-interface --request-changes {ref} --comments-json * {fixed})",
-        f"Bash(github-interface --reviewed-clean {ref} {fixed})",
+        f"Bash(github-interface --request-changes {ref} --comments-json * --assessment-json * {fixed})",
+        f"Bash(github-interface --reviewed-clean {ref} --assessment-json * {fixed})",
     ]
 
 

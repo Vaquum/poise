@@ -316,6 +316,9 @@ describe('approval eligibility and review activity', () => {
       completedAt: '2026-07-15T11:40:00.000Z',
       headSha: HEAD_SHA,
     })).toBe(true)
+    fixture.agentLogs = [agentLog({ id: 'b'.repeat(32), behavior: 'pr_approve', status: 'completed', action: 'approved', outcome: 'approved',
+      head_sha: HEAD_SHA, correlation_id: claimId, started_at: '2026-07-15T11:39:00.000Z', started_at_precise: '2026-07-15T11:39:00.000Z',
+      completed_at: '2026-07-15T11:40:00.000Z' })]
 
     await runtime.runEnabledBehaviorsOnce()
 
@@ -724,6 +727,9 @@ describe('approval eligibility and review activity', () => {
       completedAt: new Date(Date.now() - 30_000).toISOString(), headSha: HEAD_SHA,
     })
     if (!completed) throw new Error('could not complete approval basis')
+    fixture.agentLogs = [agentLog({ id: 'a'.repeat(32), behavior: 'pr_approve', status: 'completed', action: 'approved', outcome: 'approved',
+      head_sha: HEAD_SHA, correlation_id: claimId, started_at: new Date(Date.now() - 60_000).toISOString(),
+      started_at_precise: new Date(Date.now() - 60_000).toISOString(), completed_at: new Date(Date.now() - 30_000).toISOString() })]
 
     await runtime.runEnabledBehaviorsOnce()
 

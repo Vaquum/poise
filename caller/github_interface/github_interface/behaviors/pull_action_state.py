@@ -2,6 +2,7 @@ from typing import Any
 import re
 
 from github_interface.atoms.pulls import get_pr_readiness_state, get_pull, list_reviews
+from github_interface.atoms.review_response import context_sha, parse_body
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository, token_user
@@ -46,6 +47,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                 if payload.get("queue_evidence"):
                     marker = re.search(r"<!-- poise-invocation ([0-9a-f]{32}) -->\s*\Z", review.get("body") or "")
                     mine[-1]["invocation_id"] = marker.group(1) if marker else None
+                    mine[-1]["review_response"] = parse_body(review.get("body") or "")
 
         queue_entry_id = None
         steady = True
@@ -94,6 +96,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "merged_by": _login(pull.get("merged_by")),
         "head_sha": (pull.get("head") or {}).get("sha"),
         "merge_sha": pull.get("merge_commit_sha"),
+        **({"review_context": context_sha(pull), "merged_at": pull.get("merged_at")} if payload.get("queue_evidence") else {}),
         "queue_entry_id": queue_entry_id,
         "my_reviews": mine,
         **queue_evidence,

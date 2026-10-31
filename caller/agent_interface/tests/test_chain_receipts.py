@@ -27,7 +27,7 @@ class ManagedReceipts(TestCase):
         self.conn.execute("create table calls (id text primary key, source text, status text, behavior text, error_code text, artifact text, "
                           "action text, outcome text, head_sha text, resources_settled_at real, action_plan text)")
         self.conn.execute("insert into calls(id,source,status,behavior,artifact) values(?, 'poise:behavior-chain','running','pr_review',?)",
-                          (CALL, json.dumps({"phase": "reviewing"})))
+                          (CALL, json.dumps({"phase": "reviewing", "review_response": {"head_sha": HEAD, "completed_at": 1}})))
         self.conn.commit()
         self.addCleanup(patch.stopall)
         patch.dict(os.environ, {"AGENT_INTERFACE_RECEIPT_DB": str(self.path), "AGENT_INTERFACE_RECEIPT_CALL": CALL}).start()
@@ -39,6 +39,13 @@ class ManagedReceipts(TestCase):
         self.assertEqual(phase, "submitting_review")
         with self.assertRaisesRegex(RuntimeError, "unsubmitted native action"):
             review_receipt.begin_submission("Duplicate", HEAD)
+
+    def test_metadata_only_or_future_response_cannot_enter_terminal_submission(self):
+        for response in (None, {"head_sha": "c" * 40, "completed_at": 1}, {"head_sha": HEAD, "completed_at": 10 ** 15}):
+            self.conn.execute("update calls set artifact=?", (json.dumps({"phase": "reviewing", "review_response": response}),))
+            self.conn.commit()
+            with self.assertRaisesRegex(RuntimeError, "unsubmitted native action"):
+                review_receipt.begin_submission("Actual verdict", HEAD)
 
     def test_a_pushed_head_preserves_unattempted_replies_and_reserves_them_only_once(self):
         self.conn.execute("update calls set behavior='repair_pr', action_plan='{}', artifact=?",

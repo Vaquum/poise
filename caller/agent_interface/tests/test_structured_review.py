@@ -20,6 +20,9 @@ from agent_interface.review_watch import ReviewWatch
 
 FINDING = {"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "[p1] O'Brien's input crashes."}
 MUSE_SESSION_ERROR = "muse: local session messaging disabled: session logging is required"
+ASSESSMENT = {"verdict": "The changed validation paths have no remaining blocking defects.",
+              "reviewed_context": "Inspected the supplied immutable diff and its affected callers.",
+              "limitations": "Provider fixture; no application test execution."}
 
 
 def scripted_muse(directory: Path) -> Path:
@@ -123,13 +126,23 @@ class TestReviewModel(TestCase):
 
 
 class TestStructuredVerdict(TestCase):
+    def test_terminal_result_requires_substantive_assessment(self):
+        for value in (None, {}, {**ASSESSMENT, "verdict": "Acknowledged"},
+                      {**ASSESSMENT, "verdict": "Reviewed: no blocking findings."},
+                      {**ASSESSMENT, "limitations": ""}, {**ASSESSMENT, "reviewed_context": "x" * 4001}):
+            verdict = {"action": "reviewed_clean", "comments": [], **({"assessment": value} if value is not None else {})}
+            with self.subTest(value=value), self.assertRaises(structured_review.InvalidVerdict):
+                structured_review.validate_verdict(json.dumps(verdict), "pr_review")
+        verdict = {"action": "reviewed_clean", "comments": [], "assessment": ASSESSMENT}
+        self.assertEqual(structured_review.validate_verdict(json.dumps(verdict), "pr_review"), verdict)
+
     def test_codex_resumes_only_its_review_with_new_inspection_evidence(self):
         thread = "01234567-89ab-4cde-8123-456789abcdef"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             watch = SimpleNamespace(run=lambda *args, **kwargs: None)
             def process(args, **kwargs):
-                Path(args[args.index("--output-last-message") + 1]).write_text('{"action":"reviewed_clean","comments":[]}')
+                Path(args[args.index("--output-last-message") + 1]).write_text('{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action":"reviewed_clean","comments":[]}')
                 return SimpleNamespace(returncode=0, stdout=json.dumps({"type":"thread.started","thread_id":thread}), stderr="")
             with patch.object(watch, "run", side_effect=process) as run:
                 first = "immutable packet\n\nInspection rounds remaining: 12."
@@ -154,7 +167,7 @@ class TestStructuredVerdict(TestCase):
             watch = SimpleNamespace(run=lambda *args, **kwargs: None)
             threads = iter(["01234567-89ab-4cde-8123-456789abcdef", "01234567-89ab-4cde-8123-456789abcdea"])
             def process(args, **kwargs):
-                Path(args[args.index("--output-last-message") + 1]).write_text('{"action":"reviewed_clean","comments":[]}')
+                Path(args[args.index("--output-last-message") + 1]).write_text('{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action":"reviewed_clean","comments":[]}')
                 return SimpleNamespace(returncode=0, stdout=json.dumps({"type":"thread.started","thread_id":next(threads)}), stderr="")
             with patch.object(watch, "run", side_effect=process):
                 model = CATALOG.resolve("gpt-6-astra-max")
@@ -182,7 +195,7 @@ class TestStructuredVerdict(TestCase):
 
     def test_submits_exactly_one_atomic_review_with_fixed_target(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "CODEX_API_KEY": "test-key"}):
-            result, run = self._run({"action": "request_changes", "comments": [FINDING]})
+            result, run = self._run({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]})
         self.assertIn('"review_id": 91', result)
         self.assertEqual(run.call_count, 2)
         model_call, mutation = run.call_args_list
@@ -200,7 +213,8 @@ class TestStructuredVerdict(TestCase):
         self.assertNotIn("OPENAI_API_KEY", model_call.kwargs["env"])
         self.assertNotIn("CODEX_API_KEY", model_call.kwargs["env"])
         self.assertEqual(mutation.args[0], ["github-interface", "--request-changes", "#12", "--comments-json",
-                                          json.dumps([FINDING]), "--expected-head", "a" * 40, "--token-user", "bit-mis"])
+                                          json.dumps([FINDING]), "--assessment-json", json.dumps(ASSESSMENT),
+                                          "--expected-head", "a" * 40, "--token-user", "bit-mis"])
         self.assertEqual(mutation.kwargs["cwd"], "/repo")
 
     def test_stale_head_refusal_at_submit_is_superseded_not_a_violation(self):
@@ -211,7 +225,7 @@ class TestStructuredVerdict(TestCase):
                 return SimpleNamespace(returncode=1, stdout="",
                                        stderr="error: pull-request head changed: expected %s, got %s" % ("a" * 40, "b" * 40))
             Path(args[args.index("--output-last-message") + 1]).write_text(
-                json.dumps({"action": "request_changes", "comments": [FINDING]}))
+                json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with patch.object(structured_review.subprocess, "run", side_effect=process), \
@@ -229,7 +243,7 @@ class TestStructuredVerdict(TestCase):
                 return SimpleNamespace(returncode=1, stdout="",
                                        stderr="error: 1 unresolved review conversation(s) from other reviewers remain")
             Path(args[args.index("--output-last-message") + 1]).write_text(
-                json.dumps({"action": "approve", "comments": []}))
+                json.dumps({"assessment": ASSESSMENT, "action": "approve", "comments": []}))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with patch.object(structured_review.subprocess, "run", side_effect=process), \
@@ -253,7 +267,7 @@ class TestStructuredVerdict(TestCase):
                                               "  File \"client.py\", line 69, in request\n"
                                               "httpx.ReadTimeout: timed out\n")
             Path(args[args.index("--output-last-message") + 1]).write_text(
-                json.dumps({"action": "approve", "comments": []}))
+                json.dumps({"assessment": ASSESSMENT, "action": "approve", "comments": []}))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with patch.object(structured_review.subprocess, "run", side_effect=process), \
@@ -266,16 +280,16 @@ class TestStructuredVerdict(TestCase):
     def test_clean_and_approval_are_distinct_terminal_actions(self):
         for behavior, action, flag in (("pr_review", "reviewed_clean", "--reviewed-clean"), ("pr_approve", "approve", "--approve-pr")):
             with self.subTest(behavior=behavior):
-                _, run = self._run({"action": action, "comments": []}, behavior)
+                _, run = self._run({"assessment": ASSESSMENT, "action": action, "comments": []}, behavior)
                 self.assertEqual(run.call_args.args[0][1], flag)
 
     def test_malformed_or_conflicting_verdicts_never_submit(self):
-        verdicts = [None, {}, {"action": "approve", "comments": []},
-                    {"action": "request_changes", "comments": []},
-                    {"action": "reviewed_clean", "comments": [FINDING]},
-                    {"action": "request_changes", "comments": [{**FINDING, "line": True}]},
-                    {"action": "request_changes", "comments": [FINDING] * 101},
-                    {"action": "reviewed_clean", "comments": [], "head": "b" * 40}]
+        verdicts = [None, {}, {"assessment": ASSESSMENT, "action": "approve", "comments": []},
+                    {"assessment": ASSESSMENT, "action": "request_changes", "comments": []},
+                    {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": [FINDING]},
+                    {"assessment": ASSESSMENT, "action": "request_changes", "comments": [{**FINDING, "line": True}]},
+                    {"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING] * 101},
+                    {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": [], "head": "b" * 40}]
         for verdict in verdicts:
             with self.subTest(verdict=verdict), self.assertRaises(atoms.AgentPreflightError):
                 self._run(verdict)
@@ -283,16 +297,16 @@ class TestStructuredVerdict(TestCase):
     def test_provider_failure_and_tool_use_do_not_submit(self):
         for kwargs in ({"code": 1}, {"event": {"item": {"type": "command_execution"}}}):
             with self.subTest(kwargs=kwargs), self.assertRaises(atoms.AgentPreflightError):
-                self._run({"action": "reviewed_clean", "comments": []}, **kwargs)
+                self._run({"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}, **kwargs)
 
     def test_disabled_tool_notice_does_not_reject_a_completed_verdict(self):
-        _, run = self._run({"action": "reviewed_clean", "comments": []},
+        _, run = self._run({"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []},
                           event={"type": "item.completed", "item": {"type": "error", "message": "Code mode is disabled"}})
         self.assertEqual(run.call_count, 2)
 
     def test_turn_failure_cannot_submit_even_with_output_and_zero_exit(self):
         with self.assertRaises(atoms.AgentPreflightError):
-            self._run({"action": "reviewed_clean", "comments": []}, event={"type": "turn.failed"})
+            self._run({"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}, event={"type": "turn.failed"})
 
     def test_timeout_is_proven_no_action_before_submission(self):
         with patch.object(ReviewWatch, "run", side_effect=subprocess.TimeoutExpired("codex", 60)) as run, \
@@ -333,6 +347,18 @@ def staged_packet(paths):
 
 
 class TestStagedReview(TestCase):
+    def test_stages_carry_a_bounded_cumulative_assessment_without_joining_full_responses(self):
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        first = {key: value + "a" * 3000 for key, value in ASSESSMENT.items()}
+        final = {key: value + "b" * 3000 for key, value in ASSESSMENT.items()}
+        _, calls = self._run(packet, [{"action": "reviewed_clean", "comments": [], "assessment": first},
+                                      {"action": "reviewed_clean", "comments": [], "assessment": final}])
+        self.assertIn(first['verdict'], calls[1][1]['input'])
+        self.assertIn('every group reviewed', calls[1][1]['input'])
+        command = calls[-1][0]
+        self.assertEqual(json.loads(command[command.index('--assessment-json') + 1]), final)
+        self.assertEqual(sum(args[0] == 'github-interface' for args, _ in calls), 1)
+
     def _run(self, packet, verdicts, text_packet=None):
         pending = list(verdicts)
         calls = []
@@ -359,8 +385,8 @@ class TestStagedReview(TestCase):
         first = {"path": "src/f00.py", "line": 1, "side": "RIGHT", "body": "first group defect"}
         second = {"path": "src/f08.py", "line": 1, "side": "RIGHT", "body": "second group defect"}
         packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
-        result, calls = self._run(packet, [{"action": "request_changes", "comments": [first]},
-                                           {"action": "request_changes", "comments": [second]}])
+        result, calls = self._run(packet, [{"assessment": ASSESSMENT, "action": "request_changes", "comments": [first]},
+                                           {"assessment": ASSESSMENT, "action": "request_changes", "comments": [second]}])
         self.assertIn('"review_id": 91', result)
         self.assertEqual(len(calls), 3)
         (first_args, first_kwargs), (second_args, second_kwargs), (mutation, _) = calls
@@ -372,18 +398,19 @@ class TestStagedReview(TestCase):
         self.assertIn("first group defect", second_kwargs["input"])
         self.assertEqual(mutation[:4], ["github-interface", "--request-changes", "#12", "--comments-json"])
         self.assertEqual(json.loads(mutation[4]), [first, second])
-        self.assertEqual(mutation[5:], ["--expected-head", "a" * 40, "--token-user", "bit-mis"])
+        self.assertEqual(mutation[5:], ["--assessment-json", json.dumps(ASSESSMENT, ensure_ascii=False),
+                                       "--expected-head", "a" * 40, "--token-user", "bit-mis"])
 
     def test_clean_groups_combine_into_one_clean_verdict(self):
         packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
-        result, calls = self._run(packet, [{"action": "reviewed_clean", "comments": []},
-                                           {"action": "reviewed_clean", "comments": []}])
+        result, calls = self._run(packet, [{"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []},
+                                           {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}])
         self.assertIn('"review_id": 91', result)
         self.assertEqual(calls[-1][0][1], "--reviewed-clean")
 
     def test_small_packet_with_packet_runs_one_unchanged_stage(self):
         packet = staged_packet(["src/only.py"])
-        result, calls = self._run(packet, [{"action": "reviewed_clean", "comments": []}])
+        result, calls = self._run(packet, [{"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}])
         self.assertIn('"review_id": 91', result)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][1]["input"], f"system\n\npolicy\n\nPR packet:\n{packet}\n\nAllowed:\nnone")
@@ -392,7 +419,7 @@ class TestStagedReview(TestCase):
     def test_mismatched_packet_and_prompt_is_a_contract_violation(self):
         packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
         with self.assertRaises(atoms.AgentPreflightError) as failure:
-            self._run(packet, [{"action": "reviewed_clean", "comments": []}],
+            self._run(packet, [{"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}],
                       text_packet=staged_packet(["src/other.py"]))
         self.assertEqual(failure.exception.code, "review_contract_violation")
 
@@ -404,10 +431,10 @@ class TestStagedReview(TestCase):
             calls.append(text)
             self.assertIn("requests", schema["required"])
             if "file group 1 of 2" in text and "Previous review step" not in text:
-                return json.dumps({"action": "inspect", "comments": [], "requests": [request]})
+                return json.dumps({"assessment": ASSESSMENT, "action": "inspect", "comments": [], "requests": [request]})
             path = "src/f00.py" if "file group 1 of 2" in text else "src/f08.py"
             finding = {"path": path, "line": 1, "side": "RIGHT", "body": "defect"}
-            return json.dumps({"action": "request_changes", "comments": [finding], "requests": []})
+            return json.dumps({"assessment": ASSESSMENT, "action": "request_changes", "comments": [finding], "requests": []})
 
         repo = review_repository.Repository(Path("/tmp/review"), {"head_sha": "a" * 40})
         inspected = {"action": "review_context", "head_sha": "a" * 40, "results": []}
@@ -556,7 +583,7 @@ class TestSincePositions(TestCase):
             return since, full
 
     def test_removal_finding_inside_the_pr_diff_submits(self):
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         result, calls, fetch = self._run(self._packet("c" * 40, self.REMOVAL), verdict,
                                          self._full(self.REMOVAL))
@@ -567,7 +594,7 @@ class TestSincePositions(TestCase):
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
     def test_removal_finding_outside_the_reviewed_since_diff_is_a_contract_violation(self):
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 99, "side": "LEFT", "body": "stale"}]}
         with self.assertRaises(atoms.AgentPreflightError) as failure:
             self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(self.REMOVAL))
@@ -576,7 +603,7 @@ class TestSincePositions(TestCase):
     def test_left_finding_remaps_onto_shifted_pr_coordinates(self):
         shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
                              "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         result, calls, _ = self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(shifted))
         self.assertIn('"review_id": 91', result)
@@ -585,7 +612,7 @@ class TestSincePositions(TestCase):
         self.assertEqual([(comment["line"], comment["side"]) for comment in submitted], [(5, "LEFT")])
 
     def test_reaffirmed_left_finding_keeps_its_original_thread_coordinates(self):
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 5, "side": "LEFT", "body": "still blocks"}]}
         for outdated in (False, True):
             with self.subTest(outdated=outdated):
@@ -598,7 +625,7 @@ class TestSincePositions(TestCase):
                 self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
     def test_resolved_thread_cannot_validate_a_finding_outside_the_since_diff(self):
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 5, "side": "LEFT", "body": "still blocks"}]}
         node = json.loads(self._packet("c" * 40, self.REMOVAL))
         node["review_threads"] = [{"path": "src/gone.py", "line": 5, "side": "LEFT",
@@ -614,7 +641,7 @@ class TestSincePositions(TestCase):
                           "--- a/src/gone.py", "+++ b/src/gone.py",
                           "@@ -4,3 +10,3 @@", " context", "-return None", "+first", " context2",
                           "@@ -40,3 +30,3 @@", " context", "-return None", "+second", " context2"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "second removal"}]}
         _, calls, _ = self._run(self._packet("c" * 40, since), verdict, self._full(full))
         self.assertEqual(json.loads(calls[-1][0][4])[0]["line"], 41)
@@ -622,7 +649,7 @@ class TestSincePositions(TestCase):
     def test_left_finding_absent_from_the_pr_diff_fails_closed(self):
         other = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
                            "@@ -4,3 +4,3 @@", " context", "-other", "+replacement", " context2"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         with self.assertRaises(atoms.AgentPreflightError) as failure:
             self._run(self._packet("c" * 40, self.REMOVAL), verdict, self._full(other))
@@ -632,7 +659,7 @@ class TestSincePositions(TestCase):
     def test_added_then_deleted_finding_fails_closed_without_approving(self):
         deleted = "\n".join(["diff --git a/src/helper.py b/src/helper.py", "--- a/src/helper.py",
                              "+++ /dev/null", "@@ -1,1 +0,0 @@", "-def helper():"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/helper.py", "line": 1, "side": "LEFT",
                                 "body": "deleted while still imported"}]}
         empty = json.dumps({"action": "read", "diff": "", "files": []})
@@ -644,7 +671,7 @@ class TestSincePositions(TestCase):
     def test_right_finding_inside_the_pr_diff_submits(self):
         full = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
                           "@@ -1,1 +1,2 @@", " old", "+new"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 2, "side": "RIGHT", "body": "defect"}]}
         result, calls, fetch = self._run(self._packet("c" * 40), verdict, self._full(full))
         self.assertIn('"review_id": 91', result)
@@ -656,7 +683,7 @@ class TestSincePositions(TestCase):
     def test_right_finding_on_a_reverted_file_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "revert issue"}]}
         with self.assertRaises(atoms.AgentPreflightError) as failure:
             self._run(self._packet("c" * 40, self.REMOVAL), verdict,
@@ -667,7 +694,7 @@ class TestSincePositions(TestCase):
     def test_reaffirmed_prior_left_finding_absent_from_since_diff_submits(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
                                 "body": "still removed upstream"}]}
         node = json.loads(self._packet("c" * 40, kept, paths=("src/kept.py",)))
@@ -687,7 +714,7 @@ class TestSincePositions(TestCase):
                           "-    return None", " tail"])
         since = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
                            "@@ -8,3 +2,2 @@", " def b():", "-    return None", " tail"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/dup.py", "line": 9, "side": "LEFT", "body": "needed"}]}
         result, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/dup.py",)), verdict,
                                      self._full(full, paths=("src/dup.py",)))
@@ -700,7 +727,7 @@ class TestSincePositions(TestCase):
                           "@@ -1,4 +1,2 @@", " ctx", "-x", "-x", " tail"])
         since = "\n".join(["diff --git a/src/dup.py b/src/dup.py", "--- a/src/dup.py", "+++ b/src/dup.py",
                            "@@ -1,3 +1,2 @@", " ctx", "-x", " tail"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/dup.py", "line": 2, "side": "LEFT", "body": "which one"}]}
         with self.assertRaises(atoms.AgentPreflightError) as failure:
             self._run(self._packet("c" * 40, since, paths=("src/dup.py",)), verdict,
@@ -713,7 +740,7 @@ class TestSincePositions(TestCase):
         prev = "def f():\n    a = 10\n    b = 2\n    return a\n"
         cur = "def f():\n    a = 10\n    return a\n"
         since, full = self._real_diffs(base, prev, cur)
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/f.py", "line": 3, "side": "LEFT", "body": "b is still needed"}]}
         _, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/f.py",)), verdict,
                                 self._full(full, paths=("src/f.py",)))
@@ -726,7 +753,7 @@ class TestSincePositions(TestCase):
         prev = f"def a():\n    return 1\n{filler}def b():\n    return None\n    tail = 1\n"
         cur = f"def a():\n    return 1\n{filler}def b():\n    tail = 1\n"
         since, full = self._real_diffs(base, prev, cur)
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/f.py", "line": 12, "side": "LEFT", "body": "second removal"}]}
         _, calls, _ = self._run(self._packet("c" * 40, since, paths=("src/f.py",)), verdict,
                                 self._full(full, paths=("src/f.py",)))
@@ -736,7 +763,7 @@ class TestSincePositions(TestCase):
     def test_reworded_reaffirmation_at_thread_location_submits(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
                                 "body": "Removing `z` still breaks callers."}]}
         node = json.loads(self._packet("c" * 40, kept, paths=("src/kept.py",)))
@@ -752,7 +779,7 @@ class TestSincePositions(TestCase):
     def test_new_finding_colliding_with_a_thread_line_is_remapped(self):
         shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
                              "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT",
                                 "body": "brand new defect here"}]}
         node = json.loads(self._packet("c" * 40, self.REMOVAL))
@@ -766,7 +793,7 @@ class TestSincePositions(TestCase):
     def test_identical_reaffirmation_inside_the_since_diff_keeps_its_location(self):
         shifted = "\n".join(["diff --git a/src/gone.py b/src/gone.py", "--- a/src/gone.py", "+++ b/src/gone.py",
                              "@@ -4,3 +10,3 @@", " context", "-removed", "+added", " context2"])
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "still blocks"}]}
         node = json.loads(self._packet("c" * 40, self.REMOVAL))
         node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
@@ -775,7 +802,7 @@ class TestSincePositions(TestCase):
         self.assertEqual(json.loads(calls[-1][0][4]), verdict["comments"])
 
     def test_outdated_reaffirmation_uses_thread_coordinates(self):
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 999, "side": "RIGHT", "body": "y is wrong"}]}
         node = json.loads(self._packet("c" * 40, self.REMOVAL))
         node["review_threads"] = [{"path": "src/gone.py", "line": 11, "side": "LEFT",
@@ -787,7 +814,7 @@ class TestSincePositions(TestCase):
     def test_partially_stale_verdict_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
-        verdict = {"action": "request_changes", "comments": [
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [
             {"path": "src/gone.py", "line": 10, "side": "RIGHT", "body": "kept"},
             {"path": "src/kept.py", "line": 99, "side": "RIGHT", "body": "stale"}]}
         with self.assertRaises(atoms.AgentPreflightError) as failure:
@@ -800,7 +827,7 @@ class TestSincePositions(TestCase):
     def test_capped_partial_stale_verdict_preserves_every_finding_or_fails_closed(self):
         kept = "\n".join(["diff --git a/src/kept.py b/src/kept.py", "--- a/src/kept.py", "+++ b/src/kept.py",
                           "@@ -1,1 +1,2 @@", " same", "+more"])
-        verdict = {"action": "request_changes", "comments": [
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [
             {"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "removed helper is still imported"},
             {"path": "src/kept.py", "line": 2, "side": "RIGHT", "body": "another defect"}]}
         with patch.object(structured_review, "_file_capped_followup", return_value="https://github.com/o/r/issues/99") as followup:
@@ -813,7 +840,7 @@ class TestSincePositions(TestCase):
         followup.assert_not_called()
 
     def test_full_review_left_findings_keep_todays_behavior(self):
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 99, "side": "LEFT", "body": "defect"}]}
         result, _, fetch = self._run(self._packet(None), verdict, "unused")
         self.assertIn('"review_id": 91', result)
@@ -824,7 +851,7 @@ class TestSincePositions(TestCase):
             with self.subTest(priority=priority):
                 node = json.loads(self._packet("c" * 40, self.REMOVAL))
                 node["p"] = priority
-                verdict = {"action": "request_changes",
+                verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                            "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
                 result, _, fetch = self._run(json.dumps(node), verdict, self._full(self.REMOVAL))
                 self.assertIn('"review_id": 91', result)
@@ -832,7 +859,7 @@ class TestSincePositions(TestCase):
                                               "a" * 40, priority, since_head=None)
 
     def test_missing_priority_fails_closed_without_fetch_or_submit(self):
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         for missing in ("absent", None, "", "   "):
             with self.subTest(missing=missing):
@@ -867,7 +894,7 @@ class TestSincePositions(TestCase):
                 self.assertNotEqual(calls[0][0][0], "github-interface")
 
     def test_malformed_and_integer_priorities_fail_closed_via_adapter(self):
-        verdict = {"action": "request_changes",
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes",
                    "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "needed file"}]}
         full = self._full(self.REMOVAL)
 
@@ -911,7 +938,7 @@ class TestOtherProviderVerdicts(TestCase):
         return result, calls
 
     def test_grok_runs_one_tool_free_turn_from_a_prompt_file_and_submits(self):
-        reply = {**GROK_REPLY, "structuredOutput": {"action": "request_changes", "comments": [FINDING]}}
+        reply = {**GROK_REPLY, "structuredOutput": {"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}}
         result, calls = self._run("grok-4.6-xhigh", json.dumps(reply))
         self.assertIn('"review_id": 91', result)
         (args, kwargs), (mutation, _) = calls
@@ -941,7 +968,7 @@ class TestOtherProviderVerdicts(TestCase):
 
         def provider(args, **kwargs):
             seen["prompt"] = Path(args[args.index("--prompt-file") + 1]).read_text()
-            reply = {**GROK_REPLY, "structuredOutput": {"action": "reviewed_clean", "comments": []}}
+            reply = {**GROK_REPLY, "structuredOutput": {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}}
             return SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")
 
         receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
@@ -954,10 +981,10 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertIn("no code fence", seen["prompt"])
 
     def test_grok_rejects_extra_turns_missing_output_and_failures(self):
-        for stdout, code in ((json.dumps({**GROK_REPLY, "structuredOutput": {"action": "reviewed_clean", "comments": []}, "num_turns": 2}), 0),
-                             (json.dumps({**GROK_REPLY, "text": '{"action":"reviewed_clean","comments":[]}'}), 0),
+        for stdout, code in ((json.dumps({**GROK_REPLY, "structuredOutput": {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}, "num_turns": 2}), 0),
+                             (json.dumps({**GROK_REPLY, "text": '{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action":"reviewed_clean","comments":[]}'}), 0),
                              ("not json", 0),
-                             (json.dumps({**GROK_REPLY, "structuredOutput": {"action": "reviewed_clean", "comments": []}}), 1)):
+                             (json.dumps({**GROK_REPLY, "structuredOutput": {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}}), 1)):
             with self.subTest(stdout=stdout, code=code), self.assertRaises(atoms.AgentPreflightError):
                 self._run("grok-4.6-xhigh", stdout, code=code)
 
@@ -972,7 +999,7 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(failure.exception.diagnostic["submission"], "none")
 
     def test_antigravity_streams_the_packet_in_plan_mode_and_submits(self):
-        result_event = {**AGY_RESULT, "structured_output": {"action": "approve", "comments": []}}
+        result_event = {**AGY_RESULT, "structured_output": {"assessment": ASSESSMENT, "action": "approve", "comments": []}}
         result, calls = self._run("gemini-3.8-flash-high", agy_stream(result_event), behavior="pr_approve")
         self.assertIn('"review_id": 91', result)
         (args, kwargs), (mutation, _) = calls
@@ -992,16 +1019,16 @@ class TestOtherProviderVerdicts(TestCase):
         self.assertEqual(mutation[:3], ["github-interface", "--approve-pr", "#12"])
 
     def test_antigravity_rejects_tool_steps_errors_and_missing_results(self):
-        clean = {**AGY_RESULT, "structured_output": {"action": "reviewed_clean", "comments": []}}
+        clean = {**AGY_RESULT, "structured_output": {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}}
         for stdout in (agy_stream(clean, steps=("user_input", "agent_response", "tool", "agent_response", "finish")),
                        agy_stream({**clean, "status": "ERROR", "error": "quota"}),
-                       agy_stream({**AGY_RESULT, "response": '{"action":"reviewed_clean","comments":[]}'}),
+                       agy_stream({**AGY_RESULT, "response": '{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action":"reviewed_clean","comments":[]}'}),
                        json.dumps({"event": "init"}) + "\n"):
             with self.subTest(stdout=stdout), self.assertRaises(atoms.AgentPreflightError):
                 self._run("gemini-3.8-flash-high", stdout)
 
     def test_muse_answers_from_a_prompt_file_with_tools_off_and_submits(self):
-        result, calls = self._run("muse-spark-1.3-contributor-max", muse_stream('```json\n{"action": "reviewed_clean", "comments": []}\n```'))
+        result, calls = self._run("muse-spark-1.3-contributor-max", muse_stream('```json\n{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action": "reviewed_clean", "comments": []}\n```'))
         self.assertIn('"review_id": 91', result)
         (args, kwargs), (mutation, _) = calls
         self.assertEqual(Path(args[0]).name, "muse")
@@ -1027,7 +1054,7 @@ class TestOtherProviderVerdicts(TestCase):
             root = Path(work)
             script = scripted_muse(root)
             reply = root / "reply.jsonl"
-            reply.write_text(muse_stream('{"action": "reviewed_clean", "comments": []}'))
+            reply.write_text(muse_stream('{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action": "reviewed_clean", "comments": []}'))
             log = root / "argv.log"
             with patch.dict(os.environ, {"MUSE_CLI": str(script), "MUSE_ARGV_LOG": str(log),
                                          "MUSE_SCRIPT_REPLY": str(reply)}):
@@ -1037,7 +1064,7 @@ class TestOtherProviderVerdicts(TestCase):
                 with ReviewWatch("/repo", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40) as watch:
                     answer = structured_review.ask_muse(root, CATALOG.resolve("muse-spark-1.3-contributor-max"),
                                                        "system", "packet", schema, watch, 60)
-            self.assertEqual(answer, '{"action": "reviewed_clean", "comments": []}')
+            self.assertEqual(answer, '{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action": "reviewed_clean", "comments": []}')
             self.assertNotIn("--no-session-log", log.read_text().splitlines())
             self.assertTrue((root / "data" / "muse" / "sessions" / "probe").is_file())
 
@@ -1097,7 +1124,7 @@ class TestOtherProviderVerdicts(TestCase):
             self.assertEqual(json.loads((original / "settings.json").read_text())["run"]["toolset"], ["workflow"])
 
     def test_muse_rejects_tool_use_prose_and_failed_runs(self):
-        clean = '{"action": "reviewed_clean", "comments": []}'
+        clean = '{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action": "reviewed_clean", "comments": []}'
         for stdout in (muse_stream(clean, tasks=("model.meta.response", "tool.read_file", "model.meta.response")),
                        muse_stream("Looks good to me: " + clean),
                        muse_stream(None),
@@ -1123,7 +1150,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
                 return SimpleNamespace(returncode=0, stdout=json.dumps(
                     {"action": action, "review_id": 91, "head_sha": "a" * 40}), stderr="")
             Path(args[args.index("--output-last-message") + 1]).write_text(
-                json.dumps(verdict or {"action": "reviewed_clean", "comments": []}))
+                json.dumps(verdict or {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}))
             return SimpleNamespace(returncode=returncode, stdout="\n".join(
                 json.dumps(event) for event in stdout_events), stderr=stderr)
         with patch.object(structured_review.subprocess, "run", side_effect=process) as run, \
@@ -1172,7 +1199,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
         self.assertEqual(failure.exception.code, "review_provider_exit")
         submit.assert_not_called()
         # Exit zero with a failed terminal.
-        stdout = muse_stream('{"action": "reviewed_clean", "comments": []}', terminal="failed")
+        stdout = muse_stream('{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action": "reviewed_clean", "comments": []}', terminal="failed")
         with patch.object(structured_review.subprocess, "run") as submit, \
                 patch.object(ReviewWatch, "run", return_value=SimpleNamespace(
                     returncode=0, stdout=stdout, stderr="")):
@@ -1187,14 +1214,14 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
     def test_duplicate_verdict_keys_and_terminals_never_submit(self):
         with self.assertRaises(structured_review.InvalidVerdict):
             structured_review.validate_verdict(
-                '{"action": "request_changes", "action": "reviewed_clean", "comments": []}', "pr_review")
+                '{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action": "request_changes", "action": "reviewed_clean", "comments": []}', "pr_review")
         dup_turns = [{"type": "turn.completed"}, {"type": "turn.completed"}]
         with self.assertRaises(atoms.AgentPreflightError):
             self._codex_run(stdout_events=dup_turns)
         first = {"payload_type": "run.terminal.completed",
-                 "payload": {"terminal": "completed", "text": '{"action": "reviewed_clean", "comments": []}'}}
+                 "payload": {"terminal": "completed", "text": '{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action": "reviewed_clean", "comments": []}'}}
         second = {"payload_type": "run.terminal.completed",
-                  "payload": {"terminal": "completed", "text": '{"action": "request_changes", "comments": []}'}}
+                  "payload": {"terminal": "completed", "text": '{"assessment": {"verdict": "The changed validation paths have no remaining blocking defects.", "reviewed_context": "Inspected the supplied immutable diff and its affected callers.", "limitations": "Provider fixture; no application test execution."}, "action": "request_changes", "comments": []}'}}
         stdout = "\n".join(json.dumps(event) for event in [first, second])
         with patch.object(ReviewWatch, "run", return_value=SimpleNamespace(returncode=0, stdout=stdout, stderr="")), \
                 patch.object(structured_review.subprocess, "run") as submit:
@@ -1206,7 +1233,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
 
     def test_submission_rejection_noop_and_uncertainty_are_typed(self):
         from agent_interface import review_receipt as receipt_mod
-        verdict = {"action": "request_changes", "comments": [FINDING]}
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}
 
         def run_with_github(reply):
             def process(args, **kwargs):
@@ -1237,7 +1264,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
 
         def provider(args, **kwargs):
             Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(
-                {"action": "reviewed_clean", "comments": []}))
+                {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}))
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         with patch.object(structured_review.subprocess, "run",
                           side_effect=subprocess.TimeoutExpired("github-interface", 1)), \
@@ -1247,7 +1274,7 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
                                       "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
 
     def test_repeat_only_noop_is_typed_for_recovery(self):
-        verdict = {"action": "request_changes", "comments": [FINDING]}
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [FINDING]}
 
         def run_with_github(reply):
             def process(args, **kwargs):

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { CheckSemaphore } from '../server/check-semaphore'
-import { mocks, pr, NEXT_HEAD_SHA, loadModules, arrangeCli, fixture, deferred } from './behaviors-runtime-fixture'
+import { mocks, pr, NEXT_HEAD_SHA, loadModules, arrangeCli, fixture, deferred, recordCompletedInitialReview } from './behaviors-runtime-fixture'
 
 // This file pins sweep-deadline and cursor behavior under load, not the
 // shared launch budget: an open budget lets every eligible PR launch, and
@@ -68,6 +68,16 @@ async function startApproving(open: typeof fixture.listedPrs) {
 }
 
 describe('approve-prs under load', () => {
+  it('does not turn metadata-only clean completion into another approval dispatch', async () => {
+    arrangeCli(false)
+    const { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user'); db.setMeta('behavior_approve_prs_enabled', '1')
+    recordCompletedInitialReview(db, { response: false })
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  })
+
   it('rotates past three slow front claims before retrying the same full batch', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))

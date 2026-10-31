@@ -3,11 +3,14 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
 from github_interface.behaviors import merge_candidates, merge_if_ready, mergeable, pr_readiness, update_branch_if_behind
+from review_response_fixture import published_review, response
 
 HEAD = "a" * 40
-PAYLOAD = {"repository": "acme/app", "pr": "#7", "expected_head": HEAD, "author": "octocat"}
+PAYLOAD = {"repository": "acme/app", "pr": "#7", "expected_head": HEAD, "author": "octocat", "token_user": "review-bot"}
 PULL = {"state": "open", "draft": False, "mergeable": True, "mergeable_state": "behind",
-        "head": {"sha": HEAD}, "user": {"login": "octocat"}, "merged": False}
+        "head": {"sha": HEAD}, "user": {"login": "octocat"}, "merged": False,
+        "base": {"sha": "b" * 40}, "title": "Fix review ordering", "body": "Retain final-context review responses."}
+PAYLOAD["review_response"] = response(PULL)
 READY = {"id": "PR_7", "state": "OPEN", "isDraft": False, "mergeable": "MERGEABLE",
          "mergeStateStatus": "BEHIND", "headRefOid": HEAD, "mergeQueue": {"id": "MQ_main"},
          "mergeQueueEntry": None, "reviewDecision": "APPROVED",
@@ -18,6 +21,7 @@ READY = {"id": "PR_7", "state": "OPEN", "isDraft": False, "mergeable": "MERGEABL
 class TestMergeQueue(IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = AsyncMock()
+        self.client.paginate.return_value = [published_review(PAYLOAD["review_response"])]
         self.client.graphql.return_value = {"enqueuePullRequest": {"mergeQueueEntry": {
             "id": "MQE_7", "pullRequest": {"headRefOid": HEAD},
         }}}
@@ -43,6 +47,14 @@ class TestMergeQueue(IsolatedAsyncioTestCase):
         self.client.get.assert_not_awaited()
         self.assertEqual((await update_branch_if_behind.run(self.client, PAYLOAD))["outcome"], "not_ready")
         self.client.request.assert_not_awaited()
+
+    async def test_queue_admission_requires_its_retained_final_context_response(self):
+        for value in (None, {}, {**PAYLOAD['review_response'], 'context_sha': 'd' * 64},
+                      {**PAYLOAD['review_response'], 'completed_at': 10 ** 15},
+                      {**PAYLOAD['review_response'], 'invocation_id': 'd' * 32}):
+            self.assertEqual((await merge_if_ready.run(self.client, {**PAYLOAD, 'review_response': value}))['outcome'], 'not_ready')
+            self.client.graphql.assert_not_awaited()
+            self.client.request.assert_not_awaited()
 
     async def test_observing_existing_entry_does_not_claim_merge_or_enqueue_again(self):
         self.ready["mergeQueueEntry"] = {"id": "MQE_existing"}

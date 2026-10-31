@@ -211,7 +211,7 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
   const issueReview = behavior === ISSUE_REVIEW_BEHAVIOR
   const atomicWork = behavior === 'implement_issue' || behavior === 'repair_pr'
   const artifact = row.artifact === null || row.artifact === undefined ? null : row.artifact
-  const managedReview = source === 'poise:behavior-chain' && (behavior === 'pr_review' || behavior === 'pr_approve' || issueReview)
+  const managedReview = behavior === 'pr_review' || behavior === 'pr_approve' || (source === 'poise:behavior-chain' && issueReview)
   if (artifact !== null && ((!atomicWork && !managedReview) || typeof artifact !== 'object' || Array.isArray(artifact)
     || Buffer.byteLength(JSON.stringify(artifact)) > 128 * 1024)) throw new Error(`agent-interface log row ${index} has an invalid atomic artifact`)
   if (!LOG_CALL_ID.test(id)

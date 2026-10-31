@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import type { DetachedProcessExit } from './process'
-import { decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { chainReviewResponse, decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 
 export interface ChainSeed { repository: string, number: number }
@@ -124,6 +124,10 @@ export class BehaviorChainRuntime {
         }
         const observation = await this.operations.observe(chain)
         chain = this.append(chain, { type: 'chain.observed', observation })
+        if (observation.pull?.merged && observation.pull.mergeSha && !chain.mergeSha) {
+          chain = this.append(chain, { type: 'chain.merged', mergeSha: observation.pull.mergeSha, evidence: { repository: chain.repository,
+            pull_number: observation.pull.number, merged: true, merge_sha: observation.pull.mergeSha, review_complete: false } })
+        }
         const pendingInvocation = chain.invocations.find((invocation) => invocation.state !== 'settled')
         if (pendingInvocation) {
           await this.recover(chain, pendingInvocation, observation, snapshot)
@@ -132,7 +136,7 @@ export class BehaviorChainRuntime {
         const decision = decideBehaviorChain(chain, observation, Date.now())
         if (decision.kind === 'complete') {
           this.append(chain, { type: 'chain.merged', mergeSha: decision.mergeSha, evidence: { repository: chain.repository,
-            pull_number: observation.pull!.number, merged: true, merge_sha: decision.mergeSha } })
+            pull_number: observation.pull!.number, merged: true, merge_sha: decision.mergeSha, review_complete: true } })
         } else if (decision.kind === 'hold') this.append(chain, { type: 'chain.held', reason: decision.reason })
         else if (decision.kind === 'invoke' && this.operations.enabled() && (!decision.reviewer || this.operations.available()) && this.operations.permitted(chain, decision)) {
           if (decision.reviewer && !this.journal.modelCapacityAvailable(this.operations.capacity())) {
@@ -251,7 +255,8 @@ export class BehaviorChainRuntime {
       const expected = invocation.request.argv[invocation.request.argv.indexOf('--expected-head') + 1]
       const review = observation.pull.reviewReceipts.find((receipt) => receipt.invocation === nativeId && receipt.head === expected)
       const action = review?.state === 'APPROVED' ? 'approved' : review?.state === 'CHANGES_REQUESTED' ? 'requested_changes' : review?.state === 'COMMENTED' ? 'reviewed_clean' : null
-      if (review && action) {
+      if (review && action && chainReviewResponse(chain, { ...invocation, callId: nativeId,
+        evidence: { ...invocation.evidence, action, review_id: review.id } }, observation, Date.now())) {
         const outcome = action === 'approved' ? 'approved' : action === 'requested_changes' ? 'changes_requested' : 'clean'
         this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: nativeId, outcome,
           evidence: { ...invocation.evidence, status: 'completed', action, outcome, review_id: review.id, head_sha: review.head,

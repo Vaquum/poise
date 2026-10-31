@@ -25,7 +25,7 @@ export function behaviorChainOwner(repository: string, number: number, kind: 'is
   const source = behaviorChainJournal()
   if (kind === 'issues') {
     const chain = source.read(chainIdentity(repository, number))
-    return chain && !chain.mergeSha ? chain.id : null
+    return chain && (!chain.mergeSha || chain.reviewPending) ? chain.id : null
   }
   const row = db.prepare(`SELECT chain_id FROM behavior_chain_current
     WHERE merged = 0 AND lower(json_extract(state, '$.repository')) = lower(?)

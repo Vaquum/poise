@@ -313,6 +313,9 @@ query($owner: String!, $repo: String!, $number: Int!) {{
       state
       isDraft
       headRefOid
+      baseRefOid
+      title
+      body
       updatedAt
       reviewRequests(first: 100) {{
         pageInfo {{ hasNextPage endCursor }}
@@ -342,7 +345,7 @@ async def get_review_activity(
         REVIEW_ACTIVITY_QUERY, {"owner": owner, "repo": repo, "number": pull_number},
     )
     first = _required_pull(data, pull_number)
-    pull = {key: first[key] for key in ("state", "isDraft", "headRefOid", "updatedAt")}
+    pull = {key: first[key] for key in ("state", "isDraft", "headRefOid", "baseRefOid", "title", "body", "updatedAt")}
     pull["reviewRequests"] = await _pull_nodes(
         client, owner, repo, pull_number, "reviewRequests", REVIEW_REQUEST_FIELDS, first["reviewRequests"],
     )
@@ -412,11 +415,10 @@ async def approve_pr(
     repo: str,
     pull_number: int,
     commit_id: str,
+    body: str,
 ) -> dict[str, Any]:
-    body = invocation_body("", commit_id)
-    payload = {"event": "APPROVE", "commit_id": commit_id}
-    if body:
-        payload["body"] = body
+    body = invocation_body(body, commit_id)
+    payload = {"event": "APPROVE", "commit_id": commit_id, "body": body}
     return await client.post(
         f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
         json=payload,

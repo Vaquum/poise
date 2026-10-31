@@ -32,7 +32,8 @@ class FakeClient:
         self.calls.append((query, variables))
         pull = {}
         if "reviewRequests" in query:
-            pull.update({"state": "OPEN", "isDraft": False, "headRefOid": HEAD, "updatedAt": "2026-09-17T10:00:00Z", "reviewRequests": {**PAGE, "nodes": []}})
+            pull.update({"state": "OPEN", "isDraft": False, "headRefOid": HEAD, "baseRefOid": 'b' * 40,
+                         "title": 'Review ordering', "body": '', "updatedAt": "2026-09-17T10:00:00Z", "reviewRequests": {**PAGE, "nodes": []}})
         if "reviewThreads" in query:
             pull["reviewThreads"] = {**PAGE, "nodes": []}
         if "reviews(" in query:
@@ -88,7 +89,8 @@ class BatchFakeClient:
     async def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(variables["number"])
         return {"repository": {"pullRequest": {
-            "state": "OPEN", "isDraft": False, "headRefOid": HEAD, "updatedAt": "2026-09-17T10:00:00Z",
+            "state": "OPEN", "isDraft": False, "headRefOid": HEAD, "baseRefOid": 'b' * 40,
+            "title": 'Review ordering', "body": '', "updatedAt": "2026-09-17T10:00:00Z",
             "reviewRequests": {**PAGE, "nodes": []},
             "reviewThreads": {**PAGE, "nodes": []},
             "reviews": {**PAGE, "nodes": self._pulls[variables["number"]]},

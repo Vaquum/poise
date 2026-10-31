@@ -1324,7 +1324,7 @@ def run_governed_behavior(
         conn.execute("update calls set review_policy=? where id=?", (review_budget.REVIEW_POLICY, id_))
     review_receipt.bind(DB, id_)
     with review_budget.ReviewBudget(timeout_s), progress.Progress(DB, id_), \
-            review_receipt.invocation_environment(DB, id_, source == 'poise:behavior-chain'):
+            review_receipt.invocation_environment(DB, id_, True):
         response = ""
         try:
             before = review_facts(mod, pr, pwd, actor, expected_head, 0)

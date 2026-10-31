@@ -76,8 +76,14 @@ def verdict_schema(behavior: str, *, inspection: bool = False) -> dict:
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["action", "comments"],
+        "required": ["action", "comments", "assessment"],
         "properties": {
+            "assessment": {
+                "type": "object", "additionalProperties": False,
+                "required": ["verdict", "reviewed_context", "limitations"],
+                "properties": {key: {"type": "string", "minLength": minimum, "maxLength": 4000}
+                               for key, minimum in (("verdict", 20), ("reviewed_context", 20), ("limitations", 4))},
+            },
             "action": {"type": "string", "enum": ["request_changes", terminal]},
             "comments": {
                 "type": "array", "maxItems": 100,
@@ -124,8 +130,16 @@ def _loads_no_duplicates(raw: str):
 def validate_verdict(raw: str, behavior: str) -> dict:
     verdict = _loads_no_duplicates(raw)
     terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
-    if not isinstance(verdict, dict) or set(verdict) != {"action", "comments"}:
-        raise InvalidVerdict("review verdict must contain only action and comments")
+    if not isinstance(verdict, dict) or set(verdict) != {"action", "comments", "assessment"}:
+        raise InvalidVerdict("review verdict must contain action, comments and assessment")
+    assessment = verdict["assessment"]
+    if not isinstance(assessment, dict) or set(assessment) != {"verdict", "reviewed_context", "limitations"}:
+        raise InvalidVerdict("review assessment requires verdict, reviewed_context and limitations")
+    for key, minimum in (("verdict", 20), ("reviewed_context", 20), ("limitations", 4)):
+        if not isinstance(assessment[key], str) or not minimum <= len(assessment[key].strip()) <= 4000:
+            raise InvalidVerdict(f"invalid review assessment {key}")
+    if assessment["verdict"].strip() == "Reviewed: no blocking findings.":
+        raise InvalidVerdict("fixed acknowledgement is not a substantive assessment")
     action, comments = verdict["action"], verdict["comments"]
     if action not in ("request_changes", terminal) or not isinstance(comments, list):
         raise InvalidVerdict("invalid review action or comments")
@@ -370,19 +384,19 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
             return raw, validate_verdict(raw, behavior)
         step = _loads_no_duplicates(raw)
         if round_number == MAX_INSPECTION_ROUNDS and isinstance(step, dict) \
-                and set(step) == {"action", "comments"}:
+                and set(step) == {"action", "comments", "assessment"}:
             # The final round offers the terminal-only verdict schema,
             # which has no requests property at all.
             return raw, validate_verdict(raw, behavior)
-        if not isinstance(step, dict) or set(step) != {"action", "comments", "requests"}:
-            raise InvalidVerdict("review step must contain action, comments, and requests")
+        if not isinstance(step, dict) or set(step) != {"action", "comments", "assessment", "requests"}:
+            raise InvalidVerdict("review step must contain action, comments, assessment and requests")
         requests = step["requests"]
         if not isinstance(requests, list):
             raise InvalidVerdict("review requests must be an array")
         if step["action"] != "inspect":
             if requests:
                 raise InvalidVerdict("terminal verdict must not request repository inspection")
-            return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments")}), behavior)
+            return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments", "assessment")}), behavior)
         if round_number == MAX_INSPECTION_ROUNDS:
             raise review_budget.ReviewLimitError(
                 "Repository inspection limit reached; needs attention",
@@ -395,7 +409,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
         # Validate provisional findings without submitting anything.
         validate_verdict(json.dumps({"action": "request_changes" if step["comments"] else
                                     "reviewed_clean" if behavior == "pr_review" else "approve",
-                                    "comments": step["comments"]}), behavior)
+                                    "comments": step["comments"], "assessment": step["assessment"]}), behavior)
         progress.stage("inspecting", "Inspecting pinned repository")
         result = repository.inspect(requests)
         context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
@@ -426,6 +440,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
             root = Path(work)
             deadline = monotonic() + timeout_s
             prior: list[dict] = []
+            assessment: dict | None = None
             for index, stage_text in enumerate(_stage_texts(text, packet)):
                 _admit(stage_text)
                 if staged:
@@ -433,13 +448,18 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                     if prior:
                         stage_text += ("\n\nFindings already recorded in earlier file groups "
                                        "(do not repeat them):\n" + json.dumps(prior))
+                    if assessment is not None:
+                        stage_text += ("\n\nCumulative assessment from the earlier file groups:\n" + json.dumps(assessment)
+                                       + "\nUpdate this assessment with the current group's evidence. Your terminal assessment "
+                                       "must cover every group reviewed so far and remain within the schema bounds.")
                 raw, verdict = _review_once(root, ask, model, system, stage_text, watch,
                                              timeout_s, deadline, repository, behavior)
                 prior.extend(verdict["comments"])
+                assessment = verdict["assessment"]
             if staged:
                 terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
                 verdict = validate_verdict(json.dumps(
-                    {"action": "request_changes" if prior else terminal, "comments": prior}), behavior)
+                    {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}), behavior)
                 raw = json.dumps(verdict)
             _validate_since_positions(pwd, pr, actor_name, head, packet, verdict)
     except review_stages.StageError as error:
@@ -472,7 +492,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                 "a capped approval round needs its round and cap numbers", "review_contract_violation")
         reference = _file_capped_followup(packet, pr, actor_name, head, review_round, review_cap,
                                           verdict["comments"], pwd)
-        verdict = {"action": "approve", "comments": []}
+        verdict = {**verdict, "action": "approve", "comments": []}
         capped_note = (f"\nReview cap reached (round {review_round} of {review_cap}); "
                        f"findings filed as {reference}.")
 
@@ -481,6 +501,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     args = [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), flag, ref]
     if verdict["action"] == "request_changes":
         args.extend(["--comments-json", json.dumps(verdict["comments"])])
+    review_receipt.complete_response(verdict["assessment"], head)
+    args.extend(["--assessment-json", json.dumps(verdict["assessment"], ensure_ascii=False)])
     limit = review_budget.timeout(600)
     progress.stage("submitting", "Submitting GitHub review", timeout=limit)
     try:

@@ -17,6 +17,42 @@ const chain: BehaviorChain = { id: 'example/repo#7', repository: 'example/repo',
   mergeSha: null, observation: null, invocations: [] }
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
 
+it('preserves actual review identities, responses and times after an external merge', async () => {
+  const completedAt = Date.now() - 5000
+  const response = { repository: 'example/repo', pull_number: 21, head_sha: HEAD, context_sha: 'b'.repeat(64),
+    reviewer: 'reviewer', invocation_id: 'c'.repeat(32), model: 'fixture', completed_at: completedAt,
+    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+      reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
+  mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
+    if (argv[0] === '--chain-seed') return { stdout: JSON.stringify({ repository: 'example/repo', issue_number: 7,
+      actor: 'author', branch: chain.branch, issue: { title: 'Seed', body: '', state: 'closed', labels: [] }, comments: [],
+      publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'closed', merged: true, merge_sha: 'd'.repeat(40) } }) }
+    if (argv[0] === '--pull-action-state') return { stdout: JSON.stringify({ pull_number: 21, state: 'closed', head_sha: HEAD,
+      review_context: response.context_sha, merged: true, merge_sha: 'd'.repeat(40), merged_at: new Date(completedAt + 2000).toISOString(),
+      my_reviews: [{ id: 91, state: 'COMMENTED', commit_id: HEAD, invocation_id: response.invocation_id,
+        review_response: response, submitted_at: new Date(completedAt + 1000).toISOString() }] }) }
+    throw new Error(`unexpected native operation ${argv[0]}`)
+  })
+  const operations = nativeChainOperations({ login: 'example' } as Organization, {
+    roster: async () => ({ issueReviewers: [], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer }),
+    resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
+    capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
+    reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
+  })
+  const observation = await operations.observe(chain)
+  expect(observation.pull).toMatchObject({ merged: true, reviewIds: [91], mergedAt: completedAt + 2000,
+    reviewReceipts: [{ id: 91, invocation: response.invocation_id, response, submittedAt: completedAt + 1000 }] })
+  const invocation = { id: 'review', behavior: 'review-pr' as const, basis: chainBasis(['pr', HEAD, response.context_sha]),
+    actor: 'reviewer', model: 'fixture', slot: 'primary', admittedAt: completedAt - 1000, admissionSequence: 1,
+    request: { command: 'agent-interface' as const, argv: [], cwd: '/fixture' }, state: 'settled' as const,
+    callId: response.invocation_id, outcome: 'clean', evidence: { status: 'completed', action: 'reviewed_clean',
+      review_id: 91, head_sha: HEAD, completedAt: completedAt + 1000, artifact: { review_response: response } } }
+  const reviewed = { ...chain, invocations: [invocation] }
+  expect(decideBehaviorChain(reviewed, observation, Date.now())).toMatchObject({ kind: 'complete' })
+  observation.pull!.mergedAt = completedAt - 1
+  expect(decideBehaviorChain(reviewed, observation, Date.now())).toMatchObject({ kind: 'hold' })
+})
+
 it.each([
   { blockers: [], mergeable: true, expected: 'approve-pr' },
   { blockers: ['merge_state_not_clean'], mergeable: true, expected: 'repair-pr' },
@@ -27,7 +63,7 @@ it.each([
       '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
         issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
         publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
-      '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
+      '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
       '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: false,
         unresolved_live_conversation_count: 0, green: false, blockers: [...blockers, 'reviewer_not_approved_current_head'] },
       '--list-failing-ci': { head_sha: HEAD, pull_number: 21, failing: [], mergeable, mergeable_state: mergeable ? 'behind' : 'dirty' },

@@ -5,6 +5,7 @@ import { behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository }
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
+import { callReviewResponse } from './review-response'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
 import { prepareModelClis } from './provider-clis'
 import { BehaviorDeadline } from './behavior-deadline'
@@ -3431,6 +3432,7 @@ interface ReviewActivityResult {
   state: string
   draft: boolean
   headSha: string
+  reviewContext: string | null
   reviewerRequested: boolean
   activeChangeRequestAuthors: string[]
   unresolvedConversationCount: number
@@ -3573,6 +3575,7 @@ function parseReviewActivityResult(
     state: data.state,
     draft: data.draft,
     headSha: headSha.toLowerCase(),
+    reviewContext: typeof data.review_context === 'string' && /^[0-9a-f]{64}$/.test(data.review_context) ? data.review_context : null,
     reviewerRequested: data.reviewer_requested,
     activeChangeRequestAuthors: data.active_change_request_authors.map(String),
     unresolvedConversationCount,
@@ -4366,7 +4369,12 @@ async function tickApprovePrs(): Promise<void> {
             parkCheck(pr, `review packet too large for head ${check.headSha.slice(0, 8)}`)
             continue
           }
-          const cleanReview = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number, reviewer)
+          const basis = check.hasChangeRequest ? null : latestApprovalBasisLaunch(pr.repo, pr.number, reviewer)
+          const basisSnapshot = basis ? await readBehaviorLogSnapshot() : null
+          const basisCall = basisSnapshot?.entries.find((call) => call.id === basis!.callId)
+          const cleanReview = basisSnapshot && basisCall && unambiguousAgentCall(basisSnapshot, basisCall)
+            && basisCall.repo === pr.repo && basisCall.pr_id === String(pr.number) && basisCall.actor === reviewer
+            && basisCall.head_sha === basis!.headSha && callReviewResponse(basisCall, Date.now()) ? basis : null
           let dismissedReview: CompletedApprovalBasisLaunch | null = null
           if (!check.hasChangeRequest && !cleanReview) {
             dismissedReview = check.reviewerLatestState === 'DISMISSED'
@@ -4471,6 +4479,9 @@ async function tickApprovePrs(): Promise<void> {
                 admittedReviewer: reviewer })
             } else {
               const review = request.review!
+              const basisCall = (await readBehaviorLogSnapshot()).entries.find((call) => call.id === review.callId)
+              const response = basisCall ? callReviewResponse(basisCall, Date.now()) : null
+              const freshContextNeeded = response !== null && activity.reviewContext !== null && response.context_sha !== activity.reviewContext
               if (!request.clean && (activity.reviewerLatestState !== 'DISMISSED'
                 || activity.headSha !== check.headSha || activity.headSha === review.headSha)) {
                 parkCheck(pr, `dismissal race (reviewer ${activity.reviewerLatestState ?? 'none'}, activity ${activity.headSha.slice(0, 8)} vs check ${check.headSha.slice(0, 8)})`)
@@ -4491,7 +4502,7 @@ async function tickApprovePrs(): Promise<void> {
                 || (activity.unresolvedLiveConversationCount > 0
                   && !reapprovalOwnsEveryUnresolvedConversation)
                 || (activity.reviewerLatestState === 'APPROVED'
-                  && activity.reviewerLatestCommit === activity.headSha)) {
+                  && activity.reviewerLatestCommit === activity.headSha && !freshContextNeeded)) {
                 const reason = activity.state !== 'OPEN' ? `PR is ${activity.state.toLowerCase()}`
                   : activity.draft ? 'PR is draft'
                     : activity.activeChangeRequestAuthors.length > 0
@@ -4506,7 +4517,7 @@ async function tickApprovePrs(): Promise<void> {
                 throw new Error(`head changed without an activity watermark for ${pr.repo}#${pr.number}`)
               }
               launches.push({ pr, expectedHead: activity.headSha,
-                seenTarget: `${pr.repo}#${pr.number}@head=${activity.headSha}`,
+                seenTarget: `${pr.repo}#${pr.number}@head=${activity.headSha}${freshContextNeeded ? `/context=${activity.reviewContext}` : ''}`,
                 firedReason: `${request.clean ? 'clean' : 'dismissed'} review ${review.callId.slice(0, 8)}, head=${activity.headSha.slice(0, 8)}`,
                 admittedReviewer: request.admittedReviewer, dismissedRecovery: !request.clean })
             }
@@ -5530,12 +5541,20 @@ async function tickMergePrs(): Promise<void> {
         await mkdir(cwd, { recursive: true })
         if (!isRunnable('merge-prs') || behaviorAborted() || !stillEligible('merge-prs', pr)
           || configuredReviewer(pr.author) !== actor) continue
+        const snapshot = await readBehaviorLogSnapshot()
+        const calls = snapshot.entries.filter((call) => call.repo === pr.repo && call.pr_id === String(pr.number)
+          && call.actor === actor && ['pr_review', 'pr_approve'].includes(call.behavior || '') && call.source?.startsWith('poise:'))
+          .sort((a, b) => Date.parse(b.started_at_precise || b.started_at) - Date.parse(a.started_at_precise || a.started_at))
+        const call = calls[0]
+        const response = call && unambiguousAgentCall(snapshot, call) && call.head_sha === expectedHead ? callReviewResponse(call, Date.now()) : null
+        if (!response) continue
         runId = startDirectBehaviorRun('merge-prs')
         captureBehaviorAdmission({ admissionKey: runId, nativeId: runId, behavior: 'merge-prs',
           source: 'poise:merge-prs', owner: currentOrganization()?.login ?? null,
           actor, repository: pr.repo, number: pr.number, head: expectedHead, startedAt: new Date().toISOString() })
         const { stdout } = await runFile(GH_INTERFACE, [
           '--merge-if-ready', `#${pr.number}`, '--expected-head', expectedHead,
+          '--review-response-json', JSON.stringify({ ...response, review_id: call.review_id }),
           '--author', pr.author, '--token-user', actor,
         ], { cwd, timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() })
         const result = objectValue(parseJson(stdout, 'github-interface --merge-if-ready'), 'merge-if-ready')
@@ -5550,6 +5569,8 @@ async function tickMergePrs(): Promise<void> {
         const disposition = result.outcome === 'enqueued' ? 'enqueued'
           : result.outcome === 'in_queue' ? 'waiting'
             : result.outcome as 'merged' | 'already_merged' | 'not_ready' | 'superseded'
+        if (result.outcome === 'not_ready' && typeof result.review_context === 'string'
+          && result.review_context !== response.context_sha) setMeta(approveCheckGateKey(pr), '')
         captureBehaviorOutcome({ nativeId: runId, state: result.outcome === 'superseded' ? 'superseded' : 'completed',
           activity: 'settled', stateSource: 'native', outcome: disposition,
           ...(result.outcome === 'enqueued'

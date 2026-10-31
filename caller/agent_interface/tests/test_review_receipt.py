@@ -17,6 +17,7 @@ from agent_interface import bash_guard, review_budget as budget, review_receipt,
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 
+ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 HEAD = "a" * 40
 CHANGES = {"id": 91, "node_id": "PRR_91", "state": "CHANGES_REQUESTED", "commit": HEAD, "submitted_at": "2026-09-17T10:05:00Z"}
 CLEAN = {"id": 92, "node_id": "PRR_92", "state": "COMMENTED", "commit": HEAD, "submitted_at": "2026-09-17T10:06:00Z"}
@@ -160,11 +161,37 @@ class TestReceiptRecording(TestCase):
         api.init_db()
         review_receipt.bind(api.DB, "run")
         with sqlite3.connect(api.DB) as conn:
-            conn.execute("insert into calls (id, started_at) values ('run', 0)")
+            conn.execute("insert into calls (id, started_at, status, actor, behavior) values ('run', 0, 'running', 'bit-mis', 'pr_review')")
+            conn.execute("update calls set artifact=? where id='run'", (json.dumps({'phase': 'reviewing'}),))
+        review_receipt.prepare_response(json.dumps({"repository": "o/r", "pull_number": 12, "head_sha": HEAD,
+            "pull": {"base": {"sha": "b" * 40}, "title": "Review ordering", "body": "Retain assessment."}}), "fixture")
 
     def stored(self):
         with sqlite3.connect(api.DB) as conn:
             return conn.execute("select review_id from calls where id='run'").fetchone()[0]
+
+    def test_response_is_retained_before_submission_with_its_original_time_and_binding(self):
+        with patch.object(review_receipt.time, "time", return_value=1234):
+            response = review_receipt.complete_response(ASSESSMENT, HEAD)
+        self.assertEqual(response['invocation_id'], 'run')
+        self.assertEqual(response['completed_at'], 1_234_000)
+        self.assertEqual(response['assessment'], ASSESSMENT)
+        with sqlite3.connect(api.DB) as conn:
+            artifact = json.loads(conn.execute("select artifact from calls where id='run'").fetchone()[0])
+        self.assertEqual(artifact['review_response'], response)
+        with patch.object(review_receipt.time, "time", return_value=5678):
+            self.assertEqual(review_receipt.complete_response(ASSESSMENT, HEAD), response)
+        corrected = {**ASSESSMENT, 'limitations': 'Corrected before any submission was attempted.'}
+        with patch.object(review_receipt.time, 'time', return_value=5678):
+            updated = review_receipt.complete_response(corrected, HEAD)
+        self.assertEqual(updated['completed_at'], 5_678_000)
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("update calls set artifact=json_set(artifact,'$.phase','submitting_review') where id='run'")
+        with self.assertRaisesRegex(RuntimeError, 'different response'):
+            review_receipt.complete_response(ASSESSMENT, HEAD)
+        receipt = review_receipt.parse(json.dumps({'action': 'reviewed_clean', 'review_id': 92,
+            'head_sha': HEAD, 'review_response': response, 'submitted_at': '2026-10-31T00:00:00Z'}))
+        self.assertEqual(receipt['review_response'], response)
 
     def test_only_a_submission_reply_is_a_receipt(self):
         for text in ("not json", json.dumps({"action": "no_review", "review_id": 5}), json.dumps({"action": "reviewed_clean"}),
@@ -213,7 +240,7 @@ class TestReceiptRecording(TestCase):
             if args[0] == "github-interface":
                 return SimpleNamespace(returncode=0, stdout=reply, stderr="")
             return SimpleNamespace(returncode=0, stdout=json.dumps({"stopReason": "end_turn", "num_turns": 1,
-                                   "structuredOutput": {"action": "reviewed_clean", "comments": []}}), stderr="")
+                                   "structuredOutput": {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}}), stderr="")
         with patch.object(structured_review.subprocess, "run", side_effect=process), patch.object(ReviewWatch, "run", side_effect=process):
             structured_review.run("/repo", "system", "packet", CATALOG.resolve("grok-4.6-xhigh"), "pr_review",
                                   "https://github.com/o/r/pull/12", "bit-mis", HEAD, 60)
@@ -225,7 +252,7 @@ class TestReceiptRecording(TestCase):
             if args[0] == "github-interface":
                 return SimpleNamespace(returncode=1, stdout="", stderr="error: GitHub 500:\n")
             return SimpleNamespace(returncode=0, stdout=json.dumps({"stopReason": "end_turn", "num_turns": 1,
-                                   "structuredOutput": {"action": "reviewed_clean", "comments": []}}), stderr="")
+                                   "structuredOutput": {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}}), stderr="")
         with patch.object(structured_review.subprocess, "run", side_effect=process), patch.object(ReviewWatch, "run", side_effect=process):
             with self.assertRaises(review_receipt.SubmissionError):
                 structured_review.run("/repo", "system", "packet", CATALOG.resolve("grok-4.6-xhigh"), "pr_review",
@@ -496,9 +523,11 @@ class TestRecoveryWithSiblings(TestCase):
 
     def test_confirmed_quota_structured_approval_records_failure_without_retry(self):
         submissions = []
-        verdict = {"action": "request_changes", "comments": [{"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "[p2] Retained finding."}]}
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [{"path": "src/main.py", "line": 4, "side": "RIGHT", "body": "[p2] Retained finding."}]}
 
         def submit(*args, **kwargs):
+            review_receipt.prepare_response(json.dumps({'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD,
+                'pull': {'base': {'sha': 'b' * 40}, 'title': 'Review ordering', 'body': ''}}), 'grok-4.6-xhigh')
             def process(command, **options):
                 if command[0] == "github-interface":
                     submissions.append(command)

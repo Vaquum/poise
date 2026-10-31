@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { agentInterfaceCwd } from './models'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import type { ChainDecision, ChainObservation, ChainReviewer } from './behavior-chain-decision'
+import { chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import type { ChainRuntimeOperations, ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { getBehaviorChainSettings, getSettings } from './settings'
@@ -212,10 +212,19 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       }
       const prior = chain.observation as ChainObservation | null
       const headSince = prior?.pull?.head === head ? prior.pull.headSince : Date.now()
+      if (typeof state.review_context !== 'string' || !/^[0-9a-f]{64}$/.test(state.review_context) || !Array.isArray(state.my_reviews)) throw new Error('native pull state lacks its review context')
+      const reviews = state.my_reviews.map((item) => object(item, 'native review'))
+      const reviewReceipts = reviews.filter((review) => review.state !== 'PENDING').map((review) => ({ id: positive(review.id, 'review'),
+        head: sha(review.commit_id, 'review commit'), state: String(review.state), invocation: typeof review.invocation_id === 'string' ? review.invocation_id : null,
+        response: review.review_response, submittedAt: Date.parse(String(review.submitted_at)) }))
       if (state.merged === true) {
+        const mergedAt = Date.parse(String(state.merged_at))
+        if (!Number.isFinite(mergedAt) || mergedAt > Date.now()) throw new Error('merged pull lacks its actual merge time')
         observation.pull = { number, head, headSince, state: String(state.state), draft: false, merged: true, mergeSha: sha(state.merge_sha, 'merged pull'),
           queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
-          reviewIds: [], reviewReceipts: [], reviewRevision: '', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
+          reviewIds: reviewReceipts.filter((review) => review.head === head && review.state !== 'DISMISSED').map((review) => review.id),
+          reviewReceipts, reviewContext: state.review_context, mergedAt,
+          reviewRevision: prior?.pull?.reviewRevision ?? '', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
         return observation
       }
       const [readiness, ci, reviewRevision] = await Promise.all([
@@ -233,7 +242,6 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const pending = checks.some((check) => ['queued', 'pending', 'in_progress', 'requested', 'waiting'].includes(String(check.state)) || (check.state === 'completed' && check.conclusion == null))
       const failures = checks.filter((check) => ['failure', 'error'].includes(String(check.state)) || (check.state === 'completed' && ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(check.conclusion))))
       if (checks.some((check) => typeof check.name !== 'string' || !['completed', 'queued', 'pending', 'in_progress', 'requested', 'waiting', 'failure', 'error', 'success'].includes(String(check.state)))) throw new Error('native CI observation contains an unknown state')
-      const reviews = state.my_reviews.map((item) => object(item, 'native review'))
       if (reviews.some((review) => !['APPROVED', 'COMMENTED', 'CHANGES_REQUESTED', 'DISMISSED', 'PENDING'].includes(String(review.state)))) throw new Error('native review observation contains an unknown state')
       reviews.sort((a, b) => String(a.submitted_at || '').localeCompare(String(b.submitted_at || '')))
       const latest = reviews.filter((review) => ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(String(review.state))).at(-1)
@@ -257,8 +265,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         changesRequested: latest?.state === 'CHANGES_REQUESTED' && latest.commit_id === head,
         unresolved: Number(readiness.unresolved_live_conversation_count), approved: readiness.reviewer_approved_current_head,
         ready: readiness.green === true, reviewIds: reviews.filter((review) => review.commit_id === head && review.state !== 'DISMISSED').map((review) => positive(review.id, 'review')),
-        reviewReceipts: reviews.filter((review) => review.state !== 'PENDING').map((review) => ({ id: positive(review.id, 'review'),
-          head: sha(review.commit_id, 'review commit'), state: String(review.state), invocation: typeof review.invocation_id === 'string' ? review.invocation_id : null })),
+        reviewReceipts, reviewContext: state.review_context,
         reviewRevision, greyRuns, pending, failing: failures.map((check) => `${check.name}:${check.conclusion || check.state}`).sort(),
         // The existing readiness primitive already applies the repository's
         // queue policy: BEHIND needs a base update only without a merge queue.
@@ -302,7 +309,13 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         if (!run) throw new Error('grey CI recovery lacks a native workflow identity')
         return { command: 'github-interface', cwd, argv: ['--rerun-grey-ci-if-ready', String(pull.number), '--run-id', String(run.id), '--run-attempt', String(run.attempt), '--author', chain.author, ...fixed] }
       }
-      return { command: 'github-interface', cwd, argv: ['--merge-if-ready', String(pull.number), '--author', chain.author, ...fixed] }
+      const reviewed = [...chain.invocations].reverse().find((invocation) => invocation.state === 'settled'
+        && invocation.evidence?.status === 'completed' && ['reviewed_clean', 'approved'].includes(String(invocation.evidence.action))
+        && chainReviewResponse(chain, invocation, observation, Date.now()))
+      if (!reviewed) throw new Error('native merge lacks its retained final-context review response')
+      const response = chainReviewResponse(chain, reviewed, observation, Date.now())!
+      return { command: 'github-interface', cwd, argv: ['--merge-if-ready', String(pull.number), '--author', chain.author,
+        '--review-response-json', JSON.stringify({ ...response, review_id: reviewed.evidence!.review_id }), ...fixed] }
     },
     async launch(invocation, onExit, allowed) {
       const release = hooks.borrow()

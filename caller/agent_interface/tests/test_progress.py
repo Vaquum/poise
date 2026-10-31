@@ -184,7 +184,8 @@ class TestProgress(TestCase):
                 patch.object(agent_interface, "DB", Path(work) / "calls.sqlite3"), \
                 patch.object(agent_interface, "RESPONSES", Path(work) / "responses"), \
                 patch.object(agent_interface, "review_facts", return_value={}), \
-                patch.object(atoms, "packet", return_value="packet"), \
+                patch.object(atoms, "packet", return_value=json.dumps({"repository": "o/r", "pull_number": 12, "head_sha": HEAD,
+                    "pull": {"base": {"sha": "b" * 40}, "title": "Review ordering", "body": ""}})), \
                 patch.object(atoms, "last_reviewed_head", return_value=None), \
                 patch.object(ReviewWatch, "run", return_value=subprocess.CompletedProcess([], 0, "malformed\n", "")), \
                 patch.object(agent_interface, "behavior_outcome", return_value={"outcome": "approved", "action": "approved", "head_sha": HEAD}) as facts, \
@@ -219,7 +220,8 @@ class TestProgress(TestCase):
                     patch.object(agent_interface, "DB", Path(work) / "calls.sqlite3"), \
                     patch.object(agent_interface, "RESPONSES", Path(work) / "responses"), \
                     patch.object(agent_interface, "review_facts", return_value={}), \
-                    patch.object(atoms, "packet", return_value="packet"), \
+                    patch.object(atoms, "packet", return_value=json.dumps({"repository": "o/r", "pull_number": 12, "head_sha": HEAD,
+                        "pull": {"base": {"sha": "b" * 40}, "title": "Review ordering", "body": ""}})), \
                     patch.object(atoms, "last_reviewed_head", return_value=None), \
                     patch.object(ReviewWatch, "run", side_effect=failed_provider), \
                     patch.object(agent_interface, "behavior_outcome") as facts, \

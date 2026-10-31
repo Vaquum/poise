@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Any
 
 from github_interface.atoms.pulls import get_review_activity
+from github_interface.atoms.review_response import context_sha
 from github_interface.atoms.request_batch import read_requests, run_batch
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
@@ -127,6 +128,7 @@ async def read_request(
         "state": pull["state"],
         "draft": pull["isDraft"],
         "head_sha": head_sha,
+        "review_context": context_sha({"base": {"sha": pull["baseRefOid"]}, "title": pull["title"], "body": pull["body"]}),
         "pull_updated_at": pull["updatedAt"],
         "requested_reviewers": requested_reviewers,
         "reviewer_requested": any(login.lower() == username_lower for login in requested_reviewers),

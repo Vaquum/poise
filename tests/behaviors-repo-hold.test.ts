@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CATALOG_STDOUT } from './model-catalog-fixture'
+import { completedReviewCall } from './review-response-fixture'
 
 // The repository hold: when the agent account cannot read a repository at
 // all (GitHub 404 or NOT_FOUND for it), the PR behaviors record one held
@@ -87,7 +88,8 @@ async function cli(command: string, all: string[], options?: { cwd?: string }) {
   }
   if (command === 'github-datastore' && args[0] === 'view' && args[1] === 'pr') return { stdout: view(pulls, args), stderr: '' }
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
-  if (command === 'agent-interface' && args[0] === '--logs') return json([])
+  if (command === 'agent-interface' && args[0] === '--logs') return json(database?.getMeta('behavior_merge_prs_enabled') === '1'
+    ? pulls.map(pr => completedReviewCall(String(pr.repo), Number(pr.number), HEAD, AGENT)) : [])
   if (command === 'github-interface') {
     const repository = githubRepository(args, options)
     const number = Number(String(args[1] || '').replace(/^#/, ''))
