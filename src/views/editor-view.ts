@@ -2422,17 +2422,23 @@ export function decodeMarkdownImport(buffer: ArrayBuffer): string {
   if (buffer.byteLength > IMPORT_MAX_BYTES) {
     throw new Error('Choose a file smaller than 5 MiB.')
   }
+  let content: string
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+    content = new TextDecoder('utf-8', { fatal: true }).decode(buffer)
   } catch {
     throw new Error('Choose a UTF-8 text file; this one could not be read as text.')
   }
+  // Line endings are the one normalization import performs: a
+  // carriage return would otherwise survive the `\n` split in
+  // loadIntoEditor, breaking fence/table/rule matching and persisting
+  // into the saved document.
+  return content.replace(/\r\n?/g, '\n')
 }
 
 // Import a markdown file as a new document: decode the picked file as
 // UTF-8, create a blank doc through the same POST newDoc uses, and
-// load the bytes into it verbatim — no format conversion. The
-// existing autosave persists the content.
+// load the text into it as markdown — line-ending normalization is
+// the only change, and the existing autosave persists the content.
 async function importDocFile(input: HTMLInputElement): Promise<void> {
   const file = input.files?.[0]
   input.value = '' // Choosing the same file again after editing still loads it.

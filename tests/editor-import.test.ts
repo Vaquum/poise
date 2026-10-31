@@ -12,6 +12,13 @@ describe('decodeMarkdownImport', () => {
     expect(decodeMarkdownImport(new ArrayBuffer(0))).toBe('')
   })
 
+  it('normalizes CRLF and lone-CR line endings to LF', () => {
+    const decoded = decodeMarkdownImport(new TextEncoder().encode('# T\r\n\r\n```\r\ncode\r\n```\r\n').buffer as ArrayBuffer)
+    expect(decoded).toBe('# T\n\n```\ncode\n```\n')
+    const lone = decodeMarkdownImport(new TextEncoder().encode('a\rb').buffer as ArrayBuffer)
+    expect(lone).toBe('a\nb')
+  })
+
   it('rejects files larger than the editor document limit', () => {
     const oversized = new ArrayBuffer(IMPORT_MAX_BYTES + 1)
     expect(() => decodeMarkdownImport(oversized)).toThrow(/smaller than 5 MiB/)
