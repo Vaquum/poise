@@ -260,6 +260,18 @@ describe('dead-letter reconcile pass', () => {
     expect(store.listBehaviorDeadLetters()).toHaveLength(1)
   })
 
+  it('reports the call identity and closure state a firing settlement guards on', async () => {
+    const store = await loadStore()
+    const error = 'review behavior produced duplicate GitHub reviews; needs attention'
+    const { claimId, callId } = await failedLaunch(store, 'review-new-prs', 'Vaquum/repo#12', 'Vaquum/repo', 12,
+      error, '2026-10-17T10:00:00Z')
+    completeFailedClaim(store, 'review-new-prs', 'Vaquum/repo#12', claimId, error)
+
+    const [result] = store.reconcileBehaviorDeadLetters(new Set())
+    expect(result).toMatchObject({ disposition: 'superseded', correlationId: claimId, callId, open: false })
+    expect(result.replacement).toBeUndefined()
+  })
+
   it('resolves issue rows only on a same-target completion', async () => {
     const store = await loadStore()
     await failedLaunch(store, 'review-new-issues', 'Vaquum/Origo#500', 'Vaquum/Origo', 500,

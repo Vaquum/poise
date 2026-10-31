@@ -1558,7 +1558,8 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                 "Review reached its total time limit; needs attention", "review_budget_exhausted")
         else:
             # An uncertain write: verify against GitHub below and adopt a
-            # landed review, but never auto-retry the write itself.
+            # receipted landed review, but never auto-retry the write itself.
+            # An unreceipted review stays unattributed and holds.
             failure = review_budget.ReviewLimitError(
                 str(error), "review_submission_failed",
                 diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
@@ -1579,7 +1580,7 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                                                        receipt=receipt, call_id=call_id, prior_error=str(failure),
                                                        prior_code=failure.code, proven_no_action=proven)
             if not proven or repeat_only:
-                own = own_reviews(before, facts, receipt, call_id)
+                own = own_reviews(before, facts, receipt, call_id, proven_no_action=proven)
                 if not proven:
                     if own is None:
                         counts = ("reviewer_change_requests_since", "reviewer_approvals_since", "reviewer_comments_since")
@@ -1661,9 +1662,12 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
 
 
 # A sibling that submitted a moment ago may not have recorded its review id
-# yet; an unclaimed review is looked at again after this long before it is
-# taken for this run's own.
+# yet; a sibling claim is looked for again after this long before the extra
+# review is left unattributed. Claims only ever exclude; they never adopt.
 SIBLING_GRACE_SECONDS = 2.0
+# The run cannot prove what it published, or another run published what this
+# run cannot distinguish from its own uncertain write. Held, never retried.
+REVIEW_PUBLICATION_UNCERTAIN_CODE = "review_publication_uncertain"
 RECEIPT_STATES = {"requested_changes": "CHANGES_REQUESTED", "reviewed_clean": "COMMENTED", "approved_pr": "APPROVED"}
 # A pull request in either state is gone for review purposes: the round the
 # run prepared is obsolete, whatever the provider did or did not submit.
@@ -1681,12 +1685,59 @@ def _review_items(facts: dict) -> list[dict] | None:
     return items
 
 
-def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | None) -> list[dict] | None:
-    """The reviews this run posted: the receipted one, or without a receipt the
-    new ones no sibling run claims. None when github-interface predates
-    per-review ids; the activity counters decide then. A second new review
-    that is neither receipted nor sibling-claimed is blamed on this run only
-    when no concurrent sibling could have written it invisibly."""
+def _receipt_conflict_error() -> review_budget.ReviewLimitError | None:
+    """This call's genuine double write, when it recorded two accepted replies.
+
+    Two POST replies observed by this same call are positive same-call
+    evidence no inventory coincidence can supply. Both identities stay in the
+    error; unrelated runs are unaffected."""
+    pair = review_receipt.conflict()
+    if pair is None:
+        return None
+    first, second = pair["first"], pair["second"]
+    if first.get("review_id") == second.get("review_id"):
+        return review_budget.ReviewLimitError(
+            f"review behavior recorded contradictory receipts for review {first.get('review_id')}; needs attention",
+            "review_contract_violation")
+    return review_budget.ReviewLimitError(
+        f"review behavior produced duplicate GitHub reviews {first.get('review_id')} and {second.get('review_id')}; needs attention",
+        "review_contract_violation")
+
+
+def _unattributed_error(unclaimed: list[dict]) -> review_budget.ReviewLimitError:
+    shown = ",".join(str(item["id"]) for item in sorted(unclaimed, key=lambda item: item["id"])[:10])
+    extra = f",+{len(unclaimed) - 10} more" if len(unclaimed) > 10 else ""
+    return review_budget.ReviewLimitError(
+        f"review publication is uncertain: {len(unclaimed)} new same-account review(s) [{shown}{extra}] "
+        f"cannot be attributed to this run; needs attention",
+        REVIEW_PUBLICATION_UNCERTAIN_CODE)
+
+
+def _unclaimed_ids(before_new: list[dict], exclude: set[int], repo: str, number: str, call_id: str) -> list[dict]:
+    found = [item for item in before_new if item["id"] not in exclude
+             and item["id"] not in review_receipt.sibling_ids(DB, call_id, repo, number)]
+    if found:
+        sleep(SIBLING_GRACE_SECONDS)
+        found = [item for item in before_new if item["id"] not in exclude
+                 and item["id"] not in review_receipt.sibling_ids(DB, call_id, repo, number)]
+    return found
+
+
+def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | None,
+                proven_no_action: bool = False) -> list[dict] | None:
+    """The reviews this run posted, by positive per-call evidence only.
+
+    With a receipt, the receipted review: this run's own POST reply named it.
+    Any other new review stays unattributed — an independent writer using the
+    account need not have a local sibling row, so elimination proves nothing,
+    and a sibling delayed past the grace must never settle the wrong run.
+    Without a receipt nothing is attributable. None when github-interface
+    predates per-review ids; the counters decide then, and they can only
+    supersede or hold, never adopt. With proven_no_action the caller proved
+    this run posted nothing, so unclaimed reviews are returned as-is instead
+    of raising: they are definitively another request's. Callers must never
+    adopt them — behavior_outcome clears attribution under proof, and the
+    recovery path uses them only for its already-published guard."""
     after = _review_items(facts)
     earlier = _review_items(before)
     if after is None or earlier is None:
@@ -1694,30 +1745,37 @@ def own_reviews(before: dict, facts: dict, receipt: dict | None, call_id: str | 
     seen = {item["id"] for item in earlier}
     new = [item for item in after if item["id"] not in seen]
     if receipt is not None:
+        if call_id:
+            duplicate = _receipt_conflict_error()
+            if duplicate is not None:
+                raise duplicate
+            repo, number = str(facts.get("repository") or ""), str(facts.get("pull_number") or "")
+            if receipt["review_id"] in review_receipt.sibling_ids(DB, call_id, repo, number):
+                raise review_budget.ReviewLimitError(
+                    f"review {receipt['review_id']} is claimed by another run; ownership conflicts, needs attention",
+                    "review_contract_violation")
         own = [item for item in new if item["id"] == receipt["review_id"]]
         if call_id and len(new) > len(own):
             repo, number = str(facts.get("repository") or ""), str(facts.get("pull_number") or "")
-            extra = [item for item in new if item["id"] != receipt["review_id"]
-                     and item["id"] not in review_receipt.sibling_ids(DB, call_id, repo, number)]
-            if extra:
-                sleep(SIBLING_GRACE_SECONDS)
-                extra = [item for item in new if item["id"] != receipt["review_id"]
-                         and item["id"] not in review_receipt.sibling_ids(DB, call_id, repo, number)]
-            if extra and not review_receipt.concurrent_unclaimed_run_exists(DB, call_id, repo, number):
-                raise review_budget.ReviewLimitError(
-                    "review behavior produced duplicate GitHub reviews; needs attention"
-                    if len(own) == 1 else
-                    "review behavior must produce exactly one atomic clean or change-request review",
-                    "review_contract_violation")
+            extra = _unclaimed_ids(new, {receipt["review_id"]}, repo, number, call_id)
+            if extra and review_receipt.failure():
+                # The receipted write stands on its own reply, but this run
+                # also saw a transient submission answer: the extra may be the
+                # uncertain write's, or an independent writer's. Retain that
+                # uncertainty instead of declaring either provenance as fact.
+                raise _unattributed_error(extra)
         return own
-    if not new or not call_id:
+    if not new:
         return new
+    if not call_id:
+        return []
     repo, number = str(facts.get("repository") or ""), str(facts.get("pull_number") or "")
-    own = [item for item in new if item["id"] not in review_receipt.sibling_ids(DB, call_id, repo, number)]
-    if own:
-        sleep(SIBLING_GRACE_SECONDS)
-        own = [item for item in new if item["id"] not in review_receipt.sibling_ids(DB, call_id, repo, number)]
-    return own
+    unclaimed = _unclaimed_ids(new, set(), repo, number, call_id)
+    if unclaimed:
+        if proven_no_action:
+            return unclaimed
+        raise _unattributed_error(unclaimed)
+    return []
 
 
 def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: dict | None) -> dict[str, str | None]:
@@ -1744,6 +1802,10 @@ def _own_outcome(behavior: str, own: list[dict], expected_head: str, receipt: di
             raise RuntimeError("submitted approval was dismissed before verification")
         else:
             raise RuntimeError("submitted review does not match its receipt")
+    if receipt is not None and str(receipt.get("head_sha") or "").lower() != expected_head:
+        # The reply's own head disagrees with the expected one: a receipt for
+        # another head cannot adopt a review on this one.
+        raise RuntimeError("submitted review receipt does not match the expected head")
     if str(review.get("commit") or "").lower() != expected_head:
         raise RuntimeError("terminal review is not attached to the expected head")
     _parse_time(str(review.get("submitted_at") or ""), "submitted_at")
@@ -1880,7 +1942,7 @@ def behavior_outcome(
         )
 
     try:
-        own = own_reviews(before, facts, receipt, call_id)
+        own = own_reviews(before, facts, receipt, call_id, proven_no_action=proven_no_action)
     except review_budget.ReviewLimitError as duplicates:
         # Two reviews under the shared identity with no attributable owner.
         # On an open target that ambiguity holds; on a confirmed-closed one
@@ -1952,6 +2014,12 @@ def behavior_outcome(
     previous_review_id = str(before.get("reviewer_latest_review_id") or "")
     previous_any_review_id = str(before.get("reviewer_latest_any_review_id") or "")
 
+    # Without per-review ids the counters cannot tell this run's review from a
+    # sibling's or an independent writer's: aggregate progress validates the
+    # shape of what happened, but never adopts a publication from it.
+    unattributed = review_budget.ReviewLimitError(
+        "review publication cannot be attributed without per-review inventory; needs attention",
+        REVIEW_PUBLICATION_UNCERTAIN_CODE)
     if behavior == "pr_review":
         if approvals:
             raise RuntimeError("review behavior produced an unexpected approval")
@@ -1967,22 +2035,14 @@ def behavior_outcome(
                 previous_any_review_id,
                 "reviewer_latest_any",
             )
-            return {
-                "action": "reviewed_clean",
-                "outcome": "clean",
-                "head_sha": expected_head,
-            }
+            raise unattributed
         _validate_latest_review(
             facts,
             "CHANGES_REQUESTED",
             expected_head,
             previous_review_id,
         )
-        return {
-            "action": "requested_changes",
-            "outcome": "changes_requested",
-            "head_sha": expected_head,
-        }
+        raise unattributed
 
     if behavior != "pr_approve":
         raise RuntimeError(f"unsupported governed behavior: {behavior}")
@@ -1992,22 +2052,14 @@ def behavior_outcome(
         )
     if approvals:
         _validate_latest_review(facts, "APPROVED", expected_head, previous_review_id)
-        return {
-            "action": "approved",
-            "outcome": "approved",
-            "head_sha": expected_head,
-        }
+        raise unattributed
     _validate_latest_review(
         facts,
         "CHANGES_REQUESTED",
         expected_head,
         previous_review_id,
     )
-    return {
-        "action": "requested_changes",
-        "outcome": "changes_requested",
-        "head_sha": expected_head,
-    }
+    raise unattributed
 
 
 def review_facts(

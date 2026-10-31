@@ -58,10 +58,22 @@ class TestHeadObservation(TestCase):
 class TestSubmissionGate(TestCase):
     def test_cancellation_refuses_a_gate_with_a_sealed_submission(self):
         with ReviewWatch("/tmp", PR, "bit-mis", HEAD) as watch:
-            with submission_gate(watch.gate_path) as seal:
-                seal()
+            with submission_gate(watch.gate_path) as gate:
+                gate.seal()
             self.assertFalse(cancel_when_idle(watch.gate_path))
             self.assertEqual(Path(watch.gate_path).read_text(), "submitted\n")
+
+    def test_uncertain_gate_blocks_new_commands_until_reconciled(self):
+        with ReviewWatch("/tmp", PR, "bit-mis", HEAD) as watch:
+            with submission_gate(watch.gate_path) as gate:
+                gate.mark_uncertain()
+            with self.assertRaisesRegex(RuntimeError, "uncertain; blocked until reconciled"):
+                with submission_gate(watch.gate_path):
+                    self.fail("uncertain review acquired permission to submit")
+            self.assertTrue(cancel_when_idle(watch.gate_path))
+            with self.assertRaisesRegex(RuntimeError, "uncertain; blocked until reconciled"):
+                with submission_gate(watch.gate_path):
+                    self.fail("cancelled uncertain review acquired permission to submit")
 
     def test_cancellation_waits_for_submission_and_then_blocks_new_commands(self):
         with ReviewWatch("/tmp", PR, "bit-mis", HEAD) as watch:

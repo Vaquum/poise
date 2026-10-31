@@ -54,7 +54,7 @@ def main():
         # submission lock or be mistaken for an ambiguous publication.
         raise SystemExit(subprocess.run(argv, text=True).returncode)
     receipt = os.environ.get("AGENT_INTERFACE_REVIEW_RECEIPT")
-    with submission_gate(os.environ.get("AGENT_INTERFACE_REVIEW_GATE")) as seal:
+    with submission_gate(os.environ.get("AGENT_INTERFACE_REVIEW_GATE")) as gate:
         if not receipt:
             done = subprocess.run(argv, text=True)
             raise SystemExit(done.returncode)
@@ -73,12 +73,15 @@ def main():
             with open(staged, "w") as handle:
                 handle.write(done.stdout)
             os.replace(staged, receipt)
-            seal()
+            gate.seal()
         elif done.returncode and (failure_message := record_failure(done.stderr or done.stdout)):
             staged = receipt + ".failure.tmp"
             with open(staged, "w") as handle:
                 handle.write(failure_message)
             os.replace(staged, receipt + ".failure")
+            # The POST may have been accepted before its answer failed: no
+            # second write until the run reconciles what landed.
+            gate.mark_uncertain()
         elif done.returncode and (refused := blocked_refusal(done.stderr or done.stdout)):
             # The approval guard refused: deterministic, retryable, and never
             # sealed — the run settles it as a blocked approval, not a failed

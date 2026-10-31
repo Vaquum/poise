@@ -102,7 +102,14 @@ class TestRecovery(TestCase):
         self.mod = SimpleNamespace(pr_number=lambda _: '1', repo_name=lambda *_: 'o/r', run=Mock())
 
     def execute(self, runs, checks, model='opus-5-high'):
-        self.mod.run.side_effect = runs
+        steps = iter(runs if isinstance(runs, list) else [runs])
+
+        def dispatch(*args, **kwargs):
+            step = next(steps)
+            if isinstance(step, BaseException):
+                raise step
+            return step(*args, **kwargs) if callable(step) else step
+        self.mod.run.side_effect = dispatch
         with patch.object(api, 'review_facts', side_effect=checks), redirect_stdout(io.StringIO()):
             try:
                 api.run_governed_behavior(self.mod, 'pr_approve', 'https://github.com/o/r/pull/1',
@@ -111,7 +118,17 @@ class TestRecovery(TestCase):
         return api.logs()[-1]
 
     def test_output_limit_recovers_once_and_records_actual_github_outcome(self):
-        row = self.execute([budget.ReviewLimitError('output token maximum'), 'done'], [facts(), facts(), approved()])
+        from agent_interface import review_receipt
+        item = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD,
+                "submitted_at": "2026-09-13T10:00:00Z"}
+        def recovered(*args, **kwargs):
+            review_receipt.record(json.dumps({"action": "approved_pr", "review_id": 93, "head_sha": HEAD}))
+            return 'done'
+        before = facts(reviewer_reviews_since_items=[])
+        mid = facts(reviewer_reviews_since_items=[])
+        after = approved()
+        after["reviewer_reviews_since_items"] = [item]
+        row = self.execute([budget.ReviewLimitError('output token maximum'), recovered], [before, mid, after])
         self.assertEqual([x.kwargs['model'] for x in self.mod.run.call_args_list], ['opus-5-high', 'gpt-6-astra-ultra'])
         self.assertEqual(row['outcome'], 'approved')
         self.assertEqual(row['review_policy'], 'bounded-v1')
@@ -119,9 +136,18 @@ class TestRecovery(TestCase):
         self.assertEqual(row['model'], 'opus-5-high')
 
     def test_completion_print_reports_budget_usage(self):
-        self.mod.run.side_effect = ['done']
+        from agent_interface import review_receipt
+        item = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD,
+                "submitted_at": "2026-09-13T10:00:00Z"}
+        def submitted(*args, **kwargs):
+            review_receipt.record(json.dumps({"action": "approved_pr", "review_id": 93, "head_sha": HEAD}))
+            return 'done'
+        self.mod.run.side_effect = submitted
+        before = facts(reviewer_reviews_since_items=[])
+        after = approved()
+        after["reviewer_reviews_since_items"] = [item]
         output = io.StringIO()
-        with patch.object(api, 'review_facts', side_effect=[facts(), approved()]), redirect_stdout(output):
+        with patch.object(api, 'review_facts', side_effect=[before, after]), redirect_stdout(output):
             try:
                 api.run_governed_behavior(self.mod, 'pr_approve', 'https://github.com/o/r/pull/1',
                     'bit-mis', HEAD, 'poise:approve-prs', uuid4().hex, pwd=self.directory.name,
@@ -195,8 +221,17 @@ class TestRecovery(TestCase):
         self.assertEqual(row['diagnostic']['call_id'], row['id'])
         self.assertEqual(row['diagnostic']['correlation_id'], row['correlation_id'])
 
-    def test_github_submission_before_provider_error_never_launches_recovery(self):
-        row = self.execute([budget.ReviewLimitError('output token maximum')], [facts(), approved()])
+    def test_receipted_submission_before_provider_error_never_launches_recovery(self):
+        from agent_interface import review_receipt
+        item = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD,
+                "submitted_at": "2026-09-13T10:00:00Z"}
+        def submitted_then_limited(*args, **kwargs):
+            review_receipt.record(json.dumps({"action": "approved_pr", "review_id": 93, "head_sha": HEAD}))
+            raise budget.ReviewLimitError('output token maximum')
+        before = facts(reviewer_reviews_since_items=[])
+        after = approved()
+        after["reviewer_reviews_since_items"] = [item]
+        row = self.execute([submitted_then_limited], [before, after])
         self.assertEqual(self.mod.run.call_count, 1)
         self.assertEqual(row['outcome'], 'approved')
         self.assertIsNone(row['recovery_model'])
@@ -228,9 +263,29 @@ class TestRecovery(TestCase):
         self.assertIsNone(row['action'])
         self.assertIsNone(row['outcome'])
 
-    def test_lost_recovery_response_adopts_verified_review(self):
+    def test_lost_recovery_response_without_receipt_holds(self):
         row = self.execute([budget.ReviewLimitError('output token maximum'), RuntimeError('lost response')], [facts(), facts(), approved()])
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(row['error_code'], 'review_recovery_failed')
+        self.assertIn('lost response', row['error'])
+        self.assertIsNone(row['action'])
+        self.assertIsNone(row['outcome'])
+        self.assertEqual(self.mod.run.call_count, 2)
+
+    def test_receipted_recovery_submission_adopts_despite_lost_response(self):
+        from agent_interface import review_receipt
+        item = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD,
+                "submitted_at": "2026-09-13T10:00:00Z"}
+        def submitted_then_lost(*args, **kwargs):
+            review_receipt.record(json.dumps({"action": "approved_pr", "review_id": 93, "head_sha": HEAD}))
+            raise RuntimeError('lost response')
+        before = facts(reviewer_reviews_since_items=[])
+        mid = facts(reviewer_reviews_since_items=[])
+        after = approved()
+        after["reviewer_reviews_since_items"] = [item]
+        row = self.execute([budget.ReviewLimitError('output token maximum'), submitted_then_lost], [before, mid, after])
         self.assertEqual(row['outcome'], 'approved')
+        self.assertEqual(row['review_id'], 93)
         self.assertEqual(self.mod.run.call_count, 2)
 
     def test_astra_primary_cannot_fallback_to_itself(self):
@@ -239,7 +294,17 @@ class TestRecovery(TestCase):
         self.assertEqual(row['error_code'], 'model_output_limit')
 
     def test_repeat_only_refusal_recovers_once_with_a_different_model(self):
-        row = self.execute([refusal_error(), 'done'], [facts(), facts(), approved()])
+        from agent_interface import review_receipt
+        item = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD,
+                "submitted_at": "2026-09-13T10:00:00Z"}
+        def recovered(*args, **kwargs):
+            review_receipt.record(json.dumps({"action": "approved_pr", "review_id": 93, "head_sha": HEAD}))
+            return 'done'
+        before = facts(reviewer_reviews_since_items=[])
+        mid = facts(reviewer_reviews_since_items=[])
+        after = approved()
+        after["reviewer_reviews_since_items"] = [item]
+        row = self.execute([refusal_error(), recovered], [before, mid, after])
         self.assertEqual([x.kwargs['model'] for x in self.mod.run.call_args_list], ['opus-5-high', 'gpt-6-astra-ultra'])
         self.assertEqual(row['outcome'], 'approved')
         self.assertEqual(row['model'], 'opus-5-high')
@@ -249,7 +314,17 @@ class TestRecovery(TestCase):
         self.assertIn('done', response)
 
     def test_repeat_only_refusal_recovers_for_a_non_claude_primary(self):
-        row = self.execute([refusal_error(), 'done'], [facts(), facts(), approved()], model='grok-4.6-xhigh')
+        from agent_interface import review_receipt
+        item = {"id": 93, "node_id": "PRR_93", "state": "APPROVED", "commit": HEAD,
+                "submitted_at": "2026-09-13T10:00:00Z"}
+        def recovered(*args, **kwargs):
+            review_receipt.record(json.dumps({"action": "approved_pr", "review_id": 93, "head_sha": HEAD}))
+            return 'done'
+        before = facts(reviewer_reviews_since_items=[])
+        mid = facts(reviewer_reviews_since_items=[])
+        after = approved()
+        after["reviewer_reviews_since_items"] = [item]
+        row = self.execute([refusal_error(), recovered], [before, mid, after], model='grok-4.6-xhigh')
         self.assertEqual([x.kwargs['model'] for x in self.mod.run.call_args_list], ['grok-4.6-xhigh', 'gpt-6-astra-ultra'])
         self.assertEqual(row['outcome'], 'approved')
         self.assertEqual(row['recovery_model'], 'gpt-6-astra-ultra')

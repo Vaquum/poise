@@ -1540,6 +1540,91 @@ function settleSupersededApprovalFirings(results: DeadLetterReconcileResult[]): 
   }
 }
 
+// A closed pull request ends its failed review and approval firings as
+// obsolete input, never as completed work. The dead-letter pass already
+// retired the incident; the firing follows so it cannot stay held past its
+// input. Activity stays unknown: closure proves the request is obsolete,
+// never what the failed run published. The retained launch keeps fencing
+// its input and no launch field is written, so an obsolete firing confers
+// no completion privilege and clears no hold. The outcome is
+// review_target_closed with a completion stamp so the ledger's closed-target
+// path settles the panel: a generic superseded outcome would convert back
+// to pending for a single-reviewer review-new-prs firing.
+function settleOneClosedTargetFiring(
+  behavior: string, target: string,
+  nativeId: string | null, callId: string | null, completedAt: string,
+): void {
+  if (!nativeId || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(nativeId)) return
+  if (!callId || !/^[0-9a-f]{32}$/.test(callId)) return
+  if (!Number.isFinite(Date.parse(completedAt))) return
+  // Guarded by the original launch contract: only the retained failed
+  // launch this incident was recorded against settles its firing, and a
+  // quarantined launch stays held for its own evidence to resolve.
+  const failed = getFailedBehaviorLaunch(behavior, target)
+  if (!failed || failed.launchCallId !== callId || failed.launchCorrelationId !== nativeId
+    || failed.launchQuarantine
+    || !failed.launchBehavior || !failed.launchRepo || !Number.isSafeInteger(failed.launchPr)
+    || !failed.launchActor || !failed.launchSource || !failed.launchExpectedHead) return
+  captureBehaviorOutcome({ nativeId, callId, state: 'superseded', activity: 'unknown', stateSource: 'native',
+    outcome: 'review_target_closed', completedAt,
+    refs: [{ kind: 'caller', identity: callId, availability: 'available' }] })
+}
+
+function settleClosedTargetFirings(results: DeadLetterReconcileResult[]): void {
+  const completedAt = new Date().toISOString()
+  for (const result of results) {
+    if ((result.behavior !== 'review-new-prs' && result.behavior !== 'approve-prs')
+      || result.disposition !== 'superseded' || result.replacement || result.open !== false) continue
+    settleOneClosedTargetFiring(result.behavior, result.target,
+      result.correlationId, result.callId, completedAt)
+  }
+}
+
+// Firings whose closed-PR incidents retired before this settlement existed:
+// the reconcile pass excludes retired rows, so those firings never reach
+// the fresh path above. Failed launches drive the scan — at most one row
+// per behavior target — so every pass examines each without a LIMIT that
+// could starve a backlog, and only rows still holding a matching failed
+// launch are read. A reopened PR skips. The incident's retirement stamp is
+// the stable completion time so repeats settle to the same record.
+function settleClosedTargetHistoricalFirings(open: ReadonlySet<string>): void {
+  const rows = db.prepare(`
+    SELECT seen.key AS behavior, seen.target AS target,
+      seen.launch_repo AS repo, seen.launch_pr AS pr,
+      seen.launch_correlation_id AS correlation_id, seen.launch_call_id AS call_id,
+      dead.resolution_evidence AS resolution_evidence, dead.retired_at AS retired_at
+    FROM behavior_seen AS seen
+    JOIN behavior_dead_letters AS dead
+      ON dead.behavior = seen.key AND dead.target = seen.target
+      AND dead.correlation_id = seen.launch_correlation_id
+      AND dead.call_id = seen.launch_call_id
+    WHERE seen.key IN ('review-new-prs', 'approve-prs')
+      AND seen.claim_id = ''
+      AND seen.launch_error IS NOT NULL
+      AND seen.launch_outcome IS NULL
+      AND dead.retired_at IS NOT NULL
+      AND dead.resolution = 'superseded'
+      AND dead.resolution_evidence LIKE '%"open":false%'
+    ORDER BY dead.retired_at ASC, dead.id ASC
+  `).all() as Array<{
+    behavior: string, target: string, repo: string | null, pr: number | null,
+    correlation_id: string | null, call_id: string | null,
+    resolution_evidence: string, retired_at: string,
+  }>
+  for (const row of rows) {
+    let evidence: { open?: unknown, replacedBy?: unknown } | null = null
+    try {
+      evidence = JSON.parse(row.resolution_evidence) as { open?: unknown, replacedBy?: unknown }
+    } catch {
+      continue
+    }
+    if (evidence?.open !== false || evidence?.replacedBy) continue
+    if (row.repo === null || row.pr === null || open.has(`${row.repo}#${row.pr}`)) continue
+    settleOneClosedTargetFiring(row.behavior, row.target,
+      row.correlation_id, row.call_id, row.retired_at)
+  }
+}
+
 function recordQuarantineIncident(claim: BehaviorLaunchClaim, error: string, callId: string | null): void {
   if (claim.launchQuarantine === 'invalid_result') return
   const updated = db.prepare(`
@@ -1793,12 +1878,19 @@ function clearCompletedUnreadableHold(claim: BehaviorLaunchClaim, call: LogEntry
       quarantineEvidence(snapshot, claim, call).hasLiveEvidence)
     return false
   }
-  db.prepare(`
-    UPDATE behavior_seen SET launch_quarantine = NULL
-    WHERE key = ? AND target = ? AND claim_id = '' AND launch_quarantine = 'unreadable'
-      AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
-  `).run(claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
   if (call.outcome === 'published' || call.outcome === 'no_changes') throw new Error('atomic publication cannot settle a legacy review claim')
+  // A recovered completion settles the launch record itself, not just the
+  // incident and the firing: without the outcome, action, completion time
+  // and head, the approval basis and round accounting would still see no
+  // completed work. The retired incident keeps the original failure text.
+  const settled = db.prepare(`
+    UPDATE behavior_seen SET launch_quarantine = NULL, launch_error = NULL,
+      launch_outcome = ?, launch_action = ?, launch_completed_at = ?, launch_head_sha = ?
+    WHERE key = ? AND target = ? AND claim_id = '' AND launch_outcome IS NULL AND launch_error IS NOT NULL
+      AND launch_call_id = ? AND launch_correlation_id = ? AND launch_requested_at = ?
+  `).run(call.outcome, call.action, call.completed_at, call.head_sha,
+    claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
+  if (settled.changes !== 1) return false
   captureBehaviorOutcome({ nativeId: claim.launchCorrelationId, callId: call.id,
     state: 'completed', activity: 'settled', stateSource: 'native', outcome: call.outcome,
     head: call.head_sha, completedAt: call.completed_at })
@@ -2523,7 +2615,10 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
   await requireFreshDatastore()
   const prs = await fetchOpenPrRows()
   const seen = new Set(prs.map((pr) => `${pr.repo}#${pr.number}`))
-  settleSupersededApprovalFirings(reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login))
+  const reconciled = reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
+  settleSupersededApprovalFirings(reconciled)
+  settleClosedTargetFirings(reconciled)
+  settleClosedTargetHistoricalFirings(seen)
   retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
   retireClosedQueueAdmissions(seen)
   return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(getMeta('me') || '', `${pr.repo}#${pr.number}`, pr))

@@ -35,7 +35,9 @@ class TestGovernedOutcomes(TestCase):
                     object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40, facts
                 )
 
-    def test_review_accepts_explicit_clean_review_on_expected_head(self) -> None:
+    def test_review_holds_clean_counters_without_per_review_inventory(self) -> None:
+        from agent_interface import review_budget
+
         before = self._facts()
         after = self._facts(
             reviewer_comments_since=1,
@@ -46,12 +48,12 @@ class TestGovernedOutcomes(TestCase):
         )
 
         with patch.object(agent_interface, "review_facts", return_value=after):
-            result = agent_interface.behavior_outcome(
-                object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40, before
-            )
+            with self.assertRaises(review_budget.ReviewLimitError) as raised:
+                agent_interface.behavior_outcome(
+                    object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40, before
+                )
 
-        self.assertEqual(result["action"], "reviewed_clean")
-        self.assertEqual(result["outcome"], "clean")
+        self.assertEqual(raised.exception.code, agent_interface.REVIEW_PUBLICATION_UNCERTAIN_CODE)
 
     def test_review_rejects_clean_review_on_wrong_head(self) -> None:
         before = self._facts()
@@ -596,7 +598,7 @@ class TestClosedTargetSettle(TestCase):
         self.assertEqual(result["error_code"], "review_target_closed")
         self.assertIn("time limit", result["error"])
         self.assertIn("target MERGED", result["error"])
-        self.assertIn("unexpected approval", result["error"])
+        self.assertIn("cannot be attributed to this run", result["error"])
         self.assertIn("77/APPROVED", result["error"])
         self.assertIn("receipt=none", result["error"])
 
@@ -630,7 +632,7 @@ class TestClosedTargetSettle(TestCase):
         self.assertIn("78/APPROVED", result["error"])
         self.assertEqual(result["diagnostic"]["outcome"], "target_closed")
 
-    def test_reconciliation_settles_duplicate_reviews_on_a_closed_target(self) -> None:
+    def test_receipted_review_still_wins_on_a_closed_target_with_an_extra_review(self) -> None:
         import sqlite3
         import tempfile
         from pathlib import Path
@@ -666,10 +668,11 @@ class TestClosedTargetSettle(TestCase):
             finally:
                 review_receipt._current.set(None)
 
-        self.assertEqual(result["outcome"], "superseded")
-        self.assertEqual(result["error_code"], "review_target_closed")
-        self.assertIn("duplicate", result["error"])
-        self.assertIn("92/APPROVED", result["error"])
+        self.assertEqual(result, {
+            "action": "reviewed_clean",
+            "outcome": "clean",
+            "head_sha": "a" * 40,
+        })
 
     def test_closed_settle_lists_sibling_claims_beside_unclaimed_reviews(self) -> None:
         import sqlite3
@@ -744,7 +747,7 @@ class TestClosedTargetSettle(TestCase):
             "head_sha": "a" * 40,
         })
 
-    def test_open_target_still_holds_an_unexpected_approval(self) -> None:
+    def test_open_target_holds_an_unattributed_approval_without_blame(self) -> None:
         from agent_interface import review_receipt
 
         before = self._facts(reviewer_reviews_since_items=[])
@@ -755,20 +758,20 @@ class TestClosedTargetSettle(TestCase):
                 patch.object(agent_interface, "review_facts", return_value=after):
             review_receipt._current.set(None)
             try:
-                with self.assertRaisesRegex(RuntimeError, "unexpected approval"):
+                with self.assertRaisesRegex(RuntimeError, "exactly one"):
                     agent_interface.behavior_outcome(
                         object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40, before
                     )
             finally:
                 review_receipt._current.set(None)
 
-    def test_open_target_still_holds_duplicate_reviews(self) -> None:
+    def test_open_target_leaves_an_extra_review_unattributed_beside_a_receipt(self) -> None:
         import sqlite3
         import tempfile
         from pathlib import Path
         from time import time
 
-        from agent_interface import review_budget, review_receipt
+        from agent_interface import review_receipt
 
         before = self._facts(reviewer_reviews_since_items=[])
         after = self._facts(
@@ -790,14 +793,17 @@ class TestClosedTargetSettle(TestCase):
                     ("call-1", time(), "bit-mis", "o/r", "68", "pr_review", "running"))
             review_receipt._current.set(None)
             try:
-                with self.assertRaises(review_budget.ReviewLimitError) as raised:
-                    agent_interface.behavior_outcome(
-                        object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40,
-                        before, receipt=receipt, call_id="call-1",
-                    )
+                result = agent_interface.behavior_outcome(
+                    object(), "pr_review", "68", "/tmp", "bit-mis", "a" * 40,
+                    before, receipt=receipt, call_id="call-1",
+                )
             finally:
                 review_receipt._current.set(None)
-        self.assertEqual(raised.exception.code, "review_contract_violation")
+        self.assertEqual(result, {
+            "action": "reviewed_clean",
+            "outcome": "clean",
+            "head_sha": "a" * 40,
+        })
 
     def test_evidence_inventory_degrades_to_unknown_instead_of_raising(self) -> None:
         malformed = self._facts(reviewer_reviews_since_items=[{"id": "not-an-int"}])

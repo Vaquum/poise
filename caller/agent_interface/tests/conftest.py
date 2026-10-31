@@ -14,9 +14,11 @@ def _clear_review_receipt():
     review_receipt._call.set(None)
     review_receipt._current.set(None)
     review_receipt._failure.set(None)
+    review_receipt._conflict.set(None)
     review_receipt._refused.set(None)
     yield
     review_receipt._call.set(None)
     review_receipt._current.set(None)
     review_receipt._failure.set(None)
+    review_receipt._conflict.set(None)
     review_receipt._refused.set(None)

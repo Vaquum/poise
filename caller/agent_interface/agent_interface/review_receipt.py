@@ -21,6 +21,7 @@ SUBMISSIONS = {"requested_changes", "reviewed_clean", "approved_pr"}
 _current: ContextVar[dict | None] = ContextVar("review_receipt", default=None)
 _call: ContextVar[tuple[Path, str] | None] = ContextVar("review_receipt_call", default=None)
 _failure: ContextVar[str | None] = ContextVar("review_submission_failure", default=None)
+_conflict: ContextVar[dict | None] = ContextVar("review_receipt_conflict", default=None)
 _blocked: ContextVar[str | None] = ContextVar("review_submission_blocked", default=None)
 _refused: ContextVar[dict | None] = ContextVar("review_submission_refused", default=None)
 # A transport error carries no status: the write may have landed before the
@@ -237,12 +238,18 @@ def bind(database: Path, call_id: str) -> None:
     _call.set((database, call_id))
     _current.set(None)
     _failure.set(None)
+    _conflict.set(None)
     _blocked.set(None)
     _refused.set(None)
 
 
 def get() -> dict | None:
     return _current.get()
+
+
+def conflict() -> dict | None:
+    """Two distinct accepted receipts for this call, when record saw both."""
+    return _conflict.get()
 
 
 def parse(text: str) -> dict | None:
@@ -255,7 +262,12 @@ def parse(text: str) -> dict | None:
     review_id = reply.get("review_id")
     if isinstance(review_id, bool) or not isinstance(review_id, int):
         return None
-    return {"action": reply["action"], "review_id": review_id, "head_sha": reply.get("head_sha")}
+    head_sha = reply.get("head_sha")
+    # A receipt without the head it posted on cannot be checked against the
+    # expected head later; it is not positive ownership evidence.
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
+        return None
+    return {"action": reply["action"], "review_id": review_id, "head_sha": head_sha.lower()}
 
 
 def _comments(text: str) -> str | None:
@@ -267,20 +279,42 @@ def _comments(text: str) -> str | None:
     return str(count) if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
 
 
+def _note_conflict(first: dict, second: dict) -> None:
+    if _conflict.get() is None:
+        _conflict.set({"first": first, "second": second})
+
+
 def record(text: str) -> dict | None:
     receipt = parse(text)
     if receipt is None:
         return None
-    _current.set(receipt)
+    kept = _current.get()
+    if kept is not None and (kept["review_id"] != receipt["review_id"] or kept["action"] != receipt["action"]):
+        # A second accepted reply for this call is this call's own double
+        # write, positive same-call evidence: the first write keeps the row,
+        # and the pair stays visible for the duplicate check instead of the
+        # scalar being overwritten with the latest id.
+        _note_conflict(kept, receipt)
+        return kept
     bound = _call.get()
     if bound:
         database, call_id = bound
         with sqlite3.connect(database, timeout=30) as conn:
+            row = conn.execute("select review_id from calls where id=?", (call_id,)).fetchone()
+            if row is not None and row[0] is not None and str(row[0]) != str(receipt["review_id"]):
+                try:
+                    first_id: int | str = int(row[0])
+                except (TypeError, ValueError):
+                    first_id = row[0]
+                _note_conflict({"review_id": first_id, "action": None, "head_sha": None}, receipt)
+                _current.set(receipt)
+                return receipt
             conn.execute("update calls set review_id=?, review_comments=? where id=?",
                          (str(receipt["review_id"]), _comments(text), call_id))
             if os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") == call_id:
                 conn.execute("update calls set artifact=json_patch(artifact,?) where id=? and status='running'",
                              (json.dumps({"phase": "review_submitted", **receipt}), call_id))
+    _current.set(receipt)
     return receipt
 
 
@@ -310,31 +344,6 @@ def record_file(path: str | Path) -> dict | None:
     except OSError:
         return None
     return record(text) if text.strip() else None
-
-
-def concurrent_unclaimed_run_exists(database: Path, call_id: str, repo: str, pr_number: str) -> bool:
-    """A sibling PR run that may have submitted without recording its review id.
-
-    True when another pr_review/pr_approve run by the same actor on this target is still running,
-    or ended after this run started without a recorded review id and without
-    provable no-action preflight state. An unclaimed extra review is then
-    unattributed: this run cannot tell its own second write from the sibling's
-    invisible one, so it must not be blamed for a duplicate.
-    """
-    with sqlite3.connect(database, timeout=30) as conn:
-        mine = conn.execute("select started_at, actor from calls where id=?", (call_id,)).fetchone()
-        if mine is None or mine[0] is None:
-            return True
-        started, actor = mine
-        row = conn.execute(
-            "select 1 from calls where id != ? and repo = ? and pr_id = ? "
-            "and actor IS ? COLLATE NOCASE "
-            "and behavior in ('pr_review', 'pr_approve') and review_id is null "
-            "and (outcome is null or action is null "
-            "or outcome != 'preflight_failed' or action != 'not_started') "
-            "and (status = 'running' or ended_at > ?) limit 1",
-            (call_id, repo, pr_number, actor, started)).fetchone()
-    return row is not None
 
 
 def sibling_ids(database: Path, call_id: str, repo: str, pr_number: str) -> set[int]:

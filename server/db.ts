@@ -1338,6 +1338,9 @@ export interface DeadLetterReconcileResult {
   behavior: string
   target: string
   correlationId: string | null
+  callId: string | null
+  /** Whether the target pull request was open at check time; null when the pass did not establish it. */
+  open: boolean | null
   disposition: DeadLetterDisposition
   reason: string
   replacement?: DeadLetterReplacement
@@ -1448,8 +1451,9 @@ export function reconcileBehaviorDeadLetters(
       const encoded = JSON.stringify({ ...evidence, checkedAt: now })
       if (disposition === 'held') hold.run(encoded, now, row.id)
       else retire.run(now, disposition, encoded, now, row.id)
+      const open = typeof evidence.open === 'boolean' ? evidence.open : null
       return { id: row.id, behavior: row.behavior, target: row.target, correlationId: row.correlation_id,
-        disposition, reason, ...(replacement ? { replacement } : {}) }
+        callId: row.call_id, open, disposition, reason, ...(replacement ? { replacement } : {}) }
     }
     if (quarantined.get(row.behavior, row.target)) {
       return settle('held', 'quarantined claim outstanding', { callId: row.call_id })

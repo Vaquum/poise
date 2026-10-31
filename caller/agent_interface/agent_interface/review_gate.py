@@ -3,10 +3,34 @@ from contextlib import contextmanager
 import fcntl
 
 
+class SubmissionSeal:
+    """The one terminal write a guarded review may make, then no more."""
+
+    def __init__(self, gate):
+        self._gate = gate
+
+    def seal(self):
+        if self._gate is None:
+            return
+        self._gate.seek(0, 2)
+        self._gate.write("submitted\n")
+        self._gate.flush()
+
+    def mark_uncertain(self):
+        # A transient GitHub answer may have accepted the write: further
+        # terminal commands stay blocked until the run reconciles, so an
+        # uncertain first POST cannot be followed by a proven second one.
+        if self._gate is None:
+            return
+        self._gate.seek(0, 2)
+        self._gate.write("uncertain\n")
+        self._gate.flush()
+
+
 @contextmanager
 def submission_gate(path: str | None):
     if not path:
-        yield lambda: None
+        yield SubmissionSeal(None)
         return
     # Never recreate a missing gate: the owning review may have finished.
     with open(path, "r+") as gate:
@@ -15,14 +39,11 @@ def submission_gate(path: str | None):
         if state:
             if "submitted" in state:
                 raise RuntimeError("review already submitted; duplicate submission blocked")
+            if "uncertain" in state:
+                raise RuntimeError("prior review submission is uncertain; blocked until reconciled")
             raise RuntimeError("review was superseded; submission blocked")
 
-        def seal():
-            gate.seek(0, 2)
-            gate.write("submitted\n")
-            gate.flush()
-
-        yield seal
+        yield SubmissionSeal(gate)
 
 
 def cancel_when_idle(path: str) -> bool:
