@@ -1579,19 +1579,30 @@ function settleClosedTargetFirings(results: DeadLetterReconcileResult[]): void {
 
 // Firings whose closed-PR incidents retired before this settlement existed:
 // the reconcile pass excludes retired rows, so those firings never reach
-// the fresh path above. Query them directly with the same guards; a
-// reopened PR skips. The incident's retirement stamp is the stable
-// completion time so repeats settle to the same record.
+// the fresh path above. Failed launches drive the scan — at most one row
+// per behavior target — so every pass examines each without a LIMIT that
+// could starve a backlog, and only rows still holding a matching failed
+// launch are read. A reopened PR skips. The incident's retirement stamp is
+// the stable completion time so repeats settle to the same record.
 function settleClosedTargetHistoricalFirings(open: ReadonlySet<string>): void {
   const rows = db.prepare(`
-    SELECT behavior, target, repo, pr, correlation_id, call_id,
-      resolution_evidence, retired_at
-    FROM behavior_dead_letters
-    WHERE retired_at IS NOT NULL
-      AND behavior IN ('review-new-prs', 'approve-prs')
-      AND resolution = 'superseded'
-      AND resolution_evidence LIKE '%"open":false%'
-    LIMIT 200
+    SELECT seen.key AS behavior, seen.target AS target,
+      seen.launch_repo AS repo, seen.launch_pr AS pr,
+      seen.launch_correlation_id AS correlation_id, seen.launch_call_id AS call_id,
+      dead.resolution_evidence AS resolution_evidence, dead.retired_at AS retired_at
+    FROM behavior_seen AS seen
+    JOIN behavior_dead_letters AS dead
+      ON dead.behavior = seen.key AND dead.target = seen.target
+      AND dead.correlation_id = seen.launch_correlation_id
+      AND dead.call_id = seen.launch_call_id
+    WHERE seen.key IN ('review-new-prs', 'approve-prs')
+      AND seen.claim_id = ''
+      AND seen.launch_error IS NOT NULL
+      AND seen.launch_outcome IS NULL
+      AND dead.retired_at IS NOT NULL
+      AND dead.resolution = 'superseded'
+      AND dead.resolution_evidence LIKE '%"open":false%'
+    ORDER BY dead.retired_at ASC, dead.id ASC
   `).all() as Array<{
     behavior: string, target: string, repo: string | null, pr: number | null,
     correlation_id: string | null, call_id: string | null,

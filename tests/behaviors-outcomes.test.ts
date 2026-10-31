@@ -468,6 +468,55 @@ describe('publication attribution settlement', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
   })
 
+  it('settles a historical firing past a large retired backlog without starvation', async () => {
+    const launched = await launchReviewBeforeCrash()
+    const failed = agentLog({ id: 'f'.repeat(32), started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'failed', error: 'review behavior produced duplicate GitHub reviews; needs attention',
+      error_code: 'review_contract_violation', review_policy: 'bounded-v1', model: 'opus-5-xhigh',
+      expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
+    fixture.agentLogs = [failed]
+    await resetLogCache()
+    const modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+
+    // Retire the incident, then bury it under more retired rows than any
+    // fixed LIMIT would read: the failed-launch-driven scan still settles it.
+    const retiredAt = new Date().toISOString()
+    const evidence = JSON.stringify({ open: false, checkedAt: retiredAt })
+    modules.database.db.prepare(`
+      UPDATE behavior_dead_letters
+      SET retired_at = ?, resolution = 'superseded',
+        resolution_evidence = ?, resolved_at = ?
+      WHERE retired_at IS NULL
+    `).run(retiredAt, evidence, retiredAt)
+    const insert = modules.database.db.prepare(`
+      INSERT INTO behavior_dead_letters(
+        id, behavior, target, repo, pr, actor, source, correlation_id,
+        call_id, error, created_at, retired_at, resolution,
+        resolution_evidence, resolved_at
+      ) VALUES(?, 'review-new-prs', ?, ?, ?, 'review-bot', 'poise:review-new-prs',
+        ?, ?, 'old failure', ?, ?, 'superseded', ?, ?)
+    `)
+    modules.database.db.transaction(() => {
+      for (let index = 0; index < 250; index++) {
+        const target = `Vaquum/old-repo#${1000 + index}`
+        insert.run(`backlog-${index}`, target, 'Vaquum/old-repo', 1000 + index,
+          `backlog-native-${index}`, 'a'.repeat(32), retiredAt, retiredAt, evidence, retiredAt)
+      }
+    })()
+    mocks.captureOutcome.mockClear()
+
+    fixture.listedPrs = []
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: launched.correlationId, callId: failed.id, state: 'superseded',
+      activity: 'unknown', outcome: 'review_target_closed', completedAt: retiredAt,
+    }))
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+  })
+
   it.each(['review-new-prs', 'approve-prs'] as const)('recovers a held %s launch into its launch record when the same call completes', async (behavior) => {
     const launched = behavior === 'review-new-prs' ? await launchReviewBeforeCrash() : await launchApprovalBeforeCrash()
     const failed = agentLog({ id: 'f'.repeat(32), started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
