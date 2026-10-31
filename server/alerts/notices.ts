@@ -22,6 +22,7 @@ import {
   type AlertKind, type AlertTarget, type OpenAlert,
 } from './store'
 import { recordHandling, type HandlingActor } from './handling'
+import { WORKER_IDLE_REPEAT_MS, refreshWorkerCapacity } from '../worker-capacity'
 
 /** How often a ready pull request is noticed again. */
 export const REMINDER_INTERVAL_MS = 15 * 60_000
@@ -38,8 +39,8 @@ const INCIDENT_READ_LIMIT = 500
 
 // The most pressing first: someone is blocked on the person, then work that
 // cannot run, then work that failed, then what waits for them.
-const ORDER: readonly AlertKind[] = ['chat_waiting', 'sign_in_needed', 'github_quota_exhausted', 'storage_low', 'github_quota_warning', 'behavior_held', 'review_requested', 'pr_conflict', 'ledger_queue_stalled', 'ledger_capture_loss', 'datastore_sync_failing', 'pr_ready', 'chat_turn_finished']
-const SILENCEABLE: ReadonlySet<AlertKind> = new Set(['pr_ready', 'review_requested'])
+const ORDER: readonly AlertKind[] = ['chat_waiting', 'sign_in_needed', 'github_quota_exhausted', 'storage_low', 'github_quota_warning', 'behavior_held', 'review_requested', 'pr_conflict', 'ledger_queue_stalled', 'ledger_capture_loss', 'datastore_sync_failing', 'pr_ready', 'worker_idle', 'chat_turn_finished']
+const SILENCEABLE: ReadonlySet<AlertKind> = new Set(['pr_ready', 'review_requested', 'worker_idle'])
 
 export interface Notice extends EvidenceAttachment {
   id: string
@@ -68,9 +69,10 @@ export interface NoticesState {
 function dueAt(alert: OpenAlert, now: number): number | null {
   const since = Date.parse(alert.createdAt)
   const dismissed = alert.dismissedAt === null ? null : Date.parse(alert.dismissedAt)
-  if (alert.kind === 'pr_ready') {
+  if (alert.kind === 'pr_ready' || alert.kind === 'worker_idle') {
     if (alert.silencedAt !== null) return null
-    const due = since + Math.max(0, Math.floor((now - since) / REMINDER_INTERVAL_MS)) * REMINDER_INTERVAL_MS
+    const interval = alert.kind === 'pr_ready' ? REMINDER_INTERVAL_MS : WORKER_IDLE_REPEAT_MS
+    const due = since + Math.max(0, Math.floor((now - since) / interval)) * interval
     return dismissed !== null && dismissed >= due ? null : due
   }
   if (alert.silencedAt !== null && SILENCEABLE.has(alert.kind)) return null
@@ -131,13 +133,14 @@ export function dismissNotice(id: string, now = Date.now()): void {
 }
 
 /** The person asked to hear no more about a ready pull request, until it is
- *  merged or closed, or about a requested review, until the request is gone:
- *  the checks forget the silence then. */
+ *  merged or closed, about a requested review, until the request is gone, or
+ *  about idle worker slots, until a slot fills or a ticket is labelled: the
+ *  checks forget the silence then. */
 export function silenceNotice(id: string, now = Date.now(), actor: HandlingActor = 'person'): void {
   const seq = storedSeq(id)
   const kind = alertKind(seq)
   if (kind === null) throw new HttpError(404, 'There is no such notification.')
-  if (!SILENCEABLE.has(kind)) throw new HttpError(400, 'Only a pull request ready to merge or asking for your review can be silenced; dismiss this notification instead.')
+  if (!SILENCEABLE.has(kind)) throw new HttpError(400, 'Only a pull request ready to merge, asking for your review, or an idle worker slot notice can be silenced; dismiss this notification instead.')
   const row = alertRow(seq)
   if (!silenceAlert(seq, now)) throw new HttpError(404, 'That notification has already cleared.')
   if (row) {
@@ -320,6 +323,7 @@ async function runPass(read: typeof readOwnPullRequests, involved: typeof readIn
     await checkReadyPullRequests(read)
     await checkReviewRequests(involved)
     await checkConflictPullRequests(read)
+    await refreshWorkerCapacity()
   } catch (error) {
     console.error('[notices] could not check what needs attention:', error)
   }

@@ -172,6 +172,15 @@ requests:
 Neither repeats while it stands: each shows until you put it away or it
 resolves.
 
+## Idle worker slots
+
+Every two minutes, on the same pass, Poise counts the Manager's worker chats
+against its Rhythm slots and the open unassigned `enhancement` tickets. When
+slots sit idle for more than 15 minutes while that backlog is empty, one
+notice names up to five open candidates to label, perf and P0/P1 first, with
+links. It comes due again at most hourly until a slot fills or a ticket is
+labelled, and silencing it lasts until then.
+
 ## Acting on a notice
 
 - **Open** goes to what the notice is about and puts the notice away. That is
@@ -184,11 +193,13 @@ resolves.
   - A failed behavior without a recorded agent call has nothing to open. Its
     diagnostic is in the entry itself.
   - A floating rail closes when it opens something; a docked rail stays open.
-- **Dismiss** puts it away: for good, or for a ready pull request until its
-  next reminder.
-- **Silence reminders**, on a ready pull request or a requested review,
-  silences it: no more reminders while a ready pull request stays open, and
-  nothing more about a review request until the request is removed.
+- **Dismiss** puts it away: for good, or for a ready pull request or idle
+  worker slots until its next reminder.
+- **Silence reminders**, on a ready pull request, a requested review, or idle
+  worker slots, silences it: no more reminders while a ready pull request
+  stays open, nothing more about a review request until the request is
+  removed, and nothing more about idle slots until a slot fills or a ticket
+  is labelled.
 
 Behaviors' conditions cannot be put away. They leave the rail when the
 condition clears.

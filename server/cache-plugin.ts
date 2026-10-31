@@ -53,6 +53,8 @@ import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceR
 import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
 import { ProcessLockError } from './process-lock'
 import { retryFailedPrReviews, setBehaviorCheckSlots } from './behaviors'
+import { setWorkerChatReader } from './worker-capacity'
+import { bindings as workBindings } from './chat/control-store'
 import { enforceApiRequest, httpStatus, readJson, setApiHeaders, type RequestAuthority } from './http'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
@@ -243,6 +245,16 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
       extensions: runtimeExtensions,
     })
     setBehaviorCheckSlots(chatRuntime.checkSlots)
+    setWorkerChatReader(() => {
+      const runtime = chatRuntime
+      if (!runtime) return { running: 0, hasManager: false, boundTargets: [] }
+      const sessions = runtime.list()
+      return {
+        running: sessions.filter((session) => session.role === 'worker' && session.status !== 'closed').length,
+        hasManager: sessions.some((session) => session.role === 'manager'),
+        boundTargets: workBindings(runtime.instance).map((binding) => binding.target),
+      }
+    })
     // Before recovery, so it sees the turns a restart cut.
     chatSwitchboard = new Switchboard(chatRuntime)
     chatControl = new ChatControl(chatRuntime, { switchboard: chatSwitchboard })
@@ -1034,6 +1046,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               failures: evidence.failures,
               deadLetters: evidence.deadLetters,
               holds: runtime.holds,
+              workerCapacity: runtime.workerCapacity,
             },
           })
         }

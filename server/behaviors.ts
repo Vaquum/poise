@@ -97,6 +97,7 @@ import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, 
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { behaviorHeld } from './alerts/producers'
+import { getWorkerCapacity, type WorkerCapacity } from './worker-capacity'
 
 const DATASTORE = 'github-datastore'
 const GH_INTERFACE = 'github-interface'
@@ -7543,6 +7544,8 @@ export interface BehaviorsRuntimeHealth {
    *  `callerLaunches` counts live agent-interface children, including manual
    *  runs outside the budget. */
   checkSlots: CheckSlotStats & { callerLaunches: number }
+  /** Manager worker slots in use versus target, and the labelled backlog. */
+  workerCapacity: WorkerCapacity
 }
 
 function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
@@ -7675,6 +7678,7 @@ function scopedBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
     deadLetters: listBehaviorIncidents(),
     eventLoop: eventLoopDelayStats(),
     checkSlots: { ...behaviorCheckSlots.stats(), callerLaunches: runningCallerLaunches() },
+    workerCapacity: getWorkerCapacity(),
   }
 }
 
