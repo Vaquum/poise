@@ -87,6 +87,8 @@ node dist/behavior-ledger.js health
 second deadline and 512 KiB response bound. Exit 0 means a successful reply with
 complete health; 1 means HTTP/transport failure or incomplete/stale coverage;
 2 means invalid arguments. The command emits server JSON unchanged.
+In service mode invoke it from `~/.poise/releases/current` or `/opt/poise`
+through existing owner/operator execution.
 
 ## Per-PR status projection
 
