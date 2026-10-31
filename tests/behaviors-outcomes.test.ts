@@ -419,8 +419,8 @@ describe('publication attribution settlement', () => {
     expect(incident.resolution).toBe('superseded')
     expect(JSON.parse(incident.resolution_evidence)).toMatchObject({ open: false })
     expect(incident.retired_at).toEqual(expect.any(String))
-    expect(firings().at(-1)).toMatchObject({ state: 'superseded', activity: 'unknown', outcome: 'superseded',
-      callId: failed.id, refs: [{ kind: 'caller', identity: failed.id }] })
+    expect(firings().at(-1)).toMatchObject({ state: 'superseded', activity: 'unknown', outcome: 'review_target_closed',
+      callId: failed.id, completedAt: expect.any(String), refs: [{ kind: 'caller', identity: failed.id }] })
     const launch = modules.database.db.prepare(
       'SELECT launch_error, launch_outcome, launch_action, launch_completed_at, launch_head_sha FROM behavior_seen WHERE key = ? AND target = ?',
     ).get(behavior, launched.target) as Record<string, string | null>
@@ -430,6 +430,41 @@ describe('publication attribution settlement', () => {
 
     // A settled firing reopens nothing: the next tick launches nothing new.
     await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+  })
+
+  it('settles a firing whose closed-PR incident already retired before the upgrade', async () => {
+    const launched = await launchReviewBeforeCrash()
+    const failed = agentLog({ id: 'f'.repeat(32), started_at: launched.requestedAt, started_at_precise: launched.requestedAt,
+      status: 'failed', error: 'review behavior produced duplicate GitHub reviews; needs attention',
+      error_code: 'review_contract_violation', review_policy: 'bounded-v1', model: 'opus-5-xhigh',
+      expected_head: launched.expectedHead, actor: launched.actor, source: launched.source, correlation_id: launched.correlationId })
+    fixture.agentLogs = [failed]
+    await resetLogCache()
+    const modules = await restartModules()
+    modules.behaviors.startBehaviorsRuntime()
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(modules.database.getFailedBehaviorLaunch('review-new-prs', launched.target)).not.toBeNull()
+    expect(modules.database.listBehaviorDeadLetters()).toHaveLength(1)
+
+    // The incident retired before this settlement existed: reconcile
+    // excludes it, so only the historical path can settle the firing.
+    const retiredAt = new Date().toISOString()
+    modules.database.db.prepare(`
+      UPDATE behavior_dead_letters
+      SET retired_at = ?, resolution = 'superseded',
+        resolution_evidence = ?, resolved_at = ?
+      WHERE retired_at IS NULL
+    `).run(retiredAt, JSON.stringify({ open: false, checkedAt: retiredAt }), retiredAt)
+    expect(modules.database.listBehaviorDeadLetters()).toEqual([])
+    mocks.captureOutcome.mockClear()
+
+    fixture.listedPrs = []
+    await modules.behaviors.runEnabledBehaviorsOnce()
+    expect(mocks.captureOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      nativeId: launched.correlationId, callId: failed.id, state: 'superseded',
+      activity: 'unknown', outcome: 'review_target_closed', completedAt: retiredAt,
+    }))
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
   })
 

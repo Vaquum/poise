@@ -281,6 +281,23 @@ class TestReceiptRecording(TestCase):
                 self.assertEqual(review_receipt.record_failure("warning before error\n" + message), message)
                 self.assertIsNone(review_receipt.get())
 
+    def test_transport_failure_is_a_transient_submission_error(self):
+        for error in ("httpx.ConnectError: [Errno 104] Connection reset by peer",
+                      "httpx.ReadTimeout: timed out", "httpx.RemoteProtocolError: peer closed",
+                      "Traceback (most recent call last):\nhttpx.ConnectError: boom"):
+            with self.subTest(error=error):
+                review_receipt.bind(api.DB, "run")
+                self.assertEqual(review_receipt.record_failure(error), error.strip().split("\n")[-1]
+                                 if "\n" in error else error)
+                self.assertIsNotNone(review_receipt.failure())
+                self.assertIsNone(review_receipt.get())
+        for prose in ("The model says httpx.ConnectError failed",
+                      "warning: mind the httpx.ReadTimeout window"):
+            with self.subTest(prose=prose):
+                review_receipt.bind(api.DB, "run")
+                self.assertIsNone(review_receipt.record_failure(prose))
+                self.assertIsNone(review_receipt.failure())
+
     def test_provider_failure_with_exact_quota_prose_is_not_a_submission_failure(self):
         with patch.object(ReviewWatch, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr=QUOTA_ERROR)), \
                 patch.object(structured_review.subprocess, "run") as submit:
@@ -628,6 +645,15 @@ class TestDuplicatePrevention(TestCase):
 
     def test_receipted_extra_with_a_transient_failure_holds_as_uncertain(self):
         review_receipt.record_failure("error: GitHub 503:")
+        after = facts([CHANGES, CLEAN])
+        with self.assertRaises(budget.ReviewLimitError) as raised:
+            api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,
+                                 receipt=receipt("reviewed_clean", 92), call_id="me")
+        self.assertEqual(raised.exception.code, api.REVIEW_PUBLICATION_UNCERTAIN_CODE)
+        self.assertIn("[91]", str(raised.exception))
+
+    def test_receipted_extra_with_a_transport_failure_holds_as_uncertain(self):
+        review_receipt.record_failure("Traceback (most recent call last):\nhttpx.ConnectError: boom")
         after = facts([CHANGES, CLEAN])
         with self.assertRaises(budget.ReviewLimitError) as raised:
             api.behavior_outcome(object(), "pr_review", "1", "/tmp", "bit-mis", HEAD, facts(), after,

@@ -24,6 +24,8 @@ _failure: ContextVar[str | None] = ContextVar("review_submission_failure", defau
 _conflict: ContextVar[dict | None] = ContextVar("review_receipt_conflict", default=None)
 _QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-remaining",
                   "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
+_TRANSPORT_ERRORS = ("TransportError|TimeoutException|ConnectError|ReadError|WriteError|CloseError|"
+                     "ReadTimeout|WriteTimeout|ConnectTimeout|PoolTimeout|RemoteProtocolError|LocalProtocolError")
 
 
 @contextmanager
@@ -153,7 +155,15 @@ def record_failure(text: str) -> str | None:
     # calls this path, and validation/authentication failures remain held.
     observed = re.search(r"(?:^|\n)(?:error: )?GitHub (\d{3})( rate-limit)?:", text)
     if not observed:
-        return None
+        # A POST accepted before its transport failed leaves no GitHub
+        # status: the traceback names the httpx transport error instead. That
+        # uncertain write fences the gate and holds against extras.
+        transport = re.search(rf"(?:^|\n)(?:error: )?httpx\.(?:{_TRANSPORT_ERRORS})\b", text)
+        if not transport:
+            return None
+        message = text[transport.start():].strip()[:4096]
+        _failure.set(message)
+        return message
     status = observed[1]
     if status == "403":
         message = _quota_failure(text[observed.end():].rstrip()) if observed[2] else None

@@ -223,6 +223,16 @@ describe('behavior firing ledger store', () => {
     expect(db.pending()).toEqual([])
   })
 
+  it('settles a single-reviewer obsolete firing as superseded with unknown activity, not pending', () => {
+    const db = store()
+    db.capture(admission('obsolete-1', { plannedSlots: ['primary'] }))
+    clock += 1_000
+    db.capture({ type: 'result', nativeId: 'obsolete-1', state: 'superseded', activity: 'unknown',
+      outcome: 'review_target_closed', completedAt: stamp() })
+    expect(records(db)[0]).toMatchObject({ state: 'superseded', activity: 'unknown',
+      outcome: 'review_target_closed', completedAt: null, plannedSlots: ['primary'] })
+  })
+
   it.each(['settled', 'running', 'unknown'] as const)('retains the actual activity of a %s sibling when closure ends its target', (activity) => {
     const db = store()
     db.capture(admission('sibling-1', { plannedSlots: ['primary', 'secondary', 'tertiary'] }))
