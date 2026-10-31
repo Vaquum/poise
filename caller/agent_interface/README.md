@@ -94,7 +94,10 @@ after proving no reviewer action. Invalid, missing, duplicate or contradictory
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
 GitHub reviews are `review_contract_violation` and held. A repeat-only
 `no_review` refusal first recovers once with the recovery model; anything
-still failing is held. An approval the unresolved-conversation guard refuses is
+still failing is held. Claude runs persist the refusal through the guard's
+`.refused` sidecar, since they submit outside the structured runner; a receipt
+from a later accepted submission wins over the stale marker. An approval the
+unresolved-conversation guard refuses is
 `approval_blocked_unresolved_conversations`: still nothing approved, but a
 waiting external blocker rather than a failed verdict publication; a superseding
 head keeps that disposition, and another request's review never settles the

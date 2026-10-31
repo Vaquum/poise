@@ -516,23 +516,17 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                 stderr=cause, provider=model.provider, submission="rejected"))
     receipt = review_receipt.record(done.stdout)
     if receipt is None:
-        try:
-            reply = json.loads(done.stdout)
-        except ValueError:
-            reply = None
-        if isinstance(reply, dict) and reply.get("action") == "no_review":
-            skipped = reply.get("skipped", [])
-            cause = bounded_cause(json.dumps(skipped) or "no review submitted")
-            # A repeat-only refusal restated already-published bodies in every
-            # finding and delivered nothing. Typed so recovery can tell it
-            # from other duplicate refusals without reading prose.
-            repeat_only = (isinstance(skipped, list) and len(skipped) > 0 and all(
-                isinstance(entry, dict) and entry.get("reason") == "repeat" for entry in skipped))
+        # A repeat-only refusal restated already-published bodies in every
+        # finding and delivered nothing. Typed so recovery can tell it
+        # from other duplicate refusals without reading prose.
+        details = review_receipt.parse_no_review(done.stdout)
+        if details is not None:
+            cause = bounded_cause(json.dumps(details["skipped"]) or "no review submitted")
             raise review_budget.ReviewLimitError(
                 f"review submission was a no-op: {cause}", "review_contract_violation",
                 diagnostic_envelope(operation="provider.review", phase="submitting", outcome="exit",
                                     stderr=cause, provider=model.provider, submission="noop",
-                                    refusal="repeat_only" if repeat_only else "duplicate"))
+                                    refusal="repeat_only" if details["repeat_only"] else "duplicate"))
         raise review_receipt.SubmissionError(
             "review submission returned no receipt; publication uncertain, reconcile before retry")
     # The outer governed behavior reads authoritative review facts afterward:

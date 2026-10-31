@@ -1592,6 +1592,11 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
                 # Require positive no-action proof, including pending reviews.
                 if _count(facts, "reviewer_pending_reviews") != 0:
                     raise RuntimeError("a pending GitHub review requires reconciliation")
+                if repeat_only and own:
+                    # Another request's review is already published on this
+                    # head: no re-verdict, so this run cannot publish a second
+                    # review the final verification would reject as duplicate.
+                    raise RuntimeError("another review is already published on this head; no re-verdict was attempted")
                 if own is None and (_count(facts, "reviewer_reviews_since") != _count(before, "reviewer_reviews_since")
                         or facts.get("reviewer_latest_any_review_id") != before.get("reviewer_latest_any_review_id")):
                     raise RuntimeError("review activity changed without matching counters")

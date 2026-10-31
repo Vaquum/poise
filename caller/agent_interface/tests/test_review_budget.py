@@ -279,6 +279,18 @@ class TestRecovery(TestCase):
         self.assertIn('could not prove a safe recovery', row['error'])
         self.assertIsNone(row['recovery_model'])
 
+    def test_repeat_only_refusal_holds_when_another_review_is_published(self):
+        before = facts()
+        before['reviewer_reviews_since_items'] = []
+        after = facts()
+        after['reviewer_reviews_since_items'] = [{'id': 99}]
+        with patch.object(api, 'sleep'):
+            row = self.execute([refusal_error()], [before, after])
+        self.assertEqual(self.mod.run.call_count, 1)
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertIn('another review is already published on this head', row['error'])
+        self.assertIsNone(row['recovery_model'])
+
     def test_repeat_only_refusal_keeps_prior_failure_when_recovery_fails(self):
         row = self.execute([refusal_error(), atoms.AgentPreflightError('codex failed')], [facts(), facts(), facts()])
         self.assertEqual(self.mod.run.call_count, 2)
