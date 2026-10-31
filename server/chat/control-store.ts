@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { db, getMeta, setMeta } from '../db'
 import { behaviorChainOwner, type ChainPullIdentity } from '../behavior-chain-journal'
 import { HttpError } from '../http'
+import type { WakeMinutes } from '../../src/chat-manager-settings-types'
 import type { ChatActor, ChatHold, PersonActor, TimerSummary, TimerView } from './protocol'
 import type { WorkTarget } from './work-observations'
 
@@ -84,6 +85,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS chat_control_inbox_timer_window ON chat_control_inbox(instance, admitted_at) WHERE timer_id IS NOT NULL;
   CREATE INDEX IF NOT EXISTS chat_control_inbox_turn ON chat_control_inbox(turn_id);
 `)
+
+// The Manager's scheduled wake-up is one system timer per instance, kept by
+// ensureSystemTimer below. The partial unique index is the backstop across
+// processes on one database file: at most one live wake timer per instance.
+try {
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(chat_control_timers)').all() as Array<{ name: string }>
+    if (!cols.some((c) => c.name === 'system_key')) db.exec('ALTER TABLE chat_control_timers ADD COLUMN system_key TEXT')
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS chat_control_timers_system ON chat_control_timers(instance, system_key)
+      WHERE system_key IS NOT NULL AND state IN ('active','held','tripped')`)
+  }).immediate()
+} catch (error) {
+  // A concurrent process added the column first; anything else stops startup.
+  if (!(error instanceof Error) || !error.message.includes('duplicate column name')) throw error
+}
 
 export type { WorkTarget } from './work-observations'
 export function workTarget(value: string): WorkTarget {
@@ -350,8 +366,9 @@ export interface TimerRow {
   label: string, message: string, kind: 'once' | 'every', interval_ms: number,
   next_at: number | null, not_before: number | null, state: TimerState, reason: TimerReason | null,
   failures: number, skipped: number, created_at: number, updated_at: number, ended_at: number | null,
+  system_key: string | null,
 }
-const TIMER_COLUMNS = 'id, instance, target, set_by_kind, set_by_session, set_by_title, set_by_role, label, message, kind, interval_ms, next_at, not_before, state, reason, failures, skipped, created_at, updated_at, ended_at'
+const TIMER_COLUMNS = 'id, instance, target, set_by_kind, set_by_session, set_by_title, set_by_role, label, message, kind, interval_ms, next_at, not_before, state, reason, failures, skipped, created_at, updated_at, ended_at, system_key'
 
 function previewOf(message: string): string {
   const points = Array.from(message)
@@ -374,6 +391,7 @@ function summaryOf(row: TimerRow, pending?: { since: string, missed: number }): 
     state: row.state, ...(row.reason ? { reason: row.reason } : {}),
     setBy: setterOf(row), failures: row.failures, skipped: row.skipped,
     ...(pending ? { pending } : {}), createdAt: new Date(row.created_at).toISOString(),
+    ...(row.system_key === 'manager-wake' ? { system: 'manager-wake' as const } : {}),
   }
 }
 
@@ -426,11 +444,13 @@ export function createTimer(instance: string, input: { sessionId: string, label:
   }
   const kind = everies ? 'every' : 'once'
   const intervalMs = (everies ? everyMinutes! : delayMinutes!) * 60_000
-  const perChat = (db.prepare(`SELECT COUNT(*) AS n FROM chat_control_timers WHERE instance = ? AND target = ? AND state IN ${LIVE_STATES}`)
+  // The wake timer keeps no slot: the Manager's own timers can never block
+  // it, and it never takes a slot from the person's timers.
+  const perChat = (db.prepare(`SELECT COUNT(*) AS n FROM chat_control_timers WHERE instance = ? AND target = ? AND state IN ${LIVE_STATES} AND system_key IS NULL`)
     .get(instance, input.sessionId) as { n: number }).n
   if (perChat >= TIMER_LIMITS.perChat) throw new HttpError(400, `this chat already has ${TIMER_LIMITS.perChat} timers`)
   if (setBy.kind === 'chat') {
-    const perInstance = (db.prepare(`SELECT COUNT(*) AS n FROM chat_control_timers WHERE instance = ? AND set_by_kind = 'chat' AND state IN ${LIVE_STATES}`)
+    const perInstance = (db.prepare(`SELECT COUNT(*) AS n FROM chat_control_timers WHERE instance = ? AND set_by_kind = 'chat' AND state IN ${LIVE_STATES} AND system_key IS NULL`)
       .get(instance) as { n: number }).n
     if (perInstance >= TIMER_LIMITS.perInstance) throw new HttpError(400, `this Poise instance already has ${TIMER_LIMITS.perInstance} timers`)
   }
@@ -500,6 +520,83 @@ export function timerForTurn(instance: string, turnId: string): TimerView | null
   const row = db.prepare(`SELECT ${TIMER_COLUMNS.split(',').map(c => `t.${c.trim()}`).join(', ')} FROM chat_control_timers t
     JOIN chat_control_inbox i ON i.timer_id = t.id WHERE t.instance = ? AND i.turn_id = ?`).get(instance, turnId) as TimerRow | undefined
   return row ? viewOf(row) : null
+}
+
+// ── The Manager's scheduled wake-up ────────────────────────────────────
+
+const WAKE_TIMER_LABEL = 'Scheduled wake-up'
+const WAKE_TIMER_MESSAGE = 'Scheduled wake-up. Review the workspace according to your charter: list the chats, read your inbox, look at chats that are waiting or failed, and check work you are bound to. If nothing needs action, end your turn in one line.'
+
+/** The instance's live wake timer, if it has one. */
+export function systemTimer(instance: string, key: 'manager-wake'): TimerView | null {
+  const row = db.prepare(`SELECT ${TIMER_COLUMNS} FROM chat_control_timers WHERE instance = ? AND system_key = ? AND state IN ${LIVE_STATES}
+    ORDER BY created_at, id LIMIT 1`).get(instance, key) as TimerRow | undefined
+  return row ? viewOf(row) : null
+}
+
+function liveSystemRow(instance: string, key: 'manager-wake'): TimerRow | undefined {
+  return db.prepare(`SELECT ${TIMER_COLUMNS} FROM chat_control_timers WHERE instance = ? AND system_key = ? AND state IN ${LIVE_STATES}
+    ORDER BY created_at, id LIMIT 1`).get(instance, key) as TimerRow | undefined
+}
+
+/** Only writer of system_key. One transaction; changes the interval in
+ *  place; a lost unique race re-selects and returns the winner. Exempt
+ *  from timer slots. want is null with no Manager or, under O2, no
+ *  /manager text. */
+export function ensureSystemTimer(instance: string, key: 'manager-wake', want: { target: string, everyMinutes: WakeMinutes } | null, now: number): TimerView | null {
+  const apply = db.transaction((current: TimerRow | undefined): TimerView | null => {
+    if (!want) {
+      // A live wake timer whose Manager is gone is already ended by
+      // forgetSession or the stale sweep, so a live row here lost its
+      // charter: under O2 there are no wake-ups without one.
+      if (current) {
+        db.prepare(`DELETE FROM chat_control_inbox WHERE instance = ? AND timer_id = ? AND state = 'pending'`).run(instance, current.id)
+        db.prepare(`UPDATE chat_control_timers SET state = 'cancelled', reason = 'no_charter', next_at = NULL,
+          updated_at = ?, ended_at = ? WHERE id = ?`).run(now, now, current.id)
+      }
+      return null
+    }
+    if (current && current.target !== want.target) {
+      db.prepare(`DELETE FROM chat_control_inbox WHERE instance = ? AND timer_id = ? AND state = 'pending'`).run(instance, current.id)
+      db.prepare(`UPDATE chat_control_timers SET state = 'cancelled', reason = 'manager_replaced', next_at = NULL,
+        updated_at = ?, ended_at = ? WHERE id = ?`).run(now, now, current.id)
+      current = undefined
+    }
+    if (current) {
+      const intervalMs = want.everyMinutes * 60_000
+      // In place, at once: a wake already pending for a busy Manager stays
+      // pending and is delivered when the Manager can take a turn.
+      if (current.interval_ms !== intervalMs) {
+        db.prepare('UPDATE chat_control_timers SET interval_ms = ?, next_at = ?, updated_at = ? WHERE id = ?')
+          .run(intervalMs, now + intervalMs, now, current.id)
+      }
+      return timerById(instance, current.id)
+    }
+    const reason = holdReasonFor(instance, want.target)
+    const inserted = db.prepare(`INSERT INTO chat_control_timers(id, instance, target, set_by_kind, label, message, kind,
+        interval_ms, next_at, state, reason, failures, skipped, created_at, updated_at, system_key)
+      VALUES(?, ?, ?, 'person', ?, ?, 'every', ?, ?, ?, ?, 0, 0, ?, ?, ?) ON CONFLICT DO NOTHING`)
+      .run(randomUUID(), instance, want.target, WAKE_TIMER_LABEL, WAKE_TIMER_MESSAGE, want.everyMinutes * 60_000,
+        now + want.everyMinutes * 60_000, reason ? 'held' : 'active', reason, now, now, key)
+    // Nothing inserted: another connection won the race, so the winner is
+    // re-selected below instead of failing the save or the tick.
+    if (inserted.changes === 0) return systemTimer(instance, key)
+    const row = liveSystemRow(instance, key)
+    return row ? viewOf(row) : null
+  })
+  try {
+    return apply(liveSystemRow(instance, key))
+  } catch (error) {
+    if (error instanceof Error && (error as { code?: unknown }).code === 'SQLITE_CONSTRAINT_UNIQUE') return systemTimer(instance, key)
+    throw error
+  }
+}
+
+/** Wake turns admitted since `since`, counted apart from every other timer. */
+export function systemTimerAdmissions(instance: string, key: 'manager-wake', since: number): number {
+  return (db.prepare(`SELECT COUNT(*) AS n FROM chat_control_inbox i JOIN chat_control_timers t ON t.id = i.timer_id
+    WHERE i.instance = ? AND t.system_key = ? AND i.state = 'admitted' AND i.admitted_at >= ?`)
+    .get(instance, key, since) as { n: number }).n
 }
 
 // ── Holds ────────────────────────────────────────────────────────────

@@ -284,6 +284,43 @@ included. Every new revision still writes a `chat.manager.charter.changed`
 diagnostic. Under a service drain, editing `/manager` still works; under a
 local release drain it returns 503 like other snippet saves.
 
+**Manager wake-ups.** The Manager wakes at an interval the person picks in
+the Manager's own chat header, mirrored in Settings → General → Manager:
+60, 30, 15, 10 or 5 minutes, 60 by default. The header and Settings show
+the cost beside it: up to 24, 48, 96, 144 or 288 turns a day. A change
+applies at once and keeps a wake already pending for a busy Manager, which
+is delivered when the Manager can take a turn.
+
+The interval is one person-set timer Poise keeps on the current Manager,
+retimed in place when the choice changes. It is exempt from the timer
+slots, so the Manager's own timers can never block it and it never takes
+a slot from the person's timers, and its admissions are counted separately
+as the wake view's `wakesLast24h`. It never backs off and never trips:
+every failed wake turn leaves a transcript note and a warning, and the
+next wake still follows at the interval. On documented paths the Manager
+cannot cancel, re-arm or retime it — the Timers pane shows it with the
+note `Interval set in the Manager's header` instead of Cancel — and that
+authority is cooperative: a same-user process can forge an `Origin` header
+on the `PUT`, or use origin-less loopback `/ws/chat` to hold it, and so
+act as the person.
+
+The control has no off position. The person stops the wake-up with Hold
+or a Stop on the Manager, with Hold all timers, or by crossing the
+Manager out; deleting it ends its timer, and a new Manager gets a new one.
+It runs only while the `/manager` snippet has text: without a charter
+there are no wake-ups, and the sync cancels the timer until the text is
+back. The default text normally ensures one from creation, and the sync
+re-creates a `/manager` removed outside Poise within a tick.
+
+Each wake turn adds the control context, the `/manager` text (at most 64
+KiB) and the fixed wake message to the Manager's native session; Poise
+does not compact or reset the Manager by itself. A turn that fails on a
+context overflow stays visible in the transcript and the header until the
+person runs `/compact` or `/reset` in the Manager. Any interval up to 60
+minutes is shorter than the 120-minute idle timeout, so the Manager's
+native process stays resident between wake-ups. Poise itself adds no
+GitHub reads for a wake-up when nothing is bound.
+
 **Worker chats.** A worker is a `role: 'worker'` chat, chosen in the New
 session dialog like the Manager; Worker and Manager are mutually exclusive
 and neither is selected by default. A worker runs on its own standing

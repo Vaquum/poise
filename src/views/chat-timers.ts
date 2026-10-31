@@ -77,14 +77,19 @@ export function renderTimersPane(container: HTMLElement, session: SessionRecord,
   }
   const rows = data.timers.map(timer => {
     const waitingSince = timer.pending ? ` · waiting since ${shortTime(timer.pending.since, zone, now)}` : ''
+    // The scheduled wake-up is set in the Manager's header, not here: no
+    // Cancel, and it never trips so there is nothing to re-arm.
+    const actions = timer.system === 'manager-wake'
+      ? `<div class="chat-timer-actions"><span class="chat-timer-system-note">Interval set in the Manager's header</span></div>`
+      : `<div class="chat-timer-actions"><button type="button" class="chat-h-btn chat-timer-cancel" aria-label="Cancel timer ${escapeHtml(timer.label)}">Cancel</button>`
+        + (timer.state === 'tripped' ? `<button type="button" class="chat-h-btn chat-timer-rearm" aria-label="Re-arm timer ${escapeHtml(timer.label)}">Re-arm</button>` : '')
+        + `</div>`
     return `<li class="chat-timer" data-timer="${escapeHtml(timer.id)}">`
       + `<div class="chat-timer-label">${escapeHtml(timer.label)}</div>`
       + `<div class="chat-timer-meta">${escapeHtml(scheduleText(timer))} · set by ${escapeHtml(timerSetterName(timer.setBy))}</div>`
       + `<div class="chat-timer-preview">${escapeHtml(timer.preview)}</div>`
       + `<div class="chat-timer-status">${escapeHtml(statusText(timer, session, zone, now))}${escapeHtml(waitingSince)}</div>`
-      + `<div class="chat-timer-actions"><button type="button" class="chat-h-btn chat-timer-cancel" aria-label="Cancel timer ${escapeHtml(timer.label)}">Cancel</button>`
-      + (timer.state === 'tripped' ? `<button type="button" class="chat-h-btn chat-timer-rearm" aria-label="Re-arm timer ${escapeHtml(timer.label)}">Re-arm</button>` : '')
-      + `</div></li>`
+      + `${actions}</li>`
   }).join('')
   container.innerHTML = `<div class="chat-timers">`
     + `<div class="chat-timers-controls"><button type="button" class="chat-h-btn chat-timers-hold" aria-pressed="${hold !== null}">${hold ? 'Resume' : 'Hold'}</button>`
@@ -129,7 +134,7 @@ export function renderTimersPane(container: HTMLElement, session: SessionRecord,
   })
   for (const row of container.querySelectorAll<HTMLElement>('.chat-timer')) {
     const id = row.dataset.timer!
-    row.querySelector('.chat-timer-cancel')!.addEventListener('click', () => {
+    row.querySelector('.chat-timer-cancel')?.addEventListener('click', () => {
       void actions.cancel(id).then(() => showError(null)).catch(showError)
     })
     row.querySelector('.chat-timer-rearm')?.addEventListener('click', () => {

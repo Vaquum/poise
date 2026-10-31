@@ -1,9 +1,14 @@
 import type { AgentId, NewSessionRequest, SessionContext } from '../../server/chat/protocol'
 import type { AgentsResponse } from '../chat-client'
 import { catalogueFamilies, familyForIdentity } from '../chat-catalog'
+import { wakeTurnsPerDay, type WakeMinutes } from '../chat-manager-settings-types'
 import { escapeHtml } from '../markdown'
 
-export interface ManagerChoice { existing: { id: string, title: string } | null, onOpen: (id: string) => void }
+export interface ManagerChoice {
+  existing: { id: string, title: string } | null
+  onOpen: (id: string) => void
+  wake: { everyMinutes: WakeMinutes } | 'unavailable'
+}
 
 export function renderNewSessionDialog(
   container: HTMLElement, info: AgentsResponse, context: SessionContext | undefined,
@@ -17,12 +22,17 @@ export function renderNewSessionDialog(
     <label class="chat-radio"><input type="radio" name="fallback" value="default" checked> Use the default, <code>${escapeHtml(info.defaults.model)}</code></label>
     <label class="chat-radio"><input type="radio" name="fallback" value="fallback"> Use the fallback, <code>${escapeHtml(info.defaults.fallback)}</code></label></fieldset>` : ''
   const showType = !context || (context.kind !== 'card' && context.kind !== 'document')
+  const wakeLine = !manager || manager.existing ? ''
+    : `<div class="st-help chat-dialog-manager-wake">${manager.wake === 'unavailable'
+      ? 'Wake interval unavailable'
+      : `Wakes every ${manager.wake.everyMinutes} minutes (up to ${wakeTurnsPerDay(manager.wake.everyMinutes)} turns a day). Change it in the Manager's header.`}</div>`
   const typeField = showType ? `<fieldset class="chat-dialog-field chat-dialog-type">
     <legend>Type</legend>
     <label class="chat-radio"><input type="radio" name="type" value="chat" checked> Chat</label>
     <label class="chat-radio"><input type="radio" name="type" value="worker"> Worker</label>
     <label class="chat-radio"><input type="radio" name="type" value="manager"${manager?.existing ? ' disabled' : ''}> Manager</label>
     <div class="st-help">A Worker carries the /worker charter on every turn. A Manager supervises your chats; only one Manager can exist.</div>
+    ${wakeLine}
     ${manager?.existing ? `<button type="button" class="st-clear chat-dialog-open-manager">Open the Manager</button>` : ''}
     </fieldset>` : ''
   container.innerHTML = `<form class="chat-dialog-body">

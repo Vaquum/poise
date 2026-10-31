@@ -20,7 +20,9 @@ import { MANAGER_SWITCH, WORKER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '.
 import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-receipts'
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
-import { findEvent } from './storage'
+import { clearWakeFailure, readWake, readWakeFailure, recordWakeFailure } from './manager-settings'
+import { findEvent, managerSession } from './storage'
+import type { ManagerWakeView, WakeMinutes } from '../../src/chat-manager-settings-types'
 import { pushedBranches, writeFileAtomic } from './git'
 import { ChatError, type ChatRuntime } from './runtime'
 import type { CiObservation } from './work-observations'
@@ -677,9 +679,12 @@ export class ChatControl {
    *  back off and trip after three with two marks, a person's Stop holds the
    *  chat, and an interruption writes its diagnostic. A stopped or cut turn
    *  ends a one-shot but leaves an every-timer on its schedule. A timer
-   *  turn's failure never pauses the chat's ordinary delivery. */
+   *  turn's failure never pauses the chat's ordinary delivery. The Manager's
+   *  scheduled wake-up never backs off or trips: each failed wake turn
+   *  leaves its mark and the next wake still follows at the interval. */
   private accountTimerTurn(sessionId: string, timer: TimerView, event: Extract<ChatEnvelope['event'], { type: 'turn.finished' }>): void {
     const now = (this.options.now ?? Date.now)()
+    const wake = timer.system === 'manager-wake'
     if (event.stopReason === 'interrupted') {
       diagnostic({ level: 'warning', operation: 'chat.timer.changed', target: timer.id,
         message: 'A timer turn was cut before it finished and was not replayed',
@@ -694,6 +699,7 @@ export class ChatControl {
     }
     if (event.stopReason === 'end_turn') {
       const result = store.recordTimerTurn(this.runtime.instance, timer.id, 'ok', now)
+      if (wake) clearWakeFailure()
       if (result.ended) {
         const view = store.timerById(this.runtime.instance, timer.id)
         if (view) this.emitTimerChanged(sessionId, view, 'ended', timer.setBy)
@@ -701,9 +707,14 @@ export class ChatControl {
       return
     }
     const lastError = sanitizeTimerError(event.error || `the turn ended with ${event.stopReason}`)
-    const result = store.recordTimerTurn(this.runtime.instance, timer.id, 'fail', now)
+    const result = store.recordTimerTurn(this.runtime.instance, timer.id, 'fail', now, wake)
     const view = store.timerById(this.runtime.instance, timer.id)
     if (!view) return
+    if (wake) {
+      recordWakeFailure(new Date(now).toISOString(), lastError)
+      this.emitTimerChanged(sessionId, view, 'failed', timer.setBy, lastError)
+      return
+    }
     if (result.tripped) this.emitTimerChanged(sessionId, view, 'tripped', timer.setBy, lastError)
     else if (result.ended) this.emitTimerChanged(sessionId, view, 'ended', timer.setBy)
   }
@@ -721,15 +732,15 @@ export class ChatControl {
 
   /** A timer change lands in the target's transcript and in Logging, with
    *  IDs, change, reason and a trip's last error — never the message. Trips,
-   *  expiries and long waits are warnings; the rest are dropped by the store
-   *  below its warning floor, like every info diagnostic. */
+   *  failed wake turns, expiries and long waits are warnings; the rest are
+   *  dropped by the store below its warning floor, like every info diagnostic. */
   private emitTimerChanged(target: string, timer: TimerView, change: Extract<ChatEnvelope['event'], { type: 'timer.changed' }>['change'],
     by?: ChatActor | PersonActor | PoiseActor, error?: string): void {
     try {
       this.runtime.recordCommandEvent(target, { type: 'timer.changed', timer: summaryOf(timer), change,
         ...(by ? { by } : {}), ...(error ? { error } : {}) })
     } catch (emitError) { this.runtime.emit('log', `[chat control] timer note unsent: ${String(emitError)}`) }
-    const level = change === 'tripped' || timer.reason === 'skipped_while_held' ? 'warning' : 'info'
+    const level = change === 'tripped' || change === 'failed' || timer.reason === 'skipped_while_held' ? 'warning' : 'info'
     diagnostic({ level, operation: 'chat.timer.changed', target: timer.id,
       message: `Timer ${change}: ${timer.label}`,
       context: { timerId: timer.id, sessionId: target, change,
@@ -1224,8 +1235,16 @@ export class ChatControl {
     if (!this.stopped) this.deliver(now)
     // 6. Long-wait warnings for firings still waiting after an hour.
     if (!this.stopped) this.warnLongWaits(now)
-    // 7. Wake sync: #356 keeps the Manager's scheduled wake-up here.
-    this.syncWake(now)
+    // 7. Wake sync: the Manager's scheduled wake-up, kept at its interval.
+    // A failure is logged once per distinct message; the rest of the tick
+    // (delivery, CI observation, timer evaluation) always runs.
+    if (!this.stopped) {
+      try {
+        await this.syncManagerWake()
+      } catch (error) {
+        this.wakeSyncFailed(error)
+      }
+    }
     // 8. Retention, at most once a minute, in bounded batches.
     if (now - this.lastRetention >= 60_000) {
       this.lastRetention = now
@@ -1721,8 +1740,108 @@ export class ChatControl {
     }
   }
 
-  /** #356 keeps the Manager's scheduled wake-up at its interval here. */
-  private syncWake(_now: number): void { /* none yet */ }
+  /** Keep the store's wake timer on the setting: exactly one system timer
+   *  on the current Manager while `/manager` has text, created, retargeted
+   *  or retimed at once, and none without a Manager or a charter. Ensures
+   *  `/manager` when a Manager exists; uses options.now and
+   *  storage.managerSession; never throws into the tick. */
+  async syncManagerWake(): Promise<void> {
+    const instance = this.runtime.instance
+    const now = (this.options.now ?? Date.now)()
+    const wake = readWake()
+    const manager = managerSession(instance)
+    if (!manager) {
+      this.settleWakeTimer(null, now)
+      return
+    }
+    // A `/manager` removed outside Poise is back within a tick.
+    await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT)
+    // One read of the snippet file per tick. O2: no wake-ups without a
+    // charter — no text, or a file that cannot be read, keeps no timer.
+    let charter: string | null = null
+    try {
+      charter = readSwitch(MANAGER_SWITCH)?.content ?? null
+    } catch {
+      charter = null
+    }
+    if (!charter || !charter.trim()) {
+      this.settleWakeTimer(null, now)
+      return
+    }
+    this.settleWakeTimer({ target: manager.id, everyMinutes: wake.everyMinutes }, now)
+  }
+
+  /** The store change behind the sync, with the person's transcript notes:
+   *  created, cancelled and updated, each with its diagnostic. */
+  private settleWakeTimer(want: { target: string, everyMinutes: WakeMinutes } | null, now: number): void {
+    const instance = this.runtime.instance
+    const person: PersonActor = { kind: 'person' }
+    const before = store.systemTimer(instance, 'manager-wake')
+    const after = store.ensureSystemTimer(instance, 'manager-wake', want, now)
+    if (before && (!after || before.id !== after.id)) {
+      const ended = store.timerById(instance, before.id)
+      if (ended) this.emitTimerChanged(before.sessionId, ended, 'cancelled', person)
+    }
+    if (!after) return
+    if (!before || before.id !== after.id) {
+      this.emitTimerChanged(after.sessionId, after, 'created', person)
+      return
+    }
+    const minutes = (timer: TimerView): number => timer.schedule.kind === 'every' ? timer.schedule.minutes : -1
+    if (minutes(before) !== minutes(after)) this.emitTimerChanged(after.sessionId, after, 'updated', person)
+  }
+
+  /** A wake sync failure is logged once per distinct message, with one
+   *  warning diagnostic, and the rest of the tick runs. */
+  private readonly wakeSyncFailures = new Set<string>()
+  private wakeSyncFailed(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    if (this.wakeSyncFailures.has(message)) return
+    this.wakeSyncFailures.add(message)
+    while (this.wakeSyncFailures.size > 1000) this.wakeSyncFailures.delete(this.wakeSyncFailures.values().next().value!)
+    this.runtime.emit('log', `[chat control] wake schedule sync failed: ${message}`)
+    diagnostic({ level: 'warning', operation: 'chat.manager.wake.sync_failed',
+      message: 'The Manager wake schedule sync failed and was skipped',
+      context: { error: message } })
+  }
+
+  /** The wake interval as the Manager's header and Settings show it: the
+   *  setting, the one timer or why there is none, the latest failure and
+   *  the wake turns admitted in the last 24 hours. */
+  managerWakeView(): ManagerWakeView {
+    const instance = this.runtime.instance
+    const now = (this.options.now ?? Date.now)()
+    const wake = readWake()
+    const timer = store.systemTimer(instance, 'manager-wake')
+    const manager = managerSession(instance)
+    let pendingOn: ManagerWakeView['pendingOn'] = null
+    if (!timer) {
+      if (!manager) {
+        pendingOn = 'manager'
+      } else {
+        let charter: string | null = null
+        try {
+          charter = readSwitch(MANAGER_SWITCH)?.content ?? null
+        } catch {
+          charter = null
+        }
+        // A Manager with a charter but no timer yet is mid-sync; the tick
+        // creates it within a second.
+        pendingOn = !charter || !charter.trim() ? 'charter' : null
+      }
+    }
+    const pending = timer ? store.timerPendingRow(instance, timer.id) : undefined
+    const waitingFor = timer && pending ? this.timerWait(timer.sessionId, timer.id, now) ?? undefined : undefined
+    return {
+      everyMinutes: wake.everyMinutes, revision: wake.revision,
+      // A live wake timer always carries its next firing; it never trips.
+      timer: timer ? { id: timer.id, state: timer.state === 'held' ? 'held' : 'active',
+        ...(timer.reason ? { reason: timer.reason } : {}), nextAt: timer.nextAt!,
+        ...(waitingFor ? { waitingFor } : {}) } : null,
+      pendingOn, lastFailure: readWakeFailure(),
+      wakesLast24h: store.systemTimerAdmissions(instance, 'manager-wake', now - 86_400_000),
+    }
+  }
 
   /** The person's timer calls, from the WebSocket commands and the read
    *  route. The socket answers each frame once; only chats need receipts. */
@@ -1742,6 +1861,7 @@ export class ChatControl {
   cancelTimer(id: string, by: PersonActor): TimerView {
     if (this.stopped) throw new ChatError(503, 'chat control is stopped', 'invalid')
     const before = store.timerById(this.runtime.instance, id)
+    if (before?.system === 'manager-wake') throw new ChatError(400, 'The scheduled wake-up cannot be cancelled. Hold the Manager to stop it.', 'invalid')
     const timer = store.cancelTimer(this.runtime.instance, id, by, (this.options.now ?? Date.now)())
     if (before && ['active', 'held', 'tripped'].includes(before.state)) this.emitTimerChanged(timer.sessionId, timer, 'cancelled', by)
     return timer

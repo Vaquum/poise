@@ -216,11 +216,13 @@ export function timerSetterName(setBy: ChatActor | PersonActor): string {
 }
 
 /** One timer change as a transcript note. Pure; the note renderer escapes it. */
-export function timerChangedText(timer: TimerSummary, change: 'created' | 'cancelled' | 'held' | 'released' | 'tripped' | 'rearmed' | 'ended', error?: string): string {
+export function timerChangedText(timer: TimerSummary, change: 'created' | 'updated' | 'failed' | 'cancelled' | 'held' | 'released' | 'tripped' | 'rearmed' | 'ended', error?: string): string {
   const name = `Timer "${timer.label}"`
   const schedule = timer.schedule.kind === 'every' ? `every ${timer.schedule.minutes} min` : `once in ${timer.schedule.delayMinutes} min`
   switch (change) {
     case 'created': return `${name} set by ${timerSetterName(timer.setBy)} · ${schedule}`
+    case 'updated': return `${name} changed by ${timerSetterName(timer.setBy)} · ${schedule}`
+    case 'failed': return `${name} failed: ${error || 'unknown error'}. The next wake-up follows at the interval.`
     case 'cancelled': return `${name} cancelled`
     case 'held': return `${name} put on hold`
     case 'released': return `${name} resumed`

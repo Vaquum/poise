@@ -4,6 +4,7 @@ import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
 import { WORKER_SNIPPET_DEFAULT } from './worker-default'
 import { readChatFile } from './file-preview'
 import { readMemories, saveMemories } from './memories'
+import { saveWake } from './manager-settings'
 // The browser-facing side of Chat v1: the WebSocket at /ws/chat (events
 // down, commands up) and the REST routes under /api/chat.
 //
@@ -475,6 +476,21 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
       }
       return json(res, 405, { error: 'Use GET or PUT for memories.' }), true
     }
+    if (path === '/api/chat/manager/wake') {
+      if (req.method === 'GET') {
+        if (!control) throw new ChatError(503, 'chat control is not started', 'invalid')
+        return json(res, 200, control.managerWakeView()), true
+      }
+      if (req.method === 'PUT') {
+        if (!person) return json(res, 403, { error: 'The Manager\'s wake interval is changed in the browser.' }), true
+        if (!control) throw new ChatError(503, 'chat control is not started', 'invalid')
+        saveWake(await readJson(req))
+        // Synced before returning, so the view already shows the new nextAt.
+        await control.syncManagerWake()
+        return json(res, 200, control.managerWakeView()), true
+      }
+      return json(res, 405, { error: 'Use GET or PUT for the Manager wake interval.' }), true
+    }
     if (path === '/api/chat/agents' && req.method === 'GET') {
       const { agents, catalog } = await runtime.agents()
       const { resolvePlace, resolveSlots } = await import('../models')
@@ -581,6 +597,15 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
           }
         } catch (error) {
           runtime.emit('log', `[chat] creating /${charter.name} failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        if (session.role === 'manager') {
+          // The saved interval applies from creation; a sync failure must
+          // not fail the creation — the tick retries within a second.
+          try {
+            await control?.syncManagerWake()
+          } catch (error) {
+            runtime.emit('log', `[chat control] wake schedule sync failed: ${error instanceof Error ? error.message : String(error)}`)
+          }
         }
         return json(res, 201, { session }), true
       }

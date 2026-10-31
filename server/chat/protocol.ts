@@ -410,6 +410,7 @@ export interface TimerSummary {
   state: 'active' | 'held' | 'tripped' | 'done' | 'cancelled' | 'expired'
   reason?: 'person_stopped' | 'person_held' | 'all_held' | 'failed_3_times' | 'completed' | 'turn_failed'
     | 'target_deleted' | 'creator_deleted' | 'cancelled_by_person' | 'cancelled_by_manager' | 'skipped_while_held'
+    | 'manager_replaced' | 'no_charter'
   setBy: ChatActor | PersonActor
   failures: number
   skipped: number
@@ -417,6 +418,8 @@ export interface TimerSummary {
   pending?: { since: string, missed: number, waitingFor?: 'starting' | 'queued' | 'running' | 'waiting' | 'stopping'
     | 'maintenance' | 'queue' | 'reopening' | 'model' | 'person' | 'update' | 'backoff' }
   createdAt: string
+  /** Present on the one timer Poise keeps for the Manager's wake interval. */
+  system?: 'manager-wake'
 }
 /** A timer with its full message: the control `timers` operation and the
  *  person's Timers pane read these, never other chats' summaries. */
@@ -472,7 +475,7 @@ export type ChatEvent =
   | { type: 'turn.started', turnId: string, prompt: PromptInput, callId?: string, queueItemId?: string, agent?: AgentId, model?: string, source?: TurnSource }
   | { type: 'steer.sent', turnId: string, text: string, attachments?: Attachment[], mentions?: Mention[], source?: ChatActor | PoiseActor }
   | { type: 'turn.finished', turnId: string, stopReason: StopReason, error?: string, usage?: TurnUsage, durationMs?: number, stoppedBy?: ChatActor | PersonActor }
-  | { type: 'timer.changed', timer: TimerSummary, change: 'created' | 'cancelled' | 'held' | 'released' | 'tripped' | 'rearmed' | 'ended', by?: ChatActor | PersonActor | PoiseActor, error?: string }
+  | { type: 'timer.changed', timer: TimerSummary, change: 'created' | 'updated' | 'failed' | 'cancelled' | 'held' | 'released' | 'tripped' | 'rearmed' | 'ended', by?: ChatActor | PersonActor | PoiseActor, error?: string }
   | { type: 'text.delta', turnId: string, messageId: string, delta: string }
   | { type: 'thought.delta', turnId: string, messageId: string, delta: string }
   | { type: 'tool.started', turnId: string, id: string, kind: ToolKind, title: string, locations?: ToolLocation[], input?: unknown }
