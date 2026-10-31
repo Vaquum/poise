@@ -158,7 +158,7 @@ beforeEach(async () => {
   prompts.clear(); finishes.clear(); seen.clear()
   servers = []
   ci.mockReset().mockResolvedValue({ head: 'a'.repeat(40), failing: [] })
-  database.db.prepare("DELETE FROM meta WHERE key IN ('chat_manager_wake', 'chat_manager_wake_failure')").run()
+  database.db.prepare("DELETE FROM meta WHERE key IN ('chat_manager_wake', 'chat_manager_wake_failure') OR key LIKE 'chat_manager_wake_armed:%'").run()
   database.setMeta('chat_custom_switches', '')
   database.db.prepare("DELETE FROM meta WHERE key LIKE 'chat_snippet_%'").run()
   await rm(join(root, 'match'), { recursive: true, force: true })

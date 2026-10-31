@@ -20,7 +20,7 @@ import { MANAGER_SWITCH, WORKER_SWITCH, SWITCH_LIMITS, type ChatSwitch } from '.
 import { countReceiptsSince, executeCommandOnce, hasReceipt } from './command-receipts'
 import { actorOf, nativeName } from './actors'
 import type { ChatActor, ChatEnvelope, ChatHold, MessageQueue, PersonActor, PoiseActor, Question, SessionRecord, TimerInput, TimerSummary, TimerView, TurnSource } from './protocol'
-import { clearWakeFailure, readWake, readWakeFailure, recordWakeFailure } from './manager-settings'
+import { clearWakeFailure, readWake, readWakeFailure, recordWakeFailure, wakeArmed } from './manager-settings'
 import { findEvent, managerSession } from './storage'
 import type { ManagerWakeView, WakeMinutes } from '../../src/chat-manager-settings-types'
 import { pushedBranches, writeFileAtomic } from './git'
@@ -1741,9 +1741,9 @@ export class ChatControl {
   }
 
   /** Keep the store's wake timer on the setting: exactly one system timer
-   *  on the current Manager while `/manager` has text, created, retargeted
-   *  or retimed at once, and none without a Manager or a charter. Ensures
-   *  `/manager` when a Manager exists; uses options.now and
+   *  on the current Manager while the lifecycle is armed and `/manager`
+   *  has text, created, retargeted or retimed at once, and none without a
+   *  Manager, arming or a charter. Uses options.now and
    *  storage.managerSession; never throws into the tick. */
   async syncManagerWake(): Promise<void> {
     const instance = this.runtime.instance
@@ -1754,17 +1754,28 @@ export class ChatControl {
       this.settleWakeTimer(null, now)
       return
     }
-    // A `/manager` removed outside Poise is back within a tick.
-    await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT)
     // One read of the snippet file per tick. O2: no wake-ups without a
     // charter — no text, or a file that cannot be read, keeps no timer.
+    // A `/manager` missing once armed was removed outside Poise and is
+    // back within a tick.
     let charter: string | null = null
+    let missing = false
     try {
-      charter = readSwitch(MANAGER_SWITCH)?.content ?? null
+      const entry = readSwitch(MANAGER_SWITCH)
+      if (entry) charter = entry.content
+      else missing = true
     } catch {
       charter = null
     }
-    if (!charter || !charter.trim()) {
+    if (missing && wakeArmed(instance)) {
+      await ensureSnippetSwitch(MANAGER_SWITCH, MANAGER_SNIPPET_DEFAULT)
+      try {
+        charter = readSwitch(MANAGER_SWITCH)?.content ?? null
+      } catch {
+        charter = null
+      }
+    }
+    if (!charter || !charter.trim() || !wakeArmed(instance)) {
       this.settleWakeTimer(null, now)
       return
     }

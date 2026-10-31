@@ -4,7 +4,7 @@ import { MANAGER_SNIPPET_DEFAULT } from './manager-default'
 import { WORKER_SNIPPET_DEFAULT } from './worker-default'
 import { readChatFile } from './file-preview'
 import { readMemories, saveMemories } from './memories'
-import { saveWake } from './manager-settings'
+import { markWakeArmed, saveWake } from './manager-settings'
 // The browser-facing side of Chat v1: the WebSocket at /ws/chat (events
 // down, commands up) and the REST routes under /api/chat.
 //
@@ -599,8 +599,10 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
           runtime.emit('log', `[chat] creating /${charter.name} failed: ${error instanceof Error ? error.message : String(error)}`)
         }
         if (session.role === 'manager') {
-          // The saved interval applies from creation; a sync failure must
-          // not fail the creation — the tick retries within a second.
+          // The person created a Manager: the wake lifecycle arms, and the
+          // saved interval applies from creation. A sync failure must not
+          // fail the creation — the tick retries within a second.
+          markWakeArmed(runtime.instance)
           try {
             await control?.syncManagerWake()
           } catch (error) {

@@ -1,10 +1,13 @@
 import { db, getMeta, setMeta } from '../db'
 import { HttpError } from '../http'
 import { diagnostic } from '../logging'
+import { readSwitch } from '../snippet-library'
 import { WAKE_OPTIONS, parseManagerWake, type ManagerWake, type WakeMinutes } from '../../src/chat-manager-settings-types'
+import { MANAGER_SWITCH } from '../../src/chat-switches'
 
 const KEY = 'chat_manager_wake'
 const FAILURE_KEY = 'chat_manager_wake_failure'
+const ARMED_PREFIX = 'chat_manager_wake_armed:'
 
 export const DEFAULT_MANAGER_WAKE: ManagerWake = { everyMinutes: 60, revision: 0 }
 
@@ -77,3 +80,30 @@ export function recordWakeFailure(at: string, error: string): void {
 export function clearWakeFailure(): void {
   db.prepare('DELETE FROM meta WHERE key = ?').run(FAILURE_KEY)
 }
+
+/** Whether the instance's wake lifecycle is armed: the person created its
+ *  Manager through the New session dialog, or one pre-existed at boot. The
+ *  sync keeps a wake timer only while armed, and re-creates a `/manager`
+ *  removed outside Poise (Snippets refuses removals) only once armed; it
+ *  never starts the lifecycle from a bare manager and charter alone. */
+export function wakeArmed(instance: string): boolean {
+  return getMeta(ARMED_PREFIX + instance) === '1'
+}
+
+export function markWakeArmed(instance: string): void {
+  setMeta(ARMED_PREFIX + instance, '1')
+}
+
+// A Manager with a charter that pre-existed this process (an upgrade) arms
+// the wake lifecycle like a fresh creation. Runs once at import, before any
+// caller creates managers, so managers created later never arm it.
+try {
+  const managers = db.prepare("SELECT DISTINCT instance FROM chat_sessions WHERE role = 'manager'").all() as Array<{ instance: string }>
+  if (managers.length > 0) {
+    let text: string | null = null
+    try {
+      text = readSwitch(MANAGER_SWITCH)?.content ?? null
+    } catch { text = null }
+    if (text && text.trim()) for (const manager of managers) setMeta(ARMED_PREFIX + manager.instance, '1')
+  }
+} catch { /* a missing table or unreadable library arms nothing */ }
