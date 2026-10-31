@@ -17,7 +17,7 @@ export interface ChainInvocation {
   /** Memory/disk allowance held while this invocation is live, including its
    *  descendants. Null for quick native actions and admissions that predate
    *  resource budgets; those never count as free against a bounded budget. */
-  reservation: BehaviorResourceReservation | null
+  reservation?: BehaviorResourceReservation | null
   admittedAt: number
   admissionSequence: number
   request: { command: 'agent-interface' | 'github-interface', argv: string[], cwd: string, context?: { head: string, reviewRevision: string, queueRemoval?: string } }
@@ -309,8 +309,17 @@ export class BehaviorChainJournal {
           if (event.type !== 'admission.changed' || event.state.sequence !== row.sequence || chainBasis(event.state) !== (row as StoredEvent & { state_hash: string }).state_hash) throw new Error('behavior cutover journal is corrupt')
           continue
         }
-        states.set(row.chain_id, reduceChain(states.get(row.chain_id) ?? null, JSON.parse(row.payload) as ChainEvent, row.sequence, row.chain_id))
-        if (chainBasis(states.get(row.chain_id)) !== (row as StoredEvent & { state_hash: string }).state_hash) throw new Error('behavior journal state hash is invalid')
+        const event = JSON.parse(row.payload) as ChainEvent
+        const next = reduceChain(states.get(row.chain_id) ?? null, event, row.sequence, row.chain_id)
+        const hash = (row as StoredEvent & { state_hash: string }).state_hash
+        if (chainBasis(next) !== hash && event.type === 'invocation.admitted' && !Object.hasOwn(event.invocation, 'reservation')) {
+          // Pre-resource admissions omitted this property in both payload
+          // and state. Resource-era payloads may also omit it but hash null.
+          // Only the original immutable hash selects the historical form.
+          delete next.invocations[next.invocations.length - 1].reservation
+        }
+        if (chainBasis(next) !== hash) throw new Error('behavior journal state hash is invalid')
+        states.set(row.chain_id, next)
       }
       const save = this.db.prepare('INSERT INTO behavior_chain_current(chain_id, sequence, state, merged) VALUES (?, ?, ?, ?)')
       for (const state of states.values()) save.run(state.id, state.sequence, JSON.stringify(state), state.mergeSha && !state.reviewPending ? 1 : 0)
