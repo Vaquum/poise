@@ -35,8 +35,11 @@ export function sshDir(home: string = homedir()): string {
   return join(home, '.ssh')
 }
 
-// `ssh-ed25519 AAAA…` with an optional trailing comment.
-const PUBLIC_KEY_LINE = /^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+) ([A-Za-z0-9+/]+={0,3})( .*)?$/
+// `ssh-ed25519 AAAA…`, `sk-ssh-ed25519@openssh.com AAAA…`, … with an optional
+// trailing comment. The type token is deliberately broad — security-key and
+// future types must not be rejected here; the wire header check in
+// sshFingerprint proves the blob is really of this type.
+const PUBLIC_KEY_LINE = /^([A-Za-z0-9][A-Za-z0-9_.@-]*) ([A-Za-z0-9+/]+={0,3})( .*)?$/
 
 /** An OpenSSH public blob starts with its own key type on the wire. */
 function blobHasType(blob: Buffer, type: string): boolean {

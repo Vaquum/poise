@@ -67,6 +67,13 @@ describe('sshFingerprint', () => {
     expect(sshFingerprint(`${type} ${blob.toString('base64')}`)).toMatch(/^SHA256:[A-Za-z0-9+/]+$/)
   })
 
+  it('accepts FIDO security-key types', () => {
+    for (const type of ['sk-ssh-ed25519@openssh.com', 'sk-ecdsa-sha2-nistp256@openssh.com']) {
+      const blob = Buffer.concat([Buffer.from([0, 0, 0, type.length]), Buffer.from(type, 'ascii'), Buffer.from('fake-security-key-payload')])
+      expect(sshFingerprint(`${type} ${blob.toString('base64')} security-key`)).toMatch(/^SHA256:[A-Za-z0-9+/]+$/)
+    }
+  })
+
   it('rejects what holds no public key', () => {
     expect(sshFingerprint('')).toBeNull()
     expect(sshFingerprint('not a key')).toBeNull()
@@ -121,6 +128,17 @@ describe('listSshKeys', () => {
       name: 'orphan', hasPrivateKey: false, privateMode: null, privateBytes: null,
       publicKey: PUB, publicKeyInvalid: false, fingerprint: FINGERPRINT,
     }])
+  })
+
+  it('fingerprints a security-key public key', async () => {
+    const type = 'sk-ssh-ed25519@openssh.com'
+    const blob = Buffer.concat([Buffer.from([0, 0, 0, type.length]), Buffer.from(type, 'ascii'), Buffer.from('fake-security-key-payload')])
+    const line = `${type} ${blob.toString('base64')}`
+    const dir = await seed({ id_sk: PRIVATE_MARKER, 'id_sk.pub': `${line}\n` })
+    expect(listSshKeys(dir)).toEqual([expect.objectContaining({
+      name: 'id_sk', publicKey: line, publicKeyInvalid: false, fingerprint: sshFingerprint(line),
+    })])
+    expect(sshFingerprint(line)).toMatch(/^SHA256:/)
   })
 
   it('skips configuration, hidden files, directories and links', async () => {
@@ -260,6 +278,22 @@ describe('the import helper', () => {
     expect(code).toBe(1)
     expect(stdout).toContain('already exists')
     expect(await readFile(join(home, '.ssh', 'id_kept'), 'utf8')).toBe('original')
+  })
+
+  it('refuses when the public file already exists, however it exists', async () => {
+    await stubKeygen('#!/bin/sh\nexit 64\n')
+    const dir = await seed({ 'taken.pub': `${PUB}\n`, 'linked.pub': `${PUB}\n` })
+    await rm(join(dir, 'linked.pub'))
+    symlinkSync(join(dir, 'elsewhere'), join(dir, 'linked.pub'))
+    await mkdir(join(dir, 'roomy.pub'), { recursive: true })
+    for (const name of ['taken', 'linked', 'roomy']) {
+      const { code, stdout } = await runHelper(`${name}\n${PASTED_PRIVATE}`)
+      expect(code).toBe(1)
+      expect(stdout).toContain(`~/.ssh/${name}.pub already exists`)
+    }
+    // The orphan public key is untouched, and no private file was created.
+    expect(await readFile(join(dir, 'taken.pub'), 'utf8')).toBe(`${PUB}\n`)
+    expect(listSshKeys(dir).filter((key) => key.hasPrivateKey)).toEqual([])
   })
 
   it('refuses what is not a private key', async () => {

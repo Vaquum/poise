@@ -17,7 +17,8 @@ export const SSH_KEY_HELPER = String.raw`# Poise's SSH key import: pastes one pr
 # terminal: nothing is sent, logged or stored anywhere else.
 #
 # Exit 0 saved the key; any other exit saved nothing, except when ssh-keygen
-# is missing (said so). An existing file is never overwritten.
+# is missing (said so). An existing file, private or public, is never
+# overwritten.
 
 import base64
 import hashlib
@@ -55,6 +56,9 @@ def main():
     target = os.path.join(ssh_dir, name)
     if os.path.lexists(target):
         return fail('~/.ssh/' + name + ' already exists; remove it in a shell first. Nothing was saved.')
+    pub_target = target + '.pub'
+    if os.path.lexists(pub_target):
+        return fail('~/.ssh/' + name + '.pub already exists; remove it in a shell first. Nothing was saved.')
     sys.stdout.write('Paste the private key, then press Ctrl-D. Nothing shows while you paste.\n')
     sys.stdout.flush()
     try:
@@ -119,7 +123,14 @@ def main():
         detail = (derived.stderr or '').strip().split('\n')[0][:160]
         return fail('ssh-keygen refused the key' + (': ' + detail if detail else '') + '; nothing was saved.')
     public = derived.stdout.strip() + '\n'
-    pub = os.open(target + '.pub', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        pub = os.open(pub_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        os.unlink(target)
+        return fail('~/.ssh/' + name + '.pub already exists; nothing was saved.')
+    except OSError as error:
+        os.unlink(target)
+        return fail('~/.ssh/' + name + '.pub could not be written: ' + str(error) + '. Nothing was saved.')
     try:
         os.write(pub, public.encode('utf-8'))
     finally:
