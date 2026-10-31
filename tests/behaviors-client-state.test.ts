@@ -41,6 +41,17 @@ afterEach(() => {
 })
 
 describe('Behaviors availability diagnostics', () => {
+  it('does not overwrite a saved implementation pause with an earlier read', async () => {
+    const until = new Date(Date.now() + 60_000).toISOString()
+    vi.stubGlobal('fetch', (_url: string, init?: RequestInit) => init?.method === 'POST'
+      ? Promise.resolve({ ok: true, json: async () => ({ pausedUntil: until }) })
+      : deferGet().then((body) => ({ ok: true, json: async () => body })))
+    const refresh = behaviors.refreshState()
+    await behaviors.setPaused('implement-issues', until)
+    deferredGets.shift()!.resolve(payload({ 'implement-issues': { pausedUntil: null } }))
+    await refresh
+    expect(behaviors.getPausedUntil('implement-issues')).toBe(until)
+  })
   it('reports one 502 warning without inventing agent-log, datastore or identity failures', async () => {
     vi.stubGlobal('fetch', async () => ({ ok: false, status: 502 }))
     await behaviors.refreshState()

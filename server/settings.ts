@@ -1,6 +1,7 @@
 import { db, getMeta, setMeta } from './db'
 import { invalidateRepoListCache } from './gh'
 import { HttpError } from './http'
+import { behaviorChainJournal } from './behavior-chain-journal'
 import { type Catalog, type ModelPlace, type ModelPlaceChoice, type ModelSettings, type ModelSlotChoices, assertSlotsDistinct, isModelPlace, isModelSlot, isPlaceSlot, migrateLegacyModelSettings, validateModelSettings } from './models'
 
 // GitHub logins and organization names: 1–39 characters, alphanumerics and
@@ -369,6 +370,8 @@ const saveSettings = db.transaction((partial: Partial<Settings>, catalog: Catalo
   let notifications: NotificationSettings | undefined
   if ('notifications' in partial && partial.notifications !== undefined) notifications = validateNotificationSettings(partial.notifications)
   const behaviorChain = 'behaviorChain' in partial ? validateBehaviorChainSettings(partial.behaviorChain) : undefined
+  if (behaviorChain?.enabled && (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_events'").get()
+    || behaviorChainJournal().cutover().mode !== 'v2')) throw new HttpError(409, 'Switch to v2 before enabling chain invocations')
   const mergedManager = 'manager' in partial && partial.manager !== undefined ? validateManagerSettings(partial.manager) : current.manager
   const manager: ManagerSettings = { ...mergedManager, version: current.manager.version + 1 }
   const orgChanged = typeof next.org === 'string' && next.org !== (getMeta('org') || '')

@@ -596,12 +596,14 @@ export interface DetachedProcessExit {
 }
 
 let callerLaunches = 0
+let behaviorCallerLaunches = 0
+export const BEHAVIOR_CALL_SOURCES = ['poise:review-new-prs', 'poise:approve-prs', 'poise:review-new-issues', 'poise:behavior-chain'] as const
 
 /** Caller (`agent-interface`) processes this server launched detached and
  *  has not yet seen exit: every behavior run, manual review, replay, card
  *  chat and /content call it started. */
-export function runningCallerLaunches(): number {
-  return callerLaunches
+export function runningCallerLaunches(behaviorOnly = false): number {
+  return behaviorOnly ? behaviorCallerLaunches : callerLaunches
 }
 
 // Resolve only after the OS accepted the launch. In particular, ENOENT and
@@ -614,6 +616,8 @@ export function spawnDetached(
 ): Promise<void> {
   assertProcessArgs(args)
   const caller = commandName(command) === 'agent-interface'
+  const sourceIndex = args.indexOf('--source')
+  const behavior = caller && sourceIndex >= 0 && (BEHAVIOR_CALL_SOURCES as readonly string[]).includes(args[sourceIndex + 1] ?? '')
   return new Promise((resolve, reject) => {
     let launched = false
     let exitReported = false
@@ -644,11 +648,13 @@ export function spawnDetached(
     child.once('spawn', () => {
       launched = true
       if (caller) callerLaunches += 1
+      if (behavior) behaviorCallerLaunches += 1
       child.unref()
       resolve()
     })
     child.once('exit', (code, signal) => {
       if (caller && launched) callerLaunches -= 1
+      if (behavior && launched) behaviorCallerLaunches -= 1
       reportExit({ code, signal })
     })
   })

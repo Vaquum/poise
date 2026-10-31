@@ -17,6 +17,13 @@ function entry(overrides: Partial<LogEntry> = {}): LogEntry {
 const NOW = Date.parse('2026-10-24T12:00:00Z')
 const iso = (ms: number) => new Date(ms).toISOString()
 
+it.each(['implement_issue', 'repair_pr'])('keeps a running %s visible when no estimate cohort exists yet', (behavior) => {
+  const running = entry({ behavior, status: 'running', source: 'poise:behavior-chain', started_at: iso(NOW - 1000) })
+  expect(readBehaviorEstimates([], [running], NOW)).toEqual([
+    { id: running.id, behavior, model: running.model, startedAt: running.started_at, estimate: null },
+  ])
+})
+
 // A completed sample of `durationMs`, finished `agoMs` ago.
 function sample(durationMs: number, agoMs: number, overrides: Partial<LogEntry> = {}): LogEntry {
   return entry({

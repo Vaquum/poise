@@ -21,6 +21,15 @@ const quarantine = (extra: Partial<QuarantinedAgentLog> = {}): QuarantinedAgentL
 })
 
 describe('behavior run metrics', () => {
+  it('attributes real chain calls to implementation, repair and review rows without counting manual work', () => {
+    const rows = [log({ behavior: 'implement_issue', source: 'poise:behavior-chain' }),
+      log({ behavior: 'repair_pr', source: 'poise:behavior-chain' }), log({ source: 'poise:behavior-chain' }),
+      log({ behavior: 'repair_pr', source: 'manual' })]
+    const report = readBehaviorMetrics(rows, window, null)
+    expect(report.behaviors['implement-issues']?.totalRuns).toBe(1)
+    expect(report.behaviors['repair-prs']?.totalRuns).toBe(1)
+    expect(report.behaviors['review-new-prs']?.totalRuns).toBe(1)
+  })
   beforeEach(() => { db.prepare('DELETE FROM behavior_runs').run() })
   afterEach(() => { vi.useRealTimers() })
 

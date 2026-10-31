@@ -7,7 +7,7 @@
 import type { LogEntry } from './agent'
 
 /** Agent behaviors launched by the scheduler, by their log behavior name. */
-export const AGENT_BEHAVIORS = ['pr_review', 'pr_approve', 'issue_review'] as const
+export const AGENT_BEHAVIORS = ['pr_review', 'pr_approve', 'issue_review', 'implement_issue', 'repair_pr'] as const
 
 /** Similar runs: the same behavior and model, completed in the last 30 days. */
 export const ESTIMATE_WINDOW_MS = 30 * 24 * 60 * 60_000

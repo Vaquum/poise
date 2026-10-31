@@ -1,6 +1,6 @@
 # Native issue-to-merge behavior chain
 
-Status: local implementation under validation. Ten unattended real cycles have not yet been demonstrated. Production execution remains disabled by default.
+Status: the native implementation completed the ten real cycles documented below. The admission cutover and GUI changes carry separate local regression proof; those historical cycles do not prove production cutover. Production execution remains disabled by default.
 
 The existing behavior scheduler consumes one durable journal in Poise's existing database. It admits one atomic invocation for a chain, records its native Caller correlation before starting a process, observes the resulting artifacts, and then decides the next behavior. A chain identifies an issue and its eventual PR; it is not a persistent Chat session or worker.
 
@@ -10,9 +10,17 @@ Intake failures remain visible in runtime health and diagnostics while already-a
 
 Settings → General → Behavior chain selects either issues bearing the configured label (default `poise`) or all open issues in followed organizations. Label intake includes old issues that acquire the label. Existing Chat bindings and linked open PRs prevent new ownership; active work is not migrated. The author and review account must be distinct and remain fixed for an admitted chain.
 
-The existing reviewer count, model slots, severity, behavior notes, switches, pauses and PR exclusions remain in effect. Issue implementation and PR repair have model places in the existing model settings. A chain can be held or resumed individually. Disabling admissions retains receipts and ownership and continues reconciling already admitted outcomes. Holding new invocations does not terminate an existing worker; its existing native Stop control still applies.
+The existing reviewer count, model slots, severity, behavior notes, switches, pauses and PR exclusions remain in effect. Implement Issues and Repair Pull Requests are rows in Behaviors with independent switches, notes, author identity, native activity, run metrics and pause/resume controls. Their switches default on within an enabled chain, preserving the existing execution semantics; they cannot enable the chain itself. Their model slots remain in Settings → Models. A chain can be held or resumed individually. Disabling invocations retains receipts and ownership and continues reconciling already admitted outcomes. Holding or pausing does not terminate an existing worker; its existing native Stop control still applies.
 
-The existing authorized HTTP API supports interactive and headless controls: `GET /api/behavior-chains`, optional `state=active|merged`, cursor `after`, or `id` with an event-sequence cursor; `POST` accepts `id`, current `sequence` and `operation=hold|resume`. Reads return bounded summaries and pages. Stale control writes fail instead of overwriting a later decision. No new poller is introduced.
+**Switch to v2** is one action in Settings → General → Behavior chain. It records a durable `draining` admission state before any asynchronous work. The existing cooperative release barrier counts behavior operations separately; late legacy launches and prepared chain admissions recheck the durable gate. Running invocations finish, Chats remain usable, and unreadable Caller activity refuses readiness. The existing behavior tick then verifies fresh, complete PR observations across all followed organizations and commits the legacy PR boundary and enabled v2 setting in the same transaction. No new polling system is added.
+
+The chain settings checkbox controls invocations only after the durable cutover completes. The settings API refuses early enablement, and the runtime independently checks the journal's v2 mode before admitting native work. Saving intake settings alone cannot enable coexistence with v1 issue intake.
+
+After completion, v2 owns new eligible seed issues; new legacy issue intake is fenced. Existing PR behaviors continue for PRs outside native chains, including PRs subsequently created manually or by Chats. They recheck canonical chain ownership immediately before acting, so v2-owned PRs cannot acquire a second behavior owner. Existing Chat bindings and linked PRs are not migrated, and standalone PRs do not acquire fabricated issue-chain history. The observed legacy boundary is retained across restart, and the UI labels its count as PRs retained at cutover, not a live remaining count. Cancel cutover is available while draining and records a return to v1; it does not terminate work or reverse a completed cutover. A failed or incomplete observation leaves the drain visible with its error. Ordinary chain pause remains available after cutover and never reopens v1 issue intake.
+
+The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while General settings is open. Unavailable reads disable cutover controls instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
+
+The existing authorized HTTP API supports interactive and headless controls: `GET /api/behavior-chains`, optional `state=active|merged`, cursor `after`, or `id` with an event-sequence cursor; `POST` accepts `id`, current `sequence` and `operation=hold|resume`. Cutover controls instead send the current cutover `sequence` and `operation=switch-to-v2|cancel-cutover`. Reads include `cutover` (mode, sequence, request time, recorded legacy targets and current drain blockers). Summaries/events are paginated. Stale writes fail instead of overwriting a later decision.
 
 ## Handoffs and outcomes
 
@@ -27,6 +35,8 @@ The chain intentionally does not use the legacy approval-round escape that files
 ## Authority and recovery
 
 `behavior_chain_events` is immutable. It owns admissions, phase progression, retry history and ownership. `behavior_chain_current` is a rebuildable index whose state is checked against the authoritative event hash. Admissions and projection updates commit together with SQLite FULL durability. Existing observational behavior ledgers do not authorize this executor.
+
+Admission-mode transitions use `admission.changed` events under the reserved `@behavior-admission` journal identity. They share the immutable log and hashes but are not fabricated issue chains and do not appear in chain pages. Rebuilding chain projections verifies and preserves this durable admission state.
 
 Native Call rows and immutable action plans record effect intent before controlled publication. They provide execution evidence to the journal, not a second phase controller. Unique native correlations prevent duplicate processes from executing the same admission. Worker resource settlement is required before a handoff; a terminal model result is insufficient. A restart or interrupted process is reconciled against the original invocation, pushed branch, posted comments and exact-head review receipts.
 

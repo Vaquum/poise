@@ -85,6 +85,7 @@ export function reapAbandonedDirectBehaviorRuns(nowMs = Date.now()): string[] {
 
 const AGENT_BEHAVIORS = {
   'review-new-prs': 'pr_review', 'approve-prs': 'pr_approve', 'review-new-issues': 'issue_review',
+  'implement-issues': 'implement_issue', 'repair-prs': 'repair_pr',
 } as const
 const FAILURE = new Set(['invalid', 'failed', 'error', 'cancelled', 'canceled', 'timed_out', 'timeout'])
 const SUCCESS = new Set(['completed', 'superseded'])
@@ -183,10 +184,14 @@ function inWindow(startedAt: string, window: AnalyticsWindow): boolean {
     && (!window.until || at < Date.parse(window.until))
 }
 
+function behaviorSource(key: string): string {
+  return key === 'implement-issues' || key === 'repair-prs' ? 'poise:behavior-chain' : `poise:${key}`
+}
+
 function quarantineMayAffect(row: QuarantinedAgentLog, identities: ReadonlySet<string>, key: string, behavior: string, window: AnalyticsWindow): boolean {
   // A duplicate's contradictory provenance cannot hide a corrupt in-window row.
   if (row.id && identities.has(`call:${row.id}`) || row.correlationId && identities.has(`correlation:${row.correlationId}`)) return true
-  if (row.behavior && row.behavior !== behavior || row.source && row.source !== `poise:${key}`) return false
+  if (row.behavior && row.behavior !== behavior || row.source && row.source !== behaviorSource(key) && row.source !== 'poise:behavior-chain') return false
   return !row.startedAt || inWindow(row.startedAt, window)
 }
 
@@ -198,7 +203,7 @@ export function readBehaviorMetrics(logs: LogEntry[], window: AnalyticsWindow, e
     if (key in AGENT_BEHAVIORS) {
       if (error) return [key, null]
       const behavior = AGENT_BEHAVIORS[key as keyof typeof AGENT_BEHAVIORS]
-      const selected = logs.filter((log) => log.behavior === behavior && log.source === `poise:${key}`)
+      const selected = logs.filter((log) => log.behavior === behavior && (log.source === behaviorSource(key) || log.source === 'poise:behavior-chain'))
       const identities = new Set(selected.filter((log) => inWindow(log.started_at_precise || log.started_at, window))
         .flatMap((log) => [`call:${log.id}`, ...(log.correlation_id ? [`correlation:${log.correlation_id}`] : [])]))
       if (quarantined.some((row) => quarantineMayAffect(row, identities, key, behavior, window))) {

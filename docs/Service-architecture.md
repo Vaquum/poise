@@ -1156,6 +1156,19 @@ variant or scope is introduced. See [Logging](Logging.md#notification-evidence).
 
 ## Workspace behavior observation
 
+The workspace's existing `/api/behavior-chains` controls also expose an explicit
+behavior-only admission cutover. One `switch-to-v2` request records a durable
+drain in the canonical behavior journal; `cancel-cutover` is permitted only
+before completion. Both require its current sequence. The cooperative release
+barrier supplies behavior settlement counts, independently of Chat/background
+work. Unknown native Caller activity or incomplete PR observations prevents
+completion. The existing tick commits the v2 mode, legacy PR ownership boundary
+and enabled chain setting atomically; late launches recheck the durable gate.
+This does not call the service-wide drain or its Chat-stop deadline, restart a
+workspace, change production defaults, or migrate existing work. Reads return
+the actual cutover mode/blockers; [Behavior chain](Behavior-chain.md) defines the
+GUI, headless controls, ownership and cancellation semantics.
+
 The [Behavior ledger](Behavior-ledger.md) adds guarded, read-only
 `/api/behavior-ledger` routes and a loopback CLI within each workspace. A separate
 bounded worker/store captures existing behavior events and Caller snapshots;
