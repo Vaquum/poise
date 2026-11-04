@@ -94,7 +94,7 @@ import { recoverLegacyDatastore } from './legacy-datastore-recovery'
 import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDetached } from './process'
 import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type CheckSlotStats } from './check-semaphore'
-import { withProcessLock } from './process-lock'
+import { ProcessLockError, withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
@@ -7190,6 +7190,8 @@ export interface RunEnabledBehaviorsOptions {
 
 const behaviorChains = new Map<string, BehaviorChainRuntime>()
 const behaviorChainHealth = new Map<string, { lastSweepAt: number, error: string | null }>()
+const CHAIN_SWEEP_BUSY_MESSAGE = 'behavior chain sweep is already running'
+class ChainSweepBusyError extends Error {}
 export interface BehaviorChainCapacity {
   status: 'available' | 'unavailable'
   error: string | null
@@ -7380,7 +7382,16 @@ async function runBehaviorChains(): Promise<void> {
     behaviorChains.set(org.login.toLowerCase(), runtime)
   }
   const directory = dirname(behaviorProcessLockPath(ISSUES_KEY))
-  await withProcessLock({ path: join(directory, `.poise-${org.login.toLowerCase()}-behavior-chain-runtime-lock.sqlite3`), timeoutMs: 1000 }, async () => {
+  // A try-lock: a zero timeout also exempts lock setup from the deadline, so a
+  // stalled controller delays this sweep instead of losing it to a false overlap.
+  await withProcessLock({
+    path: join(directory, `.poise-${org.login.toLowerCase()}-behavior-chain-runtime-lock.sqlite3`),
+    timeoutMs: 0,
+    timeoutMessage: CHAIN_SWEEP_BUSY_MESSAGE,
+    errorFactory: (message, cause) => message === CHAIN_SWEEP_BUSY_MESSAGE
+      ? new ChainSweepBusyError(message)
+      : new ProcessLockError(message, { cause }),
+  }, async () => {
     const release = trackReleaseBackground('behavior')
     try { await runtime!.run() } finally { release() }
   })
@@ -7483,9 +7494,13 @@ export async function runEnabledBehaviorsOnce(
       await runBehaviorChains()
       behaviorChainHealth.set(org.login.toLowerCase(), { lastSweepAt: Date.now(), error: null })
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      behaviorChainHealth.set(org.login.toLowerCase(), { lastSweepAt: Date.now(), error: message })
-      console.error(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
+      if (error instanceof ChainSweepBusyError) {
+        console.warn(`[behaviors] behavior chain sweep skipped for ${org.login}: ${error.message}`)
+      } else {
+        const message = error instanceof Error ? error.message : String(error)
+        behaviorChainHealth.set(org.login.toLowerCase(), { lastSweepAt: Date.now(), error: message })
+        console.error(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
+      }
     }
     const operations: Promise<void>[] = []
     if (isEnabled('review-new-prs')

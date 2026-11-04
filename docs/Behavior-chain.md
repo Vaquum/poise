@@ -31,6 +31,8 @@ The existing behavior scheduler consumes one durable journal in Poise's existing
 
 Intake failures remain visible in runtime health and diagnostics while already-admitted chains continue reconciling and advancing. A stale discovery index cannot suspend execution evidence belonging to existing chains.
 
+An organization's sweep holds a try-lock for its whole run. A sweep that finds another sweep of that organization still running skips its chain work with a warning, and the next tick tries again. The rest of that tick still runs, and chain health and diagnostics keep what they already showed. So a sweep that never returns shows only as these repeated warnings and an unchanged `lastSweepAt`. Slow lock setup delays a sweep but never skips or fails it. Any other sweep error is reported in runtime health as a failure.
+
 ## Intake and controls
 
 Settings → General → Behavior chain selects either issues bearing the configured label (default `poise`) or all open issues in followed organizations. Label intake includes old issues that acquire the label. Existing Chat bindings and linked open PRs prevent new ownership; active work is not migrated. The author and review account must be distinct and remain fixed for an admitted chain.
