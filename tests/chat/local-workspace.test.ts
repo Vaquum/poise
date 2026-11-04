@@ -10,6 +10,7 @@ import type { ChatRuntime } from '../../server/chat/runtime'
 import type { ChatEvent } from '../../server/chat/protocol'
 import type { Adapter, TurnResult } from '../../server/chat/adapters/types'
 import { ensureLocalWorkspace } from '../../server/chat/local-workspace'
+import '../fixtures/short-polls'
 
 let root: string, outer: string, Runtime: typeof ChatRuntime, runtime: ChatRuntime
 const resolveCheckout = vi.fn(async () => { throw new Error('must not look up a repository') })

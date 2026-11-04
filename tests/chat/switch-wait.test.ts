@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import type { AgentId, ChatEnvelope, PromptInput, TurnSource } from '../../server/chat/protocol'
 import type { Adapter, AdapterHost, AdapterStartOptions, TurnResult } from '../../server/chat/adapters/types'
 import { CATALOG } from '../model-catalog-fixture'
+import '../fixtures/short-polls'
 
 let root: string
 let Runtime: typeof import('../../server/chat/runtime').ChatRuntime

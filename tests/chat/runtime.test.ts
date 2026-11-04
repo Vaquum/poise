@@ -11,6 +11,7 @@ import type { RelayConnection } from '../../server/chat/relay'
 import { scrubbedChildEnvironment } from '../../server/process'
 import type { CallerTurns } from '../../server/chat/caller-turns'
 import { CATALOG } from '../model-catalog-fixture'
+import '../fixtures/short-polls'
 
 let root = ''
 let repo = ''

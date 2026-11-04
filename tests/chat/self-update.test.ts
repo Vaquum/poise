@@ -15,6 +15,7 @@ import type { SelfUpdateBridge } from '../../server/self-update-bridge'
 import type { PreparedSelfChange, SelfChange, SelfUpdateStatus } from '../../src/self-update-types'
 import { CATALOG } from '../model-catalog-fixture'
 import { POISE_REPOSITORY as REPOSITORY } from '../../src/poise-repository'
+import '../fixtures/short-polls'
 
 let root = ''
 let repo = ''
