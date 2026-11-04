@@ -2,7 +2,15 @@ import { expect, type Locator, type Page } from '@playwright/test'
 declare global { interface Window { resumeMotion?: () => void } }
 
 export async function settled(page: Page): Promise<void> {
-  await expect.poll(() => page.evaluate(() => !document.querySelector('[data-motion-running]') && !document.getAnimations().some(animation => animation.playState === 'running')), { timeout: 5000 }).toBe(true)
+  // Infinite busy pulses (the working dots) never stop by design; settling
+  // waits out finite motion only.
+  await expect.poll(() => page.evaluate(() => {
+    if (document.querySelector('[data-motion-running]')) return false
+    return !document.getAnimations().some((animation) => {
+      if (animation.playState !== 'running') return false
+      return (animation.effect as KeyframeEffect | null)?.getComputedTiming().iterations !== Infinity
+    })
+  }), { timeout: 5000 }).toBe(true)
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
 }
 

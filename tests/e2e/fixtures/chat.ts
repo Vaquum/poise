@@ -90,6 +90,7 @@ interface ServerState {
   switchboardStart?: () => { status: number, json: unknown }
   switchboardAnswer?: (id: number, body: { optionId: string } | { text: string }) => SwitchboardState
   switchboardExplain?: (id: number) => SwitchboardState
+  switchboardDismiss?: (id: number) => SwitchboardState
   switches?: ChatSwitches
   sessions: SessionRecord[]
   history: Record<string, ChatEnvelope[]>
@@ -145,10 +146,11 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     }
     if (path === '/api/chat/switchboard' || path.startsWith('/api/chat/switchboard/')) {
       const board = state.switchboard ?? switchboardState()
-      const item = /\/items\/(\d+)\/(answer|explain)$/.exec(path)
+      const item = /\/items\/(\d+)\/(answer|explain|dismiss)$/.exec(path)
       if (path.endsWith('/start') && state.switchboardStart) { const answer = state.switchboardStart(); await route.fulfill({ status: answer.status, json: answer.json }); return }
       if (item?.[2] === 'answer' && state.switchboardAnswer) { await route.fulfill({ json: state.switchboardAnswer(Number(item[1]), body as { optionId: string } | { text: string }) }); return }
       if (item?.[2] === 'explain' && state.switchboardExplain) { await route.fulfill({ json: state.switchboardExplain(Number(item[1])) }); return }
+      if (item?.[2] === 'dismiss' && state.switchboardDismiss) { await route.fulfill({ json: state.switchboardDismiss(Number(item[1])) }); return }
       if (path.endsWith('/check')) { await route.fulfill({ json: { queued: false, reason: 'nothing changed', state: board } }); return }
       if (path.endsWith('/off')) { state.switchboard = switchboardState({ revision: board.revision + 1, items: board.items }); await route.fulfill({ json: state.switchboard }); return }
       if (path.endsWith('/restart')) { state.switchboard = { ...board, revision: board.revision + 1, status: 'live', error: null }; await route.fulfill({ json: state.switchboard }); return }

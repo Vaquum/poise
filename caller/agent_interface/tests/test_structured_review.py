@@ -882,11 +882,42 @@ class TestSincePositions(TestCase):
         self.assertEqual(failure.exception.code, "review_contract_violation")
         followup.assert_not_called()
 
-    def test_full_review_left_findings_keep_todays_behavior(self):
+    def test_full_review_left_findings_keep_valid_base_coordinates(self):
         verdict = {"assessment": ASSESSMENT, "action": "request_changes",
-                   "comments": [{"path": "src/gone.py", "line": 99, "side": "LEFT", "body": "defect"}]}
-        result, _, fetch = self._run(self._packet(None), verdict, "unused")
+                   "comments": [{"path": "src/gone.py", "line": 11, "side": "LEFT", "body": "defect"}]}
+        result, _, fetch = self._run(self._packet(None, self.REMOVAL), verdict, "unused")
         self.assertIn('"review_id": 91', result)
+        fetch.assert_not_called()
+
+    def test_full_review_invalid_locations_never_reach_github(self):
+        for path, line, side in (("missing.py", 1, "RIGHT"), ("src/gone.py", 99, "LEFT"),
+                                 ("src/gone.py", 12, "RIGHT")):
+            with self.subTest(path=path, line=line, side=side):
+                packet = self._packet(None, self.REMOVAL)
+                verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [
+                    {"path": path, "line": line, "side": side, "body": "A confirmed blocking defect."}]}
+                with patch.object(structured_review, "_review_once", return_value=(json.dumps(verdict), verdict)), \
+                        patch.object(structured_review.subprocess, "run", return_value=SimpleNamespace(
+                            returncode=0, stdout='{"action":"requested_changes","review_id":91}', stderr="")) as submit, \
+                        patch.object(structured_review, "fetch_packet") as fetch:
+                    with self.assertRaises(atoms.AgentPreflightError) as failure:
+                        structured_review.run("/repo", "system", "policy", CATALOG.resolve("gpt-6-astra-ultra"),
+                                              "pr_approve", "https://github.com/o/r/pull/12", "bit-mis",
+                                              "a" * 40, 60, packet=packet)
+                self.assertEqual(failure.exception.code, "review_contract_violation")
+                self.assertEqual(failure.exception.diagnostic["submission"], "none")
+                submit.assert_not_called()
+                fetch.assert_not_called()
+
+    def test_full_review_retains_unresolved_outdated_findings(self):
+        node = json.loads(self._packet(None, self.REMOVAL))
+        node["review_threads"] = [{"path": "src/gone.py", "line": 5, "side": "LEFT",
+                                  "is_resolved": False, "is_outdated": True, "bodies": ["still blocks"]}]
+        verdict = {"assessment": ASSESSMENT, "action": "request_changes", "comments": [
+            {"path": "src/gone.py", "line": 999, "side": "RIGHT", "body": "still blocks"}]}
+        _, calls, fetch = self._run(json.dumps(node), verdict, "unused")
+        self.assertEqual(json.loads(calls[-1][0][4]), [
+            {"path": "src/gone.py", "line": 5, "side": "LEFT", "body": "still blocks"}])
         fetch.assert_not_called()
 
     def test_production_priorities_pass_through_unchanged(self):

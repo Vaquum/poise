@@ -65,6 +65,19 @@ def no_effect_body():
         assert not lease.held and lease.path.is_file()
         lease.acquire()
         assert lease.release()
+        # The real publication CLI is exec'd, so it has no in-memory scope.
+        # This no-effect component reserves only a local reply receipt.
+        with api.db() as database:
+            database.execute("update calls set behavior='repair_pr',action_plan='{}',artifact=? where id=?",
+                             (json.dumps({'phase': 'publishing', 'plan_sha': 'b' * 64}), call))
+        review_receipt.work_publication('a' * 40)
+        helper = subprocess.run([sys.executable, '-c',
+                                "from agent_interface.review_receipt import work_publication; "
+                                "work_publication('a' * 40, start_replies=True); print('original-publication-helper')"],
+                               capture_output=True, text=True, timeout=10)
+        assert helper.returncode == 0 and helper.stdout == 'original-publication-helper\n' and not helper.stderr, helper
+        with api.db() as database:
+            assert json.loads(database.execute('select artifact from calls where id=?', (call,)).fetchone()[0])['replies_started'] is True
     api.finish(call, 'failed', error='Explicit no-effect component body; no provider or GitHub action started',
                outcome='preflight_failed', action='not_started', error_code='component_no_effect')
 

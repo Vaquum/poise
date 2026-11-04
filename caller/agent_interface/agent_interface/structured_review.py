@@ -264,7 +264,7 @@ def _reaffirming_thread(comment: dict, threads: list[dict], *, in_since_diff: bo
 
 def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, packet: str,
                               verdict: dict) -> None:
-    """Remap a since-scoped verdict onto the full pull request diff.
+    """Validate full-diff findings and remap since-scoped findings.
 
     The model reviewed the diff since the last head: RIGHT numbers already
     name current-head lines, but LEFT numbers name previous-head lines, so
@@ -281,7 +281,22 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
         node = json.loads(packet)
     except ValueError:
         return
-    if not isinstance(node, dict) or not node.get("since_head_sha"):
+    if not isinstance(node, dict):
+        return
+    if not node.get("since_head_sha"):
+        try:
+            sets = review_stages.diff_line_sets(node["diff"], [entry["filename"] for entry in node["files"]])
+        except (ValueError, KeyError, TypeError) as error:
+            raise InvalidVerdict(f"cannot validate full-diff positions: {error}") from error
+        for index, comment in enumerate(verdict["comments"]):
+            thread = _reaffirming_thread(comment, node.get("review_threads", []), in_since_diff=False)
+            if thread is not None:
+                line, side = thread.get("line"), thread.get("side")
+                if type(line) is int and line >= 1 and side in ("LEFT", "RIGHT"):
+                    verdict["comments"][index] = {**comment, "line": line, "side": side}
+                    continue
+            if comment["line"] not in sets.get(comment["path"], {}).get(comment["side"].lower(), set()):
+                raise InvalidVerdict("finding cannot be anchored to the full PR diff; no review submitted")
         return
     level = node.get("p")
     if level is None or (isinstance(level, str) and not level.strip()):

@@ -64,7 +64,17 @@ The chain settings checkbox controls invocations only after the durable cutover 
 
 After completion, v2 owns new eligible seed issues; new legacy issue intake is fenced. Existing PR behaviors continue for PRs outside native chains, including PRs subsequently created manually or by Chats. They recheck canonical chain ownership immediately before acting, so v2-owned PRs cannot acquire a second behavior owner. Existing Chat bindings and linked PRs are not migrated, and standalone PRs do not acquire fabricated issue-chain history. The observed legacy boundary is retained across restart, and the UI labels its count as PRs retained at cutover, not a live remaining count. Cancel cutover is available while draining and records a return to v1; it does not terminate work or reverse a completed cutover. A failed or incomplete observation leaves the drain visible with its error. Ordinary chain pause remains available after cutover and never reopens v1 issue intake.
 
+Automatic PR behaviors also retain the published PR identity after a chain
+completes: a stale open datastore row cannot admit a legacy worker for a PR
+the journal already records as merged. This uses the existing bounded journal
+status reader. A later standalone PR on a completed chain's retired branch
+remains eligible; this fence does not change manual Chat binding controls.
+
 The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while General settings is open. Unavailable reads disable cutover controls instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
+
+In v2, Review New Issues shows that saved seed scope instead of the inactive
+legacy repository filter. Its setting opens the existing General seed controls,
+using capacity data already returned by the Behaviors read.
 
 API summaries include nullable `reviewPending` and `reviewStatus` (`pending`,
 `complete`, `not-recorded`). Older merges without an explicit review verdict
@@ -142,11 +152,17 @@ The existing authorized HTTP API supports interactive and headless controls: `GE
 
 ## Handoffs and outcomes
 
+An implementation or repair that explicitly reports a blocker records
+`atomic_work_blocked` and holds its chain with that reason. Cleanup still
+requires its original positive proof and does not restart blocked work. The
+hold survives journal rebuild and server replacement; the person can resume
+through the existing control after resolving the blocker.
+
 1. Each configured issue-review slot must finish successfully and its native receipt must identify an actually posted comment on the current issue revision. Once all required slots satisfy that check, implementation is eligible immediately; no elapsed review delay authorizes it.
 2. Implementation reads the actual issue and comments, makes real changes in a fresh checkout and runs the repository's checks. After the model ends, Caller's publication primitive commits, pushes and opens the linked PR. Commit trailers and the PR's chain marker preserve artifact identity across lost responses.
 3. Each current PR head receives the configured review invocations. Repairs use a fresh model invocation and the actual review packet, CI evidence and branch state. They publish code and substantive model-written replies to original findings. A new head requires fresh reviews and approval. An unchanged-code repair still requires independent approval verification.
 4. Existing native primitives handle grey CI, approved nonblocking conversation resolution, strict readiness, merge and merge-queue admission. Their repository policy leaves a merely behind branch to native queue integration; an actual conflict still requires repair. Completion requires the actual GitHub merge SHA. Queue admission, a finished turn, approval or CLOSED alone cannot complete a chain.
-5. A removed queue entry requires its actual GitHub removal event. Failed integration checks or conflicts lead to fresh repair; manual or unknown removal holds for a decision. An unchanged-head repair requires a new independent approval before another native queue attempt. Only that attempt's actual integration result can establish acceptance. Deliberate dismissal of a current-head managed approval is also held.
+5. A removed queue entry requires its actual GitHub removal event. Failed integration checks or conflicts lead to fresh repair; manual or unknown removal holds for a decision. A `merged` removal alongside an earlier open-PR read waits for confirmed merge evidence; that event alone neither completes nor holds the chain. An unchanged-head repair requires a new independent approval before another native queue attempt. Only that attempt's actual integration result can establish acceptance. Deliberate dismissal of a current-head managed approval is also held.
 
 The chain intentionally does not use the legacy approval-round escape that files remaining findings as a follow-up issue and approves. Unresolved blockers remain blockers.
 
@@ -331,6 +347,15 @@ Caller reserves the reply batch before its first POST. A lost or partial
 reply POST remains uncertain unless every original reply is found on GitHub;
 absence never authorizes another POST. Older receipts without an explicit
 unattempted checkpoint do not acquire this recovery authority.
+
+The executed publication helper verifies its original controller and PID
+namespace, its direct Caller parent and the absence of any other worker before
+reserving replies. It cannot inherit an in-memory Python scope across exec.
+After a repair publishes the current head and all required fresh reviews
+complete, answered conversations proceed to independent approval rather than
+another repair solely because the original thread is still unresolved. A new
+change request, failing CI, conflict, base update or changed seed still requires
+repair; approval and native conversation resolution retain their own gates.
 
 An uncertain grey-CI rerun is inspected through the existing native command in
 read-only mode. A later attempt of that exact workflow/head settles its original
@@ -865,3 +890,125 @@ production is never attached, followed repositories are verified
 absent from production before seeding and after the campaign, and
 production configuration, admissions, defaults and active work
 are untouched.
+
+The 3 November candidate `1508cbbbebed14b15d253bf4c058a8a829d4a703`
+stopped after its first three real merges: test-repository PRs #114–#116
+(`42be7131`, `ca17471f`, `462d9b4e`). Their exact-head approvals, native queue
+checks and independent functional assertions passed. All 18 original native
+Calls settled, their owned roots were physically absent, and their ten-minute
+handoff windows passed. The campaign nevertheless failed its ownership fence:
+after PR #116 merged, legacy review admitted Caller
+`f0db2bf4b1c24496a1dae11dea4cb9d2`. Its live closed-target check superseded it
+before any provider ran or review was posted. It is not a managed review or a
+successful lifecycle case. Levels 2–3 and the remaining seven cycles were not
+started. The fix retains completed PR provenance in automatic legacy admission
+using the existing journal reader; it changes neither manual Chat controls nor
+the eligibility of a later standalone PR on a retired branch.
+
+The immutable manifest SHA-256 is
+`0cedc250d10ab7a6e7a6badaae390491745a64d12be0666594ce22ae00d5a6fa`.
+The manifest, raw inventory, consistent journal/Caller backups, actual GitHub
+artifacts, original failing regression and corrected checks are retained in
+the validation worktree at `test-results/server-v2-final-1508cbbb-20261103/`.
+These three merges are retained evidence, not completion of the frozen
+ten-cycle campaign. A corrected candidate requires its own campaign.
+
+### Corrected candidate `fe58f67e` — sealed real campaign
+
+The corrected campaign uses source `fe58f67ef92c066077edd65037e5b500e55f2989`
+and immutable manifest SHA-256
+`8b3ba7a63abbdb7eed8d037f3899442b4aa56c97e7225971d6bd084851405e30`.
+It runs actual Codex 0.166.0 behaviors in the separate service replica, with
+zero-bang authoring and llun-ved reviewing in the excluded test organization.
+Only settled prior history was retained; the initial 19 Caller IDs are excluded
+from new-cycle counts. The operator applied intake labels and performed no
+downstream review, implementation, repair, approval or merge actions.
+
+| Achieved level | Seed → actual PR | Confirmed merge |
+| --- | --- | --- |
+| 1 | 117 → 120 | `232d1aa9511e5fedae74a1d905a12407d5cf803b` |
+| 1 | 118 → 121 | `922b9175e5366544c2bf875aa78a26c4eeae6bf6` |
+| 1 | 119 → 122 | `ce8d9dc6ffd9fbd24bba3cb0fa263047b2332e1e` |
+| 2 | 94 → 123 | `2d1f880e041060f18de14f7bc8b9c4e267b55b83` |
+| 2 | 69 → 124 | `17cf07afca642d56e265f24cd6d2018317a8ff29` |
+| 2 | 109 → 125 | `af5f854934c902812e74033c4c82a23cdba9d0a6` |
+| 3 | 106 → 126 | `6ea2a9086c4ef61119f3541403a71432ab9c1866` |
+| 3 | 105 → 127 | `d2730559e129d193397fd13f7475c657145a4217` |
+| 3 | 92 → 128 | `8113026d76e9243c63788f3710d8990aef332ef7` |
+| 3 | 93 → 129 | `538553769b995d10da7226d56353d2de898a7c20` |
+
+All ten merges have independently verified current-head approval,
+successful exact-head and native-queue checks, preserved existing assertions,
+passing merged-API assertions and positive original process/disk settlement.
+All 60 original Calls pass their ten-minute idle windows. The final 30-minute
+idle window also passes with zero remaining behavior processes, unsettled Calls
+or reservations. Actual provider overlap is 451.54 seconds at
+level 2 and 355.39 seconds at level 3, with the required admitted/unmerged backlog
+throughout. Independent observation gaps are retained; the largest interval in
+these idle windows is 6.87 seconds. Missing observations are not counted as zero
+activity. The 671-event checkpoint rebuilds exactly: 13 chains and 78 invocations
+include three prior chains and 18 prior invocations, with zero reservations.
+Initial settlement timestamps remain unchanged; replay starts no worker.
+All 60 new Caller responses are copied and hashed. All 20 original issue-review
+comments match their actual GitHub identities; two older comments on seed 69
+remain retained without new credit. The final native queue check passes 3,212
+tests, and all 28 independent merged-API checks pass, including older APIs.
+
+The stopped campaign's 317 indexed files reopen and hash-verify from the sealed
+bundle, SHA-256 `f07ff66192a3f601349f080b5682a9024b0b6bb5ed82b1f2748829aa1590515c`.
+Its archived journal rebuilds to the same 671 events, 13 chains, 78 invocations
+and zero reservations, without starting workers or performing live writes.
+
+This is ten verified merge cycles, not full resource acceptance. No repair round
+occurred at any level; that criterion remains unexercised. Real fault cases are
+kept in a separate cohort, not added to the ten frozen cycles. Paired throughput
+comparison remains pending. The 12-CPU/40-GiB replica differs from the retained 4-CPU/8-GiB
+baseline, so no matched-throughput claim is made. Production remains untouched.
+Evidence is retained at `test-results/server-v2-final-fe58f67e-20261103/` in the
+validation worktree, including the unchanged manifest, original receipts,
+consistent databases, paginated GitHub evidence, raw inventory and failed reads.
+
+The subsequent fault cohort retained the same resource implementation and
+proved real memory/disk breaches with unaffected neighbors, drained container
+replacement, maintenance reclamation after the registered cleanup owner's loss,
+and admission recovery after an actual unreadable kernel counter. Its seed
+145 subsequently reached PR 147 and actual merge
+`05cfdf846c83e7dc2f47f4a8a3d93272460181bf`, with all six original Calls positively
+settled. These are separate fault results, not new frozen-cycle credit.
+PR 146 then exposed two repair-path defects: an executed reply helper could not
+see Caller's in-memory scope, and a successfully repaired, freshly reviewed head
+could enter another repair solely for its answered but unresolved thread. The
+original failures, automatic publication continuations and extra repair are
+retained. The corrections above start a new candidate; the sealed campaign is
+not relabelled as execution on that candidate. On `039a0bd6`, the original
+complex repair reached actual PR 146 merge
+`fb09abc1b5fa030c8cbbdc98b6a35bcdeeadfc94`; its current-head approval,
+conversation resolution, head checks and native queue checks were verified.
+The accepted-response interruption for PR 150 killed its original Caller before
+the journal acknowledgement. Recovery retained one original physical Call and
+queue admission, reconciled the actual accepted response, and reached merge
+`a89103b431e69ddd3ffa61be8ada230120f946c1`. Two neighboring native behaviors
+completed normally. The original request/response hashes and first resource
+certificates remain unchanged.
+
+The real approval for PR 153 subsequently failed when GitHub rejected an inline
+path. Its uncertain submission remains retained, with no retry authorized by
+that rejection. Full-diff structured reviews now use the existing diff-line
+reader to validate inline anchors before submission, as follow-up reviews
+already did; an unanchored finding cannot be dropped or converted to approval.
+Regression coverage includes nonexistent paths, invalid lines on both sides,
+and reaffirmed unresolved outdated threads.
+
+The separate real 30-second native-action timeout on seed 143 retained the
+original uncertain merge invocation without repeating it. Positive process/disk
+release followed the timeout by 0.132 seconds; its concurrently running native
+implementation completed normally. Person Stop on seed 154 reclaimed its
+original worker and directories and held the chain until an explicit test-control
+resume. The next real worker was interrupted by killing its entire isolated
+container. Replacement preserved all 157 previously settled Caller rows and the
+1,706-event journal prefix, started no new physical Call, and retained the
+original unreclaimed directory and 2-GiB/512-MiB reservation as uncertain.
+That result proves a visible safe hold, not reclamation after lost kernel proof.
+These fault observations are retained under
+`test-results/server-v2-repair-039a0bd6-20261103/`; they do not replace the pending
+matched resource campaign or its per-level repair/throughput requirements.

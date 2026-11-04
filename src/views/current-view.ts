@@ -3,11 +3,12 @@ import { chatSidePane } from './chat-side-pane'
 import type { ChatSubject } from '../../server/chat/protocol'
 // Current — five-lane kanban that mixes free-form thinking with live GitHub
 // activity. The first three lanes (Idea / Concept / Plan) are manual cards
-// you drag around; the last two (Issue / PR) are read-only feeds pulled
+// you drag around; the last two (Issue / PR) are feeds pulled
 // from the local cache of issues + PRs you're involved in. Time + status
 // filters in the header narrow the live lanes; the manual lanes are
 // unaffected. The Issue lane has a richer composer (title / body / repo)
-// that opens a real GitHub issue via the proxy.
+// that opens a real GitHub issue via the proxy. Issue edits use that same
+// composer with a fresh GitHub title/body; PR cards keep their existing actions.
 
 import { disclosure, layout, retire, reveal } from '../motion'
 import { patchContent } from '../dom-patch'
@@ -91,17 +92,18 @@ let statusFilter: StatusFilter = 'all'
 let searchQuery = ''
 let searchDebounce: ReturnType<typeof setTimeout> | null = null
 let prStatus: Map<string, PrStatus> = new Map()
-// Optimistic queue for items the user just created (currently only
-// the issue composer pushes into it). github-datastore is a polling
-// consumer view — the moment after creation the datastore still
-// returns the pre-creation list, which would make the new issue
-// invisible. We park it here and prepend to liveItems on every
-// fetchLive() until the datastore catches up; once it does, the
-// canonical record from /api/gh takes over and the entry is dropped.
+// Confirmed issue creates/edits stay visible while the polling datastore
+// catches up. Its older record cannot overwrite a confirmed edit.
 // One-hour TTL is a safety net so a stalled sync can't leave a ghost
 // pinned at the top forever.
 let pendingLiveItems: LiveItem[] = []
 const PENDING_TTL_MS = 60 * 60 * 1000
+
+interface RepoLabel { name: string, color: string, description: string | null }
+// Label catalogues by repo, shared across composer opens so a catalogue is
+// read once per few minutes however often the composer opens.
+const repoLabelCache = new Map<string, { labels: RepoLabel[], at: number }>()
+const LABEL_CACHE_TTL_MS = 5 * 60 * 1000
 // Tick listener installed on view init; removed via stopCurrentPolling()
 // when navigating away. Single shared clock — see startRefreshTicker().
 const onLiveTick = () => pollLiveTick()
@@ -242,10 +244,10 @@ function renderShell(): string {
         <span class="lane-title">${l.label}</span>
         <span class="lane-count">0</span>
       </header>
-      <div class="lane-list" data-lane="${l.key}"></div>
       ${l.key === 'pr' ? '' : `
         <button class="lane-add" data-lane="${l.key}" aria-label="${l.key === 'issue' ? 'Add an issue' : `Add a card to ${l.label}`}">+ ${l.key === 'issue' ? 'Add an issue' : 'Add a card'}</button>
       `}
+      <div class="lane-list" data-lane="${l.key}"></div>
     </section>
   `).join('')
 
@@ -297,6 +299,8 @@ const CHAT_ICON_SVG = '<svg width="11" height="11" viewBox="0 0 14 14" fill="non
 const COPY_ICON_SVG = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none"><rect x="3" y="3" width="7" height="8" rx="1" stroke="currentColor" stroke-width="1.2"/><path d="M5.5 3V2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>'
 // Checkmark shown for ~1.2s after a successful copy as visual feedback.
 const CHECK_ICON_SVG = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M3 7.5l3 3 5-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+// Tag mark for the issue composer's label picker — quiet on purpose.
+const TAG_ICON_SVG = '<svg width="12" height="12" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2 2.5h4.5L12 8a1 1 0 0 1 0 1.4L9.4 12a1 1 0 0 1-1.4 0L2.5 6.9V2.5z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><circle cx="5" cy="5" r="1" fill="currentColor"/></svg>'
 
 // Opens the card's Chat session in the Chat view: its session when it has
 // one, else the composer with the card's prefill. The first message,
@@ -464,9 +468,9 @@ function paintLiveItem(el: HTMLElement, item: LiveItem): void {
   const st = liveStateLabel(item)
   const stateBadge = st ? `<span class="state ${st.cls}">${st.text}</span>` : ''
   // PR cards get a tiny review icon as the rightmost member of the
-  // action strip; issue cards have no primary action — only the
-  // tools row.
-  const primary = item.is_pr === 1 ? reviewButton(item) : ''
+  // action strip; issue cards expose an explicit edit instead of changing their link.
+  const primary = item.is_pr === 1 ? reviewButton(item)
+    : `<button class="card-action-btn card-issue-edit" aria-label="Edit issue ${escapeHtml(item.repo)}#${item.number}" title="Edit issue">Edit</button>`
   patchContent(el, `
     <a class="card-link" href="${safeHttpsUrl(item.url)}" target="_blank" rel="noopener">
       <div class="card-text">${escapeHtml(item.title)}</div>
@@ -804,12 +808,15 @@ function reconcilePending() {
   if (!pendingLiveItems.length) return
   const cutoff = Date.now() - PENDING_TTL_MS
   pendingLiveItems = pendingLiveItems.filter((p) => {
-    if (new Date(p.created_at).getTime() < cutoff) return false
-    return !liveItems.some((li) => li.repo === p.repo && li.number === p.number)
+    if (Date.parse(p.updated_at) < cutoff) return false
+    return !liveItems.some((li) => li.repo === p.repo && li.number === p.number
+      && (Date.parse(li.updated_at) > Date.parse(p.updated_at)
+        || Date.parse(li.updated_at) === Date.parse(p.updated_at) && li.title === p.title && li.state === p.state))
   })
   const showable = pendingLiveItems.filter(withinActiveWindow)
   if (showable.length) {
-    liveItems = [...showable, ...liveItems]
+    const keys = new Set(showable.map(prKey))
+    liveItems = [...showable, ...liveItems.filter(item => !keys.has(prKey(item)))]
   }
 }
 
@@ -937,13 +944,44 @@ interface IssueComposerPrefill {
   body?: string
   repo?: string | null
   sourceCardId?: number
+  editing?: { number: number, title: string, body: string }
+}
+
+async function openIssueEdit(item: LiveItem, button: HTMLButtonElement): Promise<void> {
+  button.disabled = true
+  button.setAttribute('aria-busy', 'true')
+  try {
+    const response = await fetch('/api/gh', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operation: 'read_issue', repository_full_name: item.repo, issue_number: item.number }) })
+    const data = await response.json() as { error?: string, issue?: { number?: number, title?: string, body?: string } }
+    if (!response.ok) throw new Error(data.error || 'Could not load the issue')
+    const issue = data.issue
+    if (!issue || issue.number !== item.number || typeof issue.title !== 'string' || typeof issue.body !== 'string') {
+      throw new Error('GitHub did not return the issue title and body')
+    }
+    openIssueComposer({ repo: item.repo, body: issue.body, editing: { number: item.number, title: issue.title, body: issue.body } })
+  } catch (error) {
+    viewFeedback(`current-edit:${prKey(item)}`, 'Current action needs attention', (error as Error).message, 'action_needed')
+  } finally {
+    button.disabled = false
+    button.removeAttribute('aria-busy')
+  }
 }
 
 function openIssueComposer(prefill?: IssueComposerPrefill) {
-  const reportError = (message: string) => viewFeedback('current-create:issue', 'Current action needs attention', message, 'action_needed')
+  const editing = prefill?.editing
+  const resultLabel = editing ? 'Issue saved' : 'Issue created'
+  const waitMessage = editing ? 'Still saving the issue — wait for it to finish.' : 'Still opening the issue — wait for it to finish.'
+  const reportError = (message: string) => viewFeedback(editing ? `current-edit:${prefill?.repo}#${editing.number}` : 'current-create:issue', 'Current action needs attention', message, 'action_needed')
+  const reportResult = (message: string) => editing ? viewFeedback('current-edited', 'Current item saved', message, 'action_finished') : showLoadError(message)
   const laneNode = laneEl('issue')
   const existing = laneNode.querySelector('.composer')
   if (existing) {
+    if (editing) {
+      reportError('Close the current issue composer before editing another issue.')
+      existing.querySelector<HTMLInputElement>('input')?.focus()
+      return
+    }
     if (!prefill || existing.querySelector<HTMLButtonElement>('.composer-add')?.disabled) {
       // A pending write keeps its composer, including during drag promotion.
       if (prefill) reportError('Still opening the issue — wait for it to finish.')
@@ -969,14 +1007,21 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
     || '<option value="">(no repos available)</option>'
 
   const composer = document.createElement('div')
-  composer.className = 'composer composer-issue'
+  composer.className = `composer composer-issue${editing ? ' composer-issue-edit' : ''}`
   composer.innerHTML = `
-    <input type="text" class="issue-title" placeholder="Issue title" autocomplete="off" spellcheck="true" />
-    <textarea class="issue-body" rows="3" placeholder="Body (optional)" spellcheck="true"></textarea>
-    <select class="issue-repo" aria-label="Repository for the new issue">${repoOptions}</select>
+    ${editing ? `<div class="st-help">Edit ${escapeHtml(prefill?.repo || '')}#${editing.number}</div>` : ''}
+    <input type="text" class="issue-title" aria-label="Issue title" placeholder="Issue title" autocomplete="off" spellcheck="true" />
+    <textarea class="issue-body" aria-label="Issue body" rows="3" placeholder="Body (optional)" spellcheck="true"></textarea>
+    <select class="issue-repo" aria-label="${editing ? 'Repository' : 'Repository for the new issue'}"${editing ? ' disabled' : ''}>${repoOptions}</select>
     <div class="composer-row">
-      <button class="composer-add">Open issue</button>
+      <button class="composer-add">${editing ? 'Save issue' : 'Open issue'}</button>
       <button class="composer-cancel" type="button">Cancel</button>
+      <button class="composer-labels" type="button" aria-label="Labels" aria-expanded="false" aria-haspopup="dialog" title="Labels"${editing ? ' hidden' : ''}>${TAG_ICON_SVG}<span class="composer-labels-count" hidden></span></button>
+    </div>
+    <div class="composer-labels-pop" role="dialog" aria-label="Issue labels" hidden>
+      <input type="search" class="composer-labels-filter" placeholder="Filter labels…" aria-label="Filter labels" autocomplete="off" />
+      <div class="composer-labels-list" role="group" aria-label="Labels"></div>
+      <div class="composer-labels-foot"></div>
     </div>
   `
   laneNode.insertBefore(composer, addBtn)
@@ -986,6 +1031,154 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   const repoSel = composer.querySelector<HTMLSelectElement>('.issue-repo')!
   const addB = composer.querySelector<HTMLButtonElement>('.composer-add')!
   const cancelB = composer.querySelector<HTMLButtonElement>('.composer-cancel')!
+  const labelsBtn = composer.querySelector<HTMLButtonElement>('.composer-labels')!
+  const labelsCount = composer.querySelector<HTMLElement>('.composer-labels-count')!
+  const labelsPop = composer.querySelector<HTMLElement>('.composer-labels-pop')!
+  const labelsFilter = composer.querySelector<HTMLInputElement>('.composer-labels-filter')!
+  const labelsList = composer.querySelector<HTMLElement>('.composer-labels-list')!
+  const labelsFoot = composer.querySelector<HTMLElement>('.composer-labels-foot')!
+
+  // Label picker state. Selections belong to one repo's catalogue: switching
+  // repos clears them, since names from repo A must never ride along into B.
+  let selectedLabels: string[] = []
+  let labelCatalogue: RepoLabel[] | null = null
+  let labelCatalogueRepo = ''
+  let labelCatalogueError: string | null = null
+  let labelLoading = false
+  let labelGen = 0
+  const paintLabelsCount = () => {
+    labelsCount.hidden = selectedLabels.length === 0
+    labelsCount.textContent = selectedLabels.length ? String(selectedLabels.length) : ''
+    labelsBtn.setAttribute('aria-label', selectedLabels.length ? `Labels, ${selectedLabels.length} selected` : 'Labels')
+  }
+  const paintLabelsList = () => {
+    const query = labelsFilter.value.trim().toLowerCase()
+    if (labelLoading) {
+      labelsList.innerHTML = '<div class="composer-labels-empty">Loading labels…</div>'
+      return
+    }
+    if (labelCatalogueError) {
+      labelsList.innerHTML = `<div class="composer-labels-empty">${escapeHtml(labelCatalogueError)}</div>`
+      return
+    }
+    if (!labelCatalogue) {
+      labelsList.innerHTML = '<div class="composer-labels-empty">Pick a repository first.</div>'
+      return
+    }
+    const rows = labelCatalogue.filter((label) => !query || label.name.toLowerCase().includes(query))
+    if (!rows.length) {
+      labelsList.innerHTML = `<div class="composer-labels-empty">${labelCatalogue.length ? 'No labels match.' : 'This repository has no labels.'}</div>`
+      return
+    }
+    labelsList.innerHTML = rows.map((label) => {
+      const checked = selectedLabels.includes(label.name)
+      const dot = /^[0-9a-fA-F]{6}$/.test(label.color) ? ` style="--dot: #${label.color}"` : ''
+      const hint = label.description ? ` title="${escapeHtml(label.description)}"` : ''
+      return `<label class="composer-label-row"${hint}><input type="checkbox" value="${escapeHtml(label.name)}"${checked ? ' checked' : ''} /><span class="composer-label-dot"${dot}></span><span class="composer-label-name">${escapeHtml(label.name)}</span></label>`
+    }).join('')
+  }
+  const paintLabelsFoot = (note: string | null) => {
+    const base = selectedLabels.length ? `${selectedLabels.length} selected` : ''
+    labelsFoot.textContent = [base, note].filter(Boolean).join(' · ')
+  }
+  const closeLabelsPop = (focusButton: boolean) => {
+    if (labelsPop.hidden) return
+    labelsPop.hidden = true
+    labelsBtn.setAttribute('aria-expanded', 'false')
+    document.removeEventListener('pointerdown', outsideLabels, true)
+    if (focusButton && labelsPop.contains(document.activeElement)) labelsBtn.focus()
+  }
+  const openLabelsPop = () => {
+    labelsPop.hidden = false
+    labelsBtn.setAttribute('aria-expanded', 'true')
+    document.addEventListener('pointerdown', outsideLabels, true)
+    // The repo list may have landed after the composer opened, selecting a
+    // repo no catalogue was ever read for.
+    if (repoSel.value && labelCatalogueRepo !== repoSel.value && !labelLoading) ensureLabels(repoSel.value)
+    paintLabelsList()
+    labelsFilter.focus()
+  }
+  function outsideLabels(event: PointerEvent): void {
+    if (labelsPop.hidden || labelsPop.contains(event.target as Node) || labelsBtn.contains(event.target as Node)) return
+    closeLabelsPop(false)
+  }
+  const loadLabels = async (repo: string, generation: number): Promise<void> => {
+    labelLoading = true
+    labelCatalogueError = null
+    if (!labelsPop.hidden) paintLabelsList()
+    try {
+      const res = await fetch('/api/gh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operation: 'list_repo_labels', repository_full_name: repo }),
+      })
+      if (generation !== labelGen || !composer.isConnected) return
+      if (!res.ok) throw new Error(`Github ${res.status}: ${(await res.text().catch(() => '')).slice(0, 120)}`)
+      const data = await res.json()
+      if (!Array.isArray(data?.labels)) throw new Error('unexpected label catalogue shape')
+      labelCatalogue = (data.labels as RepoLabel[]).filter((label) => typeof label?.name === 'string')
+      labelCatalogueRepo = repo
+      repoLabelCache.set(repo, { labels: labelCatalogue, at: Date.now() })
+    } catch (err) {
+      if (generation !== labelGen || !composer.isConnected) return
+      // A failed catalogue must read as failed, not as "no labels", and it
+      // must not block a label-less issue: the create path stays open.
+      labelCatalogue = null
+      labelCatalogueError = `Could not load labels — ${(err as Error).message}`
+    } finally {
+      if (generation === labelGen && composer.isConnected) {
+        labelLoading = false
+        if (!labelsPop.hidden) { paintLabelsList(); paintLabelsFoot(null) }
+      }
+    }
+  }
+  const ensureLabels = (repo: string): void => {
+    if (!repo) { labelCatalogue = null; labelCatalogueRepo = ''; return }
+    const cached = repoLabelCache.get(repo)
+    if (cached && Date.now() - cached.at < LABEL_CACHE_TTL_MS) {
+      labelCatalogue = cached.labels
+      labelCatalogueRepo = repo
+      labelCatalogueError = null
+      return
+    }
+    labelGen++
+    void loadLabels(repo, labelGen)
+  }
+  labelsBtn.addEventListener('click', () => {
+    if (labelsPop.hidden) openLabelsPop()
+    else closeLabelsPop(true)
+  })
+  labelsFilter.addEventListener('input', paintLabelsList)
+  labelsFilter.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeLabelsPop(true) }
+    else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void submit() }
+  })
+  labelsList.addEventListener('change', (event) => {
+    const box = event.target
+    if (!(box instanceof HTMLInputElement) || box.type !== 'checkbox') return
+    if (box.checked) {
+      if (!selectedLabels.includes(box.value)) selectedLabels.push(box.value)
+    } else selectedLabels = selectedLabels.filter(name => name !== box.value)
+    paintLabelsCount()
+    paintLabelsFoot(null)
+  })
+  repoSel.addEventListener('change', () => {
+    // A late catalogue for the previous repo must neither populate this one
+    // nor carry its selections over.
+    labelGen++
+    labelLoading = false
+    labelCatalogueError = null
+    labelsFilter.value = ''
+    if (selectedLabels.length) {
+      paintLabelsFoot(`Cleared ${selectedLabels.length} label${selectedLabels.length === 1 ? '' : 's'} from the previous repository.`)
+      selectedLabels = []
+      paintLabelsCount()
+    }
+    labelCatalogue = null
+    ensureLabels(repoSel.value)
+    if (!labelsPop.hidden) paintLabelsList()
+  })
+  if (!editing) ensureLabels(repoSel.value)
 
   // The list was a one-shot snapshot taken when the composer opened. If
   // /api/repos had not answered yet it silently degraded to the repos inside
@@ -999,14 +1192,16 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
     })
   }
 
-  // Prefilled body lands as the issue's body; user provides the title.
+  // A promoted card provides its body; an existing issue also restores its title.
   if (prefill?.body) bodyTa.value = prefill.body
+  if (editing) titleInput.value = editing.title
 
   // Cancel is refused while the write is in flight. Removing the composer did
   // not cancel anything: the issue was still created and, on a promoted card,
   // the source card still deleted — the person just never saw either happen.
   const close = () => {
-    if (submitting) { showError('Still opening the issue — wait for it to finish.'); return }
+    if (submitting) { showError(waitMessage); return }
+    closeLabelsPop(false)
     retire(composer)
     addBtn.hidden = false
   }
@@ -1021,7 +1216,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
   const submit = async () => {
     if (submitting) return
     const title = titleInput.value.trim()
-    const body = bodyTa.value.trim()
+    const body = editing ? bodyTa.value : bodyTa.value.trim()
     const repo = repoSel.value             // already the full owner/name
     if (!title) { showError('Title is required'); titleInput.focus(); return }
     if (!repo)  { showError('Repo is required'); return }
@@ -1029,34 +1224,43 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
     submitting = true
     addB.disabled = true
     reportError('')
-    let created: LiveItem | undefined
+    let confirmed: LiveItem | undefined
+    let labelsDropped: string[] = []
     try {
       const ghRes = await fetch('/api/gh', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          operation: 'open_issue',
+          operation: editing ? 'edit_issue' : 'open_issue',
           repository_full_name: repo,
           title,
           body,
+          ...(editing ? { issue_number: editing.number, expected_title: editing.title, expected_body: editing.body }
+            : selectedLabels.length ? { labels: selectedLabels } : {}),
         }),
       })
       if (!ghRes.ok) {
         const text = await ghRes.text().catch(() => '')
+        if (editing) {
+          let message = text
+          try { message = (JSON.parse(text) as { error?: string }).error || text }
+          catch { message = text.slice(0, 400) }
+          throw new Error(message || 'GitHub did not confirm the issue change')
+        }
         throw new Error(`Github ${ghRes.status}: ${text.slice(0, 160)}`)
       }
-      // The server returns the freshly-created issue normalized as a
-      // GhRecord. github-datastore is a polling consumer, so the
-      // canonical record won't show up in /api/gh for some seconds —
-      // we park the issue in pendingLiveItems and prepend it on every
-      // fetchLive() until the datastore catches up. This guarantees
-      // the new issue is visible the moment the composer closes.
+      // Keep the confirmed GitHub record visible until the polling consumer
+      // has observed this create or edit.
       try {
         const result = await ghRes.json()
+        if (Array.isArray(result?.labels_dropped)) labelsDropped = result.labels_dropped.filter((name: unknown) => typeof name === 'string')
         const r = result?.record
+        if (editing && (!r || r.kind !== 'issue' || r.repo !== repo || r.number !== editing.number || r.title !== title)) {
+          throw new Error('GitHub did not confirm the edited issue; your draft is retained')
+        }
         if (r && r.kind === 'issue' && r.number) {
           pendingLiveItems = pendingLiveItems.filter((p) => !(p.repo === r.repo && p.number === r.number))
-          created = {
+          confirmed = {
             repo: String(r.repo),
             number: Number(r.number),
             title: String(r.title),
@@ -1067,9 +1271,12 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
             merged_at: r.merged_at ? String(r.merged_at) : null,
             updated_at: String(r.updated_at),
           }
-          pendingLiveItems.unshift(created)
+          pendingLiveItems.unshift(confirmed)
         }
-      } catch { /* fall through — fetchLive on its own may still surface it */ }
+      } catch (error) {
+        if (editing) throw error
+        // Older create responses may need the following datastore refresh.
+      }
       // Drag-promote: the source manual card is deleted only after the
       // issue is confirmed created. If we got here, the POST returned
       // 200 — safe to remove. We swallow delete errors so a later DB
@@ -1080,7 +1287,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
       }
     } catch (err) {
       addB.disabled = false
-      addB.textContent = 'Open issue'
+      addB.textContent = editing ? 'Save issue' : 'Open issue'
       showError((err as Error).message)
       return
     } finally {
@@ -1089,18 +1296,24 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
     // The guard is released; close removes live controls before the next await.
     reportError('')
     close()
-    if (created && withinActiveWindow(created)) {
-      const confirmed = created
-      if (!liveItems.some(item => item.repo === confirmed.repo && item.number === confirmed.number)) liveItems.unshift(confirmed)
+    if (confirmed && withinActiveWindow(confirmed)) {
+      const item = confirmed
+      liveItems = [item, ...liveItems.filter(existing => prKey(existing) !== prKey(item))]
     }
     // Show the confirmed record even while its follow-up read is pending.
     renderLiveOnly()
     try { await fetchLive() }
-    catch (err) { showLoadError(`Issue created — could not refresh: ${(err as Error).message}`); return }
+    catch (err) { reportResult(`${resultLabel} — could not refresh: ${(err as Error).message}`); return }
     renderLiveOnly()
-    if (created && !withinActiveWindow(created)) {
-      showLoadError('Issue created — the current filter is hiding it.')
-      window.setTimeout(() => viewFeedback('current-created', 'Current item created', ''), 6000)
+    if (confirmed && !withinActiveWindow(confirmed)) {
+      reportResult(`${resultLabel} — the current filter is hiding it.`)
+      window.setTimeout(() => viewFeedback(editing ? 'current-edited' : 'current-created', editing ? 'Current item saved' : 'Current item created', ''), 6000)
+    }
+    // GitHub answers 201 and silently drops labels the account may not
+    // apply. The issue exists; say plainly which labels did not make it.
+    if (labelsDropped.length) {
+      const names = labelsDropped.slice(0, 5).join(', ') + (labelsDropped.length > 5 ? ', …' : '')
+      reportResult(`${resultLabel} — GitHub did not apply these labels (the account may lack permission): ${names}.`)
     }
   }
 
@@ -1112,7 +1325,7 @@ function openIssueComposer(prefill?: IssueComposerPrefill) {
       // going to create the issue — and delete the promoted card with it.
       if (e.key === 'Escape') {
         e.preventDefault()
-        if (submitting) { showError('Still opening the issue — wait for it to finish.'); return }
+        if (submitting) { showError(waitMessage); return }
         close()
       } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void submit() }
     })
@@ -1484,6 +1697,16 @@ function attachCardClickHandlers() {
       const draft = chatBtn.dataset.draft || ''
       if (!session) return
       chatSidePane.toggle({ subject: cardSubject(session, label), prefill: draft || undefined })
+      return
+    }
+
+    const editIssue = target.closest<HTMLButtonElement>('.card-issue-edit')
+    if (editIssue) {
+      e.preventDefault()
+      e.stopPropagation()
+      const key = editIssue.closest<HTMLElement>('.card')?.dataset.id
+      const item = liveItems.find(candidate => prKey(candidate) === key && candidate.is_pr === 0)
+      if (item && !editIssue.disabled) void openIssueEdit(item, editIssue)
       return
     }
 

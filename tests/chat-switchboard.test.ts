@@ -469,6 +469,7 @@ describe('who may act', () => {
     const board = await started()
     const { itemId } = await as(board, { operation: 'switchboard.post', sourceSessionId: person.id, sourceSeq: seq, kind: 'decision', text: 'Which mock should I build?', options: [{ label: 'A' }] })
     expect((await rest(`/items/${itemId}/answer`, { optionId: 'o1' }, {})).status).toBe(403)
+    expect((await rest(`/items/${itemId}/dismiss`, {}, {})).status).toBe(403)
     expect(inboxRows(person.id)).toHaveLength(0)
     expect((await fetch(`${origin}/api/chat/switchboard`)).status).toBe(200)
     // In service mode only the gateway's browser assertion speaks for the person.
@@ -984,6 +985,52 @@ describe('answers and explanations', () => {
     expect(itemOf((await rest('')).body, itemId).explanation).toMatchObject({ state: 'failed' })
     expect((await rest(`/items/${itemId}/explain`)).status).toBe(409)
     expect((await rest('/off')).status).toBe(409)
+  })
+})
+
+describe('dismissal', () => {
+  async function decision() {
+    const person = await chat('MCP settings and adapters')
+    const seq = await say(person.id, 'Which MCP settings design should I build: A or B?')
+    const board = await started()
+    const { itemId } = await as(board, { operation: 'switchboard.post', sourceSessionId: person.id, sourceSeq: seq, kind: 'decision',
+      text: 'Which MCP settings design should I build?', options: [{ label: 'A · Settings panel' }] })
+    return { person, board, itemId: itemId as number }
+  }
+
+  it('hides one item from the pane without telling its chat, whatever its state', async () => {
+    const { person, board, itemId } = await decision()
+    const seq = runtime.get(person.id)!.lastSeq
+    const progress = await as(board, { operation: 'switchboard.post', sourceSessionId: person.id, sourceSeq: seq, kind: 'progress', text: 'Started building A' })
+    expect((await rest(`/items/${itemId}/dismiss`)).status).toBe(200)
+    const ids = switchboard.state().items.map(item => item.id)
+    expect(ids).not.toContain(itemId)
+    expect(ids).toContain(progress.itemId)
+    expect(inboxRows(person.id)).toHaveLength(0)
+    // Dismissal is idempotent, and unknown items stay 404.
+    expect((await rest(`/items/${itemId}/dismiss`)).status).toBe(200)
+    expect((await rest('/items/999999/dismiss')).status).toBe(404)
+    // An answered decision dismisses too: its confirmation leaves Needs you.
+    const other = await as(board, { operation: 'switchboard.post', sourceSessionId: person.id, sourceSeq: seq - 1, kind: 'decision', text: 'Ship it?', options: [{ label: 'Yes' }] })
+    expect((await rest(`/items/${other.itemId}/answer`, { optionId: 'o1' })).status).toBe(200)
+    expect((await rest(`/items/${other.itemId}/dismiss`)).status).toBe(200)
+    expect(switchboard.state().items.map(item => item.id)).not.toContain(other.itemId)
+  })
+
+  it('frees the dismissed decision caps so the chat can ask again', async () => {
+    const person = await chat('MCP settings and adapters')
+    await say(person.id, 'First question?')
+    await say(person.id, 'Second question?')
+    const board = await started()
+    const ids: number[] = []
+    for (let seq = 1; seq <= 5; seq++) {
+      const posted = await as(board, { operation: 'switchboard.post', sourceSessionId: person.id, sourceSeq: seq, kind: 'decision', text: `Question ${seq}?`, options: [{ label: 'Yes' }] })
+      ids.push(posted.itemId)
+    }
+    expect((await request(board, { operation: 'switchboard.post', sourceSessionId: person.id, sourceSeq: 6, kind: 'decision', text: 'Question 6?', options: [{ label: 'Yes' }] })).status).toBe(409)
+    expect((await rest(`/items/${ids[0]}/dismiss`)).status).toBe(200)
+    const sixth = await as(board, { operation: 'switchboard.post', sourceSessionId: person.id, sourceSeq: 6, kind: 'decision', text: 'Question 6?', options: [{ label: 'Yes' }] })
+    expect(switchboard.state().items.map(item => item.id)).toContain(sixth.itemId)
   })
 })
 

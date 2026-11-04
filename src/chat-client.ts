@@ -649,6 +649,10 @@ export class ChatClient {
     return post(`/api/chat/switchboard/items/${id}/answer`, answer)
   }
 
+  dismissSwitchboardItem(id: number): Promise<SwitchboardState> {
+    return post(`/api/chat/switchboard/items/${id}/dismiss`)
+  }
+
   repos(): Promise<{ repos: string[] }> {
     return jsonFetch('/api/repos')
   }

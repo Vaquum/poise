@@ -20,6 +20,7 @@ import { TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../ti
 import type { BehaviorMetricsReport } from '../behavior-metrics'
 import { formatShortDuration } from '../analytics-format'
 import { getPausedUntil, setPaused } from '../behaviors'
+import { openSettingsAt } from '../settings'
 
 let viewEl: HTMLElement
 let initialized = false
@@ -246,7 +247,7 @@ function settingCell(meta: typeof BEHAVIORS[number]): string {
 }
 
 // Reviewers cell — how many of the slots from the PR review place's slot on
-// (Settings → Models) review each new pull request, all at the same time.
+// (Settings → Models) review each new pull request.
 // One is the default; the other behaviors show a dash.
 const REVIEWER_OPTIONS: ReviewerCount[] = [1, 2, 3]
 const reviewersInFlight = new Set<BehaviorKey>()
@@ -258,7 +259,7 @@ function reviewersCell(meta: typeof BEHAVIORS[number]): string {
     `<option value="${count}"${count === current ? ' selected' : ''}>${count}</option>`
   ).join('')
   const reviews = meta.reviews ?? { place: 'PR review', item: 'pull request' }
-  const title = `How many of the ${reviews.place} models (Settings → Models) review each new ${reviews.item}, at the same time`
+  const title = `How many of the ${reviews.place} models (Settings → Models) review each new ${reviews.item}`
   return `
     <select class="behavior-reviewers" data-behavior="${escapeHtml(meta.key)}" aria-label="Reviewers for ${escapeHtml(meta.key)}" title="${escapeHtml(title)}"${stateUnknown() || reviewersInFlight.has(meta.key) ? ' disabled' : ''}>
       ${opts}
@@ -324,9 +325,18 @@ function settingLabel(setting: BehaviorSetting): string {
 function triggersPresentation(key: BehaviorKey) {
   // What is on screen may not be what is stored; saving from it would replace
   // the stored list with a guess.
-  const unknown = stateUnknown()
+  const capacity = getBehaviorDiagnostics()?.chainCapacity
+  const unknown = stateUnknown() || (key === 'review-new-issues' && capacity?.status === 'unavailable')
   const open = triggersKey === key && !!triggersPanelEl?.classList.contains('open')
   const meta = behaviorMeta(key)
+  if (meta.hasTriggers && capacity?.mode === 'v2') {
+    const intake = capacity.intake
+    return { none: false, unknown: unknown || !intake,
+      label: !intake ? 'Seed issues unavailable' : intake.seedMode === 'all' ? 'All issues' : `Label ${intake.label}`,
+      title: intake ? `Issue-to-merge chain: ${intake.seedMode === 'all' ? 'all issues' : `issues labelled ${intake.label}`} in followed organizations. Change seed issues in General settings.`
+        : 'The seed issues could not be read from the server.',
+      open: false }
+  }
   if (meta.hasSkips) {
     const skipped = getSkipRepos(key)
     const ceiling = meta.hasSetting ? settingLabel(getSetting(key)) : ''
@@ -605,6 +615,10 @@ function positionTriggersPanel() {
 }
 
 function openTriggersPanel(key: BehaviorKey) {
+  if (key === 'review-new-issues' && getBehaviorDiagnostics()?.chainCapacity?.mode === 'v2') {
+    openSettingsAt('general')
+    return
+  }
   if (!triggersPanelEl) {
     triggersPanelEl = buildTriggersPanel()
     document.body.appendChild(triggersPanelEl)

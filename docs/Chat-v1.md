@@ -84,7 +84,9 @@ If the selected model is absent or unavailable, the draft and choice are retaine
 and the reason is shown. There is no silent fallback. Session-creation and first-send errors
 preserve the message, and repeated submission while creating cannot launch
 another session. The console also returns to this writable state after the
-last session is deleted. A selected session still starting its native agent
+last session is deleted. While a new session is being created, typing remains
+available and the draft carries over; sending waits for creation confirmation.
+A selected session still starting its native agent
 accepts a prompt through the runtime's existing serialized turn queue.
 
 The sessions pane resizes from its right edge, remembers its width, and eases
@@ -259,7 +261,9 @@ the rest; single delete hides its row the same way. The open chat moves to
 the first remaining chat at once. A failure restores its row where it was,
 still pinned and selected, and the notice names each failure; a target
 already gone on the server counts as deleted. A delete in flight blocks a
-safe reload until it answers. A setting
+safe reload until it answers. Deleting a pending creation also removes its late
+server result. If that removal fails, the real chat returns to the list and the
+notice explains the failure; the creation dialog stays closed. A setting
 caps concurrently running heavy work (default 4): Poise-local turns and the
 agent runs background behaviors launch draw from the one pool, so builds and
 test suites cannot pile past the cap no matter which surface started them. A

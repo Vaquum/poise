@@ -24,16 +24,17 @@ PACKET = json.dumps({
     "head_sha": HEAD,
     "pull": {"base": {"sha": BASE}},
     "linked_issues": [],
+    "files": [{"filename": "src/main.py"}, {"filename": "src/old.py"}],
+    "diff": "diff --git a/src/main.py b/src/main.py\n--- a/src/main.py\n+++ b/src/main.py\n"
+            "@@ -4 +4 @@\n-old\n+new\n"
+            "diff --git a/src/old.py b/src/old.py\n--- a/src/old.py\n+++ b/src/old.py\n"
+            "@@ -9 +9,0 @@\n-removed\n",
 })
 
 
 def packet_with_issue(body):
     return json.dumps({
-        "action": "read",
-        "repository": "o/r",
-        "pull_number": 12,
-        "head_sha": HEAD,
-        "pull": {"base": {"sha": BASE}},
+        **json.loads(PACKET),
         "linked_issues": [{"number": 7, "html_url": "https://github.com/o/r/issues/7", "body": body}],
     })
 
@@ -243,8 +244,9 @@ class TestStructuredCappedConversion(TestCase):
         self.assertIn("(LEFT,", bodies["body"])
 
     def test_capped_round_without_a_base_fails_loudly(self):
-        packet = json.dumps({"action": "read", "repository": "o/r", "pull_number": 12,
-                             "head_sha": HEAD, "linked_issues": []})
+        node = json.loads(PACKET)
+        del node["pull"]
+        packet = json.dumps(node)
 
         def github(args):
             raise AssertionError("no GitHub call may precede the packet check")

@@ -219,6 +219,29 @@ it.each(['switch', 'phase-pause', 'release', 'repository-skip'] as const)('repor
   } finally { release.resumeReleaseBackground() }
 })
 
+it('shows a queue-reported merge as waiting for confirmation instead of rejected work for the author', async () => {
+  const { journal, chain, obs, status } = await setup()
+  let current = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'merging-queue', behavior: 'merge-pr',
+    actor: chain.reviewer, model: null, slot: null, basis: 'queue', admittedAt: obs.checkedAt - 1,
+    request: { command: 'github-interface', cwd: '/fixture', argv: ['--merge-if-ready', String(pr.number),
+      '--expected-head', HEAD, '--token-user', chain.reviewer] } } })
+  const proof = nativeActionReceipt(current, current.invocations[0], { action: 'merge_if_ready', repository: pr.repo,
+    pull_number: pr.number, head_sha: HEAD, outcome: 'enqueued', queue_entry_id: 'merging-entry' })
+  current = record(journal, current, { type: 'invocation.settled', invocationId: 'merging-queue', callId: null,
+    outcome: 'enqueued', evidence: nativeActionSettlement(proof) })
+  obs.checkedAt = Math.max(Date.now(), proof.observedAt)
+  Object.assign(obs.pull!, { pending: false, checksState: 'SUCCESS',
+    queueRemoval: { id: 'merged-removal', reason: 'merged', at: obs.checkedAt, actor: null } })
+  current = record(journal, current, { type: 'chain.observed', observation: obs })
+  record(journal, current, { type: 'chain.waiting', reason: 'GitHub queue reports a merge; awaiting confirmed merge evidence' })
+  const before = journal.history(chain.id)
+  const reply = await status.readPrStatus(50, obs.checkedAt)
+  expect(reply.rows[0]).toMatchObject({ queue: { state: 'not_queued' }, blocker: { id: 'blocked' } })
+  expect(reply.rows[0].blocker.line).toContain('awaiting confirmed merge evidence')
+  expect(journal.history(chain.id)).toEqual(before)
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+})
+
 it('reports the actual queue rejection and retains blocker age across repeated observations', async () => {
   const { journal, chain, obs, status } = await setup()
   let queued = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'rejected-queue', behavior: 'merge-pr',

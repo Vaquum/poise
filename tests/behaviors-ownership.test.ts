@@ -5,6 +5,36 @@ import { mocks, pr, HEAD_SHA, loadModules, arrangeCli, agentLog, fixture } from 
 
 describe('launch ownership and resolution', () => {
 
+  it.each([true, false])('keeps a merged native PR out of legacy review without capturing standalone work (review complete: %s)', async (reviewComplete) => {
+    arrangeCli(false)
+    const { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user')
+    const journal = (await import('../server/behavior-chain-journal')).behaviorChainJournal()
+    let chain = journal.append('vaquum/poise-test#7', 'seed', 0, { type: 'chain.admitted', repository: pr.repo,
+      issue: 7, branch: 'poise/issue-7', author: 'poise-user', reviewer: 'review-bot' })
+    chain = journal.append(chain.id, 'published', chain.sequence, { type: 'chain.observed',
+      observation: { publication: { pull_number: pr.number } } })
+    journal.append(chain.id, 'merged', chain.sequence, { type: 'chain.merged', mergeSha: HEAD_SHA,
+      evidence: { repository: pr.repo, pull_number: pr.number, merged: true, merge_sha: HEAD_SHA, review_complete: reviewComplete } })
+    fixture.listedPrs = [
+      { ...pr, head_ref: chain.branch, head_repo: pr.repo },
+      { ...pr, number: pr.number + 1, url: `${pr.url.slice(0, -2)}${pr.number + 1}`,
+        head_ref: reviewComplete ? chain.branch : 'standalone-work', head_repo: pr.repo },
+    ]
+    runtime.startBehaviorsRuntime()
+    db.setMeta('behavior_review_new_prs_keyver', '3')
+    db.setMeta('behavior_review_new_prs_enabled', '1')
+    db.recordSeen('review-new-prs', '__snapshot_v3__')
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    const args = mocks.spawnDetached.mock.calls[0][1]
+    expect(args[args.indexOf('--pr-review') + 1]).toBe(`#${pr.number + 1}`)
+    expect(db.listBehaviorLaunchClaims('review-new-prs').map(claim => claim.target.toLowerCase()))
+      .not.toContain(`${pr.repo.toLowerCase()}#${pr.number}`)
+  })
+
   it('keeps a newly listed chain branch out of legacy review before publication is observed', async () => {
     arrangeCli(false)
     const inherited = mocks.runFile.getMockImplementation()

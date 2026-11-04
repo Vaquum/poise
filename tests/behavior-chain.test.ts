@@ -206,6 +206,29 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'complete', mergeSha: MERGE })
   })
 
+  it('waits for a confirmed merge when the queue reports merged during an open-PR observation', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    current = finish(journal, current, 'queue', 'merge-pr', 'queue-basis',
+      { status: 'completed', outcome: 'enqueued', head_sha: HEAD, queue_entry_id: 'original-entry' }, null)
+    obs.pull!.approved = true; obs.pull!.ready = true
+    obs.pull!.queueRemoval = { id: 'merged-removal', reason: 'merged', at: NOW, actor: null }
+    const decision = decideBehaviorChain(current, obs, NOW)
+    expect(decision).toEqual({ kind: 'wait', reason: 'GitHub queue reports a merge; awaiting confirmed merge evidence' })
+    if (decision.kind !== 'wait') throw new Error('expected merge observation wait')
+    current = record(journal, current, { type: 'chain.observed', observation: structuredClone(obs) })
+    current = record(journal, current, { type: 'chain.waiting', reason: decision.reason })
+    journal.rebuild()
+    current = journal.read(chain.id)!
+    expect(current.held).toBeNull()
+    expect(current.mergeSha).toBeNull()
+    expect(current.invocations).toHaveLength(3)
+    obs.pull!.merged = true; obs.pull!.state = 'closed'; obs.pull!.mergeSha = MERGE
+    expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'complete', mergeSha: MERGE })
+  })
+
   it('requires a fresh diagnosis and approval before requeueing an unchanged rejected head', () => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
@@ -232,6 +255,37 @@ describe('completion-driven atomic behavior decisions', () => {
     // Admission to the second queue attempt still cannot complete the chain.
     obs.pull!.queueEntry = 'second-integration-attempt'
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'wait' })
+  })
+
+  it('hands a published repair to approval after its fresh review instead of repeating repair for the answered thread', () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    let current = reviewed(journal, chain, obs)
+    const repair = invocation('repair', 'repair-pr', 'original-findings')
+    repair.request.context = { head: NEXT, reviewRevision: 'original-findings' }
+    repair.request.argv = ['--atomic-work', 'Example/Repo#7', '--expected-issue-revision', obs.issue.revision]
+    current = record(journal, current, { type: 'invocation.admitted', invocation: repair })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: repair.id, callId: 'repair-call', outcome: 'published',
+      evidence: { status: 'completed', action: 'published', outcome: 'published', head_sha: HEAD } })
+    obs.publication.head_invocation = 'repair-call'
+    obs.pull!.unresolved = 1
+    obs.pull!.reviewRevision = 'fresh-clean-review-with-original-thread'
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+    for (const flag of ['conflict', 'behind', 'changesRequested'] as const) {
+      obs.pull![flag] = true
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+      obs.pull![flag] = false
+    }
+    obs.pull!.failing = ['unit:failure']
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+    obs.pull!.failing = []
+    obs.publication.head_invocation = 'unrelated-call'
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+    obs.publication.head_invocation = 'repair-call'
+    current.invocations.find(item => item.id === repair.id)!.request.argv[3] = 'superseded-issue-revision'
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
   })
 })
 

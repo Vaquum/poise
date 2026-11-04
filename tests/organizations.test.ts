@@ -6,9 +6,30 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RunFileOptions } from '../server/process'
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn(), diagnosticFailure: vi.fn() }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), diagnosticFailure: vi.fn(), lockIoDelayMs: 0 }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
 vi.mock('../server/logging', () => ({ diagnosticFailure: mocks.diagnosticFailure, diagnostic: vi.fn() }))
+vi.mock('../server/process-lock', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../server/process-lock')>()
+  return {
+    ...actual,
+    // Keep real ownership; acquisition deadlines have their own lock tests.
+    withProcessLock: <T>(options: import('../server/process-lock').ProcessLockOptions, operation: () => Promise<T>) =>
+      actual.withProcessLock({ ...options, timeoutMs: 1000 }, operation),
+  }
+})
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return {
+    ...actual,
+    chmod: async (...args: Parameters<typeof actual.chmod>) => {
+      if (mocks.lockIoDelayMs && typeof args[0] === 'string' && args[0].endsWith('.lock')) {
+        await new Promise((resolve) => setTimeout(resolve, mocks.lockIoDelayMs))
+      }
+      return actual.chmod(...args)
+    },
+  }
+})
 
 let tempRoot = ''
 let database: typeof import('../server/db') | undefined
@@ -59,6 +80,7 @@ beforeEach(async () => {
   delete process.env.POISE_DATASTORE_DB
   vi.resetModules()
   mocks.diagnosticFailure.mockReset()
+  mocks.lockIoDelayMs = 0
   mocks.runFile.mockReset().mockImplementation(cli)
   await load()
   database!.setMeta('me', 'octocat')
@@ -80,6 +102,14 @@ afterEach(async () => {
 })
 
 describe('organization activation', () => {
+  it('keeps the unit activation assertions independent of slow lock filesystem setup', async () => {
+    mocks.lockIoDelayMs = 75
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    expect(operations('init-org')).toHaveLength(1)
+    expect(operations('build-user')).toHaveLength(1)
+  })
+
   it('preserves legacy routing and automation history without reinitializing its datastore', async () => {
     database!.setMeta('org', 'Vaquum')
     process.env.POISE_DATASTORE_DB = join(tempRoot, 'existing.sqlite')

@@ -1,8 +1,8 @@
 {
-  "baseline": "05a70e0b4262601001ab68e3832de54101c198ca",
+  "baseline": "e7b8fea70e24e82131e0a4f6c5f00004e514db12",
   "source": "#556 poise-ds/review.js (recovered original local design artifact)",
   "sourceSha256": "8533921c29aa9053ac420d260c5aeb6b91b41526c1679f2ea0c3d7ee4d523e0a",
-  "note": "Refresh of the existing element review. Mock decisions are preserved as design history, not approved removals. This step keeps the classic interface; v2 work orchestration is independently rehearsed. Group checks are existing executable suites, not a claim that each mock control is implemented. Gateway pages remain outside this transition.",
+  "note": "Reconciled against merged main e7b8fea7 and the #790 GUI candidate. The 390 original rows and mock decisions remain design history, not approved removals. Chat and the classic interface remain shared; durable atomic behaviors use the canonical behavior-chain journal, not the old work-rehearsal prototype or lossy behavior ledger. Checks identify executable component/browser coverage, not unattended provider acceptance or a claim that each proposed mock control exists. The frozen real campaign and resource proof remain separate obligations in docs/Behavior-chain.md. Gateway pages remain outside the GUI transition.",
   "groups": {
     "Chat": {
       "v1Source": "src/views/chat-view.ts",
@@ -12,6 +12,8 @@
         "tests/e2e/chat-queue.spec.ts",
         "tests/e2e/chat-timers.spec.ts",
         "tests/e2e/chat-switchboard.spec.ts",
+        "tests/e2e/chat-manager.spec.ts",
+        "tests/e2e/chat-working-dots.spec.ts",
         "tests/chat-control.test.ts"
       ]
     },
@@ -20,7 +22,10 @@
       "v2Source": "src/views/current-view.ts",
       "checks": [
         "tests/e2e/current-chat.spec.ts",
-        "tests/e2e/current-issue.spec.ts"
+        "tests/e2e/current-issue.spec.ts",
+        "tests/e2e/current-issue-labels.spec.ts",
+        "tests/e2e/current-issue-edit.spec.ts",
+        "tests/e2e/current-add-top.spec.ts"
       ]
     },
     "E": {
@@ -79,7 +84,8 @@
       "checks": [
         "tests/e2e/behavior-metrics.spec.ts",
         "tests/e2e/repo-skips.spec.ts",
-        "tests/e2e/review-cap.spec.ts"
+        "tests/e2e/review-cap.spec.ts",
+        "tests/e2e/behavior-cutover.spec.ts"
       ]
     },
     "S": {
@@ -556,27 +562,36 @@
     {"capability": "Extensions grid, directory, OAuth and confirmed removal", "source": "src/views/extensions-view.ts", "checks": ["tests/e2e/extensions.spec.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Timers, per-chat and global holds, provenance, restart and coalescing", "source": "src/views/chat-timers.ts", "checks": ["tests/chat-timers.test.ts", "tests/e2e/chat-timers.spec.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Worker role, per-turn charter and Manager policy/controls", "source": "server/chat/control.ts", "checks": ["tests/chat-worker-charter.test.ts", "tests/manager-controls.test.ts", "tests/e2e/chat-worker.spec.ts"], "v2": "same shared v1 implementation"},
-    {"capability": "Manager chat / work table / existing Switchboard", "source": "src/views/work-rehearsal-table.ts", "checks": ["tests/e2e/work-rehearsal.spec.ts"], "v2": "offline composition only; production remains v1"},
+    {"capability": "Manager chat / work table / existing Switchboard", "source": "src/views/chat-view.ts", "checks": ["tests/e2e/chat-manager.spec.ts", "tests/e2e/chat-switchboard.spec.ts", "tests/e2e/behavior-cutover.spec.ts", "tests/e2e/work-rehearsal.spec.ts"], "v2": "Manager and Switchboard retain their shared controls; canonical chain rows and journal are in General settings. The work-rehearsal table remains an offline prototype only, not the executor or proof of a production work table."},
     {"capability": "Card, document, passage and review Chat controls", "source": "src/views/chat-view.ts", "checks": ["tests/e2e/current-chat.spec.ts", "tests/e2e/editor-chat.spec.ts", "tests/e2e/editor-inline-threads.spec.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Tools display, drafts, question/permission and acting-chat attribution", "source": "src/views/chat-view.ts", "checks": ["tests/e2e/chat.spec.ts", "tests/chat-manager-control.test.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Explicit work bindings and PR auto-discovery across isolated checkouts", "source": "server/chat/control.ts", "checks": ["tests/chat-work-autobind.test.ts", "tests/chat-control.test.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Background jobs, leftover work and completion wakes", "source": "server/chat/control.ts", "checks": ["tests/chat/turn-stall.test.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Durable prompts, relay adoption, queued input and Stop across releases", "source": "server/chat/runtime.ts", "checks": ["tests/chat-qc-recovery.test.ts", "tests/release-worker-safety.test.mjs"], "v2": "same shared v1 implementation"},
-    {"capability": "Opposite-account review/approval, manual-review holds and replay guards", "source": "server/behaviors.ts", "checks": ["tests/behaviors-identity.test.ts", "tests/behaviors-approval.test.ts"], "v2": "same shared v1 implementation"},
-    {"capability": "Review-round cap, follow-up issue, publication receipts and safe no-action retry", "source": "server/behaviors.ts", "checks": ["tests/e2e/review-cap.spec.ts", "tests/behaviors-failure-recovery.test.ts"], "v2": "same shared v1 implementation"},
-    {"capability": "Native merge queue, ejection, actual merge and bounded branch updates", "source": "server/behaviors.ts", "checks": ["tests/behaviors-merge.test.ts", "tests/e2e/merge-behavior.spec.ts"], "v2": "same shared v1 implementation"},
-    {"capability": "Grey CI durable intents, action uncertainty and read-failure recovery", "source": "server/behaviors.ts", "checks": ["tests/behaviors-grey-ci.test.ts", "tests/e2e/grey-ci-behavior.spec.ts"], "v2": "same shared v1 implementation"},
-    {"capability": "Behavior pauses, repository skips and grouped failure diagnostics", "source": "server/behaviors.ts", "checks": ["tests/behaviors-repo-skips.test.ts", "tests/e2e/repo-skips.spec.ts", "tests/behavior-diagnostics.test.ts"], "v2": "same shared v1 implementation"},
-    {"capability": "Read-only behavior ledger, target lookup, health and bounded retention", "source": "server/behavior-ledger-store.ts", "checks": ["tests/behavior-ledger-store.test.ts", "tests/behavior-ledger-api.test.ts"], "v2": "same shared v1 implementation"},
+    {"capability": "Opposite-account review/approval, manual-review holds and replay guards", "source": "server/behaviors.ts", "checks": ["tests/behaviors-identity.test.ts", "tests/behaviors-approval.test.ts", "tests/behavior-chain-native.test.ts", "tests/behavior-chain-merge-basis.test.ts"], "v2": "canonical current-head review slots and separately attributed publication receipts retain author/reviewer separation; legacy-owned PRs retain legacy handling"},
+    {"capability": "Review-round cap, follow-up issue, publication receipts and safe no-action retry", "source": "server/behaviors.ts", "checks": ["tests/e2e/review-cap.spec.ts", "tests/behaviors-failure-recovery.test.ts", "tests/behavior-chain.test.ts", "tests/behavior-chain-action-recovery.test.ts"], "v2": "intentional difference: the legacy approval-round cap and follow-up escape do not waive v2 merge blockers; atomic review/repair repeats against the current head until strict merge evidence or an explicit hold"},
+    {"capability": "Native merge queue, ejection, actual merge and bounded branch updates", "source": "server/behaviors.ts", "checks": ["tests/behaviors-merge.test.ts", "tests/e2e/merge-behavior.spec.ts", "tests/behavior-chain.test.ts", "tests/behavior-chain-native.test.ts", "tests/behavior-chain-closed-target.test.ts"], "v2": "canonical chain decisions retain the native GitHub merge operation and actual merge receipt; queue admission is not completion; a changed head or blockers returns to atomic review/repair"},
+    {"capability": "Grey CI durable intents, action uncertainty and read-failure recovery", "source": "server/behaviors.ts", "checks": ["tests/behaviors-grey-ci.test.ts", "tests/e2e/grey-ci-behavior.spec.ts", "tests/behavior-chain-action-recovery.test.ts", "tests/behavior-chain-reconciliation.test.ts"], "v2": "legacy grey-CI behavior remains for legacy ownership; chain-owned PRs use canonical repair decisions, original action receipts and bounded read-only reconciliation before any uncertain action can repeat"},
+    {"capability": "Behavior pauses, repository skips and grouped failure diagnostics", "source": "server/behaviors.ts", "checks": ["tests/behaviors-repo-skips.test.ts", "tests/e2e/repo-skips.spec.ts", "tests/behavior-diagnostics.test.ts", "tests/behaviors-cutover.test.ts", "tests/behavior-cutover-api.test.ts"], "v2": "phase switches, pauses, notes, reviewer counts and PR exclusions remain; intentional difference: seed intake uses the chain's configured label or all-issues setting rather than legacy repository/author triggers"},
+    {"capability": "Read-only behavior ledger, target lookup, health and bounded retention", "source": "server/behavior-ledger-store.ts", "checks": ["tests/behavior-ledger-store.test.ts", "tests/behavior-ledger-api.test.ts", "tests/behavior-chain-replay.test.ts", "tests/behavior-chain-ownership.test.ts"], "v2": "observational ledger remains diagnostic only; canonical chain journal and original Caller receipts establish execution/recovery authority, including after projection loss"},
     {"capability": "Bounded Swarm history, stable paging and exact run selection", "source": "src/views/swarm-view.ts", "checks": ["tests/e2e/swarm-pagination.spec.ts", "tests/e2e/swarm-loading.spec.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Settings section drafts, model conflict recovery and authoritative account identity", "source": "src/settings.ts", "checks": ["tests/e2e/settings-save.spec.ts", "tests/settings-conflict-api.test.ts"], "v2": "same shared v1 implementation"},
-    {"capability": "Global primary/secondary/tertiary model slots and fallback", "source": "server/models.ts", "checks": ["tests/settings-model.test.ts", "tests/behaviors-model-selection.test.ts"], "v2": "same shared v1 implementation"},
+    {"capability": "Global primary/secondary/tertiary model slots, Random mode and fallback", "source": "server/models.ts", "checks": ["tests/settings-model.test.ts", "tests/behaviors-model-selection.test.ts", "tests/models.test.ts", "tests/behavior-chain-native.test.ts"], "v2": "shared configured model roster and selection feed each atomic behavior; no long-lived Chat is required"},
     {"capability": "Account participation, recorded sign-in and Muse credential choice", "source": "src/views/connected-accounts.ts", "checks": ["tests/e2e/connected-accounts.spec.ts", "tests/accounts.test.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Bulk Chat deletion and confirmed deletion despite cleanup failure", "source": "src/views/chat-view.ts", "checks": ["tests/e2e/chat.spec.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Snippets first save, protected built-ins and Manager/Worker editing", "source": "src/views/snippets-view.ts", "checks": ["tests/e2e/snippets-import.spec.ts", "tests/e2e/chat-manager.spec.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Editor undo byte budget and save/layout stability", "source": "src/views/editor-view.ts", "checks": ["tests/e2e/editor-history.spec.ts", "tests/e2e/editor-autosave-layout.spec.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Analytics indexed history, filters, account quotas and first paint", "source": "src/views/analytics-view.ts", "checks": ["tests/e2e/analytics.spec.ts", "tests/analytics-ledger.test.ts"], "v2": "same shared v1 implementation"},
     {"capability": "Distinct Admin controls and service settings", "source": "src/service-settings.ts", "checks": ["tests/e2e/service-settings.spec.ts"], "v2": "same shared v1 implementation"},
-    {"capability": "Service health, release identity and drain/restart contract", "source": "server/service/control.ts", "checks": ["tests/service-control.test.ts"], "v2": "same shared v1 implementation"}
+    {"capability": "Service health, release identity and drain/restart contract", "source": "server/service/control.ts", "checks": ["tests/service-control.test.ts"], "v2": "shared service API; resource PRs #822/#824/#826 extend the cleanup/capability/replacement contract separately from this GUI candidate"},
+    {"capability": "Current top insertion, repository label picker and existing-issue editing", "source": "src/views/current-view.ts", "checks": ["tests/e2e/current-add-top.spec.ts", "tests/e2e/current-issue-labels.spec.ts", "tests/e2e/current-issue-edit.spec.ts", "tests/gh-labels.test.ts", "tests/gh-issue-edit.test.ts"], "v2": "shared #790 GUI; explicit human issue writes use the selected account, retain failed drafts and verify actual target confirmation; manual seed creation does not bypass behavior ownership"},
+    {"capability": "Switchboard dismissal, immediate confirmed Chat deletion, drafts during startup and working dots", "source": "src/views/chat-view.ts", "checks": ["tests/chat-switchboard.test.ts", "tests/e2e/chat-switchboard.spec.ts", "tests/e2e/chat.spec.ts", "tests/e2e/chat-working-dots.spec.ts"], "v2": "shared #790 controls; dismissal does not resolve a durable blocker; startup drafts remain writable while sending waits for the actual Chat"},
+    {"capability": "Manager wake scheduling, clock changes and selection modifiers", "source": "server/chat/control.ts", "checks": ["tests/chat-manager-wake.test.ts", "tests/chat-manager-wake-status.test.ts", "tests/e2e/chat-manager.spec.ts", "tests/e2e/chat.spec.ts"], "v2": "merged shared Chat behavior remains independent of atomic chain admission"},
+    {"capability": "Editor file import, SSH keys and built-in remote desktop extension", "source": "src/views/editor-view.ts", "checks": ["tests/editor-import.test.ts", "tests/e2e/ssh-keys.spec.ts", "tests/ssh-keys.test.ts", "tests/extensions.test.ts", "tests/e2e/extensions.spec.ts"], "v2": "merged shared capabilities retained; no orchestration replacement"},
+    {"capability": "Seed discovery, completed issue-review handoff, implementation, review and repair", "source": "server/behavior-chain-runtime.ts", "checks": ["tests/behavior-chain.test.ts", "tests/behavior-chain-native.test.ts", "tests/behavior-chain-action-recovery.test.ts", "tests/behaviors-cutover.test.ts"], "v2": "canonical journal orders atomic invocations by completed configured review slots and verified GitHub artifacts; current issue comments are read by implementation; no timer or agent turn completion stands in for publication"},
+    {"capability": "Bounded journal replay, closed-target fencing and resource admission/reconciliation", "source": "server/behavior-chain-journal.ts", "checks": ["tests/behavior-chain-replay.test.ts", "tests/behavior-chain-reconciliation.test.ts", "tests/behavior-chain-closed-target.test.ts", "tests/behavior-chain-resources.test.ts", "tests/behavior-resource-receipt.test.ts", "tests/worker-capacity-chain.test.ts"], "v2": "merged canonical ownership, independent atomic-behavior capacity and physical release proof; live memory/disk guard and managed container replacement are separate resource PRs, not claimed validated by GUI fixtures"},
+    {"capability": "Idle enhancement-backlog alerts and distinct Chat/atomic-behavior capacity", "source": "server/worker-capacity.ts", "checks": ["tests/worker-capacity.test.ts", "tests/worker-capacity-chain.test.ts"], "v2": "shared Manager worker-Chat alert remains; chain ownership removes duplicate Chat backlog admission and atomic invocations retain their separate capacity"},
+    {"capability": "Configured agent collaborator access and sign-in readiness", "source": "server/agent-collaborator.ts", "checks": ["tests/agent-collaborator.test.ts", "tests/accounts.test.ts", "tests/account-alerts.test.ts", "tests/e2e/connected-accounts.spec.ts"], "v2": "shared account and organization access controls remain; readiness or a collaborator confirmation is not an atomic invocation or publication receipt"},
+    {"capability": "Fresh PRD issue reviews, review response ordering and retained failure causes", "source": "server/behaviors.ts", "checks": ["tests/behaviors-issue-review.test.ts", "tests/behaviors-outcomes.test.ts", "tests/behavior-failure-cause.test.ts", "tests/behavior-chain-action-recovery.test.ts"], "v2": "legacy review routes remain for legacy ownership; chain phases use configured review slots and original response/publication evidence, preserving failures rather than treating a provider exit as completion"}
   ]
 }

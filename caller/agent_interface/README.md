@@ -415,7 +415,9 @@ findings on current lines stay on current-head lines, while a defect caused
 by a removal is commented on the removed line and validated against the full
 pull request diff before the single submission. An unfetchable last head, or
 a base that moved since the last review, widens the round to the full diff
-instead. Any finding without a verified position fails the review before
+instead. Both full and follow-up reviews validate every inline location against
+the retained PR diff before invoking the GitHub submission command. Any finding
+without a verified position fails the review before
 submission, including a capped round's follow-up issue and approval.
 Removed lines are mapped by their content within the current-head span of their
 change block; ambiguous matches fail visibly. Reaffirmed unresolved findings

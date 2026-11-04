@@ -79,7 +79,11 @@ scrolls its own list immediately. Native dialogs retain native focus,
 cancellation and modality; supported browsers add CSS discrete visual
 transitions. Native file choosers, confirmations, OAuth navigation and the
 Poise Link desktop window remain stationary. Busy/error/selected states stay
-meaningful without decorative repeating animation.
+meaningful without decorative repeating animation, except the working pulse:
+the running turn's dots, the working session dot and the Switchboard's asking
+dots animate (opacity/scale only, on the compositor) while work is actually in
+flight. Waiting on the person or a slot holds every one of them still, and
+prefers-reduced-motion stills them all.
 
 ## Audited interaction coverage
 

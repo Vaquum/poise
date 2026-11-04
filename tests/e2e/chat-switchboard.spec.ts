@@ -261,3 +261,31 @@ test('starts the Switchboard, and says why when it cannot', async ({ page }, inf
   await expect(pane(page)).toHaveCSS('background-color', 'rgb(28, 33, 41)')
   await page.screenshot({ path: info.outputPath('switchboard-dark.png'), animations: 'disabled' })
 })
+
+test('dismisses a decision and an update from the pane', async ({ page }) => {
+  const state = makeState([session(), session({ id: 's2', title: 'MCP settings and adapters' })])
+  state.switchboard = live([second, decision, blocked, done])
+  state.switchboardDismiss = id => {
+    state.switchboard = { ...state.switchboard!, revision: state.switchboard!.revision + 1,
+      items: state.switchboard!.items.filter(entry => entry.id !== id) }
+    return state.switchboard
+  }
+  await installRoutes(page, state)
+  await installSocket(page, state)
+  await page.goto('/')
+  await page.getByRole('button', { name: /^Switchboard/ }).click()
+  const card = pane(page).locator('.sb-decision')
+  await expect(card.locator('.sb-q')).toHaveText('Which MCP settings design should I build?')
+  await card.getByRole('button', { name: 'Dismiss' }).click()
+  // The next decision comes to the front; the dismissed one is gone everywhere.
+  await expect(card.locator('.sb-q')).toHaveText('Rebase onto main now?')
+  await expect(pane(page).getByText('Which MCP settings design should I build?')).toHaveCount(0)
+  expect(state.calls.filter(call => call.path.endsWith('/dismiss'))).toEqual([{ method: 'POST', path: '/api/chat/switchboard/items/7/dismiss', body: null }])
+  // Dismissing an update from its chat row falls back to the row's next update.
+  const line = pane(page).locator('.sb-line', { hasText: 'Fix the login bug' })
+  await expect(line).toContainText('Blocked')
+  await line.locator('.sb-line-head').click()
+  await line.locator('.sb-update', { hasText: 'GitHub API quota is exhausted until 18:42.' }).getByRole('button', { name: 'Dismiss' }).click()
+  await expect(line.getByText('GitHub API quota is exhausted until 18:42.')).toHaveCount(0)
+  await expect(line).toContainText('Needs you')
+})

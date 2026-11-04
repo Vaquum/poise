@@ -373,7 +373,8 @@ export class BehaviorChainRuntime {
     if (call.status === 'running') return chain
     const stopped = ['stopped', 'stopping'].includes(call.error_code || '')
     const resourceStopped = ['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable', 'resource_receipt_unavailable'].includes(call.error_code || '')
-    if (resourceStopped && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: call.error })
+    const workBlocked = call.error_code === 'atomic_work_blocked'
+    if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: call.error })
     if (stopped && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: `behavior invocation ${invocation.id} was stopped by the person` })
     if (!nativeResourcesReleased(call)) {
       const evidence = { ...receipt(call), callId: call.id, ...(invocation.model === null ? { nativeCallId: call.id } : {}) }

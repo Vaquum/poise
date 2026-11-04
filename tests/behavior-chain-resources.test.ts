@@ -259,6 +259,36 @@ describe('resource-aware behavior admission', () => {
       expect(journal.read(chain.id)!.invocations[0].state).toBe('settled')
     })
 
+  it.each(['implement-issue', 'repair-pr'] as const)('holds an explicit %s blocker across cleanup and restart without another worker', async behavior => {
+    const { db, journal, chain } = setup()
+    const admitted = { ...invocation('blocked-original', RESERVATION), behavior, actor: chain.author, admittedAt: Date.now() - 3000 }
+    record(journal, chain, { type: 'invocation.admitted', invocation: admitted })
+    const call = { ...completedReviewCall(chain.repository, chain.issue, 'a'.repeat(40), chain.author),
+      behavior: behavior.replaceAll('-', '_'), source: 'poise:behavior-chain', correlation_id: admitted.id, model: admitted.model,
+      status: 'failed', error_code: 'atomic_work_blocked', error: 'Review requires a product decision',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null,
+      expected_head: behavior === 'repair-pr' ? 'a'.repeat(40) : null,
+      review_id: null, artifact: { phase: 'executing' }, receipts: null, response: null,
+      resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: null as string | null }
+    const launch = vi.fn(async () => true)
+    const native = operations({ launch,
+      readInvocations: async () => parseAgentLogStdout(JSON.stringify([call]), 'explicit blocked work receipt') })
+    await new BehaviorChainRuntime(journal, native).run()
+    expect(journal.read(chain.id)!.held).toBe(call.error)
+    expect(journal.reservedResources().memoryBytes).toBe(6)
+    call.resources_settled_at = new Date().toISOString()
+    await new BehaviorChainRuntime(journal, native).run()
+    expect(journal.read(chain.id)!.held).toBe(call.error)
+    expect(journal.reservedResources().memoryBytes).toBe(0)
+    expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+    expect(journal.read(chain.id)!.invocations[0].state).toBe('settled')
+    journal.rebuild()
+    await new BehaviorChainRuntime(new BehaviorChainJournal(db), native).run()
+    expect(journal.read(chain.id)!.held).toBe(call.error)
+    expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+    expect(launch).not.toHaveBeenCalled()
+  })
+
   it('retains the person Stop intent while cleanup is uncertain and after its later verified release', async () => {
     const { journal, chain } = setup()
     const admitted = { ...invocation('stopped-original', RESERVATION), admittedAt: Date.now() - 3000 }
