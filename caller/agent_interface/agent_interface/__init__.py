@@ -1914,7 +1914,7 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             # Adoption stays skipped — nothing found can be this run's.
             repeat_only = _repeat_only_refusal(failure)
             # A completed or superseded action wins over a later CLI failure.
-            if facts["head_sha"] != head or facts["state"] != "OPEN" or facts["draft"]:
+            if facts["head_sha"] != head or facts["state"] != "OPEN" or facts["draft"] or (proven and _context_moved(before, facts)):
                 return str(failure), behavior_outcome(mod, behavior, pr, pwd, actor, head, before, facts,
                                                        receipt=receipt, call_id=call_id, prior_error=str(failure),
                                                        prior_code=failure.code, proven_no_action=proven)
@@ -2240,6 +2240,10 @@ def _moved_target_result(actual_head: str, prior_error: str | None, prior_code: 
     return result
 
 
+def _context_moved(before: dict, facts: dict) -> bool:
+    return facts.get("review_context") != before.get("review_context")
+
+
 def _caller_context(envelope: dict, call_id: str, correlation_id: str, repo: str, pr_number: str,
                     reviewer: str, behavior: str, expected_head: str) -> dict:
     """The durable launch identity a close-settled diagnostic carries, the
@@ -2317,6 +2321,11 @@ def behavior_outcome(
                     return settled("no review attributable to this run was posted")
                 # Nothing posted and the target moved on: a clean supersede
                 # that keeps the preceding failure's disposition, if any.
+                return _moved_target_result(actual_head, prior_error, prior_code)
+            if not own and receipt is None and not review_receipt.failure() and _context_moved(before, facts):
+                # Nothing posted and the title, body or base changed: the
+                # current PR needs a fresh review, not a hold. An uncertain
+                # write stays held, so a re-review cannot duplicate it.
                 return _moved_target_result(actual_head, prior_error, prior_code)
             return _own_outcome(behavior, own, expected_head, receipt)
         except (review_budget.ReviewLimitError, RuntimeError) as unattributed:

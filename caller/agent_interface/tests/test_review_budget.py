@@ -390,6 +390,29 @@ class TestRecovery(TestCase):
         self.assertEqual(row['error_code'], 'review_contract_violation')
         self.assertIn('review submission was a no-op', row['error'])
 
+    def test_refused_submission_supersedes_when_the_pr_context_changed(self):
+        from agent_interface.process_diagnostic import diagnostic_envelope
+        refused = budget.ReviewLimitError(
+            'review submission rejected: retained review response differs from the current PR context',
+            'review_contract_violation',
+            diagnostic_envelope(operation='provider.review', phase='submitting', outcome='exit', submission='rejected'))
+        before = facts(review_context='a' * 64, reviewer_reviews_since_items=[])
+        row = self.execute([refused], [before, {**before, 'review_context': 'b' * 64}])
+        self.assertEqual(self.mod.run.call_count, 1)
+        self.assertEqual(row['status'], 'superseded')
+        self.assertEqual(row['outcome'], 'superseded')
+        self.assertEqual(row['head_sha'], HEAD)
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertIn('retained review response differs', row['error'])
+
+    def test_uncertain_submission_holds_when_the_pr_context_changed(self):
+        before = facts(review_context='a' * 64, reviewer_reviews_since_items=[])
+        row = self.execute([api.review_receipt.SubmissionError('publication uncertain')],
+                           [before, {**before, 'review_context': 'b' * 64}])
+        self.assertEqual(self.mod.run.call_count, 1)
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(row['error_code'], 'review_submission_failed')
+
 class TestMinuteReasoning(TestCase):
     def test_each_minute_reports_new_or_no_reasoning_and_keeps_only_bounded_text(self):
         import sqlite3, json
