@@ -55,6 +55,19 @@ async function arrangeTwoOrgApproveRun() {
   return { ...loaded, betaPr }
 }
 
+/** The retry delay and the fan-out's organization stagger, skipped: both are
+ *  only timers between a released slot and the launch these tests wait for. */
+async function launchedAfterRetry(release: () => void) {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    release()
+    await vi.waitFor(() => {
+      vi.advanceTimersByTime(1_000)
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    }, { timeout: 10_000, interval: 5 })
+  } finally { vi.useRealTimers() }
+}
+
 function saturateBehaviorBudget(runtime: { getBehaviorCheckSlots(): { tryAcquire(lane: 'behavior'): (() => void) | null } }): Array<() => void> {
   const slots = runtime.getBehaviorCheckSlots()
   const held = [slots.tryAcquire('behavior'), slots.tryAcquire('behavior'), slots.tryAcquire('behavior')]
@@ -197,10 +210,9 @@ describe('shared check slots for behavior launches', () => {
     })])
     // The release happens inside Vaquum's sweep context; the retry must
     // still reach beta's deferred launch instead of re-scanning Vaquum.
-    runtime.withBehaviorOrganization('Vaquum', () => {
+    await launchedAfterRetry(() => runtime.withBehaviorOrganization('Vaquum', () => {
       for (const release of held) release!()
-    })
-    await vi.waitFor(() => expect(mocks.spawnDetached).toHaveBeenCalledOnce(), { timeout: 10_000 })
+    }))
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   }, 30_000)
 
@@ -214,8 +226,7 @@ describe('shared check slots for behavior launches', () => {
     // A later organization sweep with no deferred work of its own, as the
     // staggered fan-out runs one, must not erase beta's pending retry.
     await runtime.withBehaviorOrganization('Vaquum', () => runtime.runEnabledBehaviorsOnce())
-    for (const release of held) release!()
-    await vi.waitFor(() => expect(mocks.spawnDetached).toHaveBeenCalledOnce(), { timeout: 10_000 })
+    await launchedAfterRetry(() => { for (const release of held) release!() })
     expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
   }, 30_000)
 })

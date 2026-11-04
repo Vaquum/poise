@@ -30,6 +30,11 @@ async function fixture(body: string, options: ConstructorParameters<typeof Behav
   await observer.start()
   return observer
 }
+/** The caller's two-second start and stop budgets at a tenth: these tests only need them to run out. */
+function shortCallerBudgets() {
+  const realSetTimeout = setTimeout
+  vi.spyOn(globalThis, 'setTimeout').mockImplementation(((run: () => void, ms: number, ...rest: []) => realSetTimeout(run, ms === 2_000 ? 200 : ms, ...rest)) as never)
+}
 const workerTiming = { totalMs: 7, readMs: 2, pendingMs: 3, encodeMs: 1, budgetScanMs: .5 }
 function blockedWorker(operation: 'capture' | 'read'): string {
   return `
@@ -385,9 +390,10 @@ describe('bounded behavior ledger transport', () => {
   })
 
   it('closes on the worker when a stop outlasts the drain budget', async () => {
-    // Ten captures at 400ms each can never drain inside the two-second stop
-    // budget, so close must be shed forward and dispatched instead of the
-    // worker being terminated with the queue still full.
+    // Ten captures at 400ms each can never drain inside the stop budget, so
+    // close must be shed forward and dispatched instead of the worker being
+    // terminated with the queue still full.
+    shortCallerBudgets()
     const observer = await fixture(`
       import { appendFileSync } from 'node:fs';
       const order=new URL('./order',import.meta.url);
@@ -575,6 +581,7 @@ describe('bounded behavior ledger transport', () => {
   }, 60000)
 
   it('accepts late readiness after the startup budget without losing queued capture', async () => {
+    shortCallerBudgets()
     const observer = await fixture(`
       import { existsSync, watch } from 'node:fs';
       const release=new URL('./release',import.meta.url);

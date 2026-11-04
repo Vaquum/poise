@@ -1,3 +1,5 @@
+import './fixtures/light-git-gate'
+import './fixtures/workspace-template'
 import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
@@ -57,6 +59,10 @@ async function until(check: () => boolean) {
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) { if (check()) return; await new Promise(done => setTimeout(done, 15)) }
   throw new Error('autobind fixture readiness deadline')
+}
+/** What the next round delivers, without waiting a second for the background's. */
+async function untilDelivered(check: () => boolean) {
+  await until(() => { void control.tick(); return check() })
 }
 async function observeMerge(target: string): Promise<void> {
   await control.tick()
@@ -205,14 +211,14 @@ describe('automatic PR binding through closing references', () => {
     // Past any window a 1s interval tick burned while setup was slow.
     clock += 61_000
     await control.tick()
-    await until(() => prompts.has(worker))
+    await untilDelivered(() => prompts.has(worker))
     expect(prompts.get(worker)).toHaveLength(1)
     // Delivery starts the task turn before the background pass discovers.
-    await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
+    await untilDelivered(() => store.bindings(runtime.instance).some(b => b.target === PR))
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(worker)
     expect(store.bindings(runtime.instance).find(b => b.target === ISSUE)?.session).toBe(worker)
     finishes.get(worker)!({ stopReason: 'end_turn' })
-    await until(() => (prompts.get(worker)?.length ?? 0) === 2)
+    await untilDelivered(() => (prompts.get(worker)?.length ?? 0) === 2)
     expect(prompts.get(worker)![1].text).toContain('failure')
     expect(store.inbox(runtime.instance, worker).some(m => m.event_key.startsWith('ci:'))).toBe(true)
   }, 60_000)
@@ -464,13 +470,13 @@ describe('automatic PR binding through workspace branches', () => {
       threads: [{ thread: 'T_1', resolved: false, outdated: false, comments: [{ id: 'C_1', author: 'reviewer' }] }] })
     clock += 61_000
     await control.tick()
-    await until(() => prompts.has(worker))
-    await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
+    await untilDelivered(() => prompts.has(worker))
+    await untilDelivered(() => store.bindings(runtime.instance).some(b => b.target === PR))
     expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(worker)
     // The worker never called bind: the discovered PR is its only binding.
     expect(store.bindings(runtime.instance).filter(b => b.session === worker)).toHaveLength(1)
     finishes.get(worker)!({ stopReason: 'end_turn' })
-    await until(() => (prompts.get(worker)?.length ?? 0) === 2)
+    await untilDelivered(() => (prompts.get(worker)?.length ?? 0) === 2)
     expect(prompts.get(worker)![1].text).toContain('CHANGES_REQUESTED')
     expect(store.inbox(runtime.instance, worker).some(m => m.event_key.startsWith('reviews:'))).toBe(true)
   }, 60_000)

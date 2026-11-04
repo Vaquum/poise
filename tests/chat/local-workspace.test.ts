@@ -1,3 +1,4 @@
+import '../fixtures/workspace-template'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
@@ -9,6 +10,7 @@ import type { ChatRuntime } from '../../server/chat/runtime'
 import type { ChatEvent } from '../../server/chat/protocol'
 import type { Adapter, TurnResult } from '../../server/chat/adapters/types'
 import { ensureLocalWorkspace } from '../../server/chat/local-workspace'
+import '../fixtures/short-polls'
 
 let root: string, outer: string, Runtime: typeof ChatRuntime, runtime: ChatRuntime
 const resolveCheckout = vi.fn(async () => { throw new Error('must not look up a repository') })

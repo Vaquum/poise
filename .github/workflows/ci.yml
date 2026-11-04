@@ -134,6 +134,9 @@ jobs:
           CI_TEST_MODE: ${{ needs.plan.outputs.mode }}
           CI_TEST_SHARD: ${{ matrix.shard }}
           BASE: ${{ needs.plan.outputs.base }}
+          # These tests commit to SQLite and git constantly; memory-backed temp
+          # files spare them the wait for the disk.
+          TMPDIR: /dev/shm
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:

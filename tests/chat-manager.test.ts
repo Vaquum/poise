@@ -1,3 +1,4 @@
+import './fixtures/workspace-template'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'

@@ -2,6 +2,7 @@
 // server's refusal to run them as turns, transcript recording through the
 // existing routes, and launch-id status. Launches and debates are faked;
 // the routes, the runtime and the durable tables are real.
+import './fixtures/workspace-template'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'

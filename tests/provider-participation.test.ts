@@ -287,8 +287,16 @@ describe('standalone eligibility', () => {
       muse: script('muse'),
       antigravity: withUpdates('antigravity', script('antigravity')),
     })
-    await writeFile(join(bin, 'codex'), `#!${process.execPath}\nconsole.log('codex-cli 0.160.0');\nsetInterval(() => {}, 1000);\n`, { mode: 0o700 })
-    await expect(resolveEligibility(env())).rejects.toThrow(/did not answer within 10 seconds/)
+    const asked = join(home, 'codex-status-asked')
+    await writeFile(join(bin, 'codex'), `#!${process.execPath}\nconst { writeFileSync } = require('node:fs');\nconsole.log('codex-cli 0.160.0');\nwriteFileSync(${JSON.stringify(asked)}, '');\nsetInterval(() => {}, 1000);\n`, { mode: 0o700 })
+    // The status command really runs and hangs; only the 10 seconds are skipped.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const resolving = expect(resolveEligibility(env())).rejects.toThrow(/did not answer within 10 seconds/)
+      while (!existsSync(asked)) await new Promise(resolve => setImmediate(resolve))
+      await vi.advanceTimersByTimeAsync(10_000)
+      await resolving
+    } finally { vi.useRealTimers() }
   }, 30_000)
 })
 

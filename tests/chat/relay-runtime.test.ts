@@ -170,6 +170,21 @@ function requireTurn(receipt: PromptReceipt): { turnId: string } {
   return receipt
 }
 
+/** Date.now with a way to skip what the runtime would only wait out. */
+function skippableClock() {
+  const now = Date.now.bind(Date)
+  let skipped = 0
+  vi.spyOn(Date, 'now').mockImplementation(() => now() + skipped)
+  return (ms: number) => { skipped += ms }
+}
+
+/** Signals that reach nothing: what the runtime signals cannot die, so it
+ *  waits out its kill grace after each one. The clock skips that grace instead. */
+function signalsReachNothing() {
+  const skip = skippableClock()
+  return vi.spyOn(worker, 'signalGroup').mockImplementation(() => { setImmediate(() => skip(5_000)) })
+}
+
 const ofType = (events: ChatEnvelope[], id: string, type: ChatEvent['type']) => events.filter((e) => e.sessionId === id && e.event.type === type).map((e) => e.event as any)
 const lastStatus = (events: ChatEnvelope[], id: string) => ofType(events, id, 'status.changed').at(-1)?.status
 
@@ -377,7 +392,12 @@ describe('relay handover between servers', () => {
     try {
       await second.runtime.recover()
       await waitFor(() => second.controls.replayTurns.length === 1)
-      await second.runtime.stop()
+      // The held replay never ends this turn, so the stop's 2 s only run out.
+      const skip = skippableClock()
+      const stopping = second.runtime.stop()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      skip(2_000)
+      await stopping
       await third.runtime.recover()
       await waitFor(() => third.controls.replayTurns.length === 1)
       const lease = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance })
@@ -530,7 +550,7 @@ describe('relay handover between servers', () => {
     const lock = await import('../../server/chat/checkout-lock')
     const relay = await import('../../server/chat/relay')
     const probe = vi.spyOn(relay, 'attachRelay').mockRejectedValueOnce(new Error('fixture probe unavailable'))
-    const signals = vi.spyOn(worker, 'signalGroup').mockImplementation(() => {})
+    const signals = signalsReachNothing()
     const second = makeRuntime(instance)
     const lease = new lock.CheckoutLease(repo, { ownerKind: 'poise:chat', ownerId: session.id, ownerLabel: '', instance })
     try {
@@ -837,7 +857,7 @@ describe('relay handover between servers', () => {
     // The replay fails, and the agent cannot be signalled: termination
     // fails, so the fallback must keep the lease, the rows and the relay.
     const second = makeRuntime(instance, { hosts: [], adapters: [], auto: true, replayTurns: [], failReplay: 'replay exploded' })
-    const signals = vi.spyOn(worker, 'signalGroup').mockImplementation(() => {})
+    const signals = signalsReachNothing()
     try {
       await second.runtime.recover()
       await waitFor(() => ofType(second.events, session.id, 'turn.finished').length === 1, 30_000)

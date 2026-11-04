@@ -1,3 +1,4 @@
+import '../fixtures/light-git-gate'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
@@ -11,6 +12,7 @@ import type { RelayConnection } from '../../server/chat/relay'
 import { scrubbedChildEnvironment } from '../../server/process'
 import type { CallerTurns } from '../../server/chat/caller-turns'
 import { CATALOG } from '../model-catalog-fixture'
+import '../fixtures/short-polls'
 
 let root = ''
 let repo = ''
@@ -1396,9 +1398,15 @@ describe('worker turn guards', () => {
       const host = controls.hosts[0]
       for (let i = 0; i < 25; i++) emitPoll(host, turnId, `poll-${i}`, 'CHANGES_REQUESTED\n')
     }
+    const now = Date.now.bind(Date)
+    let skipped = 0
+    vi.spyOn(Date, 'now').mockImplementation(() => now() + skipped)
     await runtime.prompt(session.id, { text: 'wait for review', attachments: [], mentions: [] })
     // Neither the abort nor the cancel settles the prompt: the watchdog
-    // terminates the worker group and the turn still ends as end_turn.
+    // terminates the worker group and the turn still ends as end_turn. The
+    // 2 s of Date.now it gives them first only run out.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    skipped = 2_000
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
     const finished = ofType(events, session.id, 'turn.finished')[0]
     expect(finished).toMatchObject({ stopReason: 'end_turn' })

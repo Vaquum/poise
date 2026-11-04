@@ -3,6 +3,7 @@
 // lease and removed when the turn ends. Scripted adapters and an isolated
 // POISE_DB, POISE_EDITOR_DIR and HOME; the voice guide and the review cache
 // are fixtures.
+import './fixtures/workspace-template'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'

@@ -1,3 +1,4 @@
+import './fixtures/workspace-template'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -214,6 +215,10 @@ function putWake(body: unknown, withOrigin = true, contentType = 'application/js
     headers: { 'Content-Type': contentType, ...(withOrigin ? { Origin: origin } : {}) },
     body: typeof body === 'string' ? body : JSON.stringify(body) })
 }
+/** What the next round delivers, without waiting a second for the background's. */
+async function untilDelivered(check: () => boolean) {
+  await until(() => { void control.tick(); return check() })
+}
 async function finishTurn(id: string, result: TurnResult = { stopReason: 'end_turn' }) {
   const finishedBefore = seen.get(id)?.filter(event => event.type === 'turn.finished').length ?? 0
   await until(() => finishes.has(id))
@@ -268,7 +273,7 @@ it('wakes a lone Manager on schedule with its charter and no GitHub reads', asyn
 
   clock += 60 * 60_000
   await control.tick()
-  await until(() => (prompts.get(manager.id) ?? []).length === 1)
+  await untilDelivered(() => (prompts.get(manager.id) ?? []).length === 1)
   const wakeStarts = turnStarts(manager.id).filter(start => start.source?.kind === 'timer')
   expect(wakeStarts).toHaveLength(1)
   expect(wakeStarts[0].source).toMatchObject({ kind: 'timer', label: 'Scheduled wake-up' })
@@ -414,7 +419,7 @@ it('applies a new interval at once, keeps a pending wake, and keeps waking throu
   await finishTurn(manager.id)
   // The pending wake is admitted once the person turn ends.
   await control.tick()
-  await until(() => (prompts.get(manager.id) ?? []).length === 2)
+  await untilDelivered(() => (prompts.get(manager.id) ?? []).length === 2)
   await finishTurn(manager.id)
 
   // Five failing wake turns: no backoff, no trip, each due 5 minutes after
@@ -424,7 +429,7 @@ it('applies a new interval at once, keeps a pending wake, and keeps waking throu
     const failuresBefore = timerNotes(manager.id).filter(note => note.change === 'failed').length
     const warningsBefore = reported('chat.timer.changed').filter(record => (record.context as { change?: string }).change === 'failed').length
     await control.tick()
-    await until(() => (prompts.get(manager.id) ?? []).length === 2 + n)
+    await untilDelivered(() => (prompts.get(manager.id) ?? []).length === 2 + n)
     await finishTurn(manager.id, { stopReason: 'error', error: `wake boom ${n}` })
     const row = store.timerRow(instance, timerId)!
     expect(row.not_before).toBeNull()
@@ -442,7 +447,7 @@ it('applies a new interval at once, keeps a pending wake, and keeps waking throu
   // The successful wake at T0+91m clears the failure.
   clock = t0 + 91 * 60_000
   await control.tick()
-  await until(() => (prompts.get(manager.id) ?? []).length === 8)
+  await untilDelivered(() => (prompts.get(manager.id) ?? []).length === 8)
   await finishTurn(manager.id)
   expect((await wakeView()).lastFailure).toBeNull()
 
@@ -494,7 +499,7 @@ it('does not let the Manager or the timers panel cancel, re-arm or retime the sc
   // A failed wake turn still leaves nothing to re-arm: the wake-up never trips.
   clock += 60 * 60_000
   await control.tick()
-  await until(() => (prompts.get(manager.id) ?? []).length === 1)
+  await untilDelivered(() => (prompts.get(manager.id) ?? []).length === 1)
   await finishTurn(manager.id, { stopReason: 'error', error: 'wake boom' })
   expect(store.timerById(instance, timerId)!.state).toBe('active')
   const socketRearm = await wsCommand({ type: 'timer.rearm', timerId })
@@ -583,7 +588,7 @@ it('keeps the tick delivering when the wake setting is unreadable', async () => 
   await control.tick()
   await control.tick()
 
-  await until(() => (prompts.get(chat.id) ?? []).length === 1)
+  await untilDelivered(() => (prompts.get(chat.id) ?? []).length === 1)
   expect(prompts.get(chat.id)!.at(-1)!.text).toContain('Ordinary work')
   expect(lines.filter(line => line.startsWith('[chat control] wake schedule sync failed:'))).toHaveLength(1)
   expect(reported('chat.manager.wake.sync_failed')).toHaveLength(1)
@@ -612,7 +617,7 @@ it('counts the wake timer apart from the timer slots', async () => {
   for (let n = 1; n <= 2; n++) {
     clock += 5 * 60_000
     await control.tick()
-    await until(() => turnStarts(manager.id).filter(start => start.source?.kind === 'timer'
+    await untilDelivered(() => turnStarts(manager.id).filter(start => start.source?.kind === 'timer'
       && (start.source as { timerId?: string }).timerId === pulse.id).length === n)
     await finishTurn(manager.id)
   }
@@ -628,7 +633,7 @@ it('counts the wake timer apart from the timer slots', async () => {
   for (let n = 1; n <= 3; n++) {
     clock += 5 * 60_000
     await control.tick()
-    await until(() => wakeStarts() === n)
+    await untilDelivered(() => wakeStarts() === n)
     await finishTurn(manager.id)
   }
   expect((await wakeView()).wakesLast24h).toBe(3)

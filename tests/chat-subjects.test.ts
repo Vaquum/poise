@@ -1,6 +1,7 @@
 // One session per subject: creation, races, validation, hand-off, fork,
 // reset and delete. The earlier conversation is empty here; its import is
 // covered in tests/chat-legacy-import.test.ts.
+import './fixtures/workspace-template'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'

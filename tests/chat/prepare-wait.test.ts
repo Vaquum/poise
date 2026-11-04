@@ -2,6 +2,8 @@
 // and in the stored record, a blocked step fails named within its budget,
 // and Stop reaches the awaited work without a late prompt starting.
 
+import '../fixtures/light-git-gate'
+import '../fixtures/workspace-template'
 import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
@@ -57,6 +59,25 @@ vi.mock('../../server/process', async (importOriginal) => {
 /** Let every parked subprocess call through to the real runner, and stop
  *  parking new ones. A turn parked mid-preparation advances; a turn whose
  *  cleanup parked finishes, so the runtime can stop. */
+/** A preparation budget the test expires itself once the turn has reached the
+ *  step under test, instead of waiting it out. Like the real timer, it does
+ *  nothing once the runtime has cleared it. */
+function expiringBudget(ms: number): () => void {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  let budget: { run: () => void, timer: ReturnType<typeof setTimeout> } | undefined
+  vi.spyOn(globalThis, 'setTimeout').mockImplementation(((run: () => void, delay: number, ...rest: []) => {
+    if (delay !== ms) return realSetTimeout(run, delay, ...rest)
+    const timer = realSetTimeout(() => {}, 0)
+    budget = { run, timer }
+    return timer
+  }) as never)
+  vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((timer: Parameters<typeof clearTimeout>[0]) => {
+    if (timer === budget?.timer) budget = undefined
+    realClearTimeout(timer)
+  }) as never)
+  return () => budget?.run()
+}
+
 function unhang(): void {
   stubs.hangCommands.clear()
   stubs.hangGitFirstArgs.clear()
@@ -367,6 +388,7 @@ describe('queued preparation waits', () => {
   it('fails a never-settling settings wait within budget and ignores its late settlement', async () => {
     const controls = controllableAdapter()
     const runtime = makeRuntime(controls, { budgets: { totalMs: 3_000 } })
+    const expireBudget = expiringBudget(3_000)
     const record = await idleSession(runtime, 'stuck settings')
     let releaseSafeMode!: (value: 'current_turn') => void
     controls.setSafeModeImpl(() => new Promise((resolve) => { releaseSafeMode = resolve }))
@@ -377,6 +399,7 @@ describe('queued preparation waits', () => {
     await until(() => controls.safeModeCalls.length === 1)
     unhang()
     await until(() => runtime.get(record.id)?.queuedBehind === 'applying pending settings')
+    expireBudget()
     await until(() => finished(runtime, record.id).length === 1)
     expect(finished(runtime, record.id)[0]).toMatchObject({ stopReason: 'error' })
     expect(finished(runtime, record.id)[0].error).toContain("preparation timed out during 'applying pending settings'")
@@ -396,6 +419,7 @@ describe('queued preparation waits', () => {
   it('aborts a settings restart inside its startup checkout work', async () => {
     const controls = controllableAdapter()
     const runtime = makeRuntime(controls, { budgets: { totalMs: 3_000 } })
+    const expireBudget = expiringBudget(3_000)
     const record = await idleSession(runtime, 'restart settings')
     controls.setSafeModeImpl(async () => 'next_turn')
     // Park the turn in its queued window, then defer safe mode mid-turn so
@@ -414,6 +438,7 @@ describe('queued preparation waits', () => {
     // the re-armed read. (The settings label itself shows only until the
     // restart flips to starting, so the event sequence pins it below.)
     await until(() => runtime.get(record.id)?.status === 'starting')
+    expireBudget()
     await until(() => finished(runtime, record.id).length === 1)
     expect(finished(runtime, record.id)[0]).toMatchObject({ stopReason: 'error' })
     expect(finished(runtime, record.id)[0].error).toContain("preparation timed out during 'applying pending settings'")
