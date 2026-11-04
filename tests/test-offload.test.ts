@@ -391,7 +391,8 @@ describe('on a test instance, a command for the whole suite', () => {
   })
 
   it('stays whole when the change can touch anything, or names nothing it can place', () => {
-    for (const later of [{ 'conftest.py': 'x = 1\n' }, { '__init__.py': 'x = 1\n' }, { 'data/rates.json': '{}\n' }, { 'src/nothing_mentions_me.py': 'x = 1\n' }]) {
+    const changes: Record<string, string>[] = [{ 'conftest.py': 'x = 1\n' }, { '__init__.py': 'x = 1\n' }, { 'data/rates.json': '{}\n' }, { 'src/nothing_mentions_me.py': 'x = 1\n' }]
+    for (const later of changes) {
       const { repo, since } = changed(FILES, later)
       expect(pytest(repo, ['-q'], since).seen?.args).toEqual(['-q'])
     }
