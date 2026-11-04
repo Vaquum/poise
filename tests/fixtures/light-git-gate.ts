@@ -2,7 +2,7 @@
 // far more than the command. In test files that do not test the gate, a shell
 // takes its place for git alone and keeps its protocol: nothing runs before `GO`
 // on the control descriptor, and losing the descriptor ends it. Agents and all
-// other commands keep the real gate, and tests/chat/worker-gate-path.test.ts and
+// other commands keep the real gate, and tests/chat/local-workspace.test.ts and
 // tests/chat/git-abort.test.ts keep it for git.
 import { vi } from 'vitest'
 
