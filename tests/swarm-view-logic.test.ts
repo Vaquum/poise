@@ -21,6 +21,7 @@ type Helpers = {
   quarantineDescription: (e: any) => string
   groupRuns: (entries: any[]) => Array<{ key: string, entries: any[] }>
   statusLook: (e: any) => { icon: string, tone: string, word: string, detail: string, quiet?: boolean }
+  mainRowInnerHTML: (e: any, state: any) => string
   stopIcon: string
 }
 
@@ -30,7 +31,7 @@ async function loadHelpers(): Promise<Helpers> {
   // otherwise only reachable through a DOM input event.
   const patched = source + `
 export const __test = {
-  sessionLabel, targetText, matchesSearch, startedAtMs, elapsedText, hasDetail, progressText, progressDetail, quarantineDescription, groupRuns, statusLook,
+  sessionLabel, targetText, matchesSearch, startedAtMs, elapsedText, hasDetail, progressText, progressDetail, quarantineDescription, groupRuns, statusLook, mainRowInnerHTML,
   stopIcon: ICON_STOPPED,
   setSearch: (q: string) => { searchQuery = q },
 }
@@ -177,6 +178,30 @@ describe('the filter matches what the column shows', () => {
     helpers.setSearch('changes_requested')
     expect(helpers.matchesSearch(entry({ outcome: 'changes_requested' }))).toBe(true)
     helpers.setSearch('')
+  })
+})
+
+// A native chain step's raw model and behavior say nothing about what it did,
+// and only the real rendered cells prove the row shows anything else.
+describe('a native chain step names its command and shows no model', () => {
+  const cells = (e: any) => {
+    const state = { open: false, group: '', status: '', started: '', elapsed: '', replay: '', stop: '' }
+    const [model, behavior] = [...helpers.mainRowInnerHTML(e, state).matchAll(/<td>(.*?)<\/td>/g)].map((cell) => cell[1].replace(/<[^>]+>/g, ''))
+    return { model, behavior }
+  }
+
+  it.each([
+    ['native_action', '--merge-if-ready', 'merge-if-ready'],
+    ['native_action', '--resolve-nonblocking-conversations-if-ready', 'resolve-nonblocking-conversations-if-ready'],
+    ['native_action', '--rerun-grey-ci-if-ready', 'rerun-grey-ci-if-ready'],
+    ['native_action', '--issue-work', 'publication'],
+    ['native_publication', 'Complete original repair publication', 'publication'],
+  ])('%s %s reads %s', (behavior, prompt, label) => {
+    expect(cells(entry({ model: 'native-action', behavior, prompt }))).toEqual({ model: '—', behavior: label })
+  })
+
+  it('leaves a model run as it was', () => {
+    expect(cells(entry({ behavior: 'pr_review', recovery_model: 'grok-4', prompt: '--merge-if-ready' }))).toEqual({ model: 'opus-5 → grok-4', behavior: 'pr_review' })
   })
 })
 
