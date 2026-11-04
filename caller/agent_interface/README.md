@@ -354,7 +354,9 @@ after this Caller version is installed.
 Governed reviews share one 1,413-second budget across packet preparation, model
 execution, recovery, and GitHub verification. This is the longest of 962 completed
 calls measured on 2026-09-13 (1,283.662532 seconds), plus 10%, rounded up. Opus uses
-the catalog's review effort and an explicit 64,000-output-token limit in the trusted CLI settings.
+the catalog's review effort and an explicit 128,000-output-token limit in the trusted CLI settings.
+The limit applies per response. `pr_approve` has no inspection tool, so all its reasoning
+is one response, and Claude Code restarts a response cut at the limit without that reasoning.
 Other behaviors retain their existing model assignments and limits.
 
 A Grok Build `pr_review` or `pr_approve` also has an 800-second analysis ceiling,
@@ -366,6 +368,9 @@ providers and Grok issue reviews are unchanged.
 
 On an Opus output-limit error or a repeat-only publication refusal, Caller can recover
 once with the recovery model using the same immutable packet and remaining budget.
+Claude Code reports the output-limit error only on a fourth cut. At about 110 tokens per
+second, Opus's rate measured on 2026-11-04, the budget ends first, so a review whose
+responses keep reaching the limit ends at the time limit and does not recover.
 GitHub must first confirm the same open head and no new or pending reviewer action.
 A verified completed action is adopted instead. Ambiguous activity, time exhaustion,
 or failed recovery leaves a typed failure for Poise to retain without automatically
@@ -500,7 +505,9 @@ for the artifact early; a timeout records the artifact's presence, size and
 readability in the diagnostic and never posts late work. A posting timeout is
 reconciled through the call marker before it counts as a failure, and stays
 uncertain until then. A Claude output limit before posting recovers once with
-the recovery model in a new checkout. github-interface runs in its own process
+the recovery model in a new checkout, though at Opus's measured rate the fourth
+cut that reports it comes after the 3,600-second limit, as under
+[Review limits and recovery](#review-limits-and-recovery). github-interface runs in its own process
 group, so a timeout also ends the git it started; a mirror left broken is
 cloned afresh once. `--models` lists `issue_review_providers`.
 
