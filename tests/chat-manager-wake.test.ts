@@ -1,3 +1,4 @@
+import './fixtures/workspace-template'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'

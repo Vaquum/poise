@@ -1,3 +1,4 @@
+import './fixtures/workspace-template'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'

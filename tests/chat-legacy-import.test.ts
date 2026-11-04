@@ -2,6 +2,7 @@
 // the first message creates its session, and quoted to the first native
 // turn only. Caller's log is faked at the process boundary; the runtime,
 // git workspaces and scripted adapters are real.
+import './fixtures/workspace-template'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'

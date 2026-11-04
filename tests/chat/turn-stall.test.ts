@@ -2,6 +2,7 @@
 // unpushed commits, uncommitted changes and still-running background jobs
 // flag the chat as stalled, and the monitor cycle wakes it once per episode.
 
+import '../fixtures/workspace-template'
 import { spawnSync } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'

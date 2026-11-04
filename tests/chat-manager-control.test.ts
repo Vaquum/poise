@@ -3,6 +3,7 @@
 // handleChatApi with the real person flag, the real ChatRuntime and SQLite,
 // the real native command for api calls, and scripted adapters for all four
 // agents. No live provider or GitHub calls.
+import './fixtures/workspace-template'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
