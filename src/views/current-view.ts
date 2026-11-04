@@ -116,6 +116,9 @@ interface IssueIntake {
 let issueIntake: IssueIntake | null = null
 // Confirmed assignments stay visible while the polling datastore catches up.
 const assignedIssues = new Map<string, number>()
+// Assignments GitHub has not answered. Kept here, not on the button, because a
+// repaint rewrites the button's attributes and can replace the button.
+const assigningIssues = new Set<string>()
 // Tick listener installed on view init; removed via stopCurrentPolling()
 // when navigating away. Single shared clock — see startRefreshTicker().
 const onLiveTick = () => pollLiveTick()
@@ -330,9 +333,12 @@ function intakeRow(item: LiveItem): string {
   if (issueIntake.unknownOrgs.has(item.repo.split('/')[0].toLowerCase())) return ''
   const key = prKey(item).toLowerCase()
   const { label } = issueIntake
+  // aria-disabled, not disabled, which blurs the button: whether focus is still
+  // on it is how assignIssue knows that the user has not moved on.
+  const waiting = assigningIssues.has(key) ? ' aria-disabled="true"' : ''
   const labelState = !label ? ''
     : issueIntake.labelled.has(key) || assignedIssues.has(key) ? `<span class="card-intake-label" title="Carries the behavior chain's intake label">${escapeHtml(label)}</span>`
-    : `<button class="card-assign-btn" aria-label="Assign to Poise: ${escapeHtml(item.repo)}#${item.number}" title="Add the ${escapeHtml(label)} label on GitHub">Assign to Poise</button>`
+    : `<button class="card-assign-btn"${waiting} aria-label="Assign to Poise: ${escapeHtml(item.repo)}#${item.number}" title="Add the ${escapeHtml(label)} label on GitHub">Assign to Poise</button>`
   const prs = issueIntake.prs[key] ?? []
   const prState = prs.length
     ? prs.map((pr) => `<a class="card-intake-pr" href="${safeHttpsUrl(pr.url)}" target="_blank" rel="noopener" title="Open pull request that closes this issue">PR #${pr.number}</a>`).join('')
@@ -749,10 +755,11 @@ function paintIssueCards() {
 
 async function assignIssue(item: LiveItem, button: HTMLButtonElement): Promise<void> {
   const key = prKey(item)
+  const stateKey = key.toLowerCase()
+  if (assigningIssues.has(stateKey)) return
   const reportError = (message: string) => viewFeedback(`current-assign:${key}`, 'Current action needs attention', message, 'action_needed')
-  // Not the disabled property, which blurs the button: whether focus is still
-  // on it is how the answer below knows that the user has not moved on.
-  button.setAttribute('aria-disabled', 'true')
+  assigningIssues.add(stateKey)
+  paintIssueCards()
   reportError('')
   try {
     const res = await fetch('/api/gh', {
@@ -762,7 +769,8 @@ async function assignIssue(item: LiveItem, button: HTMLButtonElement): Promise<v
     })
     const data = await res.json() as { error?: string }
     if (!res.ok) throw new Error(data.error || `/api/gh ${res.status}`)
-    assignedIssues.set(key.toLowerCase(), Date.now())
+    assigningIssues.delete(stateKey)
+    assignedIssues.set(stateKey, Date.now())
     const cardEl = button.closest<HTMLElement>('.card')
     const focused = document.activeElement === button
     paintIssueCards()
@@ -770,7 +778,8 @@ async function assignIssue(item: LiveItem, button: HTMLButtonElement): Promise<v
     // answer can take a minute, so anyone elsewhere is left where they are.
     if (focused) cardEl?.querySelector<HTMLElement>('.card-link')?.focus({ preventScroll: true })
   } catch (error) {
-    button.removeAttribute('aria-disabled')
+    assigningIssues.delete(stateKey)
+    paintIssueCards()
     reportError(`Could not assign ${key} to Poise — ${(error as Error).message}`)
   }
 }
@@ -1809,7 +1818,7 @@ function attachCardClickHandlers() {
       e.stopPropagation()
       const key = assignBtn.closest<HTMLElement>('.card')?.dataset.id
       const item = liveItems.find(candidate => prKey(candidate) === key && candidate.is_pr === 0)
-      if (item && assignBtn.getAttribute('aria-disabled') !== 'true') void assignIssue(item, assignBtn)
+      if (item) void assignIssue(item, assignBtn)
       return
     }
 

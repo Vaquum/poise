@@ -137,6 +137,52 @@ test('does not scroll back to the card when GitHub answers', async ({ page }) =>
   expect((await link.boundingBox())?.y).toBeLessThan(0)
 })
 
+test('sends one assignment however the card repaints before GitHub answers', async ({ page }) => {
+  const state = await setup(page)
+  const answer = hold(state, 1)
+  const button = assignButton(page, 1)
+  await button.click()
+
+  // The new pull request proves the intake read repainted the card.
+  state.intake = { ...INTAKE, prs: { ...INTAKE.prs, 'acme/project#1': [{ number: 10, url: 'https://github.com/acme/Project/pull/10' }] } }
+  await tick(page)
+  await expect(card(page, 'Unassigned issue').getByRole('link', { name: 'PR #10', exact: true })).toBeVisible()
+  await expect(button).toBeDisabled()
+  await button.click({ force: true })
+
+  // A failed read removes the row, so the button that comes back is a new element.
+  state.intake = 500
+  await tick(page)
+  await expect(button).toHaveCount(0)
+  state.intake = INTAKE
+  await tick(page)
+  await expect(button).toBeDisabled()
+  await button.click({ force: true })
+
+  answer()
+  await expect(card(page, 'Unassigned issue').locator('.card-intake-label')).toHaveText('poise')
+  await expect(await feedback(page, 'Current action needs attention')).toHaveCount(0)
+  expect(state.assigns).toHaveLength(1)
+})
+
+test('makes a repainted control available again when the assignment fails', async ({ page }) => {
+  const state = await setup(page)
+  state.assignStatus = 502
+  const answer = hold(state, 1)
+  const button = assignButton(page, 1)
+  await button.click()
+  state.intake = 500
+  await tick(page)
+  await expect(button).toHaveCount(0)
+  state.intake = INTAKE
+  await tick(page)
+  await expect(button).toBeDisabled()
+
+  answer()
+  await expect(await feedback(page, 'Current action needs attention')).toContainText('Could not assign acme/Project#1 to Poise')
+  await expect(button).toBeEnabled()
+})
+
 test('reports a failed assignment and leaves the control available', async ({ page }) => {
   const state = await setup(page)
   state.assignStatus = 502
