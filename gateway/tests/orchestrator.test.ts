@@ -103,6 +103,15 @@ describe('lazy start', () => {
     expect(actual.sort()).toEqual(Object.entries(desired).map(([key, value]) => `${key}=${value}`).sort())
   })
 
+  it('installs the test offload ahead of a first workspace, which installs no release', async () => {
+    const cookie = await start({ env: { POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_BASE_SERVICE: 'crn-x' } })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(h.docker.tasks.map((task) => task.name)).toEqual(['poise-test-offload-alice'])
+    expect((h.docker.tasks[0].spec as { Env: string[] }).Env).toContainEqual(expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\./))
+    expect(h.docker.containers.has('poise-ws-alice')).toBe(true)
+  })
+
   it('creates the workspace on first request behind a starting page, then proxies to it', async () => {
     const cookie = await start()
     const first = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
@@ -1105,14 +1114,6 @@ describe('updates in place', () => {
     // The relay's address and this workspace's own key, and never the Render key.
     expect(env).toEqual(['HOME=/home/poise', expect.stringMatching(/^POISE_TEST_RELAY_URL=https?:\/\/alice\..+\/api\/link\/test-relay$/), expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\.[\w-]+$/)])
     expect(env.join('\n')).not.toContain('render-key')
-  })
-
-  it('installs the test offload ahead of a first workspace, which installs no release', async () => {
-    h = await startHarness({ env: { POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_BASE_SERVICE: 'crn-x' } })
-    await h.openWorkspace('Alice')
-    expect(offloadTasks()).toHaveLength(1)
-    expect(releaseTasks()).toHaveLength(0)
-    expect((offloadTasks()[0].spec as { Env: string[] }).Env).toContainEqual(expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\./))
   })
 
   it('takes a new release even when installing the test offload fails, and reports it', async () => {
