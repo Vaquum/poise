@@ -1634,7 +1634,7 @@ function recordQuarantineIncident(claim: BehaviorLaunchClaim, error: string, cal
   const updated = db.prepare(`
     UPDATE behavior_dead_letters SET error = ?, call_id = COALESCE(call_id, ?)
     WHERE behavior = ? AND target = ? AND correlation_id = ? AND retired_at IS NULL
-  `).run(error, callId, claim.key, claim.target, claim.launchCorrelationId)
+  `).run(error.slice(-4_000), callId, claim.key, claim.target, claim.launchCorrelationId)
   if (!updated.changes) recordBehaviorDeadLetter(claim, error, callId)
 }
 
@@ -1844,8 +1844,7 @@ function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry |
         AND launch_outcome IS NULL
     `).run(message, claim.key, claim.target, claim.launchCallId, claim.launchCorrelationId, claim.launchRequestedAt)
     if (!changed.changes) return
-    retireQuarantineIncident(claim)
-    recordBehaviorDeadLetter(claim, message, call.id)
+    recordQuarantineIncident(claim, message, call.id)
     const retryFailure = claim.key === ISSUES_KEY
       ? call.error_code !== 'stopped' && (call.receipts != null || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))
       : (!boundedReviewFailure(call) || budgetExhaustedProvenNoAction(call)) && call.error_code !== 'review_packet_too_large'

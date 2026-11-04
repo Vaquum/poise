@@ -934,9 +934,16 @@ describe('Review New Issues sub-issues', () => {
     const { behaviors, database } = await start()
     issues = [issue(500)]
     await behaviors.runEnabledBehaviorsOnce()
-    agentLogs = [finished(ref(500), { status: 'failed', error: 'provider exited without action' })]
+    agentLogs = [finished(ref(500), { status: 'failed', error: `${'x'.repeat(4_000)} provider exited without action` })]
     await resetLogCache()
     await behaviors.runEnabledBehaviorsOnce()
+    const held = () => ({
+      letters: database.db.prepare('SELECT id, created_at, error, call_id, retired_at FROM behavior_dead_letters').all(),
+      alerts: database.db.prepare("SELECT id, created_at, resolved_at FROM alerts WHERE kind = 'behavior_held'").all(),
+    })
+    const before = held()
+    expect(before.letters).toHaveLength(1)
+    expect(before.alerts).toHaveLength(1)
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, ...rest) => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
@@ -950,6 +957,8 @@ describe('Review New Issues sub-issues', () => {
     await behaviors.runEnabledBehaviorsOnce()
     expect(database.getFailedBehaviorLaunch(KEY, ref(500))?.launchQuarantine).toBeNull()
     expect(database.countBehaviorDeadLetters(KEY, ref(500))).toBe(1)
+    // The same failure coming back is not news: same record, same time, same notice.
+    expect(held()).toEqual(before)
     expect(launches().map((args) => args[1])).toEqual([ref(500), ref(501)])
     skipBackoff()
     await behaviors.runEnabledBehaviorsOnce()
