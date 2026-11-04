@@ -40,6 +40,7 @@ describe('configuration', () => {
       workspaceNanoCpus: 4_000_000_000,
       workspacePids: 4096,
       behaviorResourceEnv: [],
+      testRelay: null,
       workspaceRuntime: null,
       workspaceDns: [],
       workspaceSkipCliBootstrap: false,
@@ -109,6 +110,17 @@ describe('configuration', () => {
         .toEqual([`${budget}=10`,`${reservation}=2`])
       expect(loadConfig({ ...BASE, [reservation]:'0' }).behaviorResourceEnv).toEqual([`${reservation}=0`])
     }
+  })
+
+  it('takes the test relay\'s Render settings as a pair', () => {
+    const pair = { POISE_TEST_RENDER_API_KEY: 'k', POISE_TEST_BASE_SERVICE: 'crn-x' }
+    expect(loadConfig({ ...BASE, ...pair }).testRelay).toEqual({ renderApiKey: 'k', baseService: 'crn-x', plan: 'plan-crn-003', limitSeconds: 3600, maxRuns: 30 })
+    expect(loadConfig({ ...BASE, ...pair, POISE_TEST_PLAN: 'plan-crn-007', POISE_TEST_LIMIT_SECONDS: '60', POISE_TEST_MAX_RUNS: '2' }).testRelay)
+      .toMatchObject({ plan: 'plan-crn-007', limitSeconds: 60, maxRuns: 2 })
+    const together = 'POISE_TEST_RENDER_API_KEY and POISE_TEST_BASE_SERVICE must be set together, or both left unset'
+    expect(problems({ ...BASE, POISE_TEST_RENDER_API_KEY: 'k' })).toContain(together)
+    expect(problems({ ...BASE, POISE_TEST_BASE_SERVICE: 'crn-x' })).toContain(together)
+    expect(problems({ ...BASE, ...pair, POISE_TEST_LIMIT_SECONDS: 'soon' })).toContainEqual(expect.stringContaining('POISE_TEST_LIMIT_SECONDS'))
   })
 
   it('refuses a POISE_ADMINS that names nobody', () => {
