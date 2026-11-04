@@ -1,5 +1,7 @@
 from typing import Any
 
+import httpx
+
 from github_interface.client import GitHubClient
 from github_interface.atoms.review_identity import invocation_body
 
@@ -131,6 +133,28 @@ async def list_reviews(client: GitHubClient, owner: str, repo: str, pull_number:
     return await client.paginate(f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews")
 
 
+# GitHub can answer a review POST late, so its read alone waits past the client's
+# default. Keep it small: bash_guard marks a submission uncertain only when the
+# command returns, so a command killed by the Bash tool's 2-minute default leaves
+# a reviewer free to POST again. --approve-pr can first spend about 81 s on retried
+# reads, so 30 s fits inside those 2 minutes and 60 s does not.
+_REVIEW_POST_TIMEOUT = httpx.Timeout(10.0, read=30.0)
+
+
+async def _post_review(
+    client: GitHubClient,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    review: dict[str, Any],
+) -> dict[str, Any]:
+    return await client.post(
+        f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
+        json=review,
+        timeout=_REVIEW_POST_TIMEOUT,
+    )
+
+
 async def request_changes(
     client: GitHubClient,
     owner: str,
@@ -147,10 +171,7 @@ async def request_changes(
     }
     if comments:
         review["comments"] = comments
-    return await client.post(
-        f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
-        json=review,
-    )
+    return await _post_review(client, owner, repo, pull_number, review)
 
 
 async def comment_review(
@@ -161,9 +182,12 @@ async def comment_review(
     commit_id: str,
     body: str,
 ) -> dict[str, Any]:
-    return await client.post(
-        f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
-        json={"event": "COMMENT", "body": invocation_body(body, commit_id), "commit_id": commit_id},
+    return await _post_review(
+        client,
+        owner,
+        repo,
+        pull_number,
+        {"event": "COMMENT", "body": invocation_body(body, commit_id), "commit_id": commit_id},
     )
 
 
@@ -419,10 +443,7 @@ async def approve_pr(
 ) -> dict[str, Any]:
     body = invocation_body(body, commit_id)
     payload = {"event": "APPROVE", "commit_id": commit_id, "body": body}
-    return await client.post(
-        f"/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
-        json=payload,
-    )
+    return await _post_review(client, owner, repo, pull_number, payload)
 
 
 async def resolve_conversation(client: GitHubClient, thread_id: str) -> dict[str, Any]:

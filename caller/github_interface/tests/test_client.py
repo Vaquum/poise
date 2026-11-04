@@ -98,6 +98,13 @@ class TestClientRetrySemantics(IsolatedAsyncioTestCase):
             await self.client.post("/repos/o/r/pulls/1/reviews", json={"event": "APPROVE"})
         self.assertEqual(len(self.calls), 1)
 
+    async def test_post_is_single_attempt_on_read_timeout(self) -> None:
+        self.script.extend([httpx.ReadTimeout("slow"), _response(200)])
+
+        with self.assertRaises(httpx.ReadTimeout):
+            await self.client.post("/repos/o/r/pulls/1/reviews", json={"event": "APPROVE"})
+        self.assertEqual(len(self.calls), 1)
+
     async def test_post_is_single_attempt_on_transient_status(self) -> None:
         self.script.extend([_response(502), _response(200)])
 
