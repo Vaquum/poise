@@ -158,8 +158,8 @@ export class DiagnosticStore {
       // Release payload/index pages before allocating their smaller tombstones.
       const expired = this.db.prepare("DELETE FROM log_events WHERE ingested_at < ? RETURNING id,workspace,visibility,strftime('%Y-%m-%dT%H:%M:%fZ',ingested_at,?) AS expired_at")
         .all(cutoff, `+${this.policy.retentionMs / 1000} seconds`) as ExpiredRow[]
+      this.evict(reserve, expired.length * 1024)
       this.rememberExpired(expired)
-      this.evict(reserve)
       this.db.prepare('DELETE FROM log_expired WHERE id IN (SELECT id FROM log_expired ORDER BY expired_at DESC,id DESC LIMIT -1 OFFSET ?)').run(Math.max(1, Math.min(this.policy.maxEvents * 2, Math.floor(this.policy.maxBytes / 1024))))
     })()
   }
@@ -169,7 +169,7 @@ export class DiagnosticStore {
     for (const row of rows) insert.run(row.id, row.workspace, row.visibility, row.expired_at)
   }
 
-  private evict(reserve: number): void {
+  private evict(reserve: number, pendingExpiryBytes = 0): void {
     let { count, bytes } = this.db.prepare('SELECT count,bytes FROM log_usage WHERE id=1').get() as { count: number; bytes: number }
     const pageSize = this.db.pragma('page_size', { simple: true }) as number
     const pageLimit = this.db.pragma('max_page_count', { simple: true }) as number
@@ -177,7 +177,7 @@ export class DiagnosticStore {
     const expired: ExpiredRow[] = []
     // Logical bytes omit SQLite fragmentation and tombstone/index overhead.
     // Keep write headroom without raising the physical page ceiling.
-    const headroom = reserve * 2 + MAX_COVERAGE_RECORD_BYTES * 2
+    const headroom = reserve * 2 + MAX_COVERAGE_RECORD_BYTES * 2 + pendingExpiryBytes
     while (bytes + reserve > this.policy.maxBytes || count + (reserve ? 1 : 0) > this.policy.maxEvents || available() < headroom + expired.length * 1024) {
       const oldest = this.db.prepare('SELECT id,workspace,visibility,bytes FROM log_events ORDER BY ingested_at,seq LIMIT 1').get() as { id: string; workspace: string | null; visibility: string; bytes: number } | undefined
       if (!oldest) break
