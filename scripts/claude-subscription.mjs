@@ -10,8 +10,8 @@ import {
   rmSync,
   statSync,
 } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // Claude settings can inject provider credentials after the parent process
@@ -199,6 +199,13 @@ const inheritedEnv = subscriptionLogin ? [...SAFE_ENV, ...LOGIN_ENV] : SAFE_ENV
 const env = Object.fromEntries(inheritedEnv
   .filter((key) => process.env[key] !== undefined)
   .map((key) => [key, process.env[key]]))
+// Poise's hooks that take agents' test suites off the workspace (docs/Operating.md, "Agents' test suites").
+// Nothing else on these variables may reach the CLI, so they pass only with the hooks on them.
+if ((process.env.PYTHONPATH ?? '').split(delimiter).includes(join(homedir(), '.poise', 'test-offload'))) {
+  for (const key of ['PYTHONPATH', 'NODE_OPTIONS', 'BASH_DEFAULT_TIMEOUT_MS', 'BASH_MAX_TIMEOUT_MS']) {
+    if (process.env[key] !== undefined) env[key] = process.env[key]
+  }
+}
 env.CLAUDE_CLI = wrapperPath
 env.CLAUDE_CODE_MAX_RETRIES = '0'
 env.CLAUDE_CODE_RETRY_WATCHDOG = ''
