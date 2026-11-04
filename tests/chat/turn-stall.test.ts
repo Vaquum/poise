@@ -235,8 +235,8 @@ describe('turn stall detection and waking', () => {
 
     // The same leftover never wakes again: no nag loop.
     await control.tick()
-    await new Promise((r) => setTimeout(r, 1_500))
     await control.tick()
+    await new Promise((r) => setTimeout(r, 500))
     expect(owned.prompts.length).toBe(2)
     await runtime.stop({ handover: false })
   }, 40_000)
@@ -309,8 +309,8 @@ describe('turn stall detection and waking', () => {
 
     // Each notice fires once: no completion replay, no nag loop.
     await control.tick()
-    await new Promise((r) => setTimeout(r, 1_500))
     await control.tick()
+    await new Promise((r) => setTimeout(r, 500))
     expect(owned.prompts.length).toBe(3)
     await runtime.stop({ handover: false })
   }, 40_000)
@@ -480,8 +480,8 @@ describe('turn stall detection and waking', () => {
     finishManual(owned)
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 2)
     await control.tick()
-    await new Promise((r) => setTimeout(r, 1_500))
     await control.tick()
+    await new Promise((r) => setTimeout(r, 500))
     expect(owned.prompts.length).toBe(2)
 
     // When the exec'd program really exits, its completion wakes once.
@@ -538,8 +538,8 @@ describe('turn stall detection and waking', () => {
     // No wake follows: the monitor cycle finds nothing to report.
     const control = await makeControl(runtime)
     await control.tick()
-    await new Promise((r) => setTimeout(r, 1_500))
     await control.tick()
+    await new Promise((r) => setTimeout(r, 500))
     expect(owned.prompts.length).toBe(1)
 
     process.kill(slept.pid, 'SIGTERM')
@@ -634,8 +634,8 @@ describe('turn stall detection and waking', () => {
 
     // Each notice fires once: no completion replay, no nag loop.
     await control.tick()
-    await new Promise((r) => setTimeout(r, 1_500))
     await control.tick()
+    await new Promise((r) => setTimeout(r, 500))
     expect(owned.prompts.length).toBe(5)
     spawnSync('rm', ['-f', fifo1, fifo2])
     await runtime.stop({ handover: false })
@@ -871,8 +871,8 @@ describe('turn stall detection and waking', () => {
     await waitFor(() => runtime.get(source.id)?.stall === undefined)
     const seenSource = owned.adapters[0].seen.length
     await control.tick()
-    await new Promise((r) => setTimeout(r, 1_500))
     await control.tick()
+    await new Promise((r) => setTimeout(r, 500))
     expect(owned.adapters[0].seen.length).toBe(seenSource)
     await runtime.stop({ handover: false })
   }, 40_000)
