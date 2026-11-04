@@ -175,14 +175,17 @@ class TestReceiptRecording(TestCase):
         call_id = uuid4().hex
         with sqlite3.connect(api.DB) as conn:
             conn.execute("update calls set id=? where id='run'", (call_id,))
-        with patch.dict(os.environ, {"AGENT_INTERFACE_RECEIPT_DB": str(api.DB), "AGENT_INTERFACE_RECEIPT_CALL": call_id}):
+        with patch.dict(os.environ, {"AGENT_INTERFACE_RECEIPT_DB": str(api.DB), "AGENT_INTERFACE_RECEIPT_CALL": call_id,
+                                     "AGENT_INTERFACE_DATA_DIR": self.directory.name}):
             config = json.loads(claude_acl.settings([], review_receipt=str(Path(self.directory.name) / 'receipt.json')))
         # A subscription wrapper forwards settings.env to its shell, rather
         # than necessarily preserving the review controller's environment.
         child = subprocess.run([sys.executable, '-c',
-            'import json,sys; from agent_interface.review_receipt import complete_response; '
+            'import json,sys; from pathlib import Path; from agent_interface import DATA_DIR,init_db; '
+            'assert DATA_DIR == Path(sys.argv[3]), "Caller workspace was not forwarded"; init_db(); '
+            'from agent_interface.review_receipt import complete_response; '
             'print(json.dumps(complete_response(json.loads(sys.argv[1]),sys.argv[2])))',
-            json.dumps(ASSESSMENT), HEAD], env={"HOME": self.directory.name, **config['env']},
+            json.dumps(ASSESSMENT), HEAD, self.directory.name], env={"HOME": self.directory.name, **config['env']},
             text=True, capture_output=True, check=True)
         response = json.loads(child.stdout)
         self.assertEqual(response['invocation_id'], call_id)
@@ -192,7 +195,7 @@ class TestReceiptRecording(TestCase):
             retained = json.loads(conn.execute('select artifact from calls where id=?', (call_id,)).fetchone()[0])
         self.assertEqual(retained['review_response'], response)
         with patch.dict(os.environ, {"AGENT_INTERFACE_RECEIPT_DB": str(api.DB), "AGENT_INTERFACE_RECEIPT_CALL": call_id,
-                                     "POISE_NATIVE_CONTROL": '{"store":{}}'}):
+                                     "AGENT_INTERFACE_DATA_DIR": self.directory.name, "POISE_NATIVE_CONTROL": '{"store":{}}'}):
             guarded_config = json.loads(claude_acl.settings([], review_receipt=str(Path(self.directory.name) / 'receipt.json')))
         guarded = subprocess.run(child.args, env={"HOME": self.directory.name, **guarded_config['env']}, text=True, capture_output=True)
         self.assertNotEqual(guarded.returncode, 0)
