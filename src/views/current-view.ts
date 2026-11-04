@@ -104,6 +104,18 @@ interface RepoLabel { name: string, color: string, description: string | null }
 // read once per few minutes however often the composer opens.
 const repoLabelCache = new Map<string, { labels: RepoLabel[], at: number }>()
 const LABEL_CACHE_TTL_MS = 5 * 60 * 1000
+
+// The chain's intake as the datastore reports it, keyed by lowercased
+// repo#number. Null until a read succeeds: an unread answer is not "no PR".
+interface IssueIntake {
+  label: string | null
+  labelled: Set<string>
+  prs: Record<string, { number: number, url: string }[] | undefined>
+  unknownOrgs: Set<string>
+}
+let issueIntake: IssueIntake | null = null
+// Confirmed assignments stay visible while the polling datastore catches up.
+const assignedIssues = new Map<string, number>()
 // Tick listener installed on view init; removed via stopCurrentPolling()
 // when navigating away. Single shared clock — see startRefreshTicker().
 const onLiveTick = () => pollLiveTick()
@@ -307,6 +319,27 @@ const TAG_ICON_SVG = '<svg width="12" height="12" viewBox="0 0 14 14" fill="none
 // not the click, creates the session.
 const CHAT_SESSION_ICON_SVG = '<svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M2.5 3h9a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H7l-2.5 2v-2H2.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linejoin="round"/><path d="M5 5.5l2 1.5-2 1.5M7.5 8.5h2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>'
 
+// Always visible, unlike .card-actions, and outside .card-link because it
+// holds its own link. It leads the card because .card-actions overlays the
+// bottom edge and would cover that link on hover. An organization whose intake
+// could not be read gets no row at all, so a failed read never reads as "not
+// assigned" or "no PR". The key keeps the row from taking over the action strip
+// when it first appears.
+function intakeRow(item: LiveItem): string {
+  if (item.is_pr === 1 || item.state !== 'open' || !issueIntake) return ''
+  if (issueIntake.unknownOrgs.has(item.repo.split('/')[0].toLowerCase())) return ''
+  const key = prKey(item).toLowerCase()
+  const { label } = issueIntake
+  const labelState = !label ? ''
+    : issueIntake.labelled.has(key) || assignedIssues.has(key) ? `<span class="card-intake-label" title="Carries the behavior chain's intake label">${escapeHtml(label)}</span>`
+    : `<button class="card-assign-btn" aria-label="Assign to Poise: ${escapeHtml(item.repo)}#${item.number}" title="Add the ${escapeHtml(label)} label on GitHub">Assign to Poise</button>`
+  const prs = issueIntake.prs[key] ?? []
+  const prState = prs.length
+    ? prs.map((pr) => `<a class="card-intake-pr" href="${safeHttpsUrl(pr.url)}" target="_blank" rel="noopener" title="Open pull request that closes this issue">PR #${pr.number}</a>`).join('')
+    : '<span>No open PR</span>'
+  return `<div class="card-intake" data-key="intake">${labelState}${prState}</div>`
+}
+
 function chatSessionButton(item: LiveItem): string {
   return `<button class="card-action-btn card-chat-session-btn" data-repo="${escapeHtml(item.repo)}" data-number="${item.number}" data-pr="${item.is_pr}" title="Open in Chat" aria-label="Open in Chat">${CHAT_SESSION_ICON_SVG}</button>`
 }
@@ -472,6 +505,7 @@ function paintLiveItem(el: HTMLElement, item: LiveItem): void {
   const primary = item.is_pr === 1 ? reviewButton(item)
     : `<button class="card-action-btn card-issue-edit" aria-label="Edit issue ${escapeHtml(item.repo)}#${item.number}" title="Edit issue">Edit</button>`
   patchContent(el, `
+    ${intakeRow(item)}
     <a class="card-link" href="${safeHttpsUrl(item.url)}" target="_blank" rel="noopener">
       <div class="card-text">${escapeHtml(item.title)}</div>
       <div class="card-meta">
@@ -673,6 +707,70 @@ async function fetchPrStatus() {
   } catch { /* upstream offline — silent, cards stay neutral */ }
 }
 
+// Reports its own failure: swallowing it, as the PR status read does, would
+// turn "unknown" into "no PR".
+async function fetchIssueIntake() {
+  const org = getSelectedOrganization()
+  let next: IssueIntake | null = null
+  let failure = ''
+  try {
+    const res = await fetch('/api/gh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operation: 'issue_intake', ...organizationPayload() }),
+    })
+    if (!res.ok) throw new Error(`/api/gh ${res.status}`)
+    const data = await res.json()
+    failure = organizationErrors(data)
+    next = {
+      label: data.label || null,
+      labelled: new Set<string>(data.labelled || []),
+      prs: data.prs || {},
+      unknownOrgs: new Set<string>((data.errors || []).map((entry: { org: string }) => entry.org.toLowerCase())),
+    }
+    for (const [key, at] of assignedIssues) {
+      if (next.labelled.has(key) || Date.now() - at > PENDING_TTL_MS) assignedIssues.delete(key)
+    }
+  } catch (err) {
+    failure = `Could not read which issues are assigned to Poise — ${(err as Error).message}`
+  }
+  if (org !== getSelectedOrganization()) return
+  issueIntake = next
+  viewFeedback('current-intake', 'Current is not updating', failure, 'read_failed')
+  paintIssueCards()
+}
+
+function paintIssueCards() {
+  for (const cardEl of laneListEl('issue').querySelectorAll<HTMLElement>(':scope > .card')) {
+    const item = liveItems.find((i) => prKey(i) === cardEl.dataset.id)
+    if (item) paintLiveItem(cardEl, item)
+  }
+}
+
+async function assignIssue(item: LiveItem, button: HTMLButtonElement): Promise<void> {
+  const key = prKey(item)
+  const reportError = (message: string) => viewFeedback(`current-assign:${key}`, 'Current action needs attention', message, 'action_needed')
+  button.disabled = true
+  reportError('')
+  try {
+    const res = await fetch('/api/gh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operation: 'assign_issue', repository_full_name: item.repo, issue_number: item.number }),
+    })
+    const data = await res.json() as { error?: string }
+    if (!res.ok) throw new Error(data.error || `/api/gh ${res.status}`)
+    assignedIssues.set(key.toLowerCase(), Date.now())
+    const cardEl = button.closest<HTMLElement>('.card')
+    paintIssueCards()
+    // The button just stopped existing; keep a keyboard user on the card.
+    cardEl?.querySelector<HTMLElement>('.card-link')?.focus()
+  } catch (error) {
+    button.disabled = false
+    reportError(`Could not assign ${key} to Poise — ${(error as Error).message}`)
+  }
+}
+
 // Touch the mergeable / fresh classes on PR cards in place. Avoids a full
 // re-render so the FLIP-induced inline transforms aren't disturbed and
 // the user sees no flicker when only the PR-status map changed.
@@ -719,6 +817,7 @@ async function pollLiveTick() {
   try {
     await fetchPrStatus()
   } catch { /* same */ }
+  await fetchIssueIntake()
   try {
     await fetchAgentActive()
     applyActiveClasses()
@@ -1700,6 +1799,16 @@ function attachCardClickHandlers() {
       return
     }
 
+    const assignBtn = target.closest<HTMLButtonElement>('.card-assign-btn')
+    if (assignBtn) {
+      e.preventDefault()
+      e.stopPropagation()
+      const key = assignBtn.closest<HTMLElement>('.card')?.dataset.id
+      const item = liveItems.find(candidate => prKey(candidate) === key && candidate.is_pr === 0)
+      if (item && !assignBtn.disabled) void assignIssue(item, assignBtn)
+      return
+    }
+
     const editIssue = target.closest<HTMLButtonElement>('.card-issue-edit')
     if (editIssue) {
       e.preventDefault()
@@ -1872,6 +1981,7 @@ export async function initCurrentView() {
       allRepos = []
       agentActiveKeys.clear()
       prStatus.clear()
+      issueIntake = null
       liveLoadWarning = ''
       repoLoadWarning = ''
       renderAll()
@@ -1901,6 +2011,7 @@ export async function initCurrentView() {
     load('GitHub issues and pull requests', fetchLive(), () => {
       renderAll('live')
       void fetchPrStatus()
+      void fetchIssueIntake()
     }),
     load('the repository list', fetchAllRepos(sequence), () => {}),
     load('agent activity', fetchAgentActive(sequence), applyActiveClasses),
