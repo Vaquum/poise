@@ -726,7 +726,7 @@ agent can read that key, which lets it start suites and nothing else.
 | `POISE_TEST_RENDER_API_KEY` | yes | | A Render API key. Set both of these, or neither |
 | `POISE_TEST_BASE_SERVICE` | yes | | The cron job's service ID, `crn-…` |
 | `POISE_TEST_PLAN` | | `plan-crn-003` | The instances' plan, the cheapest: 0.5 CPU and 512 MB, about $0.01 an hour |
-| `POISE_TEST_LARGER_PLAN` | | `plan-crn-005` | The plan a suite gets again, once, when it runs out of memory on the first: 1 CPU and 2 GB, about $0.035 an hour. `plan-crn-007` is 2 CPUs and 4 GB, `plan-crn-008` 4 CPUs and 8 GB, about $0.24 an hour |
+| `POISE_TEST_LARGER_PLAN` | | `plan-crn-005` | The plan a suite gets again, once, when it runs out of memory on the first, and every suite of that repository starts on after that: 1 CPU and 2 GB, about $0.035 an hour. `plan-crn-007` is 2 CPUs and 4 GB, `plan-crn-008` 4 CPUs and 8 GB, about $0.24 an hour |
 | `POISE_TEST_LIMIT_SECONDS` | | `3600` | The time limit; keep `BASH_MAX_TIMEOUT_MS` in `server/process.ts` in step |
 | `POISE_TEST_MAX_RUNS` | | `30` | Suites at once; past it an agent's command fails loudly |
 

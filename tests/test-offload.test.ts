@@ -550,6 +550,26 @@ describe('a suite on a test instance', () => {
     expect([...jobs.values()].map((job) => job.planId)).toEqual(['plan-crn-003', 'plan-crn-005'])
   })
 
+  it('starts a repository\'s suites on the larger plan once one has run out of memory', async () => {
+    await startAll()
+    const repo = repository()
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/acme/big.git'])
+    const heavy = `console.error('JavaScript heap out of memory'); process.exit(134)`
+    await suite(repo, [process.execPath, '-e', heavy]).done
+    expect([...jobs.values()].map((job) => job.planId)).toEqual(['plan-crn-003', 'plan-crn-005'])
+    const { code } = await suite(repo, [process.execPath, '-e', 'process.exit(0)']).done
+    expect(code).toBe(0)
+    expect([...jobs.values()].map((job) => job.planId)).toEqual(['plan-crn-003', 'plan-crn-005', 'plan-crn-005'])
+
+    // Another clone of the same repository too, and no other repository.
+    const clone = repository()
+    execFileSync('git', ['-C', clone, 'remote', 'add', 'origin', 'https://github.com/acme/big.git'])
+    await suite(clone, [process.execPath, '-e', 'process.exit(0)']).done
+    expect([...jobs.values()].at(-1)?.planId).toBe('plan-crn-005')
+    await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done
+    expect([...jobs.values()].at(-1)?.planId).toBe('plan-crn-003')
+  })
+
   it('stops there when it runs out of memory on the larger plan too, with the suite\'s own answer', async () => {
     await startAll()
     const script = `console.error('JavaScript heap out of memory'); process.exit(134)`

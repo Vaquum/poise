@@ -3,7 +3,8 @@
 // output on stdout and stderr, and its exit code. hook.cjs and sitecustomize.py start this in the
 // suite's place. docs/Operating.md, "Agents' test suites".
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -101,6 +102,15 @@ function say(message) {
   process.stderr.write(`[poise] ${message}\n`)
 }
 
+/**
+ * Where to remember that this repository's suites need the larger plan. Running out of memory takes minutes
+ * each time, longer than an agent's shell may wait, so it should happen once per repository.
+ */
+function largerMarker(cwd) {
+  const origin = git(cwd, 'remote', 'get-url', 'origin')?.toString().trim() ?? cwd
+  return join(HERE, `larger-${createHash('sha256').update(origin).digest('hex').slice(0, 16)}`)
+}
+
 function die(message, code = 125) {
   say(message)
   process.exit(code)
@@ -193,8 +203,11 @@ async function main(args) {
   }
 
   say('this suite runs on a disposable test instance; files it changes stay there. Starting one.')
-  let result = await runOnce(false)
-  if (result.outOfMemory) {
+  const marker = largerMarker(cwd)
+  const larger = existsSync(marker)
+  let result = await runOnce(larger)
+  if (result.outOfMemory && !larger) {
+    writeFileSync(marker, '')
     say('it ran out of memory on the smallest instance. Running it again on a larger one.')
     result = await runOnce(true)
   }
