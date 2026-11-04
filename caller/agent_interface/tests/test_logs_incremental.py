@@ -54,7 +54,7 @@ class LogsIncrementalCase(TestCase):
                 ],
             )
 
-    def cli(self, *args: str) -> subprocess.CompletedProcess:
+    def cli(self, *args: str, now: float | None = None) -> subprocess.CompletedProcess:
         env = {
             "AGENT_INTERFACE_DATA_DIR": str(self.data),
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -62,17 +62,23 @@ class LogsIncrementalCase(TestCase):
             "PATH": "",
             "HOME": self.work.name,
         }
+        entry = "import agent_interface; "
+        if now is not None:
+            entry += f"agent_interface.time = lambda: {now!r}; "
         return subprocess.run(
-            [sys.executable, "-c", "from agent_interface import main; main()", *args],
+            [sys.executable, "-c", entry + "agent_interface.main()", *args],
             text=True, capture_output=True, env=env, cwd=self.work.name, timeout=120,
         )
 
     def test_running_read_returns_only_running_rows(self):
         self.seed(5, running=2)
-        rows = agent_interface.logs(status="running")
+        now = 1761003602.0
+        with patch.object(agent_interface, "time", return_value=now):
+            rows = agent_interface.logs(status="running")
         self.assertEqual([r["status"] for r in rows], ["running", "running"])
         self.assertEqual([r["prompt"] for r in rows], ["prompt 3", "prompt 4"])
-        done = self.cli("--logs", "--status", "running")
+        self.assertEqual([r["time_elapsed"] for r in rows], ["59m 59s", "59m 58s"])
+        done = self.cli("--logs", "--status", "running", now=now)
         self.assertEqual((done.returncode, done.stderr), (0, ""), done.stderr)
         self.assertEqual(json.loads(done.stdout), rows)
 
