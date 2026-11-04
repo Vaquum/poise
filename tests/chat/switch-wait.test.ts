@@ -2,7 +2,7 @@ import '../fixtures/light-git-gate'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -87,11 +87,17 @@ class FakeTimer {
     timer.callback()
   }
 }
+// One real repository for the file: a test's own copy of it costs no git commands.
+let seedRepo: string | undefined
 async function world(options: { auto?: boolean, deferStart?: boolean } = {}) {
-  const repo = join(root, randomUUID()); await mkdir(repo)
-  git(repo, 'init', '-q', '-b', 'main'); git(repo, 'config', 'user.name', 'Switch test'); git(repo, 'config', 'user.email', 'switch@example.invalid')
-  git(repo, 'config', 'commit.gpgSign', 'false'); git(repo, 'config', 'core.hooksPath', '/dev/null')
-  await writeFile(join(repo, 'README.md'), '# Switch fixture\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'fixture')
+  if (!seedRepo) {
+    seedRepo = join(root, 'seed-repo'); await mkdir(seedRepo)
+    git(seedRepo, 'init', '-q', '-b', 'main'); git(seedRepo, 'config', 'user.name', 'Switch test'); git(seedRepo, 'config', 'user.email', 'switch@example.invalid')
+    git(seedRepo, 'config', 'commit.gpgSign', 'false'); git(seedRepo, 'config', 'core.hooksPath', '/dev/null')
+    await writeFile(join(seedRepo, 'README.md'), '# Switch fixture\n'); git(seedRepo, 'add', '.'); git(seedRepo, 'commit', '-qm', 'fixture')
+  }
+  const repo = join(root, randomUUID())
+  await cp(seedRepo, repo, { recursive: true })
   const instance = `switch-test:${randomUUID()}`
   const c: Controls = { auto: options.auto ?? true, calls: [], adapters: [], compactions: 0 }
   function make(leaseProbes?: import('../../server/chat/checkout-lock').CheckoutLeaseOptions) {

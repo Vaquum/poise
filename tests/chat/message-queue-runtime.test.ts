@@ -2,7 +2,7 @@ import '../fixtures/light-git-gate'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type RunnerTask, type RunnerTestCase } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentId, ChatEnvelope, PromptInput, StopReason } from '../../server/chat/protocol'
@@ -68,11 +68,17 @@ class Fake implements Adapter {
   async fork() { return randomUUID() }
   onExit() {}
 }
+// One real repository for the file: a test's own copy of it costs no git commands.
+let seedRepo: string | undefined
 async function world(options: { auto?: boolean, deferStart?: boolean, autoMerge?: boolean, prepareCli?: import('../../server/chat/runtime').RuntimeOptions['prepareCli'] } = {}) {
-  const repo = join(root, randomUUID()); await mkdir(repo)
-  git(repo, 'init', '-q', '-b', 'main'); git(repo, 'config', 'user.name', 'Queue test'); git(repo, 'config', 'user.email', 'queue@example.invalid')
-  git(repo, 'config', 'commit.gpgSign', 'false'); git(repo, 'config', 'core.hooksPath', '/dev/null')
-  await writeFile(join(repo, 'README.md'), '# Queue fixture\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'fixture')
+  if (!seedRepo) {
+    seedRepo = join(root, 'seed-repo'); await mkdir(seedRepo)
+    git(seedRepo, 'init', '-q', '-b', 'main'); git(seedRepo, 'config', 'user.name', 'Queue test'); git(seedRepo, 'config', 'user.email', 'queue@example.invalid')
+    git(seedRepo, 'config', 'commit.gpgSign', 'false'); git(seedRepo, 'config', 'core.hooksPath', '/dev/null')
+    await writeFile(join(seedRepo, 'README.md'), '# Queue fixture\n'); git(seedRepo, 'add', '.'); git(seedRepo, 'commit', '-qm', 'fixture')
+  }
+  const repo = join(root, randomUUID())
+  await cp(seedRepo, repo, { recursive: true })
   const instance = `queue-test:${randomUUID()}`
   const c: Controls = { auto: options.auto ?? true, calls: [], adapters: [], active: 0, maximum: 0 }
   function make() {
