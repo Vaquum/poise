@@ -20,6 +20,7 @@ export const MAX_COVERAGE_RECORD_BYTES = 64 * 1024
 // Coverage rows and their SQLite page/index overhead cannot consume event headroom.
 const COVERAGE_PAGE_RESERVE_BYTES = 2 * MAX_COVERAGE_SOURCES * MAX_COVERAGE_RECORD_BYTES
 interface EventRow { id: string; sort_time: string; payload: string }
+interface ExpiredRow { id: string; workspace: string | null; visibility: string; expired_at: string }
 interface Cursor { kind: 'page' | 'watermark' | 'delivery'; high: number; time?: string; id?: string; filter: string }
 
 export class DiagnosticCursorError extends Error {}
@@ -152,24 +153,40 @@ export class DiagnosticStore {
   prune(reserve = 0): void {
     if (reserve > this.policy.maxBytes) throw new Error('Logging event exceeds the configured storage budget')
     const cutoff = new Date(this.now() - this.policy.retentionMs).toISOString()
-    this.db.prepare("INSERT OR IGNORE INTO log_expired SELECT id,workspace,visibility,strftime('%Y-%m-%dT%H:%M:%fZ',ingested_at,?) FROM log_events WHERE ingested_at < ?").run(`+${this.policy.retentionMs / 1000} seconds`, cutoff)
-    this.db.prepare('DELETE FROM log_events WHERE ingested_at < ?').run(cutoff)
-    this.db.prepare('DELETE FROM log_expired WHERE expired_at < ?').run(cutoff)
-    this.evict(reserve)
-    this.db.prepare('DELETE FROM log_expired WHERE id IN (SELECT id FROM log_expired ORDER BY expired_at DESC,id DESC LIMIT -1 OFFSET ?)').run(Math.max(1, Math.min(this.policy.maxEvents * 2, Math.floor(this.policy.maxBytes / 1024))))
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM log_expired WHERE expired_at < ?').run(cutoff)
+      // Release payload/index pages before allocating their smaller tombstones.
+      const expired = this.db.prepare("DELETE FROM log_events WHERE ingested_at < ? RETURNING id,workspace,visibility,strftime('%Y-%m-%dT%H:%M:%fZ',ingested_at,?) AS expired_at")
+        .all(cutoff, `+${this.policy.retentionMs / 1000} seconds`) as ExpiredRow[]
+      this.evict(reserve, expired.length * 1024)
+      this.rememberExpired(expired)
+      this.db.prepare('DELETE FROM log_expired WHERE id IN (SELECT id FROM log_expired ORDER BY expired_at DESC,id DESC LIMIT -1 OFFSET ?)').run(Math.max(1, Math.min(this.policy.maxEvents * 2, Math.floor(this.policy.maxBytes / 1024))))
+    })()
   }
 
-  private evict(reserve: number): void {
-    let { count, bytes } = this.db.prepare('SELECT count,bytes FROM log_usage WHERE id=1').get() as { count: number; bytes: number }
+  private rememberExpired(rows: readonly ExpiredRow[]): void {
+    const insert = this.db.prepare('INSERT OR IGNORE INTO log_expired VALUES (?,?,?,?)')
+    for (const row of rows) insert.run(row.id, row.workspace, row.visibility, row.expired_at)
+  }
 
-    while (bytes + reserve > this.policy.maxBytes || count + (reserve ? 1 : 0) > this.policy.maxEvents) {
-      const oldest = this.db.prepare('SELECT id,workspace,visibility,sort_time,bytes FROM log_events ORDER BY ingested_at,seq LIMIT 1').get() as { id: string; workspace: string | null; visibility: string; sort_time: string; bytes: number } | undefined
+  private evict(reserve: number, pendingExpiryBytes = 0): void {
+    let { count, bytes } = this.db.prepare('SELECT count,bytes FROM log_usage WHERE id=1').get() as { count: number; bytes: number }
+    const pageSize = this.db.pragma('page_size', { simple: true }) as number
+    const pageLimit = this.db.pragma('max_page_count', { simple: true }) as number
+    const available = () => pageSize * (pageLimit - (this.db.pragma('page_count', { simple: true }) as number) + (this.db.pragma('freelist_count', { simple: true }) as number))
+    const expired: ExpiredRow[] = []
+    // Logical bytes omit SQLite fragmentation and tombstone/index overhead.
+    // Keep write headroom without raising the physical page ceiling.
+    const headroom = reserve * 2 + MAX_COVERAGE_RECORD_BYTES * 2 + pendingExpiryBytes
+    while (bytes + reserve > this.policy.maxBytes || count + (reserve ? 1 : 0) > this.policy.maxEvents || available() < headroom + expired.length * 1024) {
+      const oldest = this.db.prepare('SELECT id,workspace,visibility,bytes FROM log_events ORDER BY ingested_at,seq LIMIT 1').get() as { id: string; workspace: string | null; visibility: string; bytes: number } | undefined
       if (!oldest) break
-      this.db.prepare('INSERT OR IGNORE INTO log_expired VALUES (?,?,?,?)').run(oldest.id, oldest.workspace, oldest.visibility, new Date(this.now()).toISOString())
       this.db.prepare('DELETE FROM log_events WHERE id=?').run(oldest.id)
+      expired.push({ ...oldest, expired_at: new Date(this.now()).toISOString() })
       bytes -= oldest.bytes
       count--
     }
+    this.rememberExpired(expired)
   }
 
   coverage(value: Coverage): void {

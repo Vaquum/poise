@@ -31,3 +31,34 @@ it('measures representative operational evidence against the default bounded sto
     console.info('Logging fixture calibration', JSON.stringify({ events: usage.events, accountedBytes: usage.bytes, averageAccountedBytes, capacityAtFixtureSize, sqliteAllocatedBytes: [path, path + '-wal', path + '-shm'].reduce((bytes, file) => bytes + (existsSync(file) ? statSync(file).size : 0), 0), sourceCount: cases.length, routineEventsExcluded: 1000 }))
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
 })
+
+it.each(['none', 'one', 'all'])('continues ingestion at the SQLite page ceiling (retention expiry: %s)', (expire) => {
+  const directory = mkdtempSync(join(tmpdir(), 'poise-log-full-'))
+  const path = join(directory, 'logging.db')
+  let now = Date.parse('2026-11-04T08:00:00Z')
+  const policy = { ...DEFAULT_LOG_POLICY, retentionMs: 1000 }
+  const store = new DiagnosticStore(path, policy, () => now)
+  const fixture = (id: string) => normalize({ id, time: new Date(now).toISOString(), workspace: 'fixture', source: 'poise',
+    operation: 'storage.failure', level: 'error', message: 'retained failure ' + id, stderr: 'original evidence '.repeat(100) }, now)!
+  const first = fixture('first')
+  first.stderr = null
+  try {
+    store.append([first])
+    if (expire === 'one') now += 500
+    for (let batch = 0; batch < 5; batch++) store.append(Array.from({ length: 100 }, (_, i) => fixture(`${batch}:${i}`)))
+    // Real SQLite pressure, independent of the logical event/byte counters.
+    const database = Reflect.get(store, 'db') as Database.Database
+    const ceiling = database.pragma('page_count', { simple: true }) as number
+    database.pragma(`max_page_count = ${ceiling}`)
+    expect(database.pragma('freelist_count', { simple: true })).toBe(0)
+    if (expire === 'all') now += policy.retentionMs + 1
+    if (expire === 'one') now += 501
+    const fresh = fixture('fresh')
+    expect(store.append([fresh])).toBe(1)
+    expect(store.lookup({ workspace: 'fixture', operator: false }, fresh.id).status).toBe('found')
+    expect(store.lookup({ workspace: 'fixture', operator: false }, first.id).status).toBe('expired')
+    expect(store.append([first])).toBe(0)
+    expect(database.pragma('max_page_count', { simple: true })).toBe(ceiling)
+    expect(database.pragma('page_count', { simple: true })).toBeLessThanOrEqual(ceiling)
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }) }
+})
