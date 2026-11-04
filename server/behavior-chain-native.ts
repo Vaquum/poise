@@ -249,7 +249,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         || typeof readiness.green !== 'boolean' || typeof state.merged !== 'boolean'
         || !Array.isArray(readiness.blockers) || readiness.blockers.some((blocker) => typeof blocker !== 'string')
         || (state.queue_entry_id !== null && (typeof state.queue_entry_id !== 'string' || !state.queue_entry_id))
-        || !Array.isArray(state.queue_removals)) throw new Error('native PR observations changed head or are incomplete')
+        || (state.state === 'open' && !Array.isArray(state.queue_removals))) throw new Error('native PR observations changed head or are incomplete')
       const checks = ci.failing.map((item) => object(item, 'CI check'))
       const pending = checks.some((check) => ['queued', 'pending', 'in_progress', 'requested', 'waiting'].includes(String(check.state)) || (check.state === 'completed' && check.conclusion == null))
       const failures = checks.filter((check) => ['failure', 'error'].includes(String(check.state)) || (check.state === 'completed' && ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(check.conclusion))))
