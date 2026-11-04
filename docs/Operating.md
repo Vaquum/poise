@@ -678,10 +678,11 @@ for vitest, its own `--changed`; for pytest, changed test files and test files
 that mention a changed module or package. Pytest stays whole when it cannot tell:
 after a change to `conftest.py` or test configuration, when git fails, or when
 code changed and no test mentions it. `npm run check` is such a command, at each of its steps, and skips its build.
+On Poise itself `npm test` names [the essential tests](Testing.md#the-essential-tests), so it runs those.
 Vitest and pytest run with one worker, and Node may use 80% of the memory. What
-still does not fit fails with a line saying CI covers it, and CI runs everything
-before merge. On Poise itself that means browser tests, the typecheck of
-`tsconfig.tests.json` and the unit suite in full.
+still does not fit fails with a line saying CI is the gate before merge. On Poise
+itself that means browser tests, the typecheck of `tsconfig.tests.json` and the
+unit suite in full.
 
 **What an instance gets.** Only what the suite needs, at the same paths: the
 checkout's tracked and untracked files without what git ignores, its

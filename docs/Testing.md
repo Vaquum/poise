@@ -5,60 +5,124 @@ Poise uses Node 22 (minimum 22.13), matching the workspace image and gateway.
 
 ## Gates and parallelism
 
-`npm run check` remains the complete local lint, unit/integration and production
-build gate. `npm run test:e2e` prepares isolated fixtures, builds the application
-and runs Chromium. `npm run verify` runs both. Local runs serialize one at a
-time per workspace: `npm run test:e2e` holds the lock from before its build
-(`scripts/with-e2e-lock.mjs`), and a bare `npx playwright test` takes the
-same lock in `globalSetup` after its webServer build, so either may wait for
-another run to finish. CI shards skip it and run concurrently by design.
+Most runs use only the essential tests. The whole suite runs on a sample of
+merges.
 
-The native merge queue runs the complete lint/types/audit and production-build
-jobs, two unit/integration shards and four Chromium shards. Browser shards
-consume the same run's build artifact without rebuilding it. Each owns its
-runner, server, databases and fixtures, and retains one browser worker because
-some real-API fixtures share server state within a shard. The queue admits at
-most two candidate builds at once; each candidate retains its internal shards.
-Each CI unit shard also uses one worker: the real process/lease fixtures must
-not compete with another test file. Per-test deadlines stay unchanged; the
-job budget allows the serial file execution. Local Vitest defaults stay at two.
+`npm test` and `npm run test:e2e` run the essential tests. `npm run check` is
+lint, those tests and the production build, and `npm run verify` adds the
+browser tests. `npm run test:full` and `npm run test:e2e:full` run everything.
+A command that names tests runs exactly those, such as
+`npm test -- tests/chat/runtime.test.ts` or
+`npm run test:e2e -- tests/e2e/chat.spec.ts`. Flags alone steer the essential
+run, and the word after a bare flag counts as its value, as in
+`npm test -- --reporter dot`.
+
+Local browser runs serialize one at a time per workspace: `npm run test:e2e`
+holds the lock from before its build (`scripts/with-e2e-lock.mjs`), and a bare
+`npx playwright test` takes the same lock in `globalSetup` after its webServer
+build, so either may wait for another run to finish. CI shards skip it and run
+concurrently by design.
+
+### The essential tests
+
+Agents, PR checks and merge-queue candidates run the same set, which
+`.github/workflows/ci.mjs` chooses:
+
+- Lint, all typechecks and the production build.
+- [`tests/essential.txt`](../tests/essential.txt): the tests that guard
+  security, agent spend and PR actions, data loss and release safety, and the
+  whole-repository wiring tests an import link cannot reach. A new test that
+  guards one of those belongs in this list. A delegated self-update change may
+  not edit it.
+- Any test the change edits, and any test that directly imports a changed file.
+  One step only: following imports further selects most of the suite.
+- The core browser journeys (`smoke`, `service-mode`, `independent-startup`),
+  any spec the change edits, and the browser suites mapped to a changed frontend
+  area. A path outside those areas adds no browser suite.
+
+CI compares a PR or queue candidate with its base and uses one unit and one
+browser shard. Locally the comparison is with `origin/main`, including
+uncommitted and untracked work, and the command stops with a message if it
+cannot reach `origin/main`.
+
+A change to dependencies, test or build configuration, CI or
+`tests/essential.txt` runs everything in CI, because it can change what every
+test proves. Documentation-only changes omit application jobs. Caller omits
+Python work for frontend/browser/documentation-only PR changes; shared and
+unknown paths still run it. Every merge-queue candidate runs all Caller tests.
+
+The set comes from the record. Of about 400 PRs merged in October 2026, tests
+caught a real defect on 24. The 17 unit catches were spread over 34 files, and
+the files with repeat catches in the first half caught 1 of the 8 later ones, so
+past catches do not pick tests. A direct import of the changed file caught 14 of
+the 17, and that link with the safety tests caught 15. The browser selection
+caught 5 of the 8 browser catches. In all, 3 or 4 of the 24 would have reached
+`main`.
+
+So passing the merge queue proves the essential tests on that candidate, not the
+whole suite, and a later PR can break a regression test outside the set until
+the next full run.
+
+### The full run
+
+A push to `main` here draws the full run when the first eight hex digits of its
+commit, modulo 10, are zero: about one merge in ten, with no state to keep and
+the same answer on a rerun. That commit skips its queue evidence and runs the
+complete gates. `.github/workflows/full-suite.yml` also starts one at 03:41 UTC
+every night, so a quiet stretch cannot hide a defect for days, and
+`gh workflow run ci.yml --ref main` starts one by hand. Each push to `main` here
+has its own concurrency group, so a later merge cannot cancel one.
+
+On these runs a unit test gets one retry, as browser tests in CI get Playwright's
+two, so a lone flake does not count.
+
+When a full run on `main` finishes, `full-suite.yml` reads it through
+`ci.mjs report`. A failed one opens one issue, `fix: the full test suite fails on
+main`, labelled `poise`, naming the failed tests and jobs and what merged since
+the last full run that passed. Poise's chain fixes it in a normal PR. Nothing is
+reverted and other PRs keep merging. Another failure adds a comment, never an
+edit, because editing an issue's body re-bases the chain already fixing it. A
+later full run that passes closes the issue.
+
+Full runs can overlap, so commit order decides what counts. A pass on an older
+commit than the latest failure leaves the issue open, and a failure on an older
+commit than a pass files nothing. A run cancelled as a whole reports nothing,
+because it was superseded or stopped by hand; a job that runs out of time still
+counts as failed.
+
+A fork has no queue evidence, so every push to its `main` runs the complete
+gates, and `deploy/actions/gate.sh` refuses a tip that failed. Broken code can
+therefore land on this repository's `main` but cannot reach a fork's server: it
+pauses that fork's deploys until it is fixed. `full-suite.yml` does nothing in a
+fork.
+
+### How CI runs them
+
+A full run has independent lint/types/audit and production-build jobs, two
+unit/integration shards and four Chromium shards. Browser shards consume the
+same run's build artifact without rebuilding it. Each owns its runner, server,
+databases and fixtures, and retains one browser worker because some real-API
+fixtures share server state within a shard. The queue admits at most two
+candidate builds at once; each candidate retains its internal shards. Each CI
+unit shard also uses one worker: the real process/lease fixtures must not compete
+with another test file. Per-test deadlines stay unchanged; the job budget allows
+the serial file execution. Local Vitest defaults stay at two.
 
 All CI helper entry points live under the controller's existing protected
 `.github/workflows/` prefix. The delegated-policy regression derives the live
 workflow commands and rejects direct edits or renames out of that boundary.
-
-Pull requests use `.github/workflows/ci.mjs` to select work against the PR base SHA:
-
-- Documentation-only changes omit application jobs.
-- Recognized frontend areas run the affected Vitest import graph and their
-  browser suites, plus `smoke`, `service-mode` and `independent-startup`.
-  Changed browser specs are included directly. These runs use one unit and one
-  browser shard. An empty Vitest graph runs all unit tests instead of passing
-  without tests. The unit job has a 25-minute budget for that serial fallback;
-  individual test deadlines stay unchanged.
-- Shared code, configuration, fixtures, deleted source/tests and unknown paths
-  run all gates. The frontend-to-browser mapping is deliberately conservative;
-  adding an unmapped surface keeps full coverage.
-- Caller omits Python work for frontend/browser/documentation-only PR changes;
-  shared and unknown paths still run it. Every merge-queue candidate runs all
-  Caller tests.
-
-Affected tests provide iteration feedback; the merge queue remains the
-exhaustive pre-merge gate, including source-text and dynamic dependencies that
-Vitest's static import graph cannot discover. During local iteration, use
-`npm test -- --changed origin/main` and the relevant browser spec; the complete
-local gates remain available above.
 
 Browser jobs use the official `mcr.microsoft.com/playwright:v<VERSION>-noble`
 image, with VERSION read from the locked `@playwright/test` package. Its browsers
 and system libraries are already installed. A version/executable mismatch fails
 before tests. Browser isolation and every existing assertion are unchanged.
 
-A push to main first looks for the latest merge-queue run of the same workflow
-for the **exact same commit**, repository and queue branch. A completed success
-is reused, with its URL recorded in the Actions summary. Missing, failed,
-cancelled or unfinished evidence runs the complete main gates; API errors fail
-visibly. A new fork therefore still validates its first main push normally.
+A push to main that did not draw the full run first looks for the latest
+merge-queue run of the same workflow for the **exact same commit**, repository
+and queue branch. A completed success is reused, with its URL recorded in the
+Actions summary. Missing, failed, cancelled or unfinished evidence runs the
+complete main gates; API errors fail visibly. A fork therefore validates every
+push to its main.
 
 `Verify (Node 22)` and `Caller (Python 3.13)` retain their names and main-push
 workflow events. The aggregate accepts omitted application jobs only when the
@@ -170,11 +234,11 @@ parallel job times; GitHub's job steps include install/build overhead.
 Local equivalents:
 
 ```sh
-npm test -- --reporter=default --reporter=json --outputFile=test-results/vitest.json
-npm run test:e2e -- --workers=1
+npm run test:full -- --reporter=default --reporter=json --outputFile=test-results/vitest.json
+npm run test:e2e:full -- --workers=1
 # Inspect or reproduce an individual CI shard:
-npm test -- --shard=1/2
-npm run test:e2e -- --shard=1/4 --workers=1
+npm run test:full -- --shard=1/2
+npm run test:e2e:full -- --shard=1/4 --workers=1
 ```
 
 `POISE_E2E_PREBUILT=1 npm run test:e2e` uses an existing `dist/` build. CI uses
