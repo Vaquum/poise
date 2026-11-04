@@ -1987,7 +1987,9 @@ def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds
             # with exact ownership so a sibling's review cannot settle this run.
             try:
                 result = behavior_outcome(mod, behavior, pr, pwd, actor, head, before,
-                                          receipt=review_receipt.get(), call_id=call_id)
+                                          receipt=review_receipt.get(), call_id=call_id,
+                                          uncertain_write=not (isinstance(recovery_error, review_budget.ReviewLimitError)
+                                                               and _proven_no_action(recovery_error)))
             except Exception:
                 pass
             else:
@@ -2267,6 +2269,7 @@ def behavior_outcome(
     prior_error: str | None = None,
     prior_code: str | None = None,
     proven_no_action: bool = False,
+    uncertain_write: bool = False,
 ) -> dict:
     if facts is None:
         facts = review_facts(mod, pr, pwd, actor, expected_head, 0)
@@ -2322,7 +2325,7 @@ def behavior_outcome(
                 # Nothing posted and the target moved on: a clean supersede
                 # that keeps the preceding failure's disposition, if any.
                 return _moved_target_result(actual_head, prior_error, prior_code)
-            if not own and receipt is None and not review_receipt.failure() and _context_moved(before, facts):
+            if not own and receipt is None and not uncertain_write and not review_receipt.failure() and _context_moved(before, facts):
                 # Nothing posted and the title, body or base changed: the
                 # current PR needs a fresh review, not a hold. An uncertain
                 # write stays held, so a re-review cannot duplicate it.
