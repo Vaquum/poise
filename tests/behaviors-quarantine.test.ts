@@ -209,6 +209,63 @@ describe('durable behavior quarantine', () => {
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
   })
 
+  // Neither retry records a failure when it closes, so the row still there is
+  // the earlier attempt's: only a launch's own row outlasts a feed outage.
+  it.each((['review-new-prs', 'approve-prs'] as const).flatMap((behavior) =>
+    (['unrecorded', 'stopped'] as const).map((retry) => [behavior, retry] as const)),
+  )('does not keep the earlier attempt\'s failure row for a %s retry closed %s across a feed outage', async (behavior, retry) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const launched = behavior === 'review-new-prs' ? await launchReviewBeforeCrash() : await launchApprovalBeforeCrash()
+    const failureKey = `behavior_${behavior.replace(/-/g, '_')}_failure:${launched.target}`
+    const running = agentLog({
+      id: 'b'.repeat(32), behavior: behavior === 'review-new-prs' ? 'pr_review' : 'pr_approve', model: 'opus-5-xhigh',
+      actor: launched.actor, source: launched.source, expected_head: launched.expectedHead,
+      correlation_id: launched.correlationId, status: 'running',
+    })
+    fixture.agentLogs = [running]
+    await resetLogCache()
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    const earlierAt = Date.parse(launched.requestedAt) - 60_000
+    const earlier = JSON.stringify({ kind: 'worker', consecutiveFailures: 1, lastFailureAtMs: earlierAt, nextRetryAtMs: earlierAt + 60_000, error: 'earlier attempt failed' })
+    launched.database.setMeta(failureKey, earlier)
+    const failed = { ...running, status: 'failed', error: 'retry failed', completed_at: new Date().toISOString(),
+      ...(retry === 'stopped' ? { error_code: 'stopped', review_policy: 'bounded-v1' } : {}) }
+    if (retry === 'stopped') fixture.agentLogs = [failed]
+    else {
+      fixture.agentLogs = []
+      vi.setSystemTime(Date.now() + 2 * 60 * 60_000)
+    }
+    await resetLogCache()
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(launched.database.getFailedBehaviorLaunch(behavior, launched.target)?.launchCallId).toBe(running.id)
+    expect(launched.database.getMeta(failureKey)).toBe(earlier)
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options?: { cwd?: string }) => {
+      if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
+      return original(command, args, options)
+    })
+    await resetLogCache()
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(launched.database.getFailedBehaviorLaunch(behavior, launched.target)?.launchQuarantine).toBe('unreadable')
+    mocks.runFile.mockImplementation(original)
+    fixture.agentLogs = [failed]
+    await resetLogCache()
+    await launched.behaviors.runEnabledBehaviorsOnce()
+    expect(launched.database.getFailedBehaviorLaunch(behavior, launched.target)?.launchQuarantine).toBeNull()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    if (retry === 'stopped') {
+      vi.setSystemTime(Date.now() + 60 * 60_000)
+      await resetLogCache()
+      await launched.behaviors.runEnabledBehaviorsOnce()
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      expect(launched.database.getMeta(failureKey)).toBeFalsy()
+    } else {
+      expect(JSON.parse(launched.database.getMeta(failureKey)!)).toMatchObject({
+        error: 'retry failed', lastFailureAtMs: Date.now(), nextRetryAtMs: Date.now() + 60_000,
+      })
+    }
+  })
+
   it.each(['unknown-status', 'duplicate-call', 'quarantined-duplicate'] as const)('does not clear unreadable evidence from a %s record', async (conflict) => {
     const launched = await launchReviewBeforeCrash()
     fixture.agentLogs = [{ corrupt: true }]
