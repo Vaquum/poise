@@ -2,6 +2,7 @@
 // and in the stored record, a blocked step fails named within its budget,
 // and Stop reaches the awaited work without a late prompt starting.
 
+import '../fixtures/light-git-gate'
 import '../fixtures/workspace-template'
 import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'

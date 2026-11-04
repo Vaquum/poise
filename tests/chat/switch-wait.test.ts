@@ -1,3 +1,4 @@
+import '../fixtures/light-git-gate'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { randomUUID } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
