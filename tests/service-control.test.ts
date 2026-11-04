@@ -111,12 +111,12 @@ describe('service health', () => {
     insert.run('chat', 'failed', null, 'external', 'poise:chat', null, null)
     vi.stubEnv('AGENT_INTERFACE_DATA_DIR', records)
     try {
-      expect(service.health()).toMatchObject({ runningCallerCalls: 0, backgroundWork: 1, idle: false })
-      expect(service.drain()).toMatchObject({ draining: true, backgroundWork: 1, idle: false })
+      expect(service.health()).toMatchObject({ runningCallerCalls: 0, unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
+      expect(service.drain()).toMatchObject({ draining: true, unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
       database.exec("update calls set resources_settled_at=1 where id='interrupted'")
-      expect(service.health()).toMatchObject({ backgroundWork: 1, idle: false })
+      expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
       database.exec("update calls set resource_cleanup=null where id='interrupted'")
-      expect(service.health()).toMatchObject({ backgroundWork: 0, idle: true, draining: true })
+      expect(service.health()).toMatchObject({ unsettledNativeCalls: 0, backgroundWork: 0, idle: true, draining: true })
     } finally {
       service.resume()
       vi.stubEnv('AGENT_INTERFACE_DATA_DIR', '')
@@ -130,7 +130,7 @@ describe('service health', () => {
     session(runtime.instance, false)
     session('poise-dev:another-database', true)
     const { service } = serviceOf(runtime)
-    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number), windowStartedAt: expect.any(String) }, desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
+    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number), windowStartedAt: expect.any(String) }, desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
 
     let finish!: () => void
     const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))
@@ -166,7 +166,7 @@ describe('service health', () => {
     await writeFile(join(records, 'calls.sqlite3'), 'not a database')
     vi.stubEnv('AGENT_INTERFACE_DATA_DIR', records)
     try {
-      expect(service.health()).toMatchObject({ runningCallerCalls: 0, idle: false })
+      expect(service.health()).toMatchObject({ runningCallerCalls: 0, unsettledNativeCalls: null, idle: false })
     } finally {
       vi.stubEnv('AGENT_INTERFACE_DATA_DIR', '')
     }

@@ -1,5 +1,6 @@
 import { expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import type { LogEntry } from '../server/agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
 import type { Organization } from '../server/organizations'
@@ -20,15 +21,22 @@ const chain: BehaviorChain = { id: 'example/repo#7', repository: 'example/repo',
   mergeSha: null, observation: null, invocations: [] }
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
 
-it('verifies the original native response bytes without changing Python number formatting', async () => {
+it.each([false, true])('verifies Caller Python request encoding and original response bytes (bounded=%s)', async bounded => {
   const invocation = mergeInvocation()
+  invocation.request = { command: 'github-interface', cwd: '/fixture', nativeResources: 2, argv: invocation.request.argv,
+    ...(bounded ? { resourceLimits: { version: 1 as const, memoryBytes: 2147483648, diskBytes: 536870912 } } : {}) }
+  const requestSha = execFileSync('python3', ['-c', `
+import hashlib, json, sys
+request = json.load(sys.stdin)
+print(hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
+`], { input: JSON.stringify(invocation.request), encoding: 'utf8', timeout: 10_000 }).trim()
   const retained = '{"duration":1.0,"outcome":"enqueued"}'
   const call: LogEntry = { id: 'b'.repeat(32), pr_id: '21', repo: chain.repository, actor: invocation.actor,
     model: 'native-action', behavior: 'native_action', session_id: null, prompt: '', started_at: new Date().toISOString(),
     time_elapsed: '1s', status: 'completed', outcome: 'native_action', action: 'native_action', head_sha: HEAD,
     expected_head: HEAD, source: 'poise:behavior-chain', correlation_id: invocation.id, response: 'bbbbbbbb', error: '',
     artifact: { phase: 'received_native_action',
-    request_sha: chainBasis(invocation.request), response_sha: createHash('sha256').update(retained).digest('hex') } }
+    request_sha: requestSha, response_sha: createHash('sha256').update(retained).digest('hex') } }
   mocks.runFile.mockResolvedValueOnce({ stdout: `${retained}\n` })
   await expect(actionOperations().readActionResult(invocation, call))
     .resolves.toEqual({ duration: 1, outcome: 'enqueued' })

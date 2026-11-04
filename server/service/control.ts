@@ -29,6 +29,8 @@ export interface ServiceHealth {
   version: string | null
   activeChatTurns: number
   runningCallerCalls: number
+  /** Native Calls awaiting durable resource release or cleanup retirement; null when unreadable. */
+  unsettledNativeCalls: number | null
   backgroundWork: number
   /** True only when nothing a restart would cut is running. */
   idle: boolean
@@ -169,6 +171,7 @@ export class ServiceControl {
       version: BUILD_SHA,
       activeChatTurns,
       runningCallerCalls: calls.count,
+      unsettledNativeCalls: calls.known ? calls.pendingResources : null,
       backgroundWork,
       // Never idle while Caller's records cannot be read: calls an earlier server started may still run.
       idle: calls.known && activeChatTurns + calls.count + backgroundWork === 0,

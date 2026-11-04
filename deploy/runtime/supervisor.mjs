@@ -145,7 +145,7 @@ export async function namespaceControl({ open = openNamespaceWitness, limit = 40
           scopes.delete(id)
         }
       }
-      return { available: true, resourceProtocol: 2, ...(store ? { store: store.read() } : {}), ...(storeError ? { storeError } : {}), witnesses: scopes.size, probeAvailable: ![...scopes.values()].some(scope => scope.probe) }
+      return { available: true, resourceProtocol: 2, persistentCleanup: 1, ...(store ? { store: store.read() } : {}), ...(storeError ? { storeError } : {}), witnesses: scopes.size, probeAvailable: ![...scopes.values()].some(scope => scope.probe) }
     }
     identity(request)
     let scope = scopes.get(request.callId)

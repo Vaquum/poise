@@ -1,7 +1,29 @@
 // Original directory handles outlive Caller and cleanup workers. This is
 // physical evidence only; it neither schedules work nor deletes a pathname.
-import { closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync, realpathSync } from 'node:fs'
+import { closeSync, constants, fchmodSync, fstatSync, mkdirSync, openSync, readdirSync, readlinkSync, realpathSync } from 'node:fs'
 import { dirname, normalize } from 'node:path'
+
+function directoryUnlinked(fd) {
+  if (fstatSync(fd).nlink === 0) return true
+  const held = `/proc/self/fd/${fd}`
+  // runsc's persistent-home backend retains nlink=1 after rmdir. The suffix
+  // is only a hint: a live directory can literally be named " (deleted)".
+  if (!readlinkSync(held).endsWith(' (deleted)')) return false
+  if (readdirSync(held).length) return false
+  const original = openSync('.', constants.O_RDONLY | constants.O_DIRECTORY)
+  let unlinked = false
+  try {
+    // This synchronous control operation runs on the supervisor's main thread
+    // and restores its pinned cwd before any other request can execute.
+    process.chdir(held)
+    try { process.cwd() }
+    catch (error) { if (error.code !== 'ENOENT') throw error; unlinked = true }
+  } finally {
+    try { process.chdir(`/proc/self/fd/${original}`) }
+    finally { closeSync(original) }
+  }
+  return unlinked
+}
 
 /** Keep Caller's metadata on the original directory, including after rename.
  * The descriptor is private process configuration, never journal authority. */
@@ -85,7 +107,7 @@ export function resourceWitnesses(callId, metadata) {
   const proof = (entry) => ({ path: entry.path, state: entry.fd === null ? 'reclaimed' : 'allocated', ...entry.identity,
     parent_device: entry.parentIdentity.device, parent_inode: entry.parentIdentity.inode,
     ...(entry.fd === null ? { reclaimed_at: entry.reclaimedAt } : {
-      unlinked: fstatSync(entry.fd).nlink === 0,
+      unlinked: directoryUnlinked(entry.fd),
       anchor: { pid: process.pid, parentFd: entry.parentFd, rootFd: entry.fd },
     }),
   })
@@ -154,7 +176,7 @@ export function resourceWitnesses(callId, metadata) {
         if ([...roots.values()].some(child => child.path.startsWith(`${path}/`) && child.fd !== null)) {
           throw new Error('Native resource still owns child handles')
         }
-        if (fstatSync(entry.fd).nlink !== 0) throw new Error('Original native resource is still linked')
+        if (!directoryUnlinked(entry.fd)) throw new Error('Original native resource is still linked')
         const fd = entry.fd
         entry.fd = null
         closeSync(fd)

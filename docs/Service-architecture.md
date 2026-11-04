@@ -278,11 +278,16 @@ Environment the gateway passes:
 | `POISE_PORT` | `5555` |
 | `HOME` | `/home/poise` |
 | `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 5400), so both sides time a drain alike |
+| `POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES` | optional validated whole-byte native behavior settings from the gateway; unset remains unbounded ([configuration](../gateway/README.md)) |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
 gateway's, or with none, is recreated as one on an outdated image is: drained
 first if it runs ([Deployment](#deployment)).
+Changed or removed native behavior budget/reservation settings use that same
+replacement path and its existing native resource-settlement barrier. Existing
+invocations retain their original immutable ceilings; no setting changes an
+already-admitted booking.
 
 The gateway reaches the workspace at `http://poise-ws-<handle>:5555`, over the
 workspace's network, which it joins by its own container name,
@@ -547,7 +552,7 @@ otherwise offer it):
 **Service endpoints** (loopback, or the `admin` scope; the owner's `browser`
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
-  runningCallerCalls, backgroundWork, idle, draining, release, switching,
+  runningCallerCalls, unsettledNativeCalls, backgroundWork, idle, draining, release, switching,
   eventLoop, desiredRelease, installedRelease, pendingSince, switchWaitingOn }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
@@ -594,6 +599,9 @@ assertion may only resume, and anything else is refused with 403):
     which include those an earlier release started. That records read waits at
     most 100 ms; on contention health reports unknown (idle false) at once
     instead of blocking the loop.
+  - `unsettledNativeCalls` exposes the same bounded Caller read's count of
+    native Calls awaiting durable resource release or cleanup-claim retirement.
+    It is `null` when that read is unknown, never an assumed zero.
   - `backgroundWork` counts everything else a restart would cut: the Chat
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),
@@ -613,11 +621,17 @@ assertion may only resume, and anything else is refused with 403):
   `/api/service/drain` at least every 5 minutes. One `POISE_DRAIN_TIMEOUT`
   budget (default 5400, 90 minutes) covers the whole workspace operation: every
   drain, recheck and re-drain. Once an admitted drain reports `idle` the gateway
-  recreates the container; past the budget it recreates a workspace that confirmed
-  busy work behind an admitted drain or that it can no longer reach, and aborts one
-  whose drain was never admitted or whose answers only timed out or were refused,
+  recreates the container. Past the budget, cutting confirmed busy work requires
+  a fresh admitted drain answer with `unsettledNativeCalls: 0` and no Caller or
+  background work. This covers launches still before their Call registration.
+  Positive, null or missing native counts, unreachable workspaces and unconfirmed drain answers
+  abort replacement, preserving the original supervisor's cleanup witnesses and
   releasing its drain for the next pass (`workspace.upgrade.aborted`). While it
-  waits it logs `workspace.drain.waiting` at each renew with the counters and the
+  has pending or unknown native cleanup but no live Caller, it defers immediately
+  and releases the drain without activation or waiting out the deadline. Existing
+  maintenance retries cleanup independently; a permanent hold cannot keep Chat
+  continuously drained across upgrade passes. While waiting for live work, the gateway
+  logs `workspace.drain.waiting` at each renew with the counters and the
   time left, `workspace.drain.lifted` when a drain it saw on is gone while the
   workspace still isn't idle, and `workspace.drain.timeout` with the last known
   counters. After starting the replacement the gateway waits for its health before
@@ -635,9 +649,10 @@ assertion may only resume, and anything else is refused with 403):
     drain stops it through the person's Stop path, with a transcript notice
     naming the update, and the agent keeps its context for the next prompt.
     `idle` still means nothing a restart would cut; it follows once the
-    stopped turn settles. Past the gateway's own timeout a confirmed busy
-    container is recreated anyway, cutting whatever would not settle —
-    bounded Caller work finishes inside it, so that lands only on hung work.
+    stopped turn settles. Past the gateway's own timeout, confirmed busy work
+    can be cut only after native cleanup is positively clear. Older workspaces
+    without the native count still upgrade when cooperatively idle; they cannot
+    authorize a forced busy replacement.
   - The workspace lets a drain lapse `POISE_DRAIN_TIMEOUT` seconds (default
     5400) plus five minutes after the last drain call, so a gateway that
     stopped renewing it cannot leave the workspace refusing work.
@@ -1075,7 +1090,8 @@ the checkout's commit as the build argument `POISE_SOURCE_SHA`, which
 `/api/service/health` reports as `version`.
 Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
 recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, or
-whose `POISE_DRAIN_TIMEOUT` differs from its own, keeping its volume.
+whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
+its own, keeping its volume and respecting the native settlement barrier.
 
 **Provider CLIs** are installed into each person's home volume on first start
 and update themselves there, as Poise already does before each launch. The
@@ -1287,17 +1303,35 @@ checkout paths; ordinary shared leases retain their existing protocol. Codex
 issue/implementation and structured review histories use the same per-invocation
 home, preserving sign-in and structured resume. Older shared state remains
 retained and measured under the [storage retention policy](Operating.md#storage-maintenance).
-Forced-container lifecycle proof, post-admission budget enforcement and the
+Bounded Calls also carry immutable execution ceilings and a separate version-1
+`resource_guard` receipt. Caller samples its original boundary off the service
+event loop; a committed breach or stale measurement kills only its pinned holder
+and holds the chain. This sampled guard neither grants deletion authority nor
+replaces positive release proof. Unbounded/older Calls retain their prior path;
+older readers hold a guarded possible-write failure instead of retrying it as
+preflight work. [Accounting and limits](Behavior-chain.md) define coverage,
+overshoot and the component bounds. Forced-container lifecycle proof and the
 frozen real-provider campaign remain #806 obligations.
+The stable metadata interface remains resource protocol 2. Physical setup also
+requires the controller's `persistentCleanup: 1` feature and bounded admission
+requires Caller's `resourceGuard: 1` capability. Older images cannot advertise
+these guarantees; their v1 path stays available.
 
 Claimed disk recovery uses the same original Call and supervisor directory
-handles. A final unlink is proven by the original held directory's zero link
-count, followed by handle closure; its first certificate survives a cleanup
+handles. A final unlink requires the original held directory's zero link count,
+or an empty held directory whose kernel `getcwd` returns `ENOENT` after a
+successful descriptor-based `chdir`. This handles persistent-home backends that
+retain a link count of one after unlink; a literal ` (deleted)` name cannot
+authorize release. The synchronous controller restores its pinned working
+directory before another request runs. Handle closure follows this positive
+proof; its first certificate survives a cleanup
 worker's death before the Caller receipt commits. Private claim attempts never
 enter journal evidence. A new container or lost supervisor without retained
-positive proof remains held: this child does not satisfy the frozen container
-replacement acceptance case. Positive lifecycle evidence for that case remains
-required under #806; its fault-matrix requirement is unchanged.
+positive proof remains held, with its disk and reservation retained. Managed
+replacement uses the existing service drain to finish native cleanup before
+destroying those witnesses. Neither a forced restart nor a changed inode after
+restart can authorize deletion or release; the abrupt-loss acceptance outcome
+is a visible hold, not reclaimed capacity.
 The same supervisor holds the original Caller metadata directory, database
 and response-directory descriptors. Its private control configuration names
 them; Caller and health/maintenance readers verify and use the held originals

@@ -29,6 +29,8 @@ address, contact or policy is included in the image or overwritten on upgrade.
 | `POISE_WORKSPACE_MEMORY` | | `8g` | Memory limit per workspace (`b`, `k`, `m`, `g`) |
 | `POISE_WORKSPACE_CPUS` | | `4` | CPU limit per workspace |
 | `POISE_WORKSPACE_PIDS` | | `4096` | Process limit per workspace |
+| `POISE_BEHAVIOR_MEMORY_BUDGET_BYTES` / `POISE_BEHAVIOR_DISK_BUDGET_BYTES` | | unset | Aggregate native behavior reservations per workspace, in whole bytes; each configured dimension requires its positive reservation below |
+| `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES` / `POISE_BEHAVIOR_DISK_RESERVATION_BYTES` | | unset | Per-invocation reservation and sampled ceiling for a bounded dimension; see [Behavior chain](../docs/Behavior-chain.md#intake-and-controls). These four variables alone are forwarded; changing or removing them uses the existing cooperative container replacement |
 | `POISE_WORKSPACE_RUNTIME` | | | OCI runtime for workspaces, for example `runsc` |
 | `POISE_WORKSPACE_DNS` | | | One to three resolver IP addresses the workspaces use instead of Docker's embedded DNS, which gVisor cannot reach; required with `runsc`. The gateway writes them to `workspace-resolv.conf` in its data directory and mounts that file read-only over each workspace's `/etc/resolv.conf`, so the data directory must be a mount when the gateway runs in a container |
 | `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` | | | `1` passes `POISE_SKIP_CLI_BOOTSTRAP=1` to new workspaces, so they install no provider CLIs; for end-to-end tests, which need no CLIs |

@@ -34,6 +34,7 @@ from . import (
     progress,
     review_budget,
     review_receipt,
+    resource_guard,
     resource_ownership,
 )
 from .model_catalog import CATALOG, ModelCatalogError
@@ -113,6 +114,7 @@ def init_db():
             "resource_ownership",
             "namespace_control",
             "resource_cleanup",
+            "resource_guard",
         ):
             if col not in cols:
                 try:
@@ -218,6 +220,7 @@ def track(
     such a row records no pid, because there is no local process to signal."""
     global _native_call_id
     id_ = uuid4().hex
+    ceilings = native_execution_limits() if _native_cli else None
     with db() as conn:
         conn.execute(
             """insert into calls (
@@ -246,11 +249,23 @@ def track(
                 if _native_cli and source == "poise:behavior-chain" and not runner else None,
             ),
         )
+        if ceilings is not None:
+            conn.execute("update calls set resource_guard=? where id=?", (resource_guard.initial(ceilings), id_))
     if source == "poise:behavior-chain" and not runner:
         _native_call_id = id_
     if _native_cli and source == "poise:behavior-chain" and not runner:
         _enter_native_call(id_, correlation_id)
     return id_
+
+
+def native_execution_limits() -> dict | None:
+    args = sys.argv[1:sys.argv.index("--")] if "--" in sys.argv else sys.argv[1:]
+    flag = "--resource-limits-json"
+    if flag not in args:
+        return None
+    if args.count(flag) != 1 or args.index(flag) + 1 >= len(args):
+        raise ValueError("native execution requires exactly one resource-limits argument")
+    return resource_guard.limits(args[args.index(flag) + 1])
 
 
 def _prepare_native_clis(call_id: str) -> None:
@@ -307,8 +322,12 @@ def _enter_native_call(call_id: str, correlation: str) -> None:
         direct = sys.argv[1] in {"--native-action", "--complete-atomic-publication"}
         seconds = native_action.CALL_SECONDS if direct else issue_review.TIMEOUT_SECONDS \
             if sys.argv[1] in {"--issue-review", "--atomic-work"} else review_budget.REVIEW_TIMEOUT_SECONDS
+        with db() as conn:
+            raw_guard = conn.execute("select resource_guard from calls where id=?", (call_id,)).fetchone()[0]
+        ceilings = json.loads(raw_guard)["limits"] if raw_guard else None
         if scope.start(lambda receipt: resource_ownership.register_namespace(DB, call_id, receipt),
-                       timeout_seconds=seconds + (0 if direct else 180)):
+                       timeout_seconds=seconds + (0 if direct else 180),
+                       **({"guard": lambda original: resource_guard.Guard(DB, call_id, original, ceilings)} if ceilings else {})):
             if not direct:
                 _prepare_native_clis(call_id)
             return
@@ -352,7 +371,7 @@ def _enter_native_call(call_id: str, correlation: str) -> None:
                 no_go = scope is None or not scope.go_sent
                 stopped = row["error_code"] in {"stopping", "stopped"}
                 finish(call_id, "failed", error="Stopped by user" if stopped else str(error)[:2000],
-                       error_code="stopped" if stopped else "native_cleanup_failed",
+                       error_code="stopped" if stopped else getattr(error, "code", "native_cleanup_failed"),
                        action="not_started" if no_go else None, outcome="preflight_failed" if no_go else None)
         raise
 
@@ -516,7 +535,7 @@ def stop_call(id_: str) -> dict:
         # A verified leader receives SIGTERM and unwinds its own provider
         # handlers. Numeric killpg after verification would reopen PID reuse.
         with db() as conn:
-            conn.execute("update calls set error_code='stopping' where id=? and status='running'", (id_,))
+            conn.execute("update calls set error_code='stopping' where id=? and status='running' and error_code is null", (id_,))
         if process is not None:
             process.signal(signal.SIGTERM)
             if not process.wait(STOP_GRACE_SECONDS):
@@ -525,7 +544,7 @@ def stop_call(id_: str) -> dict:
     # The process may have finished its own row in the grace period.
     with db() as conn:
         changed = conn.execute(
-            "update calls set status='failed', ended_at=?, error='Stopped by user', error_code='stopped', progress=coalesce(?, progress) where id=? and status='running'",
+            "update calls set status='failed', ended_at=?, error='Stopped by user', error_code='stopped', progress=coalesce(?, progress) where id=? and status='running' and error_code in ('stopping','stopped')",
             (time(), progress.terminal("failed"), id_),
         ).rowcount
         after = conn.execute("select status, error_code from calls where id=?", (id_,)).fetchone()
@@ -550,6 +569,18 @@ def finish(
     path = caller_store.response_name(RESPONSES / f"{id_}.txt") if response else None
     ended_at = time()
     with db() as conn:
+        conn.execute("begin immediate")
+        prior_cause = conn.execute("select error_code,error from calls where id=?", (id_,)).fetchone()
+        if prior_cause and prior_cause["error_code"] in resource_guard.CODES:
+            # Older readers must see a possible-write failure, never the
+            # automatically retried preflight/no-write shape. Artifacts and
+            # original publication receipts remain independently readable.
+            status, error_code, error = "failed", prior_cause["error_code"], prior_cause["error"]
+            action, outcome = None, None
+        elif prior_cause and prior_cause["error_code"] in {"stopping", "stopped", "native_timeout"}:
+            status, error_code = "failed", "stopped" if prior_cause["error_code"] in {"stopping", "stopped"} else "native_timeout"
+            error = "Stopped by user" if error_code == "stopped" else prior_cause["error"]
+            action, outcome = None, None
         persisted = False
         if response:
             prior = conn.execute("select behavior,artifact,response_path from calls where id=?", (id_,)).fetchone()
@@ -644,8 +675,8 @@ def reap_interrupted() -> int:
             # may have marked it, and ended its worker, since the select above.
             count += conn.execute(
                 "update calls set status='failed', ended_at=?, "
-                "error=case when error_code='stopping' then 'Stopped by user' else ? end, "
-                "error_code=case when error_code='stopping' then 'stopped' else 'interrupted' end, "
+                "error=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error when error_code='stopping' then 'Stopped by user' else ? end, "
+                "error_code=case when error_code in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable','native_timeout') then error_code when error_code='stopping' then 'stopped' else 'interrupted' end, "
                 "progress=coalesce(?, progress) where id=? and status='running'",
                 (now, INTERRUPTED_ERROR, progress.terminal("failed"), id_),
             ).rowcount
@@ -657,7 +688,7 @@ LOG_ROW_COLUMNS = """id, model, prompt, started_at, ended_at, status,
     response_path, error, pr_id, repo, actor, behavior,
     session_id, outcome, head_sha, expected_head, source,
     correlation_id, action, error_code, progress, review_policy, recovery_model,
-    review_id, runner, receipts, review_comments, diagnostic, artifact, resources_settled_at, issue_revision, resource_ownership"""
+    review_id, runner, receipts, review_comments, diagnostic, artifact, resources_settled_at, issue_revision, resource_ownership, resource_guard"""
 
 
 def _log_row(r) -> dict:
@@ -695,6 +726,7 @@ def _log_row(r) -> dict:
         "receipts": _receipts(r["receipts"]),
         "artifact": json.loads(r["artifact"]) if r["artifact"] else None,
         "resource_ownership": json.loads(r["resource_ownership"]) if r["resource_ownership"] else None,
+        "resource_guard": json.loads(r["resource_guard"]) if r["resource_guard"] else None,
         "resources_settled_at": utc_stamp(float(r["resources_settled_at"])) if r["resources_settled_at"] else None,
         "issue_revision": r["issue_revision"],
     }
@@ -1070,8 +1102,9 @@ def run_issue_review(
                 if source == "poise:behavior-chain":
                     digest = persist_action_plan(id_, {"kind": "issue_review", "posts": posts, "model": name, "issue_revision": observed_revision})
                     with db() as conn:
-                        conn.execute("update calls set artifact=? where id=? and status='running'",
-                                     (json.dumps({"phase": "posting_issue_reviews", "plan_sha": digest}), id_))
+                        if conn.execute("update calls set artifact=? where id=? and status='running'",
+                                        (json.dumps({"phase": "posting_issue_reviews", "plan_sha": digest}), id_)).rowcount != 1:
+                            raise RuntimeError("issue review no longer owns its unstarted publication")
                 receipts = issue_review.post(posts, actor, id_, name, record, observed_revision)
             except subprocess.TimeoutExpired as e:
                 fail(review_budget.ReviewLimitError(
@@ -1198,10 +1231,12 @@ def persist_action_plan(call_id: str, plan: dict) -> str:
     if len(encoded.encode()) > issue_review.MAX_PACKET_BYTES:
         raise ValueError("native publication plan exceeds its durable byte bound")
     with db() as conn:
+        conn.execute("begin immediate")
         row = conn.execute("select action_plan, status from calls where id=?", (call_id,)).fetchone()
         if row is None or row["status"] != "running" or (row["action_plan"] is not None and row["action_plan"] != encoded):
             raise ValueError("native publication plan conflicts with its original durable record")
-        conn.execute("update calls set action_plan=? where id=?", (encoded, call_id))
+        if conn.execute("update calls set action_plan=? where id=? and status='running'", (encoded, call_id)).rowcount != 1:
+            raise RuntimeError("native publication no longer owns its unstarted plan")
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
@@ -1270,6 +1305,9 @@ def _native_action_artifact(call_id: str, phase: str, request_sha: str, response
 
 def run_native_action(argv: list[str], cwd: str, repository: str, actor: str, correlation: str, *, resource_version: bool) -> None:
     request, number, head = native_action.validate(argv, cwd, repository, actor, resource_version=resource_version)
+    ceilings = native_execution_limits()
+    if ceilings is not None:
+        request["resourceLimits"] = ceilings
     correlation = atoms.correlation_id(correlation)
     id_ = track("native-action", argv[0], number, repository, actor, "native_action", expected_head=head,
                 source="poise:behavior-chain", correlation_id=correlation)
@@ -1335,6 +1373,9 @@ def run_native_publication(call_id: str, digest: str, head: str, correlation: st
             or not re.fullmatch(r"[0-9a-f]{40}", head):
         raise ValueError("native publication requires its original Call, plan and head")
     request = {"kind": "native_publication", "call_id": call_id, "digest": digest, "head": head}
+    ceilings = native_execution_limits()
+    if ceilings is not None:
+        request["resourceLimits"] = ceilings
     encoded = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     request_sha = hashlib.sha256(encoded.encode()).hexdigest()
     correlation = atoms.correlation_id(correlation or f"publication-{request_sha}")
@@ -1342,6 +1383,9 @@ def run_native_publication(call_id: str, digest: str, head: str, correlation: st
         original = conn.execute("select * from calls where id=?", (call_id,)).fetchone()
     if not original or original["source"] != "poise:behavior-chain" or original["behavior"] != "repair_pr":
         raise ValueError("native publication lacks its original repair Call")
+    original_guard = json.loads(original["resource_guard"]) if original["resource_guard"] else None
+    if (original_guard["limits"] if original_guard else None) != ceilings:
+        raise ValueError("native publication resource limits differ from its original admission")
     id_ = track("native-action", "Complete original repair publication", original["pr_id"], original["repo"],
                 original["actor"], "native_publication", expected_head=head,
                 source="poise:behavior-chain", correlation_id=correlation)
@@ -1373,6 +1417,7 @@ def mark_managed_no_write(conn: sqlite3.Connection, call_id: str) -> None:
     # response was lost. Resource settlement is an independent prerequisite.
     conn.execute("update calls set action='not_started', outcome='preflight_failed', head_sha=null "
                  "where id=? and source='poise:behavior-chain' and status='failed' and resources_settled_at is not null and "
+                 "coalesce(error_code,'') not in ('resource_memory_exceeded','resource_disk_exceeded','resource_measurement_unavailable') and "
                  "json_valid(artifact) and (json_extract(artifact,'$.phase') in ('preparing','prepared','executing','reviewing') "
                  "or (action_plan is null and behavior in ('issue_review','implement_issue','repair_pr')))",
                  (call_id,))
@@ -2638,6 +2683,7 @@ def _main():
         parser.add_argument("--correlation-id", required=True)
         parser.add_argument("--request-cwd", required=True)
         parser.add_argument("--native-resource-v2", action="store_true")
+        parser.add_argument("--resource-limits-json")
         args = parser.parse_args(sys.argv[2:separator])
         run_native_action(sys.argv[separator + 1:], args.request_cwd, args.repository, args.actor, args.correlation_id,
                           resource_version=args.native_resource_v2)
@@ -2674,6 +2720,7 @@ def _main():
         parser = argparse.ArgumentParser(prog="agent-interface --complete-atomic-publication")
         parser.add_argument("--source", choices=["poise:behavior-chain"])
         parser.add_argument("--correlation-id")
+        parser.add_argument("--resource-limits-json")
         args = parser.parse_args(sys.argv[5:])
         run_native_publication(*sys.argv[2:5], args.correlation_id)
         return

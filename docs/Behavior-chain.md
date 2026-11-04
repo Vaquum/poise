@@ -160,6 +160,11 @@ Admission-mode transitions use `admission.changed` events under the reserved `@b
 
 Native Call rows and immutable action plans record effect intent before controlled publication. They provide execution evidence to the journal, not a second phase controller. Unique native correlations prevent duplicate processes from executing the same admission. Worker resource settlement is required before a handoff; a terminal model result is insufficient. A restart or interrupted process is reconciled against the original invocation, pushed branch, posted comments and exact-head review receipts.
 
+Native request digests use Caller's recursively sorted JSON encoding.
+Journal event/state and plan hashes keep their original serialization, while response
+digests verify the original retained bytes. These are separate contracts;
+reconciliation never rewrites historical events to make a digest match.
+
 An uncertain fixed action retains its first verified response and digest in
 the same journal, so unchanged passes and projection rebuilds do not launch
 another response reader or repeat uncertainty events. Observation-based recovery
@@ -241,7 +246,79 @@ rather than becoming ambiguous writes that never occurred.
 
 Durable model admissions use the existing semaphore's behavior-lane ceiling, including its interactive reserve. A fresh server process cannot fill that reserve with another background invocation merely because surviving workers hold no slots in its new in-memory semaphore. Existing work above a lowered ceiling finishes normally while new admissions wait. The journal's capacity check also precedes provider preparation, so waiting work cannot consume a provider recovery probe without launching; admission still rechecks capacity transactionally afterward.
 
-Resource-aware admission (#731) extends that boundary with memory/disk budgets instead of another scheduler. Each admitted native invocation holds a durable reservation covering its whole tree, including provider children and build/test descendants; the count and budget checks run in one journal transaction, so concurrent admissions cannot double-spend. A synchronous free-memory/free-disk probe guards the same boundary before provider preparation and again before spawn, and fails closed with an explicit reason. Blocked chains wait with that reason and no agent process, waking through the existing release paths. Verified settlement releases a reservation exactly once; cleanup uncertainty and pre-reservation live invocations retain or block it. Budgets and reservations are environment-only (`POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES`); unset means unbounded and production behaves as before. Deletion authority stays with the Caller sweep's ownership proofs; live breach termination is the #730 follow-up.
+Resource-aware admission (#731) extends that boundary with memory/disk budgets instead of another scheduler. Each admitted native invocation holds a durable reservation covering its whole tree, including provider children and build/test descendants; the count and budget checks run in one journal transaction, so concurrent admissions cannot double-spend. A synchronous free-memory/free-disk probe guards the same boundary before provider preparation and again before spawn, and fails closed with an explicit reason. Blocked chains wait with that reason and no agent process, waking through the existing release paths. Verified settlement releases a reservation exactly once; cleanup uncertainty and pre-reservation live invocations retain or block it. Budgets and reservations are environment-only (`POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES`); unset means unbounded and production behaves as before. Deletion authority stays with the Caller sweep's ownership proofs.
+
+A configured cgroup memory limit requires a readable, nonempty current-usage
+counter. Missing usage cannot masquerade as zero.
+
+For new bounded admissions, each bounded dimension's reservation is also its
+sampled execution ceiling. The immutable request records explicit null for an
+unbounded dimension, includes the limits in native arguments and binds fixed
+actions/publication continuations through their request digest. Later environment
+changes cannot enlarge that booking. Older admissions remain unenforced; they
+never acquire a fabricated measurement or new execution limit.
+
+The original outside Caller samples on one thread, at most once per second,
+while its existing wait loop handles Stop and deadlines. No tree walk runs on
+Poise's or the shared supervisor's event loop. Its pinned private procfs covers
+the namespace plus the original owner and holder. Charged memory is Linux PSS
+where `smaps_rollup` exists, otherwise RSS. RSS deliberately charges shared fork
+pages repeatedly; neither model includes kernel/sentry/page-cache overhead.
+Allocated blocks under pinned disposable roots and regular open-but-deleted
+files, including Caller spools, are deduplicated by device/inode. Deleted target
+names count even when runsc still reports one link. A deleted mapping lacking an
+open allocated-byte counter makes coverage partial. Tmpfs allocation counts as
+disk; it is not added again to process memory. Symlinks are not followed. Known
+build caches use disposable paths; closed files in arbitrary shared user caches
+and inode quotas are outside this byte counter.
+
+The process counter pass validates membership before the independent pinned
+filesystem walk. A child born during that later walk belongs to the next
+process sample; it does not invalidate the earlier counters. A process change
+during the process counter pass still makes coverage partial. The counters
+are sampled across an interval, not one atomic memory/filesystem snapshot.
+An exit or changed membership during that pass gets fresh reads within the
+same one-second sampling opportunity, with a short pause after the first retry
+to avoid busy spinning. Only a complete successful read refreshes
+coverage; persistent races and inaccessible counters retain the five-second
+fail-closed rule. The retry starts no process and grants no cleanup authority.
+
+A complete sample over its ceiling, or five seconds without a complete sample,
+commits the first typed cause before immediately killing the original pinned
+holder. A stalled read names its current measurement stage in that cause.
+There is no five-second grace for a resource breach. The chain is held;
+ordinary Stop, timeout, completion and reaping preserve whichever cause/result
+committed first. Publication remains guarded and original accepted/uncertain
+action receipts are retained. Ownership and cleanup failures stay separate from
+the bounded `resource_guard` measurement summary; release still requires positive
+process and disk receipts. Older consumers retain a possible-write failure rather
+than automatically retrying a breached preflight. Resume requires correcting the
+workload or reservation, then an explicit decision; it does not expand old limits.
+Brief SQLite contention defers summary persistence without terminating healthy
+work. A stop receipt that cannot commit within 1.5 seconds fails closed as
+receipt-unavailable through the original scope's teardown; it cannot certify a
+first cause or no-write result without that commit. Missing signal-timing
+annotations remain unavailable rather than zero. Proven failures before native
+scope creation retain their existing no-worker receipt and release path.
+When that optional annotation is unavailable, the component check requires the
+existing independent positive-empty observation within the same two-second bound;
+this proves completion, a stronger requirement than stop initiation.
+
+The admitted model request also includes these immutable ceilings in its existing
+behavior note. The provider must bound test/build parallelism, starting with one
+worker when a runner otherwise follows host CPU count, while preserving every
+required check and assertion. This guidance grants no authority to change the
+ceilings or enforcement; the original resource guard still stops a breach.
+
+These are sampled soft ceilings, not hard kernel quotas or a guarantee against
+instantaneous allocation. Component proof uses 256-MiB memory and 8-MiB disk
+ceilings, at most 64 MiB/s memory and 2 MiB/s disk growth, at least 1 GiB of
+outside-measured headroom and a live independent neighbor. Its frozen overshoot
+allowances are 192 MiB memory and 8 MiB disk, with stop initiation within two
+seconds and positive namespace emptiness within ten seconds of the first complete
+breach sample (monotonic completion time). The separate 180-second reclamation
+bound remains unchanged. These component checks do not establish real-provider
+campaign acceptance or forced-container recovery.
 
 Known failures before publication retry with bounded backoff and existing provider fallback. Ambiguous writes retain ownership. Confirmed actual artifacts can settle a lost response; missing receipts cannot justify another write. Partially published review/reply plans that cannot be fully reconciled remain uncertain and visible. They are not silently retried or reported successful. This limitation must be exercised and resolved if encountered in the real validation runs.
 
@@ -668,7 +745,7 @@ in its declared cohort.
 | --- | --- | --- | --- |
 | Person Stop / cancellation | Observed stop of a live invocation | Worker tree terminated and settled; chain held even after settlement (`server/behavior-chain-runtime.ts`); no silent resume | Held |
 | Timeout | Budget expiry with worker alive | Tree terminated, settlement verified, ownership retained | Held or failed per cause |
-| Native worker/parent failure | Observed worker or Caller-parent death | Descendants reclaimed; surviving live descendant reconciled against the original invocation | Held |
+| Native worker/parent failure | Observed worker or Caller-parent death | Descendants reclaimed; surviving live descendant reconciled against the original invocation. A durable pre-write phase and verified resource release permit a fresh atomic attempt; a possible external write retains the original invocation for reconciliation | Continues only with proven no-write; otherwise held or uncertain |
 | In-container server replacement | New server process with observed surviving workers | Survivors keep no duplicate admissions; capacity reuses the lane ceiling across replacement | Continues or held |
 | Container restart | New container-init epoch with persistent disk and reservations | Caller epoch handling reconciles reservations; cleanup/restart settles exactly once | Continues or held |
 | Interrupted cleanup, before reclamation | Kill between outcome durability and deletion | Failed cleanup durable, visible and retryable; retry repeats no completed external action | Held until recovered |
@@ -686,6 +763,17 @@ hold end held; an explicitly logged test-control resume is allowed
 only where the case row names it, and never counts as an
 unattended merge. A regression-only path stays explicitly unproven
 in the real run.
+
+An interrupted status alone permits no retry. Caller's existing
+`mark_managed_no_write` boundary additionally requires positive resource
+settlement and a durable phase before controlled publication. Admitted or
+submitting writes stay excluded. The runtime retains that original failed
+attempt before admitting another invocation; it does not count the failed
+attempt as a completed review. A person's Stop and resource-limit failures
+still hold the chain even when no external write occurred. The earlier blanket
+Held expectation for parent loss was broader than these existing executable
+contracts; retained tests against that expectation record the mismatch rather
+than silently claiming a pass.
 
 ### Accumulation and return to idle
 

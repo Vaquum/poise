@@ -174,6 +174,91 @@ describe('durable behavior resource reservations', () => {
 })
 
 describe('resource-aware behavior admission', () => {
+  it('settles a bounded pre-track failure without fabricating an enforced worker or aborting other reconciliation', async () => {
+    const { journal, chain } = setup()
+    const other = seed(journal, 8)
+    const limits = { version: 1 as const, memoryBytes: 6, diskBytes: null }
+    const original = invocation('pretrack-original', RESERVATION)
+    const admitted = { ...original, request: { ...original.request, resourceLimits: limits,
+      argv: [...original.request.argv, '--resource-limits-json', JSON.stringify(limits)] } }
+    record(journal, chain, { type: 'invocation.admitted', invocation: admitted })
+    const call = { ...completedReviewCall(chain.repository, chain.issue, 'a'.repeat(40), chain.reviewer),
+      behavior: 'issue_review', source: 'poise:behavior-chain', correlation_id: admitted.id, model: admitted.model,
+      status: 'failed', error_code: 'launch_preflight_failed', error: 'catalog preparation failed before track',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, expected_head: null,
+      review_id: null, artifact: null, receipts: null, response: null,
+      resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: new Date().toISOString() }
+    const runtime = new BehaviorChainRuntime(journal, operations({ enabled: () => false,
+      readInvocations: async () => parseAgentLogStdout(JSON.stringify([call]), 'pre-track native serializer contract') }))
+    await runtime.run()
+    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'settled', outcome: 'preflight_failed' })
+    expect(journal.reservedResources().memoryBytes).toBe(0)
+    expect(journal.read(chain.id)!.invocations[0].evidence).not.toHaveProperty('resource_guard')
+    expect(journal.read(other.id)!.observation).not.toBeNull()
+  })
+
+  it('journals provider-visible execution ceilings before launch and preserves old replay hashes', async () => {
+    bounded('100', '60')
+    const { journal, chain } = setup()
+    const launch = vi.fn(async () => true)
+    await new BehaviorChainRuntime(journal, operations({ launch,
+      request: async () => ({ command: 'agent-interface', argv: ['--model', 'fixture-model', '--note', 'Repository-specific instructions'], cwd: '/fixture' }),
+    })).run()
+    const admitted = journal.read(chain.id)!.invocations[0]
+    expect(admitted.reservation).toEqual({ memoryBytes: 60, diskBytes: 0 })
+    expect(admitted.request.resourceLimits).toEqual({ version: 1, memoryBytes: 60, diskBytes: null })
+    expect(JSON.parse(admitted.request.argv.at(-1)!)).toEqual(admitted.request.resourceLimits)
+    expect(admitted.request.argv.at(-2)).toBe('--resource-limits-json')
+    const note = admitted.request.argv[admitted.request.argv.indexOf('--note') + 1]
+    expect(note).toContain('Repository-specific instructions')
+    expect(note).toContain(JSON.stringify(admitted.request.resourceLimits))
+    expect(note).toContain('provider and all child processes')
+    expect(note).toContain('one worker')
+    expect(note).toContain('Preserve all required checks and assertions')
+    const before = journal.read(chain.id)
+    journal.rebuild()
+    expect(journal.read(chain.id)).toEqual(before)
+    expect(launch).toHaveBeenCalledOnce()
+  })
+
+  it.each(['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable'])(
+    'holds on %s through verified cleanup without mislabelling person Stop or admitting another behavior', async code => {
+      const { journal, chain } = setup()
+      const limits = { version: 1 as const, memoryBytes: code === 'resource_disk_exceeded' ? null : 6,
+        diskBytes: code === 'resource_disk_exceeded' ? 1 : null }
+      const original = invocation('breached-original', { memoryBytes: 6, diskBytes: 1 })
+      const admitted = { ...original, admittedAt: Date.now() - 3000,
+        request: { ...original.request, resourceLimits: limits,
+          argv: [...original.request.argv, '--resource-limits-json', JSON.stringify(limits)] } }
+      record(journal, chain, { type: 'invocation.admitted', invocation: admitted })
+      const namespace = { state: 'active', callId: 'c'.repeat(32), correlation: admitted.id,
+        controller: { version: 1, instance: 'b'.repeat(32) }, binding: { pid: 4, start: '4', namespace: 'pid:[9]',
+          owner: { pid: 2, start: '2' }, holder: { pid: 3, start: '3' },
+          epoch: { boot: 'fixture', init_start: '1', namespace_dev: '1', namespace_ino: '9' } } }
+      const call = { ...completedReviewCall(chain.repository, chain.issue, 'a'.repeat(40), chain.reviewer), id: 'c'.repeat(32),
+        behavior: 'issue_review', source: 'poise:behavior-chain', correlation_id: admitted.id, model: admitted.model,
+        status: 'failed', error_code: code, error: 'Behavior fixture resource coverage failed', action: null, outcome: null,
+        head_sha: null, expected_head: null, review_id: null, artifact: null, receipts: null,
+        resource_guard: { version: 1, limits, state: 'stopped', memoryModel: 'rss', peakMemoryBytes: 7, peakDiskBytes: 2,
+          samples: 1, partialSamples: 0, lastCompleteAt: 11, longestUnavailableSeconds: 1,
+          failure: { code, dimension: code === 'resource_disk_exceeded' ? 'diskBytes' : code === 'resource_memory_exceeded' ? 'memoryBytes' : 'coverage',
+            ceiling: code === 'resource_disk_exceeded' ? 1 : code === 'resource_memory_exceeded' ? 6 : null,
+            observed: code === 'resource_disk_exceeded' ? 2 : code === 'resource_memory_exceeded' ? 7 : null,
+            observedAt: 11, observedMonotonic: 11, message: 'Behavior fixture resource coverage failed', noWrite: true } },
+        resource_ownership: { version: 2, roots: [], errors: [], namespace }, resources_settled_at: null as string | null }
+      const runtime = new BehaviorChainRuntime(journal, operations({ readInvocations: async () => parseAgentLogStdout(JSON.stringify([call]), 'resource cause contract') }))
+      await runtime.run()
+      expect(journal.read(chain.id)!.held).toBe(call.error)
+      expect(journal.reservedResources().memoryBytes).toBe(6)
+      call.resources_settled_at = new Date().toISOString()
+      Object.assign(namespace, { state: 'settled', settled_at: 12 })
+      await runtime.run()
+      expect(journal.read(chain.id)!.held).toBe(call.error)
+      expect(journal.reservedResources().memoryBytes).toBe(0)
+      expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+      expect(journal.read(chain.id)!.invocations[0].state).toBe('settled')
+    })
+
   it('retains the person Stop intent while cleanup is uncertain and after its later verified release', async () => {
     const { journal, chain } = setup()
     const admitted = { ...invocation('stopped-original', RESERVATION), admittedAt: Date.now() - 3000 }
@@ -348,6 +433,7 @@ describe('resource-aware behavior admission', () => {
     const admitted = journal.read(chain.id)!
     expect(admitted.invocations).toHaveLength(1)
     expect(admitted.invocations[0].reservation).toBeNull()
+    expect(admitted.invocations[0].request.argv).toEqual(['--model', 'fixture-model'])
   })
 })
 
@@ -357,6 +443,15 @@ describe('spawn-time resource gate', () => {
     capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
     reviews: async () => 'reviews', existing: async () => new Set<string>(), wake: () => {}, ...overrides })
   const nativeInvocation = { id: 'native', request: { command: 'agent-interface', argv: [], cwd: '/w' } } as never
+
+  it('checks the original booking after configuration changes instead of silently increasing the allowance', async () => {
+    bounded('100', '60')
+    const admission = { ...invocation('original-booking', { memoryBytes: 8, diskBytes: 0 }),
+      admissionSequence: 1, state: 'admitted' as const, callId: null, outcome: null, evidence: null }
+    const fitting = nativeChainOperations({ login: 'example' } as Organization,
+      hooks({ measureHeadroom: () => ({ freeMemoryBytes: 10, freeDiskBytes: 100, diskPath: '/fixture' }) }))
+    expect(await fitting.launch(admission, () => {}, () => true)).toBe(true)
+  })
 
   it('defers the spawn without borrowing a slot when headroom is short or unavailable', async () => {
     bounded('100', '60')

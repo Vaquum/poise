@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { Database } from 'better-sqlite3'
 import type { BehaviorCutoverState } from '../src/behavior-cutover'
-import { budgetShortfall, type BehaviorResourceBudget, type BehaviorResourceReservation } from './behavior-resources'
+import { budgetShortfall, validateExecutionLimits, type BehaviorExecutionLimits, type BehaviorResourceBudget, type BehaviorResourceReservation } from './behavior-resources'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 
 const CUTOVER_ID = '@behavior-admission'
@@ -21,7 +21,7 @@ export interface ChainInvocation {
   reservation?: BehaviorResourceReservation | null
   admittedAt: number
   admissionSequence: number
-  request: { command: 'agent-interface' | 'github-interface', argv: string[], cwd: string, nativeResources?: 2,
+  request: { command: 'agent-interface' | 'github-interface', argv: string[], cwd: string, nativeResources?: 2, resourceLimits?: BehaviorExecutionLimits,
     context?: { head: string, reviewRevision: string, queueRemoval?: string } }
   state: 'admitted' | 'started' | 'uncertain' | 'settled'
   callId: string | null
@@ -137,6 +137,18 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     const reservation = invocation.reservation ?? null
     if (reservation !== null && (!Number.isSafeInteger(reservation.memoryBytes) || reservation.memoryBytes < 0
       || !Number.isSafeInteger(reservation.diskBytes) || reservation.diskBytes < 0)) throw new Error('behavior invocation carries an invalid resource reservation')
+    if (invocation.request.resourceLimits) {
+      validateExecutionLimits(invocation.request.resourceLimits, reservation)
+      if (invocation.request.command === 'agent-interface') {
+        const argv = invocation.request.argv, index = argv.indexOf('--resource-limits-json')
+        if (argv.filter(arg => arg === '--resource-limits-json').length !== 1
+          || chainBasis(JSON.parse(argv[index + 1])) !== chainBasis(invocation.request.resourceLimits)) {
+          throw new Error('native execution arguments differ from their original resource limits')
+        }
+      }
+    } else if (invocation.request.command === 'agent-interface' && invocation.request.argv.includes('--resource-limits-json')) {
+      throw new Error('native execution limits lack their original resource reservation')
+    }
     next.invocations.push({ ...invocation, reservation, admissionSequence: sequence, state: 'admitted', callId: null, outcome: null, evidence: null })
     next.waiting = null
   } else {

@@ -6,7 +6,8 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainAdmission, type ChainInvocation } from '../server/behavior-chain-store'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
-import { matchingNativeActionReceipt, nativeActionReceipt, nativeActionSettlement } from '../server/behavior-chain-action'
+import { matchingNativeActionReceipt, nativeActionReceipt, nativeActionSettlement, nativeRequestSha } from '../server/behavior-chain-action'
+import { BehaviorResourceRecovery } from '../server/behavior-chain-resource-recovery'
 import { completedReviewCall } from './review-response-fixture'
 import type { LogEntry } from '../server/agent-log-parse'
 
@@ -98,9 +99,35 @@ function releasedAction(invocation: ChainInvocation, result?: Record<string, unk
       correlation: invocation.id, settled_at: stamp / 1000, controller: { version: 1, instance: 'd'.repeat(32) },
       binding: { pid: 104, start: '12', namespace: 'pid:[91]', owner: { pid: 102, start: '10' },
         holder: { pid: 103, start: '11' }, epoch: { boot: 'fixture', init_start: '1', namespace_dev: '2', namespace_ino: '3' } } } },
-    artifact: { phase: result ? 'received_native_action' : 'performing_native_action', request_sha: chainBasis(invocation.request),
+    artifact: { phase: result ? 'received_native_action' : 'performing_native_action', request_sha: nativeRequestSha(invocation.request),
       ...(result ? { response_sha: chainBasis(result) } : {}) } }
 }
+
+it('releases native resources using Caller encoding while preserving the original journal receipt', async () => {
+  const { journal, chain } = setup('merge-pr', true, ':memory:', true)
+  const invocation = chain.invocations[0]
+  const result = { action: 'merge_if_ready', repository: chain.repository, pull_number: 21, head_sha: HEAD,
+    outcome: 'enqueued', queue_entry_id: 'original-queue-entry' }
+  const proof = nativeActionReceipt(chain, invocation, result)
+  const current = journal.append(chain.id, 'accepted-response', chain.sequence, { type: 'invocation.reconciled',
+    invocationId: invocation.id, evidence: { nativeActionReceipt: proof } })
+  const originalEvents = journal.history(chain.id)
+  const call = releasedAction(invocation, result)
+  const correctDigest = call.artifact!.request_sha
+  const recovery = new BehaviorResourceRecovery(journal, async () => ({ entries: [call], quarantined: [] }))
+  call.artifact!.request_sha = '0'.repeat(64)
+  await expect(recovery.run()).rejects.toThrow('immutable request')
+  expect(journal.reservedResources()).toEqual({ memoryBytes: 8, diskBytes: 16, unaccounted: 0 })
+  call.artifact!.request_sha = correctDigest
+  await recovery.run()
+  const recovered = journal.read(chain.id)!
+  expect(recovered.invocations[0]).toMatchObject({ state: current.invocations[0].state, outcome: current.invocations[0].outcome })
+  expect(recovered.invocations[0].evidence!.nativeActionReceipt).toEqual(proof)
+  expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+  expect(journal.history(chain.id).slice(0, originalEvents.length)).toEqual(originalEvents)
+  journal.rebuild()
+  expect(journal.read(chain.id)).toEqual(recovered)
+})
 
 it.each(['rerun-grey-ci', 'publish-issue'] as const)('keeps physical release proof when %s recovers from an observation', async behavior => {
   const { journal, chain } = setup('merge-pr', false)
@@ -173,7 +200,7 @@ it('keeps a contained action reserved after its accepted response until original
         controller: { version: 1, instance: 'd'.repeat(32) }, binding: { pid: 104, start: '12', namespace: 'pid:[91]',
           owner: { pid: 102, start: '10' }, holder: { pid: 103, start: '11' },
           epoch: { boot: 'fixture', init_start: '1', namespace_dev: '2', namespace_ino: '3' } } } },
-    artifact: { phase: 'received_native_action', request_sha: chainBasis(invocation.request), response_sha: chainBasis(result) } }
+    artifact: { phase: 'received_native_action', request_sha: nativeRequestSha(invocation.request), response_sha: chainBasis(result) } }
   const readActionResult = vi.fn(async () => result)
   const perform = vi.fn(async () => { throw new Error('must not repeat the action') })
   const runtime = new BehaviorChainRuntime(journal, operations(observation(), { enabled: () => false, perform, readActionResult,

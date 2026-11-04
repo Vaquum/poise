@@ -3,12 +3,25 @@ import assert from 'node:assert/strict'
 import { chmodSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { callerStore, resourceWitnesses } from '/opt/poise-runtime/resource-witness.mjs'
 
-const work = mkdtempSync('/tmp/native-resource-witness-')
+const work = mkdtempSync('/home/poise/native-resource-witness-')
 const call = 'a'.repeat(32)
 const registries = []
 const stores = []
 const registry = () => { const value = resourceWitnesses(call); registries.push(value); return value }
 try {
+  const literal = registry()
+  mkdirSync(`${work}/literal`)
+  const literalRoot = `${work}/literal/native-resources/${call}`
+  literal.allocate(literalRoot)
+  const oldCwd = process.cwd()
+  renameSync(literalRoot, `${literalRoot} (deleted)`)
+  assert.equal(literal.read(literalRoot).unlinked, false)
+  assert.throws(() => literal.finish(literalRoot), /still linked/)
+  assert.equal(process.cwd(), oldCwd)
+  rmdirSync(`${literalRoot} (deleted)`)
+  assert.equal(literal.read(literalRoot).unlinked, true)
+  assert.equal(literal.finish(literalRoot).state, 'reclaimed')
+  assert.equal(process.cwd(), oldCwd)
   const first = registry()
   const root = `${work}/native-resources/${call}`
   const original = first.allocate(root)

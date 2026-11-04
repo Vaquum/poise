@@ -5,6 +5,7 @@ import { decideBehaviorChain, type ChainObservation } from '../server/behavior-c
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import type { LogEntry } from '../server/agent-log-parse'
 import { CheckSemaphore } from '../server/check-semaphore'
+import { nativeRequestSha } from '../server/behavior-chain-action'
 
 const NOW = 1_800_000_000_000
 const HEAD = '1'.repeat(40)
@@ -443,7 +444,7 @@ describe('native admission and recovery', () => {
         expect(journal.read(chain.id)!.invocations[0].evidence).toMatchObject({ publicationResume: { callId, head: HEAD } })
         publicationCall = { ...call, id: 'c'.repeat(32), correlation_id: correlation, behavior: 'native_publication', model: 'native-action',
           status: 'running', resources_settled_at: null, artifact: { phase: 'preparing_native_action',
-            request_sha: chainBasis({ kind: 'native_publication', call_id: callId, digest: 'b'.repeat(64), head }) } }
+            request_sha: nativeRequestSha({ kind: 'native_publication', call_id: callId, digest: 'b'.repeat(64), head }) } }
         resumed++; throw new Error('completion response lost')
       }, launch: async () => { throw new Error('must not launch a replacement worker') } }))
     const releasedAt = call.resources_settled_at

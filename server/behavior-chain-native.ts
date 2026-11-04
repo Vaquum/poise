@@ -3,14 +3,14 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { agentInterfaceCwd } from './models'
-import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
+import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
 import { chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import type { ChainRuntimeOperations, ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { getBehaviorChainSettings, getSettings } from './settings'
-import { attributedNativeAction } from './behavior-chain-action'
+import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { runFile, spawnDetached } from './process'
 
@@ -337,10 +337,11 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       // re-verify measured headroom at the last boundary before spawn. A
       // deferral settles as launch_deferred without consuming an attempt;
       // the next tick's pre-check records the explicit wait reason.
-      const resources = readBehaviorResourceAdmission()
-      if (resources) {
+      if (invocation.request.resourceLimits) validateExecutionLimits(invocation.request.resourceLimits, invocation.reservation)
+      const reservation = invocation.reservation ?? readBehaviorResourceAdmission()?.reservation
+      if (reservation) {
         try {
-          if (headroomShortfall((hooks.measureHeadroom ?? measureBehaviorHeadroom)(), resources.reservation)) return false
+          if (headroomShortfall((hooks.measureHeadroom ?? measureBehaviorHeadroom)(), reservation)) return false
         } catch {
           return false
         }
@@ -380,7 +381,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       try {
         ({ stdout } = await runFile('agent-interface', ['--native-action', '--repository', chain.repository, '--actor', invocation.actor,
           '--source', 'poise:behavior-chain', '--correlation-id', invocation.id, '--request-cwd', invocation.request.cwd,
-          ...(invocation.request.nativeResources === 2 ? ['--native-resource-v2'] : []), '--', ...invocation.request.argv],
+          ...(invocation.request.nativeResources === 2 ? ['--native-resource-v2'] : []),
+          ...(invocation.request.resourceLimits ? ['--resource-limits-json', JSON.stringify(invocation.request.resourceLimits)] : []), '--', ...invocation.request.argv],
         { cwd: agentInterfaceCwd(), timeoutMs: NATIVE_ACTION_TIMEOUT_MS, maxOutputBytes: 256 * 1024 }))
       } catch (error) {
         const failure = error as { stdout?: unknown, code?: unknown, signal?: unknown }
@@ -407,7 +409,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return deferred ? { ...evidence, status: 'deferred', action: 'not_started', completedAt: Date.now() } : evidence
     },
     async readActionResult(invocation, call) {
-      if (call.artifact?.request_sha !== chainBasis(invocation.request) || typeof call.artifact.response_sha !== 'string') {
+      if (call.artifact?.request_sha !== nativeRequestSha(invocation.request) || typeof call.artifact.response_sha !== 'string') {
         throw new Error('native action response differs from its immutable request')
       }
       const { stdout } = await runFile('agent-interface', ['--read-response', call.id],
@@ -425,7 +427,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const artifact = object(invocation.evidence?.artifact, 'repair publication receipt')
       if (typeof callId !== 'string' || !/^[0-9a-f]{32}$/.test(callId) || typeof artifact.plan_sha !== 'string') throw new Error('repair lacks its original native publication identity')
       const { stdout } = await runFile('agent-interface', ['--complete-atomic-publication', callId, artifact.plan_sha, head,
-        '--source', 'poise:behavior-chain', '--correlation-id', correlation],
+        '--source', 'poise:behavior-chain', '--correlation-id', correlation,
+        ...(invocation.request.resourceLimits ? ['--resource-limits-json', JSON.stringify(invocation.request.resourceLimits)] : [])],
         { cwd: agentInterfaceCwd(), timeoutMs: NATIVE_ACTION_TIMEOUT_MS, maxOutputBytes: 256 * 1024 })
       const response = object(JSON.parse(stdout), 'native repair publication completion')
       if (typeof response.id !== 'string' || !/^[0-9a-f]{32}$/.test(response.id)) throw new Error('native publication lacks its physical Call')
