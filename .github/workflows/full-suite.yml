@@ -1,0 +1,67 @@
+# The safety net behind the essential tests (docs/Testing.md). It starts one
+# full CI run a night, so a quiet stretch cannot hide a defect for days, and it
+# files what any full run on main finds as one `poise` issue for Poise's chain
+# to fix. It does nothing in a fork, whose own CI already gates its deploys.
+name: Full suite
+
+on:
+  schedule:
+    # Off the top of the hour, when GitHub's scheduler is busiest.
+    - cron: '41 3 * * *'
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: full-suite
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    name: Start the nightly full run
+    if: github.event_name == 'schedule' && github.repository == 'autonomio/poise'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      # A dispatched run is the only run a token of this workflow can start.
+      - run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  report:
+    name: Report the full run
+    # A fork's pull request from a branch it also calls main wakes this too, and
+    # what its run reports must never reach an agent with full access.
+    if: >-
+      github.event_name == 'workflow_run' && github.repository == 'autonomio/poise'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - name: Download what the failed run's tests reported
+        if: github.event.workflow_run.conclusion != 'success'
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: reports
+      - name: File or close the issue
+        run: node .github/workflows/ci.mjs report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPORTS: reports
