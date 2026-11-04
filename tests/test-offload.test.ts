@@ -735,7 +735,7 @@ describe('a suite on a test instance', () => {
     const script = `console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
     expect(code).toBe(134)
-    expect(stderr).toContain('too big to run there. CI runs everything before merge')
+    expect(stderr).toContain('too big to run there. CI is the gate before merge')
     expect(jobs.size).toBe(1)
   })
 
@@ -750,7 +750,7 @@ describe('a suite on a test instance', () => {
     const { code, stderr } = await done
     expect(code).toBe(125)
     expect(stderr).toContain('ended without reporting a result')
-    expect(stderr).toContain('CI runs everything before merge')
+    expect(stderr).toContain('CI is the gate before merge')
     expect(jobs.size).toBe(1)
   })
 

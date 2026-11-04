@@ -62,7 +62,7 @@ if (script && process.env.POISE_TEST_INSTANCE === '1') {
     const flags = vitestFlags(args, since)
     process.argv.push(...flags)
     if (flags.some((flag) => flag.startsWith('--changed'))) {
-      process.stderr.write('[poise] running only the tests this change touches. CI runs the whole suite before merge.\n')
+      process.stderr.write('[poise] running only the tests this change touches. CI is the gate before merge.\n')
     }
     // What this runs in its turn is the suite's own business.
     delete process.env.POISE_TEST_INSTANCE
