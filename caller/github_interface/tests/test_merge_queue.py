@@ -1,3 +1,4 @@
+import asyncio
 from copy import deepcopy
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
@@ -124,6 +125,16 @@ class TestQueueReadiness(TestCase):
         self.assertIn("required_checks_not_green", pr_readiness._blockers(READY, approval, "PENDING", [], False))
         self.assertIn("unresolved_live_conversations", pr_readiness._blockers(READY, approval, "SUCCESS", [{}], False))
         self.assertIn("readiness_pagination_incomplete", pr_readiness._blockers(READY, approval, "SUCCESS", [], True))
+
+    def test_person_readiness_counts_unresolved_outdated_threads_separately(self):
+        threads = [{"isResolved": False, "isOutdated": True}, {"isResolved": True, "isOutdated": True},
+                   {"isResolved": False, "isOutdated": False}]
+        packet = {**deepcopy(READY), "reviewThreads": {"nodes": threads, "pageInfo": {"hasNextPage": False}},
+                  "reviews": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
+        with patch.object(pr_readiness, "get_pr_readiness_state", AsyncMock(return_value=packet)):
+            result = asyncio.run(pr_readiness.run(AsyncMock(), {**PAYLOAD, "username": "review-bot"}))
+        self.assertEqual(result["unresolved_outdated_conversation_count"], 1)
+        self.assertEqual(result["unresolved_live_conversation_count"], 1)
 
     def test_queue_detection_fails_closed_on_malformed_evidence(self):
         for queue in ({}, {"id": None}, "enabled"):

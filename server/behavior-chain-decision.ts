@@ -21,7 +21,7 @@ export interface ChainObservation extends Record<string, unknown> {
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,
     queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null },
-    changesRequested: boolean, unresolved: number, approved: boolean, ready: boolean,
+    changesRequested: boolean, unresolved: number, unresolvedOutdated?: number, approved: boolean, ready: boolean,
     reviewIds: number[], reviewRevision: string,
     reviewContext?: string, mergedAt?: number | null,
     reviewReceipts: Array<{ id: number, head: string, state: string, invocation: string | null, response?: unknown, submittedAt?: number }>,
@@ -229,7 +229,9 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     return propose(chain, 'approve-pr', chainBasis(['approve', pull.head, pull.reviewRevision, repair?.id ?? null]), chain.reviewer, observation.approver,
       'review the current candidate and submit the native approval verdict', now)
   }
-  if (pull.unresolved) return propose(chain, 'resolve-threads', chainBasis(['resolve', pull.head, pull.unresolved]), chain.reviewer, null,
+  // GitHub's merge rule also counts outdated conversations, which readiness does not block on.
+  const threads = pull.unresolved + (pull.unresolvedOutdated ?? 0)
+  if (threads) return propose(chain, 'resolve-threads', chainBasis(['resolve', pull.head, threads]), chain.reviewer, null,
     'resolve only conversations the native current-head approval gate permits', now)
   if (!pull.ready) return { kind: 'wait', reason: 'native repository readiness gates are not satisfied' }
   if (!chain.invocations.some((invocation) => succeeded(invocation) && ['reviewed_clean', 'approved'].includes(String(invocation.evidence?.action))
