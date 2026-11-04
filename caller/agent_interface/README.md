@@ -357,6 +357,13 @@ calls measured on 2026-09-13 (1,283.662532 seconds), plus 10%, rounded up. Opus 
 the catalog's review effort and an explicit 64,000-output-token limit in the trusted CLI settings.
 Other behaviors retain their existing model assignments and limits.
 
+A Grok Build `pr_review` or `pr_approve` also has an 800-second analysis ceiling,
+counted from when analysis starts, for one file group or many, with or without
+inspection rounds. With no verdict by then the run stops, posts nothing and fails
+with `review_budget_exhausted`, which Poise reads as a hand-off to the next slot. A
+verdict returned inside the ceiling still submits within the shared budget. Other
+providers and Grok issue reviews are unchanged.
+
 On an Opus output-limit error or a repeat-only publication refusal, Caller can recover
 once with the recovery model using the same immutable packet and remaining budget.
 GitHub must first confirm the same open head and no new or pending reviewer action.
