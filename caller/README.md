@@ -200,7 +200,8 @@ failure retries with backoff. Errors after the write begins remain held.
 ## Review preparation diagnostics
 
 Governed Claude reviews forward their original invocation ID and receipt database
-through the subscription wrapper's explicit shell settings. The submission helper
+through the subscription wrapper's explicit shell settings, together with the
+original metadata controller reference when present. The submission helper
 therefore retains the substantive response with its original model and invocation
 before publishing; a response without that identity cannot authorize approval.
 

@@ -191,6 +191,12 @@ class TestReceiptRecording(TestCase):
         with sqlite3.connect(api.DB) as conn:
             retained = json.loads(conn.execute('select artifact from calls where id=?', (call_id,)).fetchone()[0])
         self.assertEqual(retained['review_response'], response)
+        with patch.dict(os.environ, {"AGENT_INTERFACE_RECEIPT_DB": str(api.DB), "AGENT_INTERFACE_RECEIPT_CALL": call_id,
+                                     "POISE_NATIVE_CONTROL": '{"store":{}}'}):
+            guarded_config = json.loads(claude_acl.settings([], review_receipt=str(Path(self.directory.name) / 'receipt.json')))
+        guarded = subprocess.run(child.args, env={"HOME": self.directory.name, **guarded_config['env']}, text=True, capture_output=True)
+        self.assertNotEqual(guarded.returncode, 0)
+        self.assertIn('Caller metadata controller reference is invalid', guarded.stderr)
 
     def test_response_is_retained_before_submission_with_its_original_time_and_binding(self):
         with patch.object(review_receipt.time, "time", return_value=1234):
