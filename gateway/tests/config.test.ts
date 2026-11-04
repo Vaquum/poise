@@ -114,7 +114,7 @@ describe('configuration', () => {
 
   it('takes the test relay\'s Render settings as a pair', () => {
     const pair = { POISE_TEST_RENDER_API_KEY: 'k', POISE_TEST_BASE_SERVICE: 'crn-x' }
-    expect(loadConfig({ ...BASE, ...pair }).testRelay).toEqual({ renderApiKey: 'k', baseService: 'crn-x', plan: 'plan-crn-003', largerPlan: 'plan-crn-005', limitSeconds: 3600, maxRuns: 30 })
+    expect(loadConfig({ ...BASE, ...pair }).testRelay).toEqual({ renderApiKey: 'k', baseService: 'crn-x', plan: 'plan-crn-003', limitSeconds: 3600, maxRuns: 30 })
     expect(loadConfig({ ...BASE, ...pair, POISE_TEST_PLAN: 'plan-crn-007', POISE_TEST_LIMIT_SECONDS: '60', POISE_TEST_MAX_RUNS: '2' }).testRelay)
       .toMatchObject({ plan: 'plan-crn-007', limitSeconds: 60, maxRuns: 2 })
     const together = 'POISE_TEST_RENDER_API_KEY and POISE_TEST_BASE_SERVICE must be set together, or both left unset'

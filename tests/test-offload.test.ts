@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
-import { filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
+import { changeBase, filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
 import { scrubbedChildEnvironment } from '../server/process'
 
 const SOURCE = resolve('scripts/test-offload')
@@ -124,7 +124,7 @@ describe('what reaches a test instance', () => {
       RIPGREP_CONFIG_PATH: 'x',
       OLDPWD: 'x',
       EMPTY: '',
-    }, hooks)
+    }, hooks, 'abc123')
     expect(env).toEqual({
       PATH: '/venv/bin:/usr/bin',
       HOME: '/home/poise',
@@ -132,15 +132,21 @@ describe('what reaches a test instance', () => {
       CI: '1',
       FOO: 'bar',
       PYTEST_ADDOPTS: '-q',
-      PYTHONPATH: 'src',
-      NODE_OPTIONS: '--max-old-space-size=4096',
+      // The hooks go along, once each, and fit the suite to the instance there.
+      PYTHONPATH: `${hooks}:src`,
+      NODE_OPTIONS: `--require "${hooks}/hook.cjs" --max-old-space-size=4096`,
+      POISE_TEST_INSTANCE: '1',
+      POISE_TEST_CHANGED_SINCE: 'abc123',
     })
   })
 
-  it('removes the hooks from what they were alone in', () => {
+  it('sets the hooks where a command replaced them, and says nothing of a change it cannot place', () => {
     const hooks = '/h'
-    const env = testEnvironment({ PYTHONPATH: hooks, NODE_OPTIONS: `--require "${hooks}/hook.cjs"` }, hooks)
-    expect(env).toEqual({})
+    expect(testEnvironment({ PYTHONPATH: 'src', NODE_OPTIONS: '--no-warnings' }, hooks)).toEqual({
+      PYTHONPATH: '/h:src',
+      NODE_OPTIONS: '--require "/h/hook.cjs" --no-warnings',
+      POISE_TEST_INSTANCE: '1',
+    })
   })
 
   function checkout(): string {
@@ -165,7 +171,10 @@ describe('what reaches a test instance', () => {
 
   it('sends the checkout and its dependencies, without what git ignores', () => {
     const repo = checkout()
-    const names = filesToSend(join(repo), [], {}, '/nowhere').map((path: string) => path.slice(repo.length + 1))
+    const paths = filesToSend(join(repo), [], {}, '/nowhere')
+    // The hooks go along too, to fit the suite to the instance.
+    expect(paths).toEqual(expect.arrayContaining([join(SOURCE, 'hook.cjs'), join(SOURCE, 'sitecustomize.py')]))
+    const names = paths.filter((path: string) => path.startsWith(repo)).map((path: string) => path.slice(repo.length + 1))
     expect(names.sort()).toEqual(['.git', '.gitignore', '.venv', 'node_modules', 'sub/node_modules', 'tracked.py', 'untracked.py'])
   })
 
@@ -199,7 +208,8 @@ describe('what reaches a test instance', () => {
     expect(() => filesToSend(join(home, 'run'), [], { TMPDIR: tmp }, home)).toThrow('run the suite from a checkout')
     const scratch = join(tmp, 'scratch')
     mkdirSync(scratch)
-    expect(filesToSend(scratch, [], { TMPDIR: tmp }, home)).toEqual([scratch])
+    expect(filesToSend(scratch, [], { TMPDIR: tmp }, home)).toContain(scratch)
+    expect(filesToSend(scratch, [], { TMPDIR: tmp }, home).filter((path: string) => !path.startsWith(SOURCE))).toEqual([scratch])
   })
 })
 
@@ -236,7 +246,8 @@ describe('the hooks at work', () => {
     for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) copyFileSync(join(SOURCE, file), join(hooks, file))
     // Nothing listens there: a suite that reaches for its instance fails at once, and one that does not runs.
     if (relay) writeFileSync(join(hooks, 'relay'), 'http://127.0.0.1:9/api/link/test-relay\nk\n')
-    return { hooks, env: { ...process.env, NODE_OPTIONS: `--require "${join(hooks, 'hook.cjs')}"` } }
+    // Without the npm script this very test may be running under.
+    return { hooks, env: { ...process.env, npm_lifecycle_event: undefined, NODE_OPTIONS: `--require "${join(hooks, 'hook.cjs')}"` } }
   }
   const attempt = (args: string[], env: NodeJS.ProcessEnv, cwd: string) => spawnSync(process.execPath, args, { env, cwd, encoding: 'utf8' })
 
@@ -269,8 +280,19 @@ describe('the hooks at work', () => {
     expect(result.stdout).toBe('ran here\n')
   })
 
-  // /proc/self/cmdline, which the Python hook reads, is Linux's.
-  it.runIf(process.platform === 'linux')('take a Python test runner out of this machine, from any interpreter, and it never runs here', () => {
+  it('leave the steps of an npm script that stays here, as `npm run build` runs its typecheck, and take npx\'s', () => {
+    const { env } = hooked(true)
+    const repo = temp()
+    execFileSync('git', ['init', '-q', repo])
+    writeFileSync(join(repo, 'tsc'), 'console.log("ran here")')
+    const result = attempt([join(repo, 'tsc'), '--noEmit'], { ...env, npm_lifecycle_event: 'build' }, repo)
+    expect(result.status).toBe(0)
+    expect(result.stdout).toBe('ran here\n')
+    expect(attempt([join(repo, 'tsc'), '--noEmit'], { ...env, npm_lifecycle_event: 'npx' }, repo).status).toBe(125)
+    expect(attempt([join(repo, 'tsc'), '--noEmit'], { ...env, npm_lifecycle_event: 'check' }, repo).status).toBe(125)
+  })
+
+  it('take a Python test runner out of this machine, from any interpreter, and it never runs here', () => {
     const { hooks } = hooked(true)
     const repo = temp()
     execFileSync('git', ['init', '-q', repo])
@@ -281,6 +303,119 @@ describe('the hooks at work', () => {
     expect(result.status).toBe(125)
     expect(result.stderr).toContain('[poise]')
     expect(existsSync(marker)).toBe(false)
+  })
+})
+
+describe('on a test instance, a command for the whole suite', () => {
+  function changed(files: Record<string, string>, later: Record<string, string>): { repo: string; since: string } {
+    const repo = temp()
+    execFileSync('git', ['init', '-q', repo])
+    const write = (group: Record<string, string>) => {
+      for (const [path, text] of Object.entries(group)) {
+        mkdirSync(join(repo, path, '..'), { recursive: true })
+        writeFileSync(join(repo, path), text)
+      }
+    }
+    write(files)
+    const git = (...args: string[]) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-C', repo, ...args]).toString().trim()
+    git('add', '.')
+    git('commit', '-qm', 'base')
+    const since = git('rev-parse', 'HEAD')
+    write(later)
+    return { repo, since }
+  }
+  const instanceEnv = (hooks: string, since: string | null): NodeJS.ProcessEnv => {
+    const env: NodeJS.ProcessEnv = { ...process.env, POISE_TEST_INSTANCE: '1', PYTHONPATH: hooks, NODE_OPTIONS: `--require "${join(hooks, 'hook.cjs')}"` }
+    if (since) env.POISE_TEST_CHANGED_SINCE = since
+    return env
+  }
+  // A runner that says what it was asked to run, as it would read it.
+  const pytest = (repo: string, args: string[], since: string | null) => {
+    writeFileSync(join(repo, 'pytest'), 'import json, os, sys\nprint(json.dumps({"args": sys.argv[1:], "nested": os.environ.get("POISE_TEST_INSTANCE")}))\n')
+    const result = spawnSync('python3', ['pytest', ...args], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, since) })
+    return { status: result.status, stderr: result.stderr, seen: result.stdout ? JSON.parse(result.stdout) as { args: string[]; nested: string | null } : null }
+  }
+  const FILES = {
+    'src/pricing.py': 'x = 1\n',
+    'src/other.py': 'x = 1\n',
+    'tests/test_pricing.py': 'from src import pricing\n',
+    'tests/test_other.py': 'from src import other\n',
+    'README.md': 'x\n',
+  }
+
+  it('runs the Python tests that touch the change, and only those', () => {
+    const { repo, since } = changed(FILES, { 'src/pricing.py': 'x = 2\n' })
+    const { status, stderr, seen } = pytest(repo, ['-q', '-m', 'not live'], since)
+    expect(status).toBe(0)
+    expect(seen?.args).toEqual(['-q', '-m', 'not live', 'tests/test_pricing.py'])
+    expect(stderr).toContain('running only the 1 test files this change touches')
+    expect(seen?.nested).toBeNull()
+  })
+
+  it('counts a changed test file and a new one, and leaves out a deleted one', () => {
+    const { repo, since } = changed(FILES, { 'tests/test_other.py': 'x = 2\n', 'tests/test_new.py': 'x = 1\n' })
+    rmSync(join(repo, 'tests/test_pricing.py'))
+    expect(pytest(repo, [], since).seen?.args).toEqual(['tests/test_new.py', 'tests/test_other.py'])
+  })
+
+  it('answers at once when no test touches it', () => {
+    const { repo, since } = changed(FILES, { 'README.md': 'y\n' })
+    const { status, stderr, seen } = pytest(repo, ['-q'], since)
+    expect(status).toBe(0)
+    expect(seen).toBeNull()
+    expect(stderr).toContain('no test touches this change')
+  })
+
+  it('stays whole when the change can touch anything', () => {
+    const { repo, since } = changed(FILES, { 'conftest.py': 'x = 1\n' })
+    expect(pytest(repo, ['-q'], since).seen?.args).toEqual(['-q'])
+  })
+
+  it('stays as asked when the command names its tests, or no change can be placed', () => {
+    const { repo, since } = changed(FILES, { 'src/pricing.py': 'x = 2\n' })
+    expect(pytest(repo, ['tests/test_other.py'], since).seen?.args).toEqual(['tests/test_other.py'])
+    expect(pytest(repo, ['-q'], null).seen?.args).toEqual(['-q'])
+  })
+
+  it('runs with one worker however many were asked for', () => {
+    const { repo, since } = changed(FILES, { 'README.md': 'y\n' })
+    for (const [asked, fitted] of [[['-n', '10'], ['-n', '0']], [['-n', 'auto'], ['-n', '0']], [['-n4'], ['-n0']], [['-nauto'], ['-n0']], [['--numprocesses=8'], ['--numprocesses=0']], [['--numprocesses', '8'], ['--numprocesses', '0']]]) {
+      expect(pytest(repo, [...asked, 'tests/test_other.py'], since).seen?.args).toEqual([...fitted, 'tests/test_other.py'])
+    }
+    expect(pytest(repo, ['--version'], since).seen?.args).toEqual(['--version'])
+  })
+
+  it('adds vitest\'s own flags to a vitest command for the whole suite, and one worker to any', () => {
+    const { vitestFlags } = createRequire(import.meta.url)(join(SOURCE, 'hook.cjs')) as { vitestFlags: (args: string[], since?: string) => string[] }
+    const whole = ['--maxWorkers=1', '--changed=abc', '--passWithNoTests']
+    expect(vitestFlags(['run'], 'abc')).toEqual(whole)
+    expect(vitestFlags([], 'abc')).toEqual(whole)
+    expect(vitestFlags(['run', '--reporter', 'dot'], 'abc')).toEqual(whole)
+    expect(vitestFlags(['run', 'tests/x.test.ts'], 'abc')).toEqual(['--maxWorkers=1'])
+    expect(vitestFlags(['run', '--changed=other'], 'abc')).toEqual(['--maxWorkers=1'])
+    expect(vitestFlags(['run', '--maxWorkers=2', 'tests/x.test.ts'], 'abc')).toEqual([])
+    expect(vitestFlags(['run'])).toEqual(['--maxWorkers=1'])
+  })
+
+  it('changes a vitest process before it reads its arguments, and not what that process starts', () => {
+    const { repo } = changed({ 'x.js': '1' }, {})
+    const script = join(repo, 'vitest')
+    writeFileSync(script, 'console.log(JSON.stringify({ args: process.argv.slice(2), nested: process.env.POISE_TEST_INSTANCE ?? null }))')
+    const result = spawnSync(process.execPath, [script, 'run'], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, 'abc') })
+    expect(JSON.parse(result.stdout)).toEqual({ args: ['run', '--maxWorkers=1', '--changed=abc', '--passWithNoTests'], nested: null })
+    expect(result.stderr).toContain('running only the tests this change touches')
+  })
+
+  it('takes its start from where the checkout leaves the default branch', () => {
+    const { repo, since } = changed({ 'x.js': '1' }, {})
+    expect(changeBase(repo)).toBeNull()
+    const git = (...args: string[]) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-C', repo, ...args]).toString().trim()
+    git('update-ref', 'refs/remotes/origin/main', since)
+    git('checkout', '-qb', 'work')
+    writeFileSync(join(repo, 'y.js'), '1')
+    git('add', '.')
+    git('commit', '-qm', 'work')
+    expect(changeBase(repo)).toBe(since)
   })
 })
 
@@ -359,7 +494,7 @@ describe('a suite on a test instance', () => {
     const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, ...deps } = overrides
     const renderPort = await listen(render)
     const relayDeps: TestRelayDeps = {
-      config: { renderApiKey, baseService: 'crn-test', plan: 'plan-crn-003', largerPlan: 'plan-crn-005', limitSeconds, maxRuns },
+      config: { renderApiKey, baseService: 'crn-test', plan: 'plan-crn-003', limitSeconds, maxRuns },
       privateKey,
       origin: () => '',
       log: { info: () => {}, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
@@ -533,66 +668,28 @@ describe('a suite on a test instance', () => {
     expect(cancels).toContain(job.id)
   })
 
-  it('runs a suite again on the larger plan when it runs out of memory, once', async () => {
+  it('says so when a suite runs out of memory, and answers with its exit code', async () => {
     await startAll()
-    const repo = repository()
-    const marker = join(repo, 'first-try')
-    const script = `
-      const { existsSync, writeFileSync } = require('fs')
-      if (existsSync(${JSON.stringify(marker)})) { console.log('fine now'); process.exit(0) }
-      writeFileSync(${JSON.stringify(marker)}, '')
-      console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory')
-      process.exit(134)`
-    const { code, stdout, stderr } = await suite(repo, [process.execPath, '-e', script]).done
-    expect(code).toBe(0)
-    expect(stdout).toBe('fine now\n')
-    expect(stderr).toContain('Running it again on a larger one')
-    expect([...jobs.values()].map((job) => job.planId)).toEqual(['plan-crn-003', 'plan-crn-005'])
-  })
-
-  it('starts a repository\'s suites on the larger plan once one has run out of memory', async () => {
-    await startAll()
-    const repo = repository()
-    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/acme/big.git'])
-    const heavy = `console.error('JavaScript heap out of memory'); process.exit(134)`
-    await suite(repo, [process.execPath, '-e', heavy]).done
-    expect([...jobs.values()].map((job) => job.planId)).toEqual(['plan-crn-003', 'plan-crn-005'])
-    const { code } = await suite(repo, [process.execPath, '-e', 'process.exit(0)']).done
-    expect(code).toBe(0)
-    expect([...jobs.values()].map((job) => job.planId)).toEqual(['plan-crn-003', 'plan-crn-005', 'plan-crn-005'])
-
-    // Another clone of the same repository too, and no other repository.
-    const clone = repository()
-    execFileSync('git', ['-C', clone, 'remote', 'add', 'origin', 'https://github.com/acme/big.git'])
-    await suite(clone, [process.execPath, '-e', 'process.exit(0)']).done
-    expect([...jobs.values()].at(-1)?.planId).toBe('plan-crn-005')
-    await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done
-    expect([...jobs.values()].at(-1)?.planId).toBe('plan-crn-003')
-  })
-
-  it('stops there when it runs out of memory on the larger plan too, with the suite\'s own answer', async () => {
-    await startAll()
-    const script = `console.error('JavaScript heap out of memory'); process.exit(134)`
-    const { code } = await suite(repository(), [process.execPath, '-e', script]).done
+    const script = `console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
     expect(code).toBe(134)
-    expect(jobs.size).toBe(2)
+    expect(stderr).toContain('too big to run there. CI runs everything before merge')
+    expect(jobs.size).toBe(1)
   })
 
-  it('tries the larger plan when the instance dies without a word, then fails loud', async () => {
+  it('fails loud when the instance dies without a word', async () => {
     await startAll()
     const { child, done } = suite(repository(), [process.execPath, '-e', 'console.log("up"); setInterval(() => {}, 1000)'])
-    child.stdout?.on('data', () => {
-      for (const job of jobs.values()) {
-        if (job.status === 'running') {
-          job.status = 'failed'
-          job.child?.kill('SIGKILL')
-        }
-      }
+    child.stdout?.once('data', () => {
+      const [job] = jobs.values()
+      job.status = 'failed'
+      job.child?.kill('SIGKILL')
     })
     const { code, stderr } = await done
     expect(code).toBe(125)
     expect(stderr).toContain('ended without reporting a result')
-    expect([...jobs.values()].map((job) => job.planId)).toEqual(['plan-crn-003', 'plan-crn-005'])
+    expect(stderr).toContain('CI runs everything before merge')
+    expect(jobs.size).toBe(1)
   })
 
   it('cancels a job no live run owns, as a restart leaves behind', async () => {

@@ -18,8 +18,6 @@ export interface TestRelayConfig {
   /** The service the jobs run on, whose image is theirs. It runs nothing itself. */
   baseService: string
   plan: string
-  /** The plan a suite gets again when it runs out of memory on `plan`. */
-  largerPlan: string
   limitSeconds: number
   maxRuns: number
 }
@@ -44,7 +42,7 @@ interface Run {
   id: string
   handle: string
   token: string
-  spec: { argv: string[]; cwd: string; env: Record<string, string>; larger?: boolean }
+  spec: { argv: string[]; cwd: string; env: Record<string, string> }
   created: number
   lease: number
   jobId: string | null
@@ -210,14 +208,13 @@ export class TestRelay {
     const grace = this.deps.listGraceMs ?? LIST_GRACE_MS
     for (const run of this.runs.values()) {
       if (run.jobId && !running.has(run.jobId) && now - run.created > grace) {
-        // 137 as for a process the kernel killed: this is what an instance out of memory looks like from here.
-        this.kill(run, `the test instance ended without reporting a result; Render's logs for ${run.jobId} say why`, 137)
+        this.kill(run, `the test instance ended without reporting a result, as one that runs out of memory does: this is too big to run there. CI runs everything before merge; for an answer sooner, name a smaller part of it. Render's logs for ${run.jobId} say more`)
       }
     }
   }
 
   private async createRun(handle: string, body: Buffer): Promise<Run> {
-    const { maxRuns, limitSeconds, plan, largerPlan } = this.deps.config
+    const { maxRuns, limitSeconds, plan } = this.deps.config
     if (this.runs.size >= maxRuns) throw new RelayError(429, `${maxRuns} suites are already running`)
     const spec = JSON.parse(body.toString()) as Run['spec']
     if (!Array.isArray(spec.argv) || spec.argv.length === 0 || typeof spec.cwd !== 'string' || typeof spec.env !== 'object') {
@@ -232,7 +229,7 @@ export class TestRelay {
     const startCommand = `timeout -k 10 ${limitSeconds + 60} node -e ${INSTANCE_BOOTSTRAP} ${relay}/instance ${run.id} ${run.token}`
     // Listed first, so the sweep sees an owner for the job from the moment it exists.
     this.runs.set(run.id, run)
-    const response = await fetch(this.jobs, { method: 'POST', headers: this.renderHeaders, body: JSON.stringify({ startCommand, planId: spec.larger === true ? largerPlan : plan }) })
+    const response = await fetch(this.jobs, { method: 'POST', headers: this.renderHeaders, body: JSON.stringify({ startCommand, planId: plan }) })
     if (!response.ok) {
       this.runs.delete(run.id)
       throw new RelayError(502, `Render refused the test instance: HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`)

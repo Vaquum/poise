@@ -665,10 +665,22 @@ runner, these start on a test instance: `pytest`, `python -m pytest` and
 test` and `tsc --noEmit`; `npm test` and `npm run` of a script whose name starts
 with `test`, `check`, `lint`, `typecheck` or `verify`. Asking a runner for its
 version or help stays in the workspace, and so do `npm run build`, `dev` and
-`start`, whose files or servers are wanted where they are. A command that
-replaces `PYTHONPATH` or `NODE_OPTIONS` outright, as in `PYTHONPATH=src python -m
-pytest`, removes the hook and runs in the workspace. The mechanism is
-`scripts/test-offload/` and `gateway/src/test-relay.ts`.
+`start`, with their steps, because their files or servers are wanted where they
+are. A command that replaces `PYTHONPATH` or `NODE_OPTIONS` outright, as in
+`PYTHONPATH=src python -m pytest`, removes the hook and runs in the workspace. The
+mechanism is `scripts/test-offload/` and `gateway/src/test-relay.ts`.
+
+**What runs.** Agents need nothing new: they type what they always typed, and the
+hooks fit it to the instance, which has half a CPU and 512 MB. A command naming
+its tests runs those. A command for a whole suite runs the tests the change
+touches, measured from where the checkout leaves the default branch, and says so:
+for vitest, its own `--changed`; for pytest, changed test files and test files
+that mention a changed module, or the whole suite after a change to `conftest.py`
+or test configuration. `npm run check` is such a command, at each of its steps.
+Vitest and pytest run with one worker, and Node may use 80% of the memory. What
+still does not fit fails with a line saying CI covers it, and CI runs everything
+before merge. On Poise itself that means browser tests, the typecheck of
+`tsconfig.tests.json` and the unit suite in full.
 
 **What an instance gets.** Only what the suite needs, at the same paths: the
 checkout's tracked and untracked files without what git ignores, its
@@ -725,8 +737,7 @@ agent can read that key, which lets it start suites and nothing else.
 | --- | --- | --- | --- |
 | `POISE_TEST_RENDER_API_KEY` | yes | | A Render API key. Set both of these, or neither |
 | `POISE_TEST_BASE_SERVICE` | yes | | The cron job's service ID, `crn-…` |
-| `POISE_TEST_PLAN` | | `plan-crn-003` | The instances' plan, the cheapest: 0.5 CPU and 512 MB, about $0.01 an hour |
-| `POISE_TEST_LARGER_PLAN` | | `plan-crn-005` | The plan a suite gets again, once, when it runs out of memory on the first, and every suite of that repository starts on after that: 1 CPU and 2 GB, about $0.035 an hour. `plan-crn-007` is 2 CPUs and 4 GB, `plan-crn-008` 4 CPUs and 8 GB, about $0.24 an hour |
+| `POISE_TEST_PLAN` | | `plan-crn-003` | The instances' plan, the cheapest: 0.5 CPU and 512 MB, about $0.01 an hour, or $7 a month for one running without a pause |
 | `POISE_TEST_LIMIT_SECONDS` | | `3600` | The time limit; keep `BASH_MAX_TIMEOUT_MS` in `server/process.ts` in step |
 | `POISE_TEST_MAX_RUNS` | | `30` | Suites at once; past it an agent's command fails loudly |
 

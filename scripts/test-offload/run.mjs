@@ -3,9 +3,8 @@
 // output on stdout and stderr, and its exit code. hook.cjs and sitecustomize.py start this in the
 // suite's place. docs/Operating.md, "Agents' test suites".
 import { spawn, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -17,8 +16,6 @@ const CHUNK_BYTES = 8 * 1024 * 1024
 // The first bytes go at once: a proxy gives up on a download that stays silent for long.
 const FIRST_CHUNK_BYTES = 64 * 1024
 const FRAME = { heartbeat: 0, stdout: 1, stderr: 2, exit: 3, fail: 4, ready: 5, outOfMemory: 6 }
-// How a relay marks an instance that ended without reporting, which is how running out of memory can look.
-const VANISHED = 137
 // What a suite cannot run without although git ignores it.
 const DEPENDENCIES = new Set(['node_modules', '.venv', 'venv'])
 // Nothing a suite needs: credentials by name, and what only the provider CLIs and Poise read.
@@ -28,18 +25,20 @@ const SECRET_VALUE = /gh[pousr]_[A-Za-z0-9]|github_pat_|\bsk-[A-Za-z0-9]|:\/\/[^
 const LOCAL_ONLY = new Set(['_', 'OLDPWD', 'PWD', 'SHLVL', 'GOMAXPROCS', 'RIPGREP_CONFIG_PATH'])
 
 /** The environment a suite gets: this one, without what must not reach a test instance. */
-export function testEnvironment(env, hooks = HERE) {
+export function testEnvironment(env, hooks = HERE, since = null) {
   const result = {}
   for (const [name, value] of Object.entries(env)) {
     if (!value || LOCAL_ONLY.has(name) || SECRET_NAME.test(name) || AGENT_NAME.test(name) || SECRET_VALUE.test(value)) continue
     result[name] = value
   }
-  const pythonPath = (result.PYTHONPATH ?? '').split(':').filter((entry) => entry && entry !== hooks).join(':')
-  const nodeOptions = (result.NODE_OPTIONS ?? '').replace(`--require "${join(hooks, 'hook.cjs')}"`, '').trim()
-  delete result.PYTHONPATH
-  delete result.NODE_OPTIONS
-  if (pythonPath) result.PYTHONPATH = pythonPath
-  if (nodeOptions) result.NODE_OPTIONS = nodeOptions
+  // The hooks go along: on the instance they fit the suite to it, and POISE_TEST_INSTANCE tells them it is one.
+  const hook = `--require "${join(hooks, 'hook.cjs')}"`
+  const pythonPath = (result.PYTHONPATH ?? '').split(':').filter((entry) => entry && entry !== hooks)
+  const nodeOptions = (result.NODE_OPTIONS ?? '').replace(hook, '').trim()
+  result.PYTHONPATH = [hooks, ...pythonPath].join(':')
+  result.NODE_OPTIONS = [hook, nodeOptions].filter(Boolean).join(' ')
+  result.POISE_TEST_INSTANCE = '1'
+  if (since) result.POISE_TEST_CHANGED_SINCE = since
   return result
 }
 
@@ -78,11 +77,21 @@ export function filesToSend(cwd, also = [], env = process.env, home = homedir())
     if (holdsSecrets) throw new Error(`run the suite from a checkout: ${cwd} holds what must not reach a test instance`)
     paths.push(cwd)
   }
+  paths.push(join(HERE, 'hook.cjs'), join(HERE, 'sitecustomize.py'))
   // Every test instance has what the image ships.
   for (const path of also) if (!/^\/(opt|usr)\//.test(path) && existsSync(path)) paths.push(path, realpathSync(path))
   return [...new Set(paths)].filter((path) => {
     try { return Boolean(lstatSync(path)) } catch { return false }
   })
+}
+
+/** Where this checkout's change starts: where it leaves the default branch. Null when that cannot be told. */
+export function changeBase(cwd) {
+  for (const branch of ['origin/HEAD', 'origin/main', 'origin/master']) {
+    const base = git(cwd, 'merge-base', 'HEAD', branch)?.toString().trim()
+    if (base) return base
+  }
+  return null
 }
 
 /** Reads a stream of [type, 4-byte length, payload] frames, whatever pieces they arrive in. */
@@ -101,15 +110,6 @@ export function frameReader(onFrame) {
 
 function say(message) {
   process.stderr.write(`[poise] ${message}\n`)
-}
-
-/**
- * Where to remember that this repository's suites need the larger plan. Running out of memory takes minutes
- * each time, longer than an agent's shell may wait, so it should happen once per repository.
- */
-function largerMarker(cwd) {
-  const origin = git(cwd, 'remote', 'get-url', 'origin')?.toString().trim() ?? cwd
-  return join(HERE, `larger-${createHash('sha256').update(origin).digest('hex').slice(0, 16)}`)
 }
 
 /** Exits once what is written has gone out: writes to a pipe are asynchronous, and exit would drop them. */
@@ -179,49 +179,36 @@ async function main(args) {
     say(`checkout sent, ${Math.round(total / 1024 / 1024)} MB in ${Math.round((Date.now() - started) / 1000)} s. The instance is unpacking it, then runs the suite.`)
   }
 
-  /** Runs the suite once, and answers with its exit code and whether it ran out of memory. */
-  const runOnce = async (larger) => {
-    const created = await call('POST', '/runs', JSON.stringify({ argv: command, cwd, env: testEnvironment(process.env), larger }))
-    current = (await created.json()).id
-    const lease = setInterval(() => { call('POST', `/runs/${current}/lease`).catch(() => {}) }, LEASE_MS)
-    const result = { exitCode: null, outOfMemory: false }
-    const output = await call('GET', `/runs/${current}/output`)
-    const read = frameReader((type, payload) => {
-      if (type === FRAME.stdout) process.stdout.write(payload)
-      else if (type === FRAME.stderr) process.stderr.write(payload)
-      else if (type === FRAME.exit) result.exitCode = Number(payload.toString())
-      else if (type === FRAME.outOfMemory) result.outOfMemory = true
-      else if (type === FRAME.fail) {
-        if (payload[0] === VANISHED && !larger) result.outOfMemory = true
-        else die(payload.subarray(1).toString(), payload[0] === VANISHED ? 125 : payload[0])
-      } else if (type === FRAME.ready) {
-        say('the instance is up. Sending the checkout.')
-        sendTree().catch((error) => die(`sending the checkout failed: ${error.message}`))
-      }
-    })
-    try {
-      for await (const chunk of output.body) {
-        read(Buffer.from(chunk))
-        for (const stream of [process.stdout, process.stderr]) if (stream.writableNeedDrain) await once(stream, 'drain')
-      }
-    } catch (error) {
-      die(`the connection to the test relay broke: ${error.cause?.message ?? error.message}`)
-    }
-    clearInterval(lease)
-    return result
-  }
-
   say('this suite runs on a disposable test instance; files it changes stay there. Starting one.')
-  const marker = largerMarker(cwd)
-  const larger = existsSync(marker)
-  let result = await runOnce(larger)
-  if (result.outOfMemory && !larger) {
-    writeFileSync(marker, '')
-    say('it ran out of memory on the smallest instance. Running it again on a larger one.')
-    result = await runOnce(true)
+  const created = await call('POST', '/runs', JSON.stringify({ argv: command, cwd, env: testEnvironment(process.env, HERE, changeBase(cwd)) }))
+  current = (await created.json()).id
+  setInterval(() => { call('POST', `/runs/${current}/lease`).catch(() => {}) }, LEASE_MS)
+  let exitCode = null
+  let outOfMemory = false
+  const output = await call('GET', `/runs/${current}/output`)
+  const read = frameReader((type, payload) => {
+    if (type === FRAME.stdout) process.stdout.write(payload)
+    else if (type === FRAME.stderr) process.stderr.write(payload)
+    else if (type === FRAME.exit) exitCode = Number(payload.toString())
+    else if (type === FRAME.outOfMemory) outOfMemory = true
+    else if (type === FRAME.fail) die(payload.subarray(1).toString(), payload[0])
+    else if (type === FRAME.ready) {
+      say('the instance is up. Sending the checkout.')
+      sendTree().catch((error) => die(`sending the checkout failed: ${error.message}`))
+    }
+  })
+  try {
+    for await (const chunk of output.body) {
+      read(Buffer.from(chunk))
+      for (const stream of [process.stdout, process.stderr]) if (stream.writableNeedDrain) await once(stream, 'drain')
+    }
+  } catch (error) {
+    die(`the connection to the test relay broke: ${error.cause?.message ?? error.message}`)
+    return
   }
-  if (result.exitCode === null) die('the connection to the test relay ended before the suite did')
-  else finish(result.exitCode)
+  if (outOfMemory) say('this ran out of memory on the test instance, so it is too big to run there. CI runs everything before merge; for an answer sooner, name a smaller part of it.')
+  if (exitCode === null) die('the connection to the test relay ended before the suite did')
+  else finish(exitCode)
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {

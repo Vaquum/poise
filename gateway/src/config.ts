@@ -251,7 +251,6 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
       renderApiKey,
       baseService,
       plan: read('POISE_TEST_PLAN') ?? 'plan-crn-003',
-      largerPlan: read('POISE_TEST_LARGER_PLAN') ?? 'plan-crn-005',
       limitSeconds: wholeNumber('POISE_TEST_LIMIT_SECONDS', 3600),
       maxRuns: wholeNumber('POISE_TEST_MAX_RUNS', 30),
     }

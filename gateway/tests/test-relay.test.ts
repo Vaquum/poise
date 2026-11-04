@@ -13,7 +13,7 @@ describe('the relay agents\' test suites meet at', () => {
     h = await startHarness({
       env,
       testRelay: ({ privateKey, log, now, store }) => new TestRelay({
-        config: { renderApiKey: 'render-key', baseService: 'crn-x', plan: 'plan-crn-003', largerPlan: 'plan-crn-005', limitSeconds: 60, maxRuns: 2 },
+        config: { renderApiKey: 'render-key', baseService: 'crn-x', plan: 'plan-crn-003', limitSeconds: 60, maxRuns: 2 },
         privateKey,
         origin: (handle) => `https://${handle}.example`,
         log,
