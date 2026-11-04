@@ -348,8 +348,10 @@ describe('on a test instance, a command for the whole suite', () => {
   }
   // A runner that says what it was asked to run, as it would read it.
   const pytest = (repo: string, args: string[], since: string | null) => {
-    writeFileSync(join(repo, 'pytest'), 'import json, os, sys\nprint(json.dumps({"args": sys.argv[1:], "nested": os.environ.get("POISE_TEST_INSTANCE")}))\n')
-    const result = spawnSync('python3', ['pytest', ...args], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, since) })
+    // Outside the checkout, where it is no part of the change.
+    const runner = join(temp(), 'pytest')
+    writeFileSync(runner, 'import json, os, sys\nprint(json.dumps({"args": sys.argv[1:], "nested": os.environ.get("POISE_TEST_INSTANCE")}))\n')
+    const result = spawnSync('python3', [runner, ...args], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, since) })
     return { status: result.status, stderr: result.stderr, seen: result.stdout ? JSON.parse(result.stdout) as { args: string[]; nested: string | null } : null }
   }
   const FILES = {
