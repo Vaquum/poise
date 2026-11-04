@@ -92,6 +92,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await cache?.stopPoiseRuntime()
+  server?.closeAllConnections()
   await new Promise<void>((resolve) => server ? server.close(() => resolve()) : resolve())
   if (database?.db.open) database.closeDatabase()
   database = undefined

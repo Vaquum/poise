@@ -339,6 +339,9 @@ describe('a run that cannot settle', () => {
     try {
       const run = runner.run('npm', ['ci'], { env: env() })
       await waitFor(() => workers.calls.length === 1)
+      // Nothing can die here: the runner's waits for the group run on a faster Date.now.
+      const now = Date.now.bind(Date), begun = now()
+      vi.spyOn(Date, 'now').mockImplementation(() => begun + (now() - begun) * 50)
       child.emit('exit', 70, null)
       child.stdout.end()
       child.stderr.end()

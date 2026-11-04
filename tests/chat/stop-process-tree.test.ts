@@ -171,7 +171,14 @@ describe('Stop ends the turn and its process tree', () => {
     expect(recorded).not.toBeNull()
     expect(worker.pgidAlive(recorded!.gatePgid)).toBe(true)
 
-    const stopped = await runtime.cancel(session.id)
+    // This agent never acknowledges: skip the 2 s of Date.now it is given.
+    const now = Date.now.bind(Date)
+    let skipped = 0
+    vi.spyOn(Date, 'now').mockImplementation(() => now() + skipped)
+    const stopping = runtime.cancel(session.id)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    skipped = 2_000
+    const stopped = await stopping
     expect(stopped.settled).toBe(true)
     expect(ofType(events, session.id, 'turn.finished').at(-1)).toMatchObject({ stopReason: 'cancelled' })
     // No descendant survives: the group is verifiably dead.

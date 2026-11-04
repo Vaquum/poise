@@ -273,6 +273,9 @@ describe('chat runtime hardening', () => {
     })))
     const chat = await import('../server/chat')
     database = await import('../server/db')
+    // Both candidates are there at the first look: the 3 s of Date.now after it only run out.
+    const now = Date.now.bind(Date), begun = now()
+    vi.spyOn(Date, 'now').mockImplementation(() => begun + (now() - begun) * 30)
     await expect(chat.startAuthorContent('Same topic', 'ambiguous-session')).rejects.toMatchObject({
       code: 'AUTHOR_CONTENT_DISCOVERY_TIMEOUT',
       message: 'multiple matching author-content calls registered; correlation remains pending',

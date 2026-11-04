@@ -198,10 +198,13 @@ it('keeps the checkout locked while a Poise filesystem write outlives the servic
   try {
     pending = host.writeTextFile('held.txt', 'fixture')
     await until(() => entered)
+    // The runtime's grace is 5 s of Date.now. Killing the native agent cannot
+    // cancel a filesystem operation already executing inside the Poise process.
+    const now = Date.now.bind(Date), begun = now()
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => begun + (now() - begun) * 20)
     currentFinish?.({ stopReason: 'end_turn' })
-    // The runtime's grace is 5 s. Killing the native agent cannot cancel a
-    // filesystem operation already executing inside the Poise process.
-    await pause(5_400)
+    await pause(650)
+    clock.mockRestore()
     const observer = new CheckoutLease(checkout, { ownerKind: 'poise:chat', ownerId: 'observer', ownerLabel: 'test observer', instance: 'observer' })
     expect(observer.read()).not.toBeNull()
   } finally {

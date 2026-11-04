@@ -4,7 +4,7 @@
 
 import '../fixtures/workspace-template'
 import { spawnSync } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
@@ -13,6 +13,11 @@ import type { AgentId, ChatEnvelope, ChatEvent, PromptInput } from '../../server
 import type { Adapter, AdapterHost, AdapterStartOptions, TurnResult } from '../../server/chat/adapters/types'
 import type { CallerTurns } from '../../server/chat/caller-turns'
 import { CATALOG } from '../model-catalog-fixture'
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return { ...actual, readdir: vi.fn(actual.readdir) }
+})
 
 // Process starts stall past the global 10 s under suite load: the fixture
 // hook gets 25 s, and each case sets its own 40 s.
@@ -1328,12 +1333,14 @@ describe('turn stall detection and waking', () => {
     await waitFor(() => lastStatus(events, session.id) === 'idle')
     const bulk = join(session.checkout, 'bulk')
     await mkdir(bulk)
-    for (let base = 0; base < 100_005; base += 500) {
-      await Promise.all(Array.from({ length: 500 }, (_, n) => mkdir(join(bulk, `d${String(base + n).padStart(6, '0')}`))))
-    }
+    // Past the budget on the first listing, so the scan never looks at an entry.
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+    vi.mocked(readdir).mockImplementation(((path: string, options: never) => path === bulk
+      ? Promise.resolve(Array.from({ length: 100_005 }, (_, n) => `d${n}`))
+      : actual.readdir(path, options)) as never)
     store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
     runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
-    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1, 45_000)
+    await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
     await waitFor(() => lastStatus(events, session.id) === 'idle')
 
     const stalled = runtime.get(session.id)?.stall
@@ -1342,8 +1349,7 @@ describe('turn stall detection and waking', () => {
     expect(stalled?.truncatedRepos).toBe(1)
     expect(stalled?.unreadablePaths).toEqual(['bulk'])
     await runtime.stop({ handover: false })
-    // The 100k-entry fixture is heavy by design; past the file's usual 40 s.
-  }, 90_000)
+  }, 40_000)
 
   it('flags linked worktrees with quoting and newline paths exactly', async () => {
     const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
