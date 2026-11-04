@@ -4816,6 +4816,31 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
 }
 .card-action-btn:disabled { cursor: default; }
 .card-issue-edit { width: auto; padding: 0 5px; }
+/* Sits outside .card-link, so it carries the padding that link gives the rest
+   of a live card. */
+.card-intake {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 12px 12px 0;
+  margin-bottom: -6px;
+  font-size: 0.6875rem;
+  color: var(--n4);
+}
+.card-intake-label { font-weight: 500; color: var(--a2); }
+.card-intake-pr { color: var(--a1); }
+.card-assign-btn {
+  padding: 1px 6px;
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--n6);
+  font: inherit;
+  cursor: pointer;
+}
+.card-assign-btn:hover { border-color: var(--n4); }
+.card-assign-btn[aria-disabled="true"] { opacity: 0.35; cursor: default; }
 .composer-labels[hidden] { display: none; }
 
 /* Per-icon accents on direct hover. Delete tints to the destructive

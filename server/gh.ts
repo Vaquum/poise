@@ -24,7 +24,7 @@ import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { MAX_PROCESS_ARG_BYTES, runFile } from './process'
 import { isRiskPressured, quotaRiskKey } from './quota-risk'
-import { agentAccount, requireAgentAccount } from './settings'
+import { agentAccount, getBehaviorChainSettings, requireAgentAccount } from './settings'
 import { invalidateActionRunCache, listActionRuns } from './action-runs'
 
 const CLI = 'github-datastore'
@@ -733,7 +733,7 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
     return { status: 200, body: result }
   }
 
-  if (op === 'read_issue' || op === 'edit_issue') {
+  if (op === 'read_issue' || op === 'edit_issue' || op === 'assign_issue') {
     const repoFull = String(body.repository_full_name || '')
     const issueNumber: unknown = body.issue_number
     try { requireConfiguredRepository(repoFull) }
@@ -776,6 +776,19 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
         env, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024,
       })).stdout)
       if (op === 'read_issue') return { status: 200, body: { issue: current } }
+      if (op === 'assign_issue') {
+        // The label comes from the chain's settings, never from the browser.
+        const { seedMode, label } = getBehaviorChainSettings()
+        if (seedMode !== 'label') return { status: 409, body: { error: 'The behavior chain takes every open issue, so there is no label to add' } }
+        if (current.state !== 'open') return { status: 409, body: { error: 'The issue is closed' } }
+        const applied: unknown = JSON.parse((await runFile(GH, ['api', `${endpoint}/labels`, '--method', 'POST', '-f', `${ISSUE_LABEL_PREFIX}${label}`], {
+          env, timeoutMs: 60_000, maxOutputBytes: 4 * 1024 * 1024,
+        })).stdout)
+        if (!Array.isArray(applied) || !applied.some((entry) => typeof entry?.name === 'string' && entry.name.toLowerCase() === label.toLowerCase())) {
+          throw new Error(`GitHub did not confirm the ${label} label`)
+        }
+        return { status: 200, body: { label } }
+      }
       const title = body.title.trim(), issueBody = body.body
       const answer = (issue: typeof current) => ({ status: 200,
         body: { issue, record: { kind: 'issue', repo: repoFull, ...issue, merged_at: null } } })
@@ -795,6 +808,39 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
       if (token) message = message.split(token).join('***')
       return { status: error instanceof HttpError ? error.statusCode : 502, body: { error: `GitHub issue edit failed: ${message}` } }
     }
+  }
+
+  if (op === 'issue_intake') {
+    // Current's view of the chain's intake: the same label filter and the same
+    // closing references the chain reads, from local rows only. A read that
+    // cannot prove absence is an organization error, never an empty answer.
+    const { seedMode, label } = getBehaviorChainSettings()
+    const { readOpenPrClosingRefs } = await import('./chat/control')
+    const orgs = selectOrganizations(body.org)
+    const labelled: string[] = []
+    const prs: Record<string, { number: number, url: string }[]> = {}
+    const errors: OrganizationReadError[] = []
+    await Promise.all(orgs.map(async (org) => {
+      try {
+        const rows = seedMode === 'label' ? await runCli(org, ['view', 'issue', '--status', 'open', '--label', label, '--format', 'json']) : []
+        const closing: [string, { number: number, url: string }][] = []
+        let after: { repo: string, number: number } | undefined
+        for (;;) {
+          const page = await readOpenPrClosingRefs(org, after)
+          if (!page || (page.truncated && !page.more) || page.prs.some((pr) => pr.closingTruncated)) throw new Error('open pull request references are incomplete')
+          for (const pr of page.prs) for (const ref of pr.closing) closing.push([`${ref.repo}#${ref.number}`.toLowerCase(), { number: pr.number, url: pr.url }])
+          if (!page.more) break
+          const last = page.prs.at(-1)
+          if (!last || (after?.repo === last.repo && after?.number === last.number)) throw new Error('open pull request pagination did not advance')
+          after = { repo: last.repo, number: last.number }
+        }
+        labelled.push(...rows.map((row) => `${row.repo}#${row.number}`.toLowerCase()))
+        for (const [issue, pr] of closing) (prs[issue] ??= []).push(pr)
+      } catch (error) {
+        errors.push({ org: org.login, error: error instanceof Error ? error.message : String(error) })
+      }
+    }))
+    return { status: 200, body: { label: seedMode === 'label' ? label : null, labelled, prs, errors } }
   }
 
   if (op === 'open_issue') {
