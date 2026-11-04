@@ -3,6 +3,7 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -13,7 +14,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import agent_interface as api
-from agent_interface import bash_guard, review_budget as budget, review_receipt, structured_review
+from agent_interface import bash_guard, claude_acl, review_budget as budget, review_receipt, structured_review
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 
@@ -169,6 +170,33 @@ class TestReceiptRecording(TestCase):
     def stored(self):
         with sqlite3.connect(api.DB) as conn:
             return conn.execute("select review_id from calls where id='run'").fetchone()[0]
+
+    def test_claude_shell_settings_preserve_native_identity_across_a_fresh_process(self):
+        call_id = uuid4().hex
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("update calls set id=? where id='run'", (call_id,))
+        with patch.dict(os.environ, {"AGENT_INTERFACE_RECEIPT_DB": str(api.DB), "AGENT_INTERFACE_RECEIPT_CALL": call_id}):
+            config = json.loads(claude_acl.settings([], review_receipt=str(Path(self.directory.name) / 'receipt.json')))
+        # A subscription wrapper forwards settings.env to its shell, rather
+        # than necessarily preserving the review controller's environment.
+        child = subprocess.run([sys.executable, '-c',
+            'import json,sys; from agent_interface.review_receipt import complete_response; '
+            'print(json.dumps(complete_response(json.loads(sys.argv[1]),sys.argv[2])))',
+            json.dumps(ASSESSMENT), HEAD], env={"HOME": self.directory.name, **config['env']},
+            text=True, capture_output=True, check=True)
+        response = json.loads(child.stdout)
+        self.assertEqual(response['invocation_id'], call_id)
+        self.assertEqual(response['model'], 'fixture')
+        self.assertEqual(response['head_sha'], HEAD)
+        with sqlite3.connect(api.DB) as conn:
+            retained = json.loads(conn.execute('select artifact from calls where id=?', (call_id,)).fetchone()[0])
+        self.assertEqual(retained['review_response'], response)
+        with patch.dict(os.environ, {"AGENT_INTERFACE_RECEIPT_DB": str(api.DB), "AGENT_INTERFACE_RECEIPT_CALL": call_id,
+                                     "POISE_NATIVE_CONTROL": '{"store":{}}'}):
+            guarded_config = json.loads(claude_acl.settings([], review_receipt=str(Path(self.directory.name) / 'receipt.json')))
+        guarded = subprocess.run(child.args, env={"HOME": self.directory.name, **guarded_config['env']}, text=True, capture_output=True)
+        self.assertNotEqual(guarded.returncode, 0)
+        self.assertIn('Caller metadata controller reference is invalid', guarded.stderr)
 
     def test_response_is_retained_before_submission_with_its_original_time_and_binding(self):
         with patch.object(review_receipt.time, "time", return_value=1234):

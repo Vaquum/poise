@@ -15,6 +15,9 @@ def settings(rules: list[str], review_gate: str | None = None, output_tokens: in
         config["env"] = {"AGENT_INTERFACE_REVIEW_GATE": review_gate}
     if review_receipt:
         config.setdefault("env", {})["AGENT_INTERFACE_REVIEW_RECEIPT"] = review_receipt
+        for key in ("AGENT_INTERFACE_RECEIPT_DB", "AGENT_INTERFACE_RECEIPT_CALL", "POISE_NATIVE_CONTROL"):
+            if key in os.environ:
+                config["env"][key] = os.environ[key]
     if review_root:
         config.setdefault("env", {})["GITHUB_INTERFACE_REVIEW_ROOT"] = review_root
     if output_tokens is not None:
