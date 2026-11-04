@@ -448,6 +448,28 @@ describe('the commands that run the tests', () => {
     expect(npm.calls()).toEqual(['run test:full -- tests/guard.test.ts tests/linked.test.ts --reporter=dot'])
   })
 
+  it.each([
+    ['test', ['--reporter', 'dot'], 'test:full', ['tests/guard.test.ts', 'tests/linked.test.ts']],
+    ['test', ['-t', 'a name'], 'test:full', ['tests/guard.test.ts', 'tests/linked.test.ts']],
+    ['e2e', ['--workers', '1'], 'test:e2e:full', core],
+  ])('takes the word after a bare flag for its value in %s %j, not for a test', async (command, flags, script, files) => {
+    const npm = fakeNpm()
+    await ci(repo.root, [command, ...flags], {}, { path: npm.path })
+    expect(npm.calls()).toEqual([`run ${script} -- ${[...files, ...flags].join(' ')}`])
+  })
+
+  it('still sees a test named around a flag and its value', async () => {
+    const npm = fakeNpm()
+    await ci(repo.root, ['test', '--reporter', 'dot', 'tests/other.test.ts'], {}, { path: npm.path })
+    await ci(repo.root, ['test', 'tests/other.test.ts', '--reporter', 'dot'], {}, { path: npm.path })
+    await ci(repo.root, ['test', '--reporter=dot', 'tests/other.test.ts'], {}, { path: npm.path })
+    expect(npm.calls()).toEqual([
+      'run test:full -- --reporter dot tests/other.test.ts',
+      'run test:full -- tests/other.test.ts --reporter dot',
+      'run test:full -- --reporter=dot tests/other.test.ts',
+    ])
+  })
+
   it('runs exactly the tests a command names', async () => {
     const npm = fakeNpm()
     await ci(repo.root, ['test', 'tests/other.test.ts', '--reporter=dot'], {}, { path: npm.path })
@@ -570,13 +592,39 @@ describe('what a full run on main reports', () => {
     expect(api.writes()[0].body.body).toContain('- tests/a.test.ts > a breaks')
   })
 
-  it('counts a run that was cut off as failed, naming its jobs', async () => {
-    const api = await github(routes({ ...failedRun, conclusion: 'cancelled' }, [unit('cancelled')]))
+  it('counts a job that ran out of time as failed, naming it', async () => {
+    const api = await github(routes(failedRun, [unit('cancelled')]))
     const empty = tempRoot()
     expect((await report(api, join(empty, 'absent'))).code).toBe(0)
     const { body } = api.writes()[0].body
     expect(body).toContain('Did not pass: Unit & integration (2).')
     expect(body).toContain('No test report names a failed test')
+  })
+
+  it('stays quiet about a run cancelled as a whole, which leaves its aggregate failed', async () => {
+    const api = await github(routes({ ...failedRun, conclusion: 'cancelled' }, [unit('cancelled'), { name: 'Verify (Node 22)', conclusion: 'failure' }], [openIssue]))
+    expect((await report(api)).code).toBe(0)
+    expect(api.writes()).toEqual([])
+  })
+
+  it('files nothing for a failure on an older commit than a full run that passed', async () => {
+    const api = await github({ ...routes(failedRun, failingJobs), 'GET compare/': { status: 'behind', commits: [] } })
+    expect((await report(api)).code).toBe(0)
+    expect(api.writes()).toEqual([])
+  })
+
+  it('leaves the issue open when a pass is on an older commit than the latest failure', async () => {
+    const api = await github({ ...routes(passedRun, [unit('success')], [openIssue]), 'GET compare/': { status: 'behind', commits: [] } })
+    expect((await report(api)).code).toBe(0)
+    expect(api.writes()).toEqual([])
+    expect(api.requests.map(item => item.url)).toContain(`compare/${drawn}...${passedRun.head_sha}`)
+    expect(api.requests.map(item => item.url)).toContain('actions/workflows/ci.yml/runs?branch=main&status=failure&per_page=100')
+  })
+
+  it.each(['ahead', 'identical'])('closes the open issue once a full run passes on a commit %s of the latest failure', async (status) => {
+    const api = await github({ ...routes(passedRun, [unit('success')], [openIssue]), 'GET compare/': { status, commits: [] } })
+    expect((await report(api)).code).toBe(0)
+    expect(api.writes().map(item => `${item.method} ${item.url}`)).toEqual(['POST issues/42/comments', 'PATCH issues/42'])
   })
 
   it('closes the open issue once a later full run passes', async () => {

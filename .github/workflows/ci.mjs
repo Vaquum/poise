@@ -243,34 +243,49 @@ function changesFromMain() {
     ...git('ls-files', '--others', '--exclude-standard', '-z').split('\0')].filter(Boolean)
 }
 
+// A word after a bare flag may be its value, as in --reporter dot. Taking it for a test
+// would run the whole suite; taking a test for a value only adds the essential tests.
+const namesTests = args => args.some((arg, index) => !arg.startsWith('-') && !/^-[^=]*$/.test(args[index - 1] ?? ''))
+
 // What npm test and npm run test:e2e run: naming tests means exactly those; flags alone steer the essential run.
 function runEssential(kind, args) {
   const script = kind === 'unit' ? 'test:full' : 'test:e2e:full'
-  if (args.some(arg => !arg.startsWith('-'))) return npmRun([script, '--', ...args])
+  if (namesTests(args)) return npmRun([script, '--', ...args])
   const paths = changesFromMain()
   const files = kind === 'unit' ? essentialUnitTests(paths) : selectBrowserTests(paths, testFiles(browserSpec))
   console.error(`Running the essential ${kind} tests: ${files.length} files. npm run ${script} runs them all.`)
   npmRun([script, '--', ...files, ...args])
 }
 
+const isFullRun = run => run.event === 'workflow_dispatch' || (run.event === 'push' && drawsFullRun(run.head_sha))
+
 // Files what a finished full run on main found as one issue, which Poise's chain then fixes.
 export async function report() {
   const id = process.env.RUN_ID
   if (!/^\d+$/.test(id ?? '')) throw new Error('Missing RUN_ID')
   const [run, { jobs }] = await Promise.all([github(`actions/runs/${id}`), github(`actions/runs/${id}/jobs?per_page=100`)])
+  // Superseded or stopped by hand, so it says nothing about the code. A job that
+  // runs out of time is different: its run concludes as failed.
+  if (run.conclusion === 'cancelled') return
   // A commit that reused queue evidence skips its tests; only a full run has a second unit shard.
   if (!jobs.some(job => job.name === 'Unit & integration (2)' && job.conclusion !== 'skipped')) return
   const issues = await github('issues?state=open&labels=poise&per_page=100')
   const open = issues.find(issue => issue.title === fullRunIssueTitle && !issue.pull_request)
   if (run.conclusion === 'success') {
     if (!open) return
+    // Full runs overlap, and a pass on an older commit says nothing about a newer failure.
+    const { workflow_runs: failures } = await github('actions/workflows/ci.yml/runs?branch=main&status=failure&per_page=100')
+    const failure = failures.find(isFullRun)
+    if (failure && (await github(`compare/${failure.head_sha}...${run.head_sha}`)).status === 'behind') return
     await github(`issues/${open.number}/comments`, { method: 'POST', body: { body: `The full suite passed at ${run.head_sha}: ${run.html_url}\n\nClosing.` } })
     await github(`issues/${open.number}`, { method: 'PATCH', body: { state: 'closed' } })
     return
   }
-  const { workflow_runs: runs } = await github('actions/workflows/ci.yml/runs?branch=main&status=success&per_page=100')
-  const previous = runs.find(other => other.id !== run.id && (other.event === 'workflow_dispatch' || (other.event === 'push' && drawsFullRun(other.head_sha))))
+  const { workflow_runs: passes } = await github('actions/workflows/ci.yml/runs?branch=main&status=success&per_page=100')
+  const previous = passes.find(other => other.id !== run.id && isFullRun(other))
   const compared = previous ? await github(`compare/${previous.head_sha}...${run.head_sha}`) : { commits: [] }
+  // Nor does a failure on an older commit once a newer one has passed.
+  if (compared.status === 'behind') return
   const merged = compared.commits.filter(commit => commit.parents.length > 1).map((commit) => {
     const [subject, title] = commit.commit.message.split('\n').filter(Boolean)
     return `- ${subject.match(/#\d+/)?.[0] ?? commit.sha.slice(0, 8)} ${title ?? subject}`

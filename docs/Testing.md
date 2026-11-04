@@ -14,7 +14,8 @@ browser tests. `npm run test:full` and `npm run test:e2e:full` run everything.
 A command that names tests runs exactly those, such as
 `npm test -- tests/chat/runtime.test.ts` or
 `npm run test:e2e -- tests/e2e/chat.spec.ts`. Flags alone steer the essential
-run.
+run, and the word after a bare flag counts as its value, as in
+`npm test -- --reporter dot`.
 
 Local browser runs serialize one at a time per workspace: `npm run test:e2e`
 holds the lock from before its build (`scripts/with-e2e-lock.mjs`), and a bare
@@ -31,7 +32,8 @@ Agents, PR checks and merge-queue candidates run the same set, which
 - [`tests/essential.txt`](../tests/essential.txt): the tests that guard
   security, agent spend and PR actions, data loss and release safety, and the
   whole-repository wiring tests an import link cannot reach. A new test that
-  guards one of those belongs in this list.
+  guards one of those belongs in this list. A delegated self-update change may
+  not edit it.
 - Any test the change edits, and any test that directly imports a changed file.
   One step only: following imports further selects most of the suite.
 - The core browser journeys (`smoke`, `service-mode`, `independent-startup`),
@@ -81,6 +83,12 @@ the last full run that passed. Poise's chain fixes it in a normal PR. Nothing is
 reverted and other PRs keep merging. Another failure adds a comment, never an
 edit, because editing an issue's body re-bases the chain already fixing it. A
 later full run that passes closes the issue.
+
+Full runs can overlap, so commit order decides what counts. A pass on an older
+commit than the latest failure leaves the issue open, and a failure on an older
+commit than a pass files nothing. A run cancelled as a whole reports nothing,
+because it was superseded or stopped by hand; a job that runs out of time still
+counts as failed.
 
 A fork has no queue evidence, so every push to its `main` runs the complete
 gates, and `deploy/actions/gate.sh` refuses a tip that failed. Broken code can
