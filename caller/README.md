@@ -199,6 +199,11 @@ failure retries with backoff. Errors after the write begins remain held.
 
 ## Review preparation diagnostics
 
+Governed Claude reviews forward their original invocation ID and receipt database
+through the subscription wrapper's explicit shell settings. The submission helper
+therefore retains the substantive response with its original model and invocation
+before publishing; a response without that identity cannot authorize approval.
+
 Review Git failures retain a version 1 `diagnostic` object in the durable call
 and `agent-interface --logs`. `github-interface` emits the same redacted JSON
 as `caller_diagnostic: …` on stderr; agent-interface preserves it across packet
