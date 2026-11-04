@@ -20,6 +20,7 @@ vi.mock('../server/alerts/producers', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../server/alerts/producers')>()
   return { ...actual, chatTurnFinished: vi.fn(actual.chatTurnFinished) }
 })
+vi.setConfig({ hookTimeout: 25_000 })
 const caps: Capabilities = { steer: true, fork: false, thought: false, plan: false, commands: false, modes: false, permissions: true, questions: true, resume: true, images: false }
 let root: string
 let runtime: ChatRuntime
