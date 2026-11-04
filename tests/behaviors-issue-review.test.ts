@@ -940,10 +940,12 @@ describe('Review New Issues sub-issues', () => {
     const held = () => ({
       letters: database.db.prepare('SELECT id, created_at, error, call_id, retired_at FROM behavior_dead_letters').all(),
       alerts: database.db.prepare("SELECT id, created_at, resolved_at FROM alerts WHERE kind = 'behavior_held'").all(),
+      failure: database.getMeta(`behavior_review_new_issues_failure:${ref(500)}`),
     })
     const before = held()
     expect(before.letters).toHaveLength(1)
     expect(before.alerts).toHaveLength(1)
+    expect(before.failure).toContain('lastFailureAtMs')
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, ...rest) => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
@@ -963,6 +965,46 @@ describe('Review New Issues sub-issues', () => {
     skipBackoff()
     await behaviors.runEnabledBehaviorsOnce()
     expect(launches().map((args) => args[1])).toEqual([ref(500), ref(501), ref(500)])
+  })
+
+  it('records a retry\'s own failure over the earlier attempt\'s row after a feed outage', async () => {
+    const { behaviors, database } = await start()
+    issues = [issue(500)]
+    const row = () => JSON.parse(database.getMeta(`behavior_review_new_issues_failure:${ref(500)}`)!)
+    await behaviors.runEnabledBehaviorsOnce()
+    const first = finished(ref(500), { status: 'failed', error: 'first failure' })
+    agentLogs = [first]
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    skipBackoff()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(2)
+    const retry = callFor(ref(500))
+    agentLogs = [first, retry]
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    // The retry's call leaves the log for its whole lease, so it closes unrecorded.
+    agentLogs = [first]
+    vi.setSystemTime(Date.now() + 2 * 60 * MINUTE)
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(database.getFailedBehaviorLaunch(KEY, ref(500))?.launchCallId).toBe(retry.id)
+    expect(row().callId).toBe(first.id)
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command, args, ...rest) => {
+      if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
+      return original(command, args, ...rest)
+    })
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(database.getFailedBehaviorLaunch(KEY, ref(500))?.launchQuarantine).toBe('unreadable')
+    mocks.runFile.mockImplementation(original)
+    agentLogs = [first, { ...retry, status: 'failed', error: 'retry failed', completed_at: new Date().toISOString() }]
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(database.getFailedBehaviorLaunch(KEY, ref(500))?.launchQuarantine).toBeNull()
+    expect(row()).toMatchObject({ callId: retry.id, error: 'retry failed', lastFailureAtMs: Date.now() })
+    expect(launches()).toHaveLength(2)
   })
 
   it('keeps closed failures held after a feed outage and rotation without resurrecting their worker slots', async () => {

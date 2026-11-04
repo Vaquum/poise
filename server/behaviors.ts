@@ -1761,6 +1761,13 @@ function claimLogIdentity(claim: BehaviorLaunchClaim): AgentLogIdentity {
     repo: claim.launchRepo, prId: String(claim.launchPr), behavior: claim.launchBehavior }
 }
 
+// A row at least as new as the launch records that launch's failure. An older
+// one is an earlier attempt's and says nothing about this launch.
+function launchFailureRecorded(claim: BehaviorLaunchClaim): boolean {
+  const failure = readBehaviorFailure(claim.key as BehaviorKey, claim.target)
+  return failure !== null && failure.lastFailureAtMs >= Date.parse(claim.launchRequestedAt)
+}
+
 // A closed failed claim has no owner token. Its call, correlation, and
 // launch watermark jointly prevent a late read from changing a newer launch.
 function quarantineFailedClaim(
@@ -1781,7 +1788,8 @@ function quarantineFailedClaim(
     if (changed.changes) {
       recordQuarantineIncident(claim, error, claim.launchCallId)
       // Uncertainty, not success: a quarantine must not release a hold.
-      clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
+      // An unreadable log says nothing new about a recorded failure: its row stays as it was.
+      if (kind !== 'unreadable' || !launchFailureRecorded(claim)) clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
     }
     return changed.changes !== 0
   })()
@@ -1848,7 +1856,7 @@ function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry |
     const retryFailure = claim.key === ISSUES_KEY
       ? call.error_code !== 'stopped' && (call.receipts != null || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))
       : (!boundedReviewFailure(call) || budgetExhaustedProvenNoAction(call)) && call.error_code !== 'review_packet_too_large'
-    if (retryFailure) recordBehaviorFailure(claim.key as BehaviorKey, 'worker', message, claim.target,
+    if (retryFailure && !launchFailureRecorded(claim)) recordBehaviorFailure(claim.key as BehaviorKey, 'worker', message, claim.target,
       claim.key === ISSUES_KEY ? { errorCode: call.error_code, held: !issueFailureCanRetry(claim.target, call), callId: call.id } : {})
   })()
 }
