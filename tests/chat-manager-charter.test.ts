@@ -184,6 +184,10 @@ function putMemories(body: unknown, withOrigin: boolean) {
     headers: { 'Content-Type': 'application/json', ...(withOrigin ? { Origin: origin } : {}) },
     body: JSON.stringify(body) })
 }
+/** What the next round delivers, without waiting a second for the background's. */
+async function untilDelivered(check: () => boolean) {
+  await until(() => { void control.tick(); return check() })
+}
 async function finishTurn(id: string, stopReason: TurnResult['stopReason'] = 'end_turn') {
   const finishedBefore = seen.get(id)?.filter(event => event.type === 'turn.finished').length ?? 0
   await until(() => finishes.has(id))
@@ -375,6 +379,7 @@ it('places /manager between the control context and the request in Manager turns
 
   store.message(instance, manager.id, 'worker-session', 'Worker needs help')
   await control.tick()
+  await untilDelivered(() => finishes.has(manager.id))
   await finishTurn(manager.id)
   found = positions(prompts.get(manager.id)!.at(-1)!.text)
   expect(found.charter).toBeGreaterThan(found.control)
@@ -393,6 +398,7 @@ it('places /manager between the control context and the request in Manager turns
   expect(on.memories).toBe('Saved memories')
   store.message(instance, manager.id, 'worker-session', 'Worker needs help')
   await control.tick()
+  await untilDelivered(() => finishes.has(manager.id))
   await finishTurn(manager.id)
   found = positions(prompts.get(manager.id)!.at(-1)!.text)
   expect(found.modeOn).toBeGreaterThanOrEqual(0)
@@ -410,6 +416,7 @@ it('places /manager between the control context and the request in Manager turns
   expect(found.request).toBeGreaterThan(found.charterText)
   store.message(instance, manager.id, 'worker-session', 'Worker needs help')
   await control.tick()
+  await untilDelivered(() => finishes.has(manager.id))
   await finishTurn(manager.id)
   found = positions(prompts.get(manager.id)!.at(-1)!.text)
   expect(found.modeOff).toBeGreaterThanOrEqual(0)
