@@ -114,7 +114,7 @@ test('a native chain step names its command and shows no model', async ({ page }
     ['native_action', '--merge-if-ready', 'merge-if-ready'],
     ['native_action', '--resolve-nonblocking-conversations-if-ready', 'resolve-nonblocking-conversations-if-ready'],
     ['native_action', '--rerun-grey-ci-if-ready', 'rerun-grey-ci-if-ready'],
-    ['native_action', '--issue-work', 'publication'],
+    ['native_action', '--issue-work', 'issue-work'],
     ['native_publication', 'Complete original repair publication', 'publication'],
   ]
   const run = history()[0]

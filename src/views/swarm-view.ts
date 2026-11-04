@@ -398,10 +398,11 @@ function behaviorCell(s: string | null): string {
 // A native chain step runs one fixed GitHub command, and no model is involved.
 // Its Call reads `completed` whatever the command decided, so this names the
 // command and not a result: `merge` would be false on a PR that was not ready.
-// Both publication rows run `--issue-work --mode complete`.
+// Each label is part of the raw `behavior` or `prompt`, because the filter and
+// Caller's search read only those fields and must find what this column shows.
 function nativeAction(e: LogEntry): string | null {
   if (e.model !== 'native-action') return null
-  return e.behavior === 'native_publication' || e.prompt === '--issue-work' ? 'publication' : e.prompt.replace(/^--/, '')
+  return e.behavior === 'native_publication' ? 'publication' : e.prompt.replace(/^--/, '')
 }
 
 // The target is two columns, Org and Repo, each linking to its own GitHub page.

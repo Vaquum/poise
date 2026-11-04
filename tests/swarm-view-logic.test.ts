@@ -194,10 +194,14 @@ describe('a native chain step names its command and shows no model', () => {
     ['native_action', '--merge-if-ready', 'merge-if-ready'],
     ['native_action', '--resolve-nonblocking-conversations-if-ready', 'resolve-nonblocking-conversations-if-ready'],
     ['native_action', '--rerun-grey-ci-if-ready', 'rerun-grey-ci-if-ready'],
-    ['native_action', '--issue-work', 'publication'],
+    ['native_action', '--issue-work', 'issue-work'],
     ['native_publication', 'Complete original repair publication', 'publication'],
-  ])('%s %s reads %s', (behavior, prompt, label) => {
-    expect(cells(entry({ model: 'native-action', behavior, prompt }))).toEqual({ model: '—', behavior: label })
+  ])('%s %s reads %s and the filter finds it by that', (behavior, prompt, label) => {
+    const row = entry({ model: 'native-action', behavior, prompt })
+    expect(cells(row)).toEqual({ model: '—', behavior: label })
+    helpers.setSearch(label)
+    expect(helpers.matchesSearch(row)).toBe(true)
+    helpers.setSearch('')
   })
 
   it('leaves a model run as it was', () => {
