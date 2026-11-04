@@ -18,7 +18,7 @@ PYTEST_VALUE_FLAGS = {"-m", "-n", "-o", "-p", "-c", "-r", "-W", "--numprocesses"
 # A change to one of these can touch any test.
 SHARED_FILES = {"conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}
 # A change to only these touches none.
-PROSE = (".md", ".rst", ".txt")
+PROSE = (".md", ".rst")
 
 
 def split_command(args):
@@ -83,11 +83,13 @@ def touched_tests(since):
     def git(*args, nothing_found=0):
         result = subprocess.run(["git", *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if result.returncode not in (0, nothing_found):
-            raise OSError("git %s failed" % args[0])
+            raise OSError("git %s failed" % " ".join(args[:3]))
         return [path for path in os.fsdecode(result.stdout).split("\0") if path]
 
     try:
-        changed = git("diff", "--name-only", "--relative", "-z", since) + git("ls-files", "-z", "--others", "--exclude-standard")
+        # A change anywhere in the checkout counts, whichever folder the suite runs from; the tests are this folder's.
+        top = os.fsdecode(subprocess.run(["git", "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True).stdout).strip()
+        changed = git("-C", top, "diff", "--name-only", "-z", since) + git("-C", top, "ls-files", "-z", "--others", "--exclude-standard")
         if any(os.path.basename(path) in SHARED_FILES for path in changed):
             return None
         tests = set()
@@ -95,8 +97,9 @@ def touched_tests(since):
         for path in changed:
             name = os.path.basename(path)
             if name.startswith("test_") and name.endswith(".py") or name.endswith("_test.py"):
-                if os.path.exists(path):
-                    tests.add(path)
+                here = os.path.relpath(os.path.join(top, path))
+                if os.path.exists(here) and not here.startswith(".."):
+                    tests.add(here)
             elif name == "__init__.py":
                 package = os.path.basename(os.path.dirname(path))
                 if not package:
@@ -107,10 +110,10 @@ def touched_tests(since):
         if modules:
             pattern = "|".join(sorted(modules))
             tests.update(git("grep", "-z", "-l", "-w", "-E", pattern, "--", "*test_*.py", "*_test.py", nothing_found=1))
-    except OSError:
+    except (OSError, subprocess.CalledProcessError):
         return None
-    # Saying no test is touched is only safe when nothing but prose changed.
-    if not tests and not all(path.endswith(PROSE) for path in changed):
+    # Saying no test is touched is only safe when prose, and nothing but prose, changed.
+    if not tests and not (changed and all(path.endswith(PROSE) for path in changed)):
         return None
     return sorted(tests)
 

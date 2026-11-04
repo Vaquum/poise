@@ -347,11 +347,11 @@ describe('on a test instance, a command for the whole suite', () => {
     return env
   }
   // A runner that says what it was asked to run, as it would read it.
-  const pytest = (repo: string, args: string[], since: string | null) => {
+  const pytest = (repo: string, args: string[], since: string | null, cwd = repo) => {
     // Outside the checkout, where it is no part of the change.
     const runner = join(temp(), 'pytest')
     writeFileSync(runner, 'import json, os, sys\nprint(json.dumps({"args": sys.argv[1:], "nested": os.environ.get("POISE_TEST_INSTANCE")}))\n')
-    const result = spawnSync('python3', [runner, ...args], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, since) })
+    const result = spawnSync('python3', [runner, ...args], { cwd, encoding: 'utf8', env: instanceEnv(SOURCE, since) })
     return { status: result.status, stderr: result.stderr, seen: result.stdout ? JSON.parse(result.stdout) as { args: string[]; nested: string | null } : null }
   }
   const FILES = {
@@ -377,6 +377,11 @@ describe('on a test instance, a command for the whole suite', () => {
     expect(pytest(repo, [], since).seen?.args).toEqual(['tests/test_new.py', 'tests/test_other.py'])
   })
 
+  it('sees a change anywhere in the checkout, and runs this folder\'s tests, from a folder inside it', () => {
+    const { repo, since } = changed({ ...FILES, 'other/tests/test_pricing_too.py': 'from src import pricing\n' }, { 'src/pricing.py': 'x = 2\n', 'other/tests/test_new.py': 'x = 1\n', 'tests/test_new.py': 'x = 1\n' })
+    expect(pytest(repo, [], since, join(repo, 'tests')).seen?.args).toEqual(['test_new.py', 'test_pricing.py'])
+  })
+
   it('counts a changed package by those who mention it', () => {
     const { repo, since } = changed({ ...FILES, 'billing/__init__.py': 'x = 1\n', 'tests/test_billing.py': 'import billing\n' }, { 'billing/__init__.py': 'x = 2\n' })
     expect(pytest(repo, [], since).seen?.args).toEqual(['tests/test_billing.py'])
@@ -391,7 +396,7 @@ describe('on a test instance, a command for the whole suite', () => {
   })
 
   it('stays whole when the change can touch anything, or names nothing it can place', () => {
-    const changes: Record<string, string>[] = [{ 'conftest.py': 'x = 1\n' }, { '__init__.py': 'x = 1\n' }, { 'data/rates.json': '{}\n' }, { 'src/nothing_mentions_me.py': 'x = 1\n' }]
+    const changes: Record<string, string>[] = [{}, { 'conftest.py': 'x = 1\n' }, { '__init__.py': 'x = 1\n' }, { 'data/rates.json': '{}\n' }, { 'requirements.txt': 'x\n' }, { 'tests/data/expected.txt': 'x\n' }, { 'src/nothing_mentions_me.py': 'x = 1\n' }]
     for (const later of changes) {
       const { repo, since } = changed(FILES, later)
       expect(pytest(repo, ['-q'], since).seen?.args).toEqual(['-q'])
