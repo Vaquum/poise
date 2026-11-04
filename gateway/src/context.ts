@@ -15,6 +15,7 @@ import type { Session, Store, User } from './store.js'
 import { LoggingQueryPool } from './diagnostics/query-pool.js'
 import { GoogleConnections } from './google.js'
 import { loadPublicPages, type PublicPages } from './public-pages.js'
+import type { TestRelay } from './test-relay.js'
 
 export const APEX_COOKIE = 'poise_gw'
 export const WORKSPACE_COOKIE = 'poise_ws'
@@ -33,6 +34,8 @@ export interface GatewayDeps {
   orchestrator: Orchestrator
   /** What the gateway last measured of disk use; absent where nothing measures it. */
   disk?: DiskWatch
+  /** Where agents' test suites meet their test instances; absent when they run in the workspaces. */
+  testRelay?: TestRelay
   log: Logger
   now: () => number
   upstream: UpstreamResolver

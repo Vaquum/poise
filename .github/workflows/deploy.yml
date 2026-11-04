@@ -77,4 +77,5 @@ jobs:
           VARS: ${{ toJSON(vars) }}
           POISE_GITHUB_CLIENT_SECRET: ${{ secrets.POISE_GITHUB_CLIENT_SECRET }}
           POISE_GOOGLE_CLIENT_SECRET: ${{ secrets.POISE_GOOGLE_CLIENT_SECRET }}
+          POISE_TEST_RENDER_API_KEY: ${{ secrets.POISE_TEST_RENDER_API_KEY }}
         run: deploy/actions/deploy.sh

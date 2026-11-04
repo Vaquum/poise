@@ -1,4 +1,4 @@
-import { createPublicKey, verify } from 'node:crypto'
+import { createPublicKey, verify, type KeyObject } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import http, { type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -13,9 +13,10 @@ import { DockerClient } from '../src/docker.js'
 import { createGateway, type Gateway } from '../src/gateway.js'
 import { GitHubClient } from '../src/github.js'
 import { loadOrCreateKeys, type GatewayKeys } from '../src/keys.js'
-import { createLogger } from '../src/log.js'
+import { createLogger, type Logger } from '../src/log.js'
 import { Orchestrator, type Upstream } from '../src/orchestrator.js'
 import { Store } from '../src/store.js'
+import type { TestRelay } from '../src/test-relay.js'
 import { prepareWorkspaceDns } from '../src/workspace-dns.js'
 import { startFakeDocker, type FakeDocker } from './fakes/docker.js'
 import { startFakeGitHub, type FakeGitHub } from './fakes/github.js'
@@ -69,6 +70,8 @@ export interface Harness {
 }
 
 export interface HarnessOptions {
+  /** Makes the relay agents' test suites meet their instances at. */
+  testRelay?: (deps: { privateKey: KeyObject; log: Logger; now: () => number; store: Store }) => TestRelay
   publicPages?: unknown
   env?: Record<string, string | undefined>
   drainPollMs?: number
@@ -192,6 +195,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const gateway: Gateway = createGateway({
     config, store, keys, github: new GitHubClient(config), docker: dockerClient, orchestrator, disk, log, now, upstream,
     shutdownGraceMs: options.shutdownGraceMs ?? 1000,
+    testRelay: options.testRelay?.({ privateKey: keys.privateKey, log, now, store }),
   })
   await new Promise<void>((resolve) => gateway.server.listen(0, '127.0.0.1', resolve))
   const { port } = gateway.server.address() as AddressInfo

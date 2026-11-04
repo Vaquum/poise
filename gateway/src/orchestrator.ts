@@ -6,6 +6,7 @@ import type { ContainerDetails, ContainerMount, ContainerSpec, ContainerSummary,
 import type { GatewayKeys } from './keys.js'
 import { errorMessage, type LogFields, type Logger } from './log.js'
 import type { Store } from './store.js'
+import { workspaceKey, workspaceRelayUrl } from './test-relay.js'
 import { WORKSPACE_RESOLV_CONF } from './workspace-dns.js'
 
 export const WORKSPACE_PORT = 5555
@@ -64,6 +65,8 @@ export function imageRelease(labels: Record<string, string> | null): ImageReleas
 
 /** Where a release is installed from: the image's own copy, by deploy/runtime/install-release.sh. */
 const INSTALL_RELEASE = '/opt/poise-runtime/install-release.sh'
+/** Installs agents' test offload into a workspace's home volume, or turns it off. */
+const INSTALL_TEST_OFFLOAD = '/opt/poise/scripts/test-offload/install.sh'
 /** How long a workspace asked to switch may stay unreachable before it counts as hung and gets a new container. */
 const SWITCH_GRACE_MS = 10 * 60_000
 /**
@@ -588,14 +591,42 @@ export class Orchestrator {
    */
   private async installRelease(handle: string, activate: boolean): Promise<void> {
     const { config, docker } = this.deps
-    const { volume } = workspaceNames(handle)
-    const spec: TaskSpec = {
+    const code = await docker.runTask(`poise-release-${handle}`, this.homeTask(handle, 'install-release', INSTALL_RELEASE, activate ? ['--activate'] : [], []))
+    if (code !== 0) throw new Error(`installing the release of ${config.runtimeImage} into ${workspaceNames(handle).volume} exited with ${code}`)
+    this.lifecycle('workspace.release.installed', handle, { image: config.runtimeImage, activate })
+    await this.installTestOffload(handle)
+  }
+
+  /**
+   * Installs agents' test offload beside the release. It goes in the home volume, not the container's
+   * environment, because only a new container would take an environment variable, and a new container
+   * drains the workspace. A failure leaves suites running in the workspace, so it is reported, and the
+   * release goes ahead regardless.
+   */
+  private async installTestOffload(handle: string): Promise<void> {
+    const { config, docker, keys, log, store } = this.deps
+    const env = config.testRelay
+      ? [`POISE_TEST_RELAY_URL=${workspaceRelayUrl(config, handle)}`, `POISE_TEST_RELAY_KEY=${workspaceKey(keys.privateKey, handle)}`]
+      : []
+    try {
+      const code = await docker.runTask(`poise-test-offload-${handle}`, this.homeTask(handle, 'install-test-offload', INSTALL_TEST_OFFLOAD, [], env))
+      if (code !== 0) throw new Error(`${INSTALL_TEST_OFFLOAD} exited with ${code}`)
+    } catch (error) {
+      log.error('workspace.test_offload.install.failed', { handle, error: errorMessage(error) })
+      store.noteWorkspaceError(handle, `agents' test offload not installed: ${errorMessage(error)}`)
+    }
+  }
+
+  /** A short-lived container of the runtime image with only the workspace's home volume, as the workspace user. */
+  private homeTask(handle: string, task: string, entrypoint: string, cmd: string[], env: string[]): TaskSpec {
+    const { config } = this.deps
+    return {
       Image: config.runtimeImage,
       User: '10001',
-      Entrypoint: [INSTALL_RELEASE],
-      Cmd: activate ? ['--activate'] : [],
-      Env: ['HOME=/home/poise'],
-      Labels: { 'poise.task': 'install-release', 'poise.workspace': handle },
+      Entrypoint: [entrypoint],
+      Cmd: cmd,
+      Env: ['HOME=/home/poise', ...env],
+      Labels: { 'poise.task': task, 'poise.workspace': handle },
       HostConfig: {
         SecurityOpt: ['no-new-privileges'],
         CapDrop: ['ALL'],
@@ -603,13 +634,10 @@ export class Orchestrator {
         NanoCpus: 2e9,
         PidsLimit: 256,
         ...(config.workspaceRuntime ? { Runtime: config.workspaceRuntime } : {}),
-        Mounts: [{ Type: 'volume', Source: volume, Target: '/home/poise' }],
+        Mounts: [{ Type: 'volume', Source: workspaceNames(handle).volume, Target: '/home/poise' }],
         NetworkMode: 'none',
       },
     }
-    const code = await docker.runTask(`poise-release-${handle}`, spec)
-    if (code !== 0) throw new Error(`installing the release of ${config.runtimeImage} into ${volume} exited with ${code}`)
-    this.lifecycle('workspace.release.installed', handle, { image: config.runtimeImage, activate })
   }
 
   /** Before a workspace gets a new container: the new image's release becomes the one it starts. */

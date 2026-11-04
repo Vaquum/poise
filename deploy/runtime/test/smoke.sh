@@ -292,6 +292,25 @@ check_home() {
   pass "the home volume is prepared: ${layout//$'\n'/, }"
 }
 
+# Agents' test offload, installed as the gateway installs it. Nothing answers
+# at this relay, so a suite that reaches for its instance fails with 125; one
+# that ran here would fail otherwise, as no suite is there to run.
+check_test_offload() {
+  local volume=$1 hooks=/home/poise/.poise/test-offload code output
+  docker run --rm --user 10001 --env HOME=/home/poise --env POISE_TEST_RELAY_URL=http://127.0.0.1:9/api/link/test-relay \
+    --env POISE_TEST_RELAY_KEY=smoke --mount "type=volume,source=$volume,target=/home/poise" \
+    --entrypoint /opt/poise/scripts/test-offload/install.sh "$image" || fail "the test offload does not install"
+  code=0
+  output=$(docker exec --workdir /tmp --env "PYTHONPATH=$hooks" "$workspace" /opt/caller/venv/bin/python -m pytest 2>&1) || code=$?
+  [ "$code" = 125 ] || fail "python -m pytest stayed in the workspace ($code): $output"
+  code=0
+  output=$(docker exec --workdir /tmp --env "NODE_OPTIONS=--require \"$hooks/hook.cjs\"" "$workspace" npm test 2>&1) || code=$?
+  [ "$code" = 125 ] || fail "npm test stayed in the workspace ($code): $output"
+  docker run --rm --user 10001 --env HOME=/home/poise --mount "type=volume,source=$volume,target=/home/poise" \
+    --entrypoint /opt/poise/scripts/test-offload/install.sh "$image" || fail "the test offload does not turn off"
+  pass "agents' test suites leave the workspace from every interpreter"
+}
+
 # The workspace twice on one home volume, as the gateway recreates it: with
 # the plain-http origin of the gateway's POISE_INSECURE_HTTP runs, then with
 # the https origin of a real deployment.
@@ -321,6 +340,7 @@ contract() {
   pass "standalone maintenance diagnostics load without a provider or network"
   check_home "$workspace"
   check_entrypoint "$public_key"
+  check_test_offload "$volume"
 }
 
 offline() {
