@@ -159,7 +159,7 @@ it.each([
         publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
       '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
       '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: false,
-        unresolved_live_conversation_count: 0, green: false, blockers: [...blockers, 'reviewer_not_approved_current_head'] },
+        unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0, green: false, blockers: [...blockers, 'reviewer_not_approved_current_head'] },
       '--list-failing-ci': { head_sha: HEAD, pull_number: 21, failing: [], mergeable, mergeable_state: mergeable ? 'behind' : 'dirty' },
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
@@ -184,7 +184,7 @@ it('records a pull closed without merging, which carries no queue removal eviden
         publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'closed', merged: false, merge_sha: null } },
       '--pull-action-state': pullState,
       '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: false,
-        unresolved_live_conversation_count: 0, green: false, blockers: ['pull_not_open'] },
+        unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0, green: false, blockers: ['pull_not_open'] },
       '--list-failing-ci': { head_sha: HEAD, pull_number: 21, failing: [], mergeable: true, mergeable_state: 'behind' },
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
@@ -195,6 +195,34 @@ it('records a pull closed without merging, which carries no queue removal eviden
   expect(decideBehaviorChain(chain, observation, Date.now())).toEqual({ kind: 'hold', reason: 'pull request closed without a confirmed merge' })
   pullState.state = 'open'
   await expect(actionOperations().observe(chain)).rejects.toThrow('native PR observations changed head or are incomplete')
+})
+
+const invoke = (behavior: string) => ({ kind: 'invoke', behavior })
+const gatesUnsatisfied = { kind: 'wait', reason: 'native repository readiness gates are not satisfied' }
+it.each([
+  { approved: true, blockers: ['required_reviews_not_approved'], expected: invoke('resolve-threads') },
+  { approved: true, blockers: ['merge_state_not_clean'], expected: invoke('resolve-threads') },
+  { approved: false, blockers: ['required_reviews_not_approved', 'reviewer_not_approved_current_head'], expected: invoke('approve-pr') },
+  // The native resolver's gate refuses these, so admitting it would only defer and re-admit.
+  { approved: true, blockers: ['changes_requested'], expected: gatesUnsatisfied },
+  { approved: true, blockers: ['checks_missing'], expected: gatesUnsatisfied },
+  { approved: true, blockers: ['required_reviews_not_approved', 'changes_requested'], expected: gatesUnsatisfied },
+])('resolves outdated threads only when approved and a conversation can explain every blocker: $blockers', async ({ approved, blockers, expected }) => {
+  mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
+    const evidence: Record<string, unknown> = {
+      '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
+        issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+        publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
+      '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
+      '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: approved,
+        unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 1, green: false, blockers },
+      '--list-failing-ci': { head_sha: HEAD, pull_number: 21, failing: [], mergeable: true, mergeable_state: 'blocked' },
+    }
+    if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
+    return { stdout: JSON.stringify(evidence[argv[0]]) }
+  })
+  const observation = await actionOperations().observe(chain)
+  expect(decideBehaviorChain(chain, observation, Date.now())).toMatchObject(expected)
 })
 
 it('reconciles planned review comments with and without the revision marker', async () => {

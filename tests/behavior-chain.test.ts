@@ -182,6 +182,15 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
   })
 
+  it('merges a ready pull request without making its outdated threads a prerequisite', () => {
+    const { journal, chain } = setup(); const obs = observation()
+    let current = reviewed(journal, chain, obs); pull(obs)
+    current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
+      { status: 'completed', action: 'reviewed_clean', outcome: 'clean', review_id: 27, head_sha: HEAD })
+    Object.assign(obs.pull!, { approved: true, ready: true, unresolvedOutdated: 1, readinessBlockers: [] })
+    expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
+  })
+
   it('repairs actual blockers with a fresh invocation and diagnoses queue rejection instead of blindly re-enqueuing', () => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)

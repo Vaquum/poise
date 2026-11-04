@@ -56,6 +56,9 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "reviewer_approved_current_head": approval["reviewer_approved_current_head"],
         "changes_requested": approval["changes_requested"],
         "unresolved_live_conversation_count": len(unresolved_live),
+        "unresolved_outdated_conversation_count": sum(
+            not thread["isResolved"] and thread["isOutdated"] for thread in threads["nodes"]
+        ),
         "blockers": blockers,
     }
 
