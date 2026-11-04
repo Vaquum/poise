@@ -151,6 +151,21 @@ class TestOwnReviews(TestCase):
             self.outcome("pr_review", facts(), facts([CLEAN, CHANGES]))
         self.assertEqual(self.outcome("pr_approve", facts(), facts(head_sha="b" * 40))["outcome"], "superseded")
 
+    def test_changed_pr_context_supersedes_a_run_that_posted_nothing(self):
+        before, after = facts(review_context="a" * 64), facts(review_context="b" * 64)
+        for behavior in ("pr_review", "pr_approve"):
+            with self.subTest(behavior=behavior):
+                self.assertEqual(self.outcome(behavior, before, after),
+                                 {"action": None, "outcome": "superseded", "head_sha": HEAD})
+                with self.assertRaisesRegex(budget.ReviewLimitError, "exactly one"):
+                    self.outcome(behavior, before, before)
+        posted = facts([CLEAN], review_context="b" * 64)
+        self.assertEqual(self.outcome("pr_review", before, posted, receipt=receipt("reviewed_clean", 92))["outcome"], "clean")
+        # An uncertain write may have landed: a fresh review could duplicate it.
+        review_receipt.record_failure(QUOTA_ERROR)
+        with self.assertRaises(review_receipt.SubmissionError):
+            self.outcome("pr_review", before, after)
+
 
 class TestReceiptRecording(TestCase):
     def setUp(self):

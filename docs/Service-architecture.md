@@ -281,6 +281,17 @@ Environment the gateway passes:
 | `POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES` | optional validated whole-byte native behavior settings from the gateway; unset remains unbounded ([configuration](../gateway/README.md)) |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
+Beside each release, the gateway installs agents' test offload into the home
+volume by running `/opt/poise/scripts/test-offload/install.sh` in a short-lived
+container of the image. With `POISE_TEST_RENDER_API_KEY` and
+`POISE_TEST_BASE_SERVICE` set, it passes `POISE_TEST_RELAY_URL`, which is
+`/api/link/test-relay` on the workspace's host or on `POISE_PROXY_LISTEN`, and
+`POISE_TEST_RELAY_KEY`, the workspace's handle signed by the gateway. That writes the hooks and `relay`, holding those
+two, to `~/.poise/test-offload`; without them it removes `relay`. Poise starts its
+children with the hooks while `relay` exists
+([Agents' test suites](Operating.md#agents-test-suites)). The settings travel this
+way because only a new container would take an environment variable.
+
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
 gateway's, or with none, is recreated as one on an outdated image is: drained
 first if it runs ([Deployment](#deployment)).

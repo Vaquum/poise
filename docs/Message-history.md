@@ -40,7 +40,7 @@ and reduced-motion preferences are supported.
 
 ## Verification
 
-`npm run verify` exercises the full regression suite. Focused browser cases:
+`npm run test:full` and `npm run test:e2e:full` exercise the full regression suite. Focused browser cases:
 
 ```sh
 npx playwright test tests/e2e/chat.spec.ts --grep 'history:'

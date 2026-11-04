@@ -990,11 +990,11 @@ describe('durable timers that wake chats', () => {
     expect(queue.ready).toBe(false)
     expect(queue.items).toHaveLength(1)
     expect(queue.items[0].state).toBe(state === 'failed' ? 'failed' : 'waiting')
-    const timer = await heartbeat(m, p, { delayMinutes: 1 })
-    // No await from here to the tick: a background tick must not admit this row before count is read.
+    // Read before the row exists: a background tick may admit it at any await.
+    const count = (prompts.get(p.id) ?? []).length
     store.message(instance, p.id, m.id, 'Ordinary behind queue', `queue:${randomUUID()}`)
     const ordinary = store.inbox(instance, p.id).find(row => row.body === 'Ordinary behind queue')!
-    const count = (prompts.get(p.id) ?? []).length
+    const timer = await heartbeat(m, p, { delayMinutes: 1 })
     clock += 2 * 60_000
     await control.tick()
     // #590: neither a failed nor an unarmed queue item holds ordinary delivery.
@@ -1003,15 +1003,20 @@ describe('durable timers that wake chats', () => {
     const firing = store.inbox(instance, p.id).find(row => row.timer_id === timer.id)!
     expect(ordinary.seq).toBeLessThan(firing.seq)
     expect(store.inbox(instance, p.id).find(row => row.seq === ordinary.seq)?.state).toBe('admitted')
-    finishes.get(p.id)!({ stopReason: 'end_turn' })
-    if (state === 'paused') {
-      // Completing the admitted turn arms the waiting task queue normally.
-      await until(() => (prompts.get(p.id) ?? []).length === count + 2)
-      expect(prompts.get(p.id)!.at(-1)!.text).toContain('Paused task')
+    await holdingTimers(async () => {
       finishes.get(p.id)!({ stopReason: 'end_turn' })
-      clock += 61_000 // past the person's grace from the queue turn
-    }
-    // A background tick admits the firing once the turn ends, so idle can pass unseen; the prompt count cannot.
+      if (state === 'paused') {
+        // Completing the admitted turn arms the waiting task queue normally.
+        await until(() => (prompts.get(p.id) ?? []).length === count + 2)
+        expect(prompts.get(p.id)!.at(-1)!.text).toContain('Paused task')
+        finishes.get(p.id)!({ stopReason: 'end_turn' })
+        await until(() => runtime.get(p.id)?.status === 'idle')
+        clock += 61_000 // past the person's grace from the queue turn
+      } else {
+        await until(() => runtime.get(p.id)?.status === 'idle')
+      }
+    })
+    await control.tick()
     await until(() => (prompts.get(p.id) ?? []).length === count + (state === 'paused' ? 3 : 2))
     expect(starts(p.id).at(-1)!.source).toMatchObject({ kind: 'timer', timerId: timer.id })
     finishes.get(p.id)!({ stopReason: 'end_turn' })

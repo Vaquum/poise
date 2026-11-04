@@ -1,5 +1,6 @@
 import { isIPv4, isIPv6 } from 'node:net'
 import { isAbsolute } from 'node:path'
+import type { TestRelayConfig } from './test-relay.js'
 
 /** Handles that name the gateway's own addresses and can never belong to a person. */
 export const RESERVED_HANDLES: ReadonlySet<string> = new Set([
@@ -51,6 +52,8 @@ export interface Config {
   workspacePids: number
   /** Explicit native behavior budgets/reservations, forwarded to each workspace. */
   behaviorResourceEnv: string[]
+  /** Where agents' test suites run (POISE_TEST_RENDER_API_KEY and POISE_TEST_BASE_SERVICE); null keeps them in the workspaces. */
+  testRelay: TestRelayConfig | null
   workspaceRuntime: string | null
   /**
    * Resolvers every workspace uses instead of Docker's embedded DNS (POISE_WORKSPACE_DNS), which gVisor
@@ -238,6 +241,20 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
       problems.push(`${name} must be a whole byte count from ${minimum} to ${Number.MAX_SAFE_INTEGER}; got "${value}"`)
     } else behaviorResourceEnv.push(`${name}=${bytes}`)
   }
+  const renderApiKey = read('POISE_TEST_RENDER_API_KEY')
+  const baseService = read('POISE_TEST_BASE_SERVICE')
+  if ((renderApiKey === undefined) !== (baseService === undefined)) {
+    problems.push('POISE_TEST_RENDER_API_KEY and POISE_TEST_BASE_SERVICE must be set together, or both left unset')
+  }
+  const testRelay = renderApiKey !== undefined && baseService !== undefined
+    ? {
+      renderApiKey,
+      baseService,
+      plan: read('POISE_TEST_PLAN') ?? 'plan-crn-003',
+      limitSeconds: wholeNumber('POISE_TEST_LIMIT_SECONDS', 3600),
+      maxRuns: wholeNumber('POISE_TEST_MAX_RUNS', 30),
+    }
+    : null
   for (const dimension of ['MEMORY', 'DISK']) {
     const budget = `POISE_BEHAVIOR_${dimension}_BUDGET_BYTES`
     const reservation = `POISE_BEHAVIOR_${dimension}_RESERVATION_BYTES`
@@ -314,6 +331,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     workspaceNanoCpus: Math.round(cpus * 1e9),
     workspacePids,
     behaviorResourceEnv,
+    testRelay,
     workspaceRuntime,
     workspaceDns,
     workspaceSkipCliBootstrap: skipBootstrapValue === '1',

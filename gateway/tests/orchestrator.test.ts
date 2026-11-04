@@ -103,6 +103,15 @@ describe('lazy start', () => {
     expect(actual.sort()).toEqual(Object.entries(desired).map(([key, value]) => `${key}=${value}`).sort())
   })
 
+  it('installs the test offload ahead of a first workspace, which installs no release', async () => {
+    const cookie = await start({ env: { POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_BASE_SERVICE: 'crn-x' } })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(h.docker.tasks.map((task) => task.name)).toEqual(['poise-test-offload-alice'])
+    expect((h.docker.tasks[0].spec as { Env: string[] }).Env).toContainEqual(expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\./))
+    expect(h.docker.containers.has('poise-ws-alice')).toBe(true)
+  })
+
   it('creates the workspace on first request behind a starting page, then proxies to it', async () => {
     const cookie = await start()
     const first = await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
@@ -875,6 +884,8 @@ describe('updates in place', () => {
     h.workspace.health.release = release
   }
   const containerId = () => h.docker.containers.get('poise-ws-alice')?.id
+  const releaseTasks = () => h.docker.tasks.filter((task) => task.name === 'poise-release-alice')
+  const offloadTasks = () => h.docker.tasks.filter((task) => task.name === 'poise-test-offload-alice')
   afterEach(async () => {
     await h.close()
   })
@@ -884,8 +895,8 @@ describe('updates in place', () => {
     const before = containerId()
     await h.orchestrator.upgradePass()
 
-    expect(h.docker.tasks).toHaveLength(1)
-    expect(h.docker.tasks[0]).toMatchObject({
+    expect(releaseTasks()).toHaveLength(1)
+    expect(releaseTasks()[0]).toMatchObject({
       name: 'poise-release-alice',
       spec: {
         Image: 'poise-runtime:latest',
@@ -905,7 +916,7 @@ describe('updates in place', () => {
 
     // Asked again until it runs the release, but installed only once.
     await h.orchestrator.upgradePass()
-    expect(h.docker.tasks).toHaveLength(1)
+    expect(releaseTasks()).toHaveLength(1)
     expect(h.workspace.switches).toEqual(['new-release', 'new-release'])
 
     // Poise restarted on the new release.
@@ -941,7 +952,7 @@ describe('updates in place', () => {
     const before = containerId()
     await h.orchestrator.upgradePass()
     expect(h.workspace.switches).toEqual([])
-    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
+    expect(releaseTasks().map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
     const calls = dockerCalls(h)
     expect(calls.indexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(calls.indexOf('POST /containers/poise-ws-alice/stop'))
     expect(containerId()).not.toBe(before)
@@ -961,7 +972,7 @@ describe('updates in place', () => {
     expect(calls.filter((call) => call === 'POST /api/service/drain').length).toBeGreaterThanOrEqual(3)
     expect(events(h.logs, 'workspace.drain')).toEqual(['workspace.drain.requested', 'workspace.drain.requested', 'workspace.drain.idle'])
     // Activated again once idle, and only then stopped.
-    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate'], ['--activate']])
+    expect(releaseTasks().map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate'], ['--activate']])
     const docker = dockerCalls(h)
     expect(docker.lastIndexOf('POST /containers/poise-release-alice/wait')).toBeLessThan(docker.indexOf('POST /containers/poise-ws-alice/stop'))
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
@@ -1071,6 +1082,49 @@ describe('updates in place', () => {
     expect(h.docker.containers.get('poise-ws-alice')?.imageId).toBe(CURRENT_IMAGE_ID)
   })
 
+  it('installs agents\' test offload into the home volume with each release, turning it off when unset', async () => {
+    await start()
+    await h.orchestrator.upgradePass()
+    expect(offloadTasks()).toHaveLength(1)
+    expect(offloadTasks()[0]).toMatchObject({
+      spec: {
+        Image: 'poise-runtime:latest',
+        User: '10001',
+        Entrypoint: ['/opt/poise/scripts/test-offload/install.sh'],
+        Cmd: [],
+        Env: ['HOME=/home/poise'],
+        Labels: { 'poise.task': 'install-test-offload', 'poise.workspace': 'alice' },
+        HostConfig: { NetworkMode: 'none', CapDrop: ['ALL'], Mounts: [{ Type: 'volume', Source: 'poise-home-alice', Target: '/home/poise' }] },
+      },
+    })
+    expect(h.docker.containers.has('poise-test-offload-alice')).toBe(false)
+    // Installed before Poise is asked to switch, so the Poise it restarts onto finds it.
+    expect(h.workspace.switches).toEqual(['new-release'])
+    await h.close()
+
+    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_BASE_SERVICE: 'crn-x' } })
+    await h.openWorkspace('Alice')
+    h.store.noteWorkspace('alice', 'Alice')
+    h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })
+    h.docker.imageLabels.set(OLD_IMAGE_ID, { 'poise.release': 'old-release', 'poise.base': BASE })
+    addWorkspaceContainer(h, 'alice', OLD_IMAGE_ID, true)
+    h.workspace.health.release = 'old-release'
+    await h.orchestrator.upgradePass()
+    const env = (offloadTasks()[0].spec as { Env: string[] }).Env
+    // The relay's address and this workspace's own key, and never the Render key.
+    expect(env).toEqual(['HOME=/home/poise', expect.stringMatching(/^POISE_TEST_RELAY_URL=https?:\/\/alice\..+\/api\/link\/test-relay$/), expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\.[\w-]+$/)])
+    expect(env.join('\n')).not.toContain('render-key')
+  })
+
+  it('takes a new release even when installing the test offload fails, and reports it', async () => {
+    await start()
+    h.docker.taskExitCodes.set('poise-test-offload-alice', 3)
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.switches).toEqual(['new-release'])
+    expect(h.logs.find((entry) => entry.event === 'workspace.test_offload.install.failed')).toMatchObject({ handle: 'alice', error: expect.stringContaining('exited with 3') })
+    expect(h.store.getWorkspace('alice')?.lastError).toContain('test offload not installed')
+  })
+
   it('leaves the workspace on its release when installing the new one fails, and tries again', async () => {
     await start()
     h.docker.taskExitCode = 1
@@ -1109,7 +1163,7 @@ describe('updates in place', () => {
     const alice = h.docker.containers.get('poise-ws-alice')!
     alice.imageId = CURRENT_IMAGE_ID
     await h.orchestrator.upgradePass()
-    expect(h.docker.tasks).toHaveLength(1)
+    expect(releaseTasks()).toHaveLength(1)
     expect(h.workspace.switches).toEqual(['new-release'])
     h.workspace.health.release = 'new-release'
     await h.orchestrator.upgradePass()
@@ -1263,7 +1317,7 @@ describe('updates in place', () => {
   it('recreates a stopped workspace on the new image, with the new release current', async () => {
     await start({ running: false })
     await h.orchestrator.upgradePass()
-    expect(h.docker.tasks.map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
+    expect(releaseTasks().map((task) => (task.spec as { Cmd: string[] }).Cmd)).toEqual([['--activate']])
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: false })
   })
 })

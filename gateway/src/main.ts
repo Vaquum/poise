@@ -15,6 +15,7 @@ import { loadOrCreateKeys } from './keys.js'
 import { createLogger, errorMessage } from './log.js'
 import { Orchestrator, workspaceUpstream } from './orchestrator.js'
 import { startPurgeLoop, Store } from './store.js'
+import { TestRelay } from './test-relay.js'
 import { prepareWorkspaceDns } from './workspace-dns.js'
 
 const PURGE_INTERVAL_MS = 10 * 60_000
@@ -63,6 +64,16 @@ const workspaceResolvConf = await prepareWorkspaceDns(config, docker)
 if (workspaceResolvConf) log.info('workspace.dns.configured', { resolvers: config.workspaceDns, file: workspaceResolvConf })
 const orchestrator = new Orchestrator({ config, docker, store, keys, log, now, upstream: workspaceUpstream, workspaceResolvConf })
 const disk = new DiskWatch({ config, docker, log, now })
+const testRelay = config.testRelay
+  ? new TestRelay({
+    config: config.testRelay,
+    privateKey: keys.privateKey,
+    origin: (handle) => `${config.insecureHttp ? 'http' : 'https'}://${handle}.${config.domain}`,
+    log,
+    now,
+    isWorkspace: (handle) => store.getWorkspace(handle) !== null && store.getUser(handle)?.disabledAt === null,
+  })
+  : undefined
 const gateway = createGateway({
   config,
   store,
@@ -71,6 +82,7 @@ const gateway = createGateway({
   docker,
   orchestrator,
   disk,
+  testRelay,
   log,
   now,
   upstream: workspaceUpstream,
@@ -88,12 +100,14 @@ collectors.start()
 const stopUpgrades = orchestrator.startUpgradeLoop()
 const stopDiskWatch = disk.start()
 const stopPurging = startPurgeLoop(store, log, PURGE_INTERVAL_MS)
+testRelay?.start()
 
 function shutdown(signal: string): void {
   log.info('gateway.stopping', { signal })
   stopUpgrades()
   stopDiskWatch()
   stopPurging()
+  testRelay?.stop()
   hostJournal.stop()
   Promise.all([gateway.close(), collectors.stop(), ingress.close()]).then(
     () => {

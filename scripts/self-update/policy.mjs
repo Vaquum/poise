@@ -40,6 +40,7 @@ export const PROTECTED_TEST_PATTERNS = [
   /^tests\/chat\/checkout-lock/,
   /^tests\/chat\/worker-gate-path/,
   /^tests\/chat-lock-review/,
+  /^tests\/essential\.txt$/,
 ]
 
 const CREDENTIAL_SEGMENTS = /^(?:\.git|\.env(?:\..*)?|\.npmrc|\.netrc|\.ssh|\.aws|credentials(?:\..*)?|secrets(?:\..*)?)$/i

@@ -246,10 +246,11 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       if (readiness.head_sha !== head || ci.head_sha !== head || ci.pull_number !== number || !Array.isArray(ci.failing)
         || !Array.isArray(state.my_reviews) || typeof readiness.draft !== 'boolean' || typeof readiness.reviewer_approved_current_head !== 'boolean'
         || !Number.isSafeInteger(readiness.unresolved_live_conversation_count) || Number(readiness.unresolved_live_conversation_count) < 0
+        || !Number.isSafeInteger(readiness.unresolved_outdated_conversation_count) || Number(readiness.unresolved_outdated_conversation_count) < 0
         || typeof readiness.green !== 'boolean' || typeof state.merged !== 'boolean'
         || !Array.isArray(readiness.blockers) || readiness.blockers.some((blocker) => typeof blocker !== 'string')
         || (state.queue_entry_id !== null && (typeof state.queue_entry_id !== 'string' || !state.queue_entry_id))
-        || !Array.isArray(state.queue_removals)) throw new Error('native PR observations changed head or are incomplete')
+        || (state.state === 'open' && !Array.isArray(state.queue_removals))) throw new Error('native PR observations changed head or are incomplete')
       const checks = ci.failing.map((item) => object(item, 'CI check'))
       const pending = checks.some((check) => ['queued', 'pending', 'in_progress', 'requested', 'waiting'].includes(String(check.state)) || (check.state === 'completed' && check.conclusion == null))
       const failures = checks.filter((check) => ['failure', 'error'].includes(String(check.state)) || (check.state === 'completed' && ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(check.conclusion))))
@@ -275,7 +276,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         queueRemoval: removal ? { id: String(removal.id), reason: typeof removal.reason === 'string' ? removal.reason : null,
           at: Date.parse(String(removal.createdAt)), actor: removal.actor ? String(object(removal.actor, 'queue actor').login) : null } : null,
         changesRequested: latest?.state === 'CHANGES_REQUESTED' && latest.commit_id === head,
-        unresolved: Number(readiness.unresolved_live_conversation_count), approved: readiness.reviewer_approved_current_head,
+        unresolved: Number(readiness.unresolved_live_conversation_count), unresolvedOutdated: Number(readiness.unresolved_outdated_conversation_count),
+        approved: readiness.reviewer_approved_current_head,
         ready: readiness.green === true, reviewIds: reviews.filter((review) => review.commit_id === head && review.state !== 'DISMISSED').map((review) => positive(review.id, 'review')),
         checksState: typeof readiness.checks_state === 'string' ? readiness.checks_state : null,
         readinessBlockers: readiness.blockers as string[],
