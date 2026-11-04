@@ -606,9 +606,11 @@ What is configurable and what is deliberately fixed:
 ## Quality gates
 
 ```bash
-npm run check      # typecheck, lint, unit/integration tests, production build
-npm run test:e2e   # Playwright smoke and visual regression tests
-npm run verify     # both suites
+npm run check      # typecheck, lint, the essential tests, production build
+npm run test:e2e   # the core Playwright journeys and what the change touches
+npm run verify     # both
+npm run test:full  # every unit and integration test
+npm run test:e2e:full  # every Playwright test
 caller/.venv/bin/python -m pytest caller/agent_interface/tests caller/github_interface/tests caller/github_datastore/tests
 ```
 

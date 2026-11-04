@@ -29,8 +29,9 @@ independent of browser state.
 
 ## Verification scope
 
-`npm run verify` runs lint, the complete unit/integration suite, all TypeScript
-checks, both production builds and the Chromium browser suite. Existing gates
+`npm run verify` runs lint, the essential tests, all TypeScript checks, both
+production builds and the core Chromium journeys; `npm run test:full` and
+`npm run test:e2e:full` run everything ([Testing](Testing.md)). Existing gates
 continue to cover Current, Swarm, Editor, Settings, file previews, all four
 native adapters, permission handling, shared checkout leases, crash recovery,
 release staging, safe tab updates and model-independent rollback.

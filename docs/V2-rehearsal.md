@@ -126,7 +126,7 @@ Use Node 22 and the repository's existing CLI/home isolation:
 ```sh
 npm ci
 npm run check
-npm run test:e2e -- --workers=1
+npm run test:e2e:full -- --workers=1
 npx vitest run tests/work-rehearsal.test.ts tests/work-rehearsal-parity.test.ts --maxWorkers=1
 npm run test:e2e -- tests/e2e/work-rehearsal.spec.ts --workers=1
 ```
