@@ -38,7 +38,7 @@ describe('Poise-only delegated change policy', () => {
     'caller/github_interface/pyproject.toml', 'scripts/caller.mjs', 'scripts/caller-setup.mjs', 'tests/caller-setup.test.mjs',
     '.github/workflows/ci.yml', 'server/self-update.ts', 'src/self-update-reload.ts',
     'src/build-identity.ts', 'src/poise-request-intent.ts', 'tests/self-update-controller.test.mjs',
-    'tests/http.test.ts', 'tests/claude-auth.test.ts', 'scripts/install-production.mjs',
+    'tests/http.test.ts', 'tests/claude-auth.test.ts', 'tests/essential.txt', 'scripts/install-production.mjs',
     '.env.local', 'src/.npmrc', 'keys/private.pem', 'docs/.gitmodules',
   ])('keeps the agreed release/authorization/credential boundary: %s', path => {
     expect(evaluatePolicy([file(path)]).allowed, path).toBe(false)
