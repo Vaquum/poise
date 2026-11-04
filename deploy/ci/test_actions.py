@@ -35,12 +35,14 @@ def write_script(path, text):
 
 
 class EnvFileTest(unittest.TestCase):
-    def env_file(self, variables, secret: 'str | None' = 's3cret', google_secret=None):
+    def env_file(self, variables, secret: 'str | None' = 's3cret', google_secret=None, render_api_key=None):
         env = clean_env(VARS=json.dumps(variables))
         if secret is not None:
             env['POISE_GITHUB_CLIENT_SECRET'] = secret
         if google_secret is not None:
             env['POISE_GOOGLE_CLIENT_SECRET'] = google_secret
+        if render_api_key is not None:
+            env['POISE_TEST_RENDER_API_KEY'] = render_api_key
         return subprocess.run([os.path.join(ACTIONS, 'env.sh')], capture_output=True, text=True, env=env)
 
     def test_writes_the_poise_variables_then_the_client_secret(self):
@@ -91,6 +93,26 @@ class EnvFileTest(unittest.TestCase):
                 for value in ('variable-test-secret', 'google-test-secret', 'first', 'second', 's3cret'):
                     self.assertNotIn(value, result.stderr)
 
+    def test_test_relay_pair_is_optional_and_its_key_is_not_a_variable(self):
+        base = {'POISE_TEST_BASE_SERVICE': 'crn-abc'}
+        for variables, key, error in [
+            (base, None, 'must be set together'),
+            ({}, 'render-test-key', 'must be set together'),
+            ({**base, 'POISE_TEST_RENDER_API_KEY': 'variable-test-key'}, 'render-test-key', 'make it a secret instead'),
+            (base, 'first\nsecond', 'secret spans more than one line'),
+        ]:
+            with self.subTest(variables=list(variables), error=error):
+                result = self.env_file(variables, render_api_key=key)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(error, result.stderr)
+                self.assertEqual(result.stdout, '')
+                for value in ('variable-test-key', 'render-test-key', 'first', 'second'):
+                    self.assertNotIn(value, result.stderr)
+        result = self.env_file(base, render_api_key='render-test-key')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('POISE_TEST_BASE_SERVICE=crn-abc\n', result.stdout)
+        self.assertIn('POISE_TEST_RENDER_API_KEY=render-test-key\n', result.stdout)
+
     def test_empty_google_client_pair_stays_disabled(self):
         result = self.env_file({'POISE_GOOGLE_CLIENT_ID': ''}, google_secret='')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -99,6 +121,10 @@ class EnvFileTest(unittest.TestCase):
     def test_workflow_supplies_the_google_actions_secret(self):
         with open(WORKFLOWS[0]) as file:
             self.assertIn('POISE_GOOGLE_CLIENT_SECRET: ${{ secrets.POISE_GOOGLE_CLIENT_SECRET }}', file.read())
+
+    def test_workflow_supplies_the_test_relay_secret(self):
+        with open(WORKFLOWS[0]) as file:
+            self.assertIn('POISE_TEST_RENDER_API_KEY: ${{ secrets.POISE_TEST_RENDER_API_KEY }}', file.read())
 
 
 class SshSetupTest(unittest.TestCase):

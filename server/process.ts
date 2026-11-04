@@ -1,6 +1,8 @@
 import { environmentSecrets } from '../gateway/src/diagnostics/redaction.mjs'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { basename, delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { CALLER_COMMANDS, callerBinRoot } from '../scripts/caller.mjs'
@@ -21,6 +23,9 @@ export const AGENT_RIPGREP_CONFIG = fileURLToPath(new URL(
 ))
 // Bounds Go runtimes only; every other child ignores it.
 export const AGENT_GOMAXPROCS = '2'
+// An agent's shell tool waits for a suite on a test instance too, starting one included. The maximum
+// matches the time limit that instance has (POISE_TEST_LIMIT_SECONDS).
+const TEST_OFFLOAD_SHELL_TIMEOUTS = [['BASH_DEFAULT_TIMEOUT_MS', '600000'], ['BASH_MAX_TIMEOUT_MS', '3600000']] as const
 
 export function assertProcessArgSize(value: string, label = 'argument'): void {
   if (Buffer.byteLength(value, 'utf8') > MAX_PROCESS_ARG_BYTES) {
@@ -346,6 +351,7 @@ function childEnvironment(
     else env[key] = value
   }
   applyAgentToolDefaults(env, overrides)
+  applyTestOffload(env)
   return env
 }
 
@@ -363,6 +369,17 @@ function applyAgentToolDefaults(env: NodeJS.ProcessEnv, overrides: NodeJS.Proces
     if (removed.has(key)) continue
     if (!Object.keys(env).some((present) => present.toUpperCase() === key)) env[key] = value
   }
+}
+
+// Agents' test suites leave the workspace for disposable test instances (docs/Operating.md, "Agents'
+// test suites"): every Python and Node process under what Poise starts asks these hooks first, and only
+// a test runner does anything but carry on. Off until the gateway installs them into the home volume.
+function applyTestOffload(env: NodeJS.ProcessEnv): void {
+  const hooks = join(homedir(), '.poise', 'test-offload')
+  if (!existsSync(join(hooks, 'relay'))) return
+  env.PYTHONPATH = [hooks, env.PYTHONPATH].filter(Boolean).join(delimiter)
+  env.NODE_OPTIONS = [`--require "${join(hooks, 'hook.cjs')}"`, env.NODE_OPTIONS].filter(Boolean).join(' ')
+  for (const [key, value] of TEST_OFFLOAD_SHELL_TIMEOUTS) env[key] ??= value
 }
 
 function abortError(signal: AbortSignal, killSignal: NodeJS.Signals): Error {

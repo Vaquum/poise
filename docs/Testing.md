@@ -148,6 +148,10 @@ from the following eligibility sweep. The two behaviors run concurrently, so
 approval may observe the still-owned review before reconciliation settles it.
 The test keeps its no-overlap and exactly-one-approval assertions.
 
+## Agents' suites
+
+On a deployment with a test relay, a suite an agent starts in a workspace runs on a disposable test instance, not beside Poise ([Agents' test suites](Operating.md#agents-test-suites)). `tests/test-offload.test.ts` runs the real hooks, runner, relay and instance script against a stand-in for Render's API.
+
 ## Agent tool CPU defaults
 
 Repeated agent tooling runs through native caches and bounded parallelism.

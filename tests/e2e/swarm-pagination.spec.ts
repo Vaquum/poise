@@ -108,6 +108,31 @@ test('fixed pages preserve boundary focus, complete traversal, full-history sear
   expect(await page.locator('*').count()).toBeLessThan(12_000)
 })
 
+test('a native chain step names its command and shows no model', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const steps = [
+    ['native_action', '--merge-if-ready', 'merge-if-ready'],
+    ['native_action', '--resolve-nonblocking-conversations-if-ready', 'resolve-nonblocking-conversations-if-ready'],
+    ['native_action', '--rerun-grey-ci-if-ready', 'rerun-grey-ci-if-ready'],
+    ['native_action', '--issue-work', 'issue-work'],
+    ['native_publication', 'Complete original repair publication', 'publication'],
+  ]
+  const run = history()[0]
+  const logs = [
+    ...steps.map(([behavior, prompt], index) => ({ ...run, id: id(index), model: 'native-action', behavior, prompt })),
+    { ...run, id: id(steps.length), model: 'opus-5', recovery_model: 'grok-4' },
+  ]
+  await page.route('**/api/agent-logs**', route => route.fulfill({ json: { logs } }))
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  const cells = (index: number) => page.locator(`${rows}[data-id="${id(index)}"] td`)
+  for (const [index, [, , label]] of steps.entries()) {
+    await expect(cells(index).nth(1)).toHaveText('—')
+    await expect(cells(index).nth(2)).toHaveText(label)
+  }
+  await expect(cells(steps.length).nth(1)).toHaveText('opus-5 → grok-4')
+  await expect(cells(steps.length).nth(2)).toHaveText('pr_review')
+})
+
 test('expanded identical runs span bounded pages and retain disclosure on return', async ({ page }) => {
   await workspace(page); await settled(page)
   const logs = history().slice(0, 420).map((entry, index, all) => index < 210 ? { ...all[0], id: entry.id, response: null } : entry)

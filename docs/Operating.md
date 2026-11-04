@@ -140,7 +140,8 @@ signing key) in the volume `poise-gateway-data`.
 - A domain whose DNS you control.
 
 Size it for what agents do: they check out repositories, build them and run
-their test suites, often for several people at once. Each workspace may use
+their test suites, often for several people at once, unless the suites run
+elsewhere ([Agents' test suites](#agents-test-suites)). Each workspace may use
 up to 8 GB of memory and 4 CPUs by default (`POISE_WORKSPACE_MEMORY`,
 `POISE_WORKSPACE_CPUS`); those are limits, not reservations. For three to
 five people, start with:
@@ -440,6 +441,11 @@ rejects an incomplete pair or a Google secret stored as a variable before
 contacting the server. It rewrites both values into the protected `deploy/.env`
 on each deployment, so configure them in Actions rather than editing that file.
 
+**Test relay settings.** To run agents' test suites on disposable instances
+([Agents' test suites](#agents-test-suites)), add `POISE_TEST_BASE_SERVICE` as an
+Actions repository **variable** and `POISE_TEST_RENDER_API_KEY` as an Actions
+repository **secret**, under the same rules as the Google client's pair.
+
 **Serving the fork's own releases.** Set `POISE_RELEASE_REPO` to the fork,
 as an Actions variable like the settings above. The gateway then serves the
 fork's Poise Link installer links to every workspace's Settings, and each
@@ -642,6 +648,106 @@ container and the volume: `docker rm poise-ws-<handle>` and
    ```bash
    curl -fsSL https://github.com/autonomio/poise/releases/latest/download/install.sh | sh
    ```
+
+## Agents' test suites
+
+Agents run the test suites of the repositories they work on, often several at
+once and all on one workspace's CPUs. That can starve Poise itself. Set up as
+below, those suites run on disposable [Render](https://render.com) instances
+instead, and only the agent's command stays in the workspace: it still prints
+the suite's output and ends with its exit code, as if it had run there. Without
+that setup, suites run in the workspace.
+
+**What moves.** Poise starts everything with two hooks, on `PYTHONPATH` and
+`NODE_OPTIONS`, so whichever provider's agent asks and however it reaches the
+runner, these start on a test instance: `pytest`, `python -m pytest` and
+`python -m unittest` from any Python; `vitest`, `jest`, `mocha`, `playwright
+test` and `tsc --noEmit`; `npm test` and `npm run` of a script whose name starts
+with `test`, `check`, `lint`, `typecheck` or `verify`. Asking a runner for its
+version or help stays in the workspace, and so do `npm run build`, `dev` and
+`start`, with their steps, because their files or servers are wanted where they
+are. A command that replaces `PYTHONPATH` or `NODE_OPTIONS` outright, as in
+`PYTHONPATH=src python -m pytest`, removes the hook and runs in the workspace. The
+mechanism is `scripts/test-offload/` and `gateway/src/test-relay.ts`.
+
+**What runs.** Agents need nothing new: they type what they always typed, and the
+hooks fit it to the instance, which has half a CPU and 512 MB. A command naming
+its tests runs those. A command for a whole suite runs the tests the change
+touches, measured from where the checkout leaves the default branch, and says so:
+for vitest, its own `--changed`; for pytest, changed test files and test files
+that mention a changed module or package. Pytest stays whole when it cannot tell:
+after a change to `conftest.py` or test configuration, when git fails, or when
+code changed and no test mentions it. `npm run check` is such a command, at each of its steps, and skips its build.
+Vitest and pytest run with one worker, and Node may use 80% of the memory. What
+still does not fit fails with a line saying CI covers it, and CI runs everything
+before merge. On Poise itself that means browser tests, the typecheck of
+`tsconfig.tests.json` and the unit suite in full.
+
+**What an instance gets.** Only what the suite needs, at the same paths: the
+checkout's tracked and untracked files without what git ignores, its
+`node_modules`, `.venv` and `venv` folders, its `.git`, and the virtualenv and
+Python of the interpreter when they live outside the checkout. The environment
+loses every variable named like a credential or belonging to a provider CLI,
+git or GitHub. A checkout whose `.git/config` holds a credential is refused. The
+image is the workspace image, so the tools match, but it holds no sign-in. What
+the suite changes stays on the instance and goes with it, so update snapshots
+with the runner on your own machine if you need them back.
+
+**How it dies.** An instance is a Render one-off job, which Render destroys when
+its command exits, and nothing is left on Render between suites. That command
+ends in each of these cases, and none depends on the others:
+
+- The suite ends: the instance reports the exit code and exits.
+- The time limit passes (`POISE_TEST_LIMIT_SECONDS`, an hour by default): the
+  gateway cancels the job, and `timeout` ends the command a minute later if the
+  gateway could not.
+- The agent's command is stopped or killed, or stops renewing its lease for 45
+  seconds: the gateway cancels the job.
+- The gateway disappears: the instance ends itself within seconds of its next
+  message going unanswered. A gateway that restarts cancels every job it finds
+  no run for, and does so again every 15 seconds.
+
+When a suite cannot run on an instance, the agent's command says why on stderr
+and exits with 125, or 124 at the time limit. It never falls back to running in
+the workspace.
+
+**Where they meet.** A workspace and an instance can only dial out, so both dial
+the gateway, at `/api/link/test-relay` on the workspace's host. A proxy with a
+sign-in of its own must let that through without one, as it does for Poise Link.
+Behind your own proxy a workspace dials `POISE_PROXY_LISTEN` instead, so that
+address must be reachable from workspaces. The gateway starts each job and passes
+the checkout and the output between the two. It holds the Render API key, which
+reaches the whole Render account, so no workspace and no instance ever does. A
+workspace presents its own key, which the gateway signs and installs for it; an
+agent can read that key, which lets it start suites and nothing else.
+
+**Setting it up.**
+
+1. On Render, in a workspace and region with no other live service, because an
+   instance can reach its neighbours on Render's private network, create a **cron
+   job** named `poise-test-instance`: the Docker runtime, this repository,
+   Dockerfile `deploy/runtime/Dockerfile`, build context `.`, command `true`, a
+   yearly schedule, auto-deploy off, and no environment variables, since each
+   instance inherits them. It runs nothing and holds the image, at Render's $1 a
+   month minimum for a cron job. Deploy it again when `deploy/runtime/` or
+   Playwright's version changes; an image that lags shows as suites failing
+   loudly on the instance, not as wrong results.
+2. Give the gateway its service ID and a Render API key:
+
+| Setting | Required | Default | What it is |
+| --- | --- | --- | --- |
+| `POISE_TEST_RENDER_API_KEY` | yes | | A Render API key. Set both of these, or neither |
+| `POISE_TEST_BASE_SERVICE` | yes | | The cron job's service ID, `crn-…` |
+| `POISE_TEST_PLAN` | | `plan-crn-003` | The instances' plan, the cheapest: 0.5 CPU and 512 MB, about $0.01 an hour, or $7 a month for one running without a pause |
+| `POISE_TEST_LIMIT_SECONDS` | | `3600` | The time limit; keep `BASH_MAX_TIMEOUT_MS` in `server/process.ts` in step |
+| `POISE_TEST_MAX_RUNS` | | `30` | Suites at once; past it an agent's command fails loudly |
+
+In a fork, `POISE_TEST_RENDER_API_KEY` is an Actions secret and the others are
+variables. The gateway installs the hooks and each workspace's key into its home
+volume, in `~/.poise/test-offload`, whenever it installs a release there, so no
+workspace is drained or recreated for this, and agents started after that
+release's Poise restarts use them. Removing the settings turns it off at the next
+release, for running agents too.
 
 ## Upgrades
 

@@ -12,6 +12,7 @@ import { errorMessage } from './log.js'
 import { messagePage } from './pages.js'
 import { rejectUpgrade } from './proxy.js'
 import { publicPolicyPage } from './public-pages.js'
+import { TEST_RELAY_PATH } from './test-relay.js'
 import { workspaceRequest, workspaceUpgrade } from './workspace.js'
 
 type Handler = (ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL) => void | Promise<void>
@@ -117,6 +118,10 @@ function tlsAsk(ctx: Context, res: ServerResponse, url: URL): void {
 async function handle(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = requestUrl(req)
   const host = classifyHost(req.headers.host, ctx.deps.config.domain)
+  // Ahead of a workspace's sign-in: an instance has none, and these requests carry keys the relay checks.
+  if (ctx.deps.testRelay && url.pathname.startsWith(`${TEST_RELAY_PATH}/`) && (host.kind === 'workspace' || isInternalAddress(ctx, req))) {
+    return ctx.deps.testRelay.handle(req, res, url)
+  }
   if (host.kind === 'apex') {
     if (ctx.publicPages && ['/', '/privacy', '/terms'].includes(url.pathname) && (req.url ?? '/').split('?')[0] !== url.pathname) return answer(ctx, req, res, 404, 'There is nothing at this address.')
     if (!ctx.publicPages && (url.pathname === '/privacy' || url.pathname === '/terms')) return answer(ctx, req, res, 404, 'There is nothing at this address.')

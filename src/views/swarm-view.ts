@@ -395,6 +395,16 @@ function behaviorCell(s: string | null): string {
   return `<span class="agent-behavior" title="${escapeHtml(s)}">${escapeHtml(s)}</span>`
 }
 
+// A native chain step runs one fixed GitHub command, and no model is involved.
+// Its Call reads `completed` whatever the command decided, so this names the
+// command and not a result: `merge` would be false on a PR that was not ready.
+// Each label is part of the raw `behavior` or `prompt`, because the filter and
+// Caller's search read only those fields and must find what this column shows.
+function nativeAction(e: LogEntry): string | null {
+  if (e.model !== 'native-action') return null
+  return e.behavior === 'native_publication' ? 'publication' : e.prompt.replace(/^--/, '')
+}
+
 // The target is two columns, Org and Repo, each linking to its own GitHub page.
 // As one "owner/name#123" string it was cut to "autonomio/chan…" on every row —
 // the repository name and the pull request were exactly the part that went.
@@ -744,10 +754,11 @@ function mainRowInnerHTML(e: LogEntry, state: MainRowState): string {
       + ` title="${isOpen ? 'Hide detail' : (e.progress ? 'View activity' : e.response ? 'View response' : 'View error')}"`
       + ` aria-label="Toggle detail">${CHEV_SVG}</button>`
     : ''
+  const action = nativeAction(e)
   return `
     <td class="group-cell">${state.group}</td>
-    <td>${modelCell(e.recovery_model ? `${e.model} → ${e.recovery_model}` : e.model)}</td>
-    <td>${behaviorCell(e.behavior)}</td>
+    <td>${modelCell(action ? '' : e.recovery_model ? `${e.model} → ${e.recovery_model}` : e.model)}</td>
+    <td>${behaviorCell(action ?? e.behavior)}</td>
     <td class="org-cell">${orgCell(e)}</td>
     <td class="repo-cell">${repoCell(e)}</td>
     <td class="agent-status-cell">${state.status}</td>
