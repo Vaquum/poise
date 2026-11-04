@@ -473,6 +473,38 @@ describe('on a test instance, a command for the whole suite', () => {
   })
 })
 
+describe('the Claude wrapper', () => {
+  function wrapped(env: Record<string, string>): Record<string, string | undefined> {
+    const bin = temp()
+    const home = temp()
+    writeFileSync(join(bin, 'claude'), `#!/usr/bin/env node
+const status = process.argv.includes('auth') && process.argv.includes('status')
+process.stdout.write(JSON.stringify(status ? { loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' } : process.env))
+`, { mode: 0o700 })
+    const hooks = join(home, '.poise', 'test-offload')
+    mkdirSync(hooks, { recursive: true })
+    writeFileSync(join(hooks, 'hook.cjs'), '')
+    const result = spawnSync(process.execPath, [resolve('scripts/claude-subscription.mjs'), '--print', 'x'], {
+      encoding: 'utf8',
+      env: { PATH: `${bin}:${process.env.PATH}`, HOME: home, ...Object.fromEntries(Object.entries(env).map(([key, value]) => [key, value.replace('HOOKS', hooks)])) },
+    })
+    return JSON.parse(result.stdout) as Record<string, string | undefined>
+  }
+
+  it('passes the hooks on, so that agents on Claude get them', () => {
+    const seen = wrapped({ PYTHONPATH: 'HOOKS:src', NODE_OPTIONS: '--require "HOOKS/hook.cjs"', BASH_DEFAULT_TIMEOUT_MS: '600000', BASH_MAX_TIMEOUT_MS: '3600000' })
+    expect(seen.PYTHONPATH).toMatch(/\.poise\/test-offload:src$/)
+    expect(seen.NODE_OPTIONS).toMatch(/--require ".*\.poise\/test-offload\/hook\.cjs"$/)
+    expect(seen.BASH_DEFAULT_TIMEOUT_MS).toBe('600000')
+    expect(seen.BASH_MAX_TIMEOUT_MS).toBe('3600000')
+  })
+
+  it('still keeps out what those variables carry without the hooks', () => {
+    const seen = wrapped({ PYTHONPATH: 'src', NODE_OPTIONS: '--inspect', BASH_DEFAULT_TIMEOUT_MS: '5' })
+    for (const key of ['PYTHONPATH', 'NODE_OPTIONS', 'BASH_DEFAULT_TIMEOUT_MS']) expect(seen[key]).toBeUndefined()
+  })
+})
+
 describe('Poise', () => {
   beforeEach(() => { vi.stubEnv('PYTHONPATH', undefined); vi.stubEnv('NODE_OPTIONS', undefined) })
 
