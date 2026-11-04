@@ -53,6 +53,11 @@ const script = process.argv[1]
 const since = process.env.POISE_TEST_CHANGED_SINCE
 if (script && process.env.POISE_TEST_INSTANCE === '1') {
   const args = process.argv.slice(2)
+  if (/^(npm|npm-cli\.js)$/.test(basename(script)) && /^build/.test(npmScript(args) ?? '')) {
+    // A step of something like `npm run check`: too big for an instance, and its files would go with it.
+    process.stderr.write('[poise] skipping this build on the test instance. CI builds before merge.\n')
+    process.exit(0)
+  }
   if (VITEST.test(basename(script)) && !args.some((arg) => PROBES.has(arg))) {
     const flags = vitestFlags(args, since)
     process.argv.push(...flags)

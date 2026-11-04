@@ -406,6 +406,17 @@ describe('on a test instance, a command for the whole suite', () => {
     expect(result.stderr).toContain('running only the tests this change touches')
   })
 
+  it('skips a build, which is too big for an instance and whose files would go with it', () => {
+    const { repo } = changed({ 'x.js': '1' }, {})
+    const npm = join(repo, 'npm-cli.js')
+    writeFileSync(npm, 'console.log("built here")')
+    const build = spawnSync(process.execPath, [npm, 'run', 'build'], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, 'abc') })
+    expect(build.status).toBe(0)
+    expect(build.stdout).toBe('')
+    expect(build.stderr).toContain('skipping this build')
+    expect(spawnSync(process.execPath, [npm, 'test'], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, 'abc') }).stdout).toBe('built here\n')
+  })
+
   it('takes its start from where the checkout leaves the default branch', () => {
     const { repo, since } = changed({ 'x.js': '1' }, {})
     expect(changeBase(repo)).toBeNull()
