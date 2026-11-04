@@ -34,6 +34,8 @@ export interface FakeDocker {
   /** The task containers run so far, and the exit code the next one ends with. */
   tasks: FakeTask[]
   taskExitCode: number
+  /** A task's exit code by its container's name, ahead of taskExitCode. */
+  taskExitCodes: Map<string, number>
   /** Called as each task container runs, before it ends. */
   onTask?: (task: FakeTask) => void
   /** Each volume's size in bytes, as /system/df reports it. */
@@ -87,6 +89,7 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
     imageLabels,
     tasks: [],
     taskExitCode: 0,
+    taskExitCodes: new Map(),
     volumeSizes: new Map(),
     volumes,
     networks,
@@ -129,7 +132,7 @@ export async function startFakeDocker(dir: string): Promise<FakeDocker> {
         fake.tasks.push({ name: container.name, spec: container.spec })
         fake.onTask?.(fake.tasks[fake.tasks.length - 1])
         container.running = false
-        return send(res, 200, { StatusCode: fake.taskExitCode, Error: null })
+        return send(res, 200, { StatusCode: fake.taskExitCodes.get(container.name) ?? fake.taskExitCode, Error: null })
       }
       if (method === 'GET' && path === '/containers/json') {
         const filters = JSON.parse(url.searchParams.get('filters') ?? '{}') as { label?: string[] }

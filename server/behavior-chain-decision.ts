@@ -2,6 +2,9 @@ import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocatio
 import { validReviewResponse, type ReviewResponse } from './review-response'
 
 export const CHAIN_OBSERVATION_MAX_AGE_MS = 120_000
+// The readiness blockers an open conversation can explain. Any other also fails
+// the native resolver's gate, and that deferral is re-admitted without backoff.
+const CONVERSATION_BLOCKERS = new Set(['merge_state_not_clean', 'required_reviews_not_approved'])
 
 export interface ChainReviewer { slot: string, model: string, recovery: string }
 export interface ChainObservation extends Record<string, unknown> {
@@ -229,8 +232,9 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     return propose(chain, 'approve-pr', chainBasis(['approve', pull.head, pull.reviewRevision, repair?.id ?? null]), chain.reviewer, observation.approver,
       'review the current candidate and submit the native approval verdict', now)
   }
-  // GitHub's merge rule also counts outdated conversations, which readiness does not block on.
-  const threads = pull.unresolved + (pull.unresolvedOutdated ?? 0)
+  // GitHub's merge rule also counts outdated conversations, which readiness does not
+  // block on, so they are resolved only when one could be what keeps readiness red.
+  const threads = pull.unresolved || (!pull.ready && pull.readinessBlockers?.every((blocker) => CONVERSATION_BLOCKERS.has(blocker)) ? pull.unresolvedOutdated ?? 0 : 0)
   if (threads) return propose(chain, 'resolve-threads', chainBasis(['resolve', pull.head, threads]), chain.reviewer, null,
     'resolve only conversations the native current-head approval gate permits', now)
   if (!pull.ready) return { kind: 'wait', reason: 'native repository readiness gates are not satisfied' }

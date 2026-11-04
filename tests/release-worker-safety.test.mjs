@@ -36,8 +36,8 @@ function liveDescendantPid(stdout, pgid) {
   return pid
 }
 
-async function requireDescendantDead(pid) {
-  if (!await waitFor(() => pidDead(pid), 2_000)) throw new Error(`Descendant PID ${pid} is still present`)
+async function requireDescendantDead(pid, ms = 2_000) {
+  if (!await waitFor(() => pidDead(pid), ms)) throw new Error(`Descendant PID ${pid} is still present`)
 }
 
 function pidDead(pid) {
@@ -237,7 +237,7 @@ describe('a registered, gated subprocess', () => {
       expect(pidDead(survivor.pid)).toBe(false)
       expect(liveDescendantPid(String(survivor.pid), survivor.pid)).toBe(survivor.pid)
       expect(() => liveDescendantPid(String(survivor.pid), survivor.pid + 1)).toThrow(/outside worker group/)
-      await expect(requireDescendantDead(survivor.pid)).rejects.toThrow(/still present/)
+      await expect(requireDescendantDead(survivor.pid, 100)).rejects.toThrow(/still present/)
       expect(pidDead(survivor.pid)).toBe(false)
     } finally {
       survivor.kill('SIGKILL')
@@ -339,6 +339,9 @@ describe('a run that cannot settle', () => {
     try {
       const run = runner.run('npm', ['ci'], { env: env() })
       await waitFor(() => workers.calls.length === 1)
+      // Nothing can die here: the runner's waits for the group run on a faster Date.now.
+      const now = Date.now.bind(Date), begun = now()
+      vi.spyOn(Date, 'now').mockImplementation(() => begun + (now() - begun) * 50)
       child.emit('exit', 70, null)
       child.stdout.end()
       child.stderr.end()

@@ -2,6 +2,7 @@
 // print what the real CLIs print. PATH holds only the fakes (and node), so a
 // real CLI can never answer in a test.
 
+import { existsSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -471,12 +472,20 @@ describe('durable login evidence joined to Accounts', () => {
 it('keeps timed-out own-status probes unknown despite legacy sign-in history', async () => {
   setMeta('account_logins', JSON.stringify({ claude: '2026-10-09T06:00:00Z', codex: '2026-10-09T06:00:00Z', gh: '2026-10-09T06:00:00Z' }))
   await writeFakeClis(bin, home, {})
+  const asked = (name: string) => join(root, `${name}-status-asked`)
   for (const name of ['claude', 'codex', 'gh']) {
-    await writeFile(join(bin, name), '#!/bin/sh\nif [ "$1" = --version ]; then echo 1.2.3; exit 0; fi\nexec /bin/sleep 30\n')
+    await writeFile(join(bin, name), `#!/bin/sh\nif [ "$1" = --version ]; then echo 1.2.3; exit 0; fi\n: > '${asked(name)}'\nexec /bin/sleep 30\n`)
     await chmod(join(bin, name), 0o755)
   }
-  for (const [account] of await Promise.all((['claude', 'codex', 'gh'] as const).map(id => listAccounts(id)))) {
-    expect(account).toMatchObject({ signedIn: null, identity: null, detail: expect.stringContaining('did not answer within 10 seconds') })
-    expect(account).not.toHaveProperty('signInRecordedAt')
-  }
+  // The status commands really run and hang; only the 10 seconds are skipped.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    const listed = Promise.all((['claude', 'codex', 'gh'] as const).map(id => listAccounts(id)))
+    while (!['claude', 'codex', 'gh'].every(name => existsSync(asked(name)))) await new Promise(resolve => setImmediate(resolve))
+    await vi.advanceTimersByTimeAsync(10_000)
+    for (const [account] of await listed) {
+      expect(account).toMatchObject({ signedIn: null, identity: null, detail: expect.stringContaining('did not answer within 10 seconds') })
+      expect(account).not.toHaveProperty('signInRecordedAt')
+    }
+  } finally { vi.useRealTimers() }
 }, 40_000)

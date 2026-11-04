@@ -1,3 +1,5 @@
+import './fixtures/light-git-gate'
+import './fixtures/workspace-template'
 import { execFile, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -76,6 +78,10 @@ async function until(check: () => boolean) {
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) { if (check()) return; await new Promise(done => setTimeout(done, 15)) }
   throw new Error('control fixture readiness deadline')
+}
+/** What the next round delivers, without waiting a second for the background's. */
+async function untilDelivered(check: () => boolean) {
+  await until(() => { void control.tick(); return check() })
 }
 async function observeCi(target: string): Promise<void> {
   await control.tick()
@@ -472,7 +478,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     await restart()
     clock += 31 * 60_000
     await control.tick()
-    await until(() => prompts.has(parent.id))
+    await untilDelivered(() => prompts.has(parent.id))
     const messages = store.inbox(runtime.instance, parent.id)
     expect(messages).toHaveLength(1)
     expect(messages[0]).toMatchObject({ state: 'admitted' })
@@ -799,7 +805,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     database.db.prepare(`UPDATE behavior_seen SET launch_outcome = 'changes_requested', launch_action = 'requested_changes'
       WHERE key = ? AND target = ?`).run('review-new-prs', 'acme/app#78:check')
     await control.tick()
-    await until(() => prompts.has(parent.id))
+    await untilDelivered(() => prompts.has(parent.id))
     expect(prompts.get(parent.id)).toHaveLength(1)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     expect(store.inbox(runtime.instance, parent.id)[0].body).toContain('changes_requested')
@@ -816,7 +822,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id,launch_error)
       VALUES(?, ?, ?, ?, ?, ?, ?, ?)`).run('review-new-prs', 'acme/app#80:check', new Date().toISOString(), 'acme/app', 80, 'pr_review', 'c'.repeat(32), 'Review failed')
     await control.tick()
-    await until(() => prompts.has(parent.id))
+    await untilDelivered(() => prompts.has(parent.id))
     expect(prompts.get(parent.id)).toHaveLength(1)
     finishes.get(parent.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(parent.id)?.status === 'idle')
@@ -878,7 +884,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
         { repo: 'acme/app', number: 11, title: 'Both work', url: 'https://github.com/acme/app/issues/11', via: ['blocked-by', 'depends-on'] },
       ] })
     await control.tick()
-    await until(() => prompts.has(parent.id))
+    await untilDelivered(() => prompts.has(parent.id))
     expect(prompts.get(parent.id)).toHaveLength(1)
     expect(prompts.get(parent.id)![0].text).toContain('worker_pr_merged')
     const inbox = store.inbox(runtime.instance, parent.id)
@@ -925,7 +931,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     mergeWake.mockResolvedValue({ found: true, title: 'Late fix', closesVia: 'closing-references', truncated: false, closed: [], dependents: [] })
     clock += 5 * 60_000
     await control.tick()
-    await until(() => prompts.has(parent.id))
+    await untilDelivered(() => prompts.has(parent.id))
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
   }, 30_000)
 
@@ -936,7 +942,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     database.db.prepare(`INSERT INTO behavior_seen(key,target,seen_at,launch_repo,launch_pr,launch_behavior,launch_call_id,launch_outcome)
       VALUES(?, ?, ?, ?, ?, ?, ?, ?)`).run('human_comment', 'acme/app#102:human', new Date().toISOString(), 'acme/app', 102, 'pr_review', 'f'.repeat(32), 'human_comment')
     await control.tick()
-    await until(() => prompts.has(parent.id))
+    await untilDelivered(() => prompts.has(parent.id))
     expect(prompts.get(parent.id)).toHaveLength(1)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     finishes.get(parent.id)!({ stopReason: 'end_turn' })
@@ -1068,7 +1074,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     ci.mockResolvedValue({ head: 'a'.repeat(40), failing: [{ name: 'Verify', state: 'completed', conclusion: 'failure' }] })
     await command(parent.id, { operation: 'bind', target: 'https://github.com/acme/app/pull/79' })
     await control.tick()
-    await until(() => prompts.has(parent.id))
+    await untilDelivered(() => prompts.has(parent.id))
     expect(prompts.get(parent.id)).toHaveLength(1)
     expect(store.inbox(runtime.instance, parent.id)).toHaveLength(1)
     finishes.get(parent.id)!({ stopReason: 'end_turn' })
@@ -1275,7 +1281,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     ci.mockResolvedValue(failure)
     await control.tick()
     // CI reads run in their own pass behind the tick; the new owner's read follows the crossed one.
-    await until(() => store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure')))
+    await untilDelivered(() => store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure')))
     expect(store.inbox(runtime.instance, second.id).some(m => m.body.includes('failure'))).toBe(true)
   })
 
@@ -1980,7 +1986,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     const parent = await manager('grok', 'Release lead')
     const result = await command(parent.id, { operation: 'create', title: 'Worker', task: 'First task' })
     const child = (result.session as { id: string }).id
-    await control.tick(); await until(() => prompts.has(child))
+    await control.tick(); await untilDelivered(() => prompts.has(child))
     const starts = (id: string) => runtime.events(id, 0).events.map(e => e.event)
       .filter((e): e is Extract<ChatEvent, { type: 'turn.started' }> => e.type === 'turn.started')
     // The initial task names its creator.
@@ -1992,7 +1998,7 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
     // A sent message carries its sender and keeps the native header.
     await command(parent.id, { operation: 'send', sessionId: child, text: 'Fresh context' })
     const sent = store.inbox(runtime.instance, child).find(m => m.body === 'Fresh context')!
-    await control.tick(); await until(() => (prompts.get(child) ?? []).length === 2)
+    await control.tick(); await untilDelivered(() => (prompts.get(child) ?? []).length === 2)
     expect(starts(child).at(-1)!.source).toEqual({ kind: 'chat', sessionId: parent.id, title: 'Release lead', seq: sent.seq })
     expect(starts(child).at(-1)!.prompt.text).toBe('Fresh context')
     expect(prompts.get(child)!.at(-1)!.text).toContain(

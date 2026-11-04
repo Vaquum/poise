@@ -3,8 +3,8 @@
 # server: a NAME=value line for each of the repository's POISE_ variables in
 # VARS (the workflow's toJSON(vars)), except the workflow's own POISE_DEPLOY_
 # and POISE_UPSTREAM_ ones, then POISE_GITHUB_CLIENT_SECRET from the secret of
-# that name and optional POISE_GOOGLE_CLIENT_SECRET. docs/Operating.md,
-# "Run your own Poise from a fork", lists them.
+# that name and optional POISE_GOOGLE_CLIENT_SECRET and POISE_TEST_RENDER_API_KEY.
+# docs/Operating.md, "Run your own Poise from a fork", lists them.
 #
 #   VARS='{"POISE_DOMAIN": "poise.example.com", ...}' POISE_GITHUB_CLIENT_SECRET=... deploy/actions/env.sh
 set -euo pipefail
@@ -22,9 +22,14 @@ secret=${POISE_GITHUB_CLIENT_SECRET:-}
 google_secret=${POISE_GOOGLE_CLIENT_SECRET:-}
 [[ $google_secret != *[$'\r\n']* ]] || die "the POISE_GOOGLE_CLIENT_SECRET secret spans more than one line."
 
+render_api_key=${POISE_TEST_RENDER_API_KEY:-}
+[[ $render_api_key != *[$'\r\n']* ]] || die "the POISE_TEST_RENDER_API_KEY secret spans more than one line."
+
 # Validate all variables before emitting any configuration, especially secrets.
 variables=$(jq --raw-output '
   if has("POISE_GOOGLE_CLIENT_SECRET") then error("POISE_GOOGLE_CLIENT_SECRET is a variable; make it a secret instead") else . end
+  |
+  if has("POISE_TEST_RENDER_API_KEY") then error("POISE_TEST_RENDER_API_KEY is a variable; make it a secret instead") else . end
   |
   to_entries
   | sort_by(.key)[]
@@ -38,7 +43,13 @@ if { [ -n "$google_id" ] && [ -z "$google_secret" ]; } \
   || { [ -z "$google_id" ] && [ -n "$google_secret" ]; }; then
   die "POISE_GOOGLE_CLIENT_ID variable and POISE_GOOGLE_CLIENT_SECRET secret must be set together, or both left unset."
 fi
+base_service=$(jq --raw-output '.POISE_TEST_BASE_SERVICE // ""' <<<"${VARS:-{\}}")
+if { [ -n "$base_service" ] && [ -z "$render_api_key" ]; } \
+  || { [ -z "$base_service" ] && [ -n "$render_api_key" ]; }; then
+  die "POISE_TEST_BASE_SERVICE variable and POISE_TEST_RENDER_API_KEY secret must be set together, or both left unset."
+fi
 
 [ -z "$variables" ] || printf '%s\n' "$variables"
 printf 'POISE_GITHUB_CLIENT_SECRET=%s\n' "$secret"
 [ -z "$google_secret" ] || printf 'POISE_GOOGLE_CLIENT_SECRET=%s\n' "$google_secret"
+[ -z "$render_api_key" ] || printf 'POISE_TEST_RENDER_API_KEY=%s\n' "$render_api_key"

@@ -3,6 +3,7 @@
 // finish that reaches the controller only after the turn's cleanup, and the
 // drain gate the controller uses before restarting the server. The
 // controller itself is a fake here: no socket, no release, no production.
+import '../fixtures/light-git-gate'
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -15,6 +16,7 @@ import type { SelfUpdateBridge } from '../../server/self-update-bridge'
 import type { PreparedSelfChange, SelfChange, SelfUpdateStatus } from '../../src/self-update-types'
 import { CATALOG } from '../model-catalog-fixture'
 import { POISE_REPOSITORY as REPOSITORY } from '../../src/poise-repository'
+import '../fixtures/short-polls'
 
 let root = ''
 let repo = ''

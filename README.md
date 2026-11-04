@@ -144,7 +144,8 @@ anywhere in Poise or Caller:
 - **Your GitHub account** scopes Current and Archive's issue/PR history to
   what you are involved in. Archive's Actions filter reads workflows across ready
   accounts independently of that involvement. Repository lists, account
-  indexing and issues opened from Current or the Editor also use your account.
+  indexing, issues opened from Current or the Editor and issues assigned to Poise
+  from Current also use your account.
 - **GitHub automation account** is the GitHub user your reviews and comments are posted
   as: PR reviews and approvals, conversation resolution, issue reviews, and
   the checkouts and reads they need. It is optional to save, but every
@@ -219,6 +220,14 @@ same composer. Save checks the loaded text again before writing and preserves
 the draft on a conflict or failed confirmation. Retrying a lost confirmation
 reads back an already accepted edit instead of writing it again. Confirmed edits
 remain visible while the local GitHub cache catches up.
+An open issue card shows whether it carries the behavior chain's intake label
+and links any open pull request that closes it. **Assign to Poise** adds that
+label on GitHub as your account; the card keeps showing it while the local cache
+catches up. The button stays available when a pull request already exists or the
+chain is off, though the chain does not take such an issue until that changes.
+With the chain's intake set to all open issues, there is no label to show or add.
+An account whose intake or pull request references cannot be fully read shows
+none of this and reports the error.
 Archive paints its page before the full-history total is available, showing
 an available-row count until that read finishes.
 

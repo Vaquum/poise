@@ -16,6 +16,10 @@ import { createCpuCapture, installProductionCpuCapture, abandonProductionCpuCapt
 import { refuseInspectorActivation, registerProductionShutdownSignals } from './server/production-signals'
 import { requestUpdateRestart } from './server/service/restart'
 const mode = process.argv[2]
+if (mode === 'short-capture') {
+  const realSetTimeout = setTimeout
+  globalThis.setTimeout = ((run, ms, ...rest) => realSetTimeout(run, ms === 15_000 ? 1_000 : ms, ...rest)) as typeof setTimeout
+}
 refuseInspectorActivation()
 const keepAlive = setInterval(() => {}, 1000)
 if (mode.startsWith('retention')) {
@@ -78,7 +82,7 @@ async function waitFor(output: () => string, text: string, child: ChildProcess, 
 async function dispose(run: ReturnType<typeof owned>) { run.child.kill('SIGKILL'); await run.closed }
 
 it('captures once through real SIGUSR2, leaves no listener, and keeps the refusal handler after completion', async () => {
-  const run = owned()
+  const run = owned('short-capture')
   try {
     await waitFor(run.stdout, 'ready inspector=closed handlers=1', run.child)
     expect(run.stderr()).toContain('"available":true')
