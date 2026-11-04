@@ -17,12 +17,35 @@ from agent_interface import atoms, bash_guard, claude_acl, pr_review, structured
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_gate import cancel_when_idle, submission_gate
 from agent_interface import review_watch
-from agent_interface.review_budget import ReviewLimitError
+from agent_interface.review_budget import ReviewBudget, ReviewLimitError
 from agent_interface.review_watch import RateLimitAbort, ReviewSuperseded, ReviewWatch
 
 HEAD = "a" * 40
 NEW_HEAD = "b" * 40
 PR = "https://github.com/o/r/pull/12"
+# A cut response loses its reasoning, so one that needs more than the cap never
+# finishes. Measured on the canary#170 approval that ran out the budget: 86,958
+# and 88,480 output tokens.
+CUT_PROVIDER = f"""#!{sys.executable}
+import json, sys, time
+cap = json.loads(sys.argv[sys.argv.index("--settings") + 1])["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]
+sys.stdin.read()
+while int(cap) < 88000:
+    print(json.dumps({{"type": "user", "isSynthetic": True, "message": {{"role": "user", "content": [{{"type": "text", "text": "Output token limit hit."}}]}}}}), flush=True)
+    time.sleep(0.1)
+print(json.dumps({{"type": "result", "subtype": "success", "is_error": False, "result": "approved"}}), flush=True)
+"""
+
+
+class TestOutputLimit(TestCase):
+    def test_approval_that_outgrows_a_64000_token_response_returns_inside_the_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cli = Path(folder) / "claude"
+            cli.write_text(CUT_PROVIDER)
+            cli.chmod(0o755)
+            with patch.dict(os.environ, {"CLAUDE_CLI": str(cli)}), ReviewBudget(25):
+                self.assertEqual(atoms.run_agent(folder, "system", "packet", ["Bash(github-interface *)"], "pr_approve",
+                                                 pr=PR, actor_name="bit-mis", head=HEAD), "approved")
 
 
 class TestHeadObservation(TestCase):
@@ -90,7 +113,7 @@ class TestSubmissionGate(TestCase):
             args = run.call_args.args[0]
             config = json.loads(args[args.index("--settings") + 1])
             self.assertIn("AGENT_INTERFACE_REVIEW_GATE", config["env"])
-            self.assertEqual(config["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "64000")
+            self.assertEqual(config["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "128000")
             self.assertEqual(config["permissions"]["allow"], ["Bash(github-interface *)"])
         # Other Claude behaviors keep their existing settings.
         self.assertNotIn("env", json.loads(claude_acl.settings([])))

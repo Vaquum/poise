@@ -6,7 +6,7 @@ from time import monotonic
 REVIEW_TIMEOUT_SECONDS = 1413
 REVIEW_POLICY = "bounded-v1"
 FINAL_CHECK_SECONDS = 15
-OUTPUT_TOKENS = 64000
+OUTPUT_TOKENS = 128000
 _current = ContextVar("review_budget", default=None)
 
 
