@@ -750,7 +750,9 @@ function paintIssueCards() {
 async function assignIssue(item: LiveItem, button: HTMLButtonElement): Promise<void> {
   const key = prKey(item)
   const reportError = (message: string) => viewFeedback(`current-assign:${key}`, 'Current action needs attention', message, 'action_needed')
-  button.disabled = true
+  // Not the disabled property, which blurs the button: whether focus is still
+  // on it is how the answer below knows that the user has not moved on.
+  button.setAttribute('aria-disabled', 'true')
   reportError('')
   try {
     const res = await fetch('/api/gh', {
@@ -762,11 +764,13 @@ async function assignIssue(item: LiveItem, button: HTMLButtonElement): Promise<v
     if (!res.ok) throw new Error(data.error || `/api/gh ${res.status}`)
     assignedIssues.set(key.toLowerCase(), Date.now())
     const cardEl = button.closest<HTMLElement>('.card')
+    const focused = document.activeElement === button
     paintIssueCards()
-    // The button just stopped existing; keep a keyboard user on the card.
-    cardEl?.querySelector<HTMLElement>('.card-link')?.focus()
+    // The button just stopped existing; keep a keyboard user on the card. The
+    // answer can take a minute, so anyone elsewhere is left where they are.
+    if (focused) cardEl?.querySelector<HTMLElement>('.card-link')?.focus({ preventScroll: true })
   } catch (error) {
-    button.disabled = false
+    button.removeAttribute('aria-disabled')
     reportError(`Could not assign ${key} to Poise — ${(error as Error).message}`)
   }
 }
@@ -1805,7 +1809,7 @@ function attachCardClickHandlers() {
       e.stopPropagation()
       const key = assignBtn.closest<HTMLElement>('.card')?.dataset.id
       const item = liveItems.find(candidate => prKey(candidate) === key && candidate.is_pr === 0)
-      if (item && !assignBtn.disabled) void assignIssue(item, assignBtn)
+      if (item && assignBtn.getAttribute('aria-disabled') !== 'true') void assignIssue(item, assignBtn)
       return
     }
 
