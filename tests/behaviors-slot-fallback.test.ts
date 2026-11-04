@@ -4,6 +4,7 @@ import type { ReviewerTripKind } from '../server/behaviors'
 import { mocks, pr, loadModules, resetLogCache, arrangeCli, agentLog, fixture } from './behaviors-runtime-fixture'
 
 const RATE_LIMIT_ERROR = 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)'
+const GROK_ANALYSIS_LIMIT_ERROR = 'grok review reached its analysis time limit; handing off so the next model can run instead'
 
 function modelOf(call: unknown[]): string {
   const args = call[1] as string[]
@@ -21,6 +22,7 @@ describe('reviewer trip classification', () => {
     { name: 'provider exit code', error: 'codex review failed: provider exited', code: 'review_provider_exit', expected: 'provider' },
     { name: 'budget exhausted code', error: 'Review reached its total time limit; needs attention', code: 'review_budget_exhausted', expected: 'budget' },
     { name: 'provider-execution budget with diagnostic', error: 'Issue review reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'provider.review', phase: 'provider_execution' }, expected: 'budget' },
+    { name: 'Grok analysis ceiling', error: GROK_ANALYSIS_LIMIT_ERROR, code: 'review_budget_exhausted', expected: 'budget' },
     { name: '402 stays an account trip', error: 'API error (status 402 Payment Required)', expected: 'balance' },
   ]
 
@@ -90,6 +92,7 @@ describe('slot fallback on provider failure', () => {
     { name: 'a 429', overrides: { error: RATE_LIMIT_ERROR, error_code: 'review_provider_error', action: 'not_started', outcome: 'preflight_failed' } },
     { name: 'a provider error', overrides: { error: 'codex review failed: turn errored', error_code: 'review_provider_error', action: 'not_started', outcome: 'preflight_failed' } },
     { name: 'an exhausted budget', overrides: { error: 'Review reached its total time limit; needs attention', error_code: 'review_budget_exhausted', review_policy: 'bounded-v1' } },
+    { name: 'the Grok analysis ceiling', overrides: { error: GROK_ANALYSIS_LIMIT_ERROR, error_code: 'review_budget_exhausted', review_policy: 'bounded-v1' } },
   ]
 
   it.each(failures)('moves a review to the next slot on $name before a verdict', async ({ overrides }) => {

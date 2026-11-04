@@ -290,7 +290,9 @@ and rewrites the catalog when something changed; Settings → Models → Check n
 does the same on demand and shows the last report. Reviews need Caller 0.3.0
 or newer (`agent-interface
 --models`); an older Caller fails before launching a worker. The compatible
-review policy is `bounded-v1`: reviews have a total 23m33s budget. Timeouts and
+review policy is `bounded-v1`: reviews have a total 23m33s budget, and a Grok
+pull request review or approval with no verdict after 13m20s of analysis stops
+and moves to the next slot. Timeouts and
 failed recovery remain visible and are held across restarts for the same
 input/model; new commits, new approval input, or a model change can be retried.
 

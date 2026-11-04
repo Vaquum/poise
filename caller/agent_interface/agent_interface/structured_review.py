@@ -32,6 +32,10 @@ from . import review_cap as followup
 
 MAX_INSPECTION_ROUNDS = 12
 CODEX_MAX_INPUT_CHARS = 1_048_576
+# A review with no verdict by this point stops, so its PR moves to the next slot
+# instead of waiting out the shared budget. Six of Grok's 15 completed PR reviews
+# on record at 2026-11-04 took longer; 900 s cuts the same six and holds PRs longer.
+PROVIDER_ANALYSIS_SECONDS = {"grok": 800}
 GROK_DISABLED_TOOLS = (
     "run_terminal_cmd,run_terminal_command,read_file,write,search_replace,list_dir,grep,"
     "kill_command_or_subagent,todo_write,get_command_or_subagent_output,spawn_subagent,Agent,"
@@ -362,6 +366,14 @@ def _validate_since_positions(pwd: str, pr: str, actor_name: str, head: str, pac
     verdict["comments"][:] = kept
 
 
+def _time_limit_message(provider: str) -> str:
+    # Poise moves the PR on for review_budget_exhausted unless this text matches
+    # its inspection-limit wording, and it reads any "rate limit" as a throttle.
+    if provider in PROVIDER_ANALYSIS_SECONDS:
+        return f"{provider} review reached its analysis time limit; handing off so the next model can run instead"
+    return "Review reached its total time limit; needs attention"
+
+
 def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
                  timeout_s: int, deadline: float, repository, behavior: str) -> tuple[str, dict]:
     schema = verdict_schema(behavior, inspection=repository is not None)
@@ -369,10 +381,10 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
     context = ""
     for round_number in range(MAX_INSPECTION_ROUNDS + 1):
         timeout = review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS)
-        if repository is not None:
+        if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS:
             timeout = min(deadline - monotonic(), timeout)
         if timeout <= 0:
-            raise review_budget.ReviewLimitError("Review reached its total time limit", "review_budget_exhausted")
+            raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted")
         if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
             # Loop-driven growth, not #186's initial-packet overflow: keep
             # it out of the packet block so the head is not pinned.
@@ -452,7 +464,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         with resource_ownership.temporary_directory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
             root = Path(work)
-            deadline = monotonic() + timeout_s
+            deadline = monotonic() + min(timeout_s, PROVIDER_ANALYSIS_SECONDS.get(model.provider, timeout_s))
             prior: list[dict] = []
             assessment: dict | None = None
             for index, stage_text in enumerate(_stage_texts(text, packet)):
@@ -484,7 +496,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         raise AgentPreflightError(f"{model.provider} review produced no submitted verdict: {cause}",
                                   "review_contract_violation", diagnostic) from error
     except subprocess.TimeoutExpired as error:
-        raise review_budget.ReviewLimitError("Review reached its total time limit; needs attention", "review_budget_exhausted") from error
+        raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted") from error
     except (ValueError, OSError) as error:
         code = ("review_packet_too_large" if "Input exceeds the maximum length" in str(error)
                 else "review_contract_violation" if isinstance(error, (InvalidVerdict, json.JSONDecodeError))

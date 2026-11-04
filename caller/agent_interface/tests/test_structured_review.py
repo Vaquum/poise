@@ -8,13 +8,15 @@ import tempfile
 import tracemalloc
 from contextlib import redirect_stdout
 from contextlib import nullcontext
+from dataclasses import replace
+from itertools import repeat
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
 import agent_interface
-from agent_interface import atoms, pr_review, pr_approve, structured_review, review_repository
+from agent_interface import atoms, pr_review, pr_approve, review_budget, review_stages, structured_review, review_repository
 from agent_interface.model_catalog import CATALOG, ModelCatalogError
 from agent_interface.review_watch import ReviewWatch
 
@@ -496,6 +498,123 @@ class TestStagedReview(TestCase):
         self.assertEqual(len(calls), 3)
         self.assertIn("file group 2 of 2", calls[2])
         self.assertEqual(len(json.loads(submit.call_args.args[0][4])), 2)
+
+
+GROK_HANDOFF = "grok review reached its analysis time limit; handing off so the next model can run instead"
+NEVER_RETURNS = float("inf")
+INSPECT = {"assessment": ASSESSMENT, "action": "inspect", "comments": [],
+           "requests": [{"operation": "read", "path": "src/old.py", "query": "", "start_line": 1}]}
+INSPECTED = SimpleNamespace(inspect=lambda requests: {"action": "review_context", "results": []})
+
+
+class TestGrokAnalysisCeiling(TestCase):
+    """Replays through the real review loop, on a fake clock, the shapes of the
+    Grok runs that used the whole budget on 2026-11-04 without posting."""
+
+    def _replay(self, model, turns, reply, behavior="pr_review", repository=None, packet="", timeout_s=1413,
+                budget_seconds=1413):
+        clock = SimpleNamespace(now=1000.0)
+        pending = iter(turns)
+        launches = []
+
+        def provider(args, *, timeout, **_kwargs):
+            launches.append(timeout)
+            seconds = next(pending)
+            if seconds >= timeout:
+                clock.now += timeout
+                raise subprocess.TimeoutExpired(args, timeout)
+            clock.now += seconds
+            if "--output-last-message" in args:
+                Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(reply))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stderr="",
+                                   stdout=json.dumps({**GROK_REPLY, "structuredOutput": reply}))
+
+        text = f"policy\n\nPR packet:\n{packet}\n\nAllowed:\nnone"
+        receipt = json.dumps({"action": "reviewed_clean", "review_id": 91, "head_sha": "a" * 40})
+        error = None
+        with patch.object(structured_review, "monotonic", lambda: clock.now), \
+                patch.object(review_budget, "monotonic", lambda: clock.now), \
+                patch.object(ReviewWatch, "run", side_effect=provider), \
+                patch.object(structured_review.subprocess, "run",
+                             return_value=SimpleNamespace(returncode=0, stdout=receipt, stderr="")) as submit, \
+                review_budget.ReviewBudget(budget_seconds):
+            try:
+                structured_review.run("/repo", "system", text, model, behavior, "https://github.com/o/r/pull/12",
+                                      "bit-mis", "a" * 40, timeout_s, repository=repository, packet=packet)
+            except review_budget.ReviewLimitError as failure:
+                error = failure
+        return SimpleNamespace(error=error, elapsed=clock.now - 1000.0, launches=launches, submit=submit)
+
+    def _assert_handed_off(self, run):
+        # Today's code raises this same code at 1,398 s, so time decides the test.
+        self.assertEqual(run.elapsed, 800)
+        self.assertEqual(run.error.code, "review_budget_exhausted")
+        self.assertEqual(str(run.error), GROK_HANDOFF)
+        run.submit.assert_not_called()
+
+    def test_inspection_rounds_stop_at_the_ceiling(self):
+        # Isomora#317: a 3-file PR whose inspection turns each took about 531 s.
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), repeat(531), INSPECT, repository=INSPECTED)
+        self._assert_handed_off(run)
+        self.assertEqual(run.launches, [800, 269])
+
+    def test_a_long_last_turn_stops_at_the_ceiling(self):
+        # Isomora#315: a round started at 661 s was still running at 1,400 s.
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [661, NEVER_RETURNS], INSPECT, repository=INSPECTED)
+        self._assert_handed_off(run)
+        self.assertEqual(run.launches, [800, 139])
+
+    def test_file_groups_without_inspection_stop_at_the_ceiling(self):
+        # Isomora#306: pr_approve has no inspection; group 3 took 542 s.
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(36)])
+        self.assertEqual(review_stages.stage_count(packet), 5)
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), repeat(542),
+                           {"assessment": ASSESSMENT, "action": "approve", "comments": []},
+                           behavior="pr_approve", packet=packet)
+        self._assert_handed_off(run)
+        self.assertEqual(run.launches, [800, 258])
+
+    def test_a_first_turn_that_never_returns_stops_at_the_ceiling(self):
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [NEVER_RETURNS],
+                           {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []})
+        self._assert_handed_off(run)
+        self.assertEqual(run.launches, [800])
+
+    def test_the_ceiling_follows_the_provider_not_the_catalog_selector(self):
+        # The repository catalog can name an older Grok than production runs.
+        run = self._replay(replace(CATALOG.resolve("grok-4.6-xhigh"), selector="grok-4.7"), [NEVER_RETURNS],
+                           {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []})
+        self._assert_handed_off(run)
+
+    def test_a_verdict_inside_the_ceiling_is_submitted(self):
+        packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
+        run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [395, 395],
+                           {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}, packet=packet)
+        self.assertIsNone(run.error)
+        self.assertEqual(run.launches, [800, 405])
+        run.submit.assert_called_once()
+
+    def test_a_smaller_budget_still_bounds_grok(self):
+        for name, kwargs, expected in (("whole budget", {"budget_seconds": 300}, [285, 235]),
+                                       ("granted time", {"timeout_s": 60}, [60, 10])):
+            with self.subTest(name):
+                run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [50, NEVER_RETURNS], INSPECT,
+                                   repository=INSPECTED, **kwargs)
+                self.assertEqual(run.launches, expected)
+                self.assertEqual(run.error.code, "review_budget_exhausted")
+
+    def test_other_providers_keep_the_whole_budget(self):
+        for name, turns, reply, repository, expected in (
+                ("inspection rounds", repeat(531), INSPECT, INSPECTED, [1398, 867, 336]),
+                ("one turn", [NEVER_RETURNS], {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []},
+                 None, [1398])):
+            with self.subTest(name):
+                run = self._replay(CATALOG.resolve("gpt-6-astra-ultra"), turns, reply, repository=repository)
+                self.assertEqual(run.launches, expected)
+                self.assertEqual(run.elapsed, 1398)
+                self.assertEqual(run.error.code, "review_budget_exhausted")
+                self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
 
 
 class TestBoundedStagePrompts(TestCase):
