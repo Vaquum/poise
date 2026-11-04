@@ -108,7 +108,10 @@ for up to one further retention period, capped at the smaller of twice the event
 count limit and one tombstone per KiB of the storage budget (at least one).
 Unknown and inaccessible IDs share one response; expiry is reported only from
 an authorized tombstone. SQLite's page budget, cache and
-journal are also bounded. Records remain after a source or container disappears.
+journal are also bounded. Physical page pressure can expire the oldest evidence
+before the logical byte/count limits. Pruning releases payload/index pages before
+recording expiry, in the same transaction, and preserves write headroom without
+raising the SQLite page ceiling. Records remain after a source or container disappears.
 Source coverage and its unavailable intervals are separate from event counts.
 SQLite allows up to 256 coverage records of 64 KiB each, with bounded identity
 fields. Its page ceiling includes 32 MiB of separate coverage/index headroom,
