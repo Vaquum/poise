@@ -14,7 +14,15 @@ export function behaviorCutoverBlockers(): string[] {
   if (calls.pendingResources) blockers.push(`${calls.pendingResources} native cleanup(s) still unsettled`)
   const operations = behaviorBackgroundBusy()
   if (operations) blockers.push(`${operations} behavior operation(s) still settling`)
-  const leases = db.prepare("SELECT count(*) AS count FROM behavior_seen WHERE key = 'pr-operation' AND claim_id != '' AND lease_until > ?").get(Date.now()) as { count: number }
+  // A quarantined original retains its input fence, not an active operation.
+  // Native activity/cleanup above still blocks independently; no hold or receipt
+  // is cleared when new-work ownership changes.
+  const leases = db.prepare(`SELECT count(*) AS count FROM behavior_seen AS operation
+    WHERE operation.key = 'pr-operation' AND operation.claim_id != '' AND operation.lease_until > ?
+      AND NOT EXISTS (SELECT 1 FROM behavior_seen AS held
+        WHERE held.key IN ('review-new-prs', 'approve-prs') AND held.claim_id = operation.claim_id
+          AND held.launch_call_id IS NOT NULL AND held.launch_quarantine IS NOT NULL)
+  `).get(Date.now()) as { count: number }
   if (leases.count) blockers.push(`${leases.count} reserved PR operation(s) still settling`)
   return blockers
 }
