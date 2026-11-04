@@ -51,6 +51,29 @@ function gitPaths(cwd, ...args) {
   return git(cwd, ...args)?.toString().split('\0').filter(Boolean) ?? []
 }
 
+/** One checkout's files, without what git ignores, and those of the repositories inside it by the same rule. */
+function checkoutFiles(top) {
+  const paths = []
+  for (const name of gitPaths(top, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')) {
+    const path = join(top, name).replace(/\/$/, '')
+    // git names a submodule or an embedded repository as one path, and tar would take all of it.
+    if (existsSync(join(path, '.git'))) paths.push(...checkoutFiles(path))
+    else paths.push(path)
+  }
+  for (const name of gitPaths(top, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory')) {
+    if (DEPENDENCIES.has(basename(name))) paths.push(join(top, name).replace(/\/$/, ''))
+  }
+  paths.push(join(top, '.git'))
+  // A linked worktree's .git is a file naming this folder, which may be anywhere.
+  const gitDir = resolve(top, git(top, 'rev-parse', '--git-common-dir')?.toString().trim() ?? '.git')
+  const config = join(gitDir, 'config')
+  if (existsSync(config) && /extraheader|:\/\/[^\s/@]+@/i.test(readFileSync(config, 'utf8'))) {
+    throw new Error(`${config} holds a credential, which must not reach a test instance`)
+  }
+  if (relative(top, gitDir).startsWith('..')) paths.push(gitDir)
+  return paths
+}
+
 /**
  * What a suite started in `cwd` needs, as absolute paths: the checkout's own files without what git
  * ignores, its dependencies, its .git, and the interpreter's folders `also` names when no test instance
@@ -60,18 +83,7 @@ export function filesToSend(cwd, also = [], env = process.env, home = homedir())
   const paths = []
   const top = git(cwd, 'rev-parse', '--show-toplevel')?.toString().trim()
   if (top) {
-    for (const name of gitPaths(top, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')) paths.push(join(top, name))
-    for (const name of gitPaths(top, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory')) {
-      if (DEPENDENCIES.has(basename(name))) paths.push(join(top, name).replace(/\/$/, ''))
-    }
-    paths.push(join(top, '.git'))
-    // A linked worktree's .git is a file naming this folder, which may be anywhere.
-    const gitDir = resolve(top, git(top, 'rev-parse', '--git-common-dir')?.toString().trim() ?? '.git')
-    const config = join(gitDir, 'config')
-    if (existsSync(config) && /extraheader|:\/\/[^\s/@]+@/i.test(readFileSync(config, 'utf8'))) {
-      throw new Error(`${config} holds a credential, which must not reach a test instance`)
-    }
-    if (relative(top, gitDir).startsWith('..')) paths.push(gitDir)
+    paths.push(...checkoutFiles(top))
   } else {
     const holdsSecrets = [home, env.TMPDIR].filter(Boolean).some((place) => !relative(cwd, place).startsWith('..'))
     if (holdsSecrets) throw new Error(`run the suite from a checkout: ${cwd} holds what must not reach a test instance`)
@@ -206,7 +218,7 @@ async function main(args) {
     die(`the connection to the test relay broke: ${error.cause?.message ?? error.message}`)
     return
   }
-  if (outOfMemory) say('this ran out of memory on the test instance, so it is too big to run there. CI runs everything before merge; for an answer sooner, name a smaller part of it.')
+  if (outOfMemory && exitCode !== 0) say('this ran out of memory on the test instance, so it is too big to run there. CI runs everything before merge; for an answer sooner, name a smaller part of it.')
   if (exitCode === null) die('the connection to the test relay ended before the suite did')
   else finish(exitCode)
 }

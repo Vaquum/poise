@@ -18,7 +18,7 @@ describe('the relay agents\' test suites meet at', () => {
         origin: (handle) => `https://${handle}.example`,
         log,
         now,
-        isWorkspace: (handle) => store.getWorkspace(handle) !== null,
+        isWorkspace: (handle) => store.getWorkspace(handle) !== null && store.getUser(handle)?.disabledAt === null,
         renderApi: 'http://127.0.0.1:9/v1',
       }),
     })

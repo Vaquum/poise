@@ -71,7 +71,7 @@ const testRelay = config.testRelay
     origin: (handle) => `${config.insecureHttp ? 'http' : 'https'}://${handle}.${config.domain}`,
     log,
     now,
-    isWorkspace: (handle) => store.getWorkspace(handle) !== null,
+    isWorkspace: (handle) => store.getWorkspace(handle) !== null && store.getUser(handle)?.disabledAt === null,
   })
   : undefined
 const gateway = createGateway({

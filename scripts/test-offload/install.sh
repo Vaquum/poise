@@ -16,6 +16,8 @@ if [ -z "${POISE_TEST_RELAY_URL:-}" ]; then
   exit 0
 fi
 
+# On a first start this comes before the entrypoint, which makes ~/.poise private only when it creates it.
+[ -d "$HOME/.poise" ] || mkdir -m 700 "$HOME/.poise"
 mkdir -p "$target"
 for file in sitecustomize.py hook.cjs run.mjs; do
   cp "$source/$file" "$target/.$file.new"

@@ -1107,6 +1107,14 @@ describe('updates in place', () => {
     expect(env.join('\n')).not.toContain('render-key')
   })
 
+  it('installs the test offload ahead of a first workspace, which installs no release', async () => {
+    h = await startHarness({ env: { POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_BASE_SERVICE: 'crn-x' } })
+    await h.openWorkspace('Alice')
+    expect(offloadTasks()).toHaveLength(1)
+    expect(releaseTasks()).toHaveLength(0)
+    expect((offloadTasks()[0].spec as { Env: string[] }).Env).toContainEqual(expect.stringMatching(/^POISE_TEST_RELAY_KEY=alice\./))
+  })
+
   it('takes a new release even when installing the test offload fails, and reports it', async () => {
     await start()
     h.docker.taskExitCodes.set('poise-test-offload-alice', 3)

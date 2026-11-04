@@ -29,7 +29,7 @@ export interface TestRelayDeps {
   origin: (handle: string) => string
   log: Logger
   now: () => number
-  /** Whether a handle names a workspace; one removed since it got its key is refused. */
+  /** Whether a handle names a workspace whose owner may use it; one removed or disabled since it got its key is refused. */
   isWorkspace: (handle: string) => boolean
   renderApi?: string
   sweepMs?: number

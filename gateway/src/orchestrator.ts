@@ -1069,6 +1069,8 @@ export class Orchestrator {
       details = null
     }
     if (!details) {
+      // A first workspace installs no release, and its agents should not wait for the next one.
+      if (config.testRelay) await this.installTestOffload(handle)
       await docker.createContainer(container, this.containerSpec(handle, login))
       this.lifecycle('workspace.container.created', handle, { image: config.runtimeImage })
     }

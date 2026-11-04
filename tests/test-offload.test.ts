@@ -178,6 +178,21 @@ describe('what reaches a test instance', () => {
     expect(names.sort()).toEqual(['.git', '.gitignore', '.venv', 'node_modules', 'sub/node_modules', 'tracked.py', 'untracked.py'])
   })
 
+  it('holds a repository inside the checkout to the same rule, ignored files and git configuration alike', () => {
+    const repo = checkout()
+    const nested = join(repo, 'nested')
+    execFileSync('git', ['init', '-q', nested])
+    writeFileSync(join(nested, '.gitignore'), '.env\n')
+    writeFileSync(join(nested, 'kept.py'), 'x = 1\n')
+    writeFileSync(join(nested, '.env'), 'SECRET=1\n')
+    const names = filesToSend(repo, [], {}, '/nowhere').map((path: string) => path.slice(repo.length + 1))
+    expect(names).toEqual(expect.arrayContaining(['nested/.gitignore', 'nested/kept.py', 'nested/.git']))
+    expect(names).not.toContain('nested')
+    expect(names).not.toContain('nested/.env')
+    writeFileSync(join(nested, '.git', 'config'), `${readFileSync(join(nested, '.git', 'config'), 'utf8')}[http]\n\textraheader = AUTHORIZATION: basic abc\n`)
+    expect(() => filesToSend(repo, [], {}, '/nowhere')).toThrow('holds a credential')
+  })
+
   it('sends an interpreter that lives outside the checkout, unless every instance has it', () => {
     const repo = checkout()
     const elsewhere = temp()
@@ -224,6 +239,8 @@ describe('installing it into a home volume', () => {
     expect(statSync(join(hooks, 'relay')).mode & 0o777).toBe(0o600)
     for (const file of ['hook.cjs', 'sitecustomize.py', 'run.mjs']) expect(readFileSync(join(hooks, file))).toEqual(readFileSync(join(SOURCE, file)))
     expect(readdirSync(hooks).sort()).toEqual(['hook.cjs', 'relay', 'run.mjs', 'sitecustomize.py'])
+    // Ahead of a first start, whose entrypoint leaves a ~/.poise it finds as it is.
+    expect(statSync(join(home, '.poise')).mode & 0o777).toBe(0o700)
   })
 
   it('turns off without removing what running agents point at', () => {
@@ -677,6 +694,13 @@ describe('a suite on a test instance', () => {
     expect(code).toBe(143)
     const [job] = jobs.values()
     expect(cancels).toContain(job.id)
+  })
+
+  it('says nothing of memory when a suite that mentions it passes', async () => {
+    await startAll()
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.log('cannot allocate memory, as this test expected')`]).done
+    expect(code).toBe(0)
+    expect(stderr).not.toContain('too big to run there')
   })
 
   it('says so when a suite runs out of memory, and answers with its exit code', async () => {
