@@ -1781,7 +1781,8 @@ function quarantineFailedClaim(
     if (changed.changes) {
       recordQuarantineIncident(claim, error, claim.launchCallId)
       // Uncertainty, not success: a quarantine must not release a hold.
-      clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
+      // An unreadable log says nothing new about the failure: its row stays as it was.
+      if (kind !== 'unreadable') clearBehaviorFailureKeepHold(claim.key as BehaviorKey, claim.target)
     }
     return changed.changes !== 0
   })()
@@ -1848,7 +1849,7 @@ function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry |
     const retryFailure = claim.key === ISSUES_KEY
       ? call.error_code !== 'stopped' && (call.receipts != null || !HELD_ISSUE_REVIEW_ERRORS.has(call.error_code || ''))
       : (!boundedReviewFailure(call) || budgetExhaustedProvenNoAction(call)) && call.error_code !== 'review_packet_too_large'
-    if (retryFailure) recordBehaviorFailure(claim.key as BehaviorKey, 'worker', message, claim.target,
+    if (retryFailure && !readBehaviorFailure(claim.key as BehaviorKey, claim.target)) recordBehaviorFailure(claim.key as BehaviorKey, 'worker', message, claim.target,
       claim.key === ISSUES_KEY ? { errorCode: call.error_code, held: !issueFailureCanRetry(claim.target, call), callId: call.id } : {})
   })()
 }

@@ -940,10 +940,12 @@ describe('Review New Issues sub-issues', () => {
     const held = () => ({
       letters: database.db.prepare('SELECT id, created_at, error, call_id, retired_at FROM behavior_dead_letters').all(),
       alerts: database.db.prepare("SELECT id, created_at, resolved_at FROM alerts WHERE kind = 'behavior_held'").all(),
+      failure: database.getMeta(`behavior_review_new_issues_failure:${ref(500)}`),
     })
     const before = held()
     expect(before.letters).toHaveLength(1)
     expect(before.alerts).toHaveLength(1)
+    expect(before.failure).toContain('lastFailureAtMs')
     const original = mocks.runFile.getMockImplementation()!
     mocks.runFile.mockImplementation(async (command, args, ...rest) => {
       if (command === 'agent-interface' && args[0] === '--logs') throw new Error('temporary feed outage')
