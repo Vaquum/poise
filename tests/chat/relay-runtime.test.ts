@@ -825,8 +825,6 @@ describe('relay handover between servers', () => {
     expect(ofType(first.events, session.id, 'turn.finished')).toHaveLength(1)
     expect(first.runtime.working()).toBe(2)
     expect(first.runtime.relayHeldSessions()).toEqual(new Set())
-    // That is the window; what the relay would do at the end of its grace ends it.
-    worker.signalGroup(pgid, 'SIGKILL')
     await waitFor(() => ofType(first.events, session.id, 'turn.finished').length === 2, 30_000)
     expect(ofType(first.events, session.id, 'turn.finished')[1]).toMatchObject({ stopReason: 'end_turn' })
     await waitFor(() => lastStatus(first.events, session.id) === 'idle', 30_000)
