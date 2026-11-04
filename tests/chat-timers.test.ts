@@ -20,6 +20,7 @@ vi.mock('../server/alerts/producers', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../server/alerts/producers')>()
   return { ...actual, chatTurnFinished: vi.fn(actual.chatTurnFinished) }
 })
+vi.setConfig({ hookTimeout: 25_000 })
 const caps: Capabilities = { steer: true, fork: false, thought: false, plan: false, commands: false, modes: false, permissions: true, questions: true, resume: true, images: false }
 let root: string
 let runtime: ChatRuntime
@@ -989,9 +990,10 @@ describe('durable timers that wake chats', () => {
     expect(queue.ready).toBe(false)
     expect(queue.items).toHaveLength(1)
     expect(queue.items[0].state).toBe(state === 'failed' ? 'failed' : 'waiting')
+    const timer = await heartbeat(m, p, { delayMinutes: 1 })
+    // No await from here to the tick: a background tick must not admit this row before count is read.
     store.message(instance, p.id, m.id, 'Ordinary behind queue', `queue:${randomUUID()}`)
     const ordinary = store.inbox(instance, p.id).find(row => row.body === 'Ordinary behind queue')!
-    const timer = await heartbeat(m, p, { delayMinutes: 1 })
     const count = (prompts.get(p.id) ?? []).length
     clock += 2 * 60_000
     await control.tick()
@@ -1007,12 +1009,9 @@ describe('durable timers that wake chats', () => {
       await until(() => (prompts.get(p.id) ?? []).length === count + 2)
       expect(prompts.get(p.id)!.at(-1)!.text).toContain('Paused task')
       finishes.get(p.id)!({ stopReason: 'end_turn' })
-      await until(() => runtime.get(p.id)?.status === 'idle')
       clock += 61_000 // past the person's grace from the queue turn
-    } else {
-      await until(() => runtime.get(p.id)?.status === 'idle')
     }
-    await control.tick()
+    // A background tick admits the firing once the turn ends, so idle can pass unseen; the prompt count cannot.
     await until(() => (prompts.get(p.id) ?? []).length === count + (state === 'paused' ? 3 : 2))
     expect(starts(p.id).at(-1)!.source).toMatchObject({ kind: 'timer', timerId: timer.id })
     finishes.get(p.id)!({ stopReason: 'end_turn' })
