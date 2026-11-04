@@ -22,6 +22,7 @@ const HEARTBEAT_MS = 10_000
 const BATCH_BYTES = 512 * 1024
 const MAX_QUEUED_BYTES = 8 * 1024 * 1024
 const QUIET_MS = 2_000
+const HEAP_SHARE = 0.8
 const ATTEMPTS = 3
 
 function frame(type, payload) {
@@ -123,6 +124,19 @@ async function finish(code) {
   exitCode = code
 }
 
+/** Node keeps its heap to about half of an instance's memory unless told. A suite here has the instance to itself. */
+function nodeOptions(inherited) {
+  let limit = Number.NaN
+  try {
+    limit = Number(readFileSync('/sys/fs/cgroup/memory.max', 'utf8'))
+  } catch {
+    // No such file outside a test instance.
+  }
+  if (!Number.isFinite(limit)) return inherited
+  // First, so a value the suite sets for itself wins.
+  return [`--max-old-space-size=${Math.floor(limit * HEAP_SHARE / 1024 / 1024)}`, inherited].filter(Boolean).join(' ')
+}
+
 async function main() {
   void sender()
   const spec = await (await fetch(`${relay}/runs/${id}/spec`, { headers })).json()
@@ -138,6 +152,8 @@ async function main() {
 
   const env = { ...spec.env, PATH: [spec.env.PATH, process.env.PATH].filter(Boolean).join(':') }
   if (!env.PLAYWRIGHT_BROWSERS_PATH && process.env.PLAYWRIGHT_BROWSERS_PATH) env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH
+  const options = nodeOptions(env.NODE_OPTIONS)
+  if (options) env.NODE_OPTIONS = options
   for (const name of ['TMPDIR', 'TMP', 'TEMP']) if (env[name]) mkdirSync(env[name], { recursive: true })
 
   child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })

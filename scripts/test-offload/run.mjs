@@ -4,6 +4,7 @@
 // suite's place. docs/Operating.md, "Agents' test suites".
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { once } from 'node:events'
 import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
@@ -111,9 +112,14 @@ function largerMarker(cwd) {
   return join(HERE, `larger-${createHash('sha256').update(origin).digest('hex').slice(0, 16)}`)
 }
 
+/** Exits once what is written has gone out: writes to a pipe are asynchronous, and exit would drop them. */
+function finish(code) {
+  process.stdout.write('', () => process.stderr.write('', () => process.exit(code)))
+}
+
 function die(message, code = 125) {
   say(message)
-  process.exit(code)
+  finish(code)
 }
 
 async function main(args) {
@@ -134,7 +140,7 @@ async function main(args) {
   let current = null
   for (const [signal, number] of [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1]]) {
     process.once(signal, () => {
-      const exit = () => process.exit(128 + number)
+      const exit = () => finish(128 + number)
       if (!current) exit()
       call('DELETE', `/runs/${current}`).then(exit, exit)
       setTimeout(exit, 3_000)
@@ -194,7 +200,10 @@ async function main(args) {
       }
     })
     try {
-      for await (const chunk of output.body) read(Buffer.from(chunk))
+      for await (const chunk of output.body) {
+        read(Buffer.from(chunk))
+        for (const stream of [process.stdout, process.stderr]) if (stream.writableNeedDrain) await once(stream, 'drain')
+      }
     } catch (error) {
       die(`the connection to the test relay broke: ${error.cause?.message ?? error.message}`)
     }
@@ -212,7 +221,7 @@ async function main(args) {
     result = await runOnce(true)
   }
   if (result.exitCode === null) die('the connection to the test relay ended before the suite did')
-  process.exit(result.exitCode)
+  else finish(result.exitCode)
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
