@@ -60,16 +60,22 @@ vi.mock('../../server/process', async (importOriginal) => {
  *  parking new ones. A turn parked mid-preparation advances; a turn whose
  *  cleanup parked finishes, so the runtime can stop. */
 /** A preparation budget the test expires itself once the turn has reached the
- *  step under test, instead of waiting it out. */
+ *  step under test, instead of waiting it out. Like the real timer, it does
+ *  nothing once the runtime has cleared it. */
 function expiringBudget(ms: number): () => void {
-  const realSetTimeout = setTimeout
-  let expire!: () => void
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  let budget: { run: () => void, timer: ReturnType<typeof setTimeout> } | undefined
   vi.spyOn(globalThis, 'setTimeout').mockImplementation(((run: () => void, delay: number, ...rest: []) => {
     if (delay !== ms) return realSetTimeout(run, delay, ...rest)
-    expire = run
-    return realSetTimeout(() => {}, 0)
+    const timer = realSetTimeout(() => {}, 0)
+    budget = { run, timer }
+    return timer
   }) as never)
-  return () => expire()
+  vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((timer: Parameters<typeof clearTimeout>[0]) => {
+    if (timer === budget?.timer) budget = undefined
+    realClearTimeout(timer)
+  }) as never)
+  return () => budget?.run()
 }
 
 function unhang(): void {
