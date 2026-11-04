@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { budgetShortfall, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission } from '../server/behavior-resources'
+import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, parseExecutionResourceGuard, readBehaviorResourceAdmission, validateExecutionLimits } from '../server/behavior-resources'
+
+it('captures only bounded dimensions and rejects ceilings that borrow another booking', () => {
+  const resources = readBehaviorResourceAdmission({ POISE_BEHAVIOR_DISK_BUDGET_BYTES: '100', POISE_BEHAVIOR_DISK_RESERVATION_BYTES: '8',
+    POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES: '12' })!
+  expect(executionLimits(resources)).toEqual({ version: 1, memoryBytes: null, diskBytes: 8 })
+  expect(() => validateExecutionLimits({ version: 1, memoryBytes: null, diskBytes: 9 }, resources.reservation)).toThrow('original resource reservation')
+  expect(parseExecutionResourceGuard(null)).toBeNull()
+})
 
 describe('behavior resource admission', () => {
   it('is unbounded without configuration and preserves admission behavior', () => {
@@ -67,6 +75,14 @@ describe('behavior resource admission', () => {
       freeMemory: () => 7,
       diskFree: () => 9,
       cgroupFile: cgroup({ 'memory.max': 'bogus\n', 'memory.current': '1\n' }),
+    })).toThrow('behavior resource measurement unavailable: cgroup memory read is invalid')
+  })
+
+  it.each([null, '', ' \n'])('refuses an absent cgroup counter under a configured limit: %j', (current) => {
+    expect(() => measureBehaviorHeadroom({
+      freeMemory: () => 64_000,
+      diskFree: () => 9,
+      cgroupFile: (name) => name === 'memory.max' ? '100\n' : current,
     })).toThrow('behavior resource measurement unavailable: cgroup memory read is invalid')
   })
 })

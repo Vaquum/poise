@@ -1195,6 +1195,10 @@ tr:hover .review-btn { opacity: 1; }
   margin-bottom: 16px;
 }
 
+#menu-surface [data-chain-list], #menu-surface [data-history] {
+  overflow-wrap: anywhere;
+}
+
 .tp-row {
   display: flex;
   justify-content: space-between;
@@ -2456,7 +2460,7 @@ tr:hover .review-btn { opacity: 1; }
 }
 
 /* Lane-list grows to fill the lane, so an empty lane has a generous drop
-   zone instead of a thin sliver above the "+ Add a card" button. */
+   zone below the "+ Add a card" button instead of a thin sliver. */
 .lane-list {
   display: flex;
   flex-direction: column;
@@ -2829,6 +2833,112 @@ tr:hover .review-btn { opacity: 1; }
   font-weight: 400;
   color: var(--n4);
 }
+
+/* Issue-label picker: a quiet tag behind the composer row, opening an
+   overlay panel so the lane layout never shifts. */
+.composer {
+  position: relative;
+}
+.composer-labels {
+  appearance: none;
+  background: transparent;
+  color: var(--n4);
+  border: none;
+  font-family: inherit;
+  padding: 6px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.composer-labels:hover { color: var(--n6); background: var(--n1); }
+.composer-labels:focus-visible {
+  outline-width: 2px;
+  outline-style: solid;
+  outline-color: var(--a1);
+  outline-offset: 2px;
+}
+.composer-labels[aria-expanded="true"] { color: var(--n6); background: var(--n1); }
+.composer-labels-count {
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.625rem;
+  color: var(--n5);
+}
+.composer-labels-pop[hidden] { display: none; }
+.composer-labels-pop {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 100%;
+  margin-top: 4px;
+  z-index: 5;
+  background: var(--n0);
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+  box-shadow: var(--e-1);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 248px;
+}
+.composer-labels-filter {
+  width: 100%;
+  font-family: inherit;
+  font-size: 0.75rem;
+  color: var(--n6);
+  background: var(--n0);
+  border: var(--b-base);
+  border-radius: var(--r-sm);
+  padding: 5px 8px;
+}
+.composer-labels-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+}
+.composer-labels-empty {
+  font-size: 0.75rem;
+  color: var(--n4);
+  padding: 6px 8px;
+}
+.composer-label-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.75rem;
+  color: var(--n6);
+  padding: 4px 6px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.composer-label-row:hover { background: var(--n1); }
+.composer-label-row input {
+  accent-color: var(--a1);
+  margin: 0;
+}
+.composer-label-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dot, var(--n3));
+}
+.composer-label-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-labels-foot {
+  font-size: 0.6875rem;
+  color: var(--n4);
+  padding: 0 2px;
+}
+.composer-labels-foot:empty { display: none; }
 
 /* "+ Add a card" — quiet at rest, dashed b-base on hover */
 .lane-add {
@@ -4158,7 +4268,10 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
 
 /* Pulsing-dots indicator while a reply is in flight — Confab's
    thinking pattern, scaled to our scale and tinted to text-tertiary
-   so it reads as ambient activity rather than a status alarm. */
+   so it reads as ambient activity rather than a status alarm. The
+   pulse runs only while the agent is actively working (is-live);
+   waiting on the person or a slot holds the dots still. Opacity and
+   scale only, so it stays on the compositor. */
 .chat-thinking {
   display: inline-flex;
   gap: 4px;
@@ -4170,6 +4283,9 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
   height: 5px;
   background: var(--text-tertiary);
   border-radius: 50%;
+  animation: chat-pulse 1.4s ease-in-out infinite;
+}
+.chat-thinking:not(.is-live) span {
   animation: none;
 }
 .chat-thinking span:nth-child(2) { animation-delay: 0.2s; }
@@ -4699,6 +4815,8 @@ body.chat-resizing { user-select: none; cursor: col-resize; }
   background: var(--border);
 }
 .card-action-btn:disabled { cursor: default; }
+.card-issue-edit { width: auto; padding: 0 5px; }
+.composer-labels[hidden] { display: none; }
 
 /* Per-icon accents on direct hover. Delete tints to the destructive
    red; review keeps neutral hover but uses A1/A3 to signal in-flight

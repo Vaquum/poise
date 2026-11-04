@@ -475,6 +475,32 @@ class TestSubIssuesReviewedOnce(IssueReviewCase):
 
 
 class TestFullAccessCommands(TestCase):
+    def test_codex_atomic_history_and_auth_copy_stay_in_the_invocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shared = Path(directory, "shared-codex")
+            shared.mkdir()
+            (shared / "auth.json").write_text('{"auth_mode":"chatgpt"}')
+            (shared / "config.toml").write_text("personal=true")
+            (shared / "sessions").mkdir()
+            sentinel = shared / "sessions" / "keep.jsonl"
+            sentinel.write_text("original shared history")
+            work = Path(directory, "invocation")
+            work.mkdir()
+            with patch.dict(os.environ, {"CODEX_HOME": str(shared), "OPENAI_API_KEY": "test-key",
+                                         "CODEX_API_KEY": "test-key", "OPENAI_BASE_URL": "https://example.invalid"}):
+                args, _, env = issue_review.command(CATALOG.resolve("gpt-6-astra-ultra"), "review", work / "repo", work, 600)
+            self.assertIn("--ephemeral", args)
+            isolated = work / "codex-home"
+            self.assertEqual(env["CODEX_HOME"], str(isolated))
+            self.assertEqual((isolated / "auth.json").read_text(), (shared / "auth.json").read_text())
+            self.assertEqual((isolated / "auth.json").stat().st_mode & 0o777, 0o600)
+            self.assertFalse((isolated / "config.toml").exists())
+            self.assertFalse((isolated / "sessions").exists())
+            self.assertEqual(sentinel.read_text(), "original shared history")
+            self.assertEqual(env["TMPDIR"], str((work / "tmp").resolve()))
+            for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
+                self.assertNotIn(key, env)
+
     def test_every_provider_inherits_only_its_own_temporary_directory(self):
         for identity in ["opus-5-max", "gpt-6-astra-ultra", "grok-4.6-xhigh", "gemini-3.8-flash-high", "muse-spark-1.3-contributor-max"]:
             with self.subTest(identity=identity), tempfile.TemporaryDirectory() as work:

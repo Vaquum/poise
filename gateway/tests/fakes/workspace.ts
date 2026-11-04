@@ -13,6 +13,7 @@ export interface StubHealth {
   ok: boolean
   activeChatTurns: number
   runningCallerCalls: number
+  unsettledNativeCalls?: number | null
   backgroundWork: number
   draining: boolean
   /** The release its supervisor runs; null for a workspace started without one. */
@@ -65,7 +66,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
     reachable: true,
     healthStatus: 200,
     drainApplies: true,
-    health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, backgroundWork: 0, draining: false, release: null, switching: null },
+    health: { ok: true, activeChatTurns: 0, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0, draining: false, release: null, switching: null },
     switches: [],
     failedReleases: [],
     healthPadding: 0,
@@ -78,7 +79,8 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
     mode: 'service',
     version: 'test',
     ...stub.health,
-    idle: stub.health.activeChatTurns === 0 && stub.health.runningCallerCalls === 0 && stub.health.backgroundWork === 0,
+    idle: stub.health.activeChatTurns === 0 && stub.health.runningCallerCalls === 0 && stub.health.backgroundWork === 0
+      && (stub.health.unsettledNativeCalls === undefined || stub.health.unsettledNativeCalls === 0),
     ...(stub.healthPadding > 0 ? { padding: 'x'.repeat(stub.healthPadding) } : {}),
   })
 

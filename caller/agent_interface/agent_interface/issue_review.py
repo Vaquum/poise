@@ -27,7 +27,7 @@ from threading import current_thread, main_thread
 from time import monotonic, sleep, time
 from typing import Callable
 
-from . import progress, review_budget
+from . import progress, review_budget, resource_ownership
 from .atoms import AgentPreflightError, bounded_cause, provider_blocked
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
@@ -266,10 +266,21 @@ def artifact_status(path: Path) -> dict:
 
 def command(model: Model, text: str, checkout: Path, work: Path, seconds: float, unattended: str = UNATTENDED) -> tuple[list[str], str, dict]:
     """The provider's own CLI with full access — no allowlist, no sandbox."""
-    env = os.environ.copy()
+    if model.provider == "codex":
+        from .structured_review import codex_environment
+        env = codex_environment(work)
+    else:
+        env = os.environ.copy()
     scratch = work.resolve() / "tmp"
     scratch.mkdir(mode=0o700, exist_ok=True)
     env.update({key: str(scratch) for key in ("TMPDIR", "TMP", "TEMP")})
+    if resource_ownership.binding() is not None:
+        # Build caches are disposable invocation data, not shared user history.
+        # Authentication/configuration homes retain their existing routes.
+        for key, name in (("XDG_CACHE_HOME", "cache"), ("npm_config_cache", "npm-cache"),
+                          ("PIP_CACHE_DIR", "pip-cache"), ("UV_CACHE_DIR", "uv-cache"),
+                          ("GOCACHE", "go-build"), ("GOMODCACHE", "go-mod"), ("CARGO_TARGET_DIR", "cargo-target")):
+            env[key] = str(work.resolve() / name)
     if model.provider == "claude":
         settings = json.dumps({"env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(review_budget.OUTPUT_TOKENS)}})
         return [

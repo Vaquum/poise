@@ -127,6 +127,23 @@ it('serializes simultaneous Chat and Snippets additions without losing either', 
   for (let i = 0; i < 12; i++) expect(library.expandSwitches('', [`entry-${i}`])).toContain(`Body ${i}`)
 })
 
+it.each(['manager', 'worker'])('refuses native creation of /%s even when its default was restored before the write', async name => {
+  await writeFile(file, 'matches: []\n')
+  const empty = await readFile(file, 'utf8')
+  await expect(library.addSkillSnippet({ trigger: `;${name}`, replace: 'Injected' }, false))
+    .rejects.toMatchObject({ statusCode: 403, message: `The /${name} snippet is edited in the browser.` })
+  expect(await readFile(file, 'utf8')).toBe(empty)
+
+  await library.ensureSnippetSwitch(name, 'Default charter')
+  const restored = await readFile(file, 'utf8')
+  await expect(library.addSkillSnippet({ trigger: `;${name}`, replace: 'Injected' }, false))
+    .rejects.toMatchObject({ statusCode: 403, message: `The /${name} snippet is edited in the browser.` })
+  expect(await readFile(file, 'utf8')).toBe(restored)
+  await expect(library.addSkillSnippet({ trigger: `;${name}`, replace: 'Person text' }, true))
+    .rejects.toThrow(`duplicate trigger: ;${name}`)
+  expect(await readFile(file, 'utf8')).toBe(restored)
+})
+
 it('rejects stale edits from either surface while preserving unrelated additions', async () => {
   await library.saveSwitch({ name: 'shared', content: 'Original', revision: 0 })
   const initial = await library.readSkillSnippets()

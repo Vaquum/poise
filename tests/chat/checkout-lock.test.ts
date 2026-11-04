@@ -14,12 +14,14 @@ let checkout = ''
 beforeAll(async () => {
   root = await mkdtemp(join(tmpdir(), 'poise-lock-test-'))
   process.env.POISE_LOCK_DIR = join(root, 'locks')
+  process.env.AGENT_INTERFACE_DATA_DIR = join(root, 'caller')
   checkout = join(root, 'checkout')
   await mkdir(checkout)
 })
 
 afterAll(async () => {
   delete process.env.POISE_LOCK_DIR
+  delete process.env.AGENT_INTERFACE_DATA_DIR
   await rm(root, { recursive: true, force: true })
 })
 
@@ -36,6 +38,24 @@ function readRow(): any {
   const db = new Database(checkoutLockPath(canonicalCheckout(checkout)))
   try { return db.prepare('SELECT * FROM lease WHERE id = 1').get() } finally { db.close() }
 }
+
+it('refuses native disposable checkouts instead of opening a competing Chat lease', async () => {
+  const native = join(root, 'caller', 'native-resources', 'a'.repeat(32), 'repo', 'nested')
+  await mkdir(native, { recursive: true })
+  expect(() => new CheckoutLease(native, {
+    ownerKind: 'poise:chat', ownerId: 'unrelated', ownerLabel: 'unrelated Chat', instance: 'test',
+  })).toThrow('private to its original native invocation')
+})
+
+it('keeps the ordinary shared gate for a similar directory outside Caller data', async () => {
+  const checkout = join(root, 'user', 'native-resources', 'a'.repeat(32), 'repo')
+  await mkdir(checkout, { recursive: true })
+  const ordinary = new CheckoutLease(checkout, {
+    ownerKind: 'poise:chat', ownerId: 'ordinary', ownerLabel: 'user checkout', instance: 'test',
+  })
+  expect(ordinary.tryAcquire().acquired).toBe(true)
+  expect(ordinary.release()).toBe(true)
+})
 
 it('retains native ownership across expiry, dead outer IDs and token-based legacy recovery', () => {
   const original = lease('native-boundary')

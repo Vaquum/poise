@@ -35,6 +35,13 @@ def test_missing_controller_is_not_an_unsupported_platform_fallback(monkeypatch)
         native_namespace.control_address()
 
 
+def test_older_controller_cannot_advertise_safe_persistent_home_cleanup(monkeypatch):
+    monkeypatch.setattr(native_namespace, "control_address", lambda: {"store": {"path": "/isolated"}})
+    monkeypatch.setattr(native_namespace, "control_request", lambda *args: {"resourceProtocol": 2})
+    with pytest.raises(native_namespace.NamespaceUnavailable, match="persistent-home reclamation support"):
+        native_namespace.require_resource_controller()
+
+
 @pytest.mark.parametrize("evidence", [
     {"pids": [], "empty": True},
     {"callId": "f" * 32, "correlation": "original", "binding": {"namespace": "pid:[9]"}, "pids": [], "empty": True, "namespace": "pid:[9]"},

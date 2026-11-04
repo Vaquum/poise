@@ -9,6 +9,10 @@ from .model_catalog import Model
 UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended; report a blocker instead of inventing a human answer. Caller owns publication."
 
 
+class AtomicWorkBlocked(ValueError):
+    code = "atomic_work_blocked"
+
+
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
         call_id: str, record: Callable[[dict], None], pull: int | None = None,
         expected_head: str | None = None, note: str = "", merge_base: bool = False, expected_issue_revision: str | None = None) -> dict:
@@ -80,8 +84,10 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if not output.is_file() or output.stat().st_size > 64 * 1024:
                 raise ValueError("atomic behavior returned no bounded publication metadata")
             publication = json.loads(output.read_text())
-            if not isinstance(publication, dict) or publication.get("blocked"):
-                raise ValueError(f"atomic behavior blocked: {publication.get('blocked') if isinstance(publication, dict) else 'invalid output'}")
+            if not isinstance(publication, dict):
+                raise ValueError("atomic behavior blocked: invalid output")
+            if publication.get("blocked"):
+                raise AtomicWorkBlocked(f"atomic behavior blocked: {publication['blocked']}")
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
                 raise ValueError("atomic behavior publication metadata is incomplete")
             replies = publication.get("replies", [])

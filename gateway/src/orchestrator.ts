@@ -1,7 +1,7 @@
 import http from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
 import { signAssertion } from './assertion.js'
-import type { Config } from './config.js'
+import { BEHAVIOR_RESOURCE_VARIABLES, type Config } from './config.js'
 import type { ContainerDetails, ContainerMount, ContainerSpec, ContainerSummary, DockerClient, TaskSpec } from './docker.js'
 import type { GatewayKeys } from './keys.js'
 import { errorMessage, type LogFields, type Logger } from './log.js'
@@ -38,6 +38,8 @@ export interface ServiceHealth {
   ok: boolean
   activeChatTurns: number
   runningCallerCalls: number
+  /** Missing on older workspaces; null when their native resource records are unreadable. */
+  unsettledNativeCalls?: number | null
   backgroundWork: number
   /** True only when activeChatTurns, runningCallerCalls and backgroundWork are all 0. */
   idle: boolean
@@ -136,10 +138,19 @@ function parseHealth(text: string, what: string): ServiceHealth {
       `the workspace answered ${what} without ok, activeChatTurns, runningCallerCalls, backgroundWork, idle and draining`,
     )
   }
+  const nativeCalls = value.unsettledNativeCalls
+  if (nativeCalls !== undefined && nativeCalls !== null &&
+      (typeof nativeCalls !== 'number' || !Number.isSafeInteger(nativeCalls) || nativeCalls < 0)) {
+    throw new WorkspaceAnswerError(`the workspace answered ${what} with invalid unsettledNativeCalls`)
+  }
+  if (nativeCalls !== undefined && nativeCalls !== 0 && value.idle) {
+    throw new WorkspaceAnswerError(`the workspace answered ${what} idle with unsettled or unknown native resources`)
+  }
   return {
     ok: value.ok,
     activeChatTurns: value.activeChatTurns,
     runningCallerCalls: value.runningCallerCalls,
+    ...(nativeCalls === undefined ? {} : { unsettledNativeCalls: nativeCalls }),
     backgroundWork: value.backgroundWork,
     idle: value.idle,
     draining: value.draining,
@@ -239,6 +250,7 @@ export class Orchestrator {
         `POISE_PORT=${WORKSPACE_PORT}`,
         'HOME=/home/poise',
         this.drainTimeoutEnv(),
+        ...config.behaviorResourceEnv,
         ...(config.workspaceSkipCliBootstrap ? ['POISE_SKIP_CLI_BOOTSTRAP=1'] : []),
       ],
       Labels: {
@@ -666,8 +678,7 @@ export class Orchestrator {
     let recreated = false
     // Whether a drain POST left the gateway, visible even when drain() throws before returning.
     const dispatched = { value: false }
-    const abortUnknown = async (): Promise<void> => {
-      const reason = 'the drain timed out without confirmed admission and idleness'
+    const abortUnknown = async (reason = 'the drain timed out without confirmed admission and idleness'): Promise<void> => {
       await this.releaseDrain(handle, login, reason)
       // A failed admission is a deferred update, not routine: it warns so the owner can see it.
       this.deps.log.warn('workspace.upgrade.aborted', { handle, reason,
@@ -696,8 +707,8 @@ export class Orchestrator {
           // Activation can restart Poise: a switch queued before the drain fires once the drain leaves it
           // idle, and the Poise it starts holds no drain. So drain again, and stop only a workspace still
           // idle. A drain that timed out on confirmed busy work cuts it anyway; one that only timed out
-          // or was never admitted aborts instead of recreating a slow workspace blind. A workspace that
-          // reaches nothing is down and still gets a new container; one that answers unusably does not.
+          // or was never admitted aborts instead of recreating a slow workspace blind. A forced stop
+          // additionally needs a fresh native-cleanup zero below; lost witnesses cannot be recovered.
           if (running && drainedIdle) {
             this.upgradingPhase = 'recheck'
             const recheck = await this.idleUnderDrain(handle, login)
@@ -718,6 +729,14 @@ export class Orchestrator {
                 if (this.deps.now() >= deadline) drainedIdle = false
                 else return 'needs-drain'
               }
+            }
+          }
+          if (running && !drainedIdle) {
+            const fresh = await this.idleUnderDrain(handle, login)
+            if (fresh.unknown || (!fresh.idle && !fresh.nativeIdle)) {
+              this.deps.log.warn('workspace.upgrade.native-pending', { handle,
+                unsettledNativeCalls: fresh.unsettledNativeCalls ?? null })
+              return 'abort-unknown'
             }
           }
           this.ready.delete(handle)
@@ -776,6 +795,11 @@ export class Orchestrator {
         if (result.observed) admitted = result.admitted
         if (!result.idle) sawDown = sawDown || result.sawDown
         lastCounts = result.lastCounts ?? lastCounts
+        if (result.nativePending) {
+          this.deps.log.warn('workspace.upgrade.native-pending', { handle })
+          await abortUnknown('native cleanup remains pending or unknown without a live Caller; deferred to the next upgrade pass')
+          return
+        }
         if (result.idle) {
           drainedIdle = true
         } else if ((confirmedBusy && admitted) || sawDown) {
@@ -800,7 +824,7 @@ export class Orchestrator {
    * reports the drain as this answer showed it, so the caller learns a lost admission even when the
    * recheck cannot proceed; null when nothing observed it.
    */
-  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean; draining: boolean | null }> {
+  private async idleUnderDrain(handle: string, login: string): Promise<{ idle: boolean; unknown: boolean; down: boolean; draining: boolean | null; unsettledNativeCalls?: number | null; nativeIdle?: boolean }> {
     try {
       const health = await this.serviceCall(handle, login, 'POST', '/api/service/drain')
       // The recheck is the last gate before the stop: only an idle answer behind an applied drain lets
@@ -811,7 +835,10 @@ export class Orchestrator {
           activeChatTurns: health.activeChatTurns, runningCallerCalls: health.runningCallerCalls, backgroundWork: health.backgroundWork })
         return { idle: false, unknown: true, down: false, draining: health.ok ? health.draining : null }
       }
-      return { idle: health.idle, unknown: false, down: false, draining: true }
+      return { idle: health.idle, unknown: false, down: false, draining: true,
+        // An admitted tick/launch can still be between spawn and Call registration.
+        nativeIdle: health.unsettledNativeCalls === 0 && health.runningCallerCalls === 0 && health.backgroundWork === 0,
+        unsettledNativeCalls: health.unsettledNativeCalls }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
       this.deps.log.warn('workspace.drain.recheck.failed', { handle, error: errorMessage(error) })
@@ -872,7 +899,7 @@ export class Orchestrator {
    * answer showing it off un-admits, and a round with no usable answer leaves it alone.
    */
   private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }): Promise<{
-    idle: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; observed: boolean; sawDown: boolean;
+    idle: boolean; nativePending: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; observed: boolean; sawDown: boolean;
     lastCounts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null
   }> {
     const { config, log, now } = this.deps
@@ -884,7 +911,10 @@ export class Orchestrator {
     let sawDown = false
     let sawDraining = false
     const lastCounts: { counts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null } = { counts: null }
-    const done = (idle: boolean) => ({ idle, attempted: dispatched.value, confirmedBusy, admitted, observed, sawDown, lastCounts: lastCounts.counts })
+    const done = (idle: boolean, nativePending = false) => ({ idle, nativePending, attempted: dispatched.value, confirmedBusy, admitted, observed, sawDown, lastCounts: lastCounts.counts })
+    // Original cleanup may be permanently held after controller loss. It must not subject Chat
+    // to a full drain deadline on every upgrade pass; existing maintenance can retry without it.
+    const pendingCleanup = (health: ServiceHealth): boolean => !health.idle && health.unsettledNativeCalls !== 0 && health.runningCallerCalls === 0
     const waiting = (health: ServiceHealth): void => {
       log.info('workspace.drain.waiting', {
         handle,
@@ -945,6 +975,7 @@ export class Orchestrator {
         this.lifecycle('workspace.drain.requested', handle, counts(health))
         note(health)
         if (health.idle) return done(true)
+        if (pendingCleanup(health)) return done(false, true)
       }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
@@ -963,6 +994,7 @@ export class Orchestrator {
           else {
             if (!admitted) this.lifecycle('workspace.drain.requested', handle, counts(health))
             note(health)
+            if (pendingCleanup(health)) return done(false, true)
             if (health.idle) {
               this.lifecycle('workspace.drain.idle', handle)
               return done(true)
@@ -972,6 +1004,7 @@ export class Orchestrator {
         } else {
           const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
           note(health)
+          if (health.ok && health.draining && pendingCleanup(health)) return done(false, true)
           // Idle behind an applied drain finishes; idle without one waits for a renewal to admit.
           // A lifted drain re-applies on renewal, so waiting costs one renew cycle, never safety.
           if (health.ok && health.idle && health.draining) {
@@ -1090,6 +1123,13 @@ export class Orchestrator {
   /** A container setting that differs from what the gateway would create now; only a new container applies it. */
   private changedSetting(details: ContainerDetails): string | null {
     if (!(details.Config.Env ?? []).includes(this.drainTimeoutEnv())) return 'changed drain timeout'
+    for (const name of BEHAVIOR_RESOURCE_VARIABLES) {
+      const actual = (details.Config.Env ?? []).filter(value => value.startsWith(`${name}=`))
+      const expected = this.deps.config.behaviorResourceEnv.find(value => value.startsWith(`${name}=`))
+      if (actual.length !== (expected === undefined ? 0 : 1) || actual[0] !== expected) {
+        return 'changed native behavior resource budgets'
+      }
+    }
     const resolver = details.Mounts?.find((mount) => mount.Destination === WORKSPACE_RESOLV_CONF)?.Source ?? null
     if (resolver !== (this.deps.workspaceResolvConf ?? null) || (details.Config.Labels?.['poise.dns'] ?? '') !== this.dnsLabel()) {
       return 'changed workspace DNS'

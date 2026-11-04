@@ -52,7 +52,7 @@ export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org:
   const entry = fresh && pull?.queueEntry ? pull.queueEntry : newerQueue ? String(queueProof!.result.queue_entry_id) : null
   const participation = lastChainQueueInvocation(chain)
   const ejected = fresh && !entry && !!pull?.queueRemoval && participation?.evidence?.head_sha === pull.head
-    && pull.queueRemoval.at >= participation.admittedAt
+    && pull.queueRemoval.at >= participation.admittedAt && pull.queueRemoval.reason !== 'merged'
   const queue: PrStatusRow['queue'] = { state: entry ? 'queued' : ejected ? 'ejected' : fresh ? 'not_queued' : 'unknown',
     entryId: entry, since: entry ? new Date(newerQueue ? responseAt : observation!.checkedAt).toISOString()
       : ejected ? new Date(pull!.queueRemoval!.at).toISOString() : null }

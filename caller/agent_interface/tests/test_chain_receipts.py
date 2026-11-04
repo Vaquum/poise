@@ -25,7 +25,7 @@ class ManagedReceipts(TestCase):
         self.conn = sqlite3.connect(self.path)
         self.addCleanup(self.conn.close)
         self.conn.execute("create table calls (id text primary key, source text, status text, behavior text, error_code text, artifact text, "
-                          "action text, outcome text, head_sha text, resources_settled_at real, action_plan text, resource_ownership text)")
+                          "action text, outcome text, head_sha text, resources_settled_at real, action_plan text, resource_ownership text, namespace_control text)")
         self.conn.execute("insert into calls(id,source,status,behavior,artifact) values(?, 'poise:behavior-chain','running','pr_review',?)",
                           (CALL, json.dumps({"phase": "reviewing", "review_response": {"head_sha": HEAD, "completed_at": 1}})))
         self.conn.execute("update calls set resource_ownership=?", (resource_ownership.initial(),))
@@ -101,7 +101,31 @@ class ManagedReceipts(TestCase):
         self.active_publication()
         for scope in (None, SimpleNamespace(key={"callId": "d" * 32}, require_idle=MagicMock())):
             with self.subTest(scope=scope), patch.object(native_namespace, "active", return_value=scope), \
-                    self.assertRaisesRegex(RuntimeError, "native ownership"):
+                    self.assertRaises(RuntimeError):
+                review_receipt.work_publication(HEAD, start_replies=True)
+        self.assertFalse(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
+
+    def test_original_executed_publication_helper_reserves_replies_without_borrowing_parent_memory(self):
+        self.active_publication()
+        scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=MagicMock(return_value={"pids": [1, 2, 3]}))
+        with patch.object(native_namespace, "active", return_value=None), \
+                patch.object(resource_ownership, "original_scope", return_value=scope), \
+                patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=2), \
+                patch.object(os, "readlink", return_value="pid:[91]"):
+            review_receipt.work_publication(HEAD, start_replies=True)
+            with self.assertRaisesRegex(RuntimeError, "already attempted"):
+                review_receipt.work_publication(HEAD, start_replies=True)
+        self.assertTrue(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
+
+    def test_publication_helper_refuses_foreign_scope_parent_or_remaining_worker(self):
+        self.active_publication()
+        for parent, namespace, pids in ((9, "pid:[91]", [1, 2, 3]), (2, "pid:[92]", [1, 2, 3]), (2, "pid:[91]", [1, 2, 3, 4])):
+            scope = SimpleNamespace(binding={"namespace": "pid:[91]"}, read=lambda: {"pids": pids})
+            with self.subTest(parent=parent, namespace=namespace, pids=pids), \
+                    patch.object(native_namespace, "active", return_value=None), \
+                    patch.object(resource_ownership, "original_scope", return_value=scope), \
+                    patch.object(os, "getpid", return_value=3), patch.object(os, "getppid", return_value=parent), \
+                    patch.object(os, "readlink", return_value=namespace), self.assertRaises(RuntimeError):
                 review_receipt.work_publication(HEAD, start_replies=True)
         self.assertFalse(json.loads(self.conn.execute("select artifact from calls").fetchone()[0])["replies_started"])
 
@@ -195,6 +219,33 @@ class AtomicWorkLimits(TestCase):
             status, action, outcome, plan = conn.execute("select status, action, outcome, action_plan from calls").fetchone()
         self.assertEqual(modes, ["prepare", "validate"])
         self.assertEqual((status, action, outcome), ("failed", "not_started", "preflight_failed"))
+        self.assertIsNone(plan)
+
+    def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
+        modes = []
+        reason = "Review requires a product decision before implementation can continue"
+
+        def interface(*args, **_kwargs):
+            modes.append(args[args.index("--mode") + 1])
+            return {"outcome": "prepared", "checkout_head": HEAD}
+
+        def worker(_lease, _args, **kwargs):
+            (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({"blocked": reason}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                patch.object(issue_review, "interface", side_effect=interface), \
+                patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                patch.object(issue_review, "_terminal_failure", return_value=None), \
+                patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                self.assertRaisesRegex(ValueError, reason):
+            self.run_behavior()
+        with sqlite3.connect(self.path) as conn:
+            status, code, action, outcome, plan = conn.execute("select status,error_code,action,outcome,action_plan from calls").fetchone()
+        self.assertEqual(modes, ["prepare"])
+        self.assertEqual((status, code, action, outcome), ("failed", "atomic_work_blocked", "not_started", "preflight_failed"))
         self.assertIsNone(plan)
 
     def test_repair_completion_reuses_the_original_plan_without_a_worker_or_new_call(self):

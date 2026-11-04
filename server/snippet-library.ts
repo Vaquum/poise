@@ -299,9 +299,14 @@ export async function addSkillSnippet(input: unknown, person = true): Promise<{ 
   const [snippet] = validateSnippets([input])
   await importLegacy()
   await mutateSnippetLibrary(snapshot => {
-    const snippets = validateSnippets([...snapshot.state.snippets, snippet]), metadata = metadataFrom(snapshot.raw)
+    const proposed = [...snapshot.state.snippets, snippet], metadata = metadataFrom(snapshot.raw)
     const before = boundMetadata(snapshot)
-    bind(snippets, metadata)
+    const name = bind(proposed, metadata).get(snippet.trigger)!
+    // A concurrent default restoration must not mask the charter's permission refusal.
+    if (name === MANAGER_SWITCH || name === WORKER_SWITCH) {
+      guardBuiltin(liveBuiltin(snapshot.state.snippets, before, name), { trigger: snippet.trigger, content: snippet.replace }, person, name)
+    }
+    const snippets = validateSnippets(proposed)
     guardBuiltins(snapshot.state.snippets, before, snippets, metadata, person)
     return { snippets, header: header(metadata) }
   })

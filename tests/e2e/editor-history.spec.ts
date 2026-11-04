@@ -163,6 +163,7 @@ test('repeated edits across documents stay within the history budget', async ({ 
   await doc.press('ControlOrMeta+z')
   await expect(doc).toHaveText('alpha')
   await openDoc(page, 'beta')
+  await expect(doc).toHaveText('beta uno')
   await doc.press('ControlOrMeta+z')
   await expect(doc).toHaveText('beta')
 })

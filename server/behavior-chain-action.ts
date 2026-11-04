@@ -1,4 +1,12 @@
+import { createHash } from 'node:crypto'
+import { canonicalJson } from './chat/protocol'
 import { chainBasis, type BehaviorChain, type ChainInvocation } from './behavior-chain-store'
+
+/** Caller hashes native requests with sorted keys. Journal and plan hashes
+ * retain their original serialization; response bytes are hashed verbatim. */
+export function nativeRequestSha(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex')
+}
 
 const SHA = /^[a-f0-9]{40}$/i
 // The existing journal event limit is 256 KiB. Leave room for its envelope

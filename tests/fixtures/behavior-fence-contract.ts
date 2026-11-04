@@ -10,14 +10,17 @@ import { BehaviorResourceRecovery } from '../../server/behavior-chain-resource-r
 
 const wire = readFileSync(process.argv[2], 'utf8')
 const mode = process.argv[3] ?? 'fence'
-assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only'].includes(mode))
+assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard'].includes(mode))
 const physical = mode === 'namespace-physical-only'
 const interrupted = mode.startsWith('namespace-interrupted-') || physical
-const direct = mode === 'namespace-no-effect' || interrupted
+const guarded = mode === 'resource-guard'
+const direct = mode === 'namespace-no-effect' || interrupted || guarded
 const snapshot = parseAgentLogStdout(wire, 'actual native Call log output')
 assert.equal(snapshot.quarantined.length, 0, JSON.stringify(snapshot.quarantined))
 assert.equal(snapshot.entries.length, 1)
 const call = snapshot.entries[0]
+const limits = call.resource_guard?.limits
+const reservation = { memoryBytes: limits?.memoryBytes ?? 8, diskBytes: limits?.diskBytes ?? 16 }
 assert.ok(call.repo && call.actor && call.correlation_id && call.completed_at)
 const behavior = ({ issue_review: 'review-issue', implement_issue: 'implement-issue', repair_pr: 'repair-pr',
   pr_review: 'review-pr', pr_approve: 'approve-pr', native_action: 'merge-pr' } as Record<string, ChainBehavior>)[call.behavior!]
@@ -30,13 +33,14 @@ try {
     branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' })
   chain = journal.append(id, 'admit', chain.sequence, { type: 'invocation.admitted', invocation: { id: call.correlation_id,
     behavior, actor: call.actor, model: direct ? null : call.model, slot: direct ? null : 'primary', basis: 'original-contract-admission',
-    reservation: { memoryBytes: 8, diskBytes: 16 }, admittedAt: Date.parse(call.started_at_precise ?? call.started_at) - 1000,
+    reservation, admittedAt: Date.parse(call.started_at_precise ?? call.started_at) - 1000,
     request: direct ? { command: 'github-interface', nativeResources: 2, cwd: '/isolated-contract',
+      ...(limits ? { resourceLimits: limits } : {}),
       argv: ['--merge-if-ready', '21', '--expected-head', call.expected_head!, '--token-user', call.actor] }
       : { command: 'agent-interface', cwd: '/isolated-contract', argv: [] } } })
   journal.append(id, 'start', chain.sequence, { type: 'invocation.started', invocationId: call.correlation_id })
   assert.equal(journal.liveModelInvocationCount(), direct ? 0 : 1)
-  assert.deepEqual(journal.reservedResources(), { memoryBytes: 8, diskBytes: 16, unaccounted: 0 })
+  assert.deepEqual(journal.reservedResources(), { ...reservation, unaccounted: 0 })
   const forbidden = async () => { throw new Error('receipt reconciliation must not execute work') }
   const reviewer = { slot: 'primary', model: call.model, recovery: call.model }
   const operations: ChainRuntimeOperations = { enabled: () => false, accounts: () => ({ author: 'author', reviewer: 'reviewer' }),
@@ -65,13 +69,22 @@ try {
   if (direct) {
     assert.equal(call.resource_ownership?.version, 2)
     assert.equal(call.resource_ownership.namespace?.state, pending ? 'active' : 'settled')
-    if (!interrupted) assert.equal(current.invocations[0].outcome, 'preflight_failed')
-    else assert.equal(call.error_code, 'interrupted')
+    if (guarded) {
+      assert.equal(current.invocations[0].outcome, call.error_code)
+      assert.equal(current.held, call.error)
+      assert.equal(call.resource_guard?.failure?.noWrite, true)
+    } else if (!interrupted) assert.equal(current.invocations[0].outcome, 'preflight_failed')
+    else assert.equal(call.error_code, physical && limits ? call.resource_guard?.failure?.code : 'interrupted')
   }
   if (mode === 'pending' || mode === 'recovered') assert.ok(call.resource_ownership!.errors.length > 0)
   assert.equal(journal.liveModelInvocationCount(), pending && !direct ? 1 : 0)
-  assert.deepEqual(journal.reservedResources(), { memoryBytes: pending ? 8 : 0, diskBytes: pending ? 16 : 0, unaccounted: 0 })
+  assert.deepEqual(journal.reservedResources(), { memoryBytes: pending ? reservation.memoryBytes : 0,
+    diskBytes: pending ? reservation.diskBytes : 0, unaccounted: 0 })
   const events = journal.history(id)
+  if (guarded) {
+    await new BehaviorChainRuntime(journal, operations).run()
+    assert.deepEqual(journal.history(id), events)
+  }
   journal.rebuild()
   assert.deepEqual(journal.history(id), events)
   assert.deepEqual(journal.read(id), current)

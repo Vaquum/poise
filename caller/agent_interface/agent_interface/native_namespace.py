@@ -298,7 +298,7 @@ class Namespace:
                 return
             sleep(0.005)
 
-    def start(self, registered: Callable[[dict], None], *, timeout_seconds: float) -> bool:
+    def start(self, registered: Callable[[dict], None], *, timeout_seconds: float, guard=None) -> bool:
         """True in the confined continuation; False in the original Caller
         after the continuation and every namespace member have ended.
         `registered` must commit the original receipt before GO is delivered.
@@ -318,6 +318,7 @@ class Namespace:
         continuing = False
         stop_requested = False
         prior_sigterm = None
+        monitor = None
 
         def owned(fd: int) -> int:
             descriptors.add(fd)
@@ -447,6 +448,9 @@ class Namespace:
                     or response.get("namespace") != namespace or 1 not in response.get("pids", []):
                 raise RuntimeError("native namespace was not witnessed before GO")
             registered({"controller": self.address, **self.key, "binding": self.binding})
+            if guard is not None:
+                monitor = guard(self)
+                monitor.start()
             if stop_requested:
                 raise InterruptedError("native invocation was stopped before GO")
             self._send(send, {"operation": "GO", "binding": self.binding})
@@ -454,9 +458,18 @@ class Namespace:
             deadline = monotonic() + timeout_seconds
             stop_deadline = None
             while not _exited(holder_fd, 0.05):
+                if monitor is not None and monitor.poll():
+                    # A committed resource cause has no grace period. Killing
+                    # the pinned holder ends this original namespace only.
+                    signal.pidfd_send_signal(holder_fd, signal.SIGKILL)
+                    monitor.signalled()
+                    from .resource_guard import GuardStopped
+                    raise GuardStopped("native behavior stopped by its resource guard")
                 if stop_requested and stop_deadline is None:
                     stop_deadline = monotonic() + TERM_SECONDS
                 if monotonic() >= (stop_deadline if stop_deadline is not None else deadline):
+                    if monitor is not None and not stop_requested:
+                        monitor.timeout()
                     if init_fd is not None and not _exited(init_fd):
                         signal.pidfd_send_signal(init_fd, signal.SIGTERM)
                     if stop_requested or not _exited(holder_fd, TERM_SECONDS):
@@ -490,6 +503,11 @@ class Namespace:
                         os.waitpid(holder, 0)
                 except (OSError, RuntimeError, TimeoutError) as error:
                     failures.append(error)
+            if monitor is not None:
+                try:
+                    monitor.close()
+                except (OSError, RuntimeError) as error:
+                    failures.append(error)
             for fd in list(descriptors):
                 try:
                     close(fd)
@@ -509,6 +527,8 @@ def require_resource_controller() -> None:
         reason = state.get("storeError")
         raise NamespaceUnavailable(reason if isinstance(reason, str) and reason else
                                    "v2 cleanup requires the current workspace image and original Caller metadata handles")
+    if state.get("persistentCleanup") != 1:
+        raise NamespaceUnavailable("v2 cleanup requires a workspace image with persistent-home reclamation support")
 
 
 def capability() -> dict:
@@ -523,7 +543,7 @@ def capability() -> dict:
         if scope.exit_code != 0:
             raise RuntimeError("native cleanup setup check did not complete")
         scope.release()
-        return {"version": 1, "supported": True}
+        return {"version": 1, "supported": True, "resourceGuard": 1}
     except Exception as error:
         return {"version": 1, "supported": False, "error": str(error)[:500],
                 **({"unavailable": True} if not isinstance(error, NamespaceUnavailable) or not error.unsupported else {})}

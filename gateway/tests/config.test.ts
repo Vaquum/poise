@@ -39,6 +39,7 @@ describe('configuration', () => {
       workspaceDiskBudgetBytes: 50 * 1024 ** 3,
       workspaceNanoCpus: 4_000_000_000,
       workspacePids: 4096,
+      behaviorResourceEnv: [],
       workspaceRuntime: null,
       workspaceDns: [],
       workspaceSkipCliBootstrap: false,
@@ -91,6 +92,22 @@ describe('configuration', () => {
     const found = problems({})
     for (const name of ['POISE_DOMAIN', 'POISE_GITHUB_CLIENT_ID', 'POISE_GITHUB_CLIENT_SECRET', 'POISE_ADMINS', 'POISE_RUNTIME_IMAGE', 'POISE_GATEWAY_CONTAINER']) {
       expect(found.some((problem) => problem.startsWith(`${name} is required`))).toBe(true)
+    }
+  })
+
+  it('validates native behavior byte counts and requires a reservation for each bounded dimension', () => {
+    for (const dimension of ['MEMORY', 'DISK']) {
+      const budget = `POISE_BEHAVIOR_${dimension}_BUDGET_BYTES`
+      const reservation = `POISE_BEHAVIOR_${dimension}_RESERVATION_BYTES`
+      for (const value of ['-1', '1.5', 'Infinity', '9007199254740992', '2g']) {
+        expect(problems({ ...BASE, [budget]:value, [reservation]:'1' })).toContainEqual(expect.stringContaining(budget))
+        expect(problems({ ...BASE, [reservation]:value })).toContainEqual(expect.stringContaining(reservation))
+      }
+      expect(problems({ ...BASE, [budget]:'10' })).toContain(`${budget} requires a positive ${reservation}`)
+      expect(problems({ ...BASE, [budget]:'10', [reservation]:'0' })).toContain(`${budget} requires a positive ${reservation}`)
+      expect(loadConfig({ ...BASE, [budget]:'10', [reservation]:'2' }).behaviorResourceEnv)
+        .toEqual([`${budget}=10`,`${reservation}=2`])
+      expect(loadConfig({ ...BASE, [reservation]:'0' }).behaviorResourceEnv).toEqual([`${reservation}=0`])
     }
   })
 

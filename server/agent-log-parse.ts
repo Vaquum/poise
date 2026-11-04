@@ -7,6 +7,7 @@
 import { parseProgress, type ModelProgress } from '../src/agent-progress'
 import { parseProcessDiagnostic, type ProcessDiagnostic } from './process-diagnostic'
 import { parseResourceOwnership, resourceReleaseContradicted, type ResourceOwnershipReceipt } from './behavior-resource-receipt'
+import { parseExecutionResourceGuard } from './behavior-resources'
 
 export interface LogEntry {
   id: string
@@ -47,6 +48,7 @@ export interface LogEntry {
   artifact?: Record<string, unknown> | null
   resources_settled_at?: string | null
   resource_ownership?: ResourceOwnershipReceipt | null
+  resource_guard?: import('./behavior-resources').ExecutionResourceGuard | null
   issue_revision?: string | null
   // `external` for a Chat turn Poise recorded through `--record-turn`: no
   // Caller process ran, so `--stop` refuses it and Poise routes it to its
@@ -209,6 +211,13 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
   const errorCode = optionalString('error_code')
   const resourcesSettledAt = optionalString('resources_settled_at')
   const resourceOwnership = row.resource_ownership == null ? null : parseResourceOwnership(row.resource_ownership)
+  const resourceGuard = parseExecutionResourceGuard(row.resource_guard)
+  if (['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable'].includes(errorCode ?? '')
+    && !resourceGuard?.failure) throw new Error(`agent-interface log row ${index} lacks its execution guard failure`)
+  if (resourceGuard && (source !== 'poise:behavior-chain' || resourceOwnership?.version !== 2
+    || resourceGuard.failure && (errorCode !== resourceGuard.failure.code || error !== resourceGuard.failure.message))) {
+    throw new Error(`agent-interface log row ${index} has contradictory execution guard evidence`)
+  }
   if (resourceOwnership?.version === 2 && (resourceOwnership.namespace?.callId !== row.id
     || resourceOwnership.namespace?.correlation !== correlationId)) {
     throw new Error(`agent-interface log row ${index} has resource ownership from another invocation`)
@@ -339,6 +348,7 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     ...(artifact === null ? {} : { artifact: artifact as Record<string, unknown> }),
     ...(resourcesSettledAt === null ? {} : { resources_settled_at: resourcesSettledAt }),
     ...(resourceOwnership === null ? {} : { resource_ownership: resourceOwnership }),
+    ...(resourceGuard === null ? {} : { resource_guard: resourceGuard }),
     ...(row.issue_revision === null || row.issue_revision === undefined ? {} : { issue_revision: optionalString('issue_revision') }),
     runner: runner as LogEntry['runner'],
   }

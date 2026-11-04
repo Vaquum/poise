@@ -64,6 +64,12 @@ beforeEach(async () => {
   vi.stubEnv('AGENT_INTERFACE_WORK_DIR', join(home, 'agent-work'))
   vi.stubEnv('GITHUB_INTERFACE_MIRROR_DIR', join(home, 'mirrors'))
   vi.stubEnv('AGENT_INTERFACE_DATA_DIR', join(home, 'caller'))
+  vi.stubEnv('POISE_LOCK_DIR', join(home, '.poise', 'locks'))
+  vi.stubEnv('CODEX_HOME', join(home, '.codex'))
+  vi.stubEnv('CLAUDE_CONFIG_DIR', join(home, '.claude'))
+  vi.stubEnv('GROK_HOME', join(home, '.grok'))
+  vi.stubEnv('XDG_CONFIG_HOME', join(home, '.config'))
+  vi.stubEnv('XDG_DATA_HOME', join(home, '.local', 'share'))
   vi.resetModules()
   maintenance = await import('../server/storage-maintenance')
   database = await import('../server/db')
@@ -549,6 +555,29 @@ describe('disk pressure', () => {
 })
 
 describe('storage breakdown', () => {
+  it('measures and explicitly retains shared checkout coordination and provider state', async () => {
+    const shared = [
+      ['lease-metadata', join(home, '.poise', 'locks')],
+      ['codex-state', join(home, '.codex')],
+      ['claude-state', join(home, '.claude')],
+      ['grok-state', join(home, '.grok')],
+      ['muse-data', join(home, '.local', 'share', 'muse')],
+      ['muse-config', join(home, '.config', 'muse')],
+    ]
+    for (const [, path] of shared) {
+      await mkdir(path, { recursive: true })
+      await writeFile(join(path, 'shared-auth-history-and-coordination'), 'keep'.repeat(1024))
+      await ageTree(path, 365 * 24 * 60 * 60_000)
+    }
+    const report = await maintenance.runStorageMaintenance({ home, chatRoot, stateRoot })
+    const measured = await maintenance.storageBreakdown(home, chatRoot, stateRoot)
+    for (const [key, path] of shared) {
+      expect(report.removed.some(item => item.path === path)).toBe(false)
+      expect(await readFile(join(path, 'shared-auth-history-and-coordination'), 'utf8')).toBe('keep'.repeat(1024))
+      expect(measured.categories.find(category => category.key === key)).toMatchObject({ bytes: expect.any(Number), status: 'ok' })
+      expect(measured.categories.find(category => category.key === key)?.bytes).toBeGreaterThanOrEqual(4096)
+    }
+  })
   it('measures and retains unregistered native roots without granting cleanup authority', async () => {
     const native = join(home, 'caller', 'native-resources', 'a'.repeat(32))
     await mkdir(native, { recursive: true })
@@ -586,7 +615,7 @@ describe('storage breakdown', () => {
 describe('bounded storage reads', () => {
   it('measures missing directories as zero and completes', async () => {
     const breakdown = await maintenance.storageBreakdown(home, chatRoot, stateRoot)
-    expect(breakdown.categories).toHaveLength(9)
+    expect(breakdown.categories).toHaveLength(15)
     for (const category of breakdown.categories) {
       expect(category).toMatchObject({ status: 'ok', bytes: 0 })
     }

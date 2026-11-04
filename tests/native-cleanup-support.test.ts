@@ -11,6 +11,26 @@ beforeEach(() => {
 })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs() })
 
+it('refuses bounded execution on an older otherwise namespace-capable runtime image', async () => {
+  mocks.runFile.mockResolvedValue({ stdout: JSON.stringify({ version: 1, supported: true }) })
+  const support = await import('../server/native-cleanup-support')
+  await support.requireNativeCleanup()
+  vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '100')
+  vi.stubEnv('POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES', '60')
+  expect(support.nativeCleanupSupport()).toMatchObject({ status: 'unsupported', error: expect.stringContaining('resource-guard support') })
+  await expect(support.requireNativeCleanup()).rejects.toThrow('resource-guard support')
+})
+
+it('accepts explicitly supported bounded execution using the same capability check', async () => {
+  vi.stubEnv('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', '100')
+  vi.stubEnv('POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES', '60')
+  mocks.runFile.mockResolvedValue({ stdout: JSON.stringify({ version: 1, supported: true, resourceGuard: 1 }) })
+  const support = await import('../server/native-cleanup-support')
+  await support.requireNativeCleanup()
+  expect(support.nativeCleanupSupport().status).toBe('supported')
+  expect(mocks.runFile).toHaveBeenCalledTimes(1)
+})
+
 it('keeps unsupported setups on v1 without starting a capability process', async () => {
   vi.stubEnv('POISE_NATIVE_CONTROL', '')
   const support = await import('../server/native-cleanup-support')

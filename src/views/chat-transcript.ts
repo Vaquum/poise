@@ -574,6 +574,9 @@ export interface RenderContext {
   interruptedTurnId?: string
   /** Whether the session is running a turn right now (drives the dots). */
   running: boolean
+  /** The agent is actively working, as opposed to waiting on the person or a
+   *  slot (drives the dots' pulse; defaults to `running`). */
+  working?: boolean
   /** The rendered session; question drafts are kept per session. */
   sessionId?: string
   /** Render a finished turn's last text message as edit cards when it parses
@@ -1177,7 +1180,10 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
     // Dots under the running turn, which is always the last one: at the
     // bottom of the transcript for the whole turn, including long tool runs.
+    // They pulse only while the agent is actually working — waiting on the
+    // person or a slot holds them still, so motion never claims progress.
     const dots = isLast && ctx.running && !turn.finished
+    const live = dots && (ctx.working ?? true)
     let dotsEl = el.querySelector<HTMLElement>(':scope > .chat-turn-dots')
     if (dots && !dotsEl) {
       dotsEl = document.createElement('div')
@@ -1185,6 +1191,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
       dotsEl.innerHTML = '<div class="chat-thinking"><span></span><span></span><span></span></div>'
       el.insertBefore(dotsEl, foot)
     } else if (!dots && dotsEl) dotsEl.remove()
+    dotsEl?.firstElementChild?.classList.toggle('is-live', live)
 
     const footHtml = footerHtml(turn, ctx, clock, final)
     if (foot.dataset.html !== footHtml) { foot.innerHTML = footHtml; foot.dataset.html = footHtml }

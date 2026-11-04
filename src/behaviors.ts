@@ -58,6 +58,11 @@ export type BehaviorSetting = 'p0' | 'p1' | 'p2' | 'p3' | 'p4'
 export type ReviewerCount = 1 | 2 | 3
 export interface LastTriggered { at: string; target: string; url?: string }
 export interface BehaviorDiagnostics {
+  chainCapacity?: {
+    status: 'available' | 'unavailable'
+    mode: 'v1' | 'draining' | 'v2' | null
+    intake: { seedMode: 'all' | 'label', label: string | null } | null
+  }
   status: 'ok' | 'degraded' | 'unknown'
   runtimeError?: string | null
   agentLogsError: string | null

@@ -13,7 +13,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 import agent_interface
-from agent_interface import checkout_lock, fix_failing_ci, review_budget, review_watch
+from agent_interface import checkout_lock, fix_failing_ci, resource_ownership, review_budget, review_watch
 from agent_interface.checkout_lock import Lease, LeaseLost, LockBusy, WorkerOrphaned, pgid_alive, pid_alive
 from agent_interface.model_catalog import CATALOG
 
@@ -97,8 +97,9 @@ class LockCase(TestCase):
     def test_native_lease_publishes_only_outer_ids_and_requires_positive_idle_proof(self):
         native = SimpleNamespace(key={"callId": "a" * 32}, binding={"owner": {"pid": 104, "start": "10"}, "pid": 106},
                                  require_idle=Mock())
+        hold = self.lease()
         with patch.object(checkout_lock.native_namespace, "active", return_value=native):
-            hold = self.lease().acquire()
+            hold.acquire()
             hold.register_worker(3, 3, "inner-gate")
             row, = self.rows()
             self.assertEqual((row["host_pid"], row["host_start"], row["worker_pid"], row["worker_pgid"], row["native_call"]),
@@ -111,8 +112,9 @@ class LockCase(TestCase):
     def test_native_uncertainty_retains_lease_and_legacy_never_expires_or_removes_it(self):
         native = SimpleNamespace(key={"callId": "a" * 32}, binding={"owner": {"pid": 104, "start": "10"}, "pid": 106},
                                  require_idle=Mock(side_effect=RuntimeError("original witness unavailable")))
+        hold = self.lease()
         with patch.object(checkout_lock.native_namespace, "active", return_value=native):
-            hold = self.lease().acquire()
+            hold.acquire()
             with self.assertRaisesRegex(WorkerOrphaned, "original witness unavailable"):
                 hold.release()
         before, = self.rows()
@@ -130,12 +132,53 @@ class LockCase(TestCase):
 
     def test_native_contender_never_probes_foreign_outer_identifiers_from_its_inner_view(self):
         legacy = self.lease("legacy").acquire()
+        contender = self.lease("native")
         native = SimpleNamespace(key={"callId": "a" * 32}, binding={"owner": {"pid": 104, "start": "10"}, "pid": 106})
         with patch.object(checkout_lock.native_namespace, "active", return_value=native), \
                 patch.object(checkout_lock, "pid_alive", side_effect=AssertionError("inner view probed foreign outer PID")):
             with self.assertRaisesRegex(LockBusy, "retains another invocation"):
-                self.lease("native").acquire(timeout=0)
+                contender.acquire(timeout=0)
         self.assertTrue(legacy.release())
+
+    def test_native_disposable_checkout_keeps_coordination_in_its_owned_root(self):
+        call = "b" * 32
+        database = Path(self.work.name, "data", "calls.sqlite3")
+        root = resource_ownership.call_directory(database, call)
+        checkout = root / "repo"
+        checkout.mkdir(parents=True)
+        root.chmod(0o700)
+        node = root.stat()
+        proof = {"path": str(root), "state": "allocated", "unlinked": False,
+                 "device": str(node.st_dev), "inode": str(node.st_ino)}
+        native = SimpleNamespace(key={"callId": call}, resource=Mock(return_value=proof))
+        with patch.object(checkout_lock.native_namespace, "active", return_value=native), \
+                patch.object(resource_ownership, "binding", return_value=(database, call)):
+            hold = Lease(str(checkout), call, "native component")
+        self.assertEqual(hold.path, root / "checkout-lease.sqlite3")
+        self.assertFalse(Path(self.lockdir).exists())
+
+    def test_legacy_caller_refuses_a_native_disposable_checkout(self):
+        checkout = Path(self.work.name, "data", "native-resources", "a" * 32, "repo")
+        checkout.mkdir(parents=True)
+        with patch.object(checkout_lock.native_namespace, "active", return_value=None), \
+                patch.object(resource_ownership, "binding", return_value=None):
+            with self.assertRaisesRegex(LockBusy, "private to its original native invocation"):
+                Lease(str(checkout), "unrelated", "legacy component").acquire(timeout=0)
+        self.assertFalse(Path(self.lockdir).exists())
+
+    def test_native_coordination_missing_binding_cannot_create_a_global_gate(self):
+        with patch.object(checkout_lock.native_namespace, "active", return_value=SimpleNamespace()), \
+                patch.object(resource_ownership, "binding", return_value=None):
+            with self.assertRaisesRegex(LockBusy, "lacks its original Call binding"):
+                self.lease()
+        self.assertFalse(Path(self.lockdir).exists())
+
+    def test_unrelated_native_named_directory_keeps_the_ordinary_shared_gate(self):
+        checkout = Path(self.work.name, "user", "native-resources", "a" * 32, "repo")
+        checkout.mkdir(parents=True)
+        hold = Lease(str(checkout), "ordinary", "user checkout").acquire(timeout=0)
+        self.assertEqual(hold.path, checkout_lock.lock_path(str(checkout)))
+        self.assertTrue(hold.release())
 
     def meta(self) -> tuple[int, int, int, str]:
         pid, pgid, ppid, control = Path(self.log + ".meta").read_text().split()

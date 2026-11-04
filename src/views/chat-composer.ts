@@ -38,6 +38,8 @@ export interface ComposerState {
   maintaining?: boolean
   /** Nothing can be sent; `placeholder` says why. */
   disabled: boolean
+  /** Keep typing available while a new session is being created; sending stays disabled. */
+  allowDraft?: boolean
   placeholder?: string
   /** Draft model choice, shown before a session is created. */
   modelLabel?: string
@@ -623,7 +625,7 @@ export function createComposer(handlers: ComposerHandlers, options?: { idPrefix?
   })
 
   function applyState(): void {
-    input.disabled = state.disabled && !state.resume
+    input.disabled = state.disabled && !state.resume && !state.allowDraft
     attachBtn.disabled = state.disabled || uploading > 0
     const chain = parseChatCommandChain(commandDraftText(rawDraft()))
     const creating = chain.create === true

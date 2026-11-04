@@ -1077,8 +1077,14 @@ test('creates a session from the dialog with a pending entry before the server a
   // Pending entry, selected, before the POST resolves.
   await expect(page.locator('.chat-session-item.pending')).toHaveCount(1)
   await expect(page.locator('.chat-session-item.pending')).toHaveClass(/active/)
-  await expect(input(page)).toBeDisabled()
+  await expect(input(page)).toBeEnabled()
   await expect(input(page)).toHaveAttribute('placeholder', 'Starting the session…')
+  const pendingDraft = 'Draft while the session starts'
+  await input(page).fill(pendingDraft)
+  await expect(page.locator('.chat-send')).toBeDisabled()
+  await input(page).press('Enter')
+  expect(sock.framesOf('prompt')).toHaveLength(0)
+  expect(sock.framesOf('steer')).toHaveLength(0)
   release()
   await expect(page.locator('.chat-session-item.pending')).toHaveCount(0)
   await expect(page.locator('.chat-session-item')).toHaveCount(1)
@@ -1092,6 +1098,58 @@ test('creates a session from the dialog with a pending entry before the server a
   sock.push('new-1', { type: 'session.updated', session: { ...state.sessions[0], status: 'idle' } })
   await expect(page.locator('.chat-h-status')).toHaveText('idle')
   await expect(input(page)).toBeEnabled()
+  await expect(input(page)).toHaveValue(pendingDraft)
+  await input(page).press('Enter')
+  await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
+  expect(sock.framesOf('prompt')[0].command).toMatchObject({ sessionId: 'new-1', text: pendingDraft })
+})
+
+test('deleting a pending creation removes the session that arrives late', async ({ page }) => {
+  const state = makeState([], {})
+  let release: () => void = () => {}
+  state.createDelay = () => new Promise<void>((r) => { release = r })
+  await installRoutes(page, state)
+  await installSocket(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: 'New session' }).click()
+  const dialog = page.getByRole('dialog', { name: 'New session' })
+  await dialog.getByRole('button', { name: 'Create' }).click()
+  // Delete the placeholder while the POST is held.
+  const row = page.locator('.chat-session-item.pending')
+  await expect(row).toHaveCount(1)
+  await row.hover()
+  await row.locator('.chat-session-delete').click()
+  await expect(row.locator('.chat-session-delete')).toHaveText('Sure?')
+  await row.locator('.chat-session-delete').click()
+  await expect(page.locator('.chat-session-item')).toHaveCount(0)
+  release()
+  // The late arrival is deleted server-side and never surfaces; the dialog
+  // stays closed because the deletion was the person's own doing.
+  await expect.poll(() => state.calls.filter((c) => c.method === 'DELETE').map((c) => c.path)).toEqual(['/api/chat/sessions/new-1'])
+  await expect(page.locator('.chat-session-item')).toHaveCount(0)
+  await expect(page.getByRole('dialog', { name: 'New session' })).toHaveCount(0)
+})
+
+test('reports failed deletion of a late creation and keeps the real session visible', async ({ page }) => {
+  const state = makeState([], {})
+  state.deleteErrors = { 'new-1': { status: 500, json: { error: 'Removal unavailable' } } }
+  let release: () => void = () => {}
+  state.createDelay = () => new Promise<void>((resolve) => { release = resolve })
+  await installRoutes(page, state)
+  await installSocket(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: 'New session' }).click()
+  await page.getByRole('dialog', { name: 'New session' }).getByRole('button', { name: 'Create' }).click()
+  const pending = page.locator('.chat-session-item.pending')
+  await expect(pending).toHaveCount(1)
+  await pending.hover()
+  await pending.locator('.chat-session-delete').click()
+  await pending.locator('.chat-session-delete').click()
+  await expect(page.locator('.chat-session-item')).toHaveCount(0)
+  release()
+  await expect(page.locator('.chat-session-item:not(.pending)')).toHaveCount(1)
+  await expect(page.locator('.chat-notice')).toContainText('Removal unavailable')
+  await expect(page.getByRole('dialog', { name: 'New session' })).toHaveCount(0)
 })
 
 test('offers an explicit fallback choice when the default provider is not signed in, and shows create errors', async ({ page }) => {
@@ -1391,7 +1449,9 @@ test('starts a fresh console with the saved Chat default on first send, exactly 
   await input(page).press('Enter')
   await expect(page.locator('.chat-session-item.pending')).toHaveCount(1)
   await expect(page.locator('.chat-msg-user')).toHaveText('First line\nSecond line')
-  await expect(input(page)).toBeDisabled()
+  await expect(input(page)).toBeEnabled()
+  await input(page).fill('Next draft while creation is pending')
+  await expect(page.locator('.chat-send')).toBeDisabled()
   await page.locator('.chat-v-composer').dispatchEvent('submit')
   expect(sock.framesOf('prompt')).toHaveLength(0)
   expect(state.calls.filter(c => c.method === 'POST' && c.path === '/api/chat/sessions')).toHaveLength(1)
@@ -1401,6 +1461,7 @@ test('starts a fresh console with the saved Chat default on first send, exactly 
   await expect.poll(() => sock.framesOf('prompt').length).toBe(1)
   expect(sock.framesOf('prompt')[0].command).toMatchObject({ sessionId: 'new-1', text: 'First line\nSecond line', attachments: [], mentions: [] })
   await expect(page.locator('.chat-msg-user')).toHaveCount(1)
+  await expect(input(page)).toHaveValue('Next draft while creation is pending')
   await expect(page.getByRole('dialog', { name: 'New session' })).toBeHidden()
 })
 

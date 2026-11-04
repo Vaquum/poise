@@ -17,6 +17,10 @@ const MAX_DRAIN_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 
 /** The repository Poise's releases come from, unless POISE_RELEASE_REPO names a fork's. */
 export const DEFAULT_RELEASE_REPO = 'autonomio/poise'
+export const BEHAVIOR_RESOURCE_VARIABLES = [
+  'POISE_BEHAVIOR_MEMORY_BUDGET_BYTES', 'POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES',
+  'POISE_BEHAVIOR_DISK_BUDGET_BYTES', 'POISE_BEHAVIOR_DISK_RESERVATION_BYTES',
+] as const
 
 const REPO_NAME = /^[A-Za-z0-9_.-]+$/
 
@@ -45,6 +49,8 @@ export interface Config {
   workspaceDiskBudgetBytes: number
   workspaceNanoCpus: number
   workspacePids: number
+  /** Explicit native behavior budgets/reservations, forwarded to each workspace. */
+  behaviorResourceEnv: string[]
   workspaceRuntime: string | null
   /**
    * Resolvers every workspace uses instead of Docker's embedded DNS (POISE_WORKSPACE_DNS), which gVisor
@@ -222,6 +228,23 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     return parsed
   }
   const workspacePids = wholeNumber('POISE_WORKSPACE_PIDS', 4096)
+  const behaviorResourceEnv: string[] = []
+  for (const name of BEHAVIOR_RESOURCE_VARIABLES) {
+    const value = read(name)
+    if (value === undefined) continue
+    const bytes = /^\d+$/.test(value) ? Number(value) : Number.NaN
+    const minimum = name.endsWith('BUDGET_BYTES') ? 1 : 0
+    if (!Number.isSafeInteger(bytes) || bytes < minimum) {
+      problems.push(`${name} must be a whole byte count from ${minimum} to ${Number.MAX_SAFE_INTEGER}; got "${value}"`)
+    } else behaviorResourceEnv.push(`${name}=${bytes}`)
+  }
+  for (const dimension of ['MEMORY', 'DISK']) {
+    const budget = `POISE_BEHAVIOR_${dimension}_BUDGET_BYTES`
+    const reservation = `POISE_BEHAVIOR_${dimension}_RESERVATION_BYTES`
+    if (read(budget) !== undefined && !(Number(read(reservation)) > 0)) {
+      problems.push(`${budget} requires a positive ${reservation}`)
+    }
+  }
   const budgetValue = read('POISE_WORKSPACE_DISK_BUDGET') ?? '50g'
   const budgetMatch = /^(\d+(?:\.\d+)?)([bkmg]?)$/i.exec(budgetValue)
   const workspaceDiskBudgetBytes = budgetMatch ? Math.floor(Number(budgetMatch[1]) * SIZE_UNITS[budgetMatch[2].toLowerCase()]) : -1
@@ -290,6 +313,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     workspaceDiskBudgetBytes,
     workspaceNanoCpus: Math.round(cpus * 1e9),
     workspacePids,
+    behaviorResourceEnv,
     workspaceRuntime,
     workspaceDns,
     workspaceSkipCliBootstrap: skipBootstrapValue === '1',

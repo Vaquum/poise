@@ -388,6 +388,7 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     if (destroyed) return
     transcript.render(model, {
       running: !!record && isRunning(record.status),
+      working: !!record && record.status !== 'waiting' && record.status !== 'queued',
       sessionId: record?.id,
       ...(subject.surface === 'current' ? {} : { edits: { surface: subject.surface, readOnly: false, deciding: editState.deciding, applied: editState.applied, revision: editState.revision } }),
     })

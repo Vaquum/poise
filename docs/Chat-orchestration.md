@@ -277,7 +277,10 @@ The charter rides on every Manager turn, up to 64 KiB of input each time,
 and its `;manager` trigger also expands wherever Espanso runs, including
 desktops Poise Link feeds — so it must hold no secrets. Any local caller can
 read it. Only requests that speak for the person can change it or Memories:
-a browser `Origin`, and in service mode the gateway's assertion. That closes
+a browser `Origin`, and in service mode the gateway's assertion. Native
+attempts to add either built-in charter return 403 even if its default was
+restored before the write; a duplicate does not mask the permission refusal.
+That closes
 the documented agent paths, not every path — a same-user process can forge
 an `Origin` header or edit `poise.yml` directly, the Manager's own agent
 included. Every new revision still writes a `chat.manager.charter.changed`

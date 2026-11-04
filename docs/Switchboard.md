@@ -112,6 +112,14 @@ one of the two closes the other, and Escape closes the one that is open.
   45 minutes old is shown as quiet. A row opens to the chat's last five updates
   and **Open chat**.
 
+Every decision card and update has **Dismiss**. It hides that one item from
+the pane — a dismissed decision leaves **Needs you** and the amber count —
+and tells the source chat nothing: the question is still waiting, to be
+answered in its chat. A chat whose latest update was dismissed falls back to
+its next remaining update. If the chat asks again (a new source event), the
+new question surfaces; the dismissal covers only what was shown. There is no
+undo; retention prunes dismissed items like any other non-open item.
+
 While the pane is hidden, an amber count on its button shows how many decisions
 are waiting, and a red **!** shows that the Switchboard stopped.
 
@@ -128,7 +136,7 @@ offers **Try again**, which asks anew.
 Only your browser acts in the pane: every action is a request that carries the
 page's Origin (in service mode, with the gateway's assertion). A chat calling
 Poise's APIs through its control command sends none and is refused, so no chat
-can answer, start or stop anything here. A local process could forge the
+can answer, dismiss, start or stop anything here. A local process could forge the
 header; this keeps cooperating agents out, it is not a security boundary.
 
 Poise, not the Switchboard, delivers your answer: once, to the chat that
@@ -209,11 +217,12 @@ analytical source trackers have no counterpart.
 
 - **Browser:** `GET /api/chat/switchboard` returns the pane's state. `POST`
   `/start`, `/off`, `/check` (`{ queued, reason?, state }`), `/pause`
-  (`{ "paused": true | false }`), `/restart`, `/items/<id>/explain` and
-  `/items/<id>/answer` (`{ "optionId": "o1" }` or `{ "text": "…" }`) act;
-  without an Origin they are refused with 403. While Poise drains for an
-  update, Start is refused with 503 like any new chat. Every change is announced on
-  `/ws/chat` as `{ "kind": "switchboard.updated", "revision": n }`.
+  (`{ "paused": true | false }`), `/restart`, `/items/<id>/explain`,
+  `/items/<id>/answer` (`{ "optionId": "o1" }` or `{ "text": "…" }`) and
+  `/items/<id>/dismiss` act; without an Origin they are refused with 403.
+  While Poise drains for an update, Start is refused with 503 like any new
+  chat. Every change is announced on `/ws/chat` as
+  `{ "kind": "switchboard.updated", "revision": n }`.
 - **The Switchboard chat:** the native control command's `switchboard.read`,
   `switchboard.items`, `switchboard.post`, `switchboard.resolve`,
   `switchboard.explain` and `switchboard.checked`. See
@@ -221,7 +230,10 @@ analytical source trackers have no counterpart.
 - **Storage:** `chat_switchboard`, `chat_switchboard_cursors`,
   `chat_switchboard_checks` and `chat_switchboard_items` in the workspace
   database. Open decisions are always kept; other updates are pruned to the
-  newest 2,000, and finished checks to the newest 50.
+  newest 2,000, and finished checks to the newest 50. A dismissal stamps
+  `dismissed_at` on the row — separate from the answer and settlement
+  columns, so a hidden question is never reported as answered or settled —
+  and the row keeps deduplicating its source event until retention prunes it.
 
 A Switchboard check that finishes raises no "finished after N minutes"
 [notification](Notifications.md); one that ends early does, as for any chat.

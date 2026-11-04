@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -24,7 +25,7 @@ from threading import Event, Thread, current_thread, main_thread
 from time import monotonic, sleep, time
 from uuid import uuid4
 
-from . import native_namespace
+from . import native_namespace, resource_ownership
 from .provider_progress import ProviderStream
 from .review_watch import RateLimitAbort
 
@@ -84,6 +85,15 @@ def canonical(checkout: str) -> str:
 def lock_path(checkout: str) -> Path:
     key = hashlib.sha256(canonical(checkout).encode("utf-8")).hexdigest()[:32]
     return lock_dir() / f"checkout-{key}.sqlite3"
+
+
+def native_checkout(checkout: str) -> bool:
+    for parent in (Path(checkout), *Path(checkout).parents):
+        if re.fullmatch(r"[0-9a-f]{32}(?:-preparation)?", parent.name) and parent.parent.name == "native-resources":
+            data = Path(os.getenv("AGENT_INTERFACE_DATA_DIR") or Path(__file__).resolve().parent.parent / "data").resolve()
+            if parent.parent.parent.resolve() == data:
+                return True
+    return False
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -248,12 +258,85 @@ class Lease:
         self.branch = branch
         self.token = uuid4().hex
         self.instance = f"caller:{os.getpid()}"
-        self.path = lock_path(checkout)
+        self._native_scope = native_namespace.active()
+        self._native_root: Path | None = None
+        self._gate_identity: tuple[int, int] | None = None
+        private_checkout = native_checkout(self.checkout)
+        bound = resource_ownership.binding() if self._native_scope is not None or private_checkout else None
+        if self._native_scope is not None:
+            if bound is None:
+                raise LockBusy("native checkout coordination lacks its original Call binding")
+            database, call_id = bound
+            root = resource_ownership.call_directory(database, call_id)
+            if self._native_scope.key["callId"] != call_id or self.checkout != canonical(str(root / "repo")):
+                raise LockBusy("checkout is private to its original native invocation")
+            self._native_root = root
+            self.path = root / "checkout-lease.sqlite3"
+            fd = self._open_native_root()
+            os.close(fd)
+        else:
+            if private_checkout and bound is None:
+                raise LockBusy("checkout is private to its original native invocation")
+            self.path = lock_path(checkout)
         self.held = False
         self.retained: str | None = None
         self.lost = Event()
         self._stop = Event()
         self._thread: Thread | None = None
+
+    def _open_native_root(self) -> int:
+        proof = self._native_scope.resource("read-root", self._native_root)
+        if proof.get("path") != str(self._native_root) or proof.get("state") != "allocated" or proof.get("unlinked") is not False:
+            raise LeaseLost("native checkout coordination lacks its original directory")
+        fd = os.open(self._native_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            node = os.fstat(fd)
+            if node.st_uid != os.getuid() or node.st_mode & 0o077:
+                raise LeaseLost("native checkout coordination directory is not private and owned")
+            if (str(node.st_dev), str(node.st_ino)) != (proof["device"], proof["inode"]) \
+                    or self._native_scope.resource("read-root", self._native_root) != proof:
+                raise LeaseLost("native checkout coordination directory was replaced")
+            if self._gate_identity is not None:
+                gate = os.stat("checkout-lease.sqlite3", dir_fd=fd, follow_symlinks=False)
+                if not stat.S_ISREG(gate.st_mode) or (gate.st_dev, gate.st_ino) != self._gate_identity:
+                    raise LeaseLost("native checkout coordination database was replaced")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @contextmanager
+    def _connection(self):
+        fd, gate_fd, conn = None, None, None
+        try:
+            if self._native_root is not None:
+                fd = self._open_native_root()
+                # The original namespace can verify the named directory but
+                # cannot borrow its outer supervisor's procfs descriptor.
+                # This local duplicate keeps SQLite and its journal anchored.
+                path = Path(f"/proc/self/fd/{fd}/checkout-lease.sqlite3")
+                gate_fd = os.open("checkout-lease.sqlite3", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+                gate = os.fstat(gate_fd)
+                if not stat.S_ISREG(gate.st_mode) or gate.st_uid != os.getuid() or gate.st_nlink != 1:
+                    raise LeaseLost("native checkout coordination database is not private and owned")
+                if self._gate_identity is not None and (gate.st_dev, gate.st_ino) != self._gate_identity:
+                    raise LeaseLost("native checkout coordination database was replaced before opening")
+                self._gate_identity = (gate.st_dev, gate.st_ino)
+            else:
+                path = self.path
+            conn = connect(path)
+            yield conn
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                try:
+                    if gate_fd is not None:
+                        os.close(gate_fd)
+                finally:
+                    if fd is not None:
+                        os.close(fd)
 
     def acquire(self, timeout: float = ACQUIRE_WAIT_SECONDS, abort: Event | None = None) -> "Lease":
         """Wait up to `timeout` for the checkout; `abort` ends the wait early
@@ -267,8 +350,7 @@ class Lease:
             self.lost = Event()
             self._stop = Event()
         deadline = monotonic() + timeout
-        conn = connect(self.path)
-        try:
+        with self._connection() as conn:
             while True:
                 state, row = try_acquire(conn, self.checkout, self.token, self.owner_kind, self.owner_id,
                                          self.owner_label, self.instance, self.branch)
@@ -287,8 +369,6 @@ class Lease:
                     sleep(POLL_SECONDS)
                 elif abort.wait(POLL_SECONDS):
                     raise LockBusy(f"checkout {self.checkout} is in use by {holder}; aborted")
-        finally:
-            conn.close()
 
     def _own(self, conn: sqlite3.Connection, sql: str, params: tuple) -> None:
         """Renew/register only our token. Zero rows means another writer holds
@@ -297,6 +377,14 @@ class Lease:
         (or retained) never touches the row again."""
         if not self.held:
             raise LeaseLost(f"checkout lease for {self.checkout} is no longer held")
+        if self._native_root is not None:
+            try:
+                fd = self._open_native_root()
+                os.close(fd)
+            except (OSError, RuntimeError) as error:
+                self.held = False
+                self.lost.set()
+                raise LeaseLost(f"native checkout coordination could not be verified: {error}") from error
         try:
             conn.execute("begin immediate")
             try:
@@ -316,41 +404,32 @@ class Lease:
         native = native_namespace.active()
         if native:
             pid, pgid, ident = native.binding["pid"], None, f"native:{native.key['callId']}"
-        conn = connect(self.path)
-        try:
+        with self._connection() as conn:
             self._own(conn, "update lease set worker_pid = ?, worker_pgid = ?, worker_ident = ?, heartbeat_at = ?, lease_until = ? where id = 1 and token = ?",
                       (pid, pgid, ident, stamp(), now_ms() + LEASE_MS))
-        finally:
-            conn.close()
 
     def heartbeat(self, conn: sqlite3.Connection | None = None) -> None:
-        own = conn is None
-        conn = conn or connect(self.path)
-        try:
+        if conn is None:
+            with self._connection() as connection:
+                self.heartbeat(connection)
+        else:
             self._own(conn, "update lease set heartbeat_at = ?, lease_until = ? where id = 1 and token = ?",
                       (stamp(), now_ms() + LEASE_MS))
-        finally:
-            if own:
-                conn.close()
 
     def start_heartbeat(self) -> None:
         def beat():
             try:
-                conn = connect(self.path)
-            except sqlite3.Error as error:
+                with self._connection() as conn:
+                    while not self._stop.wait(HEARTBEAT_MS / 1000):
+                        try:
+                            self.heartbeat(conn)
+                        except LeaseLost as error:
+                            print(f"checkout lease heartbeat: {error}", file=sys.stderr)
+                            return
+            except (sqlite3.Error, OSError, RuntimeError) as error:
                 print(f"checkout lease heartbeat cannot open {self.path}: {error}", file=sys.stderr)
                 self.held = False
                 self.lost.set()
-                return
-            try:
-                while not self._stop.wait(HEARTBEAT_MS / 1000):
-                    try:
-                        self.heartbeat(conn)
-                    except LeaseLost as error:
-                        print(f"checkout lease heartbeat: {error}", file=sys.stderr)
-                        return
-            finally:
-                conn.close()
         self._thread = Thread(target=beat, name="checkout-lease-heartbeat", daemon=True)
         self._thread.start()
 
@@ -358,6 +437,11 @@ class Lease:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=BUSY_TIMEOUT_SECONDS + 1)
+            if self._thread.is_alive():
+                self.retained = "checkout coordination heartbeat did not stop; lease retained"
+                self.held = False
+                self.lost.set()
+                raise WorkerOrphaned(self.retained)
             self._thread = None
 
     def release(self) -> bool:
@@ -372,16 +456,13 @@ class Lease:
             except (OSError, RuntimeError, TimeoutError) as error:
                 self.retain(f"native checkout settlement is unverified: {error}")
                 raise WorkerOrphaned(self.retained) from error
-        conn = connect(self.path)
-        try:
+        with self._connection() as conn:
             conn.execute("begin immediate")
             try:
                 changed = conn.execute("delete from lease where id = 1 and token = ? and native_call is ?",
                                        (self.token, native.key["callId"] if native else None)).rowcount
             finally:
                 conn.execute("commit")
-        finally:
-            conn.close()
         self.held = False
         return changed == 1
 

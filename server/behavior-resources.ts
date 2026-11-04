@@ -50,6 +50,64 @@ export function readBehaviorResourceAdmission(env: NodeJS.ProcessEnv = process.e
   return { budget, reservation }
 }
 
+/** Captured in the immutable request, never reconstructed from a later env. */
+export interface BehaviorExecutionLimits { version: 1, memoryBytes: number | null, diskBytes: number | null }
+
+export function executionLimits(resources: BehaviorResourceAdmission): BehaviorExecutionLimits {
+  return { version: 1, memoryBytes: resources.budget.memoryBytes === null ? null : resources.reservation.memoryBytes,
+    diskBytes: resources.budget.diskBytes === null ? null : resources.reservation.diskBytes }
+}
+
+export function validateExecutionLimits(value: BehaviorExecutionLimits, reservation: BehaviorResourceReservation | null | undefined): void {
+  if (value.version !== 1 || Object.keys(value).some(key => !['version', 'memoryBytes', 'diskBytes'].includes(key))
+    || !reservation || value.memoryBytes === null && value.diskBytes === null
+    || (['memoryBytes', 'diskBytes'] as const).some(key => value[key] !== null
+      && (!Number.isSafeInteger(value[key]) || Number(value[key]) <= 0 || value[key] !== reservation[key]))) {
+    throw new Error('behavior execution limits differ from the original resource reservation')
+  }
+}
+
+export interface ExecutionResourceGuard {
+  version: 1
+  limits: BehaviorExecutionLimits
+  state: 'starting' | 'measured' | 'stopped'
+  memoryModel: string
+  peakMemoryBytes: number
+  peakDiskBytes: number
+  samples: number
+  partialSamples: number
+  lastCompleteAt: number | null
+  longestUnavailableSeconds: number
+  failure: null | { code: string, dimension: string, ceiling: number | null, observed: number | null,
+    observedAt: number, observedMonotonic: number, message: string, signalMonotonic?: number, noWrite?: boolean }
+}
+
+export function parseExecutionResourceGuard(value: unknown): ExecutionResourceGuard | null {
+  if (value == null) return null // Historical admissions are unenforced.
+  if (typeof value !== 'object' || Array.isArray(value) || Buffer.byteLength(JSON.stringify(value)) > 8192) throw new Error('invalid native execution guard')
+  const row = value as ExecutionResourceGuard
+  if (row.version !== 1 || !row.limits || Object.keys(row).sort().join() !==
+    ['version', 'limits', 'state', 'memoryModel', 'peakMemoryBytes', 'peakDiskBytes', 'samples', 'partialSamples', 'lastCompleteAt', 'longestUnavailableSeconds', 'failure'].sort().join()
+    || !['starting', 'measured', 'stopped'].includes(row.state) || !['unmeasured', 'pss', 'rss', 'pss+rss'].includes(row.memoryModel)
+    || [row.peakMemoryBytes, row.peakDiskBytes, row.samples, row.partialSamples].some(n => !Number.isSafeInteger(n) || n < 0)
+    || row.lastCompleteAt !== null && (!Number.isFinite(row.lastCompleteAt) || row.lastCompleteAt <= 0)
+    || !Number.isFinite(row.longestUnavailableSeconds) || row.longestUnavailableSeconds < 0
+    || (row.state === 'stopped') !== (row.failure !== null)) throw new Error('invalid native execution guard')
+  validateExecutionLimits(row.limits, { memoryBytes: row.limits.memoryBytes ?? 0, diskBytes: row.limits.diskBytes ?? 0 })
+  const failure = row.failure
+  if (failure && (Object.keys(failure).filter(key => !['signalMonotonic', 'noWrite'].includes(key)).sort().join() !== ['code', 'dimension', 'ceiling', 'observed', 'observedAt', 'observedMonotonic', 'message'].sort().join()
+    || !['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable'].includes(failure.code)
+    || typeof failure.message !== 'string' || !failure.message || failure.message.length > 2000
+    || !Number.isFinite(failure.observedAt) || failure.observedAt <= 0 || !Number.isFinite(failure.observedMonotonic) || failure.observedMonotonic < 0
+    || failure.signalMonotonic !== undefined && (!Number.isFinite(failure.signalMonotonic) || failure.signalMonotonic < failure.observedMonotonic)
+    || failure.noWrite !== undefined && typeof failure.noWrite !== 'boolean'
+    || (failure.code === 'resource_measurement_unavailable'
+      ? failure.dimension !== 'coverage' || failure.ceiling !== null || failure.observed !== null
+      : !['memoryBytes', 'diskBytes'].includes(failure.dimension) || failure.ceiling !== row.limits[failure.dimension as 'memoryBytes' | 'diskBytes']
+        || !Number.isSafeInteger(failure.observed) || Number(failure.observed) <= Number(failure.ceiling)))) throw new Error('invalid native execution guard failure')
+  return row
+}
+
 /** Remaining memory under this process's cgroup v2 limit, or unbounded when
  *  no limit is set or no cgroup files exist (developer machines). Behaviors
  *  run inside the memory-limited workspace container, where os.freemem()
@@ -65,8 +123,8 @@ function cgroupAllowance(read: (name: string) => string | null): number {
   } catch (error) {
     throw new Error(`behavior resource measurement unavailable: cgroup memory read failed: ${error instanceof Error ? error.message : String(error)}`)
   }
-  const max = Number(maxRaw.trim())
-  const current = Number((currentRaw ?? '').trim())
+  const max = maxRaw.trim() ? Number(maxRaw.trim()) : Number.NaN
+  const current = currentRaw?.trim() ? Number(currentRaw.trim()) : Number.NaN
   if (!Number.isSafeInteger(max) || max < 0 || !Number.isSafeInteger(current) || current < 0) {
     throw new Error('behavior resource measurement unavailable: cgroup memory read is invalid')
   }

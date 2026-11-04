@@ -175,9 +175,18 @@ def work_publication(head: str, *, start_replies: bool = False) -> None:
             ownership = json.loads(row[3]) if row[3] else None
             if row[1] == "running" and ownership and ownership.get("version") == 2:
                 scope = native_namespace.active()
-                if scope is None or scope.key["callId"] != call_id:
+                if scope is None:
+                    # github-interface is an executed child, so it cannot
+                    # inherit Caller's in-memory scope. Verify its original
+                    # kernel boundary and that only this helper remains.
+                    scope = resource_ownership.original_scope(Path(database), call_id, ownership)
+                    if os.getpid() <= 2 or os.getppid() != 2 or os.readlink("/proc/self/ns/pid") != scope.binding["namespace"] \
+                            or set(scope.read()["pids"]) != {1, 2, os.getpid()}:
+                        raise RuntimeError("planned replies lack their original idle native helper")
+                elif scope.key["callId"] != call_id:
                     raise RuntimeError("planned replies lack their original active native ownership")
-                scope.require_idle()
+                else:
+                    scope.require_idle()
             if row[1] not in {"running", "failed"} or (row[1] == "failed" and not resource_ownership.publication_released(row[2], row[3], artifact)) \
                     or (row[1] == "running" and (not resource_ownership.healthy(ownership)
                                                 or artifact.get("resource_error"))) \

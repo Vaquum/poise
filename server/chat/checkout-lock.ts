@@ -25,8 +25,9 @@ import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { ownProcessStartTime, pgidAlive, pidAlive, processStartTime } from './worker'
+import { agentInterfaceRoot } from '../../scripts/caller.mjs'
 
 export const LEASE_MS = 90_000
 export const HEARTBEAT_MS = 20_000
@@ -47,6 +48,21 @@ export function checkoutLockKey(canonical: string): string {
 }
 
 export function checkoutLockPath(canonical: string): string {
+  // Disposable native checkouts have an invocation-private gate, reclaimed
+  // with their original root. Chat/legacy writers must never open another
+  // global gate on that same checkout. This is a refusal, not ownership proof.
+  for (let parent = canonical; parent !== dirname(parent); parent = dirname(parent)) {
+    if (/^[0-9a-f]{32}(?:-preparation)?$/.test(basename(parent)) && basename(dirname(parent)) === 'native-resources') {
+      const data = process.env.AGENT_INTERFACE_DATA_DIR || join(agentInterfaceRoot(), 'data')
+      try {
+        if (realpathSync(dirname(dirname(parent))) === realpathSync(data)) {
+          throw new Error('checkout is private to its original native invocation')
+        }
+      } catch (error) {
+        if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error
+      }
+    }
+  }
   return join(lockDirectory(), `checkout-${checkoutLockKey(canonical)}.sqlite3`)
 }
 

@@ -628,6 +628,16 @@ export class Switchboard implements SwitchboardControl {
     return this.state()
   }
 
+  /** Hide one item from the pane. The source chat is told nothing: a
+   *  dismissed decision is still waiting, to be answered in its chat. */
+  dismiss(id: number): SwitchboardState {
+    const row = store.item(this.instance, id)
+    if (!row) throw new HttpError(404, 'unknown item')
+    if (row.dismissed_at) return this.state()
+    this.mutate(() => store.dismissItem(this.instance, id, this.now()))
+    return this.state()
+  }
+
   answer(id: number, body: unknown): SwitchboardState {
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'an answer needs optionId or text')
     const input = body as Record<string, unknown>
@@ -747,10 +757,11 @@ export class Switchboard implements SwitchboardControl {
         if (typeof body?.paused !== 'boolean') throw new HttpError(400, 'paused must be a boolean')
         return json(res, 200, this.setPaused(body.paused))
       }
-      const match = /^\/api\/chat\/switchboard\/items\/([1-9][0-9]{0,15})\/(explain|answer)$/.exec(path)
+      const match = /^\/api\/chat\/switchboard\/items\/([1-9][0-9]{0,15})\/(explain|answer|dismiss)$/.exec(path)
       if (match) {
         const id = Number(match[1])
         if (match[2] === 'explain') return json(res, 200, this.explain(id))
+        if (match[2] === 'dismiss') return json(res, 200, this.dismiss(id))
         return json(res, 200, this.answer(id, await readJson(req)))
       }
       return json(res, 404, { error: 'Switchboard route not found' })

@@ -307,6 +307,17 @@ export interface StorageBreakdownOptions {
   now?: () => number
 }
 
+function retainedStateDirs(home: string): Array<{ key: string, label: string, path: string }> {
+  return [
+    { key: 'lease-metadata', label: 'Shared checkout coordination (retained)', path: process.env.POISE_LOCK_DIR || join(home, '.poise', 'locks') },
+    { key: 'codex-state', label: 'Shared Codex state (retained)', path: process.env.CODEX_HOME || join(home, '.codex') },
+    { key: 'claude-state', label: 'Shared Claude state (retained)', path: process.env.CLAUDE_CONFIG_DIR || join(home, '.claude') },
+    { key: 'grok-state', label: 'Shared Grok state (retained)', path: process.env.GROK_HOME || join(home, '.grok') },
+    { key: 'muse-data', label: 'Shared Muse history (retained)', path: join(process.env.XDG_DATA_HOME || join(home, '.local', 'share'), 'muse') },
+    { key: 'muse-config', label: 'Shared Muse configuration (retained)', path: join(process.env.XDG_CONFIG_HOME || join(home, '.config'), 'muse') },
+  ]
+}
+
 /** The workspace storage breakdown: the managed categories plus disk totals.
  *  The categories share one entry budget and one deadline, so one large tree
  *  cannot hold the read past its bound; categories past it report partial or
@@ -329,6 +340,7 @@ export async function storageBreakdown(
     { key: 'agent-work', label: 'Issue-review work dirs', path: caches.agentWork },
     { key: 'native-resources', label: 'Native behavior resources', path: join(process.env.AGENT_INTERFACE_DATA_DIR || join(agentInterfaceCwd(), 'data'), 'native-resources') },
     { key: 'mirrors', label: 'GitHub mirrors', path: caches.mirrors },
+    ...retainedStateDirs(home),
   ].map(async (category) => {
     const dir = await measureDir(category.path, { budget, deadlineMs, now: clock })
     return { ...category, bytes: dir.bytes, status: dir.status, error: dir.error }

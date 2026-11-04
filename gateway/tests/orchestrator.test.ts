@@ -9,6 +9,12 @@ import { IDLE_TO_READY_MS, MAX_SERVICE_ANSWER_BYTES } from '../src/orchestrator.
 
 const ALICE = workspaceHost('alice')
 const NAVIGATE = { 'sec-fetch-mode': 'navigate', accept: 'text/html' }
+const BEHAVIOR_LIMITS = {
+  POISE_BEHAVIOR_MEMORY_BUDGET_BYTES: '6442450944',
+  POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES: '2147483648',
+  POISE_BEHAVIOR_DISK_BUDGET_BYTES: '1610612736',
+  POISE_BEHAVIOR_DISK_RESERVATION_BYTES: '536870912',
+}
 
 function dockerCalls(h: Harness): string[] {
   return h.docker.calls.map((call) => `${call.method} ${call.path.split('?')[0]}`)
@@ -71,6 +77,30 @@ describe('lazy start', () => {
   }
   afterEach(async () => {
     await h.close()
+  })
+
+  it('passes the configured native behavior budgets into the actual container specification', async () => {
+    const cookie = await start({ env: BEHAVIOR_LIMITS })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(containerEnv(h, 'alice')).toEqual(expect.arrayContaining(
+      Object.entries(BEHAVIOR_LIMITS).map(([key, value]) => `${key}=${value}`)))
+  })
+
+  it.each(['added', 'changed', 'removed'])('recreates a stopped workspace when native behavior budgets are %s', async change => {
+    const desired = change === 'removed' ? {} : BEHAVIOR_LIMITS
+    const cookie = await start({ env: desired })
+    const previous = change === 'added' ? [] : Object.entries(BEHAVIOR_LIMITS)
+      .map(([key, value]) => `${key}=${change === 'changed' && key === 'POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES' ? '1073741824' : value}`)
+    addWorkspaceContainer(h, 'alice', CURRENT_IMAGE_ID, false, {
+      env: [`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`, ...previous],
+    })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(h.logs.find(entry => entry.event === 'workspace.container.removed'))
+      .toMatchObject({ handle: 'alice', reason: 'changed native behavior resource budgets' })
+    const actual = containerEnv(h, 'alice').filter(value => value.startsWith('POISE_BEHAVIOR_'))
+    expect(actual.sort()).toEqual(Object.entries(desired).map(([key, value]) => `${key}=${value}`).sort())
   })
 
   it('creates the workspace on first request behind a starting page, then proxies to it', async () => {
@@ -482,6 +512,73 @@ describe('image upgrades', () => {
     expect(h.logs.find((entry) => entry.event === 'workspace.drain.timeout')).toMatchObject({ handle: 'alice', timeoutSeconds: 1 })
   })
 
+  it.each([
+    { pending: 1, background: 1, calls: 0 }, { pending: null, background: 1, calls: 0 },
+    { pending: undefined, background: 1, calls: 0 }, { pending: 0, background: 1, calls: 0 },
+    { pending: 0, background: 0, calls: 1 },
+  ])('preserves the original container while native work or cleanup is pending: %j', async ({ pending, background, calls }) => {
+    await start({ env: { POISE_DRAIN_TIMEOUT: '1' } })
+    const before = h.docker.containers.get('poise-ws-alice')?.id
+    h.workspace.health.backgroundWork = background
+    h.workspace.health.runningCallerCalls = calls
+    h.workspace.health.unsettledNativeCalls = pending
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(before)
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(dockerCalls(h)).not.toContain('DELETE /containers/poise-ws-alice')
+    expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
+    expect(h.workspace.health.draining).toBe(false)
+    // The same upgrade proceeds once the original owner confirms release and retires its claim.
+    h.workspace.health.unsettledNativeCalls = 0
+    h.workspace.health.backgroundWork = 0
+    h.workspace.health.runningCallerCalls = 0
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')?.id).not.toBe(before)
+  })
+
+  it('keeps original native cleanup intact while applying behavior budget changes', async () => {
+    await start({ env: { ...BEHAVIOR_LIMITS, POISE_DRAIN_TIMEOUT: '1' } })
+    h.docker.containers.get('poise-ws-alice')!.imageId = CURRENT_IMAGE_ID
+    const before = h.docker.containers.get('poise-ws-alice')?.id
+    h.workspace.health.unsettledNativeCalls = 1
+    h.workspace.health.backgroundWork = 1
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(before)
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(h.logs.find(entry => entry.event === 'workspace.upgrade.native-pending' && entry.handle === 'alice')).toBeDefined()
+    expect(h.workspace.health.draining).toBe(false)
+    h.workspace.health.unsettledNativeCalls = 0
+    h.workspace.health.backgroundWork = 0
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')?.id).not.toBe(before)
+    expect(containerEnv(h, 'alice')).toEqual(expect.arrayContaining(
+      Object.entries(BEHAVIOR_LIMITS).map(([key, value]) => `${key}=${value}`)))
+  })
+
+  it('keeps cooperative idle upgrades compatible with older health answers', async () => {
+    await start()
+    delete h.workspace.health.unsettledNativeCalls
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it.each([1, null])('promptly releases repeated drains for held native cleanup (%s), keeping Chat available', async (pending) => {
+    await start({ env: { POISE_DRAIN_TIMEOUT: '7200' } })
+    const before = h.docker.containers.get('poise-ws-alice')?.id
+    h.workspace.health.unsettledNativeCalls = pending
+    h.workspace.health.backgroundWork = 1
+    h.workspace.health.activeChatTurns = 1
+    for (let pass = 0; pass < 3; pass += 1) {
+      await h.orchestrator.upgradePass()
+      expect(h.workspace.health.draining).toBe(false)
+      expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(before)
+    }
+    expect(h.docker.tasks).toHaveLength(0)
+    expect(events(h.logs, 'workspace.drain.timeout')).toHaveLength(0)
+    expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/drain')).toHaveLength(3)
+    expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/resume')).toHaveLength(3)
+  }, 5000)
+
   it('notices a drain lifted while it waits instead of silently draining again', async () => {
     await start({ drainRenewMs: 200 })
     h.workspace.health.runningCallerCalls = 1
@@ -768,7 +865,7 @@ describe('updates in place', () => {
   const BASE = 'base-1'
   const start = async (options: { oldBase?: string | null; running?: boolean; release?: string | null } = {}) => {
     const { oldBase = BASE, running = true, release = 'old-release' } = options
-    // A workspace that does not answer is drained until this timeout, then recreated.
+    // A workspace that does not answer cannot prove native cleanup clear at this timeout.
     h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1' } })
     await h.openWorkspace('Alice')
     h.store.noteWorkspace('alice', 'Alice')
@@ -889,6 +986,21 @@ describe('updates in place', () => {
     h.workspace.drainApplies = true
     await h.orchestrator.upgradePass()
     expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
+  it('rechecks native cleanup after activation instead of forcing on an earlier idle answer', async () => {
+    await start({ oldBase: 'base-0' })
+    const before = containerId()
+    h.docker.onTask = () => {
+      h.workspace.health.unsettledNativeCalls = 1
+      h.workspace.health.backgroundWork = 1
+      h.advance(2000)
+      h.docker.onTask = undefined
+    }
+    await h.orchestrator.upgradePass()
+    expect(containerId()).toBe(before)
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
   })
 
   it('aborts when refused answers follow a recheck that lost admission, instead of cutting on stale state', async () => {
@@ -1054,7 +1166,7 @@ describe('updates in place', () => {
     expect(typeof stuck[0].elapsedMs).toBe('number')
   })
 
-  it('waits for a workspace restarting onto the release it was asked for, and recreates one that stays unreachable', async () => {
+  it('defers replacement of an unreachable switching workspace without native cleanup proof', async () => {
     await start()
     const before = containerId()
     await h.orchestrator.upgradePass()
@@ -1064,7 +1176,9 @@ describe('updates in place', () => {
     expect(containerId()).toBe(before)
     h.advance(11 * 60_000)
     await h.orchestrator.upgradePass()
-    expect(containerId()).not.toBe(before)
+    expect(containerId()).toBe(before)
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
     expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
 
@@ -1098,7 +1212,7 @@ describe('updates in place', () => {
     expect(containerId()).toBe(before)
   })
 
-  it('recreates a workspace never asked that stays unreachable past the grace', async () => {
+  it('defers replacement of an unreachable workspace never asked to switch', async () => {
     await start()
     const before = containerId()
     h.workspace.reachable = false
@@ -1106,7 +1220,9 @@ describe('updates in place', () => {
     expect(containerId()).toBe(before)
     h.advance(11 * 60_000)
     await h.orchestrator.upgradePass()
-    expect(containerId()).not.toBe(before)
+    expect(containerId()).toBe(before)
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+    expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
     expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
 
@@ -1124,7 +1240,8 @@ describe('updates in place', () => {
     expect(h.workspace.serviceRequests.some((request) => request.url === '/api/service/drain')).toBe(false)
     h.advance(11 * 60_000)
     await h.orchestrator.upgradePass()
-    expect(containerId()).not.toBe(before)
+    expect(containerId()).toBe(before)
+    expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
     expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
 

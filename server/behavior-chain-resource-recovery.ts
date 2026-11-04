@@ -3,6 +3,7 @@ import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChainJournal } from './behavior-chain-store'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { nativeBehavior } from './behavior-chain-runtime'
+import { nativeRequestSha } from './behavior-chain-action'
 
 /** Reads only the existing Caller receipts. Cleanup can release reservations
  * while admission is paused; it never claims a GitHub outcome or starts work. */
@@ -42,7 +43,7 @@ export class BehaviorResourceRecovery {
         if (invocation.model === null && (call.model !== 'native-action'
           || call.pr_id !== invocation.request.argv[1]?.replace(/^#/, '')
           || call.expected_head !== invocation.request.argv[invocation.request.argv.indexOf('--expected-head') + 1]
-          || call.artifact?.request_sha && call.artifact.request_sha !== chainBasis(invocation.request))) {
+          || call.artifact?.request_sha && call.artifact.request_sha !== nativeRequestSha(invocation.request))) {
           throw new Error('native action resource receipt differs from its immutable request')
         }
         const physical: Record<string, unknown> = { resource_ownership: call.resource_ownership, resources_settled_at: call.resources_settled_at }
@@ -62,7 +63,8 @@ export class BehaviorResourceRecovery {
             if (continuation.source !== 'poise:behavior-chain' || continuation.actor !== invocation.actor || continuation.repo !== chain.repository
               || continuation.behavior !== 'native_publication' || !('head' in resume) || continuation.expected_head !== resume.head
               || !('callId' in resume) || !('plan' in resume)
-              || continuation.artifact?.request_sha !== chainBasis({ kind: 'native_publication', call_id: resume.callId, digest: resume.plan, head: resume.head })) {
+              || continuation.artifact?.request_sha !== nativeRequestSha({ kind: 'native_publication', call_id: resume.callId, digest: resume.plan, head: resume.head,
+                ...(invocation.request.resourceLimits ? { resourceLimits: invocation.request.resourceLimits } : {}) })) {
               throw new Error('native publication resource receipt differs from its original continuation')
             }
             const prior = invocation.evidence?.publicationReceipt

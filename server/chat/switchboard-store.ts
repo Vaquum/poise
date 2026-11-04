@@ -26,6 +26,7 @@ db.exec(`
     source_title TEXT NOT NULL, source_agent TEXT NOT NULL, source_model TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     answer TEXT, answered_at INTEGER, resolved_reason TEXT, resolved_at INTEGER,
+    dismissed_at INTEGER,
     explain_state TEXT NOT NULL DEFAULT 'none', explain_attempt INTEGER NOT NULL DEFAULT 0,
     explain_requested_at INTEGER, explanation TEXT, explained_at INTEGER, explain_error TEXT,
     UNIQUE(instance, source, source_seq, kind)
@@ -33,13 +34,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS chat_switchboard_items_source ON chat_switchboard_items(instance, source, id);
 `)
 
+// The person's dismissal of an item in the pane: hidden there, told nothing
+// to the source chat, and no longer an open decision. Rows written before
+// this slice read NULL, which is not dismissed.
+try {
+  db.transaction(() => {
+    const cols = db.prepare('PRAGMA table_info(chat_switchboard_items)').all() as Array<{ name: string }>
+    if (!cols.some((c) => c.name === 'dismissed_at')) db.exec('ALTER TABLE chat_switchboard_items ADD COLUMN dismissed_at INTEGER')
+  }).immediate()
+} catch (error) {
+  // A concurrent process added the column first; anything else stops startup.
+  if (!(error instanceof Error) || !error.message.includes('duplicate column name')) throw error
+}
+
 /** Items kept besides open decisions, newest first. */
 export const RETAINED_ITEMS = 2_000
 /** Transcript events that are news; streaming chunks of them count once, status churn never. */
 const MEANINGFUL = ['turn.started', 'turn.finished', 'text.delta', 'tool.started', 'tool.finished', 'diff', 'plan.updated',
   'question.asked', 'question.answered', 'permission.requested', 'permission.resolved', 'steer.sent', 'error', 'session.closed']
 const MEANINGFUL_SQL = MEANINGFUL.map(type => `'${type}'`).join(', ')
-const OPEN_DECISION = `kind = 'decision' AND answer IS NULL AND resolved_at IS NULL`
+const OPEN_DECISION = `kind = 'decision' AND answer IS NULL AND resolved_at IS NULL AND dismissed_at IS NULL`
 
 export interface Board {
   instance: string, session: string | null, created_at: number | null,
@@ -151,7 +165,7 @@ export function lastCommitted(instance: string): { at: number, tokens: number | 
 export interface ItemRow {
   id: number, instance: string, source: string, source_seq: number, kind: string, text: string, detail: string | null, options: string | null,
   source_title: string, source_agent: string, source_model: string, created_at: number,
-  answer: string | null, answered_at: number | null, resolved_reason: string | null, resolved_at: number | null,
+  answer: string | null, answered_at: number | null, resolved_reason: string | null, resolved_at: number | null, dismissed_at: number | null,
   explain_state: 'none' | 'pending' | 'ready' | 'failed', explain_attempt: number, explain_requested_at: number | null,
   explanation: string | null, explained_at: number | null, explain_error: string | null,
 }
@@ -182,10 +196,12 @@ export function openDecisions(instance: string, source?: string): number {
 export function item(instance: string, id: number): ItemRow | undefined {
   return db.prepare('SELECT * FROM chat_switchboard_items WHERE instance = ? AND id = ?').get(instance, id) as ItemRow | undefined
 }
-/** Every open decision, and each chat's newest `perChat` items, newest first. */
+/** Every open decision, and each chat's newest `perChat` items, newest first.
+ *  Dismissed items are hidden from the pane; their rows stay for
+ *  source-event deduplication until retention prunes them. */
 export function items(instance: string, perChat = 5): ItemRow[] {
   return db.prepare(`SELECT * FROM (
-      SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY id DESC) AS position FROM chat_switchboard_items WHERE instance = ?
+      SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY id DESC) AS position FROM chat_switchboard_items WHERE instance = ? AND dismissed_at IS NULL
     ) WHERE position <= ? OR (${OPEN_DECISION}) ORDER BY id DESC`).all(instance, perChat) as ItemRow[]
 }
 export function sourceItems(instance: string, source: string, limit = 10): ItemRow[] {
@@ -198,6 +214,12 @@ export function setAnswer(instance: string, id: number, answer: unknown, now: nu
 export function resolveItem(instance: string, id: number, reason: string, now: number): boolean {
   return db.prepare(`UPDATE chat_switchboard_items SET resolved_reason = ?, resolved_at = ? WHERE instance = ? AND id = ? AND ${OPEN_DECISION}`)
     .run(reason, now, instance, id).changes === 1
+}
+/** Hide one item from the pane, whatever its state: a dismissal is the
+ *  person's own triage, not an answer and not a settlement. */
+export function dismissItem(instance: string, id: number, now: number): boolean {
+  return db.prepare('UPDATE chat_switchboard_items SET dismissed_at = ? WHERE instance = ? AND id = ? AND dismissed_at IS NULL')
+    .run(now, instance, id).changes === 1
 }
 export function requestExplanation(instance: string, id: number, attempt: number, now: number): void {
   db.prepare(`UPDATE chat_switchboard_items SET explain_state = 'pending', explain_attempt = ?, explain_requested_at = ?, explain_error = NULL

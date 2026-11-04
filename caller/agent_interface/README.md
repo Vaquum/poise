@@ -50,8 +50,9 @@ register the original private namespace with the existing workspace supervisor
 before preparation or a helper/provider starts. Only the original retained
 kernel view can certify process settlement before normal pinned disk cleanup.
 The [service contract](../../docs/Service-architecture.md#workspace-behavior-observation)
-defines support, teardown and uncertainty; automatic post-loss disk/lease
-reclamation and complete resource acceptance remain pending under #806.
+defines support, teardown and uncertainty. Same-supervisor claimed disk recovery
+uses the maintenance path below; forced-container lifecycle proof and complete
+resource acceptance remain pending under #806.
 
 Cleanup recovery uses the existing maintenance/runtime triggers and the same
 original Call. Its private `resource_cleanup` column records a bounded cleanup
@@ -154,6 +155,16 @@ the agent starts — waiting up to five minutes, then failing and naming the
 holder (`checkout … is in use by chat "…" on … (Poise dev)`) — and heartbeats
 it every 20 seconds while the agent runs. If the heartbeat finds the row taken
 over, the agent is stopped and the call fails.
+
+Native implementation/repair checkouts are private to their original Call.
+Their same lease/gate protocol uses `checkout-lease.sqlite3` inside the owned
+Call root, checked against the original supervisor's pinned directory identity.
+Connections and heartbeat writers verify that identity; SQLite and its journals
+use a local directory descriptor. Other application writers refuse these paths.
+The original normal or claimed cleanup reclaims the gate together with the root,
+while older global metadata stays retained. See the shared
+[lease contract](../../docs/Chat-v1.md#sessions-and-working-context) and
+[retention policy](../../docs/Operating.md#storage-maintenance).
 
 The agent never runs unregistered: `lease_gate.py` is started first as the
 leader of a new process group, its pid, group and a random `--lease-worker`
@@ -404,7 +415,9 @@ findings on current lines stay on current-head lines, while a defect caused
 by a removal is commented on the removed line and validated against the full
 pull request diff before the single submission. An unfetchable last head, or
 a base that moved since the last review, widens the round to the full diff
-instead. Any finding without a verified position fails the review before
+instead. Both full and follow-up reviews validate every inline location against
+the retained PR diff before invoking the GitHub submission command. Any finding
+without a verified position fails the review before
 submission, including a capped round's follow-up issue and approval.
 Removed lines are mapped by their content within the current-head span of their
 change block; ambiguous matches fail visibly. Reaffirmed unresolved findings

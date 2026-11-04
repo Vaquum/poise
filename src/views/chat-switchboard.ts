@@ -301,6 +301,7 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
     return `<div class="sb-actions">
       <button type="button" class="sb-action" data-act="explain" data-id="${item.id}" aria-expanded="${shown}" aria-controls="sb-expl-${where}-${item.id}"${unavailable ? ' disabled title="The Switchboard is not running"' : ''}>${ICON_EXPLAIN}${shown ? 'Hide explanation' : 'Explain'}</button>
       ${where === 'card' ? `<button type="button" class="sb-action" data-act="open" data-src="${escapeHtml(item.source.sessionId)}"${item.source.exists ? '' : ' disabled title="This chat was deleted"'}>${ICON_OPEN}Open chat</button>` : ''}
+      <button type="button" class="sb-action" data-act="dismiss" data-dismiss-id="${item.id}" title="Hide this update. The chat is told nothing.">${ICON_CLOSE}Dismiss</button>
     </div>`
   }
   function explanation(item: SwitchboardItem, where: 'card' | 'line'): string {
@@ -509,6 +510,15 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
         return
       }
       case 'explain-again': void act(`explain:${id}`, () => chatClient.explainSwitchboardItem(id)); return
+      case 'dismiss': {
+        // data-id would share the Explain button's patch identity and unmount
+        // it on the next render; the dismiss target carries its own attribute.
+        const dismissed = Number(target.dataset.dismissId)
+        explaining.delete(dismissed)
+        answering.delete(dismissed)
+        void act(`dismiss:${dismissed}`, () => chatClient.dismissSwitchboardItem(dismissed))
+        return
+      }
     }
   })
   inner.addEventListener('input', event => {

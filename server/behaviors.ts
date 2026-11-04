@@ -1,7 +1,7 @@
 import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
-import { behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
+import { behaviorChainForPull, behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
 import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type BehaviorResourceReservation } from './behavior-resources'
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
@@ -2640,7 +2640,7 @@ async function listEligiblePrs(behavior: SkippableBehavior, author: string): Pro
 
 function chainOwnsPr(pr: DatastorePr): boolean {
   if (behaviorChainOwnsRepository(pr.repo) && (!pr.headRef || !pr.headRepo)) throw new Error(`PR ${pr.repo}#${pr.number} lacks complete branch ownership evidence while behavior chains own work in its repository`)
-  return behaviorChainOwner(pr.repo, pr.number, 'pull', pr) !== null
+  return behaviorChainForPull(pr.repo, pr.number, pr) !== null
 }
 
 // Read just before a launch: a skip saved, or your account changed, while the

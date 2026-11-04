@@ -211,6 +211,14 @@ Current keeps an issue draft open while its write is pending and closes it
 after confirmation. A failed write retains the draft for an explicit retry.
 A later refresh failure does not reopen the draft or report the confirmed
 write as failed.
+The issue composer's label button reads the selected repository's labels.
+Filtering keeps selections that are out of view; changing repositories clears them.
+The create result names any selected labels GitHub did not apply.
+An issue card's Edit control loads its current GitHub title and body into the
+same composer. Save checks the loaded text again before writing and preserves
+the draft on a conflict or failed confirmation. Retrying a lost confirmation
+reads back an already accepted edit instead of writing it again. Confirmed edits
+remain visible while the local GitHub cache catches up.
 Archive paints its page before the full-history total is available, showing
 an available-row count until that read finishes.
 
