@@ -133,8 +133,11 @@ describe.skipIf(!enabled)('workspaces on a real Docker Engine', () => {
   /** A new gateway process, which knows nothing yet about the networks its container is on. */
   const gatewayProcess = (settings: Record<string, string> = {}): Orchestrator => {
     const config = loadConfig({ ...SETTINGS, POISE_GATEWAY_DATA: dir, ...settings })
+    const engine = new DockerClient(config.dockerSocket)
+    const inventory = engine.listManagedContainers.bind(engine)
+    engine.listManagedContainers = async () => (await inventory()).filter((container) => container.Labels['poise.workspace'] === 'ci')
     return new Orchestrator({
-      config, docker: new DockerClient(config.dockerSocket), store, keys, log, now: Date.now,
+      config, docker: engine, store, keys, log, now: Date.now,
       upstream: () => ({ host: gatewayAddress, port: 8080 }), drainPollMs: 100,
     })
   }
