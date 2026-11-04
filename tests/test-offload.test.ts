@@ -375,7 +375,12 @@ describe('on a test instance, a command for the whole suite', () => {
     expect(pytest(repo, [], since).seen?.args).toEqual(['tests/test_new.py', 'tests/test_other.py'])
   })
 
-  it('answers at once when no test touches it', () => {
+  it('counts a changed package by those who mention it', () => {
+    const { repo, since } = changed({ ...FILES, 'billing/__init__.py': 'x = 1\n', 'tests/test_billing.py': 'import billing\n' }, { 'billing/__init__.py': 'x = 2\n' })
+    expect(pytest(repo, [], since).seen?.args).toEqual(['tests/test_billing.py'])
+  })
+
+  it('answers at once when only prose changed', () => {
     const { repo, since } = changed(FILES, { 'README.md': 'y\n' })
     const { status, stderr, seen } = pytest(repo, ['-q'], since)
     expect(status).toBe(0)
@@ -383,14 +388,25 @@ describe('on a test instance, a command for the whole suite', () => {
     expect(stderr).toContain('no test touches this change')
   })
 
-  it('stays whole when the change can touch anything', () => {
-    const { repo, since } = changed(FILES, { 'conftest.py': 'x = 1\n' })
-    expect(pytest(repo, ['-q'], since).seen?.args).toEqual(['-q'])
+  it('stays whole when the change can touch anything, or names nothing it can place', () => {
+    for (const later of [{ 'conftest.py': 'x = 1\n' }, { '__init__.py': 'x = 1\n' }, { 'data/rates.json': '{}\n' }, { 'src/nothing_mentions_me.py': 'x = 1\n' }]) {
+      const { repo, since } = changed(FILES, later)
+      expect(pytest(repo, ['-q'], since).seen?.args).toEqual(['-q'])
+    }
   })
 
-  it('stays as asked when the command names its tests, or no change can be placed', () => {
+  it('stays whole, and never answers with a pass, when git cannot say what changed', () => {
+    const { repo } = changed(FILES, { 'README.md': 'y\n' })
+    const { status, seen } = pytest(repo, ['-q'], '0000000000000000000000000000000000000000')
+    expect(status).toBe(0)
+    expect(seen?.args).toEqual(['-q'])
+  })
+
+  it('stays as asked when the command names its tests by path or by name, or no change can be placed', () => {
     const { repo, since } = changed(FILES, { 'src/pricing.py': 'x = 2\n' })
     expect(pytest(repo, ['tests/test_other.py'], since).seen?.args).toEqual(['tests/test_other.py'])
+    expect(pytest(repo, ['-k', 'other'], since).seen?.args).toEqual(['-k', 'other'])
+    expect(pytest(repo, ['-kother'], since).seen?.args).toEqual(['-kother'])
     expect(pytest(repo, ['-q'], null).seen?.args).toEqual(['-q'])
   })
 
@@ -410,6 +426,8 @@ describe('on a test instance, a command for the whole suite', () => {
     expect(vitestFlags(['run', '--reporter', 'dot'], 'abc')).toEqual(whole)
     expect(vitestFlags(['run', 'tests/x.test.ts'], 'abc')).toEqual(['--maxWorkers=1'])
     expect(vitestFlags(['run', '--changed=other'], 'abc')).toEqual(['--maxWorkers=1'])
+    expect(vitestFlags(['run', '-t', 'checkout'], 'abc')).toEqual(['--maxWorkers=1'])
+    expect(vitestFlags(['run', '--testNamePattern=checkout'], 'abc')).toEqual(['--maxWorkers=1'])
     expect(vitestFlags(['run', '--maxWorkers=2', 'tests/x.test.ts'], 'abc')).toEqual([])
     expect(vitestFlags(['run'])).toEqual(['--maxWorkers=1'])
   })
@@ -604,8 +622,9 @@ describe('a suite on a test instance', () => {
     // Render splits this at spaces and mangles quotes.
     expect(job.startCommand).toMatch(/^timeout -k 10 3660 node -e \S+ \S+\/instance [0-9a-f]{32} [0-9a-f]{64}$/)
     expect(job.startCommand).not.toMatch(/['"]/)
-    await until(() => job.status === 'succeeded', 'the instance process to end')
-    expect(job.child?.exitCode).toBe(0)
+    // It exits by itself, unless the sweep gets there first: a job nothing wants any more gets cancelled.
+    await until(() => job.status !== 'running', 'the instance process to end')
+    expect(['succeeded', 'canceled']).toContain(job.status)
     expect(relay.runs.size).toBe(0)
   })
 

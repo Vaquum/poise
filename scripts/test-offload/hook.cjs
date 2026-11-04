@@ -14,7 +14,7 @@ const LOCAL_SCRIPTS = /^(pre|post)?(build|start|dev|preview|prepare|install)/
 const VITEST = /^(vitest|vitest\.mjs)$/
 const VITEST_COMMANDS = new Set(['run', 'watch', 'dev'])
 const VITEST_VALUE_FLAGS = new Set(['--config', '-c', '--root', '-r', '--dir', '--project', '--reporter', '--pool', '--shard',
-  '--outputFile', '--environment', '--mode', '-m', '--maxWorkers', '--minWorkers', '--testTimeout', '--testNamePattern', '-t'])
+  '--outputFile', '--environment', '--mode', '-m', '--maxWorkers', '--minWorkers', '--testTimeout'])
 
 // `npm test` and `npm run NAME` name a script; the flags in front of them can carry a value.
 function npmScript(args) {
@@ -41,7 +41,7 @@ function testCommand(script, args) {
 /** What a vitest command should add on a test instance: one worker always, and the change's tests for a whole suite. */
 function vitestFlags(args, since) {
   const flags = args.some((arg) => arg.startsWith('--maxWorkers')) ? [] : ['--maxWorkers=1']
-  let chosen = args.some((arg) => arg.startsWith('--changed'))
+  let chosen = args.some((arg) => /^(--changed|--testNamePattern|-t)/.test(arg))
   for (let index = 0; index < args.length; index += 1) {
     if (VITEST_VALUE_FLAGS.has(args[index])) index += 1
     else if (!args[index].startsWith('-') && !VITEST_COMMANDS.has(args[index])) chosen = true

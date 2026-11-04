@@ -14,9 +14,11 @@ PROBES = {"--version", "-V", "--help", "-h"}
 # The interpreter's flags whose value is the next argument.
 VALUE_FLAGS = {"-W", "-X"}
 # pytest's, for telling a path it was given from a flag's value.
-PYTEST_VALUE_FLAGS = {"-m", "-k", "-n", "-o", "-p", "-c", "-r", "-W", "--numprocesses", "--maxfail", "--rootdir", "--junitxml", "--durations", "--tb", "--cov", "--cov-report"}
+PYTEST_VALUE_FLAGS = {"-m", "-n", "-o", "-p", "-c", "-r", "-W", "--numprocesses", "--maxfail", "--rootdir", "--junitxml", "--durations", "--tb", "--cov", "--cov-report"}
 # A change to one of these can touch any test.
 SHARED_FILES = {"conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}
+# A change to only these touches none.
+PROSE = (".md", ".rst", ".txt")
 
 
 def split_command(args):
@@ -47,7 +49,7 @@ def names_tests(args):
         arg = args[index]
         if arg in PYTEST_VALUE_FLAGS:
             index += 1
-        elif not arg.startswith("-"):
+        elif not arg.startswith("-") or arg.startswith("-k"):
             return True
         index += 1
     return False
@@ -74,30 +76,42 @@ def one_worker(args):
 
 
 def touched_tests(since):
-    """The test files a change touches, by name and by who mentions the changed modules; None when it can touch any."""
+    """The test files a change touches, by name and by who mentions the changed modules; None when that cannot be told."""
     import re
     import subprocess
 
-    def git(*args):
+    def git(*args, nothing_found=0):
         result = subprocess.run(["git", *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if result.returncode not in (0, nothing_found):
+            raise OSError("git %s failed" % args[0])
         return [path for path in os.fsdecode(result.stdout).split("\0") if path]
 
-    changed = git("diff", "--name-only", "--relative", "-z", since) + git("ls-files", "-z", "--others", "--exclude-standard")
-    if any(os.path.basename(path) in SHARED_FILES for path in changed):
+    try:
+        changed = git("diff", "--name-only", "--relative", "-z", since) + git("ls-files", "-z", "--others", "--exclude-standard")
+        if any(os.path.basename(path) in SHARED_FILES for path in changed):
+            return None
+        tests = set()
+        modules = set()
+        for path in changed:
+            name = os.path.basename(path)
+            if name.startswith("test_") and name.endswith(".py") or name.endswith("_test.py"):
+                if os.path.exists(path):
+                    tests.add(path)
+            elif name == "__init__.py":
+                package = os.path.basename(os.path.dirname(path))
+                if not package:
+                    return None
+                modules.add(re.escape(package))
+            elif name.endswith(".py"):
+                modules.add(re.escape(name[:-3]))
+        if modules:
+            pattern = "|".join(sorted(modules))
+            tests.update(git("grep", "-z", "-l", "-w", "-E", pattern, "--", "*test_*.py", "*_test.py", nothing_found=1))
+    except OSError:
         return None
-    tests = set()
-    modules = set()
-    for path in changed:
-        name = os.path.basename(path)
-        if not name.endswith(".py"):
-            continue
-        if name.startswith("test_") or name.endswith("_test.py"):
-            if os.path.exists(path):
-                tests.add(path)
-        elif name != "__init__.py":
-            modules.add(re.escape(name[:-3]))
-    if modules:
-        tests.update(git("grep", "-z", "-l", "-w", "-E", "|".join(sorted(modules)), "--", "*test_*.py", "*_test.py"))
+    # Saying no test is touched is only safe when nothing but prose changed.
+    if not tests and not all(path.endswith(PROSE) for path in changed):
+        return None
     return sorted(tests)
 
 
