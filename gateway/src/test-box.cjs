@@ -19,7 +19,7 @@ const DOCKER_WAIT_MS = 30_000
 const HEAP_SHARE = 0.8
 
 function fail(why) {
-  process.stderr.write(`[poise] the test runner failed: ${why}. There is no test result, and this says nothing about your code. Do not retry: CI is the gate before merge.\n`, () => process.exit(RUNNER_FAILED))
+  process.stderr.write(`[poise] no test result: ${why}. This says nothing about your code. Skip local tests for this work: don't retry, and don't run parts of it. Push your change and let CI run the tests.\n`, () => process.exit(RUNNER_FAILED))
 }
 
 async function startDocker() {
@@ -102,7 +102,7 @@ function runSuite(spec, env) {
       child.once('close', () => { closed = true })
       while (!closed && Date.now() - lastOutput < QUIET_MS) await sleep(50)
       const status = code ?? 128 + (constants.signals[signal] ?? 0)
-      if (status !== 0 && (/^oom_kill [1-9]/m.test(tryRead('/proc/vmstat')) || OUT_OF_MEMORY.test(tail))) fail('this suite ran out of memory on its box')
+      if (status !== 0 && (/^oom_kill [1-9]/m.test(tryRead('/proc/vmstat')) || OUT_OF_MEMORY.test(tail))) fail('this suite is too big for its test box: it ran out of memory')
       else process.stdout.write('', () => process.stderr.write('', () => process.exit(status)))
     })()
   })

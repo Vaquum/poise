@@ -346,7 +346,7 @@ export class TestRelay {
     const { limitSeconds } = this.deps.config
     for (const run of this.runs.values()) {
       if (now - run.lease > leaseMs) this.kill(run, 'the workspace stopped answering')
-      else if (now - run.created > limitSeconds * 1000) this.kill(run, `the suite passed the ${limitSeconds} s time limit`, 124)
+      else if (now - run.created > limitSeconds * 1000) this.kill(run, `this suite is too big for its test box: it passed the ${limitSeconds} s time limit`, 124)
       else run.output?.write(frame(FRAME.heartbeat))
     }
     if (!withRender || !this.group) return

@@ -632,13 +632,14 @@ describe('a suite on a test box', () => {
     expect(stderr).toContain('cannot start /no/such/command')
   })
 
-  it('destroys the box of a suite that hangs when the time limit passes, and says this is no result', async () => {
+  it('destroys the box of a suite too slow for it at the time limit, and sends the agent to CI', async () => {
     await startAll({ limitSeconds: 2 })
     const started = Date.now()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'setInterval(() => {}, 1000)']).done
     expect(code).toBe(124)
-    expect(stderr).toContain('the test runner failed: the suite passed the 2 s time limit')
-    expect(stderr).toContain('says nothing about your code. Do not retry')
+    expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
+    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+    expect(stderr).toContain('let CI run the tests')
     expect(Date.now() - started).toBeLessThan(10_000)
     const box = runBox()
     await until(() => terminated.includes(box.id), 'the box to be terminated')
@@ -669,7 +670,7 @@ describe('a suite on a test box', () => {
     child.stdout?.once('data', () => { child.kill('SIGTERM') })
     const { code, stderr } = await done
     expect(code).toBe(143)
-    expect(stderr).not.toContain('the test runner failed')
+    expect(stderr).not.toContain('no test result')
     expect(terminated).toContain(runBox().id)
   })
 
@@ -677,16 +678,17 @@ describe('a suite on a test box', () => {
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.log('cannot allocate memory, as this test expected')`]).done
     expect(code).toBe(0)
-    expect(stderr).not.toContain('the test runner failed')
+    expect(stderr).not.toContain('no test result')
   })
 
-  it('tells a suite that ran out of memory from one that failed, and asks nothing of the agent', async () => {
+  it('tells a suite too big for its memory from one that failed, and sends the agent to CI', async () => {
     await startAll()
     const script = `console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
     expect(code).toBe(125)
-    expect(stderr).toContain('the test runner failed: this suite ran out of memory on its box')
-    expect(stderr).toContain('says nothing about your code. Do not retry: CI is the gate before merge')
+    expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
+    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+    expect(stderr).toContain('let CI run the tests')
     // Choosing tests is no job of an agent's.
     expect(stderr).not.toContain('name a')
   })
@@ -701,7 +703,7 @@ describe('a suite on a test box', () => {
     })
     const { code, stderr } = await done
     expect(code).toBe(125)
-    expect(stderr).toContain('the test runner failed')
+    expect(stderr).toContain('no test result')
     expect(stderr).toContain('says nothing about your code')
   })
 
@@ -726,7 +728,7 @@ describe('a suite on a test box', () => {
     const marker = join(repo, 'ran-here')
     const { code, stderr } = await suite(repo, [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, '')`]).done
     expect(code).toBe(125)
-    expect(stderr).toContain('the test runner failed: no test box could start')
+    expect(stderr).toContain('no test result: no test box could start')
     expect(existsSync(marker)).toBe(false)
   })
 

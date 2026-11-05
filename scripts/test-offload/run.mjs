@@ -120,7 +120,7 @@ function finish(code) {
 
 /** There is no result to give: everything that ends a run early comes through here, in words an agent can't mistake for one. */
 function die(message, code = 125) {
-  say(`the test runner failed: ${message}. There is no test result, and this says nothing about your code. Do not retry: CI is the gate before merge.`)
+  say(`no test result: ${message}. This says nothing about your code. Skip local tests for this work: don't retry, and don't run parts of it. Push your change and let CI run the tests.`)
   finish(code)
 }
 

@@ -698,7 +698,7 @@ update snapshots with the runner on your own machine if you need them back.
 happens in each of these cases, and none depends on the others:
 
 - The suite ends: the gateway passes on its exit code and terminates the box.
-- The time limit passes (`POISE_TEST_LIMIT_SECONDS`, an hour by default): the
+- The time limit passes (`POISE_TEST_LIMIT_SECONDS`, nine minutes by default): the
   gateway terminates the box, and Render ends it a minute later if the gateway
   could not.
 - The agent's command is stopped or killed, or stops renewing its lease for 45
@@ -707,14 +707,18 @@ happens in each of these cases, and none depends on the others:
   that restarts terminates every box it finds no run for, and does so again every
   15 seconds.
 
-**When there is no result.** The box can fail to start, the checkout can fail to
-arrive, the suite can run out of memory or time, or Render can be down. The agent's
-command then says on stderr that the test runner failed, that there is no test
-result and this says nothing about its code, not to retry, and that CI is the gate
-before merge. It exits with 125, or 124 at the time limit, and never falls back to
+**When there is no result.** A suite can be too big for its box, by running out of
+memory or passing the time limit, and the box can also fail to start, the checkout
+can fail to arrive, or Render can be down. The agent's command then says on stderr
+why there is no test result, that this says nothing about its code, and to skip
+local tests for this work: not to retry or run parts of it, but to push and let CI
+run the tests. It exits with 125, or 124 at the time limit, and never falls back to
 running in the workspace. Each of these also reaches the gateway's diagnostics as
 `test_relay.run.failed`, with the workspace, the command and the reason; every run
 is logged with its command, exit code and duration as `test_relay.run.finished`.
+The time limit is under an agent's shell tool's default of ten minutes
+(`BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts`), so that the agent hears this
+from the box and not as a command its tool gave up on.
 
 **Where they meet.** A workspace dials the gateway at `/api/link/test-relay` on its
 host. A proxy with a sign-in of its own must let that through without one, as it
@@ -738,7 +742,7 @@ gateway a Render API key and the ID of the Render workspace, and it does the res
 | `POISE_TEST_RENDER_API_KEY` | yes | | A Render API key. Set both of these, or neither |
 | `POISE_TEST_WORKSPACE` | yes | | The Render workspace's ID, `tea-…` |
 | `POISE_TEST_BOX_PLAN` | | `1c-2g` | The boxes' size |
-| `POISE_TEST_LIMIT_SECONDS` | | `3600` | The time limit; keep `BASH_MAX_TIMEOUT_MS` in `server/process.ts` in step |
+| `POISE_TEST_LIMIT_SECONDS` | | `540` | The time limit, from starting a box to the suite's end; keep it under `BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts` |
 | `POISE_TEST_MAX_RUNS` | | `30` | Suites at once; past it an agent's command fails loudly |
 
 In a fork, `POISE_TEST_RENDER_API_KEY` is an Actions secret and the others are
