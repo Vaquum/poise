@@ -276,7 +276,8 @@ the ledger ephemeral. Files use private permissions and SQLite rollback
 journaling. Capture queues arrivals past 1,000 queued observations or 2 MiB
 while the worker drains, and spills new arrivals explicitly with loss markers
 only once the oldest queued capture outwaits the ten-second stall budget or
-the worker is down. Captures the store rejects as storage failures wait at the
+the worker has failed. Startup uses the same stall budget while readiness is
+pending. Captures the store rejects as storage failures wait at the
 head of the queue and retry; observations the store rejects as invalid are shed
 with loss accounting. A store that fails to open retries on later operations,
 and health names the cause in `unavailableReason` (`worker_unavailable`,

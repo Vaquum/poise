@@ -75,6 +75,32 @@ async function fixtureObserver(body: string): Promise<{ observer: BehaviorLedger
 }
 
 describe('ledger recovery boundaries', () => {
+  it('drains every capture in a startup burst past the queue cap without loss', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-startup-burst-'))
+    asyncRoots.push(directory)
+    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db'), captureLimit: 25 })
+    observers.push(observer)
+    const starting = observer.start()
+    const burst = Array.from({ length: 75 }, (_, index) => admission(`startup-${index}`, { number: index + 1 }))
+    // Initialization yields before readiness, as it can under startup load.
+    for (const observation of burst) observer.capture(observation)
+    expect(observer.snapshot()).toMatchObject({ ready: false, pending: burst.length, unreportedLoss: 0 })
+    await starting
+    await vi.waitFor(() => {
+      expect(observer.snapshot()).toMatchObject({ pending: 0, unreportedLoss: 0, health: { dropped: 0 } })
+    }, { timeout: 9000, interval: 25 })
+    const page = await observer.read({ operation: 'list', limit: 100 })
+    expect(page).toMatchObject({ status: 200, body: { health: {
+      status: 'ok', pending: 0, dropped: 0, gaps: [], instances: burst.length * 2,
+    } } })
+    const next = await observer.read({ operation: 'list', limit: 100, cursor: page.body.nextCursor! })
+    expect(next.status).toBe(200)
+    expect(next.body.nextCursor).toBeNull()
+    const retained = [...page.body.records!, ...next.body.records!].flatMap((record) => record.refs)
+      .filter((ref) => ref.kind === 'correlation').map((ref) => ref.identity)
+    expect(retained.sort()).toEqual(burst.map((observation) => observation.nativeId).sort())
+  })
+
   it('keeps two restart gaps separate across a healthy capture with checkpoint endpoints', () => {
     const db = store()
     db.capture(admission())
