@@ -23,8 +23,8 @@ export const AGENT_RIPGREP_CONFIG = fileURLToPath(new URL(
 ))
 // Bounds Go runtimes only; every other child ignores it.
 export const AGENT_GOMAXPROCS = '2'
-// An agent's shell tool waits for a suite on a test instance too, starting one included. The maximum
-// matches the time limit that instance has (POISE_TEST_LIMIT_SECONDS).
+// An agent's shell tool waits for a suite on a test box too, starting one included. The default
+// outlasts the box's time limit (POISE_TEST_LIMIT_SECONDS), so the agent hears why from the box.
 const TEST_OFFLOAD_SHELL_TIMEOUTS = [['BASH_DEFAULT_TIMEOUT_MS', '600000'], ['BASH_MAX_TIMEOUT_MS', '3600000']] as const
 
 export function assertProcessArgSize(value: string, label = 'argument'): void {
@@ -371,7 +371,7 @@ function applyAgentToolDefaults(env: NodeJS.ProcessEnv, overrides: NodeJS.Proces
   }
 }
 
-// Agents' test suites leave the workspace for disposable test instances (docs/Operating.md, "Agents'
+// Agents' test suites leave the workspace for disposable test boxes (docs/Operating.md, "Agents'
 // test suites"): every Python and Node process under what Poise starts asks these hooks first, and only
 // a test runner does anything but carry on. Off until the gateway installs them into the home volume.
 function applyTestOffload(env: NodeJS.ProcessEnv): void {

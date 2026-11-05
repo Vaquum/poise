@@ -5,7 +5,8 @@ import { TEST_RELAY_PATH, TestRelay, workspaceKey, workspaceRelayUrl } from '../
 import { APEX, startHarness, workspaceHost, type Harness } from './harness.js'
 
 const PROXY = '192.168.150.10:8080'
-const INSTANCE = `${TEST_RELAY_PATH}/instance`
+const RUNS = `${TEST_RELAY_PATH}/runs`
+const POST = { method: 'POST', body: '{}' }
 
 describe('the relay agents\' test suites meet at', () => {
   let h: Harness
@@ -13,9 +14,8 @@ describe('the relay agents\' test suites meet at', () => {
     h = await startHarness({
       env,
       testRelay: ({ privateKey, log, now, store }) => new TestRelay({
-        config: { renderApiKey: 'render-key', baseService: 'crn-x', plan: 'plan-crn-003', limitSeconds: 60, maxRuns: 2 },
+        config: { renderApiKey: 'render-key', workspace: 'tea-x', deployment: 'poise.example.com', plan: '1c-2g', limitSeconds: 60, maxRuns: 2 },
         privateKey,
-        origin: (handle) => `https://${handle}.example`,
         log,
         now,
         isWorkspace: (handle) => store.getWorkspace(handle) !== null && store.getUser(handle)?.disabledAt === null,
@@ -26,24 +26,25 @@ describe('the relay agents\' test suites meet at', () => {
   }
   afterEach(async () => { await h.close() })
 
-  it('answers on a workspace host without a session: an instance has none', async () => {
+  // A run without a key is refused by the relay itself, so its 401 tells it got there.
+  it('answers on a workspace host without a session: the key is what counts', async () => {
     await start()
-    const reply = await h.request({ host: workspaceHost('alice'), path: INSTANCE })
-    expect(reply.status).toBe(200)
-    expect(reply.body).toContain('docs/Operating.md')
+    const reply = await h.request({ host: workspaceHost('alice'), path: RUNS, ...POST })
+    expect(reply.status).toBe(401)
+    expect(reply.body).toContain('is not a workspace')
     expect(reply.body).not.toContain('render-key')
   })
 
   it('answers at the address a proxy of the operator\'s own publishes, for workspaces that cannot reach their public address', async () => {
     await start({ POISE_PROXY_LISTEN: PROXY })
-    expect((await h.request({ host: PROXY, path: INSTANCE })).status).toBe(200)
+    expect((await h.request({ host: PROXY, path: RUNS, ...POST })).body).toContain('is not a workspace')
   })
 
   it('answers nowhere else', async () => {
     await start()
-    expect((await h.request({ host: APEX, path: INSTANCE })).status).toBe(404)
-    expect((await h.request({ host: 'elsewhere.example.com', path: INSTANCE })).status).toBe(404)
-    expect((await h.request({ host: PROXY, path: INSTANCE })).status).toBe(404)
+    for (const host of [APEX, 'elsewhere.example.com', PROXY]) {
+      expect((await h.request({ host, path: RUNS, ...POST })).body).not.toContain('is not a workspace')
+    }
   })
 
   it('starts nothing for a key the gateway did not sign, or for a workspace that does not exist', async () => {
@@ -64,9 +65,8 @@ describe('the relay agents\' test suites meet at', () => {
 
   it('is not there when unset, and a request gets what any path gets', async () => {
     h = await startHarness()
-    const reply = await h.request({ host: workspaceHost('alice'), path: INSTANCE })
-    expect(reply.status).not.toBe(200)
-    expect(reply.body).not.toContain('docs/Operating.md')
+    const reply = await h.request({ host: workspaceHost('alice'), path: RUNS, ...POST })
+    expect(reply.body).not.toContain('is not a workspace')
   })
 })
 
@@ -79,8 +79,8 @@ describe('where a workspace reaches the relay', () => {
 })
 
 describe('the gateway image', () => {
-  it('ships the instance script beside the relay that serves it', () => {
+  it('ships what a box runs beside the relay that sends it', () => {
     const { scripts } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { scripts: { build: string } }
-    expect(scripts.build).toContain('cp src/test-instance.cjs dist/test-instance.cjs')
+    expect(scripts.build).toContain('cp src/test-box.cjs src/test-box-setup.sh dist/')
   })
 })

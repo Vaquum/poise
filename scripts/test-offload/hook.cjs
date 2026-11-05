@@ -1,20 +1,17 @@
 /* eslint-disable @typescript-eslint/no-require-imports -- a --require preload is CommonJS */
 'use strict'
-// In a workspace, starts a test suite on a disposable test instance instead. On a test instance, fits a
-// whole-suite command to it. Poise puts this on NODE_OPTIONS for what it starts, so every Node process
-// asks here first, however it was reached. docs/Operating.md, "Agents' test suites".
+// Starts a test suite on a disposable test box instead of in this workspace, exactly as it was typed. Poise puts this
+// on NODE_OPTIONS for what it starts, so every Node process asks here first, however it was reached.
+// docs/Operating.md, "Agents' test suites".
 const { existsSync } = require('node:fs')
-const { basename, join } = require('node:path')
+const { basename, dirname, join } = require('node:path')
 
-// Asking a runner about itself costs nothing, and needs no test instance.
+// Asking a runner about itself costs nothing, and needs no test box.
 const PROBES = new Set(['--version', '-v', '--help', '-h'])
 const SCRIPTS = /^(test|check|lint|typecheck|verify)/
 // npm scripts whose files or servers are wanted here, with every step of them.
 const LOCAL_SCRIPTS = /^(pre|post)?(build|start|dev|preview|prepare|install)/
 const VITEST = /^(vitest|vitest\.mjs)$/
-const VITEST_COMMANDS = new Set(['run', 'watch', 'dev'])
-const VITEST_VALUE_FLAGS = new Set(['--config', '-c', '--root', '-r', '--dir', '--project', '--reporter', '--pool', '--shard',
-  '--outputFile', '--environment', '--mode', '-m', '--maxWorkers', '--minWorkers', '--testTimeout'])
 
 // `npm test` and `npm run NAME` name a script; the flags in front of them can carry a value.
 function npmScript(args) {
@@ -38,45 +35,20 @@ function testCommand(script, args) {
   return false
 }
 
-/** What a vitest command should add on a test instance: one worker always, and the change's tests for a whole suite. */
-function vitestFlags(args, since) {
-  const flags = args.some((arg) => arg.startsWith('--maxWorkers')) ? [] : ['--maxWorkers=1']
-  let chosen = args.some((arg) => /^(--changed|--testNamePattern|-t)/.test(arg))
-  for (let index = 0; index < args.length; index += 1) {
-    if (VITEST_VALUE_FLAGS.has(args[index])) index += 1
-    else if (!args[index].startsWith('-') && !VITEST_COMMANDS.has(args[index])) chosen = true
-  }
-  return chosen || !since ? flags : [...flags, `--changed=${since}`, '--passWithNoTests']
-}
-
 const script = process.argv[1]
-const since = process.env.POISE_TEST_CHANGED_SINCE
-if (script && process.env.POISE_TEST_INSTANCE === '1') {
-  const args = process.argv.slice(2)
-  if (/^(npm|npm-cli\.js)$/.test(basename(script)) && /^build/.test(npmScript(args) ?? '')) {
-    // A step of something like `npm run check`: too big for an instance, and its files would go with it.
-    process.stderr.write('[poise] skipping this build on the test instance. CI builds before merge.\n')
-    process.exit(0)
-  }
-  if (VITEST.test(basename(script)) && !args.some((arg) => PROBES.has(arg))) {
-    const flags = vitestFlags(args, since)
-    process.argv.push(...flags)
-    if (flags.some((flag) => flag.startsWith('--changed'))) {
-      process.stderr.write('[poise] running only the tests this change touches. CI is the gate before merge.\n')
-    }
-    // What this runs in its turn is the suite's own business.
-    delete process.env.POISE_TEST_INSTANCE
-  }
-} else if (script && !LOCAL_SCRIPTS.test(process.env.npm_lifecycle_event ?? '') && existsSync(join(__dirname, 'relay')) && testCommand(script, process.argv.slice(2))) {
+if (script && !LOCAL_SCRIPTS.test(process.env.npm_lifecycle_event ?? '') && existsSync(join(__dirname, 'relay')) && testCommand(script, process.argv.slice(2))) {
+  // This Node goes along, as a box may have no other at this path. By name: its folder can hold far more than Node.
+  const prefix = dirname(dirname(process.execPath))
+  const node = ['bin/node', 'bin/npm', 'bin/npx', 'lib/node_modules/npm', 'lib/node_modules/corepack'].flatMap((path) => ['--also', join(prefix, path)])
   try {
     process.execve(process.execPath, [
-      process.execPath, join(__dirname, 'run.mjs'), '--', process.execPath, ...process.execArgv, ...process.argv.slice(1),
+      process.execPath, join(__dirname, 'run.mjs'), ...node, '--', process.execPath, ...process.execArgv, ...process.argv.slice(1),
     ], process.env)
   } catch (error) {
     // The suite must not run here instead.
-    process.stderr.write(`[poise] cannot start the test instance: ${error.message}\n`)
+    process.stderr.write(`[poise] cannot start the test box: ${error.message}\n`)
     process.exit(125)
   }
 }
 
-module.exports = { npmScript, testCommand, vitestFlags }
+module.exports = { npmScript, testCommand }

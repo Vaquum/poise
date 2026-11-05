@@ -43,10 +43,10 @@ if { [ -n "$google_id" ] && [ -z "$google_secret" ]; } \
   || { [ -z "$google_id" ] && [ -n "$google_secret" ]; }; then
   die "POISE_GOOGLE_CLIENT_ID variable and POISE_GOOGLE_CLIENT_SECRET secret must be set together, or both left unset."
 fi
-base_service=$(jq --raw-output '.POISE_TEST_BASE_SERVICE // ""' <<<"${VARS:-{\}}")
-if { [ -n "$base_service" ] && [ -z "$render_api_key" ]; } \
-  || { [ -z "$base_service" ] && [ -n "$render_api_key" ]; }; then
-  die "POISE_TEST_BASE_SERVICE variable and POISE_TEST_RENDER_API_KEY secret must be set together, or both left unset."
+test_workspace=$(jq --raw-output '.POISE_TEST_WORKSPACE // ""' <<<"${VARS:-{\}}")
+if { [ -n "$test_workspace" ] && [ -z "$render_api_key" ]; } \
+  || { [ -z "$test_workspace" ] && [ -n "$render_api_key" ]; }; then
+  die "POISE_TEST_WORKSPACE variable and POISE_TEST_RENDER_API_KEY secret must be set together, or both left unset."
 fi
 
 [ -z "$variables" ] || printf '%s\n' "$variables"

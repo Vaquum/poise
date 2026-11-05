@@ -52,7 +52,7 @@ export interface Config {
   workspacePids: number
   /** Explicit native behavior budgets/reservations, forwarded to each workspace. */
   behaviorResourceEnv: string[]
-  /** Where agents' test suites run (POISE_TEST_RENDER_API_KEY and POISE_TEST_BASE_SERVICE); null keeps them in the workspaces. */
+  /** Where agents' test suites run (POISE_TEST_RENDER_API_KEY and POISE_TEST_WORKSPACE); null keeps them in the workspaces. */
   testRelay: TestRelayConfig | null
   workspaceRuntime: string | null
   /**
@@ -242,16 +242,17 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     } else behaviorResourceEnv.push(`${name}=${bytes}`)
   }
   const renderApiKey = read('POISE_TEST_RENDER_API_KEY')
-  const baseService = read('POISE_TEST_BASE_SERVICE')
-  if ((renderApiKey === undefined) !== (baseService === undefined)) {
-    problems.push('POISE_TEST_RENDER_API_KEY and POISE_TEST_BASE_SERVICE must be set together, or both left unset')
+  const workspace = read('POISE_TEST_WORKSPACE')
+  if ((renderApiKey === undefined) !== (workspace === undefined)) {
+    problems.push('POISE_TEST_RENDER_API_KEY and POISE_TEST_WORKSPACE must be set together, or both left unset')
   }
-  const testRelay = renderApiKey !== undefined && baseService !== undefined
+  const testRelay = renderApiKey !== undefined && workspace !== undefined
     ? {
       renderApiKey,
-      baseService,
-      plan: read('POISE_TEST_PLAN') ?? 'plan-crn-005',
-      limitSeconds: wholeNumber('POISE_TEST_LIMIT_SECONDS', 3600),
+      workspace,
+      deployment: domain,
+      plan: read('POISE_TEST_BOX_PLAN') ?? '1c-2g',
+      limitSeconds: wholeNumber('POISE_TEST_LIMIT_SECONDS', 540),
       maxRuns: wholeNumber('POISE_TEST_MAX_RUNS', 30),
     }
     : null

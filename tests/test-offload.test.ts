@@ -1,22 +1,19 @@
 // @vitest-environment node
-// Agents' test suites run on disposable test instances: these run the real hooks, runner, relay and
-// instance script, with only Render itself replaced. docs/Operating.md, "Agents' test suites".
+// Agents' test suites run on disposable test boxes: these run the real hooks, runner, relay and box
+// script, with only Render itself replaced. docs/Operating.md, "Agents' test suites".
 import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { generateKeyPairSync } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
-import { createServer, type Server } from 'node:http'
+import { createServer, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
-import { changeBase, filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
+import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
+import { filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
 import { scrubbedChildEnvironment } from '../server/process'
 
 const SOURCE = resolve('scripts/test-offload')
-const INSTANCE = resolve('gateway/src/test-instance.cjs')
-// How test-relay.ts starts it, with the fetched script replaced by this checkout's.
-const instanceArgs = (...args: string[]) => ['-e', `require(${JSON.stringify(INSTANCE)})`, ...args]
 const { privateKey } = generateKeyPairSync('ed25519')
 const KEY = workspaceKey(privateKey, 'alice')
 
@@ -90,7 +87,7 @@ describe('what counts as a test suite', () => {
   })
 })
 
-describe('what reaches a test instance', () => {
+describe('what reaches a test box', () => {
   it('forwards a suite its own settings, and no credential or agent setting', () => {
     const hooks = '/home/poise/.poise/test-offload'
     const env = testEnvironment({
@@ -124,7 +121,7 @@ describe('what reaches a test instance', () => {
       RIPGREP_CONFIG_PATH: 'x',
       OLDPWD: 'x',
       EMPTY: '',
-    }, hooks, 'abc123')
+    }, hooks)
     expect(env).toEqual({
       PATH: '/venv/bin:/usr/bin',
       HOME: '/home/poise',
@@ -132,21 +129,16 @@ describe('what reaches a test instance', () => {
       CI: '1',
       FOO: 'bar',
       PYTEST_ADDOPTS: '-q',
-      // The hooks go along, once each, and fit the suite to the instance there.
-      PYTHONPATH: `${hooks}:src`,
-      NODE_OPTIONS: `--require "${hooks}/hook.cjs" --max-old-space-size=4096`,
-      POISE_TEST_INSTANCE: '1',
-      POISE_TEST_CHANGED_SINCE: 'abc123',
+      // The hooks stay here, and what else these held goes along.
+      PYTHONPATH: 'src',
+      NODE_OPTIONS: '--max-old-space-size=4096',
     })
   })
 
-  it('sets the hooks where a command replaced them, and says nothing of a change it cannot place', () => {
+  it('leaves nothing of the hooks where they were all those variables held', () => {
     const hooks = '/h'
-    expect(testEnvironment({ PYTHONPATH: 'src', NODE_OPTIONS: '--no-warnings' }, hooks)).toEqual({
-      PYTHONPATH: '/h:src',
-      NODE_OPTIONS: '--require "/h/hook.cjs" --no-warnings',
-      POISE_TEST_INSTANCE: '1',
-    })
+    expect(testEnvironment({ PYTHONPATH: hooks, NODE_OPTIONS: '--require "/h/hook.cjs"', CI: '1' }, hooks)).toEqual({ CI: '1' })
+    expect(testEnvironment({ PYTHONPATH: 'src', NODE_OPTIONS: '--no-warnings' }, hooks)).toEqual({ PYTHONPATH: 'src', NODE_OPTIONS: '--no-warnings' })
   })
 
   function checkout(): string {
@@ -172,9 +164,8 @@ describe('what reaches a test instance', () => {
   it('sends the checkout and its dependencies, without what git ignores', () => {
     const repo = checkout()
     const paths = filesToSend(join(repo), [], {}, '/nowhere')
-    // The hooks go along too, to fit the suite to the instance.
-    expect(paths).toEqual(expect.arrayContaining([join(SOURCE, 'hook.cjs'), join(SOURCE, 'sitecustomize.py')]))
-    const names = paths.filter((path: string) => path.startsWith(repo)).map((path: string) => path.slice(repo.length + 1))
+    expect(paths.every((path: string) => path.startsWith(repo))).toBe(true)
+    const names = paths.map((path: string) => path.slice(repo.length + 1))
     expect(names.sort()).toEqual(['.git', '.gitignore', '.venv', 'node_modules', 'sub/node_modules', 'tracked.py', 'untracked.py'])
   })
 
@@ -193,7 +184,7 @@ describe('what reaches a test instance', () => {
     expect(() => filesToSend(repo, [], {}, '/nowhere')).toThrow('holds a credential')
   })
 
-  it('sends an interpreter that lives outside the checkout, unless every instance has it', () => {
+  it('sends an interpreter that lives outside the checkout, unless it is the system\'s', () => {
     const repo = checkout()
     const elsewhere = temp()
     const venv = join(elsewhere, 'venv')
@@ -202,9 +193,19 @@ describe('what reaches a test instance', () => {
     mkdirSync(venv)
     mkdirSync(base)
     symlinkSync(base, link)
-    const paths = filesToSend(repo, [venv, link, '/opt/python/cpython-3.13-linux-x86_64-gnu', '/usr/lib/python3'], {}, '/nowhere')
+    const paths = filesToSend(repo, [venv, link, '/usr', '/usr/lib', '/usr/local'], {}, '/nowhere')
     expect(paths).toEqual(expect.arrayContaining([venv, link, base]))
-    expect(paths.filter((path: string) => path.startsWith('/opt/') || path.startsWith('/usr/'))).toEqual([])
+    expect(paths.filter((path: string) => path.startsWith('/usr'))).toEqual([])
+  })
+
+  it('refuses to send an interpreter\'s folder with the home or the run\'s temporary files in it', () => {
+    const repo = checkout()
+    const home = temp()
+    expect(() => filesToSend(repo, [home], {}, home)).toThrow('holds what must not reach a test box')
+    expect(() => filesToSend(repo, [join(home, '..')], {}, home)).toThrow('holds what must not reach a test box')
+    const tmp = join(home, 'tmp')
+    mkdirSync(tmp)
+    expect(() => filesToSend(repo, [home], { TMPDIR: tmp }, '/nowhere')).toThrow('holds what must not reach a test box')
   })
 
   it('refuses a checkout whose git configuration holds a credential', () => {
@@ -223,8 +224,7 @@ describe('what reaches a test instance', () => {
     expect(() => filesToSend(join(home, 'run'), [], { TMPDIR: tmp }, home)).toThrow('run the suite from a checkout')
     const scratch = join(tmp, 'scratch')
     mkdirSync(scratch)
-    expect(filesToSend(scratch, [], { TMPDIR: tmp }, home)).toContain(scratch)
-    expect(filesToSend(scratch, [], { TMPDIR: tmp }, home).filter((path: string) => !path.startsWith(SOURCE))).toEqual([scratch])
+    expect(filesToSend(scratch, [], { TMPDIR: tmp }, home)).toEqual([scratch])
   })
 })
 
@@ -281,6 +281,20 @@ describe('the hooks at work', () => {
     expect(existsSync(marker)).toBe(false)
   })
 
+  it('send the Node that started a suite by name, never the folder it lives in, which can be the home', () => {
+    const { env, hooks } = hooked(true)
+    // Says what it was asked to send and run, in the place of the real sender.
+    writeFileSync(join(hooks, 'run.mjs'), 'console.log(JSON.stringify(process.argv.slice(2)))')
+    const repo = temp()
+    writeFileSync(join(repo, 'vitest'), '')
+    const result = attempt([join(repo, 'vitest'), 'run'], env, repo)
+    const args = JSON.parse(result.stdout) as string[]
+    const prefix = dirname(dirname(process.execPath))
+    const also = args.slice(0, args.indexOf('--')).filter((arg) => arg !== '--also')
+    expect(also).toEqual(['bin/node', 'bin/npm', 'bin/npx', 'lib/node_modules/npm', 'lib/node_modules/corepack'].map((path) => join(prefix, path)))
+    expect(args.slice(args.indexOf('--') + 1)).toEqual([process.execPath, join(repo, 'vitest'), 'run'])
+  })
+
   it('leave everything else alone', () => {
     const { env } = hooked(true)
     const result = attempt(['-e', 'console.log("ran here")'], env, temp())
@@ -320,156 +334,6 @@ describe('the hooks at work', () => {
     expect(result.status).toBe(125)
     expect(result.stderr).toContain('[poise]')
     expect(existsSync(marker)).toBe(false)
-  })
-})
-
-describe('on a test instance, a command for the whole suite', () => {
-  function changed(files: Record<string, string>, later: Record<string, string>): { repo: string; since: string } {
-    const repo = temp()
-    execFileSync('git', ['init', '-q', repo])
-    const write = (group: Record<string, string>) => {
-      for (const [path, text] of Object.entries(group)) {
-        mkdirSync(join(repo, path, '..'), { recursive: true })
-        writeFileSync(join(repo, path), text)
-      }
-    }
-    write(files)
-    const git = (...args: string[]) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-C', repo, ...args]).toString().trim()
-    git('add', '.')
-    git('commit', '-qm', 'base')
-    const since = git('rev-parse', 'HEAD')
-    write(later)
-    return { repo, since }
-  }
-  const instanceEnv = (hooks: string, since: string | null): NodeJS.ProcessEnv => {
-    const env: NodeJS.ProcessEnv = { ...process.env, POISE_TEST_INSTANCE: '1', PYTHONPATH: hooks, NODE_OPTIONS: `--require "${join(hooks, 'hook.cjs')}"` }
-    if (since) env.POISE_TEST_CHANGED_SINCE = since
-    return env
-  }
-  // A runner that says what it was asked to run, as it would read it.
-  const pytest = (repo: string, args: string[], since: string | null, cwd = repo) => {
-    // Outside the checkout, where it is no part of the change.
-    const runner = join(temp(), 'pytest')
-    writeFileSync(runner, 'import json, os, sys\nprint(json.dumps({"args": sys.argv[1:], "nested": os.environ.get("POISE_TEST_INSTANCE")}))\n')
-    const result = spawnSync('python3', [runner, ...args], { cwd, encoding: 'utf8', env: instanceEnv(SOURCE, since) })
-    return { status: result.status, stderr: result.stderr, seen: result.stdout ? JSON.parse(result.stdout) as { args: string[]; nested: string | null } : null }
-  }
-  const FILES = {
-    'src/pricing.py': 'x = 1\n',
-    'src/other.py': 'x = 1\n',
-    'tests/test_pricing.py': 'from src import pricing\n',
-    'tests/test_other.py': 'from src import other\n',
-    'README.md': 'x\n',
-  }
-
-  it('runs the Python tests that touch the change, and only those', () => {
-    const { repo, since } = changed(FILES, { 'src/pricing.py': 'x = 2\n' })
-    const { status, stderr, seen } = pytest(repo, ['-q', '-m', 'not live'], since)
-    expect(status).toBe(0)
-    expect(seen?.args).toEqual(['-q', '-m', 'not live', 'tests/test_pricing.py'])
-    expect(stderr).toContain('running only the 1 test files this change touches')
-    expect(seen?.nested).toBeNull()
-  })
-
-  it('counts a changed test file and a new one, and leaves out a deleted one', () => {
-    const { repo, since } = changed(FILES, { 'tests/test_other.py': 'x = 2\n', 'tests/test_new.py': 'x = 1\n' })
-    rmSync(join(repo, 'tests/test_pricing.py'))
-    expect(pytest(repo, [], since).seen?.args).toEqual(['tests/test_new.py', 'tests/test_other.py'])
-  })
-
-  it('sees a change anywhere in the checkout, and runs this folder\'s tests, from a folder inside it', () => {
-    const { repo, since } = changed({ ...FILES, 'other/tests/test_pricing_too.py': 'from src import pricing\n' }, { 'src/pricing.py': 'x = 2\n', 'other/tests/test_new.py': 'x = 1\n', 'tests/test_new.py': 'x = 1\n' })
-    expect(pytest(repo, [], since, join(repo, 'tests')).seen?.args).toEqual(['test_new.py', 'test_pricing.py'])
-  })
-
-  it('counts a changed package by those who mention it', () => {
-    const { repo, since } = changed({ ...FILES, 'billing/__init__.py': 'x = 1\n', 'tests/test_billing.py': 'import billing\n' }, { 'billing/__init__.py': 'x = 2\n' })
-    expect(pytest(repo, [], since).seen?.args).toEqual(['tests/test_billing.py'])
-  })
-
-  it('answers at once when only prose changed', () => {
-    const { repo, since } = changed(FILES, { 'README.md': 'y\n' })
-    const { status, stderr, seen } = pytest(repo, ['-q'], since)
-    expect(status).toBe(0)
-    expect(seen).toBeNull()
-    expect(stderr).toContain('no test touches this change')
-  })
-
-  it('stays whole when the change can touch anything, or names nothing it can place', () => {
-    const changes: Record<string, string>[] = [{}, { 'conftest.py': 'x = 1\n' }, { '__init__.py': 'x = 1\n' }, { 'data/rates.json': '{}\n' }, { 'requirements.txt': 'x\n' }, { 'tests/data/expected.txt': 'x\n' }, { 'src/nothing_mentions_me.py': 'x = 1\n' }]
-    for (const later of changes) {
-      const { repo, since } = changed(FILES, later)
-      expect(pytest(repo, ['-q'], since).seen?.args).toEqual(['-q'])
-    }
-  })
-
-  it('stays whole, and never answers with a pass, when git cannot say what changed', () => {
-    const { repo } = changed(FILES, { 'README.md': 'y\n' })
-    const { status, seen } = pytest(repo, ['-q'], '0000000000000000000000000000000000000000')
-    expect(status).toBe(0)
-    expect(seen?.args).toEqual(['-q'])
-  })
-
-  it('stays as asked when the command names its tests by path or by name, or no change can be placed', () => {
-    const { repo, since } = changed(FILES, { 'src/pricing.py': 'x = 2\n' })
-    expect(pytest(repo, ['tests/test_other.py'], since).seen?.args).toEqual(['tests/test_other.py'])
-    expect(pytest(repo, ['-k', 'other'], since).seen?.args).toEqual(['-k', 'other'])
-    expect(pytest(repo, ['-kother'], since).seen?.args).toEqual(['-kother'])
-    expect(pytest(repo, ['-q'], null).seen?.args).toEqual(['-q'])
-  })
-
-  it('runs with one worker however many were asked for', () => {
-    const { repo, since } = changed(FILES, { 'README.md': 'y\n' })
-    for (const [asked, fitted] of [[['-n', '10'], ['-n', '0']], [['-n', 'auto'], ['-n', '0']], [['-n4'], ['-n0']], [['-nauto'], ['-n0']], [['--numprocesses=8'], ['--numprocesses=0']], [['--numprocesses', '8'], ['--numprocesses', '0']]]) {
-      expect(pytest(repo, [...asked, 'tests/test_other.py'], since).seen?.args).toEqual([...fitted, 'tests/test_other.py'])
-    }
-    expect(pytest(repo, ['--version'], since).seen?.args).toEqual(['--version'])
-  })
-
-  it('adds vitest\'s own flags to a vitest command for the whole suite, and one worker to any', () => {
-    const { vitestFlags } = createRequire(import.meta.url)(join(SOURCE, 'hook.cjs')) as { vitestFlags: (args: string[], since?: string) => string[] }
-    const whole = ['--maxWorkers=1', '--changed=abc', '--passWithNoTests']
-    expect(vitestFlags(['run'], 'abc')).toEqual(whole)
-    expect(vitestFlags([], 'abc')).toEqual(whole)
-    expect(vitestFlags(['run', '--reporter', 'dot'], 'abc')).toEqual(whole)
-    expect(vitestFlags(['run', 'tests/x.test.ts'], 'abc')).toEqual(['--maxWorkers=1'])
-    expect(vitestFlags(['run', '--changed=other'], 'abc')).toEqual(['--maxWorkers=1'])
-    expect(vitestFlags(['run', '-t', 'checkout'], 'abc')).toEqual(['--maxWorkers=1'])
-    expect(vitestFlags(['run', '--testNamePattern=checkout'], 'abc')).toEqual(['--maxWorkers=1'])
-    expect(vitestFlags(['run', '--maxWorkers=2', 'tests/x.test.ts'], 'abc')).toEqual([])
-    expect(vitestFlags(['run'])).toEqual(['--maxWorkers=1'])
-  })
-
-  it('changes a vitest process before it reads its arguments, and not what that process starts', () => {
-    const { repo } = changed({ 'x.js': '1' }, {})
-    const script = join(repo, 'vitest')
-    writeFileSync(script, 'console.log(JSON.stringify({ args: process.argv.slice(2), nested: process.env.POISE_TEST_INSTANCE ?? null }))')
-    const result = spawnSync(process.execPath, [script, 'run'], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, 'abc') })
-    expect(JSON.parse(result.stdout)).toEqual({ args: ['run', '--maxWorkers=1', '--changed=abc', '--passWithNoTests'], nested: null })
-    expect(result.stderr).toContain('running only the tests this change touches')
-  })
-
-  it('skips a build, which is too big for an instance and whose files would go with it', () => {
-    const { repo } = changed({ 'x.js': '1' }, {})
-    const npm = join(repo, 'npm-cli.js')
-    writeFileSync(npm, 'console.log("built here")')
-    const build = spawnSync(process.execPath, [npm, 'run', 'build'], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, 'abc') })
-    expect(build.status).toBe(0)
-    expect(build.stdout).toBe('')
-    expect(build.stderr).toContain('skipping this build')
-    expect(spawnSync(process.execPath, [npm, 'test'], { cwd: repo, encoding: 'utf8', env: instanceEnv(SOURCE, 'abc') }).stdout).toBe('built here\n')
-  })
-
-  it('takes its start from where the checkout leaves the default branch', () => {
-    const { repo, since } = changed({ 'x.js': '1' }, {})
-    expect(changeBase(repo)).toBeNull()
-    const git = (...args: string[]) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-C', repo, ...args]).toString().trim()
-    git('update-ref', 'refs/remotes/origin/main', since)
-    git('checkout', '-qb', 'work')
-    writeFileSync(join(repo, 'y.js'), '1')
-    git('add', '.')
-    git('commit', '-qm', 'work')
-    expect(changeBase(repo)).toBe(since)
   })
 })
 
@@ -529,75 +393,141 @@ describe('Poise', () => {
   })
 })
 
-describe('a suite on a test instance', () => {
-  interface Job { id: string; startCommand: string; planId: string; createdAt: string; child: ChildProcess | null; status: string }
+describe('a suite on a test box', () => {
+  interface Box { id: string; plan: string; group: string; snapshotName: string | null; timeoutSeconds: number; idleTimeoutSeconds: number; createdAt: string; status: string; child: ChildProcess | null; dir: string }
+  interface Snapshot { id: string; name: string; status: string; expiresAt: string; sandboxGroupId: string }
   let render: Server
-  let jobs: Map<string, Job>
-  let cancels: string[]
+  let renderOrigin: string
+  let boxes: Map<string, Box>
+  let snapshots: Map<string, Snapshot>
+  let groups: string[]
+  let terminated: string[]
+  let setups: number
+  let setupExit: number
+  let setupMs: number
+  let listLagMs: number
+  let runBoxes: boolean
+  let warnings: Record<string, unknown>[]
   let relay: TestRelay
   let relayServer: Server
   let relayUrl: string
   let hooks: string
   let unpacked: string
-  let startInstances: boolean
 
   async function listen(server: Server): Promise<number> {
     await new Promise<void>((done) => { server.listen(0, '127.0.0.1', done) })
     return (server.address() as { port: number }).port
   }
 
-  // Render, as far as the relay sees it. A job is the real instance script, and it ends when it ends.
+  const json = (res: ServerResponse, status: number, body: unknown) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+
+  // What a box's command does here: the real box script over what was uploaded, or a stand-in for the setup.
+  function runOnBox(box: Box, command: string, res: ServerResponse): void {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    const event = (name: string, data: unknown) => res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`)
+    if (command === SETUP_COMMAND) {
+      setups += 1
+      expect(readFileSync(join(box.dir, 'tmp/poise-setup.sh'))).toEqual(readFileSync('gateway/src/test-box-setup.sh'))
+      setTimeout(() => {
+        event('output', { data: 'set up\n', stream: 'stdout' })
+        event('exit', { exit_code: setupExit })
+        res.end()
+      }, setupMs)
+      return
+    }
+    expect(command).toBe(BOX_COMMAND)
+    const [, script, spec, tree] = command.split(' ')
+    const inBox = (path: string) => join(box.dir, path)
+    if (!runBoxes) return
+    const child = spawn(process.execPath, [inBox(script), inBox(spec), inBox(tree), unpacked], { stdio: ['ignore', 'pipe', 'pipe'] })
+    box.child = child
+    child.stdout?.on('data', (chunk) => { event('output', { data: chunk.toString(), stream: 'stdout' }) })
+    child.stderr?.on('data', (chunk) => { event('output', { data: chunk.toString(), stream: 'stderr' }) })
+    child.on('close', (code) => {
+      if (box.status === 'running') event('exit', { exit_code: code })
+      res.end()
+    })
+  }
+
+  // Render, as far as the relay sees it.
   function startRender(): Server {
     return createServer(async (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://render')
+      const path = url.pathname
+      if (path.startsWith('/connect/upload/')) {
+        const box = boxes.get(path.split('/')[3])
+        const file = join(box?.dir ?? '', url.searchParams.get('path') ?? '')
+        mkdirSync(dirname(file), { recursive: true })
+        const chunks: Buffer[] = []
+        for await (const chunk of req) chunks.push(chunk as Buffer)
+        writeFileSync(file, Buffer.concat(chunks))
+        res.writeHead(200).end()
+        return
+      }
       const chunks: Buffer[] = []
       for await (const chunk of req) chunks.push(chunk as Buffer)
-      if (req.headers.authorization !== 'Bearer render-key') { res.writeHead(401).end(); return }
-      const cancel = /\/jobs\/(job-\d+)\/cancel$/.exec(req.url ?? '')
-      if (req.method === 'POST' && cancel) {
-        cancels.push(cancel[1])
-        const job = jobs.get(cancel[1])
-        if (job) { job.status = 'canceled'; job.child?.kill('SIGKILL') }
-        res.writeHead(200).end('{}')
-      } else if (req.method === 'POST') {
-        const { startCommand, planId } = JSON.parse(Buffer.concat(chunks).toString()) as { startCommand: string; planId: string }
-        const id = `job-${jobs.size + 1}`
-        const job: Job = { id, startCommand, planId, createdAt: new Date().toISOString(), child: null, status: 'running' }
-        jobs.set(id, job)
-        if (startInstances) {
-          const [, url, run, token] = / node -e \S+ (\S+) (\S+) (\S+)$/.exec(startCommand) ?? []
-          job.child = spawn(process.execPath, instanceArgs(url, run, token, unpacked), { stdio: 'inherit' })
-          job.child.on('exit', () => { if (job.status === 'running') job.status = 'succeeded' })
-        }
-        res.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify({ id, startCommand, planId }))
-      } else {
-        const listed = [...jobs.values()].filter((job) => job.status === 'running').map(({ id, startCommand }) => ({ job: { id, startCommand } }))
-        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(listed))
+      const text = Buffer.concat(chunks).toString()
+      const body = (text ? JSON.parse(text) : {}) as Record<string, unknown>
+      if (path.startsWith('/connect/run/')) {
+        runOnBox(boxes.get(path.split('/')[3]) as Box, body.command as string, res)
+        return
       }
+      if (req.headers.authorization !== 'Bearer render-key') { res.writeHead(401).end('no such key'); return }
+      const [, id, action, operation] = /^\/v1\/sandboxes\/([^/]+)\/?([^/]*)\/?(.*)$/.exec(path) ?? []
+      const box = id ? boxes.get(id) : undefined
+      if (path === '/v1/sandbox-groups' && req.method === 'GET') json(res, 200, groups.map((name, index) => ({ cursor: 'c', sandboxGroup: { id: `sbg-${index}`, name } })))
+      else if (path === '/v1/sandbox-groups') { groups.push(body.name as string); json(res, 201, { id: `sbg-${groups.length - 1}`, name: body.name }) }
+      else if (/^\/v1\/sandbox-groups\/[^/]+\/snapshots$/.test(path)) json(res, 200, [...snapshots.values()].filter((item) => item.status === 'available').map((snapshot) => ({ cursor: 'c', snapshot })))
+      else if (/^\/v1\/sandbox-groups\/[^/]+\/snapshots\//.test(path)) json(res, 200, snapshots.get(path.split('/').at(-1) as string))
+      else if (path === '/v1/sandboxes' && req.method === 'GET') {
+        // Render's list can lag behind a box that was just created.
+        const listed = [...boxes.values()].filter((item) => item.status === 'running' && item.group === url.searchParams.get('sandboxGroupId') && Date.now() - Date.parse(item.createdAt) >= listLagMs)
+        json(res, 200, listed.map((sandbox) => ({ cursor: 'c', sandbox: { id: sandbox.id, createdAt: sandbox.createdAt } })))
+      }
+      else if (path === '/v1/sandboxes') {
+        const name = body.snapshotName as string | undefined
+        if (name && ![...snapshots.values()].some((item) => item.name === name)) { res.writeHead(404).end('no such snapshot'); return }
+        const created: Box = {
+          id: `sbx-${boxes.size + 1}`, plan: body.plan as string, group: body.sandboxGroupId as string, snapshotName: name ?? null, timeoutSeconds: body.timeoutSeconds as number,
+          idleTimeoutSeconds: body.idleTimeoutSeconds as number, createdAt: new Date().toISOString(), status: 'running', child: null, dir: temp('test-box-'),
+        }
+        boxes.set(created.id, created)
+        json(res, 201, { id: created.id, status: 'creating' })
+      } else if (box && action === 'terminate') {
+        terminated.push(box.id)
+        box.status = 'terminated'
+        box.child?.kill('SIGKILL')
+        res.writeHead(204).end()
+      } else if (box && action === 'files' && operation === 'upload/token') json(res, 200, { uri: `${renderOrigin}/connect/upload/${box.id}?path=${encodeURIComponent(url.searchParams.get('path') ?? '')}`, method: 'PUT', token: 't' })
+      else if (box && action === 'runs' && operation === 'stream/token') json(res, 200, { uri: `${renderOrigin}/connect/run/${box.id}`, method: 'POST', token: 't' })
+      else if (box && action === 'snapshots') {
+        const snapshot: Snapshot = { id: `snp-${snapshots.size + 1}`, name: body.name as string, status: 'available', expiresAt: body.expiresAt as string, sandboxGroupId: box.group }
+        snapshots.set(snapshot.id, snapshot)
+        json(res, 201, snapshot)
+      } else if (box) json(res, 200, { id: box.id, status: box.status })
+      else res.writeHead(404).end('nothing here')
     })
   }
 
   async function startAll(overrides: Partial<TestRelayDeps['config']> & Partial<TestRelayDeps> = {}): Promise<void> {
-    const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, ...deps } = overrides
-    const renderPort = await listen(render)
-    const relayDeps: TestRelayDeps = {
-      config: { renderApiKey, baseService: 'crn-test', plan: 'plan-crn-003', limitSeconds, maxRuns },
+    const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, deployment = 'poise.example.com', ...deps } = overrides
+    renderOrigin = `http://127.0.0.1:${await listen(render)}`
+    relay = new TestRelay({
+      config: { renderApiKey, workspace: 'tea-test', deployment, plan: '1c-2g', limitSeconds, maxRuns },
       privateKey,
-      origin: () => '',
-      log: { info: () => {}, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: () => {}, warn: (_event: string, fields: Record<string, unknown>) => { warnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
-      renderApi: `http://127.0.0.1:${renderPort}/v1`,
+      renderApi: `${renderOrigin}/v1`,
       sweepMs: 50,
       renderSweepMs: 100,
       leaseMs: 60_000,
       listGraceMs: 500,
+      pollMs: 10,
       ...deps,
-    }
-    relay = new TestRelay(relayDeps)
+    })
     relayServer = createServer((req, res) => { void relay.handle(req, res, new URL(req.url ?? '/', 'http://relay')) })
-    const origin = `http://127.0.0.1:${await listen(relayServer)}`
-    relayDeps.origin = () => origin
-    relayUrl = `${origin}${TEST_RELAY_PATH}`
+    relayUrl = `http://127.0.0.1:${await listen(relayServer)}${TEST_RELAY_PATH}`
     relay.start()
     hooks = temp()
     for (const file of ['run.mjs', 'hook.cjs', 'sitecustomize.py']) copyFileSync(join(SOURCE, file), join(hooks, file))
@@ -606,15 +536,22 @@ describe('a suite on a test instance', () => {
   }
 
   beforeEach(() => {
-    jobs = new Map()
-    cancels = []
-    startInstances = true
+    boxes = new Map()
+    snapshots = new Map()
+    groups = []
+    terminated = []
+    setups = 0
+    setupExit = 0
+    setupMs = 0
+    listLagMs = 0
+    warnings = []
+    runBoxes = true
     render = startRender()
     relayServer = undefined as unknown as Server
   })
 
   afterEach(async () => {
-    for (const job of jobs.values()) job.child?.kill('SIGKILL')
+    for (const box of boxes.values()) box.child?.kill('SIGKILL')
     relay?.stop()
     for (const server of [relayServer, render]) {
       server?.closeAllConnections()
@@ -648,7 +585,9 @@ describe('a suite on a test instance', () => {
     }
   }
 
-  it('gives the agent the output and exit code, and the instance ends with the suite', async () => {
+  const runBox = () => [...boxes.values()].find((box) => box.snapshotName !== null) as Box
+
+  it('gives the agent the output and exit code, and the box ends with the suite', async () => {
     await startAll()
     const repo = repository()
     const script = 'console.log("to stdout " + process.cwd()); console.error("to stderr"); process.exit(7)'
@@ -656,16 +595,26 @@ describe('a suite on a test instance', () => {
     expect(code).toBe(7)
     expect(stdout).toBe(`to stdout ${repo}\n`)
     expect(stderr).toContain('to stderr\n')
-    expect(stderr).toContain('disposable test instance')
-    const [job] = jobs.values()
-    expect(job.planId).toBe('plan-crn-003')
-    // Render splits this at spaces and mangles quotes. tini is PID 1, or what a suite kills never goes away.
-    expect(job.startCommand).toMatch(/^tini -- timeout -k 10 3660 node -e \S+ \S+\/instance [0-9a-f]{32} [0-9a-f]{64}$/)
-    expect(job.startCommand).not.toMatch(/['"]/)
-    // It exits by itself, unless the sweep gets there first: a job nothing wants any more gets cancelled.
-    await until(() => job.status !== 'running', 'the instance process to end')
-    expect(['succeeded', 'canceled']).toContain(job.status)
+    expect(stderr).toContain('disposable test box')
+    const box = runBox()
+    // It ends at the time limit whatever else happens, and never sleeps through a quiet suite.
+    expect(box).toMatchObject({ plan: '1c-2g', timeoutSeconds: 3660, idleTimeoutSeconds: 0 })
+    await until(() => terminated.includes(box.id), 'the box to be terminated')
     expect(relay.runs.size).toBe(0)
+  })
+
+  it('runs the command exactly as it was typed, with nothing of this workspace\'s hooks', async () => {
+    await startAll()
+    const repo = repository()
+    const runner = join(repo, 'vitest')
+    writeFileSync(runner, 'console.log(JSON.stringify({ args: process.argv.slice(2), options: process.env.NODE_OPTIONS ?? null, path: process.env.PYTHONPATH ?? null }))')
+    const hooked = { PYTHONPATH: hooks, NODE_OPTIONS: `--require "${join(hooks, 'hook.cjs')}"` }
+    const { code, stdout } = await suite(repo, [process.execPath, runner, 'run', '--reporter=dot'], hooked).done
+    expect(code).toBe(0)
+    const seen = JSON.parse(stdout) as { args: string[]; options: string | null; path: string | null }
+    expect(seen.args).toEqual(['run', '--reporter=dot'])
+    expect(seen.options ?? '').not.toContain('hook.cjs')
+    expect(seen.path).toBeNull()
   })
 
   it('unpacks the checkout, without what git ignores, at the same path', async () => {
@@ -719,101 +668,140 @@ describe('a suite on a test instance', () => {
     expect(stderr).toContain('cannot start /no/such/command')
   })
 
-  it('destroys the instance of a suite that hangs when the time limit passes', async () => {
+  it('destroys the box of a suite too slow for it at the time limit, and sends the agent to CI', async () => {
     await startAll({ limitSeconds: 2 })
     const started = Date.now()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'setInterval(() => {}, 1000)']).done
     expect(code).toBe(124)
-    expect(stderr).toContain('time limit')
+    expect(stderr).toContain('no test result: this suite is too big for its test box: it passed the 2 s time limit')
+    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+    expect(stderr).toContain('let CI run the tests')
     expect(Date.now() - started).toBeLessThan(10_000)
-    const [job] = jobs.values()
-    expect(cancels).toContain(job.id)
-    await until(() => job.child?.exitCode !== null || job.child?.signalCode !== null, 'the instance to die')
+    const box = runBox()
+    await until(() => terminated.includes(box.id), 'the box to be terminated')
   })
 
-  it('destroys the instance when the agent’s side is killed outright', async () => {
+  it('destroys the box when the agent’s side is killed outright', async () => {
     await startAll()
     const { child, done } = suite(repository(), [process.execPath, '-e', 'console.log("up"); setInterval(() => {}, 1000)'])
-    await until(() => jobs.size === 1 && relay.runs.size === 1, 'the run to start')
     child.stdout?.once('data', () => { child.kill('SIGKILL') })
     await done
-    const [job] = jobs.values()
-    await until(() => cancels.includes(job.id), 'the job to be cancelled')
-    await until(() => job.child?.signalCode === 'SIGKILL', 'the instance to die')
+    const box = runBox()
+    await until(() => terminated.includes(box.id), 'the box to be terminated')
     expect(relay.runs.size).toBe(0)
   })
 
-  it('destroys the instance when the agent’s side goes quiet with its connection open', async () => {
+  it('destroys the box when the agent’s side goes quiet with its connection open', async () => {
     await startAll({ leaseMs: 300 })
     const { child, done } = suite(repository(), [process.execPath, '-e', 'console.log("up"); setInterval(() => {}, 1000)'])
-    await until(() => jobs.size === 1, 'the run to start')
     child.stdout?.once('data', () => { child.kill('SIGSTOP') })
-    const [job] = jobs.values()
-    await until(() => cancels.includes(job.id), 'the job to be cancelled')
+    await until(() => boxes.size > 0 && terminated.includes(runBox()?.id), 'the box to be terminated')
     child.kill('SIGKILL')
     await done
   })
 
-  it('stops the run at once when the agent stops it', async () => {
+  it('stops the run at once when the agent stops it, with no word of a failure', async () => {
     await startAll()
     const { child, done } = suite(repository(), [process.execPath, '-e', 'console.log("up"); setInterval(() => {}, 1000)'])
     child.stdout?.once('data', () => { child.kill('SIGTERM') })
-    const { code } = await done
+    const { code, stderr } = await done
     expect(code).toBe(143)
-    const [job] = jobs.values()
-    expect(cancels).toContain(job.id)
+    expect(stderr).not.toContain('no test result')
+    expect(terminated).toContain(runBox().id)
   })
 
   it('says nothing of memory when a suite that mentions it passes', async () => {
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.log('cannot allocate memory, as this test expected')`]).done
     expect(code).toBe(0)
-    expect(stderr).not.toContain('too big to run there')
+    expect(stderr).not.toContain('no test result')
   })
 
-  it('says so when a suite runs out of memory, and answers with its exit code', async () => {
+  it('leaves a failing suite\'s exit code alone, whatever it says about memory', async () => {
+    await startAll()
+    const script = `console.log('cannot allocate memory: heap out of memory, as this test expected'); process.exit(7)`
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
+    expect(code).toBe(7)
+    expect(stderr).not.toContain('no test result')
+    expect(warnings).toEqual([])
+  })
+
+  it('tells a suite too big for its memory from one that failed, and sends the agent to CI', async () => {
     await startAll()
     const script = `console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
-    expect(code).toBe(134)
-    expect(stderr).toContain('too big to run there. CI is the gate before merge')
+    expect(code).toBe(125)
+    expect(stderr).toContain('no test result: this suite is too big for its test box: it ran out of memory')
+    expect(stderr).toContain('says nothing about your code. Skip local tests for this work')
+    expect(stderr).toContain('let CI run the tests')
     // Choosing tests is no job of an agent's.
     expect(stderr).not.toContain('name a')
-    expect(jobs.size).toBe(1)
+    // Poise hears of it too, with what it needs to find the suite.
+    const [warning] = warnings
+    expect(warning.event).toBe('test_relay.run.failed')
+    expect(warning.error).toContain('this suite is too big for its test box: it ran out of memory')
+    expect(warning.error).toContain('workspace alice')
+    expect(warning.error).toContain('command node -e')
   })
 
-  it('fails loud when the instance dies without a word', async () => {
+  it('fails loud when the box dies without a word', async () => {
     await startAll()
     const { child, done } = suite(repository(), [process.execPath, '-e', 'console.log("up"); setInterval(() => {}, 1000)'])
     child.stdout?.once('data', () => {
-      const [job] = jobs.values()
-      job.status = 'failed'
-      job.child?.kill('SIGKILL')
+      const box = runBox()
+      box.status = 'errored'
+      box.child?.kill('SIGKILL')
     })
     const { code, stderr } = await done
     expect(code).toBe(125)
-    expect(stderr).toContain('ended without reporting a result')
-    expect(stderr).toContain('CI is the gate before merge')
-    expect(stderr).not.toContain('name a')
-    expect(jobs.size).toBe(1)
+    expect(stderr).toContain('no test result')
+    expect(stderr).toContain('says nothing about your code')
   })
 
-  it('cancels a job no live run owns, as a restart leaves behind', async () => {
-    await startAll()
-    jobs.set('job-99', { id: 'job-99', startCommand: 'timeout 1 node -e x https://gone/instance 0123456789abcdef0123456789abcdef token', planId: 'p', createdAt: '', child: null, status: 'running' })
-    await until(() => cancels.includes('job-99'), 'the orphan to be cancelled')
+  it('keeps a healthy run whose box took long to get, however far Render\'s list lags', async () => {
+    setupMs = 800
+    listLagMs = 400
+    await startAll({ listGraceMs: 600 })
+    const { code, stdout } = await suite(repository(), [process.execPath, '-e', 'console.log("up"); setTimeout(() => {}, 300)']).done
+    expect(code).toBe(0)
+    expect(stdout).toBe('up\n')
   })
 
-  it('keeps a job whose run is still being created', async () => {
-    startInstances = false
+  it('builds once for suites that wait together, and all hear when that fails', async () => {
+    setupExit = 1
+    setupMs = 200
     await startAll()
-    const repo = repository()
-    const { child, done } = suite(repo, [process.execPath, '-e', 'process.exit(0)'])
-    await until(() => jobs.size === 1, 'the job to exist')
+    const runs = await Promise.all([1, 2, 3].map(() => suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done))
+    for (const { code, stderr } of runs) {
+      expect(code).toBe(125)
+      expect(stderr).toContain('setting up the test box failed')
+    }
+    // The one the relay began on starting, and then the one all three waited on.
+    expect(setups).toBeLessThanOrEqual(2)
+    expect(groups).toHaveLength(1)
+  })
+
+  it('leaves alone the boxes of another deployment in the same Render workspace', async () => {
+    await startAll({ deployment: 'a.example.com' })
+    await until(() => groups.length === 1, 'the group to exist')
+    boxes.set('sbx-99', { id: 'sbx-99', plan: 'p', group: 'sbg-other', snapshotName: 'x', timeoutSeconds: 1, idleTimeoutSeconds: 0, createdAt: '2020-01-01T00:00:00Z', status: 'running', child: null, dir: temp() })
     await new Promise((resolved) => setTimeout(resolved, 300))
-    expect(cancels).toEqual([])
-    child.kill('SIGKILL')
-    await done
+    expect(terminated).not.toContain('sbx-99')
+  })
+
+  it('terminates a box no live run owns, as a restart leaves behind', async () => {
+    await startAll()
+    await until(() => relay !== undefined && groups.length === 1, 'the group to exist')
+    boxes.set('sbx-99', { id: 'sbx-99', plan: 'p', group: 'sbg-0', snapshotName: 'x', timeoutSeconds: 1, idleTimeoutSeconds: 0, createdAt: '2020-01-01T00:00:00Z', status: 'running', child: null, dir: temp() })
+    await until(() => terminated.includes('sbx-99'), 'the orphan to be terminated')
+  })
+
+  it('keeps a box whose run does not know its id yet', async () => {
+    await startAll()
+    await until(() => groups.length === 1, 'the group to exist')
+    boxes.set('sbx-99', { id: 'sbx-99', plan: 'p', group: 'sbg-0', snapshotName: 'x', timeoutSeconds: 1, idleTimeoutSeconds: 0, createdAt: new Date().toISOString(), status: 'running', child: null, dir: temp() })
+    await new Promise((resolved) => setTimeout(resolved, 300))
+    expect(terminated).not.toContain('sbx-99')
   })
 
   it('fails loud when Render refuses, and never runs the suite here', async () => {
@@ -822,7 +810,7 @@ describe('a suite on a test instance', () => {
     const marker = join(repo, 'ran-here')
     const { code, stderr } = await suite(repo, [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, '')`]).done
     expect(code).toBe(125)
-    expect(stderr).toContain('Render refused the test instance')
+    expect(stderr).toContain('no test result: no test box could start')
     expect(existsSync(marker)).toBe(false)
   })
 
@@ -837,8 +825,66 @@ describe('a suite on a test instance', () => {
     await first.done
   })
 
-  it('accepts only a workspace\'s key, and each instance only its own run', async () => {
-    startInstances = false
+  it('builds what boxes start from once, in their own group, and reuses it', async () => {
+    await startAll()
+    expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
+    expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
+    expect(setups).toBe(1)
+    expect(groups).toEqual([expect.stringMatching(/^poise-test-boxes-[0-9a-f]{16}$/)])
+    expect(snapshots.size).toBe(1)
+    const [snapshot] = snapshots.values()
+    expect(snapshot.name).toMatch(/^box-[0-9a-f]{32}$/)
+    const builder = [...boxes.values()].find((box) => box.snapshotName === null) as Box
+    expect(terminated).toContain(builder.id)
+    expect(Date.parse(snapshot.expiresAt)).toBeGreaterThan(Date.now() + 300 * 24 * 3_600_000)
+    // A restart finds it, and a snapshot about to expire gets replaced.
+    relay.stop()
+    await startAll2()
+    await until(() => relay.runs !== undefined && groups.length === 1, 'the relay')
+    expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
+    expect(setups).toBe(1)
+    expect(groups).toHaveLength(1)
+    snapshot.expiresAt = new Date(Date.now() + 3_600_000).toISOString()
+    relay.stop()
+    await startAll2()
+    await until(() => setups === 2, 'the snapshot to be built again')
+  })
+
+  // Another gateway, of the same Render workspace.
+  async function startAll2(): Promise<void> {
+    relayServer.closeAllConnections()
+    await new Promise((done) => { relayServer.close(done) })
+    relay = new TestRelay({
+      config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', limitSeconds: 3600, maxRuns: 5 },
+      privateKey,
+      log: { info: () => {}, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
+      now: Date.now,
+      isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
+      renderApi: `${renderOrigin}/v1`,
+      sweepMs: 50,
+      renderSweepMs: 100,
+      pollMs: 10,
+    })
+    relayServer = createServer((req, res) => { void relay.handle(req, res, new URL(req.url ?? '/', 'http://relay')) })
+    relayUrl = `http://127.0.0.1:${await listen(relayServer)}${TEST_RELAY_PATH}`
+    relay.start()
+    writeFileSync(join(hooks, 'relay'), `${relayUrl}\n${KEY}\n`)
+  }
+
+  it('builds it again after a setup that failed, and says why until then', async () => {
+    setupExit = 1
+    await startAll()
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done
+    expect(code).toBe(125)
+    expect(stderr).toContain('setting up the test box failed with exit code 1: set up')
+    expect(snapshots.size).toBe(0)
+    setupExit = 0
+    expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
+    expect(snapshots.size).toBe(1)
+  })
+
+  it('accepts only a workspace\'s key, and each workspace only its own run', async () => {
+    runBoxes = false
     await startAll()
     const post = (path: string, authorization?: string, body = '{"argv":["x"],"cwd":"/","env":{}}') => fetch(`${relayUrl}${path}`, { method: 'POST', body, headers: authorization ? { authorization } : {} })
     const forged = workspaceKey(generateKeyPairSync('ed25519').privateKey, 'alice')
@@ -849,53 +895,23 @@ describe('a suite on a test instance', () => {
     const created = await post('/runs', `Bearer ${KEY}`)
     expect(created.status).toBe(201)
     const { id } = await created.json() as { id: string }
-    const token = [...jobs.values()][0].startCommand.split(' ').at(-1)
-    expect((await fetch(`${relayUrl}/runs/${id}/spec`)).status).toBe(410)
-    expect((await fetch(`${relayUrl}/runs/${id}/spec`, { headers: { authorization: `Bearer ${KEY}` } })).status).toBe(410)
-    expect((await fetch(`${relayUrl}/runs/${id}/spec`, { headers: { authorization: `Bearer ${token}` } })).status).toBe(200)
-    expect((await post(`/runs/${id}/lease`, `Bearer ${token}`)).status).toBe(401)
-    expect((await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: `Bearer ${token}` } })).status).toBe(401)
     // Another workspace's key opens nothing of this one's.
     const bob = `Bearer ${workspaceKey(privateKey, 'bob')}`
     expect((await post(`/runs/${id}/lease`, bob)).status).toBe(403)
+    expect((await post(`/runs/${id}/tree`, bob)).status).toBe(403)
     expect((await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: bob } })).status).toBe(403)
     expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers: { authorization: bob } })).status).toBe(403)
+    expect((await post(`/runs/${id}/lease`)).status).toBe(401)
     expect((await post('/runs', `Bearer ${KEY}`, '{"argv":[]}')).status).toBe(400)
-    // Open to all, and it holds nothing that is not in this public repository.
-    expect((await fetch(`${relayUrl}/instance`)).status).toBe(200)
+    expect((await fetch(`${relayUrl}/instance`)).status).toBe(404)
   })
+})
 
-  it('serves an instance script its bootstrap can run', async () => {
-    startInstances = false
-    await startAll()
-    const repo = repository()
-    const { child, done } = suite(repo, [process.execPath, '-e', 'console.log("from the instance"); process.exit(4)'])
-    await until(() => jobs.size === 1, 'the job to exist')
-    // The start command exactly as Render gets it, past `tini` and `timeout`, which a developer's Mac may not have.
-    const [, code, url, run, token] = /^tini -- timeout -k 10 \d+ node -e (\S+) (\S+) (\S+) (\S+)$/.exec([...jobs.values()][0].startCommand) ?? []
-    const instance = spawn(process.execPath, ['-e', code, url, run, token, unpacked], { stdio: 'ignore' })
-    const { code: exit, stdout } = await done
-    instance.kill('SIGKILL')
-    expect(exit).toBe(4)
-    expect(stdout).toBe('from the instance\n')
-    child.kill('SIGKILL')
+describe('what a box starts from', () => {
+  it('has the Chromium this repository\'s Playwright expects', () => {
+    const lock = JSON.parse(readFileSync('package-lock.json', 'utf8')) as { packages: Record<string, { version: string }> }
+    expect(readFileSync('gateway/src/test-box-setup.sh', 'utf8')).toContain(`playwright@${lock.packages['node_modules/@playwright/test'].version} install`)
   })
-
-  it('ends an instance whose run is over', async () => {
-    startInstances = false
-    await startAll()
-    const instance = spawn(process.execPath, instanceArgs(`${relayUrl}/instance`, '0'.repeat(32), 'token', unpacked), { stdio: 'ignore' })
-    const code = await new Promise((done) => { instance.on('exit', done) })
-    expect(code).toBe(1)
-  })
-
-  it('ends an instance when the relay is gone', async () => {
-    startInstances = false
-    await startAll()
-    const instance = spawn(process.execPath, instanceArgs('http://127.0.0.1:9/instance', '0'.repeat(32), 'token', unpacked), { stdio: 'ignore' })
-    const code = await new Promise((done) => { instance.on('exit', done) })
-    expect(code).toBe(1)
-  }, 30_000)
 })
 
 describe('the frame reader', () => {

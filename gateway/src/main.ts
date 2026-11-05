@@ -68,7 +68,6 @@ const testRelay = config.testRelay
   ? new TestRelay({
     config: config.testRelay,
     privateKey: keys.privateKey,
-    origin: (handle) => `${config.insecureHttp ? 'http' : 'https'}://${handle}.${config.domain}`,
     log,
     now,
     isWorkspace: (handle) => store.getWorkspace(handle) !== null && store.getUser(handle)?.disabledAt === null,
