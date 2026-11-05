@@ -208,7 +208,7 @@ export class TestRelay {
     const grace = this.deps.listGraceMs ?? LIST_GRACE_MS
     for (const run of this.runs.values()) {
       if (run.jobId && !running.has(run.jobId) && now - run.created > grace) {
-        this.kill(run, `the test instance ended without reporting a result, as one that runs out of memory does: this is too big to run there. CI is the gate before merge; for an answer sooner, name a smaller part of it. Render's logs for ${run.jobId} say more`)
+        this.kill(run, `the test instance ended without reporting a result, as one that runs out of memory does: this is too big to run there. CI is the gate before merge. Render's logs for ${run.jobId} say more`)
       }
     }
   }
