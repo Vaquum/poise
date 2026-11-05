@@ -671,7 +671,7 @@ are. A command that replaces `PYTHONPATH` or `NODE_OPTIONS` outright, as in
 mechanism is `scripts/test-offload/` and `gateway/src/test-relay.ts`.
 
 **What runs.** Agents need nothing new: they type what they always typed, and the
-hooks fit it to the instance, which has half a CPU and 512 MB. A command naming
+hooks fit it to the instance, which has one CPU and 2 GB. A command naming
 its tests runs those. A command for a whole suite runs the tests the change
 touches, measured from where the checkout leaves the default branch, and says so:
 for vitest, its own `--changed`; for pytest, changed test files and test files
@@ -680,9 +680,7 @@ after a change to `conftest.py` or test configuration, when git fails, or when
 code changed and no test mentions it. `npm run check` is such a command, at each of its steps, and skips its build.
 On Poise itself `npm test` names [the essential tests](Testing.md#the-essential-tests), so it runs those.
 Vitest and pytest run with one worker, and Node may use 80% of the memory. What
-still does not fit fails with a line saying CI is the gate before merge. On Poise
-itself that means browser tests, the typecheck of `tsconfig.tests.json` and the
-unit suite in full.
+still does not fit fails with a line saying CI is the gate before merge.
 
 **What an instance gets.** Only what the suite needs, at the same paths: the
 checkout's tracked and untracked files without what git ignores, its
@@ -742,7 +740,7 @@ agent can read that key, which lets it start suites and nothing else.
 | --- | --- | --- | --- |
 | `POISE_TEST_RENDER_API_KEY` | yes | | A Render API key. Set both of these, or neither |
 | `POISE_TEST_BASE_SERVICE` | yes | | The cron job's service ID, `crn-…` |
-| `POISE_TEST_PLAN` | | `plan-crn-003` | The instances' plan, the cheapest: 0.5 CPU and 512 MB, about $0.01 an hour, or $7 a month for one running without a pause |
+| `POISE_TEST_PLAN` | | `plan-crn-005` | The instances' plan: one CPU and 2 GB, about $0.035 an hour, or $25 a month for one running without a pause |
 | `POISE_TEST_LIMIT_SECONDS` | | `3600` | The time limit; keep `BASH_MAX_TIMEOUT_MS` in `server/process.ts` in step |
 | `POISE_TEST_MAX_RUNS` | | `30` | Suites at once; past it an agent's command fails loudly |
 
