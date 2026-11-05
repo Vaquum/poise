@@ -161,11 +161,11 @@ export class BehaviorLedgerObserver {
       const bytes = Buffer.byteLength(serialized)
       if (bytes > 4_096 || this.failed) { this.lose(1); return }
       const captured = JSON.parse(serialized) as LedgerObservation
-      // Overflow waits for the drain while the worker makes progress and
-      // spills only once captures sit undrained past the stall budget.
+      // Startup shares the drain grace: readiness alone does not prove a stall.
+      // Spill overflow only once captures sit undrained past the stall budget.
       if ((this.captures >= (this.options.captureLimit ?? 1_000)
         || this.captureBytes + bytes > (this.options.captureBytes ?? 2 * 1024 * 1024))
-        && (!this.ready || this.stalled())) {
+        && this.stalled()) {
         this.lose(1)
         return
       }
