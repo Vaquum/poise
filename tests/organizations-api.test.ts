@@ -13,7 +13,18 @@ import { CATALOG_STDOUT } from './model-catalog-fixture'
 
 vi.setConfig({ testTimeout: 25_000, hookTimeout: 25_000 })
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), lockStallMs: 0 }))
+vi.mock('node:fs/promises', async (original) => {
+  const actual = await original<typeof import('node:fs/promises')>()
+  return {
+    ...actual,
+    // A busy machine, at the step of taking a datastore's lock.
+    chmod: async (...args: Parameters<typeof actual.chmod>) => {
+      if (mocks.lockStallMs && String(args[0]).endsWith('github.sqlite.lock')) await new Promise((resolve) => setTimeout(resolve, mocks.lockStallMs))
+      return actual.chmod(...args)
+    },
+  }
+})
 vi.mock('../server/process', async (original) => ({
   ...(await original<typeof import('../server/process')>()),
   runFile: mocks.runFile,
@@ -236,6 +247,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  mocks.lockStallMs = 0
   await cache?.stopPoiseRuntime()
   await new Promise<void>((resolve) => server ? server.close(() => resolve()) : resolve())
   if (database?.db.open) database.closeDatabase()
@@ -252,6 +264,12 @@ afterEach(async () => {
 })
 
 describe('organizations API', () => {
+  it('activates although taking the datastore lock is slow, as on a busy machine', async () => {
+    mocks.lockStallMs = 120
+    expect((await request('/api/organizations', { org: 'acme' })).status).toBe(202)
+    await orgStatus('acme', 'ready')
+  })
+
   it('says this is a personal computer, so Settings adds no gateway sections and setup never opens', async () => {
     const response = await fetch(`${base}/api/workspace`)
     expect(response.status).toBe(200)
