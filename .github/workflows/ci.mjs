@@ -235,7 +235,8 @@ function runTests(kind) {
 function changesFromMain() {
   let base
   try {
-    base = git('merge-base', 'origin/main', 'HEAD')
+    // Mid-merge the working tree holds all that main brought: what differs from main's side is this branch's own.
+    base = existsSync(git('rev-parse', '--git-path', 'MERGE_HEAD')) ? 'MERGE_HEAD' : git('merge-base', 'origin/main', 'HEAD')
   } catch {
     throw new Error('The essential tests are chosen against origin/main, which this checkout cannot reach. Fetch it, name the tests (npm test -- tests/x.test.ts), or run everything (npm run test:full).')
   }
