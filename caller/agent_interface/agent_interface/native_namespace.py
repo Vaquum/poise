@@ -285,17 +285,40 @@ class Namespace:
         if active() is not self or os.getpid() != 2:
             raise RuntimeError("native checkout cleanup requires its original Caller continuation")
         deadline = monotonic() + SETTLE_SECONDS
+        pending = "namespace evidence not yet read"
         while True:
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise TimeoutError("native invocation still owns a helper or worker")
-            state = self.read(timeout_seconds=min(CONTROL_SECONDS, remaining))
+                raise TimeoutError(f"native invocation still owns a helper or worker: {pending}")
+            try:
+                state = self.read(timeout_seconds=min(CONTROL_SECONDS, remaining))
+            except (OSError, RuntimeError) as error:
+                raise RuntimeError(f"native idle proof unavailable: {pending}: {error}") from error
+            pending = f"pids={state['pids']}"
+            for pid in state["pids"]:
+                if pid <= 2:
+                    continue
+                try:
+                    name, _, fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")
+                    pending += f"; pid={pid} name={name.partition('(')[2]!r} state={fields.split()[0]}"
+                except OSError as error:
+                    pending += f"; pid={pid} name/state unavailable: {error}"
             if monotonic() > deadline:
-                raise TimeoutError("native idle proof arrived after its deadline")
+                raise TimeoutError(f"native idle proof arrived after its deadline: {pending}")
             # PID 1 is the trusted reaper; PID 2 is this synchronous Caller.
             # Any other member, including an unreaped child, keeps the lease.
             if state["pids"] == [1, 2]:
                 return
+            # This private namespace owns even detached/stopped helpers.
+            # SIGKILL ends stopped helpers without resuming their writes.
+            for pid in state["pids"]:
+                if pid > 2:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except OSError as error:
+                        raise RuntimeError(f"native helper termination failed: {pending}: {error}") from error
             sleep(0.005)
 
     def start(self, registered: Callable[[dict], None], *, timeout_seconds: float, guard=None) -> bool:

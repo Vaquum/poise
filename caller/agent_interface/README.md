@@ -49,6 +49,11 @@ release from PID loss, wall-clock order or path absence. Physical v2 CLI calls
 register the original private namespace with the existing workspace supervisor
 before preparation or a helper/provider starts. Only the original retained
 kernel view can certify process settlement before normal pinned disk cleanup.
+At idle settlement, the original Caller kills leftover helpers inside its
+private PID namespace, preserving PID 1's reaper and PID 2's Caller. The existing
+two-second deadline and positive idle proof still gate lease release and
+publication. An unverified settlement retains ownership and reports remaining
+PIDs, process names and states.
 The [service contract](../../docs/Service-architecture.md#workspace-behavior-observation)
 defines support, teardown and uncertainty. Same-supervisor claimed disk recovery
 uses the maintenance path below; forced-container lifecycle proof and complete
