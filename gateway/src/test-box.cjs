@@ -12,7 +12,10 @@ const [specPath, treePath, root = '/'] = process.argv.slice(2)
 const onBox = root === '/'
 const asUser = onBox ? { uid: 10001, gid: 10001 } : {}
 const RUNNER_FAILED = 125
-const OUT_OF_MEMORY = /heap out of memory|reaching memory limit|cannot allocate memory/i
+// What only a runtime that ran out says, not a test that talks about memory.
+const OUT_OF_MEMORY = /FATAL ERROR: .*heap out of memory|Worker terminated due to reaching memory limit/
+// The kernel killing for the whole box, not a memory-capped container a test started: that one says "Memory cgroup out of memory".
+const BOX_OUT_OF_MEMORY = /(^|\] )Out of memory: Killed process/m
 const OUTPUT_TAIL_CHARS = 64 * 1024
 const QUIET_MS = 2_000
 const DOCKER_WAIT_MS = 30_000
@@ -102,7 +105,7 @@ function runSuite(spec, env) {
       child.once('close', () => { closed = true })
       while (!closed && Date.now() - lastOutput < QUIET_MS) await sleep(50)
       const status = code ?? 128 + (constants.signals[signal] ?? 0)
-      if (status !== 0 && (/^oom_kill [1-9]/m.test(tryRead('/proc/vmstat')) || OUT_OF_MEMORY.test(tail))) fail('this suite is too big for its test box: it ran out of memory')
+      if (status !== 0 && (OUT_OF_MEMORY.test(tail) || (onBox && BOX_OUT_OF_MEMORY.test(spawnSync('dmesg', { encoding: 'utf8' }).stdout ?? '')))) fail('this suite is too big for its test box: it ran out of memory')
       else process.stdout.write('', () => process.stderr.write('', () => process.exit(status)))
     })()
   })

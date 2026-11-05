@@ -682,7 +682,9 @@ Chromium of this repository's Playwright. `/tmp` is its own, whatever temporary
 folder the agent has, because that can be too long for a Unix socket made under
 it. `gateway/src/test-box-setup.sh` builds all this once, in about a minute, and
 the gateway keeps the result as a Render snapshot named after that file's
-contents, so a change there builds a new one. Nothing else needs setting up.
+contents, so a change there builds a new one. Boxes live in a sandbox group of their
+own, one per `POISE_DOMAIN`, so deployments sharing a Render workspace leave each
+other's alone. Nothing else needs setting up.
 
 **What a box gets.** Only what the suite needs, at the same paths: the
 checkout's tracked and untracked files without what git ignores, its
@@ -713,9 +715,9 @@ can fail to arrive, or Render can be down. The agent's command then says on stde
 why there is no test result, that this says nothing about its code, and to skip
 local tests for this work: not to retry or run parts of it, but to push and let CI
 run the tests. It exits with 125, or 124 at the time limit, and never falls back to
-running in the workspace. Each of these also reaches the gateway's diagnostics as
-`test_relay.run.failed`, with the workspace, the command and the reason; every run
-is logged with its command, exit code and duration as `test_relay.run.finished`.
+running in the workspace. Each that the gateway can see also reaches its diagnostics
+as `test_relay.run.failed`, naming the workspace, the command and the reason; every
+run is logged with its command, exit code and duration as `test_relay.run.finished`.
 The time limit is under an agent's shell tool's default of ten minutes
 (`BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts`), so that the agent hears this
 from the box and not as a command its tool gave up on.

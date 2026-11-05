@@ -14,7 +14,7 @@ describe('the relay agents\' test suites meet at', () => {
     h = await startHarness({
       env,
       testRelay: ({ privateKey, log, now, store }) => new TestRelay({
-        config: { renderApiKey: 'render-key', workspace: 'tea-x', plan: '1c-2g', limitSeconds: 60, maxRuns: 2 },
+        config: { renderApiKey: 'render-key', workspace: 'tea-x', deployment: 'poise.example.com', plan: '1c-2g', limitSeconds: 60, maxRuns: 2 },
         privateKey,
         log,
         now,

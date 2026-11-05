@@ -17,6 +17,8 @@ export interface TestRelayConfig {
   renderApiKey: string
   /** The Render workspace the boxes run in. */
   workspace: string
+  /** This deployment's name: several may share a Render workspace, and each leaves the others' boxes alone. */
+  deployment: string
   plan: string
   limitSeconds: number
   maxRuns: number
@@ -45,6 +47,7 @@ interface Run {
   created: number
   lease: number
   boxId: string | null
+  boxCreated: number
   ready: boolean
   output: ServerResponse | null
   parts: number
@@ -77,7 +80,11 @@ const MAX_SPEC_BYTES = 1024 * 1024
 const MAX_TREE_PART_BYTES = 64 * 1024 * 1024
 const UPLOAD_ATTEMPTS = 3
 const RUN_ID = /^[0-9a-f]{32}$/
-const GROUP = 'poise-test-boxes'
+const GROUP_PREFIX = 'poise-test-boxes'
+const RUNNER_FAILED = 125
+const OUTPUT_TAIL_CHARS = 2_000
+// What test-box.cjs says when a suite ended without a result.
+const NO_RESULT = /\[poise\] no test result: (.*?)\. This says nothing/
 const TREE_PATH = '/tmp/poise-tree'
 const SPEC_PATH = '/tmp/poise-spec.json'
 const SCRIPT_PATH = '/tmp/poise-box.cjs'
@@ -289,9 +296,10 @@ export class TestRelay {
   }
 
   private async prepare(): Promise<{ group: string; snapshot: string }> {
+    const name = `${GROUP_PREFIX}-${createHash('sha256').update(this.deps.config.deployment).digest('hex').slice(0, 16)}`
     const groups = await this.render<{ sandboxGroup: { id: string; name: string } }[]>('GET', `/sandbox-groups?${this.owner}&limit=100`)
-    const group = groups.find((item) => item.sandboxGroup.name === GROUP)?.sandboxGroup.id
-      ?? (await this.render<{ id: string }>('POST', '/sandbox-groups', { name: GROUP, ownerId: this.deps.config.workspace, region: 'oregon' })).id
+    const group = groups.find((item) => item.sandboxGroup.name === name)?.sandboxGroup.id
+      ?? (await this.render<{ id: string }>('POST', '/sandbox-groups', { name, ownerId: this.deps.config.workspace, region: 'oregon' })).id
     this.group = group
     const snapshot = `box-${createHash('sha256').update(this.setupScript).digest('hex').slice(0, 32)}`
     const listed = await this.render<{ snapshot: { name: string; expiresAt?: string | null } }[]>('GET', `/sandbox-groups/${group}/snapshots?${this.owner}&status=available&limit=100`)
@@ -326,14 +334,20 @@ export class TestRelay {
     }
   }
 
+  /** A warning reaches Poise's diagnostics, which keep only `error` of what a gateway operation says of itself. */
+  private runFailed(run: Run, why: string): void {
+    this.deps.log.warn('test_relay.run.failed', {
+      id: run.id, handle: run.handle, boxId: run.boxId, error: `${why} (workspace ${run.handle}, command ${commandLabel(run.spec.argv)})`,
+    })
+  }
+
   /** Ends a run that will report nothing more. The sweep terminates its box again if this fails. */
   private kill(run: Run, why: string, code = 125): void {
     if (!this.runs.delete(run.id)) return
-    // A warning reaches Poise's diagnostics. What an agent or a restart stopped is no failure of the runner.
+    // What an agent or a restart stopped is no failure of the runner.
     const failure = code !== 143 && why !== 'the gateway restarted' && why !== 'the workspace went away'
-    const fields = { id: run.id, handle: run.handle, boxId: run.boxId, command: commandLabel(run.spec.argv), error: why }
-    if (failure) this.deps.log.warn('test_relay.run.failed', fields)
-    else this.deps.log.info('test_relay.run.killed', fields)
+    if (failure) this.runFailed(run, why)
+    else this.deps.log.info('test_relay.run.killed', { id: run.id, handle: run.handle, boxId: run.boxId, command: commandLabel(run.spec.argv), error: why })
     if (run.output) {
       run.output.write(frame(FRAME.fail, Buffer.concat([Buffer.from([code]), Buffer.from(why)])))
       run.output.end()
@@ -360,24 +374,23 @@ export class TestRelay {
     const alive = new Set(listed.map((box) => box.id))
     const listGrace = this.deps.listGraceMs ?? LIST_GRACE_MS
     for (const run of this.runs.values()) {
-      if (run.boxId && !alive.has(run.boxId) && now - run.created > listGrace) this.kill(run, `its box ${run.boxId} ended without reporting a result`)
+      if (run.boxId && !alive.has(run.boxId) && now - run.boxCreated > listGrace) this.kill(run, `its box ${run.boxId} ended without reporting a result`)
     }
   }
 
   private async provision(run: Run): Promise<void> {
     const { limitSeconds } = this.deps.config
-    const start = async (): Promise<{ id: string }> => {
-      const { group, snapshot } = await this.prepared()
-      // Ends the box whatever the suite does, and whether or not this gateway still lives.
-      return this.createBox({ sandboxGroupId: group, snapshotName: snapshot, timeoutSeconds: limitSeconds + 60 })
-    }
-    const box = await start().catch(async (error: unknown) => {
-      // The snapshot may be gone since this gateway last looked.
+    // Ends the box whatever the suite does, and whether or not this gateway still lives.
+    const start = ({ group, snapshot }: { group: string; snapshot: string }): Promise<{ id: string }> => this.createBox({ sandboxGroupId: group, snapshotName: snapshot, timeoutSeconds: limitSeconds + 60 })
+    const base = this.prepared()
+    const box = await start(await base).catch(async (error: unknown) => {
+      // The snapshot may be gone since this gateway last looked. Runs noticing it together share one new one.
       if (!(error instanceof RelayError)) throw error
-      this.base = null
-      return start()
+      if (this.base === base) this.base = null
+      return start(await this.prepared())
     })
     run.boxId = box.id
+    run.boxCreated = this.deps.now()
     if (!this.runs.has(run.id)) {
       void this.terminate(box.id)
       return
@@ -397,7 +410,7 @@ export class TestRelay {
       throw new RelayError(400, 'a run names argv, cwd and env')
     }
     const now = this.deps.now()
-    const run: Run = { id: randomBytes(16).toString('hex'), handle, spec, created: now, lease: now, boxId: null, ready: false, output: null, parts: 0 }
+    const run: Run = { id: randomBytes(16).toString('hex'), handle, spec, created: now, lease: now, boxId: null, boxCreated: 0, ready: false, output: null, parts: 0 }
     this.runs.set(run.id, run)
     return run
   }
@@ -474,7 +487,10 @@ export class TestRelay {
           await this.uploadTo(run.boxId, path, new Blob([new Uint8Array(part)]))
           break
         } catch (error) {
-          if (attempt >= UPLOAD_ATTEMPTS) throw error
+          if (attempt >= UPLOAD_ATTEMPTS) {
+            this.kill(run, `sending the checkout to the box failed: ${errorMessage(error)}`)
+            return
+          }
           await new Promise((done) => { setTimeout(done, (this.deps.pollMs ?? POLL_MS) * attempt) })
         }
       }
@@ -484,14 +500,19 @@ export class TestRelay {
 
   private async execute(run: Run): Promise<void> {
     const boxId = run.boxId as string
+    let tail = ''
     try {
       await this.uploadTo(boxId, SPEC_PATH, JSON.stringify(run.spec))
       await this.uploadTo(boxId, SCRIPT_PATH, new Blob([new Uint8Array(this.boxScript)]))
       const code = await this.exec(boxId, BOX_COMMAND, (stream, data) => {
-        if (!run.output) return undefined
+        // A run that was ended has ended its response too, and writing to that would bring down the gateway.
+        if (!this.runs.has(run.id) || !run.output) return undefined
+        if (stream === 'stderr') tail = (tail + data).slice(-OUTPUT_TAIL_CHARS)
         return write(run.output, frame(stream === 'stderr' ? FRAME.stderr : FRAME.stdout, Buffer.from(data)))
       })
       if (!this.runs.delete(run.id)) return
+      const noResult = code === RUNNER_FAILED ? NO_RESULT.exec(tail)?.[1] : undefined
+      if (noResult) this.runFailed(run, noResult)
       this.deps.log.info('test_relay.run.finished', {
         id: run.id, handle: run.handle, boxId, command: commandLabel(run.spec.argv), exit: code, seconds: Math.round((this.deps.now() - run.created) / 1000),
       })

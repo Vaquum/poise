@@ -198,6 +198,16 @@ describe('what reaches a test box', () => {
     expect(paths.filter((path: string) => path.startsWith('/usr'))).toEqual([])
   })
 
+  it('refuses to send an interpreter\'s folder with the home or the run\'s temporary files in it', () => {
+    const repo = checkout()
+    const home = temp()
+    expect(() => filesToSend(repo, [home], {}, home)).toThrow('holds what must not reach a test box')
+    expect(() => filesToSend(repo, [join(home, '..')], {}, home)).toThrow('holds what must not reach a test box')
+    const tmp = join(home, 'tmp')
+    mkdirSync(tmp)
+    expect(() => filesToSend(repo, [home], { TMPDIR: tmp }, '/nowhere')).toThrow('holds what must not reach a test box')
+  })
+
   it('refuses a checkout whose git configuration holds a credential', () => {
     for (const line of ['\turl = https://x-access-token:abc@github.com/a/b.git', '\textraheader = AUTHORIZATION: basic abc']) {
       const repo = checkout()
@@ -380,7 +390,10 @@ describe('a suite on a test box', () => {
   let terminated: string[]
   let setups: number
   let setupExit: number
+  let setupMs: number
+  let listLagMs: number
   let runBoxes: boolean
+  let warnings: Record<string, unknown>[]
   let relay: TestRelay
   let relayServer: Server
   let relayUrl: string
@@ -401,9 +414,11 @@ describe('a suite on a test box', () => {
     if (command === SETUP_COMMAND) {
       setups += 1
       expect(readFileSync(join(box.dir, 'tmp/poise-setup.sh'))).toEqual(readFileSync('gateway/src/test-box-setup.sh'))
-      event('output', { data: 'set up\n', stream: 'stdout' })
-      event('exit', { exit_code: setupExit })
-      res.end()
+      setTimeout(() => {
+        event('output', { data: 'set up\n', stream: 'stdout' })
+        event('exit', { exit_code: setupExit })
+        res.end()
+      }, setupMs)
       return
     }
     expect(command).toBe(BOX_COMMAND)
@@ -450,7 +465,11 @@ describe('a suite on a test box', () => {
       else if (path === '/v1/sandbox-groups') { groups.push(body.name as string); json(res, 201, { id: `sbg-${groups.length - 1}`, name: body.name }) }
       else if (/^\/v1\/sandbox-groups\/[^/]+\/snapshots$/.test(path)) json(res, 200, [...snapshots.values()].filter((item) => item.status === 'available').map((snapshot) => ({ cursor: 'c', snapshot })))
       else if (/^\/v1\/sandbox-groups\/[^/]+\/snapshots\//.test(path)) json(res, 200, snapshots.get(path.split('/').at(-1) as string))
-      else if (path === '/v1/sandboxes' && req.method === 'GET') json(res, 200, [...boxes.values()].filter((item) => item.status === 'running').map((sandbox) => ({ cursor: 'c', sandbox: { id: sandbox.id, createdAt: sandbox.createdAt } })))
+      else if (path === '/v1/sandboxes' && req.method === 'GET') {
+        // Render's list can lag behind a box that was just created.
+        const listed = [...boxes.values()].filter((item) => item.status === 'running' && item.group === url.searchParams.get('sandboxGroupId') && Date.now() - Date.parse(item.createdAt) >= listLagMs)
+        json(res, 200, listed.map((sandbox) => ({ cursor: 'c', sandbox: { id: sandbox.id, createdAt: sandbox.createdAt } })))
+      }
       else if (path === '/v1/sandboxes') {
         const name = body.snapshotName as string | undefined
         if (name && ![...snapshots.values()].some((item) => item.name === name)) { res.writeHead(404).end('no such snapshot'); return }
@@ -477,12 +496,12 @@ describe('a suite on a test box', () => {
   }
 
   async function startAll(overrides: Partial<TestRelayDeps['config']> & Partial<TestRelayDeps> = {}): Promise<void> {
-    const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, ...deps } = overrides
+    const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, deployment = 'poise.example.com', ...deps } = overrides
     renderOrigin = `http://127.0.0.1:${await listen(render)}`
     relay = new TestRelay({
-      config: { renderApiKey, workspace: 'tea-test', plan: '1c-2g', limitSeconds, maxRuns },
+      config: { renderApiKey, workspace: 'tea-test', deployment, plan: '1c-2g', limitSeconds, maxRuns },
       privateKey,
-      log: { info: () => {}, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: () => {}, warn: (_event: string, fields: Record<string, unknown>) => { warnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
@@ -509,6 +528,9 @@ describe('a suite on a test box', () => {
     terminated = []
     setups = 0
     setupExit = 0
+    setupMs = 0
+    listLagMs = 0
+    warnings = []
     runBoxes = true
     render = startRender()
     relayServer = undefined as unknown as Server
@@ -681,6 +703,15 @@ describe('a suite on a test box', () => {
     expect(stderr).not.toContain('no test result')
   })
 
+  it('leaves a failing suite\'s exit code alone, whatever it says about memory', async () => {
+    await startAll()
+    const script = `console.log('cannot allocate memory: heap out of memory, as this test expected'); process.exit(7)`
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
+    expect(code).toBe(7)
+    expect(stderr).not.toContain('no test result')
+    expect(warnings).toEqual([])
+  })
+
   it('tells a suite too big for its memory from one that failed, and sends the agent to CI', async () => {
     await startAll()
     const script = `console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
@@ -691,6 +722,12 @@ describe('a suite on a test box', () => {
     expect(stderr).toContain('let CI run the tests')
     // Choosing tests is no job of an agent's.
     expect(stderr).not.toContain('name a')
+    // Poise hears of it too, with what it needs to find the suite.
+    const [warning] = warnings
+    expect(warning.event).toBe('test_relay.run.failed')
+    expect(warning.error).toContain('this suite is too big for its test box: it ran out of memory')
+    expect(warning.error).toContain('workspace alice')
+    expect(warning.error).toContain('command node -e')
   })
 
   it('fails loud when the box dies without a word', async () => {
@@ -707,17 +744,48 @@ describe('a suite on a test box', () => {
     expect(stderr).toContain('says nothing about your code')
   })
 
+  it('keeps a healthy run whose box took long to get, however far Render\'s list lags', async () => {
+    setupMs = 800
+    listLagMs = 400
+    await startAll({ listGraceMs: 600 })
+    const { code, stdout } = await suite(repository(), [process.execPath, '-e', 'console.log("up"); setTimeout(() => {}, 300)']).done
+    expect(code).toBe(0)
+    expect(stdout).toBe('up\n')
+  })
+
+  it('builds once for suites that wait together, and all hear when that fails', async () => {
+    setupExit = 1
+    setupMs = 200
+    await startAll()
+    const runs = await Promise.all([1, 2, 3].map(() => suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done))
+    for (const { code, stderr } of runs) {
+      expect(code).toBe(125)
+      expect(stderr).toContain('setting up the test box failed')
+    }
+    // The one the relay began on starting, and then the one all three waited on.
+    expect(setups).toBeLessThanOrEqual(2)
+    expect(groups).toHaveLength(1)
+  })
+
+  it('leaves alone the boxes of another deployment in the same Render workspace', async () => {
+    await startAll({ deployment: 'a.example.com' })
+    await until(() => groups.length === 1, 'the group to exist')
+    boxes.set('sbx-99', { id: 'sbx-99', plan: 'p', group: 'sbg-other', snapshotName: 'x', timeoutSeconds: 1, idleTimeoutSeconds: 0, createdAt: '2020-01-01T00:00:00Z', status: 'running', child: null, dir: temp() })
+    await new Promise((resolved) => setTimeout(resolved, 300))
+    expect(terminated).not.toContain('sbx-99')
+  })
+
   it('terminates a box no live run owns, as a restart leaves behind', async () => {
     await startAll()
     await until(() => relay !== undefined && groups.length === 1, 'the group to exist')
-    boxes.set('sbx-99', { id: 'sbx-99', plan: 'p', group: 'g', snapshotName: 'x', timeoutSeconds: 1, idleTimeoutSeconds: 0, createdAt: '2020-01-01T00:00:00Z', status: 'running', child: null, dir: temp() })
+    boxes.set('sbx-99', { id: 'sbx-99', plan: 'p', group: 'sbg-0', snapshotName: 'x', timeoutSeconds: 1, idleTimeoutSeconds: 0, createdAt: '2020-01-01T00:00:00Z', status: 'running', child: null, dir: temp() })
     await until(() => terminated.includes('sbx-99'), 'the orphan to be terminated')
   })
 
   it('keeps a box whose run does not know its id yet', async () => {
     await startAll()
     await until(() => groups.length === 1, 'the group to exist')
-    boxes.set('sbx-99', { id: 'sbx-99', plan: 'p', group: 'g', snapshotName: 'x', timeoutSeconds: 1, idleTimeoutSeconds: 0, createdAt: new Date().toISOString(), status: 'running', child: null, dir: temp() })
+    boxes.set('sbx-99', { id: 'sbx-99', plan: 'p', group: 'sbg-0', snapshotName: 'x', timeoutSeconds: 1, idleTimeoutSeconds: 0, createdAt: new Date().toISOString(), status: 'running', child: null, dir: temp() })
     await new Promise((resolved) => setTimeout(resolved, 300))
     expect(terminated).not.toContain('sbx-99')
   })
@@ -748,7 +816,7 @@ describe('a suite on a test box', () => {
     expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
     expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
     expect(setups).toBe(1)
-    expect(groups).toEqual(['poise-test-boxes'])
+    expect(groups).toEqual([expect.stringMatching(/^poise-test-boxes-[0-9a-f]{16}$/)])
     expect(snapshots.size).toBe(1)
     const [snapshot] = snapshots.values()
     expect(snapshot.name).toMatch(/^box-[0-9a-f]{32}$/)
@@ -761,7 +829,7 @@ describe('a suite on a test box', () => {
     await until(() => relay.runs !== undefined && groups.length === 1, 'the relay')
     expect((await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done).code).toBe(0)
     expect(setups).toBe(1)
-    expect(groups).toEqual(['poise-test-boxes'])
+    expect(groups).toHaveLength(1)
     snapshot.expiresAt = new Date(Date.now() + 3_600_000).toISOString()
     relay.stop()
     await startAll2()
@@ -773,7 +841,7 @@ describe('a suite on a test box', () => {
     relayServer.closeAllConnections()
     await new Promise((done) => { relayServer.close(done) })
     relay = new TestRelay({
-      config: { renderApiKey: 'render-key', workspace: 'tea-test', plan: '1c-2g', limitSeconds: 3600, maxRuns: 5 },
+      config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', limitSeconds: 3600, maxRuns: 5 },
       privateKey,
       log: { info: () => {}, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,

@@ -250,6 +250,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     ? {
       renderApiKey,
       workspace,
+      deployment: domain,
       plan: read('POISE_TEST_BOX_PLAN') ?? '1c-2g',
       limitSeconds: wholeNumber('POISE_TEST_LIMIT_SECONDS', 540),
       maxRuns: wholeNumber('POISE_TEST_MAX_RUNS', 30),

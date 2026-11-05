@@ -80,16 +80,20 @@ function checkoutFiles(top) {
  */
 export function filesToSend(cwd, also = [], env = process.env, home = homedir()) {
   const paths = []
+  const holdsSecrets = (path) => [home, env.TMPDIR].filter(Boolean).some((place) => !relative(path, place).startsWith('..'))
   const top = git(cwd, 'rev-parse', '--show-toplevel')?.toString().trim()
   if (top) {
     paths.push(...checkoutFiles(top))
   } else {
-    const holdsSecrets = [home, env.TMPDIR].filter(Boolean).some((place) => !relative(cwd, place).startsWith('..'))
-    if (holdsSecrets) throw new Error(`run the suite from a checkout: ${cwd} holds what must not reach a test box`)
+    if (holdsSecrets(cwd)) throw new Error(`run the suite from a checkout: ${cwd} holds what must not reach a test box`)
     paths.push(cwd)
   }
   // Every test box has its own system.
-  for (const path of also) if (!/^\/usr(\/|$)/.test(path) && existsSync(path)) paths.push(path, realpathSync(path))
+  for (const path of also) {
+    if (/^\/usr(\/|$)/.test(path) || !existsSync(path)) continue
+    if (holdsSecrets(path)) throw new Error(`${path} holds what must not reach a test box`)
+    paths.push(path, realpathSync(path))
+  }
   return [...new Set(paths)].filter((path) => {
     try { return Boolean(lstatSync(path)) } catch { return false }
   })

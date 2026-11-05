@@ -4,7 +4,7 @@
 // on NODE_OPTIONS for what it starts, so every Node process asks here first, however it was reached.
 // docs/Operating.md, "Agents' test suites".
 const { existsSync } = require('node:fs')
-const { basename, dirname, join } = require('node:path')
+const { basename, join } = require('node:path')
 
 // Asking a runner about itself costs nothing, and needs no test box.
 const PROBES = new Set(['--version', '-v', '--help', '-h'])
@@ -39,8 +39,7 @@ const script = process.argv[1]
 if (script && !LOCAL_SCRIPTS.test(process.env.npm_lifecycle_event ?? '') && existsSync(join(__dirname, 'relay')) && testCommand(script, process.argv.slice(2))) {
   try {
     process.execve(process.execPath, [
-      // This Node goes along when it is not the one every box has.
-      process.execPath, join(__dirname, 'run.mjs'), '--also', dirname(dirname(process.execPath)), '--', process.execPath, ...process.execArgv, ...process.argv.slice(1),
+      process.execPath, join(__dirname, 'run.mjs'), '--', process.execPath, ...process.execArgv, ...process.argv.slice(1),
     ], process.env)
   } catch (error) {
     // The suite must not run here instead.
