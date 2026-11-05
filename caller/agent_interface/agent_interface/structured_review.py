@@ -3,10 +3,10 @@
 Claude reviews with governed tools (claude_acl). Every other provider —
 Codex, Grok Build, Antigravity, Muse — gets the same immutable packet with
 no tools, in an empty work directory, and answers with one JSON verdict that
-Caller validates and submits. A run that used a tool, failed, or answered
-anything but the verdict submits nothing. A packet larger than one provider
-call reliably finishes is reviewed in file-group stages; every stage's
-findings combine into the single submitted verdict.
+Caller validates and submits. Invalid responses get one correction attempt;
+a run that used a tool, failed, or still has no valid verdict submits nothing.
+A packet larger than one provider call reliably finishes is reviewed in
+file-group stages; every stage's findings combine into the single submitted verdict.
 """
 from __future__ import annotations
 
@@ -379,9 +379,11 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
     schema = verdict_schema(behavior, inspection=repository is not None)
     (root / "verdict.schema.json").write_text(json.dumps(schema))
     context = ""
-    for round_number in range(MAX_INSPECTION_ROUNDS + 1):
+    round_number = 0
+    correction_attempted = False
+    while round_number <= MAX_INSPECTION_ROUNDS:
         timeout = review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS)
-        if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS:
+        if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS or correction_attempted:
             timeout = min(deadline - monotonic(), timeout)
         if timeout <= 0:
             raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted")
@@ -406,39 +408,49 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                      if repository is not None else "")
         raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
         progress.stage("validating", "Validating review result")
-        if repository is None:
-            return raw, validate_verdict(raw, behavior)
-        step = _loads_no_duplicates(raw)
-        if round_number == MAX_INSPECTION_ROUNDS and isinstance(step, dict) \
-                and set(step) == {"action", "comments", "assessment"}:
-            # The final round offers the terminal-only verdict schema,
-            # which has no requests property at all.
-            return raw, validate_verdict(raw, behavior)
-        if not isinstance(step, dict) or set(step) != {"action", "comments", "assessment", "requests"}:
-            raise InvalidVerdict("review step must contain action, comments, assessment and requests")
-        requests = step["requests"]
-        if not isinstance(requests, list):
-            raise InvalidVerdict("review requests must be an array")
-        if step["action"] != "inspect":
-            if requests:
-                raise InvalidVerdict("terminal verdict must not request repository inspection")
-            return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments", "assessment")}), behavior)
-        if round_number == MAX_INSPECTION_ROUNDS:
-            raise review_budget.ReviewLimitError(
-                "Repository inspection limit reached; needs attention",
-                "review_budget_exhausted",
-                diagnostic_envelope(operation="provider.review", phase="inspection_rounds",
-                                    outcome="resource_failure", provider=model.provider,
-                                    context={"rounds": MAX_INSPECTION_ROUNDS}))
-        if not 1 <= len(requests) <= 8:
-            raise InvalidVerdict("invalid repository inspection request count")
-        # Validate provisional findings without submitting anything.
-        validate_verdict(json.dumps({"action": "request_changes" if step["comments"] else
-                                    "reviewed_clean" if behavior == "pr_review" else "approve",
-                                    "comments": step["comments"], "assessment": step["assessment"]}), behavior)
+        try:
+            if repository is None:
+                return raw, validate_verdict(raw, behavior)
+            step = _loads_no_duplicates(raw)
+            if round_number == MAX_INSPECTION_ROUNDS and isinstance(step, dict) \
+                    and set(step) == {"action", "comments", "assessment"}:
+                # The final round offers the terminal-only verdict schema,
+                # which has no requests property at all.
+                return raw, validate_verdict(raw, behavior)
+            if not isinstance(step, dict) or set(step) != {"action", "comments", "assessment", "requests"}:
+                raise InvalidVerdict("review step must contain action, comments, assessment and requests")
+            requests = step["requests"]
+            if not isinstance(requests, list):
+                raise InvalidVerdict("review requests must be an array")
+            if step["action"] != "inspect":
+                if requests:
+                    raise InvalidVerdict("terminal verdict must not request repository inspection")
+                return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments", "assessment")}), behavior)
+            if round_number == MAX_INSPECTION_ROUNDS:
+                raise review_budget.ReviewLimitError(
+                    "Repository inspection limit reached; needs attention",
+                    "review_budget_exhausted",
+                    diagnostic_envelope(operation="provider.review", phase="inspection_rounds",
+                                        outcome="resource_failure", provider=model.provider,
+                                        context={"rounds": MAX_INSPECTION_ROUNDS}))
+            if not 1 <= len(requests) <= 8:
+                raise InvalidVerdict("invalid repository inspection request count")
+            # Validate provisional findings without submitting anything.
+            validate_verdict(json.dumps({"action": "request_changes" if step["comments"] else
+                                        "reviewed_clean" if behavior == "pr_review" else "approve",
+                                        "comments": step["comments"], "assessment": step["assessment"]}), behavior)
+        except (InvalidVerdict, json.JSONDecodeError) as error:
+            if correction_attempted:
+                raise
+            correction_attempted = True
+            context += (f"\n\nYour previous review response was rejected:\n{raw}"
+                        f"\nValidation error: {error}\nReturn a corrected JSON response matching the review contract, "
+                        "preserving your substantive assessment and findings.")
+            continue
         progress.stage("inspecting", "Inspecting pinned repository")
         result = repository.inspect(requests)
         context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
+        round_number += 1
     raise AssertionError("review rounds did not return a verdict")
 
 

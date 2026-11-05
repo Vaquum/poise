@@ -220,21 +220,24 @@ class TestStructuredVerdict(TestCase):
                     self.assertNotIn("--ephemeral", call.args[0])
                 self.assertEqual(resumed.args[0][-3:], ["resume", thread, "-"])
 
-    def _run(self, verdict, behavior="pr_review", event=None, code=0):
+    def _run(self, verdict, behavior="pr_review", event=None, code=0, *, correction=None, expected_attempts=1):
+        responses = iter((verdict, correction)) if correction is not None else repeat(verdict)
+
         def process(args, **kwargs):
             if args[0] == "github-interface":
                 action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
                           "--approve-pr": "approved_pr"}[args[1]]
                 return SimpleNamespace(returncode=0, stdout=json.dumps(
                     {"action": action, "review_id": 91, "head_sha": "a" * 40}), stderr="")
-            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+            Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(next(responses)))
             return SimpleNamespace(returncode=code, stdout=json.dumps(event) if event else "", stderr="provider failed" if code else "")
         with patch.object(structured_review.subprocess, "run", side_effect=process) as run, \
                 patch.object(ReviewWatch, "run", side_effect=run):
             try:
                 result = structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"), behavior, "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
             except atoms.AgentPreflightError:
-                self.assertEqual(run.call_count, 1)
+                self.assertEqual(run.call_count, expected_attempts)
+                self.assertFalse(any(call.args[0][0] == "github-interface" for call in run.call_args_list))
                 raise
         return result, run
 
@@ -261,6 +264,77 @@ class TestStructuredVerdict(TestCase):
                                           json.dumps([FINDING]), "--assessment-json", json.dumps(ASSESSMENT),
                                           "--expected-head", "a" * 40, "--token-user", "bit-mis"])
         self.assertEqual(mutation.kwargs["cwd"], "/repo")
+
+    def test_invalid_verdict_gets_one_correction_in_the_same_codex_conversation(self):
+        corrected = {"action": "request_changes", "comments": [{**FINDING, "body": "[p1] Reject empty input before indexing."}],
+                     "assessment": {**ASSESSMENT, "verdict": "Empty input still crashes the changed validation path."}}
+        cases = [({**corrected, "assessment": {**ASSESSMENT, "verdict": "request_changes"}},
+                  "invalid review assessment verdict"),
+                 ({**corrected, "comments": []}, "request_changes requires 1-100 findings; other verdicts require none"),
+                 ({**corrected, "action": "approve"}, "request_changes requires 1-100 findings; other verdicts require none")]
+        thread = "01234567-89ab-4cde-8123-456789abcdef"
+        for invalid, error in cases:
+            with self.subTest(error=error, invalid=invalid):
+                result, run = self._run(invalid, "pr_approve", correction=corrected,
+                                        event={"type": "thread.started", "thread_id": thread})
+                self.assertIn('"review_id": 91', result)
+                self.assertEqual(run.call_count, 3)
+                first, retry, submission = run.call_args_list
+                self.assertEqual(retry.args[0], [*first.args[0][:-1], "resume", thread, "-"])
+                self.assertNotIn("packet", retry.kwargs["input"])
+                self.assertIn(json.dumps(invalid), retry.kwargs["input"])
+                self.assertIn(error, retry.kwargs["input"])
+                command = submission.args[0]
+                self.assertEqual(command[:3], ["github-interface", "--request-changes", "#12"])
+                self.assertEqual(json.loads(command[command.index("--comments-json") + 1]), corrected["comments"])
+                self.assertEqual(json.loads(command[command.index("--assessment-json") + 1]), corrected["assessment"])
+
+    def test_invalid_correction_fails_explicitly_without_submitting(self):
+        invalid = {"action": "request_changes", "comments": [], "assessment": ASSESSMENT}
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._run(invalid, "pr_approve", expected_attempts=2)
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
+
+    def test_correction_uses_only_the_remaining_review_time(self):
+        for allowance, durations, expected in ((60, [40, 5], [45, 5]),
+                                                (60, [40, 10], [45, 5]),
+                                                (60, [45], [45]),
+                                                (120, [40, 25], [60, 20])):
+            with self.subTest(allowance=allowance, durations=durations):
+                clock = SimpleNamespace(now=1000.0)
+                pending = iter(durations)
+                launches = []
+
+                def process(args, *, timeout, **kwargs):
+                    launches.append(timeout)
+                    duration = next(pending)
+                    clock.now += min(duration, timeout)
+                    if duration > timeout:
+                        raise subprocess.TimeoutExpired(args, timeout)
+                    verdict = {"action": "approve" if len(launches) > 1 else "request_changes",
+                               "comments": [], "assessment": ASSESSMENT}
+                    Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(verdict))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                receipt = json.dumps({"action": "approved_pr", "review_id": 91, "head_sha": "a" * 40})
+                with patch.object(structured_review, "monotonic", lambda: clock.now), \
+                        patch.object(review_budget, "monotonic", lambda: clock.now), \
+                        patch.object(ReviewWatch, "run", side_effect=process), \
+                        patch.object(structured_review.subprocess, "run", return_value=SimpleNamespace(
+                            returncode=0, stdout=receipt, stderr="")) as submit, \
+                        review_budget.ReviewBudget(allowance):
+                    if durations == [40, 5]:
+                        structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                              "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                        submit.assert_called_once()
+                    else:
+                        with self.assertRaises(review_budget.ReviewLimitError) as failure:
+                            structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                                  "pr_approve", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60)
+                        self.assertEqual(failure.exception.code, "review_budget_exhausted")
+                        submit.assert_not_called()
+                self.assertEqual(launches, expected)
 
     def test_stale_head_refusal_at_submit_is_superseded_not_a_violation(self):
         from agent_interface.review_watch import ReviewSuperseded
@@ -337,7 +411,7 @@ class TestStructuredVerdict(TestCase):
                     {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": [], "head": "b" * 40}]
         for verdict in verdicts:
             with self.subTest(verdict=verdict), self.assertRaises(atoms.AgentPreflightError):
-                self._run(verdict)
+                self._run(verdict, expected_attempts=2)
 
     def test_provider_failure_and_tool_use_do_not_submit(self):
         for kwargs in ({"code": 1}, {"event": {"item": {"type": "command_execution"}}}):
