@@ -196,7 +196,7 @@ bounded redacted cause and known (`none`, `rejected`, `noop`, `blocked`) or
 unknown submission state. Structured provider exits and signals are `review_provider_exit`,
 provider-reported error terminals are `review_provider_error`; both keep
 `not_started` / `preflight_failed` with no receipt, so Poise can safely retry
-after proving no reviewer action. Invalid, missing, duplicate or contradictory
+after proving no reviewer action. Uncorrected invalid, missing, duplicate or contradictory
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
 GitHub reviews are `review_contract_violation` and held. A repeat-only
 `no_review` refusal first recovers once with the recovery model; anything
@@ -286,6 +286,10 @@ with provisional `comments` and a `requests` array; Caller reads the requested
 source and supplies the result in their next turn. Terminal verdicts require
 `requests: []`. At most 12 inspection rounds fit within the existing total review
 deadline and 3 MB prompt limit; exhausting inspection never submits a review.
+After a successful provider call, an invalid response gets one correction attempt
+with the rejected output and validation error, within the remaining review budget
+and prompt limit. Codex reuses the same review conversation. The same validation
+checks apply; a second invalid response fails explicitly without submitting.
 Codex messages at or below its 1,048,576-character input limit keep their existing
 single-turn path. Only overflowing messages are sent as consecutive bounded
 fragments through the same native review conversation. Intermediate turns must
@@ -302,7 +306,7 @@ its built-in tools, web search and subagents off; Antigravity (`agy`) in plan
 mode, the packet streamed on stdin; Muse (`muse`) with an isolated configuration,
 an empty tool roster, workflows and reminders off, schema-enforced output and
 one model step per inspection round. Sign-in is preserved without importing
-personal settings. A run that used a native tool, failed, or answered anything but a valid
+personal settings. A run that used a native tool, failed, or still has no valid
 inspection request or terminal verdict
 submits nothing, and the existing authoritative outcome check still determines
 completion or supersession.
