@@ -94,7 +94,7 @@ class EnvFileTest(unittest.TestCase):
                     self.assertNotIn(value, result.stderr)
 
     def test_test_relay_pair_is_optional_and_its_key_is_not_a_variable(self):
-        base = {'POISE_TEST_BASE_SERVICE': 'crn-abc'}
+        base = {'POISE_TEST_WORKSPACE': 'tea-abc'}
         for variables, key, error in [
             (base, None, 'must be set together'),
             ({}, 'render-test-key', 'must be set together'),
@@ -110,7 +110,7 @@ class EnvFileTest(unittest.TestCase):
                     self.assertNotIn(value, result.stderr)
         result = self.env_file(base, render_api_key='render-test-key')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('POISE_TEST_BASE_SERVICE=crn-abc\n', result.stdout)
+        self.assertIn('POISE_TEST_WORKSPACE=tea-abc\n', result.stdout)
         self.assertIn('POISE_TEST_RENDER_API_KEY=render-test-key\n', result.stdout)
 
     def test_empty_google_client_pair_stays_disabled(self):

@@ -104,7 +104,7 @@ describe('lazy start', () => {
   })
 
   it('installs the test offload ahead of a first workspace, which installs no release', async () => {
-    const cookie = await start({ env: { POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_BASE_SERVICE: 'crn-x' } })
+    const cookie = await start({ env: { POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_WORKSPACE: 'tea-x' } })
     await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
     await h.orchestrator.startInProgress('alice')
     expect(h.docker.tasks.map((task) => task.name)).toEqual(['poise-test-offload-alice'])
@@ -1102,7 +1102,7 @@ describe('updates in place', () => {
     expect(h.workspace.switches).toEqual(['new-release'])
     await h.close()
 
-    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_BASE_SERVICE: 'crn-x' } })
+    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_TEST_RENDER_API_KEY: 'render-key', POISE_TEST_WORKSPACE: 'tea-x' } })
     await h.openWorkspace('Alice')
     h.store.noteWorkspace('alice', 'Alice')
     h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })

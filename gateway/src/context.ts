@@ -34,7 +34,7 @@ export interface GatewayDeps {
   orchestrator: Orchestrator
   /** What the gateway last measured of disk use; absent where nothing measures it. */
   disk?: DiskWatch
-  /** Where agents' test suites meet their test instances; absent when they run in the workspaces. */
+  /** Where agents' test suites leave for their test boxes; absent when they run in the workspaces. */
   testRelay?: TestRelay
   log: Logger
   now: () => number

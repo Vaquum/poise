@@ -284,7 +284,7 @@ Environment the gateway passes:
 Beside each release, the gateway installs agents' test offload into the home
 volume by running `/opt/poise/scripts/test-offload/install.sh` in a short-lived
 container of the image. With `POISE_TEST_RENDER_API_KEY` and
-`POISE_TEST_BASE_SERVICE` set, it passes `POISE_TEST_RELAY_URL`, which is
+`POISE_TEST_WORKSPACE` set, it passes `POISE_TEST_RELAY_URL`, which is
 `/api/link/test-relay` on the workspace's host or on `POISE_PROXY_LISTEN`, and
 `POISE_TEST_RELAY_KEY`, the workspace's handle signed by the gateway. That writes the hooks and `relay`, holding those
 two, to `~/.poise/test-offload`; without them it removes `relay`. Poise starts its
