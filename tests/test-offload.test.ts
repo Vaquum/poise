@@ -622,8 +622,8 @@ describe('a suite on a test instance', () => {
     }
   })
 
-  function suite(cwd: string, args: string[]): { child: ChildProcess; done: Promise<{ code: number | null; stdout: string; stderr: string }> } {
-    const child = spawn(process.execPath, [join(hooks, 'run.mjs'), '--', ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+  function suite(cwd: string, args: string[], env: Record<string, string> = {}): { child: ChildProcess; done: Promise<{ code: number | null; stdout: string; stderr: string }> } {
+    const child = spawn(process.execPath, [join(hooks, 'run.mjs'), '--', ...args], { cwd, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
     child.stdout?.on('data', (chunk) => { stdout += chunk })
@@ -676,6 +676,15 @@ describe('a suite on a test instance', () => {
     expect(readFileSync(join(unpacked, repo, 'tracked.txt'), 'utf8')).toBe('checked out\n')
     expect(existsSync(join(unpacked, repo, '.git', 'HEAD'))).toBe(true)
     expect(existsSync(join(unpacked, repo, '.env'))).toBe(false)
+  })
+
+  it('leaves the agent’s temporary folder behind, which can be too long for a Unix socket', async () => {
+    await startAll()
+    const script = 'console.log(process.env.TMPDIR, process.env.TMP, process.env.TEMP)'
+    const tmp = { TMPDIR: '/run/agent/tmp', TMP: '/run/agent/tmp', TEMP: '/run/agent/tmp' }
+    const { code, stdout } = await suite(repository(), [process.execPath, '-e', script], tmp).done
+    expect(code).toBe(0)
+    expect(stdout).toBe('undefined undefined undefined\n')
   })
 
   it('gets large output through whole and in order', async () => {
