@@ -43,8 +43,8 @@ Agents, PR checks and merge-queue candidates run the same set, which
 CI compares a PR or queue candidate with its base and uses one unit and one
 browser shard. Locally the comparison is with `origin/main`, including
 uncommitted and untracked work, and the command stops with a message if it
-cannot reach `origin/main`. While a merge is in progress the comparison is with
-what is being merged, so what the merge brings does not count as the change.
+cannot reach `origin/main`. While `main` is being merged in, the comparison is
+with its side, so what it brings does not count as the change.
 
 A change to dependencies, test or build configuration, CI or
 `tests/essential.txt` runs everything in CI, because it can change what every
