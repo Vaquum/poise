@@ -218,7 +218,7 @@ async function main(args) {
     die(`the connection to the test relay broke: ${error.cause?.message ?? error.message}`)
     return
   }
-  if (outOfMemory && exitCode !== 0) say('this ran out of memory on the test instance, so it is too big to run there. CI is the gate before merge; for an answer sooner, name a smaller part of it.')
+  if (outOfMemory && exitCode !== 0) say('this ran out of memory on the test instance, so it is too big to run there. CI is the gate before merge.')
   if (exitCode === null) die('the connection to the test relay ended before the suite did')
   else finish(exitCode)
 }

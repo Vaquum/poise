@@ -777,6 +777,8 @@ describe('a suite on a test instance', () => {
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
     expect(code).toBe(134)
     expect(stderr).toContain('too big to run there. CI is the gate before merge')
+    // Choosing tests is no job of an agent's.
+    expect(stderr).not.toContain('name a')
     expect(jobs.size).toBe(1)
   })
 
@@ -792,6 +794,7 @@ describe('a suite on a test instance', () => {
     expect(code).toBe(125)
     expect(stderr).toContain('ended without reporting a result')
     expect(stderr).toContain('CI is the gate before merge')
+    expect(stderr).not.toContain('name a')
     expect(jobs.size).toBe(1)
   })
 
