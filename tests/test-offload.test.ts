@@ -281,6 +281,20 @@ describe('the hooks at work', () => {
     expect(existsSync(marker)).toBe(false)
   })
 
+  it('send the Node that started a suite by name, never the folder it lives in, which can be the home', () => {
+    const { env, hooks } = hooked(true)
+    // Says what it was asked to send and run, in the place of the real sender.
+    writeFileSync(join(hooks, 'run.mjs'), 'console.log(JSON.stringify(process.argv.slice(2)))')
+    const repo = temp()
+    writeFileSync(join(repo, 'vitest'), '')
+    const result = attempt([join(repo, 'vitest'), 'run'], env, repo)
+    const args = JSON.parse(result.stdout) as string[]
+    const prefix = dirname(dirname(process.execPath))
+    const also = args.slice(0, args.indexOf('--')).filter((arg) => arg !== '--also')
+    expect(also).toEqual(['bin/node', 'bin/npm', 'bin/npx', 'lib/node_modules/npm', 'lib/node_modules/corepack'].map((path) => join(prefix, path)))
+    expect(args.slice(args.indexOf('--') + 1)).toEqual([process.execPath, join(repo, 'vitest'), 'run'])
+  })
+
   it('leave everything else alone', () => {
     const { env } = hooked(true)
     const result = attempt(['-e', 'console.log("ran here")'], env, temp())

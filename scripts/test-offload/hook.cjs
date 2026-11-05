@@ -4,7 +4,7 @@
 // on NODE_OPTIONS for what it starts, so every Node process asks here first, however it was reached.
 // docs/Operating.md, "Agents' test suites".
 const { existsSync } = require('node:fs')
-const { basename, join } = require('node:path')
+const { basename, dirname, join } = require('node:path')
 
 // Asking a runner about itself costs nothing, and needs no test box.
 const PROBES = new Set(['--version', '-v', '--help', '-h'])
@@ -37,9 +37,12 @@ function testCommand(script, args) {
 
 const script = process.argv[1]
 if (script && !LOCAL_SCRIPTS.test(process.env.npm_lifecycle_event ?? '') && existsSync(join(__dirname, 'relay')) && testCommand(script, process.argv.slice(2))) {
+  // This Node goes along, as a box may have no other at this path. By name: its folder can hold far more than Node.
+  const prefix = dirname(dirname(process.execPath))
+  const node = ['bin/node', 'bin/npm', 'bin/npx', 'lib/node_modules/npm', 'lib/node_modules/corepack'].flatMap((path) => ['--also', join(prefix, path)])
   try {
     process.execve(process.execPath, [
-      process.execPath, join(__dirname, 'run.mjs'), '--', process.execPath, ...process.execArgv, ...process.argv.slice(1),
+      process.execPath, join(__dirname, 'run.mjs'), ...node, '--', process.execPath, ...process.execArgv, ...process.argv.slice(1),
     ], process.env)
   } catch (error) {
     // The suite must not run here instead.
