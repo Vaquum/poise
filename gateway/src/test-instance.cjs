@@ -3,7 +3,7 @@
 // test-relay.ts serves this file and starts it under `timeout`. docs/Operating.md, "Agents' test suites".
 'use strict'
 const { spawn } = require('node:child_process')
-const { mkdirSync, readFileSync } = require('node:fs')
+const { readFileSync } = require('node:fs')
 const { constants } = require('node:os')
 const { Readable } = require('node:stream')
 const { pipeline } = require('node:stream/promises')
@@ -154,7 +154,8 @@ async function main() {
   if (!env.PLAYWRIGHT_BROWSERS_PATH && process.env.PLAYWRIGHT_BROWSERS_PATH) env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH
   const options = nodeOptions(env.NODE_OPTIONS)
   if (options) env.NODE_OPTIONS = options
-  for (const name of ['TMPDIR', 'TMP', 'TEMP']) if (env[name]) mkdirSync(env[name], { recursive: true })
+  // /tmp here is this suite's alone, and the agent's folder can be too long for a Unix socket made under it.
+  for (const name of ['TMPDIR', 'TMP', 'TEMP']) delete env[name]
 
   child = spawn(spec.argv[0], spec.argv.slice(1), { cwd: spec.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
   child.stdout.on('data', (chunk) => enqueue(FRAME.stdout, chunk))

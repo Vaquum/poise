@@ -622,8 +622,8 @@ describe('a suite on a test instance', () => {
     }
   })
 
-  function suite(cwd: string, args: string[]): { child: ChildProcess; done: Promise<{ code: number | null; stdout: string; stderr: string }> } {
-    const child = spawn(process.execPath, [join(hooks, 'run.mjs'), '--', ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+  function suite(cwd: string, args: string[], env: Record<string, string> = {}): { child: ChildProcess; done: Promise<{ code: number | null; stdout: string; stderr: string }> } {
+    const child = spawn(process.execPath, [join(hooks, 'run.mjs'), '--', ...args], { cwd, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
     child.stdout?.on('data', (chunk) => { stdout += chunk })
@@ -659,8 +659,8 @@ describe('a suite on a test instance', () => {
     expect(stderr).toContain('disposable test instance')
     const [job] = jobs.values()
     expect(job.planId).toBe('plan-crn-003')
-    // Render splits this at spaces and mangles quotes.
-    expect(job.startCommand).toMatch(/^timeout -k 10 3660 node -e \S+ \S+\/instance [0-9a-f]{32} [0-9a-f]{64}$/)
+    // Render splits this at spaces and mangles quotes. tini is PID 1, or what a suite kills never goes away.
+    expect(job.startCommand).toMatch(/^tini -- timeout -k 10 3660 node -e \S+ \S+\/instance [0-9a-f]{32} [0-9a-f]{64}$/)
     expect(job.startCommand).not.toMatch(/['"]/)
     // It exits by itself, unless the sweep gets there first: a job nothing wants any more gets cancelled.
     await until(() => job.status !== 'running', 'the instance process to end')
@@ -676,6 +676,15 @@ describe('a suite on a test instance', () => {
     expect(readFileSync(join(unpacked, repo, 'tracked.txt'), 'utf8')).toBe('checked out\n')
     expect(existsSync(join(unpacked, repo, '.git', 'HEAD'))).toBe(true)
     expect(existsSync(join(unpacked, repo, '.env'))).toBe(false)
+  })
+
+  it('leaves the agent’s temporary folder behind, which can be too long for a Unix socket', async () => {
+    await startAll()
+    const script = 'console.log(process.env.TMPDIR, process.env.TMP, process.env.TEMP)'
+    const tmp = { TMPDIR: '/run/agent/tmp', TMP: '/run/agent/tmp', TEMP: '/run/agent/tmp' }
+    const { code, stdout } = await suite(repository(), [process.execPath, '-e', script], tmp).done
+    expect(code).toBe(0)
+    expect(stdout).toBe('undefined undefined undefined\n')
   })
 
   it('gets large output through whole and in order', async () => {
@@ -859,8 +868,8 @@ describe('a suite on a test instance', () => {
     const repo = repository()
     const { child, done } = suite(repo, [process.execPath, '-e', 'console.log("from the instance"); process.exit(4)'])
     await until(() => jobs.size === 1, 'the job to exist')
-    // The start command exactly as Render gets it, past `timeout`, which a developer's Mac may not have.
-    const [, code, url, run, token] = /^timeout -k 10 \d+ node -e (\S+) (\S+) (\S+) (\S+)$/.exec([...jobs.values()][0].startCommand) ?? []
+    // The start command exactly as Render gets it, past `tini` and `timeout`, which a developer's Mac may not have.
+    const [, code, url, run, token] = /^tini -- timeout -k 10 \d+ node -e (\S+) (\S+) (\S+) (\S+)$/.exec([...jobs.values()][0].startCommand) ?? []
     const instance = spawn(process.execPath, ['-e', code, url, run, token, unpacked], { stdio: 'ignore' })
     const { code: exit, stdout } = await done
     instance.kill('SIGKILL')

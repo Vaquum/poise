@@ -689,10 +689,13 @@ checkout's tracked and untracked files without what git ignores, its
 `node_modules`, `.venv` and `venv` folders, its `.git`, and the virtualenv and
 Python of the interpreter when they live outside the checkout. The environment
 loses every variable named like a credential or belonging to a provider CLI,
-git or GitHub. A checkout whose `.git/config` holds a credential is refused. The
-image is the workspace image, so the tools match, but it holds no sign-in. What
-the suite changes stays on the instance and goes with it, so update snapshots
-with the runner on your own machine if you need them back.
+git or GitHub, and the agent's temporary folder: a suite uses the instance's own
+`/tmp`, because the agent's can be too long for a Unix socket made under it. A
+checkout whose `.git/config` holds a credential is refused. The
+image is the workspace image, so the tools match, but it holds no sign-in. `tini`
+is its PID 1, as in a workspace, so a process the suite kills goes away instead of
+still looking alive. What the suite changes stays on the instance and goes with
+it, so update snapshots with the runner on your own machine if you need them back.
 
 **How it dies.** An instance is a Render one-off job, which Render destroys when
 its command exits, and nothing is left on Render between suites. That command
