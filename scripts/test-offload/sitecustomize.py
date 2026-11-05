@@ -56,7 +56,7 @@ def names_tests(args):
 
 
 def one_worker(args):
-    """The same pytest arguments, without xdist's workers: a test instance has half a CPU."""
+    """The same pytest arguments, without xdist's workers: a test instance has one CPU."""
     result = []
     index = 0
     while index < len(args):
