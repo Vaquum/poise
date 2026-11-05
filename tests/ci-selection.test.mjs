@@ -442,6 +442,47 @@ describe('the commands that run the tests', () => {
     expect(stderr).toContain('npm run test:full runs them all')
   })
 
+  it('counts only the branch’s own work while main is being merged into it', async () => {
+    const { root, base, git } = checkout()
+    git('checkout', '-q', '--detach', base)
+    write(root, 'server/other.ts', 'export const other = 1\n')
+    git('add', '.')
+    git('commit', '-qm', 'on main')
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+    git('checkout', '-q', 'change')
+    git('merge', '-q', '--no-commit', '--no-ff', 'origin/main')
+    const npm = fakeNpm()
+    const { code, stderr } = await ci(root, ['test'], {}, { path: npm.path })
+    expect(code, stderr).toBe(0)
+    expect(npm.calls()).toEqual(['run test:full -- tests/guard.test.ts tests/linked.test.ts'])
+  })
+
+  it('still counts what a branch shares with its own remote while merging that', async () => {
+    const { root, git } = checkout()
+    write(root, 'server/other.ts', 'export const other = 1\n')
+    git('add', '.')
+    git('commit', '-qm', 'pushed from elsewhere')
+    git('update-ref', 'refs/remotes/origin/change', 'HEAD')
+    git('reset', '-q', '--hard', 'HEAD~1')
+    write(root, 'tests/guard.test.ts', '// edited here\n')
+    git('commit', '-qam', 'edited here')
+    git('merge', '-q', '--no-commit', '--no-ff', 'origin/change')
+    const npm = fakeNpm()
+    const { code, stderr } = await ci(root, ['test'], {}, { path: npm.path })
+    expect(code, stderr).toBe(0)
+    expect(npm.calls()).toEqual(['run test:full -- tests/guard.test.ts tests/linked.test.ts tests/other.test.ts'])
+  })
+
+  it('still counts a branch being merged into main', async () => {
+    const { root, git } = checkout()
+    git('checkout', '-q', 'main')
+    git('merge', '-q', '--no-commit', '--no-ff', 'change')
+    const npm = fakeNpm()
+    const { code, stderr } = await ci(root, ['test'], {}, { path: npm.path })
+    expect(code, stderr).toBe(0)
+    expect(npm.calls()).toEqual(['run test:full -- tests/guard.test.ts tests/linked.test.ts'])
+  })
+
   it('treats flags alone as steering the essential run', async () => {
     const npm = fakeNpm()
     await ci(repo.root, ['test', '--reporter=dot'], {}, { path: npm.path })
