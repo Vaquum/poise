@@ -225,8 +225,9 @@ export class TestRelay {
       id: randomBytes(16).toString('hex'), handle, token: randomBytes(32).toString('hex'), spec, created: now, lease: now, jobId: null, output: null, tree: null,
     }
     const relay = `${this.deps.origin(handle)}${TEST_RELAY_PATH}`
-    // Ends the instance whatever the suite does, and whether or not this gateway still lives.
-    const startCommand = `timeout -k 10 ${limitSeconds + 60} node -e ${INSTANCE_BOOTSTRAP} ${relay}/instance ${run.id} ${run.token}`
+    // Ends the instance whatever the suite does, and whether or not this gateway still lives. tini as PID 1 reaps
+    // what the suite kills: `timeout` there would not, and a suite checking that a killed process is gone would fail.
+    const startCommand = `tini -- timeout -k 10 ${limitSeconds + 60} node -e ${INSTANCE_BOOTSTRAP} ${relay}/instance ${run.id} ${run.token}`
     // Listed first, so the sweep sees an owner for the job from the moment it exists.
     this.runs.set(run.id, run)
     const response = await fetch(this.jobs, { method: 'POST', headers: this.renderHeaders, body: JSON.stringify({ startCommand, planId: plan }) })

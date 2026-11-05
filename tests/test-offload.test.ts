@@ -659,8 +659,8 @@ describe('a suite on a test instance', () => {
     expect(stderr).toContain('disposable test instance')
     const [job] = jobs.values()
     expect(job.planId).toBe('plan-crn-003')
-    // Render splits this at spaces and mangles quotes.
-    expect(job.startCommand).toMatch(/^timeout -k 10 3660 node -e \S+ \S+\/instance [0-9a-f]{32} [0-9a-f]{64}$/)
+    // Render splits this at spaces and mangles quotes. tini is PID 1, or what a suite kills never goes away.
+    expect(job.startCommand).toMatch(/^tini -- timeout -k 10 3660 node -e \S+ \S+\/instance [0-9a-f]{32} [0-9a-f]{64}$/)
     expect(job.startCommand).not.toMatch(/['"]/)
     // It exits by itself, unless the sweep gets there first: a job nothing wants any more gets cancelled.
     await until(() => job.status !== 'running', 'the instance process to end')
@@ -859,8 +859,8 @@ describe('a suite on a test instance', () => {
     const repo = repository()
     const { child, done } = suite(repo, [process.execPath, '-e', 'console.log("from the instance"); process.exit(4)'])
     await until(() => jobs.size === 1, 'the job to exist')
-    // The start command exactly as Render gets it, past `timeout`, which a developer's Mac may not have.
-    const [, code, url, run, token] = /^timeout -k 10 \d+ node -e (\S+) (\S+) (\S+) (\S+)$/.exec([...jobs.values()][0].startCommand) ?? []
+    // The start command exactly as Render gets it, past `tini` and `timeout`, which a developer's Mac may not have.
+    const [, code, url, run, token] = /^tini -- timeout -k 10 \d+ node -e (\S+) (\S+) (\S+) (\S+)$/.exec([...jobs.values()][0].startCommand) ?? []
     const instance = spawn(process.execPath, ['-e', code, url, run, token, unpacked], { stdio: 'ignore' })
     const { code: exit, stdout } = await done
     instance.kill('SIGKILL')
