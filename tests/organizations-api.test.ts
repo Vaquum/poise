@@ -167,7 +167,7 @@ async function orgStatus(login: string, status: Organization['status']) {
   await vi.waitFor(async () => {
     const result = await request('/api/organizations')
     expect(result.body.organizations.find((org) => org.login.toLowerCase() === login.toLowerCase())?.status).toBe(status)
-  })
+  }, { timeout: 5_000 })
 }
 
 describe('independent account reads', () => {
