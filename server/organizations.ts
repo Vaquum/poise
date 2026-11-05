@@ -532,7 +532,8 @@ function launch(login: string): void {
       const directory = dirname(initial.datastore_path)
       mkdirSync(directory, { recursive: true, mode: 0o700 })
       chmodSync(directory, 0o700)
-      await withProcessLock({ path: `${initial.datastore_path}.lock`, timeoutMs: 50 }, async () => {
+      // Long enough that a busy machine isn't taken for another instance holding the lock: this job would give up until the next tick.
+      await withProcessLock({ path: `${initial.datastore_path}.lock`, timeoutMs: 500 }, async () => {
         const row = rowFor(login)
         controller.signal.throwIfAborted()
         // Recheck under the process lock: another Poise instance may have
