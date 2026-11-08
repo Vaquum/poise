@@ -107,22 +107,59 @@ describe('agent log compatibility', () => {
     expect(mocks.diagnostic).not.toHaveBeenCalled()
   })
 
-  // Every --logs read still dumps the whole Caller log, and the 32 MiB
-  // runFile cap fails all of them at once. A read past 75% of the cap warns
-  // into the workspace diagnostics, at most hourly, and still resolves.
-  it('warns once as --logs nears the read cap, and still resolves', async () => {
-    const huge = logRow({ prompt: 'x'.repeat(25 * 1024 * 1024) })
-    mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([huge]), stderr: '' })
-    const first = await fetchAgentLogSnapshot()
-    const second = await fetchAgentLogSnapshot()
-    expect(first.entries).toHaveLength(1)
-    expect(second.entries).toHaveLength(1)
+  it('decodes history above 32 MiB with a 128 MiB process output cap', async () => {
+    const prompt = 'x'.repeat(33 * 1024 * 1024)
+    const stdout = JSON.stringify([logRow({ prompt })])
+    expect(Buffer.byteLength(stdout, 'utf8')).toBeGreaterThan(32 * 1024 * 1024)
+    mocks.runFile.mockResolvedValue({ stdout, stderr: '' })
+    const snapshot = await fetchAgentLogSnapshot({ fresh: true })
+    expect(snapshot.entries).toHaveLength(1)
+    expect(snapshot.entries[0]!.prompt).toBe(prompt)
+    expect(snapshot.quarantined).toEqual([])
+    expect(mocks.runFile).toHaveBeenCalledExactlyOnceWith('agent-interface', ['--logs'],
+      expect.objectContaining({ maxOutputBytes: 134217728 }))
+    expect(mocks.diagnostic).not.toHaveBeenCalled()
+  })
+
+  it('warns at 96 MiB once per high-history state and rearms below it', async () => {
+    const now = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now)
+    const threshold = 96 * 1024 * 1024
+    const history = JSON.stringify([logRow()]).padEnd(threshold + 1, ' ')
+    const read = async (bytes: number) => {
+      // JSON whitespace reaches the exact byte boundary without a huge decoded row.
+      const stdout = history.slice(0, bytes)
+      expect(Buffer.byteLength(stdout, 'utf8')).toBe(bytes)
+      mocks.runFile.mockResolvedValueOnce({ stdout, stderr: '' })
+      const snapshot = await fetchAgentLogSnapshot({ fresh: true })
+      expect(snapshot.entries).toHaveLength(1)
+      expect(snapshot.quarantined).toEqual([])
+    }
+
+    await read(threshold - 1)
+    expect(mocks.diagnostic).not.toHaveBeenCalled()
+    await read(threshold)
     expect(mocks.diagnostic).toHaveBeenCalledTimes(1)
-    const warning = mocks.diagnostic.mock.calls[0][0]
-    expect(warning).toMatchObject({ level: 'warning', operation: 'agent.logs.cap' })
-    expect(warning.resources).toEqual({ bytes: expect.any(Number), rows: 1, cap: 32 * 1024 * 1024 })
-    expect(warning.resources.bytes).toBeGreaterThan(24 * 1024 * 1024)
-    expect(warning.message).toContain('33554432')
+    expect(mocks.diagnostic.mock.calls[0][0]).toMatchObject({
+      level: 'warning', operation: 'agent.logs.cap', condition: 'agent_logs_read_cap',
+      message: expect.stringContaining('134217728'),
+      resources: { bytes: threshold, rows: 1, cap: 134217728 },
+    })
+    await read(threshold + 1)
+    expect(mocks.diagnostic).toHaveBeenCalledTimes(1)
+
+    clock.mockReturnValue(now + 60_000)
+    await read(threshold - 1)
+    expect(mocks.diagnostic).toHaveBeenCalledTimes(1)
+    clock.mockReturnValue(now + 120_000)
+    await read(threshold + 1)
+    expect(mocks.diagnostic).toHaveBeenCalledTimes(2)
+    expect(mocks.diagnostic.mock.calls[1][0].resources).toEqual({ bytes: threshold + 1, rows: 1, cap: 134217728 })
+
+    clock.mockReturnValue(now + 120_000 + 60 * 60 * 1000 + 1)
+    await read(threshold + 1)
+    expect(mocks.diagnostic).toHaveBeenCalledTimes(2)
+    expect(mocks.runFile).toHaveBeenCalledTimes(6)
   })
 
   // Fields agent-interface added over time — expected_head, source,
