@@ -222,6 +222,17 @@ historical uncertainty/gaps. The reader excludes unrelated hosts and request
 payloads before transport; canonical gateway normalization/redaction remains
 authoritative. Manual one-record delivery cannot renew this continuous lease.
 
+Caddy's native `warn` from `http.handlers.reverse_proxy` with message
+`aborting with incomplete response` is a normal close only for GET
+`/api/link/events` and the exact cause `reading: context canceled`. That warning
+occurs after response headers; it supplies neither status nor content type.
+The edge derives this one fixed route label before discarding the request URI.
+Missing discriminators, other routes, unexpected EOF, refusal, timeouts and
+other cancellations remain faults. All ingress paths retain the redacted native
+cause in `stderr`. A successful cancellation-only scan advances its checkpoint
+and renews observation without adding a fault or a gap; failed and bounded scans
+keep their existing coverage semantics. Link reconnect and replay are unchanged.
+
 Production starts capture after secure environment validation and before the
 application database modules load. An uncaught process failure retains a
 Critical event and then exits with the existing failure status. Structured

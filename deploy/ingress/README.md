@@ -104,6 +104,8 @@ Python 3.10+, Node, Docker and OpenSSH. Redaction and strict host projection run
 locally before SSH transmission. Raw request headers, bodies, addresses and URIs
 never form an outgoing record. Full native timestamps remain in occurrence
 identity even though display times use milliseconds. Reads never use `--tail`.
+The edge retains only the fixed `/api/link/events` route label derived before
+discarding the URI, for the [native cancellation policy](../../docs/Logging.md#collection-and-operation).
 
 Attributable TLS records require a structured Poise name. Unattributable
 hostless shared-proxy records are excluded; access loggers are also excluded.

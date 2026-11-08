@@ -123,6 +123,8 @@ def projected(line, domain, start, end, occurrence=0):
     # Never transmit headers, URI/query, body or unrelated application fields.
     log = {key: row[key] for key in ("level", "ts", "msg", "message", "logger", "request_id", "duration", "errno", "error", "status", "err_id", "err_trace", "upstream", "server_name", "identifier") if key in row}
     log["request"] = {"host": header, "method": request.get("method")}
+    if isinstance(request.get("uri"), str) and request["uri"].partition("?")[0] == "/api/link/events":
+        log["request"]["route"] = "/api/link/events"
     record = {"id": hashlib.sha256(line + b":" + str(occurrence).encode()).hexdigest(), "time": iso(observed), "log": log}
     if len(json.dumps(record).encode()) > 64 * 1024:
         raise ReadBound("Poise source record exceeds 64 KiB")
