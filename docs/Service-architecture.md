@@ -1382,6 +1382,11 @@ scope allows 60 seconds, and the outer client 120 seconds for interpreter/setup,
 durable receipts and teardown. The kernel emptiness deadline remains two
 seconds; these outer bounds do not extend the command or kernel deadlines.
 
+Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
+code and existing v1 diagnostic into chain receipts and History. The unchanged
+no-publication shape and retry requirements are defined in
+[Behavior chain](Behavior-chain.md#authority-and-recovery).
+
 ## Google document publishing
 
 Google account grants belong to the gateway, partitioned by immutable GitHub

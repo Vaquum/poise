@@ -33,7 +33,7 @@ function authority(db: Database.Database) {
   return db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').all()
 }
 
-it.each(['unchanged', 'findings', 'head'])('requires Resume after repair exhaustion and restarts once with %s inputs', async (changed) => {
+it.each(['unchanged', 'findings', 'head', 'execution-budget'])('requires Resume after repair exhaustion and restarts once with %s inputs', async (changed) => {
   const directory = mkdtempSync(join(tmpdir(), 'poise-repair-replay-'))
   directories.push(directory)
   const path = join(directory, 'journal.sqlite')
@@ -54,15 +54,18 @@ it.each(['unchanged', 'findings', 'head'])('requires Resume after repair exhaust
   }
   const first = decideBehaviorChain(current, observation, now)
   if (first.kind !== 'invoke') throw new Error('expected initial repair')
-  const error = 'repair did not answer every unresolved review finding: missing_root_comment_ids=[18]; missing_count=1; required_count=2'
+  const exhausted = changed === 'execution-budget'
+  const error = exhausted ? 'Atomic behavior provider exhausted its execution budget; no publication attempted'
+    : 'repair did not answer every unresolved review finding: missing_root_comment_ids=[18]; missing_count=1; required_count=2'
   for (let attempt = 0; attempt < 3; attempt++) {
     expect(decideBehaviorChain(current, observation, observation.checkedAt)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr', basis: first.basis })
     const id = `repair-${attempt}`
     append({ type: 'invocation.admitted', invocation: { id, behavior: 'repair-pr', basis: first.basis, actor: 'author',
       model: reviewer.model, slot: reviewer.slot, admittedAt: now,
       request: { command: 'agent-interface', argv: ['--atomic-work'], cwd: '/isolated' } } })
-    append({ type: 'invocation.settled', invocationId: id, callId: id, outcome: 'preflight_failed',
-      evidence: { status: 'failed', error_code: 'atomic_work_failed', action: 'not_started', outcome: 'preflight_failed', error,
+    const errorCode = exhausted ? 'atomic_work_execution_budget_exhausted' : 'atomic_work_failed'
+    append({ type: 'invocation.settled', invocationId: id, callId: id, outcome: exhausted ? errorCode : 'preflight_failed',
+      evidence: { status: 'failed', error_code: errorCode, action: 'not_started', outcome: 'preflight_failed', error,
         completedAt: observation.checkedAt, resources_settled_at: new Date(now).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
     if (attempt < 2) expect(decideBehaviorChain(current, observation, observation.checkedAt)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('backoff') })
     observation.checkedAt += 120_000
@@ -102,7 +105,7 @@ it.each(['unchanged', 'findings', 'head'])('requires Resume after repair exhaust
   expect(launches).toHaveLength(1)
   expect(reopened.journal.read(TARGET)!.invocations).toHaveLength(4)
   expect(launches[0].request.context).toEqual({ head: observation.pull!.head, reviewRevision: observation.pull!.reviewRevision })
-  expect(launches[0].basis === first.basis).toBe(changed === 'unchanged')
+  expect(launches[0].basis === first.basis).toBe(changed === 'unchanged' || exhausted)
 })
 
 describe.each(historicalJournals)('journal compatibility from $revision', ({ hashes, reservationPresent }) => {

@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from contextlib import nullcontext, redirect_stdout
 from io import StringIO
@@ -192,6 +193,85 @@ class AtomicWorkLimits(TestCase):
         self.assertEqual(status, "failed")
         self.assertEqual(json.loads(artifact)["resource_error"], "resources_unknown")
         self.assertIsNone(settled)
+
+    def test_provider_deadline_and_preflight_timeout_reach_chain_history_distinctly(self):
+        repo = Path(__file__).resolve().parents[3]
+        output = repo / "test-results"
+        output.mkdir(exist_ok=True)
+        with TemporaryDirectory(prefix="atomic-timeout-contract-", dir=output) as work:
+            root = Path(work)
+            env = {"PATH": os.environ["PATH"], "HOME": str(self.path.parent), "TMPDIR": work}
+            build = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"),
+                                    str(repo / "tests/fixtures/behavior-fence-contract.ts"), "--bundle", "--platform=node",
+                                    "--packages=external", "--format=esm", "--target=node22", f"--outfile={root / 'contract.mjs'}"],
+                                   cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            for phase in ("preflight", "provider"):
+                with self.subTest(phase=phase):
+                    modes = []
+
+                    def interface(*args, **kwargs):
+                        if args[0] == "--pr-review":
+                            return {"review_threads": []}
+                        if args[0] != "--issue-work":
+                            return {}
+                        modes.append(args[args.index("--mode") + 1])
+                        if phase == "preflight":
+                            raise subprocess.TimeoutExpired("preflight", 1800)
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+
+                    def worker(_lease, args, **kwargs):
+                        # Even valid late metadata cannot authorize publication.
+                        (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                            "commitMessage": "fix: seed", "title": "fix: seed", "body": "Checked repair", "replies": []}))
+                        raise subprocess.TimeoutExpired(args, kwargs["timeout"], output="private stdout", stderr="private stderr")
+
+                    def execute():
+                        # Use the CLI finalizer with the existing v1 library
+                        # boundary; namespace execution has separate guards.
+                        with patch.object(api, "_native_cli", False):
+                            api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain", f"timeout-{phase}",
+                                                "fixture-model", "poise/issue-7", 3, HEAD)
+
+                    expected = review_budget.ReviewLimitError if phase == "provider" else subprocess.TimeoutExpired
+                    with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                            patch.object(issue_review, "interface", side_effect=interface), \
+                            patch.object(issue_review, "command", return_value=(["fixture", "private prompt"], "", {})), \
+                            patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                            patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                            patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker) as provider, \
+                            patch.object(review_budget, "timeout", return_value=3443.25), \
+                            patch.object(api.atomic_work, "monotonic", side_effect=[10, 3453.375]), \
+                            patch.object(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source",
+                                                      "poise:behavior-chain", "--correlation-id", f"timeout-{phase}"]), \
+                            patch.object(api, "_main", side_effect=execute), self.assertRaises(expected):
+                        api.main()
+                    call, = [row for row in api.logs() if row["correlation_id"] == f"timeout-{phase}"]
+                    self.assertEqual(modes, ["prepare"])
+                    self.assertEqual((call["status"], call["action"], call["outcome"]), ("failed", "not_started", "preflight_failed"))
+                    self.assertIsNone(call["head_sha"])
+                    self.assertIsNotNone(call["resources_settled_at"])
+                    with api.db() as conn:
+                        self.assertIsNone(conn.execute("select action_plan from calls where id=?", (call["id"],)).fetchone()[0])
+                    if phase == "provider":
+                        self.assertEqual(call["error_code"], "atomic_work_execution_budget_exhausted")
+                        self.assertEqual(call["diagnostic"], {
+                            "version": 1, "source": "caller", "severity": "error", "operation": "provider.atomic_work",
+                            "phase": "provider_execution", "outcome": "timed_out", "stderr": "", "stderr_truncated": False,
+                            "executable": "codex", "elapsed_ms": 3443375, "timeout_seconds": 3443.25,
+                            "repository": "example/repo", "pr": 3, "expected_head": HEAD, "behavior": "repair_pr",
+                            "message": "Seed issue example/repo#7", "submission": "none", "call_id": call["id"]})
+                        self.assertNotIn("private", json.dumps(call))
+                        provider.assert_called_once()
+                    else:
+                        self.assertEqual(call["error_code"], "atomic_work_failed")
+                        self.assertIsNone(call["diagnostic"])
+                        provider.assert_not_called()
+                    wire = root / f"{phase}.json"
+                    wire.write_text(json.dumps([call]))
+                    consumed = subprocess.run(["node", str(root / "contract.mjs"), str(wire), f"atomic-{phase}-timeout"],
+                                              cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(consumed.returncode, 0, consumed.stderr)
 
     def test_invalid_publication_is_a_known_unstarted_failure_without_an_action_plan(self):
         modes = []
