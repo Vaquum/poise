@@ -7839,9 +7839,12 @@ export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   if (health.length === 0) return scopedBehaviorsRuntimeHealth(chainCapacity)
   const first = health[0].health
   if (health.length === 1) return first
+  const isTransientObservation = (message: string) => message.startsWith('behavior observation failed for ')
+    && ['upstream_unavailable', 'network_interruption'].includes(classifyBehaviorDiagnostic(message).code)
   return {
     ...first,
-    runtimeError: health.find((entry) => entry.health.runtimeError)?.health.runtimeError ?? null,
+    runtimeError: health.find((entry) => entry.health.runtimeError && !isTransientObservation(entry.health.runtimeError))?.health.runtimeError
+      ?? health.find((entry) => entry.health.runtimeError)?.health.runtimeError ?? null,
     status: health.some((entry) => entry.health.status === 'degraded') ? 'degraded' : 'ok',
     busy: health.flatMap((entry) => entry.health.busy.map((item) => ({ ...item, org: entry.org }))),
     failures: health.flatMap((entry) => entry.health.failures.map((item) => ({ ...item, org: entry.org }))),

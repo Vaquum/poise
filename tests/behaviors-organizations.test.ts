@@ -362,6 +362,33 @@ describe('multiple organization behavior isolation', () => {
     expect(runtime.getResolveUnblockingLastFired()).toEqual(legacy)
   })
 
+  it('prefers a Poise-fault runtime error over a transient observation error across organizations', async () => {
+    const { database: db, behaviors: runtime } = await arrangeOrganizations()
+    db.setMeta('behavior_chain_settings', JSON.stringify({ enabled: true, seedMode: 'label', label: 'poise' }))
+    const { BehaviorChainRuntime } = await import('../server/behavior-chain-runtime')
+    const { behaviorDiagnosticGroups } = await import('../src/behavior-diagnostics')
+    const transient = 'behavior observation failed for acme/api#9: GitHub 503: Service Unavailable'
+    const fault = 'Internal journal failure: database is locked'
+    const run = vi.spyOn(BehaviorChainRuntime.prototype, 'run')
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      run.mockRejectedValueOnce(new Error(transient))
+      await runtime.withBehaviorOrganization('Vaquum', () => runtime.runEnabledBehaviorsOnce())
+      run.mockRejectedValueOnce(new Error(fault))
+      await runtime.withBehaviorOrganization('beta', () => runtime.runEnabledBehaviorsOnce())
+      expect(runtime.withBehaviorOrganization('Vaquum', () => runtime.getBehaviorsRuntimeHealth()))
+        .toMatchObject({ status: 'degraded', runtimeError: transient })
+      expect(runtime.withBehaviorOrganization('beta', () => runtime.getBehaviorsRuntimeHealth()))
+        .toMatchObject({ status: 'degraded', runtimeError: fault })
+      expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'degraded', runtimeError: fault })
+      expect(behaviorDiagnosticGroups({ ...runtime.getBehaviorsRuntimeHealth(), agentLogsError: null }))
+        .toEqual([expect.objectContaining({ severity: 'error', code: 'runtime_unhealthy' })])
+    } finally {
+      run.mockRestore()
+    }
+  })
+
   it('disables every account but keeps per-account reconciliation and incident ownership', async () => {
     const { database: db, behaviors: runtime } = await arrangeOrganizations()
     for (const owner of ['Vaquum', 'beta']) {
