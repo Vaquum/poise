@@ -43,9 +43,20 @@ export function recordProviderRejection(id: AccountId, callId: string, model: st
     const previous = providerSignInFailure(id)
     if (previous && previous.rejectedAt >= rejectedAt) return
     const recovered = previous?.verifiedAt != null && previous.verifiedAt > previous.rejectedAt
+    // A Connect that finished after the call completed but before this record
+    // must keep its eligibility: carry a fresh reconnect forward instead of
+    // resetting it to null.
+    let reconnectedAt: number | null = null
+    const prevReconnect = previous?.reconnectedAt
+    if (typeof prevReconnect === 'number' && prevReconnect > rejectedAt) reconnectedAt = prevReconnect
+    else {
+      const loginAt = accountLogins()[id]
+      const loginMs = typeof loginAt === 'string' ? Date.parse(loginAt) : NaN
+      if (Number.isSafeInteger(loginMs) && loginMs > rejectedAt) reconnectedAt = loginMs
+    }
     setMeta(rejectionKey(id), JSON.stringify({ callId, model, rejectedAt,
       since: !previous || recovered ? rejectedAt : previous.since,
-      verifiedAt: null, consumedAt: null, reconnectedAt: null, verificationLogin: null } satisfies ProviderSignInFailure))
+      verifiedAt: null, consumedAt: null, reconnectedAt, verificationLogin: null } satisfies ProviderSignInFailure))
   }).immediate()
 }
 
@@ -130,13 +141,11 @@ export function recordLogin(preset: string, code: number): void {
   const id = preset === 'muse-api-key' ? 'muse' : preset
   if (code !== 0 || !isAccountId(id) || EXIT_IS_NO_LOGIN.has(id)) return
   const completedAt = Date.now()
-  db.transaction(() => {
-    setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [id]: new Date(completedAt).toISOString() }))
-    const failure = providerSignInFailure(id)
-    if (failure && completedAt > failure.rejectedAt) {
-      setMeta(rejectionKey(id), JSON.stringify({ ...failure, reconnectedAt: completedAt }))
-    }
-  }).immediate()
+  setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [id]: new Date(completedAt).toISOString() }))
+  const failure = providerSignInFailure(id)
+  if (failure && completedAt > failure.rejectedAt) {
+    setMeta(rejectionKey(id), JSON.stringify({ ...failure, reconnectedAt: completedAt }))
+  }
 }
 
 /** The person says whether a CLI that reports no sign-in is signed in. */

@@ -23,7 +23,8 @@ process.stdin.on('end', () => {
       if (typeof log[key] === 'string') safe[key] = redact(log[key]).replace(/\?[^\s'"\]]+/g, '?[query omitted]')
     }
     for (const key of ['ts', 'status', 'duration']) if (typeof log[key] === 'number' && Number.isFinite(log[key])) safe[key] = log[key]
-    safe.request = { host: hostName(header), method: typeof log.request?.method === 'string' ? redact(log.request.method) : null }
+    safe.request = { host: hostName(header), method: typeof log.request?.method === 'string' ? redact(log.request.method) : null,
+      ...(log.request?.route === '/api/link/events' ? { route: '/api/link/events' } : {}) }
     return [{ id: record.id, time: record.time, log: safe }]
   })
   process.stdout.write(JSON.stringify(result))

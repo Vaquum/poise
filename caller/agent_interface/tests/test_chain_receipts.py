@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import sys
 from contextlib import nullcontext, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -151,7 +152,8 @@ class ManagedReceipts(TestCase):
 
 class AtomicWorkLimits(TestCase):
     def setUp(self):
-        self.directory = TemporaryDirectory()
+        # Cleanup needs consistent file/directory device IDs on managed boxes.
+        self.directory = TemporaryDirectory(dir="/dev/shm" if sys.platform == "linux" else None)
         self.addCleanup(self.directory.cleanup)
         root = Path(self.directory.name)
         self.path = root / "calls.sqlite3"
@@ -220,6 +222,76 @@ class AtomicWorkLimits(TestCase):
         self.assertEqual(modes, ["prepare", "validate"])
         self.assertEqual((status, action, outcome), ("failed", "not_started", "preflight_failed"))
         self.assertIsNone(plan)
+
+    def test_repair_prompts_exact_roots_and_keeps_missing_ids_after_cleanup(self):
+        threads = [
+            {"root_comment_id": 17, "is_resolved": False, "is_outdated": False, "bodies": ["private current finding"]},
+            {"root_comment_id": 18, "is_resolved": False, "is_outdated": True, "bodies": ["private outdated finding", "earlier reply"]},
+            {"root_comment_id": 19, "is_resolved": True, "is_outdated": False, "bodies": ["private resolved finding"]},
+            {"root_comment_id": 20, "is_resolved": True, "is_outdated": True, "bodies": ["private resolved outdated finding"]},
+        ]
+        for attempt, reply_ids in enumerate(([17], [17, 18]), 1):
+            with self.subTest(reply_ids=reply_ids):
+                modes, workspaces = [], []
+
+                def interface(*args, **_kwargs):
+                    if args[0] == "--pr-review":
+                        return {"review_threads": threads}
+                    if args[0] != "--issue-work":
+                        return {}
+                    mode = args[args.index("--mode") + 1]
+                    modes.append(mode)
+                    if mode == "prepare":
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+                    self.assertEqual(json.loads(args[args.index("--replies-json") + 1]), replies)
+                    return {"outcome": "validated" if mode == "validate" else "published", "head_sha": HEAD}
+
+                replies = [{"commentId": root, "body": "Verified the finding against the repair and its regression."} for root in reply_ids]
+
+                def worker(_lease, _args, **kwargs):
+                    workspace = Path(kwargs["cwd"]).parent
+                    workspaces.append(workspace)
+                    (workspace / "publication.json").write_text(json.dumps({
+                        "commitMessage": "fix: repair seed", "title": "fix: repair seed", "body": "Concrete repair and checks.",
+                        "replies": replies, "blocked": None}))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                        patch.object(issue_review, "interface", side_effect=interface), \
+                        patch.object(issue_review, "command", return_value=(["fixture"], "", {})) as command, \
+                        patch.object(issue_review, "_terminal_failure", return_value=None), \
+                        patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                        patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                        patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), redirect_stdout(StringIO()):
+                    context = self.assertRaisesRegex(ValueError, "repair did not answer every unresolved review finding") if attempt == 1 else nullcontext()
+                    with context:
+                        api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
+                                            f"00000000-0000-4000-8000-{attempt:012d}", "fixture-model", "poise/issue-7", 3, HEAD)
+
+                instruction = command.call_args.args[1]
+                self.assertIn("required unresolved root comment IDs: [17, 18]", instruction)
+                self.assertIn("outdated", instruction)
+                self.assertIn("already have replies", instruction)
+                with sqlite3.connect(self.path) as conn:
+                    row = conn.execute("select status,error_code,action,outcome,error,action_plan,artifact,resource_ownership from calls "
+                                       "where correlation_id=?", (f"00000000-0000-4000-8000-{attempt:012d}",)).fetchone()
+                status, code, action, outcome, error, plan, artifact, ownership = row
+                self.assertFalse(workspaces[0].exists(), f"publication metadata must be cleaned up: {ownership}")
+                if attempt == 1:
+                    self.assertEqual(modes, ["prepare"])
+                    self.assertEqual((status, code, action, outcome), ("failed", "atomic_work_failed", "not_started", "preflight_failed"))
+                    self.assertIn("missing_root_comment_ids=[18]", error)
+                    self.assertIn("missing_count=1; required_count=2", error)
+                    self.assertNotIn("private", error + artifact)
+                    self.assertIsNone(plan)
+                    with self.assertRaisesRegex(ValueError, "no durable publication plan"):
+                        with api.db() as conn:
+                            call = conn.execute("select id from calls where correlation_id=?",
+                                                (f"00000000-0000-4000-8000-{attempt:012d}",)).fetchone()[0]
+                        api.complete_atomic_publication(call, "c" * 64, HEAD)
+                else:
+                    self.assertEqual(modes, ["prepare", "validate", "publish"])
+                    self.assertEqual((status, action, outcome), ("completed", "published", "published"))
 
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         modes = []

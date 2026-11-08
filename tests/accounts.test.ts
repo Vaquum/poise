@@ -98,6 +98,15 @@ describe('GET /api/accounts', () => {
     expect(native).toHaveBeenCalledTimes(2)
   })
 
+  it('keeps a Connect that finished before reconciliation recorded the rejection', async () => {
+    const rejectedAt = Date.now() - 5_000
+    recordLogin('codex', 0)
+    const loginMs = Date.parse(accountLogins().codex!)
+    expect(loginMs).toBeGreaterThan(rejectedAt)
+    recordProviderRejection('codex', 'b'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    expect(providerSignInFailure('codex')).toMatchObject({ rejectedAt, reconnectedAt: loginMs })
+  })
+
   it('reads a fast account independently of a pending provider', async () => {
     let release!: () => void
     const held = new Promise<void>(resolve => { release = resolve })

@@ -1,4 +1,8 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { probeAccount } from '../server/accounts/status'
 import {
   CLAUDE_AUTH_LOGIN_TIMEOUT_MS,
   CLAUDE_AUTH_POLL_MS,
@@ -9,7 +13,9 @@ import {
   type ClaudeAuthRunFile,
   type ClaudeAuthTimer,
 } from '../server/claude-auth'
-import { CLAUDE_SUBSCRIPTION_CLI } from '../server/process'
+import { loggingRuntime, startLogging, stopLogging } from '../server/logging'
+import { CLAUDE_SUBSCRIPTION_CLI, runFile } from '../server/process'
+import { STATUS, fakeCalls, script, setScript, writeFakeClis } from './fixtures/accounts/fake-clis'
 
 const VALID_STATUS = JSON.stringify({
   loggedIn: true,
@@ -612,5 +618,113 @@ describe('Claude subscription authentication monitor', () => {
     await monitor.stop()
     expect(monitor.snapshot().status).toBe('unavailable')
     expect(heard).toEqual(['reauth_required', 'authenticated'])
+  })
+})
+
+describe('Claude status diagnostics through the process helper', () => {
+  let root = ''
+  let home = ''
+  const canaryArgs = '--print --model haiku --effort low --permission-mode dontAsk --tools  --no-session-persistence -- Reply with exactly OK.'
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'poise-claude-status-'))
+    home = join(root, 'home')
+    const bin = join(root, 'bin')
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('PATH', bin)
+    vi.stubEnv('POISE_DB', join(root, 'cache.db'))
+    vi.stubEnv('POISE_MODE', 'service')
+    vi.stubEnv('POISE_WORKSPACE_HANDLE', 'alice')
+    await writeFakeClis(bin, home, { claude: script('claude', STATUS.claudeSignedOut) })
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    startLogging()
+  })
+
+  afterEach(async () => {
+    await stopLogging()
+    vi.unstubAllEnvs()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  function failures() {
+    loggingRuntime()!.flush()
+    return loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false })).events
+      .filter((event) => event.source === 'poise' && event.severity === 'error')
+  }
+
+  it('keeps one sign-in notice across repeated signed-out probes and failures until a canary verifies recovery', async () => {
+    const database = await import('../server/db')
+    const { claudeAuthStatusChanged } = await import('../server/alerts/producers')
+    const { openAlerts, latestAlertSeq } = await import('../server/alerts/store')
+    database.setMeta('account_logins', JSON.stringify({ claude: new Date().toISOString() }))
+    const clock = new FakeClock()
+    const monitor = new ClaudeAuthMonitor({ canaryModel: async () => ({ selector: 'haiku', effort: 'low' }), clock })
+    const unsubscribe = monitor.onStatus(claudeAuthStatusChanged)
+    try {
+      await monitor.check()
+      const [notice] = openAlerts()
+      expect(notice).toMatchObject({ kind: 'sign_in_needed' })
+      for (let poll = 0; poll < 3; poll += 1) {
+        clock.advance(CLAUDE_AUTH_POLL_MS)
+        await expect(monitor.check()).resolves.toMatchObject({ status: 'reauth_required' })
+        await expect(probeAccount('claude', runFile)).resolves.toMatchObject({ signedIn: false })
+        expect(openAlerts()).toEqual([notice])
+      }
+      expect(latestAlertSeq()).toBe(notice.seq)
+      expect(failures()).toEqual([])
+
+      await setScript(home, 'claude', script('claude', { stdout: '{"error":"broken"}', stderr: 'status could not be read', code: 1 }))
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'reauth_required' })
+      expect(failures()).toMatchObject([{ exitCode: 1, stderr: 'status could not be read' }])
+      expect(openAlerts()).toEqual([notice])
+
+      await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: { stderr: '502 Bad Gateway', code: 2 } })
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'reauth_required', verifiedAt: null })
+      expect(openAlerts()).toEqual([notice])
+      expect(failures()).toMatchObject([{ exitCode: 2, stderr: '502 Bad Gateway' }, { exitCode: 1 }])
+
+      await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: OK })
+      clock.advance(CLAUDE_AUTH_RETRY_BASE_MS)
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'authenticated', verifiedAt: new Date(clock.now()).toISOString() })
+      expect(openAlerts()).toEqual([])
+      expect(failures()).toHaveLength(2)
+      expect((await fakeCalls(home)).filter((call) => call.args[0] === '--print')).toHaveLength(2)
+    } finally {
+      unsubscribe()
+      await monitor.stop()
+      database.closeDatabase()
+    }
+  })
+
+  describe.each(['monitor', 'accounts'] as const)('%s', (caller) => {
+    async function probe(run: ClaudeAuthRunFile = runFile) {
+      if (caller === 'accounts') return (await probeAccount('claude', run)).signedIn
+      return (await new ClaudeAuthMonitor({ runFile: run, clock: new FakeClock() }).check()).status
+    }
+
+    it.each([0, 1])('records unrecognized status output with exit %i, without treating it as signed out', async (code) => {
+      for (const stdout of ['{}', '{"error":"broken"}', '{"loggedIn":"false"}', 'not JSON', '']) {
+        await setScript(home, 'claude', script('claude', { stdout, stderr: 'status diagnostic', code }))
+        const before = failures().length
+        expect(await probe()).toBe(caller === 'accounts' ? null : 'unavailable')
+        expect(failures()).toHaveLength(before + 1)
+        expect(failures()[0]).toMatchObject({ exitCode: code === 1 ? 1 : null })
+      }
+    })
+
+    it('records other nonzero exits and start failures exactly once', async () => {
+      await setScript(home, 'claude', script('claude', { stderr: 'status failed', code: 2 }))
+      await probe()
+      expect(failures()).toMatchObject([{ exitCode: 2, stderr: 'status failed' }])
+      await probe((command, args, options) => runFile(args[0] === 'auth' ? join(root, 'missing-cli') : command, args, options))
+      expect(failures()).toHaveLength(2)
+      expect(failures()[0]).toMatchObject({ exitCode: null, context: { code: 'ENOENT' } })
+    })
+
+    it('records a timed-out status probe exactly once', async () => {
+      await writeFile(join(root, 'bin', 'claude'), '#!/bin/sh\nif [ "$1" = --version ]; then echo "2.1.288 (Claude Code)"; exit 0; fi\nexec node -e "setInterval(() => {}, 1000)"\n')
+      await probe((command, args, options) => runFile(command, args, { ...options, ...(args[0] === 'auth' ? { timeoutMs: 500 } : {}) }))
+      expect(failures()).toMatchObject([{ exitCode: null, timeoutMs: 500, context: { killed: true } }])
+    })
   })
 })

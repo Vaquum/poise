@@ -227,6 +227,15 @@ const CLAUDE_ENV = [
   ...NETWORK_ENV,
 ]
 
+// Direct Codex invocations need their configured home and network route, but
+// never inherit API-key overrides. Issue-review invocations inherit the same
+// proxy route through agent-interface; the native sign-in verification must
+// match it instead of stripping proxy variables and failing behind a proxy.
+const CODEX_ENV = [
+  'CODEX_HOME',
+  ...NETWORK_ENV,
+]
+
 // Browser launchers on Linux and WSL rely on these non-secret desktop/session
 // coordinates. Keep them out of ordinary status/model workers and inherit them
 // only for Poise's exact Claude.ai login command.
@@ -266,6 +275,8 @@ const COMMAND_ENV = new Map<string, ReadonlySet<string>>([
   ['claude', new Set(CLAUDE_ENV)],
   ['claude-subscription', new Set(CLAUDE_ENV)],
   ['claude-subscription.mjs', new Set(CLAUDE_ENV)],
+  ['codex', new Set(CODEX_ENV)],
+  ['codex.js', new Set(CODEX_ENV)],
 ])
 
 function commandName(command: string): string {

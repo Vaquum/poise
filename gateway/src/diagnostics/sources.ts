@@ -24,9 +24,13 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
   if (!diagnostic && !error && !row.error_code && !priorWarning) return null
   const repository = text(row.repo)
   const pr = text(row.pr_id)
+  const heldRepair = row.behavior === 'repair_pr' && row.status === 'failed'
+    && row.action === 'not_started' && row.outcome === 'preflight_failed' && row.head_sha == null
+    && (row.error_code === 'atomic_work_blocked' || row.error_code === 'atomic_work_failed'
+      && error === 'repair did not answer every unresolved review finding')
   return {
     id: 'caller:' + row.id, time: text(row.completed_at), source: unavailable && !row.error && !diagnostic ? 'collection' : 'caller', component: text(row.behavior) ?? 'agent-interface',
-    level: unavailable && !row.error && !diagnostic ? 'warning' : diagnostic?.severity === 'warning' ? 'warning' : diagnostic?.severity === 'error' ? 'error' : ['overloaded', 'rate_limit', 'authentication_failed', 'interrupted'].includes(String(row.error_code)) ? 'warning' : 'error',
+    level: unavailable && !row.error && !diagnostic ? 'warning' : diagnostic?.severity === 'warning' ? 'warning' : diagnostic?.severity === 'error' ? 'error' : heldRepair || ['overloaded', 'rate_limit', 'authentication_failed', 'interrupted'].includes(String(row.error_code)) ? 'warning' : 'error',
     operation: unavailable && !row.error && !diagnostic ? 'caller.evidence_unavailable' : text(diagnostic?.operation) || text(row.behavior) || 'call.failed', phase: text(diagnostic?.phase), workspace,
     repository, pr, target: repository && pr ? `${repository}#${pr}` : repository,
     account: text(row.actor), reviewer: text(row.actor), behavior: text(row.behavior), callId: String(row.id),
@@ -72,19 +76,25 @@ export function workspaceEnvelope(value: unknown, workspace: string, now: number
   return { ...event, id: row.id, incidentId: row.incidentId, sourceLevel: redact(text(row.sourceLevel) ?? event.sourceLevel, secrets).slice(0, 64) }
 }
 
-/** Native levels remain authoritative; unknown levels become collection warnings. */
+/** Native levels remain authoritative except for verified Link stream closes. */
 export function nativeDiagnostic(value: unknown, source: 'ingress' | 'kernel' | 'docker', id: string, workspace: string | null): DiagnosticInput {
   const row = object(value)
   if (!row) return { id, source: 'collection', level: 'warning', workspace, operation: 'record.unreadable', message: `${source} supplied an unreadable record; content was excluded` }
+  const request = object(row.request), uri = text(request?.uri)?.split('?')[0]
+  const linkEvents = uri === undefined ? request?.route === '/api/link/events' : uri === '/api/link/events'
+  // Caddy emits this warning only after writing the upstream response headers.
+  const routineClose = source === 'ingress' && row.level === 'warn' && request?.method === 'GET' && linkEvents
+    && row.logger === 'http.handlers.reverse_proxy' && row.msg === 'aborting with incomplete response' && row.error === 'reading: context canceled'
   const clock = row.__REALTIME_TIMESTAMP !== undefined ? Number(row.__REALTIME_TIMESTAMP) / 1000
     : typeof row.ts === 'number' ? row.ts * 1000 : null
   const time = clock === null ? text(row.time) ?? text(row.timestamp) ?? null
     : Number.isFinite(clock) && clock >= 0 && clock <= 8.64e15 ? new Date(clock).toISOString() : 'invalid source timestamp'
-  return { id, time, source, level: typeof row.level === 'string' || typeof row.level === 'number' ? row.level : typeof row.PRIORITY === 'string' || typeof row.PRIORITY === 'number' ? row.PRIORITY : 'unknown',
+  return { id, time, source, level: routineClose ? 'info' : typeof row.level === 'string' || typeof row.level === 'number' ? row.level : typeof row.PRIORITY === 'string' || typeof row.PRIORITY === 'number' ? row.PRIORITY : 'unknown',
     workspace, visibility: workspace ? 'infrastructure' : 'operator', operation: text(row.event) ?? text(row.logger) ?? source + '.diagnostic',
     message: (text(row.message) ?? text(row.msg) ?? text(row.MESSAGE) ?? 'Source supplied no message').replace(/\?[^\s'"]+/g, '?[query omitted]'),
+    stderr: text(row.error)?.replace(/\?[^\s'"]+/g, '?[query omitted]'),
     requestId: text(row.request_id), container: text(row.container), release: text(row.release),
-    context: { method: object(row.request)?.method ?? row.method ?? null, route: text(object(row.request)?.uri)?.startsWith('/api/') ? text(object(row.request)?.uri)?.split('?')[0].split('/').slice(0, 3).join('/') : null,
+    context: { method: request?.method ?? row.method ?? null, route: linkEvents ? '/api/link/events' : uri?.startsWith('/api/') ? uri.split('/').slice(0, 3).join('/') : null,
       durationMs: number(row.duration) === null ? null : Number(row.duration) * 1000,
       upstream: text(row.upstream), errno: text(row.errno), sourceCursor: text(row.__CURSOR) },
   }

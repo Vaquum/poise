@@ -311,6 +311,27 @@ class TestIssueReviewRun(IssueReviewCase):
             row, _ = self.run_review(FakeGitHub(), agent_writes(None), recovery="gpt-6-astra-ultra", expect_exit=True)
         self.assertEqual((row["status"], row["error_code"], row["recovery_model"]), ("failed", "review_budget_exhausted", None))
 
+    def test_a_credential_rejection_on_the_recovery_route_keeps_its_sign_in_condition(self):
+        attempts = []
+
+        def review(model, repo, number, data, actor, note, work):
+            attempts.append(model.identity)
+            if len(attempts) == 1:
+                raise review_budget.ReviewLimitError("Claude's response exceeded the 64000 output token maximum")
+            raise issue_review.ProviderFailure("Your refresh token was already used", "authentication_failed",
+                {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+                 "phase": "provider_execution", "outcome": "exit", "stderr": "refresh already used",
+                 "stderr_truncated": False, "provider": "codex", "submission": "none"})
+
+        with patch.object(issue_review, "review", side_effect=review):
+            row, _ = self.run_review(FakeGitHub(), agent_writes(None), recovery="gpt-6-astra-ultra", expect_exit=True)
+        self.assertEqual(attempts, ["opus-5-max", "gpt-6-astra-ultra"])
+        self.assertEqual((row["status"], row["error_code"], row["action"], row["outcome"], row["recovery_model"]),
+                         ("failed", "authentication_failed", "not_started", "preflight_failed", "gpt-6-astra-ultra"))
+        exported = self.exported(row)
+        self.assertEqual(exported["diagnostic"]["operation"], "provider.review")
+        self.assertIsNone(exported["receipts"])
+
 
 class TestRevisionBoundReview(IssueReviewCase):
     def test_revision_is_the_exact_title_and_body(self):

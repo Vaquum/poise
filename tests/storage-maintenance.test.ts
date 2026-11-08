@@ -531,6 +531,62 @@ describe('snapshot expiry', () => {
   })
 })
 
+describe('filesystem trim', () => {
+  let logging: typeof import('../server/logging')
+
+  beforeEach(async () => {
+    const bin = join(root, 'bin')
+    await mkdir(bin)
+    await writeFile(join(bin, 'fstrim'), `#!/usr/bin/env node
+const fs = require('node:fs')
+fs.appendFileSync(${JSON.stringify(join(root, 'trim-calls'))}, process.argv[3] + '\\n')
+process.stderr.write('fstrim: ' + process.argv[3] + ': ' + fs.readFileSync(${JSON.stringify(join(root, 'trim-error'))}, 'utf8') + '\\n')
+process.exit(1)
+`, { mode: 0o700 })
+    vi.stubEnv('PATH', `${bin}:${process.env.PATH}`)
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('POISE_MODE', 'service')
+    vi.stubEnv('POISE_WORKSPACE_HANDLE', 'storage-test')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging = await import('../server/logging')
+    logging.startLogging()
+  })
+
+  afterEach(async () => { await logging.stopLogging() })
+
+  it.each([
+    { cause: 'the discard operation is not supported', attempts: 1, severity: 'warning' },
+    { cause: 'FITRIM ioctl failed: Input/output error', attempts: 2, severity: 'error' },
+  ])('retains $severity evidence and makes $attempts attempts for "$cause"', async ({ cause, attempts, severity }) => {
+    await writeFile(join(root, 'trim-error'), cause)
+    for (let run = 0; run < 2; run++) {
+      const expired = join(stateRoot, 'incident-recovery', `old-${run}`)
+      await mkdir(expired, { recursive: true })
+      await writeFile(join(expired, 'dump'), 'expired snapshot\n')
+      await age(expired, 31 * DAY)
+
+      const report = await maintenance.runStorageMaintenance({ chatRoot, stateRoot, home, claims: () => [] })
+      expect(report.trimmedBytes).toBeNull()
+      expect(report.errors).toEqual([])
+      expect(report.removed.map(item => item.path)).toContain(expired)
+      expect(report.reclaimedBytes).toBeGreaterThan(0)
+      await expect(lstat(expired)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(maintenance.lastMaintenanceRun()).toEqual(report)
+    }
+
+    expect((await readFile(join(root, 'trim-calls'), 'utf8')).trim().split('\n')).toEqual(Array(attempts).fill(home))
+    logging.loggingRuntime()!.flush()
+    const events = logging.loggingRuntime()!.query(store => store.query(
+      { workspace: 'storage-test', operator: false }, { search: 'fstrim' },
+    )).events
+    expect(events).toHaveLength(attempts)
+    for (const event of events) {
+      expect(event).toMatchObject({ severity, exitCode: 1, stderr: `fstrim: ${home}: ${cause}\n` })
+    }
+    if (severity === 'warning') expect(events[0]).toMatchObject({ operation: 'storage.trim.unsupported', target: home })
+  })
+})
+
 describe('disk pressure', () => {
   it('runs maintenance and alerts past the threshold, and resolves below the clear line', async () => {
     const alerts = await import('../server/alerts/store')

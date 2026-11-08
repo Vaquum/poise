@@ -156,7 +156,7 @@ describe('the notices', () => {
     handling.recordHandling({ kind: 'caller-update', source: 'pr_review', title: 'Old run',
       startedAt: new Date(at(0)).toISOString(), finishedAt: new Date(at(1)).toISOString(),
       outcome: 'completed', actor: 'caller', ref: 'caller:abc123' }, new Date(at(1)).toISOString())
-    expect(handling.listHandling().map((row) => row.title)).toEqual(['Recent dismissal', 'Old run'])
+    expect(handling.listHandling(200, at(61)).map((row) => row.title)).toEqual(['Recent dismissal', 'Old run'])
   })
 
   it('compares since cutoffs carrying timezone offsets in UTC', () => {
@@ -164,7 +164,7 @@ describe('the notices', () => {
       startedAt: '2026-10-09T11:00:00.000Z', finishedAt: '2026-10-09T11:00:00.000Z',
       outcome: 'dismissed', actor: 'person', ref: 'alert:9:dismissed' }, '2026-10-09T11:00:00.000Z')
     // Noon at +02:00 is 10:00Z: the 11:00Z handling is at and after it.
-    expect(handling.listHandling(200, Date.now(), '2026-10-09T12:00:00+02:00').map((row) => row.title))
+    expect(handling.listHandling(200, at(61), '2026-10-09T12:00:00+02:00').map((row) => row.title))
       .toEqual(['Eleven oclock'])
   })
 

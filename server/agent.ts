@@ -72,11 +72,10 @@ export async function fetchRunningAgentLogs(
 // `--logs` still dumps the whole Caller log on every read, and runFile kills
 // the child once stdout passes the cap below: reads work fully until then,
 // then all fail at once. Warn into the workspace diagnostics at 75% of the
-// cap so the cliff is seen first. At most hourly: every spawn would refire.
-const AGENT_LOG_READ_CAP_BYTES = 32 * 1024 * 1024
+// cap, once until a successful history read falls below the threshold.
+const AGENT_LOG_READ_CAP_BYTES = 128 * 1024 * 1024
 const AGENT_LOG_CAP_WARN_BYTES = (AGENT_LOG_READ_CAP_BYTES * 3) / 4
-const AGENT_LOG_CAP_WARN_INTERVAL_MS = 60 * 60 * 1000
-let lastAgentLogCapWarningAt = 0
+let agentLogCapWarningActive = false
 
 // Two lanes share nothing: a history read's seconds-long child never queues a
 // current read behind it. One child runs per lane: the whole-log dump used
@@ -528,9 +527,12 @@ async function selectedAgentLogSnapshot(
 
 function warnAgentLogCap(stdout: string, rows: number): void {
   const bytes = Buffer.byteLength(stdout, 'utf8')
-  const now = Date.now()
-  if (bytes < AGENT_LOG_CAP_WARN_BYTES || now - lastAgentLogCapWarningAt < AGENT_LOG_CAP_WARN_INTERVAL_MS) return
-  lastAgentLogCapWarningAt = now
+  if (bytes < AGENT_LOG_CAP_WARN_BYTES) {
+    agentLogCapWarningActive = false
+    return
+  }
+  if (agentLogCapWarningActive) return
+  agentLogCapWarningActive = true
   diagnostic({ level: 'warning', operation: 'agent.logs.cap', condition: 'agent_logs_read_cap',
     message: `agent-interface --logs is ${bytes} bytes (${rows} row${rows === 1 ? '' : 's'}), past 75% of the ${AGENT_LOG_READ_CAP_BYTES}-byte read cap`,
     resources: { bytes, rows, cap: AGENT_LOG_READ_CAP_BYTES } })

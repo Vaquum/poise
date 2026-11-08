@@ -58,7 +58,6 @@ export async function receiveIngress(db: DiagnosticStore, domain: string, stdin:
     const input = nativeDiagnostic(record.log, 'ingress', id, null)
     input.time ??= record.time as string
     input.container = batch.container
-    input.stderr = typeof record.log.error === 'string' ? record.log.error : undefined
     input.context = { ...input.context, host, status: typeof record.log.status === 'number' ? record.log.status : null, errorId: record.log.err_id ?? null, errorTrace: record.log.err_trace ?? null, integration: 'external-proxy-window' }
     const event = normalize(input, at, environmentSecrets())
     if (event) events.push(event)

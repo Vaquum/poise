@@ -1043,7 +1043,11 @@ disk):
 Then start the VM and compare the guest's `df` against the host's
 `virsh domblkinfo` allocation: after the guest trims, the two agree again.
 The guest side needs nothing from the operator: each maintenance run issues
-`fstrim` on the home volume when the tool is available.
+`fstrim` on the home volume when the tool is available. If the filesystem
+reports that discard is unsupported, Poise records one warning and skips trim
+for that home volume until the server restarts. Other trim failures retain
+their stderr diagnostic and are retried on the next run. Maintenance still
+completes its cleanup report when trim fails or is skipped.
 
 ## Logs
 

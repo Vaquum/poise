@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { mocks, pr, loadModules, arrangeCli } from './behaviors-runtime-fixture'
+import { mocks, pr, loadModules, arrangeCli, deferred } from './behaviors-runtime-fixture'
 
 const slowLockSetup = vi.hoisted(() => ({ path: '' }))
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -19,6 +19,7 @@ async function arrangeChainSweep() {
   const { database: db, behaviors: runtime } = await loadModules()
   const { BehaviorChainRuntime } = await import('../server/behavior-chain-runtime')
   const run = vi.spyOn(BehaviorChainRuntime.prototype, 'run').mockResolvedValue()
+  vi.spyOn(console, 'log').mockImplementation(() => undefined)
   runtime.startBehaviorsRuntime()
   db.setMeta('me', 'poise-user')
   db.setMeta('behavior_chain_settings', JSON.stringify({ enabled: true, seedMode: 'label', label: 'poise' }))
@@ -26,6 +27,8 @@ async function arrangeChainSweep() {
     db, runtime, run,
     lockPath: join(dirname(process.env.POISE_DB!), '.poise-vaquum-behavior-chain-runtime-lock.sqlite3'),
     reported: () => vi.mocked(console.error).mock.calls.map(([line]) => String(line)).filter((line) => line.includes('behavior chain failed')),
+    warnings: () => vi.mocked(console.warn).mock.calls.map(([line]) => String(line)).filter((line) => line.includes('behavior chain sweep')),
+    observations: () => vi.mocked(console.log).mock.calls.map(([line]) => String(line)).filter((line) => line.includes('behavior chain sweep overlap ended')),
   }
 }
 
@@ -45,7 +48,7 @@ const holderNames = Object.keys(holders) as (keyof typeof holders)[]
 
 describe('behavior chain sweep lock', () => {
   it.each(holderNames)('skips only the chain sweep, reporting nothing, while %s holds its lock', async (name) => {
-    const { db, runtime, run, lockPath, reported } = await arrangeChainSweep()
+    const { db, runtime, run, lockPath, reported, warnings, observations } = await arrangeChainSweep()
     db.setMeta('behavior_review_new_prs_keyver', '3')
     db.setMeta('behavior_review_new_prs_enabled', '1')
     db.recordSeen('review-new-prs', '__snapshot_v3__')
@@ -56,16 +59,141 @@ describe('behavior chain sweep lock', () => {
       expect(run).not.toHaveBeenCalled()
       expect(mocks.spawnDetached).toHaveBeenCalledOnce()
       expect(reported()).toEqual([])
+      expect(warnings()).toEqual([])
       expect(runtime.getBehaviorChainRuntimeHealth().filter((entry) => entry.error)).toEqual([])
       expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', runtimeError: null })
     })
 
     await runtime.runEnabledBehaviorsOnce()
     expect(run).toHaveBeenCalled()
+    expect(observations()).toEqual([expect.stringContaining('skipped ticks: 1')])
+  })
+
+  it.each(holderNames)('reports overdue overlap once per episode while %s holds its lock', async (name) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const began = Date.parse('2026-11-08T12:00:00Z')
+    vi.setSystemTime(began)
+    const { runtime, run, lockPath, reported, warnings, observations } = await arrangeChainSweep()
+    const budget = 2 * runtime.BEHAVIOR_TICK_MS
+
+    await holders[name](lockPath, async () => {
+      // Frequent check-slot retries must not turn a skip count into a deadline.
+      for (const elapsed of [0, 1_000, 2_000, budget - 1, budget]) {
+        vi.setSystemTime(began + elapsed)
+        await runtime.runEnabledBehaviorsOnce()
+        expect(warnings()).toEqual([])
+        expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', runtimeError: null })
+      }
+      vi.setSystemTime(began + budget + 1)
+      expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({
+        status: 'degraded', runtimeError: expect.stringContaining('chain sweep overlap'),
+      })
+      for (const elapsed of [budget + 1, budget + 1_001, budget + 2_001]) {
+        vi.setSystemTime(began + elapsed)
+        await runtime.runEnabledBehaviorsOnce()
+      }
+      expect(warnings()).toEqual([expect.stringContaining('Vaquum')])
+      expect(run).not.toHaveBeenCalled()
+      expect(reported()).toEqual([])
+      expect(runtime.getBehaviorChainRuntimeHealth()).toEqual([])
+    })
+
+    // A failed completion ends the episode without turning its failure healthy.
+    run.mockRejectedValueOnce(new Error('boom'))
+    await runtime.runEnabledBehaviorsOnce()
+    const failed = runtime.getBehaviorChainRuntimeHealth()
+    expect(failed).toEqual([{ organization: 'vaquum', lastSweepAt: Date.now(), error: 'boom' }])
+    expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'degraded', runtimeError: 'boom' })
+    expect(observations()).toEqual([expect.stringContaining('skipped ticks: 8; elapsed: 122001ms')])
+
+    const next = Date.now() + 1
+    await holders[name](lockPath, async () => {
+      vi.setSystemTime(next)
+      await runtime.runEnabledBehaviorsOnce()
+      expect(warnings()).toHaveLength(1)
+      vi.setSystemTime(next + budget + 1)
+      await runtime.runEnabledBehaviorsOnce()
+      expect(warnings()).toEqual([expect.stringContaining('Vaquum'), expect.stringContaining('Vaquum')])
+      expect(runtime.getBehaviorChainRuntimeHealth()).toEqual(failed)
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(runtime.getBehaviorChainRuntimeHealth()).toEqual([{ organization: 'vaquum', lastSweepAt: Date.now(), error: null }])
+    expect(observations()).toEqual([
+      expect.stringContaining('skipped ticks: 8; elapsed: 122001ms'),
+      expect.stringContaining('skipped ticks: 2; elapsed: 120001ms'),
+    ])
+  })
+
+  it.each(holderNames)('keeps overlap clocks and warnings separate by organization with %s', async (name) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const began = Date.parse('2026-11-08T12:00:00Z')
+    vi.setSystemTime(began)
+    const { db, runtime, lockPath, warnings, observations } = await arrangeChainSweep()
+    db.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES ('beta', ?, 1, 'ready', 'ready', 'poise-user')`).run(join(dirname(lockPath), 'beta.sqlite'))
+    const betaLock = join(dirname(lockPath), '.poise-beta-behavior-chain-runtime-lock.sqlite3')
+    const budget = 2 * runtime.BEHAVIOR_TICK_MS
+
+    await holders[name](lockPath, async () => {
+      await runtime.runEnabledBehaviorsOnce()
+      await holders[name](betaLock, async () => {
+        vi.setSystemTime(began + 1_000)
+        await runtime.runEnabledBehaviorsOnce()
+        vi.setSystemTime(began + budget + 1)
+        await runtime.runEnabledBehaviorsOnce()
+        expect(warnings()).toEqual([expect.stringContaining('Vaquum')])
+        expect(runtime.withBehaviorOrganization('beta', () => runtime.getBehaviorsRuntimeHealth()))
+          .toMatchObject({ status: 'ok', runtimeError: null })
+        vi.setSystemTime(began + budget + 1_001)
+        await runtime.runEnabledBehaviorsOnce()
+        expect(warnings()).toEqual([expect.stringContaining('Vaquum'), expect.stringContaining('beta')])
+      })
+      await runtime.runEnabledBehaviorsOnce()
+      expect(observations()).toEqual([expect.stringContaining('ended for beta: skipped ticks: 3')])
+      expect(runtime.withBehaviorOrganization('Vaquum', () => runtime.getBehaviorsRuntimeHealth()))
+        .toMatchObject({ status: 'degraded', runtimeError: expect.stringContaining('chain sweep overlap') })
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(warnings()).toHaveLength(2)
+    expect(observations()).toHaveLength(2)
+    expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', runtimeError: null })
+  })
+
+  it('reports a blocked sweep through health despite completed scheduler ticks, then recovers', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-08T12:00:00Z'))
+    const { runtime, run, warnings, observations } = await arrangeChainSweep()
+    const held = deferred<void>()
+    run.mockReturnValueOnce(held.promise)
+    const sweep = runtime.runEnabledBehaviorsOnce()
+    try {
+      await vi.waitFor(() => expect(run).toHaveBeenCalledOnce())
+      for (let tick = 1; tick <= 4; tick++) {
+        await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_TICK_MS)
+        await vi.waitFor(() => {
+          const health = runtime.getBehaviorsRuntimeHealth()
+          expect(health.lastTickAt).not.toBeNull()
+          expect(Date.parse(health.lastTickCompletedAt!)).toBeGreaterThanOrEqual(Date.parse(health.lastTickAt!))
+        })
+      }
+      expect(run).toHaveBeenCalledOnce()
+      expect(warnings()).toHaveLength(1)
+      expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({
+        status: 'degraded', runtimeError: expect.stringContaining('chain sweep overlap'),
+      })
+    } finally {
+      held.resolve()
+      await sweep
+    }
+    expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', runtimeError: null })
+    expect(observations()).toEqual([expect.stringContaining('skipped ticks: 4')])
   })
 
   it('reports another sweep error as a failure and keeps it through a skipped sweep', async () => {
-    const { runtime, run, lockPath, reported } = await arrangeChainSweep()
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const began = Date.parse('2026-11-08T12:00:00Z')
+    vi.setSystemTime(began)
+    const { runtime, run, lockPath, reported, warnings } = await arrangeChainSweep()
     run.mockRejectedValue(new Error('boom'))
 
     await runtime.runEnabledBehaviorsOnce()
@@ -76,11 +204,14 @@ describe('behavior chain sweep lock', () => {
 
     await holders['another SQLite connection'](lockPath, async () => {
       const held = runtime.getBehaviorChainRuntimeHealth()
-      await new Promise((resolve) => setTimeout(resolve, 2))
-      await runtime.runEnabledBehaviorsOnce()
+      for (const elapsed of [1_000, 121_001, 122_001]) {
+        vi.setSystemTime(began + elapsed)
+        await runtime.runEnabledBehaviorsOnce()
 
-      expect(runtime.getBehaviorChainRuntimeHealth()).toEqual(held)
-      expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'degraded', runtimeError: 'boom' })
+        expect(runtime.getBehaviorChainRuntimeHealth()).toEqual(held)
+        expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'degraded', runtimeError: 'boom' })
+      }
+      expect(warnings()).toHaveLength(1)
     })
   })
 
