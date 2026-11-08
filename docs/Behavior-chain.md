@@ -91,7 +91,12 @@ the headless API refuses those operations with 409 after a confirmed merge.
 The UI explains missing original pre-merge evidence without a way to create a
 replacement review. `state=active` retains open obligations, including merged
 PRs with pending review evidence; `state=merged` retains the existing terminal
-classification, including legacy not-recorded merges. Failed refreshes disable
+classification, including legacy not-recorded merges. Confirmed closed seeds
+leave the active list only when no open owned or linked PR, unsettled invocation,
+native resource obligation or pending review evidence remains. Missing or
+contradictory closure evidence keeps the chain active. This exclusion precedes
+pagination and changes neither merge evidence nor ownership; the unfiltered list
+and ID/history reads retain closed chains. Failed refreshes disable
 the retained row's write controls until a successful read. Native action summaries
 distinguish original accepted responses, observed no-action results and uncertain
 or unrecorded attribution without returning the full receipt. Quiescent evidence
@@ -114,7 +119,7 @@ target does not govern atomic chain admissions. No new refresh loop is added.
 
 The existing scheduler selects a normal-work page before a separate due
 reconciliation page under its existing pass budget. Quiescent held or merged
-chains keep their original ownership and active-list membership, but cannot
+chains keep their original ownership, but cannot
 consume the normal-work page. Native model/resource receipts are still read
 while an original model lacks resource-release proof, including after a merge;
 only unnecessary GitHub observation waits.
