@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { BehaviorChainJournal, chainBasis } from '../server/behavior-chain-store'
+import { BehaviorChainJournal, chainBasis, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
+import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
+import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { historicalEvents, historicalJournals } from './fixtures/behavior-chain-journal'
 
 const TARGET = 'historical/repo#7'
@@ -30,6 +32,78 @@ function retain(db: Database.Database, hashes: string[], events = historicalEven
 function authority(db: Database.Database) {
   return db.prepare('SELECT * FROM behavior_chain_events ORDER BY sequence').all()
 }
+
+it.each(['unchanged', 'findings', 'head'])('requires Resume after repair exhaustion and restarts once with %s inputs', async (changed) => {
+  const directory = mkdtempSync(join(tmpdir(), 'poise-repair-replay-'))
+  directories.push(directory)
+  const path = join(directory, 'journal.sqlite')
+  const { db, journal } = database(path)
+  const now = Date.now(), head = 'a'.repeat(40)
+  const reviewer = { slot: 'primary', model: 'fixture-model', recovery: 'fixture-model' }
+  const observation: ChainObservation = { checkedAt: now, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'seed', commentIds: [] }, issueReviewers: [], prReviewers: [],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 21, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 21, head, headSince: now, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: true, unresolved: 1, unresolvedOutdated: 1, approved: false, ready: false,
+      reviewIds: [], reviewRevision: 'findings-1', reviewReceipts: [], greyRuns: [], pending: false, failing: [], conflict: false, behind: false } }
+  let current = journal.append(TARGET, 'seed', 0, { type: 'chain.admitted', repository: 'Historical/Repo', issue: 7,
+    branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' }, now)
+  function append(event: ChainEvent) {
+    current = journal.append(TARGET, `event-${current.sequence}`, current.sequence, event, now)
+  }
+  const first = decideBehaviorChain(current, observation, now)
+  if (first.kind !== 'invoke') throw new Error('expected initial repair')
+  const error = 'repair did not answer every unresolved review finding: missing_root_comment_ids=[18]; missing_count=1; required_count=2'
+  for (let attempt = 0; attempt < 3; attempt++) {
+    expect(decideBehaviorChain(current, observation, observation.checkedAt)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr', basis: first.basis })
+    const id = `repair-${attempt}`
+    append({ type: 'invocation.admitted', invocation: { id, behavior: 'repair-pr', basis: first.basis, actor: 'author',
+      model: reviewer.model, slot: reviewer.slot, admittedAt: now,
+      request: { command: 'agent-interface', argv: ['--atomic-work'], cwd: '/isolated' } } })
+    append({ type: 'invocation.settled', invocationId: id, callId: id, outcome: 'preflight_failed',
+      evidence: { status: 'failed', error_code: 'atomic_work_failed', action: 'not_started', outcome: 'preflight_failed', error,
+        completedAt: observation.checkedAt, resources_settled_at: new Date(now).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+    if (attempt < 2) expect(decideBehaviorChain(current, observation, observation.checkedAt)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('backoff') })
+    observation.checkedAt += 120_000
+  }
+  const launches: ChainInvocation[] = []
+  const unexpected = async () => { throw new Error('preflight failure cannot continue publication or perform a GitHub action') }
+  const operations: ChainRuntimeOperations = {
+    enabled: () => true, accounts: () => ({ author: 'author', reviewer: 'reviewer' }), discover: async () => [], ownsRepository: () => true,
+    observe: async () => ({ ...observation, checkedAt: Date.now() }), readInvocations: async () => ({ entries: [], quarantined: [] }),
+    received: () => {}, available: () => true, capacity: () => 1, permitted: () => true,
+    request: async (_chain, latest, decision) => {
+      expect(decision).toMatchObject({ behavior: 'repair-pr' })
+      expect(latest.pull).toMatchObject({ head: observation.pull!.head, reviewRevision: observation.pull!.reviewRevision })
+      return { command: 'agent-interface', argv: ['--atomic-work', '--model', reviewer.model, '--expected-head', latest.pull!.head], cwd: '/isolated',
+        context: { head: latest.pull!.head, reviewRevision: latest.pull!.reviewRevision } }
+    },
+    launch: async (invocation) => { launches.push(invocation); return true },
+    perform: unexpected, readActionResult: unexpected, resumePublication: unexpected, fenceClosedTarget: unexpected, wake: () => {},
+  }
+  await new BehaviorChainRuntime(journal, operations).run()
+  expect(journal.read(TARGET)!.held).toContain(`failed before publication three times: ${error}`)
+  expect(launches).toHaveLength(0)
+  db.close()
+  const reopened = database(path)
+  reopened.journal.verifyProjection()
+  if (changed === 'findings') observation.pull!.reviewRevision = 'findings-2'
+  if (changed === 'head') observation.pull!.head = 'b'.repeat(40)
+  const runtime = new BehaviorChainRuntime(reopened.journal, operations)
+  await runtime.run()
+  current = reopened.journal.read(TARGET)!
+  expect(current.held).toContain(error)
+  expect(current.invocations).toHaveLength(3)
+  expect(launches).toHaveLength(0)
+  reopened.journal.append(TARGET, 'operator-resume', current.sequence, { type: 'chain.resumed' })
+  await runtime.run()
+  await runtime.run()
+  expect(launches).toHaveLength(1)
+  expect(reopened.journal.read(TARGET)!.invocations).toHaveLength(4)
+  expect(launches[0].request.context).toEqual({ head: observation.pull!.head, reviewRevision: observation.pull!.reviewRevision })
+  expect(launches[0].basis === first.basis).toBe(changed === 'unchanged')
+})
 
 describe.each(historicalJournals)('journal compatibility from $revision', ({ hashes, reservationPresent }) => {
   it('rebuilds and reopens the original immutable evidence without changing hashes or ownership', () => {
