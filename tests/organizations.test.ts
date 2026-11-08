@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { withProcessLock } from '../server/process-lock'
 import type { RunFileOptions } from '../server/process'
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn(), diagnosticFailure: vi.fn(), lockIoDelayMs: 0 }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), diagnosticFailure: vi.fn(), lockIoDelayMs: 0, lockIoDelayPath: '' }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile }))
 vi.mock('../server/logging', () => ({ diagnosticFailure: mocks.diagnosticFailure, diagnostic: vi.fn() }))
 vi.mock('../server/process-lock', async (importOriginal) => {
@@ -24,7 +24,8 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   return {
     ...actual,
     chmod: async (...args: Parameters<typeof actual.chmod>) => {
-      if (mocks.lockIoDelayMs && typeof args[0] === 'string' && args[0].endsWith('.lock')) {
+      if (mocks.lockIoDelayMs && typeof args[0] === 'string' && args[0].endsWith('.lock')
+        && (!mocks.lockIoDelayPath || args[0] === mocks.lockIoDelayPath)) {
         await new Promise((resolve) => setTimeout(resolve, mocks.lockIoDelayMs))
       }
       return actual.chmod(...args)
@@ -82,6 +83,7 @@ beforeEach(async () => {
   vi.resetModules()
   mocks.diagnosticFailure.mockReset()
   mocks.lockIoDelayMs = 0
+  mocks.lockIoDelayPath = ''
   mocks.runFile.mockReset().mockImplementation(cli)
   await load()
   database!.setMeta('me', 'octocat')
@@ -359,6 +361,163 @@ describe('managed organization synchronization', () => {
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
 
+  it.each(['contention', 'setup deadline'] as const)('retains overdue lock %s across restart, bounds polling and recovers independently', async (failure) => {
+    let background = await import('../server/release-background')
+    const account = organizations!.addOrganization('acme')
+    organizations!.addOrganization('beta')
+    await ready('acme')
+    await ready('beta')
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+    mocks.runFile.mockClear()
+    mocks.diagnosticFailure.mockClear()
+    vi.mocked(withProcessLock).mockClear()
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const wallNow = Date.now.bind(Date)
+    let elapsed = 0
+    vi.spyOn(Date, 'now').mockImplementation(() => wallNow() + elapsed)
+    const lastSync = failure === 'contention' ? Date.now() - 333_000 : 0
+    database!.db.prepare("UPDATE organizations SET last_sync_at = ? WHERE login = 'acme'").run(lastSync)
+    database!.db.prepare("UPDATE organizations SET last_sync_at = 0 WHERE login = 'beta'").run()
+    let holder: InstanceType<typeof Database> | undefined
+    if (failure === 'contention') {
+      holder = new Database(`${account.datastorePath}.lock`, { fileMustExist: true })
+      holder.exec('BEGIN IMMEDIATE')
+    } else {
+      // The unit wrapper above grants 1,000 ms, rather than production's 500.
+      mocks.lockIoDelayMs = 1100
+      mocks.lockIoDelayPath = `${account.datastorePath}.lock`
+    }
+    const streak = () => database!.db.prepare("SELECT next_sync_at AS retry, sync_failures AS failures, sync_failing_since AS since FROM organizations WHERE login = 'acme'").get() as { retry: number, failures: number, since: number }
+    const alerts = () => database!.db.prepare("SELECT resolved_at AS resolved FROM alerts WHERE dedupe_key = 'datastore-sync:acme'").all()
+    try {
+      organizations!.startOrganizationsRuntime()
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0), { timeout: 4000 })
+      const first = streak()
+      expect(first.failures).toBe(1)
+      expect(first.since).toBeGreaterThan(0)
+      expect(first.retry - Date.now()).toBeGreaterThan(50_000)
+      expect(first.retry - Date.now()).toBeLessThanOrEqual(60_000)
+      expect(organizations!.getOrganizations().find((org) => org.login === 'acme')).toMatchObject({
+        status: 'ready', stage: 'sync-error', retryAt: new Date(first.retry).toISOString(),
+        error: 'timed out waiting for process lock',
+      })
+      expect(operations('sync').map((call) => call[1][1])).toEqual([join(tempRoot, 'datastores/beta/github.sqlite')])
+      expect(alerts()).toEqual([])
+      const diagnostic = mocks.diagnosticFailure.mock.calls.find(([operation]) => operation === 'datastore.sync')!
+      // Even behind a busy holder, the final setup can expire before BEGIN.
+      // Keep its actual cause instead of inferring a verified process owner.
+      expect(mocks.diagnosticFailure).toHaveBeenCalledWith('process_lock.acquire', diagnostic[1].cause,
+        expect.objectContaining({ holderPid: null, holderIdentityVerified: false }), { level: 'warning' })
+      if (failure === 'setup deadline') expect(diagnostic[1].cause.message).toBe('process lock acquisition exceeded its deadline')
+      expect(diagnostic[2]).toMatchObject({
+        account: 'acme', phase: 'acquisition', holderPid: null, holderIdentityVerified: false,
+        lastSuccessfulSyncAt: lastSync ? new Date(lastSync).toISOString() : null,
+        ageMs: lastSync ? expect.any(Number) : null, freshnessLimitMs: 120_000,
+        retryCount: 1, nextRetryAt: first.retry,
+      })
+      if (lastSync) expect(diagnostic[2].ageMs).toBeGreaterThanOrEqual(333_000)
+      const attempts = vi.mocked(withProcessLock).mock.calls.length
+      const diagnostics = mocks.diagnosticFailure.mock.calls.length
+      for (let index = 0; index < 3; index++) {
+        elapsed += 5000
+        await vi.advanceTimersByTimeAsync(5000)
+      }
+      expect(withProcessLock).toHaveBeenCalledTimes(attempts)
+      expect(mocks.diagnosticFailure).toHaveBeenCalledTimes(diagnostics)
+
+      await organizations!.stopOrganizationsRuntime()
+      database!.closeDatabase()
+      vi.resetModules()
+      await load()
+      background = await import('../server/release-background')
+      organizations!.startOrganizationsRuntime()
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+      expect(streak()).toEqual(first)
+      expect(withProcessLock).toHaveBeenCalledTimes(attempts)
+      expect(mocks.diagnosticFailure).toHaveBeenCalledTimes(diagnostics)
+
+      elapsed += 15 * 60_000
+      await vi.advanceTimersByTimeAsync(5000)
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0), { timeout: 4000 })
+      const second = streak()
+      expect(second).toMatchObject({ failures: 2, since: first.since })
+      expect(second.retry - Date.now()).toBeGreaterThan(110_000)
+      expect(second.retry - Date.now()).toBeLessThanOrEqual(120_000)
+      const repeated = mocks.diagnosticFailure.mock.calls.filter(([operation]) => operation === 'datastore.sync')
+      expect(repeated).toHaveLength(2)
+      expect(repeated[1]![2].correlationId).toBe(diagnostic[2].correlationId)
+      expect(alerts()).toEqual([{ resolved: null }])
+
+      holder?.exec('ROLLBACK')
+      holder?.close()
+      holder = undefined
+      mocks.lockIoDelayMs = 0
+      mocks.runFile.mockImplementation(async (command, args, options) => {
+        if (command === 'github-datastore' && args[1] === account.datastorePath && args[2] === 'health') {
+          return { stdout: JSON.stringify({ action: 'health', status: 'stale', healthy: false, database: args[1] }), stderr: '' }
+        }
+        return cli(command, args, options)
+      })
+      elapsed += 120_000
+      await vi.advanceTimersByTimeAsync(5000)
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+      expect(streak()).toMatchObject({ failures: 3, since: first.since })
+      expect(alerts()).toEqual([{ resolved: null }])
+      mocks.runFile.mockImplementation(cli)
+      elapsed += 240_000
+      await vi.advanceTimersByTimeAsync(5000)
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+      expect(streak()).toEqual({ retry: 0, failures: 0, since: 0 })
+      expect(organizations!.getOrganizations().find((org) => org.login === 'acme')).toMatchObject({
+        status: 'ready', stage: 'ready', error: null, retryAt: null,
+      })
+      expect(operations('health').find((call) => call[1][1] === account.datastorePath)?.[1].slice(2))
+        .toEqual(['health', '--max-age-seconds', '120'])
+      expect(alerts()).toEqual([{ resolved: expect.any(String) }])
+    } finally {
+      if (holder?.inTransaction) holder.exec('ROLLBACK')
+      holder?.close()
+    }
+  })
+
+  it.each(['successful sync', 'scheduled retry', 'new generation', 'new identity'] as const)('preserves a peer\'s %s when lock setup expires', async (peer) => {
+    const background = await import('../server/release-background')
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0').run()
+    mocks.runFile.mockClear()
+    mocks.diagnosticFailure.mockClear()
+    vi.mocked(withProcessLock).mockClear()
+    mocks.lockIoDelayMs = 1100
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(withProcessLock).toHaveBeenCalledTimes(1))
+    const registry = new Database(process.env.POISE_DB!)
+    try {
+      if (peer === 'successful sync') registry.prepare("UPDATE organizations SET last_sync_at = ?, stage = 'ready', error = NULL").run(Date.now())
+      if (peer === 'scheduled retry') registry.prepare("UPDATE organizations SET next_sync_at = ?, sync_failures = 1, sync_failing_since = ?, stage = 'sync-error', error = 'peer failure'").run(Date.now() + 60_000, Date.now())
+      if (peer === 'new generation') database!.setMeta('organization_generation:acme', '1')
+      if (peer === 'new identity') database!.setMeta('me', 'new-user')
+      const state = registry.prepare('SELECT * FROM organizations').get()
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0), { timeout: 4000 })
+      expect(registry.prepare('SELECT * FROM organizations').get()).toEqual(state)
+      expect(mocks.diagnosticFailure.mock.calls.filter(([operation]) => operation === 'datastore.sync')).toEqual([])
+      expect(mocks.runFile).not.toHaveBeenCalled()
+    } finally { registry.close() }
+  })
+
+  it('keeps activation eligible after its acquisition deadline', async () => {
+    const background = await import('../server/release-background')
+    mocks.lockIoDelayMs = 1100
+    organizations!.addOrganization('acme')
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0), { timeout: 4000 })
+    expect(organizations!.getOrganizations()[0]).toMatchObject({ status: 'initializing', error: null, retryAt: null })
+    expect(mocks.runFile).not.toHaveBeenCalled()
+    mocks.lockIoDelayMs = 0
+    organizations!.startOrganizationsRuntime()
+    await ready('acme')
+  })
+
   it('repairs legacy full-build retry markers in bounded chunks before requesting a delta sync', async () => {
     organizations!.addOrganization('acme')
     await ready('acme')
@@ -605,6 +764,17 @@ describe('managed organization synchronization', () => {
     await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.error).toBeNull())
     expect(streak()).toEqual({ failures: 0, since: 0 })
     expect(alerts()).toEqual([{ kind: 'datastore_sync_failing', key: 'datastore-sync:acme', resolved: expect.any(String) }])
+
+    failing = true
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(streak().failures).toBe(1))
+    database!.db.prepare("UPDATE organizations SET sync_failing_since = ? WHERE login = 'acme'").run(Date.now() - 15 * 60_000)
+    organizations!.retryOrganization('acme')
+    await vi.waitFor(() => expect(streak().failures).toBe(2))
+    expect(alerts()).toEqual([
+      { kind: 'datastore_sync_failing', key: 'datastore-sync:acme', resolved: expect.any(String) },
+      { kind: 'datastore_sync_failing', key: 'datastore-sync:acme', resolved: null },
+    ])
   })
 })
 
