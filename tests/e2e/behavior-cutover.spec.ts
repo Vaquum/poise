@@ -31,7 +31,11 @@ for (const width of [390, 1280]) {
     })
     await page.route('**/api/behavior-chains', route => unavailable
       ? route.fulfill({ status: 503, json: { error: 'journal unavailable' } }) : route.fulfill({ json: snapshot }))
-    await page.route('**/api/behavior-chains?*', route => route.fulfill({ json: { events, next: null } }))
+    const journalAfters: Array<string | null> = []
+    await page.route('**/api/behavior-chains?*', route => {
+      journalAfters.push(new URL(route.request().url()).searchParams.get('after'))
+      return route.fulfill({ json: { events, next: null } })
+    })
     const controls = await general(page)
     const attention = controls.getByRole('region', { name: 'Work needing attention' })
     const entries = attention.locator('li')
@@ -52,7 +56,10 @@ for (const width of [390, 1280]) {
     await attention.scrollIntoViewIfNeeded()
     await expect.poll(() => attention.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true)
     await page.screenshot({ path: `test-results/behavior-chain-attention-${width}.png`, fullPage: true })
+    const journalHref = await entries.first().getByRole('link', { name: 'Journal evidence' }).getAttribute('href')
+    const expectedAfter = new URL(journalHref!, 'http://localhost').searchParams.get('after')
     await entries.first().getByRole('link', { name: 'Journal evidence' }).click()
+    await expect.poll(() => journalAfters.at(-1)).toBe(expectedAfter)
     await expect(controls.getByRole('region', { name: 'Chain journal' })).toContainText('incomplete review replies')
     await controls.getByRole('button', { name: 'Refresh chains' }).click()
     await expect(entries.first()).toContainText('No verified advance for 2d 23h')

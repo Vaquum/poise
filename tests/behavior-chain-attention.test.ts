@@ -70,6 +70,56 @@ it('selects an oldest unpublished admission beyond page one and applies the exac
     step: 'Issue admission', evidence: { state: 'unavailable' } })
 })
 
+it('advances the age when blocking outdated conversations resolve while live threads stay zero', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const base: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 910, head_sha: 'a'.repeat(40), head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 910, head: 'a'.repeat(40), headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, unresolvedOutdated: 1, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', readinessBlockers: ['merge_state_not_clean'], pending: false, failing: [], conflict: false, behind: false } }
+  let chain = admit(journal, 910, admittedAt)
+  const firstAt = admittedAt + 60_000
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...base, checkedAt: firstAt } }, firstAt)
+  chain = append(journal, chain, { type: 'chain.held', reason: 'awaiting operator' }, firstAt + 60_000)
+  const resolved = structuredClone(base) as ChainObservation
+  resolved.pull!.unresolvedOutdated = 0
+  resolved.pull!.readinessBlockers = []
+  resolved.checkedAt = now
+  chain = append(journal, chain, { type: 'chain.observed', observation: resolved }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.progressAt).toBe(now)
+  expect(entry.ageMs).toBe(0)
+  expect(entry.blocker).toContain('awaiting operator')
+})
+
+it('directs conflict or behind to repair before approval', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  for (const [offset, flag] of [[0, 'conflict'], [1, 'behind']] as Array<[number, 'conflict' | 'behind']>) {
+    const issue = 920 + offset
+    const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+      issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+      implementer: reviewer, repairer: reviewer, approver: reviewer,
+      publication: { pull_number: issue + 10, head_sha: 'a'.repeat(40), head_invocation: null, state: 'open', merged: false, merge_sha: null },
+      pull: { number: issue + 10, head: 'a'.repeat(40), headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+        queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+        reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+        greyRuns: [], checksState: 'SUCCESS', pending: false, failing: [], conflict: flag === 'conflict', behind: flag === 'behind' } }
+    let chain = admit(journal, issue, admittedAt)
+    chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+    chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+    const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+    expect(entry.nextAction).toContain('Repair the branch conflict or required base update')
+    expect(entry.evidence.state).toBe('fresh')
+  }
+})
+
 it('advances the age on verified recovery without clearing a durable hold or missing original receipt', () => {
   const journal = new BehaviorChainJournal(db)
   delayedChainFixture(journal, now)

@@ -4,6 +4,18 @@ import { reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainE
 
 export const CHAIN_ATTENTION_DELAY_MS = 24 * 60 * 60_000
 
+/** Effective blocking conversations, mirroring decideBehaviorChain: live
+ * threads always block, outdated ones only while readiness stays red on
+ * conversation blockers. */
+function blockingThreads(pull: NonNullable<ChainObservation['pull']>): number {
+  if (pull.unresolved) return pull.unresolved
+  if (!pull.ready && Array.isArray(pull.readinessBlockers) && pull.readinessBlockers.length > 0
+    && pull.readinessBlockers.every(blocker => blocker === 'merge_state_not_clean' || blocker === 'required_reviews_not_approved')) {
+    return Number.isSafeInteger(pull.unresolvedOutdated) ? pull.unresolvedOutdated as number : 0
+  }
+  return 0
+}
+
 function exactPull(observation: ChainObservation | null) {
   const pull = observation?.pull
   return pull && /^[a-f0-9]{40}$/i.test(pull.head) && observation!.publication?.pull_number === pull.number
@@ -45,7 +57,7 @@ function chainProgress(journal: BehaviorChainJournal, id: string) {
                 (pull.checksState === 'SUCCESS' && !pull.pending && !pull.failing.length
                   && (previous.checksState !== 'SUCCESS' || previous.pending || previous.failing.length > 0))
                 || (!previous.approved && pull.approved) || (previous.changesRequested && !pull.changesRequested)
-                || pull.unresolved < previous.unresolved || (previous.conflict && !pull.conflict) || (previous.behind && !pull.behind))) advanced = true
+                || blockingThreads(pull) < blockingThreads(previous) || (previous.conflict && !pull.conflict) || (previous.behind && !pull.behind))) advanced = true
               previous = pull
             }
           }
@@ -113,7 +125,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                 : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
                   : pull?.failing.length ? 'Repair the failing required checks'
                     : pull?.changesRequested ? 'Address current-head review findings'
-                      : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
+                      : pull?.conflict || pull?.behind ? 'Repair the branch conflict or required base update'
+                        : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
                         : chain.waiting || 'Await the next invocation under existing admission gates'
       let retryAt: number | null = null
       if (!chain.held && !chain.reviewPending && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`) {

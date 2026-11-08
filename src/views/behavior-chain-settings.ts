@@ -123,11 +123,13 @@ export function behaviorChainSettings() {
     const link = (event.target as HTMLElement).closest<HTMLAnchorElement>('a[data-chain-journal]')
     if (!link) return
     event.preventDefault()
-    void readHistory(link.dataset.chainJournal!)
+    const afterParam = new URL(link.href, window.location.origin).searchParams.get('after')
+    const startAfter = afterParam !== null && /^\d+$/.test(afterParam) ? Number(afterParam) : undefined
+    void readHistory(link.dataset.chainJournal!, false, startAfter)
   })
-  async function readHistory(id: string, append = false): Promise<void> {
+  async function readHistory(id: string, append = false, startAfter?: number): Promise<void> {
     const generation = ++historyGeneration
-    const after = append ? historyNext : 0
+    const after = append ? historyNext : (startAfter ?? 0)
     historyMore.disabled = true
     try {
       const response = await fetch(`/api/behavior-chains?${new URLSearchParams({ id, after: String(after ?? 0) })}`)
