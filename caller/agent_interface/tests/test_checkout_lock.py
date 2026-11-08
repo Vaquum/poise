@@ -414,6 +414,35 @@ class TestGate(LockCase):
 
 
 class TestRunGated(LockCase):
+    def test_tool_output_does_not_stop_a_healthy_implementation_writer(self):
+        os.environ["WRITER_TICKS"] = "5"
+        lease = self.lease().acquire(1)
+        output = '\n'.join(json.dumps(event) for event in [
+            {"type": "error", "message": "Reconnecting... 1/5 (429 Too Many Requests)"},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "cat fixture",
+             "aggregated_output": "429 Too Many Requests", "exit_code": 0, "status": "completed"}},
+        ])
+        writer = f"print({output!r}, flush=True)\n" + WRITER
+        check = review_watch.RateLimitAbort.check
+        quiet_checks = []
+
+        def after_quiet_minute(abort, provider, process):
+            with patch.object(review_watch, "monotonic", return_value=161.0):
+                check(abort, provider, process)
+            if abort.out_offset:
+                quiet_checks.append(process.poll() is None)
+
+        with patch.object(review_watch, "monotonic", return_value=100.0), \
+                patch.object(checkout_lock, "POLL_SECONDS", 0.01), \
+                patch.object(review_watch.RateLimitAbort, "check", after_quiet_minute):
+            done = checkout_lock.run_gated(lease, [sys.executable, "-c", writer], cwd=self.checkout,
+                                          env=None, timeout=30, provider="codex")
+        self.assertTrue(any(quiet_checks))
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, output + "\nwrote", ""))
+        self.assertEqual(Path(self.log).read_text(), "x" * 5)
+        self.assertFalse(pgid_alive(self.meta()[1]))
+        self.assertEqual((lease.held, lease.retained, self.rows()), (False, None, []))
+
     def test_provider_quota_supervision_stops_the_registered_writer_and_releases_its_lease(self):
         lease = self.lease().acquire(1)
         writer = 'print(\'{"type":"error","message":"Reconnecting... 429 Too Many Requests"}\', flush=True)\n' + WRITER
