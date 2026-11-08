@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { chainReviewResponse, closedChainTarget, decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -64,6 +64,38 @@ function beforeNativeScope(call: LogEntry): boolean {
 
 function sameReceipt(prior: Record<string, unknown> | null, next: Record<string, unknown>): boolean {
   return Object.entries(next).every(([key, value]) => chainBasis(prior?.[key] ?? null) === chainBasis(value ?? null))
+}
+
+function ciOnlyHold(invocation: ChainInvocation, call: LogEntry): BehaviorChain['ciHold'] {
+  const ci = call.artifact?.ci_blocker as Record<string, unknown> | undefined
+  if (invocation.behavior !== 'repair-pr' || call.status !== 'failed' || call.action !== 'not_started'
+    || call.error_code !== 'atomic_work_blocked' || call.artifact?.phase !== 'executing' || call.artifact.plan_sha
+    || !ci || ci.action !== 'list_failing_ci' || ci.repository !== call.repo || ci.pull_number !== Number(call.pr_id)
+    || ci.head_sha !== call.expected_head || ci.head_sha !== invocation.request.context?.head
+    || typeof ci.head_sha !== 'string' || !/^[0-9a-f]{40}$/i.test(ci.head_sha)
+    || !Array.isArray(ci.failing) || !ci.failing.length) return undefined
+  // A job/check identity pins the failed attempt even after the workflow is
+  // rerun. Pending checks or a worker's prose alone cannot establish a cause.
+  if (!ci.failing.some((check: Record<string, unknown>) => check?.type === 'check_run' && check.state === 'completed'
+    && ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(check.conclusion))
+    && Number.isSafeInteger(check.check_run_id) && Number(check.check_run_id) > 0
+    && Number.isSafeInteger(check.log_id) && Number(check.log_id) > 0
+    && typeof check.url === 'string' && check.url.length > 0)) return undefined
+  return { invocationId: invocation.id, callId: call.id, head: ci.head_sha }
+}
+
+function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
+  const hold = chain.ciHold, pull = observation.pull, original = chain.invocations.at(-1)
+  const evidence = original?.evidence, artifact = evidence?.artifact as Record<string, unknown> | undefined
+  return !!chain.held && !!hold && !chain.mergeSha && original?.id === hold.invocationId && original.state === 'settled'
+    && original.callId === hold.callId && evidence?.status === 'failed' && evidence.error_code === 'atomic_work_blocked'
+    && evidence.action === 'not_started' && artifact?.phase === 'executing' && !artifact.plan_sha && !evidence.publicationResume
+    && resourceReleaseProven(evidence, true) && typeof evidence.completedAt === 'number'
+    && Number.isFinite(observation.checkedAt) && observation.checkedAt >= evidence.completedAt
+    && observation.checkedAt >= Date.parse(String(evidence.resources_settled_at))
+    && observation.checkedAt <= now && now - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
+    && observation.issue.open && !!pull && pull.state === 'open' && !pull.merged && pull.head === hold.head
+    && pull.checksState === 'SUCCESS' && !pull.pending && pull.failing.length === 0
 }
 
 class ClosedTargetFenceError extends Error {}
@@ -213,6 +245,9 @@ export class BehaviorChainRuntime {
             try { await this.recover(chain, pendingInvocation, observation, snapshot) }
             catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError ??= error }
             continue
+          }
+          if (ciRecovered(chain, observation, Date.now())) {
+            chain = this.append(chain, { type: 'chain.resumed', ciRecovery: chain.ciHold })
           }
           const mergeEvidence = observation.pull?.merged ? {
             before: this.journal.preMergeObservation(chain.id, observation.pull.mergedAt ?? Number.NaN) as ChainObservation | null,
@@ -374,7 +409,9 @@ export class BehaviorChainRuntime {
     const stopped = ['stopped', 'stopping'].includes(call.error_code || '')
     const resourceStopped = ['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable', 'resource_receipt_unavailable'].includes(call.error_code || '')
     const workBlocked = call.error_code === 'atomic_work_blocked'
-    if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: call.error })
+    const ciHold = workBlocked ? ciOnlyHold(invocation, call) : undefined
+    if ((resourceStopped || workBlocked) && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: call.error,
+      ...(ciHold ? { ciHold } : {}) })
     if (stopped && !chain.held) chain = this.append(chain, { type: 'chain.held', reason: `behavior invocation ${invocation.id} was stopped by the person` })
     if (!nativeResourcesReleased(call)) {
       const evidence = { ...receipt(call), callId: call.id, ...(invocation.model === null ? { nativeCallId: call.id } : {}) }

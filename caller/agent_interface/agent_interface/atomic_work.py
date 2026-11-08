@@ -59,6 +59,8 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "For a repair, include one substantive answer for every original actionable inline review comment, using its actual numeric id. "
         "Do not reply to replies, invent comment ids, or use generic acknowledgements. For initial implementation replies must be empty. "
         "If unable to finish, set blocked to the concrete reason; do not claim the work complete. "
+        'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
+        "Use a string for every other blocker, including missing evidence, a product decision or uncertain publication. "
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
         f"Behavior note: {note}\nPreparation receipt:\n{json.dumps(prepared)}\nActual issue and comments:\n{json.dumps(data)}\nActual PR evidence:\n{json.dumps(evidence)}"
     )
@@ -87,7 +89,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if not isinstance(publication, dict):
                 raise ValueError("atomic behavior blocked: invalid output")
             if publication.get("blocked"):
-                raise AtomicWorkBlocked(f"atomic behavior blocked: {publication['blocked']}")
+                blocked = publication["blocked"]
+                if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
+                        and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
+                    record({"phase": "executing", "prepared": prepared, "ci_blocker": evidence["ci"]})
+                    blocked = blocked["reason"]
+                raise AtomicWorkBlocked(f"atomic behavior blocked: {blocked}")
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
                 raise ValueError("atomic behavior publication metadata is incomplete")
             replies = publication.get("replies", [])
