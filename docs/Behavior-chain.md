@@ -363,6 +363,20 @@ campaign acceptance or forced-container recovery.
 
 Known failures before publication retry with bounded backoff and existing provider fallback. Ambiguous writes retain ownership. Confirmed actual artifacts can settle a lost response; missing receipts cannot justify another write. Partially published review/reply plans that cannot be fully reconciled remain uncertain and visible. They are not silently retried or reported successful. This limitation must be exercised and resolved if encountered in the real validation runs.
 
+Repair prompts name the exact unresolved root comment IDs from the head-verified
+review packet, including outdated threads and roots with earlier replies.
+Caller requires that same set before publication. Missing coverage records
+`atomic_work_failed`, `not_started` / `preflight_failed`, with the missing count,
+required count and at most 20 sorted missing IDs in the retained error field;
+comment text is not retained there. No publication plan exists at this point,
+so recovery uses fresh repair attempts, not publication completion. Three
+same-basis failures exhaust the existing attempt window and hold the chain.
+The hold survives deployment, restart and changed head/findings. After deploying
+the fix for incomplete reply instructions, use **Resume** on the already-held
+chains for `autonomio/poise#893` (seed #887) and `autonomio/poise#900` (seed #896).
+Resume opens a new bounded attempt window using the current head and findings;
+it does not repeat an uncertain publication or release unsettled resources.
+
 A repair push checkpoints its exact native head before bounded PR-head
 confirmation. If GitHub's PR projection still trails the push, the existing
 reconciliation pass can complete the original immutable reply plan once the
