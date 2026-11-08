@@ -6,7 +6,7 @@ import { getBehaviorChainSettings, getSettings } from './settings'
 import { getBehaviorChainCapacity, getBehaviorChainRuntimeHealth } from './behaviors'
 import { behaviorCutoverBlockers } from './behavior-cutover'
 import type { BehaviorChain, ChainEvent } from './behavior-chain-store'
-import { behaviorChainSummary } from './behavior-chain-summary'
+import { behaviorChainAttention, behaviorChainSummary } from './behavior-chain-summary'
 import { nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 
 function reply(res: ServerResponse, status: number, value: unknown): void {
@@ -39,7 +39,9 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
       }
       const after = params.get('after') || ''
       const chains = journal.page(after, 100, params.get('state') === 'active' ? false : params.get('state') === 'merged' ? true : null)
-      return reply(res, 200, { chains: chains.map(summary), next: chains.length === 100 ? chains.at(-1)!.id : null, cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })
+      return reply(res, 200, { chains: chains.map(summary), next: chains.length === 100 ? chains.at(-1)!.id : null,
+        ...(!after ? { attention: behaviorChainAttention(journal) } : {}),
+        cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })
     }
     if (req.method !== 'POST') throw new HttpError(405, 'behavior chains support GET and POST')
     const body = await readJson<unknown>(req)

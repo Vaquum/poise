@@ -1266,6 +1266,14 @@ declaring a collector outage. No extra poller, gateway scope or event type is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 
+The first `/api/behavior-chains` list page also includes read-only `attention`
+across all active chain pages. It joins durable progress age, holds, exact-head
+merge gates and the next known retry/intervention, including pending original
+review obligations after merge. The existing journal history supplies the clock;
+unchanged polls cannot refresh it. Stale/incomplete evidence stays explicit.
+This adds no observation, scheduler, event type, scope or execution authority.
+[Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
+
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
 started originals without a Call use the bounded native correlation-fence

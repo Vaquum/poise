@@ -88,6 +88,29 @@ remains eligible; this fence does not change manual Chat binding controls.
 
 The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while General settings is open. Unavailable reads disable cutover controls instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
+**Work needing attention** joins each delayed or held admitted issue's step,
+progress age, hold, exact-head CI/review gates and next known action, with issue,
+PR and journal-evidence links. Held, uncertain and pending-original-review work
+appears immediately; other active work appears after 24 hours without a verified
+advance. Selection covers every active chain page, including unpublished issues
+and merged PRs with pending review evidence, sorted by oldest progress first.
+The clock starts at admission. Canonical history advances it on a newly verified
+PR head, posted issue-review comment, qualifying PR review, queue entry, confirmed
+merge, or recovery of an observed same-head CI/review/conflict gate. Unchanged
+polls, admission/start, failed attempts, holds and Resume do not reset it. Restart
+and projection rebuild derive the same clock without changing journal events.
+Fresh, stale, incomplete and unavailable evidence remain labelled. A known native
+failure backoff shows retry eligibility under existing admission gates; an unknown
+provider backoff has no invented deadline. Scheduled evidence rechecks never retry
+held work. CI or approval recovery cannot clear a hold or missing original receipt,
+and a queue entry cannot establish merge completion. Verified progress can remove
+a delayed entry; a durable hold remains until explicitly resumed, and a merged
+review obligation remains until its original evidence is verified. The first list
+page's optional `attention` projection is independent of the ordinary chain-list
+cursor/filter; later list pages retain the existing pagination contract. Failed
+refreshes label retained attention entries stale. These are read-only summaries
+on the existing refresh clock, with no new observation or execution authority.
+
 In v2, Review New Issues shows that saved seed scope instead of the inactive
 legacy repository filter. Its setting opens the existing General seed controls,
 using capacity data already returned by the Behaviors read.
