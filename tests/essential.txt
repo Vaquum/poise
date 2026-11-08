@@ -53,6 +53,7 @@ tests/archive-view-logic.test.ts
 tests/behavior-ledger-recovery.test.ts
 tests/behavior-ledger-store.test.ts
 tests/behaviors-db.test.ts
+tests/chat-control.test.ts
 tests/chat-legacy-import.test.ts
 tests/chat-session-state.test.ts
 tests/chat-tab-drafts.test.ts

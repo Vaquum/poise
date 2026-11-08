@@ -243,9 +243,9 @@ export function pendingExplanations(instance: string): Array<Pick<ItemRow, 'id' 
 
 // ── ChatControl's inbox: read here; only the Switchboard's own pending rows are withdrawn ──
 
-export function inboxState(instance: string, recipient: string, eventKey: string): 'pending' | 'admitted' | undefined {
+export function inboxState(instance: string, recipient: string, eventKey: string): 'pending' | 'admitted' | 'recipient_deleted' | undefined {
   const row = db.prepare('SELECT state FROM chat_control_inbox WHERE instance = ? AND recipient = ? AND event_key = ?')
-    .get(instance, recipient, eventKey) as { state: 'pending' | 'admitted' } | undefined
+    .get(instance, recipient, eventKey) as { state: 'pending' | 'admitted' | 'recipient_deleted' } | undefined
   return row?.state
 }
 export function admittedEventKey(instance: string, recipient: string, turnId: string): string | undefined {
