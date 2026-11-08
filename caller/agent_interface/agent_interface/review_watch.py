@@ -14,7 +14,7 @@ from threading import current_thread, main_thread
 
 from . import atoms, progress, review_budget, review_receipt, resource_ownership
 from .review_gate import cancel_when_idle, submission_active
-from .provider_progress import ProviderStream, READ_BYTES
+from .provider_progress import MAX_LINE_BYTES, ProviderStream, READ_BYTES
 
 PROGRESS_SECONDS = 1
 POLL_SECONDS = 30
@@ -141,8 +141,10 @@ class RateLimitAbort:
             setattr(self, offsets[0], getattr(self, offsets[0]) + len(chunk))
             data = getattr(self, offsets[1]) + chunk
             *lines, rest = data.split(b"\n")
-            # A marker can straddle two reads; only the tail can hold half of one.
-            setattr(self, offsets[1], rest[-1024:])
+            # An unfinished line can straddle reads. Keep it whole (up to the
+            # shared line cap) so a long structured event still parses once
+            # its newline arrives; diagnostics themselves stay bounded.
+            setattr(self, offsets[1], rest[-MAX_LINE_BYTES:])
             for line in lines:
                 self.feed(line, stderr=stream is stderr)
 

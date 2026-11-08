@@ -450,6 +450,33 @@ class TestRateLimitAbort(TestCase):
             self.assertEqual(abort.signal, b"")
             stop.assert_not_called()
 
+    def test_long_structured_quota_event_spanning_reads_keeps_stall(self):
+        event = json.dumps({"type": "error",
+                            "message": "Reconnecting... 1/5 (429 Too Many Requests)",
+                            "pad": "x" * 2000})
+        self.assertGreater(len(event), 1024)
+        abort = RateLimitAbort()
+        with tempfile.TemporaryFile(mode="w+t") as out, tempfile.TemporaryFile(mode="w+t") as err, \
+                patch.object(review_watch, "monotonic", return_value=100.0) as clock, \
+                patch.object(review_watch, "_stop_process_group") as stop:
+            out.write(event[:1500])
+            out.flush()
+            abort.scan(out, err)
+            self.assertIsNone(abort.since)
+            out.write(event[1500:] + "\n")
+            out.flush()
+            abort.scan(out, err)
+            self.assertEqual(abort.since, 100.0)
+            self.assertTrue(abort.quota)
+            self.assertIn(b"429 Too Many Requests", abort.signal)
+            self.assertNotIn(b"x" * 10, abort.signal)
+            clock.return_value = 161.0
+            with self.assertRaises(ReviewLimitError) as raised:
+                abort.check("codex", SimpleNamespace(pid=1234))
+            self.assertEqual(raised.exception.code, "review_provider_error")
+            self.assertIn("rate-limited", str(raised.exception))
+            stop.assert_called_once()
+
     def test_persistent_structured_provider_signals_keep_only_diagnostics(self):
         cases = [
             ({"type": "error", "message": "429 Too Many Requests"}, "rate-limited", "429 Too Many Requests"),
