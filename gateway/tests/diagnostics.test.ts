@@ -73,6 +73,21 @@ function event(id: string, update: Partial<DiagnosticInput> = {}): LogEvent {
 }
 
 describe('one diagnostic contract', () => {
+  it.each([
+    ['pr_review', 'GitHub 500: Internal Server Error', 'warning'],
+    ['pr_approve', 'GitHub 503: Service Unavailable', 'warning'],
+    ['pr_review', 'httpx.ReadTimeout: response lost', 'warning'],
+    ['pr_review', 'GitHub 401: Bad credentials', 'error'],
+    ['pr_review', 'GitHub 403: Resource not accessible', 'error'],
+    ['pr_review', 'No space left on device', 'error'],
+    ['pr_review', 'Command failed (1): github-interface', 'error'],
+  ])('retains untyped %s failures with cause %s at %s', (behavior, error, severity) => {
+    const row = { id: 'a'.repeat(32), status: 'failed', behavior, error, error_code: 'review_submission_failed' }
+    expect(normalize(callerDiagnostic(row, 'alice')!, NOW)).toMatchObject({ severity, message: error })
+    expect(callerDiagnostic({ ...row, error_code: null }, 'alice')).toMatchObject({ level: severity })
+    expect(callerDiagnostic({ ...row, diagnostic: { version: 1, severity: 'error', operation: 'fetch' } }, 'alice')).toMatchObject({ level: 'error' })
+  })
+
   it('keeps a nonfatal Caller preparation warning at warning severity', () => {
     const input = callerDiagnostic({ id: 'a'.repeat(32), status: 'completed', diagnostic: { version: 1,
       severity: 'warning', operation: 'provider.cli_update', phase: 'launcher_verification', message: 'Updater unavailable; retained launcher usable' } }, 'alice')!

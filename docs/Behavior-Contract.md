@@ -49,6 +49,9 @@ diagnostic decides.
 Unknown causes stay yellow until their cause is established; a process exit or
 retry count alone never proves Poise is broken. Each row expands to its full
 diagnostic details, retaining its expansion through refresh.
+Chain observation summaries include the bounded, redacted stderr cause. Known
+upstream 5xx and transport observation failures are grey while the existing
+scheduler rechecks them; other runtime faults remain red.
 
 The last terminal provider event is selected first; otherwise the message
 inside a JSON error — with a rate-limit error's resource, remaining and reset

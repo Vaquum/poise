@@ -7517,9 +7517,13 @@ export async function runEnabledBehaviorsOnce(
           console.warn(`[behaviors] behavior chain sweep overlap exceeded ${CHAIN_SWEEP_PROGRESS_BUDGET_MS}ms progress budget for ${org.login}: skipped ticks: ${overlap.skips}; elapsed: ${elapsedMs}ms`)
         }
       } else {
-        const message = error instanceof Error ? error.message : String(error)
+        const message = behaviorErrorMessage(error)
         behaviorChainHealth.set(organization, { lastSweepAt: Date.now(), error: message })
-        console.error(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
+        const code = classifyBehaviorDiagnostic(message).code
+        const transient = message.startsWith('behavior observation failed for ')
+          && ['upstream_unavailable', 'network_interruption'].includes(code)
+        const report = transient ? console.warn : console.error
+        report(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
       }
     }
     if (!sweepSkipped) {

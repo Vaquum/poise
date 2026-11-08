@@ -83,6 +83,39 @@ describe('independent application capture', () => {
     for (const value of ['private-output', 'private-argument']) expect(JSON.stringify(page)).not.toContain(value)
   })
 
+  it.each([
+    ['github-interface', 'error: GitHub 500: Internal Server Error', 'warning'],
+    ['github-interface', 'httpx.ConnectError: connection reset', 'warning'],
+    ['github-datastore', 'GraphQL request failed: HTTP 503', 'warning'],
+    ['github-interface', 'error: GitHub 401: Bad credentials', 'error'],
+    ['github-interface', 'error: GitHub 403: Resource not accessible', 'error'],
+    ['github-datastore', 'datastore health stale: age 300s exceeds maximum 120s', 'error'],
+    ['github-interface', 'fatal: No space left on device', 'error'],
+    ['github-interface', '', 'error'],
+  ])('retains %s failure evidence at %s (%s)', async (command, stderr, severity) => {
+    start()
+    writeFileSync(join(directory, command), `#!${process.execPath}\nprocess.stdout.write('private-output');process.stderr.write(${JSON.stringify(stderr)});process.exit(1)`, { mode: 0o755 })
+    vi.stubEnv('CALLER_BIN_ROOT', directory)
+    await expect(runFile(command, ['private-argument'])).rejects.toThrow('Command failed (1)')
+    loggingRuntime()!.flush()
+    const page = loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false }, { source: 'poise' }))
+    expect(page.events.find((event) => event.operation === command)).toMatchObject({ severity, exitCode: 1, stderr })
+    for (const value of ['private-output', 'private-argument']) expect(JSON.stringify(page)).not.toContain(value)
+  })
+
+  it('bounds and redacts captured GitHub stderr without losing failure status', async () => {
+    start()
+    vi.stubEnv('CALLER_BIN_ROOT', directory)
+    const stderr = 'error: GitHub 503: upstream unavailable\nAuthorization: Bearer private-api-credential\n' + 'detail\n'.repeat(4000)
+    writeFileSync(join(directory, 'github-interface'), `#!${process.execPath}\nprocess.stderr.write(${JSON.stringify(stderr)});process.exit(1)`, { mode: 0o755 })
+    await expect(runFile('github-interface', [])).rejects.toThrow('Command failed (1)')
+    loggingRuntime()!.flush()
+    const event = loggingRuntime()!.query((db) => db.query({ workspace: 'alice', operator: false }, { source: 'poise' })).events.find((event) => event.operation === 'github-interface')!
+    expect(event).toMatchObject({ exitCode: 1, truncated: true, stderr: expect.stringContaining('GitHub 503') })
+    expect(Buffer.byteLength(event.stderr!)).toBeLessThanOrEqual(16_384)
+    expect(JSON.stringify(event)).not.toContain('private-api-credential')
+  })
+
   it('reports a failed sink independently and leaves source work operational', async () => {
     start(true)
     expect(() => diagnostic({ source: 'poise', level: 'error', operation: 'read', message: 'cause' })).not.toThrow()

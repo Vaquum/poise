@@ -153,6 +153,11 @@ def main(argv: list[str] | None = None) -> None:
         result = health(db_path, args.max_age_seconds)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         if not result["healthy"]:
+            print(
+                f"datastore health stale: last successful sync {result['last_success_at']}; "
+                f"age {result['age_seconds']}s exceeds maximum {result['max_age_seconds']}s",
+                file=sys.stderr,
+            )
             raise SystemExit(1)
     else:
         raise AssertionError(args.command)

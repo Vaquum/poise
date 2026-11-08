@@ -9,6 +9,8 @@ import { DiagnosticRuntime } from '../gateway/src/diagnostics/runtime'
 import { diagnosticDeliveryPage } from '../gateway/src/diagnostics/workspace-delivery'
 import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
 import { runFile, setProcessFailureObserver } from './process'
+import { behaviorErrorMessage } from './behavior-diagnostics'
+import { classifyBehaviorDiagnostic } from '../src/behavior-failure-cause'
 
 let active: DiagnosticRuntime | null = null
 let timer: ReturnType<typeof setInterval> | null = null
@@ -157,7 +159,12 @@ export function startLogging(options: { captureFatal?: boolean } = {}): void {
     }
   } catch (error) { active.observe('caller', 'caller', workspace, error instanceof Error ? error.message : String(error)) }
   active.start()
-  setProcessFailureObserver((error, evidence) => diagnosticFailure(evidence.operation, error, { executable: evidence.executable, configuredCommand: evidence.command, cwd: evidence.cwd, elapsedMs: evidence.elapsedMs, timeoutMs: evidence.timeoutMs }, { secrets: evidence.secrets, stderr: evidence.stderrAllowed }))
+  setProcessFailureObserver((error, evidence) => {
+    const code = ['github-interface', 'github-datastore'].includes(evidence.command)
+      ? classifyBehaviorDiagnostic(behaviorErrorMessage(error, Infinity)).code : null
+    diagnosticFailure(evidence.operation, error, { executable: evidence.executable, configuredCommand: evidence.command, cwd: evidence.cwd, elapsedMs: evidence.elapsedMs, timeoutMs: evidence.timeoutMs },
+      { level: code === 'upstream_unavailable' || code === 'network_interruption' ? 'warning' : 'error', secrets: evidence.secrets, stderr: evidence.stderrAllowed })
+  })
   active.observe('application', 'poise', workspace)
   if (process.env.POISE_MODE !== 'service') for (const source of ['docker', 'kernel', 'ingress']) {
     active.unconfigured(source, source, workspace, 'This local application has no configured ' + source + ' collector')

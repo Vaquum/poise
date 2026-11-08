@@ -7,6 +7,7 @@ import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, ty
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
+import { behaviorErrorMessage } from './behavior-diagnostics'
 
 export interface ChainSeed { repository: string, number: number }
 export interface ChainRuntimeOperations {
@@ -200,7 +201,7 @@ export class BehaviorChainRuntime {
           let observation: ChainObservation
           try { observation = await this.operations.observe(chain) }
           catch (error) {
-            observationError ??= new Error(`behavior observation failed for ${chain.id}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+            observationError ??= new Error(`behavior observation failed for ${chain.id}: ${behaviorErrorMessage(error)}`, { cause: error })
             continue
           }
           chain = this.append(chain, { type: 'chain.observed', observation })

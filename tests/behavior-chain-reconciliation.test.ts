@@ -82,6 +82,23 @@ it('preserves the person hold rather than replacing it with a merge-verification
   expect(journal.read(chain.id)?.held).toBe('New invocations held by the person')
 })
 
+it('retains the redacted observation cause and rechecks without launching work', async () => {
+  const { journal } = setup()
+  seed(journal)
+  vi.stubEnv('GH_TOKEN', 'observation-private-credential')
+  const error = Object.assign(new Error('Command failed (1): github-interface'), {
+    stderr: 'error: GitHub 500: observation-private-credential upstream unavailable', stdout: 'private-output',
+  })
+  const observe = vi.fn().mockRejectedValueOnce(error).mockResolvedValue(observation(false))
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe }))
+  try {
+    await expect(runtime.run()).rejects.toThrow(
+      'behavior observation failed for acme/repo#7: Command failed (1): github-interface: error: GitHub 500: [redacted] upstream unavailable')
+    await runtime.run()
+    expect(observe).toHaveBeenCalledTimes(2)
+  } finally { vi.unstubAllEnvs() }
+})
+
 it('reconciles live work on every pass despite 250 quiescent merged chains and one failing observation', async () => {
   const { db, journal } = setup()
   db.transaction(() => {

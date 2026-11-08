@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 
 import pytest
 
+from github_datastore.cli import main
 from github_datastore.health import health
 
 
@@ -37,6 +39,24 @@ def test_health_reports_stale_sync(tmp_path):
     assert result["healthy"] is False
     assert result["status"] == "stale"
     assert result["age_seconds"] == 300
+
+
+def test_stale_health_cli_keeps_json_and_explains_refusal_on_stderr(tmp_path, capsys):
+    db_path = tmp_path / "github.sqlite"
+    _state(db_path, "2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z")
+
+    with pytest.raises(SystemExit) as error:
+        main(["--db", str(db_path), "health", "--max-age-seconds", "120"])
+
+    assert error.value.code == 1
+    output = capsys.readouterr()
+    result = json.loads(output.out)
+    assert result["status"] == "stale"
+    assert result["healthy"] is False
+    assert output.err == (
+        f"datastore health stale: last successful sync {result['last_success_at']}; "
+        f"age {result['age_seconds']}s exceeds maximum {result['max_age_seconds']}s\n"
+    )
 
 
 def test_health_fails_without_sync_state(tmp_path):

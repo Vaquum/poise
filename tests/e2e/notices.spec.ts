@@ -666,6 +666,23 @@ test('shows a quota-exhausted check as automatic with its reset, not a repositor
   await expect(entry.locator('.nr-history')).toContainText('1800000000')
 })
 
+test('folds a transient chain observation failure into automatic recovery and clears it after recovery', async ({ page }) => {
+  const error = 'behavior observation failed for acme/api#9: Command failed (1): github-interface: error: GitHub 500: Internal Server Error'
+  const state = await workspace(page, [WAITING], { diagnostics: diagnostics({ status: 'degraded', runtimeError: error }) })
+  await page.goto('/')
+  await openRail(page)
+  await expect(rail(page).getByRole('region', { name: 'Poise faults' })).toHaveCount(0)
+  const automatic = rail(page).getByRole('region', { name: 'Handled automatically' })
+  const fold = automatic.getByRole('button', { name: 'Handled automatically, 1' })
+  await expect(fold).toHaveAttribute('aria-expanded', 'false')
+  await fold.click()
+  await automatic.locator('.nr-card-head').click()
+  await expect(automatic.locator('.nr-history')).toContainText(error)
+  state.diagnostics = diagnostics()
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(automatic).toHaveCount(0)
+})
+
 test('links a held repository to its access settings, naming the agent and the pending invitation', async ({ page }) => {
   await workspace(page, [], { diagnostics: diagnostics({ holds: [{ actor: 'octo-agent', repo: 'acme/api',
     error: 'GitHub 404: Not Found', heldAt: iso(0), nextRecheckAt: iso(60) }] }) })

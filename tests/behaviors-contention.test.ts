@@ -226,6 +226,18 @@ describe('behavior chain sweep lock', () => {
     expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'degraded', runtimeError: 'process lock is unavailable' })
   })
 
+  it('retains a transient observation warning until a later sweep succeeds', async () => {
+    const { runtime, run, reported } = await arrangeChainSweep()
+    const error = 'behavior observation failed for acme/api#9: GitHub 503: Service Unavailable'
+    run.mockRejectedValueOnce(new Error(error))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(reported()).toEqual([])
+    expect(console.warn).toHaveBeenCalledWith(`[behaviors] behavior chain failed for Vaquum: ${error}`)
+    expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'degraded', runtimeError: error })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(runtime.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', runtimeError: null })
+  })
+
   it('delays the sweep rather than losing it when lock setup is slow and nothing holds the lock', async () => {
     const { runtime, run, lockPath, reported } = await arrangeChainSweep()
     slowLockSetup.path = lockPath

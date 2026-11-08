@@ -80,6 +80,19 @@ describe('behavior diagnostic groups', () => {
       ['error', 'runtime_unhealthy'], ['info', 'upstream_unavailable'],
     ])
   })
+  it.each([
+    ['GitHub 500: Internal Server Error', 'info', 'upstream_unavailable'],
+    ['httpx.ReadTimeout: response lost', 'info', 'network_interruption'],
+    ['GitHub 403: Resource not accessible', 'error', 'runtime_unhealthy'],
+    ['Command failed (1): github-interface', 'error', 'runtime_unhealthy'],
+  ])('classifies a rechecked chain observation cause %s as %s', (cause, severity, code) => {
+    const diagnostics = snapshot()
+    diagnostics.status = 'degraded'
+    diagnostics.runtimeError = `behavior observation failed for acme/repo#7: ${cause}`
+    expect(behaviorDiagnosticGroups(diagnostics)).toEqual([expect.objectContaining({ severity, code })])
+    diagnostics.runtimeError = `Internal journal failure: ${cause}`
+    expect(behaviorDiagnosticGroups(diagnostics)).toEqual([expect.objectContaining({ severity: 'error', code: 'runtime_unhealthy' })])
+  })
   it('retains the organization and behavior origin for an untargeted GitHub access failure', () => {
     const diagnostics = snapshot()
     diagnostics.failures.push({ org: 'acme', behavior: 'approve-prs', kind: 'operation',
