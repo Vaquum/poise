@@ -44,6 +44,7 @@ tests/chat/auto-merge.test.ts
 tests/gh-merge-order.test.ts
 tests/github-quota.test.ts
 tests/pr-account-routing.test.ts
+tests/test-offload.test.ts
 tests/quota-risk.test.ts
 tests/worker-capacity-chain.test.ts
 tests/worker-capacity.test.ts

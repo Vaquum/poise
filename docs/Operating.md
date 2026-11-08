@@ -719,6 +719,17 @@ run the tests. It exits with 125, or 124 at the time limit, and never falls back
 running in the workspace. Each that the gateway can see also reaches its diagnostics
 as `test_relay.run.failed`, naming the workspace, the command and the reason; every
 run is logged with its command, exit code and duration as `test_relay.run.finished`.
+An explicit gateway-restart failure is the one exception: the active command
+records an interrupted validation with its candidate digest, suite and run ID,
+with no test result. It waits at most 30 seconds for the existing authenticated
+run handshake and retries the whole suite once. Both attempts use one captured
+checkout archive, command, cwd and environment, including uncommitted edits.
+Capture, provisioning, upload, waiting and the complete rerun share a nine-minute
+command budget, capped by a shorter inherited `BASH_DEFAULT_TIMEOUT_MS`.
+Cancellation retires the active upload and lease and prevents recovery from
+starting a new suite. Only the fresh suite's complete exit is returned; a genuine
+suite exit (including 125), a broken stream or another relay cause never retries.
+A second restart or an unrecovered relay retains the no-result contract above.
 The time limit is under an agent's shell tool's default of ten minutes
 (`BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts`), so that the agent hears this
 from the box and not as a command its tool gave up on.

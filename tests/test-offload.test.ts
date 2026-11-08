@@ -9,8 +9,11 @@ import { createServer, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import Database from 'better-sqlite3'
 import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
 import { filesToSend, frameReader, testEnvironment } from '../scripts/test-offload/run.mjs'
+import { BehaviorChainJournal, chainBasis, type ChainEvent } from '../server/behavior-chain-store'
+import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { scrubbedChildEnvironment } from '../server/process'
 
 const SOURCE = resolve('scripts/test-offload')
@@ -408,14 +411,16 @@ describe('a suite on a test box', () => {
   let listLagMs: number
   let runBoxes: boolean
   let warnings: Record<string, unknown>[]
+  let events: Record<string, unknown>[]
+  let runners: { child: ChildProcess; done: Promise<unknown> }[]
   let relay: TestRelay
   let relayServer: Server
   let relayUrl: string
   let hooks: string
   let unpacked: string
 
-  async function listen(server: Server): Promise<number> {
-    await new Promise<void>((done) => { server.listen(0, '127.0.0.1', done) })
+  async function listen(server: Server, port = 0): Promise<number> {
+    await new Promise<void>((done) => { server.listen(port, '127.0.0.1', done) })
     return (server.address() as { port: number }).port
   }
 
@@ -515,7 +520,7 @@ describe('a suite on a test box', () => {
     relay = new TestRelay({
       config: { renderApiKey, workspace: 'tea-test', deployment, plan: '1c-2g', limitSeconds, maxRuns },
       privateKey,
-      log: { info: () => {}, warn: (_event: string, fields: Record<string, unknown>) => { warnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: (_event: string, fields: Record<string, unknown>) => { warnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
@@ -545,12 +550,16 @@ describe('a suite on a test box', () => {
     setupMs = 0
     listLagMs = 0
     warnings = []
+    events = []
+    runners = []
     runBoxes = true
     render = startRender()
     relayServer = undefined as unknown as Server
   })
 
   afterEach(async () => {
+    for (const runner of runners) if (runner.child.exitCode === null) runner.child.kill('SIGTERM')
+    await Promise.all(runners.map((runner) => runner.done))
     for (const box of boxes.values()) box.child?.kill('SIGKILL')
     relay?.stop()
     for (const server of [relayServer, render]) {
@@ -565,7 +574,9 @@ describe('a suite on a test box', () => {
     let stderr = ''
     child.stdout?.on('data', (chunk) => { stdout += chunk })
     child.stderr?.on('data', (chunk) => { stderr += chunk })
-    return { child, done: new Promise((done) => { child.on('close', (code) => { done({ code, stdout, stderr }) }) }) }
+    const done = new Promise<{ code: number | null; stdout: string; stderr: string }>((done) => { child.on('close', (code) => { done({ code, stdout, stderr }) }) })
+    runners.push({ child, done })
+    return { child, done }
   }
 
   function repository(): string {
@@ -630,7 +641,9 @@ describe('a suite on a test box', () => {
   it('leaves the agent’s temporary folder behind, which can be too long for a Unix socket', async () => {
     await startAll()
     const script = 'console.log(process.env.TMPDIR, process.env.TMP, process.env.TEMP)'
-    const tmp = { TMPDIR: '/run/agent/tmp', TMP: '/run/agent/tmp', TEMP: '/run/agent/tmp' }
+    const folder = join(temp(), 'agent-tmp'.repeat(16))
+    mkdirSync(folder)
+    const tmp = { TMPDIR: folder, TMP: folder, TEMP: folder }
     const { code, stdout } = await suite(repository(), [process.execPath, '-e', script], tmp).done
     expect(code).toBe(0)
     expect(stdout).toBe('undefined undefined undefined\n')
@@ -709,6 +722,225 @@ describe('a suite on a test box', () => {
     expect(stderr).not.toContain('no test result')
     expect(terminated).toContain(runBox().id)
   })
+
+  it('recovers a mid-suite relay replacement with the captured input and continues through the existing chain gates', async () => {
+    await startAll()
+    const repo = repository()
+    execFileSync('git', ['-C', repo, 'add', 'tracked.txt'])
+    execFileSync('git', ['-C', repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'fixture'])
+    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD']).toString().trim()
+    writeFileSync(join(repo, 'tracked.txt'), 'authorized uncommitted input\n')
+    const db = new Database(':memory:')
+    try {
+      const journal = new BehaviorChainJournal(db)
+      const reviewer = { slot: 'primary', model: 'fixture-model', recovery: 'fixture-model' }
+      const now = Date.now(), context = 'c'.repeat(64)
+      let chain = journal.append('example/repo#951', 'seed', 0, { type: 'chain.admitted', repository: 'Example/Repo', issue: 951,
+        branch: 'poise/issue-951', author: 'author', reviewer: 'reviewer' }, now)
+      const append = (event: ChainEvent) => { chain = journal.append(chain.id, `event-${chain.sequence}`, chain.sequence, event, now) }
+      const obs: ChainObservation = { checkedAt: now, existingPulls: [],
+        issue: { open: true, eligible: true, revision: 'seed', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+        implementer: reviewer, repairer: reviewer, approver: reviewer,
+        publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null }
+      expect(decideBehaviorChain(chain, obs, now)).toMatchObject({ kind: 'invoke', behavior: 'implement-issue' })
+      append({ type: 'invocation.admitted', invocation: { id: 'implementation', behavior: 'implement-issue', basis: chainBasis(['issue', 'seed']),
+        actor: 'author', model: reviewer.model, slot: reviewer.slot, admittedAt: now, request: { command: 'agent-interface', argv: [], cwd: repo } } })
+      append({ type: 'invocation.started', invocationId: 'implementation' })
+
+      const input = join(unpacked, repo, 'tracked.txt')
+      const script = `console.log(JSON.stringify({ input: require('fs').readFileSync(process.argv[1], 'utf8'), cwd: process.cwd(), option: process.env.SUITE_OPTION })); setTimeout(() => console.log('complete'), 300)`
+      const run = suite(repo, [process.execPath, '-e', script, input], { SUITE_OPTION: 'authorized' })
+      await new Promise((done) => { run.child.stdout?.once('data', done) })
+      const interrupted = runBox()
+      const originalId = [...relay.runs.keys()][0]
+      writeFileSync(join(repo, 'tracked.txt'), 'changed under the same HEAD\n')
+      expect(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD']).toString().trim()).toBe(head)
+      expect(decideBehaviorChain(chain, obs, now)).toMatchObject({ kind: 'wait', reason: expect.stringContaining('started') })
+      relay.stop()
+      await startAll2()
+      const { code, stdout, stderr } = await run.done
+      expect(code).toBe(0)
+      const line = JSON.stringify({ input: 'authorized uncommitted input\n', cwd: repo, option: 'authorized' })
+      expect(stdout).toBe(`${line}\n${line}\ncomplete\n`)
+      expect(stderr).toMatch(new RegExp(`interrupted validation: candidate [a-f0-9]{64}, suite .*run ${originalId}: no test result: the gateway restarted`))
+      expect(stderr).toContain('retrying this captured suite once')
+      expect(stderr).not.toContain('Skip local tests')
+      const attempts = [...boxes.values()].filter((box) => box.snapshotName !== null)
+      expect(attempts).toHaveLength(2)
+      const uploaded = (box: Box) => Buffer.concat(readdirSync(join(box.dir, 'tmp/poise-tree')).sort().map((part) => readFileSync(join(box.dir, 'tmp/poise-tree', part))))
+      expect(uploaded(attempts[1])).toEqual(uploaded(interrupted))
+      expect(readFileSync(join(attempts[1].dir, 'tmp/poise-spec.json'))).toEqual(readFileSync(join(interrupted.dir, 'tmp/poise-spec.json')))
+      expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([expect.objectContaining({ exit: 0 })])
+      expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.killed', id: originalId, error: 'the gateway restarted' }))
+      expect(terminated).toContain(interrupted.id)
+
+      // Model publication/remote observations only after the real runner's fresh complete result.
+      append({ type: 'invocation.settled', invocationId: 'implementation', callId: 'implementation', outcome: 'published',
+        evidence: { status: 'completed', action: 'published', head_sha: head } })
+      obs.publication = { pull_number: 21, head_sha: head, head_invocation: 'implementation', state: 'open', merged: false, merge_sha: null }
+      obs.pull = { number: 21, head, headSince: now, state: 'open', draft: false, merged: false, mergeSha: null,
+        queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+        reviewIds: [], reviewContext: context, reviewReceipts: [], reviewRevision: 'review', greyRuns: [], pending: true, failing: [], conflict: false, behind: false }
+      expect(decideBehaviorChain(chain, obs, now)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+      const callId = '1'.repeat(32)
+      const response = { repository: 'Example/Repo', pull_number: 21, head_sha: head, context_sha: context, invocation_id: callId,
+        reviewer: 'reviewer', model: reviewer.model, completed_at: now,
+        assessment: { verdict: 'Fixture candidate passes review.', reviewed_context: 'Fixture exact-head diff.', limitations: 'No live GitHub actions.' } }
+      append({ type: 'invocation.admitted', invocation: { id: 'review', behavior: 'review-pr', basis: chainBasis(['pr', head, context]),
+        actor: 'reviewer', model: reviewer.model, slot: reviewer.slot, admittedAt: now, request: { command: 'agent-interface', argv: [], cwd: repo } } })
+      append({ type: 'invocation.settled', invocationId: 'review', callId, outcome: 'clean', evidence: { status: 'completed', action: 'reviewed_clean',
+        review_id: 27, head_sha: head, completedAt: now, artifact: { review_response: response } } })
+      obs.pull.reviewIds = [27]
+      obs.pull.reviewReceipts = [{ id: 27, head, state: 'COMMENTED', invocation: callId, submittedAt: now, response }]
+      expect(decideBehaviorChain(chain, obs, now)).toEqual({ kind: 'wait', reason: 'exact-head CI is still running' })
+      obs.pull.pending = false
+      expect(decideBehaviorChain(chain, obs, now)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+      obs.pull.approved = true
+      expect(decideBehaviorChain(chain, obs, now)).toEqual({ kind: 'wait', reason: 'native repository readiness gates are not satisfied' })
+      obs.pull.ready = true
+      expect(decideBehaviorChain(chain, obs, now)).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
+      obs.pull.head = 'd'.repeat(40)
+      expect(decideBehaviorChain(chain, obs, now)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+      obs.pull.head = head
+      append({ type: 'chain.observed', observation: structuredClone(obs) })
+      obs.pull.merged = true; obs.pull.state = 'closed'; obs.pull.mergeSha = 'e'.repeat(40); obs.pull.mergedAt = now
+      expect(decideBehaviorChain(chain, obs, now)).toEqual({ kind: 'complete', mergeSha: obs.pull.mergeSha })
+      expect(chain.held).toBeNull()
+      expect(db.prepare("SELECT count(*) AS count FROM behavior_chain_events WHERE json_extract(payload, '$.type') = 'chain.resumed'").get()).toEqual({ count: 0 })
+    } finally {
+      db.close()
+    }
+  })
+
+  it.each([7, 125])('returns a genuine suite exit %s without retrying, even if its output names a gateway restart', async (status) => {
+    await startAll()
+    const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.error('the gateway restarted'); process.exit(${status})`]).done
+    expect(code).toBe(status)
+    expect(stderr).not.toContain('interrupted validation')
+    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
+  })
+
+  it('preserves a genuine failing result from the fresh suite after recovery', async () => {
+    await startAll()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setTimeout(() => process.exit(125), 300)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relay.stop()
+    await startAll2()
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(stdout).toBe('started\nstarted\n')
+    expect(stderr).toContain('interrupted validation')
+    expect(stderr).not.toContain('Skip local tests')
+    expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([expect.objectContaining({ exit: 125 })])
+  })
+
+  it('does not recover a dropped output stream without an explicit restart frame', async () => {
+    await startAll()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relayServer.closeAllConnections()
+    const { code, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(stderr).toContain('the connection to the test relay broke')
+    expect(stderr).not.toContain('interrupted validation')
+    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
+  })
+
+  it('refuses recovery when the workspace no longer owns relay access', async () => {
+    await startAll()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relay.stop()
+    await startAll2({ isWorkspace: () => false })
+    const { code, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(stderr).toContain('HTTP 401')
+    expect(relay.runs.size).toBe(0)
+    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
+  })
+
+  it('cancels while waiting for recovery without starting another run', async () => {
+    await startAll()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    let notices = ''
+    run.child.stderr?.on('data', (chunk) => { notices += chunk })
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relay.stop()
+    await new Promise((done) => { relayServer.close(done) })
+    await until(() => notices.includes('waiting up to 30 s'), 'the recovery wait')
+    run.child.kill('SIGTERM')
+    const { code, stderr } = await run.done
+    expect(code).toBe(143)
+    expect(stderr).not.toContain('Skip local tests')
+    await startAll2()
+    await new Promise((done) => setTimeout(done, 1100))
+    expect(relay.runs.size).toBe(0)
+    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
+  })
+
+  it('does not retry a second gateway restart', async () => {
+    await startAll()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    let starts = 0
+    run.child.stdout?.on('data', () => { starts += 1 })
+    await until(() => starts === 1, 'the first suite to start')
+    relay.stop()
+    await startAll2()
+    await until(() => starts === 2, 'the fresh suite to start')
+    relay.stop()
+    const { code, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(stderr.match(/interrupted validation:/g)).toHaveLength(2)
+    expect(stderr).toContain("don't retry")
+    expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
+    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)
+  })
+
+  it('keeps the recovery wait within the original command budget', async () => {
+    await startAll()
+    const started = Date.now()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'], { BASH_DEFAULT_TIMEOUT_MS: '2500' })
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relay.stop()
+    await new Promise((done) => { relayServer.close(done) })
+    const { code, stderr } = await run.done
+    expect(code).toBe(124)
+    expect(stderr).toContain('no test result: the test offload exhausted its total time budget')
+    expect(Date.now() - started).toBeLessThan(4500)
+    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(1)
+  })
+
+  it('keeps the full rerun within the remaining command budget', async () => {
+    await startAll()
+    const started = Date.now()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 2500)'], { BASH_DEFAULT_TIMEOUT_MS: '3500' })
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    await new Promise((done) => setTimeout(done, 500))
+    relay.stop()
+    await startAll2()
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(124)
+    expect(stdout).toBe('started\nstarted\n')
+    expect(stderr).toContain('total time budget')
+    expect(Date.now() - started).toBeLessThan(5500)
+    expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
+    await until(() => relay.runs.size === 0, 'the timed-out run to be retired')
+  })
+
+  it('gives up when the relay never recovers', async () => {
+    await startAll()
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    const started = Date.now()
+    relay.stop()
+    await new Promise((done) => { relayServer.close(done) })
+    const { code, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(stderr).toContain('the test relay did not recover within 30 s')
+    expect(stderr).toContain("don't retry")
+    expect(Date.now() - started).toBeLessThan(35_000)
+    expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
+  }, 40_000)
 
   it('says nothing of memory when a suite that mentions it passes', async () => {
     await startAll()
@@ -851,22 +1083,23 @@ describe('a suite on a test box', () => {
   })
 
   // Another gateway, of the same Render workspace.
-  async function startAll2(): Promise<void> {
-    relayServer.closeAllConnections()
+  async function startAll2(overrides: Partial<TestRelayDeps> = {}): Promise<void> {
+    const port = Number(new URL(relayUrl).port)
     await new Promise((done) => { relayServer.close(done) })
     relay = new TestRelay({
       config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', limitSeconds: 3600, maxRuns: 5 },
       privateKey,
-      log: { info: () => {}, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
+      log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
       renderApi: `${renderOrigin}/v1`,
       sweepMs: 50,
       renderSweepMs: 100,
       pollMs: 10,
+      ...overrides,
     })
     relayServer = createServer((req, res) => { void relay.handle(req, res, new URL(req.url ?? '/', 'http://relay')) })
-    relayUrl = `http://127.0.0.1:${await listen(relayServer)}${TEST_RELAY_PATH}`
+    relayUrl = `http://127.0.0.1:${await listen(relayServer, port)}${TEST_RELAY_PATH}`
     relay.start()
     writeFileSync(join(hooks, 'relay'), `${relayUrl}\n${KEY}\n`)
   }

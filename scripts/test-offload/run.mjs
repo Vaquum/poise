@@ -3,15 +3,21 @@
 // output on stdout and stderr, and its exit code. hook.cjs and sitecustomize.py start this in the
 // suite's place. docs/Operating.md, "Agents' test suites".
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
+import { pipeline } from 'node:stream/promises'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { createGzip } from 'node:zlib'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const LEASE_MS = 10_000
+const LIMIT_MS = 9 * 60_000
+const RECOVERY_MS = 30_000
+const GATEWAY_RESTART = 'the gateway restarted'
 const CHUNK_BYTES = 8 * 1024 * 1024
 // The first bytes go at once: a proxy gives up on a download that stays silent for long.
 const FIRST_CHUNK_BYTES = 64 * 1024
@@ -135,6 +141,30 @@ async function main(args) {
   const [relay, key] = readFileSync(join(HERE, 'relay'), 'utf8').split('\n')
   const headers = { authorization: `Bearer ${key}` }
   const cwd = process.cwd()
+  const spec = JSON.stringify({ argv: command, cwd, env: testEnvironment(process.env) })
+  // One clock includes capture, provisioning, upload, recovery and the complete rerun.
+  const shellLimit = Number(process.env.BASH_DEFAULT_TIMEOUT_MS)
+  const limit = shellLimit > 0 ? Math.min(LIMIT_MS, shellLimit) : LIMIT_MS
+  const lifetime = new AbortController()
+  let current = null
+  let ending = false
+  const call = async (method, path, body, signal = lifetime.signal) => {
+    const response = await fetch(`${relay}${path}`, { method, headers, body, signal })
+    if (!response.ok) throw Object.assign(new Error(`the test relay answered ${method} ${path} with HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`), { status: response.status })
+    return response
+  }
+  const stop = (code, message) => {
+    if (ending) return
+    ending = true
+    lifetime.abort()
+    const exit = () => message ? die(message, code) : finish(code)
+    if (current) call('DELETE', `/runs/${current}`, undefined, AbortSignal.timeout(1_000)).then(exit, exit)
+    else exit()
+  }
+  const deadline = setTimeout(() => stop(124, 'the test offload exhausted its total time budget'), limit)
+  for (const [signal, number] of [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1]]) {
+    process.once(signal, () => stop(128 + number))
+  }
   let paths
   try {
     paths = filesToSend(cwd, also)
@@ -145,82 +175,136 @@ async function main(args) {
     return
   }
 
-  const call = async (method, path, body) => {
-    const response = await fetch(`${relay}${path}`, { method, headers, body })
-    if (!response.ok) throw new Error(`the test relay answered ${method} ${path} with HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`)
-    return response
-  }
-
-  let current = null
-  for (const [signal, number] of [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1]]) {
-    process.once(signal, () => {
-      const exit = () => finish(128 + number)
-      if (!current) exit()
-      call('DELETE', `/runs/${current}`).then(exit, exit)
-      setTimeout(exit, 3_000)
-    })
-  }
-
-  const sendTree = async () => {
-    const id = current
+  const directory = mkdtempSync(join(tmpdir(), 'poise-test-input-'))
+  const archive = join(directory, 'tree.tgz')
+  process.once('exit', () => rmSync(directory, { recursive: true, force: true }))
+  const capture = async () => {
     const tar = spawn('tar', ['-C', '/', '--null', '-T', '-', '-cf', '-'], { stdio: ['pipe', 'pipe', 'pipe'] })
-    const closed = new Promise((done) => { tar.on('close', done) })
+    const closed = new Promise((done, reject) => { tar.on('close', done); tar.on('error', reject) })
     let errors = ''
     tar.stderr.on('data', (chunk) => { errors = (errors + chunk).slice(-2000) })
     tar.stdin.end(paths.map((path) => path.replace(/^\//, '')).join('\0'))
     const gzip = createGzip({ level: 1 })
-    tar.stdout.pipe(gzip)
+    const hash = createHash('sha256').update(spec)
+    gzip.on('data', (chunk) => hash.update(chunk))
+    try {
+      const [, code] = await Promise.all([pipeline(tar.stdout, gzip, createWriteStream(archive), { signal: lifetime.signal }), closed])
+      // tar's exit 1 says a file changed as it was read. Both attempts still use these exact bytes.
+      if (code !== 0 && code !== 1) throw new Error(`tar exited with ${code}: ${errors}`)
+      return hash.digest('hex')
+    } finally {
+      if (tar.exitCode === null) tar.kill()
+    }
+  }
+
+  const sendTree = async (id, signal) => {
     let parts = []
     let size = 0
     let total = 0
     let limit = FIRST_CHUNK_BYTES
     const started = Date.now()
-    for await (const chunk of gzip) {
+    for await (const chunk of createReadStream(archive, { highWaterMark: FIRST_CHUNK_BYTES, signal })) {
       parts.push(chunk)
       size += chunk.length
       total += chunk.length
       if (size >= limit) {
-        await call('POST', `/runs/${id}/tree`, Buffer.concat(parts))
+        await call('POST', `/runs/${id}/tree`, Buffer.concat(parts), signal)
         parts = []
         size = 0
         limit = CHUNK_BYTES
       }
     }
-    // tar's exit 1 says a file changed as it was read, which a live checkout does.
-    const code = await closed
-    if (code !== 0 && code !== 1) throw new Error(`tar exited with ${code}: ${errors}`)
-    await call('POST', `/runs/${id}/tree?end=1`, Buffer.concat(parts))
+    await call('POST', `/runs/${id}/tree?end=1`, Buffer.concat(parts), signal)
     say(`checkout sent, ${Math.round(total / 1024 / 1024)} MB in ${Math.round((Date.now() - started) / 1000)} s. The box is unpacking it, then runs the suite.`)
   }
 
-  say('this suite runs on a disposable test box; files it changes stay there. Starting one.')
-  const created = await call('POST', '/runs', JSON.stringify({ argv: command, cwd, env: testEnvironment(process.env) }))
-  current = (await created.json()).id
-  setInterval(() => { call('POST', `/runs/${current}/lease`).catch(() => {}) }, LEASE_MS)
-  let exitCode = null
-  const output = await call('GET', `/runs/${current}/output`)
-  const read = frameReader((type, payload) => {
-    if (type === FRAME.stdout) process.stdout.write(payload)
-    else if (type === FRAME.stderr) process.stderr.write(payload)
-    else if (type === FRAME.exit) exitCode = Number(payload.toString())
-    else if (type === FRAME.fail && payload[0] === 143) finish(143)
-    else if (type === FRAME.fail) die(payload.subarray(1).toString(), payload[0])
-    else if (type === FRAME.ready) {
-      say('the box is up. Sending the checkout.')
-      sendTree().catch((error) => die(`sending the checkout failed: ${error.message}`))
+  const createRun = async (signal = lifetime.signal) => {
+    const created = await call('POST', '/runs', spec, signal)
+    const { id } = await created.json()
+    if (!/^[0-9a-f]{32}$/.test(id)) throw new Error('the test relay did not name the new run')
+    return id
+  }
+  const recover = async () => {
+    const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(RECOVERY_MS)])
+    let lastError
+    while (!signal.aborted) {
+      try {
+        await sleep(1_000, undefined, { signal })
+        return await createRun(signal)
+      } catch (error) {
+        if (lifetime.signal.aborted) throw error
+        if (signal.aborted) break
+        // Only a gateway that is still coming up may be waited on. Authentication and admission refusals are final.
+        if (error.status && ![502, 503, 504].includes(error.status)) throw error
+        lastError = error
+      }
     }
-  })
+    throw new Error(`the test relay did not recover within ${RECOVERY_MS / 1000} s${lastError ? `: ${lastError.message}` : ''}`)
+  }
+
   try {
-    for await (const chunk of output.body) {
-      read(Buffer.from(chunk))
-      for (const stream of [process.stdout, process.stderr]) if (stream.writableNeedDrain) await once(stream, 'drain')
+    say('this suite runs on a disposable test box; files it changes stay there. Capturing the checkout.')
+    const candidate = await capture()
+    const suite = command.slice(0, 5).map((word) => basename(word)).join(' ').slice(0, 200)
+    say(`candidate ${candidate}, suite ${suite}, cwd ${cwd}`)
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      current = attempt === 0 ? await createRun() : await recover()
+      lifetime.signal.throwIfAborted()
+      const id = current
+      if (attempt === 1) say(`relay recovered; rerunning candidate ${candidate} as run ${id}`)
+      const controller = new AbortController()
+      const signal = AbortSignal.any([lifetime.signal, controller.signal])
+      const lease = setInterval(() => { call('POST', `/runs/${id}/lease`, undefined, signal).catch(() => {}) }, LEASE_MS)
+      let exitCode = null
+      let failure = null
+      let upload = null
+      let uploadError = null
+      const read = frameReader((type, payload) => {
+        if (type === FRAME.stdout) process.stdout.write(payload)
+        else if (type === FRAME.stderr) process.stderr.write(payload)
+        else if (type === FRAME.exit) exitCode = Number(payload.toString())
+        else if (type === FRAME.fail) failure = { code: payload[0], message: payload.subarray(1).toString() }
+        else if (type === FRAME.ready && !upload) {
+          say('the box is up. Sending the captured checkout.')
+          upload = sendTree(id, signal).catch((error) => {
+            uploadError = error
+            controller.abort()
+          })
+        }
+      })
+      try {
+        const output = await call('GET', `/runs/${id}/output`, undefined, signal)
+        for await (const chunk of output.body) {
+          read(Buffer.from(chunk))
+          for (const stream of [process.stdout, process.stderr]) if (stream.writableNeedDrain) await once(stream, 'drain')
+          if (failure || exitCode !== null) break
+        }
+      } catch (error) {
+        if (!failure && exitCode === null) throw new Error(uploadError ? `sending the checkout failed: ${uploadError.message}` : `the connection to the test relay broke: ${error.cause?.message ?? error.message}`)
+      } finally {
+        clearInterval(lease)
+        controller.abort()
+        await upload
+      }
+      current = null
+      if (failure?.code === 143) { finish(143); return }
+      if (failure?.code === 125 && failure.message === GATEWAY_RESTART) {
+        say(`interrupted validation: candidate ${candidate}, suite ${suite}, run ${id}: no test result: ${failure.message}`)
+        if (attempt === 0) {
+          say('waiting up to 30 s for the authenticated relay handshake, then retrying this captured suite once within the remaining time budget')
+          continue
+        }
+      }
+      if (failure) die(failure.message, failure.code)
+      else if (exitCode === null) die('the connection to the test relay ended before the suite did')
+      else finish(exitCode)
+      return
     }
   } catch (error) {
-    die(`the connection to the test relay broke: ${error.cause?.message ?? error.message}`)
-    return
+    if (!ending) stop(125, error.message)
+  } finally {
+    clearTimeout(deadline)
   }
-  if (exitCode === null) die('the connection to the test relay ended before the suite did')
-  else finish(exitCode)
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
