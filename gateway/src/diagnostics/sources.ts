@@ -24,9 +24,13 @@ export function callerDiagnostic(value: unknown, workspace: string): DiagnosticI
   if (!diagnostic && !error && !row.error_code && !priorWarning) return null
   const repository = text(row.repo)
   const pr = text(row.pr_id)
+  const heldRepair = row.behavior === 'repair_pr' && row.status === 'failed'
+    && row.action === 'not_started' && row.outcome === 'preflight_failed' && row.head_sha == null
+    && (row.error_code === 'atomic_work_blocked' || row.error_code === 'atomic_work_failed'
+      && error === 'repair did not answer every unresolved review finding')
   return {
     id: 'caller:' + row.id, time: text(row.completed_at), source: unavailable && !row.error && !diagnostic ? 'collection' : 'caller', component: text(row.behavior) ?? 'agent-interface',
-    level: unavailable && !row.error && !diagnostic ? 'warning' : diagnostic?.severity === 'warning' ? 'warning' : diagnostic?.severity === 'error' ? 'error' : ['overloaded', 'rate_limit', 'authentication_failed', 'interrupted'].includes(String(row.error_code)) ? 'warning' : 'error',
+    level: unavailable && !row.error && !diagnostic ? 'warning' : diagnostic?.severity === 'warning' ? 'warning' : diagnostic?.severity === 'error' ? 'error' : heldRepair || ['overloaded', 'rate_limit', 'authentication_failed', 'interrupted'].includes(String(row.error_code)) ? 'warning' : 'error',
     operation: unavailable && !row.error && !diagnostic ? 'caller.evidence_unavailable' : text(diagnostic?.operation) || text(row.behavior) || 'call.failed', phase: text(diagnostic?.phase), workspace,
     repository, pr, target: repository && pr ? `${repository}#${pr}` : repository,
     account: text(row.actor), reviewer: text(row.actor), behavior: text(row.behavior), callId: String(row.id),

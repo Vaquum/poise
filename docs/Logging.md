@@ -26,6 +26,13 @@ Logging event. Unknown levels or invalid source timestamps produce visible
 collection warnings with the original source identity. Notification colors and
 successful change-request reviews do not determine technical severity.
 
+Repair preflight refusals are retained as Warnings when a failed `repair_pr`
+Call has `not_started` / `preflight_failed`, no executed head, and either
+`atomic_work_blocked` or `atomic_work_failed` with the exact cause
+`repair did not answer every unresolved review finding`. Structured process
+failure evidence remains authoritative. This classification changes neither
+Caller status nor publication, retry or hold rules.
+
 Credentials, encoded Git authentication, authorization/cookie headers and
 credential-bearing URLs are redacted before persistence. Context excludes
 prompts, content, responses, stdout, arguments, environment and conversation
