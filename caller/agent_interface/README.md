@@ -190,6 +190,13 @@ lease never touches the row again.
 
 # PR review models
 
+Provider supervision hands off after a minute of quota or reconnect diagnostics
+without progress. It reads bounded diagnostic fields from structured provider
+error/retry events and supported native stderr diagnostics; tool events,
+assistant prose and reasoning clear the stall timer. Malformed stdout never
+supplies quota evidence. The retained cause excerpt contains only the selected
+diagnostics, and GitHub quota errors do not trigger a provider handoff.
+
 Every attempt ends with one durable terminal state: a validated result with its
 authoritative `review_id` receipt, or a typed failure carrying provider, phase,
 bounded redacted cause and known (`none`, `rejected`, `noop`, `blocked`) or

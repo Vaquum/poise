@@ -392,6 +392,100 @@ class TestCancellationOutcome(TestCase):
 
 
 class TestRateLimitAbort(TestCase):
+    def test_tool_output_and_prose_clear_stalls_before_a_quiet_minute(self):
+        text = "429 Too Many Requests; rate limit exceeded; Reconnecting... 2/5"
+        events = [
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "cat fixture",
+             "aggregated_output": text, "exit_code": 0, "status": "completed"}},
+            {"type": "item.started", "item": {"type": "mcp_tool_call", "arguments": {"text": text}}},
+            {"type": "item.completed", "item": {"type": "mcp_tool_call", "result": text}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
+            {"type": "item.completed", "item": {"type": "reasoning", "text": text}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "input": text}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": text}]}},
+            {"type": "assistant", "text": text},
+            {"type": "stream_event", "event": {"delta": {"type": "thinking_delta", "thinking": text}}},
+            {"type": "result", "is_error": False, "result": text},
+            {"type": "error", "message": "unrelated error", "output": text, "arguments": {"text": text}},
+        ]
+        lines = [json.dumps(event).encode() for event in events]
+        lines.extend([b"Reconnecting... 2/5 (429 Too Many Requests)",
+                      b'{"type":"error","message":"429 Too Many Requests"',
+                      b'["429 Too Many Requests"]'])
+        for line in lines:
+            for retry_first in (False, True):
+                with self.subTest(line=line, retry_first=retry_first), \
+                        patch.object(review_watch, "monotonic", return_value=100.0) as clock, \
+                        patch.object(review_watch, "_stop_process_group") as stop:
+                    abort = RateLimitAbort()
+                    if retry_first:
+                        abort.note(b'{"type":"error","message":"Reconnecting... 1/5 (429 Too Many Requests)"}\n')
+                        self.assertEqual(abort.since, 100.0)
+                    abort.note(line + b"\n")
+                    clock.return_value = 161.0
+                    abort.check("codex", SimpleNamespace())
+                    self.assertIsNone(abort.since)
+                    self.assertFalse(abort.quota)
+                    self.assertEqual(abort.signal, b"")
+                    stop.assert_not_called()
+
+    def test_tool_event_spanning_reads_never_becomes_a_plain_text_signal(self):
+        event = json.dumps({"type": "item.completed", "item": {
+            "type": "command_execution", "aggregated_output": "x" * 3000 + "429 Too Many Requests",
+            "exit_code": 0, "status": "completed"}})
+        abort = RateLimitAbort()
+        with tempfile.TemporaryFile(mode="w+t") as out, tempfile.TemporaryFile(mode="w+t") as err, \
+                patch.object(review_watch, "monotonic", return_value=100.0) as clock, \
+                patch.object(review_watch, "_stop_process_group") as stop:
+            abort.note(b'{"type":"error","message":"Reconnecting... 1/5"}\n')
+            out.write(event[:2500])
+            out.flush()
+            abort.scan(out, err)
+            out.write(event[2500:] + "\n")
+            out.flush()
+            abort.scan(out, err)
+            clock.return_value = 161.0
+            abort.check("codex", SimpleNamespace())
+            self.assertIsNone(abort.since)
+            self.assertEqual(abort.signal, b"")
+            stop.assert_not_called()
+
+    def test_persistent_structured_provider_signals_keep_only_diagnostics(self):
+        cases = [
+            ({"type": "error", "message": "429 Too Many Requests"}, "rate-limited", "429 Too Many Requests"),
+            ({"type": "turn.failed", "error": {"message": "rate limit exceeded", "output": "private-tool-output"}},
+             "rate-limited", "rate limit exceeded"),
+            ({"type": "system", "subtype": "api_retry", "error": "rate_limit", "attempt": 2},
+             "rate-limited", "rate_limit"),
+            ({"type": "error", "error": {"http_status": 429}}, "rate-limited", "429"),
+            ({"type": "result", "is_error": True, "errors": ["rate limit exceeded"]},
+             "rate-limited", "rate limit exceeded"),
+            ({"type": "error", "message": "Reconnecting... 2/5 (WebSocket idle timeout)"},
+             "reconnecting", "WebSocket idle timeout"),
+        ]
+        for event, cause, excerpt in cases:
+            event = {"arguments": "private-tool-arguments", "output": "private-tool-output", **event}
+            with self.subTest(event=event), patch.object(review_watch, "monotonic", return_value=100.0) as clock, \
+                    patch.object(review_watch, "_stop_process_group") as stop:
+                abort = RateLimitAbort()
+                line = json.dumps(event).encode() + b"\n"
+                abort.note(line)
+                clock.return_value = 130.0
+                abort.note(line)
+                self.assertEqual(abort.since, 100.0)
+                clock.return_value = 161.0
+                process = SimpleNamespace(pid=1234)
+                with self.assertRaises(ReviewLimitError) as raised:
+                    abort.check("codex", process)
+                self.assertEqual(raised.exception.code, "review_provider_error")
+                self.assertIn(cause, str(raised.exception))
+                self.assertIn(excerpt, str(raised.exception))
+                self.assertNotIn("private-tool", str(raised.exception))
+                self.assertLessEqual(len(abort.signal), 200)
+                if cause == "reconnecting":
+                    self.assertNotIn("rate-limit", str(raised.exception))
+                stop.assert_called_once_with(process)
+
     def test_healthy_output_never_starts_the_clock(self):
         abort = RateLimitAbort()
         abort.note(b'{"type":"turn","text":"reviewing line 429"}\nmore progress\n')
@@ -401,7 +495,7 @@ class TestRateLimitAbort(TestCase):
     def test_signal_then_progress_resets_the_clock(self):
         abort = RateLimitAbort()
         with patch.object(review_watch, "monotonic", side_effect=[100.0, 130.0]):
-            abort.note(b"Reconnecting... 1/5 (last status: 429 Too Many Requests)\n")
+            abort.note(b"Reconnecting... 1/5 (last status: 429 Too Many Requests)\n", stderr=True)
             self.assertEqual(abort.since, 100.0)
             abort.note(b'{"type":"assistant","text":"back to work"}\n')
             self.assertIsNone(abort.since)
@@ -412,8 +506,8 @@ class TestRateLimitAbort(TestCase):
         proc = SimpleNamespace(pid=1234)
         with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
                 patch.object(review_watch, "_stop_process_group") as stop:
-            abort.note(b"Reconnecting... 1/5\n")
-            abort.note(b"Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)\n")
+            abort.note(b"Reconnecting... 1/5\n", stderr=True)
+            abort.note(b"Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)\n", stderr=True)
             with self.assertRaises(ReviewLimitError) as raised:
                 abort.check("codex", proc)
         self.assertEqual(raised.exception.code, "review_provider_error")
@@ -427,8 +521,8 @@ class TestRateLimitAbort(TestCase):
         proc = SimpleNamespace(pid=1234)
         with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
                 patch.object(review_watch, "_stop_process_group") as stop:
-            abort.note(b"Reconnecting... 1/5 (WebSocket idle timeout)\n")
-            abort.note(b"Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for websocket)\n")
+            abort.note(b"Reconnecting... 1/5 (WebSocket idle timeout)\n", stderr=True)
+            abort.note(b"Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for websocket)\n", stderr=True)
             with self.assertRaises(ReviewLimitError) as raised:
                 abort.check("codex", proc)
         self.assertEqual(raised.exception.code, "review_provider_error")
@@ -444,8 +538,8 @@ class TestRateLimitAbort(TestCase):
         abort = RateLimitAbort()
         with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
                 patch.object(review_watch, "_stop_process_group"):
-            abort.note(b"error: rate limit exceeded, retrying in 30s\n")
-            abort.note(b"Reconnecting... 2/5 (backing off)\n")
+            abort.note(b"error: rate limit exceeded, retrying in 30s\n", stderr=True)
+            abort.note(b"Reconnecting... 2/5 (backing off)\n", stderr=True)
             with self.assertRaises(ReviewLimitError) as raised:
                 abort.check("codex", SimpleNamespace())
         self.assertEqual(raised.exception.code, "review_provider_error")
@@ -467,14 +561,15 @@ class TestRateLimitAbort(TestCase):
         abort = RateLimitAbort()
         with patch.object(review_watch, "monotonic", side_effect=[100.0, 161.0]), \
                 patch.object(review_watch, "_stop_process_group"):
-            abort.note(b"Provider retry: rate limit; attempt 3; waiting 120s\n")
+            abort.note(b"Provider retry: rate limit; attempt 3; waiting 120s\n", stderr=True)
             with self.assertRaises(ReviewLimitError):
                 abort.check("claude", SimpleNamespace())
 
     def test_github_limits_never_start_the_clock(self):
         abort = RateLimitAbort()
-        abort.note(b"error: GitHub 429: rate limit exceeded for resource\n")
-        abort.note(b"error: GitHub 403 rate-limit: {}\n")
+        abort.note(b"error: GitHub 429: rate limit exceeded for resource\n", stderr=True)
+        abort.note(b"error: GitHub 403 rate-limit: {}\n", stderr=True)
+        abort.note(b'{"type":"error","error":{"message":"GitHub 429: rate limit exceeded"}}\n')
         self.assertIsNone(abort.since)
         with patch.object(review_watch, "monotonic", return_value=10_000.0):
             abort.check("codex", SimpleNamespace())
@@ -482,12 +577,12 @@ class TestRateLimitAbort(TestCase):
     def test_marker_across_reads_still_counts(self):
         abort = RateLimitAbort()
         with tempfile.TemporaryFile(mode="w+t") as out, tempfile.TemporaryFile(mode="w+t") as err:
-            out.write("rate")
-            out.flush()
+            err.write("error: rate")
+            err.flush()
             abort.scan(out, err)
             self.assertIsNone(abort.since)
-            out.write(" limit exceeded, backing off\n")
-            out.flush()
+            err.write(" limit exceeded, backing off\n")
+            err.flush()
             abort.scan(out, err)
             self.assertIsNotNone(abort.since)
 
@@ -504,20 +599,20 @@ class TestRateLimitAbort(TestCase):
 
     def test_throttle_action_counts_without_a_status_code(self):
         abort = RateLimitAbort()
-        abort.note(b"error: rate limit exceeded, retrying in 30s\n")
+        abort.note(b"error: rate limit exceeded, retrying in 30s\n", stderr=True)
         self.assertIsNotNone(abort.since)
 
     def test_check_leaves_a_split_fragment_for_the_next_read(self):
         abort = RateLimitAbort()
         with tempfile.TemporaryFile(mode="w+t") as out, tempfile.TemporaryFile(mode="w+t") as err:
-            out.write("Reconnecting...")
-            out.flush()
+            err.write("Reconnecting...")
+            err.flush()
             abort.scan(out, err)
             self.assertIsNone(abort.since)
             abort.check("codex", SimpleNamespace())
-            self.assertEqual(abort.pending_out, b"Reconnecting...")
-            out.write(" 2/5, waiting\n")
-            out.flush()
+            self.assertEqual(abort.pending_err, b"Reconnecting...")
+            err.write(" 2/5, waiting\n")
+            err.flush()
             abort.scan(out, err)
             self.assertIsNotNone(abort.since)
 
@@ -533,7 +628,7 @@ class TestRateLimitAbort(TestCase):
         proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
         try:
             abort = RateLimitAbort()
-            abort.note(b"Reconnecting... 1/5\n")
+            abort.note(b"Reconnecting... 1/5\n", stderr=True)
             assert abort.since is not None
             with patch.object(review_watch, "monotonic", return_value=abort.since + 61):
                 with self.assertRaises(ReviewLimitError):
