@@ -37,6 +37,8 @@ export interface NativeChainHooks {
   note(behavior: ChainBehavior): string
   severity(behavior: ChainBehavior): string
   received(invocation: ChainInvocation, call: LogEntry): void
+  authenticationRejected?(call: LogEntry): void
+  authRecovered?(invocation: ChainInvocation): boolean
   reviews(repository: string, number: number): Promise<string>
   existing(seeds: ChainSeed[]): Promise<Set<string>>
   wake(): void
@@ -96,6 +98,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     permitted: hooks.permitted,
     wake: hooks.wake,
     received: hooks.received,
+    authenticationRejected: hooks.authenticationRejected,
+    authRecovered: hooks.authRecovered,
     async discover(): Promise<ChainSeed[]> {
       await runFile('github-datastore', organizationArgs(org, ['health', '--max-age-seconds', '120']), { timeoutMs: 30_000 })
       const settings = getBehaviorChainSettings()

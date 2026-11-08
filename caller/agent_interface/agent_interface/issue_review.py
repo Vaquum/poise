@@ -544,7 +544,7 @@ def _terminal_failure(provider: str, stdout: str) -> str | None:
         if not isinstance(event, dict):
             continue
         if provider == "codex" and event.get("type") in {"error", "turn.failed"}:
-            return str(event.get("message") or "Codex review did not complete successfully")
+            return provider_error(stdout, "") or "Codex review did not complete successfully"
         if provider == "claude" and event.get("type") == "result":
             if event.get("is_error") or event.get("subtype") not in (None, "success"):
                 text = event.get("result")
@@ -628,6 +628,10 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
         if provider_blocked(error):
             raise AgentPreflightError(error, "review_provider_blocked", diagnostic)
         code = "review_provider_error" if terminal and not done.returncode else "review_provider_exit"
+        # Classify the provider's own cause before credential redaction can
+        # hide natural-language words such as "token was".
+        if model.provider == "codex" and credential_rejected(raw):
+            code = "authentication_failed"
         raise ProviderFailure(error, code, diagnostic)
     progress.stage("validating", "Validating review comments")
     try:
@@ -637,6 +641,16 @@ def review(model: Model, repo: str, number: int, data: dict, actor: str, note: s
                                                     outcome="invalid_output", provider=model.provider,
                                                     artifact=artifact_status(output), submission="none")
         raise
+
+
+def credential_rejected(message: str) -> bool:
+    if re.search(r"github|\bgh:", message, re.I):
+        return False
+    return bool(re.search(
+        r"not\s+(?:signed|logged)\s+in|missing\s+credentials|invalid_grant|refresh_token_(?:reused|expired|revoked)"
+        r"|\b401\s+unauthorized\b|authentication[_ ](?:failed|error)"
+        r"|(?:refresh\s+token|credentials?)[^.\n]{0,160}(?:already\s+used|reused|revoked|expired|invalid|rejected)"
+        r"|(?:invalid|expired|revoked)\s+(?:refresh\s+)?(?:token|credentials?)", message, re.I))
 
 
 def provider_error(stdout: str, stderr: str) -> str:

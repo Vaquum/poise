@@ -99,7 +99,8 @@ import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
-import { behaviorHeld } from './alerts/producers'
+import { behaviorHeld, providerSignInRejected, providerSignInVerified } from './alerts/producers'
+import { consumeProviderRecovery, providerRecoveryAvailable, providerSignInFailure, recordProviderRecovery } from './accounts/logins'
 import { getWorkerCapacity, type WorkerCapacity } from './worker-capacity'
 
 const DATASTORE = 'github-datastore'
@@ -852,6 +853,7 @@ function reviewSlotOfTarget(target: string): ReviewerSlot {
 export type ReviewAccountFailureKind = 'balance' | 'signin'
 
 export function reviewAccountFailure(call: LogEntry): ReviewAccountFailureKind | null {
+  if (call.diagnostic && !call.diagnostic.operation.startsWith('provider.')) return null
   const error = String(call.error || '')
   // A bare 402 also matches pull/issue numbers and line numbers in wrapped
   // exceptions, so only the HTTP status reading trips: Caller's
@@ -860,7 +862,8 @@ export function reviewAccountFailure(call: LogEntry): ReviewAccountFailureKind |
     || /status\s+402\b/i.test(error)
     || /\b402\s+payment\b/i.test(error)
     || /http_status\D{0,8}402\b/i.test(error)) return 'balance'
-  if (/not\s+signed\s+in/i.test(error) || /missing\s+credentials/i.test(error)) return 'signin'
+  if (call.error_code === 'authentication_failed'
+    || !/github|\bgh:/i.test(error) && (/not\s+signed\s+in/i.test(error) || /missing\s+credentials/i.test(error))) return 'signin'
   return null
 }
 
@@ -948,7 +951,16 @@ function reviewerTripTarget(identity: string): string {
 type TripBehavior = PanelBehavior | 'approve-prs'
 const TRIP_BEHAVIORS: readonly TripBehavior[] = [...PANEL_BEHAVIORS, 'approve-prs']
 
+function observeProviderRejection(call: LogEntry): void {
+  if (call.status !== 'failed' || reviewAccountFailure(call) !== 'signin' || call.diagnostic?.operation !== 'provider.review') return
+  const identity = tripIdentity(call)
+  if (loadedCatalog()?.models.find(model => model.identity === identity)?.provider !== 'codex') return
+  providerSignInRejected('codex', { callId: call.id, model: identity!, rejectedAt: Date.parse(call.completed_at ?? ''),
+    phase: `${call.behavior} / ${call.diagnostic.phase}`, work: `${call.repo}#${call.pr_id}`, cause: call.error })
+}
+
 function tripReviewer(behavior: TripBehavior, identity: string, kind: ReviewerTripKind, callId: string): void {
+  if (kind === 'signin' && readBehaviorFailure(behavior, reviewerTripTarget(identity))?.callId === callId) return
   const message = kind === 'balance'
     ? `${identity} cannot review: its account is out of balance (402). Top up its credit; Poise retries automatically.`
     : kind === 'signin'
@@ -958,13 +970,21 @@ function tripReviewer(behavior: TripBehavior, identity: string, kind: ReviewerTr
         : kind === 'provider'
           ? `${identity} cannot review: its provider failed before the verdict. Poise retries automatically.`
           : `${identity} cannot review: it timed out before a verdict. Poise retries automatically.`
-  recordBehaviorFailure(behavior, 'operation', message, reviewerTripTarget(identity), { callId })
+  recordBehaviorFailure(behavior, 'operation', message, reviewerTripTarget(identity),
+    { callId, ...(kind === 'signin' ? { errorCode: 'authentication_failed' } : {}) })
+}
+
+function authTripRecovery(identity: string, trips: Array<PersistedBehaviorFailure | null>): boolean {
+  return trips.some(Boolean) && trips.every(trip => !trip || trip.diagnostic?.code === 'authentication')
+    && loadedCatalog()?.models.find(model => model.identity === identity)?.provider === 'codex'
+    && providerRecoveryAvailable('codex')
 }
 
 // A trip one behavior recorded gates the others too, until its backoff
 // comes due and one probe launch tests whether the reviewer works again.
 function reviewerTripped(identity: string): boolean {
-  return TRIP_BEHAVIORS.some((behavior) => !behaviorRetryDue(behavior, reviewerTripTarget(identity)))
+  const trips = TRIP_BEHAVIORS.map(behavior => readBehaviorFailure(behavior, reviewerTripTarget(identity)))
+  return trips.some(trip => trip && Date.now() < trip.nextRetryAtMs) && !authTripRecovery(identity, trips)
 }
 
 // Claims this launch as the backoff window's probe: bumps every due trip
@@ -974,27 +994,52 @@ function reviewerTripped(identity: string): boolean {
 // backoff. True for a reviewer with no trip at all. Two racing ticks may
 // each claim one probe; anything more is serialized out.
 function claimReviewerTripProbe(identity: string): boolean {
-  const trips = TRIP_BEHAVIORS.map((behavior) => ({
-    behavior,
-    trip: readBehaviorFailure(behavior, reviewerTripTarget(identity)),
-  }))
-  if (trips.some(({ trip }) => trip && Date.now() < trip.nextRetryAtMs)) return false
-  for (const { behavior, trip } of trips) {
-    if (!trip) continue
-    recordBehaviorFailure(behavior, 'operation', trip.error ?? `${identity} cannot review`,
-      reviewerTripTarget(identity), trip.callId ? { callId: trip.callId } : undefined)
-  }
-  return true
+  return db.transaction(() => {
+    const trips = TRIP_BEHAVIORS.map((behavior) => ({ behavior, trip: readBehaviorFailure(behavior, reviewerTripTarget(identity)) }))
+    const recovering = authTripRecovery(identity, trips.map(({ trip }) => trip))
+    if (trips.some(({ trip }) => trip && Date.now() < trip.nextRetryAtMs) && !recovering) return false
+    if (recovering && !consumeProviderRecovery('codex')) return false
+    for (const { behavior, trip } of trips) {
+      if (!trip) continue
+      recordBehaviorFailure(behavior, 'operation', trip.error ?? `${identity} cannot review`, reviewerTripTarget(identity),
+        { callId: trip.callId, ...(trip.diagnostic?.code === 'authentication' ? { errorCode: 'authentication_failed' } : {}) })
+    }
+    return true
+  }).immediate()
 }
 
 function clearReviewerTrip(identity: string): void {
   for (const behavior of TRIP_BEHAVIORS) clearBehaviorFailure(behavior, reviewerTripTarget(identity))
 }
 
+function reviewerSucceeded(call: LogEntry): void {
+  const identity = call.recovery_model || call.model
+  const catalog = loadedCatalog()
+  if (catalog?.models.find(model => model.identity === identity)?.provider === 'codex') {
+    const failure = providerSignInFailure('codex')
+    if (failure) {
+      const startedAt = Date.parse(agentCallStartedAt(call))
+      if (!Number.isFinite(startedAt) || startedAt <= failure.rejectedAt) return
+      recordProviderRecovery('codex', failure.callId, startedAt)
+      providerSignInVerified('codex')
+      // A successful review after the bounded probe releases sibling auth
+      // trips for this provider. Quota and other causes keep their clocks.
+      for (const behavior of TRIP_BEHAVIORS) for (const target of behaviorFailureTargets(behavior)) {
+        if (!target.startsWith(REVIEWER_TRIP_TARGET_PREFIX)) continue
+        const model = target.slice(REVIEWER_TRIP_TARGET_PREFIX.length)
+        if (catalog.models.find(entry => entry.identity === model)?.provider === 'codex'
+          && readBehaviorFailure(behavior, target)?.diagnostic?.code === 'authentication') clearBehaviorFailure(behavior, target)
+      }
+    }
+  }
+  clearReviewerTrip(identity)
+}
+
 // Trips the reviewer when a failed call is a provider failure before a
 // verdict, and releases the target so the next slot runs on the next tick —
 // true when the claim was released and reconciliation moves on.
 function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, call: LogEntry): boolean {
+  observeProviderRejection(call)
   const kind = reviewerTripKind(call)
   const identity = kind ? tripIdentity(call) : null
   if (!kind || !identity || !postedNothing(call)) return false
@@ -2285,8 +2330,7 @@ async function reconcileBehaviorLaunchClaims(
       // A verified verdict proves the account works again, whatever behavior
       // launched it. A verdict recovered from an output limit proves the
       // recovery model, which Caller names in `recovery_model`.
-      const prover = call.recovery_model || call.model
-      if (prover) clearReviewerTrip(prover)
+      reviewerSucceeded(call)
       const completed = completeBehaviorLaunchOwned({
         key: claim.key,
         target: claim.target,
@@ -6834,8 +6878,7 @@ async function reconcileIssueReviewClaims(): Promise<void> {
         quarantineClaim(claim, 'invalid_result', error, call.id, quarantineEvidence(snapshot, claim, call).mayRun)
         continue
       }
-      const prover = call.recovery_model || call.model
-      if (prover) clearReviewerTrip(prover)
+      reviewerSucceeded(call)
       dropActiveClaim(claim.claimId)
       if (completeIssueReviewLaunchOwned({
         key: claim.key,
@@ -7252,6 +7295,7 @@ async function runBehaviorChains(): Promise<void> {
     || !db.prepare('SELECT 1 FROM behavior_chain_current WHERE merged = 0 LIMIT 1').get())) return
   const org = currentOrganization()
   if (!org) return
+  if (!loadedCatalog() && providerSignInFailure('codex')?.verifiedAt != null) await loadCatalog()
   const cleanup = nativeCleanupSupport()
   if (behaviorChainJournal().cutover().mode === 'v2' && ['unsupported', 'unavailable'].includes(cleanup.status)) {
     behaviorChainHealth.set('@native-cleanup', { lastSweepAt: Date.now(), error: cleanup.error })
@@ -7329,15 +7373,34 @@ async function runBehaviorChains(): Promise<void> {
       },
       note: (behavior) => { const key = chainBehaviorKey(behavior); return key ? noteArgs(key)[1] ?? '' : '' },
       severity: (behavior) => getSetting(behavior === 'approve-pr' ? 'approve-prs' : 'review-new-prs'),
+      authenticationRejected(call) {
+        observeProviderRejection(call)
+        if (reviewAccountFailure(call) === 'signin' && call.action === 'not_started' && postedNothing(call)) {
+          const identity = tripIdentity(call)
+          if (identity) tripReviewer(call.behavior === 'pr_review' || call.behavior === 'pr_approve' ? 'review-new-prs' : ISSUES_KEY,
+            identity, 'signin', call.id)
+        }
+      },
       received(invocation, call) {
+        observeProviderRejection(call)
         if (call.error_code === 'native_cleanup_failed') invalidateNativeCleanup(call.error || 'Native cleanup verification failed')
         if (invocation.model === null) return
         const identity = call.recovery_model || call.model
-        if (call.status === 'completed') clearReviewerTrip(identity)
+        if (call.status === 'completed') reviewerSucceeded(call)
         else {
           const kind = reviewerTripKind(call)
           if (kind) tripReviewer(invocation.behavior === 'review-pr' || invocation.behavior === 'approve-pr' ? 'review-new-prs' : ISSUES_KEY, identity, kind, call.id)
         }
+      },
+      authRecovered(invocation) {
+        if (loadedCatalog()?.models.find(model => model.identity === invocation.model)?.provider !== 'codex') return false
+        const failure = providerSignInFailure('codex')
+        const completedAt = invocation.evidence?.completedAt
+        const diagnostic = invocation.evidence?.diagnostic as LogEntry['diagnostic']
+        return !!failure && failure.verifiedAt !== null && failure.verifiedAt > failure.rejectedAt
+          && typeof completedAt === 'number' && completedAt >= failure.since && completedAt <= failure.rejectedAt
+          && diagnostic?.operation === 'provider.review' && diagnostic.context.submission === 'none'
+          && invocation.evidence?.error_code === 'authentication_failed'
       },
       async reviews(repository, number) {
         const { readWorkReviews } = await import('./chat/control')

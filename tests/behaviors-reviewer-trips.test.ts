@@ -62,6 +62,64 @@ function expireBackoff(db: { getMeta: (key: string) => string | null, setMeta: (
 }
 
 describe('reviewer account trips', () => {
+  it.each([['authentication', false], ['rate limit', false], ['authentication', true]])('consumes verified recovery once when the next probe fails with %s (backoff expired=%s)', async (kind, expired) => {
+    const identity = 'gpt-6-astra-ultra'
+    const { db, runtime } = await startPrReviews({ primary: identity, secondary: 'opus-5-xhigh', tertiary: 'grok-4.6-xhigh' })
+    for (const model of ['opus-5-xhigh', 'grok-4.6-xhigh']) tripReviewer(db, model)
+    await runtime.runEnabledBehaviorsOnce()
+    const key = `${pr.repo}#${pr.number}`
+    const failure = { error: 'Your refresh [redacted credential] was already used. Please sign in again.',
+      error_code: 'authentication_failed', completed_at: new Date().toISOString(), action: 'not_started', outcome: 'preflight_failed',
+      diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'provider_execution',
+        outcome: 'exit', stderr: 'refresh rejected', submission: 'none' } }
+    fixture.agentLogs = [failedLog(db, key, identity, failure)]
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+    const producers = await import('../server/alerts/producers')
+    producers.accountsChecked([{ id: 'codex', installed: true, signedIn: true, version: '1', identity: null, detail: null, login: { label: 'codex' } }],
+      { me: 'poise-user', agentAccount: 'review-bot' })
+    expect(db.db.prepare("SELECT count(*) AS n FROM alerts WHERE dedupe_key='sign-in:codex' AND resolved_at IS NULL").get()).toEqual({ n: 1 })
+
+    const evidence = await import('../server/accounts/logins')
+    const rejection = evidence.providerSignInFailure('codex')!
+    evidence.recordProviderRecovery('codex', rejection.callId, Date.now())
+    if (expired) expireBackoff(db, 'review_new_prs', `reviewer:${identity}`)
+    fixture.listedPrs = [pr, { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18' }]
+    await runtime.runEnabledBehaviorsOnce()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(evidence.providerRecoveryAvailable('codex')).toBe(false)
+    const probe = db.listBehaviorLaunchClaims('review-new-prs')[0]
+    const target = `${probe.launchRepo}#${probe.launchPr}`
+    fixture.agentLogs = [failedLog(db, target, identity, { ...failure, id: '2'.repeat(32), pr_id: String(probe.launchPr),
+      repo: probe.launchRepo, completed_at: new Date().toISOString(),
+      ...(kind === 'rate limit' ? { error: 'HTTP 429 Too Many Requests', error_code: 'review_provider_exit' } : {}) })]
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+    // Re-reading the successful native request cannot rearm its allowance.
+    evidence.recordProviderRecovery('codex', rejection.callId, Date.now())
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ target: `reviewer:${identity}`, consecutiveFailures: 3 }),
+    ]))
+  })
+
+  it('preserves an unrelated rate-limit trip when the provider has fresh sign-in recovery', async () => {
+    const identity = 'gpt-6-astra-ultra'
+    const { db, runtime } = await startPrReviews({ primary: identity, secondary: 'opus-5-xhigh', tertiary: 'grok-4.6-xhigh' })
+    for (const model of ['opus-5-xhigh', 'grok-4.6-xhigh']) tripReviewer(db, model)
+    db.setMeta(`behavior_review_new_prs_failure:reviewer:${identity}`, JSON.stringify({ kind: 'operation', consecutiveFailures: 1,
+      lastFailureAtMs: Date.now(), nextRetryAtMs: Date.now() + 3600_000, diagnostic: { severity: 'info', code: 'rate_limit' }, error: 'HTTP 429 Too Many Requests' }))
+    const evidence = await import('../server/accounts/logins')
+    evidence.recordProviderRejection('codex', 'a'.repeat(32), identity, Date.now() - 1000)
+    evidence.recordProviderRecovery('codex', 'a'.repeat(32), Date.now())
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(evidence.providerRecoveryAvailable('codex')).toBe(true)
+  })
+
   const accountFailures: Array<{ name: string, error: string, extras: Record<string, unknown> }> = [
     {
       name: 'a 402 balance-exhausted preflight',

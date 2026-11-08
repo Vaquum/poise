@@ -10,7 +10,8 @@
 
 import { createHash } from 'node:crypto'
 import { materialFailureCause } from '../../gateway/src/diagnostics/material-cause'
-import { accountLoginsStrict, recordObservedSignIn, type AccountLogins } from '../accounts/logins'
+import { accountLoginsStrict, providerSignInFailure, recordObservedSignIn, recordProviderRejection, type AccountLogins } from '../accounts/logins'
+import { environmentSecrets, redact } from '../../gateway/src/diagnostics/redaction.mjs'
 import { CONNECTED_ACCOUNTS_PATH, GITHUB_AUTOMATION_SIGN_IN_TITLE, type AccountId, type ConnectedAccount } from '../accounts/types'
 import { behaviorLedgerSnapshot, type BehaviorLedgerSnapshot } from '../behavior-ledger'
 import type { ClaudeAuthStatus } from '../claude-auth'
@@ -94,6 +95,25 @@ export function claudeAuthStatusChanged(status: ClaudeAuthStatus): void {
 
 const ACCOUNT_NAMES: Partial<Record<AccountId, string>> = { codex: 'Codex', grok: 'Grok', muse: 'Muse', antigravity: 'Antigravity' }
 
+export function providerSignInRejected(id: AccountId, failure: { callId: string, model: string, rejectedAt: number,
+  phase: string, work: string, cause: string }): void {
+  recordProviderRejection(id, failure.callId, failure.model, failure.rejectedAt)
+  if (providerSignInFailure(id)?.verifiedAt != null) return
+  const name = ACCOUNT_NAMES[id] ?? id
+  const dedupeKey = `sign-in:${id}`
+  const body = `${name} rejected credentials during ${failure.phase} for ${failure.work}: ${redact(failure.cause, environmentSecrets()).slice(0, 500)} Connect it in Settings → Accounts.`
+  record(`the ${name} runtime sign-in alert`, () => {
+    raiseAlert({ kind: 'sign_in_needed', dedupeKey, title: `${name} needs you to sign in again`, body,
+      path: CONNECTED_ACCOUNTS_PATH, target: ACCOUNTS })
+    updateAlertDetails(dedupeKey, `${name} needs you to sign in again`, body)
+  })
+}
+
+export function providerSignInVerified(id: AccountId): void {
+  if (providerSignInFailure(id)?.verifiedAt == null) return
+  record(`the end of the ${id} runtime sign-in alert`, () => resolveAlert(`sign-in:${id}`))
+}
+
 /** The two GitHub accounts Settings → General names, each of which gh must
  *  hold signed in. */
 export interface GitHubIdentities {
@@ -140,6 +160,10 @@ export function accountsChecked(accounts: readonly ConnectedAccount[], identitie
     }
     const name = ACCOUNT_NAMES[account.id] ?? account.id
     const dedupeKey = `sign-in:${account.id}`
+    // A CLI can still report signed in after its server rejected refresh.
+    // Only a later successful native request can clear that condition.
+    const rejection = providerSignInFailure(account.id)
+    if (rejection && rejection.verifiedAt === null) continue
     if (!account.installed) {
       // Gone without a record it reads as never configured: clear a stale
       // demand. A configured provider keeps its demand until signed in.
