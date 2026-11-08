@@ -31,7 +31,19 @@ The existing behavior scheduler consumes one durable journal in Poise's existing
 
 Intake failures remain visible in runtime health and diagnostics while already-admitted chains continue reconciling and advancing. A stale discovery index cannot suspend execution evidence belonging to existing chains.
 
-An organization's sweep holds a try-lock for its whole run. A sweep that finds another sweep of that organization still running skips its chain work with a warning, and the next tick tries again. The rest of that tick still runs, and chain health and diagnostics keep what they already showed. So a sweep that never returns shows only as these repeated warnings and an unchanged `lastSweepAt`. Slow lock setup delays a sweep but never skips or fails it. Any other sweep error is reported in runtime health as a failure.
+An organization's sweep holds a zero-timeout try-lock for its whole run. An
+overlapping attempt skips only its chain work; the rest of the tick still runs.
+Skips are counted per organization without warning until overlap lasts more than
+two scheduler intervals (120 seconds) from its first skip, even before any sweep
+has completed. This elapsed-time progress budget is independent of one-second
+check-slot retries. Overdue overlap degrades runtime health with `runtimeError`,
+and the next contended attempt warns once for that episode. Contention establishes
+overdue overlap, not that the lock holder has stopped progressing. Skips and
+warnings preserve `lastSweepAt` and any genuine sweep error, which takes precedence
+in health. An observed sweep completion, successful or failed, ends the episode
+and logs its aggregate skip count and elapsed time; a failed completion retains
+its error. A later episode can warn again. Slow lock setup delays a sweep but
+never skips or fails it. Any other sweep error is reported in runtime health as a failure.
 
 ## Intake and controls
 
