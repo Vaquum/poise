@@ -26,6 +26,13 @@ Logging event. Unknown levels or invalid source timestamps produce visible
 collection warnings with the original source identity. Notification colors and
 successful change-request reviews do not determine technical severity.
 
+Repair preflight refusals are retained as Warnings when a failed `repair_pr`
+Call has `not_started` / `preflight_failed`, no executed head, and either
+`atomic_work_blocked` or `atomic_work_failed` with the exact cause
+`repair did not answer every unresolved review finding`. Structured process
+failure evidence remains authoritative. This classification changes neither
+Caller status nor publication, retry or hold rules.
+
 Credentials, encoded Git authentication, authorization/cookie headers and
 credential-bearing URLs are redacted before persistence. Context excludes
 prompts, content, responses, stdout, arguments, environment and conversation
@@ -161,11 +168,21 @@ immediate. These technical records do not depend on popup issuance or dismissal.
 The application starts a dedicated `logging.db` beside `POISE_DB` (otherwise
 `~/.poise/logging.db`). This is independent of alerts, dismissal and recovery.
 An adjacent private journal retains collection gaps and loss across restart.
+Full Caller history reads are capped at 128 MiB (134,217,728 bytes). A successful
+read at or above 96 MiB (75%) records one approaching-cap warning. A successful
+full-history read below 96 MiB rearms the warning.
 The bounded Caller completion stream is polled every 15 seconds without
 opening prompts or response/reasoning artifacts. Process capture excludes argv,
 stdout and environments; credential commands also exclude stderr. Sync phases,
 input admission limits, model-discovery outcomes, lock acquisition failures and
 temporary-filesystem pressure retain measurements known at the source.
+
+Claude auth status probes from the auth monitor and Connected accounts treat a
+recognized sign-in requirement returned with exit 1 as an ongoing condition,
+without another process error. The existing sign-in notice stays until the
+monitor verifies recovery with its canary. Status JSON must contain a boolean
+`loggedIn`; unrecognized output (including exit 0), other exit-1 failures,
+start failures and timeouts remain diagnostic errors.
 
 The gateway retains its separate central `logging.db` in `poise-gateway-data`.
 Existing volume backup/restore snapshots it with the other SQLite databases.
@@ -221,6 +238,17 @@ within 30 days (an empty source starts with five minutes); rotation, replacement
 historical uncertainty/gaps. The reader excludes unrelated hosts and request
 payloads before transport; canonical gateway normalization/redaction remains
 authoritative. Manual one-record delivery cannot renew this continuous lease.
+
+Caddy's native `warn` from `http.handlers.reverse_proxy` with message
+`aborting with incomplete response` is a normal close only for GET
+`/api/link/events` and the exact cause `reading: context canceled`. That warning
+occurs after response headers; it supplies neither status nor content type.
+The edge derives this one fixed route label before discarding the request URI.
+Missing discriminators, other routes, unexpected EOF, refusal, timeouts and
+other cancellations remain faults. All ingress paths retain the redacted native
+cause in `stderr`. A successful cancellation-only scan advances its checkpoint
+and renews observation without adding a fault or a gap; failed and bounded scans
+keep their existing coverage semantics. Link reconnect and replay are unchanged.
 
 Production starts capture after secure environment validation and before the
 application database modules load. An uncaught process failure retains a

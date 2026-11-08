@@ -400,9 +400,28 @@ export class BehaviorChainJournal {
 
   page(after = '', limit = 100, merged: boolean | null = null): BehaviorChain[] {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('behavior chain page must contain 1 to 100 records')
+    // Closure only changes this view; incomplete or conflicting evidence stays visible.
     const rows = (merged === null
       ? this.db.prepare('SELECT chain_id FROM behavior_chain_current WHERE chain_id > ? ORDER BY chain_id LIMIT ?').all(after, limit)
-      : this.db.prepare('SELECT chain_id FROM behavior_chain_current WHERE merged = ? AND chain_id > ? ORDER BY chain_id LIMIT ?').all(merged ? 1 : 0, after, limit)) as Array<{ chain_id: string }>
+      : this.db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE merged = ?
+        ${merged ? '' : `AND NOT coalesce((
+          json_type(state, '$.observation.issue.open') = 'false'
+          AND json_type(state, '$.observation.existingPulls') = 'array'
+          AND json_array_length(state, '$.observation.existingPulls') = 0
+          AND resource_pending = 0 AND json_extract(state, '$.reviewPending') IS NOT 1
+          AND NOT EXISTS (SELECT 1 FROM json_each(state, '$.invocations') i WHERE json_extract(i.value, '$.state') IS NOT 'settled')
+          AND json_extract(state, '$.observation.publication.merged') IS 0
+          AND json_extract(state, '$.observation.publication.merge_sha') IS NULL
+          AND ((json_type(state, '$.observation.pull') = 'null'
+            AND json_type(state, '$.observation.publication.pull_number') = 'null'
+            AND json_type(state, '$.observation.publication.state') = 'null')
+          OR (json_extract(state, '$.observation.pull.state') = 'closed'
+            AND json_extract(state, '$.observation.publication.state') = 'closed'
+            AND json_extract(state, '$.observation.pull.number') = json_extract(state, '$.observation.publication.pull_number')
+            AND json_extract(state, '$.observation.pull.merged') IS 0
+            AND json_extract(state, '$.observation.pull.mergeSha') IS NULL))
+        ), 0)`}
+        AND chain_id > ? ORDER BY chain_id LIMIT ?`).all(merged ? 1 : 0, after, limit)) as Array<{ chain_id: string }>
     return rows.map((row) => this.read(row.chain_id)!)
   }
 

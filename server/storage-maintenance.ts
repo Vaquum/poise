@@ -16,8 +16,8 @@ import { statfs } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { getMeta, setMeta } from './db'
-import { diagnostic } from './logging'
-import { isAbortError, runFile } from './process'
+import { diagnostic, diagnosticFailure } from './logging'
+import { isAbortError, isExpectedFailure, runFile } from './process'
 import { raiseAlert, resolveAlert } from './alerts/store'
 import { canonicalCheckout, CheckoutLease } from './chat/checkout-lock'
 import { inspectCheckout } from './chat/git'
@@ -675,14 +675,23 @@ async function expireEntries(
   }
 }
 
+const unsupportedTrimPaths = new Set<string>()
+
 async function trimFilesystem(path: string): Promise<number | null> {
+  if (unsupportedTrimPaths.has(path)) return null
   try {
-    const result = await runFile('fstrim', ['-v', path], { timeoutMs: 120_000, maxOutputBytes: 64 * 1024 })
+    const result = await runFile('fstrim', ['-v', path], {
+      timeoutMs: 120_000, maxOutputBytes: 64 * 1024,
+      expected: { codes: [1], stderr: /^fstrim: .+: the discard operation is not supported\s*$/ },
+    })
     const trimmed = /([\d,]+) bytes were trimmed/.exec(result.stdout)?.[1]?.replace(/,/g, '')
     return trimmed !== undefined && /^\d+$/.test(trimmed) ? Number(trimmed) : 0
   } catch (error) {
-    if (errorCode(error) === 'ENOENT') return null
-    console.error(`[storage] fstrim failed: ${error instanceof Error ? error.message : String(error)}`)
+    if (isExpectedFailure(error)) {
+      unsupportedTrimPaths.add(path)
+      diagnosticFailure('storage.trim.unsupported', error, { target: path }, { level: 'warning' })
+    }
+    // runFile's observer retains unexpected failures with their original stderr.
     return null
   }
 }

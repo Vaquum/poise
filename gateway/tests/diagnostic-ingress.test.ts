@@ -7,10 +7,15 @@ import { receiveIngress, INGRESS_LEASE_MS } from '../src/diagnostics/ingress.js'
 import { DiagnosticStore } from '../src/diagnostics/store.js'
 import { receiveManualIngress } from '../src/diagnostics/ingress.js'
 import { executeLoggingRead } from '../src/diagnostics/query-worker.js'
+import { nativeDiagnostic } from '../src/diagnostics/sources.js'
+import { normalize } from '../src/diagnostics/contract.js'
 
 const NOW = Date.parse('2026-10-19T10:00:00.000Z')
 const access = { workspace: null, operator: true }
 const container = 'a'.repeat(64)
+// Caddy's post-header warning has no response status or content type.
+const cancellation = { level: 'warn', ts: (NOW - 2000) / 1000, logger: 'http.handlers.reverse_proxy', msg: 'aborting with incomplete response', error: 'reading: context canceled',
+  request: { host: 'alice.poise.test', method: 'GET', uri: '/api/link/events?private-query', headers: { Authorization: 'private-header' } } }
 const dirs: string[] = []
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }) })
 function store(now = () => NOW) {
@@ -36,18 +41,88 @@ it('commits actual Python source projection through the consumer, redaction and 
     '2026-10-19T09:59:58.123456789Z ' + JSON.stringify(input.records[0].log),
     '2026-10-19T09:59:58.123456789Z ' + JSON.stringify({ ...input.records[0].log, request: { host: 'unrelated-business.test' }, msg: 'other-business-private-cause' }),
     '2026-10-19T09:59:58.123456789Z ' + JSON.stringify({ ...input.records[0].log, level: 'info', msg: 'routine native record' }),
+    '2026-10-19T09:59:58.123456789Z ' + JSON.stringify(cancellation),
+    '2026-10-19T09:59:58.123456790Z ' + JSON.stringify({ ...cancellation, error: 'reading: unexpected EOF' }),
   ]
-  const projected: unknown = JSON.parse(execFileSync('python3', ['-c', python, resolve('../deploy/ingress/reporter.py')], { input: JSON.stringify({ ...input, lines }), encoding: 'utf8', timeout: 5000 }))
+  const projected: { records: unknown[] } = JSON.parse(execFileSync('python3', ['-c', python, resolve('../deploy/ingress/reporter.py')], { input: JSON.stringify({ ...input, lines }), encoding: 'utf8', timeout: 5000 }))
+  execFileSync(process.execPath, ['deploy/ingress/build.mjs'], { cwd: resolve('..'), timeout: 15_000 })
+  const safe = execFileSync(process.execPath, [resolve('../test-results/ingress/projection.cjs'), 'poise.test'], { input: JSON.stringify(projected.records), encoding: 'utf8', timeout: 5000 })
   const db = store()
   try {
-    const replies = await send(db, projected)
-    expect(replies[1]).toMatchObject({ accepted: true, currentStatus: 'connected', events: 1 })
+    const replies = await send(db, { ...projected, records: JSON.parse(safe) })
+    expect(replies[1]).toMatchObject({ accepted: true, currentStatus: 'connected', events: 2 })
     const page = db.query(access)
-    expect(page.total).toBe(1)
-    expect(page.events[0]).toMatchObject({ source: 'ingress', visibility: 'operator', workspace: null, message: 'dial tcp: refused ?[query omitted]', context: { host: 'alice.poise.test', method: 'GET' } })
+    expect(page.total).toBe(2)
+    expect(page.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: 'ingress', visibility: 'operator', workspace: null, message: 'dial tcp:[redacted header]' }),
+      expect.objectContaining({ message: cancellation.msg, stderr: 'reading: unexpected EOF', context: expect.objectContaining({ route: '/api/link/events', method: 'GET' }) }),
+    ]))
+    expect(safe).not.toMatch(/private-header|private-query|uri|headers/)
+    expect(JSON.stringify(page)).not.toContain('reading: context canceled')
     expect(JSON.stringify(page)).not.toMatch(/private-header|private-query|other-business-private-cause|routine native record/)
     expect(db.query({ workspace: 'alice', operator: false }).total).toBe(0)
     expect(db.readCoverage(access)[0]).toMatchObject({ currentStatus: 'connected', availableFrom: input.from })
+  } finally { db.close() }
+})
+
+it('excludes only the exact native Link cancellation and retains ambiguous cancellations and other causes', () => {
+  expect(normalize(nativeDiagnostic(cancellation, 'ingress', 'cancel', null), NOW)).toBeNull()
+  const faults = [
+    { ...cancellation, error: 'reading: unexpected EOF' },
+    { ...cancellation, error: 'dial tcp: connection refused' },
+    { ...cancellation, error: 'reading: i/o timeout' },
+    { ...cancellation, error: 'context canceled' },
+    { ...cancellation, error: 'reading: context canceled (unknown cause)' },
+    ...['level', 'logger', 'msg', 'error'].map((key) => Object.fromEntries(Object.entries(cancellation).filter(([name]) => name !== key))),
+    { ...cancellation, level: 'error' },
+    { ...cancellation, logger: 'http.handlers.other' },
+    { ...cancellation, msg: 'request canceled before response' },
+    ...[{}, { method: 'GET' }, { uri: '/api/link/events' }, { method: 'POST', uri: '/api/link/events' },
+      { method: 'GET', uri: '/api/link/snippets' }, { method: 'GET', uri: '/api/link/events/other' },
+      { method: 'GET', uri: '/api/link/snippets', route: '/api/link/events' }].map((request) => ({ ...cancellation, request })),
+  ]
+  for (const [index, fault] of faults.entries()) {
+    const event = normalize(nativeDiagnostic(fault, 'ingress', String(index), null), NOW)
+    expect(event, JSON.stringify(fault)).not.toBeNull()
+    if (typeof fault.error === 'string') expect(event?.stderr).toBe(fault.error)
+  }
+})
+
+it('advances cancellation-only scans and renews observation without faults, gaps or an ingestion timestamp', async () => {
+  let now = NOW
+  const db = store(() => now)
+  const record = { id: 'c'.repeat(64), time: new Date(NOW - 2000).toISOString(), log: { ...cancellation, request: { host: 'alice.poise.test', method: 'GET', route: '/api/link/events' } } }
+  try {
+    const first = { ...batch(), until: record.time, records: [record] }
+    const [, ack] = await send(db, first, () => now)
+    expect(ack).toMatchObject({ events: 0, currentStatus: 'connected' })
+    expect(db.checkpoint('external-ingress-window')).toBe(ack.checkpoint)
+    expect(db.readCoverage(access)[0]).toMatchObject({ status: 'connected', gaps: [], ingestedAt: null, observationExpiresAt: new Date(now + INGRESS_LEASE_MS).toISOString() })
+    now += 15_000
+    const next = { ...first, expected: ack.checkpoint, from: first.until, until: new Date(now - 1000).toISOString() }
+    const [, renewed] = await send(db, next, () => now)
+    expect(renewed).toMatchObject({ events: 0, currentStatus: 'connected' })
+    expect(renewed.checkpoint).not.toBe(ack.checkpoint)
+    expect(db.checkpoint('external-ingress-window')).toBe(renewed.checkpoint)
+    expect(db.query(access).total).toBe(0)
+    expect(db.readCoverage(access)[0]).toMatchObject({ status: 'connected', gaps: [], ingestedAt: null, observedAt: new Date(now).toISOString(), observationExpiresAt: new Date(now + INGRESS_LEASE_MS).toISOString() })
+  } finally { db.close() }
+})
+
+it('preserves redacted native causes in manual ingress while routine cancellation acknowledges no fault', async () => {
+  const db = store()
+  try {
+    for (const error of ['reading: context canceled', 'reading: unexpected EOF', 'dial tcp: refused\nAuthorization: Bearer private-secret']) {
+      async function* stdin() { yield JSON.stringify({ ...cancellation, error }) }
+      const replies: string[] = []
+      await receiveManualIngress(db, 'poise.test', stdin(), (line) => replies.push(line))
+      if (error === cancellation.error) expect(JSON.parse(replies[0]).eventId).toBeNull()
+    }
+    const page = db.query(access)
+    expect(page.total).toBe(2)
+    expect(page.events.map((event) => event.stderr)).toContain('reading: unexpected EOF')
+    expect(page.events.some((event) => event.stderr?.includes('dial tcp: refused'))).toBe(true)
+    expect(JSON.stringify(page)).not.toMatch(/private-secret|private-query|private-header/)
   } finally { db.close() }
 })
 

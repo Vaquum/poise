@@ -48,6 +48,17 @@ class IngressTests(unittest.TestCase):
         self.assertNotIn("private-header", json.dumps(result))
         self.assertNotIn("private-query", json.dumps(result))
 
+    def test_link_events_route_is_classified_before_discarding_the_uri(self):
+        start, end = NOW - dt.timedelta(minutes=5), NOW
+        for uri in ("/api/link/events", "/api/link/events?private-query", "/api/link/events/other", "/api/link/snippets", None):
+            with self.subTest(uri=uri):
+                native = {"level": "warn", "logger": "http.handlers.reverse_proxy", "msg": "aborting with incomplete response", "error": "reading: context canceled",
+                          "request": {"host": "alice.poise.test", "method": "GET", "uri": uri, "headers": {"Authorization": "private-header"}}}
+                record = reporter.projected(b"2026-10-19T09:59:58.123456789Z " + json.dumps(native).encode(), "poise.test", start, end)
+                expected = "/api/link/events" if uri in ("/api/link/events", "/api/link/events?private-query") else None
+                self.assertEqual(record["log"]["request"].get("route"), expected)
+                self.assertNotIn("private-", json.dumps(record))
+
     def test_unstructured_lines_do_not_discard_attributable_records_in_the_same_second(self):
         native = b"2026-10-19T09:59:58.123456789Z goroutine 1 [running]:\n" + line() + b"\n"
         def source(argv, **_options):
