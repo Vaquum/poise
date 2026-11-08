@@ -1157,6 +1157,9 @@ at its last confirmed time; restart remains initializing until a fresh scan.
 Canonical host selection and redaction run on the edge before transmission,
 then attribution and normalization run again at the gateway. See the
 [external reader installation contract](../deploy/ingress/README.md).
+The edge also derives the fixed `/api/link/events` route label before removing
+the URI. All ingress paths apply the narrow native cancellation exception and
+retain other redacted causes as defined in [Logging](Logging.md#collection-and-operation).
 
 `GET /api/service/diagnostics?cursor=OPAQUE` is a maintenance-only delivery
 route: loopback or the existing gateway `admin` assertion, never browser/link
