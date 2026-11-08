@@ -527,6 +527,9 @@ function launch(login: string): void {
   const promise = Promise.resolve().then(async () => {
     const initial = rowFor(login)
     if (!initial?.managed || !initial.datastore_path) return
+    const me = getMeta('me')?.trim()
+    if (initial.status === 'ready' && initial.next_sync_at > Date.now()) return
+    if (initial.status === 'ready' && initial.indexed_user === me && Date.now() - initial.last_sync_at < SYNC_INTERVAL_MS) return
     let env: NodeJS.ProcessEnv | undefined
     try {
       const directory = dirname(initial.datastore_path)

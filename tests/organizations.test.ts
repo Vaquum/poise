@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { withProcessLock } from '../server/process-lock'
 import type { RunFileOptions } from '../server/process'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), diagnosticFailure: vi.fn(), lockIoDelayMs: 0 }))
@@ -14,8 +15,8 @@ vi.mock('../server/process-lock', async (importOriginal) => {
   return {
     ...actual,
     // Keep real ownership; acquisition deadlines have their own lock tests.
-    withProcessLock: <T>(options: import('../server/process-lock').ProcessLockOptions, operation: () => Promise<T>) =>
-      actual.withProcessLock({ ...options, timeoutMs: 1000 }, operation),
+    withProcessLock: vi.fn(<T>(options: import('../server/process-lock').ProcessLockOptions, operation: () => Promise<T>) =>
+      actual.withProcessLock({ ...options, timeoutMs: 1000 }, operation)),
   }
 })
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -312,6 +313,52 @@ describe('organization activation', () => {
 })
 
 describe('managed organization synchronization', () => {
+  it.each([
+    { state: 'fresh', age: 0, backoff: 0, me: 'octocat' },
+    { state: 'in backoff', age: 60_000, backoff: 60_000, me: 'octocat' },
+    { state: 'in backoff after an identity change', age: 60_000, backoff: 60_000, me: 'new-user' },
+  ])('skips lock setup for a mirror that is $state', async ({ age, backoff, me }) => {
+    const background = await import('../server/release-background')
+    organizations!.addOrganization('acme')
+    await ready('acme')
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+    mocks.runFile.mockClear()
+    vi.mocked(withProcessLock).mockClear()
+    database!.setMeta('me', me)
+    const now = Date.now()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = ?, next_sync_at = ?').run(now - age, backoff ? now + backoff : 0)
+
+    organizations!.startOrganizationsRuntime()
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+
+    expect(withProcessLock).not.toHaveBeenCalled()
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
+  it('rechecks freshness after acquiring a lock for a due mirror', async () => {
+    const background = await import('../server/release-background')
+    const account = organizations!.addOrganization('acme')
+    await ready('acme')
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+    mocks.runFile.mockClear()
+    vi.mocked(withProcessLock).mockClear()
+    database!.db.prepare('UPDATE organizations SET last_sync_at = 0').run()
+    const holder = new Database(`${account.datastorePath}.lock`, { fileMustExist: true })
+    holder.exec('BEGIN IMMEDIATE')
+    try {
+      organizations!.startOrganizationsRuntime()
+      await vi.waitFor(() => expect(withProcessLock).toHaveBeenCalledTimes(1))
+      database!.db.prepare('UPDATE organizations SET last_sync_at = ?').run(Date.now())
+    } finally {
+      holder.exec('ROLLBACK')
+      holder.close()
+    }
+
+    await expect(vi.mocked(withProcessLock).mock.results[0]!.value).resolves.toBeUndefined()
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+    expect(mocks.runFile).not.toHaveBeenCalled()
+  })
+
   it('repairs legacy full-build retry markers in bounded chunks before requesting a delta sync', async () => {
     organizations!.addOrganization('acme')
     await ready('acme')
@@ -433,9 +480,11 @@ describe('managed organization synchronization', () => {
     await ready('acme')
     await ready('beta')
     mocks.runFile.mockClear()
+    vi.mocked(withProcessLock).mockClear()
     database!.db.prepare('UPDATE organizations SET last_sync_at = 0, last_reconcile_at = 0 WHERE managed = 1').run()
     organizations!.startOrganizationsRuntime()
     await vi.waitFor(() => expect(operations('health')).toHaveLength(2))
+    expect(withProcessLock).toHaveBeenCalledTimes(2)
     expect(operations('sync').filter((call) => call[1].includes('--reconcile'))).toHaveLength(2)
     expect(operations('sync').every((call) => call[1][1].includes('/datastores/'))).toBe(true)
     expect(operations('init-org')).toHaveLength(0)
