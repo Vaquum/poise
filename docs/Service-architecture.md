@@ -1251,7 +1251,10 @@ unreadable, and its backlog excludes proven chain-owned issues. See
 Chain/status summaries also expose derived reconciliation timing for quiescent
 ownership. The existing scheduler and indexed journal projection bound GitHub
 rechecks while preserving the public active/merged filters, native resource
-settlement and immutable history. The normal-work page precedes due quiescent
+settlement and immutable history. Confirmed closed seeds without remaining
+obligations leave the active list before pagination, retaining ownership and
+unfiltered/history reads as defined in [Behavior chain](Behavior-chain.md).
+The normal-work page precedes due quiescent
 reconciliation; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
