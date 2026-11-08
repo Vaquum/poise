@@ -363,6 +363,15 @@ campaign acceptance or forced-container recovery.
 
 Known failures before publication retry with bounded backoff and existing provider fallback. Ambiguous writes retain ownership. Confirmed actual artifacts can settle a lost response; missing receipts cannot justify another write. Partially published review/reply plans that cannot be fully reconciled remain uncertain and visible. They are not silently retried or reported successful. This limitation must be exercised and resolved if encountered in the real validation runs.
 
+An implementation or repair provider that reaches its execution deadline records
+`atomic_work_execution_budget_exhausted`. Its v1 diagnostic retains the provider,
+execution phase, measured elapsed milliseconds, actual seconds allowance and
+seed issue/PR/head, without command arguments or provider output. Caller keeps
+`not_started` / `preflight_failed`; the chain retains the diagnostic and exposes
+the specific cause as its invocation outcome in History. Preparation timeouts
+remain distinct. Retry still requires positive resource release and the existing
+same-basis backoff; three failures hold the chain across restart until **Resume**.
+
 Repair prompts name the exact unresolved root comment IDs from the head-verified
 review packet, including outdated threads and roots with earlier replies.
 Caller requires that same set before publication. Missing coverage records

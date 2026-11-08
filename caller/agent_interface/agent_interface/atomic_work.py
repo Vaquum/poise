@@ -1,10 +1,13 @@
 """One implementation or repair invocation, with no persistent model session."""
 import json
+import subprocess
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 
 from . import checkout_lock, issue_review, progress, review_budget, resource_ownership
 from .model_catalog import Model
+from .process_diagnostic import diagnostic_envelope
 
 UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended; report a blocker instead of inventing a human answer. Caller owns publication."
 
@@ -72,7 +75,18 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         try:
             record({"phase": "executing", "prepared": prepared})
             progress.stage("waiting_provider", "Waiting for atomic behavior provider", timeout=seconds)
-            done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
+            started = monotonic()
+            try:
+                done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
+            except subprocess.TimeoutExpired as error:
+                raise review_budget.ReviewLimitError(
+                    "Atomic behavior provider exhausted its execution budget; no publication attempted",
+                    "atomic_work_execution_budget_exhausted",
+                    diagnostic_envelope(operation="provider.atomic_work", phase="provider_execution", outcome="timed_out",
+                                        executable=model.provider, elapsed_ms=round((monotonic() - started) * 1000),
+                                        timeout_seconds=seconds, repository=repo, pr=pull, expected_head=expected_head,
+                                        behavior="repair_pr" if pull is not None else "implement_issue",
+                                        message=f"Seed issue {repo}#{number}", submission="none")) from error
             record({"phase": "resources_unknown", "prepared": prepared})
             issue_review.stop_leftovers(work)
             if issue_review._cwd_pids(work, require_complete=True) != []:

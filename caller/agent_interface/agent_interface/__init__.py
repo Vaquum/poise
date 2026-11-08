@@ -1485,7 +1485,8 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         finish(id_, "failed", error="Stopped by user" if stopped else str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
                action="not_started" if no_publication else None,
-               outcome="preflight_failed" if no_publication else None)
+               outcome="preflight_failed" if no_publication else None,
+               diagnostic=getattr(error, "diagnostic", None))
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)

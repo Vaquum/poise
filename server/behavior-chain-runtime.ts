@@ -46,6 +46,7 @@ function receipt(call: LogEntry): Record<string, unknown> {
     resources_settled_at: call.resources_settled_at ?? null,
     resource_ownership: call.resource_ownership ?? null,
     ...(call.resource_guard ? { resource_guard: call.resource_guard } : {}),
+    ...(call.diagnostic ? { diagnostic: call.diagnostic } : {}),
     error: call.error, error_code: call.error_code ?? null, completedAt: call.completed_at ? Date.parse(call.completed_at) : null }
 }
 
@@ -469,7 +470,8 @@ export class BehaviorChainRuntime {
     }
     this.operations.received(invocation, call)
     chain = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
-      outcome: call.outcome || call.error_code || call.status, evidence: receipt(call) })
+      outcome: call.error_code === 'atomic_work_execution_budget_exhausted' ? call.error_code : call.outcome || call.error_code || call.status,
+      evidence: receipt(call) })
     if (stopped) return chain
     if (call.status === 'failed' && call.action !== 'not_started') return this.append(chain, { type: 'chain.held',
       reason: `behavior invocation ${invocation.id} failed after a possible write; its artifact needs reconciliation` })
