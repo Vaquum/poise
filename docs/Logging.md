@@ -167,6 +167,13 @@ stdout and environments; credential commands also exclude stderr. Sync phases,
 input admission limits, model-discovery outcomes, lock acquisition failures and
 temporary-filesystem pressure retain measurements known at the source.
 
+Claude auth status probes from the auth monitor and Connected accounts treat a
+recognized sign-in requirement returned with exit 1 as an ongoing condition,
+without another process error. The existing sign-in notice stays until the
+monitor verifies recovery with its canary. Status JSON must contain a boolean
+`loggedIn`; unrecognized output (including exit 0), other exit-1 failures,
+start failures and timeouts remain diagnostic errors.
+
 The gateway retains its separate central `logging.db` in `poise-gateway-data`.
 Existing volume backup/restore snapshots it with the other SQLite databases.
 Gateway warnings/errors are redacted before Docker stdout and retained directly.
