@@ -6,6 +6,7 @@ type Settings = NonNullable<AppSettings['behaviorChain']>
 interface ChainRow {
   id: string, repository: string, issue: number, sequence: number, held: string | null, waiting: string | null,
   mergeSha: string | null, reviewPending?: boolean | null, reviewStatus?: 'pending' | 'complete' | 'not-recorded', pullNumber: number | null,
+  supersession?: { covering: Array<{ number: number, mergeSha: string }>, failures: Array<{ id: number }>, recovery: { id: number } } | null,
   reconciliation?: { nextObservationAt: number | null, waitingForOriginalResponse: boolean, waitingForResourceRelease?: boolean } | null,
   invocations: Array<{ behavior: string, state: string, outcome?: string | null,
     nativeAction?: { attribution: string, outcome: string | null } | null }>
@@ -184,16 +185,22 @@ export function behaviorChainSettings() {
       list.innerHTML = rows.map((chain) => {
         const active = chain.invocations.find(invocation => invocation.state !== 'settled')
         const last = chain.invocations[chain.invocations.length - 1]
-        const github = /^[-A-Za-z0-9_.]+\/[-A-Za-z0-9_.]+$/.test(chain.repository) && Number.isSafeInteger(chain.issue)
+        const githubTarget = /^[-A-Za-z0-9_.]+\/[-A-Za-z0-9_.]+$/.test(chain.repository) && Number.isSafeInteger(chain.issue)
+        const github = githubTarget
           ? `<a href="https://github.com/${escapeHtml(chain.repository)}/issues/${chain.issue}">#${chain.issue}</a>` : escapeHtml(chain.id)
-        const complete = !!chain.mergeSha && !chain.reviewPending
+        const complete = !!chain.supersession || !!chain.mergeSha && !chain.reviewPending
         const progress = active ? `${active.behavior}: ${active.state}${active.outcome ? ` · ${active.outcome}` : ''}`
           : chain.waiting || 'Awaiting the next observation'
-        const state = [chain.mergeSha ? `Merged: ${chain.mergeSha.slice(0, 12)}` : '',
+        const state = [chain.supersession ? 'Superseded; duplicate PR closed' : '', chain.mergeSha ? `Merged: ${chain.mergeSha.slice(0, 12)}` : '',
           chain.reviewPending ? 'Review evidence pending' : '',
           chain.mergeSha && (chain.reviewStatus === 'not-recorded' || chain.reviewPending == null) ? 'Pre-merge review completion not recorded' : '',
           !complete && chain.held ? `Held: ${chain.held}` : '', !complete ? progress : ''].filter(Boolean).join(' · ')
-        const control = chain.mergeSha ? '' : ` <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-sequence="${Number(chain.sequence)}" data-operation="${chain.held ? 'resume' : 'hold'}"${!cutover ? ' disabled' : ''}>${chain.held ? 'Resume' : 'Hold new invocations'}</button>`
+        const control = chain.mergeSha || chain.supersession ? '' : ` <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-sequence="${Number(chain.sequence)}" data-operation="${chain.held ? 'resume' : 'hold'}"${!cutover ? ' disabled' : ''}>${chain.held ? 'Resume' : 'Hold new invocations'}</button>`
+        const supersession = chain.supersession && githubTarget ? [
+          ...chain.supersession.covering.map(pull => `<a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(pull.number)}">Covering PR #${Number(pull.number)} (${escapeHtml(pull.mergeSha.slice(0, 12))})</a>`),
+          ...chain.supersession.failures.map(run => `<a href="https://github.com/${escapeHtml(chain.repository)}/actions/runs/${Number(run.id)}">Failing run</a>`),
+          `<a href="https://github.com/${escapeHtml(chain.repository)}/actions/runs/${Number(chain.supersession.recovery.id)}">Recovery run</a>`,
+        ].join(' · ') : ''
         const attribution = last?.nativeAction?.attribution === 'accepted-response' ? ' · original action response accepted'
           : last?.nativeAction?.attribution === 'observed-no-action' ? ' · observed; mutation not attributed'
             : last?.nativeAction?.attribution === 'not-recorded' ? ' · action attribution not recorded' : ''
@@ -203,7 +210,7 @@ export function behaviorChainSettings() {
           : chain.reconciliation?.waitingForOriginalResponse ? ' · Original action response required; GitHub reads cannot settle this invocation.'
           : chain.reconciliation?.nextObservationAt && chain.reconciliation.nextObservationAt > Date.now()
             ? ` · Next original-evidence observation: ${new Date(chain.reconciliation.nextObservationAt).toLocaleString()}.` : ''
-        return `<li>v2 · ${github}${chain.pullNumber ? ` → <a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(chain.pullNumber)}">PR #${Number(chain.pullNumber)}</a>` : ''}: ${escapeHtml(state)}${escapeHtml(obligation)}${escapeHtml(recheck)}${!active && last ? ` · Last: ${escapeHtml(last.behavior)} (${escapeHtml(last.outcome || last.state)}${escapeHtml(attribution)})` : ''}${control} <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-operation="history">History</button></li>`
+        return `<li>v2 · ${github}${chain.pullNumber ? ` → <a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(chain.pullNumber)}">PR #${Number(chain.pullNumber)}</a>` : ''}: ${escapeHtml(state)}${supersession ? ` · ${supersession}` : ''}${escapeHtml(obligation)}${escapeHtml(recheck)}${!active && last ? ` · Last: ${escapeHtml(last.behavior)} (${escapeHtml(last.outcome || last.state)}${escapeHtml(attribution)})` : ''}${control} <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-operation="history">History</button></li>`
       }).join('') || '<li>No behavior chains.</li>'
       const errors = Array.isArray(data.runtime) ? data.runtime.filter((entry: { error: string | null }) => entry.error).map((entry: { organization: string, error: string }) => `${entry.organization}: ${entry.error}`).join('; ') : ''
       status.textContent = `Read ${new Date().toLocaleTimeString()}${errors ? ` · ${errors}` : ''}`

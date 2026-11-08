@@ -137,6 +137,23 @@ test('unmerged ownership retains its Hold control and unavailable reads disable 
   await expect(hold).toBeDisabled()
 })
 
+test('supersession links the covering merge and both runs without claiming the duplicate merged or offering Resume', async ({ page }) => {
+  await workspace(page)
+  const snapshot = chainSummaryFixture('unmerged')
+  snapshot.chains[0].supersession = { verified: true, covering: [{ number: 940, mergeSha: 'b'.repeat(40) }],
+    failures: [{ id: 1 }], recovery: { id: 2 }, duplicate: { number: 17, head: 'a'.repeat(40) } }
+  await page.route('**/api/behavior-chains', route => route.fulfill({ json: snapshot }))
+  const controls = await general(page)
+  const list = controls.locator('[data-chain-list]')
+  await expect(list).toContainText('Superseded; duplicate PR closed')
+  await expect(list).not.toContainText('Merged:')
+  await expect(list.getByRole('link', { name: /Covering PR #940/ })).toHaveAttribute('href', 'https://github.com/acme/repo/pull/940')
+  await expect(list.getByRole('link', { name: 'Recovery run' })).toHaveAttribute('href', 'https://github.com/acme/repo/actions/runs/2')
+  await expect(list.getByRole('link', { name: 'Failing run' })).toHaveAttribute('href', 'https://github.com/acme/repo/actions/runs/1')
+  await expect(list.getByRole('button', { name: /Resume|Hold new invocations/ })).toHaveCount(0)
+  await expect(list.getByRole('button', { name: 'History' })).toBeEnabled()
+})
+
 for (const state of ['pending-admitted', 'pending-no-invocation', 'pending-original-response', 'historical'] as const) {
   test(`merged chain controls reflect canonical ${state} evidence without creating review authority`, async ({ page }) => {
     await workspace(page)

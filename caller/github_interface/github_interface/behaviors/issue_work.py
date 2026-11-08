@@ -158,6 +158,37 @@ async def run(client: GitHubClient, payload: dict) -> dict:
             result["reply_receipts"] = await review_replies(client, target, int(pull["number"]), actor, str(payload.get("invocation_id") or ""), replies, publish=False)
             result["replies_complete"] = len(result["reply_receipts"]) == len(replies)
         return result
+    if mode == "retire":
+        from github_interface import full_suite_repair
+        from github_interface.behaviors import issue_comments
+
+        expected = str(payload.get("expected_head") or "")
+        proof = json.loads(payload.get("coverage_json") or "null")
+        if not pull or not SHA.fullmatch(expected) or not isinstance(proof, dict) or proof.get("verified") is not True \
+                or proof.get("duplicate") != {"number": pull["number"], "head": expected}:
+            raise ValueError("retirement requires the original verified full-suite coverage and duplicate head")
+        if pull.get("merged_at") or pull.get("merged"):
+            raise ValueError("a merged pull request cannot be retired as redundant")
+        result.update(merged=False, merge_sha=None, head_sha=expected)
+        if result["existing_pulls"]:
+            return {**result, "outcome": "not_ready", "reason": "linked work needs a decision"}
+        if pull["head"]["sha"] != expected or remote_head != expected:
+            return {**result, "outcome": "superseded", "reason": "duplicate head changed; a decision is required"}
+        issue = await client.get(f"/repos/{target}/issues/{issue_number}")
+        comments = await issue_comments.run(client, payload)
+        verified = await full_suite_repair.inspect(client, target, issue, comments["comments"], pull)
+        if verified != proof:
+            return {**result, "outcome": "not_ready", "reason": "full-suite coverage changed; a decision is required"}
+        current = await get_pull(client, owner, repo, pull["number"])
+        if any(current.get(key) != pull.get(key) for key in ("head", "base", "body", "user", "updated_at")) \
+                or current["head"]["sha"] != expected or remote_head != expected or current.get("merged"):
+            return {**result, "outcome": "superseded", "reason": "duplicate head or publication context changed; a decision is required"}
+        if current["state"] == "closed":
+            return {**result, "outcome": "already_closed", "coverage": verified}
+        closed = await client.patch(f"/repos/{target}/pulls/{pull['number']}", json={"state": "closed"})
+        if closed.get("state") != "closed" or closed.get("merged") or closed.get("merged_at") or closed["head"]["sha"] != expected:
+            raise RuntimeError("GitHub did not confirm closing the original redundant head")
+        return {**result, "outcome": "closed", "state": "closed", "coverage": verified}
     if result["existing_pulls"]:
         raise ValueError("seed issue already has another open pull request; its existing owner must continue")
     issue = await client.get(f"/repos/{target}/issues/{issue_number}")

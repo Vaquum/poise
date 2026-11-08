@@ -7,7 +7,7 @@ import { nativeResourcesPending, resourceReleaseProven } from './behavior-resour
 const CUTOVER_ID = '@behavior-admission'
 interface CutoverEvent { type: 'admission.changed', state: BehaviorCutoverState }
 
-export type ChainBehavior = 'review-issue' | 'implement-issue' | 'publish-issue' | 'review-pr' | 'repair-pr' | 'approve-pr' | 'resolve-threads' | 'merge-pr' | 'rerun-grey-ci'
+export type ChainBehavior = 'review-issue' | 'implement-issue' | 'publish-issue' | 'review-pr' | 'repair-pr' | 'approve-pr' | 'resolve-threads' | 'merge-pr' | 'rerun-grey-ci' | 'retire-pr'
 export interface ChainInvocation {
   id: string
   behavior: ChainBehavior
@@ -40,6 +40,7 @@ export interface BehaviorChain {
   waiting: string | null
   resumedAfterSequence: number
   mergeSha: string | null
+  supersession?: Record<string, unknown>
   reviewPending?: boolean
   observation: Record<string, unknown> | null
   invocations: ChainInvocation[]
@@ -54,6 +55,7 @@ export type ChainEvent =
   | { type: 'chain.waiting', reason: string }
   | { type: 'chain.resumed' }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
+  | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
   | { type: 'invocation.started', invocationId: string }
   | { type: 'invocation.reconciled', invocationId: string, evidence: Record<string, unknown> }
@@ -84,9 +86,10 @@ function resourceArtifact(prior: unknown, value: unknown): Record<string, unknow
 // contradictory historical releases. Index the projection so settled history
 // cannot turn each capacity/observation read into a full journal scan.
 const LIVE_MODEL_SQL = 'resource_pending = 1'
-const ACTIVE_WORK_SQL = `CASE WHEN (json_extract(state, '$.mergeSha') IS NULL AND json_extract(state, '$.held') IS NULL)
+const ACTIVE_WORK_SQL = `CASE WHEN (json_extract(state, '$.mergeSha') IS NULL AND json_extract(state, '$.supersession') IS NULL AND json_extract(state, '$.held') IS NULL)
   OR (${LIVE_MODEL_SQL}) THEN 1 ELSE 0 END`
 const RECHECK_AT_SQL = `CASE
+  WHEN json_extract(state, '$.supersession') IS NOT NULL THEN NULL
   WHEN json_extract(state, '$.mergeSha') IS NOT NULL AND json_extract(state, '$.reviewPending') IS NOT 1 THEN NULL
   WHEN (${ACTIVE_WORK_SQL}) = 1 THEN 0
   WHEN json_extract(state, '$.mergeSha') IS NOT NULL AND json_extract(state, '$.invocations[#-1].state') != 'settled'
@@ -128,8 +131,20 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
     if (next.mergeSha && next.mergeSha !== event.mergeSha) throw new Error('behavior chain merge evidence conflicts')
     next.mergeSha = event.mergeSha.toLowerCase()
     if (typeof event.evidence.review_complete === 'boolean') next.reviewPending = !event.evidence.review_complete
+  } else if (event.type === 'chain.superseded') {
+    const close = next.invocations.at(-1)
+    const result = (close?.evidence?.nativeActionReceipt as { result?: Record<string, unknown> } | undefined)?.result
+    if (next.mergeSha || next.held || next.supersession || !close || close.behavior !== 'retire-pr'
+      || close.state !== 'settled' || !['closed', 'already_closed'].includes(String(result?.outcome))
+      || event.evidence.verified !== true || chainBasis(result?.coverage) !== chainBasis(event.evidence)
+      || next.invocations.some(invocation => invocation.state !== 'settled' || nativeResourcesPending({ ...invocation })
+        || invocation.model !== null && invocation.callId !== null && !resourceReleaseProven(invocation.evidence ?? {}, true))) {
+      throw new Error('supersession requires the original close response and settled native ownership')
+    }
+    next.supersession = event.evidence
+    next.waiting = null
   } else if (event.type === 'invocation.admitted') {
-    if (next.held || next.mergeSha) throw new Error('behavior chain does not admit invocations')
+    if (next.held || next.mergeSha || next.supersession) throw new Error('behavior chain does not admit invocations')
     const invocation = event.invocation
     if (!invocation.id || !invocation.basis || !invocation.actor || !Number.isSafeInteger(invocation.admittedAt)
       || invocation.admittedAt < 0 || next.invocations.some((prior) => prior.id === invocation.id)
@@ -220,7 +235,7 @@ export class BehaviorChainJournal {
     }
     const index = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'behavior_chain_reconciliation'")
       .get() as { sql: string } | undefined
-    if (index && !index.sql.includes('resource_pending')) db.exec('DROP INDEX behavior_chain_reconciliation')
+    if (index && (!index.sql.includes('resource_pending') || !index.sql.includes('$.supersession'))) db.exec('DROP INDEX behavior_chain_reconciliation')
     db.exec(`
       CREATE TABLE IF NOT EXISTS behavior_chain_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT, chain_id TEXT NOT NULL,
@@ -404,7 +419,7 @@ export class BehaviorChainJournal {
     const rows = (merged === null
       ? this.db.prepare('SELECT chain_id FROM behavior_chain_current WHERE chain_id > ? ORDER BY chain_id LIMIT ?').all(after, limit)
       : this.db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE merged = ?
-        ${merged ? '' : `AND NOT coalesce((
+        ${merged ? '' : `AND json_extract(state, '$.supersession') IS NULL AND NOT coalesce((
           json_type(state, '$.observation.issue.open') = 'false'
           AND json_type(state, '$.observation.existingPulls') = 'array'
           AND json_array_length(state, '$.observation.existingPulls') = 0
