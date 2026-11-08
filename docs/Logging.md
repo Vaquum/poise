@@ -161,6 +161,9 @@ immediate. These technical records do not depend on popup issuance or dismissal.
 The application starts a dedicated `logging.db` beside `POISE_DB` (otherwise
 `~/.poise/logging.db`). This is independent of alerts, dismissal and recovery.
 An adjacent private journal retains collection gaps and loss across restart.
+Full Caller history reads are capped at 128 MiB (134,217,728 bytes). A successful
+read at or above 96 MiB (75%) records one approaching-cap warning. A successful
+full-history read below 96 MiB rearms the warning.
 The bounded Caller completion stream is polled every 15 seconds without
 opening prompts or response/reasoning artifacts. Process capture excludes argv,
 stdout and environments; credential commands also exclude stderr. Sync phases,
