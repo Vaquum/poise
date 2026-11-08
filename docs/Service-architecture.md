@@ -1116,6 +1116,11 @@ Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
 recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, or
 whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
 its own, keeping its volume and respecting the native settlement barrier.
+The operator scripts retain an exact-release rollout receipt beyond their
+bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
+receipt through the existing workspace health/image proof without initiating
+another rollout; [Upgrades](Operating.md#upgrades) defines its outcomes and
+retained evidence. This adds no gateway or workspace API.
 
 **Provider CLIs** are installed into each person's home volume on first start
 and update themselves there, as Poise already does before each launch. The
