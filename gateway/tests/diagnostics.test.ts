@@ -90,6 +90,45 @@ describe('one diagnostic contract', () => {
     expect(JSON.stringify(input)).not.toContain('private argument')
   })
 
+  it.each([
+    { error_code: 'atomic_work_failed', error: 'repair did not answer every unresolved review finding' },
+    { error_code: 'atomic_work_blocked', error: 'atomic behavior blocked: required CI is failing' },
+  ])('retains a repair preflight refusal as a queryable warning: $error_code', (failure) => {
+    const row = { id: 'd'.repeat(32), correlation_id: 'repair-attempt', completed_at: new Date(NOW).toISOString(),
+      behavior: 'repair_pr', status: 'failed', action: 'not_started', outcome: 'preflight_failed', head_sha: null,
+      repo: 'acme/repo', pr_id: '12', actor: 'bot', expected_head: 'a'.repeat(40), ...failure }
+    const record = workspaceEnvelope(normalize(callerDiagnostic(row, 'alice')!, NOW)!, 'alice', NOW, [])
+    const db = store(); db.append([record])
+    expect(db.query(alice, { severities: ['warning'], source: 'caller', callId: row.id, correlationId: row.correlation_id })).toMatchObject({
+      total: 1, events: [{ severity: 'warning', source: 'caller', operation: 'repair_pr', message: failure.error,
+        callId: row.id, correlationId: row.correlation_id, repository: row.repo, pr: row.pr_id,
+        context: { errorCode: failure.error_code, action: row.action, outcome: row.outcome, expectedHead: row.expected_head, observedHead: null } }],
+    })
+    expect(callerDiagnostic({ ...row, diagnostic: { version: 1, severity: 'warning', operation: 'provider.cli_update' } }, 'alice')).toMatchObject({ level: 'warning' })
+  })
+
+  it.each([
+    { name: 'another behavior', update: { behavior: 'implement_issue' } },
+    { name: 'a nonfailed call', update: { status: 'completed' } },
+    { name: 'a possible write', update: { action: null, outcome: null } },
+    { name: 'a missing action', update: { action: null } },
+    { name: 'a missing outcome', update: { outcome: null } },
+    { name: 'an executed head', update: { head_sha: 'b'.repeat(40) } },
+    { name: 'a blocked repair with an executed head', update: { error_code: 'atomic_work_blocked', head_sha: 'b'.repeat(40) } },
+    { name: 'a provider crash', update: { error: 'provider exited 1' } },
+    { name: 'malformed output', update: { error: 'atomic behavior blocked: invalid output' } },
+    { name: 'a nonexact missing-replies message', update: { error: 'repair did not answer every unresolved review finding: extra detail' } },
+    { name: 'another error code', update: { error_code: 'review_provider_error' } },
+    { name: 'a structured process failure', update: { diagnostic: { version: 1, severity: 'error', operation: 'fetch',
+      stderr: 'fatal: missing ref', context: { exit_code: 128 } } } },
+  ])('keeps $name at error severity despite repair preflight metadata', ({ update }) => {
+    const input = callerDiagnostic({ id: 'e'.repeat(32), behavior: 'repair_pr', status: 'failed',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, error_code: 'atomic_work_failed',
+      error: 'repair did not answer every unresolved review finding', ...update }, 'alice')!
+    expect(normalize(input, NOW)).toMatchObject({ severity: 'error' })
+    if ('diagnostic' in update) expect(input).toMatchObject({ operation: 'fetch', stderr: 'fatal: missing ref', exitCode: 128 })
+  })
+
   it('preserves typed source and Caller identities through short-secret redaction and backfill', async () => {
     const callId = 'a1'.repeat(16); const correlationId = 'ab12cd34-ab12-cd34-ab12-cd34ab12cd34'
     const input = callerDiagnostic({ id: callId, correlation_id: correlationId, completed_at: new Date(NOW).toISOString(),
