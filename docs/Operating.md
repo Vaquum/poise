@@ -461,11 +461,21 @@ both of these:
 | `POISE_UPSTREAM_SYNC` | variable | `true` |
 | `POISE_SYNC_TOKEN` | secret | A fine-grained personal access token for the fork, made as below |
 
-The Sync workflow then merges autonomio/poise's main into the fork's main
-every five minutes, as the **Sync fork** button on the fork's page does, and
-what that brought in deploys once its CI passes, so a merged change reaches
-the server about ten to twenty-five minutes later. GitHub may start a
-scheduled run some minutes late when it is busy.
+The Sync workflow checks every five minutes. With `POISE_DEPLOY_HOST` set, it
+retains the fork's current main through both required push workflows (CI and
+Caller) and its gated, serialized Deploy attempt. Green CI alone does not
+release the candidate, nor does a successful Deploy that skipped its apply
+step. Then Sync merges directly to the newest upstream main, coalescing changes
+that arrived during verification. Forks without deployment keep syncing every
+five minutes. GitHub may start a scheduled run some minutes late when it is busy.
+
+Missing verification, a failed or cancelled required workflow or Deploy attempt,
+or two hours since verification began lets the next sync admit a newer fix;
+it never permits deployment without that fix's own required CI. API errors stop
+the sync visibly. Sync's Actions summary names waiting, blocked and superseded
+SHAs and links the available runs. A completed Deploy attempt alone is not a
+serving claim: the existing [workspace verification](#upgrades) and
+`/api/service/health`'s `release` establish the commit actually serving.
 A change to Poise alone then reaches the running workspaces within five more
 minutes. A change to the system under `deploy/runtime/` first waits for their
 running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
