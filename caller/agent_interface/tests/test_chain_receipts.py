@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import sys
 from contextlib import nullcontext, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -151,7 +152,8 @@ class ManagedReceipts(TestCase):
 
 class AtomicWorkLimits(TestCase):
     def setUp(self):
-        self.directory = TemporaryDirectory()
+        # Cleanup needs consistent file/directory device IDs on managed boxes.
+        self.directory = TemporaryDirectory(dir="/dev/shm" if sys.platform == "linux" else None)
         self.addCleanup(self.directory.cleanup)
         root = Path(self.directory.name)
         self.path = root / "calls.sqlite3"

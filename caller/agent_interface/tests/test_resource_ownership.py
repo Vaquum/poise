@@ -10,7 +10,7 @@ import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from unittest import TestCase, skipUnless
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import agent_interface as api
 from agent_interface import issue_review, resource_ownership as ownership, review_receipt
@@ -18,7 +18,9 @@ from agent_interface import issue_review, resource_ownership as ownership, revie
 
 class ResourceOwnershipCase(TestCase):
     def setUp(self):
-        self.work = tempfile.TemporaryDirectory()
+        # Managed test boxes report different devices for files and directories
+        # on /tmp. Keep these cleanup fixtures on a consistent filesystem.
+        self.work = tempfile.TemporaryDirectory(dir="/dev/shm" if sys.platform == "linux" else None)
         self.addCleanup(self.work.cleanup)
         self.root = Path(self.work.name).resolve()
         for target in (patch.object(api, "DB", self.root / "calls.sqlite3"),
@@ -173,6 +175,26 @@ class ResourceOwnershipCase(TestCase):
                 self.assertFalse(ownership.cleanup(api.DB, call, root))
                 self.assertEqual(sentinel.read_text(), "protected")
                 self.assertFalse(ownership.released(self.state(call)))
+
+    def test_cleanup_refuses_a_differing_child_device_without_releasing_ownership(self):
+        call = self.call()
+        root = ownership.allocate(api.DB, call, self.root / "owned")
+        sentinel = root / "foreign-data"
+        sentinel.write_text("protected")
+        before = self.state(call)
+        info = list(sentinel.stat())
+        info[2] = root.stat().st_dev + 1  # st_dev
+        child = Mock()
+        child.name = sentinel.name
+        child.stat.return_value = os.stat_result(info)
+        with patch.object(ownership.os, "scandir") as scan:
+            scan.return_value.__enter__.return_value = [child]
+            self.assertFalse(ownership.cleanup(api.DB, call, root))
+        after = self.state(call)
+        self.assertEqual(sentinel.read_text(), "protected")
+        self.assertEqual(after["roots"], before["roots"])
+        self.assertEqual(after["errors"][0]["cause"], "native resource cleanup crosses a filesystem boundary")
+        self.assertFalse(ownership.released(after))
 
     def test_a_failed_positive_receipt_write_is_not_replaced_by_a_release_from_path_absence(self):
         call = self.call()
