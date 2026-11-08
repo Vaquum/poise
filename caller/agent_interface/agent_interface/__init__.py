@@ -1481,7 +1481,7 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         with db() as conn:
             row = conn.execute("select error_code from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
-        no_publication = artifact.get("phase") in {"preparing", "prepared", "executing"}
+        no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline"}
         finish(id_, "failed", error="Stopped by user" if stopped else str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
                action="not_started" if no_publication else None,

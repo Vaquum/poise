@@ -1,5 +1,6 @@
 """One implementation or repair invocation, with no persistent model session."""
 import json
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -11,6 +12,65 @@ UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended
 
 class AtomicWorkBlocked(ValueError):
     code = "atomic_work_blocked"
+
+
+def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: str, queue: dict) -> dict:
+    """Bind a worker's diagnosis to native integration and exact-base log evidence."""
+    if not isinstance(value, dict) or value.get("head") != head \
+            or not re.fullmatch(rf"https://github\.com/{re.escape(repo)}/(?:issues|pull)/[1-9][0-9]*", str(value.get("remediation"))):
+        raise ValueError("CI dependency lacks its candidate or remediation")
+    removals = queue.get("queue_removals", [])
+    removal = removals[-1] if removals else None
+    if queue.get("head_sha") != head or not removal or removal.get("reason") != "failed_checks" \
+            or removal.get("id") != value.get("removal") \
+            or (removal.get("beforeCommit") or {}).get("oid") != value.get("integration"):
+        raise ValueError("CI dependency does not identify the failed queue integration")
+    common = [str(pull), "--repository", repo, "--token-user", actor]
+    integration = issue_review.interface("--list-failing-ci", *common, "--ref", str(value["integration"]))
+    base = value.get("base")
+    parents = integration.get("parents", [])
+    if integration.get("head_sha") != head or integration.get("ref") != value["integration"] \
+            or not parents or parents[0] != base or head not in parents[1:]:
+        raise ValueError("CI dependency integration does not contain the exact candidate and base")
+    baseline = issue_review.interface("--list-failing-ci", *common, "--ref", str(base))
+    failures = value.get("failures")
+    if baseline.get("head_sha") != head or baseline.get("ref") != base \
+            or not isinstance(failures, list) or not failures or len(failures) > 100:
+        raise ValueError("CI dependency lacks exact-base failure evidence")
+    verified, used = [], set()
+    for failure in failures:
+        if not isinstance(failure, dict):
+            raise ValueError("CI dependency failure evidence is invalid")
+        check = next((item for item in integration["failing"] if item.get("check_run_id") == failure.get("check")), None)
+        prior = next((item for item in baseline["failing"] if item.get("check_run_id") == failure.get("baselineCheck")), None)
+        excerpt = failure.get("evidence")
+        if not check or not prior or check["check_run_id"] in used or check.get("head_sha") != value["integration"] \
+                or prior.get("head_sha") != base or check.get("name") != prior.get("name") \
+                or check.get("state") != "completed" or check.get("conclusion") != "failure" \
+                or prior.get("state") != "completed" or prior.get("conclusion") != "failure" \
+                or not isinstance(excerpt, str) or not 20 <= len(excerpt.strip()) <= 2000:
+            raise ValueError("CI dependency requires matching completed failures and a specific cause excerpt")
+        run = next((item for item in integration["runs"] if item.get("id") == check.get("run_id")), None)
+        base_run = next((item for item in baseline["runs"] if item.get("id") == prior.get("run_id")), None)
+        if not run or run.get("event") != "merge_group" or run.get("head_sha") != value["integration"] \
+                or not base_run or base_run.get("head_sha") != base or base_run.get("event") not in {"push", "workflow_dispatch", "schedule"} \
+                or not run.get("workflow_id") or run["workflow_id"] != base_run.get("workflow_id"):
+            raise ValueError("CI dependency workflow identities do not prove a baseline failure")
+        for item in (check, prior):
+            if not item.get("log_id"):
+                raise ValueError("CI dependency has no readable job log")
+            log = issue_review.interface("--read-failing-ci-log", str(item["log_id"]), "--repository", repo, "--token-user", actor)
+            if log.get("repository", "").lower() != repo.lower() or excerpt not in log.get("log", ""):
+                raise ValueError("CI dependency cause is absent from its actual job logs")
+        used.add(check["check_run_id"])
+        verified.append({**failure, "name": check["name"], "run": run["id"], "workflow": run["workflow_id"],
+                         "baselineRun": base_run["id"]})
+    remediation = issue_review.interface("--read-issue", value["remediation"].rsplit("/", 1)[1],
+                                         "--repository", repo, "--token-user", actor)
+    if not remediation.get("issue"):
+        raise ValueError("CI dependency remediation could not be read")
+    return {**value, "failures": verified,
+            "allShared": len(used) == len(integration["failing"])}
 
 
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
@@ -48,6 +108,16 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         f"for {repo}#{number}. Read the issue and ALL its review comments below before changing code. "
         "Implement the actual requested behavior with minimal changes and meaningful regression coverage. "
         "For a repair, address every actionable review/CI/conflict blocker in the evidence; inspect actual CI logs through github-interface. "
+        "Keep repairs scoped to the seed issue. Never independently edit a verified shared baseline failure; use its existing remediation. "
+        "Green PR checks, another PR failing the same shard, or a remediation link alone do not establish a shared cause. "
+        "For a shared queue failure, add ciDependency to the JSON: {head: candidate SHA, removal: queue removal id, "
+        "integration: failed merge-group SHA, base: its first parent SHA, remediation: existing GitHub issue/PR URL, "
+        "failures: [{check: failed check id, baselineCheck: failed check id on that exact base, evidence: specific common failure excerpt}]}. "
+        "For a verified shared-only failure leave blocked null; Caller retains a recoverable wait without publishing a baseline patch. "
+        "Use github-interface --list-failing-ci PR --ref SHA to inspect integration/base checks, parents and workflow runs, "
+        "and --read-failing-ci-log for the actual causes. Account for every cause in each claimed shared check; "
+        "a generic failure line is insufficient. Fix candidate-specific failures and review findings normally alongside the dependency. "
+        "Incomplete or contradictory evidence remains unresolved; do not claim it shared or return no_changes as acceptance. "
         "Run the repository's required checks. Never fabricate reviews, approvals, CI, completion, or tests. "
         "Do not start other agents or chats, schedule work, create orchestration scripts, modify Poise settings, "
         "commit, push, open a PR, submit reviews, resolve threads or merge. Caller performs publication after this invocation ends. "
@@ -88,6 +158,13 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                 raise ValueError("atomic behavior blocked: invalid output")
             if publication.get("blocked"):
                 raise AtomicWorkBlocked(f"atomic behavior blocked: {publication['blocked']}")
+            dependency = None
+            if publication.get("ciDependency") is not None:
+                if pull is None or not expected_head:
+                    raise ValueError("CI dependencies require an exact repair candidate")
+                dependency = _verify_ci_dependency(publication["ciDependency"], repo, pull, expected_head, actor, evidence["queue"])
+                if dependency["remediation"] in {f"https://github.com/{repo}/issues/{number}", f"https://github.com/{repo}/pull/{pull}"}:
+                    raise ValueError("CI dependency cannot use its own repair as the external remediation")
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
                 raise ValueError("atomic behavior publication metadata is incomplete")
             replies = publication.get("replies", [])
@@ -111,6 +188,27 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                 return validated
             if validated.get("outcome") != "validated":
                 raise ValueError("publication validation returned no confirmation; no publication attempted")
+            if dependency is not None:
+                if type(validated.get("has_changes")) is not bool:
+                    raise ValueError("CI dependency requires a complete checkout validation")
+                record({"phase": "executing", "prepared": prepared, "ci_dependency": dependency})
+                candidate_checks = [check for check in evidence["ci"].get("failing", [])
+                                    if check.get("state") in {"failure", "error"}
+                                    or check.get("state") == "completed" and check.get("conclusion") not in {"success", "neutral", "skipped", None}]
+                candidate_blockers = candidate_checks or merge_base or any(
+                    not thread["is_resolved"] for thread in evidence["review_packet"]["review_threads"])
+                if dependency["allShared"] and not candidate_blockers:
+                    # The disposable worker checkout may contain an independent
+                    # baseline patch. Only its external dependency is retained.
+                    record({"phase": "waiting_baseline", "prepared": prepared, "ci_dependency": dependency})
+                    return {"outcome": "no_changes", "head_sha": expected_head}
+                if validated.get("has_changes") is not True and not dependency["allShared"]:
+                    raise AtomicWorkBlocked("candidate integration failures remain unresolved alongside the shared dependency")
+                if validated.get("has_changes") is False and not replies:
+                    if evidence["ci"].get("failing"):
+                        raise AtomicWorkBlocked("candidate CI failures remain unresolved alongside the shared dependency")
+                    record({"phase": "waiting_baseline", "prepared": prepared, "ci_dependency": dependency})
+                    return {"outcome": "no_changes", "head_sha": expected_head}
             receipt = {"phase": "publishing", "prepared": prepared, "publication": publication}
             record(receipt)
             progress.stage("publishing", "Publishing the verified checkout through github-interface")

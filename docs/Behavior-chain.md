@@ -378,6 +378,28 @@ another repair solely because the original thread is still unresolved. A new
 change request, failing CI, conflict, base update or changed seed still requires
 repair; approval and native conversation resolution retain their own gates.
 
+A queue repair can retain a shared baseline CI dependency in its existing
+Caller artifact (`ci_dependency`), instead of editing unrelated baseline code.
+The worker's `ciDependency` output must identify the exact candidate, latest
+queue removal, failed merge-group commit and its base, failing check/run,
+existing remediation, and a specific cause excerpt verified in both integration
+and exact-base job logs from the same workflow. Green PR checks, another PR's
+failure or a remediation link alone provide no such proof. Missing evidence
+remains unresolved; candidate-specific failures still require normal repair.
+
+An unchanged, verified shared failure settles as `no_changes` with that
+dependency, without publication or a durable hold. The normal tick retains the
+candidate/check/remediation in its wait reason and rechecks the current base's
+latest matching workflow checks. Missing, pending or failed checks keep the
+wait; remediation closure or merge does not release it. Operator holds retain
+their authority. Recovery re-observes the current candidate and passes the
+normal exact-head reviews, independent approval and fresh native merge-group
+gates. Current heads retain their own review/CI obligations; a new queue
+rejection needs its own diagnosis. Mixed repairs may
+publish candidate fixes while retaining the verified shared dependency.
+When every failure is shared and no candidate CI, review or conflict blocker
+exists, Caller retains only the dependency, even if the worker proposed edits.
+
 An uncertain grey-CI rerun is inspected through the existing native command in
 read-only mode. A later attempt of that exact workflow/head settles its original
 admission; an unchanged attempt remains uncertain. A confirmed preflight read

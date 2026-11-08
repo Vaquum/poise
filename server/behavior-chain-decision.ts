@@ -21,6 +21,7 @@ export interface ChainObservation extends Record<string, unknown> {
   existingPulls: string[]
   workPublication?: { callId: string, repliesComplete: boolean, resumable?: boolean, planSha?: string }
   greyRecovery?: { invocationId: string, receipt: Record<string, unknown> }
+  ciDependency?: { invocationId: string, base: string, recovered: boolean }
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,
     queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null },
@@ -47,6 +48,24 @@ function settled(chain: BehaviorChain, behavior: ChainBehavior, basis: string, s
 
 function succeeded(invocation: ChainInvocation): boolean {
   return invocation.evidence?.status === 'completed'
+}
+
+export function chainCiDependency(chain: BehaviorChain, removal?: string | null) {
+  const invocation = [...chain.invocations].reverse().find(item => item.behavior === 'repair-pr' && item.state === 'settled' && succeeded(item)
+    && (item.evidence?.artifact as Record<string, unknown> | null)?.ci_dependency)
+  if (!invocation) return null
+  const value = (invocation.evidence!.artifact as Record<string, unknown>).ci_dependency
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('repair CI dependency is invalid')
+  const dependency = value as { head: string, integration: string, base: string, removal: string, remediation: string,
+    allShared: boolean, failures: Array<{ check: number, name: string, run: number, workflow: number }> }
+  if (![dependency.head, dependency.integration, dependency.base].every(sha => typeof sha === 'string' && /^[0-9a-f]{40}$/.test(sha))
+    || dependency.head !== invocation.request.context?.head || dependency.removal !== invocation.request.context.queueRemoval
+    || typeof dependency.remediation !== 'string' || !Array.isArray(dependency.failures) || !dependency.failures.length
+    || dependency.failures.some(item => !item || typeof item.name !== 'string'
+      || ![item.check, item.run, item.workflow].every(id => Number.isSafeInteger(id) && id > 0))
+    || dependency.allShared !== true && invocation.evidence?.action !== 'published') throw new Error('repair CI dependency lacks its verified integration evidence')
+  if (removal && removal !== dependency.removal) return null
+  return { invocation, dependency }
 }
 
 export function chainReviewResponse(chain: BehaviorChain, invocation: ChainInvocation, observation: ChainObservation,
@@ -177,7 +196,15 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     && chain.invocations.some((invocation) => invocation.behavior === 'approve-pr' && invocation.callId === review.invocation))
   if (dismissed) return { kind: 'hold', reason: `approval ${dismissed.id} was dismissed on the current head; a decision is required` }
   const lastQueue = lastChainQueueInvocation(chain)
+  const dependency = chainCiDependency(chain, pull.queueRemoval?.id)
   let queueVerification: string | null = null
+  if (dependency && !pull.failing.length && !pull.conflict && !pull.behind && !pull.changesRequested
+    && !(pull.unresolved && !pull.approved)) {
+    const recovery = observation.ciDependency
+    if (recovery?.invocationId !== dependency.invocation.id || !recovery.recovered) return { kind: 'wait',
+      reason: `shared baseline CI dependency: ${dependency.dependency.remediation}; candidate ${dependency.dependency.head}; integration ${dependency.dependency.integration}; base ${dependency.dependency.base}; ${dependency.dependency.failures.map(item => `${item.name} (run ${item.run}, check ${item.check})`).join(', ')}; awaiting verified base recovery` }
+    queueVerification = chainBasis(['baseline-recovery', pull.head, dependency.invocation.id, recovery.base, pull.reviewContext])
+  }
   if (lastQueue?.evidence?.head_sha === pull.head) {
     const removal = pull.queueRemoval
     if (!removal || removal.at < lastQueue.admittedAt) return { kind: 'wait', reason: 'queue entry disappeared; awaiting GitHub removal evidence' }
@@ -189,7 +216,7 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       && repair.request.context?.reviewRevision !== pull.reviewRevision)) return propose(chain, 'repair-pr',
       chainBasis(['queue', pull.head, removal.id, pull.reviewRevision]), chain.author, observation.repairer,
       `diagnose and repair GitHub queue rejection ${removal.id}: ${removal.reason}; PR-head green checks do not prove integration success`, now)
-    queueVerification = chainBasis(['queue-verification', pull.head, removal.id, repair.id])
+    queueVerification ??= chainBasis(['queue-verification', pull.head, removal.id, repair.id])
   }
   const reviewedHeadBasis = chainBasis(['pr', pull.head, pull.reviewContext])
   for (const reviewer of observation.prReviewers) {

@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import httpx
 from github_interface.client import GitHubClient
+from github_interface.atoms.pulls import read_job_log
 
 from github_interface import client as client_module
 
@@ -133,3 +134,22 @@ class TestClientRetrySemantics(IsolatedAsyncioTestCase):
         with self.assertRaises(httpx.TransportError):
             await self.client.graphql("mutation($id: ID!) { x }", {"id": "1"})
         self.assertEqual(len(self.calls), 1)
+
+
+class TestJobLogRedirect(IsolatedAsyncioTestCase):
+    async def test_job_logs_follow_github_redirects_without_forwarding_credentials(self) -> None:
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if request.url.host == "api.github.com":
+                return httpx.Response(302, headers={"Location": "https://logs.example.test/job.txt"})
+            return httpx.Response(200, text="specific failing assertion")
+
+        real_client = httpx.AsyncClient
+        with patch.object(client_module, "get_token", return_value="test-token"), \
+                patch.object(client_module.httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(respond), **kwargs)):
+            self.assertEqual(await read_job_log(GitHubClient("account"), "o", "r", 1), "specific failing assertion")
+        self.assertEqual(len(requests), 2)
+        self.assertIn("authorization", requests[0].headers)
+        self.assertNotIn("authorization", requests[1].headers)

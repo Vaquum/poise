@@ -197,6 +197,66 @@ it('records a pull closed without merging, which carries no queue removal eviden
   await expect(actionOperations().observe(chain)).rejects.toThrow('native PR observations changed head or are incomplete')
 })
 
+it.each(['failure', 'pending', 'missing', 'success', 'queue-success', 'reused-queue', 'stale-success', 'wrong-head', 'wrong-base', 'unknown-run'])(
+  'rechecks the exact current base for a retained CI dependency: %s', async state => {
+    const base = 'd'.repeat(40)
+    const dependency = { head: HEAD, integration: 'c'.repeat(40), base: 'b'.repeat(40), removal: 'failed-integration',
+      remediation: 'https://github.com/example/repo/pull/99', allShared: true,
+      failures: [{ name: 'unit', check: 11, run: 10, workflow: 1 }] }
+    const repair: ChainInvocation = { ...mergeInvocation(), id: 'diagnosis', behavior: 'repair-pr', actor: 'author', model: 'fixture',
+      state: 'settled', callId: 'b'.repeat(32), outcome: 'no_changes',
+      request: { command: 'agent-interface', cwd: '/fixture', argv: [],
+        context: { head: HEAD, reviewRevision: 'reviews', queueRemoval: 'failed-integration' } },
+      evidence: { status: 'completed', action: 'no_changes', head_sha: HEAD, artifact: { ci_dependency: dependency } } }
+    const baseline = { head_sha: state === 'wrong-head' ? 'e'.repeat(40) : HEAD,
+      ref: state === 'wrong-base' ? 'e'.repeat(40) : base,
+      checks: state === 'missing' ? [] : [
+        { name: 'unit', check_run_id: 21, head_sha: base, run_id: 20,
+          state: state === 'pending' ? 'in_progress' : 'completed', conclusion: ['success', 'queue-success', 'reused-queue', 'stale-success'].includes(state) ? 'success' : 'failure' },
+        ...(state === 'stale-success' ? [{ name: 'unit', check_run_id: 22, head_sha: base, run_id: 20, state: 'completed', conclusion: 'failure' }] : []),
+        ...(state === 'reused-queue' ? [{ name: 'unit', check_run_id: 22, head_sha: base, run_id: 20, state: 'completed', conclusion: 'skipped' }] : []),
+      ], runs: state === 'unknown-run' ? [] : [{ id: 20, head_sha: base, workflow_id: 1,
+        event: ['queue-success', 'reused-queue'].includes(state) ? 'merge_group' : 'push' }] }
+    const reads: string[][] = []
+    mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
+      reads.push(argv)
+      const evidence: Record<string, unknown> = {
+        '--chain-seed': { repository: chain.repository, issue_number: 7, actor: 'author', branch: chain.branch,
+          issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+          publication: { existing_pulls: [], pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
+        '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64), merged: false,
+          queue_entry_id: null, queue_removals: [{ id: 'failed-integration', reason: 'failed_checks', createdAt: new Date(Date.now() - 500).toISOString(), actor: null }], my_reviews: [] },
+        '--pr-readiness': { head_sha: HEAD, draft: false, reviewer_approved_current_head: true,
+          unresolved_live_conversation_count: 0, unresolved_outdated_conversation_count: 0, green: true, blockers: [] },
+        '--list-failing-ci': argv.includes('--ref') ? baseline : { head_sha: HEAD, base_sha: base, pull_number: 21,
+          failing: [], mergeable: true, mergeable_state: 'clean' },
+      }
+      if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
+      return { stdout: JSON.stringify(evidence[argv[0]]) }
+    })
+    const operations = actionOperations()
+    const current = { ...chain, invocations: [repair] }
+    if (['wrong-head', 'wrong-base'].includes(state)) {
+      await expect(operations.observe(current)).rejects.toThrow('changed candidate/base')
+      return
+    }
+    const observation = await operations.observe(current)
+    const recovered = ['success', 'queue-success', 'reused-queue'].includes(state)
+    expect(observation.ciDependency).toEqual({ invocationId: repair.id, base, recovered })
+    expect(decideBehaviorChain(current, observation, Date.now())).toMatchObject(recovered
+      ? { kind: 'invoke', behavior: 'approve-pr' } : { kind: 'wait', reason: expect.stringContaining('shared baseline CI dependency') })
+    expect(reads.filter(argv => argv.includes('--ref'))).toEqual([
+      ['--list-failing-ci', '21', '--ref', 'base', '--token-user', 'reviewer'],
+    ])
+    const request = await operations.request(current, observation,
+      { kind: 'invoke', behavior: 'repair-pr', basis: 'repair', actor: 'author', reviewer, reason: '' }, 'repair-id')
+    expect(request?.argv).not.toContain('--merge-base')
+    observation.pull!.queueRemoval!.reason = 'merge_conflict'
+    const conflict = await operations.request(current, observation,
+      { kind: 'invoke', behavior: 'repair-pr', basis: 'repair', actor: 'author', reviewer, reason: '' }, 'repair-id')
+    expect(conflict?.argv).toContain('--merge-base')
+  })
+
 const invoke = (behavior: string) => ({ kind: 'invoke', behavior })
 const gatesUnsatisfied = { kind: 'wait', reason: 'native repository readiness gates are not satisfied' }
 it.each([

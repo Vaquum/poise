@@ -224,7 +224,7 @@ async def run(client: GitHubClient, payload: dict) -> dict:
     if mode == "validate":
         if replies and pull is not None:
             await review_replies(client, target, int(pull["number"]), actor, call_id, replies, publish=False)
-        return {**result, "outcome": "validated"}
+        return {**result, "outcome": "validated", "has_changes": bool(dirty)}
     if not dirty:
         if replies and pull is not None:
             work_publication(current_head)
