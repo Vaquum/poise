@@ -265,7 +265,12 @@ export class BehaviorChainRuntime {
             const id = randomUUID()
             let request = await this.operations.request(chain, observation, decision, id)
             if (!request) {
-              this.append(chain, { type: 'chain.waiting', reason: `${decision.behavior} is waiting for native provider backoff` })
+              const reason = `${decision.behavior} is waiting for native provider backoff`
+              // Resume retains waiting; its first observed sweep starts a new episode.
+              if (chain.waiting !== reason || (chain.resumedAfterSequence > 0
+                && this.journal.history(chain.id, chain.resumedAfterSequence, 1)[0]?.sequence === chain.sequence)) {
+                this.append(chain, { type: 'chain.waiting', reason })
+              }
               continue
             }
             if (resources) {

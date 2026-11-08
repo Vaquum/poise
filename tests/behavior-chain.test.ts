@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
@@ -308,6 +308,95 @@ describe('native admission and recovery', () => {
       readActionResult: async () => { throw new Error('unexpected native response read') },
       fenceClosedTarget: async () => { throw new Error('unexpected closed-target fence') }, wake: () => {}, ...overrides }
   }
+
+  it('deduplicates provider waits across runtime replacement without skipping changed blockers, recovery or retries', async () => {
+    const { db, journal, chain } = setup(); const obs = observation()
+    let blocked = true
+    const request = vi.fn<ChainRuntimeOperations['request']>(async () => blocked ? null
+      : { command: 'agent-interface', argv: ['--model', 'fixture-model'], cwd: '/fixture' })
+    const launch = vi.fn<ChainRuntimeOperations['launch']>(async () => true)
+    const ops = operations({ observe: async () => ({ ...obs, checkedAt: Date.now() }), request, launch })
+    let runtime = new BehaviorChainRuntime(journal, ops)
+    const waits = () => journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'chain.waiting')
+    const reason = 'review-issue is waiting for native provider backoff'
+
+    await runtime.run()
+    const firstWait = waits()
+    expect(firstWait).toHaveLength(1)
+    expect(JSON.parse(firstWait[0].payload)).toEqual({ type: 'chain.waiting', reason })
+    await runtime.run()
+    const restarted = new BehaviorChainJournal(db); restarted.rebuild()
+    runtime = new BehaviorChainRuntime(restarted, ops)
+    await runtime.run()
+    expect(waits()).toEqual(firstWait)
+    expect(request).toHaveBeenCalledTimes(3)
+    expect(journal.read(chain.id)!.invocations).toHaveLength(0)
+    expect(launch).not.toHaveBeenCalled()
+
+    obs.issue.eligible = false
+    await runtime.run()
+    obs.issue.eligible = true
+    await runtime.run()
+    await runtime.run()
+    expect(waits().map(row => JSON.parse(row.payload).reason)).toEqual([
+      reason, 'seed issue no longer matches intake settings', reason,
+    ])
+    expect(request).toHaveBeenCalledTimes(5)
+    expect(journal.read(chain.id)!.invocations).toHaveLength(0)
+    expect(launch).not.toHaveBeenCalled()
+
+    blocked = false
+    await runtime.run()
+    const admitted = journal.read(chain.id)!
+    expect(request).toHaveBeenCalledTimes(6)
+    expect(launch).toHaveBeenCalledTimes(1)
+    expect(admitted.waiting).toBeNull()
+    expect(admitted.invocations).toHaveLength(1)
+    expect(admitted.invocations[0]).toMatchObject({ behavior: 'review-issue', state: 'started' })
+
+    record(journal, admitted, { type: 'invocation.settled', invocationId: admitted.invocations[0].id,
+      callId: 'failed-attempt', outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started',
+        completedAt: Date.now() - 61_000, resources_settled_at: new Date().toISOString() } })
+    blocked = true
+    await runtime.run()
+    await runtime.run()
+    expect(waits()).toHaveLength(4)
+    expect(JSON.parse(waits().at(-1)!.payload)).toEqual({ type: 'chain.waiting', reason })
+    expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+    expect(launch).toHaveBeenCalledTimes(1)
+    blocked = false
+    await runtime.run()
+    expect(journal.read(chain.id)!.invocations).toHaveLength(2)
+    expect(launch).toHaveBeenCalledTimes(2)
+  })
+
+  it('records one fresh provider wait after Hold and Resume without a sweep while held', async () => {
+    const { db, journal, chain } = setup()
+    const request = vi.fn<ChainRuntimeOperations['request']>(async () => null)
+    const launch = vi.fn<ChainRuntimeOperations['launch']>(async () => true)
+    const ops = operations({ request, launch })
+    const waits = () => journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'chain.waiting')
+    await new BehaviorChainRuntime(journal, ops).run()
+    const firstWait = waits()[0]
+    let current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'person paused it' })
+    current = record(journal, current, { type: 'chain.resumed' })
+    expect(current.waiting).toBe(JSON.parse(firstWait.payload).reason)
+    const restarted = new BehaviorChainJournal(db); restarted.rebuild()
+    expect(restarted.read(chain.id)).toEqual(current)
+
+    const runtime = new BehaviorChainRuntime(restarted, ops)
+    await runtime.run()
+    expect(waits()).toHaveLength(2)
+    expect(waits()[0]).toEqual(firstWait)
+    expect(waits()[1].payload).toBe(firstWait.payload)
+    expect(waits()[1].sequence).toBeGreaterThan(current.resumedAfterSequence)
+    await runtime.run()
+    await new BehaviorChainRuntime(restarted, ops).run()
+    expect(waits()).toHaveLength(2)
+    expect(request).toHaveBeenCalledTimes(4)
+    expect(journal.read(chain.id)!.invocations).toHaveLength(0)
+    expect(launch).not.toHaveBeenCalled()
+  })
 
   it('recovers a review only with its retained substantive response and preserves its original completion time', async () => {
     const { journal, chain } = setup(); const obs = observation(); pull(obs)
