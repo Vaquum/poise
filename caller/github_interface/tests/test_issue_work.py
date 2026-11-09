@@ -144,6 +144,11 @@ class ReviewReplyReceipts(IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "reviewer input"):
             await review_replies(client, "example/repo", 3, "author", "b" * 32, [{"commentId": 17, "body": body}], publish=True)
         client.post.assert_not_awaited()
+        # A reviewer edit within the reply's creation second truncates equal and must not count as coverage.
+        client.paginate.return_value = [{**root, "updated_at": "2026-11-09T11:00:00Z"}, prior]
+        with self.assertRaisesRegex(ValueError, "reviewer input"):
+            await review_replies(client, "example/repo", 3, "author", "b" * 32, [{"commentId": 17, "body": body}], publish=True)
+        client.post.assert_not_awaited()
         # Later feedback cannot erase proof that the original Call posted its answer.
         original = [{"commentId": 17, "body": body.split("\n\n<!-- poise-reply", 1)[0]}]
         reconciled = await review_replies(client, "example/repo", 3, "author", CALL, original, publish=False)

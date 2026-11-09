@@ -88,7 +88,9 @@ async def review_replies(client: GitHubClient, target: str, pull: int, actor: st
                         raise ValueError("missing timezone")
                 except (KeyError, TypeError, ValueError) as error:
                     raise ValueError("reused review reply lacks verified reviewer input timestamps") from error
-                if any(revision > answered_at for revision in revisions) or any(comment["id"] > posted["id"] for comment in reviewer_input):
+                # GitHub timestamps truncate to the second: an edit within the reply's
+                # creation second compares equal, so equality means changed input.
+                if any(revision >= answered_at for revision in revisions) or any(comment["id"] > posted["id"] for comment in reviewer_input):
                     raise ValueError("reused review reply predates changed reviewer input; provide a fresh answer")
         elif marker:
             raise ValueError("reused review reply lacks its verified native publication receipt")
