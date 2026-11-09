@@ -10,7 +10,7 @@ import { html, page } from './pages.js'
 import { hashSecret, newSecret, type User } from './store.js'
 
 interface Authorization { client: string; redirect: string; challenge: string; state: string }
-interface Code extends Authorization { scope: Omit<McpGrantScope, 'grantId'>; expires: number }
+interface Code extends Authorization { scope: Omit<McpGrantScope, 'grantId'>; expires: number; redirects: string[] }
 const VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26']
 const INSTRUCTIONS = 'Use poise_describe to identify the authorized workspace and its available tools.'
 
@@ -98,7 +98,7 @@ export class McpGateway {
         for (const [key, value] of this.codes) if (value.expires <= ctx.deps.now()) this.codes.delete(key)
         if (this.codes.size >= 256) throw new HttpError(429, 'too_many_requests')
         const code = newSecret()
-        this.codes.set(hashSecret(code), { ...auth, expires: ctx.deps.now() + 60_000,
+        this.codes.set(hashSecret(code), { ...auth, expires: ctx.deps.now() + 60_000, redirects: this.grants.redirects(auth.client),
           scope: { resource: this.resource, handle: principal.user.handle, ownerId: principal.user.githubId } })
         target.searchParams.set('code', code)
       }
@@ -115,7 +115,7 @@ export class McpGateway {
           || form.get('resource') !== code.scope.resource || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)
           || !safeEqual(Buffer.from(hashSecret(verifier), 'hex').toString('base64url'), code.challenge)) throw new HttpError(400, 'invalid_grant')
         this.owner(code.scope)
-        return sendJson(res, 200, this.grants.create(code.scope, client))
+        return sendJson(res, 200, this.grants.create(code.scope, client, code.redirects.length ? code.redirects : [code.redirect]))
       }
       if (form.get('grant_type') === 'refresh_token') {
         const grant = this.grants.find(form.get('refresh_token') ?? '', 'refresh')

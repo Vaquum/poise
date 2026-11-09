@@ -168,3 +168,27 @@ it('retains a consented registration past its original deadline while its grant 
   expect(retryPage.body).toContain('Allow read access')
 })
 
+it('retains a first-time grant evicted between consent and code exchange', async () => {
+  const client = await register()
+  const params = new URLSearchParams({ client_id: client, redirect_uri: redirectUri, code_challenge: challenge,
+    code_challenge_method: 'S256', resource, scope: 'poise:read', response_type: 'code', state: 's1' })
+  const path = `/mcp/authorize?${params}`
+  const { apexCookie } = await h.signIn('Alice', path)
+  const csrf = h.store.findSession(apexCookie.slice('poise_gw='.length))!.csrf
+  const approved = await form('/mcp/authorize', { request: params.toString(), csrf, decision: 'approve' }, apexCookie)
+  expect(approved.status).toBe(303)
+  const code = new URL(String(approved.headers.location)).searchParams.get('code')!
+  for (let index = 0; index < 256; index++) await register()
+  const token = await form('/mcp/token', { grant_type: 'authorization_code', client_id: client,
+    code, redirect_uri: redirectUri, resource, code_verifier: verifier })
+  expect(token.status).toBe(200)
+  expect(h.context.mcp.grants.redirects(client)).toEqual([redirectUri])
+  const retryParams = new URLSearchParams({ client_id: client, redirect_uri: redirectUri, code_challenge: challenge,
+    code_challenge_method: 'S256', resource, scope: 'poise:read', response_type: 'code', state: 's2' })
+  const retryPath = `/mcp/authorize?${retryParams}`
+  const retrySignIn = await h.signIn('Alice', retryPath)
+  const retryPage = await h.request({ host: APEX, path: retryPath, headers: { cookie: retrySignIn.apexCookie } })
+  expect(retryPage.status).toBe(200)
+  expect(retryPage.body).toContain('Allow read access')
+})
+

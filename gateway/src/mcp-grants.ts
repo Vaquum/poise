@@ -45,14 +45,17 @@ export class McpGrants {
       .map(row => JSON.parse(row.state) as StoredGrant).map(({ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt }) =>
         ({ resource, ownerId, handle, grantId, clientId, createdAt, expiresAt, revokedAt }))
   }
-  create(scope: Omit<McpGrantScope, 'grantId'>, clientId: string) {
+  create(scope: Omit<McpGrantScope, 'grantId'>, clientId: string, redirects: string[]) {
     this.db.prepare("DELETE FROM mcp_grants WHERE json_extract(state, '$.expiresAt') <= ?").run(this.now())
     if (this.list(scope.ownerId).length >= 100) throw new Error('read grant capacity reached; wait for a retained grant to expire')
     const grant: StoredGrant = { ...scope, clientId, grantId: randomUUID(), createdAt: this.now(), expiresAt: this.now() + GRANT_MS,
       revokedAt: null, accessHash: '', refreshHash: '', accessExpires: 0 }
     const tokens = this.rotate(grant)
     // A live grant retains its registration; otherwise redirects() would reject consented clients after 30 days from registration.
-    this.db.prepare('UPDATE mcp_clients SET expires = ? WHERE id = ?').run(grant.expiresAt, clientId)
+    const retained = this.db.prepare('UPDATE mcp_clients SET expires = ? WHERE id = ?').run(grant.expiresAt, clientId)
+    // A burst between consent and exchange can evict a first-time registration while its code is pending;
+    // restore it so the live grant keeps the redirect it was consented with.
+    if (retained.changes === 0) this.db.prepare('INSERT OR IGNORE INTO mcp_clients VALUES (?, ?, ?)').run(clientId, JSON.stringify(redirects), grant.expiresAt)
     return tokens
   }
   private rotate(grant: StoredGrant) {
