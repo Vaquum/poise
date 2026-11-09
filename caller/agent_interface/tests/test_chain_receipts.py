@@ -539,6 +539,17 @@ class AtomicWorkLimits(TestCase):
             self.assertNotIn(private, masked)
             self.assertNotIn(private, json.dumps(fragmented.diagnostic))
 
+    def test_atomic_work_blocked_credential_shaped_env_value_masks_whole_before_patterns(self):
+        credential = '{"auth":"Bearer abc","password":"opaque-secret"}'
+        with patch.dict(os.environ, {"SERVICE_CREDENTIALS": credential}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked(f"blocked {credential} end")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: blocked [redacted] end")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (credential, "Bearer abc", "opaque-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         reason = "Review requires a product decision before implementation can continue"
         secret = "opaque-environment-credential-crossing-cutoff"

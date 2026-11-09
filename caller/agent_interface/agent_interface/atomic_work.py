@@ -21,9 +21,9 @@ class AtomicWorkBlocked(ValueError):
         message = "AtomicWorkBlocked"
         if isinstance(reason, str) and reason.strip():
             # Mask complete environment credentials around pattern redaction:
-            # values patterns would only fragment to a plain marker (a ghp_
-            # token inside a JSON credential) are masked whole first; values
-            # carrying a header/credential shape wait until after so masking
+            # values patterns would only fragment (a ghp_ token or a Bearer
+            # token inside a JSON credential) are masked whole first;
+            # values carrying a header shape wait until after so masking
             # cannot rewrite the pattern keyword and leave a trailing secret.
             secrets = sorted({value for key, value in os.environ.items()
                               if value and re.search(r"TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL|COOKIE|GIT_CONFIG_VALUE", key, re.I)},
@@ -42,8 +42,7 @@ class AtomicWorkBlocked(ValueError):
                         if not form:
                             continue
                         shaped = atoms.redact_cause(form)
-                        if shaped != form and shaped not in markers and "[redacted header]" not in shaped \
-                                and "[redacted credential]" not in shaped:
+                        if shaped != form and shaped not in markers and "[redacted header]" not in shaped:
                             forms[form] = True
                 before = sorted(forms, key=len, reverse=True)
                 if before:
