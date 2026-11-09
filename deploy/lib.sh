@@ -44,137 +44,59 @@ require_docker() {
     || die "the Docker Compose plugin is missing ('docker compose' does not run). Install it: https://docs.docker.com/compose/install/linux/"
 }
 
-# Decode one JSON string's escapes: Compose's `config --format json` encodes
-# control characters (a trailing newline arrives as \n) while the gateway's
-# JSON.parse decodes them before trimming.
-json_unescape() {
-  local raw=$1 out='' i=0 n=${#1} c esc hex decoded codepoint b1 b2 b3
-  while [ "$i" -lt "$n" ]; do
-    c=${raw:$i:1}
-    if [ "$c" != "\\" ]; then
-      out+="$c"
-      i=$((i + 1))
-      continue
-    fi
-    esc=${raw:$((i + 1)):1}
-    case $esc in
-      '"') out+='"'; i=$((i + 2)) ;;
-      "\\") out+="\\"; i=$((i + 2)) ;;
-      '/') out+='/'; i=$((i + 2)) ;;
-      b) out+=$'\b'; i=$((i + 2)) ;;
-      f) out+=$'\f'; i=$((i + 2)) ;;
-      n) out+=$'\n'; i=$((i + 2)) ;;
-      r) out+=$'\r'; i=$((i + 2)) ;;
-      t) out+=$'\t'; i=$((i + 2)) ;;
-      u)
-        hex=${raw:$((i + 2)):4}
-        case $hex in
-          [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])
-            # Encode the codepoint as UTF-8 bytes directly: bash printf '%b'
-            # decodes \uXXXX only outside the C locale, while the guard must
-            # match the gateway's JSON.parse even with LC_ALL=C.
-            codepoint=$((16#$hex))
-            if [ "$codepoint" -lt 128 ]; then
-              printf -v decoded '%b' "\\x$(printf '%02x' "$codepoint")"
-            elif [ "$codepoint" -lt 2048 ]; then
-              b1=$(( (codepoint >> 6) | 192 ))
-              b2=$(( (codepoint & 63) | 128 ))
-              printf -v decoded '%b' "\\x$(printf '%02x' "$b1")\\x$(printf '%02x' "$b2")"
-            else
-              b1=$(( (codepoint >> 12) | 224 ))
-              b2=$(( ((codepoint >> 6) & 63) | 128 ))
-              b3=$(( (codepoint & 63) | 128 ))
-              printf -v decoded '%b' "\\x$(printf '%02x' "$b1")\\x$(printf '%02x' "$b2")\\x$(printf '%02x' "$b3")"
-            fi
-            out+="$decoded"
-            i=$((i + 6)) ;;
-          *)
-            out+="\\"
-            i=$((i + 1)) ;;
-        esac ;;
-      '')
-        out+="\\"
-        i=$((i + 1)) ;;
-      *)
-        out+="\\"
-        out+="$esc"
-        i=$((i + 2)) ;;
-    esac
-  done
-  printf '%s' "$out"
+# The image whose Node parses the resolved Compose JSON: the existing
+# runtime image when it is already on this host (it already contains Node 22),
+# otherwise the pinned Node base. This never builds or moves the live
+# workspace tags to decide the guard.
+guard_parser_image() {
+  local live
+  live=$(env_value POISE_RUNTIME_IMAGE)
+  live=${live:-poise-runtime:latest}
+  case $live in
+    *@*) live="poise-runtime:latest" ;;
+  esac
+  if docker image inspect "$live" >/dev/null 2>&1; then
+    printf '%s' "$live"
+  else
+    printf '%s' "node:22-bookworm-slim"
+  fi
 }
 
-# Match gateway/src/config.ts read().trim(): JavaScript String trim removes
-# WhiteSpace and LineTerminator (including U+00A0 and other Unicode spaces),
-# while POSIX [[:space:]] under LC_ALL=C keeps the nonbreaking space. Strip
-# by UTF-8 bytes so the guard decision matches the gateway even in the C locale.
-js_trim() {
-  local value=$1
-  while :; do
-    case $value in
-      ' '*) value=${value#' '} ;;
-      $'\t'*) value=${value#$'\t'} ;;
-      $'\n'*) value=${value#$'\n'} ;;
-      $'\r'*) value=${value#$'\r'} ;;
-      $'\v'*) value=${value#$'\v'} ;;
-      $'\f'*) value=${value#$'\f'} ;;
-      $'\xc2\xa0'*) value=${value#$'\xc2\xa0'} ;;
-      $'\xe1\x9a\x80'*) value=${value#$'\xe1\x9a\x80'} ;;
-      $'\xe2\x80\x80'*) value=${value#$'\xe2\x80\x80'} ;;
-      $'\xe2\x80\x81'*) value=${value#$'\xe2\x80\x81'} ;;
-      $'\xe2\x80\x82'*) value=${value#$'\xe2\x80\x82'} ;;
-      $'\xe2\x80\x83'*) value=${value#$'\xe2\x80\x83'} ;;
-      $'\xe2\x80\x84'*) value=${value#$'\xe2\x80\x84'} ;;
-      $'\xe2\x80\x85'*) value=${value#$'\xe2\x80\x85'} ;;
-      $'\xe2\x80\x86'*) value=${value#$'\xe2\x80\x86'} ;;
-      $'\xe2\x80\x87'*) value=${value#$'\xe2\x80\x87'} ;;
-      $'\xe2\x80\x88'*) value=${value#$'\xe2\x80\x88'} ;;
-      $'\xe2\x80\x89'*) value=${value#$'\xe2\x80\x89'} ;;
-      $'\xe2\x80\x8a'*) value=${value#$'\xe2\x80\x8a'} ;;
-      $'\xe2\x80\xa8'*) value=${value#$'\xe2\x80\xa8'} ;;
-      $'\xe2\x80\xa9'*) value=${value#$'\xe2\x80\xa9'} ;;
-      $'\xe2\x80\xaf'*) value=${value#$'\xe2\x80\xaf'} ;;
-      $'\xe2\x81\x9f'*) value=${value#$'\xe2\x81\x9f'} ;;
-      $'\xe3\x80\x80'*) value=${value#$'\xe3\x80\x80'} ;;
-      $'\xef\xbb\xbf'*) value=${value#$'\xef\xbb\xbf'} ;;
-      *) break ;;
-    esac
-  done
-  while :; do
-    case $value in
-      *' ') value=${value%' '} ;;
-      *$'\t') value=${value%$'\t'} ;;
-      *$'\n') value=${value%$'\n'} ;;
-      *$'\r') value=${value%$'\r'} ;;
-      *$'\v') value=${value%$'\v'} ;;
-      *$'\f') value=${value%$'\f'} ;;
-      *$'\xc2\xa0') value=${value%$'\xc2\xa0'} ;;
-      *$'\xe1\x9a\x80') value=${value%$'\xe1\x9a\x80'} ;;
-      *$'\xe2\x80\x80') value=${value%$'\xe2\x80\x80'} ;;
-      *$'\xe2\x80\x81') value=${value%$'\xe2\x80\x81'} ;;
-      *$'\xe2\x80\x82') value=${value%$'\xe2\x80\x82'} ;;
-      *$'\xe2\x80\x83') value=${value%$'\xe2\x80\x83'} ;;
-      *$'\xe2\x80\x84') value=${value%$'\xe2\x80\x84'} ;;
-      *$'\xe2\x80\x85') value=${value%$'\xe2\x80\x85'} ;;
-      *$'\xe2\x80\x86') value=${value%$'\xe2\x80\x86'} ;;
-      *$'\xe2\x80\x87') value=${value%$'\xe2\x80\x87'} ;;
-      *$'\xe2\x80\x88') value=${value%$'\xe2\x80\x88'} ;;
-      *$'\xe2\x80\x89') value=${value%$'\xe2\x80\x89'} ;;
-      *$'\xe2\x80\x8a') value=${value%$'\xe2\x80\x8a'} ;;
-      *$'\xe2\x80\xa8') value=${value%$'\xe2\x80\xa8'} ;;
-      *$'\xe2\x80\xa9') value=${value%$'\xe2\x80\xa9'} ;;
-      *$'\xe2\x80\xaf') value=${value%$'\xe2\x80\xaf'} ;;
-      *$'\xe2\x81\x9f') value=${value%$'\xe2\x81\x9f'} ;;
-      *$'\xe3\x80\x80') value=${value%$'\xe3\x80\x80'} ;;
-      *$'\xef\xbb\xbf') value=${value%$'\xef\xbb\xbf'} ;;
-      *) break ;;
-    esac
-  done
-  printf '%s' "$value"
+# The gateway's effective POISE_WORKSPACE_RUNTIME from Compose's resolved JSON:
+# only services.gateway.environment, decoded with JSON.parse and trimmed with
+# the gateway's own trim (gateway/src/config.ts). Prints the trimmed value,
+# empty when absent. Fails when the configuration cannot be parsed.
+guard_desired_runtime() {
+  local config=$1 parser_image
+  parser_image=$(guard_parser_image)
+  printf '%s' "$config" | docker run --rm --network none -i --entrypoint node "$parser_image" --input-type=module -e '
+let text="";
+process.stdin.on("data",(chunk)=>{text+=chunk;}).on("end",()=>{
+try{
+const config=JSON.parse(text||"{}");
+const environment=config?.services?.gateway?.environment;
+let value="";
+if(Array.isArray(environment)){
+const entry=environment.find((item)=>typeof item==="string"&&item.startsWith("POISE_WORKSPACE_RUNTIME="));
+if(entry!==undefined)value=entry.slice("POISE_WORKSPACE_RUNTIME=".length);
+}else if(environment!=null&&typeof environment==="object"){
+const raw=environment.POISE_WORKSPACE_RUNTIME;
+if(raw!=null)value=String(raw);
+}
+process.stdout.write(value.trim());
+}catch(error){
+console.error(String(error&&error.message?error.message:error));
+process.exit(1);
+}
+});
+'
 }
 
 # A host service, independent of the gateway's readiness cache and Docker's
 # workspace restart policy. Inspect actual runtimes as well as future settings.
+# Call this before building the runtime image, publishing a rollout, or
+# starting workspaces: both live tags stay untouched until --check proves
+# protection, and a failed read or parse stops deployment before any of those.
 ensure_caller_guard() {
   local status changed=false proof deadline=$((SECONDS + 180)) privilege=()
   local desired ids runtimes runtime inspect_runtime=false config
@@ -183,18 +105,12 @@ ensure_caller_guard() {
   # forwards ${POISE_WORKSPACE_RUNTIME:-} so quoting, comments and
   # interpolation resolve as the gateway sees them). env_value cannot do
   # Compose interpolation, so the guard reads the resolved configuration.
-  # A failed read stops deployment; absent or empty falls back to Docker's default.
+  # A failed read or parse stops deployment; absent or trimmed-empty falls
+  # back to Docker's default. Only this nested field decides: labels or any
+  # other environment value never leak into the guard decision.
   config=$(compose config --format json) || die "cannot read the gateway's resolved Compose configuration for the Caller SQLite guard."
-  # Read only the resolved gateway field: any other environment value (for
-  # example POISE_FIXTURE_TEXT=POISE_WORKSPACE_RUNTIME=runc) must not leak
-  # into the guard decision.
-  desired=$(printf '%s' "$config" | tr '\n' ' ' | sed -n 's/.*"POISE_WORKSPACE_RUNTIME"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  # Decode JSON escapes before trimming: the gateway parses JSON and trims, so
-  # a resolved `runsc` followed by a newline (encoded as \n) must read as `runsc` here too.
-  desired=$(json_unescape "$desired")
-  # Match gateway/src/config.ts read().trim(): whitespace-only means unset.
-  desired=$(js_trim "$desired")
-  if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}'); fi
+  desired=$(guard_desired_runtime "$config") || die "cannot parse the gateway's resolved Compose configuration for the Caller SQLite guard."
+  if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}') || die "cannot read Docker's default runtime for the Caller SQLite guard."; fi
   ids=$(docker ps --all --quiet --filter label=poise.managed=true) || die "cannot list workspaces for the Caller guard."
   runtimes=''
   if [ -n "$ids" ]; then

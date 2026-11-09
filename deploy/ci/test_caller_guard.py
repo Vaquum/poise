@@ -313,6 +313,20 @@ elif [ "$1" = info ]; then
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runc' ;;
   esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node: same JSON.parse and trim as deploy/lib.sh.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
 elif [ "$1" = ps ]; then
   : # Fresh deployment: no workspace containers yet.
 else
@@ -361,6 +375,20 @@ elif [ "$1" = info ]; then
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runsc' ;;
   esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node: same JSON.parse and trim as deploy/lib.sh.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
 elif [ "$1" = ps ]; then
   : # Fresh deployment: no workspace containers yet.
 else
@@ -409,6 +437,20 @@ elif [ "$1" = info ]; then
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runc' ;;
   esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node: same JSON.parse and trim as deploy/lib.sh.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
 elif [ "$1" = ps ]; then
   : # Fresh deployment: no workspace containers yet.
 else
@@ -460,6 +502,20 @@ elif [ "$1" = info ]; then
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runc' ;;
   esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node: same JSON.parse and trim as deploy/lib.sh.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
 elif [ "$1" = ps ]; then
   : # Fresh deployment: no workspace containers yet.
 else
@@ -510,6 +566,20 @@ elif [ "$1" = info ]; then
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runc' ;;
   esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node: same JSON.parse and trim as deploy/lib.sh.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
 elif [ "$1" = ps ]; then
   : # Fresh deployment: no workspace containers yet.
 else
@@ -559,6 +629,20 @@ elif [ "$1" = info ]; then
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runsc' ;;
   esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node: same JSON.parse and trim as deploy/lib.sh.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
 elif [ "$1" = ps ]; then
   : # Fresh deployment: no workspace containers yet.
 else
@@ -609,6 +693,20 @@ elif [ "$1" = info ]; then
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runc' ;;
   esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node: same JSON.parse and trim as deploy/lib.sh.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
 elif [ "$1" = ps ]; then
   : # Fresh deployment: no workspace containers yet.
 else
@@ -639,6 +737,242 @@ exit 0
         self.assertIn("install", sudo_log.read_text(),
                       "runsc followed by U+00A0 must reach guard installation under LC_ALL=C, not exit 10")
 
+    def test_gateway_label_collision_still_installs_gvisor_guard(self):
+        # Compose resolves both correctly: the nested gateway environment
+        # carries runsc while a gateway label named POISE_WORKSPACE_RUNTIME
+        # carries runc. The whole-document extractor reads the label and skips
+        # the guard; JSON.parse on the nested field must install it.
+        deploy = GUARD.parents[1]
+        env_file = self.root / "poise.env"
+        env_file.write_text('POISE_WORKSPACE_RUNTIME=runsc\n')
+        sudo_log = self.root / "sudo.log"
+        sudo_log.write_text("")
+        binary = self.root / "guard-bin-label"
+        binary.mkdir()
+        (binary / "docker").write_text("""#!/bin/bash
+if [ "$1" = compose ]; then
+  printf '%s' '{"services":{"gateway":{"environment":{"POISE_WORKSPACE_RUNTIME":"runsc"},"labels":{"POISE_WORKSPACE_RUNTIME":"runc"}}}}'
+elif [ "$1" = info ]; then
+  case "$3" in
+    *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
+    *) printf 'runc' ;;
+  esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node: same JSON.parse and trim as deploy/lib.sh.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
+elif [ "$1" = ps ]; then
+  : # Fresh deployment: no workspace containers yet.
+else
+  echo "unexpected docker $*" >&2; exit 99
+fi
+""")
+        (binary / "sudo").write_text("""#!/bin/bash
+echo "$*" >> "$GUARD_SUDO_LOG"
+for argument in "$@"; do
+  if [ "$argument" = --check ]; then
+    echo 'Host locks verified on 1 Caller inode(s)'
+    exit 0
+  fi
+done
+exit 0
+""")
+        (binary / "id").write_text("#!/bin/bash\nif [ \"$1\" = -u ]; then echo 1000; else exec /usr/bin/id \"$@\"; fi\n")
+        for name in ("docker", "sudo", "id"):
+            (binary / name).chmod(0o755)
+        env = {**self.env, "PATH": str(binary) + os.pathsep + self.env["PATH"],
+               "GUARD_SUDO_LOG": str(sudo_log)}
+        script = (f"set -uo pipefail\n. {shlex.quote(str(deploy / 'lib.sh'))}\n"
+                  f"env_file={shlex.quote(str(env_file))}\n"
+                  "ensure_caller_guard\nprintf 'RC=%s\\n' \"$?\"\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Host locks verified", result.stdout)
+        self.assertIn("install", sudo_log.read_text(),
+                      "nested runsc with a colliding runc label must reach guard installation, not skip")
+
+    def test_real_compose_resolution_proves_quoting_interpolation_comment_and_label_collision(self):
+        # Real disposable Compose resolution through the installation decision:
+        # a runtime variable holding runsc referenced double-quoted with a
+        # trailing comment resolves to runsc, while a colliding gateway label
+        # stays runc. No existing workspaces and a runc Docker default must
+        # still install the guard from the resolved value. Skipped without the
+        # real Compose CLI; the stubbed tests above still prove the decision.
+        docker_ok = subprocess.run(["docker", "compose", "version"],
+                                   capture_output=True, text=True, timeout=30)
+        if docker_ok.returncode != 0:
+            self.skipTest("needs the real Docker Compose CLI for resolved-configuration proof")
+        fixture = self.root / "compose-fixture"
+        fixture.mkdir()
+        (fixture / ".env").write_text('MY_RUNTIME=runsc\nPOISE_WORKSPACE_RUNTIME="${MY_RUNTIME}" # gVisor\n')
+        (fixture / "compose.yaml").write_text(
+            'services:\n'
+            '  gateway:\n'
+            '    image: busybox\n'
+            '    environment:\n'
+            '      POISE_WORKSPACE_RUNTIME: "${POISE_WORKSPACE_RUNTIME:-}"\n'
+            '    labels:\n'
+            '      POISE_WORKSPACE_RUNTIME: "runc"\n')
+        resolved = subprocess.run(["docker", "compose", "config", "--format", "json"],
+                                  capture_output=True, text=True, cwd=str(fixture), timeout=60)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        parsed = subprocess.run(
+            ["node", "--input-type=module", "-e",
+             'let t="";process.stdin.on("data",d=>t+=d).on("end",()=>{'
+             'const c=JSON.parse(t||"{}");'
+             'process.stdout.write(JSON.stringify({'
+             'env:(c?.services?.gateway?.environment?.POISE_WORKSPACE_RUNTIME ?? null),'
+             'label:(c?.services?.gateway?.labels?.POISE_WORKSPACE_RUNTIME ?? null)}))})'],
+            input=resolved.stdout, capture_output=True, text=True, timeout=30)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        fields = json.loads(parsed.stdout)
+        self.assertEqual((fields.get("env") or "").strip(), "runsc",
+                         "Compose must resolve quoting, interpolation and the trailing comment to runsc")
+        self.assertEqual(fields.get("label"), "runc",
+                         "the colliding gateway label must stay runc in the resolved configuration")
+        # Feed that real resolved JSON through the installation decision.
+        deploy = GUARD.parents[1]
+        env_file = self.root / "poise.env"
+        env_file.write_text('MY_RUNTIME=runsc\nPOISE_WORKSPACE_RUNTIME="${MY_RUNTIME}" # gVisor\n')
+        sudo_log = self.root / "sudo.log"
+        sudo_log.write_text("")
+        binary = self.root / "guard-bin-real-compose"
+        binary.mkdir()
+        (binary / "docker").write_text(f"""#!/bin/bash
+if [ "$1" = compose ]; then
+  cat {shlex.quote(str(fixture / "resolved.json"))}
+elif [ "$1" = info ]; then
+  case "$3" in
+    *json*) printf '{{"runsc": {{"path": "/usr/local/bin/runsc"}}, "runc": {{"path": "runc"}}}}' ;;
+    *) printf 'runc' ;;
+  esac
+elif [ "$1" = image ]; then
+  exit 1
+elif [ "$1" = run ]; then
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
+elif [ "$1" = ps ]; then
+  : # Fresh deployment: no workspace containers yet.
+else
+  echo "unexpected docker $*" >&2; exit 99
+fi
+""")
+        (fixture / "resolved.json").write_text(resolved.stdout)
+        (binary / "sudo").write_text("""#!/bin/bash
+echo "$*" >> "$GUARD_SUDO_LOG"
+for argument in "$@"; do
+  if [ "$argument" = --check ]; then
+    echo 'Host locks verified on 1 Caller inode(s)'
+    exit 0
+  fi
+done
+exit 0
+""")
+        (binary / "id").write_text("#!/bin/bash\nif [ \"$1\" = -u ]; then echo 1000; else exec /usr/bin/id \"$@\"; fi\n")
+        for name in ("docker", "sudo", "id"):
+            (binary / name).chmod(0o755)
+        env = {**self.env, "PATH": str(binary) + os.pathsep + self.env["PATH"],
+               "GUARD_SUDO_LOG": str(sudo_log)}
+        script = (f"set -uo pipefail\n. {shlex.quote(str(deploy / 'lib.sh'))}\n"
+                  f"env_file={shlex.quote(str(env_file))}\n"
+                  "ensure_caller_guard\nprintf 'RC=%s\\n' \"$?\"\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr + resolved.stderr)
+        self.assertIn("Host locks verified", result.stdout)
+        self.assertIn("install", sudo_log.read_text(),
+                      "real Compose-resolved runsc with a colliding runc label must install the guard")
+
+    def test_compose_or_parser_failure_aborts_before_install(self):
+        # A failed configuration read or parse must stop deployment before any
+        # install, and install/upgrade must keep the guard before moving either
+        # live tag, publishing a rollout, or starting workspaces.
+        deploy = GUARD.parents[1]
+        for name, compose_json, problem in (
+            ("compose-fails", None, "cannot read the gateway"),
+            ("parser-fails", "not json at all", "cannot parse the gateway"),
+        ):
+            with self.subTest(name=name):
+                env_file = self.root / f"poise-{name}.env"
+                env_file.write_text('POISE_WORKSPACE_RUNTIME=runsc\n')
+                sudo_log = self.root / f"sudo-{name}.log"
+                sudo_log.write_text("")
+                binary = self.root / f"guard-bin-{name}"
+                binary.mkdir(exist_ok=True)
+                if compose_json is None:
+                    compose_stub = "  echo 'compose unavailable' >&2; exit 1"
+                else:
+                    compose_stub = f"  printf '%s' {shlex.quote(compose_json)}"
+                (binary / "docker").write_text(f"""#!/bin/bash
+if [ "$1" = compose ]; then
+{compose_stub}
+elif [ "$1" = info ]; then
+  printf 'runc'
+elif [ "$1" = image ]; then
+  exit 1
+elif [ "$1" = run ]; then
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  exec node --input-type=module -e "$script"
+elif [ "$1" = ps ]; then
+  :
+else
+  echo "unexpected docker $*" >&2; exit 99
+fi
+""")
+                (binary / "sudo").write_text("""#!/bin/bash
+echo "$*" >> "$GUARD_SUDO_LOG"
+exit 0
+""")
+                (binary / "id").write_text("#!/bin/bash\nif [ \"$1\" = -u ]; then echo 1000; else exec /usr/bin/id \"$@\"; fi\n")
+                for exe in ("docker", "sudo", "id"):
+                    (binary / exe).chmod(0o755)
+                env = {**self.env, "PATH": str(binary) + os.pathsep + self.env["PATH"],
+                       "GUARD_SUDO_LOG": str(sudo_log)}
+                script = (f"set -uo pipefail\n. {shlex.quote(str(deploy / 'lib.sh'))}\n"
+                          f"env_file={shlex.quote(str(env_file))}\n"
+                          "ensure_caller_guard\n")
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(problem, result.stderr)
+                self.assertNotIn("install", sudo_log.read_text(),
+                                 "a failed guard read or parse must not reach installation")
+        for script_name in ("install.sh", "upgrade.sh"):
+            text = (deploy / script_name).read_text()
+            guard_at = text.index("ensure_caller_guard")
+            build_at = text.index('build_runtime_image "$image" "$sha"')
+            rollout_at = text.index('start_rollout "$sha" "$image"')
+            compose_at = text.index("compose up --detach --build")
+            self.assertLess(guard_at, build_at, f"{script_name} must guard before moving live image tags")
+            self.assertLess(guard_at, rollout_at, f"{script_name} must guard before publishing a rollout")
+            self.assertLess(guard_at, compose_at, f"{script_name} must guard before starting workspaces")
+        lib_text = (deploy / "lib.sh").read_text()
+        run_line = next(line for line in lib_text.splitlines() if "docker run --rm --network none" in line)
+        self.assertIn("--entrypoint node", run_line)
+        self.assertNotIn("-v", run_line)
+        self.assertNotIn("--volume", run_line)
+        self.assertNotIn("--mount", run_line)
+
     def test_runc_deployment_needs_no_host_guard_or_python(self):
         library = shlex.quote(str(GUARD.parents[1] / "lib.sh"))
         result = subprocess.run(["bash", "-c", f'. {library}\n' + """
@@ -649,6 +983,17 @@ docker() {
     'info --format'|'inspect --format') printf '%s\\n' runc ;;
     'compose config') printf '%s\\n' '{"services":{"gateway":{"environment":{}}}}' ;;
     'ps --all') printf '%s\\n' fixture ;;
+    'image inspect') return 1 ;;
+    'run --rm')
+      script=""
+      prev=""
+      for arg in "$@"; do
+        if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+        prev="$arg"
+      done
+      if [ -z "$script" ]; then return 99; fi
+      exec node --input-type=module -e "$script"
+      ;;
     *) return 99 ;;
   esac
 }
