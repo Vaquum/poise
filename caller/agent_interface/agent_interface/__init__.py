@@ -1354,6 +1354,10 @@ def _native_action_artifact(call_id: str, phase: str, request_sha: str, response
             or (response is None and (prior["status"] != "running" or original.get("response_sha") is not None)):
         raise RuntimeError("native response differs from its original request")
     artifact = {"phase": phase, "request_sha": request_sha}
+    if "resolution_progress" in original:
+        if phase != "received_native_action" or original["resolution_progress"]["pending"] is not None:
+            raise RuntimeError("native action still has an unconfirmed conversation resolution")
+        artifact["resolution_progress"] = original["resolution_progress"]
     if response is not None and original.get("response_sha") not in (None, hashlib.sha256(response.encode()).hexdigest()):
         raise RuntimeError("native response conflicts with its first durable receipt")
     path = None
@@ -1406,7 +1410,8 @@ def run_native_action(argv: list[str], cwd: str, repository: str, actor: str, co
         physical.mkdir(mode=0o700, parents=True)
         _native_action_artifact(id_, "performing_native_action", request_sha)
         started = True
-        result, code = native_action.execute(argv, physical)
+        with review_receipt.invocation_environment(DB, id_, argv[0] == "--resolve-nonblocking-conversations-if-ready", initialize=False):
+            result, code = native_action.execute(argv, physical)
         if code:
             result = {**result, "nativeProcessFailure": native_action.process_failure(code)}
         response = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

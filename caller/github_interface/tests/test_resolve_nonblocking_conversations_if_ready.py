@@ -50,6 +50,23 @@ class TestResolveFailurePhase(IsolatedAsyncioTestCase):
         self.assertTrue(result['ready_except_conversations'])
         self.assertEqual(self._resolve_mock().await_count, 2)
 
+    async def test_continuation_skips_original_confirmed_threads(self):
+        progress = {'confirmed': [{'id': 'thread-1', 'isResolved': True}], 'pending': None}
+        resolved = [{**thread, 'is_resolved': True} for thread in THREADS]
+        behavior.list_review_threads.side_effect = [deepcopy(THREADS), deepcopy(THREADS), resolved]
+        with patch.object(behavior, '_checkpoint', return_value=progress):
+            result = await behavior.run(self.client, PAYLOAD)
+        self._resolve_mock().assert_awaited_once_with(self.client, 'thread-2')
+        self.assertEqual([item['id'] for item in result['conversations']], ['thread-1', 'thread-2'])
+
+    async def test_closed_thread_observation_cannot_clear_an_unacknowledged_attempt(self):
+        progress = {'confirmed': [{'id': 'thread-1', 'isResolved': True}], 'pending': 'thread-2'}
+        behavior.list_review_threads.return_value = [{**thread, 'is_resolved': True} for thread in THREADS]
+        with patch.object(behavior, '_checkpoint', return_value=progress):
+            with self.assertRaisesRegex(RuntimeError, 'thread-2 lacks its original resolution response'):
+                await behavior.run(self.client, PAYLOAD)
+        self._resolve_mock().assert_not_awaited()
+
     async def test_secondary_limit_before_any_mutation_proves_no_action(self):
         behavior.get_pull.side_effect = RuntimeError(SECONDARY_LIMIT)
         with self.assertRaises(RuntimeError) as raised:

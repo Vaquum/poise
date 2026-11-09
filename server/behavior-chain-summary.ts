@@ -1,4 +1,6 @@
-import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement } from './behavior-chain-action'
+import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
+import { parseResolutionProgress } from './agent-log-parse'
+import { resourceReleaseContradicted } from './behavior-resource-receipt'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent } from './behavior-chain-store'
 
@@ -30,44 +32,51 @@ function needsPrReview(chain: BehaviorChain, observation: ChainObservation | nul
 }
 
 /** Completed issue review without its posted GitHub comment, mirroring
- * decideBehaviorChain reviewComplete: the original evidence remains
- * unverified and the chain holds instead of reviewing again. */
+ * decideBehaviorChain reviewComplete in slot order: the hold fires only when
+ * the earliest incomplete reviewer slot has a completed review whose original
+ * evidence remains unverified; an earlier slot still needing its review
+ * keeps the review-issue next action. */
 function issueReviewMissingArtifact(chain: BehaviorChain, observation: ChainObservation | null): boolean {
   if (!observation || !Array.isArray(observation.issueReviewers) || observation.issueReviewers.length === 0) return false
   const basis = chainBasis(['issue', observation.issue.revision])
-  return observation.issueReviewers.some(reviewer => {
+  for (const reviewer of observation.issueReviewers) {
     const invocation = [...chain.invocations].reverse().find(candidate =>
       candidate.behavior === 'review-issue' && candidate.basis === basis && candidate.slot === reviewer.slot
       && candidate.state === 'settled' && candidate.evidence?.status === 'completed')
     if (!invocation) return false
     const evidence = invocation.evidence as Record<string, unknown>
-    if (evidence.action !== 'commented' || evidence.issue_revision !== observation.issue.revision || !Array.isArray(evidence.receipts)) return true
-    return !(evidence.receipts as Array<{ issue?: unknown, author?: unknown, comment_id?: unknown }>).some(receipt =>
-      typeof receipt.issue === 'string' && receipt.issue.toLowerCase() === `${chain.repository}#${chain.issue}`.toLowerCase()
-      && typeof receipt.author === 'string' && receipt.author.toLowerCase() === chain.reviewer.toLowerCase()
-      && typeof receipt.comment_id === 'number' && observation.issue.commentIds.includes(receipt.comment_id))
-  })
+    const complete = evidence.action === 'commented' && evidence.issue_revision === observation.issue.revision && Array.isArray(evidence.receipts)
+      && (evidence.receipts as Array<{ issue?: unknown, author?: unknown, comment_id?: unknown }>).some(receipt =>
+        typeof receipt.issue === 'string' && receipt.issue.toLowerCase() === `${chain.repository}#${chain.issue}`.toLowerCase()
+        && typeof receipt.author === 'string' && receipt.author.toLowerCase() === chain.reviewer.toLowerCase()
+        && typeof receipt.comment_id === 'number' && observation.issue.commentIds.includes(receipt.comment_id))
+    if (!complete) return true
+  }
+  return false
 }
 
 /** Completed PR review without its exact-head submission receipt, mirroring
- * decideBehaviorChain reviewComplete: the original evidence remains
- * unverified and the chain holds instead of advancing downstream. */
+ * decideBehaviorChain reviewComplete in slot order: the hold fires only when
+ * the earliest incomplete reviewer slot has a completed review whose exact-head
+ * receipt remains unverified; an earlier slot still needing its review keeps
+ * the review-pr next action. */
 function prReviewMissingArtifact(chain: BehaviorChain, observation: ChainObservation | null, pull: NonNullable<ChainObservation['pull']>): boolean {
   if (!observation || !Array.isArray(observation.prReviewers) || observation.prReviewers.length === 0) return false
   const expected = chainBasis(['pr', pull.head, pull.reviewContext])
-  return observation.prReviewers.some(reviewer => {
+  for (const reviewer of observation.prReviewers) {
     const invocation = [...chain.invocations].reverse().find(candidate =>
       candidate.behavior === 'review-pr' && candidate.basis === expected && candidate.slot === reviewer.slot
       && candidate.state === 'settled' && candidate.evidence?.status === 'completed')
     if (!invocation) return false
     const evidence = invocation.evidence!
-    if (!chainReviewResponse(chain, invocation, observation, observation.checkedAt)) return true
-    if (typeof evidence.review_id !== 'number' || !(evidence.review_id > 0)) return true
-    if (!observation.pull?.reviewIds.includes(evidence.review_id)) return true
-    if (evidence.head_sha !== observation.pull?.head) return true
-    if (!['reviewed_clean', 'requested_changes'].includes(String(evidence.action))) return true
-    return false
-  })
+    const complete = !!chainReviewResponse(chain, invocation, observation, observation.checkedAt)
+      && typeof evidence.review_id === 'number' && evidence.review_id > 0
+      && !!observation.pull?.reviewIds.includes(evidence.review_id)
+      && evidence.head_sha === observation.pull?.head
+      && ['reviewed_clean', 'requested_changes'].includes(String(evidence.action))
+    if (!complete) return true
+  }
+  return false
 }
 
 /** Missing required issue review, mirroring decideBehaviorChain review-issue
@@ -193,6 +202,12 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         ...(pull.queueEntry ? ['Native queue owns the candidate; merge completion unverified'] : []),
       ] : [observation?.pull ? 'Exact-head PR evidence incomplete; merge gates unverified'
         : 'No verified PR evidence; merge completion unverified']
+      // Mirroring the runtime reconciliation fence and admitInvocation: a
+      // settled invocation with contradictory resource-release evidence still
+      // blocks every new invocation pending reconciliation of the original
+      // resources, so attention must not recommend downstream work for it.
+      const resourceContradicted = chain.invocations.find(invocation => !!invocation.evidence
+        && resourceReleaseContradicted(invocation.evidence as Record<string, unknown>))
       const last = chain.invocations.at(-1)
       const lastQueue = pull ? lastChainQueueInvocation(chain) : undefined
       const queueRemoval = pull?.queueRemoval ?? null
@@ -326,6 +341,7 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
           && invocation.evidence?.status === 'completed' && invocation.basis === mergeBasis && invocation.slot === null)
       let next = chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
+          : resourceContradicted ? `Hold: Invocation ${resourceContradicted.id} has contradictory resource-release evidence; ownership remains held`
           : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'
             : active ? 'Await the original invocation outcome'
               : state !== 'fresh' ? 'Await a fresh, complete chain observation'
@@ -449,6 +465,11 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
     invocationCount: chain.invocations.length, invocations: chain.invocations.slice(-20).map((invocation) => {
       const proof = attributedNativeAction(invocation) ? matchingNativeActionReceipt(chain, invocation) : null
       const settlement = proof ? nativeActionSettlement(proof) : null
+      const artifact = invocation.evidence?.artifact as Record<string, unknown> | undefined
+      const progress = artifact?.resolution_progress === undefined ? null : parseResolutionProgress(artifact.resolution_progress)
+      if (progress && (invocation.behavior !== 'resolve-threads' || artifact?.request_sha !== nativeRequestSha(invocation.request))) {
+        throw new Error('native resolution progress conflicts with its original request')
+      }
       return { id: invocation.id, behavior: invocation.behavior, state: invocation.state,
         callId: invocation.callId ?? (typeof invocation.evidence?.nativeCallId === 'string' ? invocation.evidence.nativeCallId : null), model: invocation.model,
         slot: invocation.slot, outcome: invocation.outcome, admittedAt: invocation.admittedAt,
@@ -457,6 +478,7 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
             : invocation.state === 'uncertain' ? 'uncertain' : 'not-recorded',
           outcome: settlement?.outcome ?? null, queueEntryId: settlement?.queue_entry_id ?? null,
           receivedAt: proof?.observedAt ?? null, processFailure: proof?.processFailure ?? null,
+          ...(progress ? { resolutionProgress: progress } : {}),
         },
         evidence: invocation.evidence ? { action: invocation.evidence.action, outcome: invocation.evidence.outcome,
           review_id: invocation.evidence.review_id, head_sha: invocation.evidence.head_sha,

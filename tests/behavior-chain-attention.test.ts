@@ -1104,6 +1104,92 @@ it('waits for the resolve-threads artifact instead of repeating resolve-threads'
   expect(entry.nextAction).not.toContain('Resolve 1 blocking')
 })
 
+it('reviews the earlier issue slot before holding a later slot for its missing original comment', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const early = { slot: 'early', model: 'fixture', recovery: 'fixture' }
+  const late = { slot: 'late', model: 'fixture', recovery: 'fixture' }
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue-v2', commentIds: [] }, issueReviewers: [early, late], prReviewers: [],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null },
+    pull: null }
+  let chain = admit(journal, 991, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'issue-review-991-late', behavior: 'review-issue', actor: chain.reviewer,
+    model: 'fixture', slot: 'late', basis: chainBasis(['issue', 'issue-v2']), admittedAt: admittedAt + 30_000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 30_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'issue-review-991-late', callId: 'issue-review-991-late', outcome: 'commented',
+    evidence: { status: 'completed', action: 'commented', issue_revision: 'issue-v2',
+      receipts: [{ issue: 'autonomio/poise#991', author: 'reviewer', comment_id: 11 }], completedAt: admittedAt + 40_000 } }, admittedAt + 40_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('review-issue')
+  expect(entry.nextAction).not.toContain('Hold for the missing original issue comment evidence')
+})
+
+it('reviews the earlier PR slot before holding a later slot for its missing original receipt', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const early = { slot: 'early', model: 'fixture', recovery: 'fixture' }
+  const late = { slot: 'late', model: 'fixture', recovery: 'fixture' }
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const head = 'a'.repeat(40)
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [early, late],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 992, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 992, head, headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', readinessBlockers: [], pending: false, failing: [], conflict: false, behind: false } }
+  let chain = admit(journal, 992, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'review-992-late', behavior: 'review-pr', actor: chain.reviewer,
+    model: 'fixture', slot: 'late', basis: chainBasis(['pr', head, 'b'.repeat(64)]), admittedAt: admittedAt + 30_000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 30_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'review-992-late', callId: 'review-992-late', outcome: 'clean',
+    evidence: { status: 'completed', action: 'reviewed_clean', head_sha: head, review_id: 1, completedAt: admittedAt + 40_000 } }, admittedAt + 40_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('Review the actual current pull-request head')
+  expect(entry.nextAction).not.toContain('Hold for the missing original PR submission receipt')
+})
+
+it('holds a settled contradictory resource release instead of recommending downstream work', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const head = 'c'.repeat(40)
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 993, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 993, head, headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', readinessBlockers: [], pending: false, failing: [], conflict: false, behind: false } }
+  let chain = admit(journal, 993, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'implement-993', behavior: 'implement-issue', actor: chain.author,
+    model: 'fixture', slot: 'primary', basis: chainBasis(['issue', 'issue']), admittedAt: admittedAt + 30_000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 30_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'implement-993', callId: 'implement-993', outcome: 'implemented',
+    evidence: { status: 'completed', action: 'implemented', completedAt: admittedAt + 40_000,
+      resources_settled_at: new Date(admittedAt + 40_000).toISOString(),
+      resource_ownership: { version: 1, roots: [{ path: '/tmp/poise-test', state: 'allocated', device: '1', inode: '2', parent_device: '3', parent_inode: '4' }], errors: [] } } }, admittedAt + 40_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('contradictory resource-release evidence')
+  expect(entry.nextAction).toContain('implement-993')
+  expect(entry.nextAction).not.toContain('Obtain qualifying')
+  expect(entry.nextAction).not.toContain('Review the actual current pull-request head')
+})
+
 it('waits for the merge artifact instead of repeating merge-pr', () => {
   const journal = new BehaviorChainJournal(db)
   const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
