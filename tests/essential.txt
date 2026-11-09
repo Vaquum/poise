@@ -33,26 +33,36 @@ tests/ssh-keys.test.ts
 tests/terminal.test.ts
 
 # Agent spend and PR actions: quotas, budgets, account routing, approving and merging.
+tests/behavior-resource-receipt.test.ts
 tests/behavior-chain-merge-basis.test.ts
+tests/behavior-chain-reconciliation.test.ts
+tests/behavior-chain-report.test.ts
 tests/behaviors-approval.test.ts
+tests/behaviors-cutover.test.ts
 tests/behaviors-merge.test.ts
 tests/behaviors-quota-budget.test.ts
 tests/behaviors-review-cap-api.test.ts
 tests/behaviors-review-cap-client.test.ts
 tests/behaviors-review-cap.test.ts
+tests/behaviors-slot-fallback.test.ts
 tests/chat/auto-merge.test.ts
 tests/gh-merge-order.test.ts
 tests/github-quota.test.ts
 tests/pr-account-routing.test.ts
+tests/test-offload.test.ts
 tests/quota-risk.test.ts
 tests/worker-capacity-chain.test.ts
 tests/worker-capacity.test.ts
 
 # Data loss: storage, deletion, ledgers, locks, imports and drafts.
 tests/archive-view-logic.test.ts
+tests/behavior-chain-closed-target.test.ts
+tests/behavior-chain-native.test.ts
 tests/behavior-ledger-recovery.test.ts
 tests/behavior-ledger-store.test.ts
 tests/behaviors-db.test.ts
+tests/caller-calls.test.ts
+tests/chat-control.test.ts
 tests/chat-legacy-import.test.ts
 tests/chat-session-state.test.ts
 tests/chat-tab-drafts.test.ts

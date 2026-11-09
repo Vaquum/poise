@@ -5,6 +5,7 @@ import { behaviorChainJournal } from '../server/behavior-chain-journal'
 import type { BehaviorChain, ChainEvent } from '../server/behavior-chain-store'
 import { behaviorChainSummary } from '../server/behavior-chain-summary'
 import { chainSummaryFixture } from './fixtures/behavior-chain-summary'
+import { parseProcessDiagnostic } from '../server/process-diagnostic'
 
 const native = vi.hoisted(() => ({ support: { status: 'supported', error: null as string | null } }))
 vi.mock('../server/native-cleanup-support', () => ({
@@ -141,6 +142,37 @@ it('shares the production summary and historical rebuild contract with browser p
   expect(chainSummaryFixture('pending-no-invocation').chains[0]).toMatchObject({ reviewStatus: 'pending', reviewPending: true, invocations: [] })
   expect(chainSummaryFixture('complete').chains[0]).toMatchObject({ reviewStatus: 'complete', reviewPending: false })
   expect(chainSummaryFixture('historical').chains[0]).toMatchObject({ reviewStatus: 'not-recorded', reviewPending: null })
+})
+
+it('retains the original failed native Call and diagnostic in list and History without rewriting uncertainty', async () => {
+  const journal = behaviorChainJournal()
+  const diagnostic = parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error', operation: 'merge_if_ready',
+    phase: 'native_action', outcome: 'unknown', submission: 'uncertain', refusal: null,
+    stderr: 'Queue response lost after possible submission', stderr_truncated: false })
+  let chain = journal.append('api/failed#7', 'failed-seed', 0, { type: 'chain.admitted', repository: 'api/failed', issue: 7,
+    branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' })
+  chain = journal.append(chain.id, 'failed-admit', chain.sequence, { type: 'invocation.admitted', invocation: {
+    id: 'failed-merge', behavior: 'merge-pr', actor: 'reviewer', model: null, slot: null, basis: 'original', admittedAt: Date.now(),
+    request: { command: 'github-interface', cwd: '/isolated', argv: ['--merge-if-ready', '21'] } } })
+  chain = journal.append(chain.id, 'failed-receipt', chain.sequence, { type: 'invocation.reconciled', invocationId: 'failed-merge',
+    evidence: { nativeCallId: 'c'.repeat(32), diagnostic, artifact: { private: 'not returned' } } })
+  chain = journal.append(chain.id, 'failed-uncertain', chain.sequence, { type: 'invocation.uncertain', invocationId: 'failed-merge', reason: 'original effect unknown' })
+  const before = journal.history(chain.id)
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/behavior-chains?id=${encodeURIComponent(chain.id)}`)
+    expect(response.status).toBe(200)
+    const detail = await response.json()
+    expect(detail.chain.invocations[0]).toMatchObject({ state: 'uncertain', callId: 'c'.repeat(32), evidence: { diagnostic } })
+    expect(detail.events.find((event: { type: string }) => event.type === 'invocation.reconciled'))
+      .toMatchObject({ callId: 'c'.repeat(32), evidence: { diagnostic } })
+    expect(JSON.stringify(detail)).not.toContain('not returned')
+    expect(journal.read(chain.id)!.invocations[0].callId).toBeNull()
+    expect(journal.history(chain.id)).toEqual(before)
+  } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })
 
 it('excludes closed seeds only after PR, execution, resource and review obligations are settled', async () => {

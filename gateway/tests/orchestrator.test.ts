@@ -87,6 +87,14 @@ describe('lazy start', () => {
       Object.entries(BEHAVIOR_LIMITS).map(([key, value]) => `${key}=${value}`)))
   })
 
+  it.each(['', 'acme/one,acme/two'])('passes only an explicit repair report allowlist to a new workspace (%s)', async repositories => {
+    const cookie = await start({ env: { POISE_REPAIR_EXHAUSTION_REPOSITORIES: repositories } })
+    await h.request({ host: ALICE, path: '/', headers: { ...NAVIGATE, cookie } })
+    await h.orchestrator.startInProgress('alice')
+    expect(containerEnv(h, 'alice').filter(value => value.startsWith('POISE_REPAIR_EXHAUSTION_REPOSITORIES=')))
+      .toEqual(repositories ? [`POISE_REPAIR_EXHAUSTION_REPOSITORIES=${repositories}`] : [])
+  })
+
   it.each(['added', 'changed', 'removed'])('recreates a stopped workspace when native behavior budgets are %s', async change => {
     const desired = change === 'removed' ? {} : BEHAVIOR_LIMITS
     const cookie = await start({ env: desired })
@@ -872,10 +880,10 @@ describe('image upgrades', () => {
 describe('updates in place', () => {
   let h: Harness
   const BASE = 'base-1'
-  const start = async (options: { oldBase?: string | null; running?: boolean; release?: string | null } = {}) => {
+  const start = async (options: { oldBase?: string | null; running?: boolean; release?: string | null; repairRepositories?: string } = {}) => {
     const { oldBase = BASE, running = true, release = 'old-release' } = options
     // A workspace that does not answer cannot prove native cleanup clear at this timeout.
-    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1' } })
+    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_REPAIR_EXHAUSTION_REPOSITORIES: options.repairRepositories } })
     await h.openWorkspace('Alice')
     h.store.noteWorkspace('alice', 'Alice')
     h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })
@@ -1157,6 +1165,38 @@ describe('updates in place', () => {
     expect(containerId()).not.toBe(before)
     expect(containerEnv(h, 'alice')).toContain(`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`)
   })
+
+  it.each(['added', 'changed', 'removed'].flatMap(change => [false, true].map(sameImage => ({ change, sameImage }))))(
+    'cooperatively replaces a workspace when the report allowlist is $change (same image=$sameImage)', async ({ change, sameImage }) => {
+      const desired = change === 'removed' ? '' : 'acme/one,acme/two'
+      await start({ repairRepositories: desired })
+      const container = h.docker.containers.get('poise-ws-alice')!
+      const previous = change === 'added' ? '' : 'acme/old'
+      container.spec = { ...container.spec, Env: [`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`,
+        ...(previous ? [`POISE_REPAIR_EXHAUSTION_REPOSITORIES=${previous}`] : [])] }
+      if (sameImage) {
+        container.imageId = CURRENT_IMAGE_ID
+        h.workspace.health.release = 'new-release'
+      }
+      const before = containerId()
+      h.workspace.health.unsettledNativeCalls = 1
+      h.workspace.health.backgroundWork = 1
+      await h.orchestrator.upgradePass()
+      expect(containerId()).toBe(before)
+      expect(h.workspace.switches).toEqual([])
+      expect(h.workspace.health.draining).toBe(false)
+      h.workspace.health.unsettledNativeCalls = 0
+      h.workspace.health.backgroundWork = 0
+      await h.orchestrator.upgradePass()
+      expect(containerId()).not.toBe(before)
+      expect(h.workspace.switches).toEqual([])
+      expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/drain')).toBe(true)
+      expect(containerEnv(h, 'alice').filter(value => value.startsWith('POISE_REPAIR_EXHAUSTION_REPOSITORIES=')))
+        .toEqual(desired ? [`POISE_REPAIR_EXHAUSTION_REPOSITORIES=${desired}`] : [])
+      const after = containerId()
+      await h.orchestrator.upgradePass()
+      expect(containerId()).toBe(after)
+    })
 
   it('switches a workspace on the current image that still runs an older release', async () => {
     await start()

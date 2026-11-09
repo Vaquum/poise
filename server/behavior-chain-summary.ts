@@ -292,6 +292,21 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         && chain.invocations.some(invocation => invocation.behavior === 'approve-pr' && invocation.state === 'settled'
           && invocation.evidence?.status === 'completed' && invocation.basis === normalApproveBasis
           && invocation.slot === observation.approver.slot)
+      // Mirroring decideBehaviorChain: an unpublished chain whose branch exists
+      // without the native publication receipt, or whose current-basis
+      // implementation returned no_changes, holds instead of proposing work.
+      const unpublishedIssueBasis = observation ? chainBasis(['issue', observation.issue.revision]) : null
+      const unpublishedPublishPartial = observation && !observation.pull && observation.publication?.head_sha
+        ? [...chain.invocations].reverse().find(invocation => invocation.callId === observation.publication.head_invocation
+          && !!(invocation.evidence as Record<string, unknown> | null)?.artifact)
+        : undefined
+      const unpublishedMissingReceipt = !!observation && !observation.pull
+        && typeof observation.publication?.head_sha === 'string' && observation.publication.head_sha.length > 0
+        && !unpublishedPublishPartial
+      const unpublishedNoChanges = !!observation && !observation.pull && !!unpublishedIssueBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'implement-issue' && invocation.state === 'settled'
+          && invocation.basis === unpublishedIssueBasis && invocation.slot === observation.implementer.slot
+          && (invocation.evidence as Record<string, unknown> | null)?.outcome === 'no_changes')
       let next = chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'
@@ -305,6 +320,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                     : observation && issueReviewMissingArtifact(chain, observation)
                     ? 'Hold for the missing original issue comment evidence; the posted GitHub comment remains unverified'
                     : observation && needsIssueReview(chain, observation) ? 'Review the current seed issue through review-issue'
+                    : observation && unpublishedMissingReceipt ? 'Hold: seed branch exists without this chain’s native publication receipt; a decision is required'
+                    : observation && unpublishedNoChanges ? 'Hold: implementation returned no changes and produced no pull request; a decision is required'
                     : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
                       : queueAwaitingRemoval && pull
                         ? 'Await GitHub queue removal evidence; the queue outcome remains unverified'
@@ -397,7 +414,8 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
     invocationCount: chain.invocations.length, invocations: chain.invocations.slice(-20).map((invocation) => {
       const proof = attributedNativeAction(invocation) ? matchingNativeActionReceipt(chain, invocation) : null
       const settlement = proof ? nativeActionSettlement(proof) : null
-      return { id: invocation.id, behavior: invocation.behavior, state: invocation.state, callId: invocation.callId, model: invocation.model,
+      return { id: invocation.id, behavior: invocation.behavior, state: invocation.state,
+        callId: invocation.callId ?? (typeof invocation.evidence?.nativeCallId === 'string' ? invocation.evidence.nativeCallId : null), model: invocation.model,
         slot: invocation.slot, outcome: invocation.outcome, admittedAt: invocation.admittedAt,
         nativeAction: !attributedNativeAction(invocation) ? null : {
           attribution: proof ? settlement!.status === 'completed' ? 'accepted-response' : 'observed-no-action'
@@ -407,7 +425,8 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
         },
         evidence: invocation.evidence ? { action: invocation.evidence.action, outcome: invocation.evidence.outcome,
           review_id: invocation.evidence.review_id, head_sha: invocation.evidence.head_sha,
-          resources_settled_at: invocation.evidence.resources_settled_at, error: invocation.evidence.error } : null,
+          resources_settled_at: invocation.evidence.resources_settled_at, error: invocation.evidence.error,
+          diagnostic: invocation.evidence.diagnostic } : null,
       }
     }) }
 }

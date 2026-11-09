@@ -163,6 +163,15 @@ their blocked model behaviors. A closed seed alone does not defer PR review or
 approval of an open PR. Public recheck times describe GitHub observation;
 native receipt reconciliation remains eligible on every pass.
 
+Journal revision conflicts are isolated to the affected chain. The sweep makes
+at most one fresh attempt within its existing 45-second budget, re-reading the
+chain and its native receipts and recomputing the decision. Another conflict or
+an exhausted budget defers that chain while unrelated chains remain eligible.
+Retained warning diagnostics identify the chain, phase and recovery or deferral
+outcome without marking a recovered race as an organization failure. Other
+journal errors and unreadable native receipts still surface; concurrent exit
+evidence and original invocation correlations and uncertainty are preserved.
+
 A successful quiescent observation schedules its next read at `checkedAt +
 min(24 hours, max(2 minutes, checkedAt - origin))`. Origin is the recorded actual
 merge time, otherwise the first native admission; a held chain with neither
@@ -174,6 +183,16 @@ are not repeated and a person's hold is retained. Failed observations neither
 advance timestamps nor become success: their error remains in runtime health
 after unrelated work is allowed to advance, with at most one attempt per
 target per existing pass under the existing account/native budgets.
+
+An explicitly CI-only repair blocker retains the supplied head and failed
+check/job identities and URLs in its original native artifact. Its automatic
+hold records that invocation and head and stays eligible every two minutes,
+using the same scheduler. Once that original settles with `action: not_started`
+and positive resource-release proof, a fresh matching-head `checksState: SUCCESS`
+with no pending or failing checks records `ciRecovery` on the existing resume
+event. The normal decision path then rechecks review, approval and merge gates;
+overall readiness is not required to release this hold. A generic worker
+blocker, uncertain publication or a later operator Hold cannot auto-resume.
 
 Merged `merge-pr` and `resolve-threads` uncertainty uses original journal
 receipts only. A missing original response schedules no GitHub read; retaining
@@ -280,13 +299,13 @@ has no PR; a closed PR blocks all model behaviors, and a closed seed also blocks
 issue review, implementation and repair. A never-started admission with no
 conflicting or quarantined Call settles as deferred `target_closed`, with
 explicit no-effect evidence and no failed-attempt charge. A started original
-with no Call can use Caller's atomic correlation fence: only winning the
-original unique correlation creates a terminal no-effect native Call. A late
-original cannot claim that correlation before its provider, checkout or writes.
+with no Call becomes `uncertain`: a partial receipt-store recovery can lose the
+unique correlation that once protected it. It cannot be relaunched or given a
+synthetic no-effect fence, even while held or disabled. Unreadable receipt
+snapshots also journal this uncertainty before reconciliation resumes.
 An existing Call is never altered, and normal validated receipt reconciliation
-must prove release. Fence failures remain reported and retain ownership; the
-existing tick retries that idempotent command at most once per two minutes,
-using a durable attempt time rather than a new timer.
+must prove release. [Receipt-store recovery](Operating.md#caller-receipt-store-recovery)
+defines preservation and activation requirements.
 The receipt reader accepts only the fence's exact no-provider, no-publication
 shape with its native resource-release timestamp. Other superseded outcomes
 retain their original validation; malformed fence rows stay quarantined.
@@ -386,6 +405,24 @@ campaign acceptance or forced-container recovery.
 
 Known failures before publication retry with bounded backoff and existing provider fallback. Ambiguous writes retain ownership. Confirmed actual artifacts can settle a lost response; missing receipts cannot justify another write. Partially published review/reply plans that cannot be fully reconciled remain uncertain and visible. They are not silently retried or reported successful. This limitation must be exercised and resolved if encountered in the real validation runs.
 
+An implementation or repair provider that reaches its execution deadline records
+`atomic_work_execution_budget_exhausted`. Its v1 diagnostic retains the provider,
+execution phase, measured elapsed milliseconds, actual seconds allowance and
+seed issue/PR/head, without command arguments or provider output. Caller keeps
+`not_started` / `preflight_failed`; the chain retains the diagnostic and exposes
+the specific cause as its invocation outcome in History. Preparation timeouts
+remain distinct. Retry still requires positive resource release and the existing
+same-basis backoff; three failures hold the chain across restart until **Resume**.
+
+Repair prompts receive `change_request_reviews` from the native
+`github-interface --pr-review` packet, even with no inline roots. The read selects each
+author's latest effective review (`APPROVED`, `CHANGES_REQUESTED`, `DISMISSED`),
+then includes only substantive change requests on the expected head, with their
+original body, review ID, author, commit, submission time and URL. A later
+`COMMENTED` review does not retire a request. Summaries share the packet byte
+limit; an overflowing packet or failed review read fails visibly. The final
+head/base recheck and independent approval verification still apply.
+
 Repair prompts name the exact unresolved root comment IDs from the head-verified
 review packet, including outdated threads and roots with earlier replies.
 Caller requires that same set before publication. Missing coverage records
@@ -424,6 +461,82 @@ read-only mode. A later attempt of that exact workflow/head settles its original
 admission; an unchanged attempt remains uncertain. A confirmed preflight read
 failure is a failed, unstarted action and retries with the existing backoff.
 
+## Reporting verified repair exhaustion
+
+Reporting is off by default. An operator can set
+`POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
+list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
+holds during their ordinary bounded reconciliation; no Resume or extra poller is
+needed. Reporting preserves the source hold and does not perform repair recovery.
+In service deployments, set it in `deploy/.env` or as a fork's Actions repository
+variable. The gateway forwards it on install; adding, changing or removing it
+cooperatively replaces existing workspaces, even on the same image. Unset or
+empty opts out.
+
+Reporting requires at least three settled original Caller repair receipts on the
+same current head, review basis and slot after the last Resume, each with positive
+resource release, `action=not_started`, retained `outcome=preflight_failed` and no
+publication plan or action receipts. All matching attempts must share one cause:
+`repair_incomplete_replies` requires `error_code=atomic_work_failed` and the specific
+incomplete-reply error; `repair_execution_budget_exhausted` requires
+`error_code=atomic_work_execution_budget_exhausted`.
+The historical fixed message and the newer omission-ID/count suffix represent
+the same cause. Hold text and generic failures cannot establish eligibility.
+Before first reporting, the existing datastore freshness gate must pass and a
+new native observation must still require repair on that head and review basis.
+Stale, unknown or changed findings leave reporting pending. Other causes remain
+visible in their ordinary holds without an issue report; mixed causes cannot qualify.
+
+Poise creates the report as the configured main GitHub account through its
+existing issue publisher, requesting the `poise` label. The body records the
+stage, stable cause, target, hold time/age, head/basis, safe invocation and Caller
+receipt identities, and next action. It excludes raw errors, omitted finding IDs,
+worker paths and provider output. An intent in the existing durable metadata store
+links the original hold event to the report issue. Identity uses cause + source
+chain + PR, independently of omission details, heads and subsequent attempt windows.
+Existing incomplete-reply intent keys and markers remain unchanged; budget reports
+use a separate cause with the same metadata and marker format.
+Both report bodies include the canonical clinical scope directive in the
+[report template](../server/behavior-chain-report.ts), followed by
+"Include this exact paragraph in the linked PR review." Native PR review and
+approval check closing references only when their chain's exact seed is a recorded
+report issue in that repository. The recorded issue number identifies the
+remediation ticket; the report's `pull` identifies the stalled source PR.
+The datastore must report complete `closing-references` that identify that exact
+seed; `body-keywords` cannot verify the relationship. Stale, missing or incomplete
+closing observations stop remediation review preparation. Unrelated seeds skip
+these additional datastore reads.
+A `poise` label or copied report marker alone cannot qualify a PR.
+Poise passes the trusted paragraph through `--review-scope`, separately from the
+configurable `--note`, and includes it in the reviewer's instructions. A lookalike
+marker in a configurable note cannot supply the formal review directive.
+Caller retains the trusted directive before invoking the reviewer and inserts it once
+in the formal GitHub review through the existing submission helper, for Claude
+and structured reviewers. The assessment, findings, review event and receipt
+keep their existing meaning. PR descriptions and Manager/Worker defaults do
+not acquire this policy.
+The marker lookup includes closed issues and verifies the publishing account.
+Intent is committed before creation;
+after an ambiguous POST, even repeated empty searches cannot authorize another
+POST. A crash before sending the reserved request also remains unconfirmed and
+requires reconciliation rather than an automatic replacement.
+
+A confirmed issue number is retained before label reconciliation. Missing labels
+are retried additively on that same issue; label failures, datastore indexing lag,
+incompatible saved intake labels and a held remediation chain are shown in the
+source chain's `waiting` reason, including its report URL when known. Poise does
+not add a different intake label or bypass ownership/admission gates. Admission is
+verified only when the normal datastore intake records the new chain. Generated
+remediation issues cannot report either cause recursively, using their marker
+or the retained source-to-issue link; their ordinary repair holds remain visible.
+
+`tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
+creation/restart, reconciliation and normal admission with an isolated journal
+and fake GitHub/datastore commands. Live acceptance remains pending until an
+operator follows a real qualifying hold through one labeled report, chain
+admission and the normal merge receipt after deployment. No fabricated hold,
+live write or production setting change is part of that component proof.
+
 ## Native action receipts
 
 Merge, queue-submission and conversation-resolution responses are attributed to
@@ -434,12 +547,21 @@ journal recovers that same accepted response without another native write. A
 returned response survives a subsequent nonzero process exit; the process failure
 is retained separately from the accepted effect. An observed prior merge, queue
 entry or empty thread set does not prove that this invocation performed it.
-Without its accepted response, the invocation remains uncertain and blocks a
-replacement write, even when another actor subsequently advances the PR. A
-failed receipt write has the same boundary: the returned response alone is not
-durable authority. Other chains can continue. Publication recovery likewise
-requires the original native invocation marker and pinned head; grey-CI recovery
+Merge-admission failures retain their bounded, redacted v1 diagnostic through
+the original Caller receipt. `submission: none` requires positive evidence that
+execution had not reached the mutation; `rejected` requires an explicit refusal
+response. Both use the existing no-action failure/backoff path; settlement still
+requires positive resource-release proof. Generic GraphQL errors, lost responses and
+missing queue confirmation retain `submission: uncertain`. The chain list and
+History show the original Call, cause and next action using this evidence.
+Without an accepted response or positive refusal evidence, the invocation remains
+uncertain and blocks a replacement write, even when the queue is empty or another
+actor subsequently advances the PR. A failed receipt write has the same boundary:
+the returned response alone is not durable authority. Other chains can continue.
+Publication recovery likewise requires the original native invocation marker and pinned head; grey-CI recovery
 retains its existing exact-workflow/attempt inspection.
+Historical Calls whose causes were discarded remain uncertain; this diagnostic
+path cannot reconstruct their missing evidence.
 
 ## Seed observation batch
 

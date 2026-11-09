@@ -5,6 +5,7 @@ import { BEHAVIORS } from '../../src/behaviors'
 import type { BehaviorCutoverState } from '../../src/behavior-cutover'
 import { BehaviorChainJournal } from '../../server/behavior-chain-store'
 import { chainSummaryFixture, delayedChainFixture } from '../fixtures/behavior-chain-summary'
+import { parseProcessDiagnostic } from '../../server/process-diagnostic'
 
 async function general(page: Page) {
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
@@ -13,6 +14,35 @@ async function general(page: Page) {
 }
 const row = (number: number) => ({ id: `acme/repo#${number}`, repository: 'acme/repo', issue: number, sequence: number,
   held: null, waiting: 'exact-head CI is running', mergeSha: null, pullNumber: number + 10, invocations: [] })
+
+for (const submission of ['none', 'rejected', 'uncertain']) {
+  test(`merge ${submission} evidence shows the original Call, cause and next action in chains and History`, async ({ page }) => {
+    await workspace(page)
+    const snapshot = chainSummaryFixture('pending-original-response')
+    const diagnostic = parseProcessDiagnostic({ version: 1, source: 'caller', severity: 'error', operation: 'merge_if_ready',
+      phase: 'native_action', outcome: 'exit', submission, stderr: 'Queue admission failure <private-markup>', stderr_truncated: false })
+    const callId = 'c'.repeat(32)
+    Object.assign(snapshot.chains[0].invocations[0], { callId, evidence: { diagnostic } })
+    await page.route('**/api/behavior-chains*', route => route.fulfill({ json: new URL(route.request().url()).searchParams.has('id')
+      ? { events: [{ sequence: 3, at: Date.now(), type: 'invocation.reconciled', callId, evidence: { diagnostic } }], next: null }
+      : snapshot }))
+    const controls = await general(page)
+    const list = controls.locator('[data-chain-list]')
+    const outcome = submission === 'none' ? 'Request not sent' : submission === 'rejected' ? 'Request rejected' : 'Action outcome unknown'
+    const next = submission === 'uncertain' ? 'reconcile the original Call response; do not enqueue again'
+      : 'address the cause; normal admission checks and retry backoff still apply'
+    await expect(list).toContainText(`Call ${callId}`)
+    await expect(list).toContainText(outcome)
+    await expect(list).toContainText('Cause: Queue admission failure <private-markup>')
+    await expect(list).toContainText(next)
+    await list.getByRole('button', { name: 'History', exact: true }).click()
+    const history = controls.locator('[data-history]')
+    await expect(history).toContainText(`Call ${callId}`)
+    await expect(history).toContainText(outcome)
+    await expect(history).toContainText(next)
+    await expect(controls.locator('private-markup')).toHaveCount(0)
+  })
+}
 
 for (const width of [390, 1280]) {
   test(`attention joins durable holds, progress age and exact-head gates at ${width}px`, async ({ page }) => {

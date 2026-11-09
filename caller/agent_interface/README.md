@@ -68,6 +68,12 @@ are retained with optional `recovered_at` evidence after a complete positive
 retry; an artifact's matching `resource_recovered_at` distinguishes recovered
 resource uncertainty from an uncertain external action. Neither marker alone
 can release a reservation.
+The receipt stays within 128 KiB. Allocation reserves its full directory and
+settlement certificates plus a bounded blocker before creating disk resources.
+Diagnostics are bounded and consolidated under pressure, including in existing
+receipts; consolidation retains a blocker until complete original recovery can
+cover it. A diagnostic write failure cannot prevent the private cleanup claim
+from retaining its held reason/backoff or stop later due Calls in the pass.
 An incompletely registered descendant can carry `state: covered` only when its
 original ancestor's pinned deletion certificate covers it. Its `covered_by`
 names that reclaimed ancestor; it carries no invented child device/inode.
@@ -101,6 +107,15 @@ library/unit calls retain historical receipts and are not physical CLI proof.
 Provider preparation now runs inside the original physical Call; nonfatal
 updater warnings retain warning severity in the existing diagnostic stream,
 and missing verified launchers fail with their preparation diagnostic.
+
+Native failures, including setup exceptions after Call registration, retain the
+first error in the existing v1 `diagnostic`, replacing an earlier preparation
+warning. Evidence keeps the original Call/correlation, execution phase and
+Caller operation, with exception type, errno, deadline and exit/signal when
+observed. Exception text, subprocess arguments and captured output are excluded.
+The outer detached Caller records an explicit unknown cause and observed exit
+status when its inner continuation leaves no cause. These SQLite records survive
+Poise restarts; they authorize neither publication nor resource release.
 
 # Fencing a closed behavior
 
@@ -189,6 +204,13 @@ registered group is dead too. Each hold uses a fresh token; a released or lost
 lease never touches the row again.
 
 # PR review models
+
+Provider supervision hands off after a minute of quota or reconnect diagnostics
+without progress. It reads bounded diagnostic fields from structured provider
+error/retry events and supported native stderr diagnostics; tool events,
+assistant prose and reasoning clear the stall timer. Malformed stdout never
+supplies quota evidence. The retained cause excerpt contains only the selected
+diagnostics, and GitHub quota errors do not trigger a provider handoff.
 
 Every attempt ends with one durable terminal state: a validated result with its
 authoritative `review_id` receipt, or a typed failure carrying provider, phase,
@@ -368,6 +390,15 @@ The limit applies per response. `pr_approve` has no inspection tool, so all its 
 is one response, and Claude Code restarts a response cut at the limit without that reasoning.
 Other behaviors retain their existing model assignments and limits.
 
+Local pinned-repository inspection has a separate 30-second deadline, capped by
+the remaining review budget. A timeout records `review_inspection_timeout` and
+retains the inspection phase, deadline and pinned target in the existing process
+diagnostic, without command arguments or inspection content in the error.
+Poise excludes this diagnostic from provider backoff, including older calls
+labeled `review_budget_exhausted`. The existing behavior chain retries the same
+review basis and slot after resource release and native failure backoff, holding
+after three failed attempts; Caller adds no inspection retry loop.
+
 A Grok Build `pr_review` or `pr_approve` also has an 800-second analysis ceiling,
 counted from when analysis starts, for one file group or many, with or without
 inspection rounds. With no verdict by then the run stops, posts nothing and fails
@@ -472,6 +503,11 @@ killed, and so is anything still running in its checkout, detached or not.
 Claude keeps Claude Code's own system prompt: the unattended rules are
 appended with `--append-system-prompt`, last on the line, and the task goes on
 stdin — the shape Poise's subscription wrapper reads a stdin prompt from.
+
+Issue-review and atomic implementation/repair providers and their commands run
+without `AGENT_INTERFACE_RECEIPT_DB` or `AGENT_INTERFACE_RECEIPT_CALL`. Scratch
+and managed build caches stay inside the run. Caller retains its receipt binding
+for resource checks, trusted publication and cleanup.
 
 The actor is the agent account. `GITHUB_INTERFACE_AGENT_USER` names it, and
 an `--actor` that differs from it is refused before anything runs

@@ -13,6 +13,7 @@ import { getBehaviorChainSettings, getSettings } from './settings'
 import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { runFile, spawnDetached } from './process'
+import { requireCallerReceipts } from './service/caller-calls'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
@@ -21,6 +22,7 @@ type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
 const NATIVE_ACTION_TIMEOUT_MS = 120_000
 
 export async function readNativeInvocations(ids: string[]) {
+  requireCallerReceipts()
   const { stdout } = await runFile('agent-interface', ['--logs', '--select', JSON.stringify({ latest: [], ids: [], correlations: ids })],
     { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 16 * 1024 * 1024 })
   return parseAgentLogStdout(stdout, 'behavior chain native receipts')
@@ -34,7 +36,8 @@ export interface NativeChainHooks {
   capacity(): number
   measureHeadroom?: () => BehaviorResourceHeadroom
   permitted(chain: BehaviorChain, decision: Invoke): boolean
-  note(behavior: ChainBehavior): string
+  note(behavior: ChainBehavior, chain: BehaviorChain, pull: { number: number } | null): string | Promise<string>
+  reviewScope?(chain: BehaviorChain, pull: { number: number }): string | Promise<string>
   severity(behavior: ChainBehavior): string
   received(invocation: ChainInvocation, call: LogEntry): void
   reviews(repository: string, number: number): Promise<string>
@@ -93,7 +96,10 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     available: hooks.available,
     capacity: hooks.capacity,
     measureHeadroom: hooks.measureHeadroom,
-    permitted: hooks.permitted,
+    permitted(chain, decision) {
+      requireCallerReceipts()
+      return hooks.permitted(chain, decision)
+    },
     wake: hooks.wake,
     received: hooks.received,
     async discover(): Promise<ChainSeed[]> {
@@ -292,7 +298,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const cwd = await directory(chain.repository)
       const pull = observation.pull
       const common = ['--source', 'poise:behavior-chain', '--correlation-id', id, '--actor', decision.actor]
-      const note = [hooks.note(decision.behavior), decision.reason].filter(Boolean).join('\n\n')
+      const note = [await hooks.note(decision.behavior, chain, pull), decision.reason].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
         const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`)
         if (!selected) return null
@@ -305,8 +311,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           ...common, '--model', selected.model, '--branch', chain.branch, '--expected-issue-revision', observation.issue.revision,
           ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head, ...(pull.conflict || pull.behind || pull.queueRemoval ? ['--merge-base'] : [])] : []), '--note', note] }
         if (!pull) throw new Error('PR behavior requires its actual pull request')
+        const scope = await hooks.reviewScope?.(chain, pull) ?? ''
+        const reviewNote = scope
+          ? `${note}\n\nApply this scope directive when reviewing the remediation. Caller includes it once in the formal GitHub review.\n\n${scope}` : note
         return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `https://github.com/${chain.repository}/pull/${pull.number}`,
-          ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior), '--note', note] }
+          ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior),
+          ...(scope ? ['--review-scope', scope] : []), '--note', reviewNote] }
       }
       if (decision.behavior === 'publish-issue') {
         const partial = [...chain.invocations].reverse().find((invocation) => invocation.callId === observation.publication.head_invocation)
@@ -335,6 +345,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     },
     async launch(invocation, onExit, allowed) {
       if (!allowed()) return false
+      requireCallerReceipts()
       // Provider preparation finished after the durable admission, so
       // re-verify measured headroom at the last boundary before spawn. A
       // deferral settles as launch_deferred without consuming an attempt;
@@ -354,6 +365,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         const identities = ['--model', '--recovery-model'].flatMap((flag) => { const index = invocation.request.argv.indexOf(flag); return index >= 0 ? [invocation.request.argv[index + 1]] : [] })
         const env = await hooks.prepare(identities)
         if (!allowed()) { release(); return false }
+        requireCallerReceipts()
         await spawnDetached('agent-interface', invocation.request.argv, { cwd: invocation.request.cwd, env,
           onExit: (result) => { release(); onExit(result) } })
         return true
@@ -378,6 +390,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return proof.outcome === 'fenced'
     },
     async perform(invocation, chain) {
+      requireCallerReceipts()
       let stdout: string
       let processFailure: { code: unknown, signal: unknown } | null = null
       try {
@@ -425,6 +438,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return result
     },
     async resumePublication(invocation, head, correlation) {
+      requireCallerReceipts()
       const callId = invocation.evidence?.callId
       const artifact = object(invocation.evidence?.artifact, 'repair publication receipt')
       if (typeof callId !== 'string' || !/^[0-9a-f]{32}$/.test(callId) || typeof artifact.plan_sha !== 'string') throw new Error('repair lacks its original native publication identity')

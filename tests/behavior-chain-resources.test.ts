@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseAgentLogStdout } from '../server/agent-log-parse'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent } from '../server/behavior-chain-store'
+import { parseResourceOwnership } from '../server/behavior-resource-receipt'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorResourceRecovery } from '../server/behavior-chain-resource-recovery'
 import type { ChainObservation } from '../server/behavior-chain-decision'
@@ -464,6 +465,118 @@ describe('resource-aware behavior admission', () => {
     expect(admitted.invocations).toHaveLength(1)
     expect(admitted.invocations[0].reservation).toBeNull()
     expect(admitted.invocations[0].request.argv).toEqual(['--model', 'fixture-model'])
+  })
+
+  it('reconciles a mid-size ancestor receipt that the parser allows', () => {
+    const { journal, chain } = setup()
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: invocation('large-receipt', RESERVATION) })
+    // Production ancestor coverage lands between the old 256 KiB journal bound
+    // and the 512 KiB receipt bound: ~600 reclaimed roots with long paths.
+    const roots = Array.from({ length: 600 }, (_, index) => ({ path: `/isolated/${index}/${'x'.repeat(400)}`,
+      state: 'reclaimed' as const, device: '1', inode: `${index + 2}`, parent_device: '1', parent_inode: '3', reclaimed_at: 10 }))
+    const receipt = { version: 1 as const, roots, errors: [] }
+    const receiptBytes = Buffer.byteLength(JSON.stringify(receipt))
+    expect(receiptBytes).toBeGreaterThan(256 * 1024)
+    expect(receiptBytes).toBeLessThan(512 * 1024)
+    expect(parseResourceOwnership(receipt).roots).toHaveLength(600)
+    const settledAt = new Date(NOW).toISOString()
+    current = record(journal, current, { type: 'invocation.resources_reconciled', invocationId: 'large-receipt',
+      evidence: { resource_ownership: receipt, resources_settled_at: settledAt } })
+    expect(current.invocations[0].evidence?.resource_ownership).toEqual(receipt)
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+  })
+
+  it('reconciles a large receipt alongside its retained artifact', () => {
+    const { journal, chain } = setup()
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: invocation('large-receipt-artifact', RESERVATION) })
+    const retained = { phase: 'posting_issue_reviews', plan_sha: 'd'.repeat(64), padding: 'x'.repeat(32 * 1024) }
+    current = record(journal, current, { type: 'invocation.reconciled', invocationId: 'large-receipt-artifact',
+      evidence: { artifact: retained } })
+    // A valid ~500 KiB receipt plus a permitted 32 KiB artifact exceeds the
+    // previous 516 KiB journal bound but must still reconcile.
+    const roots = Array.from({ length: 980 }, (_, index) => ({ path: `/isolated/${index}/${'x'.repeat(400)}`,
+      state: 'reclaimed' as const, device: '1', inode: `${index + 2}`, parent_device: '1', parent_inode: '3', reclaimed_at: 10 }))
+    const receipt = { version: 1 as const, roots, errors: [] }
+    const receiptBytes = Buffer.byteLength(JSON.stringify(receipt))
+    expect(receiptBytes).toBeGreaterThan(500 * 1024)
+    expect(receiptBytes).toBeLessThan(512 * 1024)
+    expect(parseResourceOwnership(receipt).roots).toHaveLength(980)
+    const settledAt = new Date(NOW).toISOString()
+    current = record(journal, current, { type: 'invocation.resources_reconciled', invocationId: 'large-receipt-artifact',
+      evidence: { resource_ownership: receipt, resources_settled_at: settledAt,
+        artifact: { ...retained, resource_recovered_at: 18 } } })
+    expect(current.invocations[0].evidence?.resource_ownership).toEqual(receipt)
+    expect(current.invocations[0].evidence?.artifact).toMatchObject({ plan_sha: 'd'.repeat(64), resource_recovered_at: 18 })
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+  })
+
+  it('reconciles a large receipt alongside its artifact and process diagnostics', () => {
+    const { journal, chain } = setup()
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: invocation('large-receipt-diagnostic', RESERVATION) })
+    // A valid ~500 KiB receipt plus a permitted 120 KiB artifact and 32 KiB
+    // stderr exceeds the previous 644 KiB journal bound but must still
+    // reconcile and settle through the runtime receipt.
+    const roots = Array.from({ length: 970 }, (_, index) => ({ path: `/isolated/${index}/${'x'.repeat(400)}`,
+      state: 'reclaimed' as const, device: '1', inode: `${index + 2}`, parent_device: '1', parent_inode: '3', reclaimed_at: 10 }))
+    const receipt = { version: 1 as const, roots, errors: [] }
+    const receiptBytes = Buffer.byteLength(JSON.stringify(receipt))
+    expect(receiptBytes).toBeGreaterThan(500 * 1024)
+    expect(receiptBytes).toBeLessThan(512 * 1024)
+    expect(parseResourceOwnership(receipt).roots).toHaveLength(970)
+    const artifact = { phase: 'posting_issue_reviews', plan_sha: 'd'.repeat(64), padding: 'x'.repeat(120 * 1024) }
+    const artifactBytes = Buffer.byteLength(JSON.stringify(artifact))
+    expect(artifactBytes).toBeGreaterThan(120 * 1024)
+    expect(artifactBytes).toBeLessThan(128 * 1024)
+    const diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'github-interface',
+      phase: 'submit', outcome: 'exit', stderr: 'e'.repeat(32 * 1024), stderr_truncated: false, context: {}, filesystem: null }
+    const diagnosticBytes = Buffer.byteLength(JSON.stringify(diagnostic))
+    expect(diagnosticBytes).toBeGreaterThan(32 * 1024)
+    const settledAt = new Date(NOW).toISOString()
+    const evidence = { status: 'completed', action: 'commented', outcome: 'commented', artifact, diagnostic,
+      resource_ownership: receipt, resources_settled_at: settledAt }
+    expect(Buffer.byteLength(JSON.stringify({ type: 'invocation.reconciled', invocationId: 'large-receipt-diagnostic', evidence })))
+      .toBeGreaterThan(512 * 1024 + 128 * 1024 + 4 * 1024)
+    current = record(journal, current, { type: 'invocation.reconciled', invocationId: 'large-receipt-diagnostic', evidence })
+    expect(current.invocations[0].evidence?.resource_ownership).toEqual(receipt)
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: 'large-receipt-diagnostic',
+      callId: 'c'.repeat(32), outcome: 'commented', evidence })
+    expect(current.invocations[0].state).toBe('settled')
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+  })
+
+  it('reconciles a large receipt alongside escaped process diagnostics', () => {
+    const { journal, chain } = setup()
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: invocation('large-receipt-escaped', RESERVATION) })
+    // 32 KiB of null bytes escapes to ~192 KiB of JSON, exceeding the previous
+    // 692 KiB journal bound alongside a valid receipt and artifact.
+    const roots = Array.from({ length: 970 }, (_, index) => ({ path: `/isolated/${index}/${'x'.repeat(400)}`,
+      state: 'reclaimed' as const, device: '1', inode: `${index + 2}`, parent_device: '1', parent_inode: '3', reclaimed_at: 10 }))
+    const receipt = { version: 1 as const, roots, errors: [] }
+    const receiptBytes = Buffer.byteLength(JSON.stringify(receipt))
+    expect(receiptBytes).toBeGreaterThan(500 * 1024)
+    expect(receiptBytes).toBeLessThan(512 * 1024)
+    expect(parseResourceOwnership(receipt).roots).toHaveLength(970)
+    const artifact = { phase: 'posting_issue_reviews', plan_sha: 'd'.repeat(64), padding: 'x'.repeat(120 * 1024) }
+    const artifactBytes = Buffer.byteLength(JSON.stringify(artifact))
+    expect(artifactBytes).toBeGreaterThan(120 * 1024)
+    expect(artifactBytes).toBeLessThan(128 * 1024)
+    const diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'github-interface',
+      phase: 'submit', outcome: 'exit', stderr: '\u0000'.repeat(32 * 1024), stderr_truncated: false, context: {}, filesystem: null }
+    const diagnosticBytes = Buffer.byteLength(JSON.stringify(diagnostic))
+    expect(diagnosticBytes).toBeGreaterThan(150 * 1024)
+    const settledAt = new Date(NOW).toISOString()
+    const evidence = { status: 'completed', action: 'commented', outcome: 'commented', artifact, diagnostic,
+      resource_ownership: receipt, resources_settled_at: settledAt }
+    expect(Buffer.byteLength(JSON.stringify({ type: 'invocation.reconciled', invocationId: 'large-receipt-escaped', evidence })))
+      .toBeGreaterThan(512 * 1024 + 128 * 1024 + 32 * 1024 + 4 * 1024)
+    current = record(journal, current, { type: 'invocation.reconciled', invocationId: 'large-receipt-escaped', evidence })
+    expect(current.invocations[0].evidence?.resource_ownership).toEqual(receipt)
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+    current = record(journal, current, { type: 'invocation.settled', invocationId: 'large-receipt-escaped',
+      callId: 'c'.repeat(32), outcome: 'commented', evidence })
+    expect(current.invocations[0].state).toBe('settled')
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
   })
 })
 

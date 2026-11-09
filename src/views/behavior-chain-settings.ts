@@ -1,16 +1,18 @@
 import { getSettings, setLocalSettings, type AppSettings } from '../config'
 import { escapeHtml } from '../markdown'
 import type { BehaviorCutoverState } from '../behavior-cutover'
+import type { ProcessDiagnostic } from '../../server/process-diagnostic'
 
 type Settings = NonNullable<AppSettings['behaviorChain']>
+interface FailureEvidence { diagnostic?: ProcessDiagnostic }
 interface ChainRow {
   id: string, repository: string, issue: number, sequence: number, held: string | null, waiting: string | null,
   mergeSha: string | null, reviewPending?: boolean | null, reviewStatus?: 'pending' | 'complete' | 'not-recorded', pullNumber: number | null,
   reconciliation?: { nextObservationAt: number | null, waitingForOriginalResponse: boolean, waitingForResourceRelease?: boolean } | null,
-  invocations: Array<{ behavior: string, state: string, outcome?: string | null,
+  invocations: Array<{ behavior: string, state: string, outcome?: string | null, callId?: string | null, evidence?: FailureEvidence | null,
     nativeAction?: { attribution: string, outcome: string | null } | null }>
 }
-interface JournalEvent { sequence: number, at: number, type: string, reason?: string, outcome?: string }
+interface JournalEvent { sequence: number, at: number, type: string, reason?: string, outcome?: string, callId?: string | null, evidence?: FailureEvidence }
 interface AttentionRow {
   id: string, repository: string, issue: number, pullNumber: number | null, step: string, progressAt: number, ageMs: number,
   blocker: string, evidence: { state: string, checkedAt: number | null, gates: string[] },
@@ -18,6 +20,17 @@ interface AttentionRow {
   reconciliation: { nextObservationAt: number | null, waitingForResourceRelease: boolean }
 }
 const defaults: Settings = { enabled: false, seedMode: 'label', label: 'poise' }
+
+function failureDetails(callId?: string | null, evidence?: FailureEvidence | null): string {
+  const call = callId ? ` · Call ${callId}` : ''
+  const diagnostic = evidence?.diagnostic
+  if (!diagnostic || (diagnostic.operation !== 'merge_if_ready' && diagnostic.phase !== 'native_action')) return call
+  const submission = diagnostic.context.submission
+  const known = submission === 'none' || submission === 'rejected'
+  return `${call} · ${submission === 'none' ? 'Request not sent' : submission === 'rejected' ? 'Request rejected' : 'Action outcome unknown'} · Cause: ${diagnostic.stderr || diagnostic.context.message || 'cause unknown'} · Next: ${known
+    ? 'address the cause; normal admission checks and retry backoff still apply.'
+    : 'reconcile the original Call response; do not enqueue again.'}`
+}
 
 export function behaviorChainSettings() {
   const element = document.createElement('section')
@@ -139,7 +152,7 @@ export function behaviorChainSettings() {
       if (data.next !== null && (!Number.isSafeInteger(data.next) || data.next <= (after ?? 0))) throw new Error('Journal cursor did not advance')
       historyId = id; historyNext = data.next; history.hidden = false
       history.querySelector('[data-history-title]')!.textContent = `v2 journal · ${id}`
-      const html = data.events.map((event: JournalEvent) => `<li>${escapeHtml(new Date(event.at).toLocaleString())} · ${escapeHtml(event.type)}${event.reason || event.outcome ? ` · ${escapeHtml(event.reason || event.outcome || '')}` : ''}</li>`).join('')
+      const html = data.events.map((event: JournalEvent) => `<li>${escapeHtml(new Date(event.at).toLocaleString())} · ${escapeHtml(event.type)}${event.reason || event.outcome ? ` · ${escapeHtml(event.reason || event.outcome || '')}` : ''}${escapeHtml(failureDetails(event.callId, event.evidence))}</li>`).join('')
       const events = history.querySelector('[data-history]')!
       if (append) events.insertAdjacentHTML('beforeend', html); else events.innerHTML = html || '<li>No journal events.</li>'
       historyMore.hidden = historyNext === null
@@ -239,7 +252,10 @@ export function behaviorChainSettings() {
           : chain.reconciliation?.waitingForOriginalResponse ? ' · Original action response required; GitHub reads cannot settle this invocation.'
           : chain.reconciliation?.nextObservationAt && chain.reconciliation.nextObservationAt > Date.now()
             ? ` · Next original-evidence observation: ${new Date(chain.reconciliation.nextObservationAt).toLocaleString()}.` : ''
-        return `<li>v2 · ${github}${chain.pullNumber ? ` → <a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(chain.pullNumber)}">PR #${Number(chain.pullNumber)}</a>` : ''}: ${escapeHtml(state)}${escapeHtml(obligation)}${escapeHtml(recheck)}${!active && last ? ` · Last: ${escapeHtml(last.behavior)} (${escapeHtml(last.outcome || last.state)}${escapeHtml(attribution)})` : ''}${control} <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-operation="history">History</button></li>`
+        const failure = active ?? last
+        const details = failure?.behavior === 'merge-pr' ? failureDetails(failure.callId,
+          failure.nativeAction?.attribution === 'accepted-response' ? null : failure.evidence) : ''
+        return `<li>v2 · ${github}${chain.pullNumber ? ` → <a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(chain.pullNumber)}">PR #${Number(chain.pullNumber)}</a>` : ''}: ${escapeHtml(state)}${escapeHtml(obligation)}${escapeHtml(recheck)}${!active && last ? ` · Last: ${escapeHtml(last.behavior)} (${escapeHtml(last.outcome || last.state)}${escapeHtml(attribution)})` : ''}${escapeHtml(details)}${control} <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-operation="history">History</button></li>`
       }).join('') || '<li>No behavior chains.</li>'
       const errors = Array.isArray(data.runtime) ? data.runtime.filter((entry: { error: string | null }) => entry.error).map((entry: { organization: string, error: string }) => `${entry.organization}: ${entry.error}`).join('; ') : ''
       status.textContent = `Read ${new Date().toLocaleTimeString()}${errors ? ` · ${errors}` : ''}`

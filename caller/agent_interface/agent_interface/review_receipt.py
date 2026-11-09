@@ -39,7 +39,7 @@ _QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-rema
                   "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
 
 
-def prepare_response(packet: str, model: str) -> None:
+def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
     """Pin controller-owned context before invoking the configured reviewer."""
     from hashlib import sha256
     bound = _call.get()
@@ -51,9 +51,10 @@ def prepare_response(packet: str, model: str) -> None:
                                ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
     database, call_id = bound
     with caller_store.connect(database, timeout=30) as conn:
-        conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?)) where id=? and status='running'",
+        conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?),'$.review_scope',?) where id=? and status='running'",
                      (json.dumps({"repository": value["repository"], "pull_number": value["pull_number"],
-                                  "head_sha": value["head_sha"], "context_sha": context, "model": model}), call_id))
+                                  "head_sha": value["head_sha"], "context_sha": context, "model": model}),
+                      review_scope or None, call_id))
 
 
 def complete_response(assessment: dict, head: str) -> dict | None:
@@ -148,6 +149,12 @@ def begin_submission(body: str, head: str) -> str:
                                (json.dumps({"phase": "submitting_review", "expected_head": head}), call_id, head, int(time.time() * 1000))).rowcount
         if changed != 1:
             raise RuntimeError("managed review does not own an unsubmitted native action receipt")
+        scope = conn.execute("select json_extract(artifact,'$.review_scope') from calls where id=?", (call_id,)).fetchone()[0]
+    if scope:
+        # Keep the retained assessment intact, including its response marker.
+        # The visible policy is supplied by Poise, not by a model echo.
+        visible, separator, response = body.partition('\n\n<!-- poise-review-response ')
+        body = f"{visible.replace(scope, '').strip()}\n\n{scope}{separator}{response}"
     return f"{body}\n\n<!-- poise-invocation {call_id} -->".strip()
 
 

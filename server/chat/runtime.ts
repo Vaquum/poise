@@ -75,7 +75,7 @@ import { actorOf, nativeName } from './actors'
 // person's own answer and keeps the person's composition.
 import { SWITCHBOARD_PERSON } from './switchboard'
 import * as storage from './storage'
-import { WORK_MONITOR_SENDER, bindings, holdChat, holds, internalTurn, message as controlMessage, moveBindings, releaseBindings, timerSummaries } from './control-store'
+import { WORK_MONITOR_SENDER, bindings, holdChat, holds, internalTurn, message as controlMessage, moveBindings, releaseBindings, settleOrphanedMessages, timerSummaries } from './control-store'
 import { groupMembers, pgidAlive, pidAlive, signalGroup, workerGateStatus, workerGroupMatches, workerIdentityMatches, type GroupMember, type WorkerGateStatus } from './worker'
 import { ADOPTION_LIVE_TIMEOUT_MS, attachRelay, livePromise, relayDirFor, relayIdentityMatches, spawnRelay, type RelayConnection } from './relay'
 import { createReplayHost, recalledDiffs } from './replay'
@@ -516,6 +516,7 @@ export class ChatRuntime extends EventEmitter {
     try {
       protectedSessions = await this.recoverState()
       await this.purgeRetiredModels(protectedSessions)
+      settleOrphanedMessages(this.instance)
     } finally {
       this.recovering = false
     }

@@ -1,16 +1,43 @@
 """One implementation or repair invocation, with no persistent model session."""
 import json
+import subprocess
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 
 from . import checkout_lock, issue_review, progress, review_budget, resource_ownership
 from .model_catalog import Model
+from .process_diagnostic import diagnostic_envelope
 
 UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended; report a blocker instead of inventing a human answer. Caller owns publication."
 
 
 class AtomicWorkBlocked(ValueError):
     code = "atomic_work_blocked"
+
+
+def _ci_only_blocker(ci: object) -> object:
+    # Durable CI-only evidence is the packet identity plus the failed
+    # check/job IDs that pin the original run attempt. Full check summaries
+    # can exceed the 128 KiB receipt limit and would turn an explicit CI-only
+    # blocker into an unrecoverable failure.
+    if not isinstance(ci, dict):
+        return ci
+    failing = ci.get("failing")
+    compact: list[object] = []
+    if isinstance(failing, list):
+        for entry in failing:
+            if isinstance(entry, dict):
+                compact.append({key: entry[key] for key in
+                                ("type", "name", "state", "conclusion", "check_run_id", "log_id", "url")
+                                if key in entry})
+    return {
+        "action": ci.get("action"),
+        "repository": ci.get("repository"),
+        "pull_number": ci.get("pull_number"),
+        "head_sha": ci.get("head_sha"),
+        "failing": compact,
+    }
 
 
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
@@ -62,6 +89,8 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "This exact set includes outdated unresolved roots and roots that already have replies; answer each with concrete changes or evidence for disagreement. "
         "Do not reply to replies, invent comment ids, or use generic acknowledgements. For initial implementation replies must be empty. "
         "If unable to finish, set blocked to the concrete reason; do not claim the work complete. "
+        'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
+        "Use a string for every other blocker, including missing evidence, a product decision or uncertain publication. "
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
         f"Behavior note: {note}\nPreparation receipt:\n{json.dumps(prepared)}\nActual issue and comments:\n{json.dumps(data)}\nActual PR evidence:\n{json.dumps(evidence)}"
     )
@@ -72,7 +101,18 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         try:
             record({"phase": "executing", "prepared": prepared})
             progress.stage("waiting_provider", "Waiting for atomic behavior provider", timeout=seconds)
-            done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
+            started = monotonic()
+            try:
+                done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
+            except subprocess.TimeoutExpired as error:
+                raise review_budget.ReviewLimitError(
+                    "Atomic behavior provider exhausted its execution budget; no publication attempted",
+                    "atomic_work_execution_budget_exhausted",
+                    diagnostic_envelope(operation="provider.atomic_work", phase="provider_execution", outcome="timed_out",
+                                        executable=model.provider, elapsed_ms=round((monotonic() - started) * 1000),
+                                        timeout_seconds=seconds, repository=repo, pr=pull, expected_head=expected_head,
+                                        behavior="repair_pr" if pull is not None else "implement_issue",
+                                        message=f"Seed issue {repo}#{number}", submission="none")) from error
             record({"phase": "resources_unknown", "prepared": prepared})
             issue_review.stop_leftovers(work)
             if issue_review._cwd_pids(work, require_complete=True) != []:
@@ -90,7 +130,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if not isinstance(publication, dict):
                 raise ValueError("atomic behavior blocked: invalid output")
             if publication.get("blocked"):
-                raise AtomicWorkBlocked(f"atomic behavior blocked: {publication['blocked']}")
+                blocked = publication["blocked"]
+                if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
+                        and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
+                    record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})
+                    blocked = blocked["reason"]
+                raise AtomicWorkBlocked(f"atomic behavior blocked: {blocked}")
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
                 raise ValueError("atomic behavior publication metadata is incomplete")
             replies = publication.get("replies", [])

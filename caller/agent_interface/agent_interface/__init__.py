@@ -38,7 +38,7 @@ from . import (
     resource_ownership,
 )
 from .model_catalog import CATALOG, ModelCatalogError
-from .process_diagnostic import diagnostic_envelope
+from .process_diagnostic import diagnostic_envelope, escaped_failure
 from .review_watch import ReviewSuperseded
 from .review_watch import _interrupted as review_watch_interrupted
 
@@ -268,6 +268,29 @@ def native_execution_limits() -> dict | None:
     return resource_guard.limits(args[args.index(flag) + 1])
 
 
+def retain_native_failure(call_id: str, error: BaseException | None, *, phase: str | None = None,
+                          exit_code: int | None = None, diagnostic: dict | None = None) -> dict | None:
+    # Only a successful original claim can annotate its Call. In particular a
+    # duplicate launch cannot borrow a row by looking up its correlation.
+    if not _native_cli or call_id != _native_call_id:
+        return diagnostic
+    with db() as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select * from calls where id=?", (call_id,)).fetchone()
+        if row is None or row["status"] != "running":
+            return diagnostic
+        prior = json.loads(row["diagnostic"]) if row["diagnostic"] else None
+        if prior and prior.get("severity") == "error":
+            return prior
+        observed = progress.decode(row["progress"]) or {}
+        evidence = diagnostic or escaped_failure(error, phase or progress.phase() or observed.get("phase") or "call_setup", exit_code)
+        evidence = {**evidence, "call_id": call_id, "correlation_id": row["correlation_id"],
+                    "repository": row["repo"], "pr": row["pr_id"], "behavior": row["behavior"],
+                    "reviewer": row["actor"], "expected_head": row["expected_head"]}
+        conn.execute("update calls set diagnostic=? where id=? and status='running'", (json.dumps(evidence), call_id))
+        return evidence
+
+
 def _prepare_native_clis(call_id: str) -> None:
     models = [required_flag("--model")]
     recovery = flag_value("--recovery-model")
@@ -304,6 +327,9 @@ def _prepare_native_clis(call_id: str) -> None:
         if done.returncode:
             raise RuntimeError(evidence["message"] if evidence else "native provider preparation failed without diagnostic evidence")
         os.environ.update(result["env"])
+    except Exception as error:
+        retain_native_failure(call_id, error, phase="provider_preparation")
+        raise
     finally:
         if not resource_ownership.cleanup(DB, call_id, staging):
             error = RuntimeError("native provider preparation cleanup is unverified")
@@ -331,6 +357,7 @@ def _enter_native_call(call_id: str, correlation: str) -> None:
             if not direct:
                 _prepare_native_clis(call_id)
             return
+        retain_native_failure(call_id, None, exit_code=scope.exit_code)
         resource_ownership.settle_namespace(DB, call_id, scope)
         with db() as conn:
             row = conn.execute("select status,error_code from calls where id=?", (call_id,)).fetchone()
@@ -341,8 +368,13 @@ def _enter_native_call(call_id: str, correlation: str) -> None:
         code = scope.exit_code
         raise SystemExit(code if code is not None and code >= 0 else 128 - code if code is not None else 1)
     except Exception as error:
+        phase = "provider_preparation" if scope is not None and native_namespace.active() is scope \
+            else "native_setup" if scope is None or not scope.go_sent else None
+        evidence = retain_native_failure(call_id, error, phase=phase, exit_code=scope.exit_code if scope is not None else None) \
+            or escaped_failure(error, phase or "native_execution")
+        message = evidence.get("message") or "Native Caller failed; see retained diagnostic"
         if scope is not None and native_namespace.active() is scope:
-            finish(call_id, "failed", error=str(error)[:2000], error_code="launch_preflight_failed",
+            finish(call_id, "failed", error=message, error_code="launch_preflight_failed",
                    outcome="preflight_failed", action="not_started")
             raise
         # Only the original process can certify no GO. A registered boundary
@@ -370,7 +402,7 @@ def _enter_native_call(call_id: str, correlation: str) -> None:
             if row["status"] == "running":
                 no_go = scope is None or not scope.go_sent
                 stopped = row["error_code"] in {"stopping", "stopped"}
-                finish(call_id, "failed", error="Stopped by user" if stopped else str(error)[:2000],
+                finish(call_id, "failed", error="Stopped by user" if stopped else message,
                        error_code="stopped" if stopped else getattr(error, "code", "native_cleanup_failed"),
                        action="not_started" if no_go else None, outcome="preflight_failed" if no_go else None)
         raise
@@ -552,6 +584,43 @@ def stop_call(id_: str) -> dict:
     return {"id": id_, "stopped": stopped, "status": after["status"], "error_code": "stopped" if stopped else None}
 
 
+def _retained_account_signal(text: str) -> str | None:
+    # Native failure evidence keeps only exception metadata so prompts and
+    # argv never persist. Server trips reviewer accounts on balance/sign-in
+    # substrings in call.error, so preserve only that safe signal.
+    if re.search(r"balance\s+exhausted", text, re.IGNORECASE):
+        return "balance exhausted"
+    if re.search(r"status\s+402\b", text, re.IGNORECASE):
+        return "status 402"
+    if re.search(r"\b402\s+payment\b", text, re.IGNORECASE):
+        return "402 payment"
+    if re.search(r"http_status\D{0,8}402\b", text, re.IGNORECASE):
+        return "http_status 402"
+    if re.search(r"not\s+signed\s+in", text, re.IGNORECASE):
+        return "not signed in"
+    if re.search(r"missing\s+credentials", text, re.IGNORECASE):
+        return "missing credentials"
+    return None
+
+
+def _retained_rate_limit_signal(text: str) -> str | None:
+    # Server trips provider rate limits on 429/rate-limit words in
+    # call.error. GitHub's own limits and bare numbers must never trip.
+    if re.search(r"github\s+\d{3}", text, re.IGNORECASE):
+        return None
+    if re.search(r"http_status\D{0,8}429\b", text, re.IGNORECASE):
+        return "http_status 429"
+    if re.search(r"status\s+429\b", text, re.IGNORECASE):
+        return "status 429"
+    if re.search(r"\b429\s+too\s+many\b", text, re.IGNORECASE):
+        return "429 too many requests"
+    if re.search(r"too\s+many\s+requests", text, re.IGNORECASE):
+        return "too many requests"
+    if re.search(r"rate[\s_\-]*limit", text, re.IGNORECASE):
+        return "rate limited"
+    return None
+
+
 def finish(
     id_: str,
     status: str,
@@ -563,6 +632,15 @@ def finish(
     error_code: str | None = None,
     diagnostic: dict | None = None,
 ) -> float:
+    if _native_cli and id_ == _native_call_id and status == "failed":
+        untyped = diagnostic is None
+        original_error = error
+        diagnostic = retain_native_failure(id_, sys.exception(), diagnostic=diagnostic)
+        if untyped and diagnostic is not None and sys.exception() is not None:
+            base = diagnostic.get("message") or "Native Caller failed; see retained diagnostic"
+            trip = (_retained_account_signal(original_error)
+                    or _retained_rate_limit_signal(original_error)) if original_error else None
+            error = f"{base}: {trip}" if trip else base
     # First terminal writer wins: a worker finishing after stop/reap must not
     # overwrite stopped/interrupted. The loser keeps its response file out of
     # the row and reports the existing state.
@@ -967,6 +1045,7 @@ def run_pr_review(
     p: str | None = None,
     model: str | None = None,
     recovery_model: str | None = None,
+    review_scope: str = "",
 ):
     return run_governed_behavior(
         pr_review,
@@ -982,6 +1061,7 @@ def run_pr_review(
         p,
         model,
         recovery_model,
+        review_scope=review_scope,
     )
 
 
@@ -1201,6 +1281,7 @@ def run_pr_approve(
     capped: bool = False,
     review_round: int | None = None,
     review_cap: int | None = None,
+    review_scope: str = "",
 ):
     return run_governed_behavior(
         pr_approve,
@@ -1219,6 +1300,7 @@ def run_pr_approve(
         capped,
         review_round,
         review_cap,
+        review_scope=review_scope,
     )
 
 
@@ -1334,9 +1416,12 @@ def run_native_action(argv: list[str], cwd: str, repository: str, actor: str, co
     except BaseException as error:
         if isinstance(error, native_action.NotStarted):
             started = False
+        diagnostic = getattr(error, "diagnostic", None)
+        no_action = not started or (argv[0] == "--merge-if-ready" and isinstance(error, native_action.ActionFailure)
+                                   and diagnostic.get("submission") in {"none", "rejected"})
         finish(id_, "failed", error=str(error)[:2000], error_code="native_action_failed",
-               outcome="preflight_failed" if not started else None, action="not_started" if not started else None,
-               diagnostic=getattr(error, "diagnostic", None))
+               outcome="preflight_failed" if no_action else None, action="not_started" if no_action else None,
+               diagnostic=diagnostic)
         raise
     finally:
         resource_ownership.cleanup_remaining(DB, id_)
@@ -1485,7 +1570,8 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
         finish(id_, "failed", error="Stopped by user" if stopped else str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
                action="not_started" if no_publication else None,
-               outcome="preflight_failed" if no_publication else None)
+               outcome="preflight_failed" if no_publication else None,
+               diagnostic=getattr(error, "diagnostic", None))
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
@@ -1635,6 +1721,7 @@ def run_governed_behavior(
     capped: bool = False,
     review_round: int | None = None,
     review_cap: int | None = None,
+    review_scope: str = "",
 ):
     if capped and (behavior != "pr_approve" or review_round is None or review_cap is None):
         raise ValueError("a capped round needs pr_approve with its round and cap numbers")
@@ -1727,7 +1814,7 @@ def run_governed_behavior(
         try:
             try:
                 response, recovered_result = _run_review_with_recovery(mod, behavior, review_pr, pwd, actor, expected_head, note, timeout_s, p, spec, recovery, before, id_,
-                                                                       capped=capped, review_round=review_round, review_cap=review_cap)
+                                                                       capped=capped, review_round=review_round, review_cap=review_cap, review_scope=review_scope)
             except ReviewSuperseded as cancelled:
                 response = str(cancelled)
                 prior = getattr(cancelled, "prior_error", None)
@@ -1884,9 +1971,11 @@ def _repeat_only_refusal(failure: BaseException) -> bool:
 
 
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
-                              capped=False, review_round=None, review_cap=None):
+                              capped=False, review_round=None, review_cap=None, review_scope=""):
     # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
     cap_kwargs = {"capped": capped, "review_round": review_round, "review_cap": review_cap} if behavior == "pr_approve" else {}
+    if review_scope:
+        cap_kwargs["review_scope"] = review_scope
     try:
         return mod.run(pwd, pr, actor, head, note, seconds, p, model=spec.identity, **cap_kwargs), None
     except (review_budget.ReviewLimitError, subprocess.TimeoutExpired, review_receipt.SubmissionError) as error:
@@ -2532,8 +2621,8 @@ behaviors:
   --read-response HASH
   --read-reasoning HASH
   --chat MESSAGE --model MODEL [--session ID] [--pwd DIR]
-  --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--model MODEL] [--recovery-model MODEL]
-  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N]
+  --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL]
+  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N]
   --fix-failing-ci PR [--pwd DIR]
   --issue-simplify ISSUE [--pwd DIR]
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--expected-issue-revision SHA256] [--note TEXT]
@@ -2604,6 +2693,11 @@ def main():
     try:
         _main()
     except Exception as error:
+        if _native_call_id is not None:
+            evidence = retain_native_failure(_native_call_id, error)
+            if evidence is not None:
+                finish(_native_call_id, "failed", error=evidence.get("message") or "Native Caller failed; see retained diagnostic",
+                       error_code="interrupted", diagnostic=evidence)
         # An accepted managed invocation also gets a durable no-effect receipt
         # if model/catalog preparation failed before its usual track() call.
         # The same unique correlation still arbitrates racing CLI starts.
@@ -2626,7 +2720,10 @@ def main():
                         repository, number = atoms.repo_name(sys.argv[2], flag_value("--pwd")), int(atoms.pr_number(sys.argv[2]))
                     id_ = track(required_flag("--model"), "", str(number), repository, atoms.actor(required_flag("--actor")), behavior,
                                 expected_head=flag_value("--expected-head"), source="poise:behavior-chain", correlation_id=correlation)
-                    finish(id_, "failed", error=str(error)[:2000], outcome="preflight_failed", action="not_started", error_code="launch_preflight_failed")
+                    evidence = {**escaped_failure(error, "call_preparation"), "correlation_id": correlation,
+                                "repository": repository, "pr": number, "behavior": behavior}
+                    finish(id_, "failed", error=evidence["message"], outcome="preflight_failed", action="not_started",
+                           error_code="launch_preflight_failed", diagnostic=evidence)
         raise
     finally:
         # The managed behavior wrapper has returned through provider/group,
@@ -2850,6 +2947,7 @@ def _main():
             p=flag_value("--p"),
             model=flag_value("--model"),
             recovery_model=flag_value("--recovery-model"),
+            review_scope=flag_value("--review-scope") or "",
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--pr-approve":
@@ -2872,6 +2970,7 @@ def _main():
             capped=capped,
             review_round=review_round,
             review_cap=review_cap,
+            review_scope=flag_value("--review-scope") or "",
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--fix-failing-ci":
