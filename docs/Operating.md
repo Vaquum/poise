@@ -465,7 +465,12 @@ The Sync workflow checks every five minutes. With `POISE_DEPLOY_HOST` set, it
 retains the fork's current main through both required push workflows (CI and
 Caller) and its gated, serialized Deploy attempt. Green CI alone does not
 release the candidate, nor does a successful Deploy that skipped its apply
-step. Then Sync merges directly to the newest upstream main, coalescing changes
+step. If the completion wake is missed after both required workflows pass,
+Sync dispatches the normal gated Deploy and retains the candidate for that
+tick, even with nothing new upstream. Queued or running Deploys suppress
+recovery, as does a successful run's `Deploy <sha>` step: a run recorded on an
+older head can deploy the current tip.
+Then Sync merges directly to the newest upstream main, coalescing changes
 that arrived during verification. Forks without deployment keep syncing every
 five minutes. GitHub may start a scheduled run some minutes late when it is busy.
 

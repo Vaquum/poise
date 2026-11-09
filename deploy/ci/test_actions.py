@@ -407,6 +407,12 @@ class GateTest(unittest.TestCase):
 
     FAKE_GH = """#!/bin/sh
 # Serves canned API answers from $GH_FIXTURES; $GH_FAIL names files that fail.
+if [ "$1" = workflow ]; then
+  [ "$*" = "workflow run deploy.yml --repo $REPO --ref main" ] || exit 99
+  printf '%s\\n' "$*" >>"$GH_CALLS"
+  case " $GH_FAIL " in *" dispatch "*) echo "boom" >&2; exit 1;; esac
+  exit 0
+fi
 path="$2"
 if [ "$path" = --method ]; then path="$4"; fi
 case "$path" in
@@ -424,11 +430,21 @@ esac
 printf '%s\\n' "$path" >>"$GH_CALLS"
 case " $GH_FAIL " in *" $file "*) echo "boom" >&2; exit 1;; esac
 if [ "$file" = upstream.json ]; then
+  if [ "$(jq -r .sha "$GH_FIXTURES/tip.json")" = "$(jq -r .sha "$GH_FIXTURES/upstream.json")" ]; then
+    echo '{"merge_type":"none","message":"already synced"}'
+    exit 0
+  fi
   cp "$GH_FIXTURES/upstream.json" "$GH_FIXTURES/tip.json"
   echo '{"merge_type":"fast-forward","message":"synced"}'
   exit 0
 fi
 if [ "${3:-}" = --jq ]; then jq -r "$4" "$GH_FIXTURES/$file"; exit; fi
+case "$path" in
+  *head_sha=*)
+    sha=${path#*head_sha=}; sha=${sha%%&*}
+    jq --arg sha "$sha" '.workflow_runs |= map(select(.head_sha == $sha))' "$GH_FIXTURES/$file"
+    exit;;
+esac
 cat "$GH_FIXTURES/$file"
 """
 
@@ -633,14 +649,119 @@ cat "$GH_FIXTURES/$file"
                                     capture_output=True, text=True, env=env)
         return result, outputs
 
-    def deploy_run(self, run_id=301, apply='skipped', **changes):
+    def deploy_run(self, run_id=301, apply='skipped', apply_sha=None, **changes):
         run = self.workflow_run(run_id, **{'event': 'workflow_run', 'created_at': self.verified_at, **changes})
         self.fixture('deploy-runs.json', {'workflow_runs': [run]})
         self.fixture(f'jobs-{run_id}.json', {'jobs': [{'steps': [
             {'name': 'Refuse any tip whose required CI did not pass on it',
              'started_at': run['created_at'], 'conclusion': 'success'},
-            {'name': f'Deploy {self.TIP}', 'conclusion': apply},
+            {'name': f'Deploy {apply_sha or self.TIP}', 'conclusion': apply},
         ]}]})
+
+    def test_sync_recovers_a_missed_completion_wake_without_an_upstream_merge(self):
+        self.green()
+        self.fixture('upstream.json', {'sha': self.TIP})
+        self.fixture('ci-runs.json', {'workflow_runs': [
+            self.workflow_run(101, status='in_progress', conclusion=None)]})
+        # Caller wakes Deploy before CI finishes; its apply step is skipped.
+        result, outputs = self.gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'false', 'sha': self.TIP})
+        self.deploy_run(created_at=self.created_at)
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['proceed'], 'false')
+        with open(self.calls) as file:
+            self.assertNotIn('workflow run', file.read())
+
+        # No completion wakes Deploy when CI finally passes. Sync must do it.
+        self.green()
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'false', 'sha': self.TIP})
+        with open(self.calls) as file:
+            calls = file.read()
+        self.assertIn(f'workflow run deploy.yml --repo {self.REPO} --ref main', calls)
+        self.assertNotIn('/merge-upstream', calls)
+
+        for status in ('queued', 'in_progress'):
+            self.deploy_run(302, event='workflow_dispatch', status=status, conclusion=None)
+            result, outputs = self.sync()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(outputs['proceed'], 'false')
+        # Only execute the normal Deploy gate after the poll requested it.
+        result, approved = self.gate(trigger='workflow_dispatch')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(approved, {'proceed': 'true', 'sha': self.TIP})
+        proof = self.workspace_proof(approved['sha'], self.TIP)
+        self.assertEqual(proof.returncode, 0, proof.stderr)
+        self.deploy_run(302, event='workflow_dispatch', apply='success')
+        for _ in range(2):
+            result, outputs = self.sync()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(outputs['proceed'], 'true')
+        with open(self.calls) as file:
+            self.assertEqual(file.read().count('workflow run'), 1)
+        with open(os.path.join(self.fixtures, 'tip.json')) as file:
+            self.assertEqual(json.load(file)['sha'], self.TIP)
+        # An operator can still reapply settings on that same green SHA.
+        result, outputs = self.gate(trigger='workflow_dispatch')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, approved)
+
+    def test_sync_deduplicates_deploys_that_reread_a_newer_tip_than_their_recorded_head(self):
+        self.green()
+        self.fixture('upstream.json', {'sha': self.TIP})
+        for status in ('queued', 'in_progress'):
+            self.deploy_run(head_sha='a' * 40, status=status, conclusion=None)
+            result, outputs = self.sync()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(outputs, {'proceed': 'false', 'sha': self.TIP})
+        self.deploy_run(head_sha='a' * 40, apply='success')
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['proceed'], 'true')
+        self.deploy_run(head_sha='a' * 40, apply='failure', conclusion='failure')
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['proceed'], 'true')
+        self.assertIn('Deploy concluded failure', self.summary_text())
+        with open(self.calls) as file:
+            self.assertNotIn('workflow run', file.read())
+
+    def test_sync_recovery_requires_verification_of_an_intervening_newer_tip(self):
+        older = 'a' * 40
+        self.TIP = older
+        self.green()
+        self.fixture('ci-runs.json', {'workflow_runs': [
+            self.workflow_run(101, status='in_progress', conclusion=None)]})
+        result, outputs = self.gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['proceed'], 'false')
+        self.TIP = 'b' * 40
+        self.green()
+        self.fixture('upstream.json', {'sha': self.TIP})
+        self.fixture('ci-runs.json', {'workflow_runs': [
+            self.workflow_run(101, head_sha=older),
+            self.workflow_run(103, status='in_progress', conclusion=None)]})
+        self.deploy_run(head_sha=older, apply_sha=older, apply='success')
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'false', 'sha': self.TIP})
+        with open(self.calls) as file:
+            self.assertNotIn('workflow run', file.read())
+        result, _ = self.gate(trigger='workflow_dispatch')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('still in_progress', result.stderr)
+        self.green()
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'false', 'sha': self.TIP})
+        with open(self.calls) as file:
+            self.assertEqual(file.read().count('workflow run'), 1)
+        result, outputs = self.gate(trigger='workflow_dispatch')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs, {'proceed': 'true', 'sha': self.TIP})
 
     def workspace_proof(self, target, active):
         # Reuse the production verification fixture, including its persistent
@@ -737,6 +858,8 @@ cat "$GH_FIXTURES/$file"
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(outputs['proceed'], 'true')
                     self.assertIn(f'concluded {conclusion}', self.summary_text())
+                    with open(self.calls) as file:
+                        self.assertNotIn('workflow run', file.read())
                     # The fix must get its own CI; the failed candidate's
                     # evidence cannot authorize its deployment.
                     self.fixture('ci-runs.json', {'workflow_runs': []})
@@ -765,7 +888,7 @@ cat "$GH_FIXTURES/$file"
         result, outputs = self.gate(script='sync-gate.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs['proceed'], 'true')
-        self.deploy_run(apply='success', head_sha='a' * 40)
+        self.deploy_run(apply='success', apply_sha='a' * 40, head_sha='a' * 40)
         result, outputs = self.gate(script='sync-gate.sh')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs['proceed'], 'false')
@@ -792,7 +915,7 @@ cat "$GH_FIXTURES/$file"
         self.assertIn('POISE_SYNC_TOKEN', self.summary_text())
         self.green()
         self.deploy_run()
-        for failing in ('tip.json', 'ci-runs.json', 'caller-runs.json', 'deploy-runs.json', 'jobs-301.json'):
+        for failing in ('tip.json', 'ci-runs.json', 'caller-runs.json', 'deploy-runs.json', 'jobs-301.json', 'dispatch'):
             with self.subTest(failing=failing):
                 result, outputs = self.gate(script='sync-gate.sh', fail=failing)
                 self.assertEqual(result.returncode, 1)
