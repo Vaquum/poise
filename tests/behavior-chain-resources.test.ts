@@ -485,6 +485,30 @@ describe('resource-aware behavior admission', () => {
     expect(current.invocations[0].evidence?.resource_ownership).toEqual(receipt)
     expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
   })
+
+  it('reconciles a large receipt alongside its retained artifact', () => {
+    const { journal, chain } = setup()
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: invocation('large-receipt-artifact', RESERVATION) })
+    const retained = { phase: 'posting_issue_reviews', plan_sha: 'd'.repeat(64), padding: 'x'.repeat(32 * 1024) }
+    current = record(journal, current, { type: 'invocation.reconciled', invocationId: 'large-receipt-artifact',
+      evidence: { artifact: retained } })
+    // A valid ~500 KiB receipt plus a permitted 32 KiB artifact exceeds the
+    // previous 516 KiB journal bound but must still reconcile.
+    const roots = Array.from({ length: 980 }, (_, index) => ({ path: `/isolated/${index}/${'x'.repeat(400)}`,
+      state: 'reclaimed' as const, device: '1', inode: `${index + 2}`, parent_device: '1', parent_inode: '3', reclaimed_at: 10 }))
+    const receipt = { version: 1 as const, roots, errors: [] }
+    const receiptBytes = Buffer.byteLength(JSON.stringify(receipt))
+    expect(receiptBytes).toBeGreaterThan(500 * 1024)
+    expect(receiptBytes).toBeLessThan(512 * 1024)
+    expect(parseResourceOwnership(receipt).roots).toHaveLength(980)
+    const settledAt = new Date(NOW).toISOString()
+    current = record(journal, current, { type: 'invocation.resources_reconciled', invocationId: 'large-receipt-artifact',
+      evidence: { resource_ownership: receipt, resources_settled_at: settledAt,
+        artifact: { ...retained, resource_recovered_at: 18 } } })
+    expect(current.invocations[0].evidence?.resource_ownership).toEqual(receipt)
+    expect(current.invocations[0].evidence?.artifact).toMatchObject({ plan_sha: 'd'.repeat(64), resource_recovered_at: 18 })
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+  })
 })
 
 describe('spawn-time resource gate', () => {

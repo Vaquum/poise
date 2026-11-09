@@ -64,8 +64,9 @@ export type ChainEvent =
 interface StoredEvent { sequence: number, chain_id: string, event_id: string, at: number, payload: string }
 const SHA = /^[0-9a-f]{40}$/i
 const REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/
-// The 512 KiB resource receipt plus its reconciliation envelope.
-const MAX_EVENT_BYTES = 512 * 1024 + 4 * 1024
+// The 512 KiB resource receipt plus a retained 128 KiB atomic artifact and
+// its reconciliation envelope.
+const MAX_EVENT_BYTES = 512 * 1024 + 128 * 1024 + 4 * 1024
 
 function recordObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
