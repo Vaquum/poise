@@ -275,6 +275,10 @@ configuration, limits preparation to 180 seconds, and rejects incomplete trees,
 more than 20,000 tree entries, or more than 256 MiB of tracked content. The checkout
 is removed after the provider finishes, fails, or is cancelled. Approvals retain
 their existing packet-only behavior.
+Head or base drift at either checkout check returns `outcome: superseded` with
+the validated observed head. Caller records the review as `superseded` without
+invoking a provider, preserves its launch provenance, and lets Poise reconsider
+the current PR. Other checkout failures remain failed.
 Preparation uses a sparse checkout: archives, images, fonts, media, and bytecode
 remain in the tracked-file inventory but are not downloaded. Reading one returns
 an explicit text-unavailable result. All other tracked source remains available.
