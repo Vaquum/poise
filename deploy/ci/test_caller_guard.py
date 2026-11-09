@@ -174,6 +174,33 @@ else:
         self.check()
         self.refused(second)
 
+    def test_renamed_failed_acquisition_stays_unhealthy_until_holder_exits(self):
+        self.database()
+        self.start()
+        self.check()
+        second = self.home / "replacement" / "calls.sqlite3"
+        self.database(second)
+        foreign = second.open("r+b")
+        self.addCleanup(foreign.close)
+        fcntl.lockf(foreign, fcntl.LOCK_EX | fcntl.LOCK_NB, guard.LENGTH, guard.START)
+        self.assertIn("protection unavailable", self.check(False).stderr)
+        renamed = second.parent / "calls.sqlite3.old"
+        second.rename(renamed)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(second) + suffix)
+            if sidecar.exists():
+                sidecar.rename(Path(str(renamed) + suffix))
+        self.database(second)
+        # The retained original stays unlocked while its holder lives, even
+        # though the replacement pathname already has an acquirable store.
+        self.assertIn("protection unavailable", self.check(False).stderr)
+        self.assertIsNone(self.process.poll())
+        foreign.close()
+        self.check()
+        self.refused(renamed)
+        self.refused(second)
+        self.refused(self.path)
+
     def test_probe_rejects_a_live_process_without_the_lock(self):
         self.database()
         with self.path.open("rb") as file:

@@ -35,6 +35,12 @@ import agent_interface as api
 api.init_db()
 connection = api.caller_store.connect(api.DB)
 connection.execute('PRAGMA wal_autocheckpoint=0')
+# Materialize WAL sidecars before readiness, so the fence proof runs against
+# a live WAL store instead of racing the guest's first write.
+ready_call = api.track('component', 'host Caller fence ready marker', actor='component', source='guard-component')
+api.finish(ready_call, 'done')
+connection.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+assert connection.execute('PRAGMA integrity_check').fetchone() == ('ok',)
 print('ready', flush=True)
 for command in sys.stdin:
     if command.strip() == 'replace':

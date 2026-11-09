@@ -108,6 +108,19 @@ class Guard:
                 del self.locks[identity]
                 LOG.info("Released host lock on %s: no gVisor workspace uses its home", identity)
 
+        # A failed acquisition stays retained under its original inode, even
+        # after its pathname is renamed away. Retry it before discovering
+        # replacements: otherwise a rescan could report protection while the
+        # original remains unlocked.
+        for identity, entry in list(self.locks.items()):
+            if not entry["acquired"]:
+                try:
+                    fcntl.lockf(entry["fds"][0], fcntl.LOCK_EX | fcntl.LOCK_NB, LENGTH, START, os.SEEK_SET)
+                except OSError as error:
+                    raise RuntimeError(f"Cannot acquire host lock on retained Caller inode {identity}: {error}") from error
+                entry["acquired"] = True
+                LOG.info("Acquired host lock on retained Caller inode %s", identity)
+
         for home in active:
             found = False
             # A restarted guard must also find Caller's retained directory after
