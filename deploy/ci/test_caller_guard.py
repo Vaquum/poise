@@ -490,6 +490,56 @@ exit 0
         self.assertIn("install", sudo_log.read_text(),
                       "interpolated runsc with a trailing comment must reach guard installation, not exit 10")
 
+    def test_newline_terminated_runtime_still_installs_gvisor_guard(self):
+        # Compose JSON encodes a trailing newline as \n; the gateway's
+        # JSON.parse decodes it before trimming, so `runsc` plus a newline
+        # must install the guard rather than exit 10. No existing workspaces
+        # and a runc Docker default must still reach installation.
+        deploy = GUARD.parents[1]
+        env_file = self.root / "poise.env"
+        env_file.write_text('POISE_WORKSPACE_RUNTIME=runsc\n')
+        sudo_log = self.root / "sudo.log"
+        sudo_log.write_text("")
+        binary = self.root / "guard-bin-newline"
+        binary.mkdir()
+        (binary / "docker").write_text("""#!/bin/bash
+if [ "$1" = compose ]; then
+  printf '%s' '{"services":{"gateway":{"environment":{"POISE_WORKSPACE_RUNTIME":"runsc\\n"}}}}'
+elif [ "$1" = info ]; then
+  case "$3" in
+    *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
+    *) printf 'runc' ;;
+  esac
+elif [ "$1" = ps ]; then
+  : # Fresh deployment: no workspace containers yet.
+else
+  echo "unexpected docker $*" >&2; exit 99
+fi
+""")
+        (binary / "sudo").write_text("""#!/bin/bash
+echo "$*" >> "$GUARD_SUDO_LOG"
+for argument in "$@"; do
+  if [ "$argument" = --check ]; then
+    echo 'Host locks verified on 1 Caller inode(s)'
+    exit 0
+  fi
+done
+exit 0
+""")
+        (binary / "id").write_text("#!/bin/bash\nif [ \"$1\" = -u ]; then echo 1000; else exec /usr/bin/id \"$@\"; fi\n")
+        for name in ("docker", "sudo", "id"):
+            (binary / name).chmod(0o755)
+        env = {**self.env, "PATH": str(binary) + os.pathsep + self.env["PATH"],
+               "GUARD_SUDO_LOG": str(sudo_log)}
+        script = (f"set -uo pipefail\n. {shlex.quote(str(deploy / 'lib.sh'))}\n"
+                  f"env_file={shlex.quote(str(env_file))}\n"
+                  "ensure_caller_guard\nprintf 'RC=%s\\n' \"$?\"\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Host locks verified", result.stdout)
+        self.assertIn("install", sudo_log.read_text(),
+                      "runsc followed by a newline must reach guard installation, not exit 10")
+
     def test_runc_deployment_needs_no_host_guard_or_python(self):
         library = shlex.quote(str(GUARD.parents[1] / "lib.sh"))
         result = subprocess.run(["bash", "-c", f'. {library}\n' + """

@@ -44,6 +44,51 @@ require_docker() {
     || die "the Docker Compose plugin is missing ('docker compose' does not run). Install it: https://docs.docker.com/compose/install/linux/"
 }
 
+# Decode one JSON string's escapes: Compose's `config --format json` encodes
+# control characters (a trailing newline arrives as \n) while the gateway's
+# JSON.parse decodes them before trimming.
+json_unescape() {
+  local raw=$1 out='' i=0 n=${#1} c esc hex decoded
+  while [ "$i" -lt "$n" ]; do
+    c=${raw:$i:1}
+    if [ "$c" != "\\" ]; then
+      out+="$c"
+      i=$((i + 1))
+      continue
+    fi
+    esc=${raw:$((i + 1)):1}
+    case $esc in
+      '"') out+='"'; i=$((i + 2)) ;;
+      "\\") out+="\\"; i=$((i + 2)) ;;
+      '/') out+='/'; i=$((i + 2)) ;;
+      b) out+=$'\b'; i=$((i + 2)) ;;
+      f) out+=$'\f'; i=$((i + 2)) ;;
+      n) out+=$'\n'; i=$((i + 2)) ;;
+      r) out+=$'\r'; i=$((i + 2)) ;;
+      t) out+=$'\t'; i=$((i + 2)) ;;
+      u)
+        hex=${raw:$((i + 2)):4}
+        case $hex in
+          [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])
+            printf -v decoded '%b' "\\u$hex"
+            out+="$decoded"
+            i=$((i + 6)) ;;
+          *)
+            out+="\\"
+            i=$((i + 1)) ;;
+        esac ;;
+      '')
+        out+="\\"
+        i=$((i + 1)) ;;
+      *)
+        out+="\\"
+        out+="$esc"
+        i=$((i + 2)) ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 # A host service, independent of the gateway's readiness cache and Docker's
 # workspace restart policy. Inspect actual runtimes as well as future settings.
 ensure_caller_guard() {
@@ -60,6 +105,9 @@ ensure_caller_guard() {
   if [ -z "$desired" ]; then
     desired=$(printf '%s' "$config" | tr '\n' ' ' | sed -n 's/.*POISE_WORKSPACE_RUNTIME=\([^"]*\)".*/\1/p')
   fi
+  # Decode JSON escapes before trimming: the gateway parses JSON and trims, so
+  # a resolved `runsc` followed by a newline (encoded as \n) must read as `runsc` here too.
+  desired=$(json_unescape "$desired")
   # Match gateway/src/config.ts, which trims POISE_WORKSPACE_RUNTIME: whitespace-only means unset.
   desired=${desired#"${desired%%[![:space:]]*}"}
   desired=${desired%"${desired##*[![:space:]]}"}
