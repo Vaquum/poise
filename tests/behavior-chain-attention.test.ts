@@ -635,3 +635,60 @@ it('waits for the stuck-CI diagnosis artifact instead of repeating repair-pr', (
   expect(entry.nextAction).toContain('verified artifact or changed input')
   expect(entry.nextAction).not.toContain('pending over 30 minutes')
 })
+
+it('waits for confirmed merge evidence when queue removal reports a merge', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const head = 'b'.repeat(40)
+  let chain = admit(journal, 972, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'queue-972', behavior: 'merge-pr', actor: chain.reviewer,
+    model: null, slot: null, basis: 'merge', admittedAt: admittedAt + 20_000,
+    request: { command: 'github-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 20_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'queue-972', callId: null, outcome: 'enqueued',
+    evidence: { status: 'completed', outcome: 'enqueued', head_sha: head, queue_entry_id: 'queue-972', completedAt: admittedAt + 30_000 } }, admittedAt + 30_000)
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 982, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 982, head, headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: { id: 'removal-972', reason: 'merged', at: admittedAt + 40_000, actor: null },
+      changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', readinessBlockers: [], pending: false, failing: [], conflict: false, behind: false } }
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('confirmed GitHub merge evidence')
+  expect(entry.nextAction).not.toContain('Obtain qualifying')
+})
+
+it('waits for the repair artifact instead of repeating repair-pr with unchanged failing CI', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const head = 'c'.repeat(40)
+  const failing = ['unit:failure']
+  const basis = chainBasis(['repair', head, failing, false, false, false, 0, 'findings', 'issue'])
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 973, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 973, head, headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'FAILURE', readinessBlockers: [], pending: false, failing, conflict: false, behind: false } }
+  let chain = admit(journal, 973, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'repair-973', behavior: 'repair-pr', actor: chain.author,
+    model: 'fixture', slot: 'primary', basis, admittedAt: admittedAt + 30_000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 30_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'repair-973', callId: 'repair-call', outcome: 'no_changes',
+    evidence: { status: 'completed', action: 'no_changes', head_sha: head, completedAt: admittedAt + 40_000 } }, admittedAt + 40_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('verified artifact or changed input')
+  expect(entry.nextAction).not.toContain('Repair the failing')
+})

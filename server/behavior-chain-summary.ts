@@ -159,6 +159,9 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       // removal evidence waits for that evidence instead of review or repair.
       const queueAwaitingRemoval = !!pull && lastQueue?.evidence?.head_sha === pull.head
         && (!queueRemoval || typeof queueRemoval.at !== 'number' || queueRemoval.at < lastQueue.admittedAt)
+      const queueMergedNeedsWait = !!pull && lastQueue?.evidence?.head_sha === pull.head
+        && !!queueRemoval && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
+        && queueRemoval.reason === 'merged'
       let queueRejectionNeedsRepair = false
       if (pull && lastQueue?.evidence?.head_sha === pull.head && queueRemoval
         && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
@@ -186,6 +189,18 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         && chain.invocations.some(invocation => invocation.behavior === 'repair-pr' && invocation.state === 'settled'
           && invocation.evidence?.status === 'completed' && invocation.basis === chainBasis(['stuck-ci', pull.head])
           && invocation.slot === observation.repairer.slot)
+      // Mirroring decideBehaviorChain propose(): a successful current-basis
+      // repair-pr waits for its verified artifact or changed input.
+      const repairBasis = pull && observation
+        ? chainBasis(['repair', pull.head, pull.failing, pull.conflict, pull.behind,
+          pull.changesRequested, pull.unresolved, pull.reviewRevision, observation.issue.revision]) : null
+      const repairCompleted = !!pull && !!observation && !!repairBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'repair-pr' && invocation.state === 'settled'
+          && invocation.evidence?.status === 'completed' && invocation.basis === repairBasis
+          && invocation.slot === observation.repairer.slot)
+      const repairNeedsWait = !!pull && repairCompleted && !repairVerified
+        && (!!pull.failing.length || pull.conflict || pull.behind || pull.changesRequested
+          || ((pull.unresolved ?? 0) > 0 && !pull.approved))
       let next = chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'
@@ -197,10 +212,14 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                     : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
                       : queueAwaitingRemoval && pull
                         ? 'Await GitHub queue removal evidence; the queue outcome remains unverified'
+                        : queueMergedNeedsWait && pull
+                        ? 'Await confirmed GitHub merge evidence; GitHub queue reports a merge'
                         : queueRejectionNeedsRepair && pull
                         ? `Diagnose and repair GitHub queue rejection ${queueRemoval!.id}: ${queueRemoval!.reason} through repair-pr; PR-head green checks do not prove integration success`
                         : pull && needsPrReview(chain, observation, pull) ? 'Review the actual current pull-request head through review-pr'
                           : grey ? `Recover completed grey workflow ${grey.id} attempt ${grey.attempt} through rerun-grey-ci`
+                            : repairNeedsWait && pull
+                            ? 'Await the repair verified artifact or changed input; repair-pr already completed for this candidate'
                             : pull?.failing.length ? 'Repair the failing required checks'
                               : pull?.changesRequested && !repairVerified ? 'Address current-head review findings'
                                 : pull?.conflict || pull?.behind ? 'Repair the branch conflict or required base update'
