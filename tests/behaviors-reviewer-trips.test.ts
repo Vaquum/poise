@@ -387,6 +387,29 @@ describe('reviewer account trips', () => {
     expect(modelOf(mocks.spawnDetached.mock.calls[1])).toBe('opus-5-xhigh')
   })
 
+  it('holds the target when the recovery route rejects credentials', async () => {
+    const { db, runtime } = await startPrReviews({
+      primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    expect(modelOf(mocks.spawnDetached.mock.calls[0])).toBe('opus-5-xhigh')
+
+    const key = `${pr.repo}#${pr.number}`
+    fixture.agentLogs = [failedLog(db, key, 'opus-5-xhigh', {
+      error: 'Your refresh token was already used. Please sign in again.',
+      error_code: 'authentication_failed',
+      review_policy: 'bounded-v1',
+      recovery_model: 'grok-4.6-xhigh',
+      diagnostic: { version: 1, source: 'caller', severity: 'error', operation: 'provider.review', phase: 'provider_execution',
+        outcome: 'exit', stderr: 'refresh rejected', submission: 'none' },
+    })]
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(db.listBehaviorDeadLetters()).toEqual([expect.objectContaining({ target: key })])
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+  })
+
   it('clears only the recovery trip when a verdict comes from the recovery', async () => {
     const { db, runtime } = await startPrReviews({
       primary: 'opus-5-xhigh', secondary: 'gpt-6-astra-ultra', tertiary: 'grok-4.6-xhigh',

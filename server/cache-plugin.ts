@@ -1,5 +1,5 @@
 import { noticeEvidence, behaviorEvidence } from './notification-evidence'
-import { addDiagnosticSecrets, startLogging, stopLogging } from './logging'
+import { addDiagnosticSecrets, diagnostic, startLogging, stopLogging } from './logging'
 import { localLogging, stopLoggingApi } from './logging-api'
 import { startBehaviorLedger, stopBehaviorLedger } from './behavior-ledger'
 import { handleBehaviorLedger } from './behavior-ledger-http'
@@ -207,7 +207,7 @@ export function startPoiseRuntime(opts: CachePluginOptions = {}): void {
   validateGoogleEnvironment(!!service)
   if (service) applyServiceEnvironment()
   startLogging()
-  void startBehaviorLedger()
+  void startBehaviorLedger({ lossDiagnostic: (event) => { diagnostic(event) } })
   const auth = opts.claudeAuth ?? claudeAuth
   if (!activeClaudeAuthRuntimes.has(auth)) activeClaudeAuthRuntimes.set(auth, auth.onStatus(claudeAuthStatusChanged))
   auth.start()

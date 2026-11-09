@@ -2,9 +2,9 @@
 # your own Poise from a fork"). Opt in with the repository variable
 # POISE_UPSTREAM_SYNC=true. Every five minutes, GitHub's shortest schedule, it
 # merges autonomio/poise's main into this repository's main, as the Sync fork
-# button does, and what that brought in deploys once its CI passes on it, so
-# a merged change reaches the server about ten to twenty-five minutes later.
-# A run with nothing to merge does nothing more.
+# button does. Deployment-enabled forks hold their tip through CI and Deploy,
+# then coalesce waiting upstream changes into the next candidate.
+# Sync also recovers a missed Deploy wake, even with nothing to merge.
 #
 # GitHub lets the workflow's own token change no workflow file. When
 # autonomio/poise changes one, the merge fails until the fork is synced by
@@ -35,11 +35,25 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Retain the deployment candidate through verification and Deploy
+        id: gate
+        if: vars.POISE_DEPLOY_HOST != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: deploy/actions/sync-gate.sh
+
       - name: Merge autonomio/poise's main into main
+        if: vars.POISE_DEPLOY_HOST == '' || steps.gate.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ secrets.POISE_SYNC_TOKEN || github.token }}
           WORKFLOW_TOKEN_ONLY: ${{ secrets.POISE_SYNC_TOKEN == '' }}
           WORKFLOW_TOKEN: ${{ github.token }}
+          PREVIOUS_SHA: ${{ steps.gate.outputs.sha }}
         run: |
           if ! result=$(gh api --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" --field branch=main 2>&1); then
             echo "::error::Merging autonomio/poise's main failed: $result"
@@ -48,6 +62,11 @@ jobs:
           fi
           jq --raw-output .message <<<"$result"
           if [ "$(jq --raw-output .merge_type <<<"$result")" = none ]; then exit 0; fi
+          if [ -n "$PREVIOUS_SHA" ]; then
+            next=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+            printf '### Fork release superseded\n\n[%s](https://github.com/%s/commit/%s) → [%s](https://github.com/%s/commit/%s). Coalesced to the newest upstream tip; required CI must pass before deployment.\n' \
+              "$PREVIOUS_SHA" "$GITHUB_REPOSITORY" "$PREVIOUS_SHA" "$next" "$GITHUB_REPOSITORY" "$next" >>"$GITHUB_STEP_SUMMARY"
+          fi
           # A push made with the workflow's own token starts no workflow, so start the deployment here.
           if [ "$WORKFLOW_TOKEN_ONLY" = true ]; then
             GH_TOKEN=$WORKFLOW_TOKEN gh workflow run deploy.yml --repo "$GITHUB_REPOSITORY" --ref main

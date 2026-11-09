@@ -1,6 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads'
 import { BehaviorLedgerStore } from './behavior-ledger-store'
-import { LEDGER_RESPONSE_BYTES, LedgerError, type LedgerPending, type LedgerReply, type LedgerWorkerData, type LedgerWorkerReply, type LedgerWorkerRequest, type LedgerWorkerTiming } from './behavior-ledger-contract'
+import { LEDGER_CAPTURE_BATCH_LIMIT, LEDGER_RESPONSE_BYTES, LedgerError, type LedgerPending, type LedgerReply, type LedgerWorkerData, type LedgerWorkerReply, type LedgerWorkerRequest, type LedgerWorkerTiming } from './behavior-ledger-contract'
 
 export function executeLedgerRequest(store: BehaviorLedgerStore, request: LedgerWorkerRequest): LedgerWorkerReply {
   const startedAt = performance.now()
@@ -24,8 +24,11 @@ export function executeLedgerRequest(store: BehaviorLedgerStore, request: Ledger
   }
   try {
     if (request.operation === 'capture') {
-      if (!request.observation) throw new Error('Missing ledger observation')
-      store.capture(request.observation)
+      const observations = request.observations ?? request.observation
+      if (!observations) throw new Error('Missing ledger observation')
+      if (Array.isArray(observations) && (!observations.length || observations.length > LEDGER_CAPTURE_BATCH_LIMIT
+        || observations.some(observation => observation.type === 'loss'))) throw new LedgerError(400, 'invalid_observation')
+      store.capture(observations)
     } else if (request.operation === 'read') {
       if (!request.request) throw new Error('Missing ledger read')
       const read = request.request
@@ -47,7 +50,7 @@ if (parentPort) {
   const port = parentPort
   const data = workerData as LedgerWorkerData
   const store = new BehaviorLedgerStore(data.path, data.policy)
-  port.postMessage({ ready: true, health: store.health(), pending: store.pending() })
+  port.postMessage({ ready: true, captureBatch: true, health: store.health(), pending: store.pending() })
   port.on('message', (request: LedgerWorkerRequest) => {
     port.postMessage(executeLedgerRequest(store, request))
     if (request.operation === 'close') port.close()

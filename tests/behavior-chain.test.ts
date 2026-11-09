@@ -367,6 +367,40 @@ describe('native admission and recovery', () => {
     }
   })
 
+  it('recovers a later slot despite an earlier slot failure and success', async () => {
+    const { journal, chain } = setup()
+    const obs = { ...observation(), checkedAt: Date.now() }
+    const basis = chainBasis(['issue', obs.issue.revision])
+    let current = chain
+    current = finish(journal, current, 'earlier-failed', 'review-issue', basis,
+      { status: 'failed', action: 'not_started', outcome: 'preflight_failed', error_code: 'review_provider_exit',
+        error: 'provider died', completedAt: Date.now(), receipts: null, review_id: null, head_sha: null,
+        resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } }, 'secondary')
+    current = finish(journal, current, 'earlier-ok', 'review-issue', basis,
+      { status: 'completed', action: 'commented', outcome: 'commented', completedAt: Date.now(),
+        receipts: [{ issue: 'Example/Repo#7', comment_id: 17, author: 'reviewer' }] }, 'secondary')
+    for (let index = 0; index < 3; index++) current = finish(journal, current, `rejected-${index}`, 'review-issue', basis,
+      { status: 'failed', action: 'not_started', outcome: 'preflight_failed', error_code: 'authentication_failed',
+        error: 'Refresh credential was rejected', completedAt: Date.now(), receipts: null,
+        review_id: null, head_sha: null, resources_settled_at: new Date().toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] } })
+    const reason = 'review-issue failed before publication three times: Refresh credential was rejected'
+    current = record(journal, current, { type: 'chain.held', reason })
+    current = record(journal, current, { type: 'chain.observed', observation: obs })
+    const launched: ChainInvocation[] = []
+    const calls: LogEntry[] = []
+    const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => ({ ...obs, checkedAt: Date.now() }),
+      readInvocations: async () => ({ entries: calls, quarantined: [] }),
+      authRecovered: () => true,
+      launch: async invocation => { launched.push(invocation); return true } }))
+    await runtime.run()
+    await runtime.run()
+    const after = journal.read(chain.id)!
+    expect(after.held).toBeNull()
+    expect(after.resumedAfterSequence).toBeGreaterThan(current.sequence)
+    expect(launched).toHaveLength(1)
+  })
+
   it.each([{ receipts: null }, { receipts: [] }])('requires original resource settlement and preserves posting receipts $receipts', async ({ receipts }) => {
     const { journal, chain } = setup(); const obs = observation()
     const pending = invocation('rejected-review', 'review-issue', chainBasis(['issue', obs.issue.revision]))
@@ -526,13 +560,12 @@ describe('native admission and recovery', () => {
     expect(current.invocations[1]).toMatchObject({ behavior: 'implement-issue', state: 'started' })
   })
 
-  it.each(['review-pr', 'approve-pr'] as const)('recovers a relative %s target against the original chain without a checkout or a new admission', async (behavior) => {
+  it.each(['review-pr', 'approve-pr'] as const)('starts a never-started relative %s target against the original chain without a checkout or a new admission', async (behavior) => {
     const { journal, chain } = setup()
     const pending = invocation('original-correlation', behavior, 'head')
     pending.admittedAt = Date.now() - 60_000
     pending.request = { command: 'agent-interface', cwd: '/interface', argv: [behavior === 'review-pr' ? '--pr-review' : '--pr-approve', '#37', '--pwd', '/empty/interface/directory'] }
-    let current = record(journal, chain, { type: 'invocation.admitted', invocation: pending })
-    current = record(journal, current, { type: 'invocation.started', invocationId: pending.id })
+    record(journal, chain, { type: 'invocation.admitted', invocation: pending })
     const launched: ChainInvocation[] = []
     await new BehaviorChainRuntime(journal, operations({ launch: async (request) => { launched.push(request); return true } })).run()
     expect(launched).toHaveLength(1)
@@ -611,15 +644,19 @@ describe('native admission and recovery', () => {
     expect(current.invocations[0]).toMatchObject({ state: 'settled', outcome: 'launch_deferred' })
   })
 
-  it('retains original ownership when a repeat launch is deferred without a native receipt', async () => {
+  it('retains original ownership without retrying a started invocation whose Call is missing', async () => {
     const { journal, chain } = setup()
     const admitted = record(journal, chain, { type: 'invocation.admitted', invocation: { ...invocation('same-correlation', 'review-issue', 'revision'), admittedAt: Date.now() - 60_000 } })
     record(journal, admitted, { type: 'invocation.started', invocationId: 'same-correlation' })
-    const runtime = new BehaviorChainRuntime(journal, operations({ launch: async (pending) => {
-      expect(pending.id).toBe('same-correlation'); return false
-    } }))
+    const launch = vi.fn(async () => false)
+    const runtime = new BehaviorChainRuntime(journal, operations({ launch }))
     await runtime.run()
-    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'started', evidence: { retryUsesSameCorrelation: true, repeatLaunchDeferred: true } })
+    await runtime.run()
+    expect(launch).not.toHaveBeenCalled()
+    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'uncertain', callId: null,
+      outcome: expect.stringContaining('without a durable Call receipt') })
+    expect(journal.liveModelInvocationCount()).toBe(1)
+    expect(journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'invocation.uncertain')).toHaveLength(1)
   })
 
   it('does not release ownership from a terminal turn without worker resource proof', async () => {

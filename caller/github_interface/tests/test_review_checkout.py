@@ -248,23 +248,29 @@ class TestCheckoutIdentity(IsolatedAsyncioTestCase):
             pull = {"head": {"sha": head}, "base": {"sha": base}}
             pull[part]["sha"] = "c" * 40
             with patch.object(checkout_review, "get_pull", AsyncMock(return_value=pull)), \
-                    patch.object(checkout_review, "checkout") as clone, self.assertRaisesRegex(RuntimeError, "changed"):
-                await checkout_review.run(AsyncMock(), {"repository": "o/r", "pr": 1,
+                    patch.object(checkout_review, "checkout") as clone:
+                result = await checkout_review.run(AsyncMock(), {"repository": "o/r", "pr": 1,
                     "expected_head": head, "base_sha": base, "merge_base_sha": base, "path": "/tmp/review"})
+            self.assertEqual(result["outcome"], "superseded")
+            self.assertEqual(result["head_sha"], pull["head"]["sha"])
             clone.assert_not_called()
 
-    async def test_changed_head_after_checkout_removes_it(self):
-        with tempfile.TemporaryDirectory() as work:
-            target = Path(work) / "review"
-            target.mkdir()
-            pull = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40}}
-            client = AsyncMock()
-            client.get.side_effect = [{"merge_base_commit": {"sha": "b" * 40}}, {"tree": []}, {"tree": []}]
-            with patch.object(checkout_review, "get_pull", AsyncMock(side_effect=[pull, {**pull, "head": {"sha": "c" * 40}}])), \
-                    patch.object(checkout_review, "checkout", return_value={}), self.assertRaisesRegex(RuntimeError, "changed"):
-                await checkout_review.run(client, {"repository": "o/r", "pr": 1, "expected_head": "a" * 40,
-                    "base_sha": "b" * 40, "merge_base_sha": "b" * 40, "path": str(target)})
-            self.assertFalse(target.exists())
+    async def test_changed_head_or_base_after_checkout_removes_it(self):
+        for part in ("head", "base"):
+            with self.subTest(part=part), tempfile.TemporaryDirectory() as work:
+                target = Path(work) / "review"
+                target.mkdir()
+                pull = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40}}
+                client = AsyncMock()
+                client.get.side_effect = [{"merge_base_commit": {"sha": "b" * 40}}, {"tree": []}, {"tree": []}]
+                latest = {**pull, part: {"sha": "c" * 40}}
+                with patch.object(checkout_review, "get_pull", AsyncMock(side_effect=[pull, latest])), \
+                        patch.object(checkout_review, "checkout", return_value={}):
+                    result = await checkout_review.run(client, {"repository": "o/r", "pr": 1, "expected_head": "a" * 40,
+                        "base_sha": "b" * 40, "merge_base_sha": "b" * 40, "path": str(target)})
+                self.assertEqual(result["outcome"], "superseded")
+                self.assertEqual(result["head_sha"], latest["head"]["sha"])
+                self.assertFalse(target.exists())
 
 
 class TestReviewCLI(TestCase):

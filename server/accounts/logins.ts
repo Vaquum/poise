@@ -42,7 +42,6 @@ export function recordProviderRejection(id: AccountId, callId: string, model: st
   db.transaction(() => {
     const previous = providerSignInFailure(id)
     if (previous && previous.rejectedAt >= rejectedAt) return
-    const recovered = previous?.verifiedAt != null && previous.verifiedAt > previous.rejectedAt
     // A Connect that finished after the call completed but before this record
     // must keep its eligibility: carry a fresh reconnect forward instead of
     // resetting it to null.
@@ -54,8 +53,11 @@ export function recordProviderRejection(id: AccountId, callId: string, model: st
       const loginMs = typeof loginAt === 'string' ? Date.parse(loginAt) : NaN
       if (Number.isSafeInteger(loginMs) && loginMs > rejectedAt) reconnectedAt = loginMs
     }
+    // A new rejection after a verified recovery must not narrow the window
+    // past the held attempts: an automatic hold swept after this record
+    // still needs its older failures eligible for a later verification.
     setMeta(rejectionKey(id), JSON.stringify({ callId, model, rejectedAt,
-      since: !previous || recovered ? rejectedAt : previous.since,
+      since: !previous ? rejectedAt : previous.since,
       verifiedAt: null, consumedAt: null, reconnectedAt, verificationLogin: null } satisfies ProviderSignInFailure))
   }).immediate()
 }

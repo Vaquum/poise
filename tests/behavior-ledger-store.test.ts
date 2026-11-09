@@ -83,6 +83,10 @@ describe('behavior firing ledger store', () => {
       expect(db.pending().map((row) => row.nativeId).sort()).toEqual(expected.sort())
     } finally { check.close() }
     expect(db.health()).toMatchObject({ status: 'ok', dropped: 0, gaps: [] })
+    db.capture(Array.from({ length: 5 }, (_, index) => admission(`open-${index + 2}`, { admissionKey: `open-${index + 2}` })))
+    expect(db.health()).toMatchObject({ instances: 6, dropped: 0 })
+    expect(db.health().gaps).toHaveLength(3)
+    expect(db.health().gaps.every(gap => gap.reason === 'eviction')).toBe(true)
   })
 
   it('groups delayed siblings and retry attempts through the explicit admission, preserving the original plan', () => {

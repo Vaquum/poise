@@ -6,6 +6,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
+import { repairReportReviewScope, reportRepairExhaustion } from './behavior-chain-report'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
@@ -897,6 +898,10 @@ function isPreparationBudgetExhaustion(call: LogEntry): boolean {
 // nothing posted. Callers gate on postedNothing, so a run that submitted
 // still holds exactly as before.
 export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
+  // Local inspection can time out after a successful provider request. Its
+  // diagnostic takes precedence over provider-like text in older errors.
+  if (call.diagnostic?.operation === 'github-interface' && call.diagnostic.phase === 'inspection'
+    && call.diagnostic.outcome === 'timed_out') return null
   const account = reviewAccountFailure(call)
   if (account) return account
   const error = String(call.error || '')
@@ -938,9 +943,12 @@ function postedNothing(call: LogEntry): boolean {
 
 // A recovery report holds its target even as it trips the recovery model:
 // the primary hit its output limit and needs the recovery to proceed, so
-// releasing would relaunch it every tick.
+// releasing would relaunch it every tick. A credential rejection on the
+// recovery route keeps its authentication_failed code so the sign-in
+// condition can fire; it must hold like the wrapped recovery failure.
 function tripHoldsTarget(call: LogEntry): boolean {
   return call.error_code === 'review_recovery_failed'
+    || (call.error_code === 'authentication_failed' && !!call.recovery_model)
 }
 
 const REVIEWER_TRIP_TARGET_PREFIX = 'reviewer:'
@@ -7381,7 +7389,11 @@ async function runBehaviorChains(): Promise<void> {
           { author: chain.author, status: pull.state, draft: pull.draft })) return false
         return true
       },
-      note: (behavior) => { const key = chainBehaviorKey(behavior); return key ? noteArgs(key)[1] ?? '' : '' },
+      note: (behavior) => {
+        const key = chainBehaviorKey(behavior)
+        return key ? noteArgs(key)[1] ?? '' : ''
+      },
+      reviewScope: (chain, pull) => repairReportReviewScope(db, chain, pull.number),
       severity: (behavior) => getSetting(behavior === 'approve-pr' ? 'approve-prs' : 'review-new-prs'),
       authenticationRejected(call) {
         observeProviderRejection(call)
@@ -7403,8 +7415,19 @@ async function runBehaviorChains(): Promise<void> {
         }
       },
       authRecovered(invocation) {
-        if (loadedCatalog()?.models.find(model => model.identity === invocation.model)?.provider !== 'codex') return false
         const failure = providerSignInFailure('codex')
+        if (!failure) return false
+        const catalog = loadedCatalog()
+        const admittedProvider = catalog?.models.find(model => model.identity === invocation.model)?.provider
+        const rejectedProvider = catalog?.models.find(model => model.identity === failure.model)?.provider
+        // The recovery route still names the Claude primary on the admitted
+        // invocation while the rejection names the Codex recovery model.
+        // Caller only writes authentication_failed for Codex, so that code
+        // proves the route when the catalog is unavailable after a restart.
+        const isCodex = admittedProvider === 'codex' || rejectedProvider === 'codex'
+          || ((admittedProvider === undefined || rejectedProvider === undefined)
+            && invocation.evidence?.error_code === 'authentication_failed')
+        if (!isCodex) return false
         const completedAt = invocation.evidence?.completedAt
         const diagnostic = invocation.evidence?.diagnostic as LogEntry['diagnostic']
         return !!failure && failure.verifiedAt !== null && failure.verifiedAt > failure.rejectedAt
@@ -7457,6 +7480,11 @@ async function runBehaviorChains(): Promise<void> {
       wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
     })
     runtime = new BehaviorChainRuntime(behaviorChainJournal(), { ...operations,
+      reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {
+        await requireFreshDatastore()
+        return operations.observe(chain)
+      }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
+        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled),
       enabled: () => behaviorChainJournal().cutover().mode === 'v2'
         && nativeCleanupSupport().status === 'supported' && operations.enabled() })
     behaviorChains.set(org.login.toLowerCase(), runtime)

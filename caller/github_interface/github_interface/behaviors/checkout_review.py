@@ -16,9 +16,10 @@ async def run(client, payload):
     base = expected_head({"expected_head": payload.get("base_sha")})
     merge_base = expected_head({"expected_head": payload.get("merge_base_sha")})
     path = Path(str(payload.get("path") or ""))
+    result = {"action": "checkout_review", "repository": f"{owner}/{repo}", "path": str(path)}
     pull = await get_pull(client, owner, repo, number)
     if pull["head"]["sha"] != head or pull["base"]["sha"] != base:
-        raise RuntimeError("pull-request head or base changed before checkout")
+        return {**result, "outcome": "superseded", "head_sha": expected_head({"expected_head": pull["head"]["sha"]})}
     comparison = await client.get(f"/repos/{owner}/{repo}/compare/{base}...{head}", params={"page": 2, "per_page": 1})
     if comparison["merge_base_commit"]["sha"] != merge_base:
         raise RuntimeError("review checkout merge base differs from the PR packet")
@@ -28,8 +29,10 @@ async def run(client, payload):
     try:
         latest = await get_pull(client, owner, repo, number)
         if latest["head"]["sha"] != head or latest["base"]["sha"] != base:
-            raise RuntimeError("pull-request head or base changed during checkout")
+            observed_head = expected_head({"expected_head": latest["head"]["sha"]})
+            shutil.rmtree(path)
+            return {**result, "outcome": "superseded", "head_sha": observed_head}
     except BaseException:
         shutil.rmtree(path, ignore_errors=True)
         raise
-    return {"action": "checkout_review", "repository": f"{owner}/{repo}", "path": str(path), **info}
+    return {**result, **info}

@@ -75,6 +75,12 @@ takes priority over new messages; unarmed waiting items and failed ones never
 hold ordinary delivery. Stop preserves pending messages and bindings.
 Dispatch preserves each recipient's message order while rotating across
 recipients, including those blocked behind a running turn or an armed queue.
+Deleting a chat retains its pending incoming ordinary messages with inbox state
+`recipient_deleted`, including self-sends. Recovery settles ordinary messages
+whose recipient no longer exists in the same instance, after retired-model
+purging; closed and paused chats keep theirs. Admitted messages retain their
+turn references. The deleted sender's pending outgoing messages to other chats
+are still dropped.
 
 A creating chat can explicitly steer its own worker or answer its pending
 question with known task data. Native answer validation still applies. The
