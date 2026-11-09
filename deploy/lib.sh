@@ -51,6 +51,9 @@ ensure_caller_guard() {
   local desired ids runtimes runtime inspect_runtime=false
   desired=$(env_value POISE_WORKSPACE_RUNTIME)
   if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}'); fi
+  # Match gateway/src/config.ts, which trims POISE_WORKSPACE_RUNTIME.
+  desired=${desired#"${desired%%[![:space:]]*}"}
+  desired=${desired%"${desired##*[![:space:]]}"}
   ids=$(docker ps --all --quiet --filter label=poise.managed=true) || die "cannot list workspaces for the Caller guard."
   runtimes=''
   if [ -n "$ids" ]; then
