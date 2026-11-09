@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import agent_interface as api
-from agent_interface import native_action, native_namespace, resource_ownership
+from agent_interface import native_action, native_namespace, resource_ownership, review_receipt
 
 
 @pytest.fixture
@@ -176,6 +176,29 @@ def test_unmapped_signal_cannot_erase_an_accepted_response():
     assert native_action.process_failure(-35) == {"code": None, "signal": "SIG35"}
 
 
+@pytest.mark.parametrize("changed", ["actor", "head", "request_sha"])
+def test_resolution_checkpoint_requires_original_actor_head_and_request(database, changed):
+    head = "a" * 40
+    argv = ["--resolve-nonblocking-conversations-if-ready", "21", "--expected-head", head,
+            "--username", "reviewer", "--token-user", "reviewer"]
+    request, number, _ = native_action.validate(argv, "/example/repo", "example/repo", "reviewer", resource_version=True)
+    call = api.track("native-action", "resolution", number, "example/repo", "reviewer", "native_action",
+                     expected_head=head, source="poise:behavior-chain", correlation_id="original-resolution")
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    api.persist_action_plan(call, {"kind": "native_action", "request": request})
+    api._native_action_artifact(call, "preparing_native_action", digest)
+    api._native_action_artifact(call, "performing_native_action", digest)
+    if changed == "request_sha":
+        with api.db() as conn:
+            conn.execute("update calls set artifact=json_set(artifact,'$.request_sha',?) where id=?", ("b" * 64, call))
+    before = row(call)
+    with review_receipt.invocation_environment(api.DB, call, True, initialize=False):
+        with pytest.raises(RuntimeError, match="original"):
+            native_action.resolution_checkpoint("example/repo", 21, "b" * 40 if changed == "head" else head,
+                                                "someone-else" if changed == "actor" else "reviewer", "A")
+    assert row(call) == before
+
+
 @pytest.mark.parametrize("mode,submission", [
     ("pre_request", "none"), ("rejected", "rejected"), ("lost", "uncertain"),
     ("graphql", "uncertain"), ("unconfirmed", "uncertain"), ("accepted", None),
@@ -314,3 +337,131 @@ if mode == 'accepted':
         assert summary["invocations"][0]["callId"] == call["id"]
         if submission is not None:
             assert summary["invocations"][0]["evidence"]["diagnostic"]["context"]["submission"] == submission
+
+
+@pytest.mark.parametrize("mode", ["timeout", "complete", "checkpoint_failed", "final_gate_failed"])
+@pytest.mark.skipif(sys.platform != "linux", reason="Native v2 receipt identity requires Linux /proc")
+def test_resolution_progress_survives_caller_deadline_and_journal_reload(database, monkeypatch, mode):
+    repo = Path(__file__).resolve().parents[3]
+    argv = ["--resolve-nonblocking-conversations-if-ready", "21", "--expected-head", "a" * 40,
+            "--username", "reviewer", "--token-user", "reviewer"]
+    mutations = database / "mutations.json"
+    monkeypatch.setenv("GITHUB_INTERFACE_AUTOMATED_REVIEWS", "[71]")
+    script = f"""
+import asyncio, json, sys
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+from github_interface import cli, client
+mode = {mode!r}
+seen = []
+async def request(self, method, path, headers, retry_transient, follow_redirects, **kwargs):
+    if method == 'GET' and path.endswith('/pulls/21'):
+        payload = {{'state': 'open', 'draft': False, 'mergeable': True, 'head': {{'sha': 'a' * 40}}}}
+    elif method == 'GET' and path.endswith('/reviews'):
+        state = 'DISMISSED' if mode == 'final_gate_failed' and len(seen) == 2 else 'APPROVED'
+        payload = [{{'id': 71, 'state': state, 'user': {{'login': 'reviewer'}}, 'commit_id': 'a' * 40,
+                    'submitted_at': '2026-11-09T15:00:00Z'}}]
+    elif method == 'GET' and path.endswith('/status'):
+        payload = {{'statuses': [{{'state': 'success'}}]}}
+    elif path == '/graphql':
+        query = kwargs['json']['query']
+        if query.lstrip().startswith('mutation'):
+            thread = kwargs['json']['variables']['threadId']
+            seen.append(thread)
+            Path({str(mutations)!r}).write_text(json.dumps(seen))
+            if mode == 'timeout' and thread == 'B':
+                await asyncio.sleep(60)  # GitHub accepted B; its reply never reaches Caller.
+            payload = {{'data': {{'resolveReviewThread': {{'thread': {{'id': thread, 'isResolved': True}}}}}}}}
+        elif 'reviewThreads' in query:
+            nodes = [{{'id': thread, 'isResolved': thread in seen, 'isOutdated': False,
+                      'path': 'file.py', 'line': 1, 'originalLine': 1, 'diffSide': 'RIGHT',
+                      'comments': {{'nodes': []}}}} for thread in ['A', 'B']]
+            payload = {{'data': {{'repository': {{'pullRequest': {{'reviewThreads': {{
+                'pageInfo': {{'hasNextPage': False}}, 'nodes': nodes}}}}}}}}}}
+        else:
+            payload = {{'data': {{'repository': {{'pullRequest': {{'headRefOid': 'a' * 40,
+                'commits': {{'nodes': [{{'commit': {{'statusCheckRollup': {{'state': 'SUCCESS'}}}}}}]}}}}}}}}}}
+    else:
+        raise AssertionError((method, path))
+    return httpx.Response(200, json=payload, request=httpx.Request(method, 'https://api.github.com' + path))
+sys.argv = ['github-interface', *{argv!r}]
+with patch.object(client, 'get_token', return_value='isolated-credential'), patch.object(client.GitHubClient, '_request', request):
+    cli.main()
+"""
+    if mode == "checkpoint_failed":
+        with api.db() as conn:
+            conn.execute("create trigger reject_resolution_checkpoint before update of artifact on calls "
+                         "when json_array_length(new.artifact,'$.resolution_progress.confirmed')=1 "
+                         "begin select raise(abort,'checkpoint unavailable'); end")
+
+    scopes = []
+    with monkeypatch.context() as process_transport:
+        children = process(process_transport, script)
+
+        def enter(call, correlation):
+            identity = json.loads(row(call)["process_identity"])
+            scope = SimpleNamespace(key={"callId": call, "correlation": correlation, "token": "b" * 32},
+                address={"version": 1, "instance": "c" * 32, "path": str(database / "test-controller")},
+                binding={"pid": os.getpid() + 2, "start": "12", "namespace": "pid:[91]",
+                         "owner": {"pid": os.getpid(), "start": identity["start"]},
+                         "holder": {"pid": os.getpid() + 1, "start": "11"},
+                         "epoch": {key: str(value) for key, value in identity["epoch"].items()}},
+                read=lambda: {"empty": all(child.poll() is not None for child in children)}, retire=lambda: None)
+            resource_ownership.request_namespace(api.DB, call, scope)
+            resource_ownership.register_namespace(api.DB, call, {"controller": scope.address, **scope.key, "binding": scope.binding})
+            scopes.append(scope)
+
+        def execute():
+            try:
+                api.run_native_action(argv, "/isolated-contract", "example/repo", "reviewer", "original-resolution", resource_version=True)
+            finally:
+                resource_ownership.settle_namespace(api.DB, scopes[0].key["callId"], scopes[0])
+
+        # Only kernel/controller witnesses are stand-ins. The CLI, timeout kill,
+        # SQLite commits, response writer and resource finalizer are Caller's own.
+        scratch = database / "scratch"
+        scratch.mkdir()
+        process_transport.setattr(resource_ownership, "allocate", lambda *_: scratch)
+        process_transport.setattr(native_namespace, "active", lambda: scopes[0] if scopes else None)
+        process_transport.setattr(api, "_enter_native_call", enter)
+        process_transport.setattr(sys, "argv", ["agent-interface", "--native-action", "--source", "poise:behavior-chain"])
+        process_transport.setattr(api, "_main", execute)
+        process_transport.setattr(native_action, "TIMEOUT_SECONDS", 2)
+        if mode == "complete":
+            api.main()
+        else:
+            with pytest.raises(native_action.ActionFailure):
+                api.main()
+    assert children[0].returncode == (-9 if mode == "timeout" else 0 if mode == "complete" else 1)
+    assert json.loads(mutations.read_text()) == (["A"] if mode == "checkpoint_failed" else ["A", "B"])
+    call_id = scopes[0].key["callId"]
+
+    environment = {**os.environ, "AGENT_INTERFACE_DATA_DIR": str(database),
+                   "PYTHONPATH": str(repo / "caller/agent_interface")}
+    stored = subprocess.run([sys.executable, "-c", "from agent_interface import main; main()", "--logs", "--select",
+                             json.dumps({"latest": [], "ids": [call_id], "correlations": []})],
+                            cwd=repo, env=environment, capture_output=True, text=True, check=True, timeout=30)
+    call = json.loads(stored.stdout)[0]
+    progress = call["artifact"]["resolution_progress"]
+    expected_ids = [] if mode == "checkpoint_failed" else ["A"] if mode == "timeout" else ["A", "B"]
+    assert progress == {"confirmed": [{"id": thread, "isResolved": True} for thread in expected_ids],
+                        "pending": "A" if mode == "checkpoint_failed" else "B" if mode == "timeout" else None}
+    assert call["resources_settled_at"]
+    assert bool(call["response"]) == (mode == "complete")
+    if mode == "timeout":
+        assert call["diagnostic"]["outcome"] == "timed_out"
+    request = api.read_action_plan(call_id)["plan"]["request"]
+    output = repo / "test-results"
+    output.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="resolution-progress-", dir=output) as work:
+        bundle = Path(work) / "contract.mjs"
+        subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"), str(repo / "tests/fixtures/native-resolution-progress.ts"),
+                        "--bundle", "--platform=node", "--packages=external", "--format=esm", "--target=node22",
+                        f"--outfile={bundle}"], cwd=repo, env=environment, check=True, capture_output=True, text=True, timeout=30)
+        wire = Path(work) / "stored.json"
+        wire.write_text(json.dumps({"logs": json.loads(stored.stdout), "request": request, "mode": mode,
+                                   "response": Path(row(call_id)["response_path"]).read_text() if call["response"] else None}))
+        consumed = subprocess.run(["node", str(bundle), str(wire)], cwd=repo, env=environment,
+                                  capture_output=True, text=True, timeout=30)
+        assert consumed.returncode == 0, consumed.stderr

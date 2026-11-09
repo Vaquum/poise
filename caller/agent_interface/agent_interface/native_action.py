@@ -1,17 +1,20 @@
 """The fixed, non-model GitHub actions admitted by the behavior journal."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import selectors
 import signal
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from time import monotonic
 
-from . import atoms
+from . import atoms, caller_store
 from .process_diagnostic import command_failure, diagnostic_envelope, diagnostic_from_stderr
 
 MAX_OUTPUT = 256 * 1024
@@ -69,6 +72,71 @@ def validate(argv: list[str], cwd: str, repository: str, actor: str, *, resource
     if len(json.dumps(request, ensure_ascii=False).encode()) > MAX_OUTPUT:
         raise ValueError("native action request exceeds its journal bound")
     return request, argv[1].lstrip("#"), head
+
+
+def resolution_checkpoint(repository: str, number: int, head: str, actor: str,
+                          thread_id: str | None = None, result: dict | None = None) -> dict:
+    """Commit an attempt, then its accepted reply, in the original managed Call.
+
+    An outstanding attempt cannot be replayed or cleared by observing a closed
+    thread. Only its actual mutation response confirms the original action.
+    """
+    database = os.environ.get("AGENT_INTERFACE_RECEIPT_DB")
+    call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database or not call_id or not re.fullmatch(r"[0-9a-f]{32}", call_id):
+        raise RuntimeError("conversation resolution lacks its native receipt binding")
+    with closing(caller_store.connect(database, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("begin immediate")
+        row = conn.execute("select * from calls where id=?", (call_id,)).fetchone()
+        if not row or row["source"] != "poise:behavior-chain" or row["behavior"] != "native_action" \
+                or row["status"] != "running" or row["error_code"] in {"stopping", "stopped"} \
+                or row["repo"] != repository or row["pr_id"] != str(number) \
+                or row["actor"] != actor or row["expected_head"] != head or not row["action_plan"]:
+            raise RuntimeError("conversation resolution differs from its original running Call")
+        plan = json.loads(row["action_plan"])
+        request = plan.get("request", {})
+        artifact = json.loads(row["artifact"] or "{}")
+        digest = hashlib.sha256(json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if plan.get("kind") != "native_action" or request.get("command") != "github-interface" \
+                or artifact.get("phase") != "performing_native_action" or artifact.get("request_sha") != digest \
+                or request.get("argv", [None])[0] != "--resolve-nonblocking-conversations-if-ready":
+            raise RuntimeError("conversation resolution lacks its original request receipt")
+        _, requested_number, requested_head = validate(request["argv"], request["cwd"], repository, actor,
+                                                     resource_version=request.get("nativeResources") == 2)
+        if requested_number != str(number) or requested_head != head:
+            raise RuntimeError("conversation resolution differs from its original target")
+        progress = artifact.get("resolution_progress", {"confirmed": [], "pending": None})
+        if not isinstance(progress, dict) or set(progress) != {"confirmed", "pending"} \
+                or not isinstance(progress["confirmed"], list) \
+                or any(not isinstance(item, dict) or set(item) != {"id", "isResolved"}
+                       or not isinstance(item["id"], str) or not re.fullmatch(r"[A-Za-z0-9_+=/-]{1,256}", item["id"])
+                       or item["isResolved"] is not True for item in progress["confirmed"]) \
+                or (progress["pending"] is not None and (not isinstance(progress["pending"], str)
+                    or not re.fullmatch(r"[A-Za-z0-9_+=/-]{1,256}", progress["pending"]))):
+            raise RuntimeError("invalid native conversation resolution progress")
+        confirmed = {item["id"] for item in progress["confirmed"]}
+        if len(confirmed) != len(progress["confirmed"]) or progress["pending"] in confirmed:
+            raise RuntimeError("contradictory native conversation resolution progress")
+        if thread_id is None:
+            return progress
+        if not isinstance(thread_id, str) or not re.fullmatch(r"[A-Za-z0-9_+=/-]{1,256}", thread_id):
+            raise ValueError("conversation resolution requires its exact thread id")
+        if result is None:
+            if progress["pending"] is not None or thread_id in confirmed:
+                raise RuntimeError("conversation resolution cannot replay an attempted thread")
+            progress["pending"] = thread_id
+        else:
+            if progress["pending"] != thread_id or result.get("id") != thread_id or result.get("isResolved") is not True:
+                raise RuntimeError("conversation resolution lacks its accepted thread response")
+            progress["confirmed"].append({"id": thread_id, "isResolved": True})
+            progress["pending"] = None
+        artifact["resolution_progress"] = progress
+        encoded = json.dumps(artifact)
+        if len(encoded.encode()) > 128 * 1024:
+            raise RuntimeError("conversation resolution progress exceeds its Call bound")
+        conn.execute("update calls set artifact=? where id=?", (encoded, call_id))
+        return progress
 
 
 def execute(argv: list[str], cwd: Path) -> tuple[dict, int]:

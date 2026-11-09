@@ -63,6 +63,25 @@ export interface IssueCommentReceipt {
   author: string
 }
 
+export interface ResolutionProgress {
+  confirmed: { id: string, isResolved: true }[]
+  pending: string | null
+}
+
+/** Partial mutation evidence is separate from a completed-batch response. */
+export function parseResolutionProgress(value: unknown): ResolutionProgress {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid native resolution progress')
+  const progress = value as Record<string, unknown>
+  const threadId = (id: unknown): id is string => typeof id === 'string' && /^[A-Za-z0-9_+=/-]{1,256}$/.test(id)
+  if (Object.keys(progress).length !== 2 || !Object.hasOwn(progress, 'confirmed') || !Object.hasOwn(progress, 'pending')
+    || !Array.isArray(progress.confirmed) || progress.confirmed.some(item => !item || typeof item !== 'object' || Array.isArray(item)
+      || Object.keys(item).length !== 2 || !threadId(item.id) || item.isResolved !== true)
+    || progress.pending !== null && !threadId(progress.pending)
+    || new Set(progress.confirmed.map(item => item.id)).size !== progress.confirmed.length
+    || progress.confirmed.some(item => item.id === progress.pending)) throw new Error('invalid native resolution progress')
+  return { confirmed: progress.confirmed.map(item => ({ id: item.id, isResolved: true })), pending: progress.pending as string | null }
+}
+
 // An issue review runs against the issue, not a pull-request head, so its
 // rows carry no expected or terminal head.
 export const ISSUE_REVIEW_BEHAVIOR = 'issue_review'
@@ -240,10 +259,17 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     const value = artifact as Record<string, unknown>
     if (!['preparing_native_action', 'performing_native_action', 'received_native_action'].includes(String(value.phase))
       || typeof value.request_sha !== 'string' || !/^[0-9a-f]{64}$/.test(value.request_sha)
-      || Object.keys(value).some(key => !['phase', 'request_sha', 'response_sha'].includes(key))
+      || Object.keys(value).some(key => !['phase', 'request_sha', 'response_sha', 'resolution_progress'].includes(key))
       || value.response_sha !== undefined && (value.phase !== 'received_native_action'
         || typeof value.response_sha !== 'string' || !/^[0-9a-f]{64}$/.test(value.response_sha))) {
       throw new Error(`agent-interface log row ${index} has an invalid native action receipt`)
+    }
+    if (value.resolution_progress !== undefined) {
+      const progress = parseResolutionProgress(value.resolution_progress)
+      if (behavior !== 'native_action' || value.phase === 'preparing_native_action'
+        || value.phase === 'received_native_action' && progress.pending !== null) {
+        throw new Error(`agent-interface log row ${index} has contradictory native resolution progress`)
+      }
     }
   }
   if (resourceReleaseContradicted({ resources_settled_at: resourcesSettledAt, artifact, resource_ownership: resourceOwnership })) {

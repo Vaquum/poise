@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 from github_interface.atoms.review_identity import require_owned_reviews
@@ -30,6 +31,14 @@ def _uncertain_suffix(resolved_count: int) -> str:
     )
 
 
+def _checkpoint(owner: str, repo: str, number: int, head: str, actor: str,
+                thread_id: str | None = None, result: dict | None = None) -> dict:
+    if not os.environ.get("AGENT_INTERFACE_RECEIPT_DB") and not os.environ.get("AGENT_INTERFACE_RECEIPT_CALL"):
+        return {"confirmed": [], "pending": None}
+    from agent_interface.native_action import resolution_checkpoint
+    return resolution_checkpoint(f"{owner}/{repo}", number, head, actor, thread_id, result)
+
+
 class HeadChanged(RuntimeError):
     def __init__(self, expected: str, actual: str, phase: str) -> None:
         self.actual = actual
@@ -50,6 +59,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     if username.lower() != actor.lower():
         raise ValueError("username must match token-user")
 
+    progress = _checkpoint(owner, repo, pull_number, required_head, actor)
+    resolved = list(progress["confirmed"])
+    confirmed = {item["id"] for item in resolved}
+    if progress["pending"] is not None:
+        raise RuntimeError(f"review thread {progress['pending']} lacks its original resolution response; outcome is uncertain")
     try:
         gate = await _read_gate(
             client,
@@ -60,6 +74,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             username,
         )
     except HeadChanged as error:
+        if resolved:
+            raise RuntimeError(f"{error} {_uncertain_suffix(len(resolved))}") from error
         return {
             "action": "resolved_nonblocking_conversations_if_ready",
             "repository": f"{owner}/{repo}",
@@ -69,15 +85,17 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             "current_head_sha": error.actual,
         }
     except Exception as error:
-        raise RuntimeError(f"{error} {NO_ACTION_SUFFIX}") from error
+        suffix = _uncertain_suffix(len(resolved)) if resolved else NO_ACTION_SUFFIX
+        raise RuntimeError(f"{error} {suffix}") from error
 
-    resolved: list[dict[str, Any]] = []
-    mutation_attempted = False
+    mutation_attempted = bool(resolved)
     try:
         threads = await list_review_threads(client, owner, repo, pull_number)
 
         unresolved = [thread for thread in threads if not thread["is_resolved"]]
         if not gate["ready"]:
+            if resolved:
+                raise RuntimeError("pull request stopped being ready after conversation resolution")
             return _result(
                 owner,
                 repo,
@@ -95,6 +113,8 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             )
 
         for thread in unresolved:
+            if thread["id"] in confirmed:
+                continue
             current_gate = await _read_gate(
                 client,
                 owner,
@@ -116,11 +136,14 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                 raise RuntimeError(f"review thread disappeared before resolution: {thread['id']}")
             if current_thread["is_resolved"]:
                 continue
+            _checkpoint(owner, repo, pull_number, required_head, actor, thread["id"])
             mutation_attempted = True
             result = await resolve_conversation(client, thread["id"])
             if result.get("id") != thread["id"] or result.get("isResolved") is not True:
                 raise RuntimeError(f"GitHub did not resolve review thread {thread['id']}")
+            _checkpoint(owner, repo, pull_number, required_head, actor, thread["id"], result)
             resolved.append(result)
+            confirmed.add(thread["id"])
 
         final_gate = await _read_gate(
             client,
