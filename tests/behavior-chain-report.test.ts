@@ -312,6 +312,18 @@ it('does not report a hold that was resumed during verification', async () => {
   expect(reports(db)).toHaveLength(0)
 })
 
+it('does not publish when the configured account changes during verification', async () => {
+  const { db, journal } = setup()
+  const chain = record(journal, exhausted(journal), { type: 'chain.observed', observation: observation() })
+  const reason = await reportRepairExhaustion(db, journal, chain, async () => {
+    mocks.accounts = { me: 'other', agentAccount: 'reviewer' }
+    return { ...fresh, checkedAt: Date.now() }
+  }, () => true)
+  expect(reason).toContain('configured accounts differ from the source chain')
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
+})
+
 it('does not adopt or label a marker issue authored by another account', async () => {
   const { db, journal } = setup()
   const chain = exhausted(journal)

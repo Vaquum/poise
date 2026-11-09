@@ -115,6 +115,11 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       || !qualifyingAttempts(chain, fresh, Date.now())) {
       return 'Repair exhaustion reporting pending: source hold changed during verification'
     }
+    const verifiedAccounts = getSettings()
+    if (verifiedAccounts.me.toLowerCase() !== chain.author.toLowerCase()
+      || verifiedAccounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) {
+      return 'Repair exhaustion reporting pending: configured accounts differ from the source chain'
+    }
     const hold = db.prepare(`SELECT sequence, at FROM behavior_chain_events WHERE chain_id = ?
       AND json_extract(payload, '$.type') = 'chain.held' AND sequence > ? ORDER BY sequence DESC LIMIT 1`)
       .get(chain.id, chain.resumedAfterSequence) as { sequence: number, at: number } | undefined
