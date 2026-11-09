@@ -68,6 +68,12 @@ are retained with optional `recovered_at` evidence after a complete positive
 retry; an artifact's matching `resource_recovered_at` distinguishes recovered
 resource uncertainty from an uncertain external action. Neither marker alone
 can release a reservation.
+The receipt stays within 128 KiB. Allocation reserves its full directory and
+settlement certificates plus a bounded blocker before creating disk resources.
+Diagnostics are bounded and consolidated under pressure, including in existing
+receipts; consolidation retains a blocker until complete original recovery can
+cover it. A diagnostic write failure cannot prevent the private cleanup claim
+from retaining its held reason/backoff or stop later due Calls in the pass.
 An incompletely registered descendant can carry `state: covered` only when its
 original ancestor's pinned deletion certificate covers it. Its `covered_by`
 names that reclaimed ancestor; it carries no invented child device/inode.

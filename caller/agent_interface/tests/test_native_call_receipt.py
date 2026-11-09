@@ -4,6 +4,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 import agent_interface as api
-from agent_interface import issue_review, native_namespace, resource_ownership as ownership, review_receipt
+from agent_interface import issue_review, native_cleanup, native_namespace, process_identity, resource_ownership as ownership, review_receipt
 from agent_interface.model_catalog import CATALOG
 
 
@@ -176,6 +177,138 @@ def test_foreign_binding_and_allocated_no_go_never_release(database):
     with pytest.raises(RuntimeError, match="no-GO"):
         ownership.namespace_not_started(api.DB, call)
     assert state(call)["namespace"]["state"] == "active"
+
+
+@pytest.mark.parametrize("proof", ["original", "missing", "mismatched"])
+def test_persisted_near_limit_receipt_recovers_only_with_original_proof(database, monkeypatch, proof):
+    call, scope = requested()
+    register(call, scope)
+    value = state(call)
+    parent = f"/home/poise/.poise/agent-interface/native-resources/{call}"
+    identity = {key: "18446744073709551615" for key in ("device", "inode", "parent_device", "parent_inode")}
+    value["roots"] = [{"path": f"{parent}/agent-interface-review-{index:032x}/codex-home",
+                       "state": "allocated", **identity} for index in range(160)]
+    partial = {"path": value["roots"][0]["path"] + "/partial", "state": "registered"}
+    value["roots"].append(partial)
+    while len(json.dumps(value, separators=(",", ":")).encode()) < 130000:
+        index = len(value["errors"])
+        value["errors"].append({"cause": f"original directory cleanup failed on retry {index}: " + "x" * 200,
+                                "path": value["roots"][index % 160]["path"], "at": 10 + index})
+    value["errors"][-1]["cause"] += "x" * (131066 - len(json.dumps(value, separators=(",", ":")).encode()))
+    encoded = json.dumps(value, separators=(",", ":"))
+    assert len(encoded.encode()) == 131066
+    artifact = {"phase": "posting_issue_reviews", "resource_error": "retained original cleanup failure"}
+    api.finish(call, "completed", outcome="commented", action="commented")
+    with api.db() as conn:
+        # This is an already-persisted receipt from before settlement was reserved.
+        conn.execute("update calls set resource_ownership=?,artifact=?,receipts=? where id=?",
+                     (encoded, json.dumps(artifact), json.dumps([
+                         {"issue": "example/repo#7", "comment_id": 91, "author": "reviewer", "url": None}]), call))
+        before = tuple(conn.execute("select status,outcome,action,receipts from calls where id=?", (call,)).fetchone())
+
+    def resource(operation, root):
+        if str(root) == partial["path"]:
+            raise RuntimeError("incomplete child has no original directory handle")
+        return {"path": str(root), "state": "reclaimed", **identity,
+                "inode": "1" if proof == "mismatched" else identity["inode"], "reclaimed_at": 1000}
+
+    def read():
+        if proof == "missing":
+            raise OSError("original namespace witness is unavailable")
+        return {"empty": True}
+
+    scope.read, scope.resource, scope.retire = read, resource, lambda: None
+    monkeypatch.setattr(native_namespace.Namespace, "restore", lambda *args: scope)
+    observed = process_identity.state
+    monkeypatch.setattr(process_identity, "state", lambda encoded, pid: observed(encoded, pid) if pid == os.getpid() else "gone")
+    report = native_cleanup.recover(api.DB)
+    with api.db() as conn:
+        after = ownership.read(conn, call)
+        row = conn.execute("select resources_settled_at,resource_cleanup,artifact,status,outcome,action,receipts from calls where id=?", (call,)).fetchone()
+        persisted = conn.execute("select resource_ownership from calls where id=?", (call,)).fetchone()[0]
+    assert len(persisted.encode()) <= 131072
+    assert len(after["errors"]) < len(value["errors"])
+    assert tuple(row[3:]) == before
+    if proof != "original":
+        assert report["held"] and not report["released"]
+        assert row[0] is None and json.loads(row[1])["next_attempt_at"] > 0
+        assert not ownership.released(after)
+        assert json.loads(row[2]) == artifact
+        return
+    assert report["released"] == [call] and not report["held"]
+    assert row[0] is not None and row[1] is None
+    assert ownership.released(after)
+    assert after["roots"][-1] == {**partial, "state": "covered", "covered_by": value["roots"][0]["path"], "reclaimed_at": 1000}
+    assert all(error["recovered_at"] >= error["at"] for error in after["errors"])
+    assert json.loads(row[2]) == {**artifact, "resource_recovered_at": after["errors"][0]["recovered_at"]}
+    # Feed the actual Caller log through Poise's unchanged decoder and journal.
+    repo = Path(__file__).resolve().parents[3]
+    output = repo / "test-results"
+    output.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="native-receipt-limit-", dir=output) as work:
+        script, wire = Path(work) / "contract.mjs", Path(work) / "receipt.json"
+        environment = {"PATH": os.environ["PATH"], "HOME": str(database), "TMPDIR": work}
+        built = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"), str(repo / "tests/fixtures/behavior-fence-contract.ts"),
+                                "--bundle", "--platform=node", "--packages=external", "--format=esm", "--target=node22", f"--outfile={script}"],
+                               cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+        assert built.returncode == 0, built.stderr
+        wire.write_text(json.dumps(api.logs_selected({"latest": [], "ids": [call]})))
+        consumed = subprocess.run(["node", str(script), str(wire), "recovered"], cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+        assert consumed.returncode == 0, consumed.stderr
+        assert json.loads(consumed.stdout) == {"accepted": 1, "settled": 1, "reservations": 0}
+
+
+def test_allocation_reserves_identity_settlement_and_a_terminal_blocker(database, monkeypatch):
+    call, scope = requested()
+    register(call, scope)
+    allocated = []
+    identity = {key: "18446744073709551615" for key in ("device", "inode", "parent_device", "parent_inode")}
+
+    def resource(operation, root):
+        if operation == "allocate-root":
+            allocated.append(str(root))
+            return {"state": "allocated", "unlinked": False, **identity}
+        return {"state": "reclaimed", "reclaimed_at": 1000, **identity}
+
+    scope.resource = resource
+    monkeypatch.setattr(native_namespace, "active", lambda: scope)
+    parent = ownership.call_directory(api.DB, call)
+    for index in range(1000):
+        root = parent / f"agent-interface-review-{index:032x}" / "codex-home"
+        before = state(call)
+        try:
+            ownership.allocate(api.DB, call, root)
+        except RuntimeError as error:
+            assert "size limit" in str(error)
+            assert state(call) == before
+            assert str(root) not in allocated and not root.exists()
+            break
+    else:
+        pytest.fail("native ownership accepted unbounded allocations")
+    assert len(allocated) > 100
+    # Escaped non-ASCII diagnostics cost more bytes than characters.
+    ownership.failure(api.DB, call, "\u2603" * 2000)
+    ownership.failure(api.DB, call, "resources_unknown")
+    ownership.settle_namespace(api.DB, call, scope)
+    ownership.cleanup_remaining(api.DB, call)
+    ownership.acknowledge_recovery(api.DB, call)
+    after = state(call)
+    assert ownership.released(after)
+    assert len(after["roots"]) == len(allocated)
+    with api.db() as conn:
+        assert len(conn.execute("select resource_ownership from calls where id=?", (call,)).fetchone()[0].encode()) <= 131072
+    stamp = max(error["recovered_at"] for error in after["errors"]) + 1
+    with patch.object(ownership, "time", return_value=stamp):
+        ownership.failure(api.DB, call, "resources_unknown")
+    assert not ownership.released(state(call)), "an earlier recovery cannot cover a repeated later failure"
+
+
+def test_settlement_blocker_reserves_worst_case_unicode_escaping():
+    value = {"version": 1, "roots": [], "errors": []}
+    stamp = "9" * 24
+    expected = {**value, "process_pending": False, "roots": [], "errors": [
+        {"cause": "\U0001F600" * ownership.MAX_ERROR_CHARACTERS, "path": None, "at": stamp, "recovered_at": stamp}]}
+    assert ownership._settlement_size(value) == len(json.dumps(expected, separators=(",", ":")).encode())
 
 
 @pytest.mark.parametrize("code,severity", [(0, "warning"), (1, "error")])
