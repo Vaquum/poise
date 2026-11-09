@@ -42,6 +42,9 @@ check_backup_safety() {
   for container in $containers; do
     details=$(docker inspect --type container --format '{{.Id}}|{{.Name}}|{{.HostConfig.Runtime}}|{{.State.Status}}|{{range .Config.Env}}{{if eq (index (split . "=") 0) "POISE_WORKSPACE_RUNTIME"}}{{.}}{{end}}{{end}}|{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}} {{end}}{{end}}|end' "$container") \
       || die "cannot inspect container $container; no backup is safe without a complete inventory."
+    # The runtime setting prints verbatim, so fold newlines to spaces before
+    # the single-line read; config.ts read().trim() accepts them as padding.
+    details=${details//$'\n'/ }
     IFS='|' read -r inspected name runtime status workspace_runtime mounts end <<<"$details"
     if [ "$inspected" != "$container" ] || [[ $name != /* ]] || [ -z "$runtime" ] || [ "$end" != end ]; then
       die "incomplete inventory for container $container."

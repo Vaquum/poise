@@ -216,6 +216,17 @@ class BackupTest(unittest.TestCase):
         self.assert_refused(result, state)
         self.assertIn('runsc', result.stderr)
 
+    def test_newline_padded_runc_workspace_runtime(self):
+        result, state = self.backup([gateway(workspace_runtime='runc\n'), container()],
+                                    default_runtime='runc')
+        self.assert_restorable(result, state)
+
+    def test_newline_padded_cross_kernel_workspace_runtime(self):
+        result, state = self.backup([gateway(workspace_runtime='runsc\n'), container()],
+                                    default_runtime='runc')
+        self.assert_refused(result, state)
+        self.assertIn('runsc', result.stderr)
+
     def test_inventory_errors_and_incomplete_inspection_fail_closed(self):
         for command, count, empty, archived in [
             ('volume ls', 1, False, ()), ('info', 1, False, ()), ('info', 1, True, ()),
