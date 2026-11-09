@@ -1289,11 +1289,10 @@ export function retireBehaviorDeadLetter(id: string): boolean {
   `).run(new Date().toISOString(), id).changes === 1
 }
 
-// Retires the dead letters of the given behaviors whose target is no longer
-// open. Each behavior passes only what it lists: an open pull request says
-// nothing about an issue, and the reverse.
+// Only exact, fresh closed-target evidence authorizes retirement. Listing
+// absence proves nothing, and closure retires no launch or quarantine proof.
 export function retireBehaviorDeadLettersForClosedPrs(
-  openTargets: ReadonlySet<string>,
+  closedTargets: ReadonlySet<string>,
   behaviors: readonly string[] = ['review-new-prs', 'approve-prs'],
   organization?: string,
   unreadRepositories?: ReadonlySet<string>,
@@ -1302,23 +1301,20 @@ export function retireBehaviorDeadLettersForClosedPrs(
     SELECT id, behavior, repo, pr
     FROM behavior_dead_letters AS dead
     WHERE retired_at IS NULL AND repo IS NOT NULL AND pr IS NOT NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM behavior_seen AS held
-        WHERE held.key = dead.behavior AND held.target = dead.target
-          AND held.launch_quarantine IS NOT NULL
-      )
   `).all() as Array<{ id: string, behavior: string, repo: string, pr: number }>)
     .filter((row) => behaviors.includes(row.behavior)
       && !unreadRepositories?.has(row.repo)
       && (organization === undefined || row.repo.split('/')[0].toLowerCase() === organization.toLowerCase()))
   const retire = db.prepare(`
-    UPDATE behavior_dead_letters SET retired_at = ?
+    UPDATE behavior_dead_letters SET retired_at = ?, resolution = 'superseded',
+      resolution_evidence = ?, resolved_at = ?
     WHERE id = ? AND retired_at IS NULL
   `)
   const retiredAt = new Date().toISOString()
+  const evidence = JSON.stringify({ open: false, checkedAt: retiredAt })
   return db.transaction(() => rows.reduce((count, row) => {
-    if (openTargets.has(`${row.repo}#${row.pr}`)) return count
-    return count + retire.run(retiredAt, row.id).changes
+    if (!closedTargets.has(`${row.repo}#${row.pr}`)) return count
+    return count + retire.run(retiredAt, evidence, retiredAt, row.id).changes
   }, 0))()
 }
 
@@ -1347,8 +1343,8 @@ export interface DeadLetterReconcileResult {
 }
 
 // One reconcile pass over the raw dead-letter inventory. Each open row is
-// resolved (a later completion settled its own request), superseded (its
-// pull request or issue closed, or a replacement request took over), or
+// resolved (a later completion settled its own request), superseded (a
+// replacement request took over), or
 // explicitly held with the reason recorded. Nothing is deleted: resolved
 // and superseded rows retire with their evidence, held rows stay open.
 // Unseen rows first, then least-recently rechecked, in bounded batches, so
@@ -1483,7 +1479,7 @@ export function reconcileBehaviorDeadLetters(
             requestedAt: next.launch_requested_at, callId: next.launch_call_id, outcome: next.launch_outcome,
             completedAt: next.launch_completed_at, headSha: next.launch_head_sha,
           }
-          const open = unreadRepositories?.has(row.repo) ? null : openTargets.has(`${row.repo}#${row.pr}`)
+          const open = !unreadRepositories?.has(row.repo) && openTargets.has(`${row.repo}#${row.pr}`) ? true : null
           return settle('superseded',
             `replaced by request ${next.launch_correlation_id ?? next.target}`
             + ` on head ${next.launch_expected_head ?? 'unknown'} at ${next.launch_requested_at}`,
@@ -1497,11 +1493,8 @@ export function reconcileBehaviorDeadLetters(
             { completedAt: completion.launch_completed_at, callId: completion.launch_call_id })
         }
       }
-      if (!unreadRepositories?.has(row.repo) && !openTargets.has(`${row.repo}#${row.pr}`)) {
-        return settle('superseded', `${row.repo}#${row.pr} is no longer open`, { open: false })
-      }
-      if (unreadRepositories?.has(row.repo)) {
-        return settle('held', `${row.repo} could not be listed; target state unknown`,
+      if (unreadRepositories?.has(row.repo) || !openTargets.has(`${row.repo}#${row.pr}`)) {
+        return settle('held', `${row.repo}#${row.pr} target state unknown`,
           { callId: row.call_id, open: null })
       }
       return settle('held', 'no later completion; target still open', { callId: row.call_id, open: true })

@@ -215,7 +215,7 @@ describe('dead-letter reconcile pass', () => {
     expect(deadLetterRow(store).error).toBe(error)
   })
 
-  it('supersedes closed targets and holds unreadable ones instead of guessing', async () => {
+  it('holds unlisted and unreadable targets instead of guessing closure', async () => {
     const store = await loadStore()
     await failedLaunch(store, 'review-new-prs', 'Vaquum/repo#13', 'Vaquum/repo', 13,
       'Not signed in', '2026-10-20T10:00:00Z')
@@ -226,11 +226,11 @@ describe('dead-letter reconcile pass', () => {
       new Set(['Vaquum/repo#12']), ['review-new-prs'], undefined, new Set(['Vaquum/dark']))
     expect(results).toHaveLength(2)
     const byTarget = Object.fromEntries(results.map((row) => [row.target, row]))
-    expect(byTarget['Vaquum/repo#13'].disposition).toBe('superseded')
-    expect(byTarget['Vaquum/repo#13'].reason).toContain('no longer open')
+    expect(byTarget['Vaquum/repo#13'].disposition).toBe('held')
+    expect(byTarget['Vaquum/repo#13'].reason).toContain('unknown')
     expect(byTarget['Vaquum/dark#1'].disposition).toBe('held')
-    expect(byTarget['Vaquum/dark#1'].reason).toContain('could not be listed')
-    expect(store.listBehaviorDeadLetters().map((row) => row.target)).toEqual(['Vaquum/dark#1'])
+    expect(byTarget['Vaquum/dark#1'].reason).toContain('unknown')
+    expect(store.listBehaviorDeadLetters()).toHaveLength(2)
     expect(store.db.prepare('SELECT count(*) FROM behavior_dead_letters').pluck().get()).toBe(2)
   })
 
@@ -260,7 +260,7 @@ describe('dead-letter reconcile pass', () => {
     expect(store.listBehaviorDeadLetters()).toHaveLength(1)
   })
 
-  it('reports the call identity and closure state a firing settlement guards on', async () => {
+  it('reports the call identity without inventing closure from listing absence', async () => {
     const store = await loadStore()
     const error = 'review behavior produced duplicate GitHub reviews; needs attention'
     const { claimId, callId } = await failedLaunch(store, 'review-new-prs', 'Vaquum/repo#12', 'Vaquum/repo', 12,
@@ -268,7 +268,7 @@ describe('dead-letter reconcile pass', () => {
     completeFailedClaim(store, 'review-new-prs', 'Vaquum/repo#12', claimId, error)
 
     const [result] = store.reconcileBehaviorDeadLetters(new Set())
-    expect(result).toMatchObject({ disposition: 'superseded', correlationId: claimId, callId, open: false })
+    expect(result).toMatchObject({ disposition: 'held', correlationId: claimId, callId, open: null })
     expect(result.replacement).toBeUndefined()
   })
 

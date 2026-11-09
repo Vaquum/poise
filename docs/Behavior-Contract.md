@@ -458,14 +458,22 @@ repository's pull requests are evaluated on the next tick like any other.
 ## Dead-letter reconciliation
 
 Every behavior tick reconciles the dead-letter inventory against the launch
-ledger and the open targets it just listed. Each open row is resolved (a
-later completion settled its target), superseded (its pull request or issue
-closed), or explicitly held, with the disposition, the evidence and the
-check time recorded on the row. Resolved and superseded rows retire; held
-rows stay open. Nothing is deleted. Quarantined rows are never resolved or
-superseded, and a repository that could not be listed holds its rows instead
-of proving anything about them. Unseen rows reconcile before rechecks of
-held rows, least-recently rechecked first.
+ledger. Resolved and superseded rows retire with their evidence and check time;
+held rows stay active. Nothing is deleted. Listing absence never proves closure.
+Unseen rows reconcile before rechecks of held rows, least-recently rechecked first.
+
+The same tick checks held targets, including quarantines and target-specific
+failure summaries, through the fresh datastore's exact issue/PR readers. Only
+an explicit closed issue or closed/merged PR retires its incidents and notices.
+Open, missing, unreadable and timed-out targets remain held. This cleanup runs
+independently of enablement, pauses, model availability and behavior cutover,
+coalesced per account under the existing 55-second operation deadline and
+shutdown signal. Pending resolver recovery retains its failure summary.
+
+Closure preserves launch ownership, quarantine, original errors and uncertain
+outcomes. Late reconciliation cannot recreate a retired closed-target incident.
+An exact open read restores held evidence for the original reviewer/request
+target when its retained launch still needs reconciliation; history stays intact.
 
 ## Replays
 

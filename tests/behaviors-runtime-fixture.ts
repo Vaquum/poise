@@ -82,6 +82,7 @@ const pr = {
 const HEAD_SHA = 'a'.repeat(40)
 const NEXT_HEAD_SHA = 'd'.repeat(40)
 let listedPrs: Array<typeof pr & { created_at?: string, head_ref?: string | null, head_repo?: string | null }> = [pr]
+let closedPrs: typeof listedPrs = []
 
 let tempRoot = ''
 let database: typeof import('../server/db') | null = null
@@ -170,7 +171,10 @@ function arrangeCli(
           stderr: '',
         }
       }
-      return { stdout: JSON.stringify(listedPrs), stderr: '' }
+      const number = args.indexOf('--number')
+      const rows = number < 0 ? listedPrs : [...listedPrs, ...closedPrs].filter((row) =>
+        row.repo === args[args.indexOf('--repo') + 1] && row.number === Number(args[number + 1]))
+      return { stdout: JSON.stringify(rows), stderr: '' }
     }
     if (command === 'github-interface' && args[0] === '--local-checkout-path') {
       if (failCheckout) throw new Error('checkout unavailable')
@@ -554,6 +558,7 @@ beforeEach(async () => {
   mocks.observeAuthFailure.mockReset()
   mocks.lockContention = false
   listedPrs = [pr]
+  closedPrs = []
   agentLogs = []
   vi.spyOn(console, 'error').mockImplementation(() => undefined)
   vi.spyOn(console, 'warn').mockImplementation(() => undefined)
@@ -575,6 +580,8 @@ export const fixture = {
   get tempRoot() { return tempRoot },
   get listedPrs() { return listedPrs },
   set listedPrs(value: typeof listedPrs) { listedPrs = value },
+  get closedPrs() { return closedPrs },
+  set closedPrs(value: typeof closedPrs) { closedPrs = value },
   get agentLogs() { return agentLogs },
   set agentLogs(value: typeof agentLogs) { agentLogs = value },
 }

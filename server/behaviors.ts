@@ -68,6 +68,7 @@ import {
   recordBehaviorDeadLetter as databaseRecordBehaviorDeadLetter,
   quarantineBehaviorLaunchOwned,
   retireBehaviorDeadLetter,
+  retireBehaviorDeadLettersForClosedPrs,
   reconcileBehaviorDeadLetters,
   releaseBehaviorReplay,
   replayReservationActive,
@@ -101,6 +102,7 @@ import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, 
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { behaviorHeld } from './alerts/producers'
+import { retireClearedBehaviorAlerts } from './alerts/notices'
 import { getWorkerCapacity, type WorkerCapacity } from './worker-capacity'
 
 const DATASTORE = 'github-datastore'
@@ -220,9 +222,28 @@ function listBehaviorIncidents(limit = 50) {
   return databaseListBehaviorIncidents(limit, currentOrganization()?.login)
 }
 
+// Closure suppresses late failure evidence only until an exact open read
+// restores an active incident. Match the original reviewer/request target.
+function closedTargetIncidentRetired(behavior: string, target: string, correlationId: string): string | null {
+  const row = db.prepare(`
+    SELECT dead.id FROM behavior_dead_letters AS dead
+    WHERE dead.behavior = ? AND dead.target = ? AND dead.retired_at IS NOT NULL
+      AND dead.resolution = 'superseded' AND json_valid(dead.resolution_evidence)
+      AND json_extract(dead.resolution_evidence, '$.open') = 0
+      AND json_extract(dead.resolution_evidence, '$.replacedBy') IS NULL
+      AND dead.correlation_id = ?
+      AND NOT EXISTS (SELECT 1 FROM behavior_dead_letters AS active
+        WHERE active.behavior = dead.behavior AND active.target = dead.target AND active.retired_at IS NULL)
+    ORDER BY dead.retired_at DESC LIMIT 1
+  `).get(behavior, target, correlationId) as { id: string } | undefined
+  return row?.id ?? null
+}
+
 // A dead letter is an incident in the Behaviors view, grouped by pull request
 // or issue. A new cause alerts even while an earlier incident still stands.
 function recordBehaviorDeadLetter(claim: BehaviorLaunchClaim, error: string, callId?: string | null): string {
+  const retired = closedTargetIncidentRetired(claim.key, claim.target, claim.launchCorrelationId)
+  if (retired) return retired
   const target = claim.launchRepo && claim.launchPr ? `${claim.launchRepo}#${claim.launchPr}` : claim.target
   const alreadyHeld = databaseListBehaviorIncidents(500)
     .some((incident) => incident.behavior === claim.key && incident.target === target)
@@ -730,19 +751,6 @@ function behaviorFailureTargets(key: BehaviorKey): string[] {
     "SELECT key FROM meta WHERE substr(key, 1, ?) = ? AND value <> ''",
   ).all(prefix.length, prefix) as Array<{ key: string }>
   return rows.map((row) => row.key.slice(prefix.length))
-}
-
-function retireClosedTargetFailures(open: ReadonlySet<string>, behaviors: readonly BehaviorKey[], unreadRepositories?: ReadonlySet<string>): void {
-  for (const behavior of behaviors) {
-    for (const target of behaviorFailureTargets(behavior)) {
-      if (behavior === 'resolve-unblocking' && getMeta(resolveRecoveryKey(target))) continue
-      const ref = target.match(/^[^#]+#\d+/)?.[0]
-      if (ref && !unreadRepositories?.has(ref.split('#')[0]) && !open.has(ref)) {
-        // A closed PR proves nothing about repository access.
-        clearBehaviorFailureKeepHold(behavior, target)
-      }
-    }
-  }
 }
 
 // Per-behavior setting (the priority ceiling for review-new-prs:
@@ -1520,6 +1528,10 @@ function completeClaimSafely(claim: BehaviorLaunchClaim, error: string | null = 
 }
 
 function deadLetterClaim(claim: BehaviorLaunchClaim, error: string, observe = true): boolean {
+  if (closedTargetIncidentRetired(claim.key, claim.target, claim.launchCorrelationId)) {
+    retainClaimSafely(claim, error)
+    return false
+  }
   recordBehaviorDeadLetter(claim, error)
   const completed = completeClaimSafely(claim, error)
   if (completed && observe) captureBehaviorOutcome({ nativeId: claim.launchCorrelationId,
@@ -1596,7 +1608,7 @@ function settleClosedTargetFirings(results: DeadLetterReconcileResult[]): void {
 // could starve a backlog, and only rows still holding a matching failed
 // launch are read. A reopened PR skips. The incident's retirement stamp is
 // the stable completion time so repeats settle to the same record.
-function settleClosedTargetHistoricalFirings(open: ReadonlySet<string>): void {
+function settleClosedTargetHistoricalFirings(closed: ReadonlySet<string>): void {
   const rows = db.prepare(`
     SELECT seen.key AS behavior, seen.target AS target,
       seen.launch_repo AS repo, seen.launch_pr AS pr,
@@ -1628,7 +1640,7 @@ function settleClosedTargetHistoricalFirings(open: ReadonlySet<string>): void {
       continue
     }
     if (evidence?.open !== false || evidence?.replacedBy) continue
-    if (row.repo === null || row.pr === null || open.has(`${row.repo}#${row.pr}`)) continue
+    if (row.repo === null || row.pr === null || !closed.has(`${row.repo}#${row.pr}`)) continue
     settleOneClosedTargetFiring(row.behavior, row.target,
       row.correlation_id, row.call_id, row.retired_at)
   }
@@ -1833,6 +1845,7 @@ function restoreReadableClaim(claim: BehaviorLaunchClaim, call: LogEntry, snapsh
 // Restore only its exact terminal failure, leaving ordinary no-action policy
 // to decide whether it can retry. Running rows cannot revive closed ownership.
 function restoreReadableFailedClaim(claim: BehaviorLaunchClaim, call: LogEntry | undefined, snapshot: AgentLogSnapshot): void {
+  if (closedTargetIncidentRetired(claim.key, claim.target, claim.launchCorrelationId)) return
   if (claim.launchQuarantine !== 'unreadable' || !call
     || !FAILED_AGENT_STATUSES.has(call.status.toLowerCase())
     || call.error_code === 'invalid_agent_result'
@@ -2224,6 +2237,11 @@ async function reconcileBehaviorLaunchClaims(
       console.log(
         `[behaviors] ${behavior} approval dismissed as stale for ${claim.launchRepo}#${claim.launchPr}; current head will be reconsidered`,
       )
+      continue
+    }
+    if (FAILED_AGENT_STATUSES.has(status)
+      && closedTargetIncidentRetired(claim.key, claim.target, claim.launchCorrelationId)) {
+      retainClaimSafely(claim, call.error || `agent call terminated with status ${status}`)
       continue
     }
     if (FAILED_AGENT_STATUSES.has(status) && boundedReviewFailure(call)) {
@@ -2636,8 +2654,6 @@ async function readOpenPrsByAuthor(_pair: string): Promise<DatastorePr[]> {
   const reconciled = reconcileBehaviorDeadLetters(seen, undefined, currentOrganization()?.login)
   settleSupersededApprovalFirings(reconciled)
   settleClosedTargetFirings(reconciled)
-  settleClosedTargetHistoricalFirings(seen)
-  retireClosedTargetFailures(seen, ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
   retireClosedQueueAdmissions(seen)
   return prs.filter((pr) => organizationOwns(pr.repo) && !ownPullRequestRefusal(getMeta('me') || '', `${pr.repo}#${pr.number}`, pr))
 }
@@ -2733,6 +2749,91 @@ async function readPullRequest(repo: string, number: number): Promise<DatastoreP
     throw new Error(`github-datastore view pr returned rows other than ${repo}#${number}`)
   }
   return rows[0] ?? null
+}
+
+const closedTargetReconciliations = new Map<string, Promise<void>>()
+
+// Read-only lifecycle evidence is independent of launch admission. The tick
+// coalesces this work per account and shares its existing deadline/cancellation.
+function reconcileClosedTargetIncidents(): Promise<void> {
+  const scope = currentOrganization()?.login.toLowerCase() ?? 'legacy'
+  const pending = closedTargetReconciliations.get(scope)
+  if (pending) return pending
+  const behaviors: BehaviorKey[] = ['review-new-issues', 'review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci']
+  const rows = db.prepare(`
+    SELECT DISTINCT dead.behavior, dead.target, dead.repo, dead.pr, dead.error
+    FROM behavior_dead_letters AS dead
+    WHERE dead.repo IS NOT NULL AND dead.pr IS NOT NULL
+      AND (dead.retired_at IS NULL OR (dead.resolution = 'superseded'
+        AND json_valid(dead.resolution_evidence) AND json_extract(dead.resolution_evidence, '$.open') = 0
+        AND json_extract(dead.resolution_evidence, '$.replacedBy') IS NULL
+        AND EXISTS (SELECT 1 FROM behavior_seen AS seen
+          WHERE seen.key = dead.behavior AND seen.target = dead.target
+            AND seen.launch_correlation_id = dead.correlation_id
+            AND seen.launch_outcome IS NULL AND seen.launch_requested_at IS NOT NULL)))
+  `).all() as Array<{ behavior: string, target: string, repo: string, pr: number, error: string }>
+  const targets = new Map<string, { repo: string, number: number, issue: boolean }>()
+  const add = (behavior: string, repo: string, number: number) => {
+    if (!behaviors.includes(behavior as BehaviorKey) || !organizationOwns(repo)) return
+    const issue = behavior === ISSUES_KEY
+    targets.set(`${issue}:${repo}#${number}`, { repo, number, issue })
+  }
+  for (const row of rows) add(row.behavior, row.repo, row.pr)
+  for (const behavior of behaviors) {
+    for (const target of behaviorFailureTargets(behavior)) {
+      const match = /^([^/#\s]+\/[^/#\s]+)#(\d+)/.exec(target)
+      if (match) add(behavior, match[1]!, Number(match[2]))
+    }
+  }
+  if (targets.size === 0 || behaviorAborted()) return Promise.resolve()
+  const clock = new BehaviorDeadline(BEHAVIOR_OPERATION_TIMEOUT_MS, 0)
+  const lifecycle = behaviorSignal()
+  const signal = lifecycle ? AbortSignal.any([lifecycle, clock.controller.signal]) : clock.controller.signal
+  const release = trackReleaseBackground('behavior')
+  const pass = behaviorOperationSignal.run(signal, async () => {
+    await requireFreshDatastore()
+    await forEachPool([...targets.values()], REVIEW_PREPARE_CONCURRENCY, async ({ repo, number, issue }) => {
+      try {
+        const target = issue ? await readIssue(repo, number) : await readPullRequest(repo, number)
+        if (behaviorAborted() || !target) return
+        const keys = behaviors.filter((key) => (key === ISSUES_KEY) === issue)
+        const ref = `${repo}#${number}`
+        if (target.status === 'closed' || target.status === 'merged') {
+          const closed = new Set([ref])
+          retireBehaviorDeadLettersForClosedPrs(closed, keys, currentOrganization()?.login)
+          retireClearedBehaviorAlerts()
+          if (!issue) settleClosedTargetHistoricalFirings(closed)
+          for (const key of keys) {
+            for (const failureTarget of behaviorFailureTargets(key)) {
+              if (failureTarget.match(/^[^#]+#\d+/)?.[0] !== ref
+                || (key === 'resolve-unblocking' && getMeta(resolveRecoveryKey(failureTarget)))) continue
+              clearBehaviorFailureKeepHold(key, failureTarget)
+            }
+          }
+        } else if (target.status === 'open') {
+          for (const row of rows.filter((row) => row.repo === repo && row.pr === number && keys.includes(row.behavior as BehaviorKey))) {
+            const claim = listBehaviorLaunchClaims(row.behavior).find((claim) => claim.target === row.target)
+              ?? getFailedBehaviorLaunch(row.behavior, row.target)
+            if (!claim || !closedTargetIncidentRetired(claim.key, claim.target, claim.launchCorrelationId)) continue
+            const error = claim.launchError || row.error
+            const alreadyHeld = listBehaviorIncidents(500).some((incident) => incident.behavior === claim.key && incident.target === ref)
+            databaseRecordBehaviorDeadLetter(claim, error)
+            behaviorHeld(claim.key, ref, alreadyHeld, error)
+          }
+        }
+      } catch (error) {
+        if (!behaviorAborted()) console.error(`[behaviors] target reconciliation unavailable for ${repo}#${number}:`, error)
+      }
+    })
+  }).catch((error: unknown) => {
+    if (!signal.aborted) console.error('[behaviors] closed-target reconciliation failed:', error)
+  }).finally(() => {
+    clock.close()
+    release()
+    if (closedTargetReconciliations.get(scope) === pass) closedTargetReconciliations.delete(scope)
+  })
+  closedTargetReconciliations.set(scope, pass)
+  return pass
 }
 
 async function localCheckoutPath(owner: string, repo: string, number: number, head: string, actor: string): Promise<string> {
@@ -6608,7 +6709,6 @@ async function tickReviewNewIssues(): Promise<void> {
   }
   // An unread repository is unknown, not empty: preserve its incidents.
   reconcileBehaviorDeadLetters(open, [ISSUES_KEY], currentOrganization()?.login, unreadRepositories)
-  retireClosedTargetFailures(open, [ISSUES_KEY], unreadRepositories)
   candidates.sort((a, b) => a.order - b.order)
   let logs: Promise<AgentLogSnapshot> | null = null
   const readLogs = () => (logs ??= readBehaviorLogSnapshot())
@@ -6858,6 +6958,10 @@ async function reconcileIssueReviewClaims(): Promise<void> {
     }
     if (FAILED_AGENT_STATUSES.has(status)) {
       const message = call.error || `agent call terminated with status ${status}`
+      if (closedTargetIncidentRetired(claim.key, claim.target, claim.launchCorrelationId)) {
+        retainClaimSafely(claim, message)
+        continue
+      }
       if (releaseTrippedCall(ISSUES_KEY, claim, call)) {
         // A time-limit trip still relaunches the review once with the next
         // reviewer — but the attempt counts toward the retry bound, so
@@ -7448,11 +7552,18 @@ async function runBehaviorCycle(
 export async function runEnabledBehaviorsOnce(
   options: RunEnabledBehaviorsOptions = {},
 ): Promise<void> {
+  const lifecycle = behaviorAbortController?.signal
+  if (!behaviorOperationSignal.getStore() && lifecycle) {
+    return behaviorOperationSignal.run(lifecycle, () => runEnabledBehaviorsOnce(options))
+  }
+  if (behaviorAborted()) return
   if (releaseBackgroundPaused()) return
-  if (behaviorAdmissionDraining() && behaviorOrganization.getStore() !== undefined) return
   prepareInitialReviewBaselines()
   if (behaviorOrganization.getStore() === undefined) {
     if (behaviorAdmissionDraining()) {
+      await Promise.allSettled(readyOrganizations().map((org) =>
+        behaviorOrganization.run(org, reconcileClosedTargetIncidents)))
+      if (behaviorAborted()) return
       const configuration = () => JSON.stringify([getSettings().me, getSettings().agentAccount,
         getOrganizations().map((org) => [org.login.toLowerCase(), org.datastorePath]).sort()])
       const expectedConfiguration = configuration()
@@ -7514,6 +7625,8 @@ export async function runEnabledBehaviorsOnce(
   // This tick's PR behaviors share one open-PR listing, dropped when the
   // tick ends.
   return sharedPrListing.run({ promise: null, author: '' }, async () => {
+    const reconciliation = reconcileClosedTargetIncidents()
+    if (behaviorAdmissionDraining()) return reconciliation
     const organization = org.login.toLowerCase()
     let sweepSkipped = false
     try {
@@ -7543,7 +7656,7 @@ export async function runEnabledBehaviorsOnce(
         console.log(`[behaviors] behavior chain sweep overlap ended for ${org.login}: skipped ticks: ${overlap.skips}; elapsed: ${Date.now() - overlap.since}ms`)
       }
     }
-    const operations: Promise<void>[] = []
+    const operations: Promise<void>[] = [reconciliation]
     if (isEnabled('review-new-prs')
       && (!options.skipBusy || !behaviorOperationTails.has(operationKey('review-new-prs')))) {
       // review-new-prs manages its own phased lock inside tickReviewNewPrs:
@@ -7921,7 +8034,7 @@ export async function stopBehaviorsRuntime(): Promise<void> {
   checkSlotRetryPending = false
   behaviorAbortController?.abort()
   behaviorAbortController = null
-  await Promise.allSettled([...behaviorOperationTails.values()])
+  await Promise.allSettled([...behaviorOperationTails.values(), ...closedTargetReconciliations.values()])
   // Detached workers survive Poise itself, but spawn acceptance is not proof
   // of a successful side effect. Leave launched claims with their durable
   // identity so a later runtime reconciles exact log status before retrying;

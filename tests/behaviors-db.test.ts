@@ -338,7 +338,8 @@ describe('behavior database lifecycle', () => {
     recordBehaviorDeadLetter(listBehaviorLaunchClaims('approve-prs')[0], 'old failure')
     expect(completeSeenOwned('approve-prs', 'Vaquum/repo#12@head=old', claimId)).toBe(true)
 
-    expect(retireBehaviorDeadLettersForClosedPrs(new Set())).toBe(1)
+    expect(retireBehaviorDeadLettersForClosedPrs(new Set())).toBe(0)
+    expect(retireBehaviorDeadLettersForClosedPrs(new Set(['Vaquum/repo#12']))).toBe(1)
     expect(listBehaviorDeadLetters()).toEqual([])
     expect(db.prepare(`
       SELECT count(*) FROM behavior_dead_letters WHERE retired_at IS NOT NULL
@@ -374,7 +375,7 @@ describe('behavior database lifecycle', () => {
     })
   })
 
-  it.each(['invalid_result', 'unreadable'] as const)('keeps a closed parent incident visible while %s evidence still holds its children', async (kind) => {
+  it.each(['invalid_result', 'unreadable'] as const)('retires a confirmed closed parent while retaining %s evidence for its children', async (kind) => {
     tempRoot = await mkdtemp(join(tmpdir(), 'poise-db-test-'))
     const store = await loadIsolatedDb(join(tempRoot, 'cache.db'))
     const target = 'Vaquum/Origo#500'
@@ -392,11 +393,14 @@ describe('behavior database lifecycle', () => {
     store.recordBehaviorDeadLetter(store.listBehaviorLaunchClaims('review-new-issues')[0], 'uncertain comments')
     expect(store.retireBehaviorDeadLettersForClosedPrs(new Set(['Vaquum/Origo#501']), ['review-new-issues'])).toBe(0)
     expect(store.listBehaviorIncidents()).toMatchObject([{ target, error: 'uncertain comments' }])
+    const original = store.listBehaviorLaunchClaims('review-new-issues')[0]
+    expect(store.retireBehaviorDeadLettersForClosedPrs(new Set([target]), ['review-new-issues'])).toBe(1)
+    expect(store.listBehaviorIncidents()).toEqual([])
+    expect(store.listBehaviorLaunchClaims('review-new-issues')[0]).toEqual(original)
     const completed = store.completeIssueReviewLaunchOwned({
       key: 'review-new-issues', target, claimId, completedAt: new Date().toISOString(),
     })
     expect(completed).toBe(kind === 'unreadable')
-    if (completed) expect(store.retireBehaviorDeadLettersForClosedPrs(new Set(), ['review-new-issues'])).toBe(1)
   })
 
   // An issue review's dead letter names an issue. A pull-request scan lists
@@ -432,8 +436,8 @@ describe('behavior database lifecycle', () => {
 
     expect(retireBehaviorDeadLettersForClosedPrs(new Set())).toBe(0)
     expect(listBehaviorDeadLetters().map((letter) => letter.behavior)).toEqual(['review-new-issues'])
-    expect(retireBehaviorDeadLettersForClosedPrs(new Set(['Vaquum/Origo#452']), ['review-new-issues'])).toBe(0)
-    expect(retireBehaviorDeadLettersForClosedPrs(new Set(), ['review-new-issues'])).toBe(1)
+    expect(retireBehaviorDeadLettersForClosedPrs(new Set(), ['review-new-issues'])).toBe(0)
+    expect(retireBehaviorDeadLettersForClosedPrs(new Set(['Vaquum/Origo#452']), ['review-new-issues'])).toBe(1)
     expect(listBehaviorDeadLetters()).toEqual([])
     // Retiring keeps the count a relaunch decision is made from.
     expect(countBehaviorDeadLetters('review-new-issues', 'Vaquum/Origo#452')).toBe(1)
