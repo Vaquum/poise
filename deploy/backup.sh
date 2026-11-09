@@ -53,6 +53,9 @@ check_backup_safety() {
     if [ "${name#/}" = "$gateway" ]; then
       gateway_status=$status
       workspace_runtime=${workspace_runtime#POISE_WORKSPACE_RUNTIME=}
+      # Match gateway/src/config.ts, which trims POISE_WORKSPACE_RUNTIME.
+      workspace_runtime=${workspace_runtime#"${workspace_runtime%%[![:space:]]*}"}
+      workspace_runtime=${workspace_runtime%"${workspace_runtime##*[![:space:]]}"}
       gateway_runtime=${workspace_runtime:-$default_runtime}
     fi
     for mounted in $mounts; do
