@@ -79,12 +79,19 @@ export class McpGateway {
       const authorization = this.authorization(url.searchParams)
       const principal = pagePrincipal(ctx, req, res, url)
       if (!principal) return
+      // The consent POST redirects to the registered client callback, which is
+      // cross-origin (including loopback). Chromium enforces form-action on that
+      // redirect, so the consent page must allow the validated redirect origin.
+      const redirectOrigin = new URL(authorization.redirect).origin
+      const policy = String(ctx.pageHeaders['content-security-policy'] ?? '')
+      const authorizeHeaders = policy.includes(redirectOrigin) ? ctx.pageHeaders
+        : { ...ctx.pageHeaders, 'content-security-policy': policy.replace("form-action 'self'", `form-action 'self' ${redirectOrigin}`) }
       return sendHtml(res, 200, page('Connect Poise', html`<div class="card"><h1>Connect this agent to Poise?</h1>
         <p>Grant read access to ${principal.user.login}'s workspace at ${ctx.workspaceOrigin(principal.user.handle)}.</p>
         <p>Client ${authorization.client}. Return to ${authorization.redirect}. Allowed tool: poise_describe (workspace identity and capabilities only).</p>
         <form method="post" action="/mcp/authorize"><input type="hidden" name="csrf" value="${principal.session.csrf}">
         <input type="hidden" name="request" value="${url.searchParams.toString()}">
-        <button name="decision" value="approve">Allow read access</button><button name="decision" value="deny">Deny</button></form></div>`), ctx.pageHeaders)
+        <button name="decision" value="approve">Allow read access</button><button name="decision" value="deny">Deny</button></form></div>`), authorizeHeaders)
     }
     if (url.pathname === '/mcp/authorize' && req.method === 'POST') {
       const principal = postPrincipal(ctx, req), form = await readForm(req)

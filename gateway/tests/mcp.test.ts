@@ -104,6 +104,20 @@ it('rejects wrong audience, PKCE, expiry, unsupported scope and tools without wo
   expect((await form('/mcp/token', { grant_type: 'refresh_token', client_id: grant.client, refresh_token: String(renewed.json().refresh_token), resource })).status).toBe(400)
 })
 
+it('allows the registered callback origin in the consent form-action CSP', async () => {
+  const client = await register()
+  const params = new URLSearchParams({ client_id: client, redirect_uri: redirectUri, code_challenge: challenge,
+    code_challenge_method: 'S256', resource, scope: 'poise:read', response_type: 'code', state: 's1' })
+  const path = `/mcp/authorize?${params}`
+  const { apexCookie } = await h.signIn('Alice', path)
+  const page = await h.request({ host: APEX, path, headers: { cookie: apexCookie } })
+  expect(page.status).toBe(200)
+  const csp = String(page.headers['content-security-policy'] ?? '')
+  expect(csp).toContain("form-action 'self'")
+  expect(csp).toContain(new URL(redirectUri).origin)
+  expect(csp).toContain(`https://${APEX}`)
+})
+
 it('requires a live owner consent and rejects expired authorization codes and malformed registrations', async () => {
   const auth = await authorize()
   const request = auth.params.toString()
