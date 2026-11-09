@@ -183,6 +183,65 @@ it('retains pending original evidence after a merge and clears only verified com
   expect(chainSummaryFixture('complete').attention).toEqual([])
 })
 
+it('preserves age when readiness gains a non-conversation blocker with unchanged threads', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const base: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 930, head_sha: 'a'.repeat(40), head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 930, head: 'a'.repeat(40), headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, unresolvedOutdated: 1, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', readinessBlockers: ['merge_state_not_clean'], pending: false, failing: [], conflict: false, behind: false } }
+  let chain = admit(journal, 930, admittedAt)
+  const firstAt = admittedAt + 60_000
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...base, checkedAt: firstAt } }, firstAt)
+  chain = append(journal, chain, { type: 'chain.held', reason: 'awaiting operator' }, firstAt + 60_000)
+  const regressed = structuredClone(base) as ChainObservation
+  regressed.pull!.readinessBlockers = ['merge_state_not_clean', 'required_checks_not_green']
+  regressed.checkedAt = now
+  chain = append(journal, chain, { type: 'chain.observed', observation: regressed }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.progressAt).toBe(firstAt)
+  expect(entry.ageMs).toBe(now - firstAt)
+  expect(entry.blocker).toContain('awaiting operator')
+})
+
+it('directs pending CI to repair-pr diagnosis when stuck and to waiting when fresh', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const makeObservation = (headSince: number): ChainObservation => ({ checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 940, head_sha: 'a'.repeat(40), head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 940, head: 'a'.repeat(40), headSince, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'PENDING', readinessBlockers: [], pending: true, failing: [], conflict: false, behind: false } })
+  let stuck = admit(journal, 940, admittedAt)
+  stuck = append(journal, stuck, { type: 'chain.observed', observation: makeObservation(now - 31 * 60_000) }, admittedAt + 60_000)
+  stuck = append(journal, stuck, { type: 'chain.observed',
+    observation: { ...makeObservation(now - 31 * 60_000), checkedAt: now } }, now)
+  let fresh = admit(journal, 941, admittedAt)
+  const freshObservation = makeObservation(now - 5 * 60_000)
+  freshObservation.publication = { pull_number: 941, head_sha: 'b'.repeat(40), head_invocation: null, state: 'open', merged: false, merge_sha: null }
+  freshObservation.pull = { ...freshObservation.pull!, number: 941, head: 'b'.repeat(40) }
+  fresh = append(journal, fresh, { type: 'chain.observed', observation: freshObservation }, admittedAt + 60_000)
+  fresh = append(journal, fresh, { type: 'chain.observed', observation: { ...structuredClone(freshObservation), checkedAt: now } }, now)
+  const entries = behaviorChainAttention(journal, now)
+  const stuckEntry = entries.find(entry => entry.id === stuck.id)!
+  expect(stuckEntry.evidence.state).toBe('fresh')
+  expect(stuckEntry.nextAction).toContain('pending over 30 minutes')
+  expect(stuckEntry.nextAction).not.toContain('approval')
+  const freshEntry = entries.find(entry => entry.id === fresh.id)!
+  expect(freshEntry.evidence.state).toBe('fresh')
+  expect(freshEntry.nextAction).toContain('Await exact-head CI')
+  expect(freshEntry.nextAction).not.toContain('approval')
+})
+
 it('advances on an accepted queue receipt while retaining unverified merge completion', () => {
   const journal = new BehaviorChainJournal(db)
   delayedChainFixture(journal, now)
