@@ -65,6 +65,65 @@ async function resolveMeToken(me: string): Promise<string> {
   }
 }
 
+/** Reconcile a marked repair report, including closed issues. Search absence
+ * never establishes whether an earlier creation request took effect. */
+export async function reconcileRepairReport(repository: string, marker: string, number: number | null, label = false) {
+  requireConfiguredRepository(repository)
+  const me = getMeta('me')
+  if (!me) throw new Error('Repair reporting requires the configured GitHub account')
+  const token = await resolveMeToken(me)
+  const env = { GH_HOST: 'github.com', GH_TOKEN: token, GITHUB_TOKEN: undefined,
+    GH_ENTERPRISE_TOKEN: undefined, GITHUB_ENTERPRISE_TOKEN: undefined }
+  const request = async (args: string[]): Promise<unknown> => JSON.parse((await runFile(GH, args, {
+    env, timeoutMs: 30_000, maxOutputBytes: 4 * 1024 * 1024,
+  })).stdout)
+  const object = (value: unknown): Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid repair report issue evidence')
+    return value as Record<string, unknown>
+  }
+  const labels = (value: unknown): string[] => {
+    if (!Array.isArray(value)) throw new Error('Repair report labels are unavailable')
+    return value.map(entry => {
+      const name = object(entry).name
+      if (typeof name !== 'string') throw new Error('Invalid repair report label')
+      return name
+    })
+  }
+  try {
+    let raw: unknown
+    if (number !== null) raw = await request(['api', `repos/${repository}/issues/${number}`, '--method', 'GET'])
+    else {
+      const result = object(await request(['api', 'search/issues', '--method', 'GET', '-f',
+        `q=repo:${repository} is:issue in:body "${marker}"`, '-f', 'per_page=100']))
+      if (result.incomplete_results !== false || !Number.isSafeInteger(result.total_count)
+        || Number(result.total_count) > 100 || !Array.isArray(result.items)
+        || result.items.length !== result.total_count) throw new Error('Repair report search is incomplete')
+      const matches = result.items.map(object).filter(issue => typeof issue.body === 'string' && issue.body.includes(marker))
+      if (matches.length > 1) throw new Error('Multiple issues claim the same repair report')
+      if (!matches.length) return null
+      raw = matches[0]
+    }
+    const issue = object(raw)
+    const author = object(issue.user)
+    if ('pull_request' in issue || !Number.isSafeInteger(issue.number) || Number(issue.number) < 1
+      || number !== null && issue.number !== number || typeof issue.body !== 'string' || !issue.body.includes(marker)
+      || typeof author.login !== 'string' || author.login.toLowerCase() !== me.toLowerCase()
+      || !['open', 'closed'].includes(String(issue.state))
+      || String(issue.html_url).toLowerCase() !== `https://github.com/${repository}/issues/${issue.number}`.toLowerCase()) {
+      throw new Error('Repair report issue identity differs from its durable intent')
+    }
+    let applied = labels(issue.labels)
+    if (label && issue.state === 'open' && !applied.some(name => name.toLowerCase() === 'poise')) {
+      applied = labels(await request(['api', `repos/${repository}/issues/${issue.number}/labels`, '--method', 'POST', '-f', 'labels[]=poise']))
+    }
+    return { number: Number(issue.number), url: String(issue.html_url), state: String(issue.state), labels: applied }
+  } catch (error) {
+    const failure = error as { stderr?: unknown, message?: string }
+    const message = typeof failure.stderr === 'string' && failure.stderr ? failure.stderr : failure.message || String(error)
+    throw new Error(`Repair report reconciliation failed: ${message.split(token).join('***')}`)
+  }
+}
+
 // github-interface resolves the repo from cwd's last two path parts when
 // no git remote is found. We make a no-op directory under tmpdir for each
 // repo and use that as cwd — `mkdir -p` is cheap and idempotent.

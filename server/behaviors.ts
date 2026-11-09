@@ -6,6 +6,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
+import { reportRepairExhaustion } from './behavior-chain-report'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
@@ -894,6 +895,10 @@ function isPreparationBudgetExhaustion(call: LogEntry): boolean {
 // nothing posted. Callers gate on postedNothing, so a run that submitted
 // still holds exactly as before.
 export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
+  // Local inspection can time out after a successful provider request. Its
+  // diagnostic takes precedence over provider-like text in older errors.
+  if (call.diagnostic?.operation === 'github-interface' && call.diagnostic.phase === 'inspection'
+    && call.diagnostic.outcome === 'timed_out') return null
   const account = reviewAccountFailure(call)
   if (account) return account
   const error = String(call.error || '')
@@ -7387,6 +7392,11 @@ async function runBehaviorChains(): Promise<void> {
       wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
     })
     runtime = new BehaviorChainRuntime(behaviorChainJournal(), { ...operations,
+      reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {
+        await requireFreshDatastore()
+        return operations.observe(chain)
+      }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
+        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled),
       enabled: () => behaviorChainJournal().cutover().mode === 'v2'
         && nativeCleanupSupport().status === 'supported' && operations.enabled() })
     behaviorChains.set(org.login.toLowerCase(), runtime)

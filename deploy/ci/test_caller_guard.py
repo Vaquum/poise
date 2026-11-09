@@ -243,11 +243,11 @@ require_docker() { :; }
 require_env_file() { :; }
 runtime_image() { printf '%s' fixture; }
 docker() {
-  case "$1 $2" in
-    'image inspect'|'volume inspect') return 0 ;;
-    'volume ls') printf '%s\\n' poise-home-fixture ;;
-    'ps --quiet') printf '%s\\n' fixture ;;
-    'inspect --format') printf '%s\\n' '/poise-ws-fixture runsc' ;;
+  case "$1" in
+    image|volume) case "$2" in inspect) return 0 ;; ls) printf '%s\\n' poise-home-fixture ;; *) return 99 ;; esac ;;
+    info) printf '%s\\n' runc ;;
+    ps) printf '%s\\n' fixture ;;
+    inspect) printf '%s\\n' 'fixture|/poise-ws-fixture|runsc|running||poise-home-fixture|end' ;;
     *) printf 'unsafe backup operation: %s\\n' "$*" >&2; return 99 ;;
   esac
 }
@@ -256,7 +256,8 @@ docker() {
         result = subprocess.run(["bash", str(operator / "backup.sh"), str(output)],
                                 capture_output=True, text=True, env=self.env, timeout=5)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("host SQLite access to its live databases is unsafe", result.stderr)
+        self.assertIn("refusing backup", result.stderr)
+        self.assertIn("another kernel", result.stderr)
         self.assertNotIn("unsafe backup operation", result.stderr)
         self.assertFalse(output.exists())
 
@@ -273,11 +274,11 @@ require_docker() {{ :; }}
 require_env_file() {{ :; }}
 runtime_image() {{ printf '%s' fixture; }}
 docker() {{
-  case "$1 $2" in
-    'image inspect'|'volume inspect') return 0 ;;
-    'volume ls') printf '%s\\n' poise-home-fixture ;;
-    'ps --quiet') printf '%s\\n' fixture ;;
-    'inspect --format') printf '%s\\n' '/poise-ws-fixture {runtime}' ;;
+  case "$1" in
+    image|volume) case "$2" in inspect) return 0 ;; ls) printf '%s\\n' poise-home-fixture ;; *) return 99 ;; esac ;;
+    info) printf '%s\\n' runc ;;
+    ps) printf '%s\\n' fixture ;;
+    inspect) printf '%s\\n' 'fixture|/poise-ws-fixture|{runtime}|running||poise-home-fixture|end' ;;
     *) printf 'unsafe backup operation: %s\\n' "$*" >&2; return 99 ;;
   esac
 }}
@@ -285,7 +286,7 @@ docker() {{
                 output = self.root / f"backups-{runtime.replace('.', '-')}"
                 result = subprocess.run(["bash", str(operator / "backup.sh"), str(output)],
                                         capture_output=True, text=True, env=self.env, timeout=5)
-                self.assertNotIn("host SQLite access to its live databases is unsafe", result.stderr)
+                self.assertNotIn("refusing backup", result.stderr)
                 self.assertIn("unsafe backup operation", result.stderr)
 
     def test_runc_deployment_needs_no_host_guard_or_python(self):

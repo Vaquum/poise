@@ -20,8 +20,8 @@ LIB = os.path.join(ROOT, 'deploy', 'lib.sh')
 
 OLD = '353d13078c523c4155d9d28097b98350ed59436d'
 NEW = 'c04cca1bc8ebcb1e931c84027296bcff0e3cf6f0'
-IMAGE_ID = 'sha256:aaaabbbbcccc'
-OLD_IMAGE_ID = 'sha256:ddddffff0000'
+IMAGE_ID = 'sha256:' + 'a' * 64
+OLD_IMAGE_ID = 'sha256:' + 'd' * 64
 
 # A docker that answers from a JSON state file. Containers print their canned
 # inspect line; exec serves the next health answer for the container (the last
@@ -40,7 +40,14 @@ save()
 if args[:2] == ['image', 'inspect']:
     if not state.get('image_ok', True):
         sys.exit(1)
-    print(state['image_id'])
+    if 'poise.release' in ' '.join(args):
+        print(state['image_id'], state.get('image_release', '<no value>'))
+    else:
+        print(state['image_id'])
+elif args[:1] == ['version']:
+    print('24.0.0')
+elif args[:2] == ['compose', 'version']:
+    print('Docker Compose version v2.0.0')
 elif args[:1] == ['ps']:
     if not state.get('ps_ok', True):
         sys.exit(1)
@@ -68,6 +75,12 @@ elif args[:1] == ['inspect']:
     if missing:
         sys.exit(1)
 elif args[:1] == ['exec']:
+    if args[2] == 'sh':
+        failure = state.get('failed_releases', {}).get(args[-1])
+        if failure is None:
+            sys.exit(1)
+        print(failure)
+        sys.exit(0)
     answers = state['health'].get(args[1], [])
     seen = state.setdefault('execs', {}).get(args[1], 0)
     state['execs'][args[1]] = seen + 1
@@ -387,6 +400,7 @@ class VerifyTest(LibTest):
         self.assertIn('symbolic link', result.stderr)
         self.assertEqual(self.calls(), [])
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'rollout records use Linux flock, as on the deployment host')
     def test_operator_scripts_capture_workspaces_before_build_can_remove_them(self):
         # Execute the real entrypoints. Building retags the image, which can
         # trigger even the old gateway before compose replaces that gateway.
@@ -416,7 +430,8 @@ class VerifyTest(LibTest):
                 with open(os.path.join(ROOT, 'deploy', name)) as source, open(target, 'w') as output:
                     output.write(source.read())
                 with open(self.state, 'w') as file:
-                    json.dump({'image_id': IMAGE_ID, 'containers': [alice, bob], 'after_build': [alice],
+                    json.dump({'image_id': IMAGE_ID, 'image_release': NEW,
+                               'containers': [alice, bob], 'after_build': [alice],
                                'health': {'poise-ws-alice': [health(NEW)]}, 'calls': []}, file)
                 env = {key: value for key, value in os.environ.items() if not key.startswith(('POISE_', 'COMPOSE_'))}
                 env.update(PATH=f'{self.bin}{os.pathsep}{env["PATH"]}', FAKE_DOCKER_STATE=self.state)
@@ -468,6 +483,192 @@ class VerifyTest(LibTest):
         result = self.verify({'ps_ok': False})
         self.assertEqual(result.returncode, 1)
         self.assertIn('cannot list the managed workspaces', result.stderr)
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'rollout records use Linux flock, as on the deployment host')
+class RolloutTest(LibTest):
+    def start(self, state, sha=NEW):
+        return self.lib('expected=$(workspace_handles) || exit 1; '
+                        f'start_rollout {sha} poise-runtime:latest "$expected"; '
+                        'verify_timeout_seconds=0; '
+                        f'verify_workspaces {sha} poise-runtime:latest "$expected"',
+                        {'image_id': IMAGE_ID, 'image_release': sha, 'containers': [], 'health': {}, **state})
+
+    def current(self):
+        with open(self.state + '.proof.rollouts/current') as file:
+            return file.read().strip()
+
+    def record(self, rollout):
+        with open(self.state + '.proof.rollouts/' + rollout) as file:
+            return file.read().splitlines()
+
+    def resume(self, rollout):
+        # A fresh process executes the real verification-only entrypoint.
+        directory = os.path.join(self.work.name, 'resume')
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, 'lib.sh'), 'w') as file:
+            file.write(f'. {shlex.quote(LIB)}\n'
+                       'workspace_proof_file="$FAKE_DOCKER_STATE.proof"\n'
+                       'require_linux() { :; }\n')
+        target = os.path.join(directory, 'verify.sh')
+        shutil.copyfile(os.path.join(ROOT, 'deploy/verify.sh'), target)
+        return self.lib(f'bash {shlex.quote(target)} {shlex.quote(rollout)}')
+
+    def change_state(self, **changes):
+        with open(self.state) as file:
+            state = json.load(file)
+        with open(self.state, 'w') as file:
+            json.dump({**state, **changes}, file)
+
+    def test_timeout_then_new_process_observes_completion_without_deploying(self):
+        alice = f'alice {IMAGE_ID} true /poise-ws-alice'
+        bob = f'bob {IMAGE_ID} false /poise-ws-bob'
+        result = self.start({'containers': [alice, bob],
+                             'health': {'poise-ws-alice': [health(OLD, desired=NEW, installed=NEW)]}})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rollout = self.current()
+        before = self.record(rollout)
+        self.assertEqual(before[:5], [NEW, IMAGE_ID, 'poise-runtime:latest', 'alice bob ', 'pending'])
+        self.assertEqual(os.stat(self.state + '.proof.rollouts/' + rollout).st_mode & 0o777, 0o600)
+        self.assertIn(f'active {OLD}', before[-1])
+        self.change_state(image_id=OLD_IMAGE_ID, health={'poise-ws-alice': [health(NEW)]})
+        call_count = len(self.calls())
+        result = self.resume(rollout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'Rollout {rollout}: complete', result.stdout)
+        after = self.record(rollout)
+        self.assertEqual(after[4], 'complete')
+        self.assertEqual(after[6:len(before)], before[6:])
+        self.assertIn('bob (stopped)', after[-1])
+        for observation in after[6:]:
+            self.assertRegex(observation, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ ')
+        self.assertFalse(os.path.exists(self.state + '.proof'))
+        # The mutable image tag now points elsewhere. Verification still uses
+        # the original image ID and performs only inventory and health reads.
+        reads = self.calls()[call_count:]
+        self.assertTrue(any(call.startswith('exec poise-ws-alice curl ') for call in reads))
+        self.assertTrue(all(call.startswith(('version ', 'compose version', 'ps ', 'inspect ', 'exec '))
+                            for call in reads), reads)
+        self.assertFalse(any('/switch' in call for call in reads))
+
+    def test_missing_expected_workspace_remains_pending_after_process_exit(self):
+        alice = f'alice {IMAGE_ID} true /poise-ws-alice'
+        bob = f'bob {IMAGE_ID} false /poise-ws-bob'
+        result = self.start({'containers': [alice, bob], 'health': {}})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rollout = self.current()
+        self.change_state(containers=[alice], health={'poise-ws-alice': [health(NEW)]})
+        result = self.resume(rollout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('bob: missing', result.stderr)
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        self.assertNotIn('Every workspace serves', result.stdout)
+
+    def test_new_rollout_supersedes_pending_target_without_certifying_its_stopped_workspace(self):
+        result = self.start({'containers': [f'bob {OLD_IMAGE_ID} false /poise-ws-bob']})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        first = self.current()
+        # Retrying the same pending target keeps its original obligation and
+        # receipt, so a later target cannot leave an older retry unresolved.
+        result = self.start({'containers': []})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.current(), first)
+        newer = 'b' * 40
+        result = self.start({'image_id': OLD_IMAGE_ID,
+                             'containers': [f'bob {OLD_IMAGE_ID} false /poise-ws-bob']}, sha=newer)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        second = self.current()
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.record(second)[4], 'complete')
+        superseded = self.record(first)
+        self.assertEqual(superseded[:2], [NEW, IMAGE_ID])
+        self.assertEqual(superseded[4], 'superseded')
+        self.assertIn(newer, superseded[-1])
+        result = self.resume(first)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'Rollout {first}: superseded', result.stdout)
+        self.assertNotIn('Every workspace serves', result.stdout)
+        self.assertEqual(self.record(first), superseded)
+
+    def test_fallback_or_unreadable_health_is_pending_until_target_has_failure_evidence(self):
+        alice = f'alice {IMAGE_ID} true /poise-ws-alice'
+        result = self.start({'containers': [alice], 'health': {'poise-ws-alice': [health(OLD)]}})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rollout = self.current()
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        self.change_state(health={})
+        result = self.resume(rollout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('unreachable', result.stderr)
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        self.change_state(health={'poise-ws-alice': [health(OLD)]},
+                          failed_releases={OLD: 'failure of a different release'})
+        result = self.resume(rollout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        self.change_state(failed_releases={NEW: 'exited with 1 within a minute of starting'})
+        result = self.resume(rollout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f'Rollout {rollout}: failed', result.stdout)
+        self.assertEqual(self.record(rollout)[4], 'failed')
+        self.assertIn('exited with 1 within a minute', self.record(rollout)[-1])
+
+    def test_observations_are_bounded_and_a_stale_verifier_cannot_overwrite_supersession(self):
+        result = self.start({'containers': [f'alice {IMAGE_ID} true /poise-ws-alice']})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rollout = self.current()
+        path = shlex.quote(self.state + '.proof.rollouts/' + rollout)
+        result = self.lib(f'read_rollout {path}; '
+                          'for ((i=0; i<40; i++)); do record_rollout pending "observation $i" "$rollout_expected"; done')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.record(rollout)[6:]), 32)
+        self.assertIn('observation 39', self.record(rollout)[-1])
+        result = self.lib(f'read_rollout {path}; record_rollout pending "new workspace" "alice bob "; '
+                          'record_rollout complete "stale inventory" "alice "')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        self.assertIn('bob', self.record(rollout)[-1])
+        result = self.start({}, sha=OLD)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        superseded = self.record(rollout)
+        result = self.lib(f'read_rollout {path}; record_rollout complete "stale success" "$rollout_expected"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record(rollout), superseded)
+
+    def test_successful_restore_clears_rollout_store_so_next_deploy_starts_fresh(self):
+        alice = f'alice {IMAGE_ID} true /poise-ws-alice'
+        bob = f'bob {IMAGE_ID} false /poise-ws-bob'
+        result = self.start({'containers': [alice, bob], 'health': {}})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('bob', self.record(self.current())[3])
+        directory = os.path.join(self.work.name, 'restore')
+        os.mkdir(directory)
+        with open(os.path.join(directory, 'lib.sh'), 'w') as file:
+            file.write(f'. {shlex.quote(LIB)}\n'
+                       'workspace_proof_file="$FAKE_DOCKER_STATE.proof"\n'
+                       'require_linux() { :; }\nrequire_docker() { :; }\nrequire_env_file() { :; }\n'
+                       'runtime_image() { printf %s poise-runtime:latest; }\n')
+        target = os.path.join(directory, 'restore.sh')
+        shutil.copyfile(os.path.join(ROOT, 'deploy/restore.sh'), target)
+        backup = os.path.join(self.work.name, 'backup')
+        os.mkdir(backup)
+        archive = 'poise-home-alice.tar.gz'
+        payload = b'fixture volume archive consumed by fake Docker'
+        with open(os.path.join(backup, archive), 'wb') as file:
+            file.write(payload)
+        with open(os.path.join(backup, 'SHA256SUMS'), 'w') as file:
+            file.write(f'{hashlib.sha256(payload).hexdigest()}  {archive}\n')
+        self.change_state(restore_ok=True)
+        env = {key: value for key, value in os.environ.items() if not key.startswith(('POISE_', 'COMPOSE_'))}
+        env.update(PATH=f'{self.bin}{os.pathsep}{env["PATH"]}', FAKE_DOCKER_STATE=self.state)
+        result = subprocess.run(['bash', target, backup], capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(os.path.exists(self.state + '.proof'))
+        self.assertFalse(os.path.exists(self.state + '.proof.rollouts'))
+        result = self.start({'containers': [alice], 'health': {'poise-ws-alice': [health(NEW)]}})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'Every workspace serves {NEW}: alice.', result.stdout)
+        self.assertNotIn('bob', self.record(self.current())[3])
 
 
 class RestoreProofTest(LibTest):

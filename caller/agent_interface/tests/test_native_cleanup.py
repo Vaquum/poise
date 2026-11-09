@@ -4,6 +4,7 @@ These do not replace the installed-image namespace/filesystem fault checks.
 """
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -135,3 +136,65 @@ def test_recovery_errors_are_retained_and_covered_only_after_original_physical_p
         ownership.acknowledge_recovery(path, call)
     with api.db() as db:
         assert ownership.read(db, call) == recovered
+
+
+def test_diagnostic_overflow_releases_the_cleanup_claim_and_keeps_the_next_call_due(database, monkeypatch):
+    path, call = database
+    second = api.track("fixture", "second due Call", repo="example/repo", actor="reviewer",
+                       behavior="issue_review", source="poise:behavior-chain", correlation_id="second")
+    with api.db() as db:
+        value = json.loads(ownership.initial(second, "second"))
+        value["namespace"].update(state="not_started", no_effect="original-no-go", settled_at=10)
+        db.execute("update calls set status='failed',resource_ownership=? where id=?", (json.dumps(value), second))
+        db.execute("update calls set pid=123 where id in (?,?)", (call, second))
+        original = db.execute("select resource_ownership from calls where id=?", (call,)).fetchone()[0]
+    observed = process_identity.state
+    monkeypatch.setattr(process_identity, "state", lambda encoded, pid: observed(encoded, pid) if pid == os.getpid() else "gone")
+    with patch.object(ownership, "failure", side_effect=RuntimeError("native resource ownership receipt exceeds its size limit")) as failure:
+        report = cleanup.recover(path)
+    failure.assert_called_once()
+    assert report["examined"] == 2 and report["released"] == [second]
+    assert report["held"][0]["callId"] == call
+    assert "diagnostic could not be recorded" in report["held"][0]["reason"]
+    assert "size limit" in report["held"][0]["reason"]
+    with api.db() as db:
+        row = db.execute("select resource_cleanup,resource_ownership,resources_settled_at from calls where id=?", (call,)).fetchone()
+        claim = json.loads(row[0])
+        assert "owner" not in claim and "token" not in claim
+        assert claim["failures"] == 1 and claim["next_attempt_at"] > claim["attempt_at"]
+        assert "original native cleanup controller" in claim["last_error"]
+        assert row[1] == original and row[2] is None
+        assert db.execute("select resources_settled_at from calls where id=?", (second,)).fetchone()[0] is not None
+    assert cleanup.recover(path)["examined"] == 0
+
+
+def test_consolidation_and_repeated_failure_preserve_recovery_ordering(database, monkeypatch):
+    path, call = database
+    artifact = {"phase": "resources_unknown", "resource_recovered_at": 15}
+    with api.db() as db:
+        value = ownership.read(db, call)
+        value["namespace"].update(state="settled", settled_at=10)
+        value["errors"] = [{"cause": "x" * 500, "path": None, "at": 5, "recovered_at": 15} for _ in range(230)]
+        value["errors"][-1]["recovered_at"] = 20
+        encoded = json.dumps(value, separators=(",", ":"))
+        assert len(encoded.encode()) < 131072
+        db.execute("update calls set resource_ownership=?,artifact=? where id=?", (encoded, json.dumps(artifact), call))
+    ownership.process_check(path, call, complete=True)
+    with api.db() as db:
+        compacted = ownership.read(db, call)
+    assert compacted["errors"] == [{"cause": "x" * 500, "path": None, "at": 5, "recovered_at": 20}]
+    assert ownership.released(compacted)
+    assert not ownership.publication_released(30, json.dumps(compacted), artifact)
+    with patch.object(ownership, "time", return_value=25):
+        ownership.failure(path, call, "x" * 500)
+    with api.db() as db:
+        assert not ownership.released(ownership.read(db, call))
+    reader = SimpleNamespace(read=lambda: {"empty": True})
+    monkeypatch.setattr(ownership, "original_scope", lambda *args: reader)
+    with patch.object(ownership, "time", return_value=30):
+        ownership.acknowledge_recovery(path, call)
+    with api.db() as db:
+        recovered = ownership.read(db, call)
+        artifact = json.loads(db.execute("select artifact from calls where id=?", (call,)).fetchone()[0])
+    assert artifact["resource_recovered_at"] == 30
+    assert ownership.publication_released(30, json.dumps(recovered), artifact)

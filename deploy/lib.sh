@@ -311,6 +311,127 @@ clear_workspace_proof() {
   rm -f "$workspace_proof_file" || die "cannot clear the completed workspace proof at $workspace_proof_file."
 }
 
+clear_rollout_store() {
+  rm -rf "$workspace_proof_file.rollouts" || die "cannot clear the rollout store at $workspace_proof_file.rollouts."
+}
+
+# Rollout records have six header lines (SHA, image ID, image tag, handles,
+# outcome, start time), followed by the last 32 timestamped observations.
+# They live beside the legacy handles-only proof so older checkouts ignore them.
+read_rollout() {
+  rollout_file=$1
+  if [ ! -f "$rollout_file" ] || [ ! -r "$rollout_file" ] || [ -L "$rollout_file" ]; then
+    die "cannot read the regular rollout record $rollout_file."
+  fi
+  {
+    IFS= read -r rollout_sha
+    IFS= read -r rollout_image_id
+    IFS= read -r rollout_image
+    IFS= read -r rollout_expected
+    IFS= read -r rollout_status
+    IFS= read -r rollout_started
+  } <"$rollout_file" || die "incomplete rollout record $rollout_file."
+  [[ $rollout_sha =~ ^[0-9a-f]{40}$ && $rollout_image_id =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "invalid target in rollout record $rollout_file."
+  [[ $rollout_expected =~ ^[a-z0-9[:space:]-]*$ ]] || die "invalid workspaces in rollout record $rollout_file."
+  case $rollout_status in
+    pending | complete | failed | superseded) ;;
+    *) die "invalid outcome in rollout record $rollout_file." ;;
+  esac
+}
+
+# Callers hold the store lock while replacing a record or its current pointer.
+write_rollout() {
+  local status=$1 detail=$2 temporary stamp
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  temporary=$(mktemp "$rollout_file.XXXXXX") || die "cannot create a rollout record beside $rollout_file."
+  if ! {
+    printf '%s\n' "$rollout_sha" "$rollout_image_id" "$rollout_image" "$rollout_expected" "$status" "$rollout_started"
+    if [ -f "$rollout_file" ]; then tail -n +7 "$rollout_file" | tail -n 31; fi
+    printf '%s %s %s\n' "$stamp" "$status" "${detail//$'\n'/; }" | cut -b 1-4096
+  } >"$temporary" || ! chmod 600 "$temporary" || ! mv "$temporary" "$rollout_file"; then
+    rm -f "$temporary"
+    die "cannot retain the rollout record $rollout_file."
+  fi
+  rollout_status=$status
+}
+
+start_rollout() {
+  local sha=$1 image=$2 expected=$3 target image_id release previous handle temporary reuse=false
+  rollout_file=''
+  [ -n "$sha" ] || return 0
+  target=$(docker image inspect --format '{{.Id}} {{index .Config.Labels "poise.release"}}' "$image") \
+    || die "cannot read the workspace image $image."
+  read -r image_id release <<<"$target"
+  [[ $sha =~ ^[0-9a-f]{40}$ && $image_id =~ ^sha256:[0-9a-f]{64}$ && $release == "$sha" ]] \
+    || die "the workspace image $image does not identify release $sha."
+  (umask 077; mkdir -p "$workspace_proof_file.rollouts") || die "cannot create the rollout store."
+  {
+    flock --exclusive 9 || die "cannot lock the rollout store."
+    if [ -e "$workspace_proof_file.rollouts/current" ]; then
+      previous=$(cat "$workspace_proof_file.rollouts/current") || die "cannot read the current rollout."
+      [[ $previous =~ ^[0-9a-f]{40}\.[a-zA-Z0-9]{6}$ ]] || die "invalid current rollout."
+      read_rollout "$workspace_proof_file.rollouts/$previous"
+      if [ "$rollout_status" = pending ]; then
+        if [ "$rollout_sha" != "$sha" ] || [ "$rollout_image_id" != "$image_id" ]; then
+          write_rollout superseded "Deployment target replaced by $sha ($image_id)."
+        else
+          reuse=true
+        fi
+        for handle in $rollout_expected; do
+          if [[ " $expected" != *" $handle "* ]]; then expected="$expected$handle "; fi
+        done
+      fi
+    fi
+    if [ "$reuse" = false ]; then
+      rollout_file=$(mktemp "$workspace_proof_file.rollouts/$sha.XXXXXX") || die "cannot create a rollout record."
+      rollout_sha=$sha rollout_image_id=$image_id rollout_image=$image
+      rollout_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    fi
+    rollout_expected=$expected
+    write_rollout pending 'Image built; awaiting workspace verification.'
+    temporary=$(mktemp "$workspace_proof_file.rollouts/current.XXXXXX") || die "cannot create the current rollout pointer."
+    if ! printf '%s\n' "${rollout_file##*/}" >"$temporary" || ! mv "$temporary" "$workspace_proof_file.rollouts/current"; then
+      rm -f "$temporary"
+      die "cannot retain the current rollout pointer."
+    fi
+  } 9>"$workspace_proof_file.rollouts/.lock"
+  say "Rollout ${rollout_file##*/}: pending. Recheck without deploying: $deploy/verify.sh ${rollout_file##*/}"
+}
+
+record_rollout() {
+  [ -n "${rollout_file:-}" ] || return 0
+  local status=$1 detail=$2 expected=$3 handle
+  {
+    flock --exclusive 9 || die "cannot lock the rollout store."
+    read_rollout "$rollout_file"
+    # A verifier still running when another deploy replaces its target cannot
+    # overwrite the recorded supersession with a stale health observation.
+    if [ "$rollout_status" = pending ]; then
+      if [ "$status" = complete ]; then
+        for handle in $rollout_expected; do
+          if [[ " $expected" != *" $handle "* ]]; then
+            write_rollout pending "Workspace $handle was added during verification; recheck required."
+            return
+          fi
+        done
+      fi
+      for handle in $expected; do
+        if [[ " $rollout_expected" != *" $handle "* ]]; then rollout_expected="$rollout_expected$handle "; fi
+      done
+      write_rollout "$status" "$detail"
+      if [ "$status" = complete ] && [ "$(cat "$workspace_proof_file.rollouts/current")" = "${rollout_file##*/}" ]; then
+        clear_workspace_proof
+      fi
+    fi
+  } 9>"$workspace_proof_file.rollouts/.lock"
+}
+
+show_rollout() {
+  say "Rollout ${rollout_file##*/}: $rollout_status (release $rollout_sha, image $rollout_image_id)."
+  tail -n 1 "$rollout_file"
+}
+
 # Capture the expected handles before building/retagging the runtime image:
 # even the old gateway can notice that tag and start replacing containers.
 # Container IDs change during replacement; these workspace labels do not.
@@ -397,13 +518,25 @@ pending_line() {
 verify_workspaces() {
   [ $# -eq 3 ] || die "verify_workspaces needs the workspace handles captured before building the image."
   local sha=$1 image=$2 expected=$3
-  local image_id inventory ids lines pending waiting serving deadline announced observed
+  local image_id inventory ids lines pending waiting serving deadline announced observed failed failure
   local handle id running name health active desired installed has_installed since
   if [ -z "$sha" ]; then
     say "This is a development build, which reports no release; skipping workspace verification."
     return 0
   fi
-  image_id=$(docker image inspect --format '{{.Id}}' "$image") || die "cannot read the workspace image $image."
+  if [ -n "${rollout_file:-}" ]; then
+    read_rollout "$rollout_file"
+    [ "$sha" = "$rollout_sha" ] || die "rollout target does not match $sha."
+    image_id=$rollout_image_id
+    expected=$rollout_expected
+    if [ "$rollout_status" != pending ]; then
+      show_rollout
+      [ "$rollout_status" = complete ]
+      return
+    fi
+  else
+    image_id=$(docker image inspect --format '{{.Id}}' "$image") || die "cannot read the workspace image $image."
+  fi
   say "Waiting for every workspace to serve $sha."
   deadline=$((SECONDS + verify_timeout_seconds))
   announced=$SECONDS
@@ -412,6 +545,7 @@ verify_workspaces() {
     waiting=''
     serving=''
     observed=''
+    failed=''
     # The gateway replaces containers as it recreates them, so list them anew every poll.
     inventory=$(docker ps --all --filter label=poise.managed=true --format '{{.ID}} {{.Label "poise.workspace"}}') \
       || die "cannot list the managed workspaces."
@@ -425,6 +559,7 @@ verify_workspaces() {
         if [[ " $expected" != *" $handle "* ]]; then
           expected="$expected$handle "
           save_workspace_proof "$expected"
+          record_rollout pending 'Workspace inventory extended.' "$expected"
         fi
         ids="$ids$id "
       done <<<"$inventory"
@@ -451,6 +586,7 @@ verify_workspaces() {
         if [[ " $expected" != *" $handle "* ]]; then
           expected="$expected$handle "
           save_workspace_proof "$expected"
+          record_rollout pending 'Workspace inventory extended.' "$expected"
         fi
         if [ "$running" = true ]; then
           if health=$(docker exec "$name" curl -fsS --max-time 10 http://127.0.0.1:5555/api/service/health 2>/dev/null); then
@@ -458,6 +594,10 @@ verify_workspaces() {
             if [ "$active" = "$sha" ]; then
               serving="$serving$handle "
               continue
+            fi
+            if [ -n "${rollout_file:-}" ] && failure=$(docker exec "$name" sh -c \
+              'test -f "$HOME/.poise/releases/$1/failed" && head -c 1024 "$HOME/.poise/releases/$1/failed"' sh "$sha" 2>/dev/null); then
+              failed="$failed  $handle: release $sha failed: $failure\n"
             fi
             desired=$(health_field "$health" desiredRelease)
             if [ -z "$desired" ]; then desired=$(health_field "$health" switching); fi
@@ -483,17 +623,41 @@ verify_workspaces() {
         waiting="$waiting$handle "
       fi
     done
+    record_rollout pending "Verified: ${serving% }. $(printf '%b' "$pending")" "$expected"
+    if [ -n "${rollout_file:-}" ] && [ "$rollout_status" != pending ]; then
+      show_rollout
+      [ "$rollout_status" = complete ]
+      return
+    fi
+    if [ -n "$failed" ]; then
+      record_rollout failed "$(printf '%b' "$failed")" "$expected"
+      show_rollout
+      die "the deploy of $sha failed: $(printf '%b' "$failed")"
+    fi
     if [ -z "$expected" ] && [ -z "$pending" ]; then
-      clear_workspace_proof
+      if [ -n "${rollout_file:-}" ]; then
+        record_rollout complete 'No workspace exists yet.' "$expected"
+        show_rollout
+        [ "$rollout_status" = complete ] || return 1
+      else
+        clear_workspace_proof
+      fi
       say "No workspace exists yet."
       return 0
     fi
     if [ -z "$pending" ]; then
-      clear_workspace_proof
+      if [ -n "${rollout_file:-}" ]; then
+        record_rollout complete "Every workspace serves $sha: ${serving% }." "$expected"
+        show_rollout
+        [ "$rollout_status" = complete ] || return 1
+      else
+        clear_workspace_proof
+      fi
       say "Every workspace serves $sha: ${serving% }."
       return 0
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
+      if [ -n "${rollout_file:-}" ]; then show_rollout; fi
       die "the deploy of $sha is still pending after ${verify_timeout_seconds}s: these workspaces do not serve it yet:
 $(printf '%b' "$pending")"
     fi

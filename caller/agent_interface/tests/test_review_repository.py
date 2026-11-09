@@ -79,7 +79,7 @@ class TestRepositoryLifecycle(TestCase):
                 self.fail("wrong checkout yielded")
 
     def test_initial_inspection_process_error_keeps_its_own_phase_path_and_deadline(self):
-        for error in (FileNotFoundError('inspection executable absent'), subprocess.TimeoutExpired('github-interface', 30)):
+        for timed_out in (False, True):
             checkout = {}
             def command(argv, **kwargs):
                 if '--checkout-review' in argv:
@@ -87,13 +87,18 @@ class TestRepositoryLifecycle(TestCase):
                     return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps({
                         'action': 'checkout_review', 'repository': 'o/r', 'path': checkout['root'],
                         'head_sha': HEAD, 'merge_base_sha': 'b' * 40}))
-                raise error
-            with self.subTest(error=type(error).__name__), patch.object(rr.subprocess, 'run', side_effect=command), self.assertRaises(atoms.AgentPreflightError) as failure:
+                if timed_out:
+                    raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
+                raise FileNotFoundError('inspection executable absent')
+            with self.subTest(timed_out=timed_out), patch.object(rr.subprocess, 'run', side_effect=command), self.assertRaises(atoms.AgentPreflightError) as failure:
                 with rr.prepare('/repo', PR, 'bot', HEAD, PACKET) as repository:
                     repository.prompt()
             self.assertEqual(failure.exception.diagnostic['phase'], 'inspection')
             self.assertEqual(failure.exception.diagnostic['cwd'], checkout['root'])
             self.assertEqual(failure.exception.diagnostic['timeout_seconds'], 30)
+            if timed_out:
+                self.assertEqual(failure.exception.code, 'review_inspection_timeout')
+                self.assertNotIn('--requests-json', str(failure.exception))
 
     def test_all_provider_prompts_receive_identical_guidance_and_scoped_access(self):
         repo = SimpleNamespace(root=Path("/tmp/review"), prompt=lambda: "trusted merge-base AGENTS.md guidance")

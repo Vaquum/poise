@@ -799,6 +799,35 @@ failed deploys and retries, and is cleared after successful verification.
 It proves handles captured by these scripts; a workspace already absent before
 the first captured inventory cannot be inferred from that inventory.
 
+Each release deployment also prints a rollout ID and retains its full commit
+SHA, immutable image ID, expected workspace set and outcome under the private
+`deploy/.env.workspace-proof.rollouts/` directory. A retry of the same pending
+target reuses its receipt. After the verifier or its
+SSH/Actions process exits, recheck that ID with `deploy/verify.sh ROLLOUT`.
+For the most recently started rollout:
+
+```bash
+deploy/verify.sh "$(cat deploy/.env.workspace-proof.rollouts/current)"
+```
+
+This takes one observation using the same verifier, without pulling, building,
+applying Compose, starting a workspace or requesting a switch. It requires no
+current `deploy/.env`: the original target and inventory come from the record.
+Running workspaces must report that exact active SHA; stopped workspaces must
+use the original image ID, even if another build has retagged `latest`.
+Timeout, missing workspaces and unreadable health remain `pending`, and the
+command exits nonzero. Invoke it again later to observe activation. A different
+`desiredRelease` alone never establishes failure or supersession.
+
+The outcome becomes `complete` only after every expected workspace passes the
+proof. A supervisor `failed` marker for the exact target release establishes
+`failed`; a subsequent deployment replacing the target SHA or image establishes
+`superseded`. Terminal observations remain historical receipts when another
+rollout finishes; the command reads those without reclassifying them. Each
+record retains the latest 32 UTC-timestamped observations, at most 4096 bytes
+each, including evidence after completion. The historical Actions result is
+unchanged: a later `complete` observation does not turn its earlier timeout green.
+
 The gateway upgrades those workspaces by itself, when it starts and every
 five minutes. Most upgrades change Poise but not the system it runs on, and
 those happen in place: the gateway installs the new release into each
@@ -898,9 +927,9 @@ deploy/backup.sh [DIRECTORY]
 
 It backs up the gateway's volume and every home volume into a new directory
 named after the time (UTC), in `DIRECTORY` or `deploy/backups`, while
-everything keeps running. Each volume becomes one gzipped tar beside a
-`SHA256SUMS` file. SQLite databases go in as snapshots taken with SQLite's
-online backup, so each is consistent even while Poise writes to it; their
+same-kernel (`runc`) containers keep running. Each volume becomes one gzipped
+tar beside a `SHA256SUMS` file. SQLite databases go in as snapshots taken with
+SQLite's online backup, so each is consistent even while Poise writes to it; their
 `-wal` and `-shm` files stay out. Everything else is archived as it is, with
 owners and permissions.
 
@@ -917,12 +946,37 @@ Not in a backup: `deploy/.env` (keep a copy somewhere safe; it holds the
 OAuth App's client secret), Caddy's certificates (it obtains new ones) and
 the images (the scripts build them).
 
-A workspace running under another kernel is outside the reach of SQLite's
-locks from the backup container. `deploy/backup.sh` refuses a backup while
-any such workspace runs, based on its actual Docker runtime. Stop it on the
-admin page first, then allow the host guard's next scan to release its locks
-before backing up. A busy or locked SQLite snapshot aborts the backup; it
-never falls back to copying that live database's files.
+A workspace that runs under gVisor (`POISE_WORKSPACE_RUNTIME=runsc`) has a
+different kernel from the backup helper, which always uses `runc`. Opening
+its live SQLite databases from that helper can crash the workspace's writer.
+`backup.sh` refuses running, paused or restarting consumers of an archived
+volume under any runtime other than `runc` or `io.containerd.runc.v2`,
+including consumers of the gateway volume and containers without workspace
+labels. A stopped gVisor workspace also requires the gateway to be stopped:
+**Stop** on the admin page is insufficient, because the next authenticated
+request can start the workspace again. A gateway configured to create
+workspaces under another runtime must be stopped even when the current
+workspace containers use `runc`.
+
+For an offline backup, stop the gateway first, then every affected workspace
+container (the error names it). For example, for `alice`:
+
+```bash
+docker stop poise-gateway
+# If paused, unpause the workspace before stopping it.
+docker stop poise-ws-alice
+deploy/backup.sh /var/backups/poise
+docker start poise-gateway
+```
+
+Keep the gateway and affected workspaces stopped until `backup.sh` finishes;
+do not start, replace or deploy containers during that interval. The gateway
+starts a stopped workspace on its owner's next visit. The script checks Docker's
+inventory before and after each volume. A failed inventory or safety check
+removes the entire new backup directory, including
+archives already completed. Live `runc` volumes still support the nightly command
+above without stopping the gateway. A busy or locked SQLite snapshot aborts the
+backup; it never falls back to copying that live database's files.
 
 ## Live Caller diagnostics under gVisor
 
