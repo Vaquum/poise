@@ -18,6 +18,7 @@ address, contact or policy is included in the image or overwritten on upgrade.
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `POISE_DOMAIN` | yes | | Apex host name with at least two labels, for example `poise.example.com` or `poise.localhost` |
+| `POISE_MCP_ENABLED` | | disabled | `1` exposes the [MCP connection boundary](../docs/Poise-MCP.md) at the apex `/mcp`; unset keeps all MCP and discovery routes absent |
 | `POISE_GITHUB_CLIENT_ID` | yes | | GitHub OAuth App client ID |
 | `POISE_GITHUB_CLIENT_SECRET` | yes | | GitHub OAuth App client secret |
 | `POISE_GOOGLE_CLIENT_ID`, `POISE_GOOGLE_CLIENT_SECRET` | together, optional | disabled | Deployment Google web client; [configuration and trust](../docs/Google-connections.md) |
@@ -59,6 +60,7 @@ On the apex:
 | `/link`, `/link/devices` | Send the signed-in person to Settings → Accounts → Poise Link in their workspace, where codes are approved and devices revoked |
 | `POST /link/device/code`, `POST /link/device/token` | Device authorization for Poise Link |
 | `/admin` | Users with their access, workspace state and image; allowed logins; start, stop and restart a workspace; disable or enable a person. Settings → Admin has the same controls; this page is for when an admin's own workspace cannot open |
+| `/mcp`, `/mcp/*`, `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-authorization-server` | Opt-in MCP transport, discovery, owner consent and grant revocation; [connection contract](../docs/Poise-MCP.md) |
 
 Every page has Poise's look: its design tokens and its typeface, Inter, which the page CSP admits from `https://rsms.me` as Poise itself loads it.
 
@@ -82,6 +84,7 @@ On a workspace host, `/_poise/session` redeems a sign-in ticket and `/_poise/log
 
 - `gateway.db`: users, the allow list, sessions, tickets, OAuth states, device codes, devices and workspace records. Session ids, tickets, binding values, OAuth states, device codes and device tokens are stored as SHA-256 hashes only. GitHub tokens are never stored.
 - `identity-ed25519.pem`: the assertion signing key, generated on first start with mode `0600` and linked into place whole, so concurrent starts agree on one key. The gateway refuses to start if others can read it.
+- `mcp.db`: opt-in MCP client metadata and owner grants, with access and refresh token hashes only; authorization codes are held in memory and expire after 60 seconds.
 
 A handle stays bound to the GitHub account id that first signed in with it, so a renamed-and-reused login cannot take over an existing workspace.
 

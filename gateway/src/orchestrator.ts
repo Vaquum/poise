@@ -234,6 +234,7 @@ export class Orchestrator {
   containerSpec(handle: string, login: string): ContainerSpec {
     const { config, keys, workspaceResolvConf } = this.deps
     const { volume, network } = workspaceNames(handle)
+    const ownerId = this.deps.store.getUser(handle)?.githubId
     const scheme = config.insecureHttp ? 'http' : 'https'
     const mounts: ContainerMount[] = [{ Type: 'volume', Source: volume, Target: '/home/poise' }]
     if (workspaceResolvConf) {
@@ -246,6 +247,7 @@ export class Orchestrator {
         'POISE_MODE=service',
         `POISE_WORKSPACE_HANDLE=${handle}`,
         `POISE_WORKSPACE_OWNER=${login}`,
+        ...(ownerId === undefined ? [] : [`POISE_WORKSPACE_OWNER_ID=${ownerId}`]),
         `POISE_PUBLIC_ORIGIN=${scheme}://${handle}.${config.domain}`,
         `POISE_GATEWAY_PUBLIC_KEY=${keys.publicKeyBase64}`,
         `POISE_RELEASE_REPO=${config.releaseRepo}`,

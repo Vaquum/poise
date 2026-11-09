@@ -34,6 +34,7 @@ export function isReleaseRepo(value: string): boolean {
 export interface Config {
   domain: string
   insecureHttp: boolean
+  mcpEnabled: boolean
   githubClientId: string
   githubClientSecret: string
   google: { clientId: string; clientSecret: string } | null
@@ -147,6 +148,8 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   }
 
   const githubClientId = required('POISE_GITHUB_CLIENT_ID', 'the GitHub OAuth App client ID')
+  const mcpValue = read('POISE_MCP_ENABLED')
+  if (mcpValue !== undefined && mcpValue !== '1') problems.push('POISE_MCP_ENABLED must be 1 or unset')
   const githubClientSecret = required('POISE_GITHUB_CLIENT_SECRET', 'the GitHub OAuth App client secret')
   const googleClientId = read('POISE_GOOGLE_CLIENT_ID'), googleClientSecret = read('POISE_GOOGLE_CLIENT_SECRET')
   if (!!googleClientId !== !!googleClientSecret) problems.push('POISE_GOOGLE_CLIENT_ID and POISE_GOOGLE_CLIENT_SECRET must be configured together')
@@ -317,6 +320,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   return {
     domain,
     insecureHttp,
+    mcpEnabled: mcpValue === '1',
     githubClientId,
     githubClientSecret,
     google: googleClientId && googleClientSecret ? { clientId: googleClientId, clientSecret: googleClientSecret } : null,

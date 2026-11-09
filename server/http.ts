@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { MCP_READ_PATH, type McpGrantScope } from '../gateway/src/mcp-contract'
 import type { ServiceConfig } from './service/config'
 import { IDENTITY_HEADER, scopeAllowsPath, verifyIdentityAssertion, type AssertionScope } from './service/identity'
 import { retainRequestIdentity } from './service/request-identity'
@@ -64,7 +65,7 @@ export interface ApiRequestPolicy {
  *  gateway with an identity assertion of one scope. */
 export type RequestAuthority =
   | { kind: 'local' }
-  | { kind: 'gateway', scope: AssertionScope }
+  | { kind: 'gateway', scope: AssertionScope, mcp?: McpGrantScope }
 
 // Unlike the local rules, an unknown peer is never taken for loopback here.
 function isLoopbackPeer(req: IncomingMessage): boolean {
@@ -87,14 +88,16 @@ function enforceGatewayRequest(req: IncomingMessage, service: ServiceConfig, api
   const origin = header(req, 'origin')
   if (origin && origin !== service.publicOrigin) throw new HttpError(403, 'request origin is not allowed')
   if (!token) throw new HttpError(401, 'an identity assertion from the gateway is required')
-  const result = verifyIdentityAssertion(token, { key: service.gatewayKey, handle: service.handle, owner: service.owner }, Date.now() / 1000)
+  const apex = new URL(service.publicOrigin)
+  apex.hostname = apex.hostname.slice(service.handle.length + 1)
+  const result = verifyIdentityAssertion(token, { key: service.gatewayKey, handle: service.handle, owner: service.owner, ownerId: service.ownerId, resource: `${apex.origin}/mcp` }, Date.now() / 1000)
   if (!result.ok) throw new HttpError(401, result.reason)
   const path = (req.url || '/').split('?')[0]
   if (!scopeAllowsPath(result.assertion.scope, path)) {
     throw new HttpError(403, `an identity assertion with the ${result.assertion.scope} scope does not reach this route`)
   }
   if (api && result.assertion.scope === 'browser') retainRequestIdentity(req, { token, peer: req.socket.remoteAddress ?? '', gatewayPort: result.assertion.gatewayPort })
-  return { kind: 'gateway', scope: result.assertion.scope }
+  return { kind: 'gateway', scope: result.assertion.scope, ...(result.assertion.mcp ? { mcp: result.assertion.mcp } : {}) }
 }
 
 /** Static files and the SPA document. Locally there is nothing to check (the
@@ -132,6 +135,7 @@ export function enforceApiRequest(
     throw new HttpError(414, 'request URL is too long')
   }
   if (policy.service) {
+    if ((req.url || '/').split('?')[0] === MCP_READ_PATH) return enforceGatewayRequest(req, policy.service, true)
     if (!isLoopbackPeer(req)) return enforceGatewayRequest(req, policy.service, true)
     delete req.headers[IDENTITY_HEADER]
   }

@@ -77,6 +77,7 @@ export function home(ctx: Context, req: IncomingMessage, res: ServerResponse): v
     workspaceHref: `/auth/login?next=${encodeURIComponent(`${workspaceOrigin}/`)}`,
     workspaceHost: new URL(workspaceOrigin).host,
     csrf: principal.session.csrf,
+    mcpEnabled: ctx.deps.config.mcpEnabled,
   }), ctx.pageHeaders)
 }
 
