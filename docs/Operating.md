@@ -925,9 +925,9 @@ deploy/backup.sh [DIRECTORY]
 
 It backs up the gateway's volume and every home volume into a new directory
 named after the time (UTC), in `DIRECTORY` or `deploy/backups`, while
-everything keeps running. Each volume becomes one gzipped tar beside a
-`SHA256SUMS` file. SQLite databases go in as snapshots taken with SQLite's
-online backup, so each is consistent even while Poise writes to it; their
+same-kernel (`runc`) containers keep running. Each volume becomes one gzipped
+tar beside a `SHA256SUMS` file. SQLite databases go in as snapshots taken with
+SQLite's online backup, so each is consistent even while Poise writes to it; their
 `-wal` and `-shm` files stay out. Everything else is archived as it is, with
 owners and permissions.
 
@@ -944,11 +944,35 @@ Not in a backup: `deploy/.env` (keep a copy somewhere safe; it holds the
 OAuth App's client secret), Caddy's certificates (it obtains new ones) and
 the images (the scripts build them).
 
-A workspace that runs under gVisor (`POISE_WORKSPACE_RUNTIME=runsc`) is
-outside the reach of SQLite's locks from the backup's container, so a busy
-one may be caught mid-write; `deploy/backup.sh` warns about each. Stop such a
-workspace on the admin page before the backup when you need a copy that is
-certainly consistent.
+A workspace that runs under gVisor (`POISE_WORKSPACE_RUNTIME=runsc`) has a
+different kernel from the backup helper, which always uses `runc`. Opening
+its live SQLite databases from that helper can crash the workspace's writer.
+`backup.sh` refuses running, paused or restarting consumers of an archived
+volume under any runtime other than `runc`, including consumers of the gateway
+volume and containers without workspace labels. A stopped gVisor workspace also
+requires the gateway to be stopped: **Stop** on the admin page is insufficient,
+because the next authenticated request can start the workspace again. A gateway
+configured to create workspaces under another runtime must be stopped even when
+the current workspace containers use `runc`.
+
+For an offline backup, stop the gateway first, then every affected workspace
+container (the error names it). For example, for `alice`:
+
+```bash
+docker stop poise-gateway
+# If paused, unpause the workspace before stopping it.
+docker stop poise-ws-alice
+deploy/backup.sh /var/backups/poise
+docker start poise-gateway
+```
+
+Keep the gateway and affected workspaces stopped until `backup.sh` finishes;
+do not start, replace or deploy containers during that interval. The gateway
+starts a stopped workspace on its owner's next visit. The script checks Docker's
+inventory before and after each volume. A failed inventory or safety check
+removes the entire new backup directory, including
+archives already completed. Live `runc` volumes still support the nightly command
+above without stopping the gateway.
 
 ## Restore
 
