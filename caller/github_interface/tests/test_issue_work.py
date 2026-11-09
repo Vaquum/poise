@@ -1,8 +1,11 @@
 """Native publication guards. These isolated API stand-ins are not cycle proof."""
+import json
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
+from github_interface.behaviors import pr_review
 from github_interface.behaviors.issue_work import confirmed_pull, publication_body, publication_metadata, review_replies, run
+from github_interface.client import GitHubClient
 
 CALL = "a" * 32
 
@@ -26,6 +29,131 @@ class PublicationScope(TestCase):
 
 
 class ReviewReplyReceipts(IsolatedAsyncioTestCase):
+    async def test_successive_repairs_reuse_prior_receipts_and_inspect_the_full_plan_after_a_lost_response(self):
+        with patch('github_interface.client.get_token', return_value="test-token"):
+            client = GitHubClient("author")
+        call, head = CALL, "b" * 40
+        pull = {"number": 3, "state": "open", "base": {"sha": "d" * 40},
+                "head": {"ref": "poise/issue-7", "sha": head, "repo": {"full_name": "example/repo"}},
+                "user": {"login": "author"}, "body": "<!-- poise-chain example/repo#7 -->"}
+        comments = [{"id": root, "body": f"Finding {root}", "user": {"login": "reviewer"},
+                     "updated_at": "2026-11-09T10:00:00Z"} for root in (17, 19)]
+        # Put the prior replies on page two of the publisher's actual paginator.
+        comments += [{"id": root, "body": "Unrelated finding", "user": {"login": "reviewer"},
+                      "updated_at": "2026-11-09T12:00:00Z"} for root in range(1000, 1098)]
+        pages = []
+
+        async def get(path, **kwargs):
+            if path == "/repos/example/repo":
+                return {"full_name": "example/repo", "default_branch": "main"}
+            if path.endswith("/issues/7"):
+                return {"state": "open"}
+            page = kwargs["params"]["page"]
+            if path.endswith("/comments"):
+                pages.append(page)
+                return comments[(page - 1) * 100:page * 100]
+            self.assertEqual(path, "/repos/example/repo/pulls")
+            return [pull]
+
+        async def graph(*_args):
+            return {"repository": {"ref": {"target": {"oid": head, "message": f"fix: repair\n\nPoise-Invocation: {call}"}},
+                "defaultBranchRef": {"target": {"oid": "d" * 40}},
+                "issue": {"closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+
+        async def post(path, *, json):
+            parent = int(path.split("/")[-2])
+            posted = {"id": 201 + sum(bool(comment.get("in_reply_to_id")) for comment in comments),
+                      "in_reply_to_id": parent, "user": {"login": "AUTHOR"}, "body": json["body"],
+                      "created_at": "2026-11-09T11:00:00Z" if call == CALL else "2026-11-09T13:00:00Z"}
+            comments.append(posted)
+            if call != CALL:
+                raise RuntimeError("reply response lost after acceptance")
+            return posted
+
+        client.get, client.graphql, client.post = AsyncMock(side_effect=get), AsyncMock(side_effect=graph), AsyncMock(side_effect=post)
+        payload = {"repository": "example/repo", "token_user": "author", "issue": 7, "branch": "poise/issue-7",
+                   "mode": "complete", "expected_head": head, "invocation_id": call, "body": "Actual repair"}
+        first = [{"commentId": root, "body": f"Fixed finding {root} and verified its regression."} for root in (17, 19)]
+        first[1]["body"] += " The answer may discuss `<!-- poise-reply CALL_ID ROOT_ID -->` syntax."
+        with patch('github_interface.behaviors.issue_work.work_publication') as checkpoint:
+            initial = await run(client, {**payload, "replies_json": json.dumps(first)})
+            self.assertEqual([receipt["comment_id"] for receipt in initial["reply_receipts"]], [201, 202])
+            checkpoint.assert_called_once_with(head, start_replies=True)
+            client.post.reset_mock()
+            checkpoint.reset_mock()
+
+            call, head = "c" * 32, "e" * 40
+            pull["head"]["sha"] = head
+            comments.append({"id": 21, "body": "One new finding", "user": {"login": "reviewer"}, "updated_at": "2026-11-09T12:00:00Z"})
+            second = [{"commentId": comment["in_reply_to_id"], "body": comment["body"]}
+                      for comment in comments if comment.get("in_reply_to_id")]
+            second.append({"commentId": 21, "body": "Fixed the new finding and verified its regression."})
+            payload.update(expected_head=head, invocation_id=call, replies_json=json.dumps(second))
+            with self.assertRaisesRegex(RuntimeError, "response lost"):
+                await run(client, payload)
+            client.post.assert_awaited_once_with("/repos/example/repo/pulls/3/comments/21/replies", json={
+                "body": second[-1]["body"] + f"\n\n<!-- poise-reply {call} 21 -->"})
+            checkpoint.assert_called_once_with(head, start_replies=True)
+            client.post.reset_mock()
+            checkpoint.reset_mock()
+
+            inspected = await run(client, {**payload, "mode": "inspect"})
+            self.assertEqual(inspected["head_sha"], head)
+            self.assertTrue(inspected["replies_complete"])
+            self.assertEqual([receipt["comment_id"] for receipt in inspected["reply_receipts"]], [201, 202, 203])
+            self.assertIn(2, pages)
+            with patch.object(pr_review, "get_pull", return_value=pull), \
+                    patch.object(pr_review, "issue_comments", return_value=[]), \
+                    patch.object(pr_review, "list_review_threads", return_value=[]), \
+                    patch.object(pr_review, "list_reviews", return_value=[]), \
+                    patch.object(pr_review, "linked_issues", return_value=[]), \
+                    patch.object(pr_review, "review_diff", return_value={}):
+                packet = await pr_review.run(client, {"repository": "example/repo", "pr": 3, "expected_head": head})
+            self.assertEqual(packet["head_sha"], head)
+            self.assertEqual([comment["body"] for comment in packet["existing_inline_comments"] if comment["user"] == "AUTHOR"],
+                             [comment["body"] for comment in comments if comment.get("in_reply_to_id")])
+            comments.pop()  # An unconfirmed POST cannot count without its actual reply.
+            incomplete = await run(client, {**payload, "mode": "inspect"})
+            self.assertFalse(incomplete["replies_complete"])
+            self.assertEqual(len(incomplete["reply_receipts"]), 2)
+            comments[:] = [comment for comment in comments if comment["id"] != 201]
+            with self.assertRaisesRegex(ValueError, "verified|receipt"):
+                await run(client, {**payload, "mode": "inspect"})
+            client.post.assert_not_awaited()
+            checkpoint.assert_not_called()
+
+    async def test_carried_reply_requires_exact_proof_and_unchanged_reviewer_input(self):
+        body = f"Fixed the input branch and verified its regression.\n\n<!-- poise-reply {CALL} 17 -->"
+        root = {"id": 17, "body": "Actual finding", "user": {"login": "reviewer"}, "updated_at": "2026-11-09T10:00:00Z"}
+        prior = {"id": 18, "in_reply_to_id": 17, "user": {"login": "author"}, "body": body, "created_at": "2026-11-09T11:00:00Z"}
+        followup = {"id": 19, "in_reply_to_id": 17, "body": "Changed reviewer input", "user": {"login": "reviewer"},
+                    "updated_at": "2026-11-09T12:00:00Z"}
+        for proof in ([], [{**prior, "user": {"login": "other"}}], [{**prior, "in_reply_to_id": 99}],
+                      [{**prior, "body": body.replace("input", "output")}], [{**prior, "created_at": None}],
+                      [prior, followup], [prior, {**followup, "id": 16, "created_at": "2026-11-09T09:00:00Z"}]):
+            for publish in (False, True):
+                with self.subTest(proof=proof, publish=publish):
+                    client = AsyncMock()
+                    client.paginate.return_value = [root, *proof]
+                    with self.assertRaisesRegex(ValueError, "reused review reply"):
+                        await review_replies(client, "example/repo", 3, "author", "b" * 32,
+                                             [{"commentId": 17, "body": body}], publish=publish)
+                    client.post.assert_not_awaited()
+        client = AsyncMock()
+        client.paginate.return_value = [{**root, "body": "Edited finding", "updated_at": "2026-11-09T12:00:00Z"}, prior]
+        with self.assertRaisesRegex(ValueError, "reviewer input"):
+            await review_replies(client, "example/repo", 3, "author", "b" * 32, [{"commentId": 17, "body": body}], publish=True)
+        client.post.assert_not_awaited()
+        # Later feedback cannot erase proof that the original Call posted its answer.
+        original = [{"commentId": 17, "body": body.split("\n\n<!-- poise-reply", 1)[0]}]
+        reconciled = await review_replies(client, "example/repo", 3, "author", CALL, original, publish=False)
+        self.assertEqual(reconciled[0]["comment_id"], 18)
+        client.post.return_value = {"id": 20}
+        changed = [{"commentId": 17, "body": "Addressed the edited finding with a new regression."}]
+        receipts = await review_replies(client, "example/repo", 3, "author", "b" * 32, changed, publish=True)
+        self.assertEqual(receipts[0]["comment_id"], 20)
+        self.assertIn("<!-- poise-reply " + "b" * 32 + " 17 -->", client.post.call_args.kwargs["json"]["body"])
+
     async def test_pr_head_lag_is_confirmed_with_bounded_reads_before_replies(self):
         client = AsyncMock()
         stale = {"number": 3, "head": {"sha": "a" * 40}}

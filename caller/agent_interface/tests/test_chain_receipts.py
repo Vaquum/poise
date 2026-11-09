@@ -306,9 +306,10 @@ class AtomicWorkLimits(TestCase):
         self.assertIsNone(plan)
 
     def test_repair_prompts_exact_roots_and_keeps_missing_ids_after_cleanup(self):
+        earlier_answer = f"Verified the outdated finding against the repair and its regression.\n\n<!-- poise-reply {CALL} 18 -->"
         threads = [
             {"root_comment_id": 17, "is_resolved": False, "is_outdated": False, "bodies": ["private current finding"]},
-            {"root_comment_id": 18, "is_resolved": False, "is_outdated": True, "bodies": ["private outdated finding", "earlier reply"]},
+            {"root_comment_id": 18, "is_resolved": False, "is_outdated": True, "bodies": ["private outdated finding", earlier_answer]},
             {"root_comment_id": 19, "is_resolved": True, "is_outdated": False, "bodies": ["private resolved finding"]},
             {"root_comment_id": 20, "is_resolved": True, "is_outdated": True, "bodies": ["private resolved outdated finding"]},
         ]
@@ -328,7 +329,8 @@ class AtomicWorkLimits(TestCase):
                     self.assertEqual(json.loads(args[args.index("--replies-json") + 1]), replies)
                     return {"outcome": "validated" if mode == "validate" else "published", "head_sha": HEAD}
 
-                replies = [{"commentId": root, "body": "Verified the finding against the repair and its regression."} for root in reply_ids]
+                replies = [{"commentId": root, "body": earlier_answer if root == 18 else "Verified the finding against the repair and its regression."}
+                           for root in reply_ids]
 
                 def worker(_lease, _args, **kwargs):
                     workspace = Path(kwargs["cwd"]).parent
@@ -354,6 +356,10 @@ class AtomicWorkLimits(TestCase):
                 self.assertIn("required unresolved root comment IDs: [17, 18]", instruction)
                 self.assertIn("outdated", instruction)
                 self.assertIn("already have replies", instruction)
+                self.assertIn("verbatim", instruction)
+                self.assertIn("original", instruction)
+                self.assertIn("changed reviewer input", instruction)
+                self.assertIn(earlier_answer, json.loads(instruction.split("Actual PR evidence:\n", 1)[1])["review_packet"]["review_threads"][1]["bodies"])
                 with sqlite3.connect(self.path) as conn:
                     row = conn.execute("select status,error_code,action,outcome,error,action_plan,artifact,resource_ownership from calls "
                                        "where correlation_id=?", (f"00000000-0000-4000-8000-{attempt:012d}",)).fetchone()
@@ -374,6 +380,7 @@ class AtomicWorkLimits(TestCase):
                 else:
                     self.assertEqual(modes, ["prepare", "validate", "publish"])
                     self.assertEqual((status, action, outcome), ("completed", "published", "published"))
+                    self.assertEqual(json.loads(plan)["publication"]["replies"], replies)
 
     def test_summary_only_change_request_reaches_repair_prompt_without_required_replies(self):
         review = {"id": 91, "state": "CHANGES_REQUESTED", "commit_id": HEAD, "user": {"login": "reviewer"},

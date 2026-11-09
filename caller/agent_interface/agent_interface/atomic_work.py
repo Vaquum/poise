@@ -86,7 +86,10 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "\"body\":\"Concrete change, reason and actual checks, without a Closes footer\","
         "\"replies\":[{\"commentId\":123,\"body\":\"Your concrete answer to this actual review finding, including what changed or evidence for disagreement\"}],\"blocked\":null}}. "
         f"For a repair, include one substantive answer for each of these required unresolved root comment IDs: {json.dumps(sorted(required_reply_ids))}. "
-        "This exact set includes outdated unresolved roots and roots that already have replies; answer each with concrete changes or evidence for disagreement. "
+        "This exact set includes outdated unresolved roots and roots that already have replies. Check each finding and its answer against the repaired code and current reviewer input. "
+        "When an existing native reply still applies and that finding's reviewer input is unchanged, carry its entire body verbatim in replies, including its original <!-- poise-reply CALL_ID ROOT_ID --> marker. "
+        "Do not prepend acknowledgements or restate that answer; a different Call/head or unrelated finding does not invalidate it. The publisher verifies its actual author, root, body and marker and returns the existing receipt. "
+        "For a new finding, changed reviewer input or a materially changed answer, write a fresh substantive answer without a native marker. Missing or uncertain prior reply proof cannot count as verified coverage. "
         "Do not reply to replies, invent comment ids, or use generic acknowledgements. For initial implementation replies must be empty. "
         "If unable to finish, set blocked to the concrete reason; do not claim the work complete. "
         'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
