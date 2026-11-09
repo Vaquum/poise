@@ -355,6 +355,51 @@ def test_failed_duplicate_main_cannot_annotate_original_call(database, monkeypat
 
 
 @pytest.mark.parametrize("cause,signal", [
+    ("Provider rate-limited this run for over a minute (codex)", "rate limited"),
+    ("API error (status 429 Too Many Requests)", "status 429"),
+    ('{"http_status": 429}', "http_status 429"),
+    ("Too many requests", "too many requests"),
+])
+def test_native_failure_preserves_rate_limit_trip_without_prompt(database, monkeypatch, cause, signal):
+    # A rate-limited recovery wrapped as review_recovery_failed without a
+    # diagnostic; finish() must keep the reviewer trip signal while still
+    # excluding prompts and argv from stored evidence.
+    private = "private-provider-prompt credential-value " * 200
+    call = claim()
+    monkeypatch.setattr(api, "_native_cli", True)
+    assert api._native_call_id == call
+    wrapped = f"grok-4.6-xhigh recovery failed; needs attention: {cause} {private}"
+    try:
+        raise api.review_budget.ReviewLimitError(wrapped, "review_recovery_failed")
+    except api.review_budget.ReviewLimitError as error:
+        api.finish(call, "failed", error=str(error), error_code=error.code, diagnostic=error.diagnostic)
+    with api.db() as conn:
+        row = conn.execute("select error, diagnostic from calls where id=?", (call,)).fetchone()
+    assert signal in row["error"]
+    assert "private-provider" not in row["error"]
+    assert "private-provider" not in row["diagnostic"]
+
+
+@pytest.mark.parametrize("cause", [
+    "error: GitHub 429: rate limit exceeded for resource",
+    "verdict failed at line 429",
+])
+def test_native_failure_never_trips_without_provider_quota(database, monkeypatch, cause):
+    # GitHub's own limits and bare numbers must not trip the recovery model.
+    call = claim()
+    monkeypatch.setattr(api, "_native_cli", True)
+    assert api._native_call_id == call
+    wrapped = f"grok-4.6-xhigh recovery failed; needs attention: {cause}"
+    try:
+        raise api.review_budget.ReviewLimitError(wrapped, "review_recovery_failed")
+    except api.review_budget.ReviewLimitError as error:
+        api.finish(call, "failed", error=str(error), error_code=error.code, diagnostic=error.diagnostic)
+    with api.db() as conn:
+        row = conn.execute("select error from calls where id=?", (call,)).fetchone()
+    assert row["error"] == "ReviewLimitError"
+
+
+@pytest.mark.parametrize("cause,signal", [
     ("Grok Build usage balance exhausted", "balance exhausted"),
     ("Not signed in", "not signed in"),
 ])

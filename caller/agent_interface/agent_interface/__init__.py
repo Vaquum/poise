@@ -603,6 +603,24 @@ def _retained_account_signal(text: str) -> str | None:
     return None
 
 
+def _retained_rate_limit_signal(text: str) -> str | None:
+    # Server trips provider rate limits on 429/rate-limit words in
+    # call.error. GitHub's own limits and bare numbers must never trip.
+    if re.search(r"github\s+\d{3}", text, re.IGNORECASE):
+        return None
+    if re.search(r"http_status\D{0,8}429\b", text, re.IGNORECASE):
+        return "http_status 429"
+    if re.search(r"status\s+429\b", text, re.IGNORECASE):
+        return "status 429"
+    if re.search(r"\b429\s+too\s+many\b", text, re.IGNORECASE):
+        return "429 too many requests"
+    if re.search(r"too\s+many\s+requests", text, re.IGNORECASE):
+        return "too many requests"
+    if re.search(r"rate[\s_\-]*limit", text, re.IGNORECASE):
+        return "rate limited"
+    return None
+
+
 def finish(
     id_: str,
     status: str,
@@ -620,7 +638,8 @@ def finish(
         diagnostic = retain_native_failure(id_, sys.exception(), diagnostic=diagnostic)
         if untyped and diagnostic is not None and sys.exception() is not None:
             base = diagnostic.get("message") or "Native Caller failed; see retained diagnostic"
-            trip = _retained_account_signal(original_error) if original_error else None
+            trip = (_retained_account_signal(original_error)
+                    or _retained_rate_limit_signal(original_error)) if original_error else None
             error = f"{base}: {trip}" if trip else base
     # First terminal writer wins: a worker finishing after stop/reap must not
     # overwrite stopped/interrupted. The loser keeps its response file out of
