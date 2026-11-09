@@ -140,6 +140,15 @@ their blocked model behaviors. A closed seed alone does not defer PR review or
 approval of an open PR. Public recheck times describe GitHub observation;
 native receipt reconciliation remains eligible on every pass.
 
+Journal revision conflicts are isolated to the affected chain. The sweep makes
+at most one fresh attempt within its existing 45-second budget, re-reading the
+chain and its native receipts and recomputing the decision. Another conflict or
+an exhausted budget defers that chain while unrelated chains remain eligible.
+Retained warning diagnostics identify the chain, phase and recovery or deferral
+outcome without marking a recovered race as an organization failure. Other
+journal errors and unreadable native receipts still surface; concurrent exit
+evidence and original invocation correlations and uncertainty are preserved.
+
 A successful quiescent observation schedules its next read at `checkedAt +
 min(24 hours, max(2 minutes, checkedAt - origin))`. Origin is the recorded actual
 merge time, otherwise the first native admission; a held chain with neither

@@ -62,6 +62,8 @@ export type ChainEvent =
   | { type: 'invocation.uncertain', invocationId: string, reason: string }
   | { type: 'invocation.settled', invocationId: string, callId: string | null, outcome: string, evidence: Record<string, unknown> }
 
+export class BehaviorChainRevisionConflict extends Error {}
+
 interface StoredEvent { sequence: number, chain_id: string, event_id: string, at: number, payload: string }
 const SHA = /^[0-9a-f]{40}$/i
 const REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/
@@ -321,7 +323,7 @@ export class BehaviorChainJournal {
       }
       const current = this.read(id)
       if (event.type === 'chain.admitted' && this.cutover().mode === 'draining') throw new Error('behavior admissions are draining')
-      if ((current?.sequence ?? 0) !== expectedSequence) throw new Error('behavior chain changed before event admission')
+      if ((current?.sequence ?? 0) !== expectedSequence) throw new BehaviorChainRevisionConflict('behavior chain changed before event admission')
       if (event.type === 'chain.admitted' && this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'chat_work_bindings'").get()
         && this.db.prepare('SELECT 1 FROM chat_work_bindings WHERE lower(target) = lower(?) LIMIT 1')
           .get(`https://github.com/${event.repository}/issues/${event.issue}`)) throw new Error('seed issue is already owned by an existing chat; active work cannot be migrated')
