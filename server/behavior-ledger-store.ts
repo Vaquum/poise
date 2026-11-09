@@ -198,7 +198,7 @@ export class BehaviorLedgerStore {
   }
   /** Successful observation is the only recovery: it closes open restart
    *  uncertainty and seals the last episode. Failed opens and failed captures
-   *  never reach here, so they can neither close nor seal anything. */
+   *  cannot seal recovery: a failed capture rolls this state back. */
   private noteRecovery(): void {
     const now = this.time()
     this.data.observedAt = now
@@ -244,12 +244,14 @@ export class BehaviorLedgerStore {
   }
   loss(count = 1, since: string | null = null): void { this.gap('capture_loss', count, since); this.persistJournal(this.currentHealth()) }
 
-  capture(observation: LedgerObservation): void {
+  capture(input: LedgerObservation | LedgerObservation[]): void {
     // A failed capture stays unaccounted here: storage failures are held for
     // retry by the observer, and poison is shed with loss accounting there.
     this.ensureOpen()
     try {
-      if (observation.type === 'loss') {
+      const observations = Array.isArray(input) ? input : [input]
+      const observation = observations[0]
+      if (observation.type === 'loss' && observations.length === 1) {
         if (!Number.isSafeInteger(observation.count) || observation.count < 1) throw new LedgerError(400, 'invalid_observation')
         // An unusable loss timestamp narrows nothing: the marker still counts,
         // attributed at receipt instead of poisoning the worker protocol.
@@ -257,14 +259,19 @@ export class BehaviorLedgerStore {
           && Date.parse(observation.since) <= Date.parse(this.time()) ? observation.since : null
         this.loss(observation.count, since); return
       }
-      const usage = { instances: this.instanceCount, instanceBytes: this.instanceBytes, changeBytes: this.changeBytes }
+      const usage = { instances: this.instanceCount, instanceBytes: this.instanceBytes, changeBytes: this.changeBytes,
+        data: { ...this.data, gaps: this.data.gaps.map(gap => ({ ...gap })) }, observedSinceGap: this.observedSinceGap }
       try {
         this.connection().transaction(() => {
-          if (observation.type === 'admit') this.admit(observation)
-          else if (observation.type === 'result') this.result(observation)
-          else if (observation.type === 'caller') this.caller(observation)
-          else if (observation.type === 'heartbeat') this.staleActivities()
-          this.prune()
+          for (const observation of observations) {
+            if (observation.type === 'admit') this.admit(observation)
+            else if (observation.type === 'result') this.result(observation)
+            else if (observation.type === 'caller') this.caller(observation)
+            else if (observation.type === 'heartbeat') this.staleActivities()
+            else throw new LedgerError(400, 'invalid_observation')
+            this.prune()
+            this.noteRecovery()
+          }
         })()
       } catch (error) {
         // The transaction rolled back; restore the incremental counters so
@@ -272,6 +279,8 @@ export class BehaviorLedgerStore {
         this.instanceCount = usage.instances
         this.instanceBytes = usage.instanceBytes
         this.changeBytes = usage.changeBytes
+        this.data = usage.data
+        this.observedSinceGap = usage.observedSinceGap
         this.rebuildPending()
         throw error
       }

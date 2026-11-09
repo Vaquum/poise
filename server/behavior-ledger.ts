@@ -7,6 +7,7 @@ import type { AgentLogSnapshot, LogEntry } from './agent'
 import { recordHandling } from './alerts/handling'
 import { AGENT_BEHAVIORS } from './behavior-estimates'
 import { db } from './db'
+import { LEDGER_CAPTURE_BATCH_LIMIT } from './behavior-ledger-contract'
 import type {
   LedgerAdmission, LedgerCaller, LedgerHealth, LedgerObservation, LedgerPending, LedgerPolicy,
   LedgerRead, LedgerReadReply, LedgerReadTiming, LedgerReply, LedgerResult, LedgerWorkerReply, LedgerWorkerRequest,
@@ -21,6 +22,9 @@ interface Options {
   readLimit?: number
   readTimeoutMs?: number
   stallTimeoutMs?: number
+  /** Capture-loss evidence. Omitted: durable dropped/gap accounting only, which
+   *  keeps isolated observer bundles (native-stop test) free of the logging chain. */
+  lossDiagnostic?: (event: { level: 'error'; operation: 'behavior-ledger.capture_loss'; message: string; context: Record<string, unknown> }) => void
 }
 interface Job {
   id: number
@@ -32,6 +36,8 @@ interface Job {
   timer?: ReturnType<typeof setTimeout>
   enqueuedAt?: number
   dispatchedAt?: number
+  batch?: Job[]
+  single?: boolean
 }
 const emptyHealth = (): LedgerHealth => ({
   status: 'unavailable', unavailableReason: 'worker_unavailable', coverageStart: null, observedAt: null, callerObservedAt: null,
@@ -39,7 +45,7 @@ const emptyHealth = (): LedgerHealth => ({
   changeLowerBound: null, lastSequence: null, instances: null, changes: null,
 })
 const CAPTURE_RETRY_MS = 250
-/** A capture queued past this long means the worker is no longer draining. */
+/** Maximum queue age before an over-capacity backlog sheds arrivals. */
 export const LEDGER_STALL_TIMEOUT_MS = 10_000
 
 /** What health and its alerts read: memory only, never the worker queue. */
@@ -62,6 +68,7 @@ export class BehaviorLedgerObserver {
   private workerExited: Promise<void> = Promise.resolve()
   private initializing: Promise<void> | null = null
   private ready = false
+  private captureBatch = false
   private closed = false
   private stopping = false
   private stopTimedOut = false
@@ -75,6 +82,7 @@ export class BehaviorLedgerObserver {
   private reads = 0
   private unreportedLoss = 0
   private unreportedLossSince: number | null = null
+  private lossReason: string | null = null
   private retryAt = 0
   private retryTimer?: ReturnType<typeof setTimeout>
   private health = emptyHealth()
@@ -121,7 +129,7 @@ export class BehaviorLedgerObserver {
     await new Promise<void>((resolveReady, rejectReady) => {
       // The startup wait bounds its caller; elapsed time does not prove worker failure.
       const timer = setTimeout(resolveReady, 2_000)
-      worker.on('message', (message: LedgerWorkerReply | { ready: true; health: LedgerHealth; pending: LedgerPending[] }) => {
+      worker.on('message', (message: LedgerWorkerReply | { ready: true; captureBatch?: boolean; health: LedgerHealth; pending: LedgerPending[] }) => {
         if (this.worker !== worker) return
         try {
           if (!message || typeof message !== 'object' || !Array.isArray(message.pending)) throw new Error('Invalid ledger worker reply')
@@ -129,6 +137,7 @@ export class BehaviorLedgerObserver {
             if (!message.health || !Array.isArray(message.health.gaps)) throw new Error('Invalid ledger worker health')
             clearTimeout(timer)
             this.ready = true
+            this.captureBatch = message.captureBatch === true
             this.health = message.health
             this.setPending(message.pending)
             resolveReady()
@@ -159,14 +168,14 @@ export class BehaviorLedgerObserver {
       if (this.closed || this.stopping) return
       const serialized = JSON.stringify(observation)
       const bytes = Buffer.byteLength(serialized)
-      if (bytes > 4_096 || this.failed) { this.lose(1); return }
+      if (bytes > 4_096 || this.failed) { this.lose(1, this.failed ? 'worker_failed' : 'capture_oversized'); return }
       const captured = JSON.parse(serialized) as LedgerObservation
       // Startup shares the drain grace: readiness alone does not prove a stall.
       // Spill overflow only once captures sit undrained past the stall budget.
       if ((this.captures >= (this.options.captureLimit ?? 1_000)
         || this.captureBytes + bytes > (this.options.captureBytes ?? 2 * 1024 * 1024))
         && this.stalled()) {
-        this.lose(1)
+        this.lose(1, 'queue_saturated')
         return
       }
       this.captures++
@@ -176,7 +185,7 @@ export class BehaviorLedgerObserver {
       }
       this.queue.push({ id: ++this.sequence, operation: 'capture', observation: captured, bytes, enqueuedAt: Date.now() })
       this.pump()
-    } catch { this.lose(1) }
+    } catch { this.lose(1, 'invalid_capture') }
   }
 
   private oldestCaptureAt(): number {
@@ -210,7 +219,27 @@ export class BehaviorLedgerObserver {
     }
   }
 
-  private lose(count: number): void {
+  private lose(count: number, reason: 'queue_saturated' | 'capture_oversized' | 'invalid_capture' | 'capture_rejected' | 'worker_failed' | 'shutdown_timeout', rejection: string | null = null): void {
+    if (!count) return
+    if (!this.unreportedLoss || this.lossReason !== reason) {
+      const oldest = this.oldestCaptureAt()
+      const context = { reason, count, rejection, pending: this.captures, queuedBytes: this.captureBytes,
+        queueAgeMs: oldest === Infinity ? null : Math.max(0, Date.now() - oldest),
+        captureLimit: this.options.captureLimit ?? 1_000, captureBytes: this.options.captureBytes ?? 2 * 1024 * 1024,
+        stallBudgetMs: this.options.stallTimeoutMs ?? LEDGER_STALL_TIMEOUT_MS }
+      // Logging may journal its own overflow; keep that I/O outside capture.
+      // Only shutdown loss emits synchronously: stopPoiseRuntime stops
+      // logging after waitForExit without yielding, so a deferred emit would
+      // be discarded by ingest. Hot-path capture (including the next capture
+      // after an idle worker failure) always stays deferred, so the behavior
+      // thread never performs logging filesystem I/O.
+      const report = (): void => { this.options.lossDiagnostic?.({ level: 'error', operation: 'behavior-ledger.capture_loss',
+        message: 'Behavior ledger captures lost', context }) }
+      const shutdown = this.stopping || this.closed || this.stopTimedOut
+      if ((reason === 'shutdown_timeout' || reason === 'worker_failed') && shutdown) report()
+      else setImmediate(report)
+      this.lossReason = reason
+    }
     // Memory-only bounds for the pending marker: losses are attributed from
     // the first unreported one, so pump delay cannot shift them forward.
     this.unreportedLossSince ??= Date.now()
@@ -285,6 +314,15 @@ export class BehaviorLedgerObserver {
     this.health = message.body.health
     this.setPending(message.pending)
     if (job.operation === 'capture') {
+      if (job.batch && message.status >= 400 && !this.stopTimedOut) {
+        // The whole transaction rolled back. Retry individually so one poison
+        // observation cannot shed its valid neighbors or be counted twice.
+        for (const capture of job.batch) capture.single = true
+        this.queue.unshift(...job.batch)
+        if (message.status >= 500) this.retryAt = Date.now() + CAPTURE_RETRY_MS
+        this.pump(true)
+        return
+      }
       if (message.status >= 500 && job.observation?.type !== 'loss' && !this.stopTimedOut) {
         // Storage-side failure: hold the job at the head for retry instead
         // of consuming it, so an outage delays captures without losing them.
@@ -294,13 +332,15 @@ export class BehaviorLedgerObserver {
         this.pump(true)
         return
       }
-      this.captures--
-      this.captureBytes -= job.bytes
-      if (job.observation?.type === 'admit') this.admitted.delete(job.observation.nativeId)
-      if (job.observation?.type === 'loss') {
-        if (message.status < 400) this.unreportedLoss = Math.max(0, this.unreportedLoss - job.observation.count)
-        else { this.fail(); return }
-      } else if (message.status >= 400) this.lose(1)
+      for (const capture of job.batch ?? [job]) {
+        this.captures--
+        this.captureBytes -= capture.bytes
+        if (capture.observation?.type === 'admit') this.admitted.delete(capture.observation.nativeId)
+        if (capture.observation?.type === 'loss') {
+          if (message.status < 400) this.unreportedLoss = Math.max(0, this.unreportedLoss - capture.observation.count)
+          else { this.fail(); return }
+        } else if (message.status >= 400) this.lose(1, this.stopTimedOut ? 'shutdown_timeout' : 'capture_rejected', message.body.error ?? null)
+      }
     }
     if (job.operation === 'read') this.reads--
     if (job.operation === 'close') this.closed = true
@@ -325,7 +365,7 @@ export class BehaviorLedgerObserver {
     }
     // Read deadlines include queue wait; permit a turn without starving capture.
     const readIndex = preferRead ? this.queue.findIndex((job) => job.operation === 'read') : -1
-    const job = readIndex < 0 ? this.queue[0] : this.queue[readIndex]
+    let job = readIndex < 0 ? this.queue[0] : this.queue[readIndex]
     if (!job) { this.worker.unref(); return }
     if (job.operation === 'capture' && Date.now() < this.retryAt) {
       // A failing store backs capture dispatch off; reads still flow.
@@ -337,11 +377,17 @@ export class BehaviorLedgerObserver {
     }
     if (readIndex < 0) this.queue.shift()
     else this.queue.splice(readIndex, 1)
+    if (this.captureBatch && !this.reads && job.operation === 'capture' && !job.single && job.observation?.type !== 'loss') {
+      const batch = [job]
+      while (batch.length < LEDGER_CAPTURE_BATCH_LIMIT && this.queue[0]?.operation === 'capture'
+        && !this.queue[0].single && this.queue[0].observation?.type !== 'loss') batch.push(this.queue.shift()!)
+      if (batch.length > 1) job = { ...job, batch }
+    }
     this.active = job
     job.dispatchedAt = performance.now()
     this.worker.ref()
     try { this.worker.postMessage({ id: job.id, operation: job.operation,
-      observation: job.observation, request: job.request } satisfies LedgerWorkerRequest) }
+      observation: job.observation, observations: job.batch?.map(capture => capture.observation!), request: job.request } satisfies LedgerWorkerRequest) }
     catch { this.fail() }
   }
 
@@ -355,10 +401,10 @@ export class BehaviorLedgerObserver {
     clearTimeout(this.retryTimer)
     this.retryTimer = undefined
     const worker = this.worker
-    const jobs = [...(this.active ? [this.active] : []), ...this.queue]
+    const jobs = [...(this.active ? this.active.batch ?? [this.active] : []), ...this.queue]
     this.active = null
     this.queue = []
-    this.lose(jobs.filter((job) => job.operation === 'capture' && job.observation?.type !== 'loss').length)
+    this.lose(jobs.filter((job) => job.operation === 'capture' && job.observation?.type !== 'loss').length, 'worker_failed')
     this.captures = 0
     this.captureBytes = 0
     this.admitted.clear()
@@ -450,7 +496,7 @@ export class BehaviorLedgerObserver {
           source: null, behavior: null, expectedHead: null, head: null, status: null,
           action: null, outcome: null, startedAt: null, completedAt: null, uncertain: true, mayRun: false })
       }
-    } catch { this.lose(1) }
+    } catch { this.lose(1, 'invalid_capture') }
   }
 
   stop(): Promise<void> {
@@ -494,7 +540,7 @@ export class BehaviorLedgerObserver {
       if (job.operation === 'capture') {
         this.captures--
         this.captureBytes -= job.bytes
-        if (job.observation?.type !== 'loss') this.lose(1)
+        if (job.observation?.type !== 'loss') this.lose(1, 'shutdown_timeout')
         else if (job.observation.since !== undefined) {
           // The marker's count stays unreported; its span must stay with it,
           // or a later marker would attribute those losses from this stop.
@@ -523,6 +569,11 @@ export async function stopBehaviorLedger(): Promise<void> {
   const previous = observer
   observer = null
   await previous?.stop()
+  // A single in-flight capture can fail after the stop budget while no queued
+  // captures remain. Logging stops after this, so wait for the worker to exit
+  // and let that late shutdown loss be diagnosed while ingestion is alive.
+  // stop() itself still returns within its budget; the native-stop proof pins it.
+  await previous?.waitForExit()
 }
 export function captureBehaviorAdmission(input: Omit<LedgerAdmission, 'type'>): void {
   observer?.capture({ ...input, type: 'admit' })

@@ -442,13 +442,12 @@ describe('native admission and recovery', () => {
     expect(current.invocations[1]).toMatchObject({ behavior: 'implement-issue', state: 'started' })
   })
 
-  it.each(['review-pr', 'approve-pr'] as const)('recovers a relative %s target against the original chain without a checkout or a new admission', async (behavior) => {
+  it.each(['review-pr', 'approve-pr'] as const)('starts a never-started relative %s target against the original chain without a checkout or a new admission', async (behavior) => {
     const { journal, chain } = setup()
     const pending = invocation('original-correlation', behavior, 'head')
     pending.admittedAt = Date.now() - 60_000
     pending.request = { command: 'agent-interface', cwd: '/interface', argv: [behavior === 'review-pr' ? '--pr-review' : '--pr-approve', '#37', '--pwd', '/empty/interface/directory'] }
-    let current = record(journal, chain, { type: 'invocation.admitted', invocation: pending })
-    current = record(journal, current, { type: 'invocation.started', invocationId: pending.id })
+    record(journal, chain, { type: 'invocation.admitted', invocation: pending })
     const launched: ChainInvocation[] = []
     await new BehaviorChainRuntime(journal, operations({ launch: async (request) => { launched.push(request); return true } })).run()
     expect(launched).toHaveLength(1)
@@ -527,15 +526,19 @@ describe('native admission and recovery', () => {
     expect(current.invocations[0]).toMatchObject({ state: 'settled', outcome: 'launch_deferred' })
   })
 
-  it('retains original ownership when a repeat launch is deferred without a native receipt', async () => {
+  it('retains original ownership without retrying a started invocation whose Call is missing', async () => {
     const { journal, chain } = setup()
     const admitted = record(journal, chain, { type: 'invocation.admitted', invocation: { ...invocation('same-correlation', 'review-issue', 'revision'), admittedAt: Date.now() - 60_000 } })
     record(journal, admitted, { type: 'invocation.started', invocationId: 'same-correlation' })
-    const runtime = new BehaviorChainRuntime(journal, operations({ launch: async (pending) => {
-      expect(pending.id).toBe('same-correlation'); return false
-    } }))
+    const launch = vi.fn(async () => false)
+    const runtime = new BehaviorChainRuntime(journal, operations({ launch }))
     await runtime.run()
-    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'started', evidence: { retryUsesSameCorrelation: true, repeatLaunchDeferred: true } })
+    await runtime.run()
+    expect(launch).not.toHaveBeenCalled()
+    expect(journal.read(chain.id)!.invocations[0]).toMatchObject({ state: 'uncertain', callId: null,
+      outcome: expect.stringContaining('without a durable Call receipt') })
+    expect(journal.liveModelInvocationCount()).toBe(1)
+    expect(journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'invocation.uncertain')).toHaveLength(1)
   })
 
   it('does not release ownership from a terminal turn without worker resource proof', async () => {

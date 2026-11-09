@@ -168,9 +168,9 @@ class AtomicWorkLimits(TestCase):
         patch.object(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _identity: SimpleNamespace(identity="fixture-model", provider="codex"))).start()
         api.init_db()
 
-    def run_behavior(self):
+    def run_behavior(self, pull=None, expected_head=None):
         api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
-                            "00000000-0000-4000-8000-000000000001", "fixture-model", "poise/issue-7")
+                            "00000000-0000-4000-8000-000000000001", "fixture-model", "poise/issue-7", pull=pull, expected_head=expected_head)
 
     def test_implementation_receives_its_requested_hour_instead_of_the_pr_review_cap(self):
         remaining = []
@@ -454,6 +454,79 @@ class AtomicWorkLimits(TestCase):
             status, code, action, outcome, plan = conn.execute("select status,error_code,action,outcome,action_plan from calls").fetchone()
         self.assertEqual(modes, ["prepare"])
         self.assertEqual((status, code, action, outcome), ("failed", "atomic_work_blocked", "not_started", "preflight_failed"))
+        self.assertIsNone(plan)
+
+    def test_ci_only_blocker_retains_the_supplied_head_and_failed_job_attempt_without_publication(self):
+        ci = {"action": "list_failing_ci", "repository": "example/repo", "pull_number": 3, "head_sha": HEAD,
+              "failing": [{"type": "check_run", "name": "unit", "state": "completed", "conclusion": "failure",
+                           "check_run_id": 41, "log_id": 42, "url": "https://github.com/example/repo/actions/runs/40/job/42"}]}
+        commands = []
+
+        def interface(*args, **_kwargs):
+            commands.append(args[0])
+            if args[0] == "--issue-work" and args[args.index("--mode") + 1] == "prepare":
+                return {"outcome": "prepared", "checkout_head": HEAD}
+            return {"--list-failing-ci": ci, "--pr-review": {"review_threads": []}, "--pull-action-state": {}}[args[0]]
+
+        def worker(_lease, _args, **kwargs):
+            (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                "blocked": {"cause": "ci_only", "reason": "The supplied unit job failed"}}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                patch.object(issue_review, "interface", side_effect=interface), \
+                patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                patch.object(issue_review, "_terminal_failure", return_value=None), \
+                patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                self.assertRaisesRegex(ValueError, "The supplied unit job failed"):
+            self.run_behavior(pull=3, expected_head=HEAD)
+        with sqlite3.connect(self.path) as conn:
+            status, code, action, artifact, plan = conn.execute("select status,error_code,action,artifact,action_plan from calls").fetchone()
+        self.assertEqual(commands, ["--issue-work", "--list-failing-ci", "--pr-review", "--pull-action-state"])
+        self.assertEqual((status, code, action), ("failed", "atomic_work_blocked", "not_started"))
+        self.assertEqual(json.loads(artifact)["ci_blocker"], ci)
+        self.assertIsNone(plan)
+
+    def test_ci_only_blocker_drops_check_summaries_to_fit_the_receipt_limit(self):
+        failing = [{"type": "check_run", "name": f"unit-{index}", "state": "completed", "conclusion": "failure",
+                    "check_run_id": 41 + index, "log_id": 42 + index,
+                    "url": f"https://github.com/example/repo/actions/runs/40/job/{42 + index}",
+                    "summary": "x" * (50 * 1024)} for index in range(3)]
+        ci = {"action": "list_failing_ci", "repository": "example/repo", "pull_number": 3, "head_sha": HEAD,
+              "failing": failing, "mergeable": True, "author": "author", "state": "open", "merged": False}
+
+        def interface(*args, **_kwargs):
+            if args[0] == "--issue-work" and args[args.index("--mode") + 1] == "prepare":
+                return {"outcome": "prepared", "checkout_head": HEAD}
+            return {"--list-failing-ci": ci, "--pr-review": {"review_threads": []}, "--pull-action-state": {}}[args[0]]
+
+        def worker(_lease, _args, **kwargs):
+            (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                "blocked": {"cause": "ci_only", "reason": "The supplied unit job failed"}}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                patch.object(issue_review, "interface", side_effect=interface), \
+                patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
+                patch.object(issue_review, "_terminal_failure", return_value=None), \
+                patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                self.assertRaisesRegex(ValueError, "The supplied unit job failed"):
+            self.run_behavior(pull=3, expected_head=HEAD)
+        with sqlite3.connect(self.path) as conn:
+            status, code, action, artifact, plan = conn.execute("select status,error_code,action,artifact,action_plan from calls").fetchone()
+        self.assertEqual((status, code, action), ("failed", "atomic_work_blocked", "not_started"))
+        stored = json.loads(artifact)["ci_blocker"]
+        self.assertEqual(stored, {"action": "list_failing_ci", "repository": "example/repo", "pull_number": 3,
+                                  "head_sha": HEAD,
+                                  "failing": [{key: entry[key] for key in
+                                               ("type", "name", "state", "conclusion", "check_run_id", "log_id", "url")}
+                                              for entry in failing]})
+        self.assertNotIn("summary", json.dumps(stored))
+        self.assertLess(len(artifact.encode()), 128 * 1024)
         self.assertIsNone(plan)
 
     def test_repair_completion_reuses_the_original_plan_without_a_worker_or_new_call(self):

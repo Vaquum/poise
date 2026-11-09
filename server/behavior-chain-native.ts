@@ -13,6 +13,7 @@ import { getBehaviorChainSettings, getSettings } from './settings'
 import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { runFile, spawnDetached } from './process'
+import { requireCallerReceipts } from './service/caller-calls'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
 type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
@@ -21,6 +22,7 @@ type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
 const NATIVE_ACTION_TIMEOUT_MS = 120_000
 
 export async function readNativeInvocations(ids: string[]) {
+  requireCallerReceipts()
   const { stdout } = await runFile('agent-interface', ['--logs', '--select', JSON.stringify({ latest: [], ids: [], correlations: ids })],
     { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 16 * 1024 * 1024 })
   return parseAgentLogStdout(stdout, 'behavior chain native receipts')
@@ -93,7 +95,10 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     available: hooks.available,
     capacity: hooks.capacity,
     measureHeadroom: hooks.measureHeadroom,
-    permitted: hooks.permitted,
+    permitted(chain, decision) {
+      requireCallerReceipts()
+      return hooks.permitted(chain, decision)
+    },
     wake: hooks.wake,
     received: hooks.received,
     async discover(): Promise<ChainSeed[]> {
@@ -335,6 +340,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     },
     async launch(invocation, onExit, allowed) {
       if (!allowed()) return false
+      requireCallerReceipts()
       // Provider preparation finished after the durable admission, so
       // re-verify measured headroom at the last boundary before spawn. A
       // deferral settles as launch_deferred without consuming an attempt;
@@ -354,6 +360,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         const identities = ['--model', '--recovery-model'].flatMap((flag) => { const index = invocation.request.argv.indexOf(flag); return index >= 0 ? [invocation.request.argv[index + 1]] : [] })
         const env = await hooks.prepare(identities)
         if (!allowed()) { release(); return false }
+        requireCallerReceipts()
         await spawnDetached('agent-interface', invocation.request.argv, { cwd: invocation.request.cwd, env,
           onExit: (result) => { release(); onExit(result) } })
         return true
@@ -378,6 +385,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return proof.outcome === 'fenced'
     },
     async perform(invocation, chain) {
+      requireCallerReceipts()
       let stdout: string
       let processFailure: { code: unknown, signal: unknown } | null = null
       try {
@@ -425,6 +433,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       return result
     },
     async resumePublication(invocation, head, correlation) {
+      requireCallerReceipts()
       const callId = invocation.evidence?.callId
       const artifact = object(invocation.evidence?.artifact, 'repair publication receipt')
       if (typeof callId !== 'string' || !/^[0-9a-f]{32}$/.test(callId) || typeof artifact.plan_sha !== 'string') throw new Error('repair lacks its original native publication identity')

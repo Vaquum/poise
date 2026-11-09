@@ -279,6 +279,7 @@ Environment the gateway passes:
 | `HOME` | `/home/poise` |
 | `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 5400), so both sides time a drain alike |
 | `POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES` | optional validated whole-byte native behavior settings from the gateway; unset remains unbounded ([configuration](../gateway/README.md)) |
+| `POISE_REPAIR_EXHAUSTION_REPOSITORIES` | optional explicit comma-separated `owner/repo` allowlist from the gateway; unset or empty keeps repair exhaustion reporting disabled |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 Beside each release, the gateway installs agents' test offload into the home
@@ -299,6 +300,9 @@ Changed or removed native behavior budget/reservation settings use that same
 replacement path and its existing native resource-settlement barrier. Existing
 invocations retain their original immutable ceilings; no setting changes an
 already-admitted booking.
+Adding, changing or removing the repair-report allowlist uses that same
+cooperative replacement path, including settings-only deployments on the same
+image; an in-place release switch cannot change a container's environment.
 
 The gateway reaches the workspace at `http://poise-ws-<handle>:5555`, over the
 workspace's network, which it joins by its own container name,
@@ -699,17 +703,18 @@ and drops its repositories from the issue review selection and the Manager's
 scope. Nothing changes on GitHub, datastores are kept, and work bindings stay
 as history.
 
-An activated account's due sync retains lock acquisition failures in its existing
-sync error and retry state. Retries back off from one minute to at most one hour,
-survive restart, and leave other accounts eligible. Five-second scheduler ticks
+An account's due sync makes one nonblocking SQLite lock attempt after filesystem
+setup, even when setup is slow. An activated account retains lock acquisition
+failures in its existing sync error and retry state. Retries back off from one
+minute to at most one hour, survive restart, and leave other accounts eligible. Five-second scheduler ticks
 do not acquire the lock or repeat diagnostics before that retry. SQLite contention
-and setup deadlines retain their actual causes; neither verifies a holder's
-process identity. A newer sync, retry, identity or registration wins over an old
+and setup errors retain their actual causes; neither verifies a holder's process
+identity. A newer sync, retry, identity or registration wins over an old
 failed acquirer. Settings shows the error and automatic retry time immediately;
 diagnostics retain the failure start, last successful sync age (unknown without a
 timestamp), and the unchanged 120-second freshness limit. The existing per-account
 alert still starts after 15 minutes of failures and clears/rearms only after a
-validated sync. An activation acquisition deadline stays eligible for automatic
+validated sync. An activation lock conflict stays eligible for automatic
 activation rather than becoming a manual-retry error.
 
 `GET /api/github-quota` reads the configured user and automation accounts'
@@ -1114,8 +1119,9 @@ the checkout's commit as the build argument `POISE_SOURCE_SHA`, which
 `/api/service/health` reports as `version`.
 Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
 recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, or
-whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
-its own, keeping its volume and respecting the native settlement barrier.
+whose `POISE_DRAIN_TIMEOUT`, configured native behavior budgets or repair-report
+allowlist differ from its own, keeping its volume and respecting the native
+settlement barrier.
 The operator scripts retain an exact-release rollout receipt beyond their
 bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
 receipt through the existing workspace health/image proof without initiating
@@ -1299,8 +1305,9 @@ defines the cadence and timestamp units.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
-started originals without a Call use the bounded native correlation-fence
-command before normal receipt reconciliation. Existing Calls and uncertain
+started originals without a Call remain uncertain without a retry or synthetic
+no-effect receipt, since partial recovery can lose the original unique correlation.
+Unreadable snapshots retain that hold in the existing journal. Existing Calls and uncertain
 resources are never released by closure alone. Merged-chain Hold/Resume writes
 return 409 and the GUI retains History and read-only reconciliation. No new
 endpoint, signal or journal event type is added; the Caller contract is in
@@ -1309,6 +1316,11 @@ Poise's existing log decoder validates the fence's exact terminal no-effect
 shape and native resource-release timestamp before the journal can settle its
 reservation. Closed-target native resource waits are separate from public
 GitHub recheck times; unrelated open-PR review/approval stays eligible.
+Managed native admissions recheck the bounded receipt reader at their final
+launch, action and publication boundaries. Its independent diagnostics retain
+the first typed SQLite cause and affected workspace; health keeps its existing
+unknown counters. Readability cannot clear missing original evidence. See
+[receipt-store recovery](Operating.md#caller-receipt-store-recovery).
 
 Native Caller receipts also carry append-only resource ownership outside
 publication artifacts. Normal cleanup acknowledges pinned directory identities;
@@ -1407,8 +1419,8 @@ no-publication shape and retry requirements are defined in
 
 Optional repair-exhaustion reporting uses the same held-chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
-environment opt-in enables only verified incomplete-reply exhaustion. Durable
-creation intent prevents another POST after an uncertain result; the source hold,
+environment opt-in enables verified incomplete-reply or execution-budget exhaustion.
+Durable creation intent prevents another POST after an uncertain result; the source hold,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. It adds no gateway route, scope, journal event,
 settings default or admission bypass. See

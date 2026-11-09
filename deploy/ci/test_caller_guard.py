@@ -540,6 +540,105 @@ exit 0
         self.assertIn("install", sudo_log.read_text(),
                       "runsc followed by a newline must reach guard installation, not exit 10")
 
+    def test_empty_runtime_ignores_unrelated_fixture_value_and_falls_back_to_docker_default(self):
+        # Only services.gateway.environment.POISE_WORKSPACE_RUNTIME decides.
+        # An unrelated value containing POISE_WORKSPACE_RUNTIME=runc must not
+        # leak in: empty resolves to the runsc Docker default and installs.
+        deploy = GUARD.parents[1]
+        env_file = self.root / "poise.env"
+        env_file.write_text('POISE_WORKSPACE_RUNTIME=\nPOISE_FIXTURE_TEXT=POISE_WORKSPACE_RUNTIME=runc\n')
+        sudo_log = self.root / "sudo.log"
+        sudo_log.write_text("")
+        binary = self.root / "guard-bin-fixture"
+        binary.mkdir()
+        (binary / "docker").write_text("""#!/bin/bash
+if [ "$1" = compose ]; then
+  printf '%s' '{"services":{"gateway":{"environment":{"POISE_WORKSPACE_RUNTIME":"","POISE_FIXTURE_TEXT":"POISE_WORKSPACE_RUNTIME=runc"}}}}'
+elif [ "$1" = info ]; then
+  case "$3" in
+    *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
+    *) printf 'runsc' ;;
+  esac
+elif [ "$1" = ps ]; then
+  : # Fresh deployment: no workspace containers yet.
+else
+  echo "unexpected docker $*" >&2; exit 99
+fi
+""")
+        (binary / "sudo").write_text("""#!/bin/bash
+echo "$*" >> "$GUARD_SUDO_LOG"
+for argument in "$@"; do
+  if [ "$argument" = --check ]; then
+    echo 'Host locks verified on 1 Caller inode(s)'
+    exit 0
+  fi
+done
+exit 0
+""")
+        (binary / "id").write_text("#!/bin/bash\nif [ \"$1\" = -u ]; then echo 1000; else exec /usr/bin/id \"$@\"; fi\n")
+        for name in ("docker", "sudo", "id"):
+            (binary / name).chmod(0o755)
+        env = {**self.env, "PATH": str(binary) + os.pathsep + self.env["PATH"],
+               "GUARD_SUDO_LOG": str(sudo_log)}
+        script = (f"set -uo pipefail\n. {shlex.quote(str(deploy / 'lib.sh'))}\n"
+                  f"env_file={shlex.quote(str(env_file))}\n"
+                  "ensure_caller_guard\nprintf 'RC=%s\\n' \"$?\"\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Host locks verified", result.stdout)
+        self.assertIn("install", sudo_log.read_text(),
+                      "empty runtime must fall back to the runsc Docker default, not read the fixture text")
+
+    def test_nbsp_terminated_runtime_still_installs_gvisor_guard_under_c_locale(self):
+        # The gateway's trim() removes U+00A0 while POSIX [[:space:]] under
+        # LC_ALL=C keeps it. A resolved `runsc` plus NBSP must install rather
+        # than exit 10. Encoded as \\u00a0, this also proves JSON decoding
+        # matches the gateway even in the C locale.
+        deploy = GUARD.parents[1]
+        env_file = self.root / "poise.env"
+        env_file.write_text('POISE_WORKSPACE_RUNTIME=runsc\n')
+        sudo_log = self.root / "sudo.log"
+        sudo_log.write_text("")
+        binary = self.root / "guard-bin-nbsp"
+        binary.mkdir()
+        (binary / "docker").write_text("""#!/bin/bash
+if [ "$1" = compose ]; then
+  printf '%s' '{"services":{"gateway":{"environment":{"POISE_WORKSPACE_RUNTIME":"runsc\\u00a0"}}}}'
+elif [ "$1" = info ]; then
+  case "$3" in
+    *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
+    *) printf 'runc' ;;
+  esac
+elif [ "$1" = ps ]; then
+  : # Fresh deployment: no workspace containers yet.
+else
+  echo "unexpected docker $*" >&2; exit 99
+fi
+""")
+        (binary / "sudo").write_text("""#!/bin/bash
+echo "$*" >> "$GUARD_SUDO_LOG"
+for argument in "$@"; do
+  if [ "$argument" = --check ]; then
+    echo 'Host locks verified on 1 Caller inode(s)'
+    exit 0
+  fi
+done
+exit 0
+""")
+        (binary / "id").write_text("#!/bin/bash\nif [ \"$1\" = -u ]; then echo 1000; else exec /usr/bin/id \"$@\"; fi\n")
+        for name in ("docker", "sudo", "id"):
+            (binary / name).chmod(0o755)
+        env = {**self.env, "PATH": str(binary) + os.pathsep + self.env["PATH"],
+               "GUARD_SUDO_LOG": str(sudo_log), "LC_ALL": "C"}
+        script = (f"set -uo pipefail\n. {shlex.quote(str(deploy / 'lib.sh'))}\n"
+                  f"env_file={shlex.quote(str(env_file))}\n"
+                  "ensure_caller_guard\nprintf 'RC=%s\\n' \"$?\"\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Host locks verified", result.stdout)
+        self.assertIn("install", sudo_log.read_text(),
+                      "runsc followed by U+00A0 must reach guard installation under LC_ALL=C, not exit 10")
+
     def test_runc_deployment_needs_no_host_guard_or_python(self):
         library = shlex.quote(str(GUARD.parents[1] / "lib.sh"))
         result = subprocess.run(["bash", "-c", f'. {library}\n' + """

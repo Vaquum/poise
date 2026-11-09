@@ -16,6 +16,30 @@ class AtomicWorkBlocked(ValueError):
     code = "atomic_work_blocked"
 
 
+def _ci_only_blocker(ci: object) -> object:
+    # Durable CI-only evidence is the packet identity plus the failed
+    # check/job IDs that pin the original run attempt. Full check summaries
+    # can exceed the 128 KiB receipt limit and would turn an explicit CI-only
+    # blocker into an unrecoverable failure.
+    if not isinstance(ci, dict):
+        return ci
+    failing = ci.get("failing")
+    compact: list[object] = []
+    if isinstance(failing, list):
+        for entry in failing:
+            if isinstance(entry, dict):
+                compact.append({key: entry[key] for key in
+                                ("type", "name", "state", "conclusion", "check_run_id", "log_id", "url")
+                                if key in entry})
+    return {
+        "action": ci.get("action"),
+        "repository": ci.get("repository"),
+        "pull_number": ci.get("pull_number"),
+        "head_sha": ci.get("head_sha"),
+        "failing": compact,
+    }
+
+
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
         call_id: str, record: Callable[[dict], None], pull: int | None = None,
         expected_head: str | None = None, note: str = "", merge_base: bool = False, expected_issue_revision: str | None = None) -> dict:
@@ -65,6 +89,8 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "This exact set includes outdated unresolved roots and roots that already have replies; answer each with concrete changes or evidence for disagreement. "
         "Do not reply to replies, invent comment ids, or use generic acknowledgements. For initial implementation replies must be empty. "
         "If unable to finish, set blocked to the concrete reason; do not claim the work complete. "
+        'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
+        "Use a string for every other blocker, including missing evidence, a product decision or uncertain publication. "
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
         f"Behavior note: {note}\nPreparation receipt:\n{json.dumps(prepared)}\nActual issue and comments:\n{json.dumps(data)}\nActual PR evidence:\n{json.dumps(evidence)}"
     )
@@ -104,7 +130,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if not isinstance(publication, dict):
                 raise ValueError("atomic behavior blocked: invalid output")
             if publication.get("blocked"):
-                raise AtomicWorkBlocked(f"atomic behavior blocked: {publication['blocked']}")
+                blocked = publication["blocked"]
+                if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
+                        and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
+                    record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})
+                    blocked = blocked["reason"]
+                raise AtomicWorkBlocked(f"atomic behavior blocked: {blocked}")
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
                 raise ValueError("atomic behavior publication metadata is incomplete")
             replies = publication.get("replies", [])

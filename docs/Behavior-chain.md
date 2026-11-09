@@ -152,6 +152,16 @@ advance timestamps nor become success: their error remains in runtime health
 after unrelated work is allowed to advance, with at most one attempt per
 target per existing pass under the existing account/native budgets.
 
+An explicitly CI-only repair blocker retains the supplied head and failed
+check/job identities and URLs in its original native artifact. Its automatic
+hold records that invocation and head and stays eligible every two minutes,
+using the same scheduler. Once that original settles with `action: not_started`
+and positive resource-release proof, a fresh matching-head `checksState: SUCCESS`
+with no pending or failing checks records `ciRecovery` on the existing resume
+event. The normal decision path then rechecks review, approval and merge gates;
+overall readiness is not required to release this hold. A generic worker
+blocker, uncertain publication or a later operator Hold cannot auto-resume.
+
 Merged `merge-pr` and `resolve-threads` uncertainty uses original journal
 receipts only. A missing original response schedules no GitHub read; retaining
 that response makes its original settlement eligible without another mutation.
@@ -257,13 +267,13 @@ has no PR; a closed PR blocks all model behaviors, and a closed seed also blocks
 issue review, implementation and repair. A never-started admission with no
 conflicting or quarantined Call settles as deferred `target_closed`, with
 explicit no-effect evidence and no failed-attempt charge. A started original
-with no Call can use Caller's atomic correlation fence: only winning the
-original unique correlation creates a terminal no-effect native Call. A late
-original cannot claim that correlation before its provider, checkout or writes.
+with no Call becomes `uncertain`: a partial receipt-store recovery can lose the
+unique correlation that once protected it. It cannot be relaunched or given a
+synthetic no-effect fence, even while held or disabled. Unreadable receipt
+snapshots also journal this uncertainty before reconciliation resumes.
 An existing Call is never altered, and normal validated receipt reconciliation
-must prove release. Fence failures remain reported and retain ownership; the
-existing tick retries that idempotent command at most once per two minutes,
-using a durable attempt time rather than a new timer.
+must prove release. [Receipt-store recovery](Operating.md#caller-receipt-store-recovery)
+defines preservation and activation requirements.
 The receipt reader accepts only the fence's exact no-provider, no-publication
 shape with its native resource-release timestamp. Other superseded outcomes
 retain their original validation; malformed fence rows stay quarantined.
@@ -426,17 +436,24 @@ Reporting is off by default. An operator can set
 list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
 holds during their ordinary bounded reconciliation; no Resume or extra poller is
 needed. Reporting preserves the source hold and does not perform repair recovery.
+In service deployments, set it in `deploy/.env` or as a fork's Actions repository
+variable. The gateway forwards it on install; adding, changing or removing it
+cooperatively replaces existing workspaces, even on the same image. Unset or
+empty opts out.
 
-The first supported cause is `repair_incomplete_replies`: at least three settled
-Caller repairs on the same current repair basis and slot after the last Resume,
-each with positive resource release, `atomic_work_failed`, `not_started` /
-`preflight_failed`, no publication plan and the specific incomplete-reply error.
+Reporting requires at least three settled original Caller repair receipts on the
+same current head, review basis and slot after the last Resume, each with positive
+resource release, `action=not_started`, retained `outcome=preflight_failed` and no
+publication plan or action receipts. All matching attempts must share one cause:
+`repair_incomplete_replies` requires `error_code=atomic_work_failed` and the specific
+incomplete-reply error; `repair_execution_budget_exhausted` requires
+`error_code=atomic_work_execution_budget_exhausted`.
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require repair on that head and review basis.
 Stale, unknown or changed findings leave reporting pending. Other causes remain
-visible in their ordinary holds without an issue report.
+visible in their ordinary holds without an issue report; mixed causes cannot qualify.
 
 Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the
@@ -445,6 +462,8 @@ receipt identities, and next action. It excludes raw errors, omitted finding IDs
 worker paths and provider output. An intent in the existing durable metadata store
 links the original hold event to the report issue. Identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
+Existing incomplete-reply intent keys and markers remain unchanged; budget reports
+use a separate cause with the same metadata and marker format.
 The marker lookup includes closed issues and verifies the publishing account.
 Intent is committed before creation;
 after an ambiguous POST, even repeated empty searches cannot authorize another
@@ -457,7 +476,7 @@ incompatible saved intake labels and a held remediation chain are shown in the
 source chain's `waiting` reason, including its report URL when known. Poise does
 not add a different intake label or bypass ownership/admission gates. Admission is
 verified only when the normal datastore intake records the new chain. Generated
-remediation issues cannot report this same cause recursively, using their marker
+remediation issues cannot report either cause recursively, using their marker
 or the retained source-to-issue link; their ordinary repair holds remain visible.
 
 `tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain

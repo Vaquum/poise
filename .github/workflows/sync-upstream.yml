@@ -4,7 +4,7 @@
 # merges autonomio/poise's main into this repository's main, as the Sync fork
 # button does. Deployment-enabled forks hold their tip through CI and Deploy,
 # then coalesce waiting upstream changes into the next candidate.
-# A run with nothing to merge does nothing more.
+# Sync also recovers a missed Deploy wake, even with nothing to merge.
 #
 # GitHub lets the workflow's own token change no workflow file. When
 # autonomio/poise changes one, the merge fails until the fork is synced by

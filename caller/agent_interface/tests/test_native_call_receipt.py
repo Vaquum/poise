@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -333,3 +334,223 @@ def test_preparation_diagnostic_survives_terminal_result(database, monkeypatch, 
     api.finish(call, "failed" if code else "completed")
     public = api.logs_selected({"latest": [], "ids": [call]})[0]
     assert public["diagnostic"] == {**evidence, "call_id": call}
+
+
+@pytest.fixture
+def decode_failure(database):
+    """Read committed SQLite in a new Caller, then use Poise's real decoder."""
+    repo = Path(__file__).resolve().parents[3]
+    environment = {"PATH": os.environ["PATH"], "HOME": str(database), "AGENT_INTERFACE_DATA_DIR": str(database),
+                   "PYTHONPATH": str(repo / "caller/agent_interface")}
+    # Keep the bundle under the repo so its external dependencies resolve.
+    output = repo / "test-results"
+    output.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="caller-failure-", dir=output) as work:
+        bundle = Path(work) / "decoder.mjs"
+        subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"), str(repo / "tests/fixtures/caller-failure-contract.ts"),
+                        "--bundle", "--platform=node", "--packages=external", "--format=esm", "--target=node22",
+                        f"--outfile={bundle}"], cwd=repo, env=environment, check=True, capture_output=True, text=True, timeout=30)
+
+        def decode():
+            read = subprocess.run([sys.executable, "-c", "from agent_interface import main; main()", "--logs", "--select",
+                                   json.dumps({"latest": [], "ids": [], "correlations": ["original-native"]})],
+                                  cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+            assert read.returncode == 0, read.stderr
+            wire = Path(work) / "stored.json"
+            wire.write_text(read.stdout)
+            decoded = subprocess.run(["node", str(bundle), str(wire)], cwd=repo, env=environment,
+                                     capture_output=True, text=True, timeout=30)
+            assert decoded.returncode == 0, decoded.stderr
+            return json.loads(read.stdout)[0], json.loads(decoded.stdout)
+
+        yield decode
+
+
+@pytest.mark.parametrize("during_cleanup", [False, True])
+def test_registered_failure_precedes_handler_and_survives_cleanup(database, monkeypatch, decode_failure, during_cleanup):
+    private = "private-provider-prompt credential-value " * 4000
+    original = OSError(28, private) if during_cleanup else subprocess.CalledProcessError(17, ["provider", private], stderr=private)
+    warning = {"version": 1, "source": "caller", "severity": "warning", "operation": "provider.cli_update",
+               "phase": "launcher_verification", "outcome": "unavailable", "message": "Earlier warning",
+               "stderr": "", "stderr_truncated": False}
+
+    def prepared(call, _correlation):
+        with api.db() as conn:
+            conn.execute("update calls set diagnostic=? where id=?", (json.dumps(warning), call))
+
+    def fail_binding(_value):
+        raise original
+
+    def execute():
+        if during_cleanup:
+            call = claim()
+            with api.progress.Progress(api.DB, call, "preparing_issue"):
+                try:
+                    raise original
+                finally:
+                    raise RuntimeError("later cleanup " + private)
+        api.run_governed_behavior(api.pr_review, "pr_review", "https://github.com/example/repo/pull/7", "reviewer",
+                                  "a" * 40, "poise:behavior-chain", "original-native", model="fixture")
+
+    monkeypatch.setattr(api, "_enter_native_call", prepared)  # Kernel-boundary stand-in; no provider is started.
+    monkeypatch.setattr(api, "CATALOG", SimpleNamespace(review_model=lambda *args: SimpleNamespace(identity="fixture"),
+                                                       behaviors={"review_recovery": "fixture"}))
+    monkeypatch.setattr(api.review_receipt, "_call", SimpleNamespace(set=fail_binding))
+    monkeypatch.setattr(ownership, "cleanup_remaining", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ownership, "acknowledge_recovery", lambda *args: None)
+    monkeypatch.setattr(api, "_main", execute)
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--pr-review", "example/repo#7", "--source", "poise:behavior-chain",
+                                      "--correlation-id", "original-native"])
+    with patch.object(api, "review_facts", side_effect=AssertionError("behavior handler must not run")) as handler:
+        with pytest.raises(RuntimeError if during_cleanup else subprocess.CalledProcessError):
+            api.main()
+        handler.assert_not_called()
+    stored, decoded = decode_failure()
+    evidence = stored["diagnostic"]
+    assert evidence["severity"] == "error" and evidence["call_id"] == stored["id"]
+    assert evidence["correlation_id"] == "original-native"
+    assert evidence["phase"] == ("preparing_issue" if during_cleanup else "call_setup")
+    assert evidence["message"] == ("OSError (ENOSPC)" if during_cleanup else "CalledProcessError")
+    assert evidence["exit_code"] == (None if during_cleanup else 17)
+    if not during_cleanup:
+        assert evidence["operation"] == "agent_interface.review_receipt.bind"
+    assert len(json.dumps(evidence)) < 2048
+    assert "private-provider" not in json.dumps(evidence) + stored["error"]
+    assert decoded["context"]["correlation_id"] == "original-native"
+    assert decoded["context"]["message"] == evidence["message"]
+    assert stored["resources_settled_at"] is None  # Diagnostics grant no resource proof.
+
+
+@pytest.mark.parametrize("code", [23, -9])
+def test_detached_inner_exit_without_cause_is_retained(database, decode_failure, code):
+    # A fork/wait boundary stand-in exercises the actual outer Caller wrapper.
+    # The inner continuation uses _exit/a signal, so it cannot run a recorder.
+    source = '''
+import os
+import agent_interface as api
+from agent_interface import native_namespace as ns, resource_ownership as owned
+class Boundary:
+    def __init__(self, *args):
+        self.exit_code = None
+    def start(self, *args, **kwargs):
+        child = os.fork()
+        if child == 0:
+            ns._active = self
+            return True
+        _, status = os.waitpid(child, 0)
+        self.exit_code = os.waitstatus_to_exitcode(status)
+        return False
+ns.Namespace = Boundary
+ns.require_resource_controller = lambda: None
+owned.request_namespace = lambda *args: None
+owned.settle_namespace = lambda *args: None
+owned.cleanup_remaining = lambda *args, **kwargs: None
+owned.acknowledge_recovery = lambda *args: None
+api._prepare_native_clis = lambda *args: None
+def execute():
+    api.track("fixture", "", "7", "example/repo", "reviewer", "issue_review",
+              source="poise:behavior-chain", correlation_id="original-native")
+    code = int(os.environ["TEST_EXIT"])
+    if code < 0:
+        os.kill(os.getpid(), -code)
+    os._exit(code)
+api._main = execute
+api.main()
+'''
+    env = {"PATH": "", "HOME": str(database), "AGENT_INTERFACE_DATA_DIR": str(database), "TEST_EXIT": str(code),
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    with subprocess.Popen([sys.executable, "-c", source, "--issue-review", "example/repo#7", "--source", "poise:behavior-chain",
+                           "--correlation-id", "original-native"], cwd=database, env=env, start_new_session=True,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as caller:
+        assert caller.wait(timeout=30) == (code if code >= 0 else 128 - code)
+    stored, decoded = decode_failure()
+    assert stored["error_code"] == "interrupted"
+    assert stored["diagnostic"]["outcome"] == "unknown"
+    assert "cause unknown" in stored["diagnostic"]["message"]
+    assert decoded["context"]["exit_code"] == (code if code >= 0 else None)
+    assert decoded["context"]["signal"] == (-code if code < 0 else None)
+    assert decoded["context"]["call_id"] == stored["id"]
+    assert decoded["context"]["correlation_id"] == "original-native"
+    assert stored["resources_settled_at"] is None
+
+
+def test_failed_duplicate_main_cannot_annotate_original_call(database, monkeypatch):
+    call = claim()
+    with api.db() as conn:
+        before = dict(conn.execute("select * from calls where id=?", (call,)).fetchone())
+    monkeypatch.setattr(api, "_main", claim)
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--issue-review", "example/repo#7", "--source", "poise:behavior-chain",
+                                      "--correlation-id", "original-native"])
+    with pytest.raises(sqlite3.IntegrityError):
+        api.main()
+    with api.db() as conn:
+        assert dict(conn.execute("select * from calls where id=?", (call,)).fetchone()) == before
+
+
+@pytest.mark.parametrize("cause,signal", [
+    ("Provider rate-limited this run for over a minute (codex)", "rate limited"),
+    ("API error (status 429 Too Many Requests)", "status 429"),
+    ('{"http_status": 429}', "http_status 429"),
+    ("Too many requests", "too many requests"),
+])
+def test_native_failure_preserves_rate_limit_trip_without_prompt(database, monkeypatch, cause, signal):
+    # A rate-limited recovery wrapped as review_recovery_failed without a
+    # diagnostic; finish() must keep the reviewer trip signal while still
+    # excluding prompts and argv from stored evidence.
+    private = "private-provider-prompt credential-value " * 200
+    call = claim()
+    monkeypatch.setattr(api, "_native_cli", True)
+    assert api._native_call_id == call
+    wrapped = f"grok-4.6-xhigh recovery failed; needs attention: {cause} {private}"
+    try:
+        raise api.review_budget.ReviewLimitError(wrapped, "review_recovery_failed")
+    except api.review_budget.ReviewLimitError as error:
+        api.finish(call, "failed", error=str(error), error_code=error.code, diagnostic=error.diagnostic)
+    with api.db() as conn:
+        row = conn.execute("select error, diagnostic from calls where id=?", (call,)).fetchone()
+    assert signal in row["error"]
+    assert "private-provider" not in row["error"]
+    assert "private-provider" not in row["diagnostic"]
+
+
+@pytest.mark.parametrize("cause", [
+    "error: GitHub 429: rate limit exceeded for resource",
+    "verdict failed at line 429",
+])
+def test_native_failure_never_trips_without_provider_quota(database, monkeypatch, cause):
+    # GitHub's own limits and bare numbers must not trip the recovery model.
+    call = claim()
+    monkeypatch.setattr(api, "_native_cli", True)
+    assert api._native_call_id == call
+    wrapped = f"grok-4.6-xhigh recovery failed; needs attention: {cause}"
+    try:
+        raise api.review_budget.ReviewLimitError(wrapped, "review_recovery_failed")
+    except api.review_budget.ReviewLimitError as error:
+        api.finish(call, "failed", error=str(error), error_code=error.code, diagnostic=error.diagnostic)
+    with api.db() as conn:
+        row = conn.execute("select error from calls where id=?", (call,)).fetchone()
+    assert row["error"] == "ReviewLimitError"
+
+
+@pytest.mark.parametrize("cause,signal", [
+    ("Grok Build usage balance exhausted", "balance exhausted"),
+    ("Not signed in", "not signed in"),
+])
+def test_native_failure_preserves_account_trip_without_prompt(database, monkeypatch, cause, signal):
+    # _issue_review_with_recovery wraps a recovery account failure without a
+    # diagnostic; finish() must keep the reviewer trip signal while still
+    # excluding prompts and argv from stored evidence.
+    private = "private-provider-prompt credential-value " * 200
+    call = claim()
+    monkeypatch.setattr(api, "_native_cli", True)
+    assert api._native_call_id == call
+    wrapped = f"grok-4.6-xhigh recovery failed; needs attention: {cause} {private}"
+    try:
+        raise api.review_budget.ReviewLimitError(wrapped, "review_recovery_failed")
+    except api.review_budget.ReviewLimitError as error:
+        api.finish(call, "failed", error=str(error), error_code=error.code, diagnostic=error.diagnostic)
+    with api.db() as conn:
+        row = conn.execute("select error, diagnostic from calls where id=?", (call,)).fetchone()
+    assert signal in row["error"]
+    assert "private-provider" not in row["error"]
+    assert "private-provider" not in row["diagnostic"]

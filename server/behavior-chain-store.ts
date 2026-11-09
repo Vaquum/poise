@@ -37,6 +37,7 @@ export interface BehaviorChain {
   reviewer: string
   sequence: number
   held: string | null
+  ciHold?: { invocationId: string, callId: string, head: string }
   waiting: string | null
   resumedAfterSequence: number
   mergeSha: string | null
@@ -50,9 +51,9 @@ export type ChainAdmission = Omit<ChainInvocation, 'state' | 'callId' | 'outcome
 export type ChainEvent =
   | { type: 'chain.admitted', repository: string, issue: number, branch: string, author: string, reviewer: string }
   | { type: 'chain.observed', observation: Record<string, unknown> }
-  | { type: 'chain.held', reason: string }
+  | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'] }
   | { type: 'chain.waiting', reason: string }
-  | { type: 'chain.resumed' }
+  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'] }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }
   | { type: 'invocation.started', invocationId: string }
@@ -94,6 +95,7 @@ const RECHECK_AT_SQL = `CASE
     AND json_extract(state, '$.invocations[#-1].behavior') IN ('merge-pr', 'resolve-threads') THEN
       CASE WHEN json_type(state, '$.invocations[#-1].evidence.nativeActionReceipt') IS NULL THEN NULL ELSE 0 END
   WHEN json_extract(state, '$.observation.checkedAt') IS NULL THEN 0
+  WHEN json_extract(state, '$.ciHold') IS NOT NULL THEN json_extract(state, '$.observation.checkedAt') + 120000
   ELSE json_extract(state, '$.observation.checkedAt') + min(86400000, max(120000,
     json_extract(state, '$.observation.checkedAt') - coalesce(json_extract(state, '$.observation.pull.mergedAt'),
       json_extract(state, '$.invocations[0].admittedAt'), 0))) END`
@@ -119,7 +121,13 @@ export function reduceChain(current: BehaviorChain | null, event: ChainEvent, se
   else if (event.type === 'chain.held') {
     if (!event.reason.trim()) throw new Error('a behavior chain hold needs a reason')
     next.held = event.reason
-  } else if (event.type === 'chain.resumed') { next.held = null; next.resumedAfterSequence = sequence }
+    if (event.ciHold) next.ciHold = event.ciHold
+    else delete next.ciHold
+  } else if (event.type === 'chain.resumed') {
+    next.held = null
+    if (!event.ciRecovery) next.resumedAfterSequence = sequence
+    delete next.ciHold
+  }
   else if (event.type === 'chain.merged') {
     if (!SHA.test(event.mergeSha) || event.evidence.merged !== true || event.evidence.merge_sha !== event.mergeSha
       || event.evidence.repository !== next.repository || !Number.isSafeInteger(event.evidence.pull_number)
@@ -220,7 +228,7 @@ export class BehaviorChainJournal {
     }
     const index = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'behavior_chain_reconciliation'")
       .get() as { sql: string } | undefined
-    if (index && !index.sql.includes('resource_pending')) db.exec('DROP INDEX behavior_chain_reconciliation')
+    if (index && !index.sql.includes(RECHECK_AT_SQL)) db.exec('DROP INDEX behavior_chain_reconciliation')
     db.exec(`
       CREATE TABLE IF NOT EXISTS behavior_chain_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT, chain_id TEXT NOT NULL,

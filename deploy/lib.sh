@@ -48,7 +48,7 @@ require_docker() {
 # control characters (a trailing newline arrives as \n) while the gateway's
 # JSON.parse decodes them before trimming.
 json_unescape() {
-  local raw=$1 out='' i=0 n=${#1} c esc hex decoded
+  local raw=$1 out='' i=0 n=${#1} c esc hex decoded codepoint b1 b2 b3
   while [ "$i" -lt "$n" ]; do
     c=${raw:$i:1}
     if [ "$c" != "\\" ]; then
@@ -70,7 +70,22 @@ json_unescape() {
         hex=${raw:$((i + 2)):4}
         case $hex in
           [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])
-            printf -v decoded '%b' "\\u$hex"
+            # Encode the codepoint as UTF-8 bytes directly: bash printf '%b'
+            # decodes \uXXXX only outside the C locale, while the guard must
+            # match the gateway's JSON.parse even with LC_ALL=C.
+            codepoint=$((16#$hex))
+            if [ "$codepoint" -lt 128 ]; then
+              printf -v decoded '%b' "\\x$(printf '%02x' "$codepoint")"
+            elif [ "$codepoint" -lt 2048 ]; then
+              b1=$(( (codepoint >> 6) | 192 ))
+              b2=$(( (codepoint & 63) | 128 ))
+              printf -v decoded '%b' "\\x$(printf '%02x' "$b1")\\x$(printf '%02x' "$b2")"
+            else
+              b1=$(( (codepoint >> 12) | 224 ))
+              b2=$(( ((codepoint >> 6) & 63) | 128 ))
+              b3=$(( (codepoint & 63) | 128 ))
+              printf -v decoded '%b' "\\x$(printf '%02x' "$b1")\\x$(printf '%02x' "$b2")\\x$(printf '%02x' "$b3")"
+            fi
             out+="$decoded"
             i=$((i + 6)) ;;
           *)
@@ -89,6 +104,75 @@ json_unescape() {
   printf '%s' "$out"
 }
 
+# Match gateway/src/config.ts read().trim(): JavaScript String trim removes
+# WhiteSpace and LineTerminator (including U+00A0 and other Unicode spaces),
+# while POSIX [[:space:]] under LC_ALL=C keeps the nonbreaking space. Strip
+# by UTF-8 bytes so the guard decision matches the gateway even in the C locale.
+js_trim() {
+  local value=$1
+  while :; do
+    case $value in
+      ' '*) value=${value#' '} ;;
+      $'\t'*) value=${value#$'\t'} ;;
+      $'\n'*) value=${value#$'\n'} ;;
+      $'\r'*) value=${value#$'\r'} ;;
+      $'\v'*) value=${value#$'\v'} ;;
+      $'\f'*) value=${value#$'\f'} ;;
+      $'\xc2\xa0'*) value=${value#$'\xc2\xa0'} ;;
+      $'\xe1\x9a\x80'*) value=${value#$'\xe1\x9a\x80'} ;;
+      $'\xe2\x80\x80'*) value=${value#$'\xe2\x80\x80'} ;;
+      $'\xe2\x80\x81'*) value=${value#$'\xe2\x80\x81'} ;;
+      $'\xe2\x80\x82'*) value=${value#$'\xe2\x80\x82'} ;;
+      $'\xe2\x80\x83'*) value=${value#$'\xe2\x80\x83'} ;;
+      $'\xe2\x80\x84'*) value=${value#$'\xe2\x80\x84'} ;;
+      $'\xe2\x80\x85'*) value=${value#$'\xe2\x80\x85'} ;;
+      $'\xe2\x80\x86'*) value=${value#$'\xe2\x80\x86'} ;;
+      $'\xe2\x80\x87'*) value=${value#$'\xe2\x80\x87'} ;;
+      $'\xe2\x80\x88'*) value=${value#$'\xe2\x80\x88'} ;;
+      $'\xe2\x80\x89'*) value=${value#$'\xe2\x80\x89'} ;;
+      $'\xe2\x80\x8a'*) value=${value#$'\xe2\x80\x8a'} ;;
+      $'\xe2\x80\xa8'*) value=${value#$'\xe2\x80\xa8'} ;;
+      $'\xe2\x80\xa9'*) value=${value#$'\xe2\x80\xa9'} ;;
+      $'\xe2\x80\xaf'*) value=${value#$'\xe2\x80\xaf'} ;;
+      $'\xe2\x81\x9f'*) value=${value#$'\xe2\x81\x9f'} ;;
+      $'\xe3\x80\x80'*) value=${value#$'\xe3\x80\x80'} ;;
+      $'\xef\xbb\xbf'*) value=${value#$'\xef\xbb\xbf'} ;;
+      *) break ;;
+    esac
+  done
+  while :; do
+    case $value in
+      *' ') value=${value%' '} ;;
+      *$'\t') value=${value%$'\t'} ;;
+      *$'\n') value=${value%$'\n'} ;;
+      *$'\r') value=${value%$'\r'} ;;
+      *$'\v') value=${value%$'\v'} ;;
+      *$'\f') value=${value%$'\f'} ;;
+      *$'\xc2\xa0') value=${value%$'\xc2\xa0'} ;;
+      *$'\xe1\x9a\x80') value=${value%$'\xe1\x9a\x80'} ;;
+      *$'\xe2\x80\x80') value=${value%$'\xe2\x80\x80'} ;;
+      *$'\xe2\x80\x81') value=${value%$'\xe2\x80\x81'} ;;
+      *$'\xe2\x80\x82') value=${value%$'\xe2\x80\x82'} ;;
+      *$'\xe2\x80\x83') value=${value%$'\xe2\x80\x83'} ;;
+      *$'\xe2\x80\x84') value=${value%$'\xe2\x80\x84'} ;;
+      *$'\xe2\x80\x85') value=${value%$'\xe2\x80\x85'} ;;
+      *$'\xe2\x80\x86') value=${value%$'\xe2\x80\x86'} ;;
+      *$'\xe2\x80\x87') value=${value%$'\xe2\x80\x87'} ;;
+      *$'\xe2\x80\x88') value=${value%$'\xe2\x80\x88'} ;;
+      *$'\xe2\x80\x89') value=${value%$'\xe2\x80\x89'} ;;
+      *$'\xe2\x80\x8a') value=${value%$'\xe2\x80\x8a'} ;;
+      *$'\xe2\x80\xa8') value=${value%$'\xe2\x80\xa8'} ;;
+      *$'\xe2\x80\xa9') value=${value%$'\xe2\x80\xa9'} ;;
+      *$'\xe2\x80\xaf') value=${value%$'\xe2\x80\xaf'} ;;
+      *$'\xe2\x81\x9f') value=${value%$'\xe2\x81\x9f'} ;;
+      *$'\xe3\x80\x80') value=${value%$'\xe3\x80\x80'} ;;
+      *$'\xef\xbb\xbf') value=${value%$'\xef\xbb\xbf'} ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$value"
+}
+
 # A host service, independent of the gateway's readiness cache and Docker's
 # workspace restart policy. Inspect actual runtimes as well as future settings.
 ensure_caller_guard() {
@@ -101,16 +185,15 @@ ensure_caller_guard() {
   # Compose interpolation, so the guard reads the resolved configuration.
   # A failed read stops deployment; absent or empty falls back to Docker's default.
   config=$(compose config --format json) || die "cannot read the gateway's resolved Compose configuration for the Caller SQLite guard."
+  # Read only the resolved gateway field: any other environment value (for
+  # example POISE_FIXTURE_TEXT=POISE_WORKSPACE_RUNTIME=runc) must not leak
+  # into the guard decision.
   desired=$(printf '%s' "$config" | tr '\n' ' ' | sed -n 's/.*"POISE_WORKSPACE_RUNTIME"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-  if [ -z "$desired" ]; then
-    desired=$(printf '%s' "$config" | tr '\n' ' ' | sed -n 's/.*POISE_WORKSPACE_RUNTIME=\([^"]*\)".*/\1/p')
-  fi
   # Decode JSON escapes before trimming: the gateway parses JSON and trims, so
   # a resolved `runsc` followed by a newline (encoded as \n) must read as `runsc` here too.
   desired=$(json_unescape "$desired")
-  # Match gateway/src/config.ts, which trims POISE_WORKSPACE_RUNTIME: whitespace-only means unset.
-  desired=${desired#"${desired%%[![:space:]]*}"}
-  desired=${desired%"${desired##*[![:space:]]}"}
+  # Match gateway/src/config.ts read().trim(): whitespace-only means unset.
+  desired=$(js_trim "$desired")
   if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}'); fi
   ids=$(docker ps --all --quiet --filter label=poise.managed=true) || die "cannot list workspaces for the Caller guard."
   runtimes=''

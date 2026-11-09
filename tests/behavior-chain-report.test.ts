@@ -23,6 +23,8 @@ vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ 
 const NOW = 1_800_000_000_000
 const HEAD = 'a'.repeat(40)
 const LEGACY = 'repair did not answer every unresolved review finding'
+const BUDGET_CODE = 'atomic_work_execution_budget_exhausted'
+const BUDGET_ERRORS = Array<string>(3).fill('Atomic behavior provider exhausted its execution budget; no publication attempted')
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
 const databases: Database.Database[] = []
 const roots: string[] = []
@@ -108,20 +110,21 @@ function setup(path = ':memory:') {
 function record(journal: BehaviorChainJournal, chain: BehaviorChain, event: ChainEvent) {
   return journal.append(chain.id, `${chain.id}:${chain.sequence}`, chain.sequence, event, NOW - 60_000)
 }
-function exhausted(journal: BehaviorChainJournal, errors = [LEGACY, LEGACY, LEGACY], seed = 7, pull = 21) {
-  let chain = journal.append(`acme/repo#${seed}`, `seed:${seed}`, 0, { type: 'chain.admitted', repository: 'acme/repo', issue: seed,
+function exhausted(journal: BehaviorChainJournal, errors = [LEGACY, LEGACY, LEGACY], seed = 7, pull = 21, errorCode = 'atomic_work_failed') {
+  let chain = journal.read(`acme/repo#${seed}`) ?? journal.append(`acme/repo#${seed}`, `seed:${seed}`, 0, { type: 'chain.admitted', repository: 'acme/repo', issue: seed,
     branch: `poise/issue-${seed}`, author: 'author', reviewer: 'reviewer' }, NOW - 600_000)
   chain = record(journal, chain, { type: 'chain.observed', observation: { ...observation(pull), checkedAt: NOW - 600_000 } })
   const decision = decideBehaviorChain(chain, observation(pull), NOW)
   if (decision.kind !== 'invoke' || decision.behavior !== 'repair-pr') throw new Error('Fixture must need repair')
   for (const [index, error] of errors.entries()) {
-    const id = `repair-${seed}-${index}`
+    const id = `repair-${seed}-${chain.resumedAfterSequence}-${index}`
     chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id, behavior: 'repair-pr', basis: decision.basis,
       actor: 'author', slot: 'primary', model: 'fixture', admittedAt: NOW - 500_000 + index * 100_000,
       request: { command: 'agent-interface', cwd: '/fixture', context: { head: HEAD, reviewRevision: observation().pull!.reviewRevision },
         argv: ['--atomic-work', chain.id, '--expected-issue-revision', observation().issue.revision, '--pull-number', String(pull), '--expected-head', HEAD] } } })
-    chain = record(journal, chain, { type: 'invocation.settled', invocationId: id, callId: chainBasis([chain.id, index]).slice(0, 32), outcome: 'preflight_failed',
-      evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed', error_code: 'atomic_work_failed', error,
+    chain = record(journal, chain, { type: 'invocation.settled', invocationId: id, callId: chainBasis(id).slice(0, 32),
+      outcome: errorCode === BUDGET_CODE ? BUDGET_CODE : 'preflight_failed',
+      evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed', error_code: errorCode, error,
         completedAt: NOW - 400_000 + index * 100_000, head_sha: null,
         artifact: { phase: 'executing', prepared: { checkout_head: HEAD }, resource_root: '/private/work' },
         resources_settled_at: new Date(NOW - 100_000).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
@@ -147,17 +150,25 @@ function operations(db: Database.Database, journal: BehaviorChainJournal, overri
 const posts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1] === 'repos/acme/repo/issues')
 const reports = (db: Database.Database) => db.prepare("SELECT value FROM meta WHERE key LIKE 'behavior_chain_repair_report:%'").all() as { value: string }[]
 
-it.each([false, true])('reports a pre-existing hold and verifies ordinary admission, with diagnostic omissions=%s', async modern => {
+it.each(['legacy', 'diagnostic omissions', 'execution budget'])('reports a pre-existing %s hold and verifies ordinary admission', async mode => {
   const { db, journal } = setup()
-  const errors = modern ? [1, 2, 3].map(n => `${LEGACY}: missing_root_comment_ids=[${Array.from({ length: n }, (_, i) => n * 10 + i).join(', ')}]; missing_count=${n}; required_count=6`) : undefined
-  const source = exhausted(journal, errors)
+  const budget = mode === 'execution budget'
+  const errors = budget ? BUDGET_ERRORS : mode === 'diagnostic omissions' ? [1, 2, 3].map(n => `${LEGACY}: missing_root_comment_ids=[${Array.from({ length: n }, (_, i) => n * 10 + i).join(', ')}]; missing_count=${n}; required_count=6`) : undefined
+  const source = exhausted(journal, errors, 7, 21, budget ? BUDGET_CODE : 'atomic_work_failed')
   const runtime = new BehaviorChainRuntime(journal, operations(db, journal))
   await runtime.run()
   expect(posts()).toHaveLength(1)
   expect(remote[0].labels).toEqual([{ name: 'poise' }])
-  expect(remote[0].body).toContain('Stage: repair-pr. Cause: repair_incomplete_replies.')
+  const cause = budget ? 'repair_execution_budget_exhausted' : 'repair_incomplete_replies'
+  expect(remote[0].body).toContain(`Stage: repair-pr. Cause: ${cause}.`)
+  expect(remote[0].body).toContain(`<!-- poise-repair-exhaustion:${chainBasis([cause, source.id, 21])} -->`)
+  if (budget) {
+    expect(remote[0].title).toContain('execution budget')
+    expect(remote[0].body).toContain(BUDGET_CODE)
+    expect(remote[0].body).toContain('Next action: inspect the repair execution budget and source receipts')
+  }
   expect(remote[0].body).toContain(`hold event ${source.sequence}`)
-  expect(remote[0].body).toContain('Caller ' + chainBasis([source.id, 1]).slice(0, 32))
+  expect(remote[0].body).toContain('Caller ' + source.invocations[1].callId)
   expect(remote[0].body).not.toMatch(/missing_root_comment_ids|\/private\/work/)
   expect(journal.read(source.id)).toMatchObject({ held: source.held, resumedAfterSequence: 0,
     waiting: expect.stringContaining('admission pending normal datastore intake') })
@@ -175,6 +186,22 @@ it.each([false, true])('reports a pre-existing hold and verifies ordinary admiss
   expect(posts()).toHaveLength(1)
   expect(mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][0] === 'auth')
     .every(call => call[1].includes('author'))).toBe(true)
+})
+
+it.each(['mixed causes', 'generic failure', 'uncertain receipt', 'pending resources', 'publication', 'only two'])('does not report unverified execution exhaustion: %s', async change => {
+  const { db, journal } = setup()
+  const chain = structuredClone(exhausted(journal, BUDGET_ERRORS, 7, 21, BUDGET_CODE))
+  chain.observation = observation()
+  const attempt = chain.invocations[1]
+  if (change === 'mixed causes') Object.assign(attempt.evidence!, { error_code: 'atomic_work_failed', error: LEGACY })
+  if (change === 'generic failure') attempt.evidence!.error_code = 'atomic_work_failed'
+  if (change === 'uncertain receipt') attempt.state = 'uncertain'
+  if (change === 'pending resources') attempt.evidence!.resource_ownership = { version: 1, roots: [], errors: [], process_pending: true }
+  if (change === 'publication') attempt.evidence!.action = 'completed'
+  if (change === 'only two') chain.invocations.pop()
+  await operations(db, journal).reportHold!(chain)
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
 })
 
 it.each(['different cause', 'missing receipt', 'unreleased resources', 'possible publication', 'unsettled', 'other basis', 'other slot', 'resumed', 'changed head', 'changed finding', 'closed', 'no hold', 'unknown basis'])('does not report unverified exhaustion: %s', async change => {
@@ -277,26 +304,57 @@ it('never repeats an ambiguous POST across empty searches, restart or a closed m
     .every(call => call[1].some((arg: string) => arg.includes('is:issue')) && !call[1].join(' ').includes('is:open'))).toBe(true)
 })
 
-it('suppresses recursion from a generated remediation seed while preserving its different repair hold', async () => {
+it.each([false, true])('suppresses a generated remediation marker with the opposite repair cause (budget=%s)', async budget => {
   const { db, journal } = setup()
-  const chain = exhausted(journal)
-  seedBody = `Remediation\n<!-- poise-repair-exhaustion:${'e'.repeat(64)} -->`
+  const chain = exhausted(journal, budget ? BUDGET_ERRORS : undefined, 7, 21, budget ? BUDGET_CODE : 'atomic_work_failed')
+  const sourceCause = budget ? 'repair_incomplete_replies' : 'repair_execution_budget_exhausted'
+  seedBody = `Remediation\n<!-- poise-repair-exhaustion:${chainBasis([sourceCause, 'acme/repo#6', 20])} -->`
   await new BehaviorChainRuntime(journal, operations(db, journal)).run()
   expect(journal.read(chain.id)).toMatchObject({ held: chain.held, waiting: expect.stringContaining('suppressed for a generated remediation issue') })
   expect(posts()).toHaveLength(0)
   expect(reports(db)).toHaveLength(0)
 })
 
-it('retains the recursion boundary when a generated issue body is edited', async () => {
+it.each([false, true])('retains cross-cause recursion suppression when a generated issue body is edited (budget=%s)', async budget => {
   const { db, journal } = setup()
-  exhausted(journal)
+  exhausted(journal, budget ? undefined : BUDGET_ERRORS, 7, 21, budget ? 'atomic_work_failed' : BUDGET_CODE)
   await new BehaviorChainRuntime(journal, operations(db, journal)).run()
   expect(posts()).toHaveLength(1)
-  const remediation = exhausted(journal, undefined, 99, 22)
+  const remediation = exhausted(journal, budget ? BUDGET_ERRORS : undefined, 99, 22, budget ? BUDGET_CODE : 'atomic_work_failed')
   remote[0].body = 'An edited remediation description without the original marker'
   await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async chain => observation(chain.issue === 99 ? 22 : 21) })).run()
   expect(journal.read(remediation.id)).toMatchObject({ held: remediation.held,
     waiting: expect.stringContaining('suppressed for a generated remediation issue') })
+  expect(posts()).toHaveLength(1)
+})
+
+it('retains an old incomplete-reply intent and uses a distinct budget intent for the same target after Resume', async () => {
+  const { db, journal } = setup()
+  const chain = exhausted(journal)
+  const key = chainBasis(['repair_incomplete_replies', chain.id, 21])
+  const storageKey = 'behavior_chain_repair_report:' + key
+  const legacyIntent = JSON.stringify({ key, source: chain.id, pull: 21, holdSequence: chain.sequence, heldAt: NOW - 60_000,
+    head: HEAD, basis: chain.invocations[0].basis, slot: 'primary',
+    attempts: chain.invocations.map(invocation => ({ invocation: invocation.id, call: invocation.callId, completedAt: invocation.evidence!.completedAt })),
+    issueNumber: 44 })
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run(storageKey, legacyIntent)
+  remote = [issue(44, `<!-- poise-repair-exhaustion:${key} -->`)]
+  remote[0].labels = [{ name: 'poise' }]
+  journal.rebuild()
+  const runtime = new BehaviorChainRuntime(journal, operations(db, journal))
+  await runtime.run()
+  expect(posts()).toHaveLength(0)
+  expect(journal.read(chain.id)?.waiting).toContain('/issues/44')
+  record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  const budget = exhausted(journal, BUDGET_ERRORS, 7, 21, BUDGET_CODE)
+  await runtime.run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[1].body).toContain(`<!-- poise-repair-exhaustion:${chainBasis(['repair_execution_budget_exhausted', chain.id, 21])} -->`)
+  expect(reports(db)).toHaveLength(2)
+  expect(db.prepare('SELECT value FROM meta WHERE key = ?').get(storageKey)).toEqual({ value: legacyIntent })
+  expect(journal.read(chain.id)?.held).toBe(budget.held)
+  vi.setSystemTime(Date.now() + 86_400_000)
+  await runtime.run()
   expect(posts()).toHaveLength(1)
 })
 
