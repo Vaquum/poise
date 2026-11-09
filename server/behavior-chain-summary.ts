@@ -40,6 +40,7 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
           ...(progress ? { resolutionProgress: progress } : {}),
         },
         evidence: invocation.evidence ? { action: invocation.evidence.action, outcome: invocation.evidence.outcome,
+          ...(invocation.evidence.publicationPlan ? { publicationPlan: invocation.evidence.publicationPlan } : {}),
           review_id: invocation.evidence.review_id, head_sha: invocation.evidence.head_sha,
           resources_settled_at: invocation.evidence.resources_settled_at, error: invocation.evidence.error,
           diagnostic: invocation.evidence.diagnostic } : null,

@@ -8,6 +8,13 @@ const CUTOVER_ID = '@behavior-admission'
 interface CutoverEvent { type: 'admission.changed', state: BehaviorCutoverState }
 
 export type ChainBehavior = 'review-issue' | 'implement-issue' | 'publish-issue' | 'review-pr' | 'repair-pr' | 'approve-pr' | 'resolve-threads' | 'merge-pr' | 'rerun-grey-ci'
+export interface PublicationPlanCondition {
+  code: 'original_publication_plan_missing'
+  callId: string
+  planSha: string
+  missingAt: number
+  recoveredAt: number | null
+}
 export interface ChainInvocation {
   id: string
   behavior: ChainBehavior
@@ -26,7 +33,7 @@ export interface ChainInvocation {
   state: 'admitted' | 'started' | 'uncertain' | 'settled'
   callId: string | null
   outcome: string | null
-  evidence: Record<string, unknown> | null
+  evidence: (Record<string, unknown> & { publicationPlan?: PublicationPlanCondition }) | null
 }
 export interface BehaviorChain {
   id: string
