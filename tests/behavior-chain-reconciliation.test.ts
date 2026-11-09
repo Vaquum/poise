@@ -99,6 +99,19 @@ it('retains the redacted observation cause and rechecks without launching work',
   } finally { vi.unstubAllEnvs() }
 })
 
+it('prefers an access failure over an earlier transient observation failure in the same sweep', async () => {
+  const { journal } = setup()
+  seed(journal)
+  seed(journal, 'acme/repo', 8)
+  const transient = new Error('Command failed (1): github-interface: error: GitHub 500: Internal Server Error')
+  const access = new Error('Command failed (1): github-interface: error: GitHub 403: Resource not accessible')
+  const observe = vi.fn().mockRejectedValueOnce(transient).mockRejectedValueOnce(access)
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe }))
+  await expect(runtime.run()).rejects.toThrow(
+    'behavior observation failed for acme/repo#8: Command failed (1): github-interface: error: GitHub 403: Resource not accessible')
+  expect(observe).toHaveBeenCalledTimes(2)
+})
+
 it('reconciles live work on every pass despite 250 quiescent merged chains and one failing observation', async () => {
   const { db, journal } = setup()
   db.transaction(() => {
