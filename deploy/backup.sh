@@ -28,15 +28,22 @@ for volume in $(docker volume ls --quiet --filter name=poise-home-); do
 done
 
 # SQLite's locks reach every container on this host except one that runs under
-# another kernel, such as gVisor's.
-containers=$(docker ps --quiet --filter label=poise.managed=true) \
-  || die "cannot inventory running workspaces; refusing to open live databases for backup."
-for container in $containers; do
-  read -r name runtime < <(docker inspect --format '{{.Name}} {{.HostConfig.Runtime}}' "$container")
-  if [ "$runtime" != runc ]; then
-    die "${name#/} runs under $runtime; opening its live SQLite databases across kernels can disrupt writers. Refusing backup. Quiesce native work and stop the workspace before backing up."
-  fi
-done
+# another kernel, such as gVisor's. The gateway can start a stopped workspace
+# after this check but before its volume is archived, so re-verify before
+# opening each volume instead of relying on a single up-front inventory.
+refuse_foreign_runtime() {
+  local containers container name runtime
+  containers=$(docker ps --quiet --filter label=poise.managed=true) \
+    || die "cannot inventory running workspaces; refusing to open live databases for backup."
+  for container in $containers; do
+    read -r name runtime < <(docker inspect --format '{{.Name}} {{.HostConfig.Runtime}}' "$container")
+    if [ "$runtime" != runc ]; then
+      die "${name#/} runs under $runtime; opening its live SQLite databases across kernels can disrupt writers. Refusing backup. Quiesce native work and stop the workspace before backing up."
+    fi
+  done
+}
+
+refuse_foreign_runtime
 
 umask 077
 parent=${1:-$deploy/backups}
@@ -48,6 +55,7 @@ trap 'if [ "$finished" = false ]; then rm -rf "$backup"; warn "the backup failed
 
 for volume in "${volumes[@]}"; do
   say "Backing up $volume."
+  refuse_foreign_runtime
   docker run --rm --network none --no-healthcheck --user 0:0 \
     --mount "type=volume,source=$volume,target=/volume" \
     --mount "type=bind,source=$backup,target=/backup" \
