@@ -205,7 +205,7 @@ export class BehaviorChainRuntime {
           if (owned && !call && closedChainTarget(chain, chain.observation as ChainObservation | null, owned.behavior)
             && !released) {
             try { await this.closeRecovery(chain, owned, chain.observation as ChainObservation | null, snapshot) }
-            catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError ??= error }
+            catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError = preferObservationError(observationError, error) }
             continue
           }
           if (chain.mergeSha && owned && !released) continue
@@ -230,7 +230,7 @@ export class BehaviorChainRuntime {
           const pendingInvocation = chain.invocations.find((invocation) => invocation.state !== 'settled')
           if (pendingInvocation) {
             try { await this.recover(chain, pendingInvocation, observation, snapshot) }
-            catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError ??= error }
+            catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError = preferObservationError(observationError, error) }
             continue
           }
           const mergeEvidence = observation.pull?.merged ? {

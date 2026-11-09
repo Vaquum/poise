@@ -112,6 +112,24 @@ it('prefers an access failure over an earlier transient observation failure in t
   expect(observe).toHaveBeenCalledTimes(2)
 })
 
+it('prefers a closed-target fence failure over an earlier transient observation failure', async () => {
+  const { journal } = setup()
+  seed(journal)
+  let fenced = seed(journal, 'acme/repo', 8)
+  fenced = record(journal, fenced, { type: 'invocation.admitted', invocation: { id: 'fence-1', behavior: 'repair-pr',
+    basis: 'basis', actor: 'author', model: 'fixture', slot: 'primary', admittedAt: NOW - 60_000,
+    request: { command: 'agent-interface', cwd: '/isolated', argv: ['--atomic-work', 'acme/repo#8', '--model', 'fixture'] } } })
+  record(journal, fenced, { type: 'invocation.started', invocationId: 'fence-1' })
+  const transient = new Error('Command failed (1): github-interface: error: GitHub 500: Internal Server Error')
+  const observe = vi.fn(async (chain: BehaviorChain) => {
+    if (chain.id === 'acme/repo#7') throw transient
+    return observation(true)
+  })
+  const fenceClosedTarget = vi.fn(async () => { throw new Error('native receipt store unavailable') })
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe, fenceClosedTarget }))
+  await expect(runtime.run()).rejects.toThrow('native receipt store unavailable')
+})
+
 it('reconciles live work on every pass despite 250 quiescent merged chains and one failing observation', async () => {
   const { db, journal } = setup()
   db.transaction(() => {
