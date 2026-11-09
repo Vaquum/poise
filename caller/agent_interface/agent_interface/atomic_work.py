@@ -16,6 +16,30 @@ class AtomicWorkBlocked(ValueError):
     code = "atomic_work_blocked"
 
 
+def _ci_only_blocker(ci: object) -> object:
+    # Durable CI-only evidence is the packet identity plus the failed
+    # check/job IDs that pin the original run attempt. Full check summaries
+    # can exceed the 128 KiB receipt limit and would turn an explicit CI-only
+    # blocker into an unrecoverable failure.
+    if not isinstance(ci, dict):
+        return ci
+    failing = ci.get("failing")
+    compact: list[object] = []
+    if isinstance(failing, list):
+        for entry in failing:
+            if isinstance(entry, dict):
+                compact.append({key: entry[key] for key in
+                                ("type", "name", "state", "conclusion", "check_run_id", "log_id", "url")
+                                if key in entry})
+    return {
+        "action": ci.get("action"),
+        "repository": ci.get("repository"),
+        "pull_number": ci.get("pull_number"),
+        "head_sha": ci.get("head_sha"),
+        "failing": compact,
+    }
+
+
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
         call_id: str, record: Callable[[dict], None], pull: int | None = None,
         expected_head: str | None = None, note: str = "", merge_base: bool = False, expected_issue_revision: str | None = None) -> dict:
@@ -109,7 +133,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                 blocked = publication["blocked"]
                 if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
                         and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
-                    record({"phase": "executing", "prepared": prepared, "ci_blocker": evidence["ci"]})
+                    record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})
                     blocked = blocked["reason"]
                 raise AtomicWorkBlocked(f"atomic behavior blocked: {blocked}")
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
