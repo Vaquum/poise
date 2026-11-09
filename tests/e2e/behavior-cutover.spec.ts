@@ -61,14 +61,22 @@ for (const width of [390, 1280]) {
     await entries.first().getByRole('link', { name: 'Journal evidence' }).click()
     await expect.poll(() => journalAfters.at(-1)).toBe(expectedAfter)
     await expect(controls.getByRole('region', { name: 'Chain journal' })).toContainText('incomplete review replies')
+    // data-chain-more carries hidden while empty, so query by attribute: the
+    // role query cannot see it until it is shown.
+    const moreChains = controls.locator('[data-chain-more]')
     const refreshed = page.waitForResponse(response => response.url().includes('/api/behavior-chains') && !response.url().includes('id='))
     await controls.getByRole('button', { name: 'Refresh chains' }).click()
     await refreshed
+    // Refresh renders after the response arrives; More chains re-enables in the
+    // same finally block that releases the reading guard, so this proves the
+    // refresh completed instead of passing on pre-refresh DOM.
+    await expect(moreChains).toBeEnabled()
     await expect(entries.first()).toContainText('No verified advance for 2d 23h')
     unavailable = true
     const unavailableRefresh = page.waitForResponse(response => response.url().includes('/api/behavior-chains') && !response.url().includes('id='))
     await controls.getByRole('button', { name: 'Refresh chains' }).click()
     await unavailableRefresh
+    await expect(moreChains).toBeEnabled()
     await expect(attention).toContainText('Attention evidence unavailable; any retained entries are stale')
     expect(writes).toEqual([])
   })
