@@ -1,6 +1,10 @@
-import { expect, it, vi } from 'vitest'
+import Database from 'better-sqlite3'
+import { afterEach, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { LogEntry } from '../server/agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
 import type { Organization } from '../server/organizations'
@@ -14,12 +18,58 @@ vi.mock('../server/settings', () => ({ getSettings: () => ({ me: 'author', agent
 vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ login: 'example' }), organizationArgs: vi.fn() }))
 const { nativeChainOperations } = await import('../server/behavior-chain-native')
 const { decideBehaviorChain } = await import('../server/behavior-chain-decision')
+const { CallerReceiptStoreError } = await import('../server/service/caller-calls')
+const { spawnDetached } = await import('../server/process')
+
+let directory = ''
+afterEach(() => {
+  vi.unstubAllEnvs()
+  if (directory) rmSync(directory, { recursive: true, force: true })
+  directory = ''
+})
 
 const HEAD = 'a'.repeat(40)
 const chain: BehaviorChain = { id: 'example/repo#7', repository: 'example/repo', issue: 7, branch: 'poise/issue-7',
   author: 'author', reviewer: 'reviewer', sequence: 1, held: null, waiting: null, resumedAfterSequence: 0,
   mergeSha: null, observation: null, invocations: [] }
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+
+it('refuses managed admission and effects on unreadable receipts, including failure during preparation, and rechecks existing controls after recovery', async () => {
+  directory = mkdtempSync(join(tmpdir(), 'poise-native-receipts-'))
+  vi.stubEnv('AGENT_INTERFACE_DATA_DIR', directory)
+  const path = join(directory, 'calls.sqlite3')
+  const corrupt = () => writeFileSync(path, 'not a database')
+  const restore = () => {
+    rmSync(path)
+    const db = new Database(path)
+    db.exec('create table calls (status text, pid integer, runner text, source text, resources_settled_at real, resource_cleanup text)')
+    expect(db.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }])
+    db.close()
+  }
+  corrupt()
+  const permitted = vi.fn(() => true)
+  const prepare = vi.fn(async () => ({}))
+  const operations = actionOperations({ permitted, prepare })
+  const invocation = mergeInvocation()
+  const decision = { kind: 'invoke', behavior: 'merge-pr', actor: 'reviewer', basis: 'merge', reviewer: null, reason: 'ready' } as const
+  expect(() => operations.permitted(chain, decision)).toThrow(CallerReceiptStoreError)
+  await expect(operations.launch(invocation, () => {}, () => true)).rejects.toMatchObject({ kind: 'integrity', code: 'SQLITE_NOTADB' })
+  await expect(operations.perform(invocation, chain)).rejects.toBeInstanceOf(CallerReceiptStoreError)
+  await expect(operations.resumePublication(invocation, HEAD, 'continuation')).rejects.toBeInstanceOf(CallerReceiptStoreError)
+  expect(prepare).not.toHaveBeenCalled()
+  expect(mocks.runFile).not.toHaveBeenCalled()
+  expect(spawnDetached).not.toHaveBeenCalled()
+  restore()
+  expect(operations.permitted(chain, decision)).toBe(true)
+  prepare.mockImplementation(async () => { corrupt(); return {} })
+  await expect(operations.launch(invocation, () => {}, () => true)).rejects.toBeInstanceOf(CallerReceiptStoreError)
+  expect(spawnDetached).not.toHaveBeenCalled()
+  restore()
+  permitted.mockReturnValue(false)
+  expect(operations.permitted(chain, decision)).toBe(false)
+  permitted.mockReturnValue(true)
+  expect(operations.permitted(chain, decision)).toBe(true)
+})
 
 it.each([false, true])('verifies Caller Python request encoding and original response bytes (bounded=%s)', async bounded => {
   const invocation = mergeInvocation()

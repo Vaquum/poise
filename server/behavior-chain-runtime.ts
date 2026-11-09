@@ -163,7 +163,17 @@ export class BehaviorChainRuntime {
           const resume = invocation.evidence?.publicationResume as { correlation?: unknown } | undefined
           return [invocation.id, ...(typeof resume?.correlation === 'string' ? [resume.correlation] : [])]
         })
-        const snapshot = pending.length ? await this.operations.readInvocations(correlations) : { entries: [], quarantined: [] }
+        let snapshot: AgentLogSnapshot
+        try { snapshot = pending.length ? await this.operations.readInvocations(correlations) : { entries: [], quarantined: [] } }
+        catch (error) {
+          for (let chain of page) {
+            for (const invocation of chain.invocations.filter(invocation => invocation.state === 'started')) {
+              chain = this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
+                reason: 'native receipt store is unreadable; original action and resource evidence must be reconciled' })
+            }
+          }
+          throw error
+        }
         for (let chain of page) {
           if (Date.now() - began > 45_000) break
           this[cursorKey] = chain.id
@@ -360,7 +370,12 @@ export class BehaviorChainRuntime {
         reason: 'native call evidence is quarantined; absence cannot authorize another effect' })
     }
     const calls = snapshot.entries.filter((call) => call.correlation_id === invocation.id)
-    if (!calls.length) return chain
+    if (!calls.length) {
+      // A partial restore can lose the UNIQUE correlation row. Absence after
+      // launch cannot authorize either a retry or a synthetic no-effect fence.
+      return invocation.state !== 'started' ? chain : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
+        reason: 'native invocation is without a durable Call receipt; original action and resource evidence must be reconciled' })
+    }
     if (calls.length !== 1) return invocation.state === 'uncertain' ? chain : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
       reason: 'multiple native calls claim one admitted invocation' })
     const call = calls[0]
@@ -671,15 +686,6 @@ export class BehaviorChainRuntime {
         reason: 'native process exited without a durable Call receipt; its exit evidence must be reconciled before another effect' })
       return
     }
-    // Caller has a UNIQUE correlation index, reserved by track() before any
-    // checkout/provider/write. Resuming this SAME native identity cannot start
-    // a second behavior even if the first CLI is still preparing to track it.
     if (invocation.state === 'admitted') await this.start(chain, invocation)
-    else {
-      this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id, evidence: { nativeCallAbsent: true, retryUsesSameCorrelation: true } })
-      const started = await this.operations.launch(this.nativeInvocation(chain, invocation), (result) => this.exited(chain, invocation, result), () => this.allowed(chain, invocation))
-      if (!started) this.append(this.current(chain), { type: 'invocation.reconciled', invocationId: invocation.id,
-        evidence: { repeatLaunchDeferred: true } })
-    }
   }
 }

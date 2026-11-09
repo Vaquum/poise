@@ -1281,8 +1281,9 @@ defines the cadence and timestamp units.
 
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
-started originals without a Call use the bounded native correlation-fence
-command before normal receipt reconciliation. Existing Calls and uncertain
+started originals without a Call remain uncertain without a retry or synthetic
+no-effect receipt, since partial recovery can lose the original unique correlation.
+Unreadable snapshots retain that hold in the existing journal. Existing Calls and uncertain
 resources are never released by closure alone. Merged-chain Hold/Resume writes
 return 409 and the GUI retains History and read-only reconciliation. No new
 endpoint, signal or journal event type is added; the Caller contract is in
@@ -1291,6 +1292,11 @@ Poise's existing log decoder validates the fence's exact terminal no-effect
 shape and native resource-release timestamp before the journal can settle its
 reservation. Closed-target native resource waits are separate from public
 GitHub recheck times; unrelated open-PR review/approval stays eligible.
+Managed native admissions recheck the bounded receipt reader at their final
+launch, action and publication boundaries. Its independent diagnostics retain
+the first typed SQLite cause and affected workspace; health keeps its existing
+unknown counters. Readability cannot clear missing original evidence. See
+[receipt-store recovery](Operating.md#caller-receipt-store-recovery).
 
 Native Caller receipts also carry append-only resource ownership outside
 publication artifacts. Normal cleanup acknowledges pinned directory identities;

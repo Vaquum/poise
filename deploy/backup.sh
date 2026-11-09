@@ -29,10 +29,12 @@ done
 
 # SQLite's locks reach every container on this host except one that runs under
 # another kernel, such as gVisor's.
-for container in $(docker ps --quiet --filter label=poise.managed=true); do
+containers=$(docker ps --quiet --filter label=poise.managed=true) \
+  || die "cannot inventory running workspaces; refusing to open live databases for backup."
+for container in $containers; do
   read -r name runtime < <(docker inspect --format '{{.Name}} {{.HostConfig.Runtime}}' "$container")
   if [ "$runtime" != runc ]; then
-    warn "${name#/} runs under $runtime, so its databases may be caught mid-write. For a copy that is certainly consistent, stop it on the admin page first."
+    die "${name#/} runs under $runtime; opening its live SQLite databases across kernels can disrupt writers. Refusing backup. Quiesce native work and stop the workspace before backing up."
   fi
 done
 
