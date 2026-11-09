@@ -609,6 +609,19 @@ describe('bounded behavior ledger transport', () => {
       expect.arrayContaining([expect.objectContaining({ reason: 'capture_loss' })]))
   })
 
+  it('defers the worker-failed diagnostic on the hot capture path', async () => {
+    // After an idle worker failure the next capture() must stay memory-only:
+    // logging may journal its own overflow with filesystem I/O, so the
+    // diagnostic stays deferred while no stop is in progress.
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
+    const observer = await fixture('throw new Error("fixture failed startup");')
+    diagnostic.mockClear()
+    expect(() => observer.capture(admission)).not.toThrow()
+    expect(diagnostic).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'worker_failed', count: 1 }) })))
+  })
+
   it('keeps a failed startup observational and health readable', async () => {
     const diagnostic = vi.spyOn(logging, 'diagnostic')
     const observer = await fixture('throw new Error("fixture failed startup");')
