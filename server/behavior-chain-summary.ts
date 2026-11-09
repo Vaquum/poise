@@ -129,11 +129,12 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                   : pull?.failing.length ? 'Repair the failing required checks'
                     : pull?.changesRequested ? 'Address current-head review findings'
                       : pull?.conflict || pull?.behind ? 'Repair the branch conflict or required base update'
-                        : pull?.pending && Number.isFinite(pull.headSince) && now - pull.headSince >= 30 * 60_000
-                          ? 'Diagnose the checks pending over 30 minutes through repair-pr'
-                          : pull?.pending ? 'Await exact-head CI completion'
-                            : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
-                            : chain.waiting || 'Await the next invocation under existing admission gates'
+                        : pull && (pull.unresolved ?? 0) > 0 && !pull.approved ? 'Address current-head review conversations through repair-pr'
+                          : pull?.pending && Number.isFinite(pull.headSince) && now - pull.headSince >= 30 * 60_000
+                            ? 'Diagnose the checks pending over 30 minutes through repair-pr'
+                            : pull?.pending ? 'Await exact-head CI completion'
+                              : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
+                                : chain.waiting || 'Await the next invocation under existing admission gates'
       let retryAt: number | null = null
       if (!chain.held && !chain.reviewPending && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`) {
         const attempts = chain.invocations.filter(invocation => invocation.behavior === last.behavior && invocation.basis === last.basis

@@ -61,10 +61,14 @@ for (const width of [390, 1280]) {
     await entries.first().getByRole('link', { name: 'Journal evidence' }).click()
     await expect.poll(() => journalAfters.at(-1)).toBe(expectedAfter)
     await expect(controls.getByRole('region', { name: 'Chain journal' })).toContainText('incomplete review replies')
+    const refreshed = page.waitForResponse(response => response.url().includes('/api/behavior-chains') && !response.url().includes('id='))
     await controls.getByRole('button', { name: 'Refresh chains' }).click()
+    await refreshed
     await expect(entries.first()).toContainText('No verified advance for 2d 23h')
     unavailable = true
+    const unavailableRefresh = page.waitForResponse(response => response.url().includes('/api/behavior-chains') && !response.url().includes('id='))
     await controls.getByRole('button', { name: 'Refresh chains' }).click()
+    await unavailableRefresh
     await expect(attention).toContainText('Attention evidence unavailable; any retained entries are stale')
     expect(writes).toEqual([])
   })
