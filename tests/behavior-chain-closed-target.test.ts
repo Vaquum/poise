@@ -36,7 +36,7 @@ function setup(behavior: ChainBehavior | null = 'repair-pr', started = false) {
     branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' })
   if (behavior) chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original', behavior,
     actor: ['implement-issue', 'repair-pr'].includes(behavior) ? 'author' : 'reviewer', model: 'fixture', slot: 'primary',
-    basis: 'original', admittedAt: NOW - 60_000,
+    basis: 'original', admittedAt: NOW - 60_000, reservation: { memoryBytes: 8, diskBytes: 16 },
     request: { command: 'agent-interface', cwd: '/isolated', argv: ['--atomic-work', 'aaa/repo#7', '--model', 'fixture'] } } })
   if (started) chain = record(journal, chain, { type: 'invocation.started', invocationId: 'original' })
   const calls: LogEntry[] = []
@@ -78,22 +78,22 @@ it.each(['repair-pr', 'review-pr', 'approve-pr', 'review-issue', 'implement-issu
     expect(fenceClosedTarget).not.toHaveBeenCalled()
   })
 
-it.each(['merged', 'closed', 'issue-closed'] as const)('fences a started original after %s without a worker relaunch', async kind => {
+it.each(['merged', 'closed', 'issue-closed'] as const)('holds a started original missing from readable receipts after %s without a retry or no-effect fence', async kind => {
   const { db, journal, chain, operations, forbidden, fenceClosedTarget } = setup(kind === 'issue-closed' ? 'review-issue' : 'repair-pr', true)
   operations.observe = vi.fn(async () => observed(kind))
   const runtime = new BehaviorChainRuntime(journal, operations)
   await runtime.run()
-  expect(fenceClosedTarget).toHaveBeenCalledTimes(1)
-  expect(journal.read(chain.id)?.invocations[0]).toMatchObject({ state: 'settled', outcome: 'target_closed',
-    evidence: { resources_settled_at: new Date().toISOString() } })
-  expect(journal.liveModelInvocationCount()).toBe(0)
-  expect(journal.reservedResources().unaccounted).toBe(0)
+  expect(fenceClosedTarget).not.toHaveBeenCalled()
+  expect(journal.read(chain.id)?.invocations[0]).toMatchObject({ state: 'uncertain', callId: null,
+    outcome: expect.stringContaining('without a durable Call receipt') })
+  expect(journal.liveModelInvocationCount()).toBe(1)
+  expect(journal.reservedResources()).toEqual({ memoryBytes: 8, diskBytes: 16, unaccounted: 0 })
   const before = journal.history(chain.id)
   const reopened = new BehaviorChainJournal(db)
   reopened.rebuild()
   expect(journal.history(chain.id)).toEqual(before)
   await new BehaviorChainRuntime(reopened, operations).run()
-  expect(fenceClosedTarget).toHaveBeenCalledTimes(1)
+  expect(fenceClosedTarget).not.toHaveBeenCalled()
   expect(forbidden).not.toHaveBeenCalled()
 })
 
@@ -103,13 +103,13 @@ it('honors a durable merge even when a later observation has no PR', async () =>
   current = record(journal, current, { type: 'chain.merged', mergeSha: MERGE,
     evidence: { repository: chain.repository, pull_number: 17, merged: true, merge_sha: MERGE, review_complete: false } })
   await new BehaviorChainRuntime(journal, operations).run()
-  expect(fenceClosedTarget).toHaveBeenCalledTimes(1)
-  expect(journal.read(chain.id)?.invocations[0].state).toBe('settled')
+  expect(fenceClosedTarget).not.toHaveBeenCalled()
+  expect(journal.read(chain.id)?.invocations[0].state).toBe('uncertain')
   expect(operations.observe).not.toHaveBeenCalled()
   expect(forbidden).not.toHaveBeenCalled()
 })
 
-it('admits unrelated work in the same pass after fencing the closed original at capacity one', async () => {
+it('keeps capacity reserved for a closed original whose receipt is missing', async () => {
   const { journal, operations, fenceClosedTarget } = setup('repair-pr', true)
   const other = journal.append('zzz/repo#8', 'other-seed', 0, { type: 'chain.admitted', repository: 'zzz/repo', issue: 8,
     branch: 'poise/issue-8', author: 'author', reviewer: 'reviewer' })
@@ -121,9 +121,9 @@ it('admits unrelated work in the same pass after fencing the closed original at 
   operations.request = vi.fn(async () => ({ command: 'agent-interface' as const, cwd: '/isolated', argv: ['--issue-review', 'zzz/repo#8', '--model', 'fixture'] }))
   operations.launch = vi.fn(async (_invocation, _exit, allowed) => allowed())
   await new BehaviorChainRuntime(journal, operations).run()
-  expect(fenceClosedTarget).toHaveBeenCalledTimes(1)
-  expect(journal.read(other.id)?.invocations[0]).toMatchObject({ behavior: 'review-issue', state: 'started' })
-  expect(operations.launch).toHaveBeenCalledTimes(1)
+  expect(fenceClosedTarget).not.toHaveBeenCalled()
+  expect(journal.read(other.id)?.invocations).toEqual([])
+  expect(operations.launch).not.toHaveBeenCalled()
   expect(journal.liveModelInvocationCount()).toBe(1)
 })
 
@@ -174,23 +174,23 @@ it('keeps a running original and uncertain resource ownership until native settl
   expect(forbidden).not.toHaveBeenCalled()
 })
 
-it('retains and reports a failed fence without repeated commands/events, while unrelated observations continue', async () => {
-  const { journal, operations, fenceClosedTarget } = setup('repair-pr', true)
-  const other = journal.append('zzz/repo#8', 'other-seed', 0, { type: 'chain.admitted', repository: 'zzz/repo', issue: 8,
-    branch: 'poise/issue-8', author: 'author', reviewer: 'reviewer' })
-  operations.observe = vi.fn(async () => observed())
-  fenceClosedTarget.mockRejectedValue(new Error('native receipt store unavailable'))
+it('journals the recovery hold before a partial restore is readable, including held and disabled work', async () => {
+  const { db, journal, chain, operations, forbidden, fenceClosedTarget } = setup('repair-pr', true)
+  record(journal, chain, { type: 'chain.held', reason: 'person hold' })
+  operations.enabled = () => false
+  operations.readInvocations = vi.fn(async () => { throw new Error('native receipt store unavailable') })
   const runtime = new BehaviorChainRuntime(journal, operations)
   await expect(runtime.run()).rejects.toThrow('native receipt store unavailable')
-  const before = journal.history('aaa/repo#7')
-  await expect(new BehaviorChainRuntime(journal, operations).run()).rejects.toThrow('native receipt store unavailable')
-  expect(fenceClosedTarget).toHaveBeenCalledTimes(1)
-  expect(journal.history('aaa/repo#7')).toEqual(before)
-  expect(operations.observe).toHaveBeenCalledWith(expect.objectContaining({ id: other.id }))
+  expect(journal.read(chain.id)).toMatchObject({ held: 'person hold', invocations: [{ state: 'uncertain', callId: null }] })
+  const reopened = new BehaviorChainJournal(db)
+  reopened.rebuild()
+  operations.readInvocations = async () => ({ entries: [], quarantined: [] })
+  await new BehaviorChainRuntime(reopened, operations).run()
+  expect(journal.read(chain.id)).toMatchObject({ held: 'person hold', invocations: [{ state: 'uncertain', callId: null }] })
+  expect(fenceClosedTarget).not.toHaveBeenCalled()
+  expect(forbidden).not.toHaveBeenCalled()
   expect(journal.liveModelInvocationCount()).toBe(1)
-  vi.setSystemTime(NOW + 120_000)
-  await expect(runtime.run()).rejects.toThrow('native receipt store unavailable')
-  expect(fenceClosedTarget).toHaveBeenCalledTimes(2)
+  expect(journal.reservedResources()).toEqual({ memoryBytes: 8, diskBytes: 16, unaccounted: 0 })
 })
 
 it.each([false, true])('retains native-exit uncertainty without closure as release proof, with quarantine: %s', async quarantined => {
@@ -248,16 +248,13 @@ it('rechecks canonical closure at the late launch boundary without accepting a w
   expect(fenceClosedTarget).not.toHaveBeenCalled()
 })
 
-it('adopts the original native fence after a lost acknowledgement without repeating it or starting a worker', async () => {
+it('adopts an already-recorded native fence without repeating it or starting a worker', async () => {
   const { journal, chain, operations, fenceClosedTarget, forbidden } = setup('repair-pr', true)
-  const fence = fenceClosedTarget.getMockImplementation()!
-  fenceClosedTarget.mockImplementation(async (chain, invocation) => { await fence(chain, invocation); throw new Error('fence acknowledgement lost') })
-  const runtime = new BehaviorChainRuntime(journal, operations)
-  await expect(runtime.run()).rejects.toThrow('fence acknowledgement lost')
-  expect(journal.liveModelInvocationCount()).toBe(1)
+  await fenceClosedTarget(chain, chain.invocations[0])
+  fenceClosedTarget.mockClear()
   await new BehaviorChainRuntime(journal, operations).run()
   expect(journal.read(chain.id)?.invocations[0]).toMatchObject({ state: 'settled', outcome: 'target_closed' })
   expect(journal.liveModelInvocationCount()).toBe(0)
-  expect(fenceClosedTarget).toHaveBeenCalledTimes(1)
+  expect(fenceClosedTarget).not.toHaveBeenCalled()
   expect(forbidden).not.toHaveBeenCalled()
 })

@@ -976,7 +976,11 @@ volume and containers without workspace labels. A stopped gVisor workspace also
 requires the gateway to be stopped: **Stop** on the admin page is insufficient,
 because the next authenticated request can start the workspace again. A gateway
 configured to create workspaces under another runtime must be stopped even when
-the current workspace containers use `runc`.
+the current workspace containers use `runc`. Quiesce native work through the
+existing drain and settlement gates before stopping such a workspace for backup.
+Never query its live SQLite files from the host or another kernel, including
+with `mode=ro` and `PRAGMA query_only=on`: those reads can change shared WAL
+state and disrupt a writer. Use the workspace kernel or a preserved offline copy.
 
 For an offline backup, stop the gateway first, then every affected workspace
 container (the error names it). For example, for `alice`:
@@ -996,6 +1000,47 @@ inventory before and after each volume. A failed inventory or safety check
 removes the entire new backup directory, including
 archives already completed. Live `runc` volumes still support the nightly command
 above without stopping the gateway.
+
+### Caller receipt-store recovery
+
+`caller.receipts.integrity` diagnostics retain the first observed SQLite cause,
+time and workspace independently of Caller's damaged store. `SQLITE_NOTADB`
+and `SQLITE_CORRUPT` are integrity failures; busy/locked reads are contention,
+and other read failures remain unavailable. Health keeps `idle: false` and
+`unsettledNativeCalls: null` while unreadable. Managed chain admission and its
+final launch/action/publication boundaries refuse unavailable receipts.
+A successful health response or SQL read does not prove recovery completeness.
+
+1. Preserve the original main file, WAL (including deleted files held open by
+   original processes), shared-memory state, behavior journal and process/resource
+   identities before changing writers or storage. Use the workspace kernel for
+   live observations. A release restart leaves original workers alive; a zero
+   process-local count cannot establish quiescence.
+2. Retain the existing journal's `invocation.uncertain` holds for started work
+   whose receipts cannot be read or are absent. Check those holds before exposing
+   a partial recovery to normal reconciliation. Missing rows cannot authorize a
+   retry, a synthetic no-effect Call, or reservation release, even on a closed,
+   disabled or held chain. Never recreate missing receipt identities.
+3. Work on separate offline copies. Check SQLite integrity, foreign keys and the
+   unchanged application schema, then inventory missing and invalid receipts
+   against the preserved journal and actual GitHub effects. Structural integrity
+   alone cannot validate incomplete Call, publication or resource evidence.
+4. Quiesce original writers and verify their original namespace/resource witnesses
+   before any activation. Preserve settlement certificates before any lifecycle
+   change that destroys supervisor handles. Both Caller and Poise's bounded
+   health/maintenance reader pin the original database identity and reject a
+   replacement inode; verify recovery through both actual readers in the
+   workspace kernel. Do not bypass that identity check or destroy an unsettled
+   supervisor to make a replacement readable.
+5. Reconcile original Calls and GitHub artifacts through the existing receipt
+   checks. Missing or invalid evidence stays uncertain and retains capacity until
+   original resource release is proven. New work then passes the existing enable,
+   hold, identity, capacity and final receipt gates; readability alone clears no
+   invocation hold and authorizes no repeated effect.
+
+The #971 disposable reproduction established that cross-kernel read-only access
+can disrupt a guest writer. The exact production corruption transaction remains
+unverified; the backup refusal prevents the demonstrated unsafe access.
 
 ## Restore
 

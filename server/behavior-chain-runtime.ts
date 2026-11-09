@@ -7,6 +7,7 @@ import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, ty
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
+import { CallerReceiptStoreError } from './service/caller-calls'
 
 export interface ChainSeed { repository: string, number: number }
 export interface ChainRuntimeOperations {
@@ -164,7 +165,17 @@ export class BehaviorChainRuntime {
           const resume = invocation.evidence?.publicationResume as { correlation?: unknown } | undefined
           return [invocation.id, ...(typeof resume?.correlation === 'string' ? [resume.correlation] : [])]
         })
-        const snapshot = pending.length ? await this.operations.readInvocations(correlations) : { entries: [], quarantined: [] }
+        let snapshot: AgentLogSnapshot
+        try { snapshot = pending.length ? await this.operations.readInvocations(correlations) : { entries: [], quarantined: [] } }
+        catch (error) {
+          for (let chain of page) {
+            for (const invocation of chain.invocations.filter(invocation => invocation.state === 'started')) {
+              chain = this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
+                reason: 'native receipt store is unreadable; original action and resource evidence must be reconciled' })
+            }
+          }
+          throw error
+        }
         for (let chain of page) {
           if (Date.now() - began > 45_000) break
           this[cursorKey] = chain.id
@@ -374,7 +385,12 @@ export class BehaviorChainRuntime {
         reason: 'native call evidence is quarantined; absence cannot authorize another effect' })
     }
     const calls = snapshot.entries.filter((call) => call.correlation_id === invocation.id)
-    if (!calls.length) return chain
+    if (!calls.length) {
+      // A partial restore can lose the UNIQUE correlation row. Absence after
+      // launch cannot authorize either a retry or a synthetic no-effect fence.
+      return invocation.state !== 'started' ? chain : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
+        reason: 'native invocation is without a durable Call receipt; original action and resource evidence must be reconciled' })
+    }
     if (calls.length !== 1) return invocation.state === 'uncertain' ? chain : this.append(chain, { type: 'invocation.uncertain', invocationId: invocation.id,
       reason: 'multiple native calls claim one admitted invocation' })
     const call = calls[0]
@@ -527,6 +543,15 @@ export class BehaviorChainRuntime {
           outcome: String(evidence.outcome || evidence.action), evidence: { status: 'completed', ...evidence } })
         this.operations.wake()
       } catch (error) {
+        if (error instanceof CallerReceiptStoreError) {
+          // requireCallerReceipts throws before any CLI: no Call and no side
+          // effect. Settle as deferred so a fresh attempt can be admitted after
+          // recovery, then abort this run while receipts stay unreadable.
+          this.append(this.current(chain), { type: 'invocation.settled', invocationId: invocation.id, callId: null,
+            outcome: 'receipt_unavailable', evidence: { status: 'deferred', action: 'not_started',
+              outcome: 'receipt_unavailable', error: String(error), completedAt: Date.now() } })
+          throw error
+        }
         this.append(this.current(chain), { type: 'invocation.uncertain', invocationId: invocation.id, reason: String(error) })
       }
     }
@@ -645,6 +670,13 @@ export class BehaviorChainRuntime {
         await this.operations.resumePublication(current.invocations.find((item) => item.id === invocation.id)!, observation.publication.head_sha, correlation)
         this.operations.wake()
       } catch (error) {
+        if (error instanceof CallerReceiptStoreError) {
+          // No continuation Call was created. Clear the dangling correlation
+          // so recovery retries with a fresh one after readability returns.
+          this.append(this.current(chain), { type: 'invocation.reconciled', invocationId: invocation.id,
+            evidence: { publicationResume: null, publicationResumeError: String(error) } })
+          throw error
+        }
         this.append(this.current(chain), { type: 'invocation.reconciled', invocationId: invocation.id,
           evidence: { publicationResumeError: String(error) } })
       }
@@ -685,15 +717,6 @@ export class BehaviorChainRuntime {
         reason: 'native process exited without a durable Call receipt; its exit evidence must be reconciled before another effect' })
       return
     }
-    // Caller has a UNIQUE correlation index, reserved by track() before any
-    // checkout/provider/write. Resuming this SAME native identity cannot start
-    // a second behavior even if the first CLI is still preparing to track it.
     if (invocation.state === 'admitted') await this.start(chain, invocation)
-    else {
-      this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id, evidence: { nativeCallAbsent: true, retryUsesSameCorrelation: true } })
-      const started = await this.operations.launch(this.nativeInvocation(chain, invocation), (result) => this.exited(chain, invocation, result), () => this.allowed(chain, invocation))
-      if (!started) this.append(this.current(chain), { type: 'invocation.reconciled', invocationId: invocation.id,
-        evidence: { repeatLaunchDeferred: true } })
-    }
   }
 }
