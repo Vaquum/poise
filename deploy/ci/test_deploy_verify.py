@@ -400,6 +400,7 @@ class VerifyTest(LibTest):
         self.assertIn('symbolic link', result.stderr)
         self.assertEqual(self.calls(), [])
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'rollout records use Linux flock, as on the deployment host')
     def test_operator_scripts_capture_workspaces_before_build_can_remove_them(self):
         # Execute the real entrypoints. Building retags the image, which can
         # trigger even the old gateway before compose replaces that gateway.
@@ -632,6 +633,41 @@ class RolloutTest(LibTest):
         result = self.lib(f'read_rollout {path}; record_rollout complete "stale success" "$rollout_expected"')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.record(rollout), superseded)
+
+    def test_successful_restore_clears_rollout_store_so_next_deploy_starts_fresh(self):
+        alice = f'alice {IMAGE_ID} true /poise-ws-alice'
+        bob = f'bob {IMAGE_ID} false /poise-ws-bob'
+        result = self.start({'containers': [alice, bob], 'health': {}})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('bob', self.record(self.current())[3])
+        directory = os.path.join(self.work.name, 'restore')
+        os.mkdir(directory)
+        with open(os.path.join(directory, 'lib.sh'), 'w') as file:
+            file.write(f'. {shlex.quote(LIB)}\n'
+                       'workspace_proof_file="$FAKE_DOCKER_STATE.proof"\n'
+                       'require_linux() { :; }\nrequire_docker() { :; }\nrequire_env_file() { :; }\n'
+                       'runtime_image() { printf %s poise-runtime:latest; }\n')
+        target = os.path.join(directory, 'restore.sh')
+        shutil.copyfile(os.path.join(ROOT, 'deploy/restore.sh'), target)
+        backup = os.path.join(self.work.name, 'backup')
+        os.mkdir(backup)
+        archive = 'poise-home-alice.tar.gz'
+        payload = b'fixture volume archive consumed by fake Docker'
+        with open(os.path.join(backup, archive), 'wb') as file:
+            file.write(payload)
+        with open(os.path.join(backup, 'SHA256SUMS'), 'w') as file:
+            file.write(f'{hashlib.sha256(payload).hexdigest()}  {archive}\n')
+        self.change_state(restore_ok=True)
+        env = {key: value for key, value in os.environ.items() if not key.startswith(('POISE_', 'COMPOSE_'))}
+        env.update(PATH=f'{self.bin}{os.pathsep}{env["PATH"]}', FAKE_DOCKER_STATE=self.state)
+        result = subprocess.run(['bash', target, backup], capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(os.path.exists(self.state + '.proof'))
+        self.assertFalse(os.path.exists(self.state + '.proof.rollouts'))
+        result = self.start({'containers': [alice], 'health': {'poise-ws-alice': [health(NEW)]}})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f'Every workspace serves {NEW}: alice.', result.stdout)
+        self.assertNotIn('bob', self.record(self.current())[3])
 
 
 class RestoreProofTest(LibTest):

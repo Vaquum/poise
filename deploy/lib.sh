@@ -263,6 +263,10 @@ clear_workspace_proof() {
   rm -f "$workspace_proof_file" || die "cannot clear the completed workspace proof at $workspace_proof_file."
 }
 
+clear_rollout_store() {
+  rm -rf "$workspace_proof_file.rollouts" || die "cannot clear the rollout store at $workspace_proof_file.rollouts."
+}
+
 # Rollout records have six header lines (SHA, image ID, image tag, handles,
 # outcome, start time), followed by the last 32 timestamped observations.
 # They live beside the legacy handles-only proof so older checkouts ignore them.
