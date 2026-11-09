@@ -1379,6 +1379,13 @@ replacement uses the existing service drain to finish native cleanup before
 destroying those witnesses. Neither a forced restart nor a changed inode after
 restart can authorize deletion or release; the abrupt-loss acceptance outcome
 is a visible hold, not reclaimed capacity.
+Before retrying registered child handles, each bounded cleanup pass commits
+coverage from verified original reclaimed ancestors. Coverage also runs after
+the pass's own reclamations, within the same 15-second budget. Later passes
+skip committed coverage and preserve the first deletion certificates. Allocated
+roots and unrelated siblings still require their own proof. Caller and Poise
+bound the unchanged resource receipt format at 512 KiB so hundreds of children
+can retain their paths, original errors and recovery evidence through release.
 The same supervisor holds the original Caller metadata directory, database
 and response-directory descriptors. Its private control configuration names
 them; Caller and health/maintenance readers verify and use the held originals

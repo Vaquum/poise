@@ -17,7 +17,7 @@ from time import monotonic, time
 from uuid import uuid4
 
 
-MAX_RECEIPT_BYTES = 128 * 1024
+MAX_RECEIPT_BYTES = 512 * 1024
 MAX_ERROR_CHARACTERS = 512
 
 
@@ -534,35 +534,51 @@ def temporary_directory(prefix: str):
 
 
 def cleanup_remaining(database: Path, call_id: str, *, claim: str | None = None, deadline: float | None = None) -> None:
-    with _database(database) as conn:
-        value = read(conn, call_id)
-    # Nested temporary directories are acknowledged before their Call parent.
-    for entry in sorted(value["roots"], key=lambda item: len(Path(item["path"]).parts), reverse=True):
-        if deadline is not None and monotonic() >= deadline:
-            return
-        if entry["state"] not in {"reclaimed", "covered"}:
-            cleanup(database, call_id, Path(entry["path"]), claim=claim, deadline=deadline)
-    with _database(database) as conn:
-        value = read(conn, call_id)
-    if value["version"] != 2 or value["namespace"]["state"] != "settled":
-        return
-    for entry in value["roots"]:
-        if entry["state"] != "registered":
-            continue
-        ancestors = [root for root in value["roots"] if root["state"] == "reclaimed"
-                     and entry["path"].startswith(root["path"] + "/")]
-        if not ancestors:
-            continue
-        ancestor = max(ancestors, key=lambda root: len(root["path"]))
-        proof = original_scope(database, call_id, value).resource("read-root", Path(ancestor["path"]))
-        if proof["state"] != "reclaimed" or any(ancestor.get(key) != proof[key]
-                for key in ("device", "inode", "parent_device", "parent_inode", "reclaimed_at")):
-            raise RuntimeError("incomplete native allocation lacks its original ancestor proof")
+    from . import native_namespace, process_identity
+    # Use retained proof before retrying children, then cover parents reclaimed
+    # during this pass. Each acknowledgement survives a bounded pass yielding.
+    for cover in (True, False, True):
         with _database(database) as conn:
-            conn.execute("begin immediate")
-            current = read(conn, call_id)
-            kept = next(root for root in current["roots"] if root["path"] == entry["path"])
-            if kept != entry:
-                raise RuntimeError("native allocation changed before ancestor coverage acknowledgement")
-            kept.update(state="covered", covered_by=ancestor["path"], reclaimed_at=proof["reclaimed_at"])
-            _write(conn, call_id, current)
+            value = read(conn, call_id)
+        if not cover:
+            # Nested temporary directories are acknowledged before their Call parent.
+            for entry in sorted(value["roots"], key=lambda item: len(Path(item["path"]).parts), reverse=True):
+                if entry["state"] in {"reclaimed", "covered"}:
+                    continue
+                if deadline is not None and monotonic() >= deadline:
+                    return
+                cleanup(database, call_id, Path(entry["path"]), claim=claim, deadline=deadline)
+            continue
+        if value["version"] != 2 or value["namespace"]["state"] != "settled" or value.get("process_pending"):
+            continue
+        for entry in value["roots"]:
+            if entry["state"] != "registered":
+                continue
+            if deadline is not None and monotonic() >= deadline:
+                return
+            ancestors = [root for root in value["roots"] if root["state"] == "reclaimed"
+                         and entry["path"].startswith(root["path"] + "/")]
+            if not ancestors:
+                continue
+            ancestor = max(ancestors, key=lambda root: len(root["path"]))
+            scope = original_scope(database, call_id, value)
+            if not scope.read()["empty"]:
+                raise RuntimeError("original native namespace is not empty")
+            proof = scope.resource("read-root", Path(ancestor["path"]))
+            if proof["state"] != "reclaimed" or any(ancestor.get(key) != proof[key]
+                    for key in ("device", "inode", "parent_device", "parent_inode", "reclaimed_at")):
+                raise RuntimeError("incomplete native allocation lacks its original ancestor proof")
+            with _database(database) as conn:
+                conn.execute("begin immediate")
+                current = read(conn, call_id)
+                row = conn.execute("select process_identity,resource_cleanup from calls where id=?", (call_id,)).fetchone()
+                cleaner = json.loads(row[1] or "null")
+                if native_namespace.active() is not scope and not process_identity.owns_registration(row[0]) \
+                        and (not isinstance(cleaner, dict) or cleaner.get("token") != claim
+                             or not process_identity.owns_registration(cleaner.get("owner"))):
+                    raise RuntimeError("native cleanup lacks its original owner or current cleanup claim")
+                kept = next(root for root in current["roots"] if root["path"] == entry["path"])
+                if kept != entry:
+                    raise RuntimeError("native allocation changed before ancestor coverage acknowledgement")
+                kept.update(state="covered", covered_by=ancestor["path"], reclaimed_at=proof["reclaimed_at"])
+                _write(conn, call_id, current)

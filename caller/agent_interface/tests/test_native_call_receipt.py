@@ -191,13 +191,13 @@ def test_persisted_near_limit_receipt_recovers_only_with_original_proof(database
                        "state": "allocated", **identity} for index in range(160)]
     partial = {"path": value["roots"][0]["path"] + "/partial", "state": "registered"}
     value["roots"].append(partial)
-    while len(json.dumps(value, separators=(",", ":")).encode()) < 130000:
+    while len(json.dumps(value, separators=(",", ":")).encode()) < 523000:
         index = len(value["errors"])
         value["errors"].append({"cause": f"original directory cleanup failed on retry {index}: " + "x" * 200,
                                 "path": value["roots"][index % 160]["path"], "at": 10 + index})
-    value["errors"][-1]["cause"] += "x" * (131066 - len(json.dumps(value, separators=(",", ":")).encode()))
+    value["errors"][-1]["cause"] += "x" * (524282 - len(json.dumps(value, separators=(",", ":")).encode()))
     encoded = json.dumps(value, separators=(",", ":"))
-    assert len(encoded.encode()) == 131066
+    assert len(encoded.encode()) == 524282
     artifact = {"phase": "posting_issue_reviews", "resource_error": "retained original cleanup failure"}
     api.finish(call, "completed", outcome="commented", action="commented")
     with api.db() as conn:
@@ -227,7 +227,7 @@ def test_persisted_near_limit_receipt_recovers_only_with_original_proof(database
         after = ownership.read(conn, call)
         row = conn.execute("select resources_settled_at,resource_cleanup,artifact,status,outcome,action,receipts from calls where id=?", (call,)).fetchone()
         persisted = conn.execute("select resource_ownership from calls where id=?", (call,)).fetchone()[0]
-    assert len(persisted.encode()) <= 131072
+    assert len(persisted.encode()) <= 524288
     assert len(after["errors"]) < len(value["errors"])
     assert tuple(row[3:]) == before
     if proof != "original":
@@ -274,7 +274,7 @@ def test_allocation_reserves_identity_settlement_and_a_terminal_blocker(database
     scope.resource = resource
     monkeypatch.setattr(native_namespace, "active", lambda: scope)
     parent = ownership.call_directory(api.DB, call)
-    for index in range(1000):
+    for index in range(4000):
         root = parent / f"agent-interface-review-{index:032x}" / "codex-home"
         before = state(call)
         try:
@@ -297,7 +297,7 @@ def test_allocation_reserves_identity_settlement_and_a_terminal_blocker(database
     assert ownership.released(after)
     assert len(after["roots"]) == len(allocated)
     with api.db() as conn:
-        assert len(conn.execute("select resource_ownership from calls where id=?", (call,)).fetchone()[0].encode()) <= 131072
+        assert len(conn.execute("select resource_ownership from calls where id=?", (call,)).fetchone()[0].encode()) <= 524288
     stamp = max(error["recovered_at"] for error in after["errors"]) + 1
     with patch.object(ownership, "time", return_value=stamp):
         ownership.failure(api.DB, call, "resources_unknown")
