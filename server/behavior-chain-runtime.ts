@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { staleDatastoreFailure } from './datastore-health'
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
@@ -206,7 +207,7 @@ export class BehaviorChainRuntime {
         }
       } catch (error) {
         intakeError = error instanceof Error ? error : new Error(String(error))
-        console.error('[behavior-chain] intake failed; admitted chains continue', intakeError)
+        if (!staleDatastoreFailure(intakeError)) console.error('[behavior-chain] intake failed; admitted chains continue', intakeError)
       }
       const began = Date.now()
       let observationError: Error | null = null

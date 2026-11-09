@@ -45,6 +45,8 @@ export interface ExpectedFailure {
   /** When present, only stderr matching one of these is expected; the same
    *  code with any other stderr still reports. */
   stderr?: RegExp | readonly RegExp[]
+  /** Validate structured probe output before suppressing its process fault. */
+  stdout?: (stdout: string) => boolean
 }
 
 export interface RunFileOptions {
@@ -557,6 +559,7 @@ export function runFile(
         const expected = code !== null
           && (options.expected?.codes.includes(code) ?? false)
           && stderrMatches(options.expected?.stderr, stderr)
+          && (options.expected?.stdout?.(stdout) ?? true)
         const error = Object.assign(
           new Error(`Command failed (${code ?? signal ?? 'unknown'}): ${command}`),
           {

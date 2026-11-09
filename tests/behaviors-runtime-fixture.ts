@@ -13,6 +13,7 @@ function externalCalls(): unknown[][] {
 const mocks = vi.hoisted(() => ({
   captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
   runFile: vi.fn(),
+  realRunFile: null as typeof import('../server/process').runFile | null,
   spawnDetached: vi.fn(),
   authStatus: 'authenticated',
   requireAuth: vi.fn(),
@@ -32,19 +33,24 @@ vi.mock('../server/native-cleanup-support', () => ({
   invalidateNativeCleanup: vi.fn(),
 }))
 
-vi.mock('../server/process', () => ({
-  CLAUDE_SUBSCRIPTION_CLI: '/poise/claude-subscription',
-  runFile: mocks.runFile,
-  spawnDetached: mocks.spawnDetached,
-  runningCallerLaunches: () => 0,
-  claudeSubscriptionEnvironment: () => ({
-    ANTHROPIC_API_KEY: undefined,
-    ANTHROPIC_AUTH_TOKEN: undefined,
-    ANTHROPIC_BASE_URL: undefined,
-    CLAUDE_CODE_OAUTH_TOKEN: undefined,
-    CLAUDE_CLI: '/poise/claude-subscription',
-  }),
-}))
+vi.mock('../server/process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../server/process')>()
+  mocks.realRunFile = actual.runFile
+  return {
+    setProcessFailureObserver: actual.setProcessFailureObserver,
+    CLAUDE_SUBSCRIPTION_CLI: '/poise/claude-subscription',
+    runFile: mocks.runFile,
+    spawnDetached: mocks.spawnDetached,
+    runningCallerLaunches: () => 0,
+    claudeSubscriptionEnvironment: () => ({
+      ANTHROPIC_API_KEY: undefined,
+      ANTHROPIC_AUTH_TOKEN: undefined,
+      ANTHROPIC_BASE_URL: undefined,
+      CLAUDE_CODE_OAUTH_TOKEN: undefined,
+      CLAUDE_CLI: '/poise/claude-subscription',
+    }),
+  }
+})
 vi.mock('../server/claude-auth', async (importOriginal) => ({
   ClaudeAuthReadinessError: (await importOriginal<typeof import('../server/claude-auth')>()).ClaudeAuthReadinessError,
   claudeAuth: {

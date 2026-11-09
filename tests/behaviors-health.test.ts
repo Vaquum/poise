@@ -9,7 +9,7 @@ describe('scan health and dependency recovery', () => {
     db.setMeta('behavior_resolve_unblocking_enabled', '1')
     runtime.startBehaviorsRuntime()
     const stdout = JSON.stringify({
-      action: 'health', status: 'stale', healthy: false, database: '/legacy/github.sqlite',
+      action: 'health', status: 'stale', healthy: false, database: JSON.parse(datastoreHealthOutput().stdout).database,
       max_age_seconds: 120, age_seconds: 3600, last_success_at: '2026-10-02T12:46:25Z',
     })
     mocks.runFile.mockRejectedValue(Object.assign(new Error('Command failed (1): github-datastore'), { code: 1, stdout, stderr: '' }))
