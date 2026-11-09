@@ -53,6 +53,12 @@ class CallerGuardTest(unittest.TestCase):
         docker = binary / "docker"
         docker.write_text(f'#!{sys.executable}\n' + """
 import json, os, sys
+if sys.argv[1] == 'compose':
+    # Resolved Compose configuration: no workspace runtime is configured in
+    # these lifecycle tests, so the guard decision falls back to Docker's
+    # default and the actual container runtime. `compose config` needs no daemon.
+    print(json.dumps({'services': {'gateway': {'environment': {}}}}))
+    sys.exit(0)
 state = json.load(open(os.environ['GUARD_DOCKER_STATE']))
 if state.get('unavailable'):
     sys.exit(1)
@@ -290,8 +296,8 @@ docker() {{
                 self.assertIn("unsafe backup operation", result.stderr)
 
     def test_padded_workspace_runtime_still_installs_gvisor_guard(self):
-        # A quoted padded setting is valid: the gateway trims it to runsc, so
-        # the host fence must be installed rather than skipped via exit 10.
+        # A quoted padded setting is valid: Compose resolves it with padding
+        # and the gateway trims it to runsc, so the host fence must be installed.
         deploy = GUARD.parents[1]
         env_file = self.root / "poise.env"
         env_file.write_text('POISE_WORKSPACE_RUNTIME=" runsc "\n')
@@ -300,7 +306,9 @@ docker() {{
         binary = self.root / "guard-bin"
         binary.mkdir()
         (binary / "docker").write_text("""#!/bin/bash
-if [ "$1" = info ]; then
+if [ "$1" = compose ]; then
+  printf '%s' '{"services":{"gateway":{"environment":{"POISE_WORKSPACE_RUNTIME":" runsc "}}}}'
+elif [ "$1" = info ]; then
   case "$3" in
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runc' ;;
@@ -346,7 +354,9 @@ exit 0
         binary = self.root / "guard-bin-ws"
         binary.mkdir()
         (binary / "docker").write_text("""#!/bin/bash
-if [ "$1" = info ]; then
+if [ "$1" = compose ]; then
+  printf '%s' '{"services":{"gateway":{"environment":{"POISE_WORKSPACE_RUNTIME":"   "}}}}'
+elif [ "$1" = info ]; then
   case "$3" in
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runsc' ;;
@@ -383,7 +393,7 @@ exit 0
 
     def test_quoted_runtime_with_trailing_comment_still_installs_gvisor_guard(self):
         # Compose strips surrounding quotes and drops a trailing comment, so
-        # the gateway sees runsc while the shell reader must agree.
+        # the resolved gateway environment carries runsc.
         deploy = GUARD.parents[1]
         env_file = self.root / "poise.env"
         env_file.write_text('POISE_WORKSPACE_RUNTIME="runsc" # gVisor\n')
@@ -392,7 +402,9 @@ exit 0
         binary = self.root / "guard-bin-comment"
         binary.mkdir()
         (binary / "docker").write_text("""#!/bin/bash
-if [ "$1" = info ]; then
+if [ "$1" = compose ]; then
+  printf '%s' '{"services":{"gateway":{"environment":{"POISE_WORKSPACE_RUNTIME":"runsc"}}}}'
+elif [ "$1" = info ]; then
   case "$3" in
     *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
     *) printf 'runc' ;;
@@ -427,6 +439,57 @@ exit 0
         self.assertIn("install", sudo_log.read_text(),
                       "quoted runsc with a trailing comment must reach guard installation, not exit 10")
 
+    def test_compose_interpolation_with_trailing_comment_still_installs_gvisor_guard(self):
+        # Compose resolves quoting, interpolation and trailing comments
+        # together: a variable holding runsc referenced double-quoted with a
+        # trailing comment resolves to runsc, while the shell reader would see
+        # the literal reference. No existing workspaces and a runc Docker
+        # default must still install the guard from the resolved value.
+        deploy = GUARD.parents[1]
+        env_file = self.root / "poise.env"
+        env_file.write_text('MY_RUNTIME=runsc\nPOISE_WORKSPACE_RUNTIME="${MY_RUNTIME}" # gVisor\n')
+        sudo_log = self.root / "sudo.log"
+        sudo_log.write_text("")
+        binary = self.root / "guard-bin-interpolation"
+        binary.mkdir()
+        (binary / "docker").write_text("""#!/bin/bash
+if [ "$1" = compose ]; then
+  printf '%s' '{"services":{"gateway":{"environment":{"POISE_WORKSPACE_RUNTIME":"runsc"}}}}'
+elif [ "$1" = info ]; then
+  case "$3" in
+    *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
+    *) printf 'runc' ;;
+  esac
+elif [ "$1" = ps ]; then
+  : # Fresh deployment: no workspace containers yet.
+else
+  echo "unexpected docker $*" >&2; exit 99
+fi
+""")
+        (binary / "sudo").write_text("""#!/bin/bash
+echo "$*" >> "$GUARD_SUDO_LOG"
+for argument in "$@"; do
+  if [ "$argument" = --check ]; then
+    echo 'Host locks verified on 1 Caller inode(s)'
+    exit 0
+  fi
+done
+exit 0
+""")
+        (binary / "id").write_text("#!/bin/bash\nif [ \"$1\" = -u ]; then echo 1000; else exec /usr/bin/id \"$@\"; fi\n")
+        for name in ("docker", "sudo", "id"):
+            (binary / name).chmod(0o755)
+        env = {**self.env, "PATH": str(binary) + os.pathsep + self.env["PATH"],
+               "GUARD_SUDO_LOG": str(sudo_log)}
+        script = (f"set -uo pipefail\n. {shlex.quote(str(deploy / 'lib.sh'))}\n"
+                  f"env_file={shlex.quote(str(env_file))}\n"
+                  "ensure_caller_guard\nprintf 'RC=%s\\n' \"$?\"\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Host locks verified", result.stdout)
+        self.assertIn("install", sudo_log.read_text(),
+                      "interpolated runsc with a trailing comment must reach guard installation, not exit 10")
+
     def test_runc_deployment_needs_no_host_guard_or_python(self):
         library = shlex.quote(str(GUARD.parents[1] / "lib.sh"))
         result = subprocess.run(["bash", "-c", f'. {library}\n' + """
@@ -435,6 +498,7 @@ env_value() { :; }
 docker() {
   case "$1 $2" in
     'info --format'|'inspect --format') printf '%s\\n' runc ;;
+    'compose config') printf '%s\\n' '{"services":{"gateway":{"environment":{}}}}' ;;
     'ps --all') printf '%s\\n' fixture ;;
     *) return 99 ;;
   esac

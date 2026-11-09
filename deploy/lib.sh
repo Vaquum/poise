@@ -48,8 +48,18 @@ require_docker() {
 # workspace restart policy. Inspect actual runtimes as well as future settings.
 ensure_caller_guard() {
   local status changed=false proof deadline=$((SECONDS + 180)) privilege=()
-  local desired ids runtimes runtime inspect_runtime=false
-  desired=$(env_value POISE_WORKSPACE_RUNTIME)
+  local desired ids runtimes runtime inspect_runtime=false config
+  # The gateway's effective runtime is Compose's resolved
+  # services.gateway.environment.POISE_WORKSPACE_RUNTIME (deploy/compose.yaml
+  # forwards ${POISE_WORKSPACE_RUNTIME:-} so quoting, comments and
+  # interpolation resolve as the gateway sees them). env_value cannot do
+  # Compose interpolation, so the guard reads the resolved configuration.
+  # A failed read stops deployment; absent or empty falls back to Docker's default.
+  config=$(compose config --format json) || die "cannot read the gateway's resolved Compose configuration for the Caller SQLite guard."
+  desired=$(printf '%s' "$config" | tr '\n' ' ' | sed -n 's/.*"POISE_WORKSPACE_RUNTIME"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -z "$desired" ]; then
+    desired=$(printf '%s' "$config" | tr '\n' ' ' | sed -n 's/.*POISE_WORKSPACE_RUNTIME=\([^"]*\)".*/\1/p')
+  fi
   # Match gateway/src/config.ts, which trims POISE_WORKSPACE_RUNTIME: whitespace-only means unset.
   desired=${desired#"${desired%%[![:space:]]*}"}
   desired=${desired%"${desired##*[![:space:]]}"}

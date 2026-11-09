@@ -156,7 +156,7 @@ class CallerGuardDockerTest(unittest.TestCase):
     def test_host_service_lifecycle_and_guest_caller_survive_the_fence(self):
         self.start_workspace("runsc")
         self.start_writer()
-        self.run_command("bash", "-c", 'set -euo pipefail; . deploy/lib.sh; env_value() { :; }; ensure_caller_guard', cwd=ROOT)
+        self.run_command("bash", "-c", 'set -euo pipefail; . deploy/lib.sh; compose() { printf \'%s\' \'{"services":{"gateway":{"environment":{}}}}\'; }; ensure_caller_guard', cwd=ROOT)
         self.assertEqual(self.run_command("systemctl", "is-enabled", "poise-caller-guard.service"), "enabled")
         self.protected(self.path)
         self.write()
