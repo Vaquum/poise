@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3'
+import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -14,9 +15,7 @@ vi.mock('../server/process-lock', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../server/process-lock')>()
   return {
     ...actual,
-    // Keep real ownership; acquisition deadlines have their own lock tests.
-    withProcessLock: vi.fn(<T>(options: import('../server/process-lock').ProcessLockOptions, operation: () => Promise<T>) =>
-      actual.withProcessLock({ ...options, timeoutMs: 1000 }, operation)),
+    withProcessLock: vi.fn(actual.withProcessLock),
   }
 })
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -315,6 +314,65 @@ describe('organization activation', () => {
 })
 
 describe('managed organization synchronization', () => {
+  it('refreshes stale labelled intake after lock setup exceeds 500 ms without failure backoff', async () => {
+    const background = await import('../server/release-background')
+    const { nativeChainOperations } = await import('../server/behavior-chain-native')
+    const account = organizations!.addOrganization('acme')
+    await ready('acme')
+    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+    const mirror = new Database(account.datastorePath!)
+    try {
+      mirror.exec(`
+        ALTER TABLE sync_state ADD COLUMN updated_at TEXT;
+        CREATE TABLE items(item_id INTEGER, item_type TEXT, state TEXT, expanded_json TEXT);
+        CREATE TABLE issues(repo TEXT, number INTEGER, status TEXT, updated_at TEXT, payload_ref INTEGER);
+        INSERT INTO items VALUES (988, 'issue', 'open', '{"issue":{"labels":[]}}');
+        INSERT INTO issues VALUES ('acme/repo', 988, 'open', '2026-01-01T00:00:00Z', 988);
+      `)
+      const stale = Date.now() - 333_000
+      mirror.prepare('INSERT INTO sync_state VALUES (?, ?, ?, ?)').run('org', 'last_sync_at', new Date(stale).toISOString(), new Date(stale).toISOString())
+      database!.db.prepare('UPDATE organizations SET last_sync_at = ?').run(stale)
+      mocks.runFile.mockClear()
+      mocks.diagnosticFailure.mockClear()
+      mocks.runFile.mockImplementation(async (command, args, options) => {
+        if (command === 'github-datastore' && args[1] === account.datastorePath) {
+          if (args[2] === 'sync') {
+            const now = new Date().toISOString()
+            mirror.prepare("UPDATE sync_state SET value = ?, updated_at = ? WHERE scope = 'org' AND key = 'last_sync_at'").run(now, now)
+            mirror.prepare('UPDATE items SET expanded_json = ?').run(JSON.stringify({ issue: { labels: [{ name: 'poise' }] } }))
+          }
+          if (args[2] === 'health' || args[2] === 'view') {
+            // Use Caller's real freshness and label readers against this mirror.
+            return { stdout: execFileSync('python3', ['-m', 'github_datastore', ...args], {
+              cwd: join(process.cwd(), 'caller/github_datastore'), encoding: 'utf8', timeout: 10_000,
+            }), stderr: '' }
+          }
+        }
+        return cli(command, args, options)
+      })
+      const intake = nativeChainOperations(account, {
+        roster: vi.fn(), resolve: vi.fn(), prepare: vi.fn(), borrow: vi.fn(), available: () => true,
+        capacity: () => 1, permitted: () => true, note: () => '', severity: () => 'p2', received: vi.fn(),
+        reviews: vi.fn(), existing: async () => new Set<string>(), wake: vi.fn(),
+      })
+      await expect(intake.discover()).rejects.toMatchObject({ status: 1, stdout: expect.stringContaining('"status": "stale"') })
+      expect(operations('view')).toHaveLength(0)
+
+      mocks.lockIoDelayMs = 600
+      mocks.lockIoDelayPath = `${account.datastorePath}.lock`
+      organizations!.startOrganizationsRuntime()
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0), { timeout: 4000 })
+
+      expect(operations('sync')).toHaveLength(1)
+      expect(database!.db.prepare('SELECT next_sync_at, sync_failures, sync_failing_since FROM organizations').get())
+        .toEqual({ next_sync_at: 0, sync_failures: 0, sync_failing_since: 0 })
+      expect(organizations!.getOrganizations()[0]).toMatchObject({ stage: 'ready', error: null, retryAt: null })
+      expect(mocks.diagnosticFailure).not.toHaveBeenCalled()
+      await expect(intake.discover()).resolves.toEqual([{ repository: 'acme/repo', number: 988 }])
+      expect(operations('view').every((call) => call[1].includes('--label') && call[1].includes('poise'))).toBe(true)
+    } finally { mirror.close() }
+  })
+
   it.each([
     { state: 'fresh', age: 0, backoff: 0, me: 'octocat' },
     { state: 'in backoff', age: 60_000, backoff: 60_000, me: 'octocat' },
@@ -345,6 +403,7 @@ describe('managed organization synchronization', () => {
     mocks.runFile.mockClear()
     vi.mocked(withProcessLock).mockClear()
     database!.db.prepare('UPDATE organizations SET last_sync_at = 0').run()
+    mocks.lockIoDelayMs = 600
     const holder = new Database(`${account.datastorePath}.lock`, { fileMustExist: true })
     holder.exec('BEGIN IMMEDIATE')
     try {
@@ -361,7 +420,7 @@ describe('managed organization synchronization', () => {
     expect(mocks.runFile).not.toHaveBeenCalled()
   })
 
-  it.each(['contention', 'setup deadline'] as const)('retains overdue lock %s across restart, bounds polling and recovers independently', async (failure) => {
+  it('retains overdue lock contention across restart, bounds polling and recovers independently', async () => {
     let background = await import('../server/release-background')
     const account = organizations!.addOrganization('acme')
     organizations!.addOrganization('beta')
@@ -375,18 +434,11 @@ describe('managed organization synchronization', () => {
     const wallNow = Date.now.bind(Date)
     let elapsed = 0
     vi.spyOn(Date, 'now').mockImplementation(() => wallNow() + elapsed)
-    const lastSync = failure === 'contention' ? Date.now() - 333_000 : 0
+    const lastSync = Date.now() - 333_000
     database!.db.prepare("UPDATE organizations SET last_sync_at = ? WHERE login = 'acme'").run(lastSync)
     database!.db.prepare("UPDATE organizations SET last_sync_at = 0 WHERE login = 'beta'").run()
-    let holder: InstanceType<typeof Database> | undefined
-    if (failure === 'contention') {
-      holder = new Database(`${account.datastorePath}.lock`, { fileMustExist: true })
-      holder.exec('BEGIN IMMEDIATE')
-    } else {
-      // The unit wrapper above grants 1,000 ms, rather than production's 500.
-      mocks.lockIoDelayMs = 1100
-      mocks.lockIoDelayPath = `${account.datastorePath}.lock`
-    }
+    let holder: InstanceType<typeof Database> | undefined = new Database(`${account.datastorePath}.lock`, { fileMustExist: true })
+    holder.exec('BEGIN IMMEDIATE')
     const streak = () => database!.db.prepare("SELECT next_sync_at AS retry, sync_failures AS failures, sync_failing_since AS since FROM organizations WHERE login = 'acme'").get() as { retry: number, failures: number, since: number }
     const alerts = () => database!.db.prepare("SELECT resolved_at AS resolved FROM alerts WHERE dedupe_key = 'datastore-sync:acme'").all()
     try {
@@ -404,11 +456,7 @@ describe('managed organization synchronization', () => {
       expect(operations('sync').map((call) => call[1][1])).toEqual([join(tempRoot, 'datastores/beta/github.sqlite')])
       expect(alerts()).toEqual([])
       const diagnostic = mocks.diagnosticFailure.mock.calls.find(([operation]) => operation === 'datastore.sync')!
-      // Even behind a busy holder, the final setup can expire before BEGIN.
-      // Keep its actual cause instead of inferring a verified process owner.
-      expect(mocks.diagnosticFailure).toHaveBeenCalledWith('process_lock.acquire', diagnostic[1].cause,
-        expect.objectContaining({ holderPid: null, holderIdentityVerified: false }), { level: 'warning' })
-      if (failure === 'setup deadline') expect(diagnostic[1].cause.message).toBe('process lock acquisition exceeded its deadline')
+      expect(diagnostic[1]).toMatchObject({ code: 'PROCESS_LOCK_UNAVAILABLE', cause: { code: 'SQLITE_BUSY' } })
       expect(diagnostic[2]).toMatchObject({
         account: 'acme', phase: 'acquisition', holderPid: null, holderIdentityVerified: false,
         lastSuccessfulSyncAt: lastSync ? new Date(lastSync).toISOString() : null,
@@ -480,9 +528,9 @@ describe('managed organization synchronization', () => {
     }
   })
 
-  it.each(['successful sync', 'scheduled retry', 'new generation', 'new identity'] as const)('preserves a peer\'s %s when lock setup expires', async (peer) => {
+  it.each(['successful sync', 'scheduled retry', 'new generation', 'new identity'] as const)('preserves a peer\'s %s when lock acquisition fails', async (peer) => {
     const background = await import('../server/release-background')
-    organizations!.addOrganization('acme')
+    const account = organizations!.addOrganization('acme')
     await ready('acme')
     await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
     database!.db.prepare('UPDATE organizations SET last_sync_at = 0').run()
@@ -490,6 +538,8 @@ describe('managed organization synchronization', () => {
     mocks.diagnosticFailure.mockClear()
     vi.mocked(withProcessLock).mockClear()
     mocks.lockIoDelayMs = 1100
+    const holder = new Database(`${account.datastorePath}.lock`, { fileMustExist: true })
+    holder.exec('BEGIN IMMEDIATE')
     organizations!.startOrganizationsRuntime()
     await vi.waitFor(() => expect(withProcessLock).toHaveBeenCalledTimes(1))
     const registry = new Database(process.env.POISE_DB!)
@@ -503,17 +553,21 @@ describe('managed organization synchronization', () => {
       expect(registry.prepare('SELECT * FROM organizations').get()).toEqual(state)
       expect(mocks.diagnosticFailure.mock.calls.filter(([operation]) => operation === 'datastore.sync')).toEqual([])
       expect(mocks.runFile).not.toHaveBeenCalled()
-    } finally { registry.close() }
+    } finally { registry.close(); holder.exec('ROLLBACK'); holder.close() }
   })
 
-  it('keeps activation eligible after its acquisition deadline', async () => {
+  it('keeps activation eligible after lock contention', async () => {
     const background = await import('../server/release-background')
-    mocks.lockIoDelayMs = 1100
-    organizations!.addOrganization('acme')
-    await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0), { timeout: 4000 })
-    expect(organizations!.getOrganizations()[0]).toMatchObject({ status: 'initializing', error: null, retryAt: null })
-    expect(mocks.runFile).not.toHaveBeenCalled()
-    mocks.lockIoDelayMs = 0
+    const path = join(tempRoot, 'datastores/acme/github.sqlite.lock')
+    await mkdir(dirname(path), { recursive: true })
+    const holder = new Database(path)
+    holder.exec('BEGIN IMMEDIATE')
+    try {
+      organizations!.addOrganization('acme')
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0), { timeout: 4000 })
+      expect(organizations!.getOrganizations()[0]).toMatchObject({ status: 'initializing', error: null, retryAt: null })
+      expect(mocks.runFile).not.toHaveBeenCalled()
+    } finally { holder.exec('ROLLBACK'); holder.close() }
     organizations!.startOrganizationsRuntime()
     await ready('acme')
   })
