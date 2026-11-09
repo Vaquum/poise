@@ -9,16 +9,20 @@ import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/beh
 import { nativeActionReceipt } from '../server/behavior-chain-action'
 import { completedReviewCall } from './review-response-fixture'
 import { parseAgentLogStdout, type LogEntry } from '../server/agent-log-parse'
+import { diagnosticPage, loggingRuntime, startLogging, stopLogging } from '../server/logging'
+import * as processes from '../server/process'
 
 const NOW = 1_800_000_000_000
 const MERGE = 'c'.repeat(40)
 const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
 const databases: Database.Database[] = []
 const roots: string[] = []
-afterEach(() => {
+afterEach(async () => {
+  vi.useRealTimers()
+  await stopLogging()
+  vi.unstubAllEnvs()
   for (const db of databases.splice(0)) db.close()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
-  vi.useRealTimers()
 })
 
 function setup(path = ':memory:') {
@@ -51,6 +55,125 @@ function operations(overrides: Partial<ChainRuntimeOperations> = {}): ChainRunti
     received: () => {}, available: () => false, capacity: () => 3, permitted: () => false, request: forbidden,
     launch: forbidden, perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {}, ...overrides }
 }
+
+function captureDiagnostics() {
+  const root = mkdtempSync(join(tmpdir(), 'poise-chain-conflict-')); roots.push(root)
+  vi.stubEnv('POISE_DB', join(root, 'cache.db'))
+  vi.stubEnv('POISE_WORKSPACE_HANDLE', 'fixture')
+  vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+  vi.spyOn(processes, 'runFile').mockResolvedValue({ stdout: JSON.stringify({ version: 1, streamId: 'd'.repeat(32),
+    events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '' })
+  startLogging()
+  return () => {
+    loggingRuntime()!.flush()
+    return diagnosticPage(null).events.filter(event => event.operation === 'behavior-chain.revision-conflict')
+  }
+}
+
+it.each(['receipt-read', 'observation', 'request-preparation'] as const)(
+  'recovers a competing write during %s and advances another chain without a stale effect', async phase => {
+    const { journal } = setup()
+    let first = seed(journal, 'aaa/repo')
+    const second = seed(journal, 'zzz/repo')
+    if (phase === 'receipt-read') {
+      first = record(journal, first, { type: 'invocation.admitted', invocation: { id: 'original', behavior: 'implement-issue',
+        actor: first.author, model: reviewer.model, slot: reviewer.slot, basis: 'seed', admittedAt: NOW - 60_000,
+        request: { command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] } } })
+      first = record(journal, first, { type: 'invocation.started', invocationId: 'original' })
+    }
+    const diagnostics = captureDiagnostics()
+    let raced = false
+    const compete = () => {
+      if (raced) return
+      raced = true
+      record(journal, journal.read(first.id)!, phase === 'receipt-read'
+        ? { type: 'invocation.reconciled', invocationId: 'original', evidence: { nativeExit: { code: 1, signal: null, error: null } } }
+        : { type: 'chain.held', reason: 'concurrent person hold' })
+    }
+    const call: LogEntry = { ...completedReviewCall(first.repository, 7, 'a'.repeat(40), first.author),
+      source: 'poise:behavior-chain', correlation_id: 'original', behavior: 'implement_issue', status: 'failed',
+      action: null, outcome: null, resources_settled_at: null, artifact: null }
+    const readInvocations = vi.fn<ChainRuntimeOperations['readInvocations']>(async () => {
+      if (!raced) { compete(); return { entries: [], quarantined: [] } }
+      return { entries: [call], quarantined: [] }
+    })
+    const observe = vi.fn(async (chain: BehaviorChain) => {
+      if (chain.id === first.id && phase === 'observation') compete()
+      return observation(false)
+    })
+    const request = vi.fn(async (chain: BehaviorChain) => {
+      if (chain.id === first.id && phase === 'request-preparation') compete()
+      return { command: 'agent-interface' as const, cwd: '/fixture', argv: ['--model', reviewer.model] }
+    })
+    const launch = vi.fn<ChainRuntimeOperations['launch']>(async () => true)
+    await expect(new BehaviorChainRuntime(journal, operations({ enabled: () => true, available: () => true,
+      permitted: () => true, observe, request, launch, readInvocations })).run()).resolves.toBeUndefined()
+    expect(raced).toBe(true)
+    expect(journal.read(second.id)?.invocations).toMatchObject([{ behavior: 'implement-issue', state: 'started' }])
+    expect(launch).toHaveBeenCalledTimes(1)
+    expect(launch.mock.calls[0][0]).toMatchObject({ id: journal.read(second.id)!.invocations[0].id })
+    const current = journal.read(first.id)!
+    if (phase === 'receipt-read') {
+      expect(readInvocations.mock.calls).toEqual([[['original']], [['original']]])
+      expect(current.invocations).toMatchObject([{ id: 'original', state: 'uncertain', callId: null,
+        evidence: { nativeExit: { code: 1 }, callId: call.id } }])
+    } else {
+      expect(current.held).toBe('concurrent person hold')
+      expect(current.invocations).toHaveLength(0)
+      expect(observe.mock.calls.filter(([chain]) => chain.id === first.id)).toHaveLength(2)
+    }
+    expect(diagnostics()).toMatchObject([{ severity: 'warning', target: first.id,
+      phase: phase === 'receipt-read' ? 'reconciliation' : phase === 'request-preparation' ? 'invocation-admission' : phase,
+      context: { outcome: 'recovered', attempts: 2 } }])
+  })
+
+it('defers repeated conflicts after one retry, including a chain moved to the deferred page', async () => {
+  const { journal } = setup()
+  const first = seed(journal, 'aaa/repo'), second = seed(journal, 'zzz/repo')
+  const diagnostics = captureDiagnostics()
+  let writes = 0
+  const launch = vi.fn(async () => true)
+  const runtime = new BehaviorChainRuntime(journal, operations({ enabled: () => true, available: () => true,
+    permitted: () => true, launch, request: async () => ({ command: 'agent-interface', cwd: '/fixture', argv: ['--model', reviewer.model] }),
+    observe: async chain => {
+      if (chain.id === first.id) record(journal, journal.read(first.id)!, { type: 'chain.held', reason: `competing hold ${++writes}` })
+      return observation(false)
+    } }))
+  await expect(runtime.run()).resolves.toBeUndefined()
+  expect(writes).toBe(2)
+  expect(journal.read(first.id)).toMatchObject({ held: 'competing hold 2', invocations: [], observation: null })
+  expect(journal.read(second.id)?.invocations).toMatchObject([{ state: 'started' }])
+  expect(launch).toHaveBeenCalledTimes(1)
+  expect(diagnostics()).toMatchObject([{ target: first.id, phase: 'observation', context: { outcome: 'deferred', attempts: 2 } }])
+})
+
+it('defers a revision conflict when the existing sweep budget is exhausted', async () => {
+  const { journal } = setup()
+  const chain = seed(journal)
+  const diagnostics = captureDiagnostics()
+  const observe = vi.fn(async () => {
+    record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'concurrent hold' })
+    vi.setSystemTime(NOW + 45_001)
+    return observation(false)
+  })
+  await expect(new BehaviorChainRuntime(journal, operations({ observe })).run()).resolves.toBeUndefined()
+  expect(observe).toHaveBeenCalledTimes(1)
+  expect(journal.read(chain.id)).toMatchObject({ held: 'concurrent hold', invocations: [], observation: null })
+  expect(diagnostics()).toMatchObject([{ target: chain.id, phase: 'observation', context: { outcome: 'deferred', attempts: 1 } }])
+})
+
+it('surfaces a real journal failure even when its message matches a revision conflict', async () => {
+  const { db, journal } = setup()
+  seed(journal)
+  const diagnostics = captureDiagnostics()
+  db.exec(`CREATE TRIGGER fail_observation BEFORE INSERT ON behavior_chain_events
+    WHEN json_extract(NEW.payload, '$.type') = 'chain.observed'
+    BEGIN SELECT RAISE(ABORT, 'behavior chain changed before event admission'); END`)
+  const observe = vi.fn(async () => observation(false))
+  await expect(new BehaviorChainRuntime(journal, operations({ observe })).run()).rejects.toThrow('behavior chain changed before event admission')
+  expect(observe).toHaveBeenCalledTimes(1)
+  expect(diagnostics()).toEqual([])
+})
 
 it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause', 'missing failure identity'])(
   'rechecks a CI-only repair hold without duplicate work: %s', async mode => {

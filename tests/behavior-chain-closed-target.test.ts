@@ -174,23 +174,44 @@ it('keeps a running original and uncertain resource ownership until native settl
   expect(forbidden).not.toHaveBeenCalled()
 })
 
-it('journals the recovery hold before a partial restore is readable, including held and disabled work', async () => {
+it.each([false, true])('journals the recovery hold before a partial restore is readable, with a competing exit: %s', async competingExit => {
   const { db, journal, chain, operations, forbidden, fenceClosedTarget } = setup('repair-pr', true)
   record(journal, chain, { type: 'chain.held', reason: 'person hold' })
   operations.enabled = () => false
-  operations.readInvocations = vi.fn(async () => { throw new Error('native receipt store unavailable') })
+  const receiptError = new Error('native receipt store unavailable')
+  const nativeExit = { code: 1, signal: null, error: null }
+  operations.readInvocations = vi.fn(async () => {
+    if (competingExit) record(journal, journal.read(chain.id)!, { type: 'invocation.reconciled', invocationId: 'original', evidence: { nativeExit } })
+    throw receiptError
+  })
   const runtime = new BehaviorChainRuntime(journal, operations)
-  await expect(runtime.run()).rejects.toThrow('native receipt store unavailable')
+  await expect(runtime.run()).rejects.toBe(receiptError)
   expect(journal.read(chain.id)).toMatchObject({ held: 'person hold', invocations: [{ state: 'uncertain', callId: null }] })
+  if (competingExit) expect(journal.read(chain.id)?.invocations[0].evidence?.nativeExit).toEqual(nativeExit)
   const reopened = new BehaviorChainJournal(db)
   reopened.rebuild()
   operations.readInvocations = async () => ({ entries: [], quarantined: [] })
   await new BehaviorChainRuntime(reopened, operations).run()
   expect(journal.read(chain.id)).toMatchObject({ held: 'person hold', invocations: [{ state: 'uncertain', callId: null }] })
+  if (competingExit) expect(journal.read(chain.id)?.invocations[0].evidence?.nativeExit).toEqual(nativeExit)
   expect(fenceClosedTarget).not.toHaveBeenCalled()
   expect(forbidden).not.toHaveBeenCalled()
   expect(journal.liveModelInvocationCount()).toBe(1)
   expect(journal.reservedResources()).toEqual({ memoryBytes: 8, diskBytes: 16, unaccounted: 0 })
+})
+
+it('keeps receipt and journal failures visible when uncertainty cannot be recorded', async () => {
+  const { db, journal, operations, forbidden } = setup('repair-pr', true)
+  const receiptError = new Error('native receipt store unavailable')
+  operations.readInvocations = async () => { throw receiptError }
+  db.exec(`CREATE TRIGGER fail_uncertainty BEFORE INSERT ON behavior_chain_events
+    WHEN json_extract(NEW.payload, '$.type') = 'invocation.uncertain'
+    BEGIN SELECT RAISE(ABORT, 'journal unavailable'); END`)
+  await expect(new BehaviorChainRuntime(journal, operations).run()).rejects.toMatchObject({
+    message: expect.stringContaining('native receipt store unavailable'),
+    cause: receiptError, errors: [receiptError, { message: 'journal unavailable' }],
+  })
+  expect(forbidden).not.toHaveBeenCalled()
 })
 
 it.each([false, true])('retains native-exit uncertainty without closure as release proof, with quarantine: %s', async quarantined => {
