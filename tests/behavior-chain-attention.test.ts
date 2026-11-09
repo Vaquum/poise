@@ -1074,3 +1074,73 @@ it('holds a dismissed chain approval for a decision instead of directing a missi
   expect(entry.nextAction).toContain('77')
   expect(entry.nextAction).not.toContain('Review the actual current pull-request head')
 })
+
+it('waits for the resolve-threads artifact instead of repeating resolve-threads', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const head = 'a'.repeat(40)
+  const resolveBasis = chainBasis(['resolve', head, 1])
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 989, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 989, head, headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, unresolvedOutdated: 1, approved: true, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', readinessBlockers: ['merge_state_not_clean'], pending: false, failing: [], conflict: false, behind: false } }
+  let chain = admit(journal, 989, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'resolve-989', behavior: 'resolve-threads', actor: chain.reviewer,
+    model: null, slot: null, basis: resolveBasis, admittedAt: admittedAt + 30_000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 30_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'resolve-989', callId: 'resolve-989', outcome: 'resolved',
+    evidence: { status: 'completed', completedAt: admittedAt + 40_000 } }, admittedAt + 40_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('verified artifact or changed input')
+  expect(entry.nextAction).toContain('resolve-threads already completed')
+  expect(entry.nextAction).not.toContain('Resolve 1 blocking')
+})
+
+it('waits for the merge artifact instead of repeating merge-pr', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const head = 'e'.repeat(40)
+  const callId = chainBasis('review-990').slice(0, 32)
+  const response = { repository: 'autonomio/poise', pull_number: 990, reviewer: 'reviewer', model: 'fixture',
+    invocation_id: callId, head_sha: head, context_sha: 'b'.repeat(64), completed_at: admittedAt + 40_000,
+    assessment: { verdict: 'The changed validation has no remaining blocking defects.',
+      reviewed_context: 'Inspected the immutable diff and affected callers.', limitations: 'No live provider calls.' } }
+  const mergeBasis = chainBasis(['merge', head, null])
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 990, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 990, head, headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: true, ready: true,
+      reviewIds: [8], reviewReceipts: [{ id: 8, head, state: 'COMMENTED', invocation: callId, submittedAt: admittedAt + 40_000, response }],
+      reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', readinessBlockers: [], pending: false, failing: [], conflict: false, behind: false } }
+  let chain = admit(journal, 990, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'review-990', behavior: 'review-pr', actor: chain.reviewer,
+    model: 'fixture', slot: 'primary', basis: chainBasis(['pr', head, 'b'.repeat(64)]), admittedAt: admittedAt + 30_000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 30_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'review-990', callId, outcome: 'clean',
+    evidence: { status: 'completed', action: 'reviewed_clean', head_sha: head, review_id: 8, completedAt: admittedAt + 40_000,
+      artifact: { review_response: response } } }, admittedAt + 40_000)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'merge-990', behavior: 'merge-pr', actor: chain.reviewer,
+    model: null, slot: null, basis: mergeBasis, admittedAt: admittedAt + 45_000,
+    request: { command: 'github-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 45_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'merge-990', callId: null, outcome: 'deferred',
+    evidence: { status: 'completed', completedAt: admittedAt + 50_000 } }, admittedAt + 50_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('verified artifact or changed input')
+  expect(entry.nextAction).toContain('merge-pr already completed')
+  expect(entry.nextAction).not.toContain('Merge or enqueue')
+})

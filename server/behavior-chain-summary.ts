@@ -313,6 +313,17 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         && chain.invocations.some(invocation => invocation.behavior === 'implement-issue' && invocation.state === 'settled'
           && invocation.basis === unpublishedIssueBasis && invocation.slot === observation.implementer.slot
           && (invocation.evidence as Record<string, unknown> | null)?.outcome === 'no_changes')
+      // Mirroring decideBehaviorChain propose(): a successful current-basis
+      // resolve-threads or merge-pr waits for its verified artifact or changed input.
+      const resolveThreadsCount = pull ? blockingThreads(pull) : 0
+      const resolveThreadsBasis = pull && resolveThreadsCount > 0 ? chainBasis(['resolve', pull.head, resolveThreadsCount]) : null
+      const resolveThreadsCompleted = !!pull && !!resolveThreadsBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'resolve-threads' && invocation.state === 'settled'
+          && invocation.evidence?.status === 'completed' && invocation.basis === resolveThreadsBasis && invocation.slot === null)
+      const mergeBasis = pull && observation ? chainBasis(['merge', pull.head, queueVerificationBasis]) : null
+      const mergeCompleted = !!pull && !!observation && !!mergeBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'merge-pr' && invocation.state === 'settled'
+          && invocation.evidence?.status === 'completed' && invocation.basis === mergeBasis && invocation.slot === null)
       let next = chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'
@@ -371,13 +382,19 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                                             // Mirroring decideBehaviorChain: past approval, blocking
                                             // conversations resolve through resolve-threads, then readiness,
                                             // then the retained substantive review, then merge-pr.
-                                            : pull && blockingThreads(pull) > 0 ? `Resolve ${blockingThreads(pull)} blocking review conversation(s) through resolve-threads; only the native approval gate permits resolution`
+                                            : pull && blockingThreads(pull) > 0
+                                              ? resolveThreadsCompleted && pull
+                                                ? 'Await the resolve-threads verified artifact or changed input; resolve-threads already completed for this head'
+                                                : `Resolve ${blockingThreads(pull)} blocking review conversation(s) through resolve-threads; only the native approval gate permits resolution`
                                               : pull && !pull.ready ? 'Await native repository readiness gates; no new invocation can proceed until they pass'
                                                 : pull && observation && !chain.invocations.some(invocation => invocation.evidence?.status === 'completed'
                                                   && ['reviewed_clean', 'approved'].includes(String(invocation.evidence.action))
                                                   && !!chainReviewResponse(chain, invocation, observation, now))
                                                 ? 'Hold: merge requires a retained substantive final-context review response; a decision is required'
-                                                : pull ? 'Merge or enqueue through merge-pr under native head-pinned repository gates'
+                                                : pull
+                                                  ? mergeCompleted
+                                                    ? 'Await the merge verified artifact or changed input; merge-pr already completed for this head'
+                                                    : 'Merge or enqueue through merge-pr under native head-pinned repository gates'
                                                   : chain.waiting || 'Await the next invocation under existing admission gates'
       let retryAt: number | null = null
       if (!chain.held && !chain.reviewPending && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`) {
