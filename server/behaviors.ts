@@ -6,6 +6,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
+import { reportRepairExhaustion } from './behavior-chain-report'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
@@ -7387,6 +7388,11 @@ async function runBehaviorChains(): Promise<void> {
       wake() { checkSlotRetryPending = true; onCheckSlotReleased() },
     })
     runtime = new BehaviorChainRuntime(behaviorChainJournal(), { ...operations,
+      reportHold: chain => reportRepairExhaustion(db, behaviorChainJournal(), chain, async () => {
+        await requireFreshDatastore()
+        return operations.observe(chain)
+      }, () => tickerStarted && !behaviorAbortController?.signal.aborted && !releaseBackgroundPaused()
+        && behaviorChainJournal().cutover().mode === 'v2' && getBehaviorChainSettings().enabled),
       enabled: () => behaviorChainJournal().cutover().mode === 'v2'
         && nativeCleanupSupport().status === 'supported' && operations.enabled() })
     behaviorChains.set(org.login.toLowerCase(), runtime)

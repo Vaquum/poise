@@ -34,6 +34,7 @@ tests/terminal.test.ts
 
 # Agent spend and PR actions: quotas, budgets, account routing, approving and merging.
 tests/behavior-chain-merge-basis.test.ts
+tests/behavior-chain-report.test.ts
 tests/behaviors-approval.test.ts
 tests/behaviors-merge.test.ts
 tests/behaviors-quota-budget.test.ts
