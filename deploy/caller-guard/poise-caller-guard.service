@@ -1,0 +1,19 @@
+[Unit]
+Description=Poise host SQLite fence for gVisor Caller stores
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/poise-caller-guard/guard.py
+Restart=always
+RestartSec=1
+RuntimeDirectory=poise-caller-guard
+RuntimeDirectoryMode=0700
+NotifyAccess=main
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

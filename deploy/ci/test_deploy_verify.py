@@ -396,6 +396,7 @@ class VerifyTest(LibTest):
             file.write(f'. {shlex.quote(LIB)}\n'
                        'workspace_proof_file="$FAKE_DOCKER_STATE.proof"\n'
                        'require_linux() { :; }\nrequire_docker() { :; }\n'
+                       'ensure_caller_guard() { :; }\n'
                        'require_env_file() { require_free_ports() { :; }; }\n'
                        'env_value() { :; }\nproxy_listen() { :; }\n'
                        f'source_sha() {{ printf %s {NEW}; }}\n'

@@ -134,6 +134,8 @@ signing key) in the volume `poise-gateway-data`.
 - 64-bit Linux with Docker Engine 24 or newer and its Compose plugin
   ([install Docker](https://docs.docker.com/engine/install/)), and `git`.
   The deployment is tested on Ubuntu on x86-64.
+- For gVisor deployments, Python 3.10+, systemd and root or passwordless sudo
+  on the host to install the Caller guard.
 - Ports 80 and 443 reachable from the internet, and nothing else listening on
   them, or a proxy already on them that will front Poise too
   ([Behind your own proxy](#behind-your-own-proxy)).
@@ -915,11 +917,61 @@ Not in a backup: `deploy/.env` (keep a copy somewhere safe; it holds the
 OAuth App's client secret), Caddy's certificates (it obtains new ones) and
 the images (the scripts build them).
 
-A workspace that runs under gVisor (`POISE_WORKSPACE_RUNTIME=runsc`) is
-outside the reach of SQLite's locks from the backup's container, so a busy
-one may be caught mid-write; `deploy/backup.sh` warns about each. Stop such a
-workspace on the admin page before the backup when you need a copy that is
-certainly consistent.
+A workspace running under another kernel is outside the reach of SQLite's
+locks from the backup container. `deploy/backup.sh` refuses a backup while
+any such workspace runs, based on its actual Docker runtime. Stop it on the
+admin page first, then allow the host guard's next scan to release its locks
+before backing up. A busy or locked SQLite snapshot aborts the backup; it
+never falls back to copying that live database's files.
+
+## Live Caller diagnostics under gVisor
+
+Use Poise's History, Behaviors, Logging and workspace service health readers.
+Run any required Caller reader inside the workspace kernel, using its existing
+supervisor metadata reference. Host SQLite access is unsafe even with `mode=ro`
+or `PRAGMA query_only=on`: it can modify the guest's WAL shared-memory file.
+For offline SQL, first stop the workspace and preserve its database and sidecars.
+
+`deploy/install.sh` and `deploy/upgrade.sh` install and enable
+`poise-caller-guard.service` when the configured or an existing workspace runtime
+is gVisor. It runs on the host, independently of the gateway and workspace
+restart policies. It inspects each container's actual runtime (including aliases
+registered with a `runsc` executable), and fences only gVisor home volumes.
+Every five seconds, and on an explicit check, it discovers Caller stores and
+holds SQLite's Unix lock range on their exact host inodes. It retains locks on
+original inodes after ancestor renames and replacement, while that home still
+belongs to a gVisor workspace. A restarted guard rescans the home volume to find
+those originals. It never opens SQLite or WAL sidecars. Ordinary `runc`
+workspaces retain their normal SQLite locking.
+
+Check protection explicitly; an active service or live PID is insufficient:
+
+```sh
+sudo python3 /opt/poise-caller-guard/guard.py --check
+sudo systemctl status poise-caller-guard.service
+sudo journalctl -u poise-caller-guard.service
+```
+
+The check scans current stores and verifies every retained lock's owner, range
+and inode from a separate host process. Deployment fails if it cannot obtain
+that proof. Missing first stores, acquisition failures, unavailable Docker
+inventory and lock loss report protection unavailable in checks, the journal
+and the unit's status text. Existing locks remain held during inventory errors.
+The boot-enabled service restarts after guard death and rechecks after host,
+Docker or workspace restart. First store creation and newly replaced inodes
+are protected only after discovery and verified acquisition. Guard downtime
+and discovery intervals are not continuous protection; inspect the check after
+recovery before performing host maintenance. Unexpected lock loss requires
+repair and guard restart; it is never concealed by a surviving PID.
+If an existing ad hoc guard owns this range, deployment refuses acquisition;
+transfer protection to the packaged service through a controlled operator handoff.
+
+This is advisory protection for ordinary SQLite clients, not a boundary against
+privileged host access. Root or Docker administrators can stop the guard, remove
+its locks or modify files directly. SQLite's `immutable=1` and `nolock=1` bypass
+locking and are **not supported live diagnostic workarounds**. Do not use them
+on live stores. The guard does not establish receipt integrity or authorize
+store replacement; Caller's existing metadata identity checks still apply.
 
 ## Restore
 

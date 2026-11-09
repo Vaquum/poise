@@ -32,7 +32,7 @@ done
 for container in $(docker ps --quiet --filter label=poise.managed=true); do
   read -r name runtime < <(docker inspect --format '{{.Name}} {{.HostConfig.Runtime}}' "$container")
   if [ "$runtime" != runc ]; then
-    warn "${name#/} runs under $runtime, so its databases may be caught mid-write. For a copy that is certainly consistent, stop it on the admin page first."
+    die "${name#/} runs under $runtime: host SQLite access to its live databases is unsafe. Stop it on the admin page before backing up."
   fi
 done
 

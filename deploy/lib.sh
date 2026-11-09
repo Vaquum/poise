@@ -44,6 +44,54 @@ require_docker() {
     || die "the Docker Compose plugin is missing ('docker compose' does not run). Install it: https://docs.docker.com/compose/install/linux/"
 }
 
+# A host service, independent of the gateway's readiness cache and Docker's
+# workspace restart policy. Inspect actual runtimes as well as future settings.
+ensure_caller_guard() {
+  local status changed=false proof deadline=$((SECONDS + 180)) privilege=()
+  local desired ids runtimes runtime inspect_runtime=false
+  desired=$(env_value POISE_WORKSPACE_RUNTIME)
+  if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}'); fi
+  ids=$(docker ps --all --quiet --filter label=poise.managed=true) || die "cannot list workspaces for the Caller guard."
+  runtimes=''
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086 # one argument per container ID
+    runtimes=$(docker inspect --format '{{.HostConfig.Runtime}}' $ids) || die "cannot inspect workspace runtimes for the Caller guard."
+  fi
+  for runtime in "$desired" $runtimes; do
+    case $runtime in runc|io.containerd.runc.v2) ;; *) inspect_runtime=true ;; esac
+  done
+  [ "$inspect_runtime" = true ] || return 0
+  command -v python3 >/dev/null || die "Python 3.10+ is required on the host for the Caller SQLite guard."
+  if python3 "$deploy/caller-guard/guard.py" --needed --runtime "$desired"; then
+    :
+  else
+    status=$?
+    [ "$status" -eq 10 ] && return 0
+    die "cannot inspect the actual Docker runtimes for the Caller SQLite guard."
+  fi
+  if [ "$(id -u)" -ne 0 ]; then privilege=(sudo -n); fi
+  "${privilege[@]}" install -d -m 755 /opt/poise-caller-guard \
+    || die "installing the host Caller guard requires root or passwordless sudo."
+  if ! cmp -s "$deploy/caller-guard/guard.py" /opt/poise-caller-guard/guard.py \
+    || ! cmp -s "$deploy/caller-guard/poise-caller-guard.service" /etc/systemd/system/poise-caller-guard.service; then
+    changed=true
+    "${privilege[@]}" install -m 644 "$deploy/caller-guard/guard.py" /opt/poise-caller-guard/guard.py
+    "${privilege[@]}" install -m 644 "$deploy/caller-guard/poise-caller-guard.service" /etc/systemd/system/poise-caller-guard.service
+    "${privilege[@]}" systemctl daemon-reload
+  fi
+  "${privilege[@]}" systemctl enable poise-caller-guard.service
+  if [ "$changed" = true ]; then
+    "${privilege[@]}" systemctl restart poise-caller-guard.service
+  else
+    "${privilege[@]}" systemctl start poise-caller-guard.service
+  fi
+  while ! proof=$("${privilege[@]}" python3 /opt/poise-caller-guard/guard.py --check 2>&1); do
+    [ "$SECONDS" -lt "$deadline" ] || die "Caller host protection is not established: $proof. Inspect journalctl -u poise-caller-guard."
+    sleep 2
+  done
+  say "$proof"
+}
+
 # The value deploy/.env gives NAME, as Compose reads a NAME=value line: without
 # surrounding quotes, or else without a trailing comment; empty when unset.
 env_value() {

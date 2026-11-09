@@ -68,6 +68,7 @@ esac
 require_linux
 require_docker
 require_env_file
+ensure_caller_guard
 image=$(runtime_image)
 sha=$(source_sha)
 expected_workspaces=$(workspace_handles)
@@ -78,5 +79,6 @@ compose up --detach --build
 wait_for_gateway
 check_gateway_networks
 verify_workspaces "$sha" "$image" "$expected_workspaces"
+ensure_caller_guard
 prune_docker_storage "$image"
 say "$plan"
