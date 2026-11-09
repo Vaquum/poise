@@ -406,8 +406,14 @@ matches a PR whose closing list is incomplete through that list, and never
 guesses between two chats: a PR matching several chats — through closing
 references, workspace branches, or one of each — stays unbound with one
 warning naming it, and one of those chats must bind it explicitly. A branch
-scan that cannot read a workspace pauses branch matching for that minute
-without touching closing references. A PR with an unknown head branch, or
+scan that hits its entry/deadline bound or cannot read a workspace defers
+branch matching for the whole sweep without touching existing bindings or
+closing references. Retained Logging warns once for an unchanged failure,
+with the affected chat, bounded relative paths and technical causes, overflow,
+and the last successful discovery time (unknown before one). Failed or
+deferred passes do not advance that time. The existing discovery pass rechecks;
+a complete scan records recovery and rearms the warning for a recurrence.
+These diagnostics contain no chat content. A PR with an unknown head branch, or
 one no chat's workspace pushed, still needs an explicit bind in the turn
 that opens it.
 
