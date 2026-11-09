@@ -20,10 +20,14 @@ class AtomicWorkBlocked(ValueError):
     def __init__(self, reason: object):
         message = "AtomicWorkBlocked"
         if isinstance(reason, str) and reason.strip():
-            safe = atoms.redact_cause(reason)
+            # Mask complete environment credentials before pattern redaction:
+            # redacting credential shapes first would rewrite a known value
+            # (for example a ghp_ token inside a JSON credential) so the exact
+            # value no longer matches and the remainder leaks.
             secrets = sorted({value for key, value in os.environ.items()
                               if value and re.search(r"TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL|COOKIE|GIT_CONFIG_VALUE", key, re.I)},
                              key=len, reverse=True)
+            safe = reason
             if secrets:
                 marker = r"\[redacted(?: header| credential)?\]"
                 safe = re.sub(marker + "|" + "|".join(map(re.escape, secrets)),

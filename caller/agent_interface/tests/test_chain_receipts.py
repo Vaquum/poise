@@ -429,6 +429,18 @@ class AtomicWorkLimits(TestCase):
         self.assertIn("Run the repository's required checks", instruction)
         self.assertEqual(modes, ["prepare", "validate", "publish"])
 
+    def test_atomic_work_blocked_masks_env_value_before_pattern_redaction(self):
+        credential = '{"token":"ghp_abc123","password":"opaque-secret"}'
+        reason = f"blocked by check; SERVICE_CREDENTIALS={credential}"
+        with patch.dict(os.environ, {"SERVICE_CREDENTIALS": credential}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked(reason)
+        message = str(blocked)
+        self.assertIn("[redacted]", message)
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (credential, "ghp_abc123", "opaque-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         reason = "Review requires a product decision before implementation can continue"
         secret = "opaque-environment-credential-crossing-cutoff"
