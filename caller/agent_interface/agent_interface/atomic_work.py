@@ -1,11 +1,13 @@
 """One implementation or repair invocation, with no persistent model session."""
 import json
+import os
+import re
 import subprocess
 from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from . import checkout_lock, issue_review, progress, review_budget, resource_ownership
+from . import atoms, checkout_lock, issue_review, progress, review_budget, resource_ownership
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
 
@@ -14,6 +16,24 @@ UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended
 
 class AtomicWorkBlocked(ValueError):
     code = "atomic_work_blocked"
+
+    def __init__(self, reason: object):
+        message = "AtomicWorkBlocked"
+        if isinstance(reason, str) and reason.strip():
+            safe = atoms.redact_cause(reason)
+            secrets = sorted({value for key, value in os.environ.items()
+                              if value and re.search(r"TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL|COOKIE|GIT_CONFIG_VALUE", key, re.I)},
+                             key=len, reverse=True)
+            if secrets:
+                marker = r"\[redacted(?: header| credential)?\]"
+                safe = re.sub(marker + "|" + "|".join(map(re.escape, secrets)),
+                              lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
+            # Mask complete credentials before whitespace normalization or the
+            # cutoff, including a secret spanning either boundary.
+            message = "atomic behavior blocked: " + atoms.bounded_cause(safe)
+        super().__init__(message)
+        self.diagnostic = diagnostic_envelope(operation="provider.atomic_work", phase="validating", outcome="blocked",
+                                              message=message, submission="none")
 
 
 def _ci_only_blocker(ci: object) -> object:
@@ -129,13 +149,13 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             publication = json.loads(output.read_text())
             if not isinstance(publication, dict):
                 raise ValueError("atomic behavior blocked: invalid output")
-            if publication.get("blocked"):
+            if publication.get("blocked") is not None:
                 blocked = publication["blocked"]
                 if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
                         and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
                     record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})
                     blocked = blocked["reason"]
-                raise AtomicWorkBlocked(f"atomic behavior blocked: {blocked}")
+                raise AtomicWorkBlocked(blocked)
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
                 raise ValueError("atomic behavior publication metadata is incomplete")
             replies = publication.get("replies", [])
