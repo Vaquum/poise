@@ -225,9 +225,13 @@ export class BehaviorLedgerObserver {
         queueAgeMs: oldest === Infinity ? null : Math.max(0, Date.now() - oldest),
         captureLimit: this.options.captureLimit ?? 1_000, captureBytes: this.options.captureBytes ?? 2 * 1024 * 1024,
         stallBudgetMs: this.options.stallTimeoutMs ?? LEDGER_STALL_TIMEOUT_MS }
-      // Logging may journal its own overflow; keep that I/O outside capture.
-      setImmediate(() => diagnostic({ level: 'error', operation: 'behavior-ledger.capture_loss',
-        message: 'Behavior ledger captures lost', context }))
+      // Logging may journal its own overflow; keep that I/O outside capture,
+      // except shutdown loss: stopPoiseRuntime stops logging before a deferred
+      // diagnostic could run, so emit it synchronously while logging is alive.
+      const report = (): void => { diagnostic({ level: 'error', operation: 'behavior-ledger.capture_loss',
+        message: 'Behavior ledger captures lost', context }) }
+      if (reason === 'shutdown_timeout') report()
+      else setImmediate(report)
       this.lossReason = reason
     }
     // Memory-only bounds for the pending marker: losses are attributed from

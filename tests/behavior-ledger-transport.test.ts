@@ -421,6 +421,30 @@ describe('bounded behavior ledger transport', () => {
     }, { timeout: 5000, interval: 50 })
   })
 
+  it('emits shutdown-timeout loss synchronously before logging stops', async () => {
+    // Slow captures outlast the stop budget, so queued arrivals are shed as
+    // shutdown_timeout. stopPoiseRuntime stops logging without yielding to
+    // the event loop when no query pool or Caller pass is outstanding, which
+    // would discard a deferred diagnostic before DiagnosticRuntime.ingest.
+    shortCallerBudgets()
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
+    diagnostic.mockClear()
+    const observer = await fixture(`
+      port.postMessage({ready:true,health,pending:[]});
+      port.on('message',request=>{
+        const reply=()=>port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+        if(request.operation==='capture') setTimeout(reply,400);
+        else reply();
+      });`)
+    for (let index = 0; index < 10; index++) {
+      observer.capture({ ...admission, admissionKey: `shutdown-${index}`, nativeId: `shutdown-${index}` })
+    }
+    await observer.stop()
+    // No waitFor: a setImmediate-deferred emit would still be queued here.
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'shutdown_timeout' }) }))
+  })
+
   it('holds captures through a storage outage and recovers to ok with the list answering', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-outage-'))
     directories.push(directory)
