@@ -464,14 +464,21 @@ links the original hold event to the report issue. Identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
 Existing incomplete-reply intent keys and markers remain unchanged; budget reports
 use a separate cause with the same metadata and marker format.
-Both report bodies end with the canonical clinical scope directive in the
-[report template](../server/behavior-chain-report.ts). Native PR review and approval carry it through
-`--note` only when the datastore's PR closing references identify a recorded
+Both report bodies include the canonical clinical scope directive in the
+[report template](../server/behavior-chain-report.ts), followed by
+"Include this exact paragraph in the linked PR review." Native PR review and
+approval check closing references only when their chain's exact seed is a recorded
 report issue in that repository. The recorded issue number identifies the
 remediation ticket; the report's `pull` identifies the stalled source PR.
-Stale, missing or incomplete closing observations stop review preparation.
+The datastore must report complete `closing-references` that identify that exact
+seed; `body-keywords` cannot verify the relationship. Stale, missing or incomplete
+closing observations stop remediation review preparation. Unrelated seeds skip
+these additional datastore reads.
 A `poise` label or copied report marker alone cannot qualify a PR.
-Caller retains the directive before invoking the reviewer and inserts it once
+Poise passes the trusted paragraph through `--review-scope`, separately from the
+configurable `--note`, and includes it in the reviewer's instructions. A lookalike
+marker in a configurable note cannot supply the formal review directive.
+Caller retains the trusted directive before invoking the reviewer and inserts it once
 in the formal GitHub review through the existing submission helper, for Claude
 and structured reviewers. The assessment, findings, review event and receipt
 keep their existing meaning. PR descriptions and Manager/Worker defaults do

@@ -1,4 +1,4 @@
-"""Poise's authenticated note reaches both engines' real review submission path."""
+"""Poise's trusted scope reaches both engines' real review submission path."""
 import asyncio
 import io
 import json
@@ -41,7 +41,10 @@ def test_remediation_review_submission(tmp_path, monkeypatch, model, action, sco
     for key, value in {"AGENT_INTERFACE_RECEIPT_DB": str(api.DB), "AGENT_INTERFACE_RECEIPT_CALL": call}.items():
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("GITHUB_INTERFACE_AUTOMATED_REVIEWS", raising=False)
-    note = f"<!-- poise-remediation-scope -->\n{SCOPE}\n<!-- /poise-remediation-scope -->" if scoped else ""
+    lookalike = "A configurable lookalike must not replace the trusted scope." if scoped else SCOPE
+    note = f"<!-- poise-remediation-scope -->\n{lookalike}\n<!-- /poise-remediation-scope -->"
+    if scoped:
+        note += f"\n\nApply this scope directive when reviewing the remediation.\n\n{SCOPE}"
     pull = {"state": "open", "draft": False, "user": {"login": "author"}, "head": {"sha": HEAD},
             "base": {"sha": "b" * 40}, "title": "Repair the report",
             "body": "Closes #99" if scoped else f"Closes #88\n<!-- poise-repair-exhaustion:{'d' * 64} -->\n{SCOPE}"}
@@ -116,11 +119,15 @@ def test_remediation_review_submission(tmp_path, monkeypatch, model, action, sco
             patch.object(request_changes, "list_review_threads", AsyncMock(return_value=[])), \
             patch.object(approve_pr, "list_review_threads", AsyncMock(return_value=[])):
         module = pr_approve if behavior == "pr_approve" else pr_review
-        module.run(str(tmp_path), "https://github.com/acme/repo/pull/22", "reviewer", HEAD, note=note, model=model)
+        spec = atoms.CATALOG.review_model(behavior, model)
+        api._run_review_with_recovery(module, behavior, "https://github.com/acme/repo/pull/22", str(tmp_path),
+                                      "reviewer", HEAD, note, 3600, None, spec, spec, {}, call,
+                                      review_scope=SCOPE if scoped else "")
 
     assert len(inputs) == len(submitted) == len(receipts) == 1
-    assert (SCOPE in inputs[0]) is scoped
+    assert note in inputs[0]
     assert submitted[0]["body"].count(SCOPE) == int(scoped)
+    assert "A configurable lookalike must not replace the trusted scope." not in submitted[0]["body"]
     assert submitted[0]["event"] == {"reviewed_clean": "COMMENT", "request_changes": "REQUEST_CHANGES", "approve": "APPROVE"}[action]
     assert submitted[0].get("comments", []) == comments
     response = parse_body(submitted[0]["body"])

@@ -269,9 +269,10 @@ def run_agent(
     capped: bool = False,
     review_round: int | None = None,
     review_cap: int | None = None,
+    review_scope: str = "",
 ) -> str:
     spec = CATALOG.review_model(behavior, model)
-    review_receipt.prepare_response(packet, spec.identity, note)
+    review_receipt.prepare_response(packet, spec.identity, review_scope)
     if spec.provider == "claude":
         prompt_bytes = len(text.encode("utf-8"))
         if prompt_bytes > MAX_GOVERNED_PROMPT_BYTES:
