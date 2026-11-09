@@ -7,7 +7,6 @@ import type { AgentLogSnapshot, LogEntry } from './agent'
 import { recordHandling } from './alerts/handling'
 import { AGENT_BEHAVIORS } from './behavior-estimates'
 import { db } from './db'
-import { diagnostic } from './logging'
 import { LEDGER_CAPTURE_BATCH_LIMIT } from './behavior-ledger-contract'
 import type {
   LedgerAdmission, LedgerCaller, LedgerHealth, LedgerObservation, LedgerPending, LedgerPolicy,
@@ -23,6 +22,9 @@ interface Options {
   readLimit?: number
   readTimeoutMs?: number
   stallTimeoutMs?: number
+  /** Capture-loss evidence. Omitted: durable dropped/gap accounting only, which
+   *  keeps isolated observer bundles (native-stop test) free of the logging chain. */
+  lossDiagnostic?: (event: { level: 'error'; operation: 'behavior-ledger.capture_loss'; message: string; context: Record<string, unknown> }) => void
 }
 interface Job {
   id: number
@@ -228,7 +230,7 @@ export class BehaviorLedgerObserver {
       // Logging may journal its own overflow; keep that I/O outside capture,
       // except shutdown loss: stopPoiseRuntime stops logging before a deferred
       // diagnostic could run, so emit it synchronously while logging is alive.
-      const report = (): void => { diagnostic({ level: 'error', operation: 'behavior-ledger.capture_loss',
+      const report = (): void => { this.options.lossDiagnostic?.({ level: 'error', operation: 'behavior-ledger.capture_loss',
         message: 'Behavior ledger captures lost', context }) }
       if (reason === 'shutdown_timeout') report()
       else setImmediate(report)
@@ -563,6 +565,11 @@ export async function stopBehaviorLedger(): Promise<void> {
   const previous = observer
   observer = null
   await previous?.stop()
+  // A single in-flight capture can fail after the stop budget while no queued
+  // captures remain. Logging stops after this, so wait for the worker to exit
+  // and let that late shutdown loss be diagnosed while ingestion is alive.
+  // stop() itself still returns within its budget; the native-stop proof pins it.
+  await previous?.waitForExit()
 }
 export function captureBehaviorAdmission(input: Omit<LedgerAdmission, 'type'>): void {
   observer?.capture({ ...input, type: 'admit' })

@@ -5,7 +5,7 @@ import { Worker } from 'node:worker_threads'
 import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { BehaviorLedgerObserver } from '../server/behavior-ledger'
+import { BehaviorLedgerObserver, captureBehaviorAdmission, startBehaviorLedger, stopBehaviorLedger } from '../server/behavior-ledger'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import * as logging from '../server/logging'
 import type { LogEntry } from '../server/agent'
@@ -26,7 +26,7 @@ async function fixture(body: string, options: ConstructorParameters<typeof Behav
   directories.push(directory)
   const workerPath = join(directory, 'worker.mjs')
   await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\n${body}\nport.on('message',request=>{if(request.operation==='close')port.close()});`)
-  const observer = new BehaviorLedgerObserver({ workerPath, ...options })
+  const observer = new BehaviorLedgerObserver({ lossDiagnostic: (event) => { logging.diagnostic(event) }, workerPath, ...options })
   observers.push(observer)
   await observer.start()
   return observer
@@ -132,7 +132,7 @@ describe('bounded behavior ledger transport', () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-overflow-'))
     directories.push(directory)
     const path = join(directory, 'ledger.db')
-    const observer = new BehaviorLedgerObserver({ path })
+    const observer = new BehaviorLedgerObserver({ path, lossDiagnostic: (event) => { logging.diagnostic(event) } })
     observers.push(observer)
     await observer.start()
     observer.capture(admission)
@@ -445,6 +445,36 @@ describe('bounded behavior ledger transport', () => {
       context: expect.objectContaining({ reason: 'shutdown_timeout' }) }))
   })
 
+  it('diagnoses a single in-flight failure when stop waits for worker exit', async () => {
+    // One capture in flight and nothing queued at the stop deadline: the
+    // worker reply arrives after stop() resolved. stopBehaviorLedger waits for
+    // exit so logging (stopped after it in stopPoiseRuntime) still ingests the
+    // shutdown_timeout diagnostic. Without the wait the reply lands after
+    // logging stopped and the loss is never diagnosed.
+    shortCallerBudgets()
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
+    diagnostic.mockClear()
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-single-shutdown-'))
+    directories.push(directory)
+    const workerPath = join(directory, 'worker.mjs')
+    await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\nport.postMessage({ready:true,health,pending:[]});\nport.on('message',request=>{\nif(request.operation==='close'){port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});port.close();return;}\nif(request.operation==='capture'&&request.observation?.type!=='loss'){setTimeout(()=>port.postMessage({id:request.id,status:500,body:{version:1,health,error:'boom'},pending:[]}),400);return;}\nport.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});\n});`)
+    await stopBehaviorLedger().catch(() => {})
+    await startBehaviorLedger({ path: join(directory, 'ledger.db'), workerPath,
+      lossDiagnostic: (event) => { logging.diagnostic(event) } })
+    try {
+      captureBehaviorAdmission({ admissionKey: 'single-shutdown', nativeId: 'single-shutdown', behavior: admission.behavior,
+        source: admission.source, owner: admission.owner, actor: admission.actor, repository: admission.repository,
+        number: admission.number, head: admission.head, slot: admission.slot, plannedSlots: admission.plannedSlots })
+      await stopBehaviorLedger()
+      // No waitFor: without waiting for exit the failing reply (400ms) lands
+      // after the shortened stop budget (200ms) and logging would already be stopped.
+      expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+        context: expect.objectContaining({ reason: 'shutdown_timeout' }) }))
+    } finally {
+      await stopBehaviorLedger().catch(() => {})
+    }
+  })
+
   it('holds captures through a storage outage and recovers to ok with the list answering', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-outage-'))
     directories.push(directory)
@@ -539,7 +569,7 @@ describe('bounded behavior ledger transport', () => {
     const diagnostic = vi.spyOn(logging, 'diagnostic')
     const directory = await mkdtemp(join(tmpdir(), 'ledger-poison-'))
     directories.push(directory)
-    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db') })
+    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db'), lossDiagnostic: (event) => { logging.diagnostic(event) } })
     observers.push(observer)
     await observer.start()
     observer.capture(admission)
