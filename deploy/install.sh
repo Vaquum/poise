@@ -112,6 +112,7 @@ image=$(runtime_image)
 sha=$(source_sha)
 expected_workspaces=$(workspace_handles)
 build_runtime_image "$image" "$sha"
+start_rollout "$sha" "$image" "$expected_workspaces"
 if [ -n "$(proxy_listen)" ]; then
   say "Starting the gateway on $(proxy_listen), for your own proxy."
 else

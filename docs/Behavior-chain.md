@@ -372,6 +372,15 @@ the specific cause as its invocation outcome in History. Preparation timeouts
 remain distinct. Retry still requires positive resource release and the existing
 same-basis backoff; three failures hold the chain across restart until **Resume**.
 
+Repair prompts receive `change_request_reviews` from the native
+`github-interface --pr-review` packet, even with no inline roots. The read selects each
+author's latest effective review (`APPROVED`, `CHANGES_REQUESTED`, `DISMISSED`),
+then includes only substantive change requests on the expected head, with their
+original body, review ID, author, commit, submission time and URL. A later
+`COMMENTED` review does not retire a request. Summaries share the packet byte
+limit; an overflowing packet or failed review read fails visibly. The final
+head/base recheck and independent approval verification still apply.
+
 Repair prompts name the exact unresolved root comment IDs from the head-verified
 review packet, including outdated threads and roots with earlier replies.
 Caller requires that same set before publication. Missing coverage records
@@ -409,6 +418,54 @@ An uncertain grey-CI rerun is inspected through the existing native command in
 read-only mode. A later attempt of that exact workflow/head settles its original
 admission; an unchanged attempt remains uncertain. A confirmed preflight read
 failure is a failed, unstarted action and retries with the existing backoff.
+
+## Reporting verified repair exhaustion
+
+Reporting is off by default. An operator can set
+`POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
+list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
+holds during their ordinary bounded reconciliation; no Resume or extra poller is
+needed. Reporting preserves the source hold and does not perform repair recovery.
+
+The first supported cause is `repair_incomplete_replies`: at least three settled
+Caller repairs on the same current repair basis and slot after the last Resume,
+each with positive resource release, `atomic_work_failed`, `not_started` /
+`preflight_failed`, no publication plan and the specific incomplete-reply error.
+The historical fixed message and the newer omission-ID/count suffix represent
+the same cause. Hold text and generic failures cannot establish eligibility.
+Before first reporting, the existing datastore freshness gate must pass and a
+new native observation must still require repair on that head and review basis.
+Stale, unknown or changed findings leave reporting pending. Other causes remain
+visible in their ordinary holds without an issue report.
+
+Poise creates the report as the configured main GitHub account through its
+existing issue publisher, requesting the `poise` label. The body records the
+stage, stable cause, target, hold time/age, head/basis, safe invocation and Caller
+receipt identities, and next action. It excludes raw errors, omitted finding IDs,
+worker paths and provider output. An intent in the existing durable metadata store
+links the original hold event to the report issue. Identity uses cause + source
+chain + PR, independently of omission details, heads and subsequent attempt windows.
+The marker lookup includes closed issues and verifies the publishing account.
+Intent is committed before creation;
+after an ambiguous POST, even repeated empty searches cannot authorize another
+POST. A crash before sending the reserved request also remains unconfirmed and
+requires reconciliation rather than an automatic replacement.
+
+A confirmed issue number is retained before label reconciliation. Missing labels
+are retried additively on that same issue; label failures, datastore indexing lag,
+incompatible saved intake labels and a held remediation chain are shown in the
+source chain's `waiting` reason, including its report URL when known. Poise does
+not add a different intake label or bypass ownership/admission gates. Admission is
+verified only when the normal datastore intake records the new chain. Generated
+remediation issues cannot report this same cause recursively, using their marker
+or the retained source-to-issue link; their ordinary repair holds remain visible.
+
+`tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
+creation/restart, reconciliation and normal admission with an isolated journal
+and fake GitHub/datastore commands. Live acceptance remains pending until an
+operator follows a real qualifying hold through one labeled report, chain
+admission and the normal merge receipt after deployment. No fabricated hold,
+live write or production setting change is part of that component proof.
 
 ## Native action receipts
 

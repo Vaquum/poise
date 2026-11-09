@@ -65,8 +65,8 @@ interface StoredEvent { sequence: number, chain_id: string, event_id: string, at
 const SHA = /^[0-9a-f]{40}$/i
 const REPOSITORY = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]+$/
 // The 512 KiB resource receipt plus a retained 128 KiB atomic artifact,
-// 32 KiB of process diagnostics and its reconciliation envelope.
-const MAX_EVENT_BYTES = 512 * 1024 + 128 * 1024 + 32 * 1024 + 4 * 1024
+// worst-case JSON-escaped 32 KiB of process diagnostics and its envelope.
+const MAX_EVENT_BYTES = 512 * 1024 + 128 * 1024 + 32 * 1024 * 6 + 4 * 1024
 
 function recordObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)

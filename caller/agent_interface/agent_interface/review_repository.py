@@ -45,8 +45,10 @@ class Repository:
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             diagnostic = command_failure(error, "inspection", str(self.root), limit)
-            raise atoms.AgentPreflightError(f"cannot inspect review repository: {error}",
-                                            "review_budget_exhausted" if isinstance(error, subprocess.TimeoutExpired) else None,
+            message = (f"Local review repository inspection timed out after {limit:g} seconds"
+                       if isinstance(error, subprocess.TimeoutExpired) else f"cannot inspect review repository: {error}")
+            raise atoms.AgentPreflightError(message,
+                                            "review_inspection_timeout" if isinstance(error, subprocess.TimeoutExpired) else None,
                                             diagnostic) from error
         if done.returncode:
             message = (done.stderr or done.stdout).strip() or "repository inspection failed"
