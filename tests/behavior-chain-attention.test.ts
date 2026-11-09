@@ -141,6 +141,71 @@ it('directs unaddressed live conversations to repair before approval', () => {
   expect(entry.nextAction).not.toContain('approval')
 })
 
+it('hands answered live conversations to approval instead of repeating repair', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 951, head_sha: 'a'.repeat(40), head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 951, head: 'a'.repeat(40), headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 2, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', pending: false, failing: [], conflict: false, behind: false } }
+  let chain = admit(journal, 951, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'repair', behavior: 'repair-pr', actor: chain.author,
+    model: 'fixture', slot: 'primary', basis: 'repair', admittedAt: admittedAt + 30_000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [],
+      context: { head: 'a'.repeat(40), reviewRevision: 'findings' } } } }, admittedAt + 30_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'repair', callId: 'repair-call', outcome: 'published',
+    evidence: { status: 'completed', action: 'published', head_sha: 'a'.repeat(40), completedAt: admittedAt + 40_000 } }, admittedAt + 40_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('approval')
+  expect(entry.nextAction).not.toContain('repair-pr')
+})
+
+it('directs a queue rejection without diagnosis to repair before approval', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const head = 'c'.repeat(40)
+  const makeObservation = (queueRemoval: { id: string, reason: string | null, at: number, actor: null } | null): ChainObservation => ({ checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 952, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 952, head, headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', pending: false, failing: [], conflict: false, behind: false } })
+  let chain = admit(journal, 952, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'queue', behavior: 'merge-pr', actor: chain.reviewer,
+    model: null, slot: null, basis: 'merge', admittedAt: admittedAt + 20_000,
+    request: { command: 'github-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 20_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'queue', callId: null, outcome: 'enqueued',
+    evidence: { status: 'completed', outcome: 'enqueued', head_sha: head, queue_entry_id: 'queue-1', completedAt: admittedAt + 30_000 } }, admittedAt + 30_000)
+  const rejected = makeObservation({ id: 'removal-1', reason: 'failed_checks', at: admittedAt + 40_000, actor: null })
+  chain = append(journal, chain, { type: 'chain.observed', observation: rejected }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(rejected), checkedAt: now } }, now)
+  const withoutDiagnosis = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(withoutDiagnosis.evidence.state).toBe('fresh')
+  expect(withoutDiagnosis.nextAction).toContain('queue rejection')
+  expect(withoutDiagnosis.nextAction).toContain('repair-pr')
+  expect(withoutDiagnosis.nextAction).not.toContain('Obtain qualifying')
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'diagnosis', behavior: 'repair-pr', actor: chain.author,
+    model: 'fixture', slot: 'primary', basis: 'queue-repair', admittedAt: now,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [],
+      context: { head, reviewRevision: 'findings', queueRemoval: 'removal-1' } } } }, now)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'diagnosis', callId: 'diagnosis-call', outcome: 'no_changes',
+    evidence: { status: 'completed', action: 'no_changes', head_sha: head, completedAt: now } }, now)
+  const withDiagnosis = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(withDiagnosis.nextAction).toContain('approval')
+  expect(withDiagnosis.nextAction).not.toContain('queue rejection')
+})
+
 it('advances the age on verified recovery without clearing a durable hold or missing original receipt', () => {
   const journal = new BehaviorChainJournal(db)
   delayedChainFixture(journal, now)
