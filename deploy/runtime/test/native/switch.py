@@ -147,7 +147,8 @@ if sys.argv[1:2] == ['worker']:
         destination = owned / ('publication.json' if kind == 'implementation' else 'review.json')
         body = ('import json, os, time\nfrom pathlib import Path\n'
                 f'work = Path({str(work)!r})\n'
-                'work.joinpath("ready").write_text(json.dumps({"call": os.environ["AGENT_INTERFACE_RECEIPT_CALL"], "provider_pid": os.getpid()}))\n'
+                'work.joinpath("ready.tmp").write_text(json.dumps({"call": os.environ["AGENT_INTERFACE_RECEIPT_CALL"], "provider_pid": os.getpid()}))\n'
+                'work.joinpath("ready.tmp").replace(work.joinpath("ready"))\n'
                 'while not work.joinpath("release").exists(): time.sleep(0.02)\n'
                 f'Path({str(destination)!r}).write_text({json.dumps(output)!r})\n'
                 'print(json.dumps({"type": "turn.completed"}), flush=True)\n')
