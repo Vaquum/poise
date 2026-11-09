@@ -12,7 +12,8 @@ from unittest.mock import patch
 import pytest
 
 import agent_interface as api
-from agent_interface import native_cleanup, native_namespace, process_identity, resource_ownership as ownership
+from agent_interface import issue_review, native_cleanup, native_namespace, process_identity, resource_ownership as ownership, review_receipt
+from agent_interface.model_catalog import CATALOG
 
 
 @pytest.fixture
@@ -54,6 +55,34 @@ def requested():
 def register(call, scope):
     ownership.request_namespace(api.DB, call, scope)
     ownership.register_namespace(api.DB, call, {"controller": scope.address, **scope.key, "binding": scope.binding})
+
+
+@pytest.mark.parametrize("identity", ["opus-5-max", "gpt-6-astra-ultra", "grok-4.6-xhigh",
+                                      "gemini-3.8-flash-high", "muse-spark-1.3-contributor-max"])
+def test_provider_child_scratch_leaves_managed_parent_receipt_unchanged(database, identity):
+    call, scope = requested()
+    register(call, scope)
+    before = state(call)
+    work = database / "worker"
+    work.mkdir()
+    with review_receipt.invocation_environment(api.DB, call, True):
+        _, _, env = issue_review.command(CATALOG.resolve(identity), "test scratch", work / "repo", work, 60)
+        done = subprocess.run(
+            [sys.executable, "-c", "from pathlib import Path\n"
+             "from agent_interface import resource_ownership\n"
+             "with resource_ownership.temporary_directory('caller-pr-review-') as directory:\n"
+             "    assert Path(directory).is_dir()\n"
+             "    print(directory)\n"],
+            cwd=work, env=env, text=True, capture_output=True, timeout=30,
+        )
+        assert state(call) == before
+        assert done.returncode == 0, done.stderr
+        assert os.environ["AGENT_INTERFACE_RECEIPT_DB"] == str(api.DB)
+        assert os.environ["AGENT_INTERFACE_RECEIPT_CALL"] == call
+        assert env["XDG_CACHE_HOME"] == str(work / "cache")
+        assert env["npm_config_cache"] == str(work / "npm-cache")
+    assert Path(done.stdout.strip()).parent == work / "tmp"
+    assert not Path(done.stdout.strip()).exists()
 
 
 def test_physical_cli_wins_original_claim_before_contacting_controller(database, monkeypatch):

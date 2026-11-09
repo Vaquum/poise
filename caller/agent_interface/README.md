@@ -486,6 +486,11 @@ Claude keeps Claude Code's own system prompt: the unattended rules are
 appended with `--append-system-prompt`, last on the line, and the task goes on
 stdin — the shape Poise's subscription wrapper reads a stdin prompt from.
 
+Issue-review and atomic implementation/repair providers and their commands run
+without `AGENT_INTERFACE_RECEIPT_DB` or `AGENT_INTERFACE_RECEIPT_CALL`. Scratch
+and managed build caches stay inside the run. Caller retains its receipt binding
+for resource checks, trusted publication and cleanup.
+
 The actor is the agent account. `GITHUB_INTERFACE_AGENT_USER` names it, and
 an `--actor` that differs from it is refused before anything runs
 (`actor_mismatch`); without it nothing runs (`agent_account_missing`). Every

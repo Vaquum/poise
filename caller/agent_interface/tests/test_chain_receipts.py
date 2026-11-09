@@ -1,4 +1,5 @@
 """Durable native-effect receipts; these guards do not validate live cycles."""
+import asyncio
 import json
 import os
 import sqlite3
@@ -10,10 +11,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import agent_interface as api
 from agent_interface import issue_review, native_namespace, review_budget, review_receipt, resource_ownership
+from github_interface.behaviors import pr_review
 
 CALL = "a" * 32
 HEAD = "b" * 40
@@ -372,6 +374,60 @@ class AtomicWorkLimits(TestCase):
                 else:
                     self.assertEqual(modes, ["prepare", "validate", "publish"])
                     self.assertEqual((status, action, outcome), ("completed", "published", "published"))
+
+    def test_summary_only_change_request_reaches_repair_prompt_without_required_replies(self):
+        review = {"id": 91, "state": "CHANGES_REQUESTED", "commit_id": HEAD, "user": {"login": "reviewer"},
+                  "body": "  Verify the current-head failure before repairing it.\n", "submitted_at": "2026-11-08T19:51:00Z",
+                  "html_url": "https://github.com/example/repo/pull/3#pullrequestreview-91"}
+        client = AsyncMock()
+        client.paginate.return_value = [review]
+        modes = []
+
+        def interface(*args, **_kwargs):
+            if args[0] == "--pr-review":
+                return asyncio.run(pr_review.run(client, {"repository": "example/repo", "pr": 3, "expected_head": HEAD}))
+            if args[0] != "--issue-work":
+                return {}
+            mode = args[args.index("--mode") + 1]
+            modes.append(mode)
+            if mode == "prepare":
+                return {"outcome": "prepared", "checkout_head": HEAD}
+            self.assertEqual(json.loads(args[args.index("--replies-json") + 1]), [])
+            return {"outcome": "validated" if mode == "validate" else "published", "head_sha": HEAD}
+
+        def worker(_lease, _args, **kwargs):
+            (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                "commitMessage": "fix: repair seed", "title": "fix: repair seed", "body": "Concrete repair and checks.",
+                "replies": [], "blocked": None}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(pr_review, "get_pull", AsyncMock(return_value={"head": {"sha": HEAD}, "base": {"sha": "c" * 40}})), \
+                patch.object(pr_review, "list_inline_comments", AsyncMock(return_value=[])), \
+                patch.object(pr_review, "issue_comments", AsyncMock(return_value=[])), \
+                patch.object(pr_review, "list_review_threads", AsyncMock(return_value=[])), \
+                patch.object(pr_review, "linked_issues", AsyncMock(return_value=[])), \
+                patch.object(pr_review, "review_diff", AsyncMock(return_value={})), \
+                patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                patch.object(issue_review, "interface", side_effect=interface), \
+                patch.object(issue_review, "command", return_value=(["fixture"], "", {})) as command, \
+                patch.object(issue_review, "_terminal_failure", return_value=None), \
+                patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), redirect_stdout(StringIO()):
+            api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain", "summary-only-repair",
+                                "fixture-model", "poise/issue-7", 3, HEAD)
+
+        instruction = command.call_args.args[1]
+        packet = json.loads(instruction.split("Actual PR evidence:\n", 1)[1])["review_packet"]
+        self.assertEqual(packet["change_request_reviews"], [
+            {"id": 91, "user": "reviewer", "state": "CHANGES_REQUESTED", "commit_id": HEAD,
+             "submitted_at": review["submitted_at"], "url": review["html_url"], "body": review["body"]}
+        ])
+        self.assertEqual(packet["review_threads"], [])
+        self.assertIn("required unresolved root comment IDs: []", instruction)
+        self.assertIn("address every actionable review/CI/conflict blocker", instruction)
+        self.assertIn("Run the repository's required checks", instruction)
+        self.assertEqual(modes, ["prepare", "validate", "publish"])
 
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         modes = []
