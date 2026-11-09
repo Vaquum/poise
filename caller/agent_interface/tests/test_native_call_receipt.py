@@ -274,7 +274,7 @@ def test_allocation_reserves_identity_settlement_and_a_terminal_blocker(database
     scope.resource = resource
     monkeypatch.setattr(native_namespace, "active", lambda: scope)
     parent = ownership.call_directory(api.DB, call)
-    for index in range(1000):
+    for index in range(4000):
         root = parent / f"agent-interface-review-{index:032x}" / "codex-home"
         before = state(call)
         try:
