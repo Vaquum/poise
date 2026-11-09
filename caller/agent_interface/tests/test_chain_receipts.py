@@ -520,6 +520,25 @@ class AtomicWorkLimits(TestCase):
                         self.assertNotIn(private, message)
                         self.assertNotIn(private, json.dumps(blocked.diagnostic))
 
+    def test_atomic_work_blocked_keyword_ending_and_whitespace_variant_values_stay_masked(self):
+        with patch.dict(os.environ, {"TEST_KEY": "ghp_a Bearer"}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("ghp_a Bearer my-secret")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: [redacted] [redacted credential]")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in ("ghp_a Bearer", "ghp_a", "my-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+        credential = "ghp_a:\nopaque-secret"
+        with patch.dict(os.environ, {"SERVICE_CREDENTIALS": credential}, clear=True):
+            fragmented = api.atomic_work.AtomicWorkBlocked("blocked ghp_a: opaque-secret end")
+        masked = str(fragmented)
+        self.assertEqual(masked, "atomic behavior blocked: blocked [redacted] end")
+        self.assertEqual(fragmented.diagnostic["message"], masked)
+        for private in (credential, "ghp_a: opaque-secret", "ghp_a", "opaque-secret"):
+            self.assertNotIn(private, masked)
+            self.assertNotIn(private, json.dumps(fragmented.diagnostic))
+
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         reason = "Review requires a product decision before implementation can continue"
         secret = "opaque-environment-credential-crossing-cutoff"

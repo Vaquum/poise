@@ -32,12 +32,20 @@ class AtomicWorkBlocked(ValueError):
             if secrets:
                 marker = r"\[redacted(?: header| credential)?\]"
                 markers = ("[redacted]", "[redacted header]", "[redacted credential]")
-                before = []
+                keyword_end = re.compile(r"(?i)\b(?:proxy-authorization|authorization|set-cookie|cookie|bearer|basic|token)\s*[:=]?\s*$")
+                forms: dict[str, bool] = {}
                 for value in secrets:
-                    shaped = atoms.redact_cause(value)
-                    if shaped != value and shaped not in markers and "[redacted header]" not in shaped \
-                            and "[redacted credential]" not in shaped:
-                        before.append(value)
+                    norm = " ".join(value.split())
+                    if norm and keyword_end.search(norm):
+                        continue
+                    for form in {value, norm}:
+                        if not form:
+                            continue
+                        shaped = atoms.redact_cause(form)
+                        if shaped != form and shaped not in markers and "[redacted header]" not in shaped \
+                                and "[redacted credential]" not in shaped:
+                            forms[form] = True
+                before = sorted(forms, key=len, reverse=True)
                 if before:
                     safe = re.sub(marker + "|" + "|".join(map(re.escape, before)),
                                   lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
