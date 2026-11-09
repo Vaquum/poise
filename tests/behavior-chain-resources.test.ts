@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseAgentLogStdout } from '../server/agent-log-parse'
 import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, type ChainAdmission, type ChainEvent } from '../server/behavior-chain-store'
+import { parseResourceOwnership } from '../server/behavior-resource-receipt'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorResourceRecovery } from '../server/behavior-chain-resource-recovery'
 import type { ChainObservation } from '../server/behavior-chain-decision'
@@ -464,6 +465,25 @@ describe('resource-aware behavior admission', () => {
     expect(admitted.invocations).toHaveLength(1)
     expect(admitted.invocations[0].reservation).toBeNull()
     expect(admitted.invocations[0].request.argv).toEqual(['--model', 'fixture-model'])
+  })
+
+  it('reconciles a mid-size ancestor receipt that the parser allows', () => {
+    const { journal, chain } = setup()
+    let current = record(journal, chain, { type: 'invocation.admitted', invocation: invocation('large-receipt', RESERVATION) })
+    // Production ancestor coverage lands between the old 256 KiB journal bound
+    // and the 512 KiB receipt bound: ~600 reclaimed roots with long paths.
+    const roots = Array.from({ length: 600 }, (_, index) => ({ path: `/isolated/${index}/${'x'.repeat(400)}`,
+      state: 'reclaimed' as const, device: '1', inode: `${index + 2}`, parent_device: '1', parent_inode: '3', reclaimed_at: 10 }))
+    const receipt = { version: 1 as const, roots, errors: [] }
+    const receiptBytes = Buffer.byteLength(JSON.stringify(receipt))
+    expect(receiptBytes).toBeGreaterThan(256 * 1024)
+    expect(receiptBytes).toBeLessThan(512 * 1024)
+    expect(parseResourceOwnership(receipt).roots).toHaveLength(600)
+    const settledAt = new Date(NOW).toISOString()
+    current = record(journal, current, { type: 'invocation.resources_reconciled', invocationId: 'large-receipt',
+      evidence: { resource_ownership: receipt, resources_settled_at: settledAt } })
+    expect(current.invocations[0].evidence?.resource_ownership).toEqual(receipt)
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
   })
 })
 
