@@ -8,6 +8,7 @@ import type { ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { nativeActionReceipt } from '../server/behavior-chain-action'
 import { completedReviewCall } from './review-response-fixture'
+import { parseAgentLogStdout, type LogEntry } from '../server/agent-log-parse'
 
 const NOW = 1_800_000_000_000
 const MERGE = 'c'.repeat(40)
@@ -50,6 +51,129 @@ function operations(overrides: Partial<ChainRuntimeOperations> = {}): ChainRunti
     received: () => {}, available: () => false, capacity: () => 3, permitted: () => false, request: forbidden,
     launch: forbidden, perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {}, ...overrides }
 }
+
+it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause', 'missing failure identity'])(
+  'rechecks a CI-only repair hold without duplicate work: %s', async mode => {
+    const { db, journal } = setup()
+    const obs = observation()
+    obs.publication.state = 'open'; obs.publication.merged = false; obs.publication.merge_sha = null
+    Object.assign(obs.pull!, { state: 'open', merged: false, mergeSha: null, checksState: 'FAILURE', failing: ['unit:failure'] })
+    obs.prReviewers = []
+    let chain = seed(journal)
+    chain = record(journal, chain, { type: 'chain.observed', observation: structuredClone(obs) })
+    const id = 'blocked-repair'
+    record(journal, chain, { type: 'invocation.admitted', invocation: { id, behavior: 'repair-pr', actor: chain.author,
+      model: reviewer.model, slot: reviewer.slot, basis: 'failed-ci', admittedAt: NOW - 86_400_000,
+      request: { command: 'agent-interface', argv: ['--atomic-work', 'acme/repo#7', '--expected-head', obs.pull!.head],
+        cwd: '/fixture', context: { head: obs.pull!.head, reviewRevision: obs.pull!.reviewRevision } } } })
+    const ci = { action: 'list_failing_ci', repository: chain.repository, pull_number: 17, head_sha: obs.pull!.head,
+      failing: [{ type: 'check_run', name: 'unit', state: 'completed', conclusion: 'failure', check_run_id: 41,
+        log_id: mode === 'missing failure identity' ? 0 : 42, url: 'https://github.com/acme/repo/actions/runs/40/job/42' },
+      { type: 'check_run', name: 'build', state: 'in_progress', conclusion: null, check_run_id: 43, log_id: 44,
+        url: 'https://github.com/acme/repo/actions/runs/40/job/44' }] }
+    const call: LogEntry = { ...completedReviewCall(chain.repository, 17, obs.pull!.head, chain.author), id: 'a'.repeat(32),
+      behavior: 'repair_pr', source: 'poise:behavior-chain', correlation_id: id, status: 'failed',
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, review_id: null,
+      error_code: 'atomic_work_blocked', error: 'CI failed; repair cannot continue',
+      artifact: { phase: 'executing', ...(mode === 'ambiguous cause' ? {} : { ci_blocker: ci }) },
+      resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: null }
+    const calls = [call]
+    const observe = vi.fn(async () => ({ ...structuredClone(obs), checkedAt: Date.now() }))
+    const launch = vi.fn(async () => true)
+    const request = vi.fn(async () => ({ command: 'agent-interface' as const, cwd: '/fixture', argv: ['--model', reviewer.model] }))
+    const native = operations({ enabled: () => true, available: () => true, permitted: () => true, observe, launch, request,
+      readInvocations: async () => parseAgentLogStdout(JSON.stringify(calls), 'CI hold regression') })
+    let runtime = new BehaviorChainRuntime(journal, native)
+    await runtime.run()
+    expect(journal.read(chain.id)!.held).toBe(call.error)
+    expect(observe).not.toHaveBeenCalled()
+    await runtime.run()
+    expect(launch).not.toHaveBeenCalled()
+    if (mode === 'uncertain publication') {
+      call.action = null
+      call.artifact = { ...call.artifact, phase: 'publishing', plan_sha: 'd'.repeat(64) }
+    }
+    vi.setSystemTime(NOW + 5000)
+    call.resources_settled_at = new Date().toISOString()
+    await runtime.run()
+    chain = journal.read(chain.id)!
+    expect(chain.held).toBe(call.error)
+    expect(chain.invocations[0].state).toBe(mode === 'uncertain publication' ? 'uncertain' : 'settled')
+    const failedReceipt = structuredClone(chain.invocations[0])
+    if (mode === 'operator hold') chain = record(journal, chain, { type: 'chain.held', reason: call.error })
+    const history = journal.history(chain.id)
+    journal.rebuild()
+    runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
+    for (let tick = 0; tick < 3; tick++) await runtime.run()
+    if (mode !== 'uncertain publication') expect(journal.history(chain.id)).toEqual(history)
+    expect(launch).not.toHaveBeenCalled()
+    if (mode === 'recovery') {
+      expect(journal.reconciliationAt(chain)).toBe(Date.now() + 120_000)
+      for (const state of [
+        { checksState: 'PENDING', pending: true, failing: [] },
+        { checksState: 'FAILURE', pending: false, failing: ['unit:failure'] },
+        { checksState: 'SUCCESS', pending: true, failing: [] },
+        { checksState: 'SUCCESS', pending: false, failing: ['unit:failure'] },
+        { checksState: null, pending: false, failing: [] },
+        { checksState: 'SUCCESS', pending: false, failing: [], head: 'c'.repeat(40) },
+      ]) {
+        Object.assign(obs.pull!, { head: ci.head_sha, ...state })
+        vi.setSystemTime(Date.now() + 120_000)
+        await runtime.run()
+        expect(journal.read(chain.id)!.held).toBe(call.error)
+        expect(launch).not.toHaveBeenCalled()
+        expect(journal.reconciliationAt(journal.read(chain.id)!)).toBe(Date.now() + 120_000)
+      }
+      Object.assign(obs.pull!, { checksState: 'SUCCESS', head: ci.head_sha, pending: false, failing: [] })
+      for (const offset of [-120_001, 1]) {
+        vi.setSystemTime(Date.now() + 120_000)
+        observe.mockImplementationOnce(async () => ({ ...structuredClone(obs), checkedAt: Date.now() + offset }))
+        await runtime.run()
+        expect(journal.read(chain.id)!.held).toBe(call.error)
+      }
+      vi.setSystemTime(Date.now() + 120_001)
+      observe.mockRejectedValueOnce(new Error('CI evidence unavailable'))
+      await expect(runtime.run()).rejects.toThrow('CI evidence unavailable')
+      expect(journal.read(chain.id)!.held).toBe(call.error)
+    }
+    Object.assign(obs.pull!, { checksState: 'SUCCESS', head: ci.head_sha, pending: false, failing: [] })
+    if (mode === 'recovery') obs.issue.open = false
+    vi.setSystemTime(Date.now() + 86_400_000)
+    await runtime.run()
+    chain = journal.read(chain.id)!
+    if (mode !== 'recovery') {
+      expect(chain.held).toBe(call.error)
+      expect(chain.invocations).toHaveLength(1)
+      expect(launch).not.toHaveBeenCalled()
+      return
+    }
+    expect(chain.held).toBeNull()
+    expect(chain.ciHold).toBeUndefined()
+    expect(chain.resumedAfterSequence).toBe(0)
+    expect(chain.invocations[0]).toEqual(failedReceipt)
+    expect(chain.invocations.at(-1)!.behavior).toBe('approve-pr')
+    expect(launch).toHaveBeenCalledTimes(1)
+    const recovery = journal.history(chain.id).map(row => JSON.parse(row.payload)).filter(event => event.ciRecovery)
+    expect(recovery).toEqual([{ type: 'chain.resumed', ciRecovery: { invocationId: id, callId: call.id, head: ci.head_sha } }])
+    journal.rebuild()
+    runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
+    for (let tick = 0; tick < 3; tick++) await runtime.run()
+    expect(launch).toHaveBeenCalledTimes(1)
+    vi.setSystemTime(Date.now() + 2000)
+    const approval: LogEntry = { ...completedReviewCall(chain.repository, 17, ci.head_sha, chain.reviewer),
+      correlation_id: chain.invocations.at(-1)!.id, source: 'poise:behavior-chain', behavior: 'pr_approve',
+      action: 'approved', outcome: 'approved', resources_settled_at: new Date().toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] } }
+    calls.push(approval)
+    Object.assign(obs.pull!, { approved: true, reviewIds: [approval.review_id!],
+      reviewReceipts: [{ id: approval.review_id!, head: ci.head_sha, state: 'APPROVED', invocation: approval.id,
+        response: approval.artifact!.review_response, submittedAt: Date.now() }] })
+    await runtime.run()
+    expect(journal.read(chain.id)!.invocations.at(-1)).toMatchObject({ state: 'settled', outcome: 'approved' })
+    expect(journal.read(chain.id)!.waiting).toBe('native repository readiness gates are not satisfied')
+    expect(journal.read(chain.id)!.invocations[0]).toEqual(failedReceipt)
+    expect(launch).toHaveBeenCalledTimes(1)
+  })
 
 it('deduplicates merged holds and bounds repeated observation from durable state across runtime replacement', async () => {
   const { journal } = setup()

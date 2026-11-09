@@ -33,6 +33,15 @@ CALL_ID PLAN_SHA HEAD_SHA` continuation accepts only an original failed repair
 whose immutable plan, pushed head, unattempted replies and released worker
 resources are proven. It starts no model and cannot replace that plan.
 
+An atomic repair blocked solely by the supplied head's failed CI can return
+`blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains
+its own supplied CI snapshot as `artifact.ci_blocker`, including the failed
+check and job IDs that identify the original run attempt. Other blockers remain
+strings and confer no automatic recovery authority. The
+[chain reconciler](../docs/Behavior-chain.md#bounded-reconciliation) checks the
+original no-publication receipt, resource release and fresh same-head CI before
+resuming the remaining gates.
+
 ## Accounts
 
 No GitHub account is fixed in Caller. Each `github-interface` behavior acts as
