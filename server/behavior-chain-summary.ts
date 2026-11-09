@@ -368,7 +368,17 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                                           : normalApproveCompleted && pull && !pull.approved
                                           ? 'Await the approval verified artifact or changed input; approve-pr already completed for this candidate'
                                           : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
-                                            : chain.waiting || 'Await the next invocation under existing admission gates'
+                                            // Mirroring decideBehaviorChain: past approval, blocking
+                                            // conversations resolve through resolve-threads, then readiness,
+                                            // then the retained substantive review, then merge-pr.
+                                            : pull && blockingThreads(pull) > 0 ? `Resolve ${blockingThreads(pull)} blocking review conversation(s) through resolve-threads; only the native approval gate permits resolution`
+                                              : pull && !pull.ready ? 'Await native repository readiness gates; no new invocation can proceed until they pass'
+                                                : pull && observation && !chain.invocations.some(invocation => invocation.evidence?.status === 'completed'
+                                                  && ['reviewed_clean', 'approved'].includes(String(invocation.evidence.action))
+                                                  && !!chainReviewResponse(chain, invocation, observation, now))
+                                                ? 'Hold: merge requires a retained substantive final-context review response; a decision is required'
+                                                : pull ? 'Merge or enqueue through merge-pr under native head-pinned repository gates'
+                                                  : chain.waiting || 'Await the next invocation under existing admission gates'
       let retryAt: number | null = null
       if (!chain.held && !chain.reviewPending && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`) {
         const attempts = chain.invocations.filter(invocation => invocation.behavior === last.behavior && invocation.basis === last.basis
