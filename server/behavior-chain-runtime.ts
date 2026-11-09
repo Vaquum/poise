@@ -96,7 +96,7 @@ function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: n
     && Number.isFinite(observation.checkedAt) && observation.checkedAt >= evidence.completedAt
     && observation.checkedAt >= Date.parse(String(evidence.resources_settled_at))
     && observation.checkedAt <= now && now - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
-    && observation.issue.open && !!pull && pull.state === 'open' && !pull.merged && pull.head === hold.head
+    && !!pull && pull.state === 'open' && !pull.merged && pull.head === hold.head
     && pull.checksState === 'SUCCESS' && !pull.pending && pull.failing.length === 0
 }
 

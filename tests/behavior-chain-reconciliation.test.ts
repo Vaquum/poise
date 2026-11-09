@@ -137,6 +137,7 @@ it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause'
       expect(journal.read(chain.id)!.held).toBe(call.error)
     }
     Object.assign(obs.pull!, { checksState: 'SUCCESS', head: ci.head_sha, pending: false, failing: [] })
+    if (mode === 'recovery') obs.issue.open = false
     vi.setSystemTime(Date.now() + 86_400_000)
     await runtime.run()
     chain = journal.read(chain.id)!
