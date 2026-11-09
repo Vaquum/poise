@@ -44,20 +44,148 @@ require_docker() {
     || die "the Docker Compose plugin is missing ('docker compose' does not run). Install it: https://docs.docker.com/compose/install/linux/"
 }
 
-# The value deploy/.env gives NAME, as Compose reads a NAME=value line: without
-# surrounding quotes, or else without a trailing comment; empty when unset.
+# The image whose Node parses the resolved Compose JSON: the existing
+# runtime image when it is already on this host (it already contains Node 22),
+# otherwise the pinned Node base. This never builds or moves the live
+# workspace tags to decide the guard.
+guard_parser_image() {
+  local live
+  live=$(env_value POISE_RUNTIME_IMAGE)
+  live=${live:-poise-runtime:latest}
+  case $live in
+    *@*) live="poise-runtime:latest" ;;
+  esac
+  if docker image inspect "$live" >/dev/null 2>&1; then
+    printf '%s' "$live"
+  else
+    printf '%s' "node:22-bookworm-slim"
+  fi
+}
+
+# The gateway's effective POISE_WORKSPACE_RUNTIME from Compose's resolved JSON:
+# only services.gateway.environment, decoded with JSON.parse and trimmed with
+# the gateway's own trim (gateway/src/config.ts). Prints the trimmed value,
+# empty when absent. Fails when the configuration cannot be parsed.
+guard_desired_runtime() {
+  local config=$1 parser_image
+  parser_image=$(guard_parser_image)
+  printf '%s' "$config" | docker run --rm --network none -i --entrypoint node "$parser_image" --input-type=module -e '
+let chunks=[];
+process.stdin.on("data",(chunk)=>{chunks.push(chunk);}).on("end",()=>{
+try{
+const text=Buffer.concat(chunks).toString("utf8");
+const config=JSON.parse(text||"{}");
+const environment=config?.services?.gateway?.environment;
+let value="";
+if(Array.isArray(environment)){
+const entry=environment.find((item)=>typeof item==="string"&&item.startsWith("POISE_WORKSPACE_RUNTIME="));
+if(entry!==undefined)value=entry.slice("POISE_WORKSPACE_RUNTIME=".length);
+}else if(environment!=null&&typeof environment==="object"){
+const raw=environment.POISE_WORKSPACE_RUNTIME;
+if(raw!=null)value=String(raw);
+}
+process.stdout.write(value.trim());
+}catch(error){
+console.error(String(error&&error.message?error.message:error));
+process.exit(1);
+}
+});
+'
+}
+
+# A host service, independent of the gateway's readiness cache and Docker's
+# workspace restart policy. Inspect actual runtimes as well as future settings.
+# Call this before building the runtime image, publishing a rollout, or
+# starting workspaces: both live tags stay untouched until --check proves
+# protection, and a failed read or parse stops deployment before any of those.
+ensure_caller_guard() {
+  local status changed=false proof deadline=$((SECONDS + 180)) privilege=()
+  local desired ids runtimes runtime inspect_runtime=false config
+  # The gateway's effective runtime is Compose's resolved
+  # services.gateway.environment.POISE_WORKSPACE_RUNTIME (deploy/compose.yaml
+  # forwards ${POISE_WORKSPACE_RUNTIME:-} so quoting, comments and
+  # interpolation resolve as the gateway sees them). env_value cannot do
+  # Compose interpolation, so the guard reads the resolved configuration.
+  # A failed read or parse stops deployment; absent or trimmed-empty falls
+  # back to Docker's default. Only this nested field decides: labels or any
+  # other environment value never leak into the guard decision.
+  config=$(compose config --format json) || die "cannot read the gateway's resolved Compose configuration for the Caller SQLite guard."
+  desired=$(guard_desired_runtime "$config") || die "cannot parse the gateway's resolved Compose configuration for the Caller SQLite guard."
+  if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}') || die "cannot read Docker's default runtime for the Caller SQLite guard."; fi
+  ids=$(docker ps --all --quiet --filter label=poise.managed=true) || die "cannot list workspaces for the Caller guard."
+  runtimes=''
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086 # one argument per container ID
+    runtimes=$(docker inspect --format '{{.HostConfig.Runtime}}' $ids) || die "cannot inspect workspace runtimes for the Caller guard."
+  fi
+  for runtime in "$desired" $runtimes; do
+    case $runtime in runc|io.containerd.runc.v2) ;; *) inspect_runtime=true ;; esac
+  done
+  [ "$inspect_runtime" = true ] || return 0
+  command -v python3 >/dev/null || die "Python 3.10+ is required on the host for the Caller SQLite guard."
+  if python3 "$deploy/caller-guard/guard.py" --needed --runtime "$desired"; then
+    :
+  else
+    status=$?
+    [ "$status" -eq 10 ] && return 0
+    die "cannot inspect the actual Docker runtimes for the Caller SQLite guard."
+  fi
+  if [ "$(id -u)" -ne 0 ]; then privilege=(sudo -n); fi
+  "${privilege[@]}" install -d -m 755 /opt/poise-caller-guard \
+    || die "installing the host Caller guard requires root or passwordless sudo."
+  if ! cmp -s "$deploy/caller-guard/guard.py" /opt/poise-caller-guard/guard.py \
+    || ! cmp -s "$deploy/caller-guard/poise-caller-guard.service" /etc/systemd/system/poise-caller-guard.service; then
+    changed=true
+    "${privilege[@]}" install -m 644 "$deploy/caller-guard/guard.py" /opt/poise-caller-guard/guard.py
+    "${privilege[@]}" install -m 644 "$deploy/caller-guard/poise-caller-guard.service" /etc/systemd/system/poise-caller-guard.service
+    "${privilege[@]}" systemctl daemon-reload
+  fi
+  "${privilege[@]}" systemctl enable poise-caller-guard.service
+  if [ "$changed" = true ]; then
+    "${privilege[@]}" systemctl restart poise-caller-guard.service
+  else
+    "${privilege[@]}" systemctl start poise-caller-guard.service
+  fi
+  while ! proof=$("${privilege[@]}" python3 /opt/poise-caller-guard/guard.py --check 2>&1); do
+    [ "$SECONDS" -lt "$deadline" ] || die "Caller host protection is not established: $proof. Inspect journalctl -u poise-caller-guard."
+    sleep 2
+  done
+  say "$proof"
+}
+
+# The value deploy/.env gives NAME, as Compose reads a NAME=value line:
+# surrounding quotes are stripped and a trailing ` # comment` is dropped
+# (`#` inside quotes is kept; unquoted `abc#def` keeps the `#`); empty when unset.
 env_value() {
-  local line value
+  local line value rest
   line=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$env_file" | tail -n 1) || true
   value=${line#*=}
   value=${value#"${value%%[![:space:]]*}"}
   case $value in
-    \"* | \'*) ;;
-    *) value=${value%%[[:space:]]#*} ;;
-  esac
-  value=${value%"${value##*[![:space:]]}"}
-  case $value in
-    \"*\" | \'*\') value=${value:1:${#value}-2} ;;
+    \"*)
+      rest=${value:1}
+      case $rest in
+        *\"*) value=${rest%%\"*} ;;
+        *)
+          value=${value%%[[:space:]]#*}
+          value=${value%"${value##*[![:space:]]}"}
+          ;;
+      esac
+      ;;
+    \'*)
+      rest=${value:1}
+      case $rest in
+        *\'*) value=${rest%%\'*} ;;
+        *)
+          value=${value%%[[:space:]]#*}
+          value=${value%"${value##*[![:space:]]}"}
+          ;;
+      esac
+      ;;
+    *)
+      value=${value%%[[:space:]]#*}
+      value=${value%"${value##*[![:space:]]}"}
+      ;;
   esac
   printf '%s' "$value"
 }

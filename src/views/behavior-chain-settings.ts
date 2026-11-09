@@ -4,7 +4,10 @@ import type { BehaviorCutoverState } from '../behavior-cutover'
 import type { ProcessDiagnostic } from '../../server/process-diagnostic'
 
 type Settings = NonNullable<AppSettings['behaviorChain']>
-interface FailureEvidence { diagnostic?: ProcessDiagnostic }
+interface FailureEvidence {
+  diagnostic?: ProcessDiagnostic
+  publicationPlan?: { callId: string, recoveredAt: number | null }
+}
 interface ChainRow {
   id: string, repository: string, issue: number, sequence: number, held: string | null, waiting: string | null,
   mergeSha: string | null, reviewPending?: boolean | null, reviewStatus?: 'pending' | 'complete' | 'not-recorded', pullNumber: number | null,
@@ -233,6 +236,10 @@ export function behaviorChainSettings() {
       list.innerHTML = rows.map((chain) => {
         const active = chain.invocations.find(invocation => invocation.state !== 'settled')
         const last = chain.invocations[chain.invocations.length - 1]
+        const plan = (active ?? last)?.evidence?.publicationPlan
+        const planStatus = !plan ? '' : plan.recoveredAt === null
+          ? ` · Original Call ${plan.callId}: original publication plan is missing; publication evidence remains unverified. Restore the original Caller plan and let reconciliation validate it; do not retry publication.`
+          : ` · Original publication plan recovered for Call ${plan.callId}; publication and resource-release checks still apply.`
         const github = /^[-A-Za-z0-9_.]+\/[-A-Za-z0-9_.]+$/.test(chain.repository) && Number.isSafeInteger(chain.issue)
           ? `<a href="https://github.com/${escapeHtml(chain.repository)}/issues/${chain.issue}">#${chain.issue}</a>` : escapeHtml(chain.id)
         const complete = !!chain.mergeSha && !chain.reviewPending
@@ -255,7 +262,7 @@ export function behaviorChainSettings() {
         const failure = active ?? last
         const details = failure?.behavior === 'merge-pr' ? failureDetails(failure.callId,
           failure.nativeAction?.attribution === 'accepted-response' ? null : failure.evidence) : ''
-        return `<li>v2 · ${github}${chain.pullNumber ? ` → <a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(chain.pullNumber)}">PR #${Number(chain.pullNumber)}</a>` : ''}: ${escapeHtml(state)}${escapeHtml(obligation)}${escapeHtml(recheck)}${!active && last ? ` · Last: ${escapeHtml(last.behavior)} (${escapeHtml(last.outcome || last.state)}${escapeHtml(attribution)})` : ''}${escapeHtml(details)}${control} <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-operation="history">History</button></li>`
+        return `<li>v2 · ${github}${chain.pullNumber ? ` → <a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(chain.pullNumber)}">PR #${Number(chain.pullNumber)}</a>` : ''}: ${escapeHtml(state)}${escapeHtml(planStatus)}${escapeHtml(obligation)}${escapeHtml(recheck)}${!active && last ? ` · Last: ${escapeHtml(last.behavior)} (${escapeHtml(last.outcome || last.state)}${escapeHtml(attribution)})` : ''}${escapeHtml(details)}${control} <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-operation="history">History</button></li>`
       }).join('') || '<li>No behavior chains.</li>'
       const errors = Array.isArray(data.runtime) ? data.runtime.filter((entry: { error: string | null }) => entry.error).map((entry: { organization: string, error: string }) => `${entry.organization}: ${entry.error}`).join('; ') : ''
       status.textContent = `Read ${new Date().toLocaleTimeString()}${errors ? ` · ${errors}` : ''}`

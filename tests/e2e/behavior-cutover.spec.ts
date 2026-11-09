@@ -15,6 +15,27 @@ async function general(page: Page) {
 const row = (number: number) => ({ id: `acme/repo#${number}`, repository: 'acme/repo', issue: number, sequence: number,
   held: null, waiting: 'exact-head CI is running', mergeSha: null, pullNumber: number + 10, invocations: [] })
 
+test('an active uncertain invocation displays its original missing plan and validated recovery', async ({ page }) => {
+  await workspace(page)
+  const callId = 'c'.repeat(32)
+  let recoveredAt: number | null = null
+  await page.route('**/api/behavior-chains', route => route.fulfill({ json: chainSummaryFixture('pending-active', {
+    code: 'original_publication_plan_missing', callId, planSha: 'd'.repeat(64), missingAt: 1, recoveredAt,
+  }) }))
+  const controls = await general(page)
+  const list = controls.locator('[data-chain-list]')
+  await expect(list).toContainText('repair-pr: uncertain')
+  await expect(list).toContainText(`Original Call ${callId}: original publication plan is missing`)
+  await expect(list).toContainText('publication evidence remains unverified')
+  await expect(list).toContainText('Restore the original Caller plan and let reconciliation validate it; do not retry publication')
+  recoveredAt = Date.now()
+  await controls.getByRole('button', { name: 'Refresh chains' }).click()
+  await expect(list).toContainText(`Original publication plan recovered for Call ${callId}`)
+  await expect(list).toContainText('publication and resource-release checks still apply')
+  await expect(list).toContainText('repair-pr: uncertain')
+  await expect(list).not.toContainText('original publication plan is missing')
+})
+
 for (const submission of ['none', 'rejected', 'uncertain']) {
   test(`merge ${submission} evidence shows the original Call, cause and next action in chains and History`, async ({ page }) => {
     await workspace(page)
