@@ -1392,6 +1392,16 @@ code and existing v1 diagnostic into chain receipts and History. The unchanged
 no-publication shape and retry requirements are defined in
 [Behavior chain](Behavior-chain.md#authority-and-recovery).
 
+Optional repair-exhaustion reporting uses the same held-chain reconciliation,
+configured-account issue publisher and datastore intake. An explicit per-repository
+environment opt-in enables only verified incomplete-reply exhaustion. Durable
+creation intent prevents another POST after an uncertain result; the source hold,
+label/intake blockers and generated-issue recursion boundary stay visible through
+the existing `waiting` field. It adds no gateway route, scope, journal event,
+settings default or admission bypass. See
+[reporting verified repair exhaustion](Behavior-chain.md#reporting-verified-repair-exhaustion)
+for configuration, evidence and pending live acceptance.
+
 ## Google document publishing
 
 Google account grants belong to the gateway, partitioned by immutable GitHub
