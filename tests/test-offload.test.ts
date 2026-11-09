@@ -942,6 +942,53 @@ describe('a suite on a test box', () => {
     expect(events.filter((event) => event.event === 'test_relay.run.finished')).toEqual([])
   }, 40_000)
 
+  it('recovers mid-suite when only one suite may run', async () => {
+    await startAll({ maxRuns: 1 })
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 300)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relay.stop()
+    await startAll2({ maxRuns: 1 })
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(0)
+    expect(stdout).toBe('started\nstarted\ncomplete\n')
+    expect(stderr).toContain('interrupted validation')
+    expect(stderr).not.toContain('429')
+    expect(stderr).not.toContain('Skip local tests')
+    expect(relay.runs.size).toBe(0)
+    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)
+  })
+
+  it('sends no second admission after a lost admission response', async () => {
+    await startAll({ maxRuns: 1 })
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relay.stop()
+    await startAll2({ maxRuns: 1 })
+    let admissions = 0
+    const inner = relayServer.listeners('request').slice()
+    relayServer.removeAllListeners('request')
+    relayServer.on('request', (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://relay')
+      if (req.method === 'POST' && url.pathname === `${TEST_RELAY_PATH}/runs`) {
+        admissions += 1
+        if (admissions === 1) {
+          // The run is admitted, but its response never reaches the runner.
+          res.end = ((() => { res.destroy(); return res }) as typeof res.end)
+          void relay.handle(req, res, url).then(() => res.destroy(), () => res.destroy())
+          return
+        }
+      }
+      for (const listener of inner) (listener as (req: typeof req, res: typeof res) => void)(req, res)
+    })
+    const { code, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(admissions).toBe(1)
+    expect(relay.runs.size).toBe(1)
+    expect(stderr).toContain('interrupted validation')
+    expect(stderr.match(/interrupted validation:/g)).toHaveLength(1)
+    expect(stderr).not.toContain('429')
+  })
+
   it('says nothing of memory when a suite that mentions it passes', async () => {
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.log('cannot allocate memory, as this test expected')`]).done
@@ -1083,11 +1130,12 @@ describe('a suite on a test box', () => {
   })
 
   // Another gateway, of the same Render workspace.
-  async function startAll2(overrides: Partial<TestRelayDeps> = {}): Promise<void> {
+  async function startAll2(overrides: Partial<TestRelayDeps['config']> & Partial<TestRelayDeps> = {}): Promise<void> {
+    const { maxRuns = 5, ...deps } = overrides
     const port = Number(new URL(relayUrl).port)
     await new Promise((done) => { relayServer.close(done) })
     relay = new TestRelay({
-      config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', limitSeconds: 3600, maxRuns: 5 },
+      config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', limitSeconds: 3600, maxRuns },
       privateKey,
       log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
@@ -1096,7 +1144,7 @@ describe('a suite on a test box', () => {
       sweepMs: 50,
       renderSweepMs: 100,
       pollMs: 10,
-      ...overrides,
+      ...deps,
     })
     relayServer = createServer((req, res) => { void relay.handle(req, res, new URL(req.url ?? '/', 'http://relay')) })
     relayUrl = `http://127.0.0.1:${await listen(relayServer, port)}${TEST_RELAY_PATH}`

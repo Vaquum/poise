@@ -227,18 +227,44 @@ async function main(args) {
   const recover = async () => {
     const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(RECOVERY_MS)])
     let lastError
+    // Wait with a handshake that creates nothing, then admit exactly one run. Retrying POST /runs
+    // after a lost admission response would leave that run occupying a slot, so the next attempt
+    // answers 429 when only one suite may run.
     while (!signal.aborted) {
       try {
         await sleep(1_000, undefined, { signal })
+      } catch (error) {
+        if (lifetime.signal.aborted) throw error
+        break
+      }
+      try {
+        await call('GET', `/runs/probe/output`, undefined, signal)
+        throw Object.assign(new Error('the test relay answered the recovery handshake'), { status: 500 })
+      } catch (error) {
+        if (lifetime.signal.aborted) throw error
+        if (signal.aborted) break
+        if (error.status !== 410) {
+          // Only a gateway that is still coming up may be waited on. Authentication and admission refusals are final.
+          if (error.status && ![502, 503, 504].includes(error.status)) throw error
+          lastError = error
+          continue
+        }
+      }
+      try {
         return await createRun(signal)
       } catch (error) {
         if (lifetime.signal.aborted) throw error
         if (signal.aborted) break
-        // Only a gateway that is still coming up may be waited on. Authentication and admission refusals are final.
-        if (error.status && ![502, 503, 504].includes(error.status)) throw error
-        lastError = error
+        // A proxy's 502/503/504 never admitted a run, so waiting and admitting once stays safe.
+        // Any other admission failure (including a lost response or 429) must not send another POST.
+        if (error.status && [502, 503, 504].includes(error.status)) {
+          lastError = error
+          continue
+        }
+        throw error
       }
     }
+    if (lifetime.signal.aborted) lifetime.signal.throwIfAborted()
     throw new Error(`the test relay did not recover within ${RECOVERY_MS / 1000} s${lastError ? `: ${lastError.message}` : ''}`)
   }
 
