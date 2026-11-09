@@ -1406,6 +1406,13 @@ scope allows 60 seconds, and the outer client 120 seconds for interpreter/setup,
 durable receipts and teardown. The kernel emptiness deadline remains two
 seconds; these outer bounds do not extend the command or kernel deadlines.
 
+Native merge-admission failures retain their bounded, redacted v1 diagnostic in
+the original Call. Existing chain summaries and History expose that Call and
+diagnostic so the browser can show its cause and next action. Positive refusal
+evidence, unknown external outcomes and resource release remain separate; an
+empty queue cannot authorize another enqueue. See
+[native action receipts](Behavior-chain.md#native-action-receipts).
+
 Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
 code and existing v1 diagnostic into chain receipts and History. The unchanged
 no-publication shape and retry requirements are defined in

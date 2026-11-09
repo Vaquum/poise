@@ -106,8 +106,9 @@ class TestMergeQueue(IsolatedAsyncioTestCase):
                          {"enqueuePullRequest": {"mergeQueueEntry": {"id": "MQE_7", "pullRequest": {"headRefOid": "b" * 40}}}}):
             with self.subTest(response=response):
                 self.client.graphql.return_value = response
-                with self.assertRaisesRegex(RuntimeError, "did not confirm"):
+                with self.assertRaisesRegex(RuntimeError, "did not confirm") as unconfirmed:
                     await merge_if_ready.run(self.client, PAYLOAD)
+                self.assertEqual(unconfirmed.exception.diagnostic["submission"], "uncertain")
 
 
 class TestQueueReadiness(TestCase):
