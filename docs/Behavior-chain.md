@@ -540,6 +540,15 @@ retains its existing exact-workflow/attempt inspection.
 Historical Calls whose causes were discarded remain uncertain; this diagnostic
 path cannot reconstruct their missing evidence.
 
+Conversation resolution checkpoints each attempted thread and validated mutation
+response in the original Call's `artifact.resolution_progress` before another
+mutation. Chain summaries expose its `confirmed` results and `pending` thread as
+`nativeAction.resolutionProgress`, including after a subprocess timeout and journal
+reload. Confirmed threads are skipped on continuation; an unacknowledged attempt
+refuses continuation and remains uncertain even if a later read finds it closed.
+A failed checkpoint stops further mutations. Partial progress cannot replace the
+completed batch response, final readiness/thread checks or resource-release proof.
+
 ## Seed observation batch
 
 One observation starts one native process for its seed issue, comments and

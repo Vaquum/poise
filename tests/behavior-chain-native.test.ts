@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { LogEntry } from '../server/agent-log-parse'
+import { parseAgentLogList, type LogEntry } from '../server/agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
 import type { Organization } from '../server/organizations'
 import type { NativeChainHooks } from '../server/behavior-chain-native'
@@ -109,6 +109,35 @@ function mergeInvocation(): ChainInvocation {
     reservation: null, admittedAt: Date.now() - 1000, admissionSequence: 2, state: 'started', callId: null, outcome: null, evidence: null,
     request: { command: 'github-interface', cwd: '/fixture', argv: ['--merge-if-ready', '21', '--expected-head', HEAD, '--token-user', 'reviewer'] } }
 }
+
+it('accepts only validated partial resolution progress without relaxing completed-batch receipts', () => {
+  const id = 'b'.repeat(32)
+  const stamp = Date.now()
+  const progress = { confirmed: [{ id: 'A', isResolved: true }], pending: 'B' }
+  const call = { id, pr_id: '21', repo: chain.repository, actor: 'reviewer', model: 'native-action', behavior: 'native_action',
+    prompt: '', started_at: new Date(stamp - 1000).toISOString(), completed_at: new Date(stamp).toISOString(), time_elapsed: '1s',
+    status: 'failed', outcome: null, action: null, error: 'deadline', source: 'poise:behavior-chain',
+    correlation_id: 'original-resolution', expected_head: HEAD,
+    resource_ownership: { version: 2, roots: [], errors: [], namespace: { state: 'settled', callId: id,
+      correlation: 'original-resolution', settled_at: stamp / 1000, controller: { version: 1, instance: 'c'.repeat(32) },
+      binding: { pid: 104, start: '12', namespace: 'pid:[91]', owner: { pid: 102, start: '10' }, holder: { pid: 103, start: '11' },
+        epoch: { boot: 'fixture', init_start: '1', namespace_dev: '2', namespace_ino: '3' } } } },
+    artifact: { phase: 'performing_native_action', request_sha: 'd'.repeat(64), resolution_progress: progress } }
+  expect(parseAgentLogList([call]).quarantined).toEqual([])
+  for (const invalid of [null, {}, { ...progress, extra: true }, { confirmed: [{ id: 'A', isResolved: false }], pending: 'B' },
+    { confirmed: [...progress.confirmed, ...progress.confirmed], pending: 'B' }, { ...progress, pending: 'A' },
+    { ...progress, pending: 12 }, { confirmed: [{ id: 'A', isResolved: true, extra: true }], pending: null }]) {
+    expect(parseAgentLogList([{ ...call, artifact: { ...call.artifact, resolution_progress: invalid } }]).quarantined).toHaveLength(1)
+  }
+  for (const artifact of [
+    { ...call.artifact, unexpected: true },
+    { ...call.artifact, phase: 'preparing_native_action' },
+    { ...call.artifact, phase: 'received_native_action', response_sha: 'e'.repeat(64) },
+  ]) expect(parseAgentLogList([{ ...call, artifact }]).quarantined).toHaveLength(1)
+  // A progress-only artifact has no accepted final response or readiness proof.
+  expect(parseAgentLogList([{ ...call, status: 'completed', outcome: 'native_action', action: 'native_action', head_sha: HEAD }])
+    .quarantined).toHaveLength(1)
+})
 
 it.each(['fenced', 'existing'] as const)('validates the original closed-target fence response without provider preparation: %s', async outcome => {
   const prepare = vi.fn(async () => ({}))

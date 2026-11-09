@@ -1,4 +1,5 @@
-import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement } from './behavior-chain-action'
+import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
+import { parseResolutionProgress } from './agent-log-parse'
 import { closedChainTarget, type ChainObservation } from './behavior-chain-decision'
 import type { BehaviorChain } from './behavior-chain-store'
 
@@ -23,6 +24,11 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
     invocationCount: chain.invocations.length, invocations: chain.invocations.slice(-20).map((invocation) => {
       const proof = attributedNativeAction(invocation) ? matchingNativeActionReceipt(chain, invocation) : null
       const settlement = proof ? nativeActionSettlement(proof) : null
+      const artifact = invocation.evidence?.artifact as Record<string, unknown> | undefined
+      const progress = artifact?.resolution_progress === undefined ? null : parseResolutionProgress(artifact.resolution_progress)
+      if (progress && (invocation.behavior !== 'resolve-threads' || artifact?.request_sha !== nativeRequestSha(invocation.request))) {
+        throw new Error('native resolution progress conflicts with its original request')
+      }
       return { id: invocation.id, behavior: invocation.behavior, state: invocation.state,
         callId: invocation.callId ?? (typeof invocation.evidence?.nativeCallId === 'string' ? invocation.evidence.nativeCallId : null), model: invocation.model,
         slot: invocation.slot, outcome: invocation.outcome, admittedAt: invocation.admittedAt,
@@ -31,6 +37,7 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
             : invocation.state === 'uncertain' ? 'uncertain' : 'not-recorded',
           outcome: settlement?.outcome ?? null, queueEntryId: settlement?.queue_entry_id ?? null,
           receivedAt: proof?.observedAt ?? null, processFailure: proof?.processFailure ?? null,
+          ...(progress ? { resolutionProgress: progress } : {}),
         },
         evidence: invocation.evidence ? { action: invocation.evidence.action, outcome: invocation.evidence.outcome,
           review_id: invocation.evidence.review_id, head_sha: invocation.evidence.head_sha,
