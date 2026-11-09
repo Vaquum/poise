@@ -61,7 +61,7 @@ export function parseResourceOwnership(value: unknown): ResourceOwnershipReceipt
     || Object.keys(value).some(key => !['version', 'roots', 'errors', 'process_pending', ...(value.version === 2 ? ['namespace'] : [])].includes(key))
     || value.version === 2 && (!namespaceReceipt(value.namespace)
       || (value.namespace.state === 'not_started' || value.namespace.no_effect === 'verified-pre-go') && value.roots.length > 0)
-    || Buffer.byteLength(JSON.stringify(value)) > 128 * 1024) throw new Error('invalid native resource ownership')
+    || Buffer.byteLength(JSON.stringify(value)) > 512 * 1024) throw new Error('invalid native resource ownership')
   const roots = new Map<string, Record<string, unknown>>()
   for (const root of value.roots) {
     if (!object(root) || typeof root.path !== 'string' || !root.path.startsWith('/') || roots.has(root.path)
