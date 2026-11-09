@@ -537,8 +537,8 @@ function launch(login: string): void {
       const directory = dirname(initial.datastore_path)
       mkdirSync(directory, { recursive: true, mode: 0o700 })
       chmodSync(directory, 0o700)
-      // Bound admission; a still-due activated mirror retains failure/backoff.
-      await withProcessLock({ path: `${initial.datastore_path}.lock`, timeoutMs: 500 }, async () => {
+      // Allow slow setup, then try ownership once; a busy mirror retains failure/backoff.
+      await withProcessLock({ path: `${initial.datastore_path}.lock`, timeoutMs: 0 }, async () => {
         const row = rowFor(login)
         controller.signal.throwIfAborted()
         // Recheck under the process lock: another Poise instance may have

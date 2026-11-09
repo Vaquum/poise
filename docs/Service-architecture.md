@@ -699,17 +699,18 @@ and drops its repositories from the issue review selection and the Manager's
 scope. Nothing changes on GitHub, datastores are kept, and work bindings stay
 as history.
 
-An activated account's due sync retains lock acquisition failures in its existing
-sync error and retry state. Retries back off from one minute to at most one hour,
-survive restart, and leave other accounts eligible. Five-second scheduler ticks
+An account's due sync makes one nonblocking SQLite lock attempt after filesystem
+setup, even when setup is slow. An activated account retains lock acquisition
+failures in its existing sync error and retry state. Retries back off from one
+minute to at most one hour, survive restart, and leave other accounts eligible. Five-second scheduler ticks
 do not acquire the lock or repeat diagnostics before that retry. SQLite contention
-and setup deadlines retain their actual causes; neither verifies a holder's
-process identity. A newer sync, retry, identity or registration wins over an old
+and setup errors retain their actual causes; neither verifies a holder's process
+identity. A newer sync, retry, identity or registration wins over an old
 failed acquirer. Settings shows the error and automatic retry time immediately;
 diagnostics retain the failure start, last successful sync age (unknown without a
 timestamp), and the unchanged 120-second freshness limit. The existing per-account
 alert still starts after 15 minutes of failures and clears/rearms only after a
-validated sync. An activation acquisition deadline stays eligible for automatic
+validated sync. An activation lock conflict stays eligible for automatic
 activation rather than becoming a manual-retry error.
 
 `GET /api/github-quota` reads the configured user and automation accounts'
