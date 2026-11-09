@@ -475,6 +475,27 @@ describe('bounded behavior ledger transport', () => {
     }
   })
 
+  it('diagnoses worker failure during shutdown synchronously before logging stops', async () => {
+    // An in-flight capture held past the stop budget while the worker then
+    // exits: fail() sheds it as worker_failed in the exit handler that also
+    // resolves waitForExit(). stopPoiseRuntime stops logging right after that
+    // wait without yielding, so a deferred emit would be discarded by ingest.
+    shortCallerBudgets()
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
+    diagnostic.mockClear()
+    const observer = await fixture(`
+      port.postMessage({ready:true,health,pending:[]});
+      port.on('message',request=>{
+        if(request.operation==='capture'){ setTimeout(()=>process.exit(1),300); return; }
+      });`)
+    observer.capture(admission)
+    await observer.stop()
+    await observer.waitForExit()
+    // No waitFor: a setImmediate-deferred emit would still be queued here.
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'worker_failed', count: 1 }) }))
+  })
+
   it('holds captures through a storage outage and recovers to ok with the list answering', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-outage-'))
     directories.push(directory)

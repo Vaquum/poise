@@ -228,11 +228,13 @@ export class BehaviorLedgerObserver {
         captureLimit: this.options.captureLimit ?? 1_000, captureBytes: this.options.captureBytes ?? 2 * 1024 * 1024,
         stallBudgetMs: this.options.stallTimeoutMs ?? LEDGER_STALL_TIMEOUT_MS }
       // Logging may journal its own overflow; keep that I/O outside capture,
-      // except shutdown loss: stopPoiseRuntime stops logging before a deferred
-      // diagnostic could run, so emit it synchronously while logging is alive.
+      // except shutdown loss: stopPoiseRuntime stops logging after
+      // waitForExit without yielding, so emit it synchronously while alive.
+      // That covers queued shutdown_timeout and worker_failed from the exit
+      // handler that resolves that wait; all other reasons stay deferred.
       const report = (): void => { this.options.lossDiagnostic?.({ level: 'error', operation: 'behavior-ledger.capture_loss',
         message: 'Behavior ledger captures lost', context }) }
-      if (reason === 'shutdown_timeout') report()
+      if (reason === 'shutdown_timeout' || reason === 'worker_failed') report()
       else setImmediate(report)
       this.lossReason = reason
     }
