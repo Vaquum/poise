@@ -227,9 +227,9 @@ async function main(args) {
   const recover = async () => {
     const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(RECOVERY_MS)])
     let lastError
-    // Wait with a handshake that creates nothing, then admit exactly one run. Retrying POST /runs
-    // after a lost admission response would leave that run occupying a slot, so the next attempt
-    // answers 429 when only one suite may run.
+    // Wait with a handshake that creates nothing, then admit exactly one run. Any admission POST
+    // may have created a run whose response was lost (surfaced as a dropped connection or as
+    // HTTP 502/503/504), so a second POST would orphan it and occupy the maxRuns:1 slot.
     while (!signal.aborted) {
       try {
         await sleep(1_000, undefined, { signal })
@@ -255,12 +255,8 @@ async function main(args) {
       } catch (error) {
         if (lifetime.signal.aborted) throw error
         if (signal.aborted) break
-        // A proxy's 502/503/504 never admitted a run, so waiting and admitting once stays safe.
-        // Any other admission failure (including a lost response or 429) must not send another POST.
-        if (error.status && [502, 503, 504].includes(error.status)) {
-          lastError = error
-          continue
-        }
+        // Never send a second admission: a lost response (including one surfaced as
+        // 502/503/504) may already have created a run.
         throw error
       }
     }
@@ -294,7 +290,9 @@ async function main(args) {
           say('the box is up. Sending the captured checkout.')
           upload = sendTree(id, signal).catch((error) => {
             uploadError = error
-            controller.abort()
+            // A 410 means the run is over: the restart frame (if any) is still on the
+            // output stream, so keep reading it instead of cancelling it.
+            if (error?.status !== 410) controller.abort()
           })
         }
       })

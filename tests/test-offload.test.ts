@@ -989,6 +989,101 @@ describe('a suite on a test box', () => {
     expect(stderr).not.toContain('429')
   })
 
+  it('sends no second admission after a 502 admission response that already created a run', async () => {
+    await startAll({ maxRuns: 1 })
+    const run = suite(repository(), [process.execPath, '-e', 'console.log("started"); setInterval(() => {}, 1000)'])
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    relay.stop()
+    await startAll2({ maxRuns: 1 })
+    let admissions = 0
+    const inner = relayServer.listeners('request').slice()
+    relayServer.removeAllListeners('request')
+    relayServer.on('request', (req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? '/', 'http://relay')
+      if (req.method === 'POST' && url.pathname === `${TEST_RELAY_PATH}/runs`) {
+        admissions += 1
+        if (admissions === 1) {
+          // A proxy surfaces the created run as 502: the run exists, but the runner must not retry.
+          const writeHead = res.writeHead.bind(res)
+          res.writeHead = ((status: number, ...args: unknown[]) => {
+            if (status === 201) return (writeHead as (...a: unknown[]) => ServerResponse)(502, ...args)
+            return (writeHead as (...a: unknown[]) => ServerResponse)(status, ...args)
+          }) as typeof res.writeHead
+        }
+      }
+      for (const listener of inner) (listener as (req: IncomingMessage, res: ServerResponse) => void)(req, res)
+    })
+    const { code, stderr } = await run.done
+    expect(code).toBe(125)
+    expect(admissions).toBe(1)
+    expect(relay.runs.size).toBe(1)
+    expect(stderr).toContain('interrupted validation')
+    expect(stderr.match(/interrupted validation:/g)).toHaveLength(1)
+    expect(stderr).not.toContain('429')
+  })
+
+  it('recovers when the restart reaches the upload before its fail frame is read', async () => {
+    await startAll()
+    const repo = repository()
+    let held: { req: IncomingMessage; res: ServerResponse } | null = null
+    let heldOnce = false
+    let failFrame: Buffer | null = null
+    let failEnd = false
+    const releaser: { release: (() => void) | null } = { release: null }
+    const inner = relayServer.listeners('request').slice()
+    relayServer.removeAllListeners('request')
+    relayServer.on('request', (req: IncomingMessage, res: ServerResponse) => {
+      const url = new URL(req.url ?? '/', 'http://relay')
+      if (req.method === 'GET' && url.pathname.endsWith('/output')) {
+        const write = res.write.bind(res)
+        const end = res.end.bind(res)
+        res.write = ((chunk: any, ...args: any[]) => {
+          if (Buffer.isBuffer(chunk) && chunk.length > 0 && chunk[0] === 4) {
+            failFrame = chunk
+            return true
+          }
+          return (write as (...a: any[]) => boolean)(chunk, ...args)
+        }) as typeof res.write
+        res.end = ((...args: any[]) => {
+          if (failFrame) { failEnd = true; return res }
+          return (end as (...a: any[]) => ServerResponse)(...args)
+        }) as typeof res.end
+        releaser.release = () => {
+          if (failFrame) (write as (c: Buffer) => void)(failFrame)
+          failFrame = null
+          if (failEnd) (end as () => void)()
+          failEnd = false
+        }
+      } else if (req.method === 'POST' && url.pathname.endsWith('/tree') && !heldOnce) {
+        heldOnce = true
+        held = { req, res }
+        req.resume()
+        return
+      }
+      for (const listener of inner) (listener as (req: IncomingMessage, res: ServerResponse) => void)(req, res)
+    })
+    const run = suite(repo, [process.execPath, '-e', 'console.log("started"); setTimeout(() => console.log("complete"), 300)'])
+    await until(() => held !== null, 'the upload to start')
+    relay.stop()
+    await until(() => failFrame !== null, 'the restart frame to be queued')
+    const pending = held as unknown as { req: IncomingMessage; res: ServerResponse }
+    held = null
+    pending.res.writeHead(410, { 'content-type': 'text/plain; charset=utf-8' }).end('this run is over')
+    pending.req.resume()
+    // Let the runner process the upload 410 before the restart frame arrives: the old code
+    // aborts the output here and never recovers.
+    await new Promise((done) => setTimeout(done, 200))
+    releaser.release?.()
+    await startAll2()
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(0)
+    expect(stdout).toBe('started\ncomplete\n')
+    expect(stderr).toContain('interrupted validation')
+    expect(stderr).toContain('no test result: the gateway restarted')
+    expect(stderr).not.toContain('Skip local tests')
+    expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)
+  })
+
   it('says nothing of memory when a suite that mentions it passes', async () => {
     await startAll()
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', `console.log('cannot allocate memory, as this test expected')`]).done
