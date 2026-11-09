@@ -34,7 +34,7 @@ export interface NativeChainHooks {
   capacity(): number
   measureHeadroom?: () => BehaviorResourceHeadroom
   permitted(chain: BehaviorChain, decision: Invoke): boolean
-  note(behavior: ChainBehavior): string
+  note(behavior: ChainBehavior, chain: BehaviorChain, pull: { number: number } | null): string | Promise<string>
   severity(behavior: ChainBehavior): string
   received(invocation: ChainInvocation, call: LogEntry): void
   reviews(repository: string, number: number): Promise<string>
@@ -292,7 +292,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const cwd = await directory(chain.repository)
       const pull = observation.pull
       const common = ['--source', 'poise:behavior-chain', '--correlation-id', id, '--actor', decision.actor]
-      const note = [hooks.note(decision.behavior), decision.reason].filter(Boolean).join('\n\n')
+      const note = [await hooks.note(decision.behavior, chain, pull), decision.reason].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
         const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`)
         if (!selected) return null

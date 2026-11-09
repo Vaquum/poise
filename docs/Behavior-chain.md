@@ -454,6 +454,18 @@ links the original hold event to the report issue. Identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
 Existing incomplete-reply intent keys and markers remain unchanged; budget reports
 use a separate cause with the same metadata and marker format.
+Both report bodies end with the canonical clinical scope directive in the
+[report template](../server/behavior-chain-report.ts). Native PR review and approval carry it through
+`--note` only when the datastore's PR closing references identify a recorded
+report issue in that repository. The recorded issue number identifies the
+remediation ticket; the report's `pull` identifies the stalled source PR.
+Stale, missing or incomplete closing observations stop review preparation.
+A `poise` label or copied report marker alone cannot qualify a PR.
+Caller retains the directive before invoking the reviewer and inserts it once
+in the formal GitHub review through the existing submission helper, for Claude
+and structured reviewers. The assessment, findings, review event and receipt
+keep their existing meaning. PR descriptions and Manager/Worker defaults do
+not acquire this policy.
 The marker lookup includes closed issues and verifies the publishing account.
 Intent is committed before creation;
 after an ambiguous POST, even repeated empty searches cannot authorize another
