@@ -203,6 +203,11 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       const queueMergedNeedsWait = !!pull && lastQueue?.evidence?.head_sha === pull.head
         && !!queueRemoval && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
         && queueRemoval.reason === 'merged'
+      // Mirroring decideBehaviorChain: a removal for any other reason than a
+      // merge or an integration rejection needs an explicit queue decision.
+      const queueRemovalNeedsDecision = !!pull && lastQueue?.evidence?.head_sha === pull.head
+        && !!queueRemoval && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
+        && queueRemoval.reason !== 'merged' && queueRemoval.reason !== 'failed_checks' && queueRemoval.reason !== 'merge_conflict'
       let queueRejectionNeedsRepair = false
       if (pull && lastQueue?.evidence?.head_sha === pull.head && queueRemoval
         && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
@@ -292,7 +297,10 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
           : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'
             : active ? 'Await the original invocation outcome'
               : state !== 'fresh' ? 'Await a fresh, complete chain observation'
+                : pull && pull.state !== 'open' ? 'Hold: pull request closed without a confirmed merge; a decision is required'
                 : pull?.draft ? 'Await the draft pull request becoming ready for review'
+                  : observation && observation.existingPulls.length
+                  ? `Hold: seed issue already belongs to existing work: ${observation.existingPulls.join(', ')}; resolve ownership before review`
                   : observation && !pull && !observation.issue.eligible ? 'Await the seed issue matching intake settings'
                     : observation && issueReviewMissingArtifact(chain, observation)
                     ? 'Hold for the missing original issue comment evidence; the posted GitHub comment remains unverified'
@@ -302,6 +310,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                         ? 'Await GitHub queue removal evidence; the queue outcome remains unverified'
                         : queueMergedNeedsWait && pull
                         ? 'Await confirmed GitHub merge evidence; GitHub queue reports a merge'
+                        : queueRemovalNeedsDecision && pull
+                        ? `Hold: queue removal requires a decision: ${queueRemoval!.reason || 'unknown reason'} (${queueRemoval!.id}); re-enqueueing needs an explicit decision`
                         : queueRejectionNeedsRepair && pull
                         ? `Diagnose and repair GitHub queue rejection ${queueRemoval!.id}: ${queueRemoval!.reason} through repair-pr; PR-head green checks do not prove integration success`
                         : pull && observation && prReviewMissingArtifact(chain, observation, pull)
