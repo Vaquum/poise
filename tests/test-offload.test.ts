@@ -952,7 +952,7 @@ describe('a suite on a test box', () => {
     expect(code).toBe(0)
     expect(stdout).toBe('started\nstarted\ncomplete\n')
     expect(stderr).toContain('interrupted validation')
-    expect(stderr).not.toContain('429')
+    expect(stderr).not.toContain('with HTTP 429:')
     expect(stderr).not.toContain('Skip local tests')
     expect(relay.runs.size).toBe(0)
     expect([...boxes.values()].filter((box) => box.snapshotName !== null)).toHaveLength(2)
@@ -986,7 +986,7 @@ describe('a suite on a test box', () => {
     expect(relay.runs.size).toBe(1)
     expect(stderr).toContain('interrupted validation')
     expect(stderr.match(/interrupted validation:/g)).toHaveLength(1)
-    expect(stderr).not.toContain('429')
+    expect(stderr).not.toContain('with HTTP 429:')
   })
 
   it('sends no second admission after a 502 admission response that already created a run', async () => {
@@ -1019,7 +1019,11 @@ describe('a suite on a test box', () => {
     expect(relay.runs.size).toBe(1)
     expect(stderr).toContain('interrupted validation')
     expect(stderr.match(/interrupted validation:/g)).toHaveLength(1)
-    expect(stderr).not.toContain('429')
+    expect(stderr).toContain('with HTTP 502:')
+    // Include a fixed candidate so a bare '429' matcher fails deterministically.
+    const diagnostic = `[poise] candidate 3130f072cc429ca49bddbe2d94e0cbbd8ba976a23e83aa221c696923f4741878
+${stderr}`
+    expect(diagnostic).not.toContain('with HTTP 429:')
   })
 
   it('recovers when the restart reaches the upload before its fail frame is read', async () => {
@@ -1195,6 +1199,8 @@ describe('a suite on a test box', () => {
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', 'process.exit(0)']).done
     expect(code).toBe(125)
     expect(stderr).toContain('1 suites are already running')
+    expect(stderr).toContain('with HTTP 429:')
+    expect(() => expect(stderr).not.toContain('with HTTP 429:')).toThrow()
     first.child.kill('SIGKILL')
     await first.done
   })
