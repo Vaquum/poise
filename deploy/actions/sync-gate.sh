@@ -26,14 +26,15 @@ fail() {
 }
 
 read_runs() {
-  local workflow=$1 event=$2 response
-  if ! response=$(gh api "repos/$REPO/actions/workflows/$workflow/runs?head_sha=$tip&per_page=30" 2>&1); then
+  local workflow=$1 event=$2 response filter=branch=main
+  if [ "$event" = push ]; then filter="head_sha=$tip"; fi
+  if ! response=$(gh api "repos/$REPO/actions/workflows/$workflow/runs?$filter&per_page=30" 2>&1); then
     fail "cannot read $workflow runs for $tip: $response"
   fi
   jq -ce --arg repo "$REPO" --arg sha "$tip" --arg event "$event" '
-    .workflow_runs | map(select(.head_sha == $sha and .head_branch == "main"
+    .workflow_runs | map(select(.head_branch == "main"
       and .head_repository.full_name == $repo
-      and (if $event == "push" then .event == "push"
+      and (if $event == "push" then .event == "push" and .head_sha == $sha
            else .event == "workflow_run" or .event == "workflow_dispatch" end)))
     | sort_by([.created_at, .id]) | reverse' <<<"$response" \
     || fail "cannot read $workflow runs for $tip: unexpected answer"
@@ -89,15 +90,24 @@ if [ "${#waiting[@]}" -gt 0 ]; then
 fi
 
 runs=$(read_runs deploy.yml deploy)
+in_flight=false
 while IFS= read -r run; do
   status=$(jq -r '.status' <<<"$run")
   url=$(jq -r '.html_url' <<<"$run")
   evidence+=("- Deploy: $status $(jq -r '.conclusion // empty' <<<"$run") ($url)")
-  [ "$status" = completed ] || continue
+  if [ "$status" != completed ]; then
+    in_flight=true
+    continue
+  fi
   id=$(jq -r '.id' <<<"$run")
   if ! jobs=$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" 2>&1); then
     fail "cannot read Deploy jobs for $tip ($url): $jobs"
   fi
+  # Deploy re-reads main: a run recorded on an older head may apply this tip.
+  targeted=$(jq -er --arg step "Deploy $tip" '
+    [.jobs[].steps[]? | select(.name == $step)] | length' <<<"$jobs") \
+    || fail "cannot read Deploy steps for $tip ($url): unexpected answer"
+  if [ "$(jq -r '.head_sha' <<<"$run")" != "$tip" ] && (( targeted == 0 )); then continue; fi
   # A green gate may have skipped before the second workflow finished. Only
   # the SHA-named apply step proves an attempt; success alone proves nothing.
   attempted=$(jq -er --arg step "Deploy $tip" '
@@ -126,6 +136,11 @@ done < <(jq -c '.[]' <<<"$runs")
 
 if (( $(date +%s) - started >= 7200 )); then
   finish blocked true 'Verification/deployment exceeded two hours. Allowing a newer upstream fix.'
+elif [ "$in_flight" = true ]; then
+  finish 'waiting for Deploy' false "Deploy is queued or running; retaining $tip until it finishes."
 else
-  finish 'waiting for Deploy' false "Required verification passed; retaining $tip until a gated Deploy attempt finishes."
+  if ! response=$(gh workflow run deploy.yml --repo "$REPO" --ref main 2>&1); then
+    fail "cannot dispatch Deploy for $tip: $response"
+  fi
+  finish 'waiting for Deploy' false "Required verification passed; requested a gated Deploy. Retaining $tip until its attempt finishes."
 fi
