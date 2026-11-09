@@ -1,12 +1,14 @@
 import {
   claudeSubscriptionEnvironment,
   CLAUDE_SUBSCRIPTION_CLI,
+  isExpectedFailure,
   runFile as defaultRunFile,
   type RunFileOptions,
   type RunFileResult,
 } from './process'
 import { canaryClaudeModel, loadCatalog } from './models'
 import { HttpError } from './http'
+import { diagnosticFailure } from './logging'
 
 export const CLAUDE_AUTH_POLL_MS = 60_000
 export const CLAUDE_AUTH_LOGIN_TIMEOUT_MS = 10 * 60_000
@@ -121,6 +123,7 @@ function parseStatusJson(raw: string): LocalAuthStatus | null {
   try { value = JSON.parse(raw) } catch { return null }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const status = value as Record<string, unknown>
+  if (typeof status.loggedIn !== 'boolean') return null
   const ready = claudeSubscriptionReady(status)
   return {
     ready,
@@ -433,13 +436,17 @@ export class ClaudeAuthMonitor {
           timeoutMs: STATUS_TIMEOUT_MS,
           maxOutputBytes: MAX_AUTH_OUTPUT_BYTES,
           signal,
+          expected: { codes: [1] },
         },
       )
       local = parseStatusJson(result.stdout)
+      if (!local) diagnosticFailure('claude.auth.status', new Error('`claude auth status` gave no answer Poise can read.'))
     } catch (error) {
       localError = error
       const stdout = errorStdout(error)
       if (stdout !== null) local = parseStatusJson(stdout)
+      // Exit 1 is quiet only when the answer establishes a sign-in requirement.
+      if (isExpectedFailure(error) && local?.ready !== false) diagnosticFailure('claude.auth.status', error)
     }
 
     if (generation !== this.stateGeneration) return this.snapshot()

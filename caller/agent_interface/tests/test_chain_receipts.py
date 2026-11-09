@@ -1,17 +1,21 @@
 """Durable native-effect receipts; these guards do not validate live cycles."""
+import asyncio
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from contextlib import nullcontext, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import agent_interface as api
 from agent_interface import issue_review, native_namespace, review_budget, review_receipt, resource_ownership
+from github_interface.behaviors import pr_review
 
 CALL = "a" * 32
 HEAD = "b" * 40
@@ -151,7 +155,8 @@ class ManagedReceipts(TestCase):
 
 class AtomicWorkLimits(TestCase):
     def setUp(self):
-        self.directory = TemporaryDirectory()
+        # Cleanup needs consistent file/directory device IDs on managed boxes.
+        self.directory = TemporaryDirectory(dir="/dev/shm" if sys.platform == "linux" else None)
         self.addCleanup(self.directory.cleanup)
         root = Path(self.directory.name)
         self.path = root / "calls.sqlite3"
@@ -191,6 +196,85 @@ class AtomicWorkLimits(TestCase):
         self.assertEqual(json.loads(artifact)["resource_error"], "resources_unknown")
         self.assertIsNone(settled)
 
+    def test_provider_deadline_and_preflight_timeout_reach_chain_history_distinctly(self):
+        repo = Path(__file__).resolve().parents[3]
+        output = repo / "test-results"
+        output.mkdir(exist_ok=True)
+        with TemporaryDirectory(prefix="atomic-timeout-contract-", dir=output) as work:
+            root = Path(work)
+            env = {"PATH": os.environ["PATH"], "HOME": str(self.path.parent), "TMPDIR": work}
+            build = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"),
+                                    str(repo / "tests/fixtures/behavior-fence-contract.ts"), "--bundle", "--platform=node",
+                                    "--packages=external", "--format=esm", "--target=node22", f"--outfile={root / 'contract.mjs'}"],
+                                   cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            for phase in ("preflight", "provider"):
+                with self.subTest(phase=phase):
+                    modes = []
+
+                    def interface(*args, **kwargs):
+                        if args[0] == "--pr-review":
+                            return {"review_threads": []}
+                        if args[0] != "--issue-work":
+                            return {}
+                        modes.append(args[args.index("--mode") + 1])
+                        if phase == "preflight":
+                            raise subprocess.TimeoutExpired("preflight", 1800)
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+
+                    def worker(_lease, args, **kwargs):
+                        # Even valid late metadata cannot authorize publication.
+                        (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                            "commitMessage": "fix: seed", "title": "fix: seed", "body": "Checked repair", "replies": []}))
+                        raise subprocess.TimeoutExpired(args, kwargs["timeout"], output="private stdout", stderr="private stderr")
+
+                    def execute():
+                        # Use the CLI finalizer with the existing v1 library
+                        # boundary; namespace execution has separate guards.
+                        with patch.object(api, "_native_cli", False):
+                            api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain", f"timeout-{phase}",
+                                                "fixture-model", "poise/issue-7", 3, HEAD)
+
+                    expected = review_budget.ReviewLimitError if phase == "provider" else subprocess.TimeoutExpired
+                    with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                            patch.object(issue_review, "interface", side_effect=interface), \
+                            patch.object(issue_review, "command", return_value=(["fixture", "private prompt"], "", {})), \
+                            patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                            patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                            patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker) as provider, \
+                            patch.object(review_budget, "timeout", return_value=3443.25), \
+                            patch.object(api.atomic_work, "monotonic", side_effect=[10, 3453.375]), \
+                            patch.object(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source",
+                                                      "poise:behavior-chain", "--correlation-id", f"timeout-{phase}"]), \
+                            patch.object(api, "_main", side_effect=execute), self.assertRaises(expected):
+                        api.main()
+                    call, = [row for row in api.logs() if row["correlation_id"] == f"timeout-{phase}"]
+                    self.assertEqual(modes, ["prepare"])
+                    self.assertEqual((call["status"], call["action"], call["outcome"]), ("failed", "not_started", "preflight_failed"))
+                    self.assertIsNone(call["head_sha"])
+                    self.assertIsNotNone(call["resources_settled_at"])
+                    with api.db() as conn:
+                        self.assertIsNone(conn.execute("select action_plan from calls where id=?", (call["id"],)).fetchone()[0])
+                    if phase == "provider":
+                        self.assertEqual(call["error_code"], "atomic_work_execution_budget_exhausted")
+                        self.assertEqual(call["diagnostic"], {
+                            "version": 1, "source": "caller", "severity": "error", "operation": "provider.atomic_work",
+                            "phase": "provider_execution", "outcome": "timed_out", "stderr": "", "stderr_truncated": False,
+                            "executable": "codex", "elapsed_ms": 3443375, "timeout_seconds": 3443.25,
+                            "repository": "example/repo", "pr": 3, "expected_head": HEAD, "behavior": "repair_pr",
+                            "message": "Seed issue example/repo#7", "submission": "none", "call_id": call["id"]})
+                        self.assertNotIn("private", json.dumps(call))
+                        provider.assert_called_once()
+                    else:
+                        self.assertEqual(call["error_code"], "atomic_work_failed")
+                        self.assertIsNone(call["diagnostic"])
+                        provider.assert_not_called()
+                    wire = root / f"{phase}.json"
+                    wire.write_text(json.dumps([call]))
+                    consumed = subprocess.run(["node", str(root / "contract.mjs"), str(wire), f"atomic-{phase}-timeout"],
+                                              cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(consumed.returncode, 0, consumed.stderr)
+
     def test_invalid_publication_is_a_known_unstarted_failure_without_an_action_plan(self):
         modes = []
 
@@ -220,6 +304,130 @@ class AtomicWorkLimits(TestCase):
         self.assertEqual(modes, ["prepare", "validate"])
         self.assertEqual((status, action, outcome), ("failed", "not_started", "preflight_failed"))
         self.assertIsNone(plan)
+
+    def test_repair_prompts_exact_roots_and_keeps_missing_ids_after_cleanup(self):
+        threads = [
+            {"root_comment_id": 17, "is_resolved": False, "is_outdated": False, "bodies": ["private current finding"]},
+            {"root_comment_id": 18, "is_resolved": False, "is_outdated": True, "bodies": ["private outdated finding", "earlier reply"]},
+            {"root_comment_id": 19, "is_resolved": True, "is_outdated": False, "bodies": ["private resolved finding"]},
+            {"root_comment_id": 20, "is_resolved": True, "is_outdated": True, "bodies": ["private resolved outdated finding"]},
+        ]
+        for attempt, reply_ids in enumerate(([17], [17, 18]), 1):
+            with self.subTest(reply_ids=reply_ids):
+                modes, workspaces = [], []
+
+                def interface(*args, **_kwargs):
+                    if args[0] == "--pr-review":
+                        return {"review_threads": threads}
+                    if args[0] != "--issue-work":
+                        return {}
+                    mode = args[args.index("--mode") + 1]
+                    modes.append(mode)
+                    if mode == "prepare":
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+                    self.assertEqual(json.loads(args[args.index("--replies-json") + 1]), replies)
+                    return {"outcome": "validated" if mode == "validate" else "published", "head_sha": HEAD}
+
+                replies = [{"commentId": root, "body": "Verified the finding against the repair and its regression."} for root in reply_ids]
+
+                def worker(_lease, _args, **kwargs):
+                    workspace = Path(kwargs["cwd"]).parent
+                    workspaces.append(workspace)
+                    (workspace / "publication.json").write_text(json.dumps({
+                        "commitMessage": "fix: repair seed", "title": "fix: repair seed", "body": "Concrete repair and checks.",
+                        "replies": replies, "blocked": None}))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                        patch.object(issue_review, "interface", side_effect=interface), \
+                        patch.object(issue_review, "command", return_value=(["fixture"], "", {})) as command, \
+                        patch.object(issue_review, "_terminal_failure", return_value=None), \
+                        patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                        patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                        patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), redirect_stdout(StringIO()):
+                    context = self.assertRaisesRegex(ValueError, "repair did not answer every unresolved review finding") if attempt == 1 else nullcontext()
+                    with context:
+                        api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
+                                            f"00000000-0000-4000-8000-{attempt:012d}", "fixture-model", "poise/issue-7", 3, HEAD)
+
+                instruction = command.call_args.args[1]
+                self.assertIn("required unresolved root comment IDs: [17, 18]", instruction)
+                self.assertIn("outdated", instruction)
+                self.assertIn("already have replies", instruction)
+                with sqlite3.connect(self.path) as conn:
+                    row = conn.execute("select status,error_code,action,outcome,error,action_plan,artifact,resource_ownership from calls "
+                                       "where correlation_id=?", (f"00000000-0000-4000-8000-{attempt:012d}",)).fetchone()
+                status, code, action, outcome, error, plan, artifact, ownership = row
+                self.assertFalse(workspaces[0].exists(), f"publication metadata must be cleaned up: {ownership}")
+                if attempt == 1:
+                    self.assertEqual(modes, ["prepare"])
+                    self.assertEqual((status, code, action, outcome), ("failed", "atomic_work_failed", "not_started", "preflight_failed"))
+                    self.assertIn("missing_root_comment_ids=[18]", error)
+                    self.assertIn("missing_count=1; required_count=2", error)
+                    self.assertNotIn("private", error + artifact)
+                    self.assertIsNone(plan)
+                    with self.assertRaisesRegex(ValueError, "no durable publication plan"):
+                        with api.db() as conn:
+                            call = conn.execute("select id from calls where correlation_id=?",
+                                                (f"00000000-0000-4000-8000-{attempt:012d}",)).fetchone()[0]
+                        api.complete_atomic_publication(call, "c" * 64, HEAD)
+                else:
+                    self.assertEqual(modes, ["prepare", "validate", "publish"])
+                    self.assertEqual((status, action, outcome), ("completed", "published", "published"))
+
+    def test_summary_only_change_request_reaches_repair_prompt_without_required_replies(self):
+        review = {"id": 91, "state": "CHANGES_REQUESTED", "commit_id": HEAD, "user": {"login": "reviewer"},
+                  "body": "  Verify the current-head failure before repairing it.\n", "submitted_at": "2026-11-08T19:51:00Z",
+                  "html_url": "https://github.com/example/repo/pull/3#pullrequestreview-91"}
+        client = AsyncMock()
+        client.paginate.return_value = [review]
+        modes = []
+
+        def interface(*args, **_kwargs):
+            if args[0] == "--pr-review":
+                return asyncio.run(pr_review.run(client, {"repository": "example/repo", "pr": 3, "expected_head": HEAD}))
+            if args[0] != "--issue-work":
+                return {}
+            mode = args[args.index("--mode") + 1]
+            modes.append(mode)
+            if mode == "prepare":
+                return {"outcome": "prepared", "checkout_head": HEAD}
+            self.assertEqual(json.loads(args[args.index("--replies-json") + 1]), [])
+            return {"outcome": "validated" if mode == "validate" else "published", "head_sha": HEAD}
+
+        def worker(_lease, _args, **kwargs):
+            (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({
+                "commitMessage": "fix: repair seed", "title": "fix: repair seed", "body": "Concrete repair and checks.",
+                "replies": [], "blocked": None}))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(pr_review, "get_pull", AsyncMock(return_value={"head": {"sha": HEAD}, "base": {"sha": "c" * 40}})), \
+                patch.object(pr_review, "list_inline_comments", AsyncMock(return_value=[])), \
+                patch.object(pr_review, "issue_comments", AsyncMock(return_value=[])), \
+                patch.object(pr_review, "list_review_threads", AsyncMock(return_value=[])), \
+                patch.object(pr_review, "linked_issues", AsyncMock(return_value=[])), \
+                patch.object(pr_review, "review_diff", AsyncMock(return_value={})), \
+                patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                patch.object(issue_review, "interface", side_effect=interface), \
+                patch.object(issue_review, "command", return_value=(["fixture"], "", {})) as command, \
+                patch.object(issue_review, "_terminal_failure", return_value=None), \
+                patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), redirect_stdout(StringIO()):
+            api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain", "summary-only-repair",
+                                "fixture-model", "poise/issue-7", 3, HEAD)
+
+        instruction = command.call_args.args[1]
+        packet = json.loads(instruction.split("Actual PR evidence:\n", 1)[1])["review_packet"]
+        self.assertEqual(packet["change_request_reviews"], [
+            {"id": 91, "user": "reviewer", "state": "CHANGES_REQUESTED", "commit_id": HEAD,
+             "submitted_at": review["submitted_at"], "url": review["html_url"], "body": review["body"]}
+        ])
+        self.assertEqual(packet["review_threads"], [])
+        self.assertIn("required unresolved root comment IDs: []", instruction)
+        self.assertIn("address every actionable review/CI/conflict blocker", instruction)
+        self.assertIn("Run the repository's required checks", instruction)
+        self.assertEqual(modes, ["prepare", "validate", "publish"])
 
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         modes = []

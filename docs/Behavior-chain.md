@@ -31,7 +31,19 @@ The existing behavior scheduler consumes one durable journal in Poise's existing
 
 Intake failures remain visible in runtime health and diagnostics while already-admitted chains continue reconciling and advancing. A stale discovery index cannot suspend execution evidence belonging to existing chains.
 
-An organization's sweep holds a try-lock for its whole run. A sweep that finds another sweep of that organization still running skips its chain work with a warning, and the next tick tries again. The rest of that tick still runs, and chain health and diagnostics keep what they already showed. So a sweep that never returns shows only as these repeated warnings and an unchanged `lastSweepAt`. Slow lock setup delays a sweep but never skips or fails it. Any other sweep error is reported in runtime health as a failure.
+An organization's sweep holds a zero-timeout try-lock for its whole run. An
+overlapping attempt skips only its chain work; the rest of the tick still runs.
+Skips are counted per organization without warning until overlap lasts more than
+two scheduler intervals (120 seconds) from its first skip, even before any sweep
+has completed. This elapsed-time progress budget is independent of one-second
+check-slot retries. Overdue overlap degrades runtime health with `runtimeError`,
+and the next contended attempt warns once for that episode. Contention establishes
+overdue overlap, not that the lock holder has stopped progressing. Skips and
+warnings preserve `lastSweepAt` and any genuine sweep error, which takes precedence
+in health. An observed sweep completion, successful or failed, ends the episode
+and logs its aggregate skip count and elapsed time; a failed completion retains
+its error. A later episode can warn again. Slow lock setup delays a sweep but
+never skips or fails it. Any other sweep error is reported in runtime health as a failure.
 
 ## Intake and controls
 
@@ -91,7 +103,12 @@ the headless API refuses those operations with 409 after a confirmed merge.
 The UI explains missing original pre-merge evidence without a way to create a
 replacement review. `state=active` retains open obligations, including merged
 PRs with pending review evidence; `state=merged` retains the existing terminal
-classification, including legacy not-recorded merges. Failed refreshes disable
+classification, including legacy not-recorded merges. Confirmed closed seeds
+leave the active list only when no open owned or linked PR, unsettled invocation,
+native resource obligation or pending review evidence remains. Missing or
+contradictory closure evidence keeps the chain active. This exclusion precedes
+pagination and changes neither merge evidence nor ownership; the unfiltered list
+and ID/history reads retain closed chains. Failed refreshes disable
 the retained row's write controls until a successful read. Native action summaries
 distinguish original accepted responses, observed no-action results and uncertain
 or unrecorded attribution without returning the full receipt. Quiescent evidence
@@ -114,7 +131,7 @@ target does not govern atomic chain admissions. No new refresh loop is added.
 
 The existing scheduler selects a normal-work page before a separate due
 reconciliation page under its existing pass budget. Quiescent held or merged
-chains keep their original ownership and active-list membership, but cannot
+chains keep their original ownership, but cannot
 consume the normal-work page. Native model/resource receipts are still read
 while an original model lacks resource-release proof, including after a merge;
 only unnecessary GitHub observation waits.
@@ -276,6 +293,10 @@ rather than becoming ambiguous writes that never occurred.
 
 Durable model admissions use the existing semaphore's behavior-lane ceiling, including its interactive reserve. A fresh server process cannot fill that reserve with another background invocation merely because surviving workers hold no slots in its new in-memory semaphore. Existing work above a lowered ceiling finishes normally while new admissions wait. The journal's capacity check also precedes provider preparation, so waiting work cannot consume a provider recovery probe without launching; admission still rechecks capacity transactionally afterward.
 
+Provider-backoff waits are journaled on entry, when the reason changes and after
+Resume. Unchanged polls still check provider recovery without another waiting
+event; an admitted invocation clears the wait for a later episode.
+
 Resource-aware admission (#731) extends that boundary with memory/disk budgets instead of another scheduler. Each admitted native invocation holds a durable reservation covering its whole tree, including provider children and build/test descendants; the count and budget checks run in one journal transaction, so concurrent admissions cannot double-spend. A synchronous free-memory/free-disk probe guards the same boundary before provider preparation and again before spawn, and fails closed with an explicit reason. Blocked chains wait with that reason and no agent process, waking through the existing release paths. Verified settlement releases a reservation exactly once; cleanup uncertainty and pre-reservation live invocations retain or block it. Budgets and reservations are environment-only (`POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES`); unset means unbounded and production behaves as before. Deletion authority stays with the Caller sweep's ownership proofs.
 
 A configured cgroup memory limit requires a readable, nonempty current-usage
@@ -352,6 +373,38 @@ campaign acceptance or forced-container recovery.
 
 Known failures before publication retry with bounded backoff and existing provider fallback. Ambiguous writes retain ownership. Confirmed actual artifacts can settle a lost response; missing receipts cannot justify another write. Partially published review/reply plans that cannot be fully reconciled remain uncertain and visible. They are not silently retried or reported successful. This limitation must be exercised and resolved if encountered in the real validation runs.
 
+An implementation or repair provider that reaches its execution deadline records
+`atomic_work_execution_budget_exhausted`. Its v1 diagnostic retains the provider,
+execution phase, measured elapsed milliseconds, actual seconds allowance and
+seed issue/PR/head, without command arguments or provider output. Caller keeps
+`not_started` / `preflight_failed`; the chain retains the diagnostic and exposes
+the specific cause as its invocation outcome in History. Preparation timeouts
+remain distinct. Retry still requires positive resource release and the existing
+same-basis backoff; three failures hold the chain across restart until **Resume**.
+
+Repair prompts receive `change_request_reviews` from the native
+`github-interface --pr-review` packet, even with no inline roots. The read selects each
+author's latest effective review (`APPROVED`, `CHANGES_REQUESTED`, `DISMISSED`),
+then includes only substantive change requests on the expected head, with their
+original body, review ID, author, commit, submission time and URL. A later
+`COMMENTED` review does not retire a request. Summaries share the packet byte
+limit; an overflowing packet or failed review read fails visibly. The final
+head/base recheck and independent approval verification still apply.
+
+Repair prompts name the exact unresolved root comment IDs from the head-verified
+review packet, including outdated threads and roots with earlier replies.
+Caller requires that same set before publication. Missing coverage records
+`atomic_work_failed`, `not_started` / `preflight_failed`, with the missing count,
+required count and at most 20 sorted missing IDs in the retained error field;
+comment text is not retained there. No publication plan exists at this point,
+so recovery uses fresh repair attempts, not publication completion. Three
+same-basis failures exhaust the existing attempt window and hold the chain.
+The hold survives deployment, restart and changed head/findings. After deploying
+the fix for incomplete reply instructions, use **Resume** on the already-held
+chains for `autonomio/poise#893` (seed #887) and `autonomio/poise#900` (seed #896).
+Resume opens a new bounded attempt window using the current head and findings;
+it does not repeat an uncertain publication or release unsettled resources.
+
 A repair push checkpoints its exact native head before bounded PR-head
 confirmation. If GitHub's PR projection still trails the push, the existing
 reconciliation pass can complete the original immutable reply plan once the
@@ -375,6 +428,54 @@ An uncertain grey-CI rerun is inspected through the existing native command in
 read-only mode. A later attempt of that exact workflow/head settles its original
 admission; an unchanged attempt remains uncertain. A confirmed preflight read
 failure is a failed, unstarted action and retries with the existing backoff.
+
+## Reporting verified repair exhaustion
+
+Reporting is off by default. An operator can set
+`POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
+list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
+holds during their ordinary bounded reconciliation; no Resume or extra poller is
+needed. Reporting preserves the source hold and does not perform repair recovery.
+
+The first supported cause is `repair_incomplete_replies`: at least three settled
+Caller repairs on the same current repair basis and slot after the last Resume,
+each with positive resource release, `atomic_work_failed`, `not_started` /
+`preflight_failed`, no publication plan and the specific incomplete-reply error.
+The historical fixed message and the newer omission-ID/count suffix represent
+the same cause. Hold text and generic failures cannot establish eligibility.
+Before first reporting, the existing datastore freshness gate must pass and a
+new native observation must still require repair on that head and review basis.
+Stale, unknown or changed findings leave reporting pending. Other causes remain
+visible in their ordinary holds without an issue report.
+
+Poise creates the report as the configured main GitHub account through its
+existing issue publisher, requesting the `poise` label. The body records the
+stage, stable cause, target, hold time/age, head/basis, safe invocation and Caller
+receipt identities, and next action. It excludes raw errors, omitted finding IDs,
+worker paths and provider output. An intent in the existing durable metadata store
+links the original hold event to the report issue. Identity uses cause + source
+chain + PR, independently of omission details, heads and subsequent attempt windows.
+The marker lookup includes closed issues and verifies the publishing account.
+Intent is committed before creation;
+after an ambiguous POST, even repeated empty searches cannot authorize another
+POST. A crash before sending the reserved request also remains unconfirmed and
+requires reconciliation rather than an automatic replacement.
+
+A confirmed issue number is retained before label reconciliation. Missing labels
+are retried additively on that same issue; label failures, datastore indexing lag,
+incompatible saved intake labels and a held remediation chain are shown in the
+source chain's `waiting` reason, including its report URL when known. Poise does
+not add a different intake label or bypass ownership/admission gates. Admission is
+verified only when the normal datastore intake records the new chain. Generated
+remediation issues cannot report this same cause recursively, using their marker
+or the retained source-to-issue link; their ordinary repair holds remain visible.
+
+`tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
+creation/restart, reconciliation and normal admission with an isolated journal
+and fake GitHub/datastore commands. Live acceptance remains pending until an
+operator follows a real qualifying hold through one labeled report, chain
+admission and the normal merge receipt after deployment. No fabricated hold,
+live write or production setting change is part of that component proof.
 
 ## Native action receipts
 

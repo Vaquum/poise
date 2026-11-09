@@ -111,6 +111,34 @@ test.beforeAll(() => {
   finally { db.close() }
 })
 
+test('repair preflight refusals remain visible as warnings with their cause and Caller identity', async ({ page }) => {
+  const repairComponent = component + '-repair'
+  const records = [
+    { error_code: 'atomic_work_failed', error: 'repair did not answer every unresolved review finding' },
+    { error_code: 'atomic_work_blocked', error: 'atomic behavior blocked: required CI is failing' },
+  ].map((failure, index) => normalize({ ...callerDiagnostic({ id: callId(120 + index), completed_at: new Date().toISOString(),
+    behavior: 'repair_pr', status: 'failed', action: 'not_started', outcome: 'preflight_failed', head_sha: null,
+    repo: 'acme/repo', pr_id: '42', correlation_id: 'repair-' + run, ...failure }, 'local')!, component: repairComponent })!)
+  const db = new DiagnosticStore(storePath)
+  try { db.append(records) } finally { db.close() }
+  await ready(page)
+  await exactFilter(page, 'component', repairComponent)
+  await openFilter(page, 'severity')
+  await page.locator('[data-level="error"]').click(); await page.locator('[data-level="critical"]').click()
+  await expect(status(page)).toContainText('2 matching retained events')
+  for (const record of records) {
+    await exactFilter(page, 'callId', record.callId!)
+    await expect(rows(page)).toHaveCount(1)
+    await expect(rows(page).locator('.agent-status.warn')).toHaveText('Warning')
+    await expect(rows(page)).toContainText(record.message)
+    await rows(page).getByRole('button', { name: 'Toggle diagnostic evidence' }).click()
+    const detail = page.locator('#logging-tbody > .agent-expand-row')
+    await expect(detail).toContainText(record.callId!)
+    await expect(detail).toContainText(record.correlationId!)
+    await expect(detail.getByRole('button', { name: 'Open Caller run in Swarm' })).toHaveAttribute('data-call', record.callId!)
+  }
+})
+
 test('real retained Caller evidence supports bounded native filters, expansion, full matching export and focus', async ({ page }) => {
   await page.addInitScript(() => {
     const tasks: number[] = []

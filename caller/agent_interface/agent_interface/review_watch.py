@@ -14,7 +14,7 @@ from threading import current_thread, main_thread
 
 from . import atoms, progress, review_budget, review_receipt, resource_ownership
 from .review_gate import cancel_when_idle, submission_active
-from .provider_progress import ProviderStream, READ_BYTES
+from .provider_progress import MAX_LINE_BYTES, ProviderStream, READ_BYTES
 
 PROGRESS_SECONDS = 1
 POLL_SECONDS = 30
@@ -49,7 +49,7 @@ _THROTTLE_COMPANIONS = (
 # every mention of reconnecting would count.
 _TRANSPORT_COMPANIONS = tuple(c for c in _THROTTLE_COMPANIONS if c != b"reconnect")
 _RETRY_COUNTER = re.compile(rb"\d+\s*/\s*\d+")
-_STATUS_429 = re.compile(rb"(?:status|http_status)\D{0,3}429\b")
+_STATUS_429 = re.compile(rb"(?:status|http_status|status_code)\D{0,3}429\b")
 _GITHUB_STATUS = re.compile(rb"github\s+\d{3}")
 
 
@@ -59,8 +59,38 @@ class ReviewSuperseded(RuntimeError):
         super().__init__(f"Review stopped early: PR head changed to {self.head_sha}")
 
 
+def _provider_diagnostic(line: bytes, *, stderr: bool) -> bytes:
+    try:
+        event = json.loads(line)
+    except ValueError:
+        # stdout may be a truncated tool event; never match its raw suffix.
+        if stderr and line.lower().startswith((b"error:", b"reconnecting...", b"provider retry:")):
+            return line[:1024]
+        return b""
+    if not isinstance(event, dict):
+        return b""
+    retry = event.get("type") == "system" and event.get("subtype") == "api_retry"
+    failed = event.get("type") in ("error", "turn.failed") or (
+        event.get("type") == "result" and event.get("is_error") is True)
+    if not (retry or failed):
+        return b""
+    diagnostics = ["Provider retry"] if retry else []
+    for source in (event, event.get("error")):
+        if isinstance(source, str):
+            diagnostics.append(source[:500])
+        elif isinstance(source, dict):
+            for key in ("message", "code", "status", "status_code", "http_status"):
+                value = source.get(key)
+                if isinstance(value, str) or type(value) is int:
+                    diagnostics.append(f"{key}: {str(value)[:500]}")
+    errors = event.get("errors")
+    if event.get("type") == "result" and isinstance(errors, list):
+        diagnostics.extend(error[:500] for error in errors[:4] if isinstance(error, str))
+    return "; ".join(diagnostics).encode("utf-8", "replace")
+
+
 def _stall_kind(line: bytes) -> str | None:
-    """Classify one provider output line as quota or transport evidence.
+    """Classify a provider diagnostic as quota or transport evidence.
 
     Returns "quota" for 429/rate-limit evidence, "transport" for a retry
     loop without quota evidence, and None for anything else — including
@@ -89,7 +119,8 @@ class RateLimitAbort:
     with nothing but signals (or silence), the run is killed so Poise can
     move the review to the next slot instead of waiting out the budget.
     The handoff keeps the observed cause: quota evidence says rate-limited,
-    a bare reconnect loop says reconnecting.
+    a bare reconnect loop says reconnecting. Only selected error/retry event
+    fields and native stderr diagnostics can start the clock or supply evidence.
     """
 
     def __init__(self) -> None:
@@ -110,28 +141,32 @@ class RateLimitAbort:
             setattr(self, offsets[0], getattr(self, offsets[0]) + len(chunk))
             data = getattr(self, offsets[1]) + chunk
             *lines, rest = data.split(b"\n")
-            # A marker can straddle two reads; only the tail can hold half of one.
-            setattr(self, offsets[1], rest[-1024:])
+            # An unfinished line can straddle reads. Keep it whole (up to the
+            # shared line cap) so a long structured event still parses once
+            # its newline arrives; diagnostics themselves stay bounded.
+            setattr(self, offsets[1], rest[-MAX_LINE_BYTES:])
             for line in lines:
-                self.feed(line)
+                self.feed(line, stderr=stream is stderr)
 
-    def note(self, chunk: bytes) -> None:
+    def note(self, chunk: bytes, *, stderr: bool = False) -> None:
         for line in chunk.split(b"\n"):
-            self.feed(line)
+            self.feed(line, stderr=stderr)
 
-    def feed(self, line: bytes) -> None:
+    def feed(self, line: bytes, *, stderr: bool = False) -> None:
         if not line.strip():
             return
-        kind = _stall_kind(line)
+        diagnostic = _provider_diagnostic(line.strip(), stderr=stderr)
+        kind = _stall_kind(diagnostic)
         if kind is None:
             self.since = None
             self.quota = False
+            self.signal = b""
         else:
             if self.since is None:
                 self.since = monotonic()
             if kind == "quota":
                 self.quota = True
-            self.signal = line.strip()[:200]
+            self.signal = diagnostic[:200]
 
     def check(self, provider: str | None, process: subprocess.Popen) -> None:
         # Only complete lines judge: a pending fragment may hold half a

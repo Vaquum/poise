@@ -15,6 +15,7 @@ export interface ChainRuntimeOperations {
   discover(): Promise<ChainSeed[]>
   ownsRepository(repository: string): boolean
   observe(chain: BehaviorChain): Promise<ChainObservation>
+  reportHold?(chain: BehaviorChain): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
   available(): boolean
@@ -46,6 +47,7 @@ function receipt(call: LogEntry): Record<string, unknown> {
     resources_settled_at: call.resources_settled_at ?? null,
     resource_ownership: call.resource_ownership ?? null,
     ...(call.resource_guard ? { resource_guard: call.resource_guard } : {}),
+    ...(call.diagnostic ? { diagnostic: call.diagnostic } : {}),
     error: call.error, error_code: call.error_code ?? null, completedAt: call.completed_at ? Date.parse(call.completed_at) : null }
 }
 
@@ -254,11 +256,13 @@ export class BehaviorChainRuntime {
             firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
           } : undefined
           const decision = decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
+          if (chain.held && decision.kind === 'wait' && this.operations.reportHold && await this.reportHold(chain)) continue
           if (decision.kind === 'complete') {
             this.append(chain, { type: 'chain.merged', mergeSha: decision.mergeSha, evidence: { repository: chain.repository,
               pull_number: observation.pull!.number, merged: true, merge_sha: decision.mergeSha, review_complete: true } })
           } else if (decision.kind === 'hold') {
-            if (!chain.held) this.append(chain, { type: 'chain.held', reason: decision.reason })
+            if (!chain.held) chain = this.append(chain, { type: 'chain.held', reason: decision.reason })
+            if (this.operations.reportHold) await this.reportHold(chain)
           } else if (decision.kind === 'invoke' && this.operations.enabled() && (!decision.reviewer || this.operations.available()) && this.operations.permitted(chain, decision)) {
             const closed = closedChainTarget(chain, observation, decision.behavior)
             if (closed) {
@@ -300,7 +304,12 @@ export class BehaviorChainRuntime {
             const id = randomUUID()
             let request = await this.operations.request(chain, observation, decision, id)
             if (!request) {
-              this.append(chain, { type: 'chain.waiting', reason: `${decision.behavior} is waiting for native provider backoff` })
+              const reason = `${decision.behavior} is waiting for native provider backoff`
+              // Resume retains waiting; its first observed sweep starts a new episode.
+              if (chain.waiting !== reason || (chain.resumedAfterSequence > 0
+                && this.journal.history(chain.id, chain.resumedAfterSequence, 1)[0]?.sequence === chain.sequence)) {
+                this.append(chain, { type: 'chain.waiting', reason })
+              }
               continue
             }
             if (resources) {
@@ -349,6 +358,17 @@ export class BehaviorChainRuntime {
     } finally {
       this.running = false
     }
+  }
+
+  private async reportHold(chain: BehaviorChain): Promise<boolean> {
+    let reason: string | null
+    try { reason = await this.operations.reportHold!(chain) }
+    catch (error) { reason = `Repair exhaustion reporting pending: ${error instanceof Error ? error.message : String(error)}` }
+    const current = this.current(chain)
+    if (reason && current.held && current.resumedAfterSequence === chain.resumedAfterSequence && current.waiting !== reason) {
+      this.append(current, { type: 'chain.waiting', reason })
+    }
+    return reason !== null
   }
 
   private async reconcile(chain: BehaviorChain, snapshot: AgentLogSnapshot): Promise<BehaviorChain> {
@@ -501,7 +521,8 @@ export class BehaviorChainRuntime {
     }
     this.operations.received(invocation, call)
     chain = this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
-      outcome: call.outcome || call.error_code || call.status, evidence: receipt(call) })
+      outcome: call.error_code === 'atomic_work_execution_budget_exhausted' ? call.error_code : call.outcome || call.error_code || call.status,
+      evidence: receipt(call) })
     if (stopped) return chain
     if (call.status === 'failed' && call.action !== 'not_started') return this.append(chain, { type: 'chain.held',
       reason: `behavior invocation ${invocation.id} failed after a possible write; its artifact needs reconciliation` })

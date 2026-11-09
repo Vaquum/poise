@@ -160,6 +160,13 @@ The test keeps its no-overlap and exactly-one-approval assertions.
 ## Agents' suites
 
 On a deployment with a test relay, a suite an agent starts in a workspace runs on a disposable test box, not beside Poise ([Agents' test suites](Operating.md#agents-test-suites)). `tests/test-offload.test.ts` runs the real hooks, runner, relay and box script against a stand-in for Render's API.
+It replaces the relay mid-suite and verifies one recovery with identical captured
+input despite unchanged-HEAD edits, genuine failures (including exit 125),
+cancellation, repeated restarts and an unrecovered relay. Recovery and the full
+rerun share the original command budget. A journal/decision fixture continues
+from the fresh complete result through exact-head review, CI, readiness and merge
+observations without Resume; it performs no live GitHub actions and retains the
+interrupted attempt as missing a result.
 
 ## Agent tool CPU defaults
 

@@ -1,6 +1,7 @@
 import io
 import json
 import subprocess
+import sys
 from uuid import uuid4
 import tempfile
 from pathlib import Path
@@ -227,6 +228,76 @@ class TestRecovery(TestCase):
         self.assertEqual(row['diagnostic']['timeout_seconds'], 600)
         self.assertEqual(row['diagnostic']['call_id'], row['id'])
         self.assertEqual(row['diagnostic']['correlation_id'], row['correlation_id'])
+
+    def test_local_inspection_timeout_retains_sanitized_target_and_never_recovers_in_place(self):
+        from agent_interface import pr_review, review_repository, structured_review
+        query = 'rate limit; not signed in; status 402 Payment Required'
+        actual_run, original_timeout = subprocess.run, budget.timeout
+        started = Path(self.directory.name) / 'inspection-started'
+        cli = Path(self.directory.name) / 'stalled-github-interface'
+        cli.write_text(f'#!{sys.executable}\nimport time\nfrom pathlib import Path\n'
+                       f'Path({str(started)!r}).touch()\nprint({query!r}, flush=True)\ntime.sleep(60)\n')
+        cli.chmod(0o700)
+        packet = json.dumps({'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD, 'merge_base_sha': 'b' * 40,
+                             'pull': {'title': 'Pinned review target', 'base': {'sha': 'b' * 40}}})
+        for initial in (True, False):
+            roots = []
+            started.unlink(missing_ok=True)
+            def command(argv, **kwargs):
+                if '--checkout-review' in argv:
+                    root = Path(argv[argv.index('--path') + 1]); root.mkdir(); roots.append(root)
+                    return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps({
+                        'action': 'checkout_review', 'repository': 'o/r', 'path': str(root),
+                        'head_sha': HEAD, 'merge_base_sha': 'b' * 40}))
+                self.assertEqual(argv[1], '--review-context')
+                requests = json.loads(argv[argv.index('--requests-json') + 1])
+                if initial or requests[0]['operation'] == 'search':
+                    return actual_run(argv, **kwargs)
+                return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps({
+                    'action': 'review_context', 'head_sha': HEAD, 'results': []}))
+
+            ask = Mock(return_value=json.dumps({'action': 'inspect', 'comments': [],
+                'assessment': {'verdict': 'Inspect the affected consumers before concluding.',
+                               'reviewed_context': 'Read the supplied immutable review packet.',
+                               'limitations': 'No repository code execution.'},
+                'requests': [{'operation': 'search', 'path': '.', 'query': query, 'start_line': 1}]}))
+            def review(*args, **kwargs):
+                return pr_review.run(self.directory.name, 'https://github.com/o/r/pull/1', 'bit-mis', HEAD,
+                                     model='gpt-6-astra-ultra')
+
+            self.mod.run.reset_mock()
+            with self.subTest(initial=initial), patch.object(atoms, 'packet', return_value=packet), \
+                    patch.object(review_repository.subprocess, 'run', side_effect=command), \
+                    patch.dict('os.environ', {'GITHUB_INTERFACE_CLI': str(cli)}), \
+                    patch.object(budget, 'timeout', side_effect=lambda cap, **kwargs: original_timeout(0.5 if cap == 30 else cap, **kwargs)), \
+                    patch.dict(structured_review.ASK, {'codex': ask}):
+                row = self.execute(review, [facts()], model='gpt-6-astra-ultra')
+            self.assertEqual(row['error_code'], 'review_inspection_timeout', row['error'])
+            self.assertEqual(row['action'], 'not_started')
+            self.assertEqual(row['outcome'], 'preflight_failed')
+            self.assertIsNone(row['head_sha'])
+            self.assertIsNone(row['review_id'])
+            self.assertIsNone(row['recovery_model'])
+            self.assertEqual(self.mod.run.call_count, 1)
+            self.assertEqual(ask.call_count, 0 if initial else 1)
+            self.assertTrue(started.exists())
+            self.assertFalse(roots[0].parent.exists())
+            self.assertIn('inspection timed out', row['error'])
+            for private in ('--requests-json', query):
+                self.assertNotIn(private, row['error'])
+                self.assertNotIn(private, json.dumps(row['diagnostic']))
+            self.assertEqual(row['diagnostic']['operation'], 'github-interface')
+            self.assertEqual(row['diagnostic']['phase'], 'inspection')
+            self.assertEqual(row['diagnostic']['outcome'], 'timed_out')
+            self.assertEqual(row['diagnostic']['timeout_seconds'], 0.5)
+            self.assertEqual(row['diagnostic']['repository'], 'o/r')
+            self.assertEqual(row['diagnostic']['pr'], '1')
+            self.assertEqual(row['diagnostic']['expected_head'], HEAD)
+            self.assertEqual(row['diagnostic']['call_id'], row['id'])
+            self.assertEqual(row['diagnostic']['correlation_id'], row['correlation_id'])
+            with api.db() as connection:
+                stored = json.loads(connection.execute('select diagnostic from calls where id=?', (row['id'],)).fetchone()[0])
+            self.assertEqual(stored, row['diagnostic'])
 
     def test_receipted_submission_before_provider_error_never_launches_recovery(self):
         from agent_interface import review_receipt

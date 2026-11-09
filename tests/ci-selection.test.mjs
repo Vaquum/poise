@@ -227,6 +227,22 @@ describe('how CI and the commands reach the choice', () => {
     expect(ci.concurrency.group).toContain("github.repository == 'autonomio/poise' && github.event_name == 'push' && github.sha || github.event_name")
   })
 
+  it('paces automatic fork updates through verification and a serialized Deploy attempt', () => {
+    const sync = parse(readFileSync('.github/workflows/sync-upstream.yml', 'utf8'))
+    const deploy = parse(readFileSync('.github/workflows/deploy.yml', 'utf8'))
+    const steps = sync.jobs.sync.steps
+    const gate = steps.find(candidate => candidate.id === 'gate')
+    const merge = steps.find(candidate => candidate.name === "Merge autonomio/poise's main into main")
+    expect(gate.if).toBe("vars.POISE_DEPLOY_HOST != ''")
+    expect(gate.run).toBe('deploy/actions/sync-gate.sh')
+    expect(gate.env.GH_TOKEN).toBe('${{ github.token }}')
+    expect(gate.env.REPO).toBe('${{ github.repository }}')
+    expect(steps.indexOf(gate)).toBeLessThan(steps.indexOf(merge))
+    expect(merge.if).toBe("vars.POISE_DEPLOY_HOST == '' || steps.gate.outputs.proceed == 'true'")
+    expect(sync.concurrency).toEqual({ group: 'sync-upstream', 'cancel-in-progress': false })
+    expect(deploy.concurrency).toEqual({ group: 'deploy', 'cancel-in-progress': false })
+  })
+
   it('can run in full by hand, without a base to audit against', () => {
     expect(ci.on).toHaveProperty('workflow_dispatch')
     expect(step('static', 'deps').if).toBe("github.event_name != 'workflow_dispatch'")

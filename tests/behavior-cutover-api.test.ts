@@ -2,6 +2,7 @@ import { createServer } from 'node:http'
 import { afterAll, beforeEach, expect, it, vi } from 'vitest'
 import { db, getMeta, setMeta, closeDatabase } from '../server/db'
 import { behaviorChainJournal } from '../server/behavior-chain-journal'
+import type { BehaviorChain, ChainEvent } from '../server/behavior-chain-store'
 import { behaviorChainSummary } from '../server/behavior-chain-summary'
 import { chainSummaryFixture } from './fixtures/behavior-chain-summary'
 
@@ -140,6 +141,74 @@ it('shares the production summary and historical rebuild contract with browser p
   expect(chainSummaryFixture('historical').chains[0]).toMatchObject({ reviewStatus: 'not-recorded', reviewPending: null })
 })
 
+it('excludes closed seeds only after PR, execution, resource and review obligations are settled', async () => {
+  const journal = behaviorChainJournal()
+  const record = (chain: BehaviorChain, event: ChainEvent) => journal.append(chain.id, `${chain.id}:${chain.sequence}`, chain.sequence, event)
+  const closed = { checkedAt: Date.now(), issue: { open: false }, existingPulls: [], pull: null,
+    publication: { pull_number: null, state: null, merged: false, merge_sha: null } }
+  const closedPull = { ...closed, publication: { pull_number: 17, state: 'closed', merged: false, merge_sha: null },
+    pull: { number: 17, state: 'closed', merged: false, mergeSha: null } }
+  const seed = (issue: number, observation: Record<string, unknown> | null = closed) => {
+    let chain = journal.append(`closed/repo#${issue}`, `closed-seed-${issue}`, 0, { type: 'chain.admitted', repository: 'closed/repo', issue,
+      branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' })
+    if (observation) chain = record(chain, { type: 'chain.observed', observation })
+    return record(chain, { type: 'chain.held', reason: 'Seed issue is closed' })
+  }
+  const quiescent = [seed(1), seed(2, { ...closedPull, publication: { ...closedPull.publication, pull_number: 16 },
+    pull: { ...closedPull.pull, number: 16 } })]
+  const retained = [seed(3, { ...closed, issue: { open: true } }), seed(4, { ...closed, issue: {} }), seed(5, null),
+    seed(6, { ...closed, existingPulls: ['https://github.com/closed/repo/pull/18'] }),
+    seed(7, { ...closedPull, publication: { ...closedPull.publication, state: 'open' }, pull: { ...closedPull.pull, state: 'open' } }),
+    seed(8, { ...closed, existingPulls: undefined }), seed(9, { ...closed, publication: undefined }),
+    seed(10, { ...closedPull, pull: null }), seed(11, { ...closedPull, pull: { ...closedPull.pull, state: 'unknown' } }),
+    seed(12, { ...closedPull, publication: { ...closedPull.publication, state: 'open' } }),
+    seed(13, { ...closedPull, pull: { ...closedPull.pull, number: 18 } }),
+    seed(14, { ...closedPull, publication: { ...closedPull.publication, merged: true, merge_sha: 'd'.repeat(40) },
+      pull: { ...closedPull.pull, merged: true, mergeSha: 'd'.repeat(40) } })]
+  for (const [index, state] of ['admitted', 'started', 'uncertain', 'settled'].entries()) {
+    let chain = seed(20 + index)
+    // Resume only to admit the original invocation; closure never settles it.
+    chain = record(chain, { type: 'chain.resumed' })
+    chain = record(chain, { type: 'invocation.admitted', invocation: { id: chain.id, behavior: 'resolve-threads', basis: 'seed',
+      actor: chain.reviewer, model: null, slot: null, admittedAt: Date.now(),
+      request: { command: 'github-interface', argv: ['--fixture'], cwd: '/fixture', ...(state === 'settled' ? { nativeResources: 2 as const } : {}) } } })
+    if (state !== 'admitted') chain = record(chain, { type: 'invocation.started', invocationId: chain.id })
+    if (state === 'uncertain') chain = record(chain, { type: 'invocation.uncertain', invocationId: chain.id, reason: 'original result unknown' })
+    if (state === 'settled') chain = record(chain, { type: 'invocation.settled', invocationId: chain.id,
+      callId: 'c'.repeat(32), outcome: 'target_closed', evidence: { status: 'deferred', action: 'not_started' } })
+    retained.push(chain)
+  }
+  let pending = seed(30)
+  pending = record(pending, { type: 'chain.merged', mergeSha: 'd'.repeat(40), evidence: {
+    repository: pending.repository, pull_number: 17, merged: true, merge_sha: 'd'.repeat(40), review_complete: false } })
+  retained.push(pending)
+  const before = quiescent.map(chain => journal.history(chain.id))
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  try {
+    const active = await (await fetch(`${base}?state=active&after=closed/`)).json()
+    expect(active.chains.map((chain: { id: string }) => chain.id).sort()).toEqual(retained.map(chain => chain.id).sort())
+    const all = await (await fetch(`${base}?after=closed/`)).json()
+    const merged = await (await fetch(`${base}?state=merged&after=closed/`)).json()
+    for (const [index, chain] of quiescent.entries()) {
+      expect(all.chains).toContainEqual(expect.objectContaining({ id: chain.id, mergeSha: null, reviewStatus: 'not-recorded' }))
+      expect(merged.chains.map((row: { id: string }) => row.id)).not.toContain(chain.id)
+      const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
+      expect(detail.chain).toEqual(behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) }))
+      expect(detail.events.map((event: { type: string }) => event.type)).toEqual(['chain.admitted', 'chain.observed', 'chain.held'])
+      expect(journal.read(chain.id)).toEqual(chain)
+      expect(journal.history(chain.id)).toEqual(before[index])
+    }
+    journal.rebuild()
+    const rebuilt = await (await fetch(`${base}?state=active&after=closed/`)).json()
+    expect(rebuilt).toEqual(active)
+    expect(journal.forPull('closed/repo', 16)).toEqual(quiescent[1])
+  } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+})
+
 it('pages a 10,000-event chain and 100 admitted chains without losing the current reason', async () => {
   const journal = behaviorChainJournal()
   let long = journal.append('history/repo#1', 'long-history-seed', 0, { type: 'chain.admitted', repository: 'history/repo', issue: 1,
@@ -149,6 +218,13 @@ it('pages a 10,000-event chain and 100 admitted chains without losing the curren
       { type: 'chain.waiting', reason: `checkpoint ${event}` })
     for (let issue = 2; issue <= 100; issue++) journal.append(`history/repo#${issue}`, `history-seed-${issue}`, 0,
       { type: 'chain.admitted', repository: 'history/repo', issue, branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' })
+    for (let issue = 1; issue <= 100; issue++) {
+      const chain = journal.append(`aaa-closed/repo#${issue}`, `page-closed-seed-${issue}`, 0,
+        { type: 'chain.admitted', repository: 'aaa-closed/repo', issue, branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' })
+      journal.append(chain.id, `page-closed-observed-${issue}`, chain.sequence, { type: 'chain.observed', observation: {
+        checkedAt: Date.now(), issue: { open: false }, existingPulls: [], pull: null,
+        publication: { pull_number: null, state: null, merged: false, merge_sha: null } } })
+    }
   })()
   const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -158,10 +234,13 @@ it('pages a 10,000-event chain and 100 admitted chains without losing the curren
   try {
     const first = await (await fetch(`${base}?state=active`)).json()
     expect(first.chains).toHaveLength(100)
+    expect(first.next).toBe(first.chains.at(-1).id)
     const second = await (await fetch(`${base}?state=active&after=${encodeURIComponent(first.next)}`)).json()
     const ids = [...first.chains, ...second.chains].map((chain: { id: string }) => chain.id)
     expect(new Set(ids).size).toBe(ids.length)
     expect(ids.filter((id: string) => id.startsWith('history/repo#'))).toHaveLength(100)
+    expect(ids.some((id: string) => id.startsWith('aaa-closed/'))).toBe(false)
+    expect(second.next).toBeNull()
     const history = await (await fetch(`${base}?id=${encodeURIComponent(long.id)}`)).json()
     expect(history.chain.waiting).toBe('checkpoint 9999')
     expect(history.events).toHaveLength(20)

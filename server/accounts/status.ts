@@ -3,8 +3,9 @@
 // only (muse-credential.ts). Only the account name a status command prints
 // leaves this module, never a token or key.
 
-import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, type RunFileOptions, type RunFileResult } from '../process'
+import { CLAUDE_SUBSCRIPTION_CLI, claudeSubscriptionEnvironment, isExpectedFailure, type RunFileOptions, type RunFileResult } from '../process'
 import { claudeSubscriptionReady, sanitizeSubscriptionType } from '../claude-auth'
+import { diagnosticFailure } from '../logging'
 import { ACCOUNT_CLIS, GH_STORED_ACCOUNTS_ENV, type AccountCli } from './clis'
 import { readMuseCredential } from './muse-credential'
 import { ACCOUNT_IDS, type AccountId, type ConnectedAccount, type GhAccount } from './types'
@@ -137,15 +138,22 @@ function parseGhStatus(stdout: string): SignIn | null {
 }
 
 async function claudeSignIn(run: RunCommand): Promise<SignIn> {
-  let stdout: string
+  const unreadable = '`claude auth status` gave no answer Poise can read.'
+  let status: SignIn | null
   try {
-    stdout = (await run(CLAUDE_SUBSCRIPTION_CLI, ['auth', 'status', '--json'], options(claudeSubscriptionEnvironment()))).stdout
+    const result = await run(CLAUDE_SUBSCRIPTION_CLI, ['auth', 'status', '--json'], {
+      ...options(claudeSubscriptionEnvironment()), expected: { codes: [1] },
+    })
+    status = parseClaudeStatus(result.stdout)
+    if (!status) diagnosticFailure('claude.auth.status', new Error(unreadable))
   } catch (error) {
     // Signed out, it still answers on stdout and exits 1.
-    if (!exitedNonZero(error) || !text(error.stdout).trim()) return unknown(failure('claude auth status', error))
-    stdout = text(error.stdout)
+    if (!exitedNonZero(error)) return unknown(failure('claude auth status', error))
+    status = parseClaudeStatus(text(error.stdout))
+    if (isExpectedFailure(error) && status?.signedIn !== false) diagnosticFailure('claude.auth.status', error)
+    if (!text(error.stdout).trim()) return unknown(failure('claude auth status', error))
   }
-  return parseClaudeStatus(stdout) ?? unknown('`claude auth status` gave no answer Poise can read.')
+  return status ?? unknown(unreadable)
 }
 
 async function codexSignIn(run: RunCommand): Promise<SignIn> {

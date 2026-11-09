@@ -1198,18 +1198,29 @@ describe('durable timers that wake chats', () => {
     await until(() => runtime.get(p.id)?.status === 'idle')
     const ordinary = store.inbox(instance, p.id).find(m => m.body === 'Ordinary during interruption')!
     expect(ordinary.state).toBe('pending')
-    // A chat left error by a failed native start is admitted with its start retried.
+    // A failed native start settles as interrupted; the timer retries it.
     const failing = await manager('Failing')
     failStarts.add(failing.id)
     const onFailing = (await command(m.id, { operation: 'timer', sessionId: failing.id, label: 'F', message: 'Ping', delayMinutes: 10 })).timer as { id: string }
     runtime.prompt(failing.id, { text: 'Will fail to start', attachments: [], mentions: [] })
-    await until(() => runtime.get(failing.id)?.status === 'error')
+    await until(() => runtime.get(failing.id)?.status === 'interrupted')
     clock += 10 * 60_000
     await control.tick()
-    await until(() => starts(failing.id).some(s => s.source?.kind === 'timer'))
-    await until(() => store.timerById(instance, onFailing.id)!.failures === 1)
-    expect(runtime.get(failing.id)?.status).toBe('error')
+    await until(() => starts(failing.id).some(s => s.source?.kind === 'timer' && s.source.timerId === onFailing.id))
+    // Timer accounting precedes asynchronous workspace cleanup and status settlement.
+    await until(() => runtime.get(failing.id)?.status === 'interrupted')
+    const timerTurn = starts(failing.id).find(s => s.source?.kind === 'timer' && s.source.timerId === onFailing.id)!
+    const finished = runtime.events(failing.id, 0).events.map(e => e.event)
+      .find(e => e.type === 'turn.finished' && e.turnId === timerTurn.turnId)
+    expect(finished).toMatchObject({ stopReason: 'error', error: 'native start failed' })
+    expect(store.timerById(instance, onFailing.id)!.failures).toBe(1)
     expect(store.holds(instance).filter(h => h.sessionId === failing.id)).toHaveLength(0)
+    failStarts.delete(failing.id)
+    runtime.prompt(failing.id, { text: 'Fresh prompt after failure', attachments: [], mentions: [] })
+    await until(() => prompts.has(failing.id))
+    expect(prompts.get(failing.id)!.at(-1)!.text).toContain('Fresh prompt after failure')
+    finishes.get(failing.id)!({ stopReason: 'end_turn' })
+    await until(() => runtime.get(failing.id)?.status === 'idle')
   }, 180_000)
 
   it('refuses timer work while draining, shapes bad input, and budgets mutating operations', async () => {

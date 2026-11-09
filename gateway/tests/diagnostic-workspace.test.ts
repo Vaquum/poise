@@ -161,6 +161,39 @@ it('excludes ordinary workspace output without false outages while retaining mal
   } finally { await collector.stop(); runtime.stop(); await h.close(); rmSync(directory, { recursive: true, force: true }); vi.restoreAllMocks() }
 })
 
+it('separates bundled Caddy stream cancellation from retained, redacted upstream failure', async () => {
+  const h = await startHarness(), directory = mkdtempSync(join(tmpdir(), 'poise-caddy-stream-'))
+  const docker = new DockerClient('/unused-fixture-socket')
+  vi.spyOn(docker, 'diagnosticContainers').mockResolvedValue([{ Id: 'caddy', ImageID: 'sha256:fixture', Names: [], State: 'running',
+    Labels: { 'com.docker.compose.project': 'poise', 'com.docker.compose.service': 'caddy' } }])
+  const cancellation = { level: 'warn', ts: Date.now() / 1000 - 2, logger: 'http.handlers.reverse_proxy', msg: 'aborting with incomplete response', error: 'reading: context canceled',
+    request: { host: 'alice.poise.test', method: 'GET', uri: '/api/link/events?private-query', headers: { Authorization: 'private-header' } } }
+  const frame = (row: unknown) => {
+    const body = Buffer.from(new Date().toISOString() + ' ' + JSON.stringify(row) + '\n'), header = Buffer.alloc(8)
+    header[0] = 2; header.writeUInt32BE(body.length, 4); return Buffer.concat([header, body])
+  }
+  let interrupted = false
+  vi.spyOn(docker, 'diagnosticRead').mockImplementation(async (path) => path.startsWith('/events') ? Buffer.alloc(0)
+    : Buffer.concat([frame(cancellation), ...(interrupted ? [frame({ ...cancellation, error: 'reading: unexpected EOF\nAuthorization: Bearer private-secret' })] : [])]))
+  const runtime = new DiagnosticRuntime({ path: join(directory, 'central.db'), report: () => undefined })
+  const collector = new EnvironmentCollectors(runtime, docker, h.context)
+  const access = { workspace: null, operator: true }
+  try {
+    collector.start()
+    await vi.waitFor(() => expect(runtime.health().sources.find((source) => source.id === 'ingress')).toMatchObject({ currentStatus: 'connected', gaps: [] }))
+    await collector.stop()
+    expect(runtime.query((db) => db.checkpoint('docker-log:caddy'))).not.toBeNull()
+    expect(runtime.query((db) => db.query(access)).total).toBe(0)
+    interrupted = true; collector.start()
+    await vi.waitFor(() => expect(runtime.query((db) => db.query(access)).total).toBe(1))
+    await collector.stop()
+    const page = runtime.query((db) => db.query(access))
+    expect(page.events[0].stderr).toContain('reading: unexpected EOF')
+    expect(JSON.stringify(page)).not.toMatch(/private-secret|private-query|private-header/)
+    expect(runtime.health().sources.find((source) => source.id === 'ingress')).toMatchObject({ currentStatus: 'connected', gaps: [] })
+  } finally { await collector.stop(); runtime.stop(); await h.close(); rmSync(directory, { recursive: true, force: true }); vi.restoreAllMocks() }
+})
+
 it('aggregates real container failures independently of order and keeps ordinary stdout outside the diagnostic window', async () => {
   const h = await startHarness(), directory = mkdtempSync(join(tmpdir(), 'poise-stream-order-'))
   const docker = new DockerClient('/unused-fixture-socket')

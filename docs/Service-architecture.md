@@ -699,6 +699,20 @@ and drops its repositories from the issue review selection and the Manager's
 scope. Nothing changes on GitHub, datastores are kept, and work bindings stay
 as history.
 
+An account's due sync makes one nonblocking SQLite lock attempt after filesystem
+setup, even when setup is slow. An activated account retains lock acquisition
+failures in its existing sync error and retry state. Retries back off from one
+minute to at most one hour, survive restart, and leave other accounts eligible. Five-second scheduler ticks
+do not acquire the lock or repeat diagnostics before that retry. SQLite contention
+and setup errors retain their actual causes; neither verifies a holder's process
+identity. A newer sync, retry, identity or registration wins over an old
+failed acquirer. Settings shows the error and automatic retry time immediately;
+diagnostics retain the failure start, last successful sync age (unknown without a
+timestamp), and the unchanged 120-second freshness limit. The existing per-account
+alert still starts after 15 minutes of failures and clears/rearms only after a
+validated sync. An activation lock conflict stays eligible for automatic
+activation rather than becoming a manual-retry error.
+
 `GET /api/github-quota` reads the configured user and automation accounts'
 stored credentials explicitly and returns their API budgets without secrets.
 Its response and forecast model are defined in [Analytics](Analytics.md#github-api-quota).
@@ -1103,6 +1117,11 @@ Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
 recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, or
 whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
 its own, keeping its volume and respecting the native settlement barrier.
+The operator scripts retain an exact-release rollout receipt beyond their
+bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
+receipt through the existing workspace health/image proof without initiating
+another rollout; [Upgrades](Operating.md#upgrades) defines its outcomes and
+retained evidence. This adds no gateway or workspace API.
 
 **Provider CLIs** are installed into each person's home volume on first start
 and update themselves there, as Poise already does before each launch. The
@@ -1157,6 +1176,9 @@ at its last confirmed time; restart remains initializing until a fresh scan.
 Canonical host selection and redaction run on the edge before transmission,
 then attribution and normalization run again at the gateway. See the
 [external reader installation contract](../deploy/ingress/README.md).
+The edge also derives the fixed `/api/link/events` route label before removing
+the URI. All ingress paths apply the narrow native cancellation exception and
+retain other redacted causes as defined in [Logging](Logging.md#collection-and-operation).
 
 `GET /api/service/diagnostics?cursor=OPAQUE` is a maintenance-only delivery
 route: loopback or the existing gateway `admin` assertion, never browser/link
@@ -1251,7 +1273,10 @@ unreadable, and its backlog excludes proven chain-owned issues. See
 Chain/status summaries also expose derived reconciliation timing for quiescent
 ownership. The existing scheduler and indexed journal projection bound GitHub
 rechecks while preserving the public active/merged filters, native resource
-settlement and immutable history. The normal-work page precedes due quiescent
+settlement and immutable history. Confirmed closed seeds without remaining
+obligations leave the active list before pagination, retaining ownership and
+unfiltered/history reads as defined in [Behavior chain](Behavior-chain.md).
+The normal-work page precedes due quiescent
 reconciliation; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
@@ -1362,6 +1387,21 @@ Fixed direct GitHub commands keep their original 30-second command deadline
 scope allows 60 seconds, and the outer client 120 seconds for interpreter/setup,
 durable receipts and teardown. The kernel emptiness deadline remains two
 seconds; these outer bounds do not extend the command or kernel deadlines.
+
+Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
+code and existing v1 diagnostic into chain receipts and History. The unchanged
+no-publication shape and retry requirements are defined in
+[Behavior chain](Behavior-chain.md#authority-and-recovery).
+
+Optional repair-exhaustion reporting uses the same held-chain reconciliation,
+configured-account issue publisher and datastore intake. An explicit per-repository
+environment opt-in enables only verified incomplete-reply exhaustion. Durable
+creation intent prevents another POST after an uncertain result; the source hold,
+label/intake blockers and generated-issue recursion boundary stay visible through
+the existing `waiting` field. It adds no gateway route, scope, journal event,
+settings default or admission bypass. See
+[reporting verified repair exhaustion](Behavior-chain.md#reporting-verified-repair-exhaustion)
+for configuration, evidence and pending live acceptance.
 
 ## Google document publishing
 

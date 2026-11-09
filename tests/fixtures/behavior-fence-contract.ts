@@ -10,7 +10,8 @@ import { BehaviorResourceRecovery } from '../../server/behavior-chain-resource-r
 
 const wire = readFileSync(process.argv[2], 'utf8')
 const mode = process.argv[3] ?? 'fence'
-assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard'].includes(mode))
+assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout'].includes(mode))
+const atomic = mode.startsWith('atomic-')
 const physical = mode === 'namespace-physical-only'
 const interrupted = mode.startsWith('namespace-interrupted-') || physical
 const guarded = mode === 'resource-guard'
@@ -50,6 +51,16 @@ try {
       publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null }),
     available: () => false, capacity: () => 1, permitted: () => false, received: () => {}, request: forbidden, launch: forbidden,
     perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {} }
+  if (atomic) {
+    const pending = JSON.stringify(JSON.parse(wire).map((row: Record<string, unknown>) => ({ ...row, resources_settled_at: null })))
+    operations.readInvocations = async () => parseAgentLogStdout(pending, 'actual timeout awaiting resource release')
+    await new BehaviorChainRuntime(journal, operations).run()
+    assert.equal(journal.read(id)!.invocations[0].state, 'uncertain')
+    assert.deepEqual(journal.read(id)!.invocations[0].evidence?.diagnostic ?? null, call.diagnostic)
+    assert.deepEqual(journal.reservedResources(), { ...reservation, unaccounted: 0 })
+    journal.rebuild()
+    operations.readInvocations = async () => snapshot
+  }
   if (physical) {
     const started = journal.read(id)!
     journal.append(id, 'original-uncertainty', started.sequence, { type: 'invocation.uncertain', invocationId: call.correlation_id,
@@ -81,6 +92,15 @@ try {
   assert.deepEqual(journal.reservedResources(), { memoryBytes: pending ? reservation.memoryBytes : 0,
     diskBytes: pending ? reservation.diskBytes : 0, unaccounted: 0 })
   const events = journal.history(id)
+  if (atomic) {
+    const outcome = mode === 'atomic-provider-timeout' ? 'atomic_work_execution_budget_exhausted' : 'preflight_failed'
+    assert.equal(current.invocations[0].outcome, outcome)
+    assert.equal(current.invocations[0].evidence?.outcome, 'preflight_failed')
+    assert.deepEqual(current.invocations[0].evidence?.diagnostic ?? null, call.diagnostic)
+    const settled = events.map(row => JSON.parse(row.payload)).find(event => event.type === 'invocation.settled')
+    assert.equal(settled.outcome, outcome)
+    assert.deepEqual(settled.evidence.diagnostic ?? null, call.diagnostic)
+  }
   if (guarded) {
     await new BehaviorChainRuntime(journal, operations).run()
     assert.deepEqual(journal.history(id), events)
