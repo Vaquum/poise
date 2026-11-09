@@ -50,7 +50,10 @@ export class McpGrants {
     if (this.list(scope.ownerId).length >= 100) throw new Error('read grant capacity reached; wait for a retained grant to expire')
     const grant: StoredGrant = { ...scope, clientId, grantId: randomUUID(), createdAt: this.now(), expiresAt: this.now() + GRANT_MS,
       revokedAt: null, accessHash: '', refreshHash: '', accessExpires: 0 }
-    return this.rotate(grant)
+    const tokens = this.rotate(grant)
+    // A live grant retains its registration; otherwise redirects() would reject consented clients after 30 days from registration.
+    this.db.prepare('UPDATE mcp_clients SET expires = ? WHERE id = ?').run(grant.expiresAt, clientId)
+    return tokens
   }
   private rotate(grant: StoredGrant) {
     const access = newSecret(), refresh = newSecret()

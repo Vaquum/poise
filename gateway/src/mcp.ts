@@ -195,26 +195,35 @@ export class McpGateway {
   private async dispatch(owner: User, grant: McpGrant, read: McpRead): Promise<Record<string, unknown>> {
     const { ctx } = this
     await ctx.deps.orchestrator.ensureStarted(owner.handle, owner.login)
+    // A container Docker just started is not yet serving; answer 503 like browser proxying instead of racing it into a 500.
+    if (!(await ctx.deps.orchestrator.readiness(owner.handle, owner.login)).ready) throw new HttpError(503, 'workspace_read_unavailable')
     const target = ctx.deps.upstream(owner.handle), payload = JSON.stringify(read)
     const scope: McpGrantScope = { resource: grant.resource, ownerId: grant.ownerId, handle: grant.handle, grantId: grant.grantId }
     const identity = signAssertion(ctx.deps.keys.privateKey, { handle: owner.handle, login: owner.login, scope: 'mcp', mcp: scope }, ctx.deps.now())
-    const text = await new Promise<string>((resolve, reject) => {
-      const upstream = http.request({ ...target, method: 'POST', path: MCP_READ_PATH, agent: ctx.agent, headers: {
-        host: new URL(ctx.workspaceOrigin(owner.handle)).host, 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-poise-identity': identity,
-      } }, response => {
-        const chunks: Buffer[] = []; let bytes = 0
-        response.on('data', (chunk: Buffer) => { bytes += chunk.length; if (bytes > MCP_RESPONSE_BYTES) upstream.destroy(new Error('MCP workspace response exceeds its bound')); else chunks.push(chunk) })
-        response.on('error', reject)
-        response.on('end', () => response.statusCode === 200 ? resolve(Buffer.concat(chunks).toString()) : reject(new HttpError(503, 'workspace_read_unavailable')))
+    let text: string
+    try {
+      text = await new Promise<string>((resolve, reject) => {
+        const upstream = http.request({ ...target, method: 'POST', path: MCP_READ_PATH, agent: ctx.agent, headers: {
+          host: new URL(ctx.workspaceOrigin(owner.handle)).host, 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-poise-identity': identity,
+        } }, response => {
+          const chunks: Buffer[] = []; let bytes = 0
+          response.on('data', (chunk: Buffer) => { bytes += chunk.length; if (bytes > MCP_RESPONSE_BYTES) upstream.destroy(new Error('MCP workspace response exceeds its bound')); else chunks.push(chunk) })
+          response.on('error', reject)
+          response.on('end', () => response.statusCode === 200 ? resolve(Buffer.concat(chunks).toString()) : reject(new HttpError(503, 'workspace_read_unavailable')))
+        })
+        const deadline = setTimeout(() => upstream.destroy(new HttpError(504, 'workspace_read_timeout')), 35_000)
+        upstream.on('close', () => clearTimeout(deadline)); upstream.on('error', reject); upstream.end(payload)
       })
-      const deadline = setTimeout(() => upstream.destroy(new HttpError(504, 'workspace_read_timeout')), 35_000)
-      upstream.on('close', () => clearTimeout(deadline)); upstream.on('error', reject); upstream.end(payload)
-    })
+    } catch (error) {
+      if (error instanceof HttpError) throw error
+      throw new HttpError(503, 'workspace_read_unavailable')
+    }
     const value: unknown = JSON.parse(text)
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(502, 'invalid_workspace_response')
     const body = value as Record<string, unknown>
     if (body.workspace !== owner.handle) throw new HttpError(502, 'wrong_workspace_response')
-    if (body.owner !== owner.login || !body.capabilities || typeof body.capabilities !== 'object'
+    // GitHub logins are case-preserved but case-insensitive; the container keeps the case from its creation.
+    if (typeof body.owner !== 'string' || body.owner.toLowerCase() !== owner.login.toLowerCase() || !body.capabilities || typeof body.capabilities !== 'object'
       || !('tools' in body.capabilities) || !Array.isArray(body.capabilities.tools)
       || body.capabilities.tools.length !== 1 || body.capabilities.tools[0] !== 'poise_describe') throw new HttpError(502, 'invalid_workspace_capabilities')
     // Project only the connection contract, even if an upstream returns additional data.

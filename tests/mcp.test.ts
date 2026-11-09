@@ -21,12 +21,14 @@ let gatewayPort: number
 let workspacePort: number
 let workspaceReads: number
 let beforeRead: (() => void) | undefined
+let workspaceHealthy: boolean
 
 beforeEach(async () => {
   vi.stubEnv('POISE_MODE', 'service')
   h = await startHarness({ env: { POISE_MCP_ENABLED: '1' } })
   workspaceReads = 0
   beforeRead = undefined
+  workspaceHealthy = true
   workspace = http.createServer(async (req, res) => {
     // Both owners use the production guard and handler, with separate workspace identities.
     const bob = req.headers.host === 'bob.poise.test'
@@ -34,6 +36,16 @@ beforeEach(async () => {
       POISE_WORKSPACE_OWNER: bob ? 'bob' : 'Alice', POISE_WORKSPACE_OWNER_ID: bob ? '1002' : '1001',
       POISE_PUBLIC_ORIGIN: `https://${bob ? 'bob' : 'alice'}.poise.test`, POISE_GATEWAY_PUBLIC_KEY: h.keys.publicKeyBase64 })
     Object.defineProperty(req.socket, 'remoteAddress', { value: '172.18.0.2', configurable: true })
+    if ((req.url ?? '').split('?')[0] === '/api/service/health' && req.method === 'GET') {
+      try {
+        enforceApiRequest(req, { service })
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ ok: workspaceHealthy, activeChatTurns: 0, runningCallerCalls: 0,
+          backgroundWork: 0, idle: workspaceHealthy, draining: false, release: null, switching: null }))
+      } catch (error) { res.statusCode = httpStatus(error, 400); res.end(JSON.stringify({ error: String(error) })) }
+      return
+    }
     try {
       const authority = enforceApiRequest(req, { service })
       expect(req.headers['x-poise-identity']).toBeUndefined()
@@ -192,5 +204,37 @@ it('withholds an in-flight workspace response when its owner revokes the grant',
     expect(await response.json()).toEqual({ error: 'invalid_token' })
     expect(workspaceReads).toBe(1)
     expect(gateway.context.mcp.grants.find(tokens.refresh_token!, 'refresh')).toBeNull()
+  } finally { await connection.client.close() }
+})
+
+it('answers 503 while a starting workspace is not yet serving instead of 500', async () => {
+  const connection = await connect('Alice')
+  try {
+    const tokens = (await connection.provider.tokens())!
+    // The orchestrator's health check uses the harness stub; a starting container answers it negatively.
+    h.workspace.health.ok = false
+    const starting = await fetcher(endpoint, { method: 'POST', headers: {
+      authorization: `Bearer ${tokens.access_token}`, 'content-type': 'application/json',
+    }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'poise_describe' } }) })
+    expect(starting.status).toBe(503)
+    expect(await starting.json()).toEqual({ error: 'workspace_read_unavailable' })
+    expect(workspaceReads).toBe(0)
+    // A refused upstream connection after a passing health check is also 503, never 500.
+    h.workspace.health.ok = true
+    gateway.context.deps.orchestrator.markNotReady('alice')
+    await new Promise<void>(resolve => workspace.close(() => resolve()))
+    const refused = await fetcher(endpoint, { method: 'POST', headers: {
+      authorization: `Bearer ${tokens.access_token}`, 'content-type': 'application/json',
+    }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'poise_describe' } }) })
+    expect(refused.status).toBe(503)
+    expect(await refused.json()).toEqual({ error: 'workspace_read_unavailable' })
+  } finally { await connection.client.close() }
+})
+
+it('accepts the same immutable owner after a case-only GitHub login change', async () => {
+  const connection = await connect('Alice')
+  try {
+    h.store.saveSignIn({ handle: 'alice', login: 'ALICE', githubId: 1001, accessOrg: null })
+    expect(await describe(connection.client)).toEqual({ workspace: 'alice', owner: 'ALICE', capabilities: { tools: ['poise_describe'] } })
   } finally { await connection.client.close() }
 })
