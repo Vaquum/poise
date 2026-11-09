@@ -797,6 +797,35 @@ failed deploys and retries, and is cleared after successful verification.
 It proves handles captured by these scripts; a workspace already absent before
 the first captured inventory cannot be inferred from that inventory.
 
+Each release deployment also prints a rollout ID and retains its full commit
+SHA, immutable image ID, expected workspace set and outcome under the private
+`deploy/.env.workspace-proof.rollouts/` directory. A retry of the same pending
+target reuses its receipt. After the verifier or its
+SSH/Actions process exits, recheck that ID with `deploy/verify.sh ROLLOUT`.
+For the most recently started rollout:
+
+```bash
+deploy/verify.sh "$(cat deploy/.env.workspace-proof.rollouts/current)"
+```
+
+This takes one observation using the same verifier, without pulling, building,
+applying Compose, starting a workspace or requesting a switch. It requires no
+current `deploy/.env`: the original target and inventory come from the record.
+Running workspaces must report that exact active SHA; stopped workspaces must
+use the original image ID, even if another build has retagged `latest`.
+Timeout, missing workspaces and unreadable health remain `pending`, and the
+command exits nonzero. Invoke it again later to observe activation. A different
+`desiredRelease` alone never establishes failure or supersession.
+
+The outcome becomes `complete` only after every expected workspace passes the
+proof. A supervisor `failed` marker for the exact target release establishes
+`failed`; a subsequent deployment replacing the target SHA or image establishes
+`superseded`. Terminal observations remain historical receipts when another
+rollout finishes; the command reads those without reclassifying them. Each
+record retains the latest 32 UTC-timestamped observations, at most 4096 bytes
+each, including evidence after completion. The historical Actions result is
+unchanged: a later `complete` observation does not turn its earlier timeout green.
+
 The gateway upgrades those workspaces by itself, when it starts and every
 five minutes. Most upgrades change Poise but not the system it runs on, and
 those happen in place: the gateway installs the new release into each
