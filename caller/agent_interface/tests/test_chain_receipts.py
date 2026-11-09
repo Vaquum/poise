@@ -441,6 +441,19 @@ class AtomicWorkLimits(TestCase):
             self.assertNotIn(private, message)
             self.assertNotIn(private, json.dumps(blocked.diagnostic))
 
+    def test_atomic_work_blocked_short_env_value_keeps_header_redaction(self):
+        with patch.dict(os.environ, {"TEST_KEY": "a"}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("Authorization: Bearer my-secret")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: [redacted header]")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in ("my-secret", "Authoriz[redacted]", "Be[redacted]"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+        with patch.dict(os.environ, {"TEST_KEY": "a"}, clear=True):
+            bare = api.atomic_work.AtomicWorkBlocked("fatal: a")
+        self.assertEqual(str(bare), "atomic behavior blocked: fatal: [redacted]")
+
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         reason = "Review requires a product decision before implementation can continue"
         secret = "opaque-environment-credential-crossing-cutoff"

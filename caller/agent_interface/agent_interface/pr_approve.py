@@ -161,5 +161,5 @@ def run(
     return atoms.run_agent(
         pwd, SYSTEM, text, tools, "pr_approve", timeout_s,
         model=spec.identity, pr=pr, actor_name=actor, head=expected_head,
-        packet=packet_text, capped=capped, review_round=review_round, review_cap=review_cap,
+        packet=packet_text, note=note, capped=capped, review_round=review_round, review_cap=review_cap,
     )

@@ -10,9 +10,10 @@ import { BehaviorResourceRecovery } from '../../server/behavior-chain-resource-r
 
 const wire = readFileSync(process.argv[2], 'utf8')
 const mode = process.argv[3] ?? 'fence'
-assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked'].includes(mode))
+assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked', 'ancestor-recovery'].includes(mode))
 const atomic = mode.startsWith('atomic-')
 const blocked = mode === 'atomic-work-blocked'
+const ancestorRecovery = mode === 'ancestor-recovery'
 const physical = mode === 'namespace-physical-only'
 const interrupted = mode.startsWith('namespace-interrupted-') || physical
 const guarded = mode === 'resource-guard'
@@ -39,7 +40,7 @@ try {
     request: direct ? { command: 'github-interface', nativeResources: 2, cwd: '/isolated-contract',
       ...(limits ? { resourceLimits: limits } : {}),
       argv: ['--merge-if-ready', '21', '--expected-head', call.expected_head!, '--token-user', call.actor] }
-      : { command: 'agent-interface', cwd: '/isolated-contract', argv: [] } } })
+      : { command: 'agent-interface', cwd: '/isolated-contract', argv: [], ...(ancestorRecovery ? { nativeResources: 2 } : {}) } } })
   journal.append(id, 'start', chain.sequence, { type: 'invocation.started', invocationId: call.correlation_id })
   assert.equal(journal.liveModelInvocationCount(), direct ? 0 : 1)
   assert.deepEqual(journal.reservedResources(), { ...reservation, unaccounted: 0 })
@@ -63,7 +64,29 @@ try {
     journal.rebuild()
     operations.readInvocations = async () => snapshot
   }
-  if (physical) {
+  if (ancestorRecovery) {
+    const pending = parseAgentLogStdout(readFileSync(process.argv[4], 'utf8'), 'actual bounded ancestor cleanup yield')
+    assert.equal(pending.quarantined.length, 0)
+    const original = pending.entries[0]
+    const started = journal.read(id)!
+    journal.append(id, 'original-failure', started.sequence, { type: 'invocation.settled', invocationId: call.correlation_id,
+      callId: call.id, outcome: 'preflight_failed', evidence: { ...original } })
+    const before = journal.read(id)!
+    assert.deepEqual(journal.reservedResources(), { ...reservation, unaccounted: 0 })
+    const recovery = new BehaviorResourceRecovery(journal, async () => snapshot)
+    await recovery.run()
+    const after = journal.read(id)!
+    assert.equal(after.invocations[0].state, before.invocations[0].state)
+    assert.equal(after.invocations[0].outcome, 'preflight_failed')
+    assert.equal(after.invocations[0].evidence?.action, 'not_started')
+    assert.equal(after.invocations[0].evidence?.error, original.error)
+    assert.equal(after.held, before.held)
+    assert.deepEqual(after.invocations[0].evidence?.resource_ownership, call.resource_ownership)
+    assert.equal(journal.history(id).length, before.sequence + 1)
+    const history = journal.history(id)
+    await recovery.run()
+    assert.deepEqual(journal.history(id), history)
+  } else if (physical) {
     const started = journal.read(id)!
     journal.append(id, 'original-uncertainty', started.sequence, { type: 'invocation.uncertain', invocationId: call.correlation_id,
       reason: 'original effect remains uncertain' })

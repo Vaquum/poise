@@ -29,8 +29,19 @@ class AtomicWorkBlocked(ValueError):
                              key=len, reverse=True)
             safe = reason
             if secrets:
+                # A value longer than any redacted header name cannot hide
+                # inside one, so substring match is safe and catches a JSON
+                # credential or a secret spanning the cutoff. Shorter values
+                # (for example a single letter) would rewrite those names
+                # before pattern redaction and defeat it, so require word
+                # boundaries for them while still redacting bare occurrences.
                 marker = r"\[redacted(?: header| credential)?\]"
-                safe = re.sub(marker + "|" + "|".join(map(re.escape, secrets)),
+                long = [value for value in secrets if len(value) >= 20]
+                short = [value for value in secrets if len(value) < 20]
+                alternatives = [re.escape(value) for value in long]
+                if short:
+                    alternatives.append(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, short)) + r")(?![A-Za-z0-9_])")
+                safe = re.sub(marker + "|" + "|".join(alternatives),
                               lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
             # Mask complete credentials before whitespace normalization or the
             # cutoff, including a secret spanning either boundary.
