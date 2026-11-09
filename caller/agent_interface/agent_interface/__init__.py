@@ -584,6 +584,25 @@ def stop_call(id_: str) -> dict:
     return {"id": id_, "stopped": stopped, "status": after["status"], "error_code": "stopped" if stopped else None}
 
 
+def _retained_account_signal(text: str) -> str | None:
+    # Native failure evidence keeps only exception metadata so prompts and
+    # argv never persist. Server trips reviewer accounts on balance/sign-in
+    # substrings in call.error, so preserve only that safe signal.
+    if re.search(r"balance\s+exhausted", text, re.IGNORECASE):
+        return "balance exhausted"
+    if re.search(r"status\s+402\b", text, re.IGNORECASE):
+        return "status 402"
+    if re.search(r"\b402\s+payment\b", text, re.IGNORECASE):
+        return "402 payment"
+    if re.search(r"http_status\D{0,8}402\b", text, re.IGNORECASE):
+        return "http_status 402"
+    if re.search(r"not\s+signed\s+in", text, re.IGNORECASE):
+        return "not signed in"
+    if re.search(r"missing\s+credentials", text, re.IGNORECASE):
+        return "missing credentials"
+    return None
+
+
 def finish(
     id_: str,
     status: str,
@@ -597,9 +616,12 @@ def finish(
 ) -> float:
     if _native_cli and id_ == _native_call_id and status == "failed":
         untyped = diagnostic is None
+        original_error = error
         diagnostic = retain_native_failure(id_, sys.exception(), diagnostic=diagnostic)
         if untyped and diagnostic is not None and sys.exception() is not None:
-            error = diagnostic.get("message") or "Native Caller failed; see retained diagnostic"
+            base = diagnostic.get("message") or "Native Caller failed; see retained diagnostic"
+            trip = _retained_account_signal(original_error) if original_error else None
+            error = f"{base}: {trip}" if trip else base
     # First terminal writer wins: a worker finishing after stop/reap must not
     # overwrite stopped/interrupted. The loser keeps its response file out of
     # the row and reports the existing state.
