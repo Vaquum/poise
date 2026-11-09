@@ -20,7 +20,7 @@ class AtomicWorkBlocked(ValueError):
     def __init__(self, reason: object):
         message = "AtomicWorkBlocked"
         if isinstance(reason, str) and reason.strip():
-            # Mask complete environment credentials before pattern redaction:
+            # Mask complete environment credentials around pattern redaction:
             # redacting credential shapes first would rewrite a known value
             # (for example a ghp_ token inside a JSON credential) so the exact
             # value no longer matches and the remainder leaks.
@@ -30,19 +30,30 @@ class AtomicWorkBlocked(ValueError):
             safe = reason
             if secrets:
                 # A value longer than any redacted header name cannot hide
-                # inside one, so substring match is safe and catches a JSON
-                # credential or a secret spanning the cutoff. Shorter values
-                # (for example a single letter) would rewrite those names
-                # before pattern redaction and defeat it, so require word
-                # boundaries for them while still redacting bare occurrences.
+                # inside one, so substring match before patterns is safe and
+                # catches a JSON credential or a secret spanning the cutoff.
                 marker = r"\[redacted(?: header| credential)?\]"
                 long = [value for value in secrets if len(value) >= 20]
                 short = [value for value in secrets if len(value) < 20]
-                alternatives = [re.escape(value) for value in long]
+                if long:
+                    safe = re.sub(marker + "|" + "|".join(map(re.escape, long)),
+                                  lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
+                # Redact credential shapes before short masking so a short
+                # value cannot rewrite a pattern keyword (for example token in
+                # "token my-secret") and leave the secret behind.
+                safe = atoms.redact_cause(" ".join(safe.split()))
                 if short:
-                    alternatives.append(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, short)) + r")(?![A-Za-z0-9_])")
-                safe = re.sub(marker + "|" + "|".join(alternatives),
-                              lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
+                    # Values under four characters would rewrite common words,
+                    # so require word boundaries for them while still redacting
+                    # bare occurrences. Longer values mask substrings so an
+                    # embedded secret stays masked without touching markers.
+                    tiny = [value for value in short if len(value) < 4]
+                    rest = [value for value in short if len(value) >= 4]
+                    alternatives = [re.escape(value) for value in rest]
+                    if tiny:
+                        alternatives.append(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, tiny)) + r")(?![A-Za-z0-9_])")
+                    safe = re.sub(marker + "|" + "|".join(alternatives),
+                                  lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
             # Mask complete credentials before whitespace normalization or the
             # cutoff, including a secret spanning either boundary.
             message = "atomic behavior blocked: " + atoms.bounded_cause(safe)

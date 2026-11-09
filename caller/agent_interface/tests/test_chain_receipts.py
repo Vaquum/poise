@@ -454,6 +454,22 @@ class AtomicWorkLimits(TestCase):
             bare = api.atomic_work.AtomicWorkBlocked("fatal: a")
         self.assertEqual(str(bare), "atomic behavior blocked: fatal: [redacted]")
 
+    def test_atomic_work_blocked_short_env_values_masked_after_pattern_redaction(self):
+        with patch.dict(os.environ, {"TEST_KEY": "opaque-secret"}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("prefixopaque-secretsuffix and token my-secret")
+        message = str(blocked)
+        self.assertIn("[redacted]", message)
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in ("opaque-secret", "prefixopaque-secretsuffix", "my-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+        with patch.dict(os.environ, {"TEST_KEY": "token"}, clear=True):
+            masked = api.atomic_work.AtomicWorkBlocked("token my-secret")
+        self.assertEqual(str(masked), "atomic behavior blocked: [redacted credential]")
+        self.assertEqual(masked.diagnostic["message"], str(masked))
+        self.assertNotIn("my-secret", str(masked))
+        self.assertNotIn("my-secret", json.dumps(masked.diagnostic))
+
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         reason = "Review requires a product decision before implementation can continue"
         secret = "opaque-environment-credential-crossing-cutoff"
