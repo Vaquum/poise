@@ -372,6 +372,15 @@ the specific cause as its invocation outcome in History. Preparation timeouts
 remain distinct. Retry still requires positive resource release and the existing
 same-basis backoff; three failures hold the chain across restart until **Resume**.
 
+Repair prompts receive `change_request_reviews` from the native
+`github-interface --pr-review` packet, even with no inline roots. The read selects each
+author's latest effective review (`APPROVED`, `CHANGES_REQUESTED`, `DISMISSED`),
+then includes only substantive change requests on the expected head, with their
+original body, review ID, author, commit, submission time and URL. A later
+`COMMENTED` review does not retire a request. Summaries share the packet byte
+limit; an overflowing packet or failed review read fails visibly. The final
+head/base recheck and independent approval verification still apply.
+
 Repair prompts name the exact unresolved root comment IDs from the head-verified
 review packet, including outdated threads and roots with earlier replies.
 Caller requires that same set before publication. Missing coverage records
