@@ -95,20 +95,39 @@ ensure_caller_guard() {
   say "$proof"
 }
 
-# The value deploy/.env gives NAME, as Compose reads a NAME=value line: without
-# surrounding quotes, or else without a trailing comment; empty when unset.
+# The value deploy/.env gives NAME, as Compose reads a NAME=value line:
+# surrounding quotes are stripped and a trailing ` # comment` is dropped
+# (`#` inside quotes is kept; unquoted `abc#def` keeps the `#`); empty when unset.
 env_value() {
-  local line value
+  local line value rest
   line=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$env_file" | tail -n 1) || true
   value=${line#*=}
   value=${value#"${value%%[![:space:]]*}"}
   case $value in
-    \"* | \'*) ;;
-    *) value=${value%%[[:space:]]#*} ;;
-  esac
-  value=${value%"${value##*[![:space:]]}"}
-  case $value in
-    \"*\" | \'*\') value=${value:1:${#value}-2} ;;
+    \"*)
+      rest=${value:1}
+      case $rest in
+        *\"*) value=${rest%%\"*} ;;
+        *)
+          value=${value%%[[:space:]]#*}
+          value=${value%"${value##*[![:space:]]}"}
+          ;;
+      esac
+      ;;
+    \'*)
+      rest=${value:1}
+      case $rest in
+        *\'*) value=${rest%%\'*} ;;
+        *)
+          value=${value%%[[:space:]]#*}
+          value=${value%"${value##*[![:space:]]}"}
+          ;;
+      esac
+      ;;
+    *)
+      value=${value%%[[:space:]]#*}
+      value=${value%"${value##*[![:space:]]}"}
+      ;;
   esac
   printf '%s' "$value"
 }
