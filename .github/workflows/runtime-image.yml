@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - "deploy/runtime/**"
+      - "deploy/caller-guard/**"
+      - "deploy/ci/test_caller_guard*.py"
+      - "deploy/lib.sh"
       - ".dockerignore"
       - "package*.json"
       - "server/**"
@@ -15,6 +18,9 @@ on:
     branches: [main]
     paths:
       - "deploy/runtime/**"
+      - "deploy/caller-guard/**"
+      - "deploy/ci/test_caller_guard*.py"
+      - "deploy/lib.sh"
       - ".dockerignore"
       - "package*.json"
       - "server/**"
@@ -93,6 +99,9 @@ jobs:
 
       - name: Check native namespace teardown and Caller resource receipts in the actual image
         run: deploy/runtime/test/native-cleanup.sh poise-runtime:ci runsc
+
+      - name: Prove the host Caller fence with actual gVisor and runc workspaces
+        run: sudo env POISE_GUARD_IMAGE=poise-runtime:ci python3 -m unittest discover --start-directory deploy/ci --pattern 'test_caller_guard_docker.py' --verbose
 
       # Installing the provider CLIs downloads about a gigabyte from five
       # vendors, so it runs only when the image's own files change.
