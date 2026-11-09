@@ -5,8 +5,9 @@ import { Worker } from 'node:worker_threads'
 import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { BehaviorLedgerObserver } from '../server/behavior-ledger'
+import { BehaviorLedgerObserver, captureBehaviorAdmission, startBehaviorLedger, stopBehaviorLedger } from '../server/behavior-ledger'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
+import * as logging from '../server/logging'
 import type { LogEntry } from '../server/agent'
 import type { LedgerAdmission, LedgerHealth, LedgerRecord } from '../server/behavior-ledger-contract'
 
@@ -25,7 +26,7 @@ async function fixture(body: string, options: ConstructorParameters<typeof Behav
   directories.push(directory)
   const workerPath = join(directory, 'worker.mjs')
   await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\n${body}\nport.on('message',request=>{if(request.operation==='close')port.close()});`)
-  const observer = new BehaviorLedgerObserver({ workerPath, ...options })
+  const observer = new BehaviorLedgerObserver({ lossDiagnostic: (event) => { logging.diagnostic(event) }, workerPath, ...options })
   observers.push(observer)
   await observer.start()
   return observer
@@ -127,14 +128,16 @@ describe('bounded behavior ledger transport', () => {
   })
 
   it('persists spill loss before acknowledgement and retains it after reopening', async () => {
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
     const directory = await mkdtemp(join(tmpdir(), 'ledger-overflow-'))
     directories.push(directory)
     const path = join(directory, 'ledger.db')
-    const observer = new BehaviorLedgerObserver({ path })
+    const observer = new BehaviorLedgerObserver({ path, lossDiagnostic: (event) => { logging.diagnostic(event) } })
     observers.push(observer)
     await observer.start()
     observer.capture(admission)
     observer.capture({ ...admission, nativeId: 'oversized', admissionKey: 'x'.repeat(4097) })
+    expect(diagnostic).not.toHaveBeenCalled()
     const prefix = await observer.read({ operation: 'list' })
     expect(prefix).toMatchObject({ status: 200, body: { health: { status: 'incomplete', dropped: 1 } } })
     observer.capture({ ...admission, nativeId: 'oversized-again', admissionKey: 'y'.repeat(4097) })
@@ -144,6 +147,8 @@ describe('bounded behavior ledger transport', () => {
     expect((await observer.read({ operation: 'health' })).body.health).toMatchObject(retained)
     const journal = JSON.parse(await readFile(path + '.coverage.json', 'utf8')) as { health: LedgerHealth }
     expect(journal.health).toMatchObject(retained)
+    await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'capture_oversized', count: 1 }) })))
     await observer.stop()
     const reopened = new BehaviorLedgerObserver({ path })
     observers.push(reopened)
@@ -416,6 +421,81 @@ describe('bounded behavior ledger transport', () => {
     }, { timeout: 5000, interval: 50 })
   })
 
+  it('emits shutdown-timeout loss synchronously before logging stops', async () => {
+    // Slow captures outlast the stop budget, so queued arrivals are shed as
+    // shutdown_timeout. stopPoiseRuntime stops logging without yielding to
+    // the event loop when no query pool or Caller pass is outstanding, which
+    // would discard a deferred diagnostic before DiagnosticRuntime.ingest.
+    shortCallerBudgets()
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
+    diagnostic.mockClear()
+    const observer = await fixture(`
+      port.postMessage({ready:true,health,pending:[]});
+      port.on('message',request=>{
+        const reply=()=>port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});
+        if(request.operation==='capture') setTimeout(reply,400);
+        else reply();
+      });`)
+    for (let index = 0; index < 10; index++) {
+      observer.capture({ ...admission, admissionKey: `shutdown-${index}`, nativeId: `shutdown-${index}` })
+    }
+    await observer.stop()
+    // No waitFor: a setImmediate-deferred emit would still be queued here.
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'shutdown_timeout' }) }))
+  })
+
+  it('diagnoses a single in-flight failure when stop waits for worker exit', async () => {
+    // One capture in flight and nothing queued at the stop deadline: the
+    // worker reply arrives after stop() resolved. stopBehaviorLedger waits for
+    // exit so logging (stopped after it in stopPoiseRuntime) still ingests the
+    // shutdown_timeout diagnostic. Without the wait the reply lands after
+    // logging stopped and the loss is never diagnosed.
+    shortCallerBudgets()
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
+    diagnostic.mockClear()
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-single-shutdown-'))
+    directories.push(directory)
+    const workerPath = join(directory, 'worker.mjs')
+    await writeFile(workerPath, `import { parentPort as port } from 'node:worker_threads';\nconst health=${JSON.stringify(health)};\nport.postMessage({ready:true,health,pending:[]});\nport.on('message',request=>{\nif(request.operation==='close'){port.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});port.close();return;}\nif(request.operation==='capture'&&request.observation?.type!=='loss'){setTimeout(()=>port.postMessage({id:request.id,status:500,body:{version:1,health,error:'boom'},pending:[]}),400);return;}\nport.postMessage({id:request.id,status:200,body:{version:1,health},pending:[]});\n});`)
+    await stopBehaviorLedger().catch(() => {})
+    await startBehaviorLedger({ path: join(directory, 'ledger.db'), workerPath,
+      lossDiagnostic: (event) => { logging.diagnostic(event) } })
+    try {
+      captureBehaviorAdmission({ admissionKey: 'single-shutdown', nativeId: 'single-shutdown', behavior: admission.behavior,
+        source: admission.source, owner: admission.owner, actor: admission.actor, repository: admission.repository,
+        number: admission.number, head: admission.head, slot: admission.slot, plannedSlots: admission.plannedSlots })
+      await stopBehaviorLedger()
+      // No waitFor: without waiting for exit the failing reply (400ms) lands
+      // after the shortened stop budget (200ms) and logging would already be stopped.
+      expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+        context: expect.objectContaining({ reason: 'shutdown_timeout' }) }))
+    } finally {
+      await stopBehaviorLedger().catch(() => {})
+    }
+  })
+
+  it('diagnoses worker failure during shutdown synchronously before logging stops', async () => {
+    // An in-flight capture held past the stop budget while the worker then
+    // exits: fail() sheds it as worker_failed in the exit handler that also
+    // resolves waitForExit(). stopPoiseRuntime stops logging right after that
+    // wait without yielding, so a deferred emit would be discarded by ingest.
+    shortCallerBudgets()
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
+    diagnostic.mockClear()
+    const observer = await fixture(`
+      port.postMessage({ready:true,health,pending:[]});
+      port.on('message',request=>{
+        if(request.operation==='capture'){ setTimeout(()=>process.exit(1),300); return; }
+      });`)
+    observer.capture(admission)
+    await observer.stop()
+    await observer.waitForExit()
+    // No waitFor: a setImmediate-deferred emit would still be queued here.
+    expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'worker_failed', count: 1 }) }))
+  })
+
   it('holds captures through a storage outage and recovers to ok with the list answering', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-outage-'))
     directories.push(directory)
@@ -477,6 +557,7 @@ describe('bounded behavior ledger transport', () => {
   })
 
   it('spills sustained overload after the stall budget even while captures succeed', async () => {
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
     const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000_000)
     try {
       const observer = await fixture(`
@@ -498,27 +579,55 @@ describe('bounded behavior ledger transport', () => {
         .toMatchObject({ pending: 1, dropped: 0 })
       clock.mockReturnValue(1_000_061)
       observer.capture({ ...admission, nativeId: 'third' })
+      await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+        context: expect.objectContaining({ reason: 'queue_saturated', pending: 1, queueAgeMs: 61,
+          captureLimit: 1, stallBudgetMs: 60, queuedBytes: expect.any(Number) }) })))
       expect((await observer.read({ operation: 'health' })).body.health.dropped).toBe(1)
     } finally { clock.mockRestore() }
   })
 
   it('sheds invalid captures with loss accounting instead of retrying them', async () => {
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
     const directory = await mkdtemp(join(tmpdir(), 'ledger-poison-'))
     directories.push(directory)
-    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db') })
+    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db'), lossDiagnostic: (event) => { logging.diagnostic(event) } })
     observers.push(observer)
     await observer.start()
-    observer.capture({ ...admission, admissionKey: 'x'.repeat(1025) })
-    await vi.waitFor(async () => {
-      expect((await observer.read({ operation: 'health' })).body.health).toMatchObject({ pending: 0, dropped: 1 })
+    observer.capture(admission)
+    observer.capture({ ...admission, nativeId: 'before-poison', admissionKey: 'before-poison' })
+    observer.capture({ ...admission, nativeId: 'poison', admissionKey: 'x'.repeat(1025) })
+    observer.capture({ ...admission, nativeId: 'after-poison', admissionKey: 'after-poison' })
+    await vi.waitFor(() => {
+      expect(observer.snapshot()).toMatchObject({ pending: 0, health: { dropped: 1, instances: 6 } })
     }, { timeout: 5000, interval: 25 })
+    await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'capture_rejected', rejection: 'invalid_observation', count: 1 }) })))
+    const page = await observer.read({ operation: 'list', limit: 100 })
+    expect(page.body.records!.flatMap(record => record.refs).filter(ref => ref.kind === 'correlation').map(ref => ref.identity).sort())
+      .toEqual(['after-poison', 'before-poison', 'native'])
     expect((await observer.read({ operation: 'health' })).body.health.gaps).toEqual(
       expect.arrayContaining([expect.objectContaining({ reason: 'capture_loss' })]))
   })
 
+  it('defers the worker-failed diagnostic on the hot capture path', async () => {
+    // After an idle worker failure the next capture() must stay memory-only:
+    // logging may journal its own overflow with filesystem I/O, so the
+    // diagnostic stays deferred while no stop is in progress.
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
+    const observer = await fixture('throw new Error("fixture failed startup");')
+    diagnostic.mockClear()
+    expect(() => observer.capture(admission)).not.toThrow()
+    expect(diagnostic).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'worker_failed', count: 1 }) })))
+  })
+
   it('keeps a failed startup observational and health readable', async () => {
+    const diagnostic = vi.spyOn(logging, 'diagnostic')
     const observer = await fixture('throw new Error("fixture failed startup");')
     expect(() => observer.capture(admission)).not.toThrow()
+    await vi.waitFor(() => expect(diagnostic).toHaveBeenCalledWith(expect.objectContaining({ operation: 'behavior-ledger.capture_loss',
+      context: expect.objectContaining({ reason: 'worker_failed', count: 1 }) })))
     expect((await observer.read({ operation: 'get', id: 'a'.repeat(64) })).status).toBe(503)
     expect((await observer.read({ operation: 'health' })).body.health.status).toBe('unavailable')
   })
