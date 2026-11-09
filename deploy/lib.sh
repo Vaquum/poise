@@ -50,10 +50,10 @@ ensure_caller_guard() {
   local status changed=false proof deadline=$((SECONDS + 180)) privilege=()
   local desired ids runtimes runtime inspect_runtime=false
   desired=$(env_value POISE_WORKSPACE_RUNTIME)
-  if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}'); fi
-  # Match gateway/src/config.ts, which trims POISE_WORKSPACE_RUNTIME.
+  # Match gateway/src/config.ts, which trims POISE_WORKSPACE_RUNTIME: whitespace-only means unset.
   desired=${desired#"${desired%%[![:space:]]*}"}
   desired=${desired%"${desired##*[![:space:]]}"}
+  if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}'); fi
   ids=$(docker ps --all --quiet --filter label=poise.managed=true) || die "cannot list workspaces for the Caller guard."
   runtimes=''
   if [ -n "$ids" ]; then
