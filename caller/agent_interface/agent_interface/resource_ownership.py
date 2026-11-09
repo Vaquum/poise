@@ -57,7 +57,9 @@ def read(conn: sqlite3.Connection, call_id: str) -> dict:
 def _settlement_size(value: dict) -> int:
     # Size-only placeholders cover full-width kernel identities and timestamps.
     # Include both possible certificates for an incomplete registration, plus
-    # one bounded terminal blocker. None of this projection is persisted.
+    # one bounded terminal blocker. The blocker uses an astral character so the
+    # reserve covers the worst-case JSON escaping (12 bytes per character).
+    # None of this projection is persisted.
     stamp = "9" * 24
     settled = {**value, "process_pending": False, "roots": [], "errors": [
         {**error, "recovered_at": stamp} for error in value["errors"]]}
@@ -72,7 +74,7 @@ def _settlement_size(value: dict) -> int:
         elif root["state"] == "covered":
             reclaimed = {**root, "reclaimed_at": stamp}
         settled["roots"].append(reclaimed)
-    settled["errors"].append({"cause": "\0" * MAX_ERROR_CHARACTERS, "path": None, "at": stamp, "recovered_at": stamp})
+    settled["errors"].append({"cause": "\U0001F600" * MAX_ERROR_CHARACTERS, "path": None, "at": stamp, "recovered_at": stamp})
     return len(json.dumps(settled, separators=(",", ":")).encode())
 
 

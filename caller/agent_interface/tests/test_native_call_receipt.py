@@ -303,6 +303,14 @@ def test_allocation_reserves_identity_settlement_and_a_terminal_blocker(database
     assert not ownership.released(state(call)), "an earlier recovery cannot cover a repeated later failure"
 
 
+def test_settlement_blocker_reserves_worst_case_unicode_escaping():
+    value = {"version": 1, "roots": [], "errors": []}
+    stamp = "9" * 24
+    expected = {**value, "process_pending": False, "roots": [], "errors": [
+        {"cause": "\U0001F600" * ownership.MAX_ERROR_CHARACTERS, "path": None, "at": stamp, "recovered_at": stamp}]}
+    assert ownership._settlement_size(value) == len(json.dumps(expected, separators=(",", ":")).encode())
+
+
 @pytest.mark.parametrize("code,severity", [(0, "warning"), (1, "error")])
 def test_preparation_diagnostic_survives_terminal_result(database, monkeypatch, code, severity):
     call = claim()
