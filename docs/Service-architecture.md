@@ -1435,7 +1435,8 @@ no-publication shape and retry requirements are defined in
 
 Optional repair-exhaustion reporting uses the same held-chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
-environment opt-in enables verified incomplete-reply or execution-budget exhaustion.
+environment opt-in enables verified repair incomplete-reply, repair execution-budget
+or PR review-budget exhaustion.
 Durable creation intent prevents another POST after an uncertain result; the source hold,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. It adds no gateway route, scope, journal event,

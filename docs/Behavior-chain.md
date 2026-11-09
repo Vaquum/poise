@@ -450,8 +450,8 @@ variable. The gateway forwards it on install; adding, changing or removing it
 cooperatively replaces existing workspaces, even on the same image. Unset or
 empty opts out.
 
-Reporting requires at least three settled original Caller repair receipts on the
-same current head, review basis and slot after the last Resume, each with positive
+Reporting requires at least three settled original Caller receipts for the same
+phase, current head, review basis and slot after the last Resume, each with positive
 resource release, `action=not_started`, retained `outcome=preflight_failed` and no
 publication plan or action receipts. All matching attempts must share one cause:
 `repair_incomplete_replies` requires `error_code=atomic_work_failed` and the specific
@@ -459,9 +459,17 @@ incomplete-reply error; `repair_execution_budget_exhausted` requires
 `error_code=atomic_work_execution_budget_exhausted`.
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
+The reporter also accepts `review_budget_exhausted` for native `review-pr`
+admissions by the reviewer account, pinned with `--expected-head`. Their basis
+includes `reviewContext` (base SHA, title and body), distinct from repair's
+`reviewRevision`. Each original receipt must retain the pre-submission `reviewing`
+phase and `error_code=review_budget_exhausted`; differing raw messages do not
+change that typed cause. `submitting_review` cannot prove no action even without
+a returned review ID.
 Before first reporting, the existing datastore freshness gate must pass and a
-new native observation must still require repair on that head and review basis.
-Stale, unknown or changed findings leave reporting pending. Other causes remain
+new native observation must still require the same phase on that head and basis.
+Stale, unknown or changed findings, heads or PR review contexts leave reporting pending,
+including title, body or base changes on an unchanged head. Other causes remain
 visible in their ordinary holds without an issue report; mixed causes cannot qualify.
 
 Poise creates the report as the configured main GitHub account through its
@@ -473,7 +481,7 @@ links the original hold event to the report issue. Identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
 Existing incomplete-reply intent keys and markers remain unchanged; budget reports
 use a separate cause with the same metadata and marker format.
-Both report bodies include the canonical clinical scope directive in the
+All report bodies include the canonical clinical scope directive in the
 [report template](../server/behavior-chain-report.ts), followed by
 "Include this exact paragraph in the linked PR review." Native PR review and
 approval check closing references only when their chain's exact seed is a recorded
@@ -504,8 +512,8 @@ incompatible saved intake labels and a held remediation chain are shown in the
 source chain's `waiting` reason, including its report URL when known. Poise does
 not add a different intake label or bypass ownership/admission gates. Admission is
 verified only when the normal datastore intake records the new chain. Generated
-remediation issues cannot report either cause recursively, using their marker
-or the retained source-to-issue link; their ordinary repair holds remain visible.
+remediation issues cannot report any supported cause recursively, using their marker
+or the retained source-to-issue link; their ordinary holds remain visible.
 
 `tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
 creation/restart, reconciliation and normal admission with an isolated journal
