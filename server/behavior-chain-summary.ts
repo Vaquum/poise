@@ -1,6 +1,6 @@
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettlement } from './behavior-chain-action'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
-import { reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent } from './behavior-chain-store'
+import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent } from './behavior-chain-store'
 
 export const CHAIN_ATTENTION_DELAY_MS = 24 * 60 * 60_000
 
@@ -17,13 +17,36 @@ function blockingThreads(pull: NonNullable<ChainObservation['pull']>): number {
 }
 
 /** Missing required PR-review slot, mirroring decideBehaviorChain review-pr first:
- * any configured reviewer without a completed same-head review-pr needs review. */
+ * any configured reviewer without a completed review-pr on the current head
+ * and review context (base/title/body) needs review. */
 function needsPrReview(chain: BehaviorChain, observation: ChainObservation | null, pull: NonNullable<ChainObservation['pull']>): boolean {
   if (!observation || !Array.isArray(observation.prReviewers) || observation.prReviewers.length === 0) return false
+  const expected = chainBasis(['pr', pull.head, pull.reviewContext])
   return observation.prReviewers.some(reviewer => !chain.invocations.some(invocation =>
     invocation.behavior === 'review-pr' && invocation.evidence?.status === 'completed'
+    && invocation.basis === expected
     && (invocation.evidence.head_sha === pull.head || invocation.request.context?.head === pull.head)
     && invocation.slot === reviewer.slot))
+}
+
+/** Missing required issue review, mirroring decideBehaviorChain review-issue
+ * first: any configured reviewer without a completed review-issue for the
+ * current seed revision and its posted comment needs review. */
+function needsIssueReview(chain: BehaviorChain, observation: ChainObservation | null): boolean {
+  if (!observation || !Array.isArray(observation.issueReviewers) || observation.issueReviewers.length === 0) return false
+  const basis = chainBasis(['issue', observation.issue.revision])
+  return observation.issueReviewers.some(reviewer => {
+    const invocation = [...chain.invocations].reverse().find(candidate =>
+      candidate.behavior === 'review-issue' && candidate.basis === basis && candidate.slot === reviewer.slot
+      && candidate.state === 'settled' && candidate.evidence?.status === 'completed')
+    if (!invocation) return true
+    const evidence = invocation.evidence as Record<string, unknown>
+    if (evidence.action !== 'commented' || evidence.issue_revision !== observation.issue.revision || !Array.isArray(evidence.receipts)) return true
+    return !(evidence.receipts as Array<{ issue?: unknown, author?: unknown, comment_id?: unknown }>).some(receipt =>
+      typeof receipt.issue === 'string' && receipt.issue.toLowerCase() === `${chain.repository}#${chain.issue}`.toLowerCase()
+      && typeof receipt.author === 'string' && receipt.author.toLowerCase() === chain.reviewer.toLowerCase()
+      && typeof receipt.comment_id === 'number' && observation.issue.commentIds.includes(receipt.comment_id))
+  })
 }
 
 function exactPull(observation: ChainObservation | null) {
@@ -152,24 +175,30 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
         && invocation.request.argv[invocation.request.argv.indexOf('--expected-issue-revision') + 1] === observation.issue.revision) : false
       const repairVerified = pull ? (answeredRepair || (publishedRepair && !pull.changesRequested))
         && !pull.failing.length && !pull.conflict && !pull.behind : false
+      const grey = pull?.greyRuns?.[0] ?? null
       let next = chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'
             : active ? 'Await the original invocation outcome'
               : state !== 'fresh' ? 'Await a fresh, complete chain observation'
-                : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
-                  : queueRejectionNeedsRepair && pull
-                    ? `Diagnose and repair GitHub queue rejection ${queueRemoval!.id}: ${queueRemoval!.reason} through repair-pr; PR-head green checks do not prove integration success`
-                    : pull && needsPrReview(chain, observation, pull) ? 'Review the actual current pull-request head through review-pr'
-                      : pull?.failing.length ? 'Repair the failing required checks'
-                        : pull?.changesRequested && !repairVerified ? 'Address current-head review findings'
-                          : pull?.conflict || pull?.behind ? 'Repair the branch conflict or required base update'
-                            : pull && (pull.unresolved ?? 0) > 0 && !pull.approved && !repairVerified ? 'Address current-head review conversations through repair-pr'
-                              : pull?.pending && Number.isFinite(pull.headSince) && now - pull.headSince >= 30 * 60_000
-                                ? 'Diagnose the checks pending over 30 minutes through repair-pr'
-                                : pull?.pending ? 'Await exact-head CI completion'
-                                  : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
-                                    : chain.waiting || 'Await the next invocation under existing admission gates'
+                : pull?.draft ? 'Await the draft pull request becoming ready for review'
+                  : observation && needsIssueReview(chain, observation) ? 'Review the current seed issue through review-issue'
+                    : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
+                      : queueRejectionNeedsRepair && pull
+                        ? `Diagnose and repair GitHub queue rejection ${queueRemoval!.id}: ${queueRemoval!.reason} through repair-pr; PR-head green checks do not prove integration success`
+                        : pull && needsPrReview(chain, observation, pull) ? 'Review the actual current pull-request head through review-pr'
+                          : grey ? `Recover completed grey workflow ${grey.id} attempt ${grey.attempt} through rerun-grey-ci`
+                            : pull?.failing.length ? 'Repair the failing required checks'
+                              : pull?.changesRequested && !repairVerified ? 'Address current-head review findings'
+                                : pull?.conflict || pull?.behind ? 'Repair the branch conflict or required base update'
+                                  : pull && (pull.unresolved ?? 0) > 0 && !pull.approved && !repairVerified ? 'Address current-head review conversations through repair-pr'
+                                    : pull && repairVerified && (pull.changesRequested || ((pull.unresolved ?? 0) > 0 && !pull.approved)) && !pull.approved
+                                      ? 'Obtain qualifying current-head review and approval'
+                                      : pull?.pending && Number.isFinite(pull.headSince) && now - pull.headSince >= 30 * 60_000
+                                        ? 'Diagnose the checks pending over 30 minutes through repair-pr'
+                                        : pull?.pending ? 'Await exact-head CI completion'
+                                          : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
+                                            : chain.waiting || 'Await the next invocation under existing admission gates'
       let retryAt: number | null = null
       if (!chain.held && !chain.reviewPending && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`) {
         const attempts = chain.invocations.filter(invocation => invocation.behavior === last.behavior && invocation.basis === last.basis
