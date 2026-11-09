@@ -431,6 +431,13 @@ server: the checkout fetches with the run's own token, which expires with the
 run, and the settings reach the server over SSH alone, never on a command
 line.
 
+**Repair exhaustion reports.** Set `POISE_REPAIR_EXHAUSTION_REPOSITORIES` as an
+Actions repository variable to opt in explicit repositories. The gateway forwards
+it to workspaces; changing or removing it cooperatively replaces existing
+containers even when deploying settings on the same image. See
+[reporting verified repair exhaustion](Behavior-chain.md#reporting-verified-repair-exhaustion)
+for eligibility, deduplication and admission.
+
 **Google OAuth client settings.** To supply an optional Google client through
 Actions, add
 `POISE_GOOGLE_CLIENT_ID` as an Actions repository **variable** and
