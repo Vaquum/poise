@@ -104,6 +104,12 @@ function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: n
 
 class ClosedTargetFenceError extends Error {}
 
+export class MissingPublicationPlanError extends Error {
+  constructor(readonly callId: string, readonly planSha: string) {
+    super(`Original Call ${callId} has no durable publication plan`)
+  }
+}
+
 /** A consumer of the existing behavior scheduler. It never owns a timer or
  * a model session. The journal owns every admission and recovery decision. */
 export class BehaviorChainRuntime {
@@ -279,8 +285,31 @@ export class BehaviorChainRuntime {
               let observation: ChainObservation
               try { observation = await this.operations.observe(chain) }
               catch (error) {
+                if (error instanceof MissingPublicationPlanError) {
+                  const invocation = chain.invocations.find(invocation => invocation.state !== 'settled'
+                    && invocation.evidence?.callId === error.callId
+                    && (invocation.evidence.artifact as { plan_sha?: unknown } | undefined)?.plan_sha === error.planSha)
+                  if (invocation) {
+                    const prior = invocation.evidence?.publicationPlan
+                    if (!prior || prior.recoveredAt !== null || prior.callId !== error.callId || prior.planSha !== error.planSha) {
+                      this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id, evidence: {
+                        publicationPlan: { code: 'original_publication_plan_missing', callId: error.callId,
+                          planSha: error.planSha, missingAt: Date.now(), recoveredAt: null } } })
+                    }
+                    continue
+                  }
+                }
                 observationError ??= new Error(`behavior observation failed for ${chain.id}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
                 continue
+              }
+              for (const invocation of chain.invocations) {
+                const condition = invocation.evidence?.publicationPlan
+                const plan = invocation.behavior === 'review-issue' ? observation.reviewPublication : observation.workPublication
+                if (invocation.state !== 'settled' && condition?.recoveredAt === null
+                  && plan?.callId === condition.callId && plan.planSha === condition.planSha) {
+                  chain = this.append(chain, { type: 'invocation.reconciled', invocationId: invocation.id,
+                    evidence: { publicationPlan: { ...condition, recoveredAt: Date.now() } } })
+                }
               }
               chain = this.append(chain, { type: 'chain.observed', observation })
               if (observation.pull?.merged && observation.pull.mergeSha && !chain.mergeSha) {

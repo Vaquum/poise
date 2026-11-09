@@ -1290,6 +1290,12 @@ declaring a collector outage. No extra poller, gateway scope or event type is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 
+Invocation summaries may also carry retained original publication-plan absence
+and recovery evidence. Settings displays the original Call and restoration
+action even while its invocation is active. This diagnostic evidence grants no
+publication, retry or resource-release authority; [Behavior chain](Behavior-chain.md#authority-and-recovery)
+defines its reconciliation rules.
+
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
 started originals without a Call remain uncertain without a retry or synthetic

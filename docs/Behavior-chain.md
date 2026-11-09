@@ -221,6 +221,17 @@ Journal event/state and plan hashes keep their original serialization, while res
 digests verify the original retained bytes. These are separate contracts;
 reconciliation never rewrites historical events to make a digest match.
 
+When reconciliation confirms that an uncertain original Call has no durable
+publication plan, its invocation retains one `original_publication_plan_missing`
+condition in `invocation.reconciled` evidence. Repeated absence, including after
+runtime replacement, keeps that episode while due reads continue. Settings shows
+the original Call, the evidence gap and the action to restore its original Caller
+plan. A matching Call, digest and validated plan records recovery; a different
+read, parse or validation failure remains an observation error and cannot clear
+the condition. Absence and recovery change neither the hold nor uncertainty,
+ownership, resource-release proof or publication gates, and authorize no retry
+or inferred no-action receipt. Unrelated chains continue advancing.
+
 An uncertain fixed action retains its first verified response and digest in
 the same journal, so unchanged passes and projection rebuilds do not launch
 another response reader or repeat uncertainty events. Observation-based recovery

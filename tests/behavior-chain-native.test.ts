@@ -341,7 +341,7 @@ it('reconciles planned review comments with and without the revision marker', as
     request: { command: 'agent-interface', argv: [], cwd: '/interface' }, state: 'uncertain', callId,
     outcome: null, evidence: { callId, artifact: { plan_sha: digest } } }] }
   const observation = await operations.observe(uncertain)
-  expect(observation.reviewPublication).toEqual({ callId, complete: true, issueRevision: 'd'.repeat(64), receipts: [
+  expect(observation.reviewPublication).toEqual({ callId, planSha: digest, complete: true, issueRevision: 'd'.repeat(64), receipts: [
     { issue: 'example/repo#7', comment_id: 7, author: 'reviewer', url: 'https://example.test/marked' },
     { issue: 'example/repo#7', comment_id: 8, author: 'reviewer', url: null },
   ] })

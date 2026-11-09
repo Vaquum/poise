@@ -7,12 +7,12 @@ import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmissi
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
 import { chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
-import type { ChainRuntimeOperations, ChainSeed } from './behavior-chain-runtime'
+import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { getBehaviorChainSettings, getSettings } from './settings'
 import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
-import { runFile, spawnDetached } from './process'
+import { isExpectedFailure, runFile, spawnDetached } from './process'
 import { requireCallerReceipts } from './service/caller-calls'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
@@ -71,8 +71,15 @@ async function github(repository: string, argv: string[], maxOutputBytes = 2 * 1
 
 async function actionPlan(callId: string, digest: unknown): Promise<Record<string, unknown>> {
   if (typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest)) throw new Error('native action plan lacks its original digest')
-  const { stdout } = await runFile('agent-interface', ['--read-action-plan', callId], { cwd: agentInterfaceCwd(), timeoutMs: 30_000,
-    maxOutputBytes: 2 * 1024 * 1024 })
+  let stdout: string
+  try {
+    ({ stdout } = await runFile('agent-interface', ['--read-action-plan', callId], { cwd: agentInterfaceCwd(), timeoutMs: 30_000,
+      maxOutputBytes: 2 * 1024 * 1024, expected: { codes: [1],
+        stderr: /(?:^|\n)ValueError: native call has no durable publication plan\r?\n?$/ } }))
+  } catch (error) {
+    if (isExpectedFailure(error)) throw new MissingPublicationPlanError(callId, digest)
+    throw error
+  }
   const response = object(JSON.parse(stdout), 'native publication plan')
   const plan = object(response.plan, 'native publication plan')
   if (response.id !== callId || response.sha !== digest || chainBasis(plan) !== digest) throw new Error('native publication plan differs from its durable receipt')
@@ -190,7 +197,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           if (found) { const id = positive(found.id, 'published issue comment'); used.add(id);
             receipts.push({ issue: String(post.issue), comment_id: id, author: String(found.author), url: typeof found.url === 'string' ? found.url : null }) }
         }
-        observation.reviewPublication = { callId: pendingReview.evidence.callId, complete: receipts.length === plan.posts.length,
+        observation.reviewPublication = { callId: pendingReview.evidence.callId, planSha: String(artifact.plan_sha), complete: receipts.length === plan.posts.length,
           issueRevision: plan.issue_revision, receipts }
       }
       const number = observation.publication.pull_number
