@@ -29,6 +29,47 @@ function needsPrReview(chain: BehaviorChain, observation: ChainObservation | nul
     && invocation.slot === reviewer.slot))
 }
 
+/** Completed issue review without its posted GitHub comment, mirroring
+ * decideBehaviorChain reviewComplete: the original evidence remains
+ * unverified and the chain holds instead of reviewing again. */
+function issueReviewMissingArtifact(chain: BehaviorChain, observation: ChainObservation | null): boolean {
+  if (!observation || !Array.isArray(observation.issueReviewers) || observation.issueReviewers.length === 0) return false
+  const basis = chainBasis(['issue', observation.issue.revision])
+  return observation.issueReviewers.some(reviewer => {
+    const invocation = [...chain.invocations].reverse().find(candidate =>
+      candidate.behavior === 'review-issue' && candidate.basis === basis && candidate.slot === reviewer.slot
+      && candidate.state === 'settled' && candidate.evidence?.status === 'completed')
+    if (!invocation) return false
+    const evidence = invocation.evidence as Record<string, unknown>
+    if (evidence.action !== 'commented' || evidence.issue_revision !== observation.issue.revision || !Array.isArray(evidence.receipts)) return true
+    return !(evidence.receipts as Array<{ issue?: unknown, author?: unknown, comment_id?: unknown }>).some(receipt =>
+      typeof receipt.issue === 'string' && receipt.issue.toLowerCase() === `${chain.repository}#${chain.issue}`.toLowerCase()
+      && typeof receipt.author === 'string' && receipt.author.toLowerCase() === chain.reviewer.toLowerCase()
+      && typeof receipt.comment_id === 'number' && observation.issue.commentIds.includes(receipt.comment_id))
+  })
+}
+
+/** Completed PR review without its exact-head submission receipt, mirroring
+ * decideBehaviorChain reviewComplete: the original evidence remains
+ * unverified and the chain holds instead of advancing downstream. */
+function prReviewMissingArtifact(chain: BehaviorChain, observation: ChainObservation | null, pull: NonNullable<ChainObservation['pull']>): boolean {
+  if (!observation || !Array.isArray(observation.prReviewers) || observation.prReviewers.length === 0) return false
+  const expected = chainBasis(['pr', pull.head, pull.reviewContext])
+  return observation.prReviewers.some(reviewer => {
+    const invocation = [...chain.invocations].reverse().find(candidate =>
+      candidate.behavior === 'review-pr' && candidate.basis === expected && candidate.slot === reviewer.slot
+      && candidate.state === 'settled' && candidate.evidence?.status === 'completed')
+    if (!invocation) return false
+    const evidence = invocation.evidence!
+    if (!chainReviewResponse(chain, invocation, observation, observation.checkedAt)) return true
+    if (typeof evidence.review_id !== 'number' || !(evidence.review_id > 0)) return true
+    if (!observation.pull?.reviewIds.includes(evidence.review_id)) return true
+    if (evidence.head_sha !== observation.pull?.head) return true
+    if (!['reviewed_clean', 'requested_changes'].includes(String(evidence.action))) return true
+    return false
+  })
+}
+
 /** Missing required issue review, mirroring decideBehaviorChain review-issue
  * first: any configured reviewer without a completed review-issue for the
  * current seed revision and its posted comment needs review. */
@@ -201,6 +242,51 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       const repairNeedsWait = !!pull && repairCompleted && !repairVerified
         && (!!pull.failing.length || pull.conflict || pull.behind || pull.changesRequested
           || ((pull.unresolved ?? 0) > 0 && !pull.approved))
+      // Mirroring decideBehaviorChain propose(): a successful current-basis
+      // rerun-grey-ci waits for its verified artifact or changed input.
+      const greyBasis = pull && grey ? chainBasis(['grey', pull.head, grey.id, grey.attempt]) : null
+      const greyCompleted = !!pull && !!observation && !!greyBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'rerun-grey-ci' && invocation.state === 'settled'
+          && invocation.evidence?.status === 'completed' && invocation.basis === greyBasis && invocation.slot === null)
+      // Mirroring decideBehaviorChain: an undiagnosed queue rejection holds
+      // repair, while a diagnosed one needs independent approve-pr
+      // verification on the queue-verification basis before re-enqueueing.
+      let queueVerificationBasis: string | null = null
+      if (pull && observation && lastQueue?.evidence?.head_sha === pull.head && queueRemoval
+        && typeof queueRemoval.at === 'number' && queueRemoval.at >= lastQueue.admittedAt
+        && (queueRemoval.reason === 'failed_checks' || queueRemoval.reason === 'merge_conflict') && !queueRejectionNeedsRepair) {
+        const diagnosis = [...chain.invocations].reverse().find(invocation => invocation.behavior === 'repair-pr'
+          && invocation.evidence?.status === 'completed' && invocation.request.context?.head === pull.head
+          && invocation.request.context.queueRemoval === queueRemoval.id)
+        if (diagnosis) queueVerificationBasis = chainBasis(['queue-verification', pull.head, queueRemoval.id, diagnosis.id])
+      }
+      const queueVerificationApproved = !!pull && !!observation && !!queueVerificationBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'approve-pr' && invocation.state === 'settled'
+          && invocation.evidence?.status === 'completed' && invocation.basis === queueVerificationBasis
+          && invocation.slot === observation.approver.slot && invocation.evidence.action === 'approved'
+          && invocation.evidence.head_sha === pull.head && typeof invocation.evidence.review_id === 'number'
+          && pull.reviewIds.includes(invocation.evidence.review_id)
+          && !!chainReviewResponse(chain, invocation, observation, now))
+      const queueApproveCompleted = !!pull && !!observation && !!queueVerificationBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'approve-pr' && invocation.state === 'settled'
+          && invocation.evidence?.status === 'completed' && invocation.basis === queueVerificationBasis
+          && invocation.slot === observation.approver.slot)
+      // Mirroring decideBehaviorChain propose(): a successful approve-pr on the
+      // current verify-repair or approve basis waits for its verified artifact.
+      const verifyApproveBasis = pull
+        ? queueVerificationBasis ?? chainBasis(['verify-repair', pull.head, pull.reviewRevision]) : null
+      const verifyApproveCompleted = !!pull && !!observation && !!verifyApproveBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'approve-pr' && invocation.state === 'settled'
+          && invocation.evidence?.status === 'completed' && invocation.basis === verifyApproveBasis
+          && invocation.slot === observation.approver.slot)
+      const normalApproveRepairId = [...chain.invocations].reverse()
+        .find(invocation => invocation.behavior === 'repair-pr' && invocation.evidence?.status === 'completed')?.id ?? null
+      const normalApproveBasis = pull && observation
+        ? chainBasis(['approve', pull.head, pull.reviewRevision, normalApproveRepairId]) : null
+      const normalApproveCompleted = !!pull && !!observation && !!normalApproveBasis
+        && chain.invocations.some(invocation => invocation.behavior === 'approve-pr' && invocation.state === 'settled'
+          && invocation.evidence?.status === 'completed' && invocation.basis === normalApproveBasis
+          && invocation.slot === observation.approver.slot)
       let next = chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
         : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before any retry'
           : chain.held ? 'Resolve the durable hold, then explicitly resume the chain'
@@ -208,6 +294,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
               : state !== 'fresh' ? 'Await a fresh, complete chain observation'
                 : pull?.draft ? 'Await the draft pull request becoming ready for review'
                   : observation && !pull && !observation.issue.eligible ? 'Await the seed issue matching intake settings'
+                    : observation && issueReviewMissingArtifact(chain, observation)
+                    ? 'Hold for the missing original issue comment evidence; the posted GitHub comment remains unverified'
                     : observation && needsIssueReview(chain, observation) ? 'Review the current seed issue through review-issue'
                     : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
                       : queueAwaitingRemoval && pull
@@ -216,7 +304,11 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                         ? 'Await confirmed GitHub merge evidence; GitHub queue reports a merge'
                         : queueRejectionNeedsRepair && pull
                         ? `Diagnose and repair GitHub queue rejection ${queueRemoval!.id}: ${queueRemoval!.reason} through repair-pr; PR-head green checks do not prove integration success`
+                        : pull && observation && prReviewMissingArtifact(chain, observation, pull)
+                        ? 'Hold for the missing original PR submission receipt; the exact-head review evidence remains unverified'
                         : pull && needsPrReview(chain, observation, pull) ? 'Review the actual current pull-request head through review-pr'
+                          : greyCompleted && pull
+                          ? 'Await the grey recovery verified artifact or changed input; rerun-grey-ci already completed for this head'
                           : grey ? `Recover completed grey workflow ${grey.id} attempt ${grey.attempt} through rerun-grey-ci`
                             : repairNeedsWait && pull
                             ? 'Await the repair verified artifact or changed input; repair-pr already completed for this candidate'
@@ -224,6 +316,9 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                               : pull?.changesRequested && !repairVerified ? 'Address current-head review findings'
                                 : pull?.conflict || pull?.behind ? 'Repair the branch conflict or required base update'
                                   : pull && (pull.unresolved ?? 0) > 0 && !pull.approved && !repairVerified ? 'Address current-head review conversations through repair-pr'
+                                    : pull && verifyApproveCompleted && repairVerified
+                                    && (pull.changesRequested || ((pull.unresolved ?? 0) > 0 && !pull.approved)) && !pull.approved
+                                      ? 'Await the approval verified artifact or changed input; approve-pr already completed for this candidate'
                                     : pull && repairVerified && (pull.changesRequested || ((pull.unresolved ?? 0) > 0 && !pull.approved)) && !pull.approved
                                       ? 'Obtain qualifying current-head review and approval'
                                       : stuckCiDiagnosed && pull
@@ -231,6 +326,12 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                                         : pull?.pending && Number.isFinite(pull.headSince) && now - pull.headSince >= 30 * 60_000
                                         ? 'Diagnose the checks pending over 30 minutes through repair-pr'
                                         : pull?.pending ? 'Await exact-head CI completion'
+                                          : queueVerificationBasis && pull && observation && !queueVerificationApproved
+                                          ? queueApproveCompleted && pull
+                                            ? 'Await the queue-verification approval verified artifact or changed input; approve-pr already completed for this head'
+                                            : 'Verify the queue-rejection diagnosis through approve-pr approval on the queue-verification basis before re-enqueueing'
+                                          : normalApproveCompleted && pull && !pull.approved
+                                          ? 'Await the approval verified artifact or changed input; approve-pr already completed for this candidate'
                                           : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
                                             : chain.waiting || 'Await the next invocation under existing admission gates'
       let retryAt: number | null = null
