@@ -5,7 +5,7 @@ import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_pr
 import { generateKeyPairSync } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
-import { createServer, type Server, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -978,7 +978,7 @@ describe('a suite on a test box', () => {
           return
         }
       }
-      for (const listener of inner) (listener as (req: typeof req, res: typeof res) => void)(req, res)
+      for (const listener of inner) (listener as (req: IncomingMessage, res: ServerResponse) => void)(req, res)
     })
     const { code, stderr } = await run.done
     expect(code).toBe(125)
