@@ -417,15 +417,17 @@ class Namespace:
                         # PID 2 preserves subprocess waits and default signals;
                         # no generic SIGCHLD handler can steal a provider result.
                         for fd in list(descriptors):
-                            if fd != executor_fd:
+                            if fd not in (executor_fd, output):
                                 close(fd)
                         while True:
                             waited, status = os.waitpid(executor, os.WNOHANG)
                             if waited == executor:
+                                self._send(output, {"executor_status": status})
                                 code = os.waitstatus_to_exitcode(status)
                                 os._exit(code if code >= 0 else 128 - code)
                             waited, status = os.waitpid(-1, 0)
                             if waited == executor:
+                                self._send(output, {"executor_status": status})
                                 code = os.waitstatus_to_exitcode(status)
                                 os._exit(code if code >= 0 else 128 - code)
                     close(control)
@@ -505,9 +507,16 @@ class Namespace:
             if not os.WIFEXITED(holder_status) or os.WEXITSTATUS(holder_status) != 0:
                 raise RuntimeError("native namespace holder ended without its original result")
             ended = self._message(read, monotonic() + CONTROL_SECONDS)
+            executor_status = ended.get("executor_status")
+            if executor_status is not None:
+                if type(executor_status) is not int or not (os.WIFEXITED(executor_status) or os.WIFSIGNALED(executor_status)):
+                    raise RuntimeError("native namespace returned an invalid executor result")
+                ended = self._message(read, monotonic() + CONTROL_SECONDS)
             if ended.get("exited") != init or type(ended.get("status")) is not int:
                 raise RuntimeError("native namespace holder returned another process's result")
-            self.exit_code = os.waitstatus_to_exitcode(ended["status"])
+            # PID 1's normal 128+signal exit is only a transport result. Keep
+            # the executor's observed status; an explicit exit 137 is not SIGKILL.
+            self.exit_code = os.waitstatus_to_exitcode(executor_status if executor_status is not None else ended["status"])
             # The synchronous teardown wait is bounded. Ongoing recovery uses
             # the existing Caller readers; this adds no independent poller.
             self.await_empty()

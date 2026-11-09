@@ -15,7 +15,8 @@ from unittest.mock import patch
 
 os.environ['AGENT_INTERFACE_DATA_DIR'] = '/tmp/isolated-call-resource-proof'
 slow = sys.argv[1:] == ['slow']
-assert not sys.argv[1:] or slow
+failure = {'exit23': 23, 'exit137': 137, 'sigkill': -signal.SIGKILL}.get(sys.argv[1] if sys.argv[1:] else '')
+assert not sys.argv[1:] or slow or failure is not None
 import agent_interface as api
 from agent_interface import checkout_lock, native_namespace, resource_ownership, review_receipt
 
@@ -30,7 +31,7 @@ foreign_hash = hashlib.sha256(foreign.read_bytes()).hexdigest()
 legacy_directory = Path.home() / '.poise' / 'locks'
 legacy_before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                  for path in legacy_directory.glob('checkout-*.sqlite3')}
-correlation = 'kernel-call-slow' if slow else 'kernel-call-original'
+correlation = 'kernel-call-' + (sys.argv[1] if sys.argv[1:] else 'original')
 
 def no_effect_body():
     call = api.track('native-action', 'no-effect resource component', '21', 'example/repo', 'reviewer', 'native_action',
@@ -52,6 +53,10 @@ def no_effect_body():
         time.sleep(31)
     root = resource_ownership.allocate(api.DB, call, resource_ownership.call_directory(api.DB, call))
     (root / 'disposable-build-output').write_text('owned component output')
+    if failure is not None:
+        if failure < 0:
+            os.kill(os.getpid(), -failure)
+        os._exit(failure)
     checkout = root / 'repo'
     checkout.mkdir()
     with review_receipt.invocation_environment(api.DB, call, True, initialize=False):
@@ -89,7 +94,7 @@ try:
         except SystemExit as result:
             if native_namespace.active() is not None:
                 os._exit(result.code)
-            assert result.code == 0, result.code
+            assert result.code == (0 if failure is None else failure if failure >= 0 else 128 - failure), result.code
         if native_namespace.active() is not None:
             os._exit(0)
     rows = api.logs_selected({'latest': [], 'ids': [], 'correlations': [correlation]})
@@ -101,7 +106,15 @@ try:
     assert len(owned['roots']) == 1 and owned['roots'][0]['state'] == 'reclaimed'
     assert not Path(owned['roots'][0]['path']).exists()
     assert row['resources_settled_at'] and resource_ownership.released(owned)
-    assert row['status'] == 'failed' and row['action'] == 'not_started'
+    assert row['status'] == 'failed', row
+    assert row['action'] == ('not_started' if failure is None else None), row
+    if failure is not None:
+        evidence = row['diagnostic']
+        assert row['error_code'] == 'interrupted' and evidence['outcome'] == 'unknown'
+        assert 'cause unknown' in evidence['message']
+        assert evidence['call_id'] == row['id'] and evidence['correlation_id'] == correlation
+        assert evidence['exit_code'] == (failure if failure >= 0 else None)
+        assert evidence['signal'] == (-failure if failure < 0 else None)
     assert hashlib.sha256(foreign.read_bytes()).hexdigest() == foreign_hash
     assert legacy_before == {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                              for path in legacy_directory.glob('checkout-*.sqlite3')}
