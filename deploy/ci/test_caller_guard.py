@@ -201,6 +201,27 @@ else:
         self.refused(second)
         self.refused(self.path)
 
+    def test_restart_rediscovers_renamed_old_store(self):
+        self.database()
+        self.start()
+        self.check()
+        self.refused(self.path)
+        old = self.path.with_name("calls.sqlite3.old")
+        self.path.rename(old)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(self.path) + suffix)
+            if sidecar.exists():
+                sidecar.rename(Path(str(old) + suffix))
+        self.database()
+        self.check()
+        self.refused(old)
+        self.refused(self.path)
+        self.stop()
+        self.start()
+        self.check()
+        self.refused(old)
+        self.refused(self.path)
+
     def test_probe_rejects_a_live_process_without_the_lock(self):
         self.database()
         with self.path.open("rb") as file:
@@ -238,6 +259,34 @@ docker() {
         self.assertIn("host SQLite access to its live databases is unsafe", result.stderr)
         self.assertNotIn("unsafe backup operation", result.stderr)
         self.assertFalse(output.exists())
+
+    def test_backup_allows_containerd_runc_like_plain_runc(self):
+        for runtime in ("runc", "io.containerd.runc.v2"):
+            with self.subTest(runtime=runtime):
+                operator = self.root / f"operator-{runtime.replace('.', '-')}"
+                operator.mkdir()
+                deploy = GUARD.parents[1]
+                (operator / "backup.sh").write_text((deploy / "backup.sh").read_text())
+                (operator / "lib.sh").write_text(f'. {shlex.quote(str(deploy / "lib.sh"))}\n' + f"""
+require_linux() {{ :; }}
+require_docker() {{ :; }}
+require_env_file() {{ :; }}
+runtime_image() {{ printf '%s' fixture; }}
+docker() {{
+  case "$1 $2" in
+    'image inspect'|'volume inspect') return 0 ;;
+    'volume ls') printf '%s\\n' poise-home-fixture ;;
+    'ps --quiet') printf '%s\\n' fixture ;;
+    'inspect --format') printf '%s\\n' '/poise-ws-fixture {runtime}' ;;
+    *) printf 'unsafe backup operation: %s\\n' "$*" >&2; return 99 ;;
+  esac
+}}
+""")
+                output = self.root / f"backups-{runtime.replace('.', '-')}"
+                result = subprocess.run(["bash", str(operator / "backup.sh"), str(output)],
+                                        capture_output=True, text=True, env=self.env, timeout=5)
+                self.assertNotIn("host SQLite access to its live databases is unsafe", result.stderr)
+                self.assertIn("unsafe backup operation", result.stderr)
 
     def test_runc_deployment_needs_no_host_guard_or_python(self):
         library = shlex.quote(str(GUARD.parents[1] / "lib.sh"))

@@ -51,6 +51,9 @@ def homes(containers, runtimes):
     return result
 
 
+STORE_NAMES = ("calls.sqlite3", "calls.sqlite3.old")
+
+
 def stores(path, parent=None):
     # fwalk can open and close a file raced into a directory name. O_DIRECTORY
     # prevents that from releasing a previously held database's POSIX locks.
@@ -58,11 +61,11 @@ def stores(path, parent=None):
     try:
         with os.scandir(fd) as entries:
             for entry in entries:
-                if entry.name == "calls.sqlite3":
-                    yield fd, str(path)
+                if entry.name in STORE_NAMES:
+                    yield fd, str(path), entry.name
                 elif entry.is_dir(follow_symlinks=False):
-                    for directory_fd, relative in stores(entry.name, fd):
-                        yield directory_fd, str(Path(path) / relative)
+                    for directory_fd, relative, store in stores(entry.name, fd):
+                        yield directory_fd, str(Path(path) / relative), store
     finally:
         os.close(fd)
 
@@ -124,15 +127,16 @@ class Guard:
         for home in active:
             found = False
             # A restarted guard must also find Caller's retained directory after
-            # ancestor renames, without following directory symlinks.
-            for directory_fd, directory in stores(home):
+            # ancestor renames, without following directory symlinks. Retained
+            # file renames (calls.sqlite3.old) are found the same way.
+            for directory_fd, directory, store in stores(home):
                 found = True
-                node = os.stat("calls.sqlite3", dir_fd=directory_fd, follow_symlinks=False)
+                node = os.stat(store, dir_fd=directory_fd, follow_symlinks=False)
                 if not stat.S_ISREG(node.st_mode):
-                    raise RuntimeError(f"{directory}/calls.sqlite3 is not a regular Caller store")
+                    raise RuntimeError(f"{directory}/{store} is not a regular Caller store")
                 identity = (node.st_dev, node.st_ino)
                 if identity not in self.locks:
-                    fd = os.open("calls.sqlite3", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+                    fd = os.open(store, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
                     node = os.fstat(fd)
                     identity = (node.st_dev, node.st_ino)
                     # Even an alias raced into this open must remain open:
@@ -141,15 +145,15 @@ class Guard:
                     entry["fds"].append(fd)
                     entry["homes"].add(home)
                     if not stat.S_ISREG(node.st_mode):
-                        raise RuntimeError(f"{directory}/calls.sqlite3 changed type")
+                        raise RuntimeError(f"{directory}/{store} changed type")
                 entry = self.locks[identity]
                 if not entry["acquired"]:
                     try:
                         fcntl.lockf(entry["fds"][0], fcntl.LOCK_EX | fcntl.LOCK_NB, LENGTH, START, os.SEEK_SET)
                     except OSError as error:
-                        raise RuntimeError(f"Cannot acquire host lock on {directory}/calls.sqlite3 device/inode {identity}: {error}") from error
+                        raise RuntimeError(f"Cannot acquire host lock on {directory}/{store} device/inode {identity}: {error}") from error
                     entry["acquired"] = True
-                    LOG.info("Acquired host lock on %s/calls.sqlite3 device/inode %s", directory, identity)
+                    LOG.info("Acquired host lock on %s/%s device/inode %s", directory, store, identity)
                 entry["homes"].add(home)
             if not found:
                 raise RuntimeError(f"{home}: waiting for the first Caller store; protection is not established")

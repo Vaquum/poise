@@ -28,12 +28,14 @@ for volume in $(docker volume ls --quiet --filter name=poise-home-); do
 done
 
 # SQLite's locks reach every container on this host except one that runs under
-# another kernel, such as gVisor's.
+# another kernel, such as gVisor's. io.containerd.runc.v2 shares the host
+# kernel like runc, as ensure_caller_guard treats it.
 for container in $(docker ps --quiet --filter label=poise.managed=true); do
   read -r name runtime < <(docker inspect --format '{{.Name}} {{.HostConfig.Runtime}}' "$container")
-  if [ "$runtime" != runc ]; then
-    die "${name#/} runs under $runtime: host SQLite access to its live databases is unsafe. Stop it on the admin page before backing up."
-  fi
+  case "$runtime" in
+    runc|io.containerd.runc.v2) ;;
+    *) die "${name#/} runs under $runtime: host SQLite access to its live databases is unsafe. Stop it on the admin page before backing up." ;;
+  esac
 done
 
 umask 077
