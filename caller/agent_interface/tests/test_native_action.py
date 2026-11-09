@@ -176,6 +176,25 @@ def test_unmapped_signal_cannot_erase_an_accepted_response():
     assert native_action.process_failure(-35) == {"code": None, "signal": "SIG35"}
 
 
+def test_resolution_checkpoint_actor_binding_is_case_insensitive(database):
+    head = "a" * 40
+    argv = ["--resolve-nonblocking-conversations-if-ready", "21", "--expected-head", head,
+            "--username", "Reviewer", "--token-user", "reviewer"]
+    request, number, _ = native_action.validate(argv, "/example/repo", "example/repo", "Reviewer", resource_version=True)
+    call = api.track("native-action", "resolution", number, "example/repo", "Reviewer", "native_action",
+                     expected_head=head, source="poise:behavior-chain", correlation_id="original-resolution")
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    api.persist_action_plan(call, {"kind": "native_action", "request": request})
+    api._native_action_artifact(call, "preparing_native_action", digest)
+    api._native_action_artifact(call, "performing_native_action", digest)
+    with review_receipt.invocation_environment(api.DB, call, True, initialize=False):
+        assert native_action.resolution_checkpoint("example/repo", 21, head, "reviewer") == {"confirmed": [], "pending": None}
+        assert native_action.resolution_checkpoint("example/repo", 21, head, "REVIEWER") == {"confirmed": [], "pending": None}
+        with pytest.raises(RuntimeError, match="original"):
+            native_action.resolution_checkpoint("example/repo", 21, head, "someone-else", "A")
+    assert json.loads(row(call)["artifact"]).get("resolution_progress", {"confirmed": [], "pending": None}) == {"confirmed": [], "pending": None}
+
+
 @pytest.mark.parametrize("changed", ["actor", "head", "request_sha"])
 def test_resolution_checkpoint_requires_original_actor_head_and_request(database, changed):
     head = "a" * 40

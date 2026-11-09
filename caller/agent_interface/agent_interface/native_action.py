@@ -92,7 +92,7 @@ def resolution_checkpoint(repository: str, number: int, head: str, actor: str,
         if not row or row["source"] != "poise:behavior-chain" or row["behavior"] != "native_action" \
                 or row["status"] != "running" or row["error_code"] in {"stopping", "stopped"} \
                 or row["repo"] != repository or row["pr_id"] != str(number) \
-                or row["actor"] != actor or row["expected_head"] != head or not row["action_plan"]:
+                or row["actor"].lower() != actor.lower() or row["expected_head"] != head or not row["action_plan"]:
             raise RuntimeError("conversation resolution differs from its original running Call")
         plan = json.loads(row["action_plan"])
         request = plan.get("request", {})
