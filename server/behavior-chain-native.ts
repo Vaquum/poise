@@ -37,6 +37,7 @@ export interface NativeChainHooks {
   measureHeadroom?: () => BehaviorResourceHeadroom
   permitted(chain: BehaviorChain, decision: Invoke): boolean
   note(behavior: ChainBehavior, chain: BehaviorChain, pull: { number: number } | null): string | Promise<string>
+  reviewScope?(chain: BehaviorChain, pull: { number: number }): string | Promise<string>
   severity(behavior: ChainBehavior): string
   received(invocation: ChainInvocation, call: LogEntry): void
   reviews(repository: string, number: number): Promise<string>
@@ -310,8 +311,12 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           ...common, '--model', selected.model, '--branch', chain.branch, '--expected-issue-revision', observation.issue.revision,
           ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head, ...(pull.conflict || pull.behind || pull.queueRemoval ? ['--merge-base'] : [])] : []), '--note', note] }
         if (!pull) throw new Error('PR behavior requires its actual pull request')
+        const scope = await hooks.reviewScope?.(chain, pull) ?? ''
+        const reviewNote = scope
+          ? `${note}\n\nApply this scope directive when reviewing the remediation. Caller includes it once in the formal GitHub review.\n\n${scope}` : note
         return { command: 'agent-interface', cwd: agentInterfaceCwd(), argv: [decision.behavior === 'review-pr' ? '--pr-review' : '--pr-approve', `https://github.com/${chain.repository}/pull/${pull.number}`,
-          ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior), '--note', note] }
+          ...common, ...model, '--pwd', cwd, '--expected-head', pull.head, '--p', hooks.severity(decision.behavior),
+          ...(scope ? ['--review-scope', scope] : []), '--note', reviewNote] }
       }
       if (decision.behavior === 'publish-issue') {
         const partial = [...chain.invocations].reverse().find((invocation) => invocation.callId === observation.publication.head_invocation)

@@ -27,27 +27,28 @@ interface RepairReport {
   issueNumber: number | null
 }
 
-export async function repairReportReviewNote(db: Database, repository: string, pull: number): Promise<string> {
-  const reports = db.prepare(`SELECT value FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
-    AND json_extract(value, '$.issueNumber') IS NOT NULL`).all(PREFIX + '*', repository.toLowerCase() + '#*') as { value: string }[]
-  if (!reports.length) return ''
+export async function repairReportReviewScope(db: Database, chain: Pick<BehaviorChain, 'repository' | 'issue'>, pull: number): Promise<string> {
+  const { repository, issue } = chain
+  const report = db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
+    AND json_extract(value, '$.issueNumber') = ? LIMIT 1`).get(PREFIX + '*', repository.toLowerCase() + '#*', issue)
+  if (!report) return ''
   const org = organizationForRepository(repository)
   if (!org) throw new Error('Repair report review requires its followed organization')
   await runFile('github-datastore', organizationArgs(org, ['health', '--max-age-seconds', '120']), { timeoutMs: 30_000 })
   const { stdout } = await runFile('github-datastore', organizationArgs(org, ['view', 'pr-closing', '--repo', repository,
     '--format', 'json', '--limit', '1', ...(pull > 1 ? ['--after-number', String(pull - 1)] : [])]),
   { timeoutMs: 30_000, maxOutputBytes: 64 * 1024 })
-  const page = JSON.parse(stdout) as { prs?: Array<{ repo: string, number: number, closing_truncated: boolean,
+  const page = JSON.parse(stdout) as { prs?: Array<{ repo: string, number: number, closes_via: string, closing_truncated: boolean,
     closing: Array<{ repo: string, number: number }> }> }
   if (!Array.isArray(page.prs) || page.prs.length > 1) throw new Error('Repair report review lacks PR closing references')
   const pr = page.prs[0]
   if (!pr || pr.number !== pull) throw new Error('Repair report review awaits indexed PR closing references')
-  if (pr.repo.toLowerCase() !== repository.toLowerCase() || pr.closing_truncated !== false || !Array.isArray(pr.closing)) {
+  if (pr.repo.toLowerCase() !== repository.toLowerCase() || pr.closes_via !== 'closing-references'
+    || pr.closing_truncated !== false || !Array.isArray(pr.closing)) {
     throw new Error('Repair report review has incomplete PR closing references')
   }
-  const issues = new Set(reports.map(row => (JSON.parse(row.value) as RepairReport).issueNumber))
-  if (!pr.closing.some(ref => ref.repo.toLowerCase() === repository.toLowerCase() && issues.has(ref.number))) return ''
-  return `Apply this scope directive when reviewing the remediation. Caller includes it once in the formal GitHub review.\n\n<!-- poise-remediation-scope -->\n${REMEDIATION_SCOPE}\n<!-- /poise-remediation-scope -->`
+  if (!pr.closing.some(ref => ref.repo.toLowerCase() === repository.toLowerCase() && ref.number === issue)) return ''
+  return REMEDIATION_SCOPE
 }
 
 function enabled(repository: string): boolean {
@@ -181,7 +182,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         `Verified receipts: three or more settled Caller repairs on this basis after the last Resume. Each failed before publication with ${budget ? 'atomic_work_execution_budget_exhausted, action=not_started, outcome=preflight_failed' : 'atomic_work_failed, action=not_started, outcome=preflight_failed and the incomplete-reply validation cause'}; resources were released.`,
         ...report.attempts.map(attempt => `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}.`), '',
         `Next action: inspect the repair ${budget ? 'execution budget' : 'reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover repair or relax any review, admission or merge gate.`,
-        '', REMEDIATION_SCOPE,
+        '', REMEDIATION_SCOPE, '', 'Include this exact paragraph in the linked PR review.',
       ].join('\n')
       const result = await handleGhBody({ operation: 'open_issue', repository_full_name: chain.repository,
         title: `fix: repair exhausted ${budget ? 'execution budget' : 'incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })

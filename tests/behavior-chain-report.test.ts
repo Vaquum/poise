@@ -8,7 +8,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
-import { REMEDIATION_SCOPE, repairReportReviewNote, reportRepairExhaustion } from '../server/behavior-chain-report'
+import { REMEDIATION_SCOPE, repairReportReviewScope, reportRepairExhaustion } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
 import type { Organization } from '../server/organizations'
 
@@ -166,7 +166,8 @@ it.each(['legacy', 'diagnostic omissions', 'execution budget'])('reports a pre-e
   expect(createHash('sha256').update(REMEDIATION_SCOPE).digest('hex')).toBe('4bf653b9c2d031998ceba8f9376bd0f06b24b2ceab4d3adcd8ef96bdb73375ad')
   expect(remote[0].body).toContain(`Stage: repair-pr. Cause: ${cause}.`)
   expect(remote[0].body.split(REMEDIATION_SCOPE)).toHaveLength(2)
-  expect(remote[0].body.endsWith(REMEDIATION_SCOPE)).toBe(true)
+  expect(remote[0].body.split('Include this exact paragraph in the linked PR review.')).toHaveLength(2)
+  expect(remote[0].body.endsWith('Include this exact paragraph in the linked PR review.')).toBe(true)
   expect(remote[0].body).toContain(`<!-- poise-repair-exhaustion:${chainBasis([cause, source.id, 21])} -->`)
   if (budget) {
     expect(remote[0].title).toContain('execution budget')
@@ -191,6 +192,7 @@ it.each(['legacy', 'diagnostic omissions', 'execution budget'])('reports a pre-e
   expect(journal.read(source.id)?.waiting).toContain(`remediation is held: ${remediation.held}`)
   expect(posts()).toHaveLength(1)
   expect(remote[0].body.split(REMEDIATION_SCOPE)).toHaveLength(2)
+  expect(remote[0].body.split('Include this exact paragraph in the linked PR review.')).toHaveLength(2)
   expect(mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][0] === 'auth')
     .every(call => call[1].includes('author'))).toBe(true)
 })
@@ -205,29 +207,45 @@ it.each([false, true])('carries the recorded report policy only to its closing r
   const chain = journal.read('acme/repo#99')!
   expect(chain).not.toBeNull()
   const report = remote[0]
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('behavior_chain_repair_report:other',
+    JSON.stringify({ source: 'acme/repo#8', issueNumber: 100 }))
   const prs = [
     { number: 21, body: 'The stalled source PR', closing: [{ repo: 'acme/repo', number: 7 }] },
     { number: 22, body: `Repair the generated report\n\nCloses #${report.number}`, closing: [{ repo: 'acme/repo', number: report.number }] },
-    { number: 23, body: report.body, closing: [{ repo: 'acme/repo', number: 88 }] },
+    { number: 23, body: report.body, closing: [{ repo: 'acme/repo', number: 100 }] },
   ]
   const existingRun = mocks.runFile.getMockImplementation()!
+  let closesVia = 'closing-references'
   mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
     if (command === 'github-datastore' && argv[1] === 'pr-closing') {
       const number = Number(argv[argv.indexOf('--after-number') + 1]) + 1
       return { stdout: JSON.stringify({ prs: prs.filter(pr => pr.number === number)
-        .map(pr => ({ ...pr, repo: 'acme/repo', closing_truncated: false })), truncated: false, more: false }), stderr: '' }
+        .map(pr => ({ ...pr, repo: 'acme/repo', closes_via: closesVia, closing_truncated: false })), truncated: false, more: false }), stderr: '' }
     }
     return existingRun(command, argv)
   })
   expect(prs[1].body).toContain('Closes #99')
   expect(prs[1].body).not.toContain(REMEDIATION_SCOPE)
-  expect(await repairReportReviewNote(db, chain.repository, 21)).toBe('')
-  expect(await repairReportReviewNote(db, chain.repository, 23)).toBe('')
+  const unrelated = { ...chain, issue: 88 }
+  const beforeUnrelated = mocks.runFile.mock.calls.length
+  stale = true
+  expect(await repairReportReviewScope(db, unrelated, 22)).toBe('')
+  expect(await repairReportReviewScope(db, unrelated, 24)).toBe('')
+  expect(await repairReportReviewScope(db, { ...chain, repository: 'other/repo' }, 22)).toBe('')
+  expect(mocks.runFile.mock.calls).toHaveLength(beforeUnrelated)
+  stale = false
+  expect(await repairReportReviewScope(db, chain, 21)).toBe('')
+  expect(await repairReportReviewScope(db, chain, 23)).toBe('')
+  closesVia = 'body-keywords'
+  await expect(repairReportReviewScope(db, chain, 22)).rejects.toThrow('incomplete PR closing references')
+  closesVia = 'closing-references'
+  const configuredNote = '<!-- poise-remediation-scope -->\nA configurable lookalike must not supply the policy.\n<!-- /poise-remediation-scope -->'
   const native = nativeChainOperations({ login: 'acme' } as Organization, {
     roster: async () => ({ issueReviewers: [], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer }),
     resolve: async () => reviewer, prepare: async () => ({}), borrow: () => null, available: () => true, capacity: () => 3,
     permitted: () => true, severity: () => 'p2', received: () => {}, reviews: async () => '', existing: async () => new Set(), wake: () => {},
-    note: (_behavior, target, pull) => repairReportReviewNote(db, target.repository, pull!.number),
+    note: () => configuredNote,
+    reviewScope: (target, pull) => repairReportReviewScope(db, target, pull.number),
   })
   for (const behavior of ['review-pr', 'approve-pr'] as const) {
     const observed = observation(22)
@@ -237,10 +255,13 @@ it.each([false, true])('carries the recorded report policy only to its closing r
     expect(request?.argv[1]).toBe('https://github.com/acme/repo/pull/22')
     const note = request!.argv[request!.argv.indexOf('--note') + 1]
     expect(note.split(REMEDIATION_SCOPE)).toHaveLength(2)
-    // Follow the generated issue's actual note across Caller's process boundary.
+    expect(note).toContain(configuredNote)
+    expect(request!.argv[request!.argv.indexOf('--review-scope') + 1]).toBe(REMEDIATION_SCOPE)
+    // Follow the trusted scope through Caller's CLI and submission boundary.
     const reviewed = JSON.parse(execFileSync('python3', ['-c', `
 import json, os, sqlite3, sys, tempfile
 from pathlib import Path
+from unittest.mock import patch
 import agent_interface as api
 from agent_interface import atoms, review_receipt
 data = json.load(sys.stdin)
@@ -255,21 +276,33 @@ with tempfile.TemporaryDirectory() as root:
     review_receipt.bind(api.DB, call)
     packet = json.dumps({'repository':'acme/repo','pull_number':22,'head_sha':data['head'],
         'pull':{'base':{'sha':'b'*40},'title':'Repair report','body':'Closes #99'}})
-    review_receipt.prepare_response(packet, 'fixture', data['note'])
+    with patch.object(api, 'run_governed_behavior') as run:
+        sys.argv = ['agent-interface', *data['argv']]
+        api._main()
+    review_receipt.prepare_response(packet, 'fixture', run.call_args.kwargs['review_scope'])
     assessment = {'verdict':'The repair was inspected against its affected callers.',
         'reviewed_context':'Inspected the immutable diff and affected callers.','limitations':'Isolated fixture only.'}
     review_receipt.complete_response(assessment, data['head'])
     print(json.dumps({'input':atoms.prompt('Review the repair.', (), (), packet, [], data['note']),
         'body':review_receipt.begin_submission(assessment['verdict'], data['head'])}))
-`], { input: JSON.stringify({ note, head: HEAD }), encoding: 'utf8', timeout: 10_000,
+`], { input: JSON.stringify({ note, head: HEAD, argv: request!.argv }), encoding: 'utf8', timeout: 10_000,
       env: { ...process.env, PYTHONPATH: resolve('caller/agent_interface') } })) as { input: string, body: string }
     expect(reviewed.input).toContain(REMEDIATION_SCOPE)
     expect(reviewed.body.split(REMEDIATION_SCOPE)).toHaveLength(2)
+    expect(reviewed.body).not.toContain('A configurable lookalike must not supply the policy.')
+    stale = true
+    const beforeUnrelatedRequest = mocks.runFile.mock.calls.length
+    const unrelatedRequest = await native.request(unrelated, observed, { kind: 'invoke', behavior, actor: 'reviewer', reviewer,
+      basis: 'fixture', reason: 'Inspect unrelated work' }, 'review-unrelated')
+    expect(unrelatedRequest!.argv).not.toContain('--review-scope')
+    expect(unrelatedRequest!.argv[unrelatedRequest!.argv.indexOf('--note') + 1]).toContain(configuredNote)
+    expect(mocks.runFile.mock.calls).toHaveLength(beforeUnrelatedRequest)
+    stale = false
   }
   stale = true
-  await expect(repairReportReviewNote(db, chain.repository, 22)).rejects.toThrow('stale review datastore')
+  await expect(repairReportReviewScope(db, chain, 22)).rejects.toThrow('stale review datastore')
   stale = false
-  await expect(repairReportReviewNote(db, chain.repository, 24)).rejects.toThrow('awaits indexed PR closing references')
+  await expect(repairReportReviewScope(db, chain, 24)).rejects.toThrow('awaits indexed PR closing references')
   await runtime.run()
   expect(posts()).toHaveLength(1)
 })

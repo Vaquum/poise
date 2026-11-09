@@ -1045,6 +1045,7 @@ def run_pr_review(
     p: str | None = None,
     model: str | None = None,
     recovery_model: str | None = None,
+    review_scope: str = "",
 ):
     return run_governed_behavior(
         pr_review,
@@ -1060,6 +1061,7 @@ def run_pr_review(
         p,
         model,
         recovery_model,
+        review_scope=review_scope,
     )
 
 
@@ -1279,6 +1281,7 @@ def run_pr_approve(
     capped: bool = False,
     review_round: int | None = None,
     review_cap: int | None = None,
+    review_scope: str = "",
 ):
     return run_governed_behavior(
         pr_approve,
@@ -1297,6 +1300,7 @@ def run_pr_approve(
         capped,
         review_round,
         review_cap,
+        review_scope=review_scope,
     )
 
 
@@ -1714,6 +1718,7 @@ def run_governed_behavior(
     capped: bool = False,
     review_round: int | None = None,
     review_cap: int | None = None,
+    review_scope: str = "",
 ):
     if capped and (behavior != "pr_approve" or review_round is None or review_cap is None):
         raise ValueError("a capped round needs pr_approve with its round and cap numbers")
@@ -1806,7 +1811,7 @@ def run_governed_behavior(
         try:
             try:
                 response, recovered_result = _run_review_with_recovery(mod, behavior, review_pr, pwd, actor, expected_head, note, timeout_s, p, spec, recovery, before, id_,
-                                                                       capped=capped, review_round=review_round, review_cap=review_cap)
+                                                                       capped=capped, review_round=review_round, review_cap=review_cap, review_scope=review_scope)
             except ReviewSuperseded as cancelled:
                 response = str(cancelled)
                 prior = getattr(cancelled, "prior_error", None)
@@ -1963,9 +1968,11 @@ def _repeat_only_refusal(failure: BaseException) -> bool:
 
 
 def _run_review_with_recovery(mod, behavior, pr, pwd, actor, head, note, seconds, p, spec, recovery, before, call_id,
-                              capped=False, review_round=None, review_cap=None):
+                              capped=False, review_round=None, review_cap=None, review_scope=""):
     # Only pr_approve runs capped rounds; pr_review neither accepts nor needs them.
     cap_kwargs = {"capped": capped, "review_round": review_round, "review_cap": review_cap} if behavior == "pr_approve" else {}
+    if review_scope:
+        cap_kwargs["review_scope"] = review_scope
     try:
         return mod.run(pwd, pr, actor, head, note, seconds, p, model=spec.identity, **cap_kwargs), None
     except (review_budget.ReviewLimitError, subprocess.TimeoutExpired, review_receipt.SubmissionError) as error:
@@ -2611,8 +2618,8 @@ behaviors:
   --read-response HASH
   --read-reasoning HASH
   --chat MESSAGE --model MODEL [--session ID] [--pwd DIR]
-  --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--model MODEL] [--recovery-model MODEL]
-  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N]
+  --pr-review PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL]
+  --pr-approve PR --actor USER --expected-head SHA --source SOURCE --correlation-id ID [--pwd DIR] [--p P] [--note TEXT] [--review-scope TEXT] [--model MODEL] [--recovery-model MODEL] [--review-cap-reached --review-round N --review-cap N]
   --fix-failing-ci PR [--pwd DIR]
   --issue-simplify ISSUE [--pwd DIR]
   --issue-review OWNER/REPO#N --model MODEL --actor USER --source SOURCE --correlation-id ID [--recovery-model MODEL] [--expected-issue-revision SHA256] [--note TEXT]
@@ -2937,6 +2944,7 @@ def _main():
             p=flag_value("--p"),
             model=flag_value("--model"),
             recovery_model=flag_value("--recovery-model"),
+            review_scope=flag_value("--review-scope") or "",
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--pr-approve":
@@ -2959,6 +2967,7 @@ def _main():
             capped=capped,
             review_round=review_round,
             review_cap=review_cap,
+            review_scope=flag_value("--review-scope") or "",
         )
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--fix-failing-ci":

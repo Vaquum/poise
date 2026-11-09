@@ -39,7 +39,7 @@ _QUOTA_HEADERS = {"x-ratelimit-resource", "x-ratelimit-limit", "x-ratelimit-rema
                   "x-ratelimit-used", "x-ratelimit-reset", "retry-after"}
 
 
-def prepare_response(packet: str, model: str, note: str = "") -> None:
+def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
     """Pin controller-owned context before invoking the configured reviewer."""
     from hashlib import sha256
     bound = _call.get()
@@ -50,12 +50,11 @@ def prepare_response(packet: str, model: str, note: str = "") -> None:
     context = sha256(json.dumps([pull["base"]["sha"], pull["title"], pull.get("body") or ""],
                                ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
     database, call_id = bound
-    scope = re.search(r"(?m)^<!-- poise-remediation-scope -->\n([^\n]+)\n<!-- /poise-remediation-scope -->$", note)
     with caller_store.connect(database, timeout=30) as conn:
         conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?),'$.review_scope',?) where id=? and status='running'",
                      (json.dumps({"repository": value["repository"], "pull_number": value["pull_number"],
                                   "head_sha": value["head_sha"], "context_sha": context, "model": model}),
-                      scope[1] if scope else None, call_id))
+                      review_scope or None, call_id))
 
 
 def complete_response(assessment: dict, head: str) -> dict | None:
