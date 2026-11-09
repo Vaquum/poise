@@ -801,6 +801,77 @@ exit 0
         self.assertIn("install", sudo_log.read_text(),
                       "nested runsc with a colliding runc label must reach guard installation, not skip")
 
+    def test_nbsp_split_across_stdin_chunks_still_installs_gvisor_guard(self):
+        # A literal U+00A0 split across stdin chunks must not corrupt the
+        # resolved runtime: Buffer.concat before decoding keeps the NBSP
+        # intact so the gateway-equivalent trim still yields runsc. The old
+        # `text += chunk` per-chunk decoding produced replacement characters
+        # and skipped the guard via exit 10.
+        deploy = GUARD.parents[1]
+        env_file = self.root / "poise.env"
+        env_file.write_text('POISE_WORKSPACE_RUNTIME=runsc\n')
+        sudo_log = self.root / "sudo.log"
+        sudo_log.write_text("")
+        binary = self.root / "guard-bin-chunks"
+        binary.mkdir()
+        (binary / "docker").write_text("""#!/bin/bash
+if [ "$1" = compose ]; then
+  python3 -c 'import json; print(json.dumps({"services": {"gateway": {"environment": {"POISE_WORKSPACE_RUNTIME": "runsc\\u00a0"}}}}, ensure_ascii=False))'
+elif [ "$1" = info ]; then
+  case "$3" in
+    *json*) printf '{"runsc": {"path": "/usr/local/bin/runsc"}, "runc": {"path": "runc"}}' ;;
+    *) printf 'runc' ;;
+  esac
+elif [ "$1" = image ]; then
+  # No existing runtime image in these fresh-deployment fixtures.
+  exit 1
+elif [ "$1" = run ]; then
+  # Emulate `docker run --rm --network none -i --entrypoint node <image>`
+  # with host Node, splitting stdin one byte at a time so the literal NBSP
+  # bytes arrive in separate chunks as on a real chunked pipe.
+  script=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-e" ]; then script="$arg"; break; fi
+    prev="$arg"
+  done
+  if [ -z "$script" ]; then echo "unexpected docker $*" >&2; exit 99; fi
+  tmp=$(mktemp)
+  cat >"$tmp"
+  python3 -c 'import sys,time; data=open(sys.argv[1],"rb").read(); [ (sys.stdout.buffer.write(bytes([b])), sys.stdout.buffer.flush(), time.sleep(0.002)) for b in data ]' "$tmp" | node --input-type=module -e "$script"
+  status=${PIPESTATUS[1]}
+  rm -f "$tmp"
+  exit $status
+elif [ "$1" = ps ]; then
+  : # Fresh deployment: no workspace containers yet.
+else
+  echo "unexpected docker $*" >&2; exit 99
+fi
+""")
+        (binary / "sudo").write_text("""#!/bin/bash
+echo "$*" >> "$GUARD_SUDO_LOG"
+for argument in "$@"; do
+  if [ "$argument" = --check ]; then
+    echo 'Host locks verified on 1 Caller inode(s)'
+    exit 0
+  fi
+done
+exit 0
+""")
+        (binary / "id").write_text("#!/bin/bash\nif [ \"$1\" = -u ]; then echo 1000; else exec /usr/bin/id \"$@\"; fi\n")
+        for name in ("docker", "sudo", "id"):
+            (binary / name).chmod(0o755)
+        env = {**self.env, "PATH": str(binary) + os.pathsep + self.env["PATH"],
+               "GUARD_SUDO_LOG": str(sudo_log), "LC_ALL": "C"}
+        script = (f"set -uo pipefail\n. {shlex.quote(str(deploy / 'lib.sh'))}\n"
+                  f"env_file={shlex.quote(str(env_file))}\n"
+                  "ensure_caller_guard\nprintf 'RC=%s\\n' \"$?\"\n")
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Host locks verified", result.stdout)
+        self.assertIn("install", sudo_log.read_text(),
+                      "runsc plus a chunk-split literal NBSP must reach guard installation, not exit 10")
+
     def test_real_compose_resolution_proves_quoting_interpolation_comment_and_label_collision(self):
         # Real disposable Compose resolution through the installation decision:
         # a runtime variable holding runsc referenced double-quoted with a

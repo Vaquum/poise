@@ -70,9 +70,10 @@ guard_desired_runtime() {
   local config=$1 parser_image
   parser_image=$(guard_parser_image)
   printf '%s' "$config" | docker run --rm --network none -i --entrypoint node "$parser_image" --input-type=module -e '
-let text="";
-process.stdin.on("data",(chunk)=>{text+=chunk;}).on("end",()=>{
+let chunks=[];
+process.stdin.on("data",(chunk)=>{chunks.push(chunk);}).on("end",()=>{
 try{
+const text=Buffer.concat(chunks).toString("utf8");
 const config=JSON.parse(text||"{}");
 const environment=config?.services?.gateway?.environment;
 let value="";
