@@ -426,17 +426,24 @@ Reporting is off by default. An operator can set
 list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
 holds during their ordinary bounded reconciliation; no Resume or extra poller is
 needed. Reporting preserves the source hold and does not perform repair recovery.
+In service deployments, set it in `deploy/.env` or as a fork's Actions repository
+variable. The gateway forwards it on install; adding, changing or removing it
+cooperatively replaces existing workspaces, even on the same image. Unset or
+empty opts out.
 
-The first supported cause is `repair_incomplete_replies`: at least three settled
-Caller repairs on the same current repair basis and slot after the last Resume,
-each with positive resource release, `atomic_work_failed`, `not_started` /
-`preflight_failed`, no publication plan and the specific incomplete-reply error.
+Reporting requires at least three settled original Caller repair receipts on the
+same current head, review basis and slot after the last Resume, each with positive
+resource release, `action=not_started`, retained `outcome=preflight_failed` and no
+publication plan or action receipts. All matching attempts must share one cause:
+`repair_incomplete_replies` requires `error_code=atomic_work_failed` and the specific
+incomplete-reply error; `repair_execution_budget_exhausted` requires
+`error_code=atomic_work_execution_budget_exhausted`.
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require repair on that head and review basis.
 Stale, unknown or changed findings leave reporting pending. Other causes remain
-visible in their ordinary holds without an issue report.
+visible in their ordinary holds without an issue report; mixed causes cannot qualify.
 
 Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the
@@ -445,6 +452,8 @@ receipt identities, and next action. It excludes raw errors, omitted finding IDs
 worker paths and provider output. An intent in the existing durable metadata store
 links the original hold event to the report issue. Identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
+Existing incomplete-reply intent keys and markers remain unchanged; budget reports
+use a separate cause with the same metadata and marker format.
 The marker lookup includes closed issues and verifies the publishing account.
 Intent is committed before creation;
 after an ambiguous POST, even repeated empty searches cannot authorize another
@@ -457,7 +466,7 @@ incompatible saved intake labels and a held remediation chain are shown in the
 source chain's `waiting` reason, including its report URL when known. Poise does
 not add a different intake label or bypass ownership/admission gates. Admission is
 verified only when the normal datastore intake records the new chain. Generated
-remediation issues cannot report this same cause recursively, using their marker
+remediation issues cannot report either cause recursively, using their marker
 or the retained source-to-issue link; their ordinary repair holds remain visible.
 
 `tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain

@@ -40,6 +40,7 @@ describe('configuration', () => {
       workspaceNanoCpus: 4_000_000_000,
       workspacePids: 4096,
       behaviorResourceEnv: [],
+      repairExhaustionRepositories: null,
       testRelay: null,
       workspaceRuntime: null,
       workspaceDns: [],
@@ -109,6 +110,16 @@ describe('configuration', () => {
       expect(loadConfig({ ...BASE, [budget]:'10', [reservation]:'2' }).behaviorResourceEnv)
         .toEqual([`${budget}=10`,`${reservation}=2`])
       expect(loadConfig({ ...BASE, [reservation]:'0' }).behaviorResourceEnv).toEqual([`${reservation}=0`])
+    }
+  })
+
+  it('requires an explicit repository allowlist for repair exhaustion reports', () => {
+    expect(loadConfig({ ...BASE, POISE_REPAIR_EXHAUSTION_REPOSITORIES: '  ' }).repairExhaustionRepositories).toBeNull()
+    expect(loadConfig({ ...BASE, POISE_REPAIR_EXHAUSTION_REPOSITORIES: 'Acme/one, acme/two' }).repairExhaustionRepositories)
+      .toBe('Acme/one, acme/two')
+    for (const value of ['*', 'acme/*', 'acme', 'acme/one,', 'acme/one,other/two/three']) {
+      expect(problems({ ...BASE, POISE_REPAIR_EXHAUSTION_REPOSITORIES: value }))
+        .toContainEqual(expect.stringContaining('POISE_REPAIR_EXHAUSTION_REPOSITORIES'))
     }
   })
 

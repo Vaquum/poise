@@ -68,6 +68,15 @@ class EnvFileTest(unittest.TestCase):
         self.assertIn('no POISE_GITHUB_CLIENT_SECRET secret', result.stderr)
         self.assertEqual(result.stdout, '')
 
+    def test_repair_report_allowlist_is_explicit_and_removable(self):
+        name = 'POISE_REPAIR_EXHAUSTION_REPOSITORIES'
+        for variables, expected in [({}, []), ({name: 'acme/one,acme/two'}, [f'{name}=acme/one,acme/two']),
+                                    ({name: ''}, [f'{name}='])]:
+            with self.subTest(variables=variables):
+                result = self.env_file(variables)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([line for line in result.stdout.splitlines() if line.startswith(name + '=')], expected)
+
     def test_refuses_values_that_would_break_the_file_or_expose_the_secret(self):
         for variables, secret, says in [
             ({'POISE_ADMINS': 'root\nPOISE_ALLOWED_USERS=mallory'}, 's3cret', 'POISE_ADMINS spans more than one line'),
