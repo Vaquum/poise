@@ -7,6 +7,7 @@ import { BehaviorChainJournal, chainBasis, chainIdentity, type BehaviorChain, ty
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
+import { CallerReceiptStoreError } from './service/caller-calls'
 
 export interface ChainSeed { repository: string, number: number }
 export interface ChainRuntimeOperations {
@@ -542,6 +543,15 @@ export class BehaviorChainRuntime {
           outcome: String(evidence.outcome || evidence.action), evidence: { status: 'completed', ...evidence } })
         this.operations.wake()
       } catch (error) {
+        if (error instanceof CallerReceiptStoreError) {
+          // requireCallerReceipts throws before any CLI: no Call and no side
+          // effect. Settle as deferred so a fresh attempt can be admitted after
+          // recovery, then abort this run while receipts stay unreadable.
+          this.append(this.current(chain), { type: 'invocation.settled', invocationId: invocation.id, callId: null,
+            outcome: 'receipt_unavailable', evidence: { status: 'deferred', action: 'not_started',
+              outcome: 'receipt_unavailable', error: String(error), completedAt: Date.now() } })
+          throw error
+        }
         this.append(this.current(chain), { type: 'invocation.uncertain', invocationId: invocation.id, reason: String(error) })
       }
     }
@@ -660,6 +670,13 @@ export class BehaviorChainRuntime {
         await this.operations.resumePublication(current.invocations.find((item) => item.id === invocation.id)!, observation.publication.head_sha, correlation)
         this.operations.wake()
       } catch (error) {
+        if (error instanceof CallerReceiptStoreError) {
+          // No continuation Call was created. Clear the dangling correlation
+          // so recovery retries with a fresh one after readability returns.
+          this.append(this.current(chain), { type: 'invocation.reconciled', invocationId: invocation.id,
+            evidence: { publicationResume: null, publicationResumeError: String(error) } })
+          throw error
+        }
         this.append(this.current(chain), { type: 'invocation.reconciled', invocationId: invocation.id,
           evidence: { publicationResumeError: String(error) } })
       }
