@@ -446,9 +446,12 @@ list of explicit `owner/repo` names. Enabled v2 chains check both new and existi
 holds during their ordinary bounded reconciliation; no Resume or extra poller is
 needed. Reporting preserves the source hold and does not perform repair recovery.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
-variable. The gateway forwards it on install; adding, changing or removing it
-cooperatively replaces existing workspaces, even on the same image. Unset or
-empty opts out.
+variable. The gateway reconciles it through trusted service configuration on
+compatible running workspaces, including when image and release already match.
+Adding, changing or removing it needs no restart or container replacement and
+does not disturb native cleanup holds. Explicit empty durably overrides a legacy
+container environment after Poise restarts. Local mode keeps environment-based
+configuration. Unset or empty opts out.
 
 Reporting requires at least three settled original Caller repair receipts on the
 same current head, review basis and slot after the last Resume, each with positive
@@ -463,6 +466,8 @@ Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require repair on that head and review basis.
 Stale, unknown or changed findings leave reporting pending. Other causes remain
 visible in their ordinary holds without an issue report; mixed causes cannot qualify.
+Revoking repository scope during verification prevents publication and leaves the
+creation intent unconsumed, so re-enabling can still report once.
 
 Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the

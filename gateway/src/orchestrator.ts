@@ -49,6 +49,8 @@ export interface ServiceHealth {
   release: string | null
   /** The release a pending switch restarts Poise onto; null when none is pending, or the workspace does not say. */
   switching: string | null
+  /** Missing on releases that cannot apply reporting configuration in place. */
+  repairExhaustionRepositories?: string
 }
 
 /** A runtime image's release and the base it runs on, from its labels (deploy/runtime/Dockerfile). */
@@ -142,6 +144,9 @@ function parseHealth(text: string, what: string): ServiceHealth {
     )
   }
   const nativeCalls = value.unsettledNativeCalls
+  if (value.repairExhaustionRepositories !== undefined && typeof value.repairExhaustionRepositories !== 'string') {
+    throw new WorkspaceAnswerError(`the workspace answered ${what} with invalid repairExhaustionRepositories`)
+  }
   if (nativeCalls !== undefined && nativeCalls !== null &&
       (typeof nativeCalls !== 'number' || !Number.isSafeInteger(nativeCalls) || nativeCalls < 0)) {
     throw new WorkspaceAnswerError(`the workspace answered ${what} with invalid unsettledNativeCalls`)
@@ -159,6 +164,7 @@ function parseHealth(text: string, what: string): ServiceHealth {
     draining: value.draining,
     release: typeof value.release === 'string' && value.release ? value.release : null,
     switching: typeof value.switching === 'string' && value.switching ? value.switching : null,
+    ...(value.repairExhaustionRepositories === undefined ? {} : { repairExhaustionRepositories: value.repairExhaustionRepositories }),
   }
 }
 
@@ -491,6 +497,7 @@ export class Orchestrator {
     }
     this.unreachableSince.delete(handle)
     if (health.release === null) return false
+    await this.configureReporting(handle, login, health)
     if (health.release === target.release) {
       await this.withdrawSwitch(handle, login, health, target)
       this.updating.delete(handle)
@@ -576,6 +583,7 @@ export class Orchestrator {
     if (!handle || !login) return
     try {
       const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+      await this.configureReporting(handle, login, health)
       if (health.release !== null && health.release !== target.release) await this.updateInPlace(handle, login, target)
       else if (health.release === target.release) {
         await this.withdrawSwitch(handle, login, health, target)
@@ -583,6 +591,15 @@ export class Orchestrator {
       }
     } catch (error) {
       this.deps.log.warn('workspace.update.check.failed', { handle, error: errorMessage(error) })
+    }
+  }
+
+  private async configureReporting(handle: string, login: string, health: ServiceHealth): Promise<void> {
+    const repositories = this.deps.config.repairExhaustionRepositories ?? ''
+    if (health.repairExhaustionRepositories === undefined || health.repairExhaustionRepositories === repositories) return
+    const applied = await this.serviceCall(handle, login, 'POST', '/api/service/config', { repairExhaustionRepositories: repositories })
+    if (applied.repairExhaustionRepositories !== repositories) {
+      throw new WorkspaceAnswerError('the workspace did not apply repairExhaustionRepositories')
     }
   }
 
@@ -1154,9 +1171,6 @@ export class Orchestrator {
   /** A container setting that differs from what the gateway would create now; only a new container applies it. */
   private changedSetting(details: ContainerDetails): string | null {
     if (!(details.Config.Env ?? []).includes(this.drainTimeoutEnv())) return 'changed drain timeout'
-    const reportRepositories = (details.Config.Env ?? []).find(value => value.startsWith('POISE_REPAIR_EXHAUSTION_REPOSITORIES='))
-      ?.slice('POISE_REPAIR_EXHAUSTION_REPOSITORIES='.length) ?? ''
-    if (reportRepositories !== (this.deps.config.repairExhaustionRepositories ?? '')) return 'changed repair exhaustion repositories'
     for (const name of BEHAVIOR_RESOURCE_VARIABLES) {
       const actual = (details.Config.Env ?? []).filter(value => value.startsWith(`${name}=`))
       const expected = this.deps.config.behaviorResourceEnv.find(value => value.startsWith(`${name}=`))
@@ -1180,10 +1194,11 @@ export class Orchestrator {
   }
 
   /** A call to the workspace's /api/service/* endpoints, carrying an admin-scope assertion. */
-  private async serviceCall(handle: string, login: string, method: 'GET' | 'POST', path: string): Promise<ServiceHealth> {
+  private async serviceCall(handle: string, login: string, method: 'GET' | 'POST', path: string, configuration?: { repairExhaustionRepositories: string }): Promise<ServiceHealth> {
     await this.ensureOnNetwork(handle)
     const { config, keys, now } = this.deps
     const publicHost = `${handle}.${config.domain}`
+    const body = configuration === undefined ? undefined : JSON.stringify(configuration)
     let response: { status: number; text: string }
     try {
       response = await this.serviceRequest(this.deps.upstream(handle), method, path, {
@@ -1192,8 +1207,9 @@ export class Orchestrator {
         'x-forwarded-proto': config.insecureHttp ? 'http' : 'https',
         'x-poise-identity': signAssertion(keys.privateKey, { handle, login, scope: 'admin' }, now()),
         accept: 'application/json',
-        ...(method === 'POST' ? { 'content-length': 0 } : {}),
-      })
+        ...(method === 'POST' ? { 'content-length': body === undefined ? 0 : Buffer.byteLength(body) } : {}),
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+      }, body)
     } catch (error) {
       // Reaching nothing is also what a lost network looks like: check it again before the next call.
       this.joined.delete(handle)

@@ -13,8 +13,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { BUILD_SHA } from '../build-identity'
+import { repairReportRepositories, setRepairReportRepositories } from '../behavior-chain-report'
 import type { ChatRuntime } from '../chat/runtime'
 import { findEvent, getOpenTurn, listOpenTurns } from '../chat/storage'
+import { db } from '../db'
 import { HttpError, readJson, type RequestAuthority } from '../http'
 import { markReleaseSwitch, pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
 import { eventLoopDelayStats, type EventLoopDelayStats } from '../event-loop-delay'
@@ -39,6 +41,8 @@ export interface ServiceHealth {
   release: string | null
   /** The release a pending switch restarts this server onto; null when none is pending. */
   switching: string | null
+  /** Effective reporting scope, including an explicitly applied empty allowlist. */
+  repairExhaustionRepositories: string
   /** Main-thread stall in the current minute window; spikes mark CLI fan-out. */
   eventLoop: EventLoopDelayStats
   /** The release this workspace is asked to run: the pending switch's target, else the active release. */
@@ -178,6 +182,7 @@ export class ServiceControl {
       draining: this.drainOn,
       release,
       switching,
+      repairExhaustionRepositories: repairReportRepositories(db),
       eventLoop: eventLoopDelayStats(),
       desiredRelease,
       installedRelease: desiredRelease !== null && this.releaseInstalled(desiredRelease) ? desiredRelease : null,
@@ -523,6 +528,14 @@ function json(res: ServerResponse, status: number, body: unknown): void {
  *  the gateway's admin scope. The owner's browser may only resume, to lift a
  *  drain the gateway left behind. */
 export function handleServiceApi(req: IncomingMessage, res: ServerResponse, path: string, authority: RequestAuthority, control: ServiceControl): void | Promise<void> {
+  if (path === '/api/service/config') {
+    if (authority.kind === 'gateway' && authority.scope !== 'admin') throw new HttpError(403, 'only the gateway configures service reporting')
+    if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return json(res, 405, { error: 'use POST for service configuration' }) }
+    return readJson<{ repairExhaustionRepositories?: unknown }>(req).then((body) => {
+      setRepairReportRepositories(db, body?.repairExhaustionRepositories)
+      json(res, 200, control.health())
+    })
+  }
   if (path === '/api/service/diagnostics') {
     if (authority.kind === 'gateway' && authority.scope !== 'admin') throw new HttpError(403, 'only the gateway collects workspace diagnostics')
     if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return json(res, 405, { error: 'use GET for diagnostics' }) }

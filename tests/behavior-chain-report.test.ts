@@ -8,7 +8,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
-import { REMEDIATION_SCOPE, repairReportReviewScope, reportRepairExhaustion } from '../server/behavior-chain-report'
+import { REMEDIATION_SCOPE, repairReportRepositories, repairReportReviewScope, reportRepairExhaustion, setRepairReportRepositories } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
 import type { Organization } from '../server/organizations'
 
@@ -354,6 +354,66 @@ it.each(['disabled', 'other repository', 'paused'])('keeps reporting opt-in: %s'
   vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', mode === 'disabled' ? '' : mode === 'other repository' ? 'acme/other' : 'acme/repo')
   await reportRepairExhaustion(db, journal, chain, async () => fresh, () => mode !== 'paused')
   expect(mocks.runFile).not.toHaveBeenCalled()
+})
+
+it('keeps an applied empty service allowlist disabled over the legacy environment after restart', async () => {
+  vi.stubEnv('POISE_MODE', 'service')
+  const root = mkdtempSync(join(tmpdir(), 'report-scope-')); roots.push(root)
+  const path = join(root, 'cache.db')
+  const initial = setup(path)
+  const chain = record(initial.journal, exhausted(initial.journal), { type: 'chain.observed', observation: observation() })
+  setRepairReportRepositories(initial.db, 'acme/other')
+  await operations(initial.db, initial.journal).reportHold!(chain)
+  expect(mocks.runFile).not.toHaveBeenCalled()
+  setRepairReportRepositories(initial.db, '')
+  initial.db.close(); databases.splice(databases.indexOf(initial.db), 1)
+
+  const { db, journal } = setup(path)
+  expect(repairReportRepositories(db)).toBe('')
+  await operations(db, journal).reportHold!(journal.read(chain.id)!)
+  expect(mocks.runFile).not.toHaveBeenCalled()
+  expect(reports(db)).toHaveLength(0)
+  setRepairReportRepositories(db, 'Acme/repo, acme/second')
+  await operations(db, journal).reportHold!(journal.read(chain.id)!)
+  expect(posts()).toHaveLength(1)
+  expect(journal.read(chain.id)).toEqual(chain)
+})
+
+it('preserves local environment reporting independently of applied service configuration', async () => {
+  vi.stubEnv('POISE_MODE', undefined)
+  const { db, journal } = setup()
+  const chain = record(journal, exhausted(journal), { type: 'chain.observed', observation: observation() })
+  setRepairReportRepositories(db, '')
+  await operations(db, journal).reportHold!(chain)
+  expect(posts()).toHaveLength(1)
+})
+
+it.each(['verification', 'source issue', 'marker search'])('revokes reporting during %s without consuming creation intent', async boundary => {
+  vi.stubEnv('POISE_MODE', 'service')
+  const { db, journal } = setup()
+  const chain = record(journal, exhausted(journal), { type: 'chain.observed', observation: observation() })
+  setRepairReportRepositories(db, 'acme/repo')
+  const run = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    const result = await run(command, argv)
+    if (command === 'gh' && (boundary === 'source issue' && argv[1] === 'repos/acme/repo/issues/7'
+      || boundary === 'marker search' && argv[1] === 'search/issues')) setRepairReportRepositories(db, '')
+    return result
+  })
+  await reportRepairExhaustion(db, journal, chain, async () => {
+    if (boundary === 'verification') setRepairReportRepositories(db, '')
+    return observation()
+  }, () => true)
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
+  expect(journal.read(chain.id)).toEqual(chain)
+
+  mocks.runFile.mockImplementation(run)
+  setRepairReportRepositories(db, 'acme/repo')
+  await operations(db, journal).reportHold!(chain)
+  await operations(db, journal).reportHold!(chain)
+  expect(posts()).toHaveLength(1)
+  expect(reports(db)).toHaveLength(1)
 })
 
 it('requires datastore freshness even on the same head and leaves an edited finding pending', async () => {
