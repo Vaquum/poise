@@ -16,6 +16,16 @@ function blockingThreads(pull: NonNullable<ChainObservation['pull']>): number {
   return 0
 }
 
+/** Missing required PR-review slot, mirroring decideBehaviorChain review-pr first:
+ * any configured reviewer without a completed same-head review-pr needs review. */
+function needsPrReview(chain: BehaviorChain, observation: ChainObservation | null, pull: NonNullable<ChainObservation['pull']>): boolean {
+  if (!observation || !Array.isArray(observation.prReviewers) || observation.prReviewers.length === 0) return false
+  return observation.prReviewers.some(reviewer => !chain.invocations.some(invocation =>
+    invocation.behavior === 'review-pr' && invocation.evidence?.status === 'completed'
+    && (invocation.evidence.head_sha === pull.head || invocation.request.context?.head === pull.head)
+    && invocation.slot === reviewer.slot))
+}
+
 function exactPull(observation: ChainObservation | null) {
   const pull = observation?.pull
   return pull && /^[a-f0-9]{40}$/i.test(pull.head) && observation!.publication?.pull_number === pull.number
@@ -148,17 +158,18 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
             : active ? 'Await the original invocation outcome'
               : state !== 'fresh' ? 'Await a fresh, complete chain observation'
                 : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
-                  : pull?.failing.length ? 'Repair the failing required checks'
-                    : pull?.changesRequested ? 'Address current-head review findings'
-                      : pull?.conflict || pull?.behind ? 'Repair the branch conflict or required base update'
-                        : pull && (pull.unresolved ?? 0) > 0 && !pull.approved && !repairVerified ? 'Address current-head review conversations through repair-pr'
-                          : pull?.pending && Number.isFinite(pull.headSince) && now - pull.headSince >= 30 * 60_000
-                            ? 'Diagnose the checks pending over 30 minutes through repair-pr'
-                            : pull?.pending ? 'Await exact-head CI completion'
-                              : queueRejectionNeedsRepair && pull && !pull.approved
-                                ? `Diagnose and repair GitHub queue rejection ${queueRemoval!.id}: ${queueRemoval!.reason} through repair-pr; PR-head green checks do not prove integration success`
-                                : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
-                                  : chain.waiting || 'Await the next invocation under existing admission gates'
+                  : queueRejectionNeedsRepair && pull
+                    ? `Diagnose and repair GitHub queue rejection ${queueRemoval!.id}: ${queueRemoval!.reason} through repair-pr; PR-head green checks do not prove integration success`
+                    : pull && needsPrReview(chain, observation, pull) ? 'Review the actual current pull-request head through review-pr'
+                      : pull?.failing.length ? 'Repair the failing required checks'
+                        : pull?.changesRequested && !repairVerified ? 'Address current-head review findings'
+                          : pull?.conflict || pull?.behind ? 'Repair the branch conflict or required base update'
+                            : pull && (pull.unresolved ?? 0) > 0 && !pull.approved && !repairVerified ? 'Address current-head review conversations through repair-pr'
+                              : pull?.pending && Number.isFinite(pull.headSince) && now - pull.headSince >= 30 * 60_000
+                                ? 'Diagnose the checks pending over 30 minutes through repair-pr'
+                                : pull?.pending ? 'Await exact-head CI completion'
+                                  : pull && !pull.approved ? 'Obtain qualifying current-head review and approval'
+                                    : chain.waiting || 'Await the next invocation under existing admission gates'
       let retryAt: number | null = null
       if (!chain.held && !chain.reviewPending && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`) {
         const attempts = chain.invocations.filter(invocation => invocation.behavior === last.behavior && invocation.basis === last.basis
