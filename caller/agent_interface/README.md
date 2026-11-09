@@ -375,6 +375,15 @@ The limit applies per response. `pr_approve` has no inspection tool, so all its 
 is one response, and Claude Code restarts a response cut at the limit without that reasoning.
 Other behaviors retain their existing model assignments and limits.
 
+Local pinned-repository inspection has a separate 30-second deadline, capped by
+the remaining review budget. A timeout records `review_inspection_timeout` and
+retains the inspection phase, deadline and pinned target in the existing process
+diagnostic, without command arguments or inspection content in the error.
+Poise excludes this diagnostic from provider backoff, including older calls
+labeled `review_budget_exhausted`. The existing behavior chain retries the same
+review basis and slot after resource release and native failure backoff, holding
+after three failed attempts; Caller adds no inspection retry loop.
+
 A Grok Build `pr_review` or `pr_approve` also has an 800-second analysis ceiling,
 counted from when analysis starts, for one file group or many, with or without
 inspection rounds. With no verdict by then the run stops, posts nothing and fails

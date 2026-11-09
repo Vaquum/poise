@@ -894,6 +894,10 @@ function isPreparationBudgetExhaustion(call: LogEntry): boolean {
 // nothing posted. Callers gate on postedNothing, so a run that submitted
 // still holds exactly as before.
 export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
+  // Local inspection can time out after a successful provider request. Its
+  // diagnostic takes precedence over provider-like text in older errors.
+  if (call.diagnostic?.operation === 'github-interface' && call.diagnostic.phase === 'inspection'
+    && call.diagnostic.outcome === 'timed_out') return null
   const account = reviewAccountFailure(call)
   if (account) return account
   const error = String(call.error || '')
