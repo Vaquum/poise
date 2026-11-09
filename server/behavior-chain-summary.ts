@@ -196,6 +196,12 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
       const last = chain.invocations.at(-1)
       const lastQueue = pull ? lastChainQueueInvocation(chain) : undefined
       const queueRemoval = pull?.queueRemoval ?? null
+      // Mirroring decideBehaviorChain: a dismissed chain approval on the
+      // current head holds for an explicit decision before any review or repair.
+      const dismissedApproval = pull
+        ? (pull.reviewReceipts ?? []).find(review => review.head === pull.head && review.state === 'DISMISSED'
+          && chain.invocations.some(invocation => invocation.behavior === 'approve-pr' && invocation.callId === review.invocation))
+        : undefined
       // Mirroring decideBehaviorChain: a previously queued head without current
       // removal evidence waits for that evidence instead of review or repair.
       const queueAwaitingRemoval = !!pull && lastQueue?.evidence?.head_sha === pull.head
@@ -323,6 +329,8 @@ export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date
                     : observation && unpublishedMissingReceipt ? 'Hold: seed branch exists without this chain’s native publication receipt; a decision is required'
                     : observation && unpublishedNoChanges ? 'Hold: implementation returned no changes and produced no pull request; a decision is required'
                     : pull?.queueEntry ? 'Await verified GitHub merge completion; a queue receipt cannot establish a merge'
+                      : dismissedApproval && pull
+                      ? `Hold: approval ${dismissedApproval.id} was dismissed on the current head; a decision is required`
                       : queueAwaitingRemoval && pull
                         ? 'Await GitHub queue removal evidence; the queue outcome remains unverified'
                         : queueMergedNeedsWait && pull

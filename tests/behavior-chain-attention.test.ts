@@ -947,3 +947,33 @@ it('holds an unpublished implementation that returned no_changes instead of an i
   expect(entry.nextAction).toContain('no changes')
   expect(entry.nextAction).not.toContain('Await the next invocation')
 })
+
+it('holds a dismissed chain approval for a decision instead of directing a missing review-pr', () => {
+  const journal = new BehaviorChainJournal(db)
+  const admittedAt = now - 2 * CHAIN_ATTENTION_DELAY_MS
+  const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const head = 'f'.repeat(40)
+  const observation: ChainObservation = { checkedAt: admittedAt + 60_000, existingPulls: [],
+    issue: { open: true, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
+    implementer: reviewer, repairer: reviewer, approver: reviewer,
+    publication: { pull_number: 984, head_sha: head, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 984, head, headSince: admittedAt + 60_000, state: 'open', draft: false, merged: false, mergeSha: null,
+      queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewReceipts: [{ id: 77, head, state: 'DISMISSED', invocation: 'approve-call-984' }],
+      reviewRevision: 'findings', reviewContext: 'b'.repeat(64),
+      greyRuns: [], checksState: 'SUCCESS', readinessBlockers: [], pending: false, failing: [], conflict: false, behind: false } }
+  let chain = admit(journal, 984, admittedAt)
+  chain = append(journal, chain, { type: 'invocation.admitted', invocation: { id: 'approve-984', behavior: 'approve-pr', actor: chain.reviewer,
+    model: 'fixture', slot: 'primary', basis: chainBasis(['approve', head, 'findings', null]), admittedAt: admittedAt + 30_000,
+    request: { command: 'agent-interface', cwd: '/isolated/fixture', argv: [] } } }, admittedAt + 30_000)
+  chain = append(journal, chain, { type: 'invocation.settled', invocationId: 'approve-984', callId: 'approve-call-984', outcome: 'approved',
+    evidence: { status: 'completed', action: 'approved', head_sha: head, review_id: 77, completedAt: admittedAt + 40_000 } }, admittedAt + 40_000)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, admittedAt + 60_000)
+  chain = append(journal, chain, { type: 'chain.resumed' })
+  chain = append(journal, chain, { type: 'chain.observed', observation: { ...structuredClone(observation), checkedAt: now } }, now)
+  const entry = behaviorChainAttention(journal, now).find(entry => entry.id === chain.id)!
+  expect(entry.evidence.state).toBe('fresh')
+  expect(entry.nextAction).toContain('was dismissed on the current head')
+  expect(entry.nextAction).toContain('77')
+  expect(entry.nextAction).not.toContain('Review the actual current pull-request head')
+})
