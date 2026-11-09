@@ -15,6 +15,7 @@ export interface ChainRuntimeOperations {
   discover(): Promise<ChainSeed[]>
   ownsRepository(repository: string): boolean
   observe(chain: BehaviorChain): Promise<ChainObservation>
+  reportHold?(chain: BehaviorChain): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
   available(): boolean
@@ -230,11 +231,13 @@ export class BehaviorChainRuntime {
             firstMerged: this.journal.firstMergedObservation(chain.id) as ChainObservation | null,
           } : undefined
           const decision = decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
+          if (chain.held && decision.kind === 'wait' && this.operations.reportHold && await this.reportHold(chain)) continue
           if (decision.kind === 'complete') {
             this.append(chain, { type: 'chain.merged', mergeSha: decision.mergeSha, evidence: { repository: chain.repository,
               pull_number: observation.pull!.number, merged: true, merge_sha: decision.mergeSha, review_complete: true } })
           } else if (decision.kind === 'hold') {
-            if (!chain.held) this.append(chain, { type: 'chain.held', reason: decision.reason })
+            if (!chain.held) chain = this.append(chain, { type: 'chain.held', reason: decision.reason })
+            if (this.operations.reportHold) await this.reportHold(chain)
           } else if (decision.kind === 'invoke' && this.operations.enabled() && (!decision.reviewer || this.operations.available()) && this.operations.permitted(chain, decision)) {
             const closed = closedChainTarget(chain, observation, decision.behavior)
             if (closed) {
@@ -330,6 +333,17 @@ export class BehaviorChainRuntime {
     } finally {
       this.running = false
     }
+  }
+
+  private async reportHold(chain: BehaviorChain): Promise<boolean> {
+    let reason: string | null
+    try { reason = await this.operations.reportHold!(chain) }
+    catch (error) { reason = `Repair exhaustion reporting pending: ${error instanceof Error ? error.message : String(error)}` }
+    const current = this.current(chain)
+    if (reason && current.held && current.resumedAfterSequence === chain.resumedAfterSequence && current.waiting !== reason) {
+      this.append(current, { type: 'chain.waiting', reason })
+    }
+    return reason !== null
   }
 
   private async reconcile(chain: BehaviorChain, snapshot: AgentLogSnapshot): Promise<BehaviorChain> {

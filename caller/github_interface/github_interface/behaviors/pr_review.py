@@ -5,6 +5,7 @@ from github_interface.atoms.pulls import (
     get_pull,
     list_inline_comments,
     list_review_threads,
+    list_reviews,
 )
 from github_interface.atoms.review_diff import review_diff
 from github_interface.client import GitHubClient
@@ -32,6 +33,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     rest_comments = await list_inline_comments(client, owner, repo, pull_number)
     public_comments = await issue_comments(client, owner, repo, pull_number)
     threads = await list_review_threads(client, owner, repo, pull_number)
+    reviews = await list_reviews(client, owner, repo, pull_number)
     issues = await linked_issues(client, owner, repo, pull_number)
 
     context = {
@@ -46,6 +48,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "author_pr_comments": _author_comment_summary(public_comments, pull),
         "review_threads": threads,
         "resolved_threads": [thread for thread in threads if thread["is_resolved"]],
+        "change_request_reviews": _change_request_summary(reviews, required_head),
         "linked_issues": issues,
     }
     packet_diff = await review_diff(client, owner, repo, pull, context, since=since)
@@ -102,6 +105,31 @@ def _author_comment_summary(comments: list[dict[str, Any]], pull: dict[str, Any]
         }
         for comment in comments
         if author and str((comment.get("user") or {}).get("login") or "").lower() == author
+    ]
+
+
+def _change_request_summary(reviews: list[dict[str, Any]], head: str) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for review in sorted(reviews, key=lambda item: str(item.get("submitted_at") or "")):
+        if review.get("state") not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+            continue
+        login = str((review.get("user") or {}).get("login") or "").lower()
+        if login:
+            latest[login] = review
+    return [
+        {
+            "id": review["id"],
+            "user": review["user"]["login"],
+            "state": review["state"],
+            "commit_id": review["commit_id"],
+            "submitted_at": review["submitted_at"],
+            "url": review["html_url"],
+            "body": review["body"],
+        }
+        for review in latest.values()
+        if review["state"] == "CHANGES_REQUESTED"
+        and str(review.get("commit_id") or "").lower() == head
+        and str(review.get("body") or "").strip()
     ]
 
 

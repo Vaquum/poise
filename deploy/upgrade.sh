@@ -72,6 +72,7 @@ image=$(runtime_image)
 sha=$(source_sha)
 expected_workspaces=$(workspace_handles)
 build_runtime_image "$image" "$sha"
+start_rollout "$sha" "$image" "$expected_workspaces"
 plan=$(plan_workspaces "$image")
 say "Recreating what changed."
 compose up --detach --build

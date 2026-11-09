@@ -1116,6 +1116,11 @@ Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
 recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, or
 whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
 its own, keeping its volume and respecting the native settlement barrier.
+The operator scripts retain an exact-release rollout receipt beyond their
+bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
+receipt through the existing workspace health/image proof without initiating
+another rollout; [Upgrades](Operating.md#upgrades) defines its outcomes and
+retained evidence. This adds no gateway or workspace API.
 
 **Provider CLIs** are installed into each person's home volume on first start
 and update themselves there, as Poise already does before each launch. The
@@ -1392,6 +1397,16 @@ Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhau
 code and existing v1 diagnostic into chain receipts and History. The unchanged
 no-publication shape and retry requirements are defined in
 [Behavior chain](Behavior-chain.md#authority-and-recovery).
+
+Optional repair-exhaustion reporting uses the same held-chain reconciliation,
+configured-account issue publisher and datastore intake. An explicit per-repository
+environment opt-in enables only verified incomplete-reply exhaustion. Durable
+creation intent prevents another POST after an uncertain result; the source hold,
+label/intake blockers and generated-issue recursion boundary stay visible through
+the existing `waiting` field. It adds no gateway route, scope, journal event,
+settings default or admission bypass. See
+[reporting verified repair exhaustion](Behavior-chain.md#reporting-verified-repair-exhaustion)
+for configuration, evidence and pending live acceptance.
 
 ## Google document publishing
 
