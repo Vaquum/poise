@@ -17,6 +17,7 @@ export interface ChainRuntimeOperations {
   discover(): Promise<ChainSeed[]>
   ownsRepository(repository: string): boolean
   observe(chain: BehaviorChain): Promise<ChainObservation>
+  /** Also reports terminal uncertain merge submissions without a chain hold. */
   reportHold?(chain: BehaviorChain): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
@@ -292,6 +293,7 @@ export class BehaviorChainRuntime {
                 phase = 'invocation-recovery'
                 try { await this.recover(chain, pendingInvocation, observation, chainSnapshot) }
                 catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError ??= error }
+                if (pendingInvocation.behavior === 'merge-pr' && this.operations.reportHold) await this.reportHold(this.current(chain))
                 continue
               }
               phase = 'decision'
@@ -425,9 +427,10 @@ export class BehaviorChainRuntime {
   private async reportHold(chain: BehaviorChain): Promise<boolean> {
     let reason: string | null
     try { reason = await this.operations.reportHold!(chain) }
-    catch (error) { reason = `Repair exhaustion reporting pending: ${error instanceof Error ? error.message : String(error)}` }
+    catch (error) { reason = `Work-failure reporting pending: ${error instanceof Error ? error.message : String(error)}` }
     const current = this.current(chain)
-    if (reason && current.held && current.resumedAfterSequence === chain.resumedAfterSequence && current.waiting !== reason) {
+    if (reason && (current.held || current.invocations.some(invocation => invocation.behavior === 'merge-pr' && invocation.state === 'uncertain'))
+      && current.resumedAfterSequence === chain.resumedAfterSequence && current.waiting !== reason) {
       this.append(current, { type: 'chain.waiting', reason })
     }
     return reason !== null

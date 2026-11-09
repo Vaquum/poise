@@ -10,6 +10,8 @@ import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/beh
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import { REMEDIATION_SCOPE, repairReportReviewScope, reportRepairExhaustion } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
+import { nativeRequestSha } from '../server/behavior-chain-action'
+import type { LogEntry } from '../server/agent-log-parse'
 import type { Organization } from '../server/organizations'
 
 const mocks = vi.hoisted(() => ({ runFile: vi.fn(), settings: { enabled: true, seedMode: 'label', label: 'poise' },
@@ -133,6 +135,28 @@ function exhausted(journal: BehaviorChainJournal, errors = [LEGACY, LEGACY, LEGA
   }
   return record(journal, chain, { type: 'chain.held', reason: 'repair-pr failed before publication three times: ' + errors.at(-1) })
 }
+function uncertainMerge(journal: BehaviorChainJournal) {
+  let chain = journal.append('acme/repo#7', 'seed:7', 0, { type: 'chain.admitted', repository: 'acme/repo', issue: 7,
+    branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' }, NOW - 600_000)
+  chain = record(journal, chain, { type: 'chain.observed', observation: observation() })
+  chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id: 'original-merge', behavior: 'merge-pr',
+    basis: chainBasis(['merge', HEAD]), actor: 'reviewer', slot: null, model: null, admittedAt: NOW - 120_000,
+    request: { command: 'github-interface', nativeResources: 2, cwd: '/fixture',
+      argv: ['--merge-if-ready', '21', '--author', 'author', '--expected-head', HEAD, '--token-user', 'reviewer'] } } })
+  chain = record(journal, chain, { type: 'invocation.started', invocationId: 'original-merge' })
+  const invocation = chain.invocations[0], id = 'c'.repeat(32)
+  const call: LogEntry = { id, correlation_id: invocation.id, model: 'native-action', behavior: 'native_action',
+    source: 'poise:behavior-chain', actor: invocation.actor, repo: chain.repository, pr_id: '21', session_id: null, prompt: '',
+    started_at: new Date(invocation.admittedAt).toISOString(), completed_at: new Date(NOW - 60_000).toISOString(), time_elapsed: '1m',
+    status: 'failed', action: null, outcome: null, error: 'native command failed', error_code: 'native_action_failed',
+    head_sha: null, expected_head: HEAD, response: null, resources_settled_at: new Date(NOW - 60_000).toISOString(),
+    artifact: { phase: 'performing_native_action', request_sha: nativeRequestSha(invocation.request) },
+    resource_ownership: { version: 2, roots: [], errors: [], namespace: { state: 'settled', callId: id,
+      correlation: invocation.id, settled_at: (NOW - 60_000) / 1000, controller: { version: 1, instance: 'd'.repeat(32) },
+      binding: { pid: 104, start: '12', namespace: 'pid:[91]', owner: { pid: 102, start: '10' },
+        holder: { pid: 103, start: '11' }, epoch: { boot: 'fixture', init_start: '1', namespace_dev: '2', namespace_ino: '3' } } } } }
+  return { chain, call }
+}
 function operations(db: Database.Database, journal: BehaviorChainJournal, overrides: Partial<ChainRuntimeOperations> = {}): ChainRuntimeOperations {
   const forbidden = async () => { throw new Error('Fixture must not start native work') }
   const intake = nativeChainOperations({ login: 'acme' } as Organization, {
@@ -151,6 +175,101 @@ function operations(db: Database.Database, journal: BehaviorChainJournal, overri
 }
 const posts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1] === 'repos/acme/repo/issues')
 const reports = (db: Database.Database) => db.prepare("SELECT value FROM meta WHERE key LIKE 'behavior_chain_repair_report:%'").all() as { value: string }[]
+
+it.each([false, true])('reports an unheld uncertain merge through recovery without another submission (diagnostic=%s)', async diagnostic => {
+  const { db, journal } = setup()
+  const { chain, call } = uncertainMerge(journal)
+  if (diagnostic) call.diagnostic = { version: 1, source: 'caller', severity: 'error', operation: 'github-interface',
+    phase: 'native_action', outcome: 'exit', stderr: '/private/work raw output', stderr_truncated: false,
+    context: { exit_code: 1, refusal: 'merge request refused' }, filesystem: null }
+  // Readiness/conflicts may need repair, but the original uncertain merge blocks it.
+  fresh.pull!.conflict = true; fresh.pull!.failing = ['Verify:failure']; fresh.pull!.ready = false
+  fresh.pull!.reviewRevision = chainBasis('changed findings on the same head')
+  const perform = vi.fn(async () => { throw new Error('must not retry the merge') })
+  const runtime = new BehaviorChainRuntime(journal, operations(db, journal, { perform,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }))
+  await runtime.run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0]).toMatchObject({ title: 'fix: uncertain merge submission for #21', labels: [{ name: 'poise' }] })
+  expect(remote[0].body).toContain(`<!-- poise-repair-exhaustion:${chainBasis(['merge_submission_uncertain', chain.id, 'original-merge'])} -->`)
+  for (const fact of ['https://github.com/acme/repo/issues/7', 'https://github.com/acme/repo/pull/21', HEAD,
+    'Invocation original-merge', 'Caller ' + call.id, 'native_action_failed', 'Next action:', 'external effect remains unconfirmed']) {
+    expect(remote[0].body).toContain(fact)
+  }
+  expect(remote[0].body).toContain(diagnostic ? 'merge request refused' : 'Process diagnostic: not recorded in this historical Call receipt')
+  expect(remote[0].body).not.toContain('/private/work')
+  expect(remote[0].body.split(REMEDIATION_SCOPE)).toHaveLength(2)
+  const current = journal.read(chain.id)!
+  expect(current).toMatchObject({ held: null, author: chain.author, reviewer: chain.reviewer, branch: chain.branch,
+    resumedAfterSequence: 0, mergeSha: null, waiting: expect.stringContaining('admission pending normal datastore intake') })
+  expect(current.invocations).toMatchObject([{ id: 'original-merge', state: 'uncertain', callId: null,
+    evidence: { nativeCallId: call.id, error_code: 'native_action_failed', resource_ownership: call.resource_ownership } }])
+  expect(reports(db).map(row => JSON.parse(row.value))).toMatchObject([{ holdSequence: null, heldAt: null,
+    attempts: [{ invocation: 'original-merge', call: call.id }], issueNumber: 99 }])
+  journal.rebuild()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { perform,
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) })).run()
+  expect(posts()).toHaveLength(1)
+  expect(journal.read(chain.id)!.invocations).toEqual(current.invocations)
+  expect(perform).not.toHaveBeenCalled()
+})
+
+it.each(['queued', 'merged', 'closed PR', 'closed seed', 'changed head', 'different PR', 'unknown queue', 'unavailable',
+  'running Call', 'pending resources', 'missing Call', 'missing terminal time', 'disabled', 'changed account',
+  'generated marker', 'generated issue link'])('defers uncertain merge reporting for %s', async change => {
+  const { db, journal } = setup()
+  const { chain, call } = uncertainMerge(journal)
+  if (change === 'queued') fresh.pull!.queueEntry = 'queue-entry'
+  if (change === 'merged') Object.assign(fresh.pull!, { state: 'closed', merged: true, mergeSha: 'b'.repeat(40) })
+  if (change === 'closed PR') fresh.pull!.state = 'closed'
+  if (change === 'closed seed') fresh.issue.open = false
+  if (change === 'changed head') fresh.pull!.head = 'b'.repeat(40)
+  if (change === 'different PR') fresh.pull!.number++
+  if (change === 'unknown queue') Reflect.deleteProperty(fresh.pull!, 'queueEntry')
+  if (change === 'unavailable') stale = true
+  if (change === 'running Call') { call.status = 'running'; call.completed_at = null; call.resources_settled_at = null }
+  if (change === 'pending resources') call.resources_settled_at = null
+  if (change === 'missing terminal time') call.completed_at = null
+  if (change === 'disabled') vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', '')
+  if (change === 'changed account') mocks.accounts.me = 'other'
+  if (change === 'generated marker') seedBody = `<!-- poise-repair-exhaustion:${chainBasis('another report')} -->`
+  if (change === 'generated issue link') db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)')
+    .run('behavior_chain_repair_report:original', JSON.stringify({ source: 'acme/repo#6', issueNumber: 7 }))
+  const priorReports = reports(db)
+  const runtime = new BehaviorChainRuntime(journal, operations(db, journal, { discover: async () => [],
+    readInvocations: async () => ({ entries: change === 'missing Call' ? [] : [call], quarantined: [] }) }))
+  await runtime.run()
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toEqual(priorReports)
+  expect(journal.read(chain.id)!.invocations).toHaveLength(1)
+  expect(journal.read(chain.id)!.invocations[0].state).not.toBe('settled')
+})
+
+it('never repeats an uncertain merge report POST after a lost acknowledgement, restart, empty searches or closure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'merge-report-')); roots.push(root)
+  const path = join(root, 'journal.sqlite')
+  const initial = setup(path)
+  const { chain, call } = uncertainMerge(initial.journal)
+  const overrides = { readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  loseCreation = true
+  await new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal, overrides)).run()
+  expect(posts()).toHaveLength(1)
+  expect(JSON.parse(reports(initial.db)[0].value).issueNumber).toBeNull()
+  initial.db.close(); databases.splice(databases.indexOf(initial.db), 1)
+  const { db, journal } = setup(path)
+  journal.rebuild()
+  searchVisible = false
+  for (let pass = 0; pass < 3; pass++) {
+    await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+    expect(journal.read(chain.id)?.waiting).toContain('creation is unconfirmed')
+  }
+  searchVisible = true; remote[0].state = 'closed'
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  expect(journal.read(chain.id)?.waiting).toContain('is closed; no replacement')
+  expect(JSON.parse(reports(db)[0].value).issueNumber).toBe(99)
+  expect(posts()).toHaveLength(1)
+  expect(journal.read(chain.id)).toMatchObject({ held: null, invocations: [{ state: 'uncertain', callId: null }] })
+})
 
 it.each(['legacy', 'diagnostic omissions', 'execution budget'])('reports a pre-existing %s hold and verifies ordinary admission', async mode => {
   const { db, journal } = setup()

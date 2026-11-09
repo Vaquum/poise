@@ -443,8 +443,9 @@ failure is a failed, unstarted action and retries with the existing backoff.
 Reporting is off by default. An operator can set
 `POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
 list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
-holds during their ordinary bounded reconciliation; no Resume or extra poller is
-needed. Reporting preserves the source hold and does not perform repair recovery.
+repair holds and uncertain merge submissions during their ordinary bounded
+reconciliation; no Resume or extra poller is needed. Reporting preserves the
+source hold, uncertainty and ownership and does not perform recovery.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
 variable. The gateway forwards it on install; adding, changing or removing it
 cooperatively replaces existing workspaces, even on the same image. Unset or
@@ -462,18 +463,35 @@ the same cause. Hold text and generic failures cannot establish eligibility.
 Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require repair on that head and review basis.
 Stale, unknown or changed findings leave reporting pending. Other causes remain
-visible in their ordinary holds without an issue report; mixed causes cannot qualify.
+visible in their ordinary holds without an issue report; mixed repair causes cannot qualify.
+
+`merge_submission_uncertain` separately qualifies the original pending `merge-pr`
+invocation after recovery rereads the journal, even without an explicit chain hold.
+Its failed terminal Call must have a completion time and positive resource-release
+proof, with no accepted action receipt or proven no-effect result. The Call identity
+can be retained as `evidence.nativeCallId` while `invocation.callId` remains null.
+A fresh native observation must verify that the seed and original PR remain open,
+the PR still has the request's pinned head, and no merge is running or queued.
+Unavailable evidence, a changed target, closure or a confirmed merge prevents
+creation. Same-head conflicts, failing CI and other readiness blockers do not
+prevent reporting: the uncertain invocation also blocks repair. The report names
+the seed, PR, head, original invocation and Call, recorded error code and bounded
+process diagnostic facts, or explicitly states that historical diagnostics are
+missing. Its next action is to inspect and reconcile those original receipts and
+the PR/queue state before deciding how to proceed. It never retries the merge or
+asserts an unobserved external write.
 
 Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the
 stage, stable cause, target, hold time/age, head/basis, safe invocation and Caller
 receipt identities, and next action. It excludes raw errors, omitted finding IDs,
 worker paths and provider output. An intent in the existing durable metadata store
-links the original hold event to the report issue. Identity uses cause + source
+links the original failure to the report issue. Repair identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
-Existing incomplete-reply intent keys and markers remain unchanged; budget reports
-use a separate cause with the same metadata and marker format.
-Both report bodies include the canonical clinical scope directive in the
+Existing repair intent keys and markers remain unchanged. Uncertain merge reports
+use cause + source chain + original invocation, with the same metadata store and
+marker format; an unheld source has no hold event or hold time.
+All report bodies include the canonical clinical scope directive in the
 [report template](../server/behavior-chain-report.ts), followed by
 "Include this exact paragraph in the linked PR review." Native PR review and
 approval check closing references only when their chain's exact seed is a recorded
@@ -504,12 +522,14 @@ incompatible saved intake labels and a held remediation chain are shown in the
 source chain's `waiting` reason, including its report URL when known. Poise does
 not add a different intake label or bypass ownership/admission gates. Admission is
 verified only when the normal datastore intake records the new chain. Generated
-remediation issues cannot report either cause recursively, using their marker
-or the retained source-to-issue link; their ordinary repair holds remain visible.
+remediation issues cannot report any supported cause recursively, using their
+marker or the retained source-to-issue link; their ordinary holds and uncertainty
+remain visible.
 
 `tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
-creation/restart, reconciliation and normal admission with an isolated journal
-and fake GitHub/datastore commands. Live acceptance remains pending until an
+creation/restart, reconciliation, uncertain merge target suppression and normal
+admission with an isolated journal and fake GitHub/datastore commands. Live
+acceptance remains pending until an
 operator follows a real qualifying hold through one labeled report, chain
 admission and the normal merge receipt after deployment. No fabricated hold,
 live write or production setting change is part of that component proof.

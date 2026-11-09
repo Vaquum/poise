@@ -279,7 +279,7 @@ Environment the gateway passes:
 | `HOME` | `/home/poise` |
 | `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 5400), so both sides time a drain alike |
 | `POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES` | optional validated whole-byte native behavior settings from the gateway; unset remains unbounded ([configuration](../gateway/README.md)) |
-| `POISE_REPAIR_EXHAUSTION_REPOSITORIES` | optional explicit comma-separated `owner/repo` allowlist from the gateway; unset or empty keeps repair exhaustion reporting disabled |
+| `POISE_REPAIR_EXHAUSTION_REPOSITORIES` | optional explicit comma-separated `owner/repo` allowlist from the gateway; unset or empty keeps work-failure reporting disabled |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 Beside each release, the gateway installs agents' test offload into the home
@@ -1433,10 +1433,13 @@ code and existing v1 diagnostic into chain receipts and History. The unchanged
 no-publication shape and retry requirements are defined in
 [Behavior chain](Behavior-chain.md#authority-and-recovery).
 
-Optional repair-exhaustion reporting uses the same held-chain reconciliation,
+Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
-environment opt-in enables verified incomplete-reply or execution-budget exhaustion.
-Durable creation intent prevents another POST after an uncertain result; the source hold,
+environment opt-in enables verified incomplete-reply or execution-budget exhaustion
+and terminal uncertain merge submissions, including sources without an explicit hold.
+Merge reports revalidate the open seed/PR, original pinned head and absent queue
+entry after recovery, retaining the original invocation's uncertainty and ownership.
+Durable creation intent prevents another POST after an uncertain result; the source state,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. It adds no gateway route, scope, journal event,
 settings default or admission bypass. See
