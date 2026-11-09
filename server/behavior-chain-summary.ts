@@ -23,7 +23,8 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
     invocationCount: chain.invocations.length, invocations: chain.invocations.slice(-20).map((invocation) => {
       const proof = attributedNativeAction(invocation) ? matchingNativeActionReceipt(chain, invocation) : null
       const settlement = proof ? nativeActionSettlement(proof) : null
-      return { id: invocation.id, behavior: invocation.behavior, state: invocation.state, callId: invocation.callId, model: invocation.model,
+      return { id: invocation.id, behavior: invocation.behavior, state: invocation.state,
+        callId: invocation.callId ?? (typeof invocation.evidence?.nativeCallId === 'string' ? invocation.evidence.nativeCallId : null), model: invocation.model,
         slot: invocation.slot, outcome: invocation.outcome, admittedAt: invocation.admittedAt,
         nativeAction: !attributedNativeAction(invocation) ? null : {
           attribution: proof ? settlement!.status === 'completed' ? 'accepted-response' : 'observed-no-action'
@@ -33,7 +34,8 @@ export function behaviorChainSummary(chain: BehaviorChain, reconciliation?: { at
         },
         evidence: invocation.evidence ? { action: invocation.evidence.action, outcome: invocation.evidence.outcome,
           review_id: invocation.evidence.review_id, head_sha: invocation.evidence.head_sha,
-          resources_settled_at: invocation.evidence.resources_settled_at, error: invocation.evidence.error } : null,
+          resources_settled_at: invocation.evidence.resources_settled_at, error: invocation.evidence.error,
+          diagnostic: invocation.evidence.diagnostic } : null,
       }
     }) }
 }

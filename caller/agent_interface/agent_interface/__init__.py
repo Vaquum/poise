@@ -1412,9 +1412,12 @@ def run_native_action(argv: list[str], cwd: str, repository: str, actor: str, co
     except BaseException as error:
         if isinstance(error, native_action.NotStarted):
             started = False
+        diagnostic = getattr(error, "diagnostic", None)
+        no_action = not started or (argv[0] == "--merge-if-ready" and isinstance(error, native_action.ActionFailure)
+                                   and diagnostic.get("submission") in {"none", "rejected"})
         finish(id_, "failed", error=str(error)[:2000], error_code="native_action_failed",
-               outcome="preflight_failed" if not started else None, action="not_started" if not started else None,
-               diagnostic=getattr(error, "diagnostic", None))
+               outcome="preflight_failed" if no_action else None, action="not_started" if no_action else None,
+               diagnostic=diagnostic)
         raise
     finally:
         resource_ownership.cleanup_remaining(DB, id_)

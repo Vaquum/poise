@@ -105,6 +105,11 @@ this request performed the mutation. API errors fail visibly; a lost merge
 response can be reconciled by the next read without merging twice. This
 operation requires an explicit acting account.
 
+Merge-admission failures emit the existing bounded, redacted `caller_diagnostic`
+v1 envelope. Native Caller retains it with the original Call; the
+[native action receipt contract](../docs/Behavior-chain.md#native-action-receipts)
+defines refusal evidence, uncertainty and the chain's displayed next action.
+
 `github-interface --update-branch-if-behind '#7' --expected-head SHA --author
 USER --token-user AGENT` updates only the named author's open, non-draft head
 that is mergeable but behind its base with nothing else blocking. It revalidates

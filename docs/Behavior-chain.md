@@ -508,12 +508,21 @@ journal recovers that same accepted response without another native write. A
 returned response survives a subsequent nonzero process exit; the process failure
 is retained separately from the accepted effect. An observed prior merge, queue
 entry or empty thread set does not prove that this invocation performed it.
-Without its accepted response, the invocation remains uncertain and blocks a
-replacement write, even when another actor subsequently advances the PR. A
-failed receipt write has the same boundary: the returned response alone is not
-durable authority. Other chains can continue. Publication recovery likewise
-requires the original native invocation marker and pinned head; grey-CI recovery
+Merge-admission failures retain their bounded, redacted v1 diagnostic through
+the original Caller receipt. `submission: none` requires positive evidence that
+execution had not reached the mutation; `rejected` requires an explicit refusal
+response. Both use the existing no-action failure/backoff path; settlement still
+requires positive resource-release proof. Generic GraphQL errors, lost responses and
+missing queue confirmation retain `submission: uncertain`. The chain list and
+History show the original Call, cause and next action using this evidence.
+Without an accepted response or positive refusal evidence, the invocation remains
+uncertain and blocks a replacement write, even when the queue is empty or another
+actor subsequently advances the PR. A failed receipt write has the same boundary:
+the returned response alone is not durable authority. Other chains can continue.
+Publication recovery likewise requires the original native invocation marker and pinned head; grey-CI recovery
 retains its existing exact-workflow/attempt inspection.
+Historical Calls whose causes were discarded remain uncertain; this diagnostic
+path cannot reconstruct their missing evidence.
 
 ## Seed observation batch
 

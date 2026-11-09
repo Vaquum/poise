@@ -1,14 +1,17 @@
 """Fixed-command transport/SQLite tests, not native workflow acceptance."""
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import pytest
 
 import agent_interface as api
-from agent_interface import native_action
+from agent_interface import native_action, native_namespace, resource_ownership
 
 
 @pytest.fixture
@@ -171,3 +174,143 @@ def test_unmapped_signal_cannot_erase_an_accepted_response():
     assert native_action.process_failure(7) == {"code": 7, "signal": None}
     assert native_action.process_failure(-9) == {"code": None, "signal": "SIGKILL"}
     assert native_action.process_failure(-35) == {"code": None, "signal": "SIG35"}
+
+
+@pytest.mark.parametrize("mode,submission", [
+    ("pre_request", "none"), ("rejected", "rejected"), ("lost", "uncertain"),
+    ("graphql", "uncertain"), ("unconfirmed", "uncertain"), ("accepted", None),
+])
+@pytest.mark.skipif(sys.platform != "linux", reason="Native v2 receipt identity requires Linux /proc")
+def test_merge_failure_survives_cli_original_call_and_chain(database, monkeypatch, mode, submission):
+    repo = Path(__file__).resolve().parents[3]
+    monkeypatch.syspath_prepend(str(repo / "caller/github_interface/tests"))
+    from test_merge_queue import PULL, READY
+    from review_response_fixture import published_review, response
+
+    pull = {**PULL, "user": {"login": "author"}}
+    review = response(pull, "example/repo", 21, "reviewer")
+    argv = ["--merge-if-ready", "21", "--expected-head", "a" * 40, "--author", "author",
+            "--token-user", "reviewer", "--review-response-json", json.dumps(review)]
+    writes = database / "mutations"
+    script = f"""
+import json, sys
+from unittest.mock import patch
+from pathlib import Path
+import httpx
+from github_interface import cli, client
+from github_interface.behaviors.merge_if_ready import MergeAdmissionError
+mode = {mode!r}
+pull = {pull!r}
+ready = {READY!r}
+if mode == 'pre_request':
+    ready['id'] = None
+secret = 'ephemeral-client-credential'
+async def request(self, method, path, headers, retry_transient, follow_redirects, **kwargs):
+    if method == 'GET' and path.endswith('/pulls/21'):
+        payload = pull
+    elif method == 'GET' and path.endswith('/reviews'):
+        payload = {[published_review(review)]!r}
+    elif path == '/graphql' and kwargs['json']['query'].lstrip().startswith('query'):
+        payload = {{'data': {{'repository': {{'pullRequest': ready}}}}}}
+    elif path == '/graphql':
+        Path({str(writes)!r}).write_text('submitted')
+        assert kwargs['json']['variables'] == {{'pull': 'PR_7', 'head': 'a' * 40}}
+        if mode == 'lost':
+            raise httpx.ReadTimeout('Queue response lost after possible submission')
+        if mode == 'rejected':
+            return httpx.Response(403, json={{'message': 'Queue admission denied ' + secret + '原因' * 20000 + '\\nAuthorization: Bearer private-header'}},
+                                  request=httpx.Request(method, 'https://api.github.com/graphql'))
+        if mode == 'graphql':
+            payload = {{'errors': [{{'message': 'Internal resolver error', 'path': ['enqueuePullRequest']}}]}}
+        elif mode == 'unconfirmed':
+            payload = {{'data': {{'enqueuePullRequest': {{'mergeQueueEntry': None}}}}}}
+        else:
+            payload = {{'data': {{'enqueuePullRequest': {{'mergeQueueEntry': {{'id': 'original-entry', 'pullRequest': {{'headRefOid': 'a' * 40}}}}}}}}}}
+    else:
+        raise AssertionError((method, path))
+    return httpx.Response(200, json=payload, request=httpx.Request(method, 'https://api.github.com' + path))
+sys.argv = ['github-interface', *{argv!r}]
+with patch.object(client, 'get_token', return_value=secret), patch.object(client.GitHubClient, '_request', request):
+    cli.main()
+if mode == 'accepted':
+    print('caller_diagnostic: ' + json.dumps(MergeAdmissionError(RuntimeError('later refusal'), 'none').diagnostic), file=sys.stderr)
+    sys.exit(7)
+"""
+    with monkeypatch.context() as transport:
+        children = process(transport, script)
+        scopes = []
+
+        def enter(call, correlation):
+            identity = json.loads(row(call)["process_identity"])
+            scope = SimpleNamespace(key={"callId": call, "correlation": correlation, "token": "b" * 32},
+                address={"version": 1, "instance": "c" * 32, "path": str(database / "test-controller")},
+                binding={"pid": os.getpid() + 2, "start": "12", "namespace": "pid:[91]",
+                         "owner": {"pid": os.getpid(), "start": identity["start"]},
+                         "holder": {"pid": os.getpid() + 1, "start": "11"},
+                         "epoch": {key: str(value) for key, value in identity["epoch"].items()}},
+                read=lambda: {"empty": all(child.poll() is not None for child in children)}, retire=lambda: None)
+            resource_ownership.request_namespace(api.DB, call, scope)
+            resource_ownership.register_namespace(api.DB, call, {"controller": scope.address, **scope.key, "binding": scope.binding})
+            scopes.append(scope)
+
+        def execute():
+            try:
+                api.run_native_action(argv, "/isolated-contract", "example/repo", "reviewer", "original-action", resource_version=True)
+            finally:
+                resource_ownership.settle_namespace(api.DB, scopes[0].key["callId"], scopes[0])
+
+        # Kernel/controller witnesses are stand-ins; scratch belongs to pytest.
+        # Caller's actual producers and finalizer still persist the v2 receipt.
+        scratch = database / "scratch"
+        scratch.mkdir()
+        transport.setattr(resource_ownership, "allocate", lambda *_: scratch)
+        transport.setattr(native_namespace, "active", lambda: scopes[0] if scopes else None)
+        transport.setattr(api, "_enter_native_call", enter)
+        transport.setattr(sys, "argv", ["agent-interface", "--native-action", "--source", "poise:behavior-chain"])
+        transport.setattr(api, "_main", execute)
+        if submission is None:
+            api.main()
+        else:
+            with pytest.raises(native_action.ActionFailure):
+                api.main()
+    assert children[0].returncode == (7 if submission is None else 1)
+    assert writes.exists() == (mode != "pre_request")
+
+    # Read committed evidence in a fresh Caller, then pass its actual bytes to
+    # Poise's decoder and reconciler. No provider or GitHub request is real.
+    environment = {**os.environ, "AGENT_INTERFACE_DATA_DIR": str(database),
+                   "PYTHONPATH": str(repo / "caller/agent_interface")}
+    stored = subprocess.run([sys.executable, "-c", "from agent_interface import main; main()", "--logs", "--select",
+                             json.dumps({"latest": [], "ids": [], "correlations": ["original-action"]})],
+                            cwd=repo, env=environment, capture_output=True, text=True, check=True, timeout=30)
+    call = json.loads(stored.stdout)[0]
+    assert call["resources_settled_at"]
+    assert call["action"] == ("native_action" if submission is None else "not_started" if submission != "uncertain" else None)
+    assert "ephemeral-client-credential" not in stored.stdout
+    assert "private-header" not in stored.stdout
+    if submission is not None:
+        assert call["diagnostic"]["submission"] == submission
+        assert call["diagnostic"]["call_id"] == call["id"]
+        assert len(call["diagnostic"]["stderr"].encode()) <= 16 * 1024 + 3
+    if mode == "rejected":
+        assert call["diagnostic"]["stderr_truncated"] is True
+        assert "Queue admission denied" in call["diagnostic"]["stderr"]
+
+    output = repo / "test-results"
+    output.mkdir(exist_ok=True)
+    with TemporaryDirectory(prefix="merge-admission-", dir=output) as work:
+        bundle = Path(work) / "contract.mjs"
+        subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"), str(repo / "tests/fixtures/native-merge-admission.ts"),
+                        "--bundle", "--platform=node", "--packages=external", "--format=esm", "--target=node22",
+                        f"--outfile={bundle}"], cwd=repo, env=environment, check=True, capture_output=True, text=True, timeout=30)
+        wire = Path(work) / "stored.json"
+        wire.write_text(json.dumps({"logs": json.loads(stored.stdout), "submission": submission,
+                                   "request": api.read_action_plan(call["id"])["plan"]["request"],
+                                   "response": Path(row(call["id"])["response_path"]).read_text() if call["response"] else None}))
+        consumed = subprocess.run(["node", str(bundle), str(wire)], cwd=repo, env=environment,
+                                  capture_output=True, text=True, timeout=30)
+        assert consumed.returncode == 0, consumed.stderr
+        summary = json.loads(consumed.stdout)
+        assert summary["invocations"][0]["callId"] == call["id"]
+        if submission is not None:
+            assert summary["invocations"][0]["evidence"]["diagnostic"]["context"]["submission"] == submission
