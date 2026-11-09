@@ -38,18 +38,24 @@ class AtomicWorkBlocked(ValueError):
                     if shaped != value and shaped not in markers and "[redacted header]" not in shaped \
                             and "[redacted credential]" not in shaped:
                         before.append(value)
-                after = [value for value in secrets if value not in before]
                 if before:
                     safe = re.sub(marker + "|" + "|".join(map(re.escape, before)),
                                   lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
                 safe = atoms.redact_cause(" ".join(safe.split()))
-                if after:
+                # Match the normalized safe: raw values with newlines, tabs or
+                # repeated/outer whitespace would otherwise miss their
+                # normalized occurrence and persist. Include before values'
+                # normalized forms too; masking after patterns cannot rewrite
+                # a pattern keyword.
+                normed = sorted({" ".join(value.split()) for value in secrets if " ".join(value.split())},
+                                key=len, reverse=True)
+                if normed:
                     # Values under four characters would rewrite common words,
                     # so require word boundaries for them while still redacting
                     # bare occurrences. Longer values mask substrings so an
                     # embedded secret stays masked without touching markers.
-                    tiny = [value for value in after if len(value) < 4]
-                    rest = [value for value in after if len(value) >= 4]
+                    tiny = [value for value in normed if len(value) < 4]
+                    rest = [value for value in normed if len(value) >= 4]
                     alternatives = [re.escape(value) for value in rest]
                     if tiny:
                         alternatives.append(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, tiny)) + r")(?![A-Za-z0-9_])")

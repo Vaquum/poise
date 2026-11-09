@@ -500,6 +500,26 @@ class AtomicWorkLimits(TestCase):
             self.assertNotIn(private, message)
             self.assertNotIn(private, json.dumps(blocked.diagnostic))
 
+    def test_atomic_work_blocked_env_values_match_across_whitespace_normalization(self):
+        cases = [
+            ("line1\nline2", "reason line1 line2 end"),
+            ("line1\tline2", "reason line1 line2 end"),
+            ("a  b", "reason a b end"),
+            ("  secret  ", "reason secret end"),
+            ("secret\n", "reason secret end"),
+        ]
+        for value, reason in cases:
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+                    blocked = api.atomic_work.AtomicWorkBlocked(reason)
+                message = str(blocked)
+                self.assertEqual(blocked.diagnostic["message"], message)
+                self.assertIn("[redacted]", message)
+                for private in ("line1", "line2", "a b", "secret"):
+                    if private in " ".join(value.split()) or private in value:
+                        self.assertNotIn(private, message)
+                        self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         reason = "Review requires a product decision before implementation can continue"
         secret = "opaque-environment-credential-crossing-cutoff"
