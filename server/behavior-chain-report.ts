@@ -11,7 +11,7 @@ import { getBehaviorChainSettings, getSettings } from './settings'
 export const REMEDIATION_SCOPE = `Minimal, clinical interventions all the way. Get in, get out, do the thing that actually has to be done, never expand it beyond that. Keep asking "is this truly the cleanest and simplest and least intrusive way to get this done" and do it that way and only that way. Don't let others come expand it, let them come make it cleaner.`
 
 const MERGE_CAUSE = 'merge_submission_uncertain'
-const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', MERGE_CAUSE] as const
+const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', MERGE_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
 const INCOMPLETE_REPLIES = /^repair did not answer every unresolved review finding(?:: missing_root_comment_ids=\[[0-9, ]*\]; missing_count=[1-9][0-9]*; required_count=[1-9][0-9]*)?$/
 const REPORT_MARKER = /<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/
@@ -65,38 +65,42 @@ function enabled(repository: string): boolean {
   return repositories.some(value => value.toLowerCase() === repository.toLowerCase())
 }
 
-/** The normal decision still has to request repair on precisely this basis.
- * Ignore failed repairs only to ask what would be needed without exhaustion. */
+/** The normal decision still has to request work on precisely this basis.
+ * Ignore failed attempts only to ask what would be needed without exhaustion. */
 function qualifyingAttempts(chain: BehaviorChain, observation: ChainObservation, now: number) {
   if (!chain.held || chain.mergeSha || !observation.issue.open || !observation.pull
     || !Number.isFinite(observation.checkedAt) || observation.checkedAt > now
     || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS
-    || !/^[a-f0-9]{64}$/.test(observation.pull.reviewRevision)
-    || observation.pull.reviewRevision === chainBasis(['datastore-not-yet-indexed', chain.repository, observation.pull.number])
     || chain.invocations.some(invocation => invocation.state !== 'settled')) return null
   const decision = decideBehaviorChain({ ...chain, held: null,
-    invocations: chain.invocations.filter(invocation => invocation.behavior !== 'repair-pr' || invocation.evidence?.status === 'completed'),
+    invocations: chain.invocations.filter(invocation => !['repair-pr', 'review-pr'].includes(invocation.behavior) || invocation.evidence?.status === 'completed'),
   }, observation, now)
-  if (decision.kind !== 'invoke' || decision.behavior !== 'repair-pr') return null
-  const attempts = chain.invocations.filter(invocation => invocation.behavior === 'repair-pr'
+  if (decision.kind !== 'invoke' || decision.behavior !== 'repair-pr' && decision.behavior !== 'review-pr') return null
+  const review = decision.behavior === 'review-pr'
+  if (review ? !/^[a-f0-9]{64}$/.test(observation.pull.reviewContext ?? '')
+    : !/^[a-f0-9]{64}$/.test(observation.pull.reviewRevision)
+      || observation.pull.reviewRevision === chainBasis(['datastore-not-yet-indexed', chain.repository, observation.pull.number])) return null
+  const attempts = chain.invocations.filter(invocation => invocation.behavior === decision.behavior
     && invocation.basis === decision.basis && invocation.slot === decision.reviewer?.slot
     && invocation.admissionSequence > chain.resumedAfterSequence && invocation.evidence?.status !== 'deferred')
   if (attempts.length < 3 || attempts.some(invocation => {
     const evidence = invocation.evidence
     const artifact = evidence?.artifact as Record<string, unknown> | null | undefined
     const argv = invocation.request.argv
-    return !invocation.callId || invocation.state !== 'settled' || invocation.actor !== chain.author
-      || invocation.request.context?.head !== observation.pull!.head
-      || invocation.request.context.reviewRevision !== observation.pull!.reviewRevision
-      || !argv.includes('--expected-issue-revision') || argv[argv.indexOf('--expected-issue-revision') + 1] !== observation.issue.revision
+    return !invocation.callId || invocation.state !== 'settled' || invocation.actor !== decision.actor
+      || (review ? !argv.includes('--expected-head') || argv[argv.indexOf('--expected-head') + 1] !== observation.pull!.head
+        : invocation.request.context?.head !== observation.pull!.head
+          || invocation.request.context.reviewRevision !== observation.pull!.reviewRevision
+          || !argv.includes('--expected-issue-revision') || argv[argv.indexOf('--expected-issue-revision') + 1] !== observation.issue.revision)
       || evidence?.status !== 'failed' || evidence.action !== 'not_started' || evidence.outcome !== 'preflight_failed'
-      || artifact != null && (!['preparing', 'prepared', 'executing'].includes(String(artifact.phase))
-        || artifact.plan_sha != null || artifact.publication_head != null || artifact.replies_started != null)
+      || (review ? artifact?.phase !== 'reviewing' : artifact != null && !['preparing', 'prepared', 'executing'].includes(String(artifact.phase)))
+      || artifact != null && (artifact.plan_sha != null || artifact.publication_head != null || artifact.replies_started != null)
       || evidence.receipts != null || evidence.review_id != null || evidence.head_sha != null
       || typeof evidence.completedAt !== 'number' || !Number.isFinite(evidence.completedAt) || evidence.completedAt > now
       || !resourceReleaseProven(evidence, true)
   })) return null
-  const cause = attempts.every(invocation => invocation.evidence?.error_code === 'atomic_work_execution_budget_exhausted')
+  const cause = review ? attempts.every(invocation => invocation.evidence?.error_code === 'review_budget_exhausted') ? 'review_budget_exhausted' : null
+    : attempts.every(invocation => invocation.evidence?.error_code === 'atomic_work_execution_budget_exhausted')
     ? 'repair_execution_budget_exhausted'
     : attempts.every(invocation => invocation.evidence?.error_code === 'atomic_work_failed'
       && typeof invocation.evidence.error === 'string' && INCOMPLETE_REPLIES.test(invocation.evidence.error))
@@ -143,7 +147,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     return { cause, key, storageKey, stored }
   })
   const intent = intents.find(intent => intent.cause === (merge ? MERGE_CAUSE : qualifying?.cause)) ?? intents.find(intent => intent.stored)
-  if (!intent) return pendingMerge ? null : 'Repair exhaustion reporting: hold has no verified repair exhaustion on the current basis'
+  if (!intent) return pendingMerge ? null : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
   const { cause, key, storageKey, stored } = intent
   const label = cause === MERGE_CAUSE ? 'Merge submission' : 'Repair exhaustion'
   let report: RepairReport | null = stored ? JSON.parse(stored.value) as RepairReport : null
@@ -158,7 +162,9 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     if (accounts.me.toLowerCase() !== chain.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) {
       return `${label} reporting pending: configured accounts differ from the source chain`
     }
-    if (cause === MERGE_CAUSE ? !merge : qualifying?.cause !== cause) return `${label} reporting: source has no verified failure on the current basis`
+    if (cause === MERGE_CAUSE ? !merge : qualifying?.cause !== cause) return cause === MERGE_CAUSE
+      ? `${label} reporting: source has no verified failure on the current basis`
+      : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
     if (db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
       AND json_extract(value, '$.issueNumber') = ? LIMIT 1`).get(PREFIX + '*', chain.repository.toLowerCase() + '#*', chain.issue)) {
       return `${label} reporting suppressed for a generated remediation issue; its ordinary hold or uncertainty remains active`
@@ -168,9 +174,11 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     const fresh = await verify()
     const verified = qualifyingAttempts(chain, fresh, Date.now())
     const verifiedMerge = qualifyingMergeSubmission(chain, fresh, Date.now())
-    if ((cause === MERGE_CAUSE ? !verifiedMerge : verified?.cause !== cause || fresh.pull?.reviewRevision !== observation.pull.reviewRevision)
-      || fresh.pull?.head !== observation.pull.head) {
-      return `${label} reporting pending: the current head or review basis no longer verifies the original failure`
+    if (cause === MERGE_CAUSE ? (!verifiedMerge || fresh.pull?.head !== observation.pull.head)
+      : (verified?.cause !== cause || fresh.pull?.head !== observation.pull.head || verified!.decision.basis !== qualifying!.decision.basis)) {
+      return cause === MERGE_CAUSE
+        ? `${label} reporting pending: the current head or review basis no longer verifies the original failure`
+        : 'Repair exhaustion reporting pending: the current head or review basis no longer verifies the exhausted attempts'
     }
     const seed = await handleGhBody({ operation: 'read_issue', repository_full_name: chain.repository, issue_number: chain.issue })
     const source = seed.body as { issue?: { body?: unknown, state?: string }, error?: string }
@@ -207,6 +215,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     if (!claimed.changes) return `${label} report pending: another reconciliation reserved this report`
     if (!existing) {
       if (!allowed()) return `${label} report creation is unconfirmed; admissions are paused`
+      const review = cause === 'review_budget_exhausted'
       const budget = cause === 'repair_execution_budget_exhausted'
       const age = hold ? Math.max(0, Math.floor((Date.now() - hold.at) / 60_000)) : null
       const evidence = verifiedMerge?.invocation.evidence
@@ -223,20 +232,20 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
           : 'Process diagnostic: not recorded in this historical Call receipt; the underlying process cause is unavailable.',
       ] : [
         `Poise is holding https://github.com/${chain.repository}/pull/${report.pull}.`, '',
-        `Stage: repair-pr. Cause: ${cause}. Held since ${new Date(hold!.at).toISOString()} (${age} minutes at reporting).`,
+        `Stage: ${verified!.decision.behavior}. Cause: ${cause}. Held since ${new Date(hold!.at).toISOString()} (${age} minutes at reporting).`,
         `Source: ${chain.id}; hold event ${hold!.sequence}; head ${report.head}; basis ${report.basis}; slot ${report.slot}.`, '',
-        `Verified receipts: three or more settled Caller repairs on this basis after the last Resume. Each failed before publication with ${budget ? 'atomic_work_execution_budget_exhausted, action=not_started, outcome=preflight_failed' : 'atomic_work_failed, action=not_started, outcome=preflight_failed and the incomplete-reply validation cause'}; resources were released.`,
+        `Verified receipts: three or more settled Caller ${review ? 'PR reviews' : 'repairs'} on this basis after the last Resume. Each failed before ${review ? 'review submission' : 'publication'} with ${review ? 'review_budget_exhausted, action=not_started, outcome=preflight_failed' : budget ? 'atomic_work_execution_budget_exhausted, action=not_started, outcome=preflight_failed' : 'atomic_work_failed, action=not_started, outcome=preflight_failed and the incomplete-reply validation cause'}; resources were released.`,
       ]
       const body = [marker, '', ...details,
         ...report.attempts.map(attempt => `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}.`), '',
         cause === MERGE_CAUSE
           ? `Next action: inspect the original Call diagnostics and reconcile the PR and merge queue at the pinned head before deciding whether to repair or replace the candidate. The external effect remains unconfirmed. This report retains the original invocation's uncertainty and chain ownership; it never retries the merge or relaxes any review, resource, admission or merge gate.`
-          : `Next action: inspect the repair ${budget ? 'execution budget' : 'reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover repair or relax any review, admission or merge gate.`,
+          : `Next action: inspect the ${review ? 'PR review budget' : budget ? 'repair execution budget' : 'repair reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover ${review ? 'review' : 'repair'} or relax any review, admission or merge gate.`,
         '', REMEDIATION_SCOPE, '', 'Include this exact paragraph in the linked PR review.',
       ].join('\n')
       const result = await handleGhBody({ operation: 'open_issue', repository_full_name: chain.repository,
         title: cause === MERGE_CAUSE ? `fix: uncertain merge submission for #${report.pull}`
-          : `fix: repair exhausted ${budget ? 'execution budget' : 'incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
+          : `fix: ${review ? 'PR review exhausted its budget' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
       const publication = result.body as { record?: { number?: unknown, url?: unknown }, error?: string }
       if (result.status !== 200 || !Number.isSafeInteger(publication.record?.number) || Number(publication.record?.number) < 1
         || publication.record?.url !== `https://github.com/${chain.repository}/issues/${publication.record?.number}`) {

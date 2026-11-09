@@ -221,6 +221,17 @@ Journal event/state and plan hashes keep their original serialization, while res
 digests verify the original retained bytes. These are separate contracts;
 reconciliation never rewrites historical events to make a digest match.
 
+When reconciliation confirms that an uncertain original Call has no durable
+publication plan, its invocation retains one `original_publication_plan_missing`
+condition in `invocation.reconciled` evidence. Repeated absence, including after
+runtime replacement, keeps that episode while due reads continue. Settings shows
+the original Call, the evidence gap and the action to restore its original Caller
+plan. A matching Call, digest and validated plan records recovery; a different
+read, parse or validation failure remains an observation error and cannot clear
+the condition. Absence and recovery change neither the hold nor uncertainty,
+ownership, resource-release proof or publication gates, and authorize no retry
+or inferred no-action receipt. Unrelated chains continue advancing.
+
 An uncertain fixed action retains its first verified response and digest in
 the same journal, so unchanged passes and projection rebuilds do not launch
 another response reader or repeat uncertainty events. Observation-based recovery
@@ -451,8 +462,8 @@ variable. The gateway forwards it on install; adding, changing or removing it
 cooperatively replaces existing workspaces, even on the same image. Unset or
 empty opts out.
 
-Reporting requires at least three settled original Caller repair receipts on the
-same current head, review basis and slot after the last Resume, each with positive
+Reporting requires at least three settled original Caller receipts for the same
+phase, current head, review basis and slot after the last Resume, each with positive
 resource release, `action=not_started`, retained `outcome=preflight_failed` and no
 publication plan or action receipts. All matching attempts must share one cause:
 `repair_incomplete_replies` requires `error_code=atomic_work_failed` and the specific
@@ -460,10 +471,18 @@ incomplete-reply error; `repair_execution_budget_exhausted` requires
 `error_code=atomic_work_execution_budget_exhausted`.
 The historical fixed message and the newer omission-ID/count suffix represent
 the same cause. Hold text and generic failures cannot establish eligibility.
+The reporter also accepts `review_budget_exhausted` for native `review-pr`
+admissions by the reviewer account, pinned with `--expected-head`. Their basis
+includes `reviewContext` (base SHA, title and body), distinct from repair's
+`reviewRevision`. Each original receipt must retain the pre-submission `reviewing`
+phase and `error_code=review_budget_exhausted`; differing raw messages do not
+change that typed cause. `submitting_review` cannot prove no action even without
+a returned review ID.
 Before first reporting, the existing datastore freshness gate must pass and a
-new native observation must still require repair on that head and review basis.
-Stale, unknown or changed findings leave reporting pending. Other causes remain
-visible in their ordinary holds without an issue report; mixed repair causes cannot qualify.
+new native observation must still require the same phase on that head and basis.
+Stale, unknown or changed findings, heads or PR review contexts leave reporting pending,
+including title, body or base changes on an unchanged head. Other causes remain
+visible in their ordinary holds without an issue report; mixed repair or review causes cannot qualify.
 
 `merge_submission_uncertain` separately qualifies the original pending `merge-pr`
 invocation after recovery rereads the journal, even without an explicit chain hold.
@@ -488,7 +507,7 @@ receipt identities, and next action. It excludes raw errors, omitted finding IDs
 worker paths and provider output. An intent in the existing durable metadata store
 links the original failure to the report issue. Repair identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
-Existing repair intent keys and markers remain unchanged. Uncertain merge reports
+Existing repair and review intent keys and markers remain unchanged. Uncertain merge reports
 use cause + source chain + original invocation, with the same metadata store and
 marker format; an unheld source has no hold event or hold time.
 All report bodies include the canonical clinical scope directive in the
