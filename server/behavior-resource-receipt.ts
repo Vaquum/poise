@@ -142,6 +142,11 @@ export function nativeResourcesPending(invocation: Record<string, unknown>): boo
   const evidence = object(invocation.evidence) ? invocation.evidence : {}
   if (object(evidence.publicationResume) && typeof evidence.publicationResume.correlation === 'string'
     && (!object(evidence.publicationReceipt) || !resourceReleaseProven(evidence.publicationReceipt, true))) return true
+  // A receipt-store failure before any CLI ran creates no Call and acquires
+  // no resources, so its deferred settlement holds no reservation. Cleanup
+  // has no Call to reconcile; readability alone clears this hold.
+  if (invocation.state === 'settled' && invocation.outcome === 'receipt_unavailable'
+    && evidence.action === 'not_started' && !evidence.nativeCallId && !evidence.resource_ownership) return false
   const request = object(invocation.request) ? invocation.request : {}
   if (invocation.model === null && request.nativeResources !== 2 && !evidence.nativeCallId && !evidence.resource_ownership) return false
   if (request.nativeResources === 2 || evidence.nativeCallId || object(evidence.resource_ownership) && evidence.resource_ownership.version === 2) {

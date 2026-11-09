@@ -463,6 +463,31 @@ it('settles a never-attempted direct action as deferred when receipts are unread
       argv: ['--merge-if-ready', '21', '--expected-head', HEAD, '--token-user', 'reviewer'] } }, 2)).not.toBeNull()
 })
 
+it('releases contained direct-action capacity when receipts are unreadable before any Call', async () => {
+  const { CallerReceiptStoreError } = await import('../server/service/caller-calls')
+  const { journal, chain } = setup('merge-pr', false)
+  const obs = observation()
+  reviewed(journal, chain, obs)
+  const receiptError = new CallerReceiptStoreError('/tmp', Object.assign(new Error('file is not a database'), { code: 'SQLITE_NOTADB' }))
+  const perform = vi.fn(async () => { throw receiptError })
+  const runtimeOperations = operations(obs, { perform, request: async () => ({ command: 'github-interface', cwd: '/fixture',
+    nativeResources: 2 as const, argv: ['--merge-if-ready', '21', '--expected-head', HEAD, '--token-user', 'reviewer'] }) })
+  await expect(new BehaviorChainRuntime(journal, runtimeOperations).run()).rejects.toBe(receiptError)
+  const current = journal.read(chain.id)!
+  const settled = current.invocations.at(-1)!
+  expect(perform).toHaveBeenCalledTimes(1)
+  expect(settled).toMatchObject({ state: 'settled', outcome: 'receipt_unavailable', callId: null })
+  expect(settled.request.nativeResources).toBe(2)
+  // No Call was created and no resources were acquired, so no reservation is retained.
+  expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+  // A fresh contained attempt can be admitted after readability returns; pending capacity would block it.
+  expect(journal.admitInvocation(current, 'admit-contained-next', { id: 'contained-retry', behavior: 'merge-pr',
+    basis: 'exact-request', actor: 'reviewer', model: null, slot: null, admittedAt: Date.now(),
+    reservation: { memoryBytes: 8, diskBytes: 16 },
+    request: { command: 'github-interface', cwd: '/fixture', nativeResources: 2 as const,
+      argv: ['--merge-if-ready', '21', '--expected-head', HEAD, '--token-user', 'reviewer'] } }, 2)).not.toBeNull()
+})
+
 it('clears a dangling publication correlation when receipts are unreadable, so recovery retries after readability returns', async () => {
   const { CallerReceiptStoreError } = await import('../server/service/caller-calls')
   const { journal, chain } = setup('merge-pr', false)
