@@ -137,7 +137,20 @@ describe('cutover launch boundary', () => {
     await runtime.setPaused('repair-prs', new Date(Date.now() + 60_000).toISOString(), 'person')
     expect(captured.permitted(chain, decision('repair-pr'))).toBe(false)
     runtime.setScratchpad('repair-prs', 'Preserve all CI gates.')
-    expect(captured.note('repair-pr')).toBe('Preserve all CI gates.')
+    await expect(captured.note('repair-pr', chain, null)).resolves.toBe('Preserve all CI gates.')
+    const { REMEDIATION_SCOPE } = await import('../server/behavior-chain-report')
+    db.setMeta('behavior_chain_repair_report:fixture', JSON.stringify({ source: chain.id, issueNumber: 99 }))
+    let closingIssue = 99
+    const run = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation((command: string, args: string[], options?: { cwd?: string }) =>
+      command === 'github-datastore' && args[1] === 'pr-closing'
+        ? Promise.resolve({ stdout: JSON.stringify({ prs: [{ repo: chain.repository, number: 18, closing_truncated: false,
+          closing: [{ repo: chain.repository, number: closingIssue }] }] }), stderr: '' }) : run(command, args, options))
+    for (const behavior of ['review-pr', 'approve-pr'] as const) {
+      await expect(captured.note(behavior, chain, { number: 18 })).resolves.toContain(REMEDIATION_SCOPE)
+    }
+    closingIssue = 88
+    await expect(captured.note('review-pr', chain, { number: 18 })).resolves.not.toContain(REMEDIATION_SCOPE)
   })
 
   it('uses the existing tick and paginated reader to complete cutover before native intake can run', async () => {

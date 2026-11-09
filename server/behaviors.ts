@@ -6,7 +6,7 @@ import { readBehaviorResourceAdmission, type BehaviorResourceBudget, type Behavi
 import { advanceBehaviorCutover, behaviorAdmissionDraining, behaviorCutoverBlockers } from './behavior-cutover'
 import { BehaviorChainRuntime } from './behavior-chain-runtime'
 import { nativeChainOperations } from './behavior-chain-native'
-import { reportRepairExhaustion } from './behavior-chain-report'
+import { repairReportReviewNote, reportRepairExhaustion } from './behavior-chain-report'
 import { invalidateNativeCleanup, nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 import { callReviewResponse } from './review-response'
 import { chainBasis, type ChainBehavior } from './behavior-chain-store'
@@ -7335,7 +7335,12 @@ async function runBehaviorChains(): Promise<void> {
           { author: chain.author, status: pull.state, draft: pull.draft })) return false
         return true
       },
-      note: (behavior) => { const key = chainBehaviorKey(behavior); return key ? noteArgs(key)[1] ?? '' : '' },
+      note: async (behavior, chain, pull) => {
+        const key = chainBehaviorKey(behavior)
+        const scope = pull && (behavior === 'review-pr' || behavior === 'approve-pr')
+          ? await repairReportReviewNote(db, chain.repository, pull.number) : ''
+        return [key ? noteArgs(key)[1] ?? '' : '', scope].filter(Boolean).join('\n\n')
+      },
       severity: (behavior) => getSetting(behavior === 'approve-pr' ? 'approve-prs' : 'review-new-prs'),
       received(invocation, call) {
         if (call.error_code === 'native_cleanup_failed') invalidateNativeCleanup(call.error || 'Native cleanup verification failed')
