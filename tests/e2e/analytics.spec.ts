@@ -523,7 +523,7 @@ function report(merged: number, hours = 27): AnalyticsReport {
   }
 }
 
-// A year of deterministic 7-day periods between the requested edges.
+// Deterministic daily or weekly periods between the requested edges.
 function history(bounds: string[]): AnalyticsHistory {
   return { errors: [], periods: bounds.slice(1).map((until, i) => {
     const quiet = i % 13 === 0
@@ -536,6 +536,7 @@ function history(bounds: string[]): AnalyticsHistory {
 interface Workspace {
   quotaReads: number
   historyReads: Array<{ bounds: string[], org: string | null }>
+  histogramReads: Array<{ bounds: string[], org: string | null }>
   historyFails: boolean
   reads: Array<{ since: string | null, until: string | null, org: string | null }>
   fail: boolean
@@ -550,7 +551,7 @@ interface Workspace {
 }
 
 async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
-  const state: Workspace = { quotaReads: 0, historyReads: [], historyFails: false, reads: [], fail: false, stale: false, partial: null, additionalMissingOrg: null, baselineHours: 54, baselineMerged: 8, pacing: null, closedUnmerged: null, medianLines: null }
+  const state: Workspace = { quotaReads: 0, historyReads: [], histogramReads: [], historyFails: false, reads: [], fail: false, stale: false, partial: null, additionalMissingOrg: null, baselineHours: 54, baselineMerged: 8, pacing: null, closedUnmerged: null, medianLines: null }
   await page.clock.setFixedTime(new Date('2026-10-09T12:00:00Z'))
   await page.addInitScript(() => {
     if (sessionStorage.getItem('seeded')) return
@@ -565,7 +566,8 @@ async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
     const url = new URL(route.request().url())
     if (url.pathname === '/api/analytics/history') {
       const bounds = url.searchParams.get('bounds')!.split(',')
-      state.historyReads.push({ bounds, org: url.searchParams.get('org') })
+      const reads = bounds.length === 31 ? state.histogramReads : state.historyReads
+      reads.push({ bounds, org: url.searchParams.get('org') })
       if (state.historyFails) return route.fulfill({ status: 502, json: { error: 'acme: datastore offline' } })
       return route.fulfill({ json: history(bounds) })
     }
@@ -735,7 +737,7 @@ test('opens from the burger as a view of its own: productivity topline, per merg
   expect(new Set(accounts).size).toBe(1)
   await expect(quota.locator('.github-quota-avatar')).toHaveCount(2)
   await expect(quota.locator('.github-quota-bucket h4')).toHaveText(['REST API', 'GraphQL'])
-  await expect(view.locator('.analytics-histogram svg rect')).toHaveCount(130)
+  await expect(view.locator('.analytics-histogram svg rect')).toHaveCount(65)
   await expect(perPr.locator('.analytics-note')).toHaveCount(5)
   await page.screenshot({ path: info.outputPath('analytics-view.png'), fullPage: true })
 
@@ -853,6 +855,7 @@ test('updates work and review cards and charts by day and organization, discardi
     const yesterday = since === '2026-10-08T00:00:00.000Z'
     const data = report(4)
     const rounds = beta ? yesterday ? 7 : 6 : yesterday ? 3 : 2
+    data.pullRequests.opened = rounds
     data.pullRequests.workReview!.types = [{ type: beta ? yesterday ? 'perf' : 'fix' : yesterday ? 'docs' : 'feat', count: 4 }]
     data.pullRequests.workReview!.rounds = { median: rounds, counted: 4, missingReviews: 0, distribution: [{ rounds, prs: 4 }] }
     data.pullRequests.workReview!.changesRequested.prs = beta ? yesterday ? 4 : 3 : yesterday ? 2 : 1
@@ -860,8 +863,8 @@ test('updates work and review cards and charts by day and organization, discardi
   }
   let release!: () => void
   const held = new Promise<void>((resolve) => { release = resolve })
-  let lateHistory = false
-  let finished = false
+  let lateHistory = 0
+  let finished = 0
   await page.route('**/api/analytics?**', async (route) => {
     const query = new URL(route.request().url()).searchParams
     await route.fulfill({ json: dataFor(query.get('org'), query.get('since')!) })
@@ -870,10 +873,10 @@ test('updates work and review cards and charts by day and organization, discardi
     const query = new URL(route.request().url()).searchParams
     const bounds = query.get('bounds')!.split(',')
     const delayed = query.get('org') === 'beta' && bounds.at(-1) === '2026-10-08T00:00:00.000Z'
-    if (delayed) { lateHistory = true; await held }
+    if (delayed) { lateHistory++; await held }
     const data = history(bounds)
     for (const period of data.periods) period.pullRequests = dataFor(query.get('org'), bounds.at(-1)!).pullRequests
-    try { await route.fulfill({ json: data }) } finally { if (delayed) finished = true }
+    try { await route.fulfill({ json: data }) } finally { if (delayed) finished++ }
   })
   await page.goto('/')
   await openAnalytics(page)
@@ -884,17 +887,18 @@ test('updates work and review cards and charts by day and organization, discardi
     await expect(value(page, 'Change-request share')).toHaveText(share)
     await expect(work.locator('.analytics-work-type')).toHaveAttribute('data-help', new RegExp(`${type}: 4 of 4`))
     if (chart) await expect(work.locator('.analytics-history[data-series="Review rounds"] .analytics-history-max')).toHaveText(`Max ${rounds}.0`)
+    if (chart) await expect(page.locator('.analytics-history[data-series="Pull requests opened"] .analytics-histogram .analytics-chart-axis > span').first()).toHaveText(`${rounds}.0/day`)
   }
   await assertCards('feat', 2, '25.0%')
   await page.getByRole('button', { name: 'Previous day' }).click()
   await assertCards('docs', 3, '50.0%')
   await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
   await assertCards('perf', 7, '100.0%', false)
-  await expect.poll(() => lateHistory).toBe(true)
+  await expect.poll(() => lateHistory).toBe(2)
   await page.getByRole('button', { name: 'Next day' }).click()
   await assertCards('fix', 6, '75.0%')
   release()
-  await expect.poll(() => finished).toBe(true)
+  await expect.poll(() => finished).toBe(2)
   await assertCards('fix', 6, '75.0%')
   await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('')
   await assertCards('feat', 2, '25.0%')
@@ -966,6 +970,121 @@ test('draws each headline figure\'s past year by 7-day period, ending at the sel
   await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
   await expect.poll(() => state.historyReads.at(-1)?.org).toBe('beta')
   expect(state.historyReads.at(-1)!.bounds.at(-1)).toBe('2026-10-08T00:00:00.000Z')
+})
+
+test('shares 30 completed local days across five-bin histograms with daily totals, medians and unknown coverage', async ({ page }) => {
+  const state = await workspace(page, 'Europe/Helsinki')
+  await page.clock.setFixedTime(new Date('2026-11-02T12:00:00Z'))
+  await page.route('**/api/analytics/history?**', async route => {
+    const bounds = new URL(route.request().url()).searchParams.get('bounds')!.split(',')
+    if (bounds.length !== 31) return route.fallback()
+    state.histogramReads.push({ bounds, org: new URL(route.request().url()).searchParams.get('org') })
+    const data = history(bounds)
+    data.periods.forEach((period, i) => {
+      const pr = report(i === 0 ? 7 : i === 1 ? 2 : 0).pullRequests
+      period.issues = { opened: i === 0 ? 14 : 0, closed: i === 0 ? 7 : 0 }
+      pr.opened = i === 0 ? 21 : 0
+      pr.closedUnmerged = i === 0 ? 3 : 0
+      pr.lines = i === 0 ? { total: 700, median: 100, counted: 7 } : i === 1 ? { total: 50, median: 50, counted: 1 } : { total: null, median: null, counted: 0 }
+      pr.medianTimeToMergeMs = i < 2 ? (i === 0 ? 2 : 8) * 3_600_000 : null
+      pr.firstReview = { count: i === 0 ? 1 : 0, medianMs: i === 0 ? 60_000 : null }
+      pr.medianCommentsPerPr = i < 2 ? 2 + i * 2 : null
+      pr.behaviors.medianPerPr = i < 2 ? i * 2 : null
+      pr.mergedByAgent = i === 0 ? 7 : i === 1 ? 1 : 0
+      period.pullRequests = pr
+    })
+    await route.fulfill({ json: data })
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const view = page.locator('#view-analytics')
+  const distribution = (label: string) => view.locator('.analytics-panel').filter({ has: page.locator('.analytics-label', { hasText: new RegExp(`^${label}$`) }) }).locator('.analytics-histogram')
+  const merged = distribution('Pull requests merged')
+  await expect(merged).toHaveAttribute('aria-label', /30 known daily values.*30 completed calendar days before the selected day.*Settings timezone.*selected organization scope.*5 equal-width bins.*Unknown daily values are excluded/)
+  await expect(view.locator('.analytics-histogram svg rect')).toHaveCount(65)
+  await expect(view.locator('[data-group="work-review"] .analytics-histogram')).toHaveCount(0)
+  expect(await merged.locator('rect').evaluateAll(bars => bars.map(bar => bar.getAttribute('width')))).toEqual(['18', '18', '18', '18', '18'])
+  expect(await merged.locator('rect').evaluateAll(bars => bars.map(bar => Number(bar.getAttribute('x'))))).toEqual([1, 21, 41, 61, 81])
+  await expect(merged.locator('rect').first()).toHaveAttribute('data-help', /: 28 days$/)
+  await expect(merged.locator('rect').nth(1)).toHaveAttribute('data-help', /: 1 day$/)
+  await expect(merged.locator('rect').last()).toHaveAttribute('data-help', /: 1 day$/)
+  await expect(merged.locator('.analytics-chart-axis > span').first()).toHaveText('0.0/day')
+  await expect(merged.locator('.analytics-chart-axis > span').last()).toHaveText('7.0/day')
+  for (const [label, count, edge] of [
+    ['Issues opened', 30, '14.0/day'], ['Issues closed', 30, '7.0/day'],
+    ['Pull requests opened', 30, '21.0/day'], ['Closed without merging', 30, '3.0/day'],
+    ['Lines changed', 29, '700/day'], ['Time to merge', 2, '8h'],
+    ['Time to first review', 1, '1m 6s'], ['Comments', 2, '4.0'],
+    ['Median lines', 1, '110'], ['Behaviors', 2, '2.0'],
+    ['Median time', 2, '8h'], ['Merged by agent', 2, '100.0%'],
+  ] as const) {
+    await expect(distribution(label)).toHaveAttribute('aria-label', new RegExp(`${count} known daily values`))
+    await expect(distribution(label).locator('.analytics-chart-axis > span').last()).toHaveText(edge)
+  }
+  expect(state.histogramReads).toHaveLength(1)
+  expect(state.historyReads).toHaveLength(1)
+  const [{ bounds }] = state.histogramReads
+  expect(bounds).toHaveLength(31)
+  expect([bounds[0], bounds.at(-1)]).toEqual(['2026-10-02T21:00:00.000Z', '2026-11-01T22:00:00.000Z'])
+  expect(bounds.slice(1).map((until, i) => (Date.parse(until) - Date.parse(bounds[i])) / 3_600_000).filter(hours => hours === 25)).toHaveLength(1)
+  await page.getByRole('button', { name: 'Previous day' }).click()
+  await expect.poll(() => state.histogramReads.at(-1)?.bounds.at(-1)).toBe('2026-10-31T22:00:00.000Z')
+  await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('beta')
+  await expect.poll(() => state.histogramReads.at(-1)?.org).toBe('beta')
+  expect(state.histogramReads.at(-1)!.bounds.at(-1)).toBe('2026-10-31T22:00:00.000Z')
+})
+
+test('renders five bins and final edges for constant daily counts and empty per-PR observations', async ({ page }) => {
+  await workspace(page)
+  await page.route('**/api/analytics/history?**', async route => {
+    const bounds = new URL(route.request().url()).searchParams.get('bounds')!.split(',')
+    if (bounds.length !== 31) return route.fallback()
+    const data = history(bounds)
+    for (const period of data.periods) {
+      period.issues.opened = 4
+      period.pullRequests = report(0).pullRequests
+    }
+    await route.fulfill({ json: data })
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const constant = page.locator('.analytics-history[data-series="Issues opened"] .analytics-histogram')
+  await expect(constant).toHaveAttribute('aria-label', /30 known daily values/)
+  await expect(constant.locator('rect')).toHaveCount(5)
+  await expect(constant.locator('rect').first()).toHaveAttribute('data-help', /: 30 days$/)
+  await expect(constant.locator('.analytics-chart-axis')).toHaveText('4.0/day5.0/day')
+  const empty = page.locator('.analytics-history[data-series="Comments"] .analytics-histogram')
+  await expect(empty).toHaveAttribute('aria-label', /0 known daily values/)
+  await expect(empty.locator('rect')).toHaveCount(5)
+  expect(await empty.locator('rect').evaluateAll(bars => bars.map(bar => bar.getAttribute('height')))).toEqual(['0', '0', '0', '0', '0'])
+  await expect(empty.locator('.analytics-chart-axis')).toHaveText('0.0—1.0')
+})
+
+test('keeps weekly lines intact when the daily histogram read fails and recovers on reentry', async ({ page }) => {
+  const state = await workspace(page)
+  let failDaily = true
+  await page.route('**/api/analytics/history?**', async route => {
+    const bounds = new URL(route.request().url()).searchParams.get('bounds')!.split(',')
+    if (bounds.length === 31 && failDaily) return route.fulfill({ status: 502, json: { error: 'Daily history offline' } })
+    await route.fallback()
+  })
+  await page.goto('/')
+  await openAnalytics(page)
+  const view = page.locator('#view-analytics')
+  await expect(view.locator('.analytics-history-line')).toHaveCount(15)
+  await expect(view.locator('.analytics-histogram[aria-label="Histogram unavailable"]')).toHaveCount(13)
+  await page.locator('.nr-bell').click()
+  await expect(page.locator('.nr-rail .nr-card').filter({ hasText: 'Daily history offline' })).toHaveCount(1)
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
+  expect(state.historyReads).toHaveLength(1)
+  failDaily = false
+  await leaveAnalytics(page)
+  await openAnalytics(page)
+  await expect(view.locator('.analytics-histogram svg rect')).toHaveCount(65)
+  await expect(view.locator('.analytics-history-line')).toHaveCount(15)
+  await page.locator('.nr-bell').click()
+  await expect(page.locator('.nr-rail')).toBeVisible()
+  await expect(page.locator('.nr-rail .nr-card').filter({ hasText: 'Daily history offline' })).toHaveCount(0)
 })
 
 test('holds each chart\'s place while the past year loads, and says when it cannot be read', async ({ page }) => {
@@ -1907,16 +2026,16 @@ test('renders day cards before admitting year history and skips history after le
     expect(historyReads).toBe(0)
     release()
     await expect(value(page, 'Pull requests merged')).toHaveText('4')
-    await expect.poll(() => historyReads).toBe(1)
+    await expect.poll(() => historyReads).toBe(2)
     await expect.poll(() => historySawCards).toBe(true)
     held = new Promise<void>(resolve => { release = resolve })
     await page.locator('#view-analytics').getByRole('button', { name: 'Previous day' }).click()
     await expect.poll(() => dayReads).toBe(4)
-    expect(historyReads).toBe(1)
+    expect(historyReads).toBe(2)
     await leaveAnalytics(page)
   } finally { release() }
   await page.waitForLoadState('networkidle')
-  expect(historyReads).toBe(1)
+  expect(historyReads).toBe(2)
 })
 
 test('shows the standard loader with no old values on initial load, day/account changes and reopening', async ({ page }, info) => {
