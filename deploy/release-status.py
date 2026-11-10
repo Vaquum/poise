@@ -96,11 +96,13 @@ def collect(repo):
                 deploy_path=os.environ['DEPLOY_PATH'])
 
 
-def workspace_proof(deploy, candidate):
+def workspace_proof(deploy, candidate, remembered=frozenset()):
     """Use the existing rollout inventory and fresh health/image evidence, even
     when the receipt is terminal. A receipt's historical success is not a probe.
+    Handles remembered from the open episode stay expected until verified, so a
+    workspace that vanishes mid-episode cannot clear it by absence.
     """
-    notes, errors, expected, serving = [], [], set(), []
+    notes, errors, expected, serving = [], [], set(remembered), []
     store = deploy / '.env.workspace-proof.rollouts'
     pointer = target = image = None
     try:
@@ -166,7 +168,8 @@ def workspace_proof(deploy, candidate):
     if not expected or not running:
         errors.append('no running workspace establishes a serving release')
     return dict(current=bool(expected) and expected <= proven and target == candidate and not errors,
-                serving=serving, notes=notes, errors=errors, rollout=pointer, switching=switching and target == candidate, lag=lag)
+                serving=serving, notes=notes, errors=errors, rollout=pointer, switching=switching and target == candidate, lag=lag,
+                expected=sorted(expected))
 
 
 def stage(evidence, proof):
@@ -231,12 +234,17 @@ def observe(evidence):
         state_path = deploy / '.env.release-lag'
         state = json.loads(state_path.read_text()) if state_path.exists() else None
         if state is not None and (not isinstance(state, dict) or not re.fullmatch(r'[0-9a-f]{32}', state.get('id', ''))
-                                  or not isinstance(state.get('since'), str) or not isinstance(state.get('notified'), bool)):
+                                  or not isinstance(state.get('since'), str) or not isinstance(state.get('notified'), bool)
+                                  or not isinstance(state.get('handles', []), list)
+                                  or any(not isinstance(handle, str) or not handle or ' ' in handle
+                                         for handle in state.get('handles', []))):
             raise ValueError('invalid retained release-lag condition; refusing to reset it')
+        remembered = set(state.get('handles', [])) if state else set()
         try:
-            proof = workspace_proof(deploy, evidence['candidate'])
+            proof = workspace_proof(deploy, evidence['candidate'], remembered)
         except (OSError, subprocess.SubprocessError, ValueError, AttributeError) as error:
-            proof = dict(current=False, serving=[], notes=[], errors=[f'workspace proof unavailable ({error})'], rollout=None)
+            proof = dict(current=False, serving=[], notes=[], errors=[f'workspace proof unavailable ({error})'], rollout=None,
+                         expected=sorted(remembered))
         evidence['errors'].extend(proof['errors'])
         now = datetime.now(timezone.utc)
         recovered = evidence['includes_upstream'] and proof['current'] and not evidence['errors']
@@ -246,8 +254,9 @@ def observe(evidence):
             reason, action = 'intended fork candidate verified serving', 'No action required.'
         elif evidence['upstream'] or evidence['candidate'] or state:
             if state is None:
-                state = dict(id=uuid4().hex, since=now.isoformat(), notified=False)
+                state = dict(id=uuid4().hex, since=now.isoformat(), notified=False, handles=[])
             age = (now - datetime.fromisoformat(state['since'])).total_seconds()
+            state['handles'] = sorted(set(state.get('handles', [])) | set(proof.get('expected', [])))
             status = 'deliberate pause' if paused else 'stale release' if age >= GRACE_SECONDS else 'in progress (30-minute grace)'
             if evidence['errors']:
                 if not paused and age >= GRACE_SECONDS and evidence['includes_upstream'] is not False and not proof.get('lag'):
@@ -259,8 +268,8 @@ def observe(evidence):
         if warning:
             state['notified'] = True
         summary = render(evidence, proof, state, status, reason, action)
-        # Store only diagnostic identity/age, never release authority or a new
-        # rollout format. A newer tip cannot replace an unresolved episode.
+        # Store only diagnostic identity/age/inventory, never release authority
+        # or a new rollout format. A newer tip cannot replace an unresolved episode.
         with tempfile.NamedTemporaryFile(mode='w', dir=deploy, prefix='.env.release-lag.', delete=False) as file:
             json.dump(None if recovered else state, file)
             temporary = Path(file.name)

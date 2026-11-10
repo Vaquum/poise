@@ -180,6 +180,34 @@ class ReleaseStatusTest(unittest.TestCase):
         self.actions.deploy_run(conclusion='failure', apply='failure')
         self.assertIn('Deploy: failure', self.observe())
 
+    def test_vanished_inventory_only_workspace_keeps_episode_open(self):
+        self.actions.fixture('upstream-tip.json', {'sha': self.actions.TIP})
+        self.actions.fixture('compare.json', {'status': 'identical'})
+        self.actions.deploy_run(apply='success')
+        stale = f'bob {IMAGE_ID} true /poise-ws-bob'
+        self.docker.write_text(json.dumps(dict(
+            image_id=IMAGE_ID,
+            containers=[f'alice {IMAGE_ID} true /poise-ws-alice', stale],
+            health={'poise-ws-alice': [health(self.actions.TIP)],
+                    'poise-ws-bob': [health(self.old)]}, calls=[])))
+        self.assertIn('workspace switch', self.observe())
+        original = self.overdue()
+        overdue = self.observe()
+        self.assertIn('::warning::', overdue)
+        self.assertIn(original['id'], overdue)
+        remembered = json.loads(self.state.read_text())
+        self.assertEqual(set(remembered['handles']), {'alice', 'bob'})
+        self.live(self.actions.TIP)
+        missing = self.observe()
+        self.assertNotIn('Production release: recovered', missing)
+        self.assertIn('bob: missing workspace; replacement not verified', missing)
+        self.assertIn('unavailable, unresolved', missing)
+        self.assertNotIn('::warning::', missing)
+        retained = json.loads(self.state.read_text())
+        self.assertEqual(retained['id'], original['id'])
+        self.assertEqual(retained['since'], original['since'])
+        self.assertEqual(set(retained['handles']), {'alice', 'bob'})
+
     def test_observer_runs_after_skipped_or_failed_sync_without_release_writes(self):
         workflow = Path(ROOT, '.github/workflows/sync-upstream.yml').read_text()
         observer = workflow.split('  observe:\n')[1].split('\n  sync:\n')[0]

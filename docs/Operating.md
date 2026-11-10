@@ -507,9 +507,9 @@ Sync, CI, Deploy or a workspace switch.
 A fixed 30-minute grace starts at the first observation of an expected release
 that is not yet verified serving. Within it, verification/deployment is shown
 as in progress. Past it, one stale-release condition warns once. Its identity,
-first observation and warning state live in the private host file
-`deploy/.env.release-lag`; repeated observations and newer upstream tips keep
-that episode and its original clock. A workflow GitHub records as manually
+first observation, warning state and expected workspace inventory live in the
+private host file `deploy/.env.release-lag`; repeated observations and newer
+upstream tips keep that episode and its original clock. A workflow GitHub records as manually
 disabled is shown as a deliberate pause, retaining the episode and age.
 False/unset `POISE_UPSTREAM_SYNC` instead says **sync disabled/missing; intent
 unknown**: confirm intent before enabling it. There is no new pause setting.
