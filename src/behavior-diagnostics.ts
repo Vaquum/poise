@@ -72,8 +72,8 @@ function diagnosticMessage(code: string, cause: string): string {
 export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): BehaviorDiagnosticGroup[] {
   const groups = new Map<string, BehaviorDiagnosticGroup>()
   const add = (classification: DiagnosticClassification, scope: string, message: string, detail: string,
-    about: Omit<DiagnosticEntry, 'detail'> = { behavior: null, target: null, at: null, next: null }) => {
-    const key = JSON.stringify([classification.severity, classification.code, scope, message])
+    about: Omit<DiagnosticEntry, 'detail'> = { behavior: null, target: null, at: null, next: null }, episode?: string) => {
+    const key = JSON.stringify([classification.severity, classification.code, scope, episode ?? message])
     const entry = { ...about, detail }
     const existing = groups.get(key)
     if (existing) {
@@ -85,7 +85,13 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
   for (const [scope, error] of [
     ['Agent log', diagnostics.agentLogsError], ['Datastore', diagnostics.datastore.error], ['Identity', diagnostics.identity.error],
   ]) {
-    if (error) add(classifyBehaviorDiagnostic(error), scope!, failureCause(error), error)
+    // A later probe refreshes the Datastore error's age without rewriting
+    // persisted behavior failures, so full-text comparison drifts apart.
+    // Match the stable stale shape instead; other faults stay separate.
+    const hasStaleGroup = scope === 'Datastore' && diagnostics.failures.some((failure) => failure.diagnostic?.code === 'datastore_stale'
+      && failure.correlationId)
+    const stale = !!error && !!hasStaleGroup && error.includes('Datastore stale:') && error.includes('exceeds')
+    if (error && !stale) add(classifyBehaviorDiagnostic(error), scope!, failureCause(error), error)
   }
   const failureCauses = new Map<string, DiagnosticClassification>()
   for (const failure of diagnostics.failures) {
@@ -93,6 +99,14 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
     let classification = failure.diagnostic ? diagnosticClassification(failure.diagnostic.code)
       : classifyBehaviorDiagnostic(error, { held: failure.kind === 'worker' })
     const cause = failureCause(error)
+    if (classification.code === 'datastore_stale' && failure.correlationId) {
+      add(classification, failure.org ? `Datastore (${failure.org})` : 'Datastore',
+        'GitHub mirror is stale. Behaviors will check again.',
+        `${failure.behavior}: ${cause}`, { behavior: failure.behavior, target: failure.target ?? null,
+          at: failure.lastFailureAt || null, next: failure.nextRetryAt || null,
+          correlationId: failure.correlationId, ...evidenceAttachment(failure) }, failure.correlationId)
+      continue
+    }
     const stronger = diagnostics.deadLetters.find((letter) => letter.diagnostic && letter.behavior === failure.behavior
       && !!failure.callId && letter.callId === failure.callId && failureCause(letter.error) === cause
       && diagnosticClassification(letter.diagnostic.code).severity !== 'info')

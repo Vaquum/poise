@@ -64,6 +64,21 @@ describe('behavior diagnostic groups', () => {
       consecutiveFailures: 3, lastFailureAt: '', nextRetryAt: '', error: 'Command failed (1): github-interface: }' })
     expect(behaviorDiagnosticGroups(diagnostics)).toEqual([expect.objectContaining({ severity: 'warning', code: 'unknown', scope: 'acme/api#9' })])
   })
+  it('groups a refreshed stale datastore error with its episode despite age drift, keeping crashes separate', () => {
+    const diagnostics = snapshot()
+    const stale = (age: number) =>
+      `Datastore stale: last successful sync 2026-10-09T10:00:00Z; age ${age}s exceeds 120s`
+    diagnostics.datastore = { status: 'unavailable', checkedAt: '', ageSeconds: 210, lastSuccessAt: '', error: stale(210) }
+    diagnostics.failures.push({ behavior: 'review-new-prs', kind: 'operation',
+      consecutiveFailures: 1, lastFailureAt: '', nextRetryAt: '', error: stale(150),
+      correlationId: 'e'.repeat(32), diagnostic: { severity: 'warning', code: 'datastore_stale' } })
+    expect(behaviorDiagnosticGroups(diagnostics)).toEqual([
+      expect.objectContaining({ code: 'datastore_stale', scope: 'Datastore' }),
+    ])
+    diagnostics.datastore.error = 'Datastore process crashed independently.'
+    expect(behaviorDiagnosticGroups(diagnostics).map((group) => group.code).sort()).toEqual(
+      ['datastore_stale', 'unknown'])
+  })
   it('keeps an API outage separate from last-known repository errors', () => {
     const diagnostics = snapshot()
     diagnostics.apiError = { severity: 'warning', code: 'upstream_unavailable', message: 'HTTP 502' }

@@ -13,6 +13,7 @@ import { getBehaviorChainSettings, getSettings } from './settings'
 import { attributedNativeAction, nativeRequestSha } from './behavior-chain-action'
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { isExpectedFailure, runFile, spawnDetached } from './process'
+import { runDatastoreHealth } from './datastore-health'
 import { requireCallerReceipts } from './service/caller-calls'
 
 type Roster = Pick<ChainObservation, 'issueReviewers' | 'prReviewers' | 'implementer' | 'repairer' | 'approver'>
@@ -114,7 +115,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
     authenticationRejected: hooks.authenticationRejected,
     authRecovered: hooks.authRecovered,
     async discover(): Promise<ChainSeed[]> {
-      await runFile('github-datastore', organizationArgs(org, ['health', '--max-age-seconds', '120']), { timeoutMs: 30_000 })
+      await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['review-new-issues'])
       const settings = getBehaviorChainSettings()
       const base = ['view', 'issue', '--status', 'open', '--format', 'json', '--limit', '100',
         ...(settings.seedMode === 'label' ? ['--label', settings.label] : [])]

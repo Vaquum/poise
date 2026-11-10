@@ -921,6 +921,9 @@ failure summaries. An unavailable Behaviors API request is one availability
 diagnostic; it cannot establish datastore or identity failure. Last-known runtime
 degradation remains visible; an initial unread runtime is unknown. The classification
 and evidence rules are in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
+Validated stale mirrors use one durable episode per account/database, with
+per-behavior refusals grouped beneath it and recovery recorded only by a
+validated healthy probe; upstream and process faults remain independent.
 
 PR automation uses the opposite configured account from the PR author, including
 follow-up approval, replay and downstream PR operations. Existing enable switches
