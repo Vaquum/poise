@@ -5,7 +5,6 @@
 # Security: identity, sessions, tokens, the terminal, replay, permission refusals.
 tests/behavior-chain-replay.test.ts
 tests/behavior-chain.test.ts
-tests/behavior-chain-native.test.ts
 tests/behaviors-identity.test.ts
 tests/behaviors-replay-refusal.test.ts
 tests/chat-manager-charter.test.ts
