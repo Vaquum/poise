@@ -311,6 +311,40 @@ test('an exhausted identical-run history keeps its pager hidden across refreshes
   expect(cursorReads).toEqual(['200', '400'])
 })
 
+test('quarantine counts follow stored records across refresh and pagination', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const logs = history().slice(0, 401)
+  const quarantine = (historyRowId: string, index: number, call: string | null = null) => ({
+    historyRowId, index, error: `Caller History row ${index} is unreadable (INVALID_UTF8)`,
+    id: call, repo: null, prId: null, correlationId: null, behavior: null, sessionId: null,
+  })
+  let offset = 0
+  let extra = false
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    const known = quarantine('500', 1 + offset, 'b'.repeat(32))
+    if (url.searchParams.get('status') === 'running') {
+      return route.fulfill({ json: { logs: [], quarantined: [{ ...known, index: 0 }] } })
+    }
+    const quarantined = url.searchParams.has('cursor')
+      ? [quarantine('299', 2)]
+      : [known, quarantine('499', 2 + offset), ...(extra ? [quarantine('501', 0)] : [])]
+    return route.fulfill({ json: { ...paged(logs, url, 200), quarantined } })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(await feedback(page)).toContainText('2 unreadable worker log row(s) isolated')
+  await next(page).click()
+  await expect(await feedback(page)).toContainText('3 unreadable worker log row(s) isolated')
+  offset = 4
+  await refreshed(page, true)
+  const notice = await feedback(page)
+  await expect(notice).toContainText('3 unreadable worker log row(s) isolated')
+  await expect(notice).toContainText('INVALID_UTF8')
+  extra = true
+  await refreshed(page, true)
+  await expect(notice).toContainText('4 unreadable worker log row(s) isolated')
+})
+
 test('arrivals larger than a page merge into run order and keep newest-target selection', async ({ page }) => {
   await workspace(page); await settled(page)
   const old = history().slice(0, 401)

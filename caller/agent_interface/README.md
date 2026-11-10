@@ -38,6 +38,16 @@ operation without a signal. This includes older rows and macOS development
 without kernel-pinned handles. The refusal is explicit; no unsafe fallback is
 used. Externally managed Chat turns retain Poise's existing Stop route.
 
+Interruption reconciliation checks the original supervisor's process identity.
+Only a reader that can observe the current workspace supervisor can reconcile
+a previous workspace epoch. A reader in a private PID namespace cannot do so.
+Existing resource and publication receipts still govern recovery.
+
+New native registrations use process identity version 2. An older Caller
+still running through a workspace update cannot reap these registrations.
+The current Caller continues to read version 1 identities and settle their
+original Calls.
+
 Native per-Call resource receipts live in `resource_ownership`, outside the
 replaceable publication artifact. Directory registration precedes allocation;
 all PR attempt roots and copied credentials use a private recorded Call parent.
@@ -296,9 +306,10 @@ Repository inspection is a read-only interface, not permission to execute code.
 `operation` (`read`, `search`, or `list`), repository-relative `path`, `query`
 (literal search text, otherwise empty), and `start_line` (1 initially). Reads and
 lists return up to 200 entries, searches up to 100 matches; use `next_line` when
-`truncated` is true. Search covers tracked UTF-8 files up to 4 MiB. Responses are
-limited to 64 KiB including JSON formatting. The budget is shared across requests;
-dense batches return shorter pages with lossless `next_line` continuations.
+`truncated` is true. Search covers tracked UTF-8 files up to 4 MiB. Shared path
+components are checked once per search request and revalidated on subsequent
+requests. Responses are limited to 64 KiB including JSON formatting. The budget is
+shared across requests; dense batches return shorter pages with lossless `next_line` continuations.
 An entry too large for its share asks for a separate request. Git metadata, untracked files, symlinks,
 path escapes, writes, test execution, and arbitrary commands are unavailable.
 Reading a non-UTF-8 file returns an explicit per-file error and no text; other
@@ -574,6 +585,18 @@ requested scope, Caller returns the readable records and quarantines the
 unreadable positions. Those positions count toward the page and preserve its
 cursor. Swarm reports them alongside the readable history. Receipt lookups
 retain their existing integrity checks.
+
+`--logs --id CALL_ID` reads one exact History record. A primary-key index
+lookup first verifies the requested ID; an unreadable record returns that ID
+with the existing typed `history_read_error` cause. Missing IDs return an empty
+array; unavailable identity/index evidence fails the read. Swarm's exact Call
+lookup uses this History read without running interruption reconciliation.
+Ordinary selected receipt reads remain strict.
+
+Bounded pages, running reads and exact History reads include the stored
+`history_rowid` as a decimal string. Swarm uses it to count unreadable rows
+once across feeds, even when a Call ID cannot be decoded or its page index
+changes. It supplies no receipt or action evidence.
 
 `--logs --select '{"latest":[{"behavior":"pr_review","source":"poise:review-new-prs","owner":"autonomio"}],"ids":["FULL_CALL_ID"]}'`
 returns an oldest-first array containing one indexed latest-started call per

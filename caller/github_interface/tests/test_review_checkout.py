@@ -150,6 +150,54 @@ class TestInspection(TestCase):
         listing = rc.inspect(self.root, [self.request("list", path="src")])["results"][0]
         self.assertEqual(listing["paths"], ["src/code.py"])
 
+    def test_real_cli_mixed_batch_bounds_path_checks_and_preserves_search_pages(self):
+        # Representative of #958's retained eight-request batch at this head.
+        head = "37bab84e661c5d836b1d482c4de7c938a9827029"
+        reads = ["AUTONOMIO_PR_GUIDELINE.md", "POISE_REPO_SPECIFICS.md",
+                 "server/behavior-chain-decision.ts", "server/behavior-chain-action.ts",
+                 "server/behavior-chain-native.ts"]
+        names = reads + [f"src/nested/consumer-{n:03d}.ts" for n in range(256)] + ["tests/consumer.ts"]
+        for name in names:
+            target = self.root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(name + "\n")
+        text = "decideBehaviorChain(); // λ"
+        (self.root / names[-1]).write_text((text + "\n") * 150 + "retire-pr closedChainTarget\n")
+        (self.root / ".git" / rc.MANIFEST).write_text(json.dumps({"head_sha": head, "files": names}))
+        requests = [self.request(path=name) for name in reads] + [
+            self.request("search", ".", query) for query in ("decideBehaviorChain", "retire-pr", "closedChainTarget")]
+
+        def inspect_cli(batch):
+            done = subprocess.run(["github-interface", "--review-context", "--requests-json", json.dumps(batch)],
+                                  cwd=self.root, env={**os.environ, "GITHUB_INTERFACE_REVIEW_ROOT": str(self.root)},
+                                  text=True, capture_output=True, check=True, timeout=30)
+            self.assertLessEqual(len(done.stdout.encode()), rc.MAX_RESPONSE_BYTES)
+            return json.loads(done.stdout)
+
+        response = inspect_cli(requests)
+        with patch.object(os, "stat", wraps=os.stat) as stat, patch.object(os, "lstat", wraps=os.lstat) as lstat:
+            self.assertEqual(rc.inspect(self.root, requests), response)
+        # Bound real filesystem work, independently of the host's syscall speed.
+        self.assertLess(stat.call_count + lstat.call_count, 4 * len(names) * 3)
+        self.assertEqual(response["head_sha"], head)
+        for result, name in zip(response["results"], reads):
+            self.assertEqual(result["lines"], [{"line": 1, "text": name}])
+            self.assertIsNone(result["next_line"])
+        for result in response["results"][-2:]:
+            self.assertEqual(result["matches"], [{"path": names[-1], "line": 151,
+                                                 "text": "retire-pr closedChainTarget"}])
+            self.assertFalse(result["truncated"])
+            self.assertIsNone(result["next_line"])
+        result = response["results"][5]
+        self.assertTrue(result["truncated"])
+        matches = result["matches"][:]
+        while result["truncated"]:
+            self.assertEqual(result["next_line"], len(matches) + 1)
+            result = inspect_cli([{**requests[5], "start_line": result["next_line"]}])["results"][0]
+            matches.extend(result["matches"])
+        self.assertIsNone(result["next_line"])
+        self.assertEqual(matches, [{"path": names[-1], "line": n, "text": text} for n in range(1, 151)])
+
     def test_dense_unicode_batch_pages_every_line_within_the_wire_byte_limit(self):
         names = [f"src/consumer{i}.py" for i in range(8)]
         text = '"\\' + "\u03bb" * 180
@@ -231,8 +279,9 @@ class TestInspection(TestCase):
         self.assertEqual(result["error"], "tracked regular file not found")
         (self.root / "src").rename(self.root / "saved")
         (self.root / "src").symlink_to(self.root / "saved")
-        with self.assertRaisesRegex(ValueError, "symlink"):
-            rc.inspect(self.root, [self.request()])
+        for operation in ("read", "search"):
+            with self.subTest(operation=operation), self.assertRaisesRegex(ValueError, "symlink"):
+                rc.inspect(self.root, [self.request(operation, query="needle")])
 
     def test_interface_has_no_auth_and_cannot_choose_an_arbitrary_root(self):
         with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, "Caller review checkout"):

@@ -160,10 +160,42 @@ class LogsIncrementalCase(TestCase):
         self.assertEqual([row.get("history_read_error") for row in first["rows"]], [
             None, "INVALID_RECORD", "INVALID_UTF8", None,
         ])
+        self.assertEqual([row["history_rowid"] for row in first["rows"]], ["3", "5", "6", "7"])
         second = agent_interface.logs_page(4, first["nextCursor"], org="acme")
         self.assertEqual([row["id"] for row in second["rows"]], [f"{0:032x}", f"{1:032x}"])
         self.assertIsNone(second["nextCursor"])
         self.assertEqual(agent_interface.logs_page(4, org="beta")["rows"][0]["id"], f"{3:032x}")
+
+        for number, reason in ((4, "INVALID_RECORD"), (5, "INVALID_UTF8")):
+            call_id = f"{number:032x}"
+            exact = self.cli("--logs", "--id", call_id)
+            self.assertEqual((exact.returncode, exact.stderr), (0, ""), exact.stderr)
+            self.assertEqual(json.loads(exact.stdout), [{
+                "id": call_id, "history_read_error": reason,
+                "history_rowid": str(number + 1),
+                **({"repo": "acme/project"} if reason == "INVALID_RECORD" else {}),
+            }])
+            strict = self.cli("--logs", "--select", json.dumps({"latest": [], "ids": [call_id]}))
+            self.assertNotEqual(strict.returncode, 0, strict.stdout)
+        readable = self.cli("--logs", "--id", f"{2:032x}")
+        self.assertEqual((readable.returncode, readable.stderr), (0, ""), readable.stderr)
+        self.assertEqual(json.loads(readable.stdout), [first["rows"][0]])
+        missing = self.cli("--logs", "--id", "f" * 32)
+        self.assertEqual((missing.returncode, json.loads(missing.stdout)), (0, []), missing.stderr)
+
+    def test_exact_history_isolates_an_unreadable_running_row(self):
+        self.seed(2, running=1)
+        target = f"{1:032x}"
+        with agent_interface.db() as conn:
+            conn.execute("update calls set pid=123, source=cast(x'ff' as text) where id=?", (target,))
+        exact = self.cli("--logs", "--id", target)
+        self.assertEqual((exact.returncode, exact.stderr), (0, ""), exact.stderr)
+        self.assertEqual(json.loads(exact.stdout), [
+            {"id": target, "history_read_error": "INVALID_UTF8", "history_rowid": "2"},
+        ])
+        readable = self.cli("--logs", "--id", f"{0:032x}")
+        self.assertEqual((readable.returncode, readable.stderr), (0, ""), readable.stderr)
+        self.assertEqual(json.loads(readable.stdout)[0]["id"], f"{0:032x}")
 
     def test_paged_cli_returns_an_envelope(self):
         self.seed(3)
@@ -184,6 +216,7 @@ class LogsIncrementalCase(TestCase):
             (("--logs", "--status", "completed"), "--status must be running"),
             (("--logs", "--status", "running", "--limit", "2"), "--status running cannot combine"),
             (("--logs", "--cursor", "2"), "--cursor requires --limit"),
+            (("--logs", "--id", "partial"), "history read requires a full call id"),
             (("--logs", "--limit", "0"), "logs page limit must be 1..1000"),
             (("--logs", "--limit", "1001"), "logs page limit must be 1..1000"),
             (("--logs", "--limit", "many"), "--limit must be an integer"),

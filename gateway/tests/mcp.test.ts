@@ -17,9 +17,9 @@ function form(path: string, values: Record<string, string>, cookie?: string) {
   return h.request({ host: APEX, path, method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded',
     ...(cookie ? { cookie, origin: `https://${APEX}` } : {}) }, body: new URLSearchParams(values).toString() })
 }
-async function register() {
+async function register(callback = redirectUri) {
   const reply = await h.request({ host: APEX, path: '/mcp/register', method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ redirect_uris: [redirectUri], token_endpoint_auth_method: 'none' }) })
+    body: JSON.stringify({ redirect_uris: [callback], token_endpoint_auth_method: 'none' }) })
   expect(reply.status).toBe(201)
   return String(reply.json().client_id)
 }
@@ -104,18 +104,17 @@ it('rejects wrong audience, PKCE, expiry, unsupported scope and tools without wo
   expect((await form('/mcp/token', { grant_type: 'refresh_token', client_id: grant.client, refresh_token: String(renewed.json().refresh_token), resource })).status).toBe(400)
 })
 
-it('allows the registered callback origin in the consent form-action CSP', async () => {
-  const client = await register()
-  const params = new URLSearchParams({ client_id: client, redirect_uri: redirectUri, code_challenge: challenge,
+it.each([redirectUri, 'https://rsms.me/callback'])('allows the registered callback %s in the consent form-action CSP', async callback => {
+  const client = await register(callback)
+  const params = new URLSearchParams({ client_id: client, redirect_uri: callback, code_challenge: challenge,
     code_challenge_method: 'S256', resource, scope: 'poise:read', response_type: 'code', state: 's1' })
   const path = `/mcp/authorize?${params}`
   const { apexCookie } = await h.signIn('Alice', path)
   const page = await h.request({ host: APEX, path, headers: { cookie: apexCookie } })
   expect(page.status).toBe(200)
   const csp = String(page.headers['content-security-policy'] ?? '')
-  expect(csp).toContain("form-action 'self'")
-  expect(csp).toContain(new URL(redirectUri).origin)
-  expect(csp).toContain(`https://${APEX}`)
+  const formAction = csp.split(';').map(directive => directive.trim()).find(directive => directive.startsWith('form-action '))
+  expect(formAction?.split(/\s+/)).toEqual(['form-action', "'self'", new URL(callback).origin, `https://${APEX}`])
 })
 
 it('requires a live owner consent and rejects expired authorization codes and malformed registrations', async () => {

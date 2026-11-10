@@ -242,7 +242,7 @@ def track(
                 correlation_id,
                 None if runner else str(os.getpid()),
                 runner,
-                None if runner else process_identity.capture(os.getpid()),
+                None if runner else process_identity.capture(os.getpid(), native=source == "poise:behavior-chain"),
                 resource_ownership.initial(id_, correlation_id) if _native_cli and source == "poise:behavior-chain" and not runner
                 else resource_ownership.initial() if source == "poise:behavior-chain" and not runner else None,
                 json.dumps({"token": uuid4().hex, "owner": process_identity.capture(os.getpid()), "attempt_at": 0})
@@ -714,8 +714,10 @@ def init_started_at() -> float | None:
 def reap_interrupted() -> int:
     """Historical non-native calls retain their age-based status reaping.
     Native supervisor loss uses its recorded kernel identity, never wall-clock
-    epoch order. Its interrupted status grants neither resource release nor
-    retry authority. Terminal native rows need no reaping or process scan;
+    epoch order. Only a reader that can observe the current workspace
+    supervisor can reconcile an earlier epoch. Interrupted status grants
+    neither resource release nor retry authority. Terminal native rows need
+    no reaping or process scan;
     verified cleanup is separate and never runs in these log reads."""
     init = init_started_at()
     now = time()
@@ -725,13 +727,19 @@ def reap_interrupted() -> int:
             "where status='running' and runner is null and pid is not null"
         ).fetchall()
     ended = []
+    workspace_observer = None
     for row in rows:
         if row["source"] == "poise:behavior-chain":
             try:
-                observed = process_identity.state(row["process_identity"], int(row["pid"]))
+                observed = process_identity.state(row["process_identity"], int(row["pid"]), True)
             except (RuntimeError, TypeError, ValueError):
                 continue
-            if observed != "alive":
+            if observed == "unobservable":
+                if workspace_observer is None:
+                    workspace_observer = caller_store.observes_workspace_supervisor()
+                if workspace_observer:
+                    observed = "different"
+            if observed in {"gone", "different"}:
                 ended.append(row["id"])
             continue
         started = float(row["started_at"] or 0)
@@ -818,13 +826,16 @@ def logs(status: str | None = None):
     if status is not None and status != "running":
         raise ValueError("logs status filter must be running")
     reap_interrupted()
+    columns = f"rowid, {LOG_ROW_COLUMNS}" if status else LOG_ROW_COLUMNS
     with db() as conn:
         rows = conn.execute(
-            f"select {LOG_ROW_COLUMNS} from calls"
+            f"select {columns} from calls"
             + (" where status='running'" if status else "")
             + " order by started_at"
         ).fetchall()
-    return [_log_row(r) for r in rows]
+    if status:
+        return [{**_log_row(row), "history_rowid": str(row["rowid"])} for row in rows]
+    return [_log_row(row) for row in rows]
 
 
 LOGS_PAGE_LIMIT_MAX = 1000
@@ -970,6 +981,19 @@ def _read_history_row(conn: sqlite3.Connection, rowid: int, where: str, params: 
     return _history_log_row(row) if row is not None else {"history_read_error": "MISSING_ROW"}
 
 
+def logs_history_by_id(id_: str) -> list[dict]:
+    """One exact History row; only a verified primary key can be quarantined."""
+    if not re.fullmatch(r"[0-9a-f]{32}", id_):
+        raise ValueError("history read requires a full call id")
+    # Reaping scans running records and can fail before this row is isolated.
+    with db() as conn:
+        key = conn.execute("select rowid from calls indexed by sqlite_autoindex_calls_1 where id=?", (id_,)).fetchone()
+        if key is None:
+            return []
+        entry = _read_history_row(conn, key[0], " where id=?", [id_])
+    return [{**entry, "id": id_, "history_rowid": str(key[0])}]
+
+
 def logs_page(limit: int, cursor: str | None = None, org: str | None = None, search: str | None = None) -> dict:
     """One bounded newest-first history page; rows stay oldest-first in it.
 
@@ -1023,6 +1047,7 @@ def logs_page(limit: int, cursor: str | None = None, org: str | None = None, sea
         else:
             keys = [row["rowid"] for row in rows]
             page = [_history_log_row(row) for row in rows[:limit]]
+    page = [{**entry, "history_rowid": str(key)} for entry, key in zip(page, keys[:limit], strict=True)]
     return {
         "rows": list(reversed(page)),
         "nextCursor": str(keys[limit - 1]) if len(keys) > limit else None,
@@ -2691,6 +2716,7 @@ behaviors:
   --models
   --refresh-models [--families claude,codex]
   --logs [--status running] [--limit 1..1000] [--cursor CURSOR] [--org OWNER] [--search TEXT]
+  --logs --id CALL_ID
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
   --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
@@ -2935,6 +2961,13 @@ def _main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--logs":
         if sys.argv[2:] == ["--watermark"]:
             print(json.dumps({"cursor": logs_watermark()}))
+            return
+        if len(sys.argv) == 4 and sys.argv[2] == "--id":
+            try:
+                selected = logs_history_by_id(sys.argv[3])
+            except ValueError as error:
+                usage(error=str(error))
+            print(json.dumps(selected, separators=(",", ":")))
             return
         if len(sys.argv) == 4 and sys.argv[2] == "--select":
             try:
