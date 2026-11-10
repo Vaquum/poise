@@ -4,16 +4,19 @@ import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJourna
 import { resourceReleaseProven } from './behavior-resource-receipt'
 import { runDatastoreHealth } from './datastore-health'
 import { handleGhBody, reconcileRepairReport } from './gh'
+import { HttpError } from './http'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
 import type { ProcessDiagnostic } from './process-diagnostic'
 import { getBehaviorChainSettings, getSettings } from './settings'
+import { isServiceMode } from './service/config'
 
 export const REMEDIATION_SCOPE = `Minimal, clinical interventions all the way. Get in, get out, do the thing that actually has to be done, never expand it beyond that. Keep asking "is this truly the cleanest and simplest and least intrusive way to get this done" and do it that way and only that way. Don't let others come expand it, let them come make it cleaner.`
 
 const MERGE_CAUSE = 'merge_submission_uncertain'
 const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', MERGE_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
+const REPOSITORIES_KEY = 'service_repair_exhaustion_repositories'
 const INCOMPLETE_REPLIES = /^repair did not answer every unresolved review finding(?:: missing_root_comment_ids=\[[0-9, ]*\]; missing_count=[1-9][0-9]*; required_count=[1-9][0-9]*)?$/
 const REPORT_MARKER = /<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/
 
@@ -57,16 +60,50 @@ export async function repairReportReviewScope(db: Database, chain: Pick<Behavior
   return REMEDIATION_SCOPE
 }
 
-function enabled(repository: string): boolean {
-  const configured = process.env.POISE_REPAIR_EXHAUSTION_REPOSITORIES
-  if (!configured?.trim()) return false
+function repositoryNames(configured: string): string[] {
+  if (!configured.trim()) return []
   const repositories = configured.split(',').map(value => value.trim())
   for (const value of repositories) {
     const [owner, repo, extra] = value.split('/')
     if (!owner || !repo || extra !== undefined) throw new Error('POISE_REPAIR_EXHAUSTION_REPOSITORIES requires comma-separated owner/repo names')
     chainIdentity(value, 1)
   }
-  return repositories.some(value => value.toLowerCase() === repository.toLowerCase())
+  return repositories
+}
+
+/** Health answers must fit the gateway's 64 KiB service-answer budget with room for every other field. */
+export const MAX_REPAIR_REPORT_REPOSITORIES_BYTES = 8 * 1024
+
+export function repairReportRepositories(db: Database): string {
+  // An applied empty value must survive restart over a legacy container environment.
+  const applied = isServiceMode()
+    ? db.prepare('SELECT value FROM meta WHERE key = ?').get(REPOSITORIES_KEY) as { value: string } | undefined
+    : undefined
+  return applied?.value ?? process.env.POISE_REPAIR_EXHAUSTION_REPOSITORIES ?? ''
+}
+
+export function repairReportRepositoriesHealth(db: Database): string {
+  const configured = repairReportRepositories(db)
+  if (Buffer.byteLength(configured) <= MAX_REPAIR_REPORT_REPOSITORIES_BYTES) return configured
+  // A legacy or environment value beyond the cap truncates: the gateway sees
+  // a mismatch and posts its own (capped) value, which converges on the next
+  // probe instead of wedging every health answer past the gateway budget.
+  return Buffer.from(configured).subarray(0, MAX_REPAIR_REPORT_REPOSITORIES_BYTES).toString('utf8')
+}
+
+export function setRepairReportRepositories(db: Database, configured: unknown): void {
+  if (typeof configured !== 'string') throw new HttpError(400, 'repairExhaustionRepositories must be a string; empty disables reporting')
+  if (Buffer.byteLength(configured) > MAX_REPAIR_REPORT_REPOSITORIES_BYTES) throw new HttpError(400,
+    `repairExhaustionRepositories exceeds ${MAX_REPAIR_REPORT_REPOSITORIES_BYTES} bytes; the gateway cannot reconcile a larger health answer`)
+  try { repositoryNames(configured) }
+  catch { throw new HttpError(400, 'repairExhaustionRepositories requires comma-separated owner/repo names') }
+  if (db.pragma('synchronous', { simple: true }) !== 2) db.pragma('synchronous = FULL')
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .run(REPOSITORIES_KEY, configured)
+}
+
+function enabled(db: Database, repository: string): boolean {
+  return repositoryNames(repairReportRepositories(db)).some(value => value.toLowerCase() === repository.toLowerCase())
 }
 
 /** The normal decision still has to request work on precisely this basis.
@@ -139,7 +176,7 @@ function qualifyingMergeSubmission(chain: BehaviorChain, observation: ChainObser
 export async function reportRepairExhaustion(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   verify: () => Promise<ChainObservation>, allowed: () => boolean): Promise<string | null> {
   const pendingMerge = chain.invocations.find(invocation => invocation.behavior === 'merge-pr' && invocation.state !== 'settled')
-  if (!enabled(chain.repository) || !allowed() || !chain.held && !pendingMerge) return null
+  if (!enabled(db, chain.repository) || !allowed() || !chain.held && !pendingMerge) return null
   const observation = chain.observation as ChainObservation | null
   if (!observation?.pull) return null
   const qualifying = qualifyingAttempts(chain, observation, Date.now())
@@ -214,10 +251,12 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       issueNumber: existing?.number ?? null }
     // FULL durability precedes the external effect. A competing runtime or a
     // crash after this insert may reconcile, but may never create again.
+    if (!enabled(db, chain.repository) || !allowed()) return null
     if (db.pragma('synchronous', { simple: true }) !== 2) db.pragma('synchronous = FULL')
     const claimed = db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING').run(storageKey, JSON.stringify(report))
     if (!claimed.changes) return `${label} report pending: another reconciliation reserved this report`
     if (!existing) {
+      if (!enabled(db, chain.repository)) return null
       if (!allowed()) return `${label} report creation is unconfirmed; admissions are paused`
       const review = cause === 'review_budget_exhausted'
       const budget = cause === 'repair_execution_budget_exhausted'
@@ -264,7 +303,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   if (report.issueNumber === null) { report.issueNumber = issue.number; save() }
   const link = `${label} report ${issue.url}`
   if (issue.state === 'closed') return `${link} is closed; no replacement will be created`
-  if (!issue.labels.some(label => label.toLowerCase() === 'poise') && allowed()) {
+  if (!issue.labels.some(label => label.toLowerCase() === 'poise') && enabled(db, chain.repository) && allowed()) {
     try { issue = (await reconcileRepairReport(chain.repository, marker, issue.number, true))! }
     catch (error) { return `${link}: poise label pending: ${error instanceof Error ? error.message : String(error)}` }
   }

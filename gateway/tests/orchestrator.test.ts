@@ -1169,35 +1169,48 @@ describe('updates in place', () => {
   })
 
   it.each(['added', 'changed', 'removed'].flatMap(change => [false, true].map(sameImage => ({ change, sameImage }))))(
-    'cooperatively replaces a workspace when the report allowlist is $change (same image=$sameImage)', async ({ change, sameImage }) => {
+    'applies the $change report allowlist in place while native cleanup remains held (same image=$sameImage)', async ({ change, sameImage }) => {
       const desired = change === 'removed' ? '' : 'acme/one,acme/two'
       await start({ repairRepositories: desired })
       const container = h.docker.containers.get('poise-ws-alice')!
       const previous = change === 'added' ? '' : 'acme/old'
       container.spec = { ...container.spec, Env: [`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`,
         ...(previous ? [`POISE_REPAIR_EXHAUSTION_REPOSITORIES=${previous}`] : [])] }
+      h.workspace.health.repairExhaustionRepositories = previous
       if (sameImage) {
         container.imageId = CURRENT_IMAGE_ID
         h.workspace.health.release = 'new-release'
       }
       const before = containerId()
+      const originalEnvironment = containerEnv(h, 'alice').slice()
       h.workspace.health.unsettledNativeCalls = 1
       h.workspace.health.backgroundWork = 1
       await h.orchestrator.upgradePass()
       expect(containerId()).toBe(before)
-      expect(h.workspace.switches).toEqual([])
+      expect(h.workspace.switches).toEqual(sameImage ? [] : ['new-release'])
       expect(h.workspace.health.draining).toBe(false)
-      h.workspace.health.unsettledNativeCalls = 0
-      h.workspace.health.backgroundWork = 0
+      expect(h.workspace.health.repairExhaustionRepositories).toBe(desired)
+      const configuration = h.workspace.serviceRequests.filter(request => request.url === '/api/service/config')
+      expect(configuration).toHaveLength(1)
+      expect(JSON.parse(configuration[0].body)).toEqual({ repairExhaustionRepositories: desired })
+      expect(configuration[0].headers.host).toBe(ALICE)
+      expect(verifyAssertion(String(configuration[0].headers['x-poise-identity']), h.keys.publicKeyBase64))
+        .toMatchObject({ aud: 'workspace:alice', sub: 'Alice', scope: 'admin' })
+      h.workspace.health.release = 'new-release'
       await h.orchestrator.upgradePass()
-      expect(containerId()).not.toBe(before)
-      expect(h.workspace.switches).toEqual([])
-      expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/drain')).toBe(true)
-      expect(containerEnv(h, 'alice').filter(value => value.startsWith('POISE_REPAIR_EXHAUSTION_REPOSITORIES=')))
-        .toEqual(desired ? [`POISE_REPAIR_EXHAUSTION_REPOSITORIES=${desired}`] : [])
-      const after = containerId()
+      expect(containerId()).toBe(before)
+      expect(containerEnv(h, 'alice')).toEqual(originalEnvironment)
+      expect(h.workspace.health).toMatchObject({ unsettledNativeCalls: 1, backgroundWork: 1, draining: false })
+      expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/config')).toHaveLength(1)
+      expect(h.workspace.serviceRequests.some(request => request.url === '/api/service/drain')).toBe(false)
+
+      // A runtime-base change still cannot replace the supervisor owning this cleanup hold.
+      h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': 'different-base' })
+      container.imageId = OLD_IMAGE_ID
       await h.orchestrator.upgradePass()
-      expect(containerId()).toBe(after)
+      expect(containerId()).toBe(before)
+      expect(h.workspace.health).toMatchObject({ unsettledNativeCalls: 1, backgroundWork: 1, draining: false })
+      expect(h.logs.some(entry => entry.event === 'workspace.upgrade.aborted')).toBe(true)
     })
 
   it('switches a workspace on the current image that still runs an older release', async () => {

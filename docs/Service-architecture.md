@@ -286,7 +286,7 @@ Environment the gateway passes:
 | `HOME` | `/home/poise` |
 | `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 5400), so both sides time a drain alike |
 | `POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES` | optional validated whole-byte native behavior settings from the gateway; unset remains unbounded ([configuration](../gateway/README.md)) |
-| `POISE_REPAIR_EXHAUSTION_REPOSITORIES` | optional explicit comma-separated `owner/repo` allowlist from the gateway; unset or empty keeps work-failure reporting disabled |
+| `POISE_REPAIR_EXHAUSTION_REPOSITORIES` | optional explicit comma-separated `owner/repo` allowlist for new containers from the gateway; trusted service configuration overrides it, including explicit empty to disable reporting |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 Beside each release, the gateway installs agents' test offload into the home
@@ -307,9 +307,13 @@ Changed or removed native behavior budget/reservation settings use that same
 replacement path and its existing native resource-settlement barrier. Existing
 invocations retain their original immutable ceilings; no setting changes an
 already-admitted booking.
-Adding, changing or removing the repair-report allowlist uses that same
-cooperative replacement path, including settings-only deployments on the same
-image; an in-place release switch cannot change a container's environment.
+Adding, changing or removing the repair-report allowlist instead uses
+`POST /api/service/config` on compatible running workspaces. Each upgrade pass
+reconciles it even when image and release already match, without a drain,
+restart or container replacement. An explicitly applied empty value is durable
+and overrides a legacy nonempty container environment after Poise restarts.
+Older releases without this configuration support retain the existing release
+upgrade path; the gateway applies the setting once a compatible release runs.
 
 The gateway reaches the workspace at `http://poise-ws-<handle>:5555`, over the
 workspace's network, which it joins by its own container name,
@@ -575,7 +579,7 @@ otherwise offer it):
 assertion may only resume, and anything else is refused with 403):
 - `GET /api/service/health` returns `{ ok, mode, version, activeChatTurns,
   runningCallerCalls, unsettledNativeCalls, backgroundWork, idle, draining, release, switching,
-  eventLoop, desiredRelease, installedRelease, pendingSince, switchWaitingOn }`. `idle` is true only
+  repairExhaustionRepositories, eventLoop, desiredRelease, installedRelease, pendingSince, switchWaitingOn }`. `idle` is true only
   when `activeChatTurns`, `runningCallerCalls` and `backgroundWork` are all 0.
   It backs the container health check and the gateway's readiness check.
   - `eventLoop` is the current minute window of event-loop delay
@@ -585,6 +589,9 @@ assertion may only resume, and anything else is refused with 403):
     stall barely moves p99.
   - `version` is the commit the running bundle was built from, `null` for a
     development build.
+  - `repairExhaustionRepositories` is the effective comma-separated reporting
+    allowlist, empty when disabled. Its absence identifies an older release
+    that cannot apply this setting through service configuration.
   - `release` is the installed release the supervisor started this server on
     ([Updates in place](#updates-in-place)), `null` without one: the active
     SHA. A deploy is done only once it equals the deployed commit.
@@ -634,6 +641,12 @@ assertion may only resume, and anything else is refused with 403):
     one-minute maintenance opportunity while admissions and behavior ticks are
     paused, so an ordinary drain preserves original supervisor witnesses until
     their durable cleanup acknowledgement.
+- `POST /api/service/config` takes `{ repairExhaustionRepositories }`, a string
+  of explicit comma-separated `owner/repo` names or empty to disable reporting,
+  persists it in the workspace metadata store and returns health (200).
+  Invalid or missing values return 400. Only loopback or an `admin` assertion
+  may write it; browser and Link assertions are refused. This setting does not
+  alter existing native resource ownership or release/replacement safeguards.
 - `POST /api/service/drain` stops admitting new Chat turns and behavior
   launches, then returns the same fields with the drain on. The gateway treats
   the drain as admitted only when the answer is `ok` and shows `draining`; an
@@ -1139,9 +1152,10 @@ the checkout's commit as the build argument `POISE_SOURCE_SHA`, which
 `/api/service/health` reports as `version`.
 Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
 recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, or
-whose `POISE_DRAIN_TIMEOUT`, configured native behavior budgets or repair-report
-allowlist differ from its own, keeping its volume and respecting the native
-settlement barrier.
+whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
+its own, keeping its volume and respecting the native settlement barrier.
+The reporting allowlist is reconciled separately through trusted service
+configuration without replacing a compatible running container.
 The operator scripts retain an exact-release rollout receipt beyond their
 bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
 receipt through the existing workspace health/image proof without initiating
@@ -1475,9 +1489,12 @@ no-publication shape and retry requirements are defined in
 
 Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
-environment opt-in enables verified repair incomplete-reply, repair execution-budget
+opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review-budget exhaustion, and terminal uncertain merge submissions, including
-sources without an explicit hold.
+sources without an explicit hold, supplied by trusted service configuration or the
+environment in local mode. Scope is rechecked after verification before reserving
+creation intent and publishing; revocation during those reads leaves the creation
+intent available.
 Merge reports revalidate the open seed/PR, original pinned head and absent queue
 entry after recovery, retaining the original invocation's uncertainty and ownership.
 Durable creation intent prevents another POST after an uncertain result; the source state,

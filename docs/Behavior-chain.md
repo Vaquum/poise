@@ -530,14 +530,18 @@ failure is a failed, unstarted action and retries with the existing backoff.
 
 Reporting is off by default. An operator can set
 `POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
-list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
+list of explicit `owner/repo` names, up to 8192 bytes so the workspace can echo
+it in health for gateway reconciliation. Enabled v2 chains check both new and existing
 repair holds and uncertain merge submissions during their ordinary bounded
 reconciliation; no Resume or extra poller is needed. Reporting preserves the
 source hold, uncertainty and ownership and does not perform recovery.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
-variable. The gateway forwards it on install; adding, changing or removing it
-cooperatively replaces existing workspaces, even on the same image. Unset or
-empty opts out.
+variable. The gateway reconciles it through trusted service configuration on
+compatible running workspaces, including when image and release already match.
+Adding, changing or removing it needs no restart or container replacement and
+does not disturb native cleanup holds. Explicit empty durably overrides a legacy
+container environment after Poise restarts. Local mode keeps environment-based
+configuration. Unset or empty opts out.
 
 Reporting requires at least three settled original Caller receipts for the same
 phase, current head, review basis and slot after the last Resume, each with positive
@@ -560,6 +564,8 @@ new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads or PR review contexts leave reporting pending,
 including title, body or base changes on an unchanged head. Other causes remain
 visible in their ordinary holds without an issue report; mixed repair or review causes cannot qualify.
+Revoking repository scope during verification prevents publication and leaves the
+creation intent unconsumed, so re-enabling can still report once.
 
 `merge_submission_uncertain` separately qualifies the original pending `merge-pr`
 invocation after recovery rereads the journal, even without an explicit chain hold.

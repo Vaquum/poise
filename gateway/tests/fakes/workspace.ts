@@ -20,6 +20,7 @@ export interface StubHealth {
   release: string | null
   /** The release a pending switch restarts it onto; null when none is pending. */
   switching: string | null
+  repairExhaustionRepositories?: string
 }
 
 /**
@@ -130,6 +131,11 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
         const answer = (status: number, body: unknown): void => {
           if (stub.answerDelayMs > 0) setTimeout(() => json(res, status, body), stub.answerDelayMs)
           else json(res, status, body)
+        }
+        if (url === '/api/service/config' && req.method === 'POST') {
+          const { repairExhaustionRepositories } = JSON.parse(seen.body) as { repairExhaustionRepositories: string }
+          stub.health.repairExhaustionRepositories = repairExhaustionRepositories
+          return answer(200, healthBody())
         }
         if (url === '/api/service/switch' && req.method === 'POST') {
           const { release } = JSON.parse(seen.body || '{}') as { release?: string }
