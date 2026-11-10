@@ -2617,6 +2617,16 @@ async function requireFreshDatastore(): Promise<void> {
     if (ageSeconds > DATASTORE_MAX_AGE_SECONDS || !Number.isFinite(Date.parse(lastSuccessAt))) {
       throw new Error('github-datastore health returned invalid freshness metadata')
     }
+    const incomingSync = Date.parse(lastSuccessAt)
+    const retained = datastoreFreshnessByOrganization.get(operationKey('review-new-prs'))
+    const retainedSync = retained?.lastSuccessAt ? Date.parse(retained.lastSuccessAt) : NaN
+    if (Number.isFinite(retainedSync) && (incomingSync < retainedSync
+      || (incomingSync === retainedSync && ageSeconds < (retained?.ageSeconds ?? Number.NEGATIVE_INFINITY)))) {
+      // A delayed healthy result from an older sync generation (or an
+      // earlier probe of the same one) carries no news: keep the retained
+      // newer evidence so readiness keeps deriving age from it.
+      return
+    }
     datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
       status: 'healthy',
       checkedAt,

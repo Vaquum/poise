@@ -201,6 +201,15 @@ it('retains the latest evidence when stale and healthy observations arrive out o
   expect(behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', failures: [],
     datastore: { status: 'healthy', lastSuccessAt: syncB, ageSeconds: 0 } })
   expect(notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now())).toEqual([])
+  // Sync A's delayed healthy result arrives after the same recovery: it
+  // carries no news, so the freshness gate keeps the retained sync B
+  // evidence instead of overwriting it with sync A.
+  saveProbe(path, health(path, 1, syncA))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(episodes(database)).toEqual([recovered])
+  expect(events()).toHaveLength(2)
+  expect(behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', failures: [],
+    datastore: { status: 'healthy', lastSuccessAt: syncB, ageSeconds: 0 } })
 
   saveProbe(path, health(path, 180, syncB))
   await behaviors.runEnabledBehaviorsOnce()
