@@ -615,6 +615,10 @@ The receipt must retain `status=failed`, `action=not_started`,
 resource ownership/release proof, without a publication plan, result or receipts.
 A fresh open seed and native inspection must also verify no pushed branch,
 bound PR or competing linked work. Poise rechecks the hold before reserving intent.
+In label-based intake, the live source must still carry the configured intake label
+before a report is created or an existing report is relabeled. Unverified eligibility
+leaves reporting pending without consuming new intent; published reports and the
+original hold and receipts remain retained. All-issues intake is unchanged.
 Ordinary retries and unknown original effects do not qualify. The report includes
 the bounded, redacted blocker as **worker-reported** and available structured Caller
 diagnostic facts. Caller's blocked result does not independently verify the worker's

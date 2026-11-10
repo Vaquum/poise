@@ -258,6 +258,7 @@ function operations(db: Database.Database, journal: BehaviorChainJournal, overri
     readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {}, ...overrides }
 }
 const posts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1] === 'repos/acme/repo/issues')
+const labelPosts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1].endsWith('/labels') && call[1].includes('POST'))
 const reports = (db: Database.Database) => db.prepare("SELECT value FROM meta WHERE key LIKE 'behavior_chain_repair_report:%'").all() as { value: string }[]
 
 it('routes an open seed past its only closed unmerged PR through ordinary continuation intake', async () => {
@@ -500,6 +501,74 @@ it.each([false, true])('reports one verified implementation hold before a PR wit
   expect(reports(db)).toEqual([intent])
   expect(posts()).toHaveLength(1)
   expect(launch).not.toHaveBeenCalled()
+})
+
+it.each([
+  { published: false, label: 'poise', eligibility: 'removed' },
+  { published: true, label: 'poise', eligibility: 'removed' },
+  { published: false, label: 'ready-for-work', eligibility: 'removed' },
+  { published: true, label: 'ready-for-work', eligibility: 'removed' },
+  { published: false, label: 'poise', eligibility: 'unknown' },
+  { published: true, label: 'poise', eligibility: 'unknown' },
+  { published: false, label: 'poise', eligibility: 'unavailable' },
+  { published: true, label: 'poise', eligibility: 'unavailable' },
+])('retains implementation holds without report writes when live eligibility is $eligibility (published=$published, label=$label)', async ({ published, label, eligibility }) => {
+  const { db, journal } = setup()
+  mocks.settings.label = label
+  const { chain, call } = blockedImplementation(journal)
+  seedLabels = [{ name: label }]
+  const overrides = { discover: async () => [], observe: async () => unpublished(),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  await new BehaviorChainRuntime(journal, operations(db, journal, { ...overrides,
+    ...(published ? {} : { reportHold: undefined }) })).run()
+  const source = journal.read(chain.id)!
+  expect(source.observation).toMatchObject({ issue: { eligible: true } })
+  expect(source.held).toBe(call.error)
+  if (published) remote[0].labels = []
+  const priorReports = reports(db)
+  const priorIssues = structuredClone(remote)
+  seedLabels = label === 'poise' ? [] : [{ name: 'poise' }]
+  if (eligibility === 'removed') fresh.issue.eligible = false
+  if (eligibility === 'unknown') Reflect.deleteProperty(fresh.issue, 'eligible')
+  if (eligibility === 'unavailable') stale = true
+  mocks.runFile.mockClear()
+  journal.rebuild()
+  vi.setSystemTime(NOW + 86_400_000)
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  expect(posts()).toHaveLength(0)
+  expect(labelPosts()).toHaveLength(0)
+  expect(reports(db)).toEqual(priorReports)
+  expect(remote).toEqual(priorIssues)
+  expect(journal.read(chain.id)).toMatchObject({ held: source.held, invocations: source.invocations,
+    resumedAfterSequence: source.resumedAfterSequence, branch: source.branch, author: source.author, reviewer: source.reviewer,
+    waiting: expect.stringContaining(eligibility === 'unavailable' ? 'stale review datastore'
+      : `the source is not verified eligible for intake label ${label}`) })
+})
+
+it.each(['custom label', 'all issues'])('preserves exactly-once implementation reporting with %s intake', async mode => {
+  const { db, journal } = setup()
+  mocks.settings.label = 'ready-for-work'
+  if (mode === 'all issues') mocks.settings.seedMode = 'all'
+  const { call } = blockedImplementation(journal)
+  seedLabels = mode === 'all issues' ? [] : [{ name: 'READY-FOR-WORK' }]
+  fresh.issue.eligible = mode !== 'all issues'
+  const overrides = { discover: async () => [], observe: async () => unpublished(),
+    readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  const runtime = new BehaviorChainRuntime(journal, operations(db, journal, overrides))
+  await runtime.run()
+  expect(remote).toHaveLength(1)
+  expect(remote[0].labels).toEqual([{ name: 'poise' }])
+  const original = reports(db)
+  remote[0].labels = []
+  journal.rebuild()
+  for (let pass = 0; pass < 2; pass++) {
+    vi.setSystemTime(Date.now() + 86_400_000)
+    await runtime.run()
+  }
+  expect(posts()).toHaveLength(1)
+  expect(labelPosts()).toHaveLength(1)
+  expect(reports(db)).toEqual(original)
+  expect(remote[0].labels).toEqual([{ name: 'poise' }])
 })
 
 it('reconciles a lost implementation report acknowledgement after restart without another POST', async () => {
