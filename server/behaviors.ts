@@ -2588,14 +2588,23 @@ async function requireFreshDatastore(): Promise<void> {
         if (unhealthyExit) throw unhealthyExit
         return
       }
-      const message = `Datastore stale: last successful sync ${data.last_success_at}; age ${data.age_seconds}s exceeds ${DATASTORE_MAX_AGE_SECONDS}s`
+      const message = stale ? staleMirrorMessage(stale.episode) : `Datastore stale: last successful sync ${data.last_success_at}; age ${data.age_seconds}s exceeds ${DATASTORE_MAX_AGE_SECONDS}s`
+      const latest = stale?.episode.latest
       datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
-        status: 'unavailable', checkedAt, ageSeconds: Number(data.age_seconds),
-        lastSuccessAt: data.last_success_at, error: message,
+        status: 'unavailable', checkedAt, ageSeconds: latest ? latest.ageSeconds : Number(data.age_seconds),
+        lastSuccessAt: latest ? latest.lastSuccessAt : String(data.last_success_at), error: message,
       })
       try { await recoverLegacyDatastore(org, behaviorSignal()) }
       catch (error) { console.error('[behaviors] legacy datastore sync recovery failed:', behaviorErrorMessage(error)) }
       throw stale ?? new Error(message)
+    }
+    if (stale) {
+      const message = staleMirrorMessage(stale.episode)
+      datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
+        status: 'unavailable', checkedAt, ageSeconds: stale.episode.latest.ageSeconds,
+        lastSuccessAt: stale.episode.latest.lastSuccessAt, error: message,
+      })
+      throw stale
     }
     if (unhealthyExit) throw unhealthyExit
     if (data.action !== 'health'
@@ -2608,6 +2617,16 @@ async function requireFreshDatastore(): Promise<void> {
     const lastSuccessAt = String(data.last_success_at || '')
     if (ageSeconds > DATASTORE_MAX_AGE_SECONDS || !Number.isFinite(Date.parse(lastSuccessAt))) {
       throw new Error('github-datastore health returned invalid freshness metadata')
+    }
+    const incomingSync = Date.parse(lastSuccessAt)
+    const retained = datastoreFreshnessByOrganization.get(operationKey('review-new-prs'))
+    const retainedSync = retained?.lastSuccessAt ? Date.parse(retained.lastSuccessAt) : NaN
+    if (Number.isFinite(retainedSync) && (incomingSync < retainedSync
+      || (incomingSync === retainedSync && ageSeconds < (retained?.ageSeconds ?? Number.NEGATIVE_INFINITY)))) {
+      // A delayed healthy result from an older sync generation (or an
+      // earlier probe of the same one) carries no news: keep the retained
+      // newer evidence so readiness keeps deriving age from it.
+      return
     }
     datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
       status: 'healthy',

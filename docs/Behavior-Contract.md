@@ -423,9 +423,14 @@ It retains the first detection, first and latest freshness evidence, and the
 union of behaviors whose gates refused work. Logging records its opening once;
 Behaviors groups those refusals under the same episode while keeping each
 behavior's refusal. Changing sync ages, later ticks and server restarts do not
-open another episode. Only a validated successful healthy probe records recovery
-and rearms the mirror. Native discovery and cutover probes share this reporting
-and retain their existing exit-based admission rules. Crashes, malformed or
+open another episode. Evidence is ordered by successful sync timestamp, then
+age within that sync; late stale or healthy results cannot replace newer evidence.
+Healthy probes keep advancing the retained evidence after recovery. Only a
+validated successful healthy probe records recovery and rearms the mirror.
+Caller's normal stale stderr with validated stale JSON is an expected probe
+outcome; unexpected stderr remains a process fault.
+Native discovery and cutover probes share this reporting and retain their
+existing exit-based admission rules. Crashes, malformed or
 mismatched health, and failed recovery commands remain independent faults, even
 while a stale episode is open. The freshness limit remains 120 seconds.
 
