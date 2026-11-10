@@ -4648,7 +4648,7 @@ async function fireApprove(
     // reads that as an abort and would drop a genuine failure silently, so log
     // and record it here, as review-new-prs phase 3 does.
     if (behaviorAborted()) return false
-    console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
+    if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
     recordBehaviorFailure('approve-prs', 'operation', err, `${pr.repo}#${pr.number}:check`)
     return false
   }
@@ -6086,7 +6086,7 @@ async function tickMergePrs(): Promise<void> {
         }
         if (behaviorAborted()) return
         recordBehaviorFailure('merge-prs', 'operation', error, target, { actingAccount: actor })
-        console.error(`[behaviors] merge-prs failed for ${target}:`, error)
+        if (!(error instanceof BehaviorLogFeedError)) console.error(`[behaviors] merge-prs failed for ${target}:`, error)
       } finally {
         if (runId) finishDirectBehaviorRun(runId, false, null, runNote ?? undefined)
         releasePrOperationOwned(operationId)

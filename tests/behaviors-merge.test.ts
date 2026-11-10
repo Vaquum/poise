@@ -36,6 +36,7 @@ let approvedAts: Record<number, string | null> = {}
 let unreadableNumbers = new Set<number>()
 let batchGate: { reached: () => void, wait: Promise<void> } | null = null
 let logOverrides: Record<string, unknown> | null = null
+let logError: Error | null = null
 
 function reviewLog(pr: Record<string, unknown>) {
   const actor = pr.author === 'octocat' ? 'review-bot' : 'octocat'
@@ -55,7 +56,10 @@ function updateCalls() {
 async function cli(command: string, args: string[], options: RunFileOptions) {
   const json = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' })
   if (command === 'agent-interface' && args[0] === '--models') return { stdout: CATALOG_STDOUT, stderr: '' }
-  if (command === 'agent-interface' && args[0] === '--logs') return json(pulls.map(reviewLog))
+  if (command === 'agent-interface' && args[0] === '--logs') {
+    if (logError) throw logError
+    return json(pulls.map(reviewLog))
+  }
   if (command === 'github-datastore' && args.includes('health')) {
     if (healthError) throw healthError
     const now = new Date().toISOString()
@@ -99,7 +103,7 @@ beforeEach(async () => {
   pulls = [pull()]
   outcome = 'merged'; updateOutcome = 'updated'; error = null; healthError = null; response = {}; batchGate = null
   readyNumbers = null; behindNumbers = new Set(); approvedAts = {}; unreadableNumbers = new Set()
-  queuedEntries = {}; heads = {}; logOverrides = null
+  queuedEntries = {}; heads = {}; logOverrides = null; logError = null
   mocks.runFile.mockReset().mockImplementation(cli)
   mocks.spawnDetached.mockReset()
   vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -497,5 +501,14 @@ describe('opposite-account merge routing', () => {
     await runtime.runEnabledBehaviorsOnce()
     expect(mergeCalls()).toHaveLength(1)
     expect(mergeCalls()[0][1]).toContain('octocat')
+  })
+  it('keeps shared history failures out of merge diagnostics while holding the merge', async () => {
+    logError = new Error('Command timed out after 30000ms')
+    enable()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mergeCalls()).toEqual([])
+    expect(updateCalls()).toEqual([])
+    expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining('merge-prs failed'), expect.anything())
+    expect(runtime.getBehaviorsRuntimeHealth().failures.length).toBeGreaterThan(0)
   })
 })
