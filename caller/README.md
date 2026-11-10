@@ -34,6 +34,15 @@ whose immutable plan, pushed head, unattempted replies and released worker
 resources are proven. It starts no model and cannot replace that plan.
 Shared baseline CI dependencies use that same atomic repair artifact and the
 existing chain tick ([dependency evidence and recovery](../docs/Behavior-chain.md)).
+Before new implementation, Poise reads `github-datastore view issue-dependencies`
+under the existing freshness gate. For each explicit same-repository prerequisite,
+`github-interface --read-issue ISSUE --delivery-base SHA --token-user USER`
+reads its state and linked closing PRs, including closed PRs. It returns
+`verified: true` only for a closed issue with a linked closing PR's merge commit
+verified on that exact base by GitHub's commit comparison; missing or incomplete
+evidence returns an explicit unverified reason. The result retains the base, PR
+number and merge SHA. [Dependency waits](../docs/Behavior-chain.md#handoffs-and-outcomes)
+preserve ordinary chain holds and admission gates.
 `github-interface --list-failing-ci PR --repository OWNER/REPO --ref SHA`
 includes the exact commit's checks, parent SHAs and workflow identities while
 retaining the current candidate head. `--ref base` reads the current base.

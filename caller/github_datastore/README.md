@@ -29,6 +29,7 @@ github-datastore view issue --author LOGIN --format csv
 github-datastore view user --username LOGIN --item-type pr --limit 20
 github-datastore view pr-reviews --repo OWNER/REPO --number 123 --page-size 200 --review-after 0 --comment-after 0
 github-datastore view pr-dependents --repo OWNER/REPO --number 123
+github-datastore view issue-dependencies --repo OWNER/REPO --number 123
 github-datastore view pr-closing --limit 50
 ```
 
@@ -46,6 +47,10 @@ available. All reads are local and preserve shared-account authors without
 claiming to know which chat posted them. The paged read requires the indexes
 created by the normal datastore initialization/sync migration; an unmigrated
 database fails the read instead of scanning full histories without those indexes.
+
+`issue-dependencies` exposes explicit forward prerequisites with capture
+completeness; [its consumer contract](CONSUMER_CONTRACT.md#viewsissue_dependencies)
+defines the evidence and freshness requirements.
 
 `pr-dependents` returns one pull request's closed issues and their open
 dependents: `found`, the PR `title`, `closed` with each issue's state,
