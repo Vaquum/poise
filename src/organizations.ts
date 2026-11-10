@@ -1,7 +1,11 @@
 import { getOrganizations } from './config'
 
+/** The persisted filter selection, readable before settings load without
+ *  touching the validated in-memory selection. */
+export const ORGANIZATION_STORAGE_KEY = 'poise-organization'
+
 let selectedOrganization = ''
-try { selectedOrganization = localStorage.getItem('poise-organization') || '' } catch { /* unavailable */ }
+try { selectedOrganization = localStorage.getItem(ORGANIZATION_STORAGE_KEY) || '' } catch { /* unavailable */ }
 
 export function getSelectedOrganization(): string {
   if (!getOrganizations().some((org) => org.login === selectedOrganization && org.status === 'ready')) selectedOrganization = ''
@@ -19,7 +23,7 @@ export function organizationUrl(path: string, org = getSelectedOrganization()): 
 
 export function setSelectedOrganization(org: string): void {
   selectedOrganization = org
-  try { localStorage.setItem('poise-organization', org) } catch { /* unavailable */ }
+  try { localStorage.setItem(ORGANIZATION_STORAGE_KEY, org) } catch { /* unavailable */ }
   window.dispatchEvent(new CustomEvent('poise:organization-filter-changed'))
 }
 
