@@ -8,6 +8,8 @@ import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainI
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
+import { behaviorErrorMessage } from './behavior-diagnostics'
+import { classifyBehaviorDiagnostic } from '../src/behavior-failure-cause'
 import { CallerReceiptStoreError } from './service/caller-calls'
 import { diagnostic } from './logging'
 
@@ -107,6 +109,22 @@ function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: n
 }
 
 class ClosedTargetFenceError extends Error {}
+
+// A transient observation failure must not mask a later access or Poise
+// fault in the same sweep: keep the first error that still needs a person,
+// falling back to the transient cause when every chain failed transiently.
+// Mirrors the sweep reporter in server/behaviors.ts and the downgrade in
+// src/behavior-diagnostics.ts.
+function isTransientObservationError(message: string): boolean {
+  return message.startsWith('behavior observation failed for ')
+    && ['upstream_unavailable', 'network_interruption'].includes(classifyBehaviorDiagnostic(message).code)
+}
+
+function preferObservationError(current: Error | null, candidate: Error): Error {
+  if (!current) return candidate
+  if (isTransientObservationError(current.message) && !isTransientObservationError(candidate.message)) return candidate
+  return current
+}
 
 export class MissingPublicationPlanError extends Error {
   constructor(readonly callId: string, readonly planSha: string) {
@@ -288,7 +306,7 @@ export class BehaviorChainRuntime {
               if (owned && !call && closedChainTarget(chain, chain.observation as ChainObservation | null, owned.behavior)
                 && !released) {
                 try { await this.closeRecovery(chain, owned, chain.observation as ChainObservation | null, chainSnapshot) }
-                catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError ??= error }
+                catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError = preferObservationError(observationError, error) }
                 continue
               }
               if (chain.mergeSha && owned && !released) continue
@@ -316,7 +334,7 @@ export class BehaviorChainRuntime {
                     continue
                   }
                 }
-                observationError ??= new Error(`behavior observation failed for ${chain.id}: ${error instanceof Error ? error.message : String(error)}`, { cause: error })
+                observationError = preferObservationError(observationError, new Error(`behavior observation failed for ${chain.id}: ${behaviorErrorMessage(error)}`, { cause: error }))
                 continue
               }
               for (const invocation of chain.invocations) {
@@ -337,7 +355,7 @@ export class BehaviorChainRuntime {
               if (pendingInvocation) {
                 phase = 'invocation-recovery'
                 try { await this.recover(chain, pendingInvocation, observation, chainSnapshot) }
-                catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError ??= error }
+                catch (error) { if (!(error instanceof ClosedTargetFenceError)) throw error; observationError = preferObservationError(observationError, error) }
                 if (pendingInvocation.behavior === 'merge-pr' && this.operations.reportHold) await this.reportHold(this.current(chain))
                 continue
               }

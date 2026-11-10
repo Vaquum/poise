@@ -329,6 +329,60 @@ it('preserves the person hold rather than replacing it with a merge-verification
   expect(journal.read(chain.id)?.held).toBe('New invocations held by the person')
 })
 
+it('retains the redacted observation cause and rechecks without launching work', async () => {
+  const { journal } = setup()
+  seed(journal)
+  vi.stubEnv('GH_TOKEN', 'observation-private-credential')
+  const error = Object.assign(new Error('Command failed (1): github-interface'), {
+    stderr: 'error: GitHub 500: observation-private-credential upstream unavailable', stdout: 'private-output',
+  })
+  const observe = vi.fn().mockRejectedValueOnce(error).mockResolvedValue(observation(false))
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe }))
+  try {
+    await expect(runtime.run()).rejects.toThrow(
+      'behavior observation failed for acme/repo#7: Command failed (1): github-interface: error: GitHub 500: [redacted] upstream unavailable')
+    await runtime.run()
+    expect(observe).toHaveBeenCalledTimes(2)
+  } finally { vi.unstubAllEnvs() }
+})
+
+it('prefers an access failure over an earlier transient observation failure in the same sweep', async () => {
+  const { journal } = setup()
+  seed(journal)
+  seed(journal, 'acme/repo', 8)
+  const transient = new Error('Command failed (1): github-interface: error: GitHub 500: Internal Server Error')
+  const access = new Error('Command failed (1): github-interface: error: GitHub 403: Resource not accessible')
+  const observe = vi.fn().mockRejectedValueOnce(transient).mockRejectedValueOnce(access)
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe }))
+  await expect(runtime.run()).rejects.toThrow(
+    'behavior observation failed for acme/repo#8: Command failed (1): github-interface: error: GitHub 403: Resource not accessible')
+  expect(observe).toHaveBeenCalledTimes(2)
+})
+
+it('holds a receiptless started invocation for reconciliation without fencing when an earlier chain failed transiently', async () => {
+  const { journal } = setup()
+  seed(journal)
+  let fenced = seed(journal, 'acme/repo', 8)
+  fenced = record(journal, fenced, { type: 'invocation.admitted', invocation: { id: 'fence-1', behavior: 'repair-pr',
+    basis: 'basis', actor: 'author', model: 'fixture', slot: 'primary', admittedAt: NOW - 60_000,
+    request: { command: 'agent-interface', cwd: '/isolated', argv: ['--atomic-work', 'acme/repo#8', '--model', 'fixture'] } } })
+  record(journal, fenced, { type: 'invocation.started', invocationId: 'fence-1' })
+  const transient = new Error('Command failed (1): github-interface: error: GitHub 500: Internal Server Error')
+  const observe = vi.fn(async (chain: BehaviorChain) => {
+    if (chain.id === 'acme/repo#7') throw transient
+    return observation(true)
+  })
+  const fenceClosedTarget = vi.fn(async () => { throw new Error('native receipt store unavailable') })
+  const runtime = new BehaviorChainRuntime(journal, operations({ observe, fenceClosedTarget }))
+  // Reconciliation marks the receiptless invocation uncertain before the
+  // closed-target fence, so the transient observation error is the only
+  // recorded cause and the chain holds for read-only reconciliation.
+  await expect(runtime.run()).rejects.toThrow('behavior observation failed for acme/repo#7')
+  expect(fenceClosedTarget).not.toHaveBeenCalled()
+  expect(journal.read('acme/repo#8')).toMatchObject({ held: expect.stringContaining('read-only reconciliation'),
+    invocations: [{ id: 'fence-1', state: 'uncertain' }] })
+})
+
 it('reconciles live work on every pass despite 250 quiescent merged chains and one failing observation', async () => {
   const { db, journal } = setup()
   db.transaction(() => {

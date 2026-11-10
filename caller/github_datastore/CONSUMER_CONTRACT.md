@@ -210,6 +210,8 @@ source: GitHub GraphQL only
 ```
 
 If health fails, consumers must treat datastore output as stale.
+Stale health keeps its JSON result on stdout and exits 1, with a short stderr
+explanation naming the last successful sync, its age and the maximum age.
 
 When upstream changes while a connection is paged (a `totalCount` change or a
 received-count mismatch), the reader discards the partial pass and restarts

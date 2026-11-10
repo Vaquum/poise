@@ -99,9 +99,9 @@ export function classifyBehaviorDiagnostic(error: string, options: DiagnosticOpt
   if (/pull-request head or base changed (?:while building review packet|before checkout|during checkout)\b|pull-request head changed(?: [a-z ]+)?: expected [a-f0-9]{40}, got [a-f0-9]{40}\b/.test(cause)) {
     return diagnosticClassification('head_changed')
   }
-  if (/\b(?:GitHub|HTTP|http_status["']?\s*[:=]|unexpected status|status)\s*["']?\s*429\b/.test(cause)
+  if (/\b(?:http_status["']?\s*[:=]\s*["']?\s*429|(?:GitHub|HTTP|unexpected status|status)(?:\s+["']?|["']\s*)429)\b/.test(cause)
     || options.errorCode === 'rate_limit' || quotaExhausted(cause)) return diagnosticClassification('rate_limit')
-  if (/\b(?:GitHub|HTTP|http_status["']?\s*[:=]|unexpected status|status)\s*["']?\s*5\d\d\b/.test(cause)
+  if (/\b(?:http_status["']?\s*[:=]\s*["']?\s*5\d\d|(?:GitHub|HTTP|unexpected status|status)(?:\s+["']?|["']\s*)5\d\d)\b/.test(cause)
     || options.errorCode === 'server_error') return diagnosticClassification('upstream_unavailable')
   if (/\b(?:httpx\.(?:ReadTimeout|ConnectTimeout|ConnectError)|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN)\b/.test(cause)) {
     return diagnosticClassification('network_interruption')

@@ -150,7 +150,12 @@ export function behaviorDiagnosticGroups(diagnostics: BehaviorDiagnostics): Beha
       { behavior: letter.behavior, target: letter.target, at: letter.createdAt || null, next: letter.nextRetryAt ?? null, callId: letter.callId, correlationId: letter.correlationId, ...evidenceAttachment(letter) })
   }
   if (diagnostics.runtimeError) {
-    add(diagnosticClassification('runtime_unhealthy'), 'Behaviors', diagnostics.runtimeError, 'Poise runtime needs repair.')
+    const classification = classifyBehaviorDiagnostic(diagnostics.runtimeError)
+    const transient = diagnostics.runtimeError.startsWith('behavior observation failed for ')
+      && ['upstream_unavailable', 'network_interruption'].includes(classification.code)
+    add(transient ? classification : diagnosticClassification('runtime_unhealthy'), 'Behaviors',
+      transient ? diagnosticMessage(classification.code, failureCause(diagnostics.runtimeError)) : diagnostics.runtimeError,
+      transient ? diagnostics.runtimeError : 'Poise runtime needs repair.')
   } else if (groups.size === 0 && diagnostics.status === 'degraded') {
     add(diagnosticClassification('runtime_status_unknown'), 'Behaviors', 'Runtime health needs checking.', 'Last-known runtime status is degraded; the cause is unavailable.')
   }

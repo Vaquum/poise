@@ -71,6 +71,12 @@ describe('deterministic behavior severity', () => {
   ])('keeps an access refusal without exhaustion evidence as repository access: %s', (error) => {
     expect(classifyBehaviorDiagnostic(error)).toEqual({ severity: 'warning', code: 'github_access' })
   })
+  it('does not read a repository name as an upstream status code', () => {
+    expect(classifyBehaviorDiagnostic('acme/status500')).toEqual({ severity: 'warning', code: 'unknown' })
+    expect(classifyBehaviorDiagnostic(
+      'behavior observation failed for acme/status500#7: GitHub 403: Resource not accessible',
+    )).toEqual({ severity: 'warning', code: 'github_access' })
+  })
   it('never downgrades a held outcome or a structured account block based on transient text', () => {
     expect(classifyBehaviorDiagnostic(CAPACITY_STREAM, { held: true }).severity).toBe('warning')
     expect(classifyBehaviorDiagnostic(CAPACITY_STREAM, { errorCode: 'review_provider_blocked' }).severity).toBe('warning')

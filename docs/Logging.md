@@ -177,6 +177,12 @@ stdout and environments; credential commands also exclude stderr. Sync phases,
 input admission limits, model-discovery outcomes, lock acquisition failures and
 temporary-filesystem pressure retain measurements known at the source.
 
+Untyped GitHub 5xx and transport failures from `github-interface`,
+`github-datastore` and Caller completions retain Warning evidence. A bare exit
+code, access refusal or local failure still retains Error evidence; an explicit
+Caller diagnostic keeps its source severity. This classification never retries
+a mutation or clears an uncertain publication hold.
+
 Claude auth status probes from the auth monitor and Connected accounts treat a
 recognized sign-in requirement returned with exit 1 as an ongoing condition,
 without another process error. The existing sign-in notice stays until the

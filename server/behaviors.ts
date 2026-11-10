@@ -7729,10 +7729,16 @@ export async function runEnabledBehaviorsOnce(
           console.warn(`[behaviors] behavior chain sweep overlap exceeded ${CHAIN_SWEEP_PROGRESS_BUDGET_MS}ms progress budget for ${org.login}: skipped ticks: ${overlap.skips}; elapsed: ${elapsedMs}ms`)
         }
       } else {
-        const message = error instanceof Error ? error.message : String(error)
+        const message = behaviorErrorMessage(error)
         const stale = !!staleDatastoreFailure(error)
         behaviorChainHealth.set(organization, { lastSweepAt: Date.now(), error: message, stale })
-        if (!stale) console.error(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
+        if (!stale) {
+          const code = classifyBehaviorDiagnostic(message).code
+          const transient = message.startsWith('behavior observation failed for ')
+            && ['upstream_unavailable', 'network_interruption'].includes(code)
+          const report = transient ? console.warn : console.error
+          report(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
+        }
       }
     }
     if (!sweepSkipped) {
@@ -8065,9 +8071,12 @@ export function getBehaviorsRuntimeHealth(): BehaviorsRuntimeHealth {
   if (health.length === 0) return scopedBehaviorsRuntimeHealth(chainCapacity)
   const first = health[0].health
   if (health.length === 1) return first
+  const isTransientObservation = (message: string) => message.startsWith('behavior observation failed for ')
+    && ['upstream_unavailable', 'network_interruption'].includes(classifyBehaviorDiagnostic(message).code)
   return {
     ...first,
-    runtimeError: health.find((entry) => entry.health.runtimeError)?.health.runtimeError ?? null,
+    runtimeError: health.find((entry) => entry.health.runtimeError && !isTransientObservation(entry.health.runtimeError))?.health.runtimeError
+      ?? health.find((entry) => entry.health.runtimeError)?.health.runtimeError ?? null,
     status: health.some((entry) => entry.health.status === 'degraded') ? 'degraded' : 'ok',
     busy: health.flatMap((entry) => entry.health.busy.map((item) => ({ ...item, org: entry.org }))),
     failures: health.flatMap((entry) => entry.health.failures.map((item) => ({ ...item, org: entry.org }))),

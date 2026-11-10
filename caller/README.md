@@ -173,6 +173,10 @@ polling. An empty list adds no API requests.
 
 ## GitHub polling reads
 
+Interface REST reads and GraphQL queries retry transport failures and HTTP
+500/502/503/504 once after a 250 ms delay. Exhaustion still fails. Mutations
+remain single-attempt; an uncertain publication must be reconciled before retry.
+
 `--requested-changes-addressed` reads the PR and its complete review list first.
 Without an active change request from the acting reviewer, its response evidence
 is empty and it skips inline comments, commits, public comments and threads.

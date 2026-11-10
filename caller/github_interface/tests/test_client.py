@@ -57,7 +57,7 @@ class TestClientRetrySemantics(IsolatedAsyncioTestCase):
         self.assertEqual(self.calls[0][:2], self.calls[1][:2])
 
     async def test_get_retries_once_after_transient_status(self) -> None:
-        self.script.extend([_response(502), _response(200, {"ok": True})])
+        self.script.extend([_response(500), _response(200, {"ok": True})])
 
         self.assertEqual(await self.client.get("/repos/o/r/pulls/1"), {"ok": True})
         self.assertEqual(len(self.calls), 2)
@@ -70,11 +70,11 @@ class TestClientRetrySemantics(IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 2)
 
     async def test_get_transient_status_retry_is_bounded_to_two_attempts(self) -> None:
-        self.script.extend([_response(503), _response(503), _response(200)])
+        self.script.extend([_response(500), _response(500), _response(200)])
 
         with self.assertRaises(RuntimeError) as raised:
             await self.client.get("/repos/o/r/pulls/1")
-        self.assertIn("503", str(raised.exception))
+        self.assertIn("500", str(raised.exception))
         self.assertEqual(len(self.calls), 2)
 
     async def test_get_does_not_retry_non_transient_status(self) -> None:
@@ -119,11 +119,13 @@ class TestClientRetrySemantics(IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
 
     async def test_post_is_single_attempt_on_transient_status(self) -> None:
-        self.script.extend([_response(502), _response(200)])
-
-        with self.assertRaises(RuntimeError):
-            await self.client.post("/repos/o/r/pulls/1/reviews", json={"event": "APPROVE"})
-        self.assertEqual(len(self.calls), 1)
+        for status in (500, 502, 503):
+            with self.subTest(status=status):
+                self.calls.clear()
+                self.script[:] = [_response(status), _response(200)]
+                with self.assertRaisesRegex(RuntimeError, f"GitHub {status}"):
+                    await self.client.post("/repos/o/r/pulls/1/reviews", json={"event": "APPROVE"})
+                self.assertEqual([call[:2] for call in self.calls], [("POST", "/repos/o/r/pulls/1/reviews")])
 
     async def test_patch_is_single_attempt_on_transient_status(self) -> None:
         self.script.extend([_response(502), _response(200)])
