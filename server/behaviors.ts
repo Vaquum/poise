@@ -5719,7 +5719,7 @@ async function tickResolveUnblocking(): Promise<void> {
             runNote = retainResolveRecoveryFailure(checkTarget, detail, headSha, unresolvedBefore, recordedAtMs, err)
           }
           if (behaviorAborted()) return
-          console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
+          if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] resolve-unblocking failed for ${pr.repo}#${pr.number}:`, err)
         } finally {
           if (runId) finishDirectBehaviorRun(runId, false, null, runNote ?? undefined)
           if (checked && !behaviorAborted()) clearBehaviorFailure('resolve-unblocking', checkTarget, reviewer)

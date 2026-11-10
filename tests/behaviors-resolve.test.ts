@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mocks, HEAD_SHA, arrangeCli, loadModules, resetLogCache } from './behaviors-runtime-fixture'
+import { mocks, HEAD_SHA, arrangeCli, fixture, loadModules, pr, resetLogCache } from './behaviors-runtime-fixture'
 import type { ReviewActivityFixture } from './behaviors-runtime-fixture'
 
 const RESOLVE = '--resolve-nonblocking-conversations-if-ready'
@@ -53,6 +53,31 @@ describe('resolve-unblocking run lineage', () => {
     })
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
     expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining('review-new-issues operation failed:'), expect.anything())
+  })
+
+  it('keeps a mid-tick history expiry out of resolve diagnostics while holding the later mutation', async () => {
+    const { behaviors } = await enableResolve({ resolveResolvedCount: 2, reviewerReviewIdsSince: [] })
+    fixture.listedPrs = [{ ...pr, author: 'review-bot' },
+      { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18', author: 'review-bot' }]
+    const original = mocks.runFile.getMockImplementation()!
+    let logCalls = 0
+    mocks.runFile.mockImplementation(async (command, args, ...rest) => {
+      if (command === 'agent-interface' && args[0] === '--logs') {
+        return ++logCalls === 1 ? original(command, args, ...rest)
+          : Promise.reject(new Error('Command timed out after 30000ms'))
+      }
+      // The first mutation lands while the shared snapshot is fresh; dropping
+      // the lane here models its TTL expiring before the second preparation.
+      if (command === 'github-interface' && args[0] === RESOLVE) await resetLogCache()
+      return original(command, args, ...rest)
+    })
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(resolveCalls()).toHaveLength(1)
+    expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining('resolve-unblocking failed'), expect.anything())
+    expect(behaviors.getBehaviorsRuntimeHealth().failures).toEqual([
+      expect.objectContaining({ target: 'Vaquum/poise-test#18:check' }),
+    ])
   })
 
   it('correlates the durable run with its firing and retains the resolve disposition', async () => {
