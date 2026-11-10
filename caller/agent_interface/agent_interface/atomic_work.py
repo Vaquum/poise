@@ -74,11 +74,10 @@ class AtomicWorkBlocked(ValueError):
                     shaped_norm = atoms.redact_cause(norm)
                     if "[redacted header]" in shaped_norm:
                         # Header-shaped values also wait for the patterns; mask
-                        # the leading secret the header match would strand. The
-                        # header runs first, so shaped text before its marker
-                        # is the value's prefix up to later pattern markers,
-                        # which are stripped to match the normalized reason.
-                        _fragment(" ".join(re.sub(marker, " ", shaped_norm.split("[redacted header]")[0]).split()))
+                        # each surviving prefix segment separately, since later
+                        # patterns may separate them with redaction markers.
+                        for segment in re.split(marker, shaped_norm.split("[redacted header]")[0]):
+                            _fragment(segment)
                     if re.search(marker, norm):
                         # Marker-first alternation would preserve a literal
                         # marker inside the value and shield the remainder, so

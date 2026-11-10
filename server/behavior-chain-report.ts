@@ -1,6 +1,7 @@
 import type { Database } from 'better-sqlite3'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal } from './behavior-chain-store'
+import { behaviorErrorMessage } from './behavior-diagnostics'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { runDatastoreHealth } from './datastore-health'
 import { handleGhBody, reconcileRepairReport } from './gh'
@@ -15,7 +16,8 @@ export const REMEDIATION_SCOPE = `Minimal, clinical interventions all the way. G
 
 const MERGE_CAUSE = 'merge_submission_uncertain'
 const CLOSED_CAUSE = 'pull_closed_unmerged'
-const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', MERGE_CAUSE, CLOSED_CAUSE] as const
+const IMPLEMENTATION_CAUSE = 'atomic_work_blocked'
+const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', MERGE_CAUSE, CLOSED_CAUSE, IMPLEMENTATION_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
 const REPOSITORIES_KEY = 'service_repair_exhaustion_repositories'
 const INCOMPLETE_REPLIES = /^repair did not answer every unresolved review finding(?:: missing_root_comment_ids=\[[0-9, ]*\]; missing_count=[1-9][0-9]*; required_count=[1-9][0-9]*)?$/
@@ -24,10 +26,10 @@ const REPORT_MARKER = /<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/
 interface RepairReport {
   key: string
   source: string
-  pull: number
+  pull: number | null
   holdSequence: number | null
   heldAt: number | null
-  head: string
+  head: string | null
   basis: string
   slot: string | null
   attempts: Array<{ invocation: string, call: string, completedAt: number }>
@@ -247,6 +249,38 @@ async function closedPullSuccessor(chain: BehaviorChain, pull: number): Promise<
     : `${link}: pending verification of an open poise successor; no replacement will be created`
 }
 
+function qualifyingImplementationHold(db: Database, chain: BehaviorChain, observation: ChainObservation, now: number) {
+  const invocation = chain.invocations.at(-1)
+  const evidence = invocation?.evidence
+  const artifact = evidence?.artifact as Record<string, unknown> | null | undefined
+  const publication = observation.publication
+  if (!chain.held || chain.mergeSha || chain.supersession || observation.issue.open !== true || observation.pull !== null
+    || publication.pull_number !== null || publication.head_sha !== null || publication.head_invocation !== null
+    || publication.state !== null || publication.merged !== false || publication.merge_sha !== null || observation.existingPulls.length
+    || !invocation || invocation.behavior !== 'implement-issue' || invocation.actor !== chain.author
+    || invocation.request.command !== 'agent-interface' || invocation.admissionSequence <= chain.resumedAfterSequence
+    || chain.invocations.some(attempt => attempt.state !== 'settled')
+    || !invocation.callId || !/^[a-f0-9]{32}$/.test(invocation.callId)
+    || evidence?.status !== 'failed' || evidence.action !== 'not_started' || evidence.outcome !== 'preflight_failed'
+    || evidence.error_code !== IMPLEMENTATION_CAUSE || evidence.error !== chain.held
+    || artifact?.phase !== 'executing'
+    || [artifact.plan_sha, artifact.publication_head, artifact.replies_started, artifact.publication, artifact.result,
+      artifact.receipts, evidence.receipts, evidence.review_id, evidence.head_sha, evidence.publicationPlan,
+      evidence.publicationResume, evidence.publicationReceipt, evidence.nativeActionReceipt].some(value => value != null)
+    || typeof evidence.completedAt !== 'number' || !Number.isFinite(evidence.completedAt) || evidence.completedAt > now
+    || !resourceReleaseProven(evidence, true)
+    || !Number.isFinite(observation.checkedAt) || observation.checkedAt > now || observation.checkedAt < evidence.completedAt
+    || observation.checkedAt < Date.parse(String(evidence.resources_settled_at))
+    || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return null
+  // Reconciliation records the automatic hold with the original Caller error.
+  // The person's later Hold replaces it and cannot report that older receipt.
+  const hold = db.prepare(`SELECT sequence, at, json_extract(payload, '$.reason') AS reason FROM behavior_chain_events
+    WHERE chain_id = ? AND json_extract(payload, '$.type') = 'chain.held' AND sequence > ? ORDER BY sequence DESC LIMIT 1`)
+    .get(chain.id, chain.resumedAfterSequence) as { sequence: number, at: number, reason: string } | undefined
+  return hold && hold.sequence > invocation.admissionSequence && hold.reason === evidence.error && hold.at <= now
+    ? { invocation, call: invocation.callId } : null
+}
+
 /** Runs only on the existing reconciliation opportunity. The existing meta
  * store holds creation intent; neither its absence on GitHub nor a restart
  * can reopen that intent for another POST. Intake remains the normal reader. */
@@ -255,12 +289,14 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   const pendingMerge = chain.invocations.find(invocation => invocation.behavior === 'merge-pr' && invocation.state !== 'settled')
   if (!enabled(db, chain.repository) || !allowed() || !chain.held && !pendingMerge) return null
   const observation = chain.observation as ChainObservation | null
-  if (!observation?.pull) return null
+  if (!observation) return null
   const qualifying = qualifyingAttempts(chain, observation, Date.now())
   const merge = qualifyingMergeSubmission(chain, observation, Date.now())
   const closed = qualifyingClosedPull(chain, observation, Date.now())
-  const intents = CAUSES.filter(cause => cause !== MERGE_CAUSE || pendingMerge).map(cause => {
-    const key = chainBasis([cause, chain.id, cause === MERGE_CAUSE ? pendingMerge!.id : observation.pull!.number])
+  const implementation = qualifyingImplementationHold(db, chain, observation, Date.now())
+  const intents = CAUSES.filter(cause => cause === MERGE_CAUSE ? pendingMerge : cause === IMPLEMENTATION_CAUSE || observation.pull).map(cause => {
+    const key = chainBasis(cause === IMPLEMENTATION_CAUSE ? [cause, chain.id]
+      : [cause, chain.id, cause === MERGE_CAUSE ? pendingMerge!.id : observation.pull!.number])
     const storageKey = PREFIX + key
     const stored = db.prepare('SELECT value FROM meta WHERE key = ?').get(storageKey) as { value: string } | undefined
     return { cause, key, storageKey, stored }
@@ -270,15 +306,15 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   const linked = closed ? db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
     AND json_extract(value, '$.source') = ? AND json_extract(value, '$.pull') = ?
     ORDER BY json_extract(value, '$.issueNumber') IS NULL, key LIMIT 1`)
-    .get(PREFIX + '*', chain.id, observation.pull.number) as { key: string, value: string } | undefined : undefined
+    .get(PREFIX + '*', chain.id, observation.pull!.number) as { key: string, value: string } | undefined : undefined
   const intent = linked ? { cause: CLOSED_CAUSE, key: (JSON.parse(linked.value) as RepairReport).key,
     storageKey: linked.key, stored: linked }
-    : intents.find(intent => intent.cause === (merge ? MERGE_CAUSE : closed ? CLOSED_CAUSE : qualifying?.cause)) ?? intents.find(intent => intent.stored)
-  if (!intent) return pendingMerge ? null : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
+    : intents.find(intent => intent.cause === (merge ? MERGE_CAUSE : closed ? CLOSED_CAUSE : implementation ? IMPLEMENTATION_CAUSE : qualifying?.cause)) ?? intents.find(intent => intent.stored)
+  if (!intent) return pendingMerge || !observation.pull ? null : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
   const { cause, key, storageKey, stored } = intent
-  const label = cause === CLOSED_CAUSE ? 'Closed PR continuation' : cause === MERGE_CAUSE ? 'Merge submission' : 'Repair exhaustion'
+  const label = cause === CLOSED_CAUSE ? 'Closed PR continuation' : cause === MERGE_CAUSE ? 'Merge submission' : cause === IMPLEMENTATION_CAUSE ? 'Implementation hold' : 'Repair exhaustion'
   let report: RepairReport | null = stored ? JSON.parse(stored.value) as RepairReport : null
-  if (report && (storageKey !== PREFIX + key || report.key !== key || report.source !== chain.id || report.pull !== observation.pull.number
+  if (report && (storageKey !== PREFIX + key || report.key !== key || report.source !== chain.id || report.pull !== (cause === IMPLEMENTATION_CAUSE ? null : observation.pull!.number)
     || report.issueNumber !== null && (!Number.isSafeInteger(report.issueNumber) || report.issueNumber < 1))) {
     throw new Error('Repair report intent conflicts with its source hold')
   }
@@ -289,7 +325,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     if (accounts.me.toLowerCase() !== chain.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) {
       return `${label} reporting pending: configured accounts differ from the source chain`
     }
-    if (cause === CLOSED_CAUSE ? !closed : cause === MERGE_CAUSE ? !merge : qualifying?.cause !== cause) return cause === MERGE_CAUSE
+    if (cause === CLOSED_CAUSE ? !closed : cause === IMPLEMENTATION_CAUSE ? !implementation : cause === MERGE_CAUSE ? !merge : qualifying?.cause !== cause) return cause === MERGE_CAUSE || cause === IMPLEMENTATION_CAUSE
       ? `${label} reporting: source has no verified failure on the current basis`
       : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
     if (db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
@@ -301,17 +337,21 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     const fresh = await verify()
     const verified = qualifyingAttempts(chain, fresh, Date.now())
     const verifiedMerge = qualifyingMergeSubmission(chain, fresh, Date.now())
-    if (cause === CLOSED_CAUSE ? (!qualifyingClosedPull(chain, fresh, Date.now()) || fresh.pull?.number !== observation.pull.number)
-      : cause === MERGE_CAUSE ? (!verifiedMerge || fresh.pull?.head !== observation.pull.head)
-      : (verified?.cause !== cause || fresh.pull?.head !== observation.pull.head || verified!.decision.basis !== qualifying!.decision.basis)) {
-      return cause === MERGE_CAUSE
+    const verifiedImplementation = qualifyingImplementationHold(db, chain, fresh, Date.now())
+    if (cause === CLOSED_CAUSE ? (!qualifyingClosedPull(chain, fresh, Date.now()) || fresh.pull?.number !== observation.pull!.number)
+      : cause === IMPLEMENTATION_CAUSE ? (!verifiedImplementation || verifiedImplementation.invocation.id !== implementation?.invocation.id)
+      : cause === MERGE_CAUSE ? (!verifiedMerge || fresh.pull?.head !== observation.pull!.head)
+        : (verified?.cause !== cause || fresh.pull?.head !== observation.pull!.head || verified!.decision.basis !== qualifying!.decision.basis)) {
+      return cause === IMPLEMENTATION_CAUSE
+        ? `${label} reporting pending: the open source, automatic hold or absence of publication no longer verifies the original failure`
+        : cause === MERGE_CAUSE
         ? `${label} reporting pending: the current head or review basis no longer verifies the original failure`
         : 'Repair exhaustion reporting pending: the current head or review basis no longer verifies the exhausted attempts'
     }
     const seed = await handleGhBody({ operation: 'read_issue', repository_full_name: chain.repository, issue_number: chain.issue })
     const source = seed.body as { issue?: { body?: unknown, state?: string }, error?: string }
     if (seed.status !== 200 || typeof source.issue?.body !== 'string') throw new Error(source.error || 'Repair report source issue is unavailable')
-    if ((cause === MERGE_CAUSE || cause === CLOSED_CAUSE) && source.issue.state !== 'open') return `${label} reporting pending: the source issue is no longer open`
+    if ((cause === MERGE_CAUSE || cause === CLOSED_CAUSE || cause === IMPLEMENTATION_CAUSE) && source.issue.state !== 'open') return `${label} reporting pending: the source issue is no longer open`
     if (REPORT_MARKER.test(source.issue.body)) return `${label} reporting suppressed for a generated remediation issue; its ordinary hold or uncertainty remains active`
     if (cause === CLOSED_CAUSE) {
       const successor = await closedPullSuccessor(chain, fresh.pull!.number)
@@ -322,7 +362,8 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     if (!current || current.resumedAfterSequence !== chain.resumedAfterSequence || current.sequence !== chain.sequence
       || (cause === CLOSED_CAUSE ? !qualifyingClosedPull(current, fresh, Date.now())
         : cause === MERGE_CAUSE ? qualifyingMergeSubmission(current, fresh, Date.now())?.invocation.id !== pendingMerge?.id
-        : !current.held || qualifyingAttempts(current, fresh, Date.now())?.cause !== cause)) {
+        : cause === IMPLEMENTATION_CAUSE ? qualifyingImplementationHold(db, current, fresh, Date.now())?.invocation.id !== implementation?.invocation.id
+          : !current.held || qualifyingAttempts(current, fresh, Date.now())?.cause !== cause)) {
       return `${label} reporting pending: source changed during verification`
     }
     const verifiedAccounts = getSettings()
@@ -334,10 +375,12 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       AND json_extract(payload, '$.type') = 'chain.held' AND sequence > ? ORDER BY sequence DESC LIMIT 1`)
       .get(chain.id, chain.resumedAfterSequence) as { sequence: number, at: number } | undefined
     if (!hold && cause !== MERGE_CAUSE) throw new Error('Repair report has no durable active hold')
-    report = { key, source: chain.id, pull: observation.pull.number, holdSequence: hold?.sequence ?? null, heldAt: hold?.at ?? null,
-      head: fresh.pull!.head, basis: cause === CLOSED_CAUSE ? key : verifiedMerge?.invocation.basis ?? verified!.decision.basis,
-      slot: verified?.decision.reviewer?.slot ?? null,
-      attempts: cause === CLOSED_CAUSE ? [] : cause === MERGE_CAUSE ? [{ invocation: verifiedMerge!.invocation.id, call: verifiedMerge!.call,
+    report = { key, source: chain.id, pull: observation.pull?.number ?? null, holdSequence: hold?.sequence ?? null, heldAt: hold?.at ?? null,
+      head: fresh.pull?.head ?? null, basis: cause === CLOSED_CAUSE ? key : verifiedImplementation?.invocation.basis ?? verifiedMerge?.invocation.basis ?? verified!.decision.basis,
+      slot: verifiedImplementation?.invocation.slot ?? verified?.decision.reviewer?.slot ?? null,
+      attempts: cause === CLOSED_CAUSE ? [] : cause === IMPLEMENTATION_CAUSE ? [{ invocation: verifiedImplementation!.invocation.id, call: verifiedImplementation!.call,
+        completedAt: Number(verifiedImplementation!.invocation.evidence!.completedAt) }]
+        : cause === MERGE_CAUSE ? [{ invocation: verifiedMerge!.invocation.id, call: verifiedMerge!.call,
         completedAt: Number(verifiedMerge!.invocation.evidence!.completedAt) }]
         : verified!.attempts.map(invocation => ({ invocation: invocation.id, call: invocation.callId!, completedAt: Number(invocation.evidence!.completedAt) })),
       issueNumber: existing?.number ?? null }
@@ -353,12 +396,23 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       const review = cause === 'review_budget_exhausted'
       const budget = cause === 'repair_execution_budget_exhausted'
       const age = hold ? Math.max(0, Math.floor((Date.now() - hold.at) / 60_000)) : null
-      const evidence = verifiedMerge?.invocation.evidence
+      const evidence = verifiedImplementation?.invocation.evidence ?? verifiedMerge?.invocation.evidence
       const diagnostic = evidence?.diagnostic as ProcessDiagnostic | undefined
       const details = cause === CLOSED_CAUSE ? [
         `Poise's open source issue https://github.com/${chain.repository}/issues/${chain.issue} has no live replacement for its closed unmerged PR https://github.com/${chain.repository}/pull/${report.pull}.`, '',
         `Cause: ${cause}. Source: ${chain.id}; hold event ${hold!.sequence}; head ${report.head}.`,
         'Fresh GitHub evidence confirms the source remains open with the poise label and its only linked PR closed without merge. No verified successor covers the work.',
+      ] : cause === IMPLEMENTATION_CAUSE ? [
+        `Poise is holding implementation of https://github.com/${chain.repository}/issues/${chain.issue}.`, '',
+        `Stage: implement-issue. Cause: ${cause}. Held since ${new Date(hold!.at).toISOString()} (${age} minutes at reporting).`,
+        `Source: ${chain.id}; hold event ${hold!.sequence}; basis ${report.basis}; slot ${report.slot}.`, '',
+        `Verified receipt: one settled original Caller implementation after the last Resume; status=failed; action=not_started; outcome=preflight_failed; error_code=${cause}. Resources were released at ${evidence!.resources_settled_at}. No publication plan, result or receipts, pushed branch, bound PR or competing linked work was observed.`,
+        `Worker-reported blocker: ${behaviorErrorMessage(evidence!.error, 500)}`,
+        diagnostic ? `Caller diagnostic facts: ${behaviorErrorMessage(JSON.stringify({ operation: diagnostic.operation,
+          phase: diagnostic.phase, outcome: diagnostic.outcome, submission: diagnostic.context.submission,
+          exit_code: diagnostic.context.exit_code, signal: diagnostic.context.signal, errno: diagnostic.context.errno }), 1500)}.`
+          : 'Caller diagnostic facts: not recorded in this historical Call receipt.',
+        'The blocked result is verified; the worker-reported explanation is not independently verified.',
       ] : cause === MERGE_CAUSE ? [
         `Poise cannot confirm the merge submission for https://github.com/${chain.repository}/pull/${report.pull}.`, '',
         `Stage: merge-pr. Cause: ${cause}. Source issue: https://github.com/${chain.repository}/issues/${chain.issue}.`,
@@ -379,6 +433,8 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
         ...report.attempts.map(attempt => `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}.`), '',
         cause === CLOSED_CAUSE
           ? 'Next action: implement the remaining source issue work through this continuation after inspecting the closed PR and original journal receipts. Original invocation and resource evidence remain retained; this report never authorizes replay, replacement publication or resource release from an unreadable or incomplete original receipt.'
+          : cause === IMPLEMENTATION_CAUSE
+          ? 'Next action: inspect the original Call and worker-reported blocker, address the cause, then explicitly Resume the source chain for a fresh implementation when appropriate. This report preserves its hold and ownership; it never relaunches implementation or relaxes review, resource, admission or merge gates.'
           : cause === MERGE_CAUSE
           ? `Next action: inspect the original Call diagnostics and reconcile the PR and merge queue at the pinned head before deciding whether to repair or replace the candidate. The external effect remains unconfirmed. This report retains the original invocation's uncertainty and chain ownership; it never retries the merge or relaxes any review, resource, admission or merge gate.`
           : `Next action: inspect the ${review ? 'PR review budget' : budget ? 'repair execution budget' : 'repair reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover ${review ? 'review' : 'repair'} or relax any review, admission or merge gate.`,
@@ -386,6 +442,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       ].join('\n')
       const result = await handleGhBody({ operation: 'open_issue', repository_full_name: chain.repository,
         title: cause === CLOSED_CAUSE ? `fix: continue #${chain.issue} after closed unmerged PR #${report.pull}`
+          : cause === IMPLEMENTATION_CAUSE ? `fix: blocked implementation for #${chain.issue}`
           : cause === MERGE_CAUSE ? `fix: uncertain merge submission for #${report.pull}`
           : `fix: ${review ? 'PR review exhausted its budget' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
       const publication = result.body as { record?: { number?: unknown, url?: unknown }, error?: string }

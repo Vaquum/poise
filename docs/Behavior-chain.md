@@ -562,10 +562,11 @@ Reporting is off by default. An operator can set
 `POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
 list of explicit `owner/repo` names, up to 8192 bytes so the workspace can echo
 it in health for gateway reconciliation. Enabled v2 chains check both new and existing
-repair holds and uncertain merge submissions during their ordinary bounded
-reconciliation, including open `poise` seeds whose only PR closed unmerged;
-no Resume or extra poller is needed. Reporting preserves the
-source hold, uncertainty and ownership and does not perform recovery.
+repair holds, automatic implementation holds before a PR, and uncertain merge
+submissions during their ordinary bounded reconciliation, including open `poise`
+seeds whose only PR closed unmerged; no Resume or extra poller is needed.
+Reporting preserves the source hold, uncertainty and ownership and does not
+perform recovery.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
 variable. The gateway reconciles it through trusted service configuration on
 compatible running workspaces, including when image and release already match.
@@ -574,9 +575,10 @@ does not disturb native cleanup holds. Explicit empty durably overrides a legacy
 container environment after Poise restarts. Local mode keeps environment-based
 configuration. Unset or empty opts out.
 
-Reporting requires at least three settled original Caller receipts for the same
-phase, current head, review basis and slot after the last Resume, each with positive
-resource release, `action=not_started`, retained `outcome=preflight_failed` and no
+Repair and PR review reporting requires at least three settled original Caller
+receipts for the same phase, current head, review basis and slot after the last
+Resume, each with positive resource release, `action=not_started`, retained
+`outcome=preflight_failed` and no
 publication plan or action receipts. All matching attempts must share one cause:
 `repair_incomplete_replies` requires `error_code=atomic_work_failed` and the specific
 incomplete-reply error; `repair_execution_budget_exhausted` requires
@@ -597,6 +599,20 @@ including title, body or base changes on an unchanged head. Other causes remain
 visible in their ordinary holds without an issue report; mixed repair or review causes cannot qualify.
 Revoking repository scope during verification prevents publication and leaves the
 creation intent unconsumed, so re-enabling can still report once.
+
+Before a PR, `atomic_work_blocked` separately qualifies one settled original
+`implement-issue` receipt after the last Resume. The current durable automatic
+hold must match that receipt's blocker; a later operator Hold excludes it.
+The receipt must retain `status=failed`, `action=not_started`,
+`outcome=preflight_failed`, the pre-publication `executing` artifact and positive
+resource ownership/release proof, without a publication plan, result or receipts.
+A fresh open seed and native inspection must also verify no pushed branch,
+bound PR or competing linked work. Poise rechecks the hold before reserving intent.
+Ordinary retries and unknown original effects do not qualify. The report includes
+the bounded, redacted blocker as **worker-reported** and available structured Caller
+diagnostic facts. Caller's blocked result does not independently verify the worker's
+health-check, test-relay or other runner explanation. Its next action is to inspect
+the original Call, remedy the blocker and explicitly Resume for a fresh implementation.
 
 `merge_submission_uncertain` separately qualifies the original pending `merge-pr`
 invocation after recovery rereads the journal, even without an explicit chain hold.
@@ -636,13 +652,16 @@ single-POST rule below.
 Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the
 stage, stable cause, target, hold time/age, head/basis, safe invocation and Caller
-receipt identities, and next action. It excludes raw errors, omitted finding IDs,
-worker paths and provider output. An intent in the existing durable metadata store
+receipt identities, and next action. Apart from the explicitly worker-reported
+implementation blocker, it excludes raw errors, omitted finding IDs, worker paths
+and provider output. An intent in the existing durable metadata store
 links the original failure to the report issue. Repair identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
 Existing repair and review intent keys and markers remain unchanged. Uncertain merge reports
 use cause + source chain + original invocation, with the same metadata store and
 marker format; an unheld source has no hold event or hold time.
+Implementation reports use cause + source chain, independently of blocker prose,
+receipt identity and observation time, with null source PR/head fields in the same intent.
 All report bodies include the canonical clinical scope directive in the
 [report template](../server/behavior-chain-report.ts), followed by
 "Include this exact paragraph in the linked PR review." Native PR review and
