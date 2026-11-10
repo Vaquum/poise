@@ -156,6 +156,18 @@ export function needsImpactRead(impacts: ReadonlyMap<string, WorkImpactRead>, ev
   return !impacts.get(eventId)?.value
 }
 
+/** Unresolved refs with never-tried ones first: retries keep leftover batch
+ *  capacity instead of starving later unread entries behind the cap. */
+export function pendingImpactRefs(current: Map<string, DiagnosticEvidence>, impacts: ReadonlyMap<string, WorkImpactRead>): DiagnosticEvidence[] {
+  const fresh: DiagnosticEvidence[] = []
+  const retry: DiagnosticEvidence[] = []
+  for (const ref of current.values()) {
+    if (!needsImpactRead(impacts, ref.eventId)) continue
+    (impacts.has(ref.eventId) ? retry : fresh).push(ref)
+  }
+  return [...fresh, ...retry]
+}
+
 function workImpactHtml(entry: EvidenceAttachment, impacts: ReadonlyMap<string, WorkImpactRead>, now: number): string {
   const ref = evidenceReferences(entry)[0]
   const state = ref ? impacts.get(ref.eventId) : null
@@ -342,7 +354,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     if (quietImpactRender) { quietImpactRender = false; return }
     const current = expandedImpactRefs(items, expanded)
     for (const id of [...impacts.keys()]) if (!current.has(id)) impacts.delete(id)
-    const refs = [...current.values()].filter(ref => needsImpactRead(impacts, ref.eventId)).slice(0, 20)
+    const refs = pendingImpactRefs(current, impacts).slice(0, 20)
     if (!refs.length) return
     const request = new AbortController()
     impactRequest = request

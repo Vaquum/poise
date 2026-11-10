@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { setLocalSettings } from '../src/config'
 import type { Notice } from '../src/notices'
 import { notificationItems, type NotificationItem } from '../src/notification-items'
-import { ago, expandedImpactRefs, itemHtml, needsImpactRead, type WorkImpactRead } from '../src/views/notification-rail'
+import { ago, expandedImpactRefs, itemHtml, needsImpactRead, pendingImpactRefs, type WorkImpactRead } from '../src/views/notification-rail'
 
 const T0 = Date.parse('2026-10-17T10:00:00.000Z')
 const iso = (minutes: number) => new Date(T0 + minutes * 60_000).toISOString()
@@ -191,5 +191,17 @@ describe('work-impact reads', () => {
     expect(needsImpactRead(reads, ref(2).eventId)).toBe(true)
     expect(needsImpactRead(reads, ref(3).eventId)).toBe(false)
     expect(needsImpactRead(reads, ref(4).eventId)).toBe(true)
+  })
+
+  it('reads never-tried entries before retrying failures behind the cap', () => {
+    const events = Array.from({ length: 25 }, (_, index) => ref(index + 1))
+    const current = new Map(events.map(entry => [entry.eventId, entry]))
+    const failed: Record<string, WorkImpactRead> = {}
+    for (const entry of events.slice(0, 20)) failed[entry.eventId] = { value: null, message: 'Workspace chain evidence is unavailable.' }
+    const pending = pendingImpactRefs(current, impacts(failed))
+    expect(pending.slice(0, 5).map(entry => entry.eventId)).toEqual(events.slice(20).map(entry => entry.eventId))
+    expect(pending).toHaveLength(25)
+    const resolved = impacts({ [events[20].eventId]: { value: { impact: 'blocked' } as WorkImpactRead['value'], message: '' } })
+    expect(pendingImpactRefs(current, resolved).map(entry => entry.eventId)).not.toContain(events[20].eventId)
   })
 })
