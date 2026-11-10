@@ -283,15 +283,28 @@ it.each(['source body', 'source comment', 'PR body', 'PR comment'])('verifies an
   expect(reports(db)).toHaveLength(0)
 })
 
-it('ignores ordinary continuation-like words without a successor reference', async () => {
+it.each(['Work continued today. No successor yet.', 'Work continued to fail. No successor yet.'])(
+  'ignores ordinary continuation-like words without a successor reference: %s', async body => {
+    const { db, journal } = setup()
+    openSeed(journal)
+    fresh = closedObservation()
+    seedBody = body
+    await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+    expect(posts()).toHaveLength(1)
+    expect(remote[0]).toMatchObject({ title: 'fix: continue #7 after closed unmerged PR #21' })
+    expect(reports(db)).toHaveLength(1)
+  })
+
+it('verifies a Markdown successor link without counting it twice', async () => {
   const { db, journal } = setup()
-  openSeed(journal)
+  const source = openSeed(journal)
   fresh = closedObservation()
-  seedBody = 'Work continued today. No successor yet.'
+  seedBody = 'Continuation: [#44](https://github.com/acme/repo/issues/44)'
+  remote = [{ ...issue(44, 'Continue #7 after https://github.com/acme/repo/pull/21'), labels: [{ name: 'poise' }] }]
   await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
-  expect(posts()).toHaveLength(1)
-  expect(remote[0]).toMatchObject({ title: 'fix: continue #7 after closed unmerged PR #21' })
-  expect(reports(db)).toHaveLength(1)
+  expect(journal.read(source.id)?.waiting).toContain('https://github.com/acme/repo/issues/44: already tracks')
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
 })
 
 it('creates a closed-PR continuation past a historical receipt_unavailable settlement', async () => {
