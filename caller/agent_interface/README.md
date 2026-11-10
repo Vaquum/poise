@@ -567,6 +567,12 @@ uses the running-call index; `--logs --limit N [--cursor C]` returns a bounded
 insertion-order page with an opaque `nextCursor`. Insertion order is not a
 call's start time.
 
+If a page's records are unreadable but its count and index still verify the
+requested scope, Caller returns the readable records and quarantines the
+unreadable positions. Those positions count toward the page and preserve its
+cursor. Swarm reports them alongside the readable history. Receipt lookups
+retain their existing integrity checks.
+
 `--logs --select '{"latest":[{"behavior":"pr_review","source":"poise:review-new-prs","owner":"autonomio"}],"ids":["FULL_CALL_ID"]}'`
 returns an oldest-first array containing one indexed latest-started call per
 behavior/source/owner needle plus exact call-ID lookups. Missing kinds return

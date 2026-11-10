@@ -33,7 +33,9 @@ Swarm pages bounded history for search, grouping and counts, mounting at most
 200 run rows per Previous/Next page, including expanded identical runs. Detail
 rows belong only to mounted runs. Each history read costs its own page plus an
 exact total that counts without loading; running statuses refresh from their
-own indexed read. Page changes replace rows directly and load older pages on
+own indexed read. Unreadable records with a verified page position appear in
+the existing quarantine warning while readable runs remain visible. Page
+changes replace rows directly and load older pages on
 demand; refresh retains keyed controls and follows a focused run across page
 boundaries. Search and organization changes reset to the first page. Deep links
 load their target's page. Leaving clears row DOM; late reads update only data.
