@@ -24,6 +24,7 @@ export interface ChainObservation extends Record<string, unknown> {
   workPublication?: { callId: string, repliesComplete: boolean, resumable?: boolean, planSha?: string }
   greyRecovery?: { invocationId: string, receipt: Record<string, unknown> }
   ciDependency?: { invocationId: string, base: string, recovered: boolean }
+  ciBaseUpdate?: { from: string, head: string, base: string, tree: string }
   fullSuite?: Record<string, unknown>
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,

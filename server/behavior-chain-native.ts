@@ -259,9 +259,11 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           reviewRevision: prior?.pull?.reviewRevision ?? '', greyRuns: [], pending: false, failing: [], conflict: false, behind: false }
         return observation
       }
+      const baseUpdateFrom = chain.held && chain.ciHold && chain.ciHold.head !== head ? chain.ciHold.head : null
       const [readiness, ci, reviewRevision] = await Promise.all([
         github(chain.repository, ['--pr-readiness', String(number), '--username', chain.reviewer, '--expected-head', head, ...reviewer]),
-        github(chain.repository, ['--list-failing-ci', String(number), ...reviewer]), hooks.reviews(chain.repository, number),
+        github(chain.repository, ['--list-failing-ci', String(number),
+          ...(baseUpdateFrom ? ['--base-update-from', baseUpdateFrom] : []), ...reviewer]), hooks.reviews(chain.repository, number),
       ])
       if (readiness.head_sha !== head || ci.head_sha !== head || ci.pull_number !== number || !Array.isArray(ci.failing)
         || !Array.isArray(state.my_reviews) || typeof readiness.draft !== 'boolean' || typeof readiness.reviewer_approved_current_head !== 'boolean'
@@ -306,6 +308,20 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         // The existing readiness primitive already applies the repository's
         // queue policy: BEHIND needs a base update only without a merge queue.
         conflict: ci.mergeable === false, behind: ci.mergeable_state === 'behind' && readiness.blockers.includes('merge_state_not_clean') }
+      if (baseUpdateFrom) {
+        if (ci.repository !== chain.repository || readiness.repository !== chain.repository || readiness.pull_number !== number
+          || ci.ref !== head || observation.publication.head_sha !== head || !('base_update' in ci)) {
+          throw new Error('CI base update proof differs from the observed repository, PR or head')
+        }
+        sha(ci.base_sha, 'CI base update target')
+        if (ci.base_update !== null) {
+          const update = object(ci.base_update, 'CI base update proof')
+          if (update.from !== baseUpdateFrom || !Array.isArray(ci.parents) || ci.parents.length !== 2
+            || ci.parents[0] !== baseUpdateFrom || ci.parents[1] !== update.base) throw new Error('CI base update proof differs from the retained failed head or parents')
+          observation.ciBaseUpdate = { from: baseUpdateFrom, head,
+            base: sha(update.base, 'CI base update parent'), tree: sha(update.tree, 'CI base update tree') }
+        }
+      }
       const dependency = chainCiDependency(chain, observation.pull.queueRemoval?.id)
       if (dependency) {
         const baseline = await github(chain.repository, ['--list-failing-ci', String(number), '--ref', 'base', ...reviewer])

@@ -1350,6 +1350,9 @@ operation or authority; a deliberate wait keeps GitHub facets unknown without
 declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
+The same reconciliation can release a CI-only hold after a proven clean base
+update, retaining the original Call, resource-release proof and remaining gates
+as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 
 The first `/api/behavior-chains` list page also includes read-only `attention`
 across all active chain pages. It joins durable progress age, holds, exact-head
