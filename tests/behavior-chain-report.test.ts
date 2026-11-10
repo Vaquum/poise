@@ -310,7 +310,7 @@ it.each(['source body', 'source comment', 'PR body', 'PR comment'])('verifies an
 })
 
 it.each(['Work continued today. No successor yet.', 'Work continued to fail. No successor yet.',
-  'Work continued to fail on #7. No successor yet.'])(
+  'Work continued to fail on #7. No successor yet.', 'Work continued to fail after #21. No successor yet.'])(
   'ignores ordinary continuation-like words without a successor reference: %s', async body => {
     const { db, journal } = setup()
     openSeed(journal)
