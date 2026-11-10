@@ -282,6 +282,20 @@ describe('agent log compatibility', () => {
 describe('agent log quarantine', () => {
   beforeEach(() => { mocks.runFile.mockReset() })
 
+  it('keeps an unreadable Caller History slot out of entries without losing the page cursor', async () => {
+    const { parseAgentLogPage } = await import('../server/agent-log-parse')
+    const page = parseAgentLogPage(JSON.stringify({
+      rows: [logRow({ id: 'a'.repeat(32) }), { history_read_error: 'SQLITE_CORRUPT' }],
+      nextCursor: '23',
+      total: 8,
+    }), 'agent-interface --logs paged read')
+    expect(page.entries.map(row => row.id)).toEqual(['a'.repeat(32)])
+    expect(page.quarantined).toMatchObject([{
+      index: 1, id: null, status: null, error: 'Caller History row 1 is unreadable (SQLITE_CORRUPT)',
+    }])
+    expect({ total: page.total, nextCursor: page.nextCursor }).toEqual({ total: 8, nextCursor: '23' })
+  })
+
   it('returns valid rows newest first while retaining malformed row attribution', async () => {
     mocks.runFile.mockResolvedValue({ stdout: JSON.stringify([
       logRow({ id: 'a'.repeat(32) }),

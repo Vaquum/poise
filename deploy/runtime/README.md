@@ -71,9 +71,14 @@ runtime automatically.
 `deploy/runtime/test/native-cleanup.sh IMAGE runsc` checks the actual service
 entrypoint/gate and kernel teardown, sanitizer semantics and native Caller
 resource serialization under the shipped uid/capability/security settings.
+It distinguishes executor signals from explicit exits in the original Call's
+diagnostics. A separate isolated supervisor exercises the real service switch
+with native review and implementation Calls held live through activation, then
+checks those same Calls' publication receipts and resource release against a
+no-switch workload. Providers and GitHub responses in this check are stand-ins.
 `... IMAGE runc` separately checks refusal under Docker's default profile.
 The Runtime image workflow installs a pinned runsc only on its disposable CI
-runner. Tests use isolated tmpfs state, no network, no provider identities or
+runner. Tests use isolated tmpfs and home-volume state, no network, no provider identities or
 GitHub actions. They are component proof; the frozen real-provider campaign
 remains separate.
 

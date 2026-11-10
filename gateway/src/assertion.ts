@@ -1,6 +1,6 @@
 import { randomBytes, sign, type KeyObject } from 'node:crypto'
 
-export type Scope = 'browser' | 'link' | 'admin'
+export type Scope = 'browser' | 'link' | 'admin' | 'mcp'
 
 export const ASSERTION_ISSUER = 'poise-gateway'
 export const ASSERTION_LIFETIME_SECONDS = 60
@@ -17,6 +17,7 @@ export interface AssertionClaims {
   jti: string
   sid?: string
   gport?: number
+  mcp?: import('./mcp-contract.js').McpGrantScope
 }
 
 export interface AssertionSubject {
@@ -26,6 +27,7 @@ export interface AssertionSubject {
   scope: Scope
   sessionIdHash?: string
   gatewayPort?: number
+  mcp?: import('./mcp-contract.js').McpGrantScope
 }
 
 /** Signs the identity assertion the gateway sends to a workspace in X-Poise-Identity. */
@@ -41,6 +43,7 @@ export function signAssertion(privateKey: KeyObject, subject: AssertionSubject, 
     jti: randomBytes(16).toString('base64url'),
     ...(subject.scope === 'browser' && subject.sessionIdHash ? { sid: subject.sessionIdHash } : {}),
     ...(subject.scope === 'browser' && subject.gatewayPort ? { gport: subject.gatewayPort } : {}),
+    ...(subject.scope === 'mcp' && subject.mcp ? { mcp: subject.mcp } : {}),
   }
   const signingInput = `${HEADER}.${Buffer.from(JSON.stringify(claims)).toString('base64url')}`
   const signature = sign(null, Buffer.from(signingInput), privateKey).toString('base64url')

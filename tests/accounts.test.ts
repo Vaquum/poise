@@ -10,7 +10,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invalidateAccounts, listAccounts, AccountsCache, ACCOUNTS_CACHE_MS, ACCOUNTS_CHECK_MS, scheduleAccountsCheck } from '../server/accounts'
 import { probeAccount, probeAccounts, type RunCommand } from '../server/accounts/status'
 import type { ConnectedAccount } from '../server/accounts/types'
-import { accountLogins, markLogin, recordLogin } from '../server/accounts/logins'
+import { accountLogins, markLogin, recordLogin, recordProviderRejection, providerSignInFailure } from '../server/accounts/logins'
+import * as processes from '../server/process'
+import * as models from '../server/models'
+import { CATALOG_STDOUT } from './model-catalog-fixture'
 import { providerEvidence } from '../server/accounts/participation'
 import { setMeta } from '../server/db'
 import { runFile } from '../server/process'
@@ -22,6 +25,7 @@ let home = ''
 
 beforeEach(async () => {
   setMeta('account_logins', '{}')
+  setMeta('account_runtime_rejection:codex', '')
   invalidateAccounts()
   root = await mkdtemp(join(tmpdir(), 'poise-accounts-'))
   bin = join(root, 'bin')
@@ -31,6 +35,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   vi.unstubAllEnvs()
   await rm(root, { recursive: true, force: true })
 })
@@ -55,6 +60,65 @@ function byId(accounts: ConnectedAccount[]): Record<string, ConnectedAccount> {
 }
 
 describe('GET /api/accounts', () => {
+  it('verifies a rejected ChatGPT credential once per fresh reconnect, despite status still saying signed in', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
+    vi.spyOn(models, 'loadCatalog').mockResolvedValue(JSON.parse(CATALOG_STDOUT))
+    const actualRun = processes.runFile
+    let succeeds = false
+    const native = vi.fn(async () => {
+      if (!succeeds) throw new Error('refresh token was already used')
+      return { stdout: '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}\n{"type":"turn.completed"}\n', stderr: '' }
+    })
+    vi.spyOn(processes, 'runFile').mockImplementation((command, args, options) => args[0] === 'exec'
+      ? native() : actualRun(command, args, options))
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 1)
+    expect((await listAccounts('codex'))[0].signedIn).toBe(true)
+    expect(native).not.toHaveBeenCalled()
+    recordLogin('codex', 0)
+    await listAccounts('codex')
+    expect(native).toHaveBeenCalledTimes(1)
+    expect(providerSignInFailure('codex')?.verifiedAt).toBeNull()
+    expect(errors).toHaveBeenCalledWith('[accounts] native Codex sign-in verification failed:', expect.stringContaining('already used'))
+    await listAccounts('codex')
+    expect(native).toHaveBeenCalledTimes(1)
+
+    succeeds = true
+    recordLogin('codex', 0)
+    await listAccounts('codex')
+    expect(native).toHaveBeenCalledTimes(2)
+    expect(providerSignInFailure('codex')?.verifiedAt).toBeGreaterThan(rejectedAt)
+    const request = vi.mocked(processes.runFile).mock.calls.find(([, args]) => args[0] === 'exec')!
+    expect(request[1]).toEqual(expect.arrayContaining(['--ignore-user-config', '--ephemeral', 'forced_login_method="chatgpt"']))
+    expect(request[2]).toMatchObject({ timeoutMs: 30_000, maxOutputBytes: 64 * 1024,
+      env: { OPENAI_API_KEY: undefined, CODEX_API_KEY: undefined, OPENAI_BASE_URL: undefined, CODEX_HOME: process.env.CODEX_HOME } })
+    await listAccounts('codex')
+    expect(native).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps a Connect that finished before reconciliation recorded the rejection', async () => {
+    const rejectedAt = Date.now() - 5_000
+    recordLogin('codex', 0)
+    const loginMs = Date.parse(accountLogins().codex!)
+    expect(loginMs).toBeGreaterThan(rejectedAt)
+    recordProviderRejection('codex', 'b'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    expect(providerSignInFailure('codex')).toMatchObject({ rejectedAt, reconnectedAt: loginMs })
+  })
+
+  it('keeps the original episode window when a new rejection follows verification', async () => {
+    const { recordProviderRecovery } = await import('../server/accounts/logins')
+    const firstAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', firstAt)
+    const since = providerSignInFailure('codex')!.since
+    expect(since).toBe(firstAt)
+    recordProviderRecovery('codex', 'a'.repeat(32), firstAt + 1)
+    const secondAt = Date.now()
+    recordProviderRejection('codex', 'b'.repeat(32), 'gpt-6-astra-ultra', secondAt)
+    expect(providerSignInFailure('codex')).toMatchObject({ since, rejectedAt: secondAt, verifiedAt: null })
+  })
+
   it('reads a fast account independently of a pending provider', async () => {
     let release!: () => void
     const held = new Promise<void>(resolve => { release = resolve })

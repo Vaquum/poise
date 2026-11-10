@@ -88,6 +88,29 @@ remains eligible; this fence does not change manual Chat binding controls.
 
 The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while General settings is open. Unavailable reads disable cutover controls instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
+**Work needing attention** joins each delayed or held admitted issue's step,
+progress age, hold, exact-head CI/review gates and next known action, with issue,
+PR and journal-evidence links. Held, uncertain and pending-original-review work
+appears immediately; other active work appears after 24 hours without a verified
+advance. Selection covers every active chain page, including unpublished issues
+and merged PRs with pending review evidence, sorted by oldest progress first.
+The clock starts at admission. Canonical history advances it on a newly verified
+PR head, posted issue-review comment, qualifying PR review, queue entry, confirmed
+merge, or recovery of an observed same-head CI/review/conflict gate. Unchanged
+polls, admission/start, failed attempts, holds and Resume do not reset it. Restart
+and projection rebuild derive the same clock without changing journal events.
+Fresh, stale, incomplete and unavailable evidence remain labelled. A known native
+failure backoff shows retry eligibility under existing admission gates; an unknown
+provider backoff has no invented deadline. Scheduled evidence rechecks never retry
+held work. CI or approval recovery cannot clear a hold or missing original receipt,
+and a queue entry cannot establish merge completion. Verified progress can remove
+a delayed entry; a durable hold remains until explicitly resumed, and a merged
+review obligation remains until its original evidence is verified. The first list
+page's optional `attention` projection is independent of the ordinary chain-list
+cursor/filter; later list pages retain the existing pagination contract. Failed
+refreshes label retained attention entries stale. These are read-only summaries
+on the existing refresh clock, with no new observation or execution authority.
+
 In v2, Review New Issues shows that saved seed scope instead of the inactive
 legacy repository filter. Its setting opens the existing General seed controls,
 using capacity data already returned by the Behaviors read.
@@ -215,6 +238,16 @@ Projection rebuild preserves historical invocation hashes across the resource-ad
 Admission-mode transitions use `admission.changed` events under the reserved `@behavior-admission` journal identity. They share the immutable log and hashes but are not fabricated issue chains and do not appear in chain pages. Rebuilding chain projections verifies and preserves this durable admission state.
 
 Native Call rows and immutable action plans record effect intent before controlled publication. They provide execution evidence to the journal, not a second phase controller. Unique native correlations prevent duplicate processes from executing the same admission. Worker resource settlement is required before a handoff; a terminal model result is insufficient. A restart or interrupted process is reconciled against the original invocation, pushed branch, posted comments and exact-head review receipts.
+
+Verified Codex sign-in recovery can retire issue-review retry accounting through
+the existing journal resume event. Every affected attempt must belong to that
+credential-rejection episode, prove `not_started` / `preflight_failed`, retain
+`receipts=null`, and have positively settled resources. Only the matching
+automatic three-failure hold is resumed; operator holds, other failures and
+uncertain publication remain held. A bounded page of these automatic holds is
+checked before their ordinary observation cadence, without another GitHub read.
+The provider's fresh recovery allowance is consumed by the existing reviewer
+probe admission, so repeated recovery reads cannot launch another probe.
 
 Native request digests use Caller's recursively sorted JSON encoding.
 Journal event/state and plan hashes keep their original serialization, while response
@@ -413,7 +446,18 @@ head/base recheck and independent approval verification still apply.
 
 Repair prompts name the exact unresolved root comment IDs from the head-verified
 review packet, including outdated threads and roots with earlier replies.
-Caller requires that same set before publication. Missing coverage records
+Caller requires that same set before publication. After checking the repaired
+code and current reviewer input, a repair can carry a still-applicable native
+reply verbatim, including its original `poise-reply` marker, in the existing
+`replies` plan. The publisher verifies the reply's author, root, exact body and
+marker against paginated GitHub comments and returns its existing receipt.
+Reviewer edits or follow-ups on that finding require a fresh answer, as do new
+findings or materially changed answers; a new Call/head or unrelated finding
+does not invalidate reuse. Prior replies remain in the current-head review
+packet and durable publication plan. Inspection/recovery verifies their proof
+again; missing or altered proof fails visibly and cannot count as coverage.
+Reuse changes neither exact-head review/approval nor conversation-resolution
+gates. Missing coverage records
 `atomic_work_failed`, `not_started` / `preflight_failed`, with the missing count,
 required count and at most 20 sorted missing IDs in the retained error field;
 comment text is not retained there. No publication plan exists at this point,
@@ -454,8 +498,9 @@ failure is a failed, unstarted action and retries with the existing backoff.
 Reporting is off by default. An operator can set
 `POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
 list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
-holds during their ordinary bounded reconciliation; no Resume or extra poller is
-needed. Reporting preserves the source hold and does not perform repair recovery.
+repair holds and uncertain merge submissions during their ordinary bounded
+reconciliation; no Resume or extra poller is needed. Reporting preserves the
+source hold, uncertainty and ownership and does not perform recovery.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
 variable. The gateway forwards it on install; adding, changing or removing it
 cooperatively replaces existing workspaces, even on the same image. Unset or
@@ -481,17 +526,34 @@ Before first reporting, the existing datastore freshness gate must pass and a
 new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads or PR review contexts leave reporting pending,
 including title, body or base changes on an unchanged head. Other causes remain
-visible in their ordinary holds without an issue report; mixed causes cannot qualify.
+visible in their ordinary holds without an issue report; mixed repair or review causes cannot qualify.
+
+`merge_submission_uncertain` separately qualifies the original pending `merge-pr`
+invocation after recovery rereads the journal, even without an explicit chain hold.
+Its failed terminal Call must have a completion time and positive resource-release
+proof, with no accepted action receipt or proven no-effect result. The Call identity
+can be retained as `evidence.nativeCallId` while `invocation.callId` remains null.
+A fresh native observation must verify that the seed and original PR remain open,
+the PR still has the request's pinned head, and no merge is running or queued.
+Unavailable evidence, a changed target, closure or a confirmed merge prevents
+creation. Same-head conflicts, failing CI and other readiness blockers do not
+prevent reporting: the uncertain invocation also blocks repair. The report names
+the seed, PR, head, original invocation and Call, recorded error code and bounded
+process diagnostic facts, or explicitly states that historical diagnostics are
+missing. Its next action is to inspect and reconcile those original receipts and
+the PR/queue state before deciding how to proceed. It never retries the merge or
+asserts an unobserved external write.
 
 Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the
 stage, stable cause, target, hold time/age, head/basis, safe invocation and Caller
 receipt identities, and next action. It excludes raw errors, omitted finding IDs,
 worker paths and provider output. An intent in the existing durable metadata store
-links the original hold event to the report issue. Identity uses cause + source
+links the original failure to the report issue. Repair identity uses cause + source
 chain + PR, independently of omission details, heads and subsequent attempt windows.
-Existing incomplete-reply intent keys and markers remain unchanged; budget reports
-use a separate cause with the same metadata and marker format.
+Existing repair and review intent keys and markers remain unchanged. Uncertain merge reports
+use cause + source chain + original invocation, with the same metadata store and
+marker format; an unheld source has no hold event or hold time.
 All report bodies include the canonical clinical scope directive in the
 [report template](../server/behavior-chain-report.ts), followed by
 "Include this exact paragraph in the linked PR review." Native PR review and
@@ -523,12 +585,14 @@ incompatible saved intake labels and a held remediation chain are shown in the
 source chain's `waiting` reason, including its report URL when known. Poise does
 not add a different intake label or bypass ownership/admission gates. Admission is
 verified only when the normal datastore intake records the new chain. Generated
-remediation issues cannot report any supported cause recursively, using their marker
-or the retained source-to-issue link; their ordinary holds remain visible.
+remediation issues cannot report any supported cause recursively, using their
+marker or the retained source-to-issue link; their ordinary holds and uncertainty
+remain visible.
 
 `tests/behavior-chain-report.test.ts` exercises publication, labeling, uncertain
-creation/restart, reconciliation and normal admission with an isolated journal
-and fake GitHub/datastore commands. Live acceptance remains pending until an
+creation/restart, reconciliation, uncertain merge target suppression and normal
+admission with an isolated journal and fake GitHub/datastore commands. Live
+acceptance remains pending until an
 operator follows a real qualifying hold through one labeled report, chain
 admission and the normal merge receipt after deployment. No fabricated hold,
 live write or production setting change is part of that component proof.

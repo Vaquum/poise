@@ -1013,6 +1013,10 @@ supervisor metadata reference. Host SQLite access is unsafe even with `mode=ro`
 or `PRAGMA query_only=on`: it can modify the guest's WAL shared-memory file.
 For offline SQL, first stop the workspace and preserve its database and sidecars.
 
+Managed Caller validates the database inode and ownership using filesystem
+metadata without opening an extra file descriptor. SQLite owns the database
+connection and its locks.
+
 `deploy/install.sh` and `deploy/upgrade.sh` install and enable
 `poise-caller-guard.service` when the configured or an existing workspace runtime
 is gVisor. It runs on the host, independently of the gateway and workspace
