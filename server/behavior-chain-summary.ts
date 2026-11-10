@@ -2,6 +2,7 @@ import { attributedNativeAction, matchingNativeActionReceipt, nativeActionSettle
 import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
+import { nativeBehavior } from './behavior-chain-runtime'
 import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent } from './behavior-chain-store'
 import type { LoggingWorkImpact } from '../src/logging'
 
@@ -117,12 +118,16 @@ function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocati
   const verified = new Set<string>()
   let failureSequence: number | null = null
   let waitingSequence = 0
+  let waitingHead: string | null = null
   for (;;) {
     const events = journal.history(id, after)
     for (const row of events) {
       const event = JSON.parse(row.payload) as ChainEvent
       chain = reduceChain(chain, event, row.sequence, id)
-      if (event.type === 'chain.waiting') waitingSequence = row.sequence
+      if (event.type === 'chain.waiting') {
+        waitingSequence = row.sequence
+        waitingHead = exactPull(chain.observation as ChainObservation | null)?.head ?? null
+      }
       if ((event.type === 'invocation.settled' || event.type === 'invocation.reconciled')
         && event.invocationId === failedInvocation && event.evidence.status === 'failed' && failureSequence === null) failureSequence = row.sequence
       let advanced = event.type === 'chain.admitted'
@@ -174,7 +179,7 @@ function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocati
     after = events.at(-1)!.sequence
   }
   if (!chain) throw new Error(`behavior chain admission history is unavailable: ${id}`)
-  return { at, sequence, failureSequence, waitingSequence }
+  return { at, sequence, failureSequence, waitingSequence, waitingHead }
 }
 
 /** Read-only incident annotation, independent of attention's age/active filters. */
@@ -190,7 +195,12 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
   const contradicted = chain.invocations.some(item => !!item.evidence && resourceReleaseContradicted(item.evidence))
   const blocked = !!chain.held || chain.reviewPending === true || active?.state === 'uncertain' || contradicted
   let retryAt: number | null = null
-  if (!blocked && !active && last && waiting === `${last.behavior} is in native failure backoff`) {
+  // A backoff outlives observation-only progress past its wait note (CI
+  // turning green mid-backoff) but not a new head: match the preserved note
+  // against the live last invocation on an unchanged head.
+  const backoffHead = exactPull(chain.observation as ChainObservation | null)?.head ?? null
+  if (!blocked && !active && last && chain.waiting === `${last.behavior} is in native failure backoff`
+    && progress.waitingHead === backoffHead) {
     const attempts = chain.invocations.filter(item => item.behavior === last.behavior && item.basis === last.basis
       && item.slot === last.slot && item.state === 'settled' && item.evidence?.status !== 'deferred'
       && item.admissionSequence > chain.resumedAfterSequence)
@@ -201,6 +211,7 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
     : active && active.admissionSequence > invocation.admissionSequence || retryAt !== null ? 'retrying' : 'unknown'
   const publication = chain.observation?.publication as { pull_number?: number | null } | undefined
   return { impact, recovered, invocationId: invocation.id, repository: chain.repository, behavior: invocation.behavior,
+    callerBehavior: nativeBehavior(invocation.behavior),
     stage: active ? `${active.behavior}: ${active.state}` : chain.mergeSha ? 'Merged' : last ? `${last.behavior}: ${last.outcome ?? last.state}` : 'Issue admission',
     target: `${chain.repository}#${publication?.pull_number ?? chain.issue}`,
     progressAt: progress.at, retryAt,

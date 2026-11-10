@@ -18,6 +18,7 @@ export interface LoggingWorkImpact {
   invocationId: string
   repository: string
   behavior: string
+  callerBehavior: string | null
   stage: string
   target: string
   progressAt: number
@@ -183,12 +184,13 @@ export async function loggingWorkImpact(access: LoggingAccess, event: LoggingEve
   if (!object(value) || !['retrying', 'blocked', 'recovered', 'unknown'].includes(String(value.impact))
     || typeof value.recovered !== 'boolean' || typeof value.invocationId !== 'string'
     || !['stage', 'target', 'journal', 'repository', 'behavior'].every(key => typeof value[key] === 'string')
+    || value.callerBehavior !== null && typeof value.callerBehavior !== 'string'
     || typeof value.journal !== 'string' || !value.journal.startsWith('/api/behavior-chains?id=')
     || !Number.isSafeInteger(value.progressAt) || Number(value.progressAt) < 0
     || value.retryAt !== null && (!Number.isSafeInteger(value.retryAt) || Number(value.retryAt) < 0)
     || value.nextAction !== null && typeof value.nextAction !== 'string') return protocol()
   if (event.repository && event.repository.toLowerCase() !== String(value.repository).toLowerCase()
-    || event.behavior && event.behavior.replace(/_/g, '-') !== value.behavior) return null
+    || event.behavior && value.callerBehavior && event.behavior !== value.callerBehavior) return null
   return value as unknown as LoggingWorkImpact
 }
 

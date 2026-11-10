@@ -89,3 +89,14 @@ it('reads completed chains and refuses missing, conflicting and ambiguous exact 
   loggingWorkFixture(journal, 'acme/repo', 9, correlation, call, at)
   expect(behaviorChainWorkImpact(journal, call, correlation)).toBeNull()
 })
+
+it('keeps a current backoff retry time when progress advances past its wait note', () => {
+  const journal = new BehaviorChainJournal(db)
+  const fixture = loggingWorkFixture(journal, 'acme/repo', 7, correlation, call, at)
+  // CI turns green mid-backoff: progress advances past the waiting event while the backoff stays current.
+  fixture.append({ type: 'chain.observed', observation: { ...fixture.observation, checkedAt: at + 4000,
+    pull: { ...fixture.observation.pull!, checksState: 'SUCCESS', pending: false, failing: [] as string[] } } }, at + 4000)
+  expect(behaviorChainWorkImpact(journal, call, correlation)).toMatchObject({ impact: 'recovered', recovered: true,
+    callerBehavior: 'repair_pr', retryAt: at + 63_000,
+    nextAction: 'Automatic retry eligible after backoff, subject to existing admission gates' })
+})

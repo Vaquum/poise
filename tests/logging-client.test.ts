@@ -37,7 +37,8 @@ it('keeps optional chain reads on the owner workspace boundary and leaves unavai
 
 it('does not associate conflicting repository or behavior evidence despite matching invocation identities', async () => {
   const impact = { impact: 'blocked', recovered: false, invocationId: '2'.repeat(32), repository: 'acme/repo', behavior: 'repair-pr',
-    stage: 'repair-pr: failed', target: 'acme/repo#42', progressAt: 1000, retryAt: null, nextAction: 'Resolve the hold', journal: '/api/behavior-chains?id=acme%2Frepo%237' }
+    callerBehavior: 'repair_pr', stage: 'repair-pr: failed', target: 'acme/repo#42', progressAt: 1000, retryAt: null,
+    nextAction: 'Resolve the hold', journal: '/api/behavior-chains?id=acme%2Frepo%237' }
   const fetch = respond({ impact })
   const owned = { ...event, callId: '1'.repeat(32), correlationId: '2'.repeat(32), behavior: 'repair_pr' }
   expect(await loggingWorkImpact(access, owned, signal())).toEqual(impact)
@@ -45,6 +46,13 @@ it('does not associate conflicting repository or behavior evidence despite match
     fetch.mockResolvedValue(new Response(JSON.stringify({ impact })))
     expect(await loggingWorkImpact(access, { ...owned, ...change }, signal())).toBeNull()
   }
+  // Caller behavior names do not normalize by separator swap: issue_review is
+  // review-issue, which underscore replacement would render issue-review.
+  const renamed = { ...impact, behavior: 'review-issue', callerBehavior: 'issue_review' }
+  fetch.mockResolvedValue(new Response(JSON.stringify({ impact: renamed })))
+  expect(await loggingWorkImpact(access, { ...owned, behavior: 'issue_review' }, signal())).toEqual(renamed)
+  fetch.mockResolvedValue(new Response(JSON.stringify({ impact: renamed })))
+  expect(await loggingWorkImpact(access, { ...owned, behavior: 'pr_review' }, signal())).toBeNull()
 })
 
 describe('canonical diagnostic browser contract', () => {
