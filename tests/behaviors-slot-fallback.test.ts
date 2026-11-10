@@ -515,3 +515,114 @@ it.each(['initial review', 'approval', 'dismissed approval'] as const)(
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
   },
 )
+
+it.each(['initial review', 'approval'] as const)(
+  'materializes an upgrade stop with no retained claim and keeps it retryable', async (lane) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-10T12:00:00Z'))
+    const initial = lane === 'initial review'
+    const behavior = initial ? 'review-new-prs' : 'approve-prs'
+    const launchBehavior = initial ? 'pr_review' : 'pr_approve'
+    const model = 'opus-5-xhigh'
+    const arrange = (head = HEAD_SHA, responses = 1) => arrangeCli(!initial, false, {
+      headSha: head, reviewerReviewIdsSince: [], latestActivityAt: new Date().toISOString(),
+    }, { commits_after_request: 0, author_commits_after_request: 0,
+      author_pr_comments_after_request: initial ? 0 : responses, response_count: initial ? 0 : responses })
+    arrange()
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    let { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user')
+    db.setMeta(`behavior_${behavior.replace(/-/g, '_')}_enabled`, '1')
+    db.setMeta('models', JSON.stringify({ slots: { primary: model, secondary: model, tertiary: model },
+      places: { [launchBehavior]: { slot: 'primary' } } }))
+    if (initial) {
+      db.setMeta('behavior_review_new_prs_keyver', '3')
+      db.recordSeen(behavior, '__snapshot_v3__')
+      db.setMeta('behavior_review_new_prs_reviewers', '1')
+    }
+    runtime.startBehaviorsRuntime()
+    const tick = async () => { await resetLogCache(); await runtime.runEnabledBehaviorsOnce() }
+    const expireBackoff = () => vi.setSystemTime(Date.now() + 3_600_001)
+    // Two matching automatic timeouts with no retained launch, as left by a
+    // runtime that released its claims before the upgrade.
+    const started = new Date().toISOString()
+    const upgradeReceipt = (id: string, correlation: string) => agentLog({ id, behavior: launchBehavior,
+      repo: pr.repo, pr_id: String(pr.number), model, status: 'failed',
+      started_at: started, started_at_precise: started, completed_at: new Date().toISOString(),
+      expected_head: HEAD_SHA, actor: 'review-bot', source: `poise:${behavior}`,
+      correlation_id: correlation, action: 'not_started', outcome: 'preflight_failed',
+      review_policy: 'bounded-v1', error_code: 'review_budget_exhausted',
+      error: 'Review reached its total time limit; needs attention' })
+    const firstId = 'a'.repeat(32)
+    const secondId = 'b'.repeat(32)
+    fixture.agentLogs.push(upgradeReceipt(firstId, 'upgrade-one'), upgradeReceipt(secondId, 'upgrade-two'))
+    await tick()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    const snapshot = await (await import('../server/agent')).fetchAgentLogSnapshot()
+    const incident = runtime.getBehaviorDiagnosticIncidents(snapshot).find((row) => row.callId === secondId)!
+    expect(incident.error).toContain('Automatic retries stopped after two review timeouts')
+    expect(incident.nextRetryAt).toBeUndefined()
+    const heldTarget = incident.target
+    expect(db.getFailedBehaviorLaunch(behavior, heldTarget)?.launchCallId).toBe(secondId)
+    await resetLogCache()
+    await expect(runtime.retryFailedPrReviews([secondId])).resolves.toEqual({ ok: true, targets: [heldTarget] })
+    expireBackoff()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+  },
+)
+
+it('honors an explicit approval retry across a same-head target drift', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date('2026-11-10T12:00:00Z'))
+  const behavior = 'approve-prs' as const
+  const model = 'opus-5-xhigh'
+  const arrange = (responses = 1) => arrangeCli(true, false, {
+    headSha: HEAD_SHA, reviewerReviewIdsSince: [], latestActivityAt: new Date().toISOString(),
+  }, { commits_after_request: 0, author_commits_after_request: 0,
+    author_pr_comments_after_request: responses, response_count: responses })
+  arrange(1)
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const { database: db, behaviors: runtime } = await loadModules()
+  db.setMeta('me', 'poise-user')
+  db.setMeta('behavior_approve_prs_enabled', '1')
+  db.setMeta('models', JSON.stringify({ slots: { primary: model, secondary: model, tertiary: model },
+    places: { pr_approve: { slot: 'primary' } } }))
+  runtime.startBehaviorsRuntime()
+  const tick = async () => { await resetLogCache(); await runtime.runEnabledBehaviorsOnce() }
+  const expireBackoff = () => vi.setSystemTime(Date.now() + 3_600_001)
+  await tick()
+  expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+  const claim = db.listBehaviorLaunchClaims(behavior).find((row) => row.launchPr === pr.number)!
+  const started = claim.launchRequestedAt
+  const receipt = (id: string, correlation: string) => agentLog({ id, behavior: 'pr_approve',
+    repo: pr.repo, pr_id: String(pr.number), model, status: 'failed', started_at: started,
+    started_at_precise: started, completed_at: new Date().toISOString(), expected_head: claim.launchExpectedHead,
+    actor: claim.launchActor, source: claim.launchSource, correlation_id: correlation,
+    action: 'not_started', outcome: 'preflight_failed', review_policy: 'bounded-v1',
+    error_code: 'review_budget_exhausted', error: 'Review reached its total time limit; needs attention' })
+  const firstId = 'c'.repeat(32)
+  const secondId = 'd'.repeat(32)
+  // Rewrite the single active claim's history as two matching timeouts: the
+  // scheduler holds the second launch, then retains it as the stop.
+  fixture.agentLogs.push(receipt(firstId, claim.launchCorrelationId))
+  await tick()
+  expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+  expireBackoff()
+  await tick()
+  expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+  const secondClaim = db.listBehaviorLaunchClaims(behavior).find((row) => row.launchPr === pr.number)!
+  fixture.agentLogs.push({ ...receipt(secondId, secondClaim.launchCorrelationId),
+    started_at: secondClaim.launchRequestedAt, started_at_precise: secondClaim.launchRequestedAt })
+  await tick()
+  expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+  const heldTarget = secondClaim.target
+  await resetLogCache()
+  await expect(runtime.retryFailedPrReviews([secondId])).resolves.toEqual({ ok: true, targets: [heldTarget] })
+  // A same-head author response derives a new approval target, but the
+  // verified retry still permits the next launch.
+  arrange(2)
+  expireBackoff()
+  await tick()
+  expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+})

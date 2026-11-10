@@ -3419,9 +3419,14 @@ async function tickReviewNewPrs(): Promise<void> {
             const launchModels = new Map((await launchReviewPanel(getReviewers('review-new-prs'), 'pr_review', seedKey))
               .reviewers.map((entry) => [entry.slot, entry.model]))
             if (launchModels.get(slot) !== bundle.model) { releaseLeases(null); continue }
-            const retry = prReviewRetryState(await readBehaviorLogSnapshot(), 'review-new-prs', pr.repo,
+            const stopSnapshot = await readBehaviorLogSnapshot()
+            const retry = prReviewRetryState(stopSnapshot, 'review-new-prs', pr.repo,
               pr.number, bundle.expectedHead, bundle.actor, bundle.model, target)
-            if (retry.stopped && !retry.operatorRetryKey) { releaseLeases(null); continue }
+            if (retry.stopped && !retry.operatorRetryKey) {
+              ensureBudgetStopHold('review-new-prs', pr.repo, pr.number, bundle.expectedHead,
+                bundle.actor, bundle.model, target, stopSnapshot)
+              releaseLeases(null); continue
+            }
             bundle.operatorRetryKey = retry.operatorRetryKey ?? undefined
             // A full shared budget stops here, before the probe and the
             // claim: the candidate retries on the next tick instead of
@@ -3835,10 +3840,111 @@ function prReviewRetryState(
     const raw = parseJsonMeta(key)
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
     const retry = raw as Record<string, unknown>
-    return retry.target === target && retry.expectedHead === head && retry.correlationId === call.correlation_id
+    // Approval targets encode the author response and review context after
+    // `@`, so a same-head reply after the grant derives a new target. Match
+    // the stable `repo#number` base there; review slots keep exact targets.
+    const targetMatches = behavior === 'approve-prs'
+      && typeof retry.target === 'string'
+      ? retry.target.split('@')[0] === target.split('@')[0]
+      : retry.target === target
+    return targetMatches && retry.expectedHead === head && retry.correlationId === call.correlation_id
       && typeof retry.at === 'string' && Number.isFinite(Date.parse(retry.at)) ? key : null
   }).find((key) => key !== null) ?? null
   return { stopped, operatorRetryKey }
+}
+
+// An upgrade from a runtime that released its claims leaves only Caller
+// receipts: two matching automatic timeouts with no retained launch would
+// otherwise skip silently with no visible hold and no retryable claim.
+// Materialize the stopped hold from the latest receipt so the stop stays
+// visible and the verified explicit retry has a claim to release.
+function ensureBudgetStopHold(
+  behavior: 'review-new-prs' | 'approve-prs',
+  repo: string,
+  number: number,
+  head: string,
+  actor: string,
+  model: string,
+  target: string,
+  snapshot: AgentLogSnapshot,
+  activeClaimId?: string,
+): void {
+  if (retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
+    claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head)) return
+  const timeouts = snapshot.entries.filter((call) => call.repo === repo && String(call.pr_id) === String(number)
+    && call.behavior === upstreamBehavior(behavior) && call.source === `poise:${behavior}`
+    && call.expected_head === head && call.actor?.toLowerCase() === actor.toLowerCase()
+    && !!call.correlation_id && Number.isFinite(Date.parse(agentCallStartedAt(call)))
+    && FAILED_AGENT_STATUSES.has(call.status.toLowerCase()) && unambiguousAgentCall(snapshot, call)
+    && call.model === model && budgetExhaustedProvenNoAction(call)
+    && reviewerTripKind(call) === 'budget'
+    && (call.action === null && call.outcome === null || call.action === 'not_started' && call.outcome === 'preflight_failed'))
+    .sort((a, b) => Date.parse(agentCallStartedAt(b)) - Date.parse(agentCallStartedAt(a)))
+  const latest = timeouts[0]
+  if (!latest?.correlation_id || !latest.id) return
+  const requestedAt = agentCallStartedAt(latest)
+  if (!Number.isFinite(Date.parse(requestedAt))) return
+  const launchBehavior = upstreamBehavior(behavior)
+  const source = `poise:${behavior}` as const
+  if (activeClaimId) {
+    const converted = db.prepare(`
+      UPDATE behavior_seen SET claim_id = '', lease_until = NULL, seen_at = ?,
+        launch_behavior = ?, launch_repo = ?, launch_pr = ?,
+        launch_requested_at = ?, launch_call_id = ?, launch_error = ?,
+        launch_outcome = NULL, launch_completed_at = NULL, launch_head_sha = NULL,
+        launch_expected_head = ?, launch_actor = ?, launch_source = ?,
+        launch_correlation_id = ?, launch_action = NULL, launch_covers = NULL,
+        launch_quarantine = NULL, launch_quarantine_may_run = 1
+      WHERE key = ? AND target = ? AND claim_id = ? AND launch_requested_at IS NULL
+    `).run(new Date().toISOString(), launchBehavior, repo, number, requestedAt,
+      latest.id, REVIEW_BUDGET_STOPPED, head, actor, source, latest.correlation_id,
+      behavior, target, activeClaimId)
+    if (converted.changes === 1) {
+      const claim = getFailedBehaviorLaunch(behavior, target)
+      if (claim && !listBehaviorDeadLetters(500).some((row) => row.behavior === behavior
+        && row.target === target && row.correlationId === claim.launchCorrelationId && row.callId === claim.launchCallId)) {
+        databaseRecordBehaviorDeadLetter(claim, REVIEW_BUDGET_STOPPED, claim.launchCallId)
+      }
+      return
+    }
+    if (listBehaviorLaunchClaims(behavior).some((claim) => claim.target === target)) return
+    if (getFailedBehaviorLaunch(behavior, target)) return
+  } else {
+    if (listBehaviorLaunchClaims(behavior).some((claim) => claim.target === target)) return
+    if (getFailedBehaviorLaunch(behavior, target)) return
+  }
+  db.prepare(`
+    INSERT INTO behavior_seen(key, target, seen_at, claim_id, launch_behavior, launch_repo, launch_pr,
+      launch_requested_at, launch_call_id, launch_error, launch_expected_head, launch_actor, launch_source, launch_correlation_id)
+    VALUES(?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(key, target) DO UPDATE SET
+      seen_at = excluded.seen_at,
+      lease_until = NULL,
+      launch_behavior = excluded.launch_behavior,
+      launch_repo = excluded.launch_repo,
+      launch_pr = excluded.launch_pr,
+      launch_requested_at = excluded.launch_requested_at,
+      launch_call_id = excluded.launch_call_id,
+      launch_error = excluded.launch_error,
+      launch_outcome = NULL,
+      launch_completed_at = NULL,
+      launch_head_sha = NULL,
+      launch_expected_head = excluded.launch_expected_head,
+      launch_actor = excluded.launch_actor,
+      launch_source = excluded.launch_source,
+      launch_correlation_id = excluded.launch_correlation_id,
+      launch_action = NULL,
+      launch_covers = NULL,
+      launch_quarantine = NULL,
+      launch_quarantine_may_run = 1
+    WHERE behavior_seen.claim_id = '' AND behavior_seen.launch_error IS NULL
+  `).run(behavior, target, new Date().toISOString(), launchBehavior, repo, number, requestedAt,
+    latest.id, REVIEW_BUDGET_STOPPED, head, actor, source, latest.correlation_id)
+  const claim = getFailedBehaviorLaunch(behavior, target)
+  if (claim && !listBehaviorDeadLetters(500).some((row) => row.behavior === behavior
+    && row.target === target && row.correlationId === claim.launchCorrelationId && row.callId === claim.launchCallId)) {
+    databaseRecordBehaviorDeadLetter(claim, REVIEW_BUDGET_STOPPED, claim.launchCallId)
+  }
 }
 
 // An explicit operator retry releases only failed slots whose live GitHub
@@ -4354,9 +4460,16 @@ async function fireApprove(
   // The model read above awaits: a pause landing in that window must
   // still hold this launch, so this is the last check before it.
   if (!isRunnable('approve-prs') || behaviorAborted()) return false
-  const retry = prReviewRetryState(await readBehaviorLogSnapshot(), 'approve-prs', pr.repo,
+  const stopSnapshot = await readBehaviorLogSnapshot()
+  const retry = prReviewRetryState(stopSnapshot, 'approve-prs', pr.repo,
     pr.number, expectedHead, actor, model, claimTarget)
-  if (!isRunnable('approve-prs') || behaviorAborted() || retry.stopped && !retry.operatorRetryKey) return false
+  if (!isRunnable('approve-prs') || behaviorAborted() || retry.stopped && !retry.operatorRetryKey) {
+    if (retry.stopped && !retry.operatorRetryKey) {
+      ensureBudgetStopHold('approve-prs', pr.repo, pr.number, expectedHead,
+        actor, model, claimTarget, stopSnapshot, claimId)
+    }
+    return false
+  }
   // At most one probe per backoff window: a sibling that already claimed it
   // makes this launch wait for the verdict instead of doubling the probe.
   if (!claimReviewerTripProbe(model)) return false
@@ -4766,6 +4879,18 @@ async function tickApprovePrs(): Promise<void> {
           }
           if (!isRunnable('approve-prs')) return
           if (!behaviorRetryDue('approve-prs', seenTarget)) return
+          {
+            const stopSnapshot = await readBehaviorLogSnapshot()
+            const stopModel = (await approvalSlot())?.model ?? ''
+            const stopActor = configuredReviewer(pr.author)
+            const stopState = prReviewRetryState(stopSnapshot, 'approve-prs', pr.repo,
+              pr.number, expectedHead, stopActor, stopModel, seenTarget)
+            if (stopState.stopped && !stopState.operatorRetryKey) {
+              ensureBudgetStopHold('approve-prs', pr.repo, pr.number, expectedHead,
+                stopActor, stopModel, seenTarget, stopSnapshot)
+              return
+            }
+          }
           let claimId = claimSeenOwnedAs('approve-prs', seenTarget, operationId)
           let replacesFailedCallId: string | undefined
           if (!claimId) {
