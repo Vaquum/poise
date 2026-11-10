@@ -314,6 +314,11 @@ conn.close()
     request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
   append(recorded, { type: 'invocation.settled', invocationId: 'recorded', callId: 'c'.repeat(32), outcome: 'published',
     evidence: { status: 'completed', action: 'published', head_sha: 'a'.repeat(40) } })
+  let runningChain = admit(8)
+  runningChain = append(runningChain, { type: 'invocation.admitted', invocation: { id: 'running', behavior: 'implement-issue', basis: 'issue',
+    actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 60_000,
+    request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
+  append(runningChain, { type: 'invocation.started', invocationId: 'running' })
   await ledger.startBehaviorLedger({ path: join(root, 'ledger.sqlite') })
   ledger.behaviorLedgerHeartbeat()
   const packagePoisePlugin = (apex: string, destination: string) => promisify(execFile)(process.execPath,
@@ -326,6 +331,7 @@ conn.close()
   const run = vi.spyOn(processes, 'runFile')
   const reads = vi.spyOn(BehaviorChainJournal.prototype, 'read')
   const pages = vi.spyOn(BehaviorChainJournal.prototype, 'page')
+  const realRead = ledger.readBehaviorLedger
   const receipts = vi.spyOn(ledger, 'readBehaviorLedger')
   async function work(args: Record<string, unknown>) {
     const result = await connection.client.callTool({ name: 'poise_work', arguments: args })
@@ -370,6 +376,18 @@ conn.close()
     expect(reads.mock.calls.map(call => call[0])).toEqual(['acme/repo#3', 'acme/repo#4'])
     expect(receipts.mock.calls).toHaveLength(4)
     expect(receipts.mock.calls.every(call => call[0].operation === 'list' && call[0].limit === 5 && call[0].repository === 'Acme/Repo')).toBe(true)
+    let inFlight = 0, maxInFlight = 0
+    receipts.mockImplementation((request) => {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      return (async () => {
+        await new Promise(resolve => setTimeout(resolve, 5))
+        try { return await realRead(request) } finally { inFlight -= 1 }
+      })()
+    })
+    await work({ repository: 'acme/repo', label: 'poise', limit: 2, cursor: first.nextCursor })
+    expect(maxInFlight).toBe(1)
+    receipts.mockImplementation((request) => realRead(request))
     const exact = await work({ repository: 'acme/repo', issue: 5 })
     expect(exact.coverage.issues.status).toBe('fresh')
     expect(exact.items[0]).toMatchObject({ stage: 'unknown', coverage: { receipts: { status: 'partial' } },
@@ -377,6 +395,9 @@ conn.close()
     const proof = await work({ repository: 'acme/repo', issue: 6 })
     expect(proof.items[0].receipts[0]).toMatchObject({ callId: 'c'.repeat(32), coverage: 'recorded', evidence: { action: 'published', head: 'a'.repeat(40) } })
     expect(proof.items[0].links.calls).toEqual([{ id: 'c'.repeat(32), url: `https://alice.poise.test/api/agent-response/${'c'.repeat(32)}` }])
+    const running = await work({ repository: 'acme/repo', issue: 8 })
+    expect(running.items[0]).toMatchObject({ stage: 'running', blocker: null,
+      coverage: { receipts: { status: 'fresh' } }, receipts: [{ id: 'running', callId: null, coverage: 'not-recorded' }] })
     expect((await work({ repository: 'acme/repo', issue: 7 })).items[0]).toMatchObject({ issue: 7, author: null, stage: 'not_recorded' })
     const mirror = new Database(path)
     mirror.prepare("UPDATE sync_state SET updated_at=? WHERE scope='org' AND key='last_sync_at'").run(new Date(now - 600_000).toISOString())

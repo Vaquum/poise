@@ -370,9 +370,9 @@ def sync_once(
         with conn:
             initialize_full_build_markers(conn)
             # Existing snapshots predate label capture. Reuse the normal
-            # full-enumeration/checkpoint path to refresh old open issues,
+            # full-enumeration/checkpoint path to refresh old issues,
             # even when their GitHub updatedAt has not changed.
-            for row in conn.execute("SELECT DISTINCT repo_id FROM items WHERE item_type='issue' AND state='open' "
+            for row in conn.execute("SELECT DISTINCT repo_id FROM items WHERE item_type='issue' "
                                     "AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array'"):
                 clear_full_build_marker(conn, int(row["repo_id"]))
         since = get_state(conn, "org", "last_sync_at")
@@ -556,7 +556,7 @@ def items_requiring_full_refresh(
             or int(row["number"]) != int(item["number"])
             or str(row["item_type"]) != item["item_kind"]
             or str(row["repo_full_name"]) != repo_full_name
-            or (row["item_type"] == "issue" and row["state"] == 'open' and not isinstance(json.loads(row["expanded_json"])["issue"].get("labels"), list))
+            or (row["item_type"] == "issue" and not isinstance(json.loads(row["expanded_json"])["issue"].get("labels"), list))
         ):
             refresh.append(item)
     return refresh

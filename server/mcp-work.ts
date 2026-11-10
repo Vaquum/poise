@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { McpGrantScope, McpWorkArguments } from '../gateway/src/mcp-contract'
 import { readBehaviorLedger } from './behavior-ledger'
-import type { LedgerReadReply } from './behavior-ledger-contract'
+import type { LedgerHealth, LedgerReadReply, LedgerRecord } from './behavior-ledger-contract'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, chainIdentity, type BehaviorChain } from './behavior-chain-store'
 import { behaviorChainSummary } from './behavior-chain-summary'
@@ -84,13 +84,18 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
     : coverage(now - checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS ? 'stale' : 'fresh', new Date(checkedAt).toISOString())
   const pullNumber = summary?.pullNumber ?? null
   const targets = [...new Set([issue.number, ...(pullNumber ? [pullNumber] : [])])]
-  const ledger = await Promise.all(targets.map(async number => {
+  // Ledger reads stay sequential: a full page fans out to two targets per
+  // issue against the worker's bounded read slots, so parallel reads
+  // deterministically return ledger_busy.
+  const ledger: Array<{ number: number; coverage: Coverage; health: LedgerHealth; hasMore: boolean;
+    records: Array<Pick<LedgerRecord, 'id' | 'behavior' | 'state' | 'activity' | 'outcome' | 'head' | 'startedAt' | 'completedAt' | 'refs'>> }> = []
+  for (const number of targets) {
     const reply = await readBehaviorLedger({ operation: 'list', repository: issue.repo, number, limit: 5 })
-    return { number, coverage: ledgerCoverage(reply), health: reply.body.health, hasMore: !!reply.body.nextCursor,
+    ledger.push({ number, coverage: ledgerCoverage(reply), health: reply.body.health, hasMore: !!reply.body.nextCursor,
       records: (reply.body.records ?? []).map(record => ({ id: record.id, behavior: record.behavior, state: record.state,
         activity: record.activity, outcome: record.outcome, head: record.head, startedAt: record.startedAt,
-        completedAt: record.completedAt, refs: record.refs })) }
-  }))
+        completedAt: record.completedAt, refs: record.refs })) })
+  }
   const active = chain?.invocations.find(invocation => invocation.state !== 'settled')
   const latest = chain?.invocations.at(-1)
   const receipts = (summary?.invocations ?? []).slice(-5).map(invocation => ({ id: invocation.id,
@@ -100,7 +105,7 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
       reviewId: invocation.evidence.review_id, head: invocation.evidence.head_sha } : null,
     coverage: invocation.callId && invocation.evidence ? 'recorded' : 'not-recorded',
   }))
-  const missingReceipt = receipts.some(receipt => receipt.state !== 'admitted' && receipt.coverage === 'not-recorded')
+  const missingReceipt = receipts.some(receipt => receipt.state !== 'admitted' && receipt.state !== 'started' && receipt.coverage === 'not-recorded')
   const omittedInvocations = Math.max(0, (summary?.invocationCount ?? 0) - receipts.length)
   let stage = 'unknown'
   let blocker = chainCoverage.reason
@@ -172,7 +177,10 @@ export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig
   } catch (error) { rows = []; source = coverage('unavailable', source.observedAt, message(error)) }
   const selected = rows.slice(0, limit)
   const now = Date.now()
-  const items = await Promise.all(selected.map(issue => workItem(issue, service, source, now)))
+  const items: Array<Awaited<ReturnType<typeof workItem>>> = []
+  for (const issue of selected) {
+    items.push(await workItem(issue, service, source, now))
+  }
   const last = selected.at(-1)
   return { repository: args.repository, issue: args.issue ?? null, label: args.label ?? null, observedAt: new Date(now).toISOString(),
     coverage: { issues: source }, items,

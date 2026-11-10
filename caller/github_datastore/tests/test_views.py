@@ -24,6 +24,19 @@ class ViewsTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'label evidence is incomplete'):
                 views.issue(db_path=db_path, label='poise')
 
+    def test_label_intake_refuses_legacy_missing_closed_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / 'db.sqlite'
+            conn = connect(db_path); init_db(conn)
+            issue = base_expanded('', [])
+            issue['issue'] = dict(issue['issue'], state='closed')
+            del issue['issue']['labels']
+            with conn:
+                upsert_repo(conn, issue['repo'])
+            store_expanded(conn, issue); conn.close()
+            with self.assertRaisesRegex(RuntimeError, 'label evidence is incomplete'):
+                views.issue(db_path=db_path, label='poise')
+
     def test_label_intake_includes_old_issues_and_drains_stable_pages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "db.sqlite"
