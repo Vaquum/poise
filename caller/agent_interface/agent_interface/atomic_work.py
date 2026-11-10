@@ -1,11 +1,13 @@
 """One implementation or repair invocation, with no persistent model session."""
 import json
+import os
+import re
 import subprocess
 from pathlib import Path
 from time import monotonic
 from typing import Callable
 
-from . import checkout_lock, issue_review, progress, review_budget, resource_ownership
+from . import atoms, checkout_lock, issue_review, progress, review_budget, resource_ownership
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
 
@@ -14,6 +16,105 @@ UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended
 
 class AtomicWorkBlocked(ValueError):
     code = "atomic_work_blocked"
+
+    def __init__(self, reason: object):
+        message = "AtomicWorkBlocked"
+        if isinstance(reason, str) and reason.strip():
+            # Mask complete environment credentials around pattern redaction:
+            # values patterns would only fragment (a ghp_ token or a Bearer
+            # token inside a JSON credential) are masked whole first;
+            # values carrying a header shape wait until after so masking
+            # cannot rewrite the pattern keyword and leave a trailing secret.
+            secrets = sorted({value for key, value in os.environ.items()
+                              if value and re.search(r"TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIAL|COOKIE|GIT_CONFIG_VALUE", key, re.I)},
+                             key=len, reverse=True)
+            safe = reason
+            if secrets:
+                marker = r"\[redacted(?: header| credential)?\]"
+                markers = ("[redacted]", "[redacted header]", "[redacted credential]")
+                keyword_end = re.compile(r"(?i)\b(?:proxy-authorization|authorization|set-cookie|cookie|bearer|basic|token)\s*[:=]?\s*$")
+                keyword_any = re.compile(r"(?i)\b(?:proxy-authorization|authorization|set-cookie|cookie|bearer|basic|token)\b")
+                forms: dict[str, bool] = {}
+                extra: set[str] = set()
+
+                def _fragment(text: str) -> None:
+                    # Secret-looking fragments of values the before-pass must
+                    # not touch: long enough to identify, or structured. Short
+                    # plain words stay readable (a bare scheme or context word
+                    # carries no credential), and markers are never fragments.
+                    text = text.strip()
+                    if not text or text in markers:
+                        return
+                    if len(text) >= 8 or len(text) >= 4 and re.search(r"[^A-Za-z ]", text):
+                        extra.add(text)
+
+                for value in secrets:
+                    norm = " ".join(value.split())
+                    end = keyword_end.search(norm) if norm else None
+                    if end:
+                        # A trailing keyword is left for the patterns, but the
+                        # secret material before it would otherwise persist
+                        # once the pattern consumes the keyword and its token.
+                        # Split on every keyword too: the credential pattern
+                        # can re-pair across value boundaries (matching a
+                        # keyword as another keyword's token) and strand the
+                        # middle of the value.
+                        _fragment(norm[:end.start()])
+                        for segment in keyword_any.split(norm):
+                            _fragment(segment)
+                        continue
+                    for form in {value, norm}:
+                        if not form:
+                            continue
+                        shaped = atoms.redact_cause(form)
+                        if shaped != form and shaped not in markers and "[redacted header]" not in shaped:
+                            forms[form] = True
+                    if not norm:
+                        continue
+                    shaped_norm = atoms.redact_cause(norm)
+                    if "[redacted header]" in shaped_norm:
+                        # Header-shaped values also wait for the patterns; mask
+                        # the leading secret the header match would strand. The
+                        # header runs first, so shaped text before its marker
+                        # is the value's prefix up to later pattern markers,
+                        # which are stripped to match the normalized reason.
+                        _fragment(" ".join(re.sub(marker, " ", shaped_norm.split("[redacted header]")[0]).split()))
+                    if re.search(marker, norm):
+                        # Marker-first alternation would preserve a literal
+                        # marker inside the value and shield the remainder, so
+                        # mask the non-marker segments directly.
+                        for segment in re.split(marker, norm):
+                            _fragment(segment)
+                before = sorted(forms, key=len, reverse=True)
+                if before:
+                    safe = re.sub(marker + "|" + "|".join(map(re.escape, before)),
+                                  lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
+                safe = atoms.redact_cause(" ".join(safe.split()))
+                # Match the normalized safe: raw values with newlines, tabs or
+                # repeated/outer whitespace would otherwise miss their
+                # normalized occurrence and persist. Include before values'
+                # normalized forms too; masking after patterns cannot rewrite
+                # a pattern keyword.
+                normed = sorted({" ".join(value.split()) for value in secrets if " ".join(value.split())} | extra,
+                                key=len, reverse=True)
+                if normed:
+                    # Values under four characters would rewrite common words,
+                    # so require word boundaries for them while still redacting
+                    # bare occurrences. Longer values mask substrings so an
+                    # embedded secret stays masked without touching markers.
+                    tiny = [value for value in normed if len(value) < 4]
+                    rest = [value for value in normed if len(value) >= 4]
+                    alternatives = [re.escape(value) for value in rest]
+                    if tiny:
+                        alternatives.append(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, tiny)) + r")(?![A-Za-z0-9_])")
+                    safe = re.sub(marker + "|" + "|".join(alternatives),
+                                  lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
+            # Mask complete credentials before whitespace normalization or the
+            # cutoff, including a secret spanning either boundary.
+            message = "atomic behavior blocked: " + atoms.bounded_cause(safe)
+        super().__init__(message)
+        self.diagnostic = diagnostic_envelope(operation="provider.atomic_work", phase="validating", outcome="blocked",
+                                              message=message, submission="none")
 
 
 def _ci_only_blocker(ci: object) -> object:
@@ -132,13 +233,13 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             publication = json.loads(output.read_text())
             if not isinstance(publication, dict):
                 raise ValueError("atomic behavior blocked: invalid output")
-            if publication.get("blocked"):
+            if publication.get("blocked") is not None:
                 blocked = publication["blocked"]
                 if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
                         and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
                     record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})
                     blocked = blocked["reason"]
-                raise AtomicWorkBlocked(f"atomic behavior blocked: {blocked}")
+                raise AtomicWorkBlocked(blocked)
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
                 raise ValueError("atomic behavior publication metadata is incomplete")
             replies = publication.get("replies", [])
