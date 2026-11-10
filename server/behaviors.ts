@@ -3889,8 +3889,17 @@ function ensureBudgetStopHold(
   snapshot: AgentLogSnapshot,
   activeClaimId?: string,
 ): void {
-  if (retainedFailedLaunchesForPr(behavior, repo, number).some((claim) =>
-    claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head)) return
+  const retainedStops = retainedFailedLaunchesForPr(behavior, repo, number).filter((claim) =>
+    claim.launchError === REVIEW_BUDGET_STOPPED && claim.launchExpectedHead === head)
+  if (retainedStops.length > 0) {
+    for (const retained of retainedStops) {
+      if (!listBehaviorDeadLetters(500).some((row) => row.behavior === behavior
+        && row.target === retained.target && row.correlationId === retained.launchCorrelationId && row.callId === retained.launchCallId)) {
+        databaseRecordBehaviorDeadLetter(retained, REVIEW_BUDGET_STOPPED, retained.launchCallId)
+      }
+    }
+    return
+  }
   const timeouts = snapshot.entries.filter((call) => call.repo === repo && String(call.pr_id) === String(number)
     && call.behavior === upstreamBehavior(behavior) && call.source === `poise:${behavior}`
     && call.expected_head === head && call.actor?.toLowerCase() === actor.toLowerCase()
@@ -4000,7 +4009,8 @@ export async function retryFailedPrReviews(callIds: unknown): Promise<{ ok: true
     if (failed.length !== calls.length || failed.some((claim) => claim.launchQuarantine
       || claim.launchRepo !== first.repo || String(claim.launchPr) !== first.pr_id
       || claim.launchBehavior !== first.behavior || claim.launchSource !== first.source
-      || claim.launchExpectedHead !== first.expected_head || claim.launchActor !== first.actor
+      || claim.launchExpectedHead !== first.expected_head
+      || claim.launchActor.toLowerCase() !== String(first.actor || '').toLowerCase()
       || !calls.some((call) => call!.id === claim.launchCallId && call!.correlation_id === claim.launchCorrelationId))) {
       throw new HttpError(409, 'Failed launch ownership changed or remains quarantined')
     }

@@ -626,3 +626,94 @@ it('honors an explicit approval retry across a same-head target drift', async ()
   await tick()
   expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
 })
+
+it('retries a budget stop after reviewer casing drift', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date('2026-11-10T12:00:00Z'))
+  const behavior = 'review-new-prs' as const
+  const model = 'opus-5-xhigh'
+  arrangeCli(false, false, {
+    headSha: HEAD_SHA, reviewerReviewIdsSince: [], latestActivityAt: new Date().toISOString(),
+  }, { commits_after_request: 0, author_commits_after_request: 0,
+    author_pr_comments_after_request: 0, response_count: 0 })
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const { database: db, behaviors: runtime } = await loadModules()
+  db.setMeta('me', 'poise-user')
+  db.setMeta('behavior_review_new_prs_enabled', '1')
+  db.setMeta('models', JSON.stringify({ slots: { primary: model, secondary: model, tertiary: model },
+    places: { pr_review: { slot: 'primary' } } }))
+  db.setMeta('behavior_review_new_prs_keyver', '3')
+  db.recordSeen(behavior, '__snapshot_v3__')
+  db.setMeta('behavior_review_new_prs_reviewers', '1')
+  // Historical Caller receipts keep the old casing while the configured
+  // reviewer now uses a different casing for the same account.
+  db.setMeta('agentAccount', 'Review-Bot')
+  runtime.startBehaviorsRuntime()
+  const tick = async () => { await resetLogCache(); await runtime.runEnabledBehaviorsOnce() }
+  const started = new Date().toISOString()
+  const upgradeReceipt = (id: string, correlation: string) => agentLog({ id, behavior: 'pr_review',
+    repo: pr.repo, pr_id: String(pr.number), model, status: 'failed',
+    started_at: started, started_at_precise: started, completed_at: new Date().toISOString(),
+    expected_head: HEAD_SHA, actor: 'review-bot', source: 'poise:review-new-prs',
+    correlation_id: correlation, action: 'not_started', outcome: 'preflight_failed',
+    review_policy: 'bounded-v1', error_code: 'review_budget_exhausted',
+    error: 'Review reached its total time limit; needs attention' })
+  const firstId = 'e'.repeat(32)
+  const secondId = 'f'.repeat(31) + '0'
+  fixture.agentLogs.push(upgradeReceipt(firstId, 'casing-one'), upgradeReceipt(secondId, 'casing-two'))
+  await tick()
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  const held = db.getFailedBehaviorLaunch(behavior, `${pr.repo}#${pr.number}`)
+  expect(held?.launchCallId).toBe(secondId)
+  expect(held?.launchActor).toBe('Review-Bot')
+  await resetLogCache()
+  await expect(runtime.retryFailedPrReviews([secondId])).resolves.toEqual({ ok: true, targets: [`${pr.repo}#${pr.number}`] })
+})
+
+it('heals a budget stop that lost its incident before the dead-letter write', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(new Date('2026-11-10T12:00:00Z'))
+  const behavior = 'review-new-prs' as const
+  const model = 'opus-5-xhigh'
+  arrangeCli(false, false, {
+    headSha: HEAD_SHA, reviewerReviewIdsSince: [], latestActivityAt: new Date().toISOString(),
+  }, { commits_after_request: 0, author_commits_after_request: 0,
+    author_pr_comments_after_request: 0, response_count: 0 })
+  mocks.spawnDetached.mockResolvedValue(undefined)
+  const { database: db, behaviors: runtime } = await loadModules()
+  db.setMeta('me', 'poise-user')
+  db.setMeta('behavior_review_new_prs_enabled', '1')
+  db.setMeta('models', JSON.stringify({ slots: { primary: model, secondary: model, tertiary: model },
+    places: { pr_review: { slot: 'primary' } } }))
+  db.setMeta('behavior_review_new_prs_keyver', '3')
+  db.recordSeen(behavior, '__snapshot_v3__')
+  db.setMeta('behavior_review_new_prs_reviewers', '1')
+  runtime.startBehaviorsRuntime()
+  const tick = async () => { await resetLogCache(); await runtime.runEnabledBehaviorsOnce() }
+  const started = new Date().toISOString()
+  const upgradeReceipt = (id: string, correlation: string) => agentLog({ id, behavior: 'pr_review',
+    repo: pr.repo, pr_id: String(pr.number), model, status: 'failed',
+    started_at: started, started_at_precise: started, completed_at: new Date().toISOString(),
+    expected_head: HEAD_SHA, actor: 'review-bot', source: 'poise:review-new-prs',
+    correlation_id: correlation, action: 'not_started', outcome: 'preflight_failed',
+    review_policy: 'bounded-v1', error_code: 'review_budget_exhausted',
+    error: 'Review reached its total time limit; needs attention' })
+  const firstId = '1'.repeat(31) + 'a'
+  const secondId = '2'.repeat(31) + 'b'
+  fixture.agentLogs.push(upgradeReceipt(firstId, 'heal-one'), upgradeReceipt(secondId, 'heal-two'))
+  await tick()
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  const heldTarget = `${pr.repo}#${pr.number}`
+  expect(db.getFailedBehaviorLaunch(behavior, heldTarget)?.launchCallId).toBe(secondId)
+  // A process exit between the hold upsert and the dead-letter insert leaves
+  // the retained stop without its incident.
+  db.db.prepare('DELETE FROM behavior_dead_letters WHERE behavior = ?').run(behavior)
+  await tick()
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  const snapshot = await (await import('../server/agent')).fetchAgentLogSnapshot()
+  const incident = runtime.getBehaviorDiagnosticIncidents(snapshot).find((row) => row.callId === secondId)!
+  expect(incident.error).toContain('Automatic retries stopped after two review timeouts')
+  expect(incident.nextRetryAt).toBeUndefined()
+  await resetLogCache()
+  await expect(runtime.retryFailedPrReviews([secondId])).resolves.toEqual({ ok: true, targets: [heldTarget] })
+})
