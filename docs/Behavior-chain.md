@@ -446,7 +446,18 @@ head/base recheck and independent approval verification still apply.
 
 Repair prompts name the exact unresolved root comment IDs from the head-verified
 review packet, including outdated threads and roots with earlier replies.
-Caller requires that same set before publication. Missing coverage records
+Caller requires that same set before publication. After checking the repaired
+code and current reviewer input, a repair can carry a still-applicable native
+reply verbatim, including its original `poise-reply` marker, in the existing
+`replies` plan. The publisher verifies the reply's author, root, exact body and
+marker against paginated GitHub comments and returns its existing receipt.
+Reviewer edits or follow-ups on that finding require a fresh answer, as do new
+findings or materially changed answers; a new Call/head or unrelated finding
+does not invalidate reuse. Prior replies remain in the current-head review
+packet and durable publication plan. Inspection/recovery verifies their proof
+again; missing or altered proof fails visibly and cannot count as coverage.
+Reuse changes neither exact-head review/approval nor conversation-resolution
+gates. Missing coverage records
 `atomic_work_failed`, `not_started` / `preflight_failed`, with the missing count,
 required count and at most 20 sorted missing IDs in the retained error field;
 comment text is not retained there. No publication plan exists at this point,

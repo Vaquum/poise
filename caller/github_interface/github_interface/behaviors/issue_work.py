@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 from github_interface.atoms.local import _run, checkout_repo
@@ -65,13 +66,34 @@ async def review_replies(client: GitHubClient, target: str, pull: int, actor: st
         if parent not in by_id or parent in used or by_id[parent].get("in_reply_to_id"):
             raise ValueError("review reply target is not a unique original finding on this pull request")
         used.add(parent)
-        body = f"{reply['body'].strip()}\n\n<!-- poise-reply {call_id} {parent} -->"
+        body = reply["body"]
+        marker = re.search(r"\n\n<!-- poise-reply ([0-9a-f]{32}) ([1-9][0-9]*) -->\Z", body)
+        if marker and (int(marker.group(2)) != parent or not body[:marker.start()].strip()):
+            raise ValueError("reused review reply requires its original native marker and substantive answer")
+        if not marker:
+            body = f"{body.strip()}\n\n<!-- poise-reply {call_id} {parent} -->"
         matching = [comment for comment in comments if comment.get("in_reply_to_id") == parent and comment.get("body") == body
                     and (comment.get("user") or {}).get("login", "").lower() == actor.lower()]
         if len(matching) > 1:
             raise ValueError("review reply has duplicate native publication receipts")
         if matching:
             posted = matching[0]
+            if marker and marker.group(1) != call_id:
+                reviewer_input = [comment for comment in comments if (comment["id"] == parent or comment.get("in_reply_to_id") == parent)
+                                  and (comment.get("user") or {}).get("login", "").lower() != actor.lower()]
+                try:
+                    answered_at = datetime.fromisoformat(posted["created_at"])
+                    revisions = [datetime.fromisoformat(comment["updated_at"]) for comment in reviewer_input]
+                    if answered_at.tzinfo is None or any(revision.tzinfo is None for revision in revisions):
+                        raise ValueError("missing timezone")
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError("reused review reply lacks verified reviewer input timestamps") from error
+                # GitHub timestamps truncate to the second: an edit within the reply's
+                # creation second compares equal, so equality means changed input.
+                if any(revision >= answered_at for revision in revisions) or any(comment["id"] > posted["id"] for comment in reviewer_input):
+                    raise ValueError("reused review reply predates changed reviewer input; provide a fresh answer")
+        elif marker:
+            raise ValueError("reused review reply lacks its verified native publication receipt")
         elif publish:
             if not reserved:
                 work_publication(head, start_replies=True)
