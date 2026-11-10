@@ -209,14 +209,23 @@ it('retains the latest evidence when stale and healthy observations arrive out o
   expect(second.id).not.toBe(first.id)
   expect(secondNotice.id).not.toBe(firstNotice.id)
   // Neither an older sync nor an earlier healthy probe of this same sync
-  // can close the new incident. An older stale result also keeps its ID.
+  // can close the new incident: delayed healthy probes reject with the open
+  // episode so scans and replay stay refused. An older stale result also
+  // keeps its ID.
   for (const delayed of [health(path, 1, syncA), health(path, 1, syncB), health(path, 150, syncB)]) {
     saveProbe(path, delayed)
-    if (delayed.code === 1) await expect(runDatastoreHealth(org)).rejects.toMatchObject({ episode: { id: second.id } })
-    else await expect(runDatastoreHealth(org)).resolves.toMatchObject({ stale: { episode: { id: second.id } } })
+    await expect(runDatastoreHealth(org)).rejects.toMatchObject({ episode: { id: second.id } })
     expect(episodes(database)).toEqual([second])
     expect(behaviors.getBehaviorsRuntimeHealth().datastore).toMatchObject({ status: 'unavailable', lastSuccessAt: syncB, ageSeconds: 180 })
   }
+  // An outdated stale probe still records a new blocked behavior without
+  // replacing the retained evidence or opening another episode.
+  saveProbe(path, health(path, 150, syncA))
+  await expect(runDatastoreHealth(org, {}, ['review-new-issues'])).rejects.toMatchObject({ episode: { id: second.id } })
+  expect(episodes(database)).toHaveLength(1)
+  expect(episodes(database)[0]).toMatchObject({ id: second.id, latest: { lastSuccessAt: syncB, ageSeconds: 180 } })
+  expect(episodes(database)[0].behaviors).toEqual(expect.arrayContaining(['review-new-issues']))
+  expect(events().filter((event) => event.phase === 'opened')).toHaveLength(2)
   saveProbe(path, health(path, 210, syncB))
   await behaviors.runEnabledBehaviorsOnce()
   expect(episodes(database)[0]).toMatchObject({ id: second.id, recoveredAt: null, latest: { lastSuccessAt: syncB, ageSeconds: 210 } })
