@@ -970,6 +970,19 @@ def _read_history_row(conn: sqlite3.Connection, rowid: int, where: str, params: 
     return _history_log_row(row) if row is not None else {"history_read_error": "MISSING_ROW"}
 
 
+def logs_history_by_id(id_: str) -> list[dict]:
+    """One exact History row; only a verified primary key can be quarantined."""
+    if not re.fullmatch(r"[0-9a-f]{32}", id_):
+        raise ValueError("history read requires a full call id")
+    # Reaping scans running records and can fail before this row is isolated.
+    with db() as conn:
+        key = conn.execute("select rowid from calls indexed by sqlite_autoindex_calls_1 where id=?", (id_,)).fetchone()
+        if key is None:
+            return []
+        entry = _read_history_row(conn, key[0], " where id=?", [id_])
+    return [{**entry, "id": id_}]
+
+
 def logs_page(limit: int, cursor: str | None = None, org: str | None = None, search: str | None = None) -> dict:
     """One bounded newest-first history page; rows stay oldest-first in it.
 
@@ -2691,6 +2704,7 @@ behaviors:
   --models
   --refresh-models [--families claude,codex]
   --logs [--status running] [--limit 1..1000] [--cursor CURSOR] [--org OWNER] [--search TEXT]
+  --logs --id CALL_ID
   --logs --select '{"latest":[{"behavior":"...","source":"...","owner":"..."}],"ids":["CALL_ID"]}'
   --logs --watermark
   --logs --after WATERMARK --session SESSION --behavior BEHAVIOR --prompt TEXT
@@ -2935,6 +2949,13 @@ def _main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--logs":
         if sys.argv[2:] == ["--watermark"]:
             print(json.dumps({"cursor": logs_watermark()}))
+            return
+        if len(sys.argv) == 4 and sys.argv[2] == "--id":
+            try:
+                selected = logs_history_by_id(sys.argv[3])
+            except ValueError as error:
+                usage(error=str(error))
+            print(json.dumps(selected, separators=(",", ":")))
             return
         if len(sys.argv) == 4 and sys.argv[2] == "--select":
             try:
