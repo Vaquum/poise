@@ -1169,6 +1169,12 @@ bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
 receipt through the existing workspace health/image proof without initiating
 another rollout; [Upgrades](Operating.md#upgrades) defines its outcomes and
 retained evidence. This adds no gateway or workspace API.
+The Sync workflow's separate release observer uses the existing five-minute
+schedule and Actions summary even when upstream sync is disabled. It reads
+exact-main workflow evidence, retained rollout inventory and fresh workspace
+health/image proof, retaining one diagnostic episode on the deployment host.
+It never invokes release gates or controls; [release lag observation](Operating.md#run-your-own-poise-from-a-fork)
+defines its fixed grace, unavailable evidence and recovery proof.
 
 For gVisor workspaces, install/upgrade also own the boot-enabled host
 `poise-caller-guard.service`. It selects actual Docker runtimes, holds host

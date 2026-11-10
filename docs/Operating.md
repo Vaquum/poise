@@ -496,6 +496,36 @@ A change to Poise alone then reaches the running workspaces within five more
 minutes. A change to the system under `deploy/runtime/` first waits for their
 running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
 
+**Release lag observation.** On that same five-minute schedule, the separate
+**Observe the production release** job runs for deployment-enabled forks even
+when Sync is skipped or fails. Its Actions summary shows the upstream tip,
+fork candidate, freshly verified serving releases, first waiting/failed stage,
+evidence links and next action. It reads the same exact-main push CI/Caller
+and SHA-named Deploy steps as the gates; it never calls those gates or starts
+Sync, CI, Deploy or a workspace switch.
+
+A fixed 30-minute grace starts at the first observation of an expected release
+that is not yet verified serving. Within it, verification/deployment is shown
+as in progress. Past it, one stale-release condition warns once. Its identity,
+first observation and warning state live in the private host file
+`deploy/.env.release-lag`; repeated observations and newer upstream tips keep
+that episode and its original clock. A workflow GitHub records as manually
+disabled is shown as a deliberate pause, retaining the episode and age.
+False/unset `POISE_UPSTREAM_SYNC` instead says **sync disabled/missing; intent
+unknown**: confirm intent before enabling it. There is no new pause setting.
+
+Recovery requires the fork candidate to contain the observed upstream tip and
+fresh workspace health to verify that candidate, with the retained rollout's
+expected workspace inventory and immutable image proof for stopped workspaces.
+At least one workspace must be running; stopped images alone cannot establish
+serving. An old successful Deploy, a terminal rollout receipt, unavailable
+GitHub/SSH/health evidence or a missing workspace cannot clear the condition.
+Observation uses Python 3.10+ on the deployment host and the existing deployment
+SSH identity. It changes only its diagnostic file, leaving rollout receipts and
+release controls intact. If the host cannot be read, the summary reports the
+unavailable condition/age and leaves the host's episode untouched. GitHub must
+keep the scheduled workflow enabled for observation to run.
+
 The token is required because GitHub never lets a workflow's own token change
 a workflow file, anything under `.github/workflows/`. autonomio/poise changes
 its workflows from time to time. Without the token, the first such change

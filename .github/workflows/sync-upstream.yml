@@ -28,6 +28,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  observe:
+    name: Observe the production release
+    needs: sync
+    if: always() && vars.POISE_DEPLOY_HOST != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up observation SSH
+        continue-on-error: true
+        env:
+          POISE_DEPLOY_HOST: ${{ vars.POISE_DEPLOY_HOST }}
+          POISE_DEPLOY_USER: ${{ vars.POISE_DEPLOY_USER }}
+          POISE_DEPLOY_PORT: ${{ vars.POISE_DEPLOY_PORT }}
+          POISE_DEPLOY_JUMP: ${{ vars.POISE_DEPLOY_JUMP }}
+          POISE_DEPLOY_KNOWN_HOSTS: ${{ vars.POISE_DEPLOY_KNOWN_HOSTS }}
+          POISE_DEPLOY_SSH_KEY: ${{ secrets.POISE_DEPLOY_SSH_KEY }}
+        run: deploy/actions/ssh-setup.sh
+      - name: Diagnose release lag without deploying
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_SYNC: ${{ vars.POISE_UPSTREAM_SYNC }}
+          DEPLOY_PATH: ${{ vars.POISE_DEPLOY_PATH || '/srv/poise' }}
+        run: python3 deploy/release-status.py
+
   sync:
     name: Merge autonomio/poise's main
     if: vars.POISE_UPSTREAM_SYNC == 'true'
