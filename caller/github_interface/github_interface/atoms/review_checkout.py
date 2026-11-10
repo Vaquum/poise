@@ -164,14 +164,22 @@ def inspect(root: Path, requests: list[dict]) -> dict:
     return response
 
 
-def _target(root: Path, relative: str) -> Path:
+def _target(root: Path, relative: str, checked: set[Path] | None = None) -> Path:
+    raw = PurePosixPath(relative)
+    if raw.is_absolute() or ".." in raw.parts or any(part.lower() == ".git" for part in raw.parts):
+        raise ValueError("inspection path must stay inside the repository")
     target = root / relative
     current = root
-    for part in PurePosixPath(relative).parts:
+    checked = set() if checked is None else checked
+    for part in raw.parts:
         current /= part
-        if current.is_symlink():
-            raise ValueError("inspection cannot follow symlinks")
-    if not target.is_file() or root not in target.resolve().parents:
+        if current not in checked:
+            if current.is_symlink():
+                raise ValueError("inspection cannot follow symlinks")
+            checked.add(current)
+    # The validated relative path and symlink walk already establish containment;
+    # resolving every absolute ancestor again dominates broad searches.
+    if not target.is_file():
         raise ValueError("inspection path must be a repository file")
     return target
 
@@ -197,8 +205,9 @@ def _lines(root: Path, relative: str, start: int):
 
 def _matches(root: Path, selected: list[str], query: str, start: int):
     seen, scanned = 0, 0
+    checked: set[Path] = set()
     for name in selected:
-        target = _target(root, name)
+        target = _target(root, name, checked)
         size = target.stat().st_size
         if scanned + size > MAX_CHECKOUT_BYTES:
             raise ValueError("search exceeds its byte limit")
