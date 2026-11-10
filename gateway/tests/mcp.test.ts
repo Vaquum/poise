@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { afterEach, beforeEach, expect, it } from 'vitest'
+import Database from 'better-sqlite3'
 import { McpGrants } from '../src/mcp-grants.js'
 import { MCP_TOOLS } from '../src/mcp-contract.js'
 import { loadConfig } from '../src/config.js'
@@ -154,6 +155,29 @@ it('isolates two owners, persists hash-only grants and revokes access and refres
   expect((await rpc(bob.access)).status).toBe(200)
   h.store.disableUser('bob', 'root')
   expect((await rpc(bob.access)).status).toBe(401)
+})
+
+it('withholds poise_work from grants consented before it existed', async () => {
+  const grant = await connect()
+  expect((await rpc(grant.access)).json()).toMatchObject({ result: { tools: MCP_TOOLS } })
+  // Simulate a pre-poise_work grant that records no permitted tools.
+  const legacy = new Database(`${h.config.dataDir}/mcp.db`)
+  legacy.prepare("UPDATE mcp_grants SET state = json_remove(state, '$.tools')").run()
+  legacy.close()
+  expect(h.context.mcp.grants.find(grant.access, 'access')).toMatchObject({ tools: ['poise_describe'] })
+  expect(((await rpc(grant.access)).json() as { result: { tools: { name: string }[] } }).result.tools.map(tool => tool.name))
+    .toEqual(['poise_describe'])
+  expect((await rpc(grant.access, 'tools/call', { name: 'poise_work', arguments: { repository: 'fixtures/work', issue: 1 } })).json())
+    .toMatchObject({ result: { isError: true } })
+  expect(h.workspace.requests).toHaveLength(0)
+  const refreshed = await form('/mcp/token', { grant_type: 'refresh_token', client_id: grant.client, refresh_token: grant.refresh, resource })
+  expect(refreshed.status).toBe(200)
+  const renewed = String((refreshed.json() as { access_token: string }).access_token)
+  expect(((await rpc(renewed)).json() as { result: { tools: { name: string }[] } }).result.tools.map(tool => tool.name))
+    .toEqual(['poise_describe'])
+  expect((await rpc(renewed, 'tools/call', { name: 'poise_work', arguments: { repository: 'fixtures/work', issue: 1 } })).json())
+    .toMatchObject({ result: { isError: true } })
+  expect(h.workspace.requests).toHaveLength(0)
 })
 
 it('retains a consented registration past its original deadline while its grant lives', async () => {

@@ -178,13 +178,16 @@ export class McpGateway {
       ? (rpc.params as { protocolVersion: string }).protocolVersion : VERSIONS[0], capabilities: { tools: {} },
       serverInfo: { name: 'poise', version: '1.0.0' }, instructions: INSTRUCTIONS })
     if (rpc.method === 'ping') return result({})
-    if (rpc.method === 'tools/list') return result({ tools: MCP_TOOLS })
+    if (rpc.method === 'tools/list') return result({ tools: MCP_TOOLS.filter(tool => grant.tools.includes(tool.name)) })
     if (rpc.method !== 'tools/call') return sendJson(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: 'unsupported method' } })
     let read: McpRead
     try {
       const params = rpc.params as Record<string, unknown> | undefined
       read = parseMcpRead(params && { name: params.name, arguments: params.arguments })
     } catch (error) { return result({ isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : 'invalid tool request' }] }) }
+    if (!grant.tools.includes(read.name)) {
+      return result({ isError: true, content: [{ type: 'text', text: 'tool not authorized by this grant; reconnect to grant consent' }] })
+    }
     const minute = Math.floor(ctx.deps.now() / 60_000)
     for (const [key, value] of this.reads) if (value.minute !== minute && !value.active) this.reads.delete(key)
     const rate = this.reads.get(grant.grantId) ?? { minute, count: 0, active: 0 }

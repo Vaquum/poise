@@ -19,6 +19,7 @@ import { enforceApiRequest, httpStatus } from '../server/http'
 import { handleMcpRead } from '../server/mcp'
 import { readServiceConfig } from '../server/service/config'
 import { BehaviorChainJournal, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
+import { nativeActionReceipt, nativeActionSettlement } from '../server/behavior-chain-action'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import { db, setMeta } from '../server/db'
@@ -329,6 +330,32 @@ conn.close()
     actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 30_000,
     request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
   append(retryChain, { type: 'invocation.started', invocationId: 'retry' })
+  let legacyNative = admit(10)
+  legacyNative = append(legacyNative, { type: 'invocation.admitted', invocation: { id: 'legacy-merge', behavior: 'merge-pr', basis: 'merge',
+    actor: 'reviewer', model: null, slot: null, admittedAt: now - 60_000,
+    request: { command: 'github-interface', cwd: '/isolated', argv: ['--merge-if-ready', '20', '--expected-head', 'a'.repeat(40), '--token-user', 'reviewer'] } } })
+  const legacyProof = nativeActionReceipt(legacyNative, legacyNative.invocations[0], { action: 'merge_if_ready', repository: 'Acme/Repo',
+    pull_number: 20, head_sha: 'a'.repeat(40), outcome: 'enqueued', queue_entry_id: 'legacy-entry' }, now - 59_000)
+  legacyNative = append(legacyNative, { type: 'invocation.settled', invocationId: 'legacy-merge', callId: null, outcome: 'enqueued',
+    evidence: nativeActionSettlement(legacyProof) })
+  legacyNative = append(legacyNative, { type: 'invocation.admitted', invocation: { id: 'legacy-retry', behavior: 'implement-issue', basis: 'issue',
+    actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 30_000,
+    request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
+  append(legacyNative, { type: 'invocation.started', invocationId: 'legacy-retry' })
+  let waitedMerge = admit(11)
+  waitedMerge = append(waitedMerge, { type: 'chain.waiting', reason: 'Model capacity is reserved by existing work' })
+  const waitedReviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
+  const waitedObservation: ChainObservation = { checkedAt: now, existingPulls: [],
+    issue: { open: false, eligible: true, revision: 'issue', commentIds: [] }, issueReviewers: [], prReviewers: [],
+    implementer: waitedReviewer, repairer: waitedReviewer, approver: waitedReviewer,
+    publication: { pull_number: 21, head_sha: 'a'.repeat(40), head_invocation: null, state: 'closed', merged: true, merge_sha: 'b'.repeat(40) },
+    pull: { number: 21, head: 'a'.repeat(40), headSince: now - 1000, state: 'closed', draft: false, merged: true,
+      mergeSha: 'b'.repeat(40), queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0,
+      approved: false, ready: false, reviewIds: [], reviewReceipts: [], reviewRevision: 'none', reviewContext: 'c'.repeat(64),
+      pending: false, failing: [], greyRuns: [], conflict: false, behind: false } }
+  waitedMerge = append(waitedMerge, { type: 'chain.observed', observation: waitedObservation })
+  append(waitedMerge, { type: 'chain.merged', mergeSha: 'b'.repeat(40), evidence: { repository: 'Acme/Repo', pull_number: 21,
+    merged: true, merge_sha: 'b'.repeat(40), review_complete: true } })
   await ledger.startBehaviorLedger({ path: join(root, 'ledger.sqlite') })
   ledger.behaviorLedgerHeartbeat()
   const packagePoisePlugin = (apex: string, destination: string) => promisify(execFile)(process.execPath,
@@ -412,6 +439,13 @@ conn.close()
     expect(retry.items[0]).toMatchObject({ stage: 'running', blocker: null,
       coverage: { receipts: { status: 'fresh' } },
       receipts: [{ id: 'deferred', callId: null, coverage: 'not-recorded' }, { id: 'retry', callId: null, coverage: 'not-recorded' }] })
+    const legacy = await work({ repository: 'acme/repo', issue: 10 })
+    expect(legacy.items[0]).toMatchObject({ stage: 'running', blocker: null,
+      coverage: { receipts: { status: 'fresh' } },
+      receipts: [{ id: 'legacy-merge', callId: null, coverage: 'recorded' }, { id: 'legacy-retry', callId: null, coverage: 'not-recorded' }] })
+    const waited = await work({ repository: 'acme/repo', issue: 11 })
+    expect(waited.items[0]).toMatchObject({ stage: 'complete', reviewStatus: 'complete' })
+    expect(waited.items[0].blocker).toBeNull()
     run.mockClear()
     const dash = await work({ repository: 'acme/repo', label: '-blocked', limit: 2 })
     expect(dash.coverage.issues.status).toBe('fresh')

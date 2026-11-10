@@ -112,7 +112,10 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
     admittedAt: invocation.admittedAt, nativeAction: invocation.nativeAction,
     evidence: invocation.evidence ? { action: invocation.evidence.action, outcome: invocation.evidence.outcome,
       reviewId: invocation.evidence.review_id, head: invocation.evidence.head_sha } : null,
-    coverage: invocation.callId && invocation.evidence ? 'recorded' : 'not-recorded',
+    // Verified native-action receipts carry no Call by design; only an unverified native action counts as a gap.
+    coverage: ((invocation.callId && invocation.evidence)
+      || invocation.nativeAction?.attribution === 'accepted-response' || invocation.nativeAction?.attribution === 'observed-no-action')
+      ? 'recorded' : 'not-recorded',
   }))
   // Deliberately settled not_started attempts (launch_deferred, spawn_failed and
   // other pre-launch deferrals) carry no Call by design; only a settled attempt
@@ -127,7 +130,8 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
       : chain.supersession ? 'superseded' : chain.held ? 'held' : active?.state === 'uncertain' ? 'unknown'
         : active ? active.state === 'admitted' ? 'admitted' : missingReceipt ? 'unknown' : 'running' : chain.waiting ? 'delayed'
           : latest?.evidence?.status === 'failed' ? 'failed' : 'waiting'
-    blocker = preview(chain.held ?? chain.waiting ?? (chain.reviewPending ? 'Original pre-merge review proof is pending'
+    // A merge preserves the earlier wait reason; it is not the current blocker once merged.
+    blocker = preview(chain.held ?? (chain.mergeSha ? null : chain.waiting) ?? (chain.reviewPending ? 'Original pre-merge review proof is pending'
       : active?.state === 'uncertain' ? active.outcome ?? 'Original invocation receipt is unavailable'
         : missingReceipt ? 'Original Call or receipt evidence is not recorded' : null))
   } else if (chainCoverage.status === 'fresh' && mirror.status === 'fresh' && ledger.every(source => source.coverage.status === 'fresh')) {
