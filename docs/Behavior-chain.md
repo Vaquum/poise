@@ -666,6 +666,43 @@ operator follows a real qualifying hold through one labeled report, chain
 admission and the normal merge receipt after deployment. No fabricated hold,
 live write or production setting change is part of that component proof.
 
+### PR #957: merged after repair exhaustion (#1044)
+
+[PR #957](https://github.com/autonomio/poise/pull/957) merged on
+10 November 2026 at 11:47:10 UTC, with final head
+`570a39ce4d4cb40518411b8c99bd6135370d774b` and merge commit
+`90031625ce91362ce5dd3f8ef1d79ec21324dae1`. This supersedes the
+"Current hold" next action in [#1044](https://github.com/autonomio/poise/issues/1044):
+repairing the old head or adding another retry mechanism is no longer needed.
+
+A read-only live journal inspection at 12:04 UTC on 10 November still found
+chain `autonomio/poise#910` at sequence 8063, hold event
+`9f014bbb-2aa2-4556-a143-2b10e86e9221` from 9 November at
+16:47:50.995 UTC, with no later Resume or recorded merge. Its last observation
+still named head `087b6f1e9522846ab496240dc565127867d5463f`. All three repairs
+on basis `ddd163087b13a0aec64478d968d985d525a9b2b413d0b28b042cada17c45d545`
+and review revision
+`df3c35c6fc859fe517f330f7e93cb5c1d84cbf198647f68f2bff11f15b9e1583`
+remain settled failures with `atomic_work_execution_budget_exhausted`,
+`action=not_started`, `outcome=preflight_failed`, released resources and no
+publication plan:
+
+| Native invocation | Caller receipt |
+| --- | --- |
+| `879e925a-0acc-432e-9026-2cc82df0d32c` | `89e7e319077a47788416c8acd9e5012a` |
+| `3c46c70b-437b-40a0-888a-db220d59a82a` | `71e8a6d8938d4d19b5786c5afa4d38ff` |
+| `c8ed00fc-46ba-4cd7-9b11-6c7819b28d52` | `f2420c18b8534935828b2af2e00871b6` |
+
+The next action is the existing [bounded reconciliation](#bounded-reconciliation)
+of the confirmed merge and original receipts, without Resume or publication.
+The runtime records a merge before evaluating a hold and retains these failures.
+GitHub's final-head approval alone does not discharge the chain's original
+review obligation: that approval has no native invocation/response receipt, and
+the last canonical pre-merge observation names a different head and context.
+Keep that obligation unproven unless qualifying original evidence is recovered;
+closing this PR-specific repair incident does not certify chain completion.
+This inspection changed neither the live journal nor GitHub.
+
 ## Native action receipts
 
 Merge, queue-submission and conversation-resolution responses are attributed to
