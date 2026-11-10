@@ -154,10 +154,11 @@ export function expandedImpactRefs(items: readonly NotificationItem[], expanded:
     .flatMap(entry => evidenceReferences(entry).slice(0, 1)).map(ref => [ref.eventId, ref]))
 }
 
-/** Refs due for a read with never-tried ones first: retries and expired
- *  resolutions keep leftover batch capacity instead of starving later unread
- *  entries behind the cap, and no resolved impact reads older than its TTL. */
-export function pendingImpactRefs(current: Map<string, DiagnosticEvidence>, impacts: ReadonlyMap<string, WorkImpactRead>, now: number): DiagnosticEvidence[] {
+/** Batch order with a rotating due window: never-tried refs first, then
+ *  failures and TTL-expired resolutions from a cursor that advances past
+ *  every taken ref, so no entry waits behind the cap indefinitely while any
+ *  batch runs. Returns the refs and the advanced cursor. */
+export function pendingImpactRefs(current: Map<string, DiagnosticEvidence>, impacts: ReadonlyMap<string, WorkImpactRead>, now: number, cursor = 0): { refs: DiagnosticEvidence[], cursor: number } {
   const fresh: DiagnosticEvidence[] = []
   const due: DiagnosticEvidence[] = []
   for (const ref of current.values()) {
@@ -165,7 +166,11 @@ export function pendingImpactRefs(current: Map<string, DiagnosticEvidence>, impa
     if (!known) fresh.push(ref)
     else if (known.value === null || now - known.at >= IMPACT_TTL_MS) due.push(ref)
   }
-  return [...fresh, ...due]
+  const start = due.length ? cursor % due.length : 0
+  const rotated = [...due.slice(start), ...due.slice(0, start)]
+  const refs = [...fresh, ...rotated].slice(0, 20)
+  const taken = refs.length - Math.min(fresh.length, 20)
+  return { refs, cursor: due.length ? (cursor + taken) % due.length : 0 }
 }
 
 function workImpactHtml(entry: EvidenceAttachment, impacts: ReadonlyMap<string, WorkImpactRead>, now: number): string {
@@ -276,6 +281,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   const impacts = new Map<string, WorkImpactRead>()
   let impactRequest: AbortController | null = null
   let quietImpactRender = false
+  let dueCursor = 0
   const announced = new Set<string>()
   const toastTimers = new Map<HTMLElement, number>()
 
@@ -354,7 +360,9 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     if (quietImpactRender) { quietImpactRender = false; return }
     const current = expandedImpactRefs(items, expanded)
     for (const id of [...impacts.keys()]) if (!current.has(id)) impacts.delete(id)
-    const refs = pendingImpactRefs(current, impacts, Date.now()).slice(0, 20)
+    const pending = pendingImpactRefs(current, impacts, Date.now(), dueCursor)
+    dueCursor = pending.cursor
+    const refs = pending.refs
     if (!refs.length) return
     const request = new AbortController()
     impactRequest = request
