@@ -311,12 +311,15 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           || check.head_sha !== baseline.ref)) throw new Error('CI dependency recovery lacks exact check identities')
         observation.ciDependency = { invocationId: dependency.invocation.id, base: sha(baseline.ref, 'baseline recovery'),
           recovered: dependency.dependency.failures.every(failure => {
+            // Select within the retained workflow first: another workflow
+            // may publish a newer same-named check, which must not shadow
+            // the retained workflow's recovery.
             const matching = checks.filter(check => check.name === failure.name && check.head_sha === baseline.ref
-              && !['skipped', 'neutral'].includes(String(check.conclusion)))
+              && !['skipped', 'neutral'].includes(String(check.conclusion))
+              && runs.some(run => run.id === check.run_id && run.head_sha === baseline.ref && run.workflow_id === failure.workflow
+                && ['push', 'workflow_dispatch', 'schedule', 'merge_group'].includes(String(run.event))))
             const latest = matching.sort((a, b) => Number(b.check_run_id) - Number(a.check_run_id))[0]
             return !!latest && latest.state === 'completed' && latest.conclusion === 'success'
-              && runs.some(run => run.id === latest.run_id && run.head_sha === baseline.ref && run.workflow_id === failure.workflow
-                && ['push', 'workflow_dispatch', 'schedule', 'merge_group'].includes(String(run.event)))
           }) }
       }
       return observation

@@ -172,7 +172,7 @@ class AtomicWorkLimits(TestCase):
         api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
                             correlation, "fixture-model", "poise/issue-7", pull=pull, expected_head=expected_head)
 
-    def test_shared_ci_dependency_is_verified_without_publication_and_mixed_or_unknown_failures_are_not_excused(self):
+    def test_shared_ci_dependency_waits_without_publication_only_without_edits_and_mixed_or_unknown_failures_are_not_excused(self):
         base, integration = "c" * 40, "d" * 40
         excerpt = "AssertionError: expired notice fixture returned no handling rows"
         dependency = {"head": HEAD, "removal": "removed", "integration": integration, "base": base,
@@ -231,7 +231,7 @@ class AtomicWorkLimits(TestCase):
                     if scenario == "shared-edits":
                         checkout = Path(kwargs["cwd"])
                         checkout.mkdir(parents=True, exist_ok=True)
-                        (checkout / "unrelated-baseline-fixture.txt").write_text("independent baseline patch")
+                        (checkout / "candidate-fix.txt").write_text("candidate-specific fix co-located in the shared check")
                     (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps(publication))
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -252,7 +252,7 @@ class AtomicWorkLimits(TestCase):
                             self.run_behavior(3, HEAD, f"00000000-0000-4000-8000-{index + 1:012d}")
                 with sqlite3.connect(self.path) as conn:
                     row = conn.execute("select status,action,artifact,action_plan from calls order by rowid desc limit 1").fetchone()
-                if scenario in {"shared", "shared-edits"}:
+                if scenario in {"shared"}:
                     self.assertEqual(modes, ["prepare", "validate"])
                     self.assertEqual(row[:2], ("completed", "no_changes"))
                     self.assertIsNone(row[3])
@@ -260,11 +260,13 @@ class AtomicWorkLimits(TestCase):
                     self.assertEqual(json.loads(row[2])["phase"], "waiting_baseline")
                     self.assertIn("Never independently edit a verified shared baseline failure", instructions[0])
                     self.assertIn("shared-only failure leave blocked null", instructions[0])
-                elif scenario in {"mixed", "candidate-only"}:
+                elif scenario in {"shared-edits", "mixed", "candidate-only"}:
                     self.assertEqual(modes, ["prepare", "validate", "publish"])
                     self.assertEqual(row[:2], ("completed", "published"))
                     if scenario == "mixed":
                         self.assertFalse(json.loads(row[2])["ci_dependency"]["allShared"])
+                    if scenario == "shared-edits":
+                        self.assertTrue(json.loads(row[2])["ci_dependency"]["allShared"])
                 else:
                     self.assertNotIn("publish", modes)
                     self.assertEqual(row[:2], ("failed", "not_started"))

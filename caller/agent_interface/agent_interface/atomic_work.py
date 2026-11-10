@@ -247,9 +247,13 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                                     or check.get("state") == "completed" and check.get("conclusion") not in {"success", "neutral", "skipped", None}]
                 candidate_blockers = candidate_checks or merge_base or any(
                     not thread["is_resolved"] for thread in evidence["review_packet"]["review_threads"])
-                if dependency["allShared"] and not candidate_blockers:
-                    # The disposable worker checkout may contain an independent
-                    # baseline patch. Only its external dependency is retained.
+                if dependency["allShared"] and not candidate_blockers and validated.get("has_changes") is not True:
+                    # A shared-only diagnosis with no candidate edits retains
+                    # only its external dependency. Validated edits publish
+                    # normally: one shared check can co-locate a
+                    # candidate-specific failure the excerpt cannot disprove,
+                    # and discarding that fix would head-of-line block the
+                    # candidate behind the baseline remediation.
                     record({"phase": "waiting_baseline", "prepared": prepared, "ci_dependency": dependency})
                     return {"outcome": "no_changes", "head_sha": expected_head}
                 if validated.get("has_changes") is not True and not dependency["allShared"]:

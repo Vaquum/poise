@@ -276,7 +276,7 @@ it('records a pull closed without merging, which carries no queue removal eviden
   await expect(actionOperations().observe(chain)).rejects.toThrow('native PR observations changed head or are incomplete')
 })
 
-it.each(['failure', 'pending', 'missing', 'success', 'queue-success', 'reused-queue', 'stale-success', 'wrong-head', 'wrong-base', 'unknown-run'])(
+it.each(['failure', 'pending', 'missing', 'success', 'queue-success', 'reused-queue', 'stale-success', 'shadowed-success', 'shadowed-failure', 'wrong-head', 'wrong-base', 'unknown-run'])(
   'rechecks the exact current base for a retained CI dependency: %s', async state => {
     const base = 'd'.repeat(40)
     const dependency = { head: HEAD, integration: 'c'.repeat(40), base: 'b'.repeat(40), removal: 'failed-integration',
@@ -291,11 +291,13 @@ it.each(['failure', 'pending', 'missing', 'success', 'queue-success', 'reused-qu
       ref: state === 'wrong-base' ? 'e'.repeat(40) : base,
       checks: state === 'missing' ? [] : [
         { name: 'unit', check_run_id: 21, head_sha: base, run_id: 20,
-          state: state === 'pending' ? 'in_progress' : 'completed', conclusion: ['success', 'queue-success', 'reused-queue', 'stale-success'].includes(state) ? 'success' : 'failure' },
+          state: state === 'pending' ? 'in_progress' : 'completed', conclusion: ['success', 'queue-success', 'reused-queue', 'stale-success', 'shadowed-success'].includes(state) ? 'success' : 'failure' },
         ...(state === 'stale-success' ? [{ name: 'unit', check_run_id: 22, head_sha: base, run_id: 20, state: 'completed', conclusion: 'failure' }] : []),
         ...(state === 'reused-queue' ? [{ name: 'unit', check_run_id: 22, head_sha: base, run_id: 20, state: 'completed', conclusion: 'skipped' }] : []),
+        ...(['shadowed-success', 'shadowed-failure'].includes(state) ? [{ name: 'unit', check_run_id: 22, head_sha: base, run_id: 30, state: 'completed', conclusion: 'success' }] : []),
       ], runs: state === 'unknown-run' ? [] : [{ id: 20, head_sha: base, workflow_id: 1,
-        event: ['queue-success', 'reused-queue'].includes(state) ? 'merge_group' : 'push' }] }
+        event: ['queue-success', 'reused-queue'].includes(state) ? 'merge_group' : 'push' },
+        ...(['shadowed-success', 'shadowed-failure'].includes(state) ? [{ id: 30, head_sha: base, workflow_id: 2, event: 'push' }] : [])] }
     const reads: string[][] = []
     mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
       reads.push(argv)
@@ -320,7 +322,7 @@ it.each(['failure', 'pending', 'missing', 'success', 'queue-success', 'reused-qu
       return
     }
     const observation = await operations.observe(current)
-    const recovered = ['success', 'queue-success', 'reused-queue'].includes(state)
+    const recovered = ['success', 'queue-success', 'reused-queue', 'shadowed-success'].includes(state)
     expect(observation.ciDependency).toEqual({ invocationId: repair.id, base, recovered })
     expect(decideBehaviorChain(current, observation, Date.now())).toMatchObject(recovered
       ? { kind: 'invoke', behavior: 'approve-pr' } : { kind: 'wait', reason: expect.stringContaining('shared baseline CI dependency') })
