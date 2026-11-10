@@ -202,13 +202,13 @@ async def get_combined_status(client: GitHubClient, owner: str, repo: str, ref: 
     return await client.get(f"/repos/{owner}/{repo}/commits/{ref}/status")
 
 
-async def list_check_runs(client: GitHubClient, owner: str, repo: str, ref: str) -> list[dict[str, Any]]:
+async def list_check_runs(client: GitHubClient, owner: str, repo: str, ref: str, *, all_runs: bool = False) -> list[dict[str, Any]]:
     runs = []
     page = 1
     while True:
         data = await client.get(
             f"/repos/{owner}/{repo}/commits/{ref}/check-runs",
-            params={"per_page": 100, "page": page},
+            params={"per_page": 100, "page": page, **({"filter": "all"} if all_runs else {})},
         )
         batch = data.get("check_runs", [])
         runs.extend(batch)
@@ -221,6 +221,7 @@ async def read_job_log(client: GitHubClient, owner: str, repo: str, job_id: int)
     return await client.get_text(
         f"/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
         accept="application/vnd.github+json",
+        follow_redirects=True,
     )
 
 

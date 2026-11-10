@@ -333,6 +333,8 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior == "--list-failing-ci":
         parser = argparse.ArgumentParser(prog="github-interface --list-failing-ci PR")
+        parser.add_argument("--ref", default=argparse.SUPPRESS,
+                            help="include checks, workflow identities and parents for an exact commit SHA or the current base")
         _add_repository(parser)
         return parser
 
@@ -357,7 +359,9 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
         return argparse.ArgumentParser(prog="github-interface --resolve-conversation CONVERSATION_ID")
 
     if behavior == "--read-failing-ci-log":
-        return argparse.ArgumentParser(prog="github-interface --read-failing-ci-log LOG_ID")
+        parser = argparse.ArgumentParser(prog="github-interface --read-failing-ci-log LOG_ID")
+        _add_repository(parser)
+        return parser
 
     if behavior == "--post-pr-comment":
         parser = argparse.ArgumentParser(prog="github-interface --post-pr-comment PR")

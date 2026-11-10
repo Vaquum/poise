@@ -32,6 +32,13 @@ and repair through `agent-interface --atomic-work`, with publication through
 CALL_ID PLAN_SHA HEAD_SHA` continuation accepts only an original failed repair
 whose immutable plan, pushed head, unattempted replies and released worker
 resources are proven. It starts no model and cannot replace that plan.
+Shared baseline CI dependencies use that same atomic repair artifact and the
+existing chain tick ([dependency evidence and recovery](../docs/Behavior-chain.md)).
+`github-interface --list-failing-ci PR --repository OWNER/REPO --ref SHA`
+includes the exact commit's checks, parent SHAs and workflow identities while
+retaining the current candidate head. `--ref base` reads the current base.
+`--read-failing-ci-log JOB_ID --repository OWNER/REPO` reads the actual job log,
+following GitHub's download redirect without forwarding credentials across hosts.
 
 For a closed full-suite reporter seed, `--chain-seed` also reads the actual
 failing/recovery runs, test artifacts and covering merges. Conservative complete

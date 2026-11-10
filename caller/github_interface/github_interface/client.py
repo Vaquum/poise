@@ -105,7 +105,7 @@ class GitHubClient:
             return response.json()
         return None
 
-    async def request_text(self, method: str, path: str, accept: str, **kwargs: Any) -> str:
+    async def request_text(self, method: str, path: str, accept: str, *, follow_redirects: bool = False, **kwargs: Any) -> str:
         headers = kwargs.pop("headers", {})
         headers["Authorization"] = f"Bearer {self.token}"
         headers["Accept"] = accept
@@ -116,7 +116,7 @@ class GitHubClient:
             path,
             headers,
             method.upper() == "GET",
-            False,
+            follow_redirects,
             **kwargs,
         )
         try:

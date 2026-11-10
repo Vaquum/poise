@@ -172,6 +172,105 @@ class AtomicWorkLimits(TestCase):
         api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
                             correlation_id, "fixture-model", "poise/issue-7", pull=pull, expected_head=expected_head)
 
+    def test_shared_ci_dependency_waits_without_publication_only_without_edits_and_mixed_or_unknown_failures_are_not_excused(self):
+        base, integration = "c" * 40, "d" * 40
+        excerpt = "AssertionError: expired notice fixture returned no handling rows"
+        dependency = {"head": HEAD, "removal": "removed", "integration": integration, "base": base,
+                      "remediation": "https://github.com/example/repo/pull/99",
+                      "failures": [{"check": 11, "baselineCheck": 21, "evidence": excerpt}]}
+        check = {"check_run_id": 11, "head_sha": integration, "name": "unit", "state": "completed", "conclusion": "failure",
+                 "run_id": 10, "log_id": 11}
+        baseline_check = {**check, "check_run_id": 21, "head_sha": base, "run_id": 20, "log_id": 21}
+        queue = {"head_sha": HEAD, "queue_removals": [{"id": "removed", "reason": "failed_checks", "beforeCommit": {"oid": integration}}]}
+        scenarios = ("shared", "shared-edits", "candidate-only", "mixed", "mixed-unfixed", "wrong-head", "wrong-parent", "wrong-base", "wrong-event", "wrong-workflow", "missing-cause")
+        for index, scenario in enumerate(scenarios):
+            with self.subTest(scenario=scenario):
+                modes, reads, instructions = [], [], []
+                integration_data = {"head_sha": HEAD, "ref": integration, "parents": [base, HEAD], "failing": [check],
+                                    "runs": [{"id": 10, "head_sha": integration, "event": "merge_group", "workflow_id": 1}]}
+                base_data = {"head_sha": HEAD, "ref": base, "failing": [baseline_check],
+                             "runs": [{"id": 20, "head_sha": base, "event": "push", "workflow_id": 1}]}
+                if scenario.startswith("mixed"):
+                    integration_data["failing"] = [check, {**check, "check_run_id": 12, "name": "candidate regression"}]
+                if scenario == "wrong-head":
+                    integration_data["head_sha"] = "e" * 40
+                if scenario == "wrong-parent":
+                    integration_data["parents"] = [base, "e" * 40]
+                if scenario == "wrong-base":
+                    base_data["ref"] = "e" * 40
+                if scenario == "wrong-event":
+                    integration_data["runs"][0]["event"] = "pull_request"
+                if scenario == "wrong-workflow":
+                    base_data["runs"][0]["workflow_id"] = 2
+
+                def interface(*args, **_kwargs):
+                    reads.append(args)
+                    if args[0] == "--issue-work":
+                        mode = args[args.index("--mode") + 1]
+                        modes.append(mode)
+                        return {"outcome": {"prepare": "prepared", "validate": "validated", "publish": "published"}[mode],
+                                "checkout_head": HEAD, "head_sha": HEAD, "has_changes": scenario in {"mixed", "candidate-only", "shared-edits"}}
+                    if args[0] == "--pr-review":
+                        return {"review_threads": []}
+                    if args[0] == "--pull-action-state":
+                        return queue
+                    if args[0] == "--list-failing-ci":
+                        if "--ref" not in args:
+                            return {"failing": []}
+                        return integration_data if args[-1] == integration else base_data
+                    if args[0] == "--read-failing-ci-log":
+                        return {"repository": "example/repo", "log": "different failure" if scenario == "missing-cause" and args[1] == "21" else excerpt}
+                    if args[0] == "--read-issue":
+                        return {"issue": {"number": 99}}
+                    raise AssertionError(args)
+
+                def worker(_lease, _args, **kwargs):
+                    publication = {"commitMessage": "fix: candidate", "title": "fix: candidate", "body": "Fix the candidate only", "replies": []}
+                    if scenario != "candidate-only":
+                        publication["ciDependency"] = dependency
+                    if scenario == "shared-edits":
+                        checkout = Path(kwargs["cwd"])
+                        checkout.mkdir(parents=True, exist_ok=True)
+                        (checkout / "candidate-fix.txt").write_text("candidate-specific fix co-located in the shared check")
+                    (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps(publication))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                def command(_model, instruction, *_args):
+                    instructions.append(instruction)
+                    return ["fixture"], "", {}
+
+                with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                        patch.object(issue_review, "interface", side_effect=interface), patch.object(issue_review, "command", side_effect=command), \
+                        patch.object(issue_review, "_terminal_failure", return_value=None), patch.object(issue_review, "stop_leftovers"), \
+                        patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                        patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                        patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), redirect_stdout(StringIO()):
+                    if scenario in {"shared", "shared-edits", "mixed", "candidate-only"}:
+                        self.run_behavior(3, HEAD, f"00000000-0000-4000-8000-{index + 1:012d}")
+                    else:
+                        with self.assertRaises(ValueError):
+                            self.run_behavior(3, HEAD, f"00000000-0000-4000-8000-{index + 1:012d}")
+                with sqlite3.connect(self.path) as conn:
+                    row = conn.execute("select status,action,artifact,action_plan from calls order by rowid desc limit 1").fetchone()
+                if scenario in {"shared"}:
+                    self.assertEqual(modes, ["prepare", "validate"])
+                    self.assertEqual(row[:2], ("completed", "no_changes"))
+                    self.assertIsNone(row[3])
+                    self.assertEqual(json.loads(row[2])["ci_dependency"]["failures"][0]["run"], 10)
+                    self.assertEqual(json.loads(row[2])["phase"], "waiting_baseline")
+                    self.assertIn("Never independently edit a verified shared baseline failure", instructions[0])
+                    self.assertIn("shared-only failure leave blocked null", instructions[0])
+                elif scenario in {"shared-edits", "mixed", "candidate-only"}:
+                    self.assertEqual(modes, ["prepare", "validate", "publish"])
+                    self.assertEqual(row[:2], ("completed", "published"))
+                    if scenario == "mixed":
+                        self.assertFalse(json.loads(row[2])["ci_dependency"]["allShared"])
+                    if scenario == "shared-edits":
+                        self.assertTrue(json.loads(row[2])["ci_dependency"]["allShared"])
+                else:
+                    self.assertNotIn("publish", modes)
+                    self.assertEqual(row[:2], ("failed", "not_started"))
+
     def test_implementation_receives_its_requested_hour_instead_of_the_pr_review_cap(self):
         remaining = []
 

@@ -6,7 +6,7 @@ import { agentInterfaceCwd } from './models'
 import { headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission, validateExecutionLimits, type BehaviorResourceHeadroom } from './behavior-resources'
 import { parseAgentLogStdout, type LogEntry } from './agent-log-parse'
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
-import { chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
+import { chainCiDependency, chainReviewResponse, type ChainDecision, type ChainObservation, type ChainReviewer } from './behavior-chain-decision'
 import { MissingPublicationPlanError, type ChainRuntimeOperations, type ChainSeed } from './behavior-chain-runtime'
 import { organizationArgs, organizationForRepository, type Organization } from './organizations'
 import { getBehaviorChainSettings, getSettings } from './settings'
@@ -306,13 +306,38 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         // The existing readiness primitive already applies the repository's
         // queue policy: BEHIND needs a base update only without a merge queue.
         conflict: ci.mergeable === false, behind: ci.mergeable_state === 'behind' && readiness.blockers.includes('merge_state_not_clean') }
+      const dependency = chainCiDependency(chain, observation.pull.queueRemoval?.id)
+      if (dependency) {
+        const baseline = await github(chain.repository, ['--list-failing-ci', String(number), '--ref', 'base', ...reviewer])
+        if (baseline.head_sha !== head || baseline.ref !== ci.base_sha || !Array.isArray(baseline.checks) || !Array.isArray(baseline.runs)) {
+          throw new Error('CI dependency recovery changed candidate/base or lacks complete checks')
+        }
+        const checks = baseline.checks.map(item => object(item, 'baseline check'))
+        const runs = baseline.runs.map(item => object(item, 'baseline workflow'))
+        if (checks.some(check => !Number.isSafeInteger(check.check_run_id) || typeof check.name !== 'string'
+          || check.head_sha !== baseline.ref)) throw new Error('CI dependency recovery lacks exact check identities')
+        observation.ciDependency = { invocationId: dependency.invocation.id, base: sha(baseline.ref, 'baseline recovery'),
+          recovered: dependency.dependency.failures.every(failure => {
+            // Select within the retained workflow first: another workflow
+            // may publish a newer same-named check, which must not shadow
+            // the retained workflow's recovery.
+            const matching = checks.filter(check => check.name === failure.name && check.head_sha === baseline.ref
+              && !['skipped', 'neutral'].includes(String(check.conclusion))
+              && runs.some(run => run.id === check.run_id && run.head_sha === baseline.ref && run.workflow_id === failure.workflow
+                && ['push', 'workflow_dispatch', 'schedule', 'merge_group'].includes(String(run.event))))
+            const latest = matching.sort((a, b) => Number(b.check_run_id) - Number(a.check_run_id))[0]
+            return !!latest && latest.state === 'completed' && latest.conclusion === 'success'
+          }) }
+      }
       return observation
     },
     async request(chain, observation, decision, id) {
       const cwd = await directory(chain.repository)
       const pull = observation.pull
       const common = ['--source', 'poise:behavior-chain', '--correlation-id', id, '--actor', decision.actor]
-      const note = [await hooks.note(decision.behavior, chain, pull), decision.reason].filter(Boolean).join('\n\n')
+      const dependency = pull && decision.behavior === 'repair-pr' ? chainCiDependency(chain, pull.queueRemoval?.id) : null
+      const note = [await hooks.note(decision.behavior, chain, pull), decision.reason,
+        dependency ? `Retained shared baseline CI dependency; keep candidate repairs scoped and do not duplicate its remediation: ${JSON.stringify(dependency.dependency)}` : ''].filter(Boolean).join('\n\n')
       if (decision.reviewer) {
         const selected = await hooks.resolve(decision, `${chain.repository}#${chain.issue}`)
         if (!selected) return null
@@ -323,7 +348,8 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           ...(pull ? { context: { head: pull.head, reviewRevision: pull.reviewRevision,
             ...(pull.queueRemoval ? { queueRemoval: pull.queueRemoval.id } : {}) } } : {}), argv: ['--atomic-work', `${chain.repository}#${chain.issue}`,
           ...common, '--model', selected.model, '--branch', chain.branch, '--expected-issue-revision', observation.issue.revision,
-          ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head, ...(pull.conflict || pull.behind || pull.queueRemoval ? ['--merge-base'] : [])] : []), '--note', note] }
+          ...(pull ? ['--pull-number', String(pull.number), '--expected-head', pull.head,
+            ...(pull.conflict || pull.behind || pull.queueRemoval?.reason === 'merge_conflict' ? ['--merge-base'] : [])] : []), '--note', note] }
         if (!pull) throw new Error('PR behavior requires its actual pull request')
         const scope = await hooks.reviewScope?.(chain, pull) ?? ''
         const reviewNote = scope

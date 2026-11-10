@@ -238,7 +238,7 @@ describe('completion-driven atomic behavior decisions', () => {
     expect(decideBehaviorChain(current, obs, NOW)).toEqual({ kind: 'complete', mergeSha: MERGE })
   })
 
-  it('requires a fresh diagnosis and approval before requeueing an unchanged rejected head', () => {
+  it.each([false, true])('requires diagnosis, baseline recovery when shared=%s, and approval before a fresh integration attempt', (shared) => {
     const { journal, chain } = setup(); const obs = observation()
     let current = reviewed(journal, chain, obs); pull(obs)
     current = finish(journal, current, 'pr-review', 'review-pr', chainBasis(['pr', HEAD, CONTEXT]),
@@ -253,13 +253,53 @@ describe('completion-driven atomic behavior decisions', () => {
     repairInvocation.request.context = { head: HEAD, reviewRevision: obs.pull!.reviewRevision, queueRemoval: 'failed-integration' }
     current = record(journal, current, { type: 'invocation.admitted', invocation: repairInvocation })
     current = record(journal, current, { type: 'invocation.settled', invocationId: 'diagnosis', callId: 'diagnosis-native', outcome: 'no_changes',
-      evidence: { status: 'completed', action: 'no_changes', head_sha: HEAD } })
+      evidence: { status: 'completed', action: 'no_changes', head_sha: HEAD,
+        ...(shared ? { artifact: { ci_dependency: { head: HEAD, integration: MERGE, base: NEXT, removal: 'failed-integration',
+          remediation: 'https://github.com/Example/Repo/pull/99', allShared: true,
+          failures: [{ name: 'unit', check: 11, run: 10, workflow: 1 }] } } } : {}) } })
+    if (shared) {
+      const waiting = { kind: 'wait', reason: expect.stringContaining('shared baseline CI dependency') }
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject(waiting)
+      obs.ciDependency = { invocationId: 'diagnosis', base: NEXT, recovered: false }
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject(waiting)
+      // A shared shard never excuses a separate candidate defect.
+      obs.pull!.failing = ['candidate-only:failure']
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+      obs.pull!.failing = []
+      obs.pull!.queueRemoval!.id = 'new-failed-integration'
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'repair-pr' })
+      obs.pull!.queueRemoval!.id = 'failed-integration'
+      current = record(journal, current, { type: 'chain.observed', observation: structuredClone(obs) })
+      const decision = decideBehaviorChain(current, obs, NOW)
+      if (decision.kind !== 'wait') throw new Error('expected dependency wait')
+      current = record(journal, current, { type: 'chain.waiting', reason: decision.reason })
+      journal.rebuild()
+      current = journal.read(chain.id)!
+      expect(current.held).toBeNull()
+      expect(current.waiting).toContain('check 11')
+      expect(current.waiting).toContain(HEAD)
+      expect(current.waiting).toContain(NEXT)
+      obs.ciDependency.recovered = true
+      expect(decideBehaviorChain({ ...current, held: 'operator hold' }, obs, NOW)).toEqual({ kind: 'wait', reason: 'operator hold' })
+      // Recovery cannot adopt another head or its old reviews.
+      obs.pull!.head = NEXT
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+      obs.pull!.head = HEAD
+      obs.pull!.reviewContext = '5'.repeat(64)
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'review-pr' })
+      obs.pull!.reviewContext = CONTEXT
+    }
     const verify = decideBehaviorChain(current, obs, NOW)
     expect(verify).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
     if (verify.kind !== 'invoke') throw new Error('expected independent approval')
     obs.pull!.reviewIds.push(28)
     current = finish(journal, current, 'verify-integration-repair', 'approve-pr', verify.basis,
       { status: 'completed', action: 'approved', outcome: 'approved', review_id: 28, head_sha: HEAD })
+    if (shared) {
+      obs.ciDependency!.base = '7'.repeat(40)
+      expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'approve-pr' })
+      obs.ciDependency!.base = NEXT
+    }
     expect(decideBehaviorChain(current, obs, NOW)).toMatchObject({ kind: 'invoke', behavior: 'merge-pr' })
     // Admission to the second queue attempt still cannot complete the chain.
     obs.pull!.queueEntry = 'second-integration-attempt'
@@ -308,6 +348,56 @@ describe('native admission and recovery', () => {
       readActionResult: async () => { throw new Error('unexpected native response read') },
       fenceClosedTarget: async () => { throw new Error('unexpected closed-target fence') }, wake: () => {}, ...overrides }
   }
+
+  it('rechecks a settled shared failure on the existing tick across restart and honors operator holds', async () => {
+    const { journal, chain } = setup(); const obs = observation(); pull(obs)
+    obs.prReviewers = []
+    let current = reviewed(journal, chain, obs)
+    current = finish(journal, current, 'queue', 'merge-pr', 'queue', { status: 'completed', outcome: 'enqueued', head_sha: HEAD }, null)
+    obs.pull!.queueRemoval = { id: 'failed-integration', reason: 'failed_checks', at: NOW, actor: null }
+    const repair = invocation('diagnosis', 'repair-pr', 'queue-repair')
+    repair.request.context = { head: HEAD, reviewRevision: obs.pull!.reviewRevision, queueRemoval: 'failed-integration' }
+    current = record(journal, current, { type: 'invocation.admitted', invocation: repair })
+    const call: LogEntry = { id: 'a'.repeat(32), correlation_id: repair.id, source: 'poise:behavior-chain', actor: 'author',
+      pr_id: '21', repo: chain.repository, behavior: 'repair_pr', model: 'fixture-model', session_id: null, prompt: '',
+      started_at: new Date(NOW).toISOString(), completed_at: new Date(NOW).toISOString(), time_elapsed: '1s',
+      expected_head: HEAD, head_sha: HEAD, response: null, error: '', status: 'completed', action: 'no_changes', outcome: 'no_changes',
+      resources_settled_at: new Date(NOW).toISOString(), resource_ownership: { version: 1, roots: [], errors: [] },
+      artifact: { phase: 'waiting_baseline', ci_dependency: { head: HEAD, integration: MERGE, base: NEXT, removal: 'failed-integration',
+        remediation: 'https://github.com/Example/Repo/pull/99', allShared: true,
+        failures: [{ name: 'unit', check: 11, run: 10, workflow: 1 }] } } }
+    let recovered = false
+    let observations = 0
+    const launched: string[] = []
+    const native = operations({ capacity: () => 10,
+      readInvocations: async () => ({ entries: [call], quarantined: [] }),
+      observe: async () => { observations++; return { ...structuredClone(obs), checkedAt: Date.now(),
+        ciDependency: { invocationId: repair.id, base: NEXT, recovered } } },
+      launch: async invocation => { launched.push(invocation.behavior); return true },
+    })
+    await new BehaviorChainRuntime(journal, native).run()
+    current = journal.read(chain.id)!
+    expect(current.invocations.at(-1)).toMatchObject({ state: 'settled', outcome: 'no_changes' })
+    expect(current.held).toBeNull()
+    expect(current.waiting).toContain('shared baseline CI dependency')
+    journal.rebuild()
+    const runtime = new BehaviorChainRuntime(journal, native)
+    await runtime.run()
+    expect(observations).toBe(2)
+    expect(launched).toEqual([])
+    current = record(journal, journal.read(chain.id)!, { type: 'chain.held', reason: 'operator hold' })
+    recovered = true
+    await runtime.run()
+    expect(journal.read(chain.id)!.held).toBe('operator hold')
+    expect(launched).toEqual([])
+    record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+    obs.pull!.pending = true
+    await runtime.run()
+    expect(launched).toEqual([])
+    obs.pull!.pending = false
+    await runtime.run()
+    expect(launched).toEqual(['approve-pr'])
+  })
 
   it.each(['recovered', 'operator hold', 'posting began', 'resources unknown', 'unrelated failure'])('reconciles only a proved auth hold: %s', async mode => {
     const { journal, chain } = setup()

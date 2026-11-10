@@ -2,7 +2,7 @@ import json
 import os
 import sys
 from io import StringIO
-from unittest import TestCase
+from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
 from github_interface import cli, interface
@@ -102,3 +102,39 @@ class TestListFailingCiCli(TestCase):
                 patch.object(cli, "list_failing_ci", operation), patch("sys.stdout", StringIO()):
             cli.main()
         self.assertEqual(operation.call_args.args[0], {"pr": "#9", "repository": None, "token_user": None})
+
+
+class TestIntegrationCi(IsolatedAsyncioTestCase):
+    async def test_exact_ref_retains_candidate_base_parents_and_paginated_workflow_identity(self):
+        integration, base = "c" * 40, "d" * 40
+        check = {**CHECKS[0], "head_sha": integration}
+        client = AsyncMock()
+        client.get.side_effect = [{"parents": [{"sha": base}, {"sha": HEAD}]},
+                                  {"workflow_runs": [{"id": n, "head_sha": integration, "event": "merge_group"} for n in range(100)]},
+                                  {"workflow_runs": [{"id": 101, "head_sha": integration, "event": "merge_group"}]}]
+        with patch.object(list_failing_ci, "get_pull", AsyncMock(return_value={**PULL, "base": {"ref": "main", "sha": base}})), \
+                patch.object(list_failing_ci, "list_check_runs", AsyncMock(return_value=[check])) as checks, \
+                patch.object(list_failing_ci, "get_combined_status", AsyncMock(return_value={"statuses": []})):
+            result = await list_failing_ci.run(client, {"repository": "acme/app", "pr": 9, "ref": integration})
+        self.assertEqual((result["head_sha"], result["ref"], result["base_sha"]), (HEAD, integration, base))
+        self.assertEqual(result["parents"], [base, HEAD])
+        self.assertEqual(len(result["runs"]), 101)
+        self.assertEqual(result["failing"][0]["run_id"], 1)
+        self.assertEqual(result["failing"][0]["log_id"], 22)
+        self.assertEqual(checks.call_args.args[1:], ("acme", "app", integration))
+        self.assertEqual(checks.call_args.kwargs, {"all_runs": True})
+        self.assertEqual(client.get.call_args.kwargs["params"]["page"], 2)
+
+    async def test_base_ref_observes_current_base_and_missing_base_never_falls_back_to_head(self):
+        base = "c" * 40
+        client = AsyncMock()
+        client.get.side_effect = [{"parents": []}, {"workflow_runs": []}]
+        with patch.object(list_failing_ci, "get_pull", AsyncMock(return_value={**PULL, "base": {"sha": base}})), \
+                patch.object(list_failing_ci, "list_check_runs", AsyncMock(return_value=[])) as checks, \
+                patch.object(list_failing_ci, "get_combined_status", AsyncMock(return_value={"statuses": []})):
+            result = await list_failing_ci.run(client, {"repository": "acme/app", "pr": 9, "ref": "base"})
+        self.assertEqual(result["ref"], base)
+        self.assertEqual(checks.call_args.args[-1], base)
+        with patch.object(list_failing_ci, "get_pull", AsyncMock(return_value=PULL)):
+            with self.assertRaisesRegex(ValueError, "CI ref"):
+                await list_failing_ci.run(client, {"repository": "acme/app", "pr": 9, "ref": "base"})
