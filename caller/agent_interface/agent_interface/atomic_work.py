@@ -33,10 +33,35 @@ class AtomicWorkBlocked(ValueError):
                 marker = r"\[redacted(?: header| credential)?\]"
                 markers = ("[redacted]", "[redacted header]", "[redacted credential]")
                 keyword_end = re.compile(r"(?i)\b(?:proxy-authorization|authorization|set-cookie|cookie|bearer|basic|token)\s*[:=]?\s*$")
+                keyword_any = re.compile(r"(?i)\b(?:proxy-authorization|authorization|set-cookie|cookie|bearer|basic|token)\b")
                 forms: dict[str, bool] = {}
+                extra: set[str] = set()
+
+                def _fragment(text: str) -> None:
+                    # Secret-looking fragments of values the before-pass must
+                    # not touch: long enough to identify, or structured. Short
+                    # plain words stay readable (a bare scheme or context word
+                    # carries no credential), and markers are never fragments.
+                    text = text.strip()
+                    if not text or text in markers:
+                        return
+                    if len(text) >= 8 or len(text) >= 4 and re.search(r"[^A-Za-z ]", text):
+                        extra.add(text)
+
                 for value in secrets:
                     norm = " ".join(value.split())
-                    if norm and keyword_end.search(norm):
+                    end = keyword_end.search(norm) if norm else None
+                    if end:
+                        # A trailing keyword is left for the patterns, but the
+                        # secret material before it would otherwise persist
+                        # once the pattern consumes the keyword and its token.
+                        # Split on every keyword too: the credential pattern
+                        # can re-pair across value boundaries (matching a
+                        # keyword as another keyword's token) and strand the
+                        # middle of the value.
+                        _fragment(norm[:end.start()])
+                        for segment in keyword_any.split(norm):
+                            _fragment(segment)
                         continue
                     for form in {value, norm}:
                         if not form:
@@ -44,6 +69,22 @@ class AtomicWorkBlocked(ValueError):
                         shaped = atoms.redact_cause(form)
                         if shaped != form and shaped not in markers and "[redacted header]" not in shaped:
                             forms[form] = True
+                    if not norm:
+                        continue
+                    shaped_norm = atoms.redact_cause(norm)
+                    if "[redacted header]" in shaped_norm:
+                        # Header-shaped values also wait for the patterns; mask
+                        # the leading secret the header match would strand. The
+                        # header runs first, so shaped text before its marker
+                        # is the value's prefix up to later pattern markers,
+                        # which are stripped to match the normalized reason.
+                        _fragment(" ".join(re.sub(marker, " ", shaped_norm.split("[redacted header]")[0]).split()))
+                    if re.search(marker, norm):
+                        # Marker-first alternation would preserve a literal
+                        # marker inside the value and shield the remainder, so
+                        # mask the non-marker segments directly.
+                        for segment in re.split(marker, norm):
+                            _fragment(segment)
                 before = sorted(forms, key=len, reverse=True)
                 if before:
                     safe = re.sub(marker + "|" + "|".join(map(re.escape, before)),
@@ -54,7 +95,7 @@ class AtomicWorkBlocked(ValueError):
                 # normalized occurrence and persist. Include before values'
                 # normalized forms too; masking after patterns cannot rewrite
                 # a pattern keyword.
-                normed = sorted({" ".join(value.split()) for value in secrets if " ".join(value.split())},
+                normed = sorted({" ".join(value.split()) for value in secrets if " ".join(value.split())} | extra,
                                 key=len, reverse=True)
                 if normed:
                     # Values under four characters would rewrite common words,

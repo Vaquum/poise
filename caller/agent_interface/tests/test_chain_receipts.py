@@ -550,6 +550,50 @@ class AtomicWorkLimits(TestCase):
             self.assertNotIn(private, message)
             self.assertNotIn(private, json.dumps(blocked.diagnostic))
 
+    def test_atomic_work_blocked_trailing_keyword_value_masks_secret_prefix(self):
+        value = "opaque-prefix-12 Bearer"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("blocked opaque-prefix-12 Bearer [REDACTED] end")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: blocked [redacted] [redacted credential] end")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "opaque-prefix-12"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_keyword_wrapped_value_survives_credential_repairing(self):
+        value = "Bearer opaque-core-99 Bearer"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked(f"{value} {value}")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: [redacted credential] [redacted credential] [redacted] Bearer")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "opaque-core-99"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_header_shaped_value_masks_leading_secret(self):
+        value = "opaque-prefix-12 Authorization: Bearer ok"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked(f"seen {value}")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: seen [redacted] [redacted header]")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "opaque-prefix-12"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_leading_marker_value_masks_remainder(self):
+        value = "[redacted] opaque-core-99"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("saw [redacted] opaque-core-99 here")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: saw [redacted] [redacted] here")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "opaque-core-99"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
         reason = "Review requires a product decision before implementation can continue"
         secret = "opaque-environment-credential-crossing-cutoff"
