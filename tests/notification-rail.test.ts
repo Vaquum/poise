@@ -49,7 +49,8 @@ describe('an entry', () => {
       holds: [],
     }, T0)
     const html = itemHtml(diagnostic, true, T0)
-    expect(html).toContain('<ol class="nr-history"><li><span>review-new-prs acme/api#9: head changed &lt;script&gt; (2 attempts)</span></li></ol>')
+    expect(html).toContain('<ol class="nr-history"><li><span>review-new-prs acme/api#9: head changed &lt;script&gt; (2 attempts)')
+    expect(html).toContain('Current impact: unknown.')
     expect(html).not.toContain('data-action="open"')
     expect(html).not.toContain('data-action="dismiss"')
     expect(html).toContain('is-auto')
@@ -140,7 +141,7 @@ describe('when its history happened', () => {
       deadLetters: [], holds: [],
     }, now)
     const html = itemHtml(failing, true, now)
-    expect(html).toContain('; next check 19:43</span>')
+    expect(html).toContain('; next check 19:43')
     expect(html).not.toContain('2026-10-17T16:43:00.000Z')
   })
 

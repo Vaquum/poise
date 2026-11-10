@@ -1,6 +1,7 @@
 import type { Database } from 'better-sqlite3'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal } from './behavior-chain-store'
+import { behaviorChainWorkImpact } from './behavior-chain-summary'
 import { behaviorErrorMessage } from './behavior-diagnostics'
 import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { runDatastoreHealth } from './datastore-health'
@@ -10,7 +11,7 @@ import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
 import type { ProcessDiagnostic } from './process-diagnostic'
 import { getBehaviorChainSettings, getSettings } from './settings'
-import { isServiceMode } from './service/config'
+import { isServiceMode, readServiceConfig } from './service/config'
 
 export const REMEDIATION_SCOPE = `Minimal, clinical interventions all the way. Get in, get out, do the thing that actually has to be done, never expand it beyond that. Keep asking "is this truly the cleanest and simplest and least intrusive way to get this done" and do it that way and only that way. Don't let others come expand it, let them come make it cleaner.`
 
@@ -359,6 +360,34 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       if (successor) return successor
     }
     const existing = await reconcileRepairReport(chain.repository, marker, null)
+    // Optional presentation must finish before the final source check and the
+    // one-shot creation intent. Its failure cannot consume the only POST.
+    const snapshotAt = new Date().toISOString()
+    let workSnapshot = `Work impact snapshot as of ${snapshotAt} (at filing; not live status).\nCurrent impact: unknown. No exact managed-work association is available.`
+    try {
+      const attempt = verifiedImplementation?.invocation ?? verifiedMerge?.invocation ?? verified?.attempts.at(-1)
+        ?? chain.invocations.at(-1)
+      const work = attempt ? behaviorChainWorkImpact(journal, attempt.callId
+        ?? (typeof attempt.evidence?.nativeCallId === 'string' ? attempt.evidence.nativeCallId : null), attempt.id) : null
+      if (work) {
+        const origin = readServiceConfig()?.publicOrigin
+        // Report causes already use their vetted detail paths; the live hold
+        // text may contain private diagnostics or review comment identities.
+        const nextAction = work.nextAction?.startsWith('Resolve the hold and explicitly resume:')
+          ? 'Resolve the hold and explicitly resume; inspect the original journal evidence for the cause' : work.nextAction
+        workSnapshot = [`Work impact snapshot as of ${snapshotAt} (at filing; not live status).`,
+          `Current impact: ${work.impact}. Work target: ${work.target}. Work stage: ${work.stage}.`,
+          `Last verified progress: ${new Date(work.progressAt).toISOString()}.`,
+          `Next retry: ${work.retryAt === null ? 'not recorded' : new Date(work.retryAt).toISOString()}.`,
+          `Next action: ${nextAction ? behaviorErrorMessage(nextAction, 500) : 'not recorded'}.`,
+          ...(work.recovered ? ['Matched failure recovered; verified progress followed this invocation failure.'] : []),
+          origin ? `[Journal evidence](${new URL(work.journal, origin).href}) (owning workspace access required).`
+            : `Journal evidence in the owning Poise workspace: \`${work.journal}\`.`,
+        ].join('\n')
+      }
+    } catch {
+      workSnapshot = `Work impact snapshot as of ${snapshotAt} (at filing; not live status).\nCurrent impact: unknown. Workspace chain evidence is unavailable.`
+    }
     const current = journal.read(chain.id)
     if (!current || current.resumedAfterSequence !== chain.resumedAfterSequence || current.sequence !== chain.sequence
       || (cause === CLOSED_CAUSE ? !qualifyingClosedPull(current, fresh, Date.now())
@@ -432,6 +461,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       ]
       const body = [marker, '', ...details,
         ...report.attempts.map(attempt => `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}.`), '',
+        workSnapshot, '',
         cause === CLOSED_CAUSE
           ? 'Next action: implement the remaining source issue work through this continuation after inspecting the closed PR and original journal receipts. Original invocation and resource evidence remain retained; this report never authorizes replay, replacement publication or resource release from an unreadable or incomplete original receipt.'
           : cause === IMPLEMENTATION_CAUSE

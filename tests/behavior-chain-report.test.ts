@@ -11,6 +11,8 @@ import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent }
 import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, setRepairReportRepositories } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
 import { nativeRequestSha } from '../server/behavior-chain-action'
+import { behaviorChainWorkImpact } from '../server/behavior-chain-summary'
+import { loggingWorkFixture } from './fixtures/logging-work-impact'
 import type { LogEntry } from '../server/agent-log-parse'
 import type { Organization } from '../server/organizations'
 
@@ -478,6 +480,12 @@ it.each([false, true])('reports one verified implementation hold before a PR wit
   expect(remote[0].body.split(REMEDIATION_SCOPE)).toHaveLength(2)
   expect(remote[0].body.endsWith('Include this exact paragraph in the linked PR review.')).toBe(true)
   const current = journal.read(chain.id)!
+  const work = behaviorChainWorkImpact(journal, call.id, call.correlation_id!)!
+  expect(work.impact).toBe('blocked')
+  for (const fact of [`Work impact snapshot as of ${new Date(NOW).toISOString()} (at filing; not live status).`,
+    `Current impact: ${work.impact}. Work target: ${work.target}. Work stage: ${work.stage}.`,
+    `Last verified progress: ${new Date(work.progressAt).toISOString()}.`, work.journal]) expect(remote[0].body).toContain(fact)
+  const filedBody = remote[0].body
   expect(current).toMatchObject({ held: call.error, author: chain.author, reviewer: chain.reviewer, branch: chain.branch,
     resumedAfterSequence: 0, mergeSha: null, waiting: expect.stringContaining('admission pending normal datastore intake'),
     invocations: [{ id: call.correlation_id, state: 'settled', callId: call.id }] })
@@ -500,6 +508,45 @@ it.each([false, true])('reports one verified implementation hold before a PR wit
   expect(reports(db)).toEqual([intent])
   expect(posts()).toHaveLength(1)
   expect(launch).not.toHaveBeenCalled()
+  // Later verified progress changes the live projection, never the filed snapshot.
+  let recovered = record(journal, journal.read(chain.id)!, { type: 'chain.resumed' })
+  fresh = observation()
+  recovered = journal.append(recovered.id, 'verified-publication', recovered.sequence,
+    { type: 'chain.observed', observation: fresh }, Date.now())
+  expect(behaviorChainWorkImpact(journal, call.id, call.correlation_id!)?.impact).toBe('recovered')
+  await reportRepairExhaustion(db, journal, recovered, async () => fresh, () => true)
+  expect(remote[0].body).toBe(filedBody)
+  expect(posts()).toHaveLength(1)
+})
+
+it.each(['unmatched', 'unavailable'])('files an eligible report once with %s optional work evidence', async mode => {
+  const { db, journal } = setup()
+  const { call } = blockedImplementation(journal)
+  const lookup = vi.spyOn(journal, 'forInvocation').mockImplementation(() => {
+    expect(reports(db)).toHaveLength(0)
+    if (mode === 'unavailable') throw new Error('optional journal annotation unavailable')
+    return null
+  })
+  const overrides = { observe: async () => fresh, readInvocations: async () => ({ entries: [call], quarantined: [] }) }
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0].body).toContain('Current impact: unknown.')
+  expect(remote[0].body).toContain(mode === 'unavailable' ? 'Workspace chain evidence is unavailable.' : 'No exact managed-work association is available.')
+  const filedBody = remote[0].body
+  lookup.mockRestore()
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0].body).toBe(filedBody)
+})
+
+it('keeps an ordinary verified retry out of remediation reporting', async () => {
+  const { db, journal } = setup()
+  const call = 'd'.repeat(32), correlation = 'e'.repeat(32)
+  const fixture = loggingWorkFixture(journal, 'acme/repo', 7, correlation, call, NOW - 10_000)
+  expect(behaviorChainWorkImpact(journal, call, correlation)?.impact).toBe('retrying')
+  await reportRepairExhaustion(db, journal, fixture.chain, async () => fixture.observation, () => true)
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
 })
 
 it('reconciles a lost implementation report acknowledgement after restart without another POST', async () => {

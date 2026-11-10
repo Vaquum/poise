@@ -10,6 +10,7 @@ import { normalize, type LogEvent } from '../../gateway/src/diagnostics/contract
 import { callerDiagnostic } from '../../gateway/src/diagnostics/sources'
 import { DiagnosticStore, DEFAULT_LOG_POLICY } from '../../gateway/src/diagnostics/store'
 import { workspace } from './fixtures/workspace'
+import type { Notice } from '../../src/notices'
 
 const storePath = resolve('test-results/e2e/logging.db')
 // Playwright retries this serial file as one group against the same logging.db,
@@ -130,6 +131,23 @@ test('incident details verify one target across duplicate errors, recovery, an i
     logs.append(records)
     await ready(page)
     await page.route('**/api/behavior-chains?*', route => route.continue())
+    // An existing notification can refer to this Call; native holds do not
+    // acquire a notification producer as part of the work-impact annotation.
+    const notice: Notice = { id: 'existing-impact-' + run, kind: 'behavior_held', title: 'Existing managed-work incident', body: 'fixture timeout',
+      since: new Date(at + 3000).toISOString(), due: new Date(at + 3000).toISOString(), silenceable: false,
+      subject: { behavior: 'resolve-unblocking', target: fixture.chain.repository + '#107' }, target: { swarm: call },
+      evidence: { eventId: records[0].id, incidentId: records[0].incidentId, from: new Date(at).toISOString(), to: new Date(at + 60_000).toISOString() } }
+    await page.route('**/api/notices', route => route.fulfill({ json: { enabled: true, notices: [notice] } }))
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    const rail = page.getByRole('complementary', { name: 'Notifications' })
+    const notification = rail.locator('.nr-card').filter({ hasText: notice.title })
+    const noticeWork = notification.getByRole('region', { name: 'Verified work impact' })
+    await page.locator('#notification-bell').click()
+    await notification.locator('.nr-card-head').click()
+    await expect(noticeWork).toContainText('Current impact: retrying')
+    await expect(noticeWork).toContainText('Next retry:')
+    await expect(noticeWork.locator('time').first()).toHaveAttribute('datetime', new Date(at + 1000).toISOString())
+    await rail.getByRole('button', { name: 'Close notifications' }).click()
     await exactFilter(page, 'component', impactComponent)
     await expect(rows(page)).toHaveCount(2)
     await expect(rows(page).first().locator('.logging-number')).toHaveText('2')
@@ -152,11 +170,25 @@ test('incident details verify one target across duplicate errors, recovery, an i
     await expect(work.locator('dd').filter({ hasText: /^blocked$/ })).toHaveCount(1)
     await expect(work).toContainText('Recovered; verified progress followed this invocation failure')
     await expect(work).toContainText('independent publication hold')
+    await page.locator('#notification-bell').click()
+    await expect(noticeWork).toContainText('Current impact: blocked')
+    await expect(noticeWork).toContainText(fixture.chain.repository + '#107')
+    await expect(noticeWork).toContainText('independent publication hold')
+    await expect(noticeWork.locator('time').first()).toHaveAttribute('datetime', new Date(at + 4000).toISOString())
+    await expect(notification.locator('.nr-card-side time')).toHaveAttribute('datetime', notice.since)
+    const actualNotices = await (await page.request.get('/api/notices')).json() as { notices: Notice[] }
+    expect(actualNotices.notices.some(row => row.subject?.target.startsWith(fixture.chain.repository + '#'))).toBe(false)
+    await rail.getByRole('button', { name: 'Close notifications' }).click()
     // Service Logging remains a separate central read when the workspace fails.
     await page.route('**/api/behavior-chains?*', route => route.fulfill({ status: 503, json: { error: 'journal unavailable' } }))
     await action(page, 'refresh').click()
     await expect(work).toContainText('Current impact: unknown')
     await expect(work).toContainText('Workspace chain evidence is unavailable')
+    await page.locator('#notification-bell').click()
+    await expect(noticeWork).toContainText('Current impact: unknown')
+    await expect(noticeWork).toContainText('Workspace chain evidence is unavailable')
+    await expect(notification.locator('.nr-card-side time')).toHaveAttribute('datetime', notice.since)
+    await rail.getByRole('button', { name: 'Close notifications' }).click()
     await expect(rows(page)).toHaveCount(2)
     await expect(rows(page).first().locator('.agent-status')).toHaveText('Error')
     await expect(rows(page).first().locator('.logging-number')).toHaveText('2')

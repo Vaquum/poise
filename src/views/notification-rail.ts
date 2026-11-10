@@ -1,6 +1,6 @@
 import { LOCAL_NOTICE_KINDS } from '../notices'
-import { evidenceReferences } from '../../gateway/src/diagnostics/evidence-contract'
-import { loggingHref } from '../logging'
+import { evidenceReferences, type EvidenceAttachment } from '../../gateway/src/diagnostics/evidence-contract'
+import { loggingAccess, loggingEvent, loggingHref, loggingWorkImpact, type LoggingWorkImpact } from '../logging'
 import { cancelMotion, disclosure, layout, retire, scrollToActor, spring, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
 import { BEHAVIORS, getBehaviorDiagnostics, refreshState } from '../behaviors'
@@ -139,15 +139,26 @@ function slug(id: string): string {
 
 const icon = (name: ItemIcon) => `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">${ICONS[name]}</svg>`
 
+type WorkImpactRead = { value: LoggingWorkImpact | null, message: string }
+
+function workImpactHtml(entry: EvidenceAttachment, impacts: ReadonlyMap<string, WorkImpactRead>, now: number): string {
+  const ref = evidenceReferences(entry)[0]
+  const state = ref ? impacts.get(ref.eventId) : null
+  const work = state?.value
+  return `<span class="nr-work-impact" role="region" aria-label="Verified work impact">${work
+    ? `Current impact: ${escapeHtml(work.impact)}. Work target: ${escapeHtml(work.target)}. Work stage: ${escapeHtml(work.stage)}. Last verified progress: <time datetime="${new Date(work.progressAt).toISOString()}">${clock(new Date(work.progressAt).toISOString(), now)}</time>. ${work.retryAt === null ? '' : `Next retry: <time datetime="${new Date(work.retryAt).toISOString()}">${clock(new Date(work.retryAt).toISOString(), now)}</time>. `}${work.nextAction ? `Next action: ${escapeHtml(work.nextAction)}. ` : ''}${work.recovered ? 'Matched failure recovered; verified progress followed this invocation failure. ' : ''}<a class="nr-link" href="${escapeHtml(work.journal)}" target="_blank" rel="noopener noreferrer">Journal evidence</a>`
+    : `Current impact: unknown. ${escapeHtml(state?.message ?? (ref ? 'Reading workspace chain evidence…' : 'No exact managed-work association is available.'))}`}</span>`
+}
+
 /** One entry as the rail lays it out; `opened` says whether it is expanded. */
-export function itemHtml(item: NotificationItem, opened: boolean, now: number): string {
+export function itemHtml(item: NotificationItem, opened: boolean, now: number, impacts: ReadonlyMap<string, WorkImpactRead> = new Map()): string {
   const id = `nr-details-${slug(item.id)}`
   // A Poise-wide condition's scope can repeat its source: "Behaviors · Behaviors".
   const meta = [item.source, item.scope === item.source ? null : item.scope, item.meta].filter(Boolean).map((part) => escapeHtml(part!)).join(' · ')
   const when = item.when && Number.isFinite(Date.parse(item.when)) ? `<time datetime="${escapeHtml(item.when)}">${ago(item.when, now)}</time>` : ''
   const linked = new Set<string>()
   const history = item.details.length
-    ? `<ol class="nr-history">${item.details.map((entry) => `<li>${entry.at && Number.isFinite(Date.parse(entry.at)) ? `<time datetime="${escapeHtml(entry.at)}">${clock(entry.at, now)}</time>` : ''}<span>${escapeHtml(entry.detail)}${nextCheck(entry, now)}${entryLink(entry, linked)}</span></li>`).join('')}</ol>`
+    ? `<ol class="nr-history">${item.details.map((entry) => `<li>${entry.at && Number.isFinite(Date.parse(entry.at)) ? `<time datetime="${escapeHtml(entry.at)}">${clock(entry.at, now)}</time>` : ''}<span>${escapeHtml(entry.detail)}${nextCheck(entry, now)}${entryLink(entry, linked)}${entry.behavior && entry.target ? workImpactHtml(entry, impacts, now) : ''}</span></li>`).join('')}</ol>`
     : ''
   const notice = item.notice
   const label = notice?.target ? openLabel(notice.target) : null
@@ -167,7 +178,7 @@ export function itemHtml(item: NotificationItem, opened: boolean, now: number): 
     + `<span class="nr-chip">${icon(item.icon)}</span>`
     + `<span class="nr-card-text"><span class="nr-card-title">${escapeHtml(item.title)}</span>${item.body ? `<span class="nr-card-body">${escapeHtml(item.body)}</span>` : ''}<span class="nr-card-meta">${meta}</span></span>`
     + `<span class="nr-card-side">${when}<span class="nr-chev">${ICON_DOWN}</span></span></button>`
-    + `<div class="nr-details" id="${id}"${opened ? '' : ' hidden'}>${history}${evidenceNote ? `<p class="nr-evidence-note">${escapeHtml(evidenceNote)}</p>` : ''}${actions ? `<div class="nr-actions">${actions}</div>` : ''}</div>`
+    + `<div class="nr-details" id="${id}"${opened ? '' : ' hidden'}>${history}${notice?.subject && !item.details.length ? workImpactHtml(notice, impacts, now) : ''}${evidenceNote ? `<p class="nr-evidence-note">${escapeHtml(evidenceNote)}</p>` : ''}${actions ? `<div class="nr-actions">${actions}</div>` : ''}</div>`
     + '</article>'
 }
 
@@ -235,6 +246,8 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   // are counted by the bell; only later ones arrive as cards.
   let primed = false
   const expanded = new Set<string>()
+  const impacts = new Map<string, WorkImpactRead>()
+  let impactRequest: AbortController | null = null
   const announced = new Set<string>()
   const toastTimers = new Map<HTMLElement, number>()
 
@@ -274,7 +287,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
 
   function groupHtml(group: typeof GROUPS[number], list: readonly NotificationItem[], now: number): string {
     const label = `<span class="nr-group-name">${group.label}</span><span class="nr-group-count">${list.length}</span><span class="nr-group-note">${group.note}</span>`
-    const cards = list.map((item) => itemHtml(item, expanded.has(item.id), now)).join('')
+    const cards = list.map((item) => itemHtml(item, expanded.has(item.id), now, impacts)).join('')
     // Automatic recovery stays folded behind its count while anything else is listed.
     const folds = group.key === 'auto' && filter === 'all' && scoped().some((item) => item.group !== 'auto')
     if (!folds) return `<section class="nr-group" data-key="group-${group.key}" data-group="${group.key}" aria-label="${group.label}"><h3 class="nr-group-label">${label}</h3>${cards}</section>`
@@ -303,6 +316,44 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
       for (const card of [...body.querySelectorAll<HTMLElement>('.nr-card')]) if (!staying.has(card.dataset.id!)) retire(card)
       patchContent(body, sections || emptyHtml(), retire)
     }, '.nr-card, .nr-group-label, .nr-empty')
+    void readWorkImpacts()
+  }
+
+  async function readWorkImpacts(): Promise<void> {
+    if (!opened || impactRequest) return
+    // Never borrow the grouped item's first evidence link for another entry.
+    const refs = [...new Map(items.filter(item => expanded.has(item.id)).flatMap<EvidenceAttachment>(item =>
+      item.details.length ? item.details.filter(entry => entry.behavior && entry.target) : item.notice?.subject ? [item.notice] : [])
+      .flatMap(entry => evidenceReferences(entry).slice(0, 1)).map(ref => [ref.eventId, ref])).values()]
+      .filter(ref => !impacts.has(ref.eventId)).slice(0, 20)
+    if (!refs.length) return
+    const request = new AbortController()
+    impactRequest = request
+    for (const ref of refs) impacts.set(ref.eventId, { value: null, message: 'Reading workspace chain evidence…' })
+    try {
+      const access = await loggingAccess(request.signal)
+      // The existing Logging worker admits two reads per owner; keep these sequential.
+      for (const ref of refs) {
+        if (request.signal.aborted) return
+        try {
+          const { event } = await loggingEvent(access, ref.eventId, 'workspace', request.signal)
+          const value = await loggingWorkImpact(access, event, request.signal)
+          if (!request.signal.aborted) impacts.set(ref.eventId, { value, message: 'No unambiguous managed chain invocation matches this evidence.' })
+        } catch {
+          if (!request.signal.aborted) impacts.set(ref.eventId, { value: null, message: 'Workspace chain evidence is unavailable.' })
+        }
+      }
+    } catch {
+      if (!request.signal.aborted) for (const ref of refs) impacts.set(ref.eventId, { value: null, message: 'Workspace chain evidence is unavailable.' })
+    } finally {
+      if (impactRequest === request) { impactRequest = null; if (opened) renderRail() }
+    }
+  }
+
+  function clearWorkImpacts(): void {
+    impactRequest?.abort()
+    impactRequest = null
+    impacts.clear()
   }
 
   function emptyHtml(): string {
@@ -311,6 +362,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   }
 
   function recompute(): void {
+    clearWorkImpacts()
     const visible = notices.filter((notice) => (enabled || LOCAL_NOTICE_KINDS.some(kind => kind === notice.kind)) && (!notice.target || !actions.inView?.(notice.target)))
     items = notificationItems(visible, getBehaviorDiagnostics(), Date.now())
     for (const id of [...expanded]) if (!items.some((item) => item.id === id)) expanded.delete(id)
@@ -346,6 +398,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   function setOpen(next: boolean, focus: 'rail' | 'bell' | null = null): void {
     if (opened !== next) {
       opened = next
+      if (!next) clearWorkImpacts()
       // watchPanel sets this too, but only once its observer runs: the rail
       // must take focus now.
       rail.inert = !next
@@ -377,6 +430,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     card.classList.toggle('is-open', open)
     card.querySelector<HTMLElement>('.nr-card-head')!.setAttribute('aria-expanded', String(open))
     disclosure(details, open)
+    if (open) void readWorkImpacts()
   }
 
   function act(action: string, id: string, toast: HTMLElement | null): void {

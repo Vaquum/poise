@@ -2,6 +2,7 @@ import type { BehaviorLaunchClaim } from '../server/db'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DiagnosticStore } from '../gateway/src/diagnostics/store'
 import { normalize } from '../gateway/src/diagnostics/contract'
@@ -14,6 +15,10 @@ import { NOTIFICATION_PLACEMENT } from '../src/notification-placement'
 import { DIAGNOSTIC_PLACEMENT, diagnosticClassification, DIAGNOSTIC_SCOPES } from '../src/behavior-failure-cause'
 import { NOTICE_KINDS, noticesFrom } from '../src/notices'
 import type { BehaviorDiagnostics } from '../src/behaviors'
+import { itemHtml } from '../src/views/notification-rail'
+import { BehaviorChainJournal } from '../server/behavior-chain-store'
+import { behaviorChainWorkImpact } from '../server/behavior-chain-summary'
+import { loggingWorkFixture } from './fixtures/logging-work-impact'
 
 const access = { workspace: 'alice', operator: false }
 const cause = 'error: exact preparation failure'
@@ -99,6 +104,7 @@ describe('retained exact-key association', () => {
   })
   it('preserves exact per-attempt references before deduplicating presentation', () => {
     const db = new DiagnosticStore(':memory:')
+    const chains = new Database(':memory:')
     try {
       const events = [caller('a'.repeat(32)), caller('b'.repeat(32))]
       db.append(events)
@@ -113,7 +119,20 @@ describe('retained exact-key association', () => {
       expect(evidenceReferences(item).map((ref) => ref.eventId)).toEqual(events.map((event) => event.id))
       state.deadLetters.push(state.deadLetters[0])
       expect(behaviorDiagnosticGroups(state)[0].entries).toHaveLength(2)
-    } finally { db.close() }
+      state.deadLetters.push({ id: 'unmatched', behavior: 'review-new-prs', target: 'acme/repo#9', error: cause,
+        createdAt: '2026-10-19T00:00:00Z', callId: 'c'.repeat(32) })
+      const journal = new BehaviorChainJournal(chains)
+      const fixture = loggingWorkFixture(journal, 'acme/repo', 9, correlationId, events[0].callId!, Date.now() - 10_000)
+      fixture.append({ type: 'chain.held', reason: 'verified hold' }, Date.now())
+      const work = behaviorChainWorkImpact(journal, events[0].callId, correlationId)!
+      const grouped = notificationItems([], state, Date.now())[0]
+      expect(grouped.details).toHaveLength(3)
+      const html = itemHtml(grouped, true, Date.now(), new Map([[events[0].id, { value: work, message: '' }]]))
+      expect(html.match(/Current impact: blocked/g)).toHaveLength(1)
+      expect(html.match(/Current impact: unknown/g)).toHaveLength(2)
+      expect(html).toContain(`Work target: ${work.target}`)
+      expect(html).toContain('No exact managed-work association is available.')
+    } finally { db.close(); chains.close() }
   })
 })
 

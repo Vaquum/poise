@@ -85,6 +85,13 @@ which also decides its group. Each Behaviors row shows that behavior's counts:
 Poise faults, needs you and automatic. A count opens the rail on that behavior
 with its first entry in that group expanded.
 
+Existing managed-work entries also show [verified work impact](Logging.md#native-logging-view)
+from each entry's own retained evidence: current impact, work target and stage,
+last verified progress, and the next known retry or action. An unmatched entry
+stays unknown even when a grouped sibling matches. These optional reads preserve
+the original notification time, actions and grouping. They create no notifications;
+a native hold without an existing notification remains absent.
+
 ## GitHub API quota
 
 A background monitor reads the configured user and automation accounts every
