@@ -46,6 +46,12 @@ export interface Settings {
 export interface BehaviorChainSettings { enabled: boolean, seedMode: 'label' | 'all', label: string }
 export const DEFAULT_BEHAVIOR_CHAIN_SETTINGS: BehaviorChainSettings = { enabled: false, seedMode: 'label', label: 'poise' }
 
+/** Persisted while a confirmed Caller receipt integrity failure fences admissions.
+ *  Set on integrity even when admissions are already disabled (for example during
+ *  a pending v2 cutover), so the automatic cutover commit cannot re-enable them.
+ *  Cleared only by an explicit Settings save that enables chain invocations. */
+export const BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY = 'behavior_chain_integrity_hold'
+
 function validateBehaviorChainSettings(value: unknown): BehaviorChainSettings {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('behavior chain settings must be an object')
   const input = value as Record<string, unknown>
@@ -55,11 +61,23 @@ function validateBehaviorChainSettings(value: unknown): BehaviorChainSettings {
   return { enabled: input.enabled, seedMode: input.seedMode as BehaviorChainSettings['seedMode'], label: input.label.trim() }
 }
 
+export function isBehaviorChainIntegrityHeld(): boolean {
+  return getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY) === '1'
+}
+
 export function getBehaviorChainSettings(): BehaviorChainSettings {
   const raw = getMeta('behavior_chain_settings')
-  if (raw === undefined || raw === null || raw === '') return { ...DEFAULT_BEHAVIOR_CHAIN_SETTINGS }
+  if (raw === undefined || raw === null || raw === '') {
+    // A hold with no saved setting still fences admissions until resume.
+    return { ...DEFAULT_BEHAVIOR_CHAIN_SETTINGS, enabled: false }
+  }
   // Corrupt authority cannot silently select broader intake or enable execution.
-  return validateBehaviorChainSettings(JSON.parse(raw))
+  const parsed = validateBehaviorChainSettings(JSON.parse(raw))
+  // A confirmed integrity hold fences admissions even when the stored setting
+  // still reads enabled (for example a stop between the hold write and the
+  // settings update). Only an explicit Settings save that enables clears it.
+  if (isBehaviorChainIntegrityHeld()) return { ...parsed, enabled: false }
+  return parsed
 }
 
 // Chat v1 (server/chat): the prefix of branches new sessions cut from the
@@ -383,6 +401,8 @@ const saveSettings = db.transaction((partial: Partial<Settings>, catalog: Catalo
   if (chat) setMeta('chat_settings', JSON.stringify(chat))
   if (notifications) setMeta('notification_settings', JSON.stringify(notifications))
   if (behaviorChain) setMeta('behavior_chain_settings', JSON.stringify(behaviorChain))
+  // An explicit save that enables invocations is the person's recovery resume.
+  if (behaviorChain?.enabled) setMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY, '')
   setMeta('manager_settings', JSON.stringify(manager))
   return { settings: getSettings(), orgChanged }
 })

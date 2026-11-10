@@ -14,7 +14,8 @@ const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn() }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/interface' }))
 vi.mock('../server/settings', () => ({ getSettings: () => ({ me: 'author', agentAccount: 'reviewer' }),
-  getBehaviorChainSettings: () => ({ enabled: true, seedMode: 'all', label: 'poise' }) }))
+  getBehaviorChainSettings: () => ({ enabled: true, seedMode: 'all', label: 'poise' }),
+  BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY: 'behavior_chain_integrity_hold' }))
 vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ login: 'example' }), organizationArgs: vi.fn() }))
 const { nativeChainOperations } = await import('../server/behavior-chain-native')
 const { decideBehaviorChain } = await import('../server/behavior-chain-decision')
