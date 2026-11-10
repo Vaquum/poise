@@ -155,16 +155,18 @@ export function expandedImpactRefs(items: readonly NotificationItem[], expanded:
 }
 
 /** Batch order with a rotating due window: never-tried refs first, then
- *  failures and TTL-expired resolutions from a cursor that advances past
- *  every taken ref, so no entry waits behind the cap indefinitely while any
- *  batch runs. Returns the refs and the advanced cursor. */
+ *  TTL-due revalidations (failures and expired resolutions alike) from a
+ *  cursor that advances past every taken ref, so no entry waits behind the
+ *  cap indefinitely while any batch runs. Failures back off on the same
+ *  cadence instead of retrying immediately ahead of expired resolutions.
+ *  Returns the refs and the advanced cursor. */
 export function pendingImpactRefs(current: Map<string, DiagnosticEvidence>, impacts: ReadonlyMap<string, WorkImpactRead>, now: number, cursor = 0): { refs: DiagnosticEvidence[], cursor: number } {
   const fresh: DiagnosticEvidence[] = []
   const due: DiagnosticEvidence[] = []
   for (const ref of current.values()) {
     const known = impacts.get(ref.eventId)
     if (!known) fresh.push(ref)
-    else if (known.value === null || now - known.at >= IMPACT_TTL_MS) due.push(ref)
+    else if (now - known.at >= IMPACT_TTL_MS) due.push(ref)
   }
   const start = due.length ? cursor % due.length : 0
   const rotated = [...due.slice(start), ...due.slice(0, start)]
@@ -415,9 +417,11 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     }
   }
 
-  // An aborted batch resumes from its unresolved refs on the next render:
-  // resolved reads stay (the feed republishes every 10s), stale entries are
-  // pruned when refs are collected, and placeholders retry.
+  // Only closing aborts a batch: the feed republishes unchanged results
+  // every 10 seconds, so aborting there would restart a sequential batch
+  // from its first reference and starve later entries. An in-flight batch
+  // runs to completion across republishes; the next render picks up the
+  // remaining refs.
   function abortWorkImpacts(): void {
     impactRequest?.abort()
     impactRequest = null
@@ -429,7 +433,6 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   }
 
   function recompute(): void {
-    abortWorkImpacts()
     const visible = notices.filter((notice) => (enabled || LOCAL_NOTICE_KINDS.some(kind => kind === notice.kind)) && (!notice.target || !actions.inView?.(notice.target)))
     items = notificationItems(visible, getBehaviorDiagnostics(), Date.now())
     for (const id of [...expanded]) if (!items.some((item) => item.id === id)) expanded.delete(id)
@@ -466,8 +469,8 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     if (opened !== next) {
       opened = next
       // A fresh display on every open: chain state may have moved while the
-      // rail was closed. Republish aborts (not opens) keep their cache.
-      if (next) impacts.clear()
+      // rail was closed. Republishes keep their cache; only opens reset it.
+      if (next) { impacts.clear(); dueCursor = 0 }
       else abortWorkImpacts()
       // watchPanel sets this too, but only once its observer runs: the rail
       // must take focus now.
