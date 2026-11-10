@@ -818,24 +818,36 @@ def _log_row(r) -> dict:
     }
 
 
+_UNREADABLE_LOG_TEXT = object()
+
+
+def _decode_history_text(value: bytes) -> object:
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return _UNREADABLE_LOG_TEXT
+
+
 def logs(status: str | None = None):
     """Every retained call, oldest first; with status, only the running ones.
 
     The running-only read is indexed on (status, started_at), so retained
-    history does not raise its cost. Use logs_page for bounded history."""
+    history does not raise its cost. Full history quarantines unreadable rows.
+    Use logs_page for bounded history."""
     if status is not None and status != "running":
         raise ValueError("logs status filter must be running")
     reap_interrupted()
-    columns = f"rowid, {LOG_ROW_COLUMNS}" if status else LOG_ROW_COLUMNS
     with db() as conn:
+        if status is None:
+            conn.text_factory = _decode_history_text
         rows = conn.execute(
-            f"select {columns} from calls"
+            f"select rowid, {LOG_ROW_COLUMNS} from calls"
             + (" where status='running'" if status else "")
             + " order by started_at"
         ).fetchall()
     if status:
         return [{**_log_row(row), "history_rowid": str(row["rowid"])} for row in rows]
-    return [_log_row(row) for row in rows]
+    return [_full_history_log_row(row) for row in rows]
 
 
 LOGS_PAGE_LIMIT_MAX = 1000
@@ -945,6 +957,20 @@ def _history_log_row(row: sqlite3.Row) -> dict:
     except (TypeError, ValueError, OverflowError, OSError):
         identity = {key: row[key] for key in ("id", "repo") if isinstance(row[key], str)}
         return {**identity, "history_read_error": "INVALID_RECORD"}
+
+
+def _full_history_log_row(row: sqlite3.Row) -> dict:
+    entry = ({"history_read_error": "INVALID_UTF8"}
+             if any(value is _UNREADABLE_LOG_TEXT for value in row) else _history_log_row(row))
+    if "history_read_error" not in entry:
+        return entry
+    # Match uncertain evidence to its own work without treating it as a receipt.
+    identity = {
+        key: row[key]
+        for key in ("id", "repo", "pr_id", "behavior", "correlation_id", "session_id", "source")
+        if isinstance(row[key], str)
+    }
+    return {**entry, **identity, "history_rowid": str(row["rowid"])}
 
 
 def _resource_recovery_logs(correlations: list[str]) -> list[dict]:

@@ -183,6 +183,28 @@ class LogsIncrementalCase(TestCase):
         missing = self.cli("--logs", "--id", "f" * 32)
         self.assertEqual((missing.returncode, json.loads(missing.stdout)), (0, []), missing.stderr)
 
+    def test_full_history_isolates_unreadable_rows_and_retains_their_identity(self):
+        self.seed(4)
+        with agent_interface.db() as conn:
+            conn.execute(
+                "update calls set repo='acme/project', pr_id='12', behavior='pr_review', "
+                "correlation_id='historical-review', progress=cast(x'ff' as text) where rowid=2"
+            )
+            conn.execute("update calls set artifact='{' where rowid=3")
+
+        result = self.cli("--logs")
+        self.assertEqual((result.returncode, result.stderr), (0, ""), result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual([row["id"] for row in rows], [f"{number:032x}" for number in range(4)])
+        self.assertEqual([rows[0]["prompt"], rows[3]["prompt"]], ["prompt 0", "prompt 3"])
+        self.assertEqual(rows[1], {
+            "id": f"{1:032x}", "repo": "acme/project", "pr_id": "12", "behavior": "pr_review",
+            "correlation_id": "historical-review", "history_read_error": "INVALID_UTF8", "history_rowid": "2",
+        })
+        self.assertEqual(rows[2], {
+            "id": f"{2:032x}", "history_read_error": "INVALID_RECORD", "history_rowid": "3",
+        })
+
     def test_exact_history_isolates_an_unreadable_running_row(self):
         self.seed(2, running=1)
         target = f"{1:032x}"
