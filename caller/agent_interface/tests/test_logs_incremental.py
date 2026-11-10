@@ -144,6 +144,27 @@ class LogsIncrementalCase(TestCase):
         self.assertEqual([r["prompt"] for r in second["rows"]], ["prompt 0", "prompt 1"])
         self.assertIsNone(second["nextCursor"])
 
+    def test_page_quarantines_unreadable_records_and_keeps_its_cursor(self):
+        self.seed(7)
+        with agent_interface.db() as conn:
+            conn.execute("update calls set repo='acme/project' where rowid != 4")
+            conn.execute("update calls set repo='beta/project' where rowid = 4")
+            conn.execute("update calls set progress=cast(x'ff' as text) where rowid=6")
+            conn.execute("update calls set artifact='{' where rowid=5")
+        first = agent_interface.logs_page(4, org="acme")
+        self.assertEqual(first["total"], 6)
+        self.assertEqual(first["nextCursor"], "3")
+        self.assertEqual([row.get("id") for row in first["rows"]], [
+            f"{2:032x}", f"{4:032x}", None, f"{6:032x}",
+        ])
+        self.assertEqual([row.get("history_read_error") for row in first["rows"]], [
+            None, "INVALID_RECORD", "INVALID_UTF8", None,
+        ])
+        second = agent_interface.logs_page(4, first["nextCursor"], org="acme")
+        self.assertEqual([row["id"] for row in second["rows"]], [f"{0:032x}", f"{1:032x}"])
+        self.assertIsNone(second["nextCursor"])
+        self.assertEqual(agent_interface.logs_page(4, org="beta")["rows"][0]["id"], f"{3:032x}")
+
     def test_paged_cli_returns_an_envelope(self):
         self.seed(3)
         done = self.cli("--logs", "--limit", "2")

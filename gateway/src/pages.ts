@@ -161,13 +161,14 @@ export function signInPage(domain: string): string {
 </div>`, { footer: domain })
 }
 
-export function homePage(input: { user: User; workspaceHref: string; workspaceHost: string; csrf: string }): string {
+export function homePage(input: { user: User; workspaceHref: string; workspaceHost: string; csrf: string; mcpEnabled?: boolean }): string {
   return page('Poise', html`<div class="card">
 <div class="label">Your workspace</div>
 <h1>Signed in as ${input.user.login}</h1>
 <p>Your workspace lives at <code>${input.workspaceHost}</code>. Devices, sign-ins and everything else are in its Settings.</p>
 <div class="actions">
 <a class="button" href="${input.workspaceHref}">Open your workspace</a>
+${input.mcpEnabled ? html`<a href="/mcp/grants">Connected agents</a>` : ''}
 ${signOutForm('/auth/logout', input.csrf)}
 </div>
 </div>`)

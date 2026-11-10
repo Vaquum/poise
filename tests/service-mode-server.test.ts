@@ -69,7 +69,7 @@ else process.stdout.write('[]')
 
   // Caller's CLIs run from CALLER_BIN_ROOT: here, the stand-in above. The
   // agent CLIs' fakes come first on PATH.
-  for (const [key, value] of Object.entries({ ...serviceEnvironment(gateway), HOME: home, CALLER_BIN_ROOT: bin, AGENT_INTERFACE_ROOT: join(root, 'agent'), PATH: `${bin}${delimiter}${process.env.PATH}` })) {
+  for (const [key, value] of Object.entries({ ...serviceEnvironment(gateway), POISE_WORKSPACE_OWNER_ID: '1001', HOME: home, CALLER_BIN_ROOT: bin, AGENT_INTERFACE_ROOT: join(root, 'agent'), PATH: `${bin}${delimiter}${process.env.PATH}` })) {
     vi.stubEnv(key, value)
   }
   // Nothing in this file may reach a real CLI, least of all a real login: the
@@ -240,6 +240,20 @@ async function callerCalls(): Promise<Array<{ args: string[], dataDir: string | 
 }
 
 describe('Poise in service mode', () => {
+  it('serves only workspace identity and capabilities through the dedicated MCP assertion', async () => {
+    const mcp = { resource: 'https://poise.example.test/mcp', ownerId: 1001, handle: 'octocat', grantId: '12345678-1234-1234-1234-123456789abc' }
+    const read = { name: 'poise_describe', arguments: {} }
+    const description = await send('POST', '/api/mcp/read', fromGateway('mcp', { mcp }), read)
+    expect(description.status).toBe(200)
+    expect(description.json).toEqual({ workspace: 'octocat', owner: OWNER, capabilities: { tools: ['poise_describe'] } })
+    for (const scope of ['browser', 'link', 'admin']) {
+      expect((await send('POST', '/api/mcp/read', fromGateway(scope), read)).status).toBe(403)
+    }
+    expect((await send('POST', '/api/mcp/read', { host: PUBLIC_HOST }, read)).status).toBe(401)
+    expect((await send('GET', '/api/settings', fromGateway('mcp', { mcp }))).status).toBe(403)
+    expect((await send('POST', '/api/mcp/read', fromGateway('mcp', { mcp }), { name: 'poise_work' })).status).toBe(400)
+  })
+
   it('keeps its state in the home volume and passes Caller its data directory there', async () => {
     expect(existsSync(join(home, '.poise', 'cache.db'))).toBe(true)
     expect((await import('../server/chat/local-workspace')).LOCAL_CHAT_ROOT).toBe(join(home, '.poise', 'chat'))

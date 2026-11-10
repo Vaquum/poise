@@ -27,6 +27,15 @@ describe('service-mode configuration', () => {
     expect(config.gatewayKey.asymmetricKeyType).toBe('ed25519')
   })
 
+  it('validates the immutable owner binding while retaining older containers without MCP access', () => {
+    const env = serviceEnvironment(keys)
+    expect(readServiceConfig(env)?.ownerId).toBeUndefined()
+    expect(readServiceConfig({ ...env, POISE_WORKSPACE_OWNER_ID: '1001' })?.ownerId).toBe(1001)
+    for (const id of ['0', '-1', 'owner', '9007199254740992']) {
+      expect(() => readServiceConfig({ ...env, POISE_WORKSPACE_OWNER_ID: id })).toThrow('POISE_WORKSPACE_OWNER_ID')
+    }
+  })
+
   it('names every missing variable at once', () => {
     let message = ''
     try { readServiceConfig({ POISE_MODE: 'service' }) } catch (error) { message = (error as Error).message }
