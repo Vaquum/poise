@@ -5,11 +5,13 @@ import { resourceReleaseProven } from './behavior-resource-receipt'
 import { handleGhBody, reconcileRepairReport } from './gh'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
+import type { ProcessDiagnostic } from './process-diagnostic'
 import { getBehaviorChainSettings, getSettings } from './settings'
 
 export const REMEDIATION_SCOPE = `Minimal, clinical interventions all the way. Get in, get out, do the thing that actually has to be done, never expand it beyond that. Keep asking "is this truly the cleanest and simplest and least intrusive way to get this done" and do it that way and only that way. Don't let others come expand it, let them come make it cleaner.`
 
-const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted'] as const
+const MERGE_CAUSE = 'merge_submission_uncertain'
+const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', MERGE_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
 const INCOMPLETE_REPLIES = /^repair did not answer every unresolved review finding(?:: missing_root_comment_ids=\[[0-9, ]*\]; missing_count=[1-9][0-9]*; required_count=[1-9][0-9]*)?$/
 const REPORT_MARKER = /<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/
@@ -18,8 +20,8 @@ interface RepairReport {
   key: string
   source: string
   pull: number
-  holdSequence: number
-  heldAt: number
+  holdSequence: number | null
+  heldAt: number | null
   head: string
   basis: string
   slot: string | null
@@ -106,24 +108,48 @@ function qualifyingAttempts(chain: BehaviorChain, observation: ChainObservation,
   return cause ? { decision, attempts, cause } : null
 }
 
+function qualifyingMergeSubmission(chain: BehaviorChain, observation: ChainObservation, now: number) {
+  const invocation = chain.invocations.find(invocation => invocation.state !== 'settled')
+  const evidence = invocation?.evidence
+  const argv = invocation?.request.argv ?? []
+  const call = invocation?.callId ?? evidence?.nativeCallId
+  const pull = observation.pull
+  if (!invocation || invocation.behavior !== 'merge-pr' || invocation.state !== 'uncertain'
+    || invocation.request.command !== 'github-interface' || argv[0] !== '--merge-if-ready'
+    || invocation.actor !== chain.reviewer || typeof call !== 'string' || !/^[a-f0-9]{32}$/.test(call)
+    || evidence?.status !== 'failed' || evidence.action === 'not_started' || evidence.nativeActionReceipt
+    || typeof evidence.completedAt !== 'number' || !Number.isFinite(evidence.completedAt) || evidence.completedAt > now
+    || !resourceReleaseProven(evidence, true) || chain.mergeSha || observation.issue.open !== true
+    || !Number.isFinite(observation.checkedAt) || observation.checkedAt > now || observation.checkedAt < evidence.completedAt
+    || observation.checkedAt < Date.parse(String(evidence.resources_settled_at))
+    || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS
+    || !pull || pull.state !== 'open' || pull.merged !== false || pull.mergeSha !== null || pull.queueEntry !== null
+    || pull.number !== Number(argv[1]?.replace(/^#/, '')) || argv.filter(arg => arg === '--expected-head').length !== 1
+    || !/^[a-f0-9]{40}$/i.test(pull.head) || pull.head !== argv[argv.indexOf('--expected-head') + 1]) return null
+  return { invocation, call }
+}
+
 /** Runs only on the existing reconciliation opportunity. The existing meta
  * store holds creation intent; neither its absence on GitHub nor a restart
  * can reopen that intent for another POST. Intake remains the normal reader. */
 export async function reportRepairExhaustion(db: Database, journal: BehaviorChainJournal, chain: BehaviorChain,
   verify: () => Promise<ChainObservation>, allowed: () => boolean): Promise<string | null> {
-  if (!enabled(chain.repository) || !allowed() || !chain.held) return null
+  const pendingMerge = chain.invocations.find(invocation => invocation.behavior === 'merge-pr' && invocation.state !== 'settled')
+  if (!enabled(chain.repository) || !allowed() || !chain.held && !pendingMerge) return null
   const observation = chain.observation as ChainObservation | null
   if (!observation?.pull) return null
   const qualifying = qualifyingAttempts(chain, observation, Date.now())
-  const intents = CAUSES.map(cause => {
-    const key = chainBasis([cause, chain.id, observation.pull!.number])
+  const merge = qualifyingMergeSubmission(chain, observation, Date.now())
+  const intents = CAUSES.filter(cause => cause !== MERGE_CAUSE || pendingMerge).map(cause => {
+    const key = chainBasis([cause, chain.id, cause === MERGE_CAUSE ? pendingMerge!.id : observation.pull!.number])
     const storageKey = PREFIX + key
     const stored = db.prepare('SELECT value FROM meta WHERE key = ?').get(storageKey) as { value: string } | undefined
     return { cause, key, storageKey, stored }
   })
-  const intent = intents.find(intent => intent.cause === qualifying?.cause) ?? intents.find(intent => intent.stored)
-  if (!intent) return 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
+  const intent = intents.find(intent => intent.cause === (merge ? MERGE_CAUSE : qualifying?.cause)) ?? intents.find(intent => intent.stored)
+  if (!intent) return pendingMerge ? null : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
   const { cause, key, storageKey, stored } = intent
+  const label = cause === MERGE_CAUSE ? 'Merge submission' : 'Repair exhaustion'
   let report: RepairReport | null = stored ? JSON.parse(stored.value) as RepairReport : null
   if (report && (report.key !== key || report.source !== chain.id || report.pull !== observation.pull.number
     || report.issueNumber !== null && (!Number.isSafeInteger(report.issueNumber) || report.issueNumber < 1))) {
@@ -134,63 +160,92 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   if (!report) {
     const accounts = getSettings()
     if (accounts.me.toLowerCase() !== chain.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) {
-      return 'Repair exhaustion reporting pending: configured accounts differ from the source chain'
+      return `${label} reporting pending: configured accounts differ from the source chain`
     }
-    if (qualifying?.cause !== cause) return 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
+    if (cause === MERGE_CAUSE ? !merge : qualifying?.cause !== cause) return cause === MERGE_CAUSE
+      ? `${label} reporting: source has no verified failure on the current basis`
+      : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
     if (db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
       AND json_extract(value, '$.issueNumber') = ? LIMIT 1`).get(PREFIX + '*', chain.repository.toLowerCase() + '#*', chain.issue)) {
-      return 'Repair exhaustion reporting suppressed for a generated remediation issue; its ordinary hold remains active'
+      return `${label} reporting suppressed for a generated remediation issue; its ordinary hold or uncertainty remains active`
     }
     // verify performs the existing datastore health check before re-reading
     // reviews. A fresh native head alone cannot validate local review rows.
     const fresh = await verify()
     const verified = qualifyingAttempts(chain, fresh, Date.now())
-    if (verified?.cause !== cause || fresh.pull?.head !== observation.pull.head || verified.decision.basis !== qualifying.decision.basis) {
-      return 'Repair exhaustion reporting pending: the current head or review basis no longer verifies the exhausted attempts'
+    const verifiedMerge = qualifyingMergeSubmission(chain, fresh, Date.now())
+    if (cause === MERGE_CAUSE ? (!verifiedMerge || fresh.pull?.head !== observation.pull.head)
+      : (verified?.cause !== cause || fresh.pull?.head !== observation.pull.head || verified!.decision.basis !== qualifying!.decision.basis)) {
+      return cause === MERGE_CAUSE
+        ? `${label} reporting pending: the current head or review basis no longer verifies the original failure`
+        : 'Repair exhaustion reporting pending: the current head or review basis no longer verifies the exhausted attempts'
     }
     const seed = await handleGhBody({ operation: 'read_issue', repository_full_name: chain.repository, issue_number: chain.issue })
-    const source = seed.body as { issue?: { body?: unknown }, error?: string }
+    const source = seed.body as { issue?: { body?: unknown, state?: string }, error?: string }
     if (seed.status !== 200 || typeof source.issue?.body !== 'string') throw new Error(source.error || 'Repair report source issue is unavailable')
-    if (REPORT_MARKER.test(source.issue.body)) return 'Repair exhaustion reporting suppressed for a generated remediation issue; its ordinary hold remains active'
+    if (cause === MERGE_CAUSE && source.issue.state !== 'open') return `${label} reporting pending: the source issue is no longer open`
+    if (REPORT_MARKER.test(source.issue.body)) return `${label} reporting suppressed for a generated remediation issue; its ordinary hold or uncertainty remains active`
     const existing = await reconcileRepairReport(chain.repository, marker, null)
     const current = journal.read(chain.id)
-    if (!current?.held || current.resumedAfterSequence !== chain.resumedAfterSequence || current.sequence !== chain.sequence
-      || qualifyingAttempts(chain, fresh, Date.now())?.cause !== cause) {
-      return 'Repair exhaustion reporting pending: source hold changed during verification'
+    if (!current || current.resumedAfterSequence !== chain.resumedAfterSequence || current.sequence !== chain.sequence
+      || (cause === MERGE_CAUSE ? qualifyingMergeSubmission(current, fresh, Date.now())?.invocation.id !== pendingMerge?.id
+        : !current.held || qualifyingAttempts(current, fresh, Date.now())?.cause !== cause)) {
+      return `${label} reporting pending: source changed during verification`
     }
     const verifiedAccounts = getSettings()
     if (verifiedAccounts.me.toLowerCase() !== chain.author.toLowerCase()
       || verifiedAccounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) {
-      return 'Repair exhaustion reporting pending: configured accounts differ from the source chain'
+      return `${label} reporting pending: configured accounts differ from the source chain`
     }
     const hold = db.prepare(`SELECT sequence, at FROM behavior_chain_events WHERE chain_id = ?
       AND json_extract(payload, '$.type') = 'chain.held' AND sequence > ? ORDER BY sequence DESC LIMIT 1`)
       .get(chain.id, chain.resumedAfterSequence) as { sequence: number, at: number } | undefined
-    if (!hold) throw new Error('Repair report has no durable active hold')
-    report = { key, source: chain.id, pull: observation.pull.number, holdSequence: hold.sequence, heldAt: hold.at,
-      head: fresh.pull!.head, basis: verified.decision.basis, slot: verified.decision.reviewer?.slot ?? null,
-      attempts: verified.attempts.map(invocation => ({ invocation: invocation.id, call: invocation.callId!, completedAt: Number(invocation.evidence!.completedAt) })),
+    if (!hold && cause !== MERGE_CAUSE) throw new Error('Repair report has no durable active hold')
+    report = { key, source: chain.id, pull: observation.pull.number, holdSequence: hold?.sequence ?? null, heldAt: hold?.at ?? null,
+      head: fresh.pull!.head, basis: verifiedMerge?.invocation.basis ?? verified!.decision.basis,
+      slot: verified?.decision.reviewer?.slot ?? null,
+      attempts: cause === MERGE_CAUSE ? [{ invocation: verifiedMerge!.invocation.id, call: verifiedMerge!.call,
+        completedAt: Number(verifiedMerge!.invocation.evidence!.completedAt) }]
+        : verified!.attempts.map(invocation => ({ invocation: invocation.id, call: invocation.callId!, completedAt: Number(invocation.evidence!.completedAt) })),
       issueNumber: existing?.number ?? null }
     // FULL durability precedes the external effect. A competing runtime or a
     // crash after this insert may reconcile, but may never create again.
     if (db.pragma('synchronous', { simple: true }) !== 2) db.pragma('synchronous = FULL')
     const claimed = db.prepare('INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING').run(storageKey, JSON.stringify(report))
-    if (!claimed.changes) return 'Repair exhaustion report pending: another reconciliation reserved this report'
+    if (!claimed.changes) return `${label} report pending: another reconciliation reserved this report`
     if (!existing) {
-      if (!allowed()) return 'Repair exhaustion report creation is unconfirmed; admissions are paused'
+      if (!allowed()) return `${label} report creation is unconfirmed; admissions are paused`
       const review = cause === 'review_budget_exhausted'
       const budget = cause === 'repair_execution_budget_exhausted'
-      const age = Math.max(0, Math.floor((Date.now() - hold.at) / 60_000))
-      const body = [marker, '', `Poise is holding https://github.com/${chain.repository}/pull/${report.pull}.`, '',
-        `Stage: ${verified.decision.behavior}. Cause: ${cause}. Held since ${new Date(hold.at).toISOString()} (${age} minutes at reporting).`,
-        `Source: ${chain.id}; hold event ${hold.sequence}; head ${report.head}; basis ${report.basis}; slot ${report.slot}.`, '',
+      const age = hold ? Math.max(0, Math.floor((Date.now() - hold.at) / 60_000)) : null
+      const evidence = verifiedMerge?.invocation.evidence
+      const diagnostic = evidence?.diagnostic as ProcessDiagnostic | undefined
+      const details = cause === MERGE_CAUSE ? [
+        `Poise cannot confirm the merge submission for https://github.com/${chain.repository}/pull/${report.pull}.`, '',
+        `Stage: merge-pr. Cause: ${cause}. Source issue: https://github.com/${chain.repository}/issues/${chain.issue}.`,
+        `Source: ${chain.id}; head ${report.head}; basis ${report.basis}.`,
+        `Terminal Caller receipt: status=${evidence!.status}; action=${evidence!.action ?? 'not recorded'}; outcome=${evidence!.outcome ?? 'not recorded'}. Resources were released; an accepted merge response is missing.`,
+        `Recorded cause: ${typeof evidence!.error_code === 'string' && /^[a-z0-9_]+$/.test(evidence!.error_code) ? evidence!.error_code : 'not recorded'}.`,
+        diagnostic ? `Process diagnostic: ${JSON.stringify({ operation: diagnostic.operation, phase: diagnostic.phase,
+          outcome: diagnostic.outcome, exit_code: diagnostic.context.exit_code, signal: diagnostic.context.signal,
+          errno: diagnostic.context.errno, refusal: diagnostic.context.refusal })}.`
+          : 'Process diagnostic: not recorded in this historical Call receipt; the underlying process cause is unavailable.',
+      ] : [
+        `Poise is holding https://github.com/${chain.repository}/pull/${report.pull}.`, '',
+        `Stage: ${verified!.decision.behavior}. Cause: ${cause}. Held since ${new Date(hold!.at).toISOString()} (${age} minutes at reporting).`,
+        `Source: ${chain.id}; hold event ${hold!.sequence}; head ${report.head}; basis ${report.basis}; slot ${report.slot}.`, '',
         `Verified receipts: three or more settled Caller ${review ? 'PR reviews' : 'repairs'} on this basis after the last Resume. Each failed before ${review ? 'review submission' : 'publication'} with ${review ? 'review_budget_exhausted, action=not_started, outcome=preflight_failed' : budget ? 'atomic_work_execution_budget_exhausted, action=not_started, outcome=preflight_failed' : 'atomic_work_failed, action=not_started, outcome=preflight_failed and the incomplete-reply validation cause'}; resources were released.`,
+      ]
+      const body = [marker, '', ...details,
         ...report.attempts.map(attempt => `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}.`), '',
-        `Next action: inspect the ${review ? 'PR review budget' : budget ? 'repair execution budget' : 'repair reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover ${review ? 'review' : 'repair'} or relax any review, admission or merge gate.`,
+        cause === MERGE_CAUSE
+          ? `Next action: inspect the original Call diagnostics and reconcile the PR and merge queue at the pinned head before deciding whether to repair or replace the candidate. The external effect remains unconfirmed. This report retains the original invocation's uncertainty and chain ownership; it never retries the merge or relaxes any review, resource, admission or merge gate.`
+          : `Next action: inspect the ${review ? 'PR review budget' : budget ? 'repair execution budget' : 'repair reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover ${review ? 'review' : 'repair'} or relax any review, admission or merge gate.`,
         '', REMEDIATION_SCOPE, '', 'Include this exact paragraph in the linked PR review.',
       ].join('\n')
       const result = await handleGhBody({ operation: 'open_issue', repository_full_name: chain.repository,
-        title: `fix: ${review ? 'PR review exhausted its budget' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
+        title: cause === MERGE_CAUSE ? `fix: uncertain merge submission for #${report.pull}`
+          : `fix: ${review ? 'PR review exhausted its budget' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
       const publication = result.body as { record?: { number?: unknown, url?: unknown }, error?: string }
       if (result.status !== 200 || !Number.isSafeInteger(publication.record?.number) || Number(publication.record?.number) < 1
         || publication.record?.url !== `https://github.com/${chain.repository}/issues/${publication.record?.number}`) {
@@ -201,9 +256,9 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     }
   }
   let issue = await reconcileRepairReport(chain.repository, marker, report.issueNumber)
-  if (!issue) return 'Repair exhaustion report creation is unconfirmed; no matching issue is visible yet. Reconcile the same marker; do not create a replacement'
+  if (!issue) return `${label} report creation is unconfirmed; no matching issue is visible yet. Reconcile the same marker; do not create a replacement`
   if (report.issueNumber === null) { report.issueNumber = issue.number; save() }
-  const link = `Repair exhaustion report ${issue.url}`
+  const link = `${label} report ${issue.url}`
   if (issue.state === 'closed') return `${link} is closed; no replacement will be created`
   if (!issue.labels.some(label => label.toLowerCase() === 'poise') && allowed()) {
     try { issue = (await reconcileRepairReport(chain.repository, marker, issue.number, true))! }
