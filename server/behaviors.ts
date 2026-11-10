@@ -2942,6 +2942,38 @@ async function currentHeadSha(
   return headSha
 }
 
+// SQLite substr and Python slices count Unicode code points while JS slice
+// counts UTF-16 units; Array.from keeps supplementary characters whole.
+function truncateCodePoints(value: string, limit: number): string {
+  if (value.length <= limit) return value
+  const chars = Array.from(value)
+  return chars.length > limit ? chars.slice(0, limit).join('') : value
+}
+
+// Length of Python json.dumps(entry, allow_nan=False).encode() without
+// running Python: JS separators gain one space each and non-ASCII becomes
+// ASCII escapes, the only systematic differences for finite JSON.
+function pythonJsonByteLength(value: unknown): number {
+  const js = JSON.stringify(value) ?? 'null'
+  let separators = 0
+  let extra = 0
+  let inString = false
+  let escaped = false
+  for (const char of js) {
+    if (inString) {
+      if (escaped) { escaped = false; continue }
+      if (char === '\\') { escaped = true; continue }
+      if (char === '"') { inString = false; continue }
+      const code = char.codePointAt(0)!
+      if (code > 127) extra += (code > 0xffff ? 12 : 6) - Buffer.byteLength(char)
+      continue
+    }
+    if (char === '"') { inString = true; continue }
+    if (char === ':' || char === ',') separators += 1
+  }
+  return Buffer.byteLength(js) + separators + extra
+}
+
 function settleClaimAfterExit(
   behavior: ActiveClaim['behavior'],
   target: string,
@@ -2993,10 +3025,36 @@ function settleClaimAfterExit(
           && call.expected_head === claim.launchExpectedHead
           && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
           && Date.parse(call.completed_at ?? '') >= Date.parse(agentCallStartedAt(call))) {
-          const row = objectValue(rows[0], 'worker exit Caller evidence')
-          // Match periodic --diagnostics truncation (substr(c.error, 1, 8192)) so delayed collection replays exactly.
-          const truncatedRow = typeof row.error === 'string' && row.error.length > 8192
-            ? { ...row, error: row.error.slice(0, 8192) } : row
+          const row = objectValue(rows[0], 'worker exit Caller evidence') as Record<string, unknown>
+          // Match periodic --diagnostics truncation and its 64 KiB envelope
+          // fallback so delayed collection replays exactly.
+          let error = typeof row.error === 'string' ? truncateCodePoints(row.error, 8192) : row.error
+          let entryDiagnostic: unknown = row.diagnostic
+          let evidence: unknown = row.evidence_unavailable
+          if (entryDiagnostic != null && pythonJsonByteLength(entryDiagnostic) > 65536) {
+            entryDiagnostic = null
+            evidence = 'Stored process diagnostic is malformed, unsupported, non-finite or exceeds bounded decoding limits'
+          }
+          let truncatedRow: Record<string, unknown> = { ...row, error, diagnostic: entryDiagnostic,
+            ...(evidence != null ? { evidence_unavailable: evidence } : {}) }
+          const fields = ['id', 'model', 'status', 'pr_id', 'repo', 'actor', 'behavior', 'outcome',
+            'head_sha', 'expected_head', 'source', 'correlation_id', 'action', 'error_code'] as const
+          const candidate: Record<string, unknown> = { seq: 0 }
+          for (const field of fields) {
+            const value = row[field]
+            candidate[field] = typeof value === 'string' ? truncateCodePoints(value, 512) : value
+          }
+          candidate.error = error
+          candidate.started_at_precise = row.started_at_precise
+          candidate.completed_at = row.completed_at
+          candidate.diagnostic = entryDiagnostic
+          if (evidence != null) candidate.evidence_unavailable = evidence
+          if (pythonJsonByteLength(candidate) > 64 * 1024) {
+            error = typeof error === 'string' ? truncateCodePoints(error, 2048) : error
+            entryDiagnostic = null
+            evidence = 'Stored process diagnostic exceeds the bounded metadata envelope'
+            truncatedRow = { ...row, error, diagnostic: null, evidence_unavailable: evidence }
+          }
           const input = row.evidence_unavailable == null ? callerDiagnostic(truncatedRow, loggingWorkspace()) : null
           if (input?.level === 'error' && diagnostic(input)) return
         }
