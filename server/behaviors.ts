@@ -1,4 +1,7 @@
 import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
+import { diagnostic, loggingWorkspace } from './logging'
+import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
+import { parseAgentLogList } from './agent-log-parse'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
 import { behaviorChainForPull, behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
@@ -2943,8 +2946,10 @@ function settleClaimAfterExit(
   behavior: ActiveClaim['behavior'],
   target: string,
   claimId: string,
-): (result: { code: number | null, signal: NodeJS.Signals | null, error?: Error }) => void {
-  return ({ code, signal, error }) => {
+): (result: { code: number | null, signal: NodeJS.Signals | null, error?: Error }) => Promise<void> {
+  const claim = behavior === 'review-new-prs'
+    ? listBehaviorLaunchClaims(behavior).find((row) => row.target === target && row.claimId === claimId) : undefined
+  return async ({ code, signal, error }) => {
     if (!error && signal === null && code === 0) {
       dropActiveClaim(claimId)
       setBehaviorLaunchErrorOwned(
@@ -2967,7 +2972,38 @@ function settleClaimAfterExit(
     )
     renewSeenOwned(behavior, target, claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
     renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
-    console.error(`[behaviors] ${behavior} worker exited for ${target}; awaiting durable result (${outcome})`)
+    const message = `[behaviors] ${behavior} worker exited for ${target}; awaiting durable result (${outcome})`
+    if (behavior === 'review-new-prs' && !error && signal === null && code === 1 && claim && !claim.launchQuarantine) {
+      try {
+        const { stdout } = await runFile(AGENT_INTERFACE, ['--logs', '--select', JSON.stringify({ latest: [],
+          ids: claim.launchCallId ? [claim.launchCallId] : [], correlations: [claimId] })],
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024 })
+        const rows = parseJson(stdout, 'worker exit Caller evidence')
+        if (!Array.isArray(rows)) throw new Error('worker exit Caller evidence is not an array')
+        const snapshot = parseAgentLogList(rows)
+        const call = snapshot.entries[0]
+        if (rows.length === 1 && snapshot.quarantined.length === 0
+          && call.status === 'failed' && call.error_code === 'review_budget_exhausted'
+          && call.behavior === 'pr_review' && call.behavior === claim.launchBehavior
+          && call.repo === claim.launchRepo && call.pr_id === String(claim.launchPr)
+          && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
+          && call.source === claim.launchSource && call.source === 'poise:review-new-prs'
+          && call.correlation_id === claimId && claim.launchCorrelationId === claimId
+          && (!claim.launchCallId || call.id === claim.launchCallId)
+          && call.expected_head === claim.launchExpectedHead
+          && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
+          && Date.parse(call.completed_at ?? '') >= Date.parse(agentCallStartedAt(call))) {
+          const row = objectValue(rows[0], 'worker exit Caller evidence')
+          // Use the original metadata and stable Caller identity so delayed collection replays exactly.
+          const input = row.evidence_unavailable == null ? callerDiagnostic(row, loggingWorkspace()) : null
+          if (input?.level === 'error' && diagnostic(input)) return
+        }
+      } catch (cause) {
+        console.error(message, cause)
+        return
+      }
+    }
+    console.error(message)
   }
 }
 
