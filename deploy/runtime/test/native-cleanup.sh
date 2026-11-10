@@ -1,5 +1,5 @@
 #!/bin/bash
-# Actual image/kernel component proof. No providers, workflow or GitHub writes.
+# Actual image/kernel component proof, with provider/GitHub stand-ins only.
 set -euo pipefail
 if [ "$#" -ne 2 ] || { [ "$2" != runsc ] && [ "$2" != runc ]; }; then
   echo 'usage: native-cleanup.sh IMAGE runsc|runc' >&2
@@ -60,6 +60,10 @@ if [ "$runtime" = runsc ]; then
   docker exec "$container" /opt/caller/venv/bin/python /contract/kernel.py
   docker exec "$container" /opt/caller/venv/bin/python /contract/receipt.py
   docker exec "$container" /opt/caller/venv/bin/python /contract/receipt.py slow
+  for failure in exit23 exit137 sigkill; do
+    docker exec "$container" /opt/caller/venv/bin/python /contract/receipt.py "$failure"
+  done
+  docker exec "$container" /opt/caller/venv/bin/python /contract/switch.py
   for fault in parent-loss before-active deleted-before-ack cleaner-loss partial-root partial-before-mkdir permission-zero unknown-process-error base-replaced data-replaced metadata-pid-collision native-coordination native-coordination-replaced paused-maintenance-tick; do
     docker exec "$container" /opt/caller/venv/bin/python /contract/recovery.py "$fault"
   done

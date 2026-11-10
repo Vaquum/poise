@@ -245,6 +245,12 @@ records filesystem bytes/inodes measured immediately after the process failure,
 with its own measurement time; unavailable readings are null with the measurement
 error. This is evidence at capture time, never a claim about earlier disk use.
 
+Native namespace init forwards the executor's observed wait status before
+exiting. The original Call retains an executor signal separately from an
+explicit exit such as 137; the init's conventional 128+signal exit does not
+establish a signal. Missing inner failure evidence still leaves the initiating
+cause unknown. Exit diagnostics grant no publication or resource-release proof.
+
 ### Bounded diagnostic reads
 
 `agent-interface --diagnostics [after-sequence] [limit]` returns version 1
