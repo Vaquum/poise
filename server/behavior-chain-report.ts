@@ -325,6 +325,13 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   }
   const marker = `<!-- poise-repair-exhaustion:${key} -->`
   const save = () => db.prepare('UPDATE meta SET value = ? WHERE key = ?').run(JSON.stringify(report), storageKey)
+  if (report && cause === IMPLEMENTATION_CAUSE && getBehaviorChainSettings().seedMode === 'label') {
+    const fresh = await verify()
+    const settings = getBehaviorChainSettings()
+    if (settings.seedMode === 'label' && fresh.issue.eligible !== true) {
+      return `${label} reporting pending: the source is not verified eligible for intake label ${settings.label}`
+    }
+  }
   if (!report) {
     const accounts = getSettings()
     if (accounts.me.toLowerCase() !== chain.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) {
@@ -340,6 +347,10 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     // verify performs the existing datastore health check before re-reading
     // reviews. A fresh native head alone cannot validate local review rows.
     const fresh = await verify()
+    const settings = getBehaviorChainSettings()
+    if (cause === IMPLEMENTATION_CAUSE && settings.seedMode === 'label' && fresh.issue.eligible !== true) {
+      return `${label} reporting pending: the source is not verified eligible for intake label ${settings.label}`
+    }
     const verified = qualifyingAttempts(chain, fresh, Date.now())
     const verifiedMerge = qualifyingMergeSubmission(chain, fresh, Date.now())
     const verifiedImplementation = qualifyingImplementationHold(db, chain, fresh, Date.now())
