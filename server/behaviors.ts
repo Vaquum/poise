@@ -2508,6 +2508,14 @@ async function requireFreshDatastore(): Promise<void> {
       && safeInteger(data.max_age_seconds, 'datastore max_age_seconds') === DATASTORE_MAX_AGE_SECONDS
       && safeInteger(data.age_seconds, 'datastore age_seconds') > DATASTORE_MAX_AGE_SECONDS
       && typeof data.last_success_at === 'string' && Number.isFinite(Date.parse(data.last_success_at))) {
+      // A stale-shaped reading with no episode is outdated: its sync
+      // generation predates the recovered one. A clean probe proceeds (the
+      // mirror is fresh); a faulted probe still surfaces its fault, only
+      // without opening a stale episode for it.
+      if (!stale) {
+        if (unhealthyExit) throw unhealthyExit
+        return
+      }
       const message = `Datastore stale: last successful sync ${data.last_success_at}; age ${data.age_seconds}s exceeds ${DATASTORE_MAX_AGE_SECONDS}s`
       datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
         status: 'unavailable', checkedAt, ageSeconds: Number(data.age_seconds),

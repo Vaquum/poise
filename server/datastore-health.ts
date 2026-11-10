@@ -101,6 +101,15 @@ function observeHealth(org: Organization | null, health: Health, blockedBy: read
       setMeta(key, JSON.stringify(episode))
       return { episode, phase: 'recovered' as const }
     }
+    if (previous?.recoveredAt && Date.parse(health.evidence.lastSuccessAt) < Date.parse(previous.latest.lastSuccessAt)) {
+      // Overlapping probes can straddle a successful sync: a stale reading
+      // from before the recovered sync generation must not reopen the outage
+      // under a new ID with another opening diagnostic and notification. A
+      // reading on the recovered generation or later is newer evidence, so it
+      // still reopens: syncs stopping after recovery re-arms on the same
+      // last_success_at with a grown age.
+      return null
+    }
     const opened = !previous || previous.recoveredAt !== null
     const episode: StaleMirrorEpisode = opened ? {
       id: randomUUID(), account, database: health.database, startedAt: health.evidence.checkedAt,
@@ -109,6 +118,7 @@ function observeHealth(org: Organization | null, health: Health, blockedBy: read
     setMeta(key, JSON.stringify(episode))
     return { episode, phase: opened ? 'opened' as const : null }
   }).immediate()
+  if (health.status === 'stale' && !transition) return null
   datastoreFreshnessByOrganization.set(`${account}:review-new-prs`, {
     status: health.status === 'healthy' ? 'healthy' : 'unavailable', checkedAt: health.evidence.checkedAt,
     ageSeconds: health.evidence.ageSeconds, lastSuccessAt: health.evidence.lastSuccessAt,
@@ -169,7 +179,19 @@ export async function runDatastoreHealth(org: Organization | null, options: RunF
       })
       throw error
     }
-    const episode = observeHealth(org, health, blockedBy)!
+    const episode = observeHealth(org, health, blockedBy)
+    if (!episode) {
+      // An outdated reading on an expected probe outcome carries no news:
+      // the mirror already recovered on a newer sync generation. A probe
+      // that itself faulted still surfaces its fault, only without opening
+      // a stale episode for it.
+      // Inline of process.isExpectedFailure: datastore-health is imported under
+      // partial process mocks that do not carry the helper.
+      if ((error as { expected?: unknown }).expected === true) {
+        return { stdout: String(failure.stdout), stderr: '', stale: null }
+      }
+      throw error
+    }
     throw new StaleDatastoreError(episode, String(failure.stdout), typeof failure.stderr === 'string' ? failure.stderr : '', error)
   }
   const health = validatedHealth(result.stdout, org)

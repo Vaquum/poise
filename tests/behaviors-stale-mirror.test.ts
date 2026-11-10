@@ -153,13 +153,19 @@ it('keeps a stale episode open across a crash and restart, and rearms only on va
   await behaviors.runEnabledBehaviorsOnce()
   expect(episodes(database)[0].id).toBe(first.id)
   expect(events().filter((event) => event.operation === 'github-datastore.stale')).toHaveLength(1)
-  saveProbe(path, health(path, 1))
+  const recoveredProbe = health(path, 1)
+  saveProbe(path, recoveredProbe)
   await behaviors.runEnabledBehaviorsOnce()
   expect(episodes(database)[0].recoveredAt).not.toBeNull()
   expect(behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', failures: [] })
   const recovery = events().find((event) => event.phase === 'recovered')!
   expect(recovery).toMatchObject({ correlationId: first.id, context: { blockedBehaviors: expect.arrayContaining(first.behaviors) } })
-  saveProbe(path, health(path, 180))
+  // Syncs stopping after recovery re-arms on the same last_success_at with a
+  // grown age; an older sync generation would be an outdated overlapping
+  // probe and must not reopen.
+  const rearmed = JSON.parse(health(path, 180).stdout)
+  rearmed.last_success_at = JSON.parse(recoveredProbe.stdout).last_success_at
+  saveProbe(path, { code: 1, stdout: JSON.stringify(rearmed) })
   await behaviors.runEnabledBehaviorsOnce()
   expect(episodes(database)[0].id).not.toBe(first.id)
   const [rearmedNotice] = notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now())
@@ -168,6 +174,48 @@ it('keeps a stale episode open across a crash and restart, and rearms only on va
   expect(opened).toHaveLength(2)
   expect(new Set(opened.map((event) => event.incidentId)).size).toBe(2)
   expect(recovery.incidentId).toBe(opened.find((event) => event.correlationId === first.id)!.incidentId)
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+})
+
+it('ignores a stale reading older than the recovered sync generation instead of reopening', async () => {
+  const { database, behaviors, path } = await start()
+  await behaviors.runEnabledBehaviorsOnce()
+  const [first] = episodes(database)
+  const recoveredProbe = health(path, 1)
+  saveProbe(path, recoveredProbe)
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(episodes(database)[0]).toMatchObject({ id: first.id, recoveredAt: expect.any(String) })
+  // An overlapping probe that observed the mirror before the recovery sync
+  // arrives late; its older last_success_at must not reopen the outage.
+  saveProbe(path, health(path, 150))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(episodes(database)).toHaveLength(1)
+  expect(episodes(database)[0]).toMatchObject({ id: first.id, recoveredAt: expect.any(String) })
+  expect(events().filter((event) => event.operation === 'github-datastore.stale' && event.phase === 'opened')).toHaveLength(1)
+  expect(behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', failures: [] })
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+})
+
+it('reports a stale review scope through the open episode without new faults on retry', async () => {
+  const { database, path } = await start()
+  // Fresh module graph: the static bindings predate this test's POISE_DB.
+  const { repairReportReviewScope } = await import('../server/behavior-chain-report')
+  const { StaleDatastoreError } = await import('../server/datastore-health')
+  database.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+    VALUES ('beta', ?, 1, 'ready', 'ready', 'poise-user')`).run(path)
+  database.db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('behavior_chain_repair_report:test',
+    JSON.stringify({ source: 'beta/repo#7', issueNumber: 7 }))
+  const chain = { repository: 'beta/repo', issue: 7 } as never
+  saveProbe(path, health(path, 150))
+  const first = await repairReportReviewScope(database.db, chain, 21).then(() => { throw new Error('scope was admitted') },
+    (error: unknown) => error as InstanceType<typeof StaleDatastoreError>)
+  expect(first).toBeInstanceOf(StaleDatastoreError)
+  expect(first.episode.behaviors).toEqual(expect.arrayContaining(['review-pr', 'approve-pr']))
+  const retry = await repairReportReviewScope(database.db, chain, 21).then(() => { throw new Error('scope was admitted') },
+    (error: unknown) => error as InstanceType<typeof StaleDatastoreError>)
+  expect(retry.episode.id).toBe(first.episode.id)
+  expect(episodes(database)).toHaveLength(1)
+  expect(events().filter((event) => event.operation === 'github-datastore.stale' && event.phase === 'opened')).toHaveLength(1)
   expect(mocks.spawnDetached).not.toHaveBeenCalled()
 })
 

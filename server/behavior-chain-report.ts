@@ -2,6 +2,7 @@ import type { Database } from 'better-sqlite3'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal } from './behavior-chain-store'
 import { resourceReleaseProven } from './behavior-resource-receipt'
+import { runDatastoreHealth } from './datastore-health'
 import { handleGhBody, reconcileRepairReport } from './gh'
 import { organizationArgs, organizationForRepository } from './organizations'
 import { runFile } from './process'
@@ -34,7 +35,10 @@ export async function repairReportReviewScope(db: Database, chain: Pick<Behavior
   if (!report) return ''
   const org = organizationForRepository(repository)
   if (!org) throw new Error('Repair report review requires its followed organization')
-  await runFile('github-datastore', organizationArgs(org, ['health', '--max-age-seconds', '120']), { timeoutMs: 30_000 })
+  // Episode-aware: a raw health gate would emit fresh process and runtime
+  // faults on every retry for the same open stale episode.
+  const { stale } = await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['review-pr', 'approve-pr'])
+  if (stale) throw stale
   const { stdout } = await runFile('github-datastore', organizationArgs(org, ['view', 'pr-closing', '--repo', repository,
     '--format', 'json', '--limit', '1', ...(pull > 1 ? ['--after-number', String(pull - 1)] : [])]),
   { timeoutMs: 30_000, maxOutputBytes: 64 * 1024 })
