@@ -580,7 +580,8 @@ retain their existing integrity checks.
 lookup first verifies the requested ID; an unreadable record returns that ID
 with the existing typed `history_read_error` cause. Missing IDs return an empty
 array; unavailable identity/index evidence fails the read. Swarm's exact Call
-lookup uses this History read. Ordinary selected receipt reads remain strict.
+lookup uses this History read without running interruption reconciliation.
+Ordinary selected receipt reads remain strict.
 
 `--logs --select '{"latest":[{"behavior":"pr_review","source":"poise:review-new-prs","owner":"autonomio"}],"ids":["FULL_CALL_ID"]}'`
 returns an oldest-first array containing one indexed latest-started call per

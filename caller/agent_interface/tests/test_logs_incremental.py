@@ -181,6 +181,18 @@ class LogsIncrementalCase(TestCase):
         missing = self.cli("--logs", "--id", "f" * 32)
         self.assertEqual((missing.returncode, json.loads(missing.stdout)), (0, []), missing.stderr)
 
+    def test_exact_history_isolates_an_unreadable_running_row(self):
+        self.seed(2, running=1)
+        target = f"{1:032x}"
+        with agent_interface.db() as conn:
+            conn.execute("update calls set pid=123, source=cast(x'ff' as text) where id=?", (target,))
+        exact = self.cli("--logs", "--id", target)
+        self.assertEqual((exact.returncode, exact.stderr), (0, ""), exact.stderr)
+        self.assertEqual(json.loads(exact.stdout), [{"id": target, "history_read_error": "INVALID_UTF8"}])
+        readable = self.cli("--logs", "--id", f"{0:032x}")
+        self.assertEqual((readable.returncode, readable.stderr), (0, ""), readable.stderr)
+        self.assertEqual(json.loads(readable.stdout)[0]["id"], f"{0:032x}")
+
     def test_paged_cli_returns_an_envelope(self):
         self.seed(3)
         done = self.cli("--logs", "--limit", "2")

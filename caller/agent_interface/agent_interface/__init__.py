@@ -974,7 +974,7 @@ def logs_history_by_id(id_: str) -> list[dict]:
     """One exact History row; only a verified primary key can be quarantined."""
     if not re.fullmatch(r"[0-9a-f]{32}", id_):
         raise ValueError("history read requires a full call id")
-    reap_interrupted()
+    # Reaping scans running records and can fail before this row is isolated.
     with db() as conn:
         key = conn.execute("select rowid from calls indexed by sqlite_autoindex_calls_1 where id=?", (id_,)).fetchone()
         if key is None:
