@@ -307,6 +307,18 @@ it('verifies a Markdown successor link without counting it twice', async () => {
   expect(reports(db)).toHaveLength(0)
 })
 
+it('verifies an explicit successor after ordinary prose on the same line', async () => {
+  const { db, journal } = setup()
+  const source = openSeed(journal)
+  fresh = closedObservation()
+  seedBody = 'Work continued to fail. Continuation: #44'
+  remote = [{ ...issue(44, 'Continue #7 after https://github.com/acme/repo/pull/21'), labels: [{ name: 'poise' }] }]
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(journal.read(source.id)?.waiting).toContain('https://github.com/acme/repo/issues/44: already tracks')
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
+})
+
 it('creates a closed-PR continuation past a historical receipt_unavailable settlement', async () => {
   const { db, journal } = setup()
   let source = openSeed(journal)
