@@ -14,7 +14,8 @@ import { isServiceMode } from './service/config'
 export const REMEDIATION_SCOPE = `Minimal, clinical interventions all the way. Get in, get out, do the thing that actually has to be done, never expand it beyond that. Keep asking "is this truly the cleanest and simplest and least intrusive way to get this done" and do it that way and only that way. Don't let others come expand it, let them come make it cleaner.`
 
 const MERGE_CAUSE = 'merge_submission_uncertain'
-const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', MERGE_CAUSE] as const
+const CLOSED_CAUSE = 'pull_closed_unmerged'
+const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', MERGE_CAUSE, CLOSED_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
 const REPOSITORIES_KEY = 'service_repair_exhaustion_repositories'
 const INCOMPLETE_REPLIES = /^repair did not answer every unresolved review finding(?:: missing_root_comment_ids=\[[0-9, ]*\]; missing_count=[1-9][0-9]*; required_count=[1-9][0-9]*)?$/
@@ -170,6 +171,77 @@ function qualifyingMergeSubmission(chain: BehaviorChain, observation: ChainObser
   return { invocation, call }
 }
 
+function qualifyingClosedPull(chain: BehaviorChain, observation: ChainObservation, now: number): boolean {
+  return !!chain.held && !chain.mergeSha && !chain.supersession && observation.issue.open === true
+    && Number.isFinite(observation.checkedAt) && observation.checkedAt <= now
+    && now - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
+    && observation.pull?.state === 'closed' && observation.pull.merged === false && observation.pull.mergeSha === null
+    && observation.publication.pull_number === observation.pull.number && observation.publication.merged === false
+    && observation.existingPulls.length === 0
+    && chain.invocations.every(invocation => invocation.state === 'settled' && resourceReleaseProven(invocation.evidence ?? {}, true))
+}
+
+/** Only an explicit work-continuation relationship can cover the closed PR.
+ * Ordinary references (for example to an original-outcome investigation) cannot. */
+async function closedPullSuccessor(chain: BehaviorChain, pull: number): Promise<string | null> {
+  const read = async (operation: '--read-issue' | '--issue-comments', number: number) => {
+    const { stdout } = await runFile('github-interface', [operation, String(number), '--repository', chain.repository,
+      '--token-user', chain.author], { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
+    const result = JSON.parse(stdout) as { repository: string, issue_number: number,
+      issue?: { number: number, html_url: string, body: string | null, state: string, labels: Array<{ name: string }>, pull_request?: unknown },
+      comments?: Array<{ author: string, body: string }> }
+    if (result.repository?.toLowerCase() !== chain.repository.toLowerCase() || result.issue_number !== number) {
+      throw new Error('Closed PR continuation evidence belongs to another target')
+    }
+    return result
+  }
+  const [seed, prior, comments, pullComments] = await Promise.all([
+    read('--read-issue', chain.issue), read('--read-issue', pull),
+    read('--issue-comments', chain.issue), read('--issue-comments', pull),
+  ])
+  const valid = (issue: NonNullable<typeof seed.issue>, number: number, pr = false) => issue.number === number
+    && issue.html_url?.toLowerCase() === `https://github.com/${chain.repository}/${pr ? 'pull' : 'issues'}/${number}`.toLowerCase()
+    && (issue.body === null || typeof issue.body === 'string') && ['open', 'closed'].includes(issue.state)
+    && Array.isArray(issue.labels) && issue.labels.every(label => typeof label.name === 'string')
+  if (!seed.issue || !valid(seed.issue, chain.issue) || seed.issue.pull_request
+    || !prior.issue || !valid(prior.issue, pull, true) || !prior.issue.pull_request
+    || !Array.isArray(comments.comments) || !Array.isArray(pullComments.comments)
+    || [...comments.comments, ...pullComments.comments].some(comment => typeof comment.body !== 'string' || typeof comment.author !== 'string')) {
+    throw new Error('Closed PR continuation evidence is incomplete')
+  }
+  if (seed.issue.state !== 'open' || prior.issue.state !== 'closed' || !seed.issue.labels.some(label => label.name.toLowerCase() === 'poise')) {
+    return 'Closed PR continuation pending: the source is no longer an open poise issue'
+  }
+  if (REPORT_MARKER.test(seed.issue.body ?? '')) return 'Closed PR continuation suppressed for a generated remediation issue'
+  const text = [seed.issue.body, prior.issue.body, ...[...comments.comments, ...pullComments.comments]
+    .filter(comment => [chain.author.toLowerCase(), chain.reviewer.toLowerCase()].includes(comment.author.toLowerCase()))
+    .map(comment => comment.body)].join('\n')
+  const references = (body: string) => [...body.matchAll(/https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/(?:issues|pull)\/([1-9][0-9]*)\b|(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+))?#([1-9][0-9]*)\b/g)]
+    .map(match => `${(match[1] ?? match[3] ?? chain.repository).toLowerCase()}#${match[2] ?? match[4]}`)
+  const successors = new Set<string>()
+  for (const match of text.matchAll(/\b(?:Continuation(?: issue)?\s*:|Replacement issue\s*:|Continued in\s*:?|Work (?:moved|continued) to\s*:?|Superseded by\s*:?)[^\S\n]*([^\n]+)/gi)) {
+    const targets = references(match[1].split(/(?<=[.!?])\s/)[0])
+    if (targets.length !== 1) throw new Error('Closed PR continuation relationship is ambiguous')
+    successors.add(targets[0])
+  }
+  if (!successors.size) return null
+  const target = [...successors][0]
+  const [repository, number] = target.split('#')
+  if (successors.size !== 1 || repository !== chain.repository.toLowerCase() || Number(number) === chain.issue) {
+    throw new Error('Closed PR continuation relationship is ambiguous or outside the source repository')
+  }
+  const successor = (await read('--read-issue', Number(number))).issue
+  if (!successor || !valid(successor, Number(number)) || successor.pull_request
+    || !references(successor.body ?? '').includes(chain.id)
+    || !references(successor.body ?? '').includes(`${chain.repository.toLowerCase()}#${pull}`)) {
+    throw new Error(`Closed PR continuation ${target} does not verify coverage of the source issue and closed PR`)
+  }
+  const link = `Closed PR continuation https://github.com/${chain.repository}/issues/${number}`
+  return successor.state === 'open' && successor.labels.some(label => label.name.toLowerCase() === 'poise')
+    ? `${link}: already tracks the source issue and closed PR; ordinary intake and ownership gates apply`
+    : `${link}: pending verification of an open poise successor; no replacement will be created`
+}
+
 /** Runs only on the existing reconciliation opportunity. The existing meta
  * store holds creation intent; neither its absence on GitHub nor a restart
  * can reopen that intent for another POST. Intake remains the normal reader. */
@@ -181,18 +253,27 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
   if (!observation?.pull) return null
   const qualifying = qualifyingAttempts(chain, observation, Date.now())
   const merge = qualifyingMergeSubmission(chain, observation, Date.now())
+  const closed = qualifyingClosedPull(chain, observation, Date.now())
   const intents = CAUSES.filter(cause => cause !== MERGE_CAUSE || pendingMerge).map(cause => {
     const key = chainBasis([cause, chain.id, cause === MERGE_CAUSE ? pendingMerge!.id : observation.pull!.number])
     const storageKey = PREFIX + key
     const stored = db.prepare('SELECT value FROM meta WHERE key = ?').get(storageKey) as { value: string } | undefined
     return { cause, key, storageKey, stored }
   })
-  const intent = intents.find(intent => intent.cause === (merge ? MERGE_CAUSE : qualifying?.cause)) ?? intents.find(intent => intent.stored)
+  // A closed target must keep any prior source/PR report, including one under
+  // another cause or an uncertain merge's invocation-based key.
+  const linked = closed ? db.prepare(`SELECT key, value FROM meta WHERE key GLOB ?
+    AND json_extract(value, '$.source') = ? AND json_extract(value, '$.pull') = ?
+    ORDER BY json_extract(value, '$.issueNumber') IS NULL, key LIMIT 1`)
+    .get(PREFIX + '*', chain.id, observation.pull.number) as { key: string, value: string } | undefined : undefined
+  const intent = linked ? { cause: CLOSED_CAUSE, key: (JSON.parse(linked.value) as RepairReport).key,
+    storageKey: linked.key, stored: linked }
+    : intents.find(intent => intent.cause === (merge ? MERGE_CAUSE : closed ? CLOSED_CAUSE : qualifying?.cause)) ?? intents.find(intent => intent.stored)
   if (!intent) return pendingMerge ? null : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
   const { cause, key, storageKey, stored } = intent
-  const label = cause === MERGE_CAUSE ? 'Merge submission' : 'Repair exhaustion'
+  const label = cause === CLOSED_CAUSE ? 'Closed PR continuation' : cause === MERGE_CAUSE ? 'Merge submission' : 'Repair exhaustion'
   let report: RepairReport | null = stored ? JSON.parse(stored.value) as RepairReport : null
-  if (report && (report.key !== key || report.source !== chain.id || report.pull !== observation.pull.number
+  if (report && (storageKey !== PREFIX + key || report.key !== key || report.source !== chain.id || report.pull !== observation.pull.number
     || report.issueNumber !== null && (!Number.isSafeInteger(report.issueNumber) || report.issueNumber < 1))) {
     throw new Error('Repair report intent conflicts with its source hold')
   }
@@ -203,7 +284,7 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     if (accounts.me.toLowerCase() !== chain.author.toLowerCase() || accounts.agentAccount.toLowerCase() !== chain.reviewer.toLowerCase()) {
       return `${label} reporting pending: configured accounts differ from the source chain`
     }
-    if (cause === MERGE_CAUSE ? !merge : qualifying?.cause !== cause) return cause === MERGE_CAUSE
+    if (cause === CLOSED_CAUSE ? !closed : cause === MERGE_CAUSE ? !merge : qualifying?.cause !== cause) return cause === MERGE_CAUSE
       ? `${label} reporting: source has no verified failure on the current basis`
       : 'Repair exhaustion reporting: hold has no verified repair or PR review exhaustion on the current basis'
     if (db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
@@ -215,7 +296,8 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     const fresh = await verify()
     const verified = qualifyingAttempts(chain, fresh, Date.now())
     const verifiedMerge = qualifyingMergeSubmission(chain, fresh, Date.now())
-    if (cause === MERGE_CAUSE ? (!verifiedMerge || fresh.pull?.head !== observation.pull.head)
+    if (cause === CLOSED_CAUSE ? (!qualifyingClosedPull(chain, fresh, Date.now()) || fresh.pull?.number !== observation.pull.number)
+      : cause === MERGE_CAUSE ? (!verifiedMerge || fresh.pull?.head !== observation.pull.head)
       : (verified?.cause !== cause || fresh.pull?.head !== observation.pull.head || verified!.decision.basis !== qualifying!.decision.basis)) {
       return cause === MERGE_CAUSE
         ? `${label} reporting pending: the current head or review basis no longer verifies the original failure`
@@ -224,12 +306,17 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
     const seed = await handleGhBody({ operation: 'read_issue', repository_full_name: chain.repository, issue_number: chain.issue })
     const source = seed.body as { issue?: { body?: unknown, state?: string }, error?: string }
     if (seed.status !== 200 || typeof source.issue?.body !== 'string') throw new Error(source.error || 'Repair report source issue is unavailable')
-    if (cause === MERGE_CAUSE && source.issue.state !== 'open') return `${label} reporting pending: the source issue is no longer open`
+    if ((cause === MERGE_CAUSE || cause === CLOSED_CAUSE) && source.issue.state !== 'open') return `${label} reporting pending: the source issue is no longer open`
     if (REPORT_MARKER.test(source.issue.body)) return `${label} reporting suppressed for a generated remediation issue; its ordinary hold or uncertainty remains active`
+    if (cause === CLOSED_CAUSE) {
+      const successor = await closedPullSuccessor(chain, fresh.pull!.number)
+      if (successor) return successor
+    }
     const existing = await reconcileRepairReport(chain.repository, marker, null)
     const current = journal.read(chain.id)
     if (!current || current.resumedAfterSequence !== chain.resumedAfterSequence || current.sequence !== chain.sequence
-      || (cause === MERGE_CAUSE ? qualifyingMergeSubmission(current, fresh, Date.now())?.invocation.id !== pendingMerge?.id
+      || (cause === CLOSED_CAUSE ? !qualifyingClosedPull(current, fresh, Date.now())
+        : cause === MERGE_CAUSE ? qualifyingMergeSubmission(current, fresh, Date.now())?.invocation.id !== pendingMerge?.id
         : !current.held || qualifyingAttempts(current, fresh, Date.now())?.cause !== cause)) {
       return `${label} reporting pending: source changed during verification`
     }
@@ -243,9 +330,9 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       .get(chain.id, chain.resumedAfterSequence) as { sequence: number, at: number } | undefined
     if (!hold && cause !== MERGE_CAUSE) throw new Error('Repair report has no durable active hold')
     report = { key, source: chain.id, pull: observation.pull.number, holdSequence: hold?.sequence ?? null, heldAt: hold?.at ?? null,
-      head: fresh.pull!.head, basis: verifiedMerge?.invocation.basis ?? verified!.decision.basis,
+      head: fresh.pull!.head, basis: cause === CLOSED_CAUSE ? key : verifiedMerge?.invocation.basis ?? verified!.decision.basis,
       slot: verified?.decision.reviewer?.slot ?? null,
-      attempts: cause === MERGE_CAUSE ? [{ invocation: verifiedMerge!.invocation.id, call: verifiedMerge!.call,
+      attempts: cause === CLOSED_CAUSE ? [] : cause === MERGE_CAUSE ? [{ invocation: verifiedMerge!.invocation.id, call: verifiedMerge!.call,
         completedAt: Number(verifiedMerge!.invocation.evidence!.completedAt) }]
         : verified!.attempts.map(invocation => ({ invocation: invocation.id, call: invocation.callId!, completedAt: Number(invocation.evidence!.completedAt) })),
       issueNumber: existing?.number ?? null }
@@ -263,7 +350,11 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       const age = hold ? Math.max(0, Math.floor((Date.now() - hold.at) / 60_000)) : null
       const evidence = verifiedMerge?.invocation.evidence
       const diagnostic = evidence?.diagnostic as ProcessDiagnostic | undefined
-      const details = cause === MERGE_CAUSE ? [
+      const details = cause === CLOSED_CAUSE ? [
+        `Poise's open source issue https://github.com/${chain.repository}/issues/${chain.issue} has no live replacement for its closed unmerged PR https://github.com/${chain.repository}/pull/${report.pull}.`, '',
+        `Cause: ${cause}. Source: ${chain.id}; hold event ${hold!.sequence}; head ${report.head}.`,
+        'Fresh GitHub evidence confirms the source remains open with the poise label and its only linked PR closed without merge. No verified successor covers the work.',
+      ] : cause === MERGE_CAUSE ? [
         `Poise cannot confirm the merge submission for https://github.com/${chain.repository}/pull/${report.pull}.`, '',
         `Stage: merge-pr. Cause: ${cause}. Source issue: https://github.com/${chain.repository}/issues/${chain.issue}.`,
         `Source: ${chain.id}; head ${report.head}; basis ${report.basis}.`,
@@ -281,13 +372,16 @@ export async function reportRepairExhaustion(db: Database, journal: BehaviorChai
       ]
       const body = [marker, '', ...details,
         ...report.attempts.map(attempt => `- Invocation ${attempt.invocation}; Caller ${attempt.call}; completed ${new Date(attempt.completedAt).toISOString()}.`), '',
-        cause === MERGE_CAUSE
+        cause === CLOSED_CAUSE
+          ? 'Next action: implement the remaining source issue work through this continuation after inspecting the closed PR and original journal receipts. Original invocation and resource evidence remain retained; this report never authorizes replay, replacement publication or resource release from an unreadable or incomplete original receipt.'
+          : cause === MERGE_CAUSE
           ? `Next action: inspect the original Call diagnostics and reconcile the PR and merge queue at the pinned head before deciding whether to repair or replace the candidate. The external effect remains unconfirmed. This report retains the original invocation's uncertainty and chain ownership; it never retries the merge or relaxes any review, resource, admission or merge gate.`
           : `Next action: inspect the ${review ? 'PR review budget' : budget ? 'repair execution budget' : 'repair reply validation'} and source receipts, address the cause, then explicitly Resume the source chain when appropriate. This report preserves its hold and does not recover ${review ? 'review' : 'repair'} or relax any review, admission or merge gate.`,
         '', REMEDIATION_SCOPE, '', 'Include this exact paragraph in the linked PR review.',
       ].join('\n')
       const result = await handleGhBody({ operation: 'open_issue', repository_full_name: chain.repository,
-        title: cause === MERGE_CAUSE ? `fix: uncertain merge submission for #${report.pull}`
+        title: cause === CLOSED_CAUSE ? `fix: continue #${chain.issue} after closed unmerged PR #${report.pull}`
+          : cause === MERGE_CAUSE ? `fix: uncertain merge submission for #${report.pull}`
           : `fix: ${review ? 'PR review exhausted its budget' : budget ? 'repair exhausted execution budget' : 'repair exhausted incomplete review replies'} for #${report.pull}`, body, labels: ['poise'] })
       const publication = result.body as { record?: { number?: unknown, url?: unknown }, error?: string }
       if (result.status !== 200 || !Number.isSafeInteger(publication.record?.number) || Number(publication.record?.number) < 1
