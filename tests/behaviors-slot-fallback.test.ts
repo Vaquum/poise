@@ -33,6 +33,7 @@ describe('reviewer trip classification', () => {
     { name: 'provider exit code', error: 'codex review failed: provider exited', code: 'review_provider_exit', expected: 'provider' },
     { name: 'budget exhausted code', error: 'Review reached its total time limit; needs attention', code: 'review_budget_exhausted', expected: 'budget' },
     { name: 'provider-execution budget with diagnostic', error: 'Issue review reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'provider.review', phase: 'provider_execution' }, expected: 'budget' },
+    { name: 'post-provider atomic budget', error: 'atomic behavior failed during validating_publication: Review reached its total time limit; needs attention (agent_interface.atomic_work.run)', code: 'review_budget_exhausted', diagnostic: { operation: 'agent_interface.atomic_work.run', phase: 'validating_publication' }, expected: 'budget' },
     { name: 'Grok analysis ceiling', error: GROK_ANALYSIS_LIMIT_ERROR, code: 'review_budget_exhausted', expected: 'budget' },
     { name: '402 stays an account trip', error: 'API error (status 402 Payment Required)', expected: 'balance' },
   ]
@@ -50,6 +51,9 @@ describe('reviewer trip classification', () => {
     { name: 'inspection round exhaustion', error: 'Repository inspection limit reached; needs attention', code: 'review_budget_exhausted' },
     { name: 'issue checkout budget', error: 'Issue review checkout reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'issue.checkout', phase: 'checking_out' } },
     { name: 'issue preparation budget', error: 'Issue review preparation reached its time limit; needs attention', code: 'review_budget_exhausted', diagnostic: { operation: 'issue.prepare', phase: 'preparing_issue' } },
+    { name: 'atomic workspace budget', error: 'atomic behavior failed during preparing_workspace: Review reached its total time limit; needs attention (agent_interface.atomic_work.run)', code: 'review_budget_exhausted', diagnostic: { operation: 'agent_interface.atomic_work.run', phase: 'preparing_workspace' } },
+    { name: 'atomic checkout budget', error: 'atomic behavior failed during preparing_checkout: Review reached its total time limit; needs attention (agent_interface.atomic_work.run)', code: 'review_budget_exhausted', diagnostic: { operation: 'agent_interface.atomic_work.run', phase: 'preparing_checkout' } },
+    { name: 'atomic provider-setup budget', error: 'atomic behavior failed during acquiring_checkout: Review reached its total time limit; needs attention (agent_interface.atomic_work.run)', code: 'review_budget_exhausted', diagnostic: { operation: 'agent_interface.atomic_work.run', phase: 'acquiring_checkout' } },
   ]
 
   it.each(trips)('trips on $name', async ({ error, code, diagnostic, expected }) => {
