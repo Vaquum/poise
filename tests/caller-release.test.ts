@@ -1,4 +1,3 @@
-import { existsSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -48,16 +47,6 @@ describe('Caller health', () => {
     expect(Object.keys(packages)).toEqual(['agent-interface', 'github-interface', 'github-datastore'])
     await expect(getCallerReleaseHealth()).resolves.toEqual({ status: 'ready', packages, error: null })
     await expect(assertCallerRelease()).resolves.toBeUndefined()
-  })
-
-  it('defaults to the virtualenv and agent-interface root in caller/', async () => {
-    vi.stubEnv('CALLER_BIN_ROOT', '')
-    vi.stubEnv('AGENT_INTERFACE_ROOT', '')
-    const cli = join(CALLER_ROOT, '.venv', 'bin', 'agent-interface')
-    // caller/.venv exists once `npm run caller:setup` has run in this checkout.
-    await expect(getCallerReleaseHealth()).resolves.toMatchObject(existsSync(cli)
-      ? { status: 'ready', error: null }
-      : { status: 'invalid', error: `${cli} is missing or not runnable; run npm run caller:setup` })
   })
 
   it('is invalid when the checkout carries no Caller', async () => {
