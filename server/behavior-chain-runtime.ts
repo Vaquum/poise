@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
+import { staleDatastoreFailure } from './datastore-health'
 import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
-import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
+import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
 import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
@@ -42,7 +43,7 @@ export interface ChainRuntimeOperations {
 export function nativeBehavior(behavior: ChainInvocation['behavior']): string | null {
   return ({ 'review-issue': 'issue_review', 'review-pr': 'pr_review', 'approve-pr': 'pr_approve',
     'implement-issue': 'implement_issue', 'repair-pr': 'repair_pr', 'merge-pr': 'native_action',
-    'resolve-threads': 'native_action', 'rerun-grey-ci': 'native_action', 'publish-issue': 'native_action' } as Partial<Record<ChainInvocation['behavior'], string>>)[behavior] ?? null
+    'resolve-threads': 'native_action', 'rerun-grey-ci': 'native_action', 'publish-issue': 'native_action', 'retire-pr': 'native_action' } as Partial<Record<ChainInvocation['behavior'], string>>)[behavior] ?? null
 }
 
 function receipt(call: LogEntry): Record<string, unknown> {
@@ -216,7 +217,7 @@ export class BehaviorChainRuntime {
         }
       } catch (error) {
         intakeError = error instanceof Error ? error : new Error(String(error))
-        console.error('[behavior-chain] intake failed; admitted chains continue', intakeError)
+        if (!staleDatastoreFailure(intakeError)) console.error('[behavior-chain] intake failed; admitted chains continue', intakeError)
       }
       const began = Date.now()
       // Auth-only automatic holds need no new GitHub read to retire their
@@ -350,11 +351,16 @@ export class BehaviorChainRuntime {
               } : undefined
               const decision = decideBehaviorChain(chain, observation, Date.now(), mergeEvidence)
               if (chain.held && decision.kind === 'wait' && this.operations.reportHold && await this.reportHold(chain)) continue
+              if ((decision.kind === 'supersede' || decision.kind === 'invoke' && decision.behavior === 'retire-pr') && automaticClosureHold(chain.held)) {
+                chain = this.append(chain, { type: 'chain.resumed' })
+              }
               if (decision.kind === 'complete') {
                 this.append(chain, { type: 'chain.merged', mergeSha: decision.mergeSha, evidence: { repository: chain.repository,
                   pull_number: observation.pull!.number, merged: true, merge_sha: decision.mergeSha, review_complete: true } })
+              } else if (decision.kind === 'supersede') {
+                this.append(chain, { type: 'chain.superseded', evidence: decision.evidence })
               } else if (decision.kind === 'hold') {
-                if (!chain.held) chain = this.append(chain, { type: 'chain.held', reason: decision.reason })
+                if (!chain.held || automaticClosureHold(chain.held)) chain = this.append(chain, { type: 'chain.held', reason: decision.reason })
                 if (this.operations.reportHold) await this.reportHold(chain)
               } else if (decision.kind === 'invoke' && this.operations.enabled() && (!decision.reviewer || this.operations.available()) && this.operations.permitted(chain, decision)) {
                 const closed = closedChainTarget(chain, observation, decision.behavior)

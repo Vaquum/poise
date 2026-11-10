@@ -21,7 +21,7 @@ behaviors:
   --read-failing-ci-log LOG_ID
   --checkout-pr-head PR
   --commit-work PR --message MESSAGE
-  --issue-work ISSUE --mode prepare|validate|publish|complete|inspect --branch BRANCH --token-user USER [--repository OWNER/REPO]
+  --issue-work ISSUE --mode prepare|validate|publish|complete|inspect|retire --branch BRANCH --token-user USER [--repository OWNER/REPO]
   --list-test-files
   --read-file PATH
   --write-file PATH --content CONTENT
@@ -196,7 +196,8 @@ def _parser(behavior: str) -> argparse.ArgumentParser:
 def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior == "--issue-work":
         parser = argparse.ArgumentParser(prog="github-interface --issue-work ISSUE")
-        parser.add_argument("--mode", required=True, choices=("prepare", "validate", "publish", "inspect", "complete"))
+        parser.add_argument("--mode", required=True, choices=("prepare", "validate", "publish", "inspect", "complete", "retire"))
+        parser.add_argument("--coverage-json")
         parser.add_argument("--branch", required=True)
         parser.add_argument("--path")
         parser.add_argument("--pull-number", type=int)

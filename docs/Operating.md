@@ -435,8 +435,10 @@ line.
 
 **Repair exhaustion reports.** Set `POISE_REPAIR_EXHAUSTION_REPOSITORIES` as an
 Actions repository variable to opt in explicit repositories. The gateway forwards
-it to workspaces; changing or removing it cooperatively replaces existing
-containers even when deploying settings on the same image. See
+it through trusted service configuration to compatible running workspaces,
+including deployments on the same image. Adding, changing or removing it needs
+no container replacement, even while native cleanup remains held. An applied
+empty value stays disabled after Poise restarts over a legacy environment. See
 [reporting verified repair exhaustion](Behavior-chain.md#reporting-verified-repair-exhaustion)
 for eligibility, deduplication and admission.
 

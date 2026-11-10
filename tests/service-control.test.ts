@@ -99,6 +99,18 @@ function call(method: string, path: string, authority: RequestAuthority, service
 }
 
 describe('service health', () => {
+  it('bounds an over-cap environment allowlist in the health echo', () => {
+    const { service } = serviceOf()
+    vi.stubEnv('POISE_MODE', undefined)
+    vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', `${'a/b,'.repeat(20000)}a/b`)
+    try {
+      const health = service.health()
+      expect(Buffer.byteLength(health.repairExhaustionRepositories)).toBeLessThanOrEqual(8192)
+      expect(Buffer.byteLength(JSON.stringify(health))).toBeLessThan(64 * 1024)
+    } finally {
+      vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', undefined)
+    }
+  })
   it('retains pending native cleanup through drain until its durable release and claim retirement', async () => {
     const { service } = serviceOf()
     const records = join(root, 'native-cleanup-records')
@@ -110,9 +122,20 @@ describe('service health', () => {
     insert.run('fenced', 'superseded', null, null, 'poise:behavior-chain', 1, null)
     insert.run('chat', 'failed', null, 'external', 'poise:chat', null, null)
     vi.stubEnv('AGENT_INTERFACE_DATA_DIR', records)
+    vi.stubEnv('POISE_MODE', 'service')
     try {
       expect(service.health()).toMatchObject({ runningCallerCalls: 0, unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
       expect(service.drain()).toMatchObject({ draining: true, unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
+      const original = database.prepare("select * from calls where id='interrupted'").get()
+      for (const repositories of ['acme/repo', '']) {
+        const body = JSON.stringify({ repairExhaustionRepositories: repositories })
+        const req = Object.assign(Readable.from([body]), { method: 'POST', headers: { 'content-type': 'application/json' } }) as unknown as IncomingMessage
+        const res = response()
+        await control.handleServiceApi(req, res as unknown as ServerResponse, '/api/service/config', { kind: 'gateway', scope: 'admin' }, service)
+        expect(res.statusCode).toBe(200)
+        expect(service.health()).toMatchObject({ repairExhaustionRepositories: repositories, draining: true, unsettledNativeCalls: 1, idle: false })
+        expect(database.prepare("select * from calls where id='interrupted'").get()).toEqual(original)
+      }
       database.exec("update calls set resources_settled_at=1 where id='interrupted'")
       expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
       database.exec("update calls set resource_cleanup=null where id='interrupted'")
@@ -120,6 +143,7 @@ describe('service health', () => {
     } finally {
       service.resume()
       vi.stubEnv('AGENT_INTERFACE_DATA_DIR', '')
+      vi.stubEnv('POISE_MODE', undefined)
       database.close()
     }
   })
@@ -130,7 +154,7 @@ describe('service health', () => {
     session(runtime.instance, false)
     session('poise-dev:another-database', true)
     const { service } = serviceOf(runtime)
-    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number), windowStartedAt: expect.any(String) }, desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
+    expect(service.health()).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 1, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: 0, idle: false, draining: false, release: null, switching: null, repairExhaustionRepositories: '', eventLoop: { p50Ms: expect.any(Number), p99Ms: expect.any(Number), maxMs: expect.any(Number), meanMs: expect.any(Number), samples: expect.any(Number), windowStartedAt: expect.any(String) }, desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
 
     let finish!: () => void
     const debate = callerCalls.countDebate(() => new Promise<void>((resolve) => { finish = resolve }))

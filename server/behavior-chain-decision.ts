@@ -1,5 +1,7 @@
 import { chainBasis, type BehaviorChain, type ChainBehavior, type ChainInvocation } from './behavior-chain-store'
 import { validReviewResponse, type ReviewResponse } from './review-response'
+import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
+import { matchingNativeActionReceipt } from './behavior-chain-action'
 
 export const CHAIN_OBSERVATION_MAX_AGE_MS = 120_000
 // The readiness blockers an open conversation can explain. Any other also fails
@@ -22,6 +24,7 @@ export interface ChainObservation extends Record<string, unknown> {
   workPublication?: { callId: string, repliesComplete: boolean, resumable?: boolean, planSha?: string }
   greyRecovery?: { invocationId: string, receipt: Record<string, unknown> }
   ciDependency?: { invocationId: string, base: string, recovered: boolean }
+  fullSuite?: Record<string, unknown>
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,
     queueEntry: string | null, queueRemoval: null | { id: string, reason: string | null, at: number, actor: string | null },
@@ -38,6 +41,7 @@ export type ChainDecision =
   | { kind: 'wait', reason: string }
   | { kind: 'hold', reason: string }
   | { kind: 'complete', mergeSha: string }
+  | { kind: 'supersede', evidence: Record<string, unknown> }
   | { kind: 'invoke', behavior: ChainBehavior, basis: string, actor: string, reviewer: ChainReviewer | null, reason: string }
 export interface MergeReviewEvidence { before: ChainObservation | null, firstMerged: ChainObservation | null }
 
@@ -135,10 +139,19 @@ export function lastChainQueueInvocation(chain: BehaviorChain): ChainInvocation 
 
 /** Closure fences effects, not adoption of original artifacts or receipts. */
 export function closedChainTarget(chain: BehaviorChain, observation: ChainObservation | null, behavior: ChainBehavior): string | null {
+  if (chain.supersession) return 'the repair is verified superseded'
   if (chain.mergeSha) return 'the pull request is confirmed merged'
+  if (behavior === 'retire-pr') return null
   if (observation?.pull && (observation.pull.merged || observation.pull.state !== 'open')) return 'the pull request is closed'
   if (observation && !observation.issue.open && ['review-issue', 'implement-issue', 'repair-pr'].includes(behavior)) return 'the seed issue is closed'
   return null
+}
+
+export function automaticClosureHold(reason: string | null): boolean {
+  return reason !== null && (reason === 'seed issue closed without a confirmed merged pull request'
+    || reason === 'pull request closed without a confirmed merge'
+    || /^No new (?:review-issue|implement-issue|repair-pr): the seed issue is closed$/.test(reason)
+    || reason === 'Original outcome requires read-only reconciliation because the seed issue is closed')
 }
 
 /** No timers, processes, GitHub writes or Chat sessions. The scheduler commits
@@ -147,6 +160,7 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
   mergeEvidence?: MergeReviewEvidence): ChainDecision {
   const pending = chain.invocations.find((invocation) => invocation.state !== 'settled')
   if (pending) return { kind: 'wait', reason: `${pending.behavior} is ${pending.state}; its native outcome must settle first` }
+  if (chain.supersession) return { kind: 'wait', reason: 'full-suite repair is verified superseded' }
   const pull = observation.pull
   if (!Number.isFinite(observation.checkedAt) || now - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS || observation.checkedAt > now) return { kind: 'wait', reason: 'behavior observations need refreshing' }
   if (pull?.merged && pull.mergeSha && /^[0-9a-f]{40}$/i.test(pull.mergeSha)) {
@@ -167,6 +181,34 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
       return { kind: 'hold', reason: 'confirmed merge retains an open review obligation: qualifying pre-merge review response is missing' }
     }
     return { kind: 'complete', mergeSha: pull.mergeSha }
+  }
+  const retired = chain.invocations.at(-1)
+  const retiredProof = retired?.behavior === 'retire-pr' ? matchingNativeActionReceipt(chain, retired) : null
+  if (retired?.behavior === 'retire-pr' && retiredProof && ['closed', 'already_closed'].includes(String(retiredProof.result.outcome))) {
+    if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation })
+      || invocation.model !== null && invocation.callId !== null && !resourceReleaseProven(invocation.evidence ?? {}, true))) return { kind: 'wait', reason: 'original native resource release must settle before supersession' }
+    if (chain.held && !automaticClosureHold(chain.held)) return { kind: 'wait', reason: chain.held }
+    return { kind: 'supersede', evidence: retiredProof.result.coverage as Record<string, unknown> }
+  }
+  // An unconfirmed retirement falls through to fresh evidence below: the
+  // duplicate head may have moved since the attempt. Re-invocation is
+  // basis-guarded there so identical evidence holds instead of looping.
+  if (!observation.issue.open && observation.fullSuite) {
+    if (chain.held && !automaticClosureHold(chain.held)) return { kind: 'wait', reason: chain.held }
+    if (observation.existingPulls.length) return { kind: 'hold', reason: `full-suite recovery needs a decision for linked work: ${observation.existingPulls.join(', ')}` }
+    const coverage = observation.fullSuite
+    const duplicate = coverage.duplicate as { number?: unknown, head?: unknown } | null
+    if (coverage.verified !== true || !pull || pull.merged || duplicate?.number !== pull.number || duplicate.head !== pull.head
+      || observation.publication.head_sha !== pull.head || observation.publication.pull_number !== pull.number) {
+      return { kind: 'hold', reason: `full-suite recovery needs a decision: ${String(coverage.reason || 'latest duplicate head is not fully covered')}` }
+    }
+    if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation })
+      || invocation.model !== null && invocation.callId !== null && !resourceReleaseProven(invocation.evidence ?? {}, true))) return { kind: 'wait', reason: 'original native resource release must settle before retirement' }
+    if (retired?.behavior === 'retire-pr' && retired.basis === chainBasis(['retire', coverage])) {
+      return { kind: 'hold', reason: `redundant PR retirement needs a decision: ${String(retiredProof?.result.reason || 'the original close response did not confirm retirement')}` }
+    }
+    return { kind: 'invoke', behavior: 'retire-pr', basis: chainBasis(['retire', coverage]), actor: chain.author,
+      reviewer: null, reason: 'close the verified redundant full-suite repair after original invocation settlement' }
   }
   if (chain.held) return { kind: 'wait', reason: chain.held }
   if (!observation.issue.open && !pull) return { kind: 'hold', reason: 'seed issue closed without a confirmed merged pull request' }

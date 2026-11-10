@@ -40,6 +40,17 @@ retaining the current candidate head. `--ref base` reads the current base.
 `--read-failing-ci-log JOB_ID --repository OWNER/REPO` reads the actual job log,
 following GitHub's download redirect without forwarding credentials across hosts.
 
+For a closed full-suite reporter seed, `--chain-seed` also reads the actual
+failing/recovery runs, test artifacts and covering merges. Conservative complete
+test-repair coverage permits `github-interface --issue-work ISSUE --mode retire
+--branch BRANCH --pull-number N --expected-head SHA --coverage-json JSON
+--token-user USER`. Retirement revalidates that evidence, preserves unrelated
+work and rechecks the owned head immediately before closing. It returns `closed`,
+`already_closed`, `not_ready` or `superseded`; a missing response proves none of
+them. The chain invokes it only through the original native action/resource
+path after settling prior writes and native ownership. See
+[full-suite reconciliation](../docs/Behavior-chain.md#bounded-reconciliation).
+
 An atomic repair blocked solely by the supplied head's failed CI can return
 `blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains
 its own supplied CI snapshot as `artifact.ci_blocker`, including the failed
@@ -251,6 +262,12 @@ An empty stderr says the cause is unknown. Explicit ENOSPC/quota evidence also
 records filesystem bytes/inodes measured immediately after the process failure,
 with its own measurement time; unavailable readings are null with the measurement
 error. This is evidence at capture time, never a claim about earlier disk use.
+
+Native namespace init forwards the executor's observed wait status before
+exiting. The original Call retains an executor signal separately from an
+explicit exit such as 137; the init's conventional 128+signal exit does not
+establish a signal. Missing inner failure evidence still leaves the initiating
+cause unknown. Exit diagnostics grant no publication or resource-release proof.
 
 ### Bounded diagnostic reads
 

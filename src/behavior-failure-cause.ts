@@ -20,6 +20,7 @@ export const DIAGNOSTIC_PLACEMENT = {
   review_packet_too_large: { rail: 'warning', logging: 'error' }, model_output_limit: { rail: 'warning', logging: 'error' },
   review_contract_violation: { rail: 'warning', logging: 'error' }, review_recovery_failed: { rail: 'warning', logging: 'error' }, review_budget_exhausted: { rail: 'warning', logging: 'error' },
   runtime_status_unknown: { rail: 'warning', logging: 'warning' },
+  datastore_stale: { rail: 'warning', logging: 'warning' },
 } as const satisfies Record<string, { rail: DiagnosticSeverity; logging: 'excluded' | 'source' | 'warning' | 'error' }>
 export type KnownDiagnosticCode = keyof typeof DIAGNOSTIC_PLACEMENT
 export const DIAGNOSTIC_SCOPES = ['Agent log', 'Datastore', 'Identity', 'Behaviors runtime', 'Behaviors API dynamic code'] as const

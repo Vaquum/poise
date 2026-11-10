@@ -10,9 +10,10 @@ import { BehaviorResourceRecovery } from '../../server/behavior-chain-resource-r
 
 const wire = readFileSync(process.argv[2], 'utf8')
 const mode = process.argv[3] ?? 'fence'
-assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'ancestor-recovery'].includes(mode))
-const ancestorRecovery = mode === 'ancestor-recovery'
+assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked', 'ancestor-recovery'].includes(mode))
 const atomic = mode.startsWith('atomic-')
+const blocked = mode === 'atomic-work-blocked'
+const ancestorRecovery = mode === 'ancestor-recovery'
 const physical = mode === 'namespace-physical-only'
 const interrupted = mode.startsWith('namespace-interrupted-') || physical
 const guarded = mode === 'resource-guard'
@@ -45,12 +46,12 @@ try {
   assert.deepEqual(journal.reservedResources(), { ...reservation, unaccounted: 0 })
   const forbidden = async () => { throw new Error('receipt reconciliation must not execute work') }
   const reviewer = { slot: 'primary', model: call.model, recovery: call.model }
-  const operations: ChainRuntimeOperations = { enabled: () => false, accounts: () => ({ author: 'author', reviewer: 'reviewer' }),
+  const operations: ChainRuntimeOperations = { enabled: () => blocked, accounts: () => ({ author: 'author', reviewer: 'reviewer' }),
     discover: async () => [], ownsRepository: () => true, readInvocations: async () => parseAgentLogStdout(wire, 'actual native receipt'),
-    observe: async () => ({ checkedAt: Date.now(), existingPulls: [], issue: { open: false, eligible: false, revision: 'closed', commentIds: [] },
+    observe: async () => ({ checkedAt: Date.now(), existingPulls: [], issue: { open: blocked, eligible: blocked, revision: 'closed', commentIds: [] },
       issueReviewers: [reviewer], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer,
       publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null }),
-    available: () => false, capacity: () => 1, permitted: () => false, received: () => {}, request: forbidden, launch: forbidden,
+    available: () => blocked, capacity: () => 1, permitted: () => blocked, received: () => {}, request: forbidden, launch: forbidden,
     perform: forbidden, readActionResult: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden, wake: () => {} }
   if (atomic) {
     const pending = JSON.stringify(JSON.parse(wire).map((row: Record<string, unknown>) => ({ ...row, resources_settled_at: null })))
@@ -58,6 +59,7 @@ try {
     await new BehaviorChainRuntime(journal, operations).run()
     assert.equal(journal.read(id)!.invocations[0].state, 'uncertain')
     assert.deepEqual(journal.read(id)!.invocations[0].evidence?.diagnostic ?? null, call.diagnostic)
+    if (blocked) assert.equal(journal.read(id)!.held, call.error)
     assert.deepEqual(journal.reservedResources(), { ...reservation, unaccounted: 0 })
     journal.rebuild()
     operations.readInvocations = async () => snapshot
@@ -123,14 +125,24 @@ try {
     const settled = events.map(row => JSON.parse(row.payload)).find(event => event.type === 'invocation.settled')
     assert.equal(settled.outcome, outcome)
     assert.deepEqual(settled.evidence.diagnostic ?? null, call.diagnostic)
+    if (blocked) {
+      assert.equal(current.held, call.error)
+      assert.equal(settled.evidence.error, call.error)
+      assert.equal(call.diagnostic?.context.message, call.error)
+    }
   }
-  if (guarded) {
+  if (guarded || blocked) {
     await new BehaviorChainRuntime(journal, operations).run()
     assert.deepEqual(journal.history(id), events)
   }
   journal.rebuild()
   assert.deepEqual(journal.history(id), events)
   assert.deepEqual(journal.read(id), current)
+  if (blocked) {
+    await new BehaviorChainRuntime(new BehaviorChainJournal(db), operations).run()
+    assert.deepEqual(journal.history(id), events)
+    assert.deepEqual(journal.read(id), current)
+  }
   if (mode === 'fence') for (const change of [{ artifact: null }, { source: 'poise:review-new-prs' }, { resources_settled_at: null },
     { head_sha: 'a'.repeat(40) }, { review_id: 91 }, { artifact: { phase: 'admission_fenced', publication: {} } }]) {
     const rejected = parseAgentLogStdout(JSON.stringify([{ ...call, ...change }]), 'invalid native fence proof')

@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 from github_interface.atoms.local import _run, checkout_repo
@@ -65,13 +66,34 @@ async def review_replies(client: GitHubClient, target: str, pull: int, actor: st
         if parent not in by_id or parent in used or by_id[parent].get("in_reply_to_id"):
             raise ValueError("review reply target is not a unique original finding on this pull request")
         used.add(parent)
-        body = f"{reply['body'].strip()}\n\n<!-- poise-reply {call_id} {parent} -->"
+        body = reply["body"]
+        marker = re.search(r"\n\n<!-- poise-reply ([0-9a-f]{32}) ([1-9][0-9]*) -->\Z", body)
+        if marker and (int(marker.group(2)) != parent or not body[:marker.start()].strip()):
+            raise ValueError("reused review reply requires its original native marker and substantive answer")
+        if not marker:
+            body = f"{body.strip()}\n\n<!-- poise-reply {call_id} {parent} -->"
         matching = [comment for comment in comments if comment.get("in_reply_to_id") == parent and comment.get("body") == body
                     and (comment.get("user") or {}).get("login", "").lower() == actor.lower()]
         if len(matching) > 1:
             raise ValueError("review reply has duplicate native publication receipts")
         if matching:
             posted = matching[0]
+            if marker and marker.group(1) != call_id:
+                reviewer_input = [comment for comment in comments if (comment["id"] == parent or comment.get("in_reply_to_id") == parent)
+                                  and (comment.get("user") or {}).get("login", "").lower() != actor.lower()]
+                try:
+                    answered_at = datetime.fromisoformat(posted["created_at"])
+                    revisions = [datetime.fromisoformat(comment["updated_at"]) for comment in reviewer_input]
+                    if answered_at.tzinfo is None or any(revision.tzinfo is None for revision in revisions):
+                        raise ValueError("missing timezone")
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError("reused review reply lacks verified reviewer input timestamps") from error
+                # GitHub timestamps truncate to the second: an edit within the reply's
+                # creation second compares equal, so equality means changed input.
+                if any(revision >= answered_at for revision in revisions) or any(comment["id"] > posted["id"] for comment in reviewer_input):
+                    raise ValueError("reused review reply predates changed reviewer input; provide a fresh answer")
+        elif marker:
+            raise ValueError("reused review reply lacks its verified native publication receipt")
         elif publish:
             if not reserved:
                 work_publication(head, start_replies=True)
@@ -158,6 +180,37 @@ async def run(client: GitHubClient, payload: dict) -> dict:
             result["reply_receipts"] = await review_replies(client, target, int(pull["number"]), actor, str(payload.get("invocation_id") or ""), replies, publish=False)
             result["replies_complete"] = len(result["reply_receipts"]) == len(replies)
         return result
+    if mode == "retire":
+        from github_interface import full_suite_repair
+        from github_interface.behaviors import issue_comments
+
+        expected = str(payload.get("expected_head") or "")
+        proof = json.loads(payload.get("coverage_json") or "null")
+        if not pull or not SHA.fullmatch(expected) or not isinstance(proof, dict) or proof.get("verified") is not True \
+                or proof.get("duplicate") != {"number": pull["number"], "head": expected}:
+            raise ValueError("retirement requires the original verified full-suite coverage and duplicate head")
+        if pull.get("merged_at") or pull.get("merged"):
+            raise ValueError("a merged pull request cannot be retired as redundant")
+        result.update(merged=False, merge_sha=None, head_sha=expected)
+        if result["existing_pulls"]:
+            return {**result, "outcome": "not_ready", "reason": "linked work needs a decision"}
+        if pull["head"]["sha"] != expected or remote_head != expected:
+            return {**result, "outcome": "superseded", "reason": "duplicate head changed; a decision is required"}
+        issue = await client.get(f"/repos/{target}/issues/{issue_number}")
+        comments = await issue_comments.run(client, payload)
+        verified = await full_suite_repair.inspect(client, target, issue, comments["comments"], pull)
+        if verified != proof:
+            return {**result, "outcome": "not_ready", "reason": "full-suite coverage changed; a decision is required"}
+        current = await get_pull(client, owner, repo, pull["number"])
+        if any(current.get(key) != pull.get(key) for key in ("head", "base", "body", "user", "updated_at")) \
+                or current["head"]["sha"] != expected or remote_head != expected or current.get("merged"):
+            return {**result, "outcome": "superseded", "reason": "duplicate head or publication context changed; a decision is required"}
+        if current["state"] == "closed":
+            return {**result, "outcome": "already_closed", "coverage": verified}
+        closed = await client.patch(f"/repos/{target}/pulls/{pull['number']}", json={"state": "closed"})
+        if closed.get("state") != "closed" or closed.get("merged") or closed.get("merged_at") or closed["head"]["sha"] != expected:
+            raise RuntimeError("GitHub did not confirm closing the original redundant head")
+        return {**result, "outcome": "closed", "state": "closed", "coverage": verified}
     if result["existing_pulls"]:
         raise ValueError("seed issue already has another open pull request; its existing owner must continue")
     issue = await client.get(f"/repos/{target}/issues/{issue_number}")
