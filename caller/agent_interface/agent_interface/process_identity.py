@@ -77,15 +77,15 @@ def decode(encoded: str | None, pid: int) -> dict:
     return value
 
 
-def state(encoded: str | None, pid: int) -> str:
-    """alive/gone/different; an unreadable inspection raises, never means gone."""
+def state(encoded: str | None, pid: int, same_epoch: bool = False) -> str:
+    """Observe a local identity. A required but different epoch is unobservable."""
     value = decode(encoded, pid)
     try:
         current_epoch = epoch()
     except (OSError, ValueError, IndexError) as error:
         raise RuntimeError(f"process epoch cannot be verified: {error}") from error
     if value["epoch"] != current_epoch:
-        return "different"
+        return "unobservable" if same_epoch else "different"
     try:
         return "alive" if value["start"] == _start(pid) else "different"
     except FileNotFoundError:

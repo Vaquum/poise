@@ -38,6 +38,10 @@ operation without a signal. This includes older rows and macOS development
 without kernel-pinned handles. The refusal is explicit; no unsafe fallback is
 used. Externally managed Chat turns retain Poise's existing Stop route.
 
+Interruption reconciliation requires the original native supervisor's kernel
+and PID namespace. A log reader in another namespace cannot mark that Call
+interrupted. Existing resource and publication receipts still govern recovery.
+
 Native per-Call resource receipts live in `resource_ownership`, outside the
 replaceable publication artifact. Directory registration precedes allocation;
 all PR attempt roots and copied credentials use a private recorded Call parent.

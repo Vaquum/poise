@@ -714,8 +714,9 @@ def init_started_at() -> float | None:
 def reap_interrupted() -> int:
     """Historical non-native calls retain their age-based status reaping.
     Native supervisor loss uses its recorded kernel identity, never wall-clock
-    epoch order. Its interrupted status grants neither resource release nor
-    retry authority. Terminal native rows need no reaping or process scan;
+    epoch order. Another PID namespace cannot establish its loss. Interrupted
+    status grants neither resource release nor retry authority. Terminal native
+    rows need no reaping or process scan;
     verified cleanup is separate and never runs in these log reads."""
     init = init_started_at()
     now = time()
@@ -728,10 +729,10 @@ def reap_interrupted() -> int:
     for row in rows:
         if row["source"] == "poise:behavior-chain":
             try:
-                observed = process_identity.state(row["process_identity"], int(row["pid"]))
+                observed = process_identity.state(row["process_identity"], int(row["pid"]), True)
             except (RuntimeError, TypeError, ValueError):
                 continue
-            if observed != "alive":
+            if observed in {"gone", "different"}:
                 ended.append(row["id"])
             continue
         started = float(row["started_at"] or 0)
