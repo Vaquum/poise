@@ -819,13 +819,16 @@ def logs(status: str | None = None):
     if status is not None and status != "running":
         raise ValueError("logs status filter must be running")
     reap_interrupted()
+    columns = f"rowid, {LOG_ROW_COLUMNS}" if status else LOG_ROW_COLUMNS
     with db() as conn:
         rows = conn.execute(
-            f"select {LOG_ROW_COLUMNS} from calls"
+            f"select {columns} from calls"
             + (" where status='running'" if status else "")
             + " order by started_at"
         ).fetchall()
-    return [_log_row(r) for r in rows]
+    if status:
+        return [{**_log_row(row), "history_rowid": str(row["rowid"])} for row in rows]
+    return [_log_row(row) for row in rows]
 
 
 LOGS_PAGE_LIMIT_MAX = 1000
@@ -981,7 +984,7 @@ def logs_history_by_id(id_: str) -> list[dict]:
         if key is None:
             return []
         entry = _read_history_row(conn, key[0], " where id=?", [id_])
-    return [{**entry, "id": id_}]
+    return [{**entry, "id": id_, "history_rowid": str(key[0])}]
 
 
 def logs_page(limit: int, cursor: str | None = None, org: str | None = None, search: str | None = None) -> dict:
@@ -1037,6 +1040,7 @@ def logs_page(limit: int, cursor: str | None = None, org: str | None = None, sea
         else:
             keys = [row["rowid"] for row in rows]
             page = [_history_log_row(row) for row in rows[:limit]]
+    page = [{**entry, "history_rowid": str(key)} for entry, key in zip(page, keys[:limit], strict=True)]
     return {
         "rows": list(reversed(page)),
         "nextCursor": str(keys[limit - 1]) if len(keys) > limit else None,
