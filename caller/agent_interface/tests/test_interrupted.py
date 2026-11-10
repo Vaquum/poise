@@ -173,6 +173,23 @@ class InterruptedCallsCase(TestCase):
                     self.assertEqual((row["artifact"], row["action_plan"], row["receipts"], row["review_id"]),
                                      (artifact, "original publication plan", receipts, "91"))
 
+    def test_another_pid_namespace_cannot_interrupt_a_native_supervisor(self):
+        identity = agent_interface.process_identity
+        outer = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+        inner = {**outer, "init_start": "20", "namespace_ino": 3}
+        with patch.object(identity, "epoch", return_value=outer), patch.object(identity, "_start", return_value="42"):
+            call = agent_interface.track("fixture-model", "native observer", repo="acme/app",
+                                         behavior="pr_review", source="poise:behavior-chain")
+            self.assertEqual(agent_interface.reap_interrupted(), 0)
+        with patch.object(identity, "epoch", return_value=inner), patch.object(identity, "_start") as start:
+            entries = agent_interface.logs(status="running")
+            start.assert_not_called()
+        self.assertIn(call, {entry["id"] for entry in entries})
+        self.assertEqual(self.row(call)["status"], "running")
+        with patch.object(identity, "epoch", return_value=outer), patch.object(identity, "_start", side_effect=FileNotFoundError):
+            self.assertEqual(agent_interface.reap_interrupted(), 1)
+        self.assertEqual(self.row(call)["error_code"], "interrupted")
+
     def test_a_forward_wall_clock_step_does_not_interrupt_or_release_a_live_native_supervisor(self):
         call = agent_interface.track("fixture-model", "native epoch contract", repo="acme/app", pr_id="7",
                                      actor="reviewer", behavior="pr_review", source="poise:behavior-chain")
