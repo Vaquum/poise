@@ -191,6 +191,26 @@ class InterruptedCallsCase(TestCase):
             self.assertEqual(agent_interface.reap_interrupted(), 1)
         self.assertEqual(self.row(call)["error_code"], "interrupted")
 
+    def test_an_old_reader_cannot_reap_a_native_registration_from_a_new_release(self):
+        identity = agent_interface.process_identity
+        epoch = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+        with patch.object(identity, "epoch", return_value=epoch), patch.object(identity, "_start", return_value="42"):
+            call = agent_interface.track("fixture-model", "mixed release", repo="acme/app",
+                                         behavior="pr_review", source="poise:behavior-chain")
+            with agent_interface.db() as conn:
+                recorded = conn.execute("select process_identity from calls where id=?", (call,)).fetchone()[0]
+            self.assertTrue(identity.owns_registration(recorded))
+            self.assertEqual(identity.state(identity.capture(os.getpid()), os.getpid()), "alive")
+
+        def old_reader(encoded, _pid, *_args):
+            if json.loads(encoded)["version"] != 1:
+                raise RuntimeError("call lacks a verified process identity")
+            return "different"
+
+        with patch.object(identity, "state", side_effect=old_reader):
+            self.assertEqual(agent_interface.reap_interrupted(), 0)
+        self.assertEqual(self.row(call)["status"], "running")
+
     def test_a_verified_workspace_observer_reaps_a_previous_epoch(self):
         identity = agent_interface.process_identity
         original = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
