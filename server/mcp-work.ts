@@ -65,7 +65,8 @@ function ledgerCoverage(reply: LedgerReadReply): Coverage {
   return coverage(status, health.observedAt, reply.body.error ?? (reply.body.nextCursor ? 'Only the first five target receipts are included' : null))
 }
 
-async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Coverage, now: number) {
+async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Coverage, now: number,
+  ledgerShortCircuit: { reply: LedgerReadReply | null }) {
   let chain: BehaviorChain | null = null
   let chainCoverage = coverage('fresh', new Date(now).toISOString())
   try {
@@ -86,11 +87,19 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
   const targets = [...new Set([issue.number, ...(pullNumber ? [pullNumber] : [])])]
   // Ledger reads stay sequential: a full page fans out to two targets per
   // issue against the worker's bounded read slots, so parallel reads
-  // deterministically return ledger_busy.
+  // deterministically return ledger_busy. Once the ledger proves unresponsive
+  // for this page, remaining targets reuse that unavailable evidence instead of
+  // paying another two-second read each and exceeding the gateway deadline.
   const ledger: Array<{ number: number; coverage: Coverage; health: LedgerHealth; hasMore: boolean;
     records: Array<Pick<LedgerRecord, 'id' | 'behavior' | 'state' | 'activity' | 'outcome' | 'head' | 'startedAt' | 'completedAt' | 'refs'>> }> = []
   for (const number of targets) {
+    if (ledgerShortCircuit.reply) {
+      ledger.push({ number, coverage: ledgerCoverage(ledgerShortCircuit.reply), health: ledgerShortCircuit.reply.body.health, hasMore: false,
+        records: [] })
+      continue
+    }
     const reply = await readBehaviorLedger({ operation: 'list', repository: issue.repo, number, limit: 5 })
+    if (reply.status !== 200 || reply.body.health.status === 'unavailable' || reply.body.health.status === 'stopped') ledgerShortCircuit.reply = reply
     ledger.push({ number, coverage: ledgerCoverage(reply), health: reply.body.health, hasMore: !!reply.body.nextCursor,
       records: (reply.body.records ?? []).map(record => ({ id: record.id, behavior: record.behavior, state: record.state,
         activity: record.activity, outcome: record.outcome, head: record.head, startedAt: record.startedAt,
@@ -105,7 +114,11 @@ async function workItem(issue: WorkIssue, service: ServiceConfig, mirror: Covera
       reviewId: invocation.evidence.review_id, head: invocation.evidence.head_sha } : null,
     coverage: invocation.callId && invocation.evidence ? 'recorded' : 'not-recorded',
   }))
-  const missingReceipt = receipts.some(receipt => receipt.state !== 'admitted' && receipt.state !== 'started' && receipt.coverage === 'not-recorded')
+  // Deliberately settled not_started attempts (launch_deferred, spawn_failed and
+  // other pre-launch deferrals) carry no Call by design; only a settled attempt
+  // that should have produced a receipt counts as a gap.
+  const missingReceipt = receipts.some(receipt => receipt.state !== 'admitted' && receipt.state !== 'started' && receipt.coverage === 'not-recorded'
+    && receipt.evidence?.action !== 'not_started')
   const omittedInvocations = Math.max(0, (summary?.invocationCount ?? 0) - receipts.length)
   let stage = 'unknown'
   let blocker = chainCoverage.reason
@@ -160,7 +173,9 @@ export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig
   if (!org || org.status !== 'ready') throw new HttpError(403, 'repository is outside the ready workspace accounts')
   const after = args.issue ? null : pageCursor(args, grant)
   const limit = args.issue ? 1 : args.limit ?? 5
-  const filters = args.issue ? ['--number', String(args.issue)] : ['--label', args.label!,
+  // Pass the label as one --label=value argument so accepted labels starting
+  // with a dash are not mistaken for another option by argparse.
+  const filters = args.issue ? ['--number', String(args.issue)] : [`--label=${args.label!}`,
     '--after-repo', after!.repo, '--after-number', String(after!.number)]
   let source = await mirrorCoverage(org)
   let rows: WorkIssue[] = []
@@ -177,9 +192,10 @@ export async function readMcpWork(args: McpWorkArguments, service: ServiceConfig
   } catch (error) { rows = []; source = coverage('unavailable', source.observedAt, message(error)) }
   const selected = rows.slice(0, limit)
   const now = Date.now()
+  const ledgerShortCircuit: { reply: LedgerReadReply | null } = { reply: null }
   const items: Array<Awaited<ReturnType<typeof workItem>>> = []
   for (const issue of selected) {
-    items.push(await workItem(issue, service, source, now))
+    items.push(await workItem(issue, service, source, now, ledgerShortCircuit))
   }
   const last = selected.at(-1)
   return { repository: args.repository, issue: args.issue ?? null, label: args.label ?? null, observedAt: new Date(now).toISOString(),

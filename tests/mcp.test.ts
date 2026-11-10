@@ -319,6 +319,16 @@ conn.close()
     actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 60_000,
     request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
   append(runningChain, { type: 'invocation.started', invocationId: 'running' })
+  let retryChain = admit(9)
+  retryChain = append(retryChain, { type: 'invocation.admitted', invocation: { id: 'deferred', behavior: 'implement-issue', basis: 'issue',
+    actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 60_000,
+    request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
+  retryChain = append(retryChain, { type: 'invocation.settled', invocationId: 'deferred', callId: null, outcome: 'launch_deferred',
+    evidence: { status: 'deferred', action: 'not_started', outcome: 'launch_deferred', completedAt: now - 59_000 } })
+  retryChain = append(retryChain, { type: 'invocation.admitted', invocation: { id: 'retry', behavior: 'implement-issue', basis: 'issue',
+    actor: 'author', model: 'fixture', slot: 'primary', admittedAt: now - 30_000,
+    request: { command: 'agent-interface', argv: [], cwd: '/isolated' } } })
+  append(retryChain, { type: 'invocation.started', invocationId: 'retry' })
   await ledger.startBehaviorLedger({ path: join(root, 'ledger.sqlite') })
   ledger.behaviorLedgerHeartbeat()
   const packagePoisePlugin = (apex: string, destination: string) => promisify(execFile)(process.execPath,
@@ -358,7 +368,7 @@ conn.close()
     expect(first.items[1].blocker).toContain('capacity')
     expect(run.mock.calls.map(call => call[1])).toEqual([
       ['--db', path, 'health', '--max-age-seconds', '120'],
-      ['--db', path, 'view', 'issue', '--repo', 'acme/repo', '--label', 'poise', '--after-repo', '', '--after-number', '0', '--limit', '3', '--format', 'json'],
+      ['--db', path, 'view', 'issue', '--repo', 'acme/repo', '--label=poise', '--after-repo', '', '--after-number', '0', '--limit', '3', '--format', 'json'],
     ])
     expect(reads.mock.calls.map(call => call[0])).toEqual(['acme/repo#1', 'acme/repo#2'])
     expect(pages).not.toHaveBeenCalled()
@@ -398,6 +408,29 @@ conn.close()
     const running = await work({ repository: 'acme/repo', issue: 8 })
     expect(running.items[0]).toMatchObject({ stage: 'running', blocker: null,
       coverage: { receipts: { status: 'fresh' } }, receipts: [{ id: 'running', callId: null, coverage: 'not-recorded' }] })
+    const retry = await work({ repository: 'acme/repo', issue: 9 })
+    expect(retry.items[0]).toMatchObject({ stage: 'running', blocker: null,
+      coverage: { receipts: { status: 'fresh' } },
+      receipts: [{ id: 'deferred', callId: null, coverage: 'not-recorded' }, { id: 'retry', callId: null, coverage: 'not-recorded' }] })
+    run.mockClear()
+    const dash = await work({ repository: 'acme/repo', label: '-blocked', limit: 2 })
+    expect(dash.coverage.issues.status).toBe('fresh')
+    expect(dash.items).toEqual([])
+    expect(dash.nextCursor).toBeNull()
+    expect(run.mock.calls[1][1]).toEqual(expect.arrayContaining(['--label=-blocked']))
+    receipts.mockClear()
+    receipts.mockImplementation(async () => ({
+      status: 503, body: { version: 1 as const, error: 'ledger_read_timeout',
+        health: { status: 'unavailable' as const, unavailableReason: 'read_timeout' as const, coverageStart: null, observedAt: null,
+          callerObservedAt: null, pending: 0, dropped: 0, gaps: [], detailFloor: null, generation: null,
+          retainedFrom: null, changeLowerBound: null, lastSequence: null, instances: null, changes: null } },
+    }))
+    const shortCircuited = await work({ repository: 'acme/repo', label: 'poise', limit: 2, cursor: first.nextCursor })
+    expect(shortCircuited.coverage.issues.status).toBe('fresh')
+    expect(shortCircuited.items.map(item => item.issue)).toEqual([3, 4])
+    expect(shortCircuited.items.every(item => item.ledger.every(source => source.coverage.status === 'unavailable'))).toBe(true)
+    expect(receipts.mock.calls).toHaveLength(1)
+    receipts.mockImplementation((request) => realRead(request))
     expect((await work({ repository: 'acme/repo', issue: 7 })).items[0]).toMatchObject({ issue: 7, author: null, stage: 'not_recorded' })
     const mirror = new Database(path)
     mirror.prepare("UPDATE sync_state SET updated_at=? WHERE scope='org' AND key='last_sync_at'").run(new Date(now - 600_000).toISOString())
