@@ -30,7 +30,8 @@ export class BehaviorResourceRecovery {
         const chain = this.journal.read(entry.chain.id)!
         const invocation = chain.invocations[entry.position]
         const selected = (correlation: string): LogEntry | undefined => {
-          if (snapshot.quarantined.some(row => !row.correlationId || row.correlationId === correlation)) throw new Error('native resource receipt is quarantined')
+          const rejected = snapshot.quarantined.find(row => !row.correlationId || row.correlationId === correlation)
+          if (rejected) throw new Error(`native resource receipt ${correlation} is quarantined`, { cause: new Error(rejected.error) })
           const calls = snapshot.entries.filter(call => call.correlation_id === correlation)
           if (calls.length > 1) throw new Error('multiple Caller receipts claim one resource owner')
           return calls[0]

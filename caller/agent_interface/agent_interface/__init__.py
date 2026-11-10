@@ -846,8 +846,10 @@ def logs_selected(selection: object) -> list[dict]:
     Each latest needle seeks one indexed row; each id seeks the primary key.
     Missing kinds and old incidents never require walking retained history.
     """
-    if not isinstance(selection, dict) or set(selection) not in ({"latest", "ids"}, {"latest", "ids", "correlations"}):
-        raise ValueError("logs selection requires latest and ids, with optional correlations")
+    if not isinstance(selection, dict) or set(selection) - {"resourceRecovery"} not in (
+        {"latest", "ids"}, {"latest", "ids", "correlations"}
+    ):
+        raise ValueError("logs selection requires latest and ids, with optional correlations and resourceRecovery")
     latest, ids = selection["latest"], selection["ids"]
     correlations = selection.get("correlations", [])
     if not isinstance(correlations, list) or len(correlations) > 256 or any(
@@ -862,6 +864,10 @@ def logs_selected(selection: object) -> list[dict]:
             raise ValueError("logs latest needle requires behavior, source and owner")
     if any(not isinstance(id_, str) or not re.fullmatch(r"[0-9a-f]{32}", id_) for id_ in ids):
         raise ValueError("logs selection requires full call ids")
+    if "resourceRecovery" in selection:
+        if selection["resourceRecovery"] is not True or latest or ids or not 1 <= len(correlations) <= 32:
+            raise ValueError("resource recovery requires 1..32 exact correlations only")
+        return _resource_recovery_logs(correlations)
     reap_interrupted()
     found: dict[str, sqlite3.Row] = {}
     with db() as conn:
@@ -930,12 +936,32 @@ def _history_log_row(row: sqlite3.Row) -> dict:
         return {**identity, "history_read_error": "INVALID_RECORD"}
 
 
+def _resource_recovery_logs(correlations: list[str]) -> list[dict]:
+    entries = []
+    with db() as conn:
+        for correlation in dict.fromkeys(correlations):
+            keys = conn.execute(
+                "select rowid from calls indexed by calls_correlation_id_unique where correlation_id=? limit 2",
+                (correlation,),
+            ).fetchall()
+            if not keys:
+                continue
+            # Verify the correlation from the record itself. The index only
+            # supplies its position.
+            if len(keys) == 1:
+                entry = _read_history_row(conn, keys[0][0], " where correlation_id=?", [correlation])
+            else:
+                entry = {"history_read_error": "INVALID_RECORD"}
+            entries.append({**entry, "correlation_id": correlation})
+    return entries
+
+
 def _read_history_row(conn: sqlite3.Connection, rowid: int, where: str, params: list[object]) -> dict:
     # Recheck the original scope on the exact read. A corrupt or short page
     # can abort SQLite's read transaction, so isolation uses separate reads.
     key_where = where + (" and" if where else " where") + " rowid=?"
     try:
-        row = conn.execute(f"select {LOG_ROW_COLUMNS} from calls{key_where}", (*params, rowid)).fetchone()
+        row = conn.execute(f"select {LOG_ROW_COLUMNS} from calls not indexed{key_where}", (*params, rowid)).fetchone()
     except sqlite3.Error as error:
         reason = _history_read_error(error)
         if reason is None:

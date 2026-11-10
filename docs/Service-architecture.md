@@ -1462,7 +1462,11 @@ an older image remains on v1 until its runtime base is upgraded. Unsupported
 metadata layouts also refuse v2 visibly while retaining v1's existing path.
 After cleanup, the same maintenance opportunity reuses Caller's existing
 selected-receipt reader to reconcile at most 16 pending admissions, including
-held and merged chains. `invocation.resources_reconciled` in the canonical
+held and merged chains. Its maintenance selection isolates unreadable rows by
+exact correlation and reports their cause through storage diagnostics. An
+unreadable or missing Call retains its reservation. See
+[Caller's selected reads](../caller/agent_interface/README.md#incremental-log-reads).
+`invocation.resources_reconciled` in the canonical
 event log changes only physical resource evidence. It preserves the original
 outcome, uncertainty, hold and merge evidence, starts no worker and repeats no
 external action. A later enabled behavior tick separately decides any next work.

@@ -79,6 +79,7 @@ describe('durable behavior resource reservations', () => {
     if (mode === 'merged') current = record(journal, current, { type: 'chain.merged', mergeSha: 'a'.repeat(40),
       evidence: { merged: true, merge_sha: 'a'.repeat(40), repository: chain.repository, pull_number: 9, review_complete: false } })
     const before = structuredClone(current)
+    const blocked = record(journal, seed(journal, 8), { type: 'invocation.admitted', invocation: { ...admitted, id: 'unreadable' } })
     const namespace = { state: 'settled', callId: 'c'.repeat(32), correlation: admitted.id, settled_at: 15,
       controller: { version: 1, instance: 'b'.repeat(32) }, binding: { pid: 4, start: '4', namespace: 'pid:[9]',
         owner: { pid: 2, start: '2' }, holder: { pid: 3, start: '3' },
@@ -88,11 +89,15 @@ describe('durable behavior resource reservations', () => {
       action: 'commented', outcome: 'commented', resources_settled_at: new Date(20_000).toISOString(),
       artifact: { phase: 'resources_unknown', resource_error: 'retained cleanup cause', resource_recovered_at: 18 },
       resource_ownership: { version: 2, roots: [], errors: [{ cause: 'resources_unknown', path: null, at: 12, recovered_at: 18 }], namespace } }
-    const read = vi.fn(async () => parseAgentLogStdout(JSON.stringify([call]), 'physical-only recovery fixture'))
+    const read = vi.fn(async () => parseAgentLogStdout(JSON.stringify([
+      call, { correlation_id: 'unreadable', history_read_error: 'SQLITE_CORRUPT' },
+    ]), 'physical-only recovery fixture'))
     const recovery = new BehaviorResourceRecovery(journal, read)
+    expect(journal.liveModelInvocationCount()).toBe(2)
+    const quarantine = { message: 'native resource receipt unreadable is quarantined', cause: { message: expect.stringContaining('SQLITE_CORRUPT') } }
+    await expect(recovery.run()).rejects.toMatchObject(quarantine)
     expect(journal.liveModelInvocationCount()).toBe(1)
-    await recovery.run()
-    expect(journal.liveModelInvocationCount()).toBe(0)
+    expect(journal.read(blocked.id)).toEqual(blocked)
     const recovered = journal.read(chain.id)!
     expect(recovered.invocations[0]).toMatchObject({ state: before.invocations[0].state, outcome: before.invocations[0].outcome,
       callId: before.invocations[0].callId })
@@ -100,7 +105,7 @@ describe('durable behavior resource reservations', () => {
     expect(recovered.mergeSha).toBe(before.mergeSha)
     expect(recovered.invocations[0].evidence?.artifact).toMatchObject({ phase: 'posting_issue_reviews', plan_sha: 'd'.repeat(64), resource_recovered_at: 18 })
     const history = journal.history(chain.id)
-    await recovery.run()
+    await expect(recovery.run()).rejects.toMatchObject(quarantine)
     expect(journal.history(chain.id)).toEqual(history)
     journal.rebuild()
     expect(journal.history(chain.id)).toEqual(history)

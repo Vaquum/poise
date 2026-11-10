@@ -730,7 +730,7 @@ async function nativeCleanup(dryRun = false): Promise<NativeCleanupReport | null
     const ids = [...released, ...held.map(item => item.callId)]
     if (ids.length !== value.examined || new Set(ids).size !== ids.length) throw new Error('Caller native cleanup returned contradictory counts')
     if (!dryRun && db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()) {
-      resourceRecovery ??= new BehaviorResourceRecovery(behaviorChainJournal(), readNativeInvocations)
+      resourceRecovery ??= new BehaviorResourceRecovery(behaviorChainJournal(), ids => readNativeInvocations(ids, 'resource-recovery'))
       await resourceRecovery.run()
     }
     return { examined: Number(value.examined), released, held }
