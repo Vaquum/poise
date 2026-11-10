@@ -1,7 +1,7 @@
 from typing import Any
 
 from github_interface.atoms.review_identity import require_other_author
-from github_interface.atoms.review_response import response_body, submission_response
+from github_interface.atoms.review_response import resolve_verified_fixes, response_body, submission_response
 from github_interface.atoms.pulls import comment_review, get_pull
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head, pull_number, repository, token_user
@@ -56,4 +56,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "review_id": review.get("id"),
         "submitted_at": review.get("submitted_at"),
         "review_response": response,
+        **await resolve_verified_fixes(client, owner, repo, response, review.get("id")),
     }

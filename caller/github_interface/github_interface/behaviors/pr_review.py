@@ -36,6 +36,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     reviews = await list_reviews(client, owner, repo, pull_number)
     issues = await linked_issues(client, owner, repo, pull_number)
 
+    author = str((pull.get("user") or {}).get("login") or "").lower()
+    reviewer = str(payload.get("token_user") or "").lower()
+    candidates = [thread["root_comment_id"] for thread in threads
+                  if author and reviewer and reviewer != author and thread["author"].lower() == reviewer
+                  and thread.get("repair_answer", {}).get("author", "").lower() == author][:100]
     context = {
         "action": "read",
         "repository": f"{owner}/{repo}",
@@ -47,6 +52,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "existing_inline_comments": _comment_summary(rest_comments),
         "author_pr_comments": _author_comment_summary(public_comments, pull),
         "review_threads": threads,
+        **({"verification_candidates": candidates} if candidates else {}),
         "resolved_threads": [thread for thread in threads if thread["is_resolved"]],
         "change_request_reviews": _change_request_summary(reviews, required_head),
         "linked_issues": issues,

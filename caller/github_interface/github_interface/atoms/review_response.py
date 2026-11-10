@@ -6,6 +6,12 @@ import re
 import time
 from datetime import datetime
 
+import httpx
+
+from github_interface.atoms.pulls import get_review_thread, list_reviews, resolve_conversation
+from github_interface.atoms.review_identity import require_owned_reviews
+from github_interface.client import GitHubClient
+
 
 def assessment(value: object) -> dict:
     if not isinstance(value, dict) or set(value) != {"verdict", "reviewed_context", "limitations"}:
@@ -49,7 +55,9 @@ def parse_body(body: str) -> dict | None:
 
 
 def submission_response(payload: dict, pull: dict, repo: str, number: int, head: str, actor: str) -> dict:
-    value = assessment(payload.get("assessment"))
+    raw = payload.get("assessment")
+    roots = raw.get("verified_fixes", []) if isinstance(raw, dict) else []
+    value = assessment({key: item for key, item in raw.items() if key != "verified_fixes"} if isinstance(raw, dict) else raw)
     context = context_sha(pull)
     # The governed runner retained the provider's response before entering
     # this command. Standalone submissions cannot acquire native ownership.
@@ -58,12 +66,62 @@ def submission_response(payload: dict, pull: dict, repo: str, number: int, head:
         response = retained_response()
         if response["assessment"] != value or response["repository"].lower() != repo.lower() \
                 or response["pull_number"] != number or response["head_sha"] != head \
-                or response["context_sha"] != context or response["reviewer"].lower() != actor.lower():
+                or response["context_sha"] != context or response["reviewer"].lower() != actor.lower() \
+                or not isinstance(roots, list) or any(type(root) is not int for root in roots) \
+                or sorted(roots) != sorted(int(root) for root in response.get("verified_fixes", {})):
             raise RuntimeError("retained review response differs from the current PR context")
         return response
+    if roots != []:
+        raise ValueError("verified fixes require a managed review")
     return {"assessment": value, "repository": repo, "pull_number": number, "head_sha": head,
             "context_sha": context, "reviewer": actor, "invocation_id": None, "model": None,
             "completed_at": int(time.time() * 1000)}
+
+
+async def resolve_verified_fixes(client: GitHubClient, owner: str, repo: str, response: dict | None,
+                                 review_id: int | None, blocked: set[int] | None = None) -> dict:
+    fixes = response.get("verified_fixes") if response else None
+    if not fixes:
+        return {}
+    from agent_interface.review_receipt import checkpoint_verified_resolution
+
+    actor = response["reviewer"].lower()
+    resolved, skipped = [], []
+    result = {"resolved": resolved, "skipped": skipped}
+    try:
+        if "GITHUB_INTERFACE_AUTOMATED_REVIEWS" in os.environ:
+            reviews = await list_reviews(client, owner, repo, response["pull_number"])
+            require_owned_reviews([review for review in reviews if review["id"] != review_id], actor)
+        for key, fix in fixes.items():
+            root = int(key)
+            if blocked and root in blocked:
+                skipped.append(root)
+                continue
+            thread = await get_review_thread(client, fix["id"])
+            pull = thread["pull"]
+            author = str((pull.get("author") or {}).get("login") or "").lower()
+            if pull["number"] != response["pull_number"] or pull["repository"]["nameWithOwner"].lower() != response["repository"].lower() \
+                    or pull["state"] != "OPEN" or pull["isDraft"] or pull["headRefOid"] != response["head_sha"] \
+                    or context_sha({"base": {"sha": pull["baseRefOid"]}, "title": pull["title"], "body": pull["body"]}) != response["context_sha"]:
+                result["stale"] = True
+                break
+            answer = thread.get("repair_answer") or {}
+            if thread["id"] != fix["id"] or thread["root_comment_id"] != root or not thread["can_resolve"] \
+                    or thread["is_resolved"] or thread["author"].lower() != actor or not author or author == actor \
+                    or answer.get("author", "").lower() != author or answer.get("revision") != fix["revision"]:
+                skipped.append(root)
+                continue
+            checkpoint_verified_resolution(response, review_id, thread["id"])
+            receipt = await resolve_conversation(client, thread["id"])
+            if receipt.get("id") != thread["id"] or receipt.get("isResolved") is not True:
+                raise RuntimeError("GitHub did not confirm the verified thread resolution")
+            checkpoint_verified_resolution(response, review_id, thread["id"], resolved=True)
+            resolved.append(root)
+    except (RuntimeError, httpx.HTTPError) as error:
+        # The accepted review is a separate effect. Keep its receipt and
+        # surface the incomplete resolution without replaying the mutation.
+        result["error"] = str(error)[:1000]
+    return {"thread_resolution": result}
 
 
 def qualifying_response(response: object, pull: dict, repo: str, number: int, head: str, actor: str) -> bool:

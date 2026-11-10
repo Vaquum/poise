@@ -49,18 +49,32 @@ def prepare_response(packet: str, model: str, review_scope: str = "") -> None:
     pull = value["pull"]
     context = sha256(json.dumps([pull["base"]["sha"], pull["title"], pull.get("body") or ""],
                                ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    candidates = set(value.get("verification_candidates", []))
+    fixes = {str(thread["root_comment_id"]): {"id": thread["id"], "revision": thread["repair_answer"]["revision"]}
+             for thread in value.get("review_threads", []) if thread.get("root_comment_id") in candidates}
     database, call_id = bound
     with caller_store.connect(database, timeout=30) as conn:
-        conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?),'$.review_scope',?) where id=? and status='running'",
+        conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.review_context',json(?),'$.review_scope',?,"
+                     "'$.verification_candidates',json(?)) where id=? and status='running'",
                      (json.dumps({"repository": value["repository"], "pull_number": value["pull_number"],
                                   "head_sha": value["head_sha"], "context_sha": context, "model": model}),
-                      review_scope or None, call_id))
+                      review_scope or None, json.dumps(fixes), call_id))
+
+
+def verified_fix_ids(assessment: dict) -> list[int]:
+    roots = assessment.get("verified_fixes", [])
+    if not isinstance(roots, list) or len(roots) > 100 or any(type(root) is not int or root <= 0 for root in roots) \
+            or len(set(roots)) != len(roots):
+        raise ValueError("verified_fixes must list up to 100 distinct root comment IDs")
+    return roots
 
 
 def complete_response(assessment: dict, head: str) -> dict | None:
     """Retain the actual response and time before the terminal command runs."""
-    if not isinstance(assessment, dict) or set(assessment) != {"verdict", "reviewed_context", "limitations"}:
+    if not isinstance(assessment, dict) or set(assessment) - {"verified_fixes"} != {"verdict", "reviewed_context", "limitations"}:
         raise ValueError("review response requires a substantive assessment")
+    roots = verified_fix_ids(assessment)
+    assessment = {key: value for key, value in assessment.items() if key != "verified_fixes"}
     for key, minimum in (("verdict", 20), ("reviewed_context", 20), ("limitations", 4)):
         if not isinstance(assessment[key], str) or not minimum <= len(assessment[key].strip()) <= 4000:
             raise ValueError(f"invalid review assessment {key}")
@@ -75,21 +89,27 @@ def complete_response(assessment: dict, head: str) -> dict | None:
         database, call_id = bound
     with caller_store.connect(database, timeout=30) as conn:
         conn.execute("begin immediate")
-        row = conn.execute("select artifact,actor,status from calls where id=?", (call_id,)).fetchone()
+        row = conn.execute("select artifact,actor,status,behavior from calls where id=?", (call_id,)).fetchone()
         if not row or row[2] != "running":
             raise RuntimeError("review response lacks its running native invocation")
         artifact = json.loads(row[0] or "{}")
         context = artifact.get("review_context")
         if not context or context["head_sha"] != head:
             raise RuntimeError("review response lacks its pinned review context")
+        candidates = artifact.get("verification_candidates", {})
+        if roots and (row[3] not in {"pr_review", "pr_approve"} or any(str(root) not in candidates for root in roots)):
+            raise ValueError("verified fix must name an answered thread in the original review packet")
+        verified = {str(root): candidates[str(root)] for root in roots}
         prior = artifact.get("review_response")
         if prior is not None:
-            if prior["assessment"] == assessment and all(prior.get(key) == value for key, value in context.items()):
+            if prior["assessment"] == assessment and prior.get("verified_fixes", {}) == verified \
+                    and all(prior.get(key) == value for key, value in context.items()):
                 return prior
             if artifact.get("phase") != "reviewing":
                 raise RuntimeError("native reviewer already submitted a different response")
         response = {**context, "reviewer": row[1], "invocation_id": call_id,
-                    "completed_at": int(time.time() * 1000), "assessment": assessment}
+                    "completed_at": int(time.time() * 1000), "assessment": assessment,
+                    **({"verified_fixes": verified} if verified else {})}
         conn.execute("update calls set artifact=json_set(artifact,'$.review_response',json(?)) where id=?",
                      (json.dumps(response), call_id))
         if prior is not None:
@@ -156,6 +176,29 @@ def begin_submission(body: str, head: str) -> str:
         visible, separator, response = body.partition('\n\n<!-- poise-review-response ')
         body = f"{visible.replace(scope, '').strip()}\n\n{scope}{separator}{response}"
     return f"{body}\n\n<!-- poise-invocation {call_id} -->".strip()
+
+
+def checkpoint_verified_resolution(response: dict, review_id: int | None, thread_id: str, *, resolved: bool = False) -> None:
+    """Record each attempt and its response within the original review Call."""
+    database, call_id = os.environ.get("AGENT_INTERFACE_RECEIPT_DB"), os.environ.get("AGENT_INTERFACE_RECEIPT_CALL")
+    if not database or not call_id or response["invocation_id"] != call_id or type(review_id) is not int or review_id <= 0:
+        raise RuntimeError("verified resolution lacks its original review")
+    with caller_store.connect(database, timeout=30) as conn:
+        conn.execute("begin immediate")
+        row = conn.execute("select artifact from calls where id=? and status='running' and behavior in ('pr_review','pr_approve') "
+                           "and coalesce(error_code,'') not in ('stopping','stopped')", (call_id,)).fetchone()
+        artifact = json.loads(row[0]) if row and row[0] else {}
+        if artifact.get("phase") != "submitting_review" or artifact.get("review_response") != response \
+                or thread_id not in {fix["id"] for fix in response["verified_fixes"].values()}:
+            raise RuntimeError("verified resolution differs from its original review")
+        progress = artifact.get("verified_resolution", {"review_id": review_id, "threads": {}})
+        threads = progress["threads"]
+        if progress["review_id"] != review_id or threads.get(thread_id) != ("attempted" if resolved else None) \
+                or not resolved and "attempted" in threads.values():
+            raise RuntimeError("verified resolution cannot replay an attempted thread")
+        threads[thread_id] = "resolved" if resolved else "attempted"
+        conn.execute("update calls set artifact=json_set(artifact,'$.verified_resolution',json(?)) where id=?",
+                     (json.dumps(progress), call_id))
 
 
 def work_publication(head: str, *, start_replies: bool = False) -> None:

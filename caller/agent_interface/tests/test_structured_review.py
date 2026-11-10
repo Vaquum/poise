@@ -520,6 +520,17 @@ class TestStagedReview(TestCase):
         self.assertEqual(mutation[5:], ["--assessment-json", json.dumps(ASSESSMENT, ensure_ascii=False),
                                        "--expected-head", "a" * 40, "--token-user", "bit-mis"])
 
+    def test_verified_fixes_survive_later_groups_with_new_blockers(self):
+        node = json.loads(staged_packet([f"src/f{i:02d}.py" for i in range(9)]))
+        packet = json.dumps({**node, "verification_candidates": [17]})
+        final = {"action": "request_changes", "comments": [{**FINDING, "path": "src/f08.py", "line": 1}],
+                 "assessment": {**ASSESSMENT, "verified_fixes": []}}
+        _, calls = self._run(packet, [{"action": "reviewed_clean", "comments": [],
+                                       "assessment": {**ASSESSMENT, "verified_fixes": [17]}}, final])
+        mutation = calls[-1][0]
+        self.assertEqual(mutation[1], "--request-changes")
+        self.assertEqual(json.loads(mutation[mutation.index("--assessment-json") + 1])["verified_fixes"], [17])
+
     def test_clean_groups_combine_into_one_clean_verdict(self):
         packet = staged_packet([f"src/f{i:02d}.py" for i in range(9)])
         result, calls = self._run(packet, [{"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []},

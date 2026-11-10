@@ -74,7 +74,7 @@ def provider_error(provider: str, message: str, *, phase: str = "provider_execut
                               _diagnostic(provider, phase, cause=bounded))
 
 
-def verdict_schema(behavior: str, *, inspection: bool = False) -> dict:
+def verdict_schema(behavior: str, *, inspection: bool = False, verify_fixes: bool = False) -> dict:
     terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
     schema = {
         "type": "object",
@@ -103,6 +103,12 @@ def verdict_schema(behavior: str, *, inspection: bool = False) -> dict:
             },
         },
     }
+    if verify_fixes:
+        assessment = schema["properties"]["assessment"]
+        assessment["required"].append("verified_fixes")
+        assessment["properties"]["verified_fixes"] = {
+            "type": "array", "maxItems": 100, "items": {"type": "integer", "minimum": 1},
+        }
     if inspection:
         schema["required"].append("requests")
         schema["properties"]["action"]["enum"].append("inspect")
@@ -136,8 +142,12 @@ def validate_verdict(raw: str, behavior: str) -> dict:
     if not isinstance(verdict, dict) or set(verdict) != {"action", "comments", "assessment"}:
         raise InvalidVerdict("review verdict must contain action, comments and assessment")
     assessment = verdict["assessment"]
-    if not isinstance(assessment, dict) or set(assessment) != {"verdict", "reviewed_context", "limitations"}:
+    if not isinstance(assessment, dict) or set(assessment) - {"verified_fixes"} != {"verdict", "reviewed_context", "limitations"}:
         raise InvalidVerdict("review assessment requires verdict, reviewed_context and limitations")
+    try:
+        review_receipt.verified_fix_ids(assessment)
+    except ValueError as error:
+        raise InvalidVerdict(str(error)) from error
     for key, minimum in (("verdict", 20), ("reviewed_context", 20), ("limitations", 4)):
         if not isinstance(assessment[key], str) or not minimum <= len(assessment[key].strip()) <= 4000:
             raise InvalidVerdict(f"invalid review assessment {key}")
@@ -375,8 +385,8 @@ def _time_limit_message(provider: str) -> str:
 
 
 def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
-                 timeout_s: int, deadline: float, repository, behavior: str) -> tuple[str, dict]:
-    schema = verdict_schema(behavior, inspection=repository is not None)
+                 timeout_s: int, deadline: float, repository, behavior: str, verify_fixes: bool = False) -> tuple[str, dict]:
+    schema = verdict_schema(behavior, inspection=repository is not None, verify_fixes=verify_fixes)
     (root / "verdict.schema.json").write_text(json.dumps(schema))
     context = ""
     round_number = 0
@@ -398,7 +408,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
         # Last round decides on evidence already held: offer only the
         # terminal verdict, never another inspection step.
         if repository is not None and round_number == MAX_INSPECTION_ROUNDS:
-            schema = verdict_schema(behavior, inspection=False)
+            schema = verdict_schema(behavior, verify_fixes=verify_fixes)
             (root / "verdict.schema.json").write_text(json.dumps(schema))
         remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
                      f"Analysis time remaining: {int(timeout)} seconds. "
@@ -473,6 +483,8 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
     try:
         total = review_stages.stage_count(packet) if packet else 1
         staged = total > 1
+        candidates = set(json.loads(packet).get("verification_candidates", [])) if packet and not capped else set()
+        verified: set[int] = set()
         with resource_ownership.temporary_directory(prefix="agent-interface-review-") as work, \
                 ReviewWatch(pwd, pr, actor_name, head) as watch:
             root = Path(work)
@@ -491,11 +503,16 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                        + "\nUpdate this assessment with the current group's evidence. Your terminal assessment "
                                        "must cover every group reviewed so far and remain within the schema bounds.")
                 raw, verdict = _review_once(root, ask, model, system, stage_text, watch,
-                                             timeout_s, deadline, repository, behavior)
+                                             timeout_s, deadline, repository, behavior, bool(candidates))
                 prior.extend(verdict["comments"])
                 assessment = verdict["assessment"]
+                verified.update(review_receipt.verified_fix_ids(assessment))
+                if verified - candidates:
+                    raise InvalidVerdict("verified fix must name an answered thread in the original review packet")
             if staged:
                 terminal = "reviewed_clean" if behavior == "pr_review" else "approve"
+                if verified:
+                    verdict["assessment"]["verified_fixes"] = sorted(verified)
                 verdict = validate_verdict(json.dumps(
                     {**verdict, "action": "request_changes" if prior else terminal, "comments": prior}), behavior)
                 raw = json.dumps(verdict)

@@ -4,6 +4,7 @@ import shlex
 
 from . import atoms
 from . import review_cap as followup
+from .pr_review import VERIFY_FIXES
 
 SYSTEM = "Decide whether this PR can be approved. Use only permitted github-interface commands."
 POLICY = (
@@ -12,7 +13,9 @@ POLICY = (
     "request-changes exactly once with every blocking inline finding in one JSON array. "
     "Every terminal review command includes --assessment-json with verdict (your substantive "
     "assessment, 20-4000 characters), reviewed_context (what you inspected, 20-4000 characters), "
-    "and limitations (including unverified tests, 4-4000 characters). Acknowledgements do not qualify."
+    "and limitations (including unverified tests, 4-4000 characters). "
+    "When the packet lists verification_candidates, the assessment also accepts a verified_fixes array of root comment IDs. "
+    "Acknowledgements do not qualify."
 )
 SEVERITY = (
     "p0: breaks a common path — data loss, crash, security hole, auth bypass.",
@@ -27,7 +30,9 @@ RULES = (
     "Do not block on unverified assumptions about dependency internals; require evidence in the supplied packet.",
     "State the defect and impact in one sentence; do not write the fix.",
     "Put one inline comment per {levels} finding into the single atomic review; for non-{levels}, do nothing.",
-    "Never publish duplicate inline comments or re-litigate resolved findings. An outdated location does not prove a defect is fixed; reaffirm an unresolved outdated finding only after confirming it still blocks the supplied head, using its original body and path.",
+    "Avoid duplicate findings. If the supplied head reintroduces a resolved defect, report the new regression and its current evidence.",
+    "Reaffirm an unresolved outdated finding only after confirming it still blocks the supplied head, using its original body and path.",
+    VERIFY_FIXES,
     "If an existing current, unresolved thread still describes a confirmed blocking defect on this head, include its original body and exact path, current line, and side in the request-changes comments array, including in a structured JSON verdict.",
     "github-interface deduplicates existing findings; when no new inline comments remain, it submits one summary-only change-request review reaffirming the current unresolved blocker.",
     "A request-changes comments array must contain at least one finding; pass the existing blocking finding instead of an empty array.",

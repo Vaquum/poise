@@ -16,6 +16,7 @@ POLICY = (
     "Every terminal command includes --assessment-json with an object containing verdict "
     "(your substantive assessment, 20-4000 characters), reviewed_context (what you inspected, "
     "20-4000 characters), and limitations (including unverified tests, 4-4000 characters). "
+    "When the packet lists verification_candidates, the assessment also accepts a verified_fixes array of root comment IDs. "
     "A fixed clean sentence or acknowledgement is insufficient."
 )
 SEVERITY = (
@@ -23,6 +24,12 @@ SEVERITY = (
     "p1: wrong on an edge or inverse case, a swallowed error, a race, missing backoff, etc.",
     "p2: a real defect worth blocking on, with smaller blast radius, etc.",
     "p3: a real but normally non-blocking defect.",
+)
+VERIFY_FIXES = (
+    "Include a verification_candidates root ID in assessment.verified_fixes only after independently verifying its fix against the supplied head. "
+    "In a staged review verify only findings covered by the current group or actual pinned inspection. "
+    "An author reply, an outdated location, or absence from your findings is not proof of a fix. "
+    "Use an empty array if none were verified. Do not post a reply to record the verification."
 )
 RULES = (
     "Review for correctness, not style: logic, edge and inverse cases, swallowed errors, masking defaults, races, missing backoff, security holes, and tests that do not exercise what they claim.",
@@ -34,7 +41,8 @@ RULES = (
     "State the defect and impact in one sentence; do not propose or write the fix.",
     "Put one inline comment per {levels} finding into the single atomic review; for non-{levels}, do nothing.",
     "If only positive things remain, call reviewed-clean exactly once.",
-    "Never publish duplicate inline comments or re-litigate resolved or outdated findings.",
+    "Avoid duplicate findings. If the supplied head reintroduces a resolved defect, report the new regression and its current evidence.",
+    VERIFY_FIXES,
     "If an existing current, unresolved thread still describes a confirmed blocking defect on this head, include its original body and exact path, current line, and side in the request-changes comments array, including in a structured JSON verdict.",
     "github-interface deduplicates existing findings; when no new inline comments remain, it submits one summary-only change-request review reaffirming the current unresolved blocker.",
     "A request-changes comments array must contain at least one finding; pass the existing blocking finding instead of an empty array.",

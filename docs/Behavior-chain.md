@@ -502,6 +502,14 @@ chains for `autonomio/poise#893` (seed #887) and `autonomio/poise#900` (seed #89
 Resume opens a new bounded attempt window using the current head and findings;
 it does not repeat an uncertain publication or release unsettled resources.
 
+An independent reviewer can explicitly verify its own answered findings on
+the current head while requesting changes elsewhere. After GitHub accepts
+that review, Caller rechecks the PR context and each selected thread's exact
+revision before resolving it without another reply. Changed threads and
+reaffirmed blockers stay open. The original review Call retains resolution
+attempts and acknowledgements separately from the submitted review. Merge
+still requires current-head approval, green checks, and resolved conversations.
+
 A repair push checkpoints its exact native head before bounded PR-head
 confirmation. If GitHub's PR projection still trails the push, the existing
 reconciliation pass can complete the original immutable reply plan once the

@@ -2,7 +2,7 @@ import os
 from typing import Any
 
 from github_interface.atoms.review_identity import require_other_author, require_owned_reviews
-from github_interface.atoms.review_response import context_sha, response_body, submission_response
+from github_interface.atoms.review_response import context_sha, resolve_verified_fixes, response_body, submission_response
 from github_interface.atoms.pulls import approve_pr, get_pull, list_review_threads, list_reviews
 from github_interface.client import GitHubClient
 from github_interface.context import expected_head, pull_number, repository, token_user
@@ -69,4 +69,5 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "review_id": review.get("id"),
         "submitted_at": review.get("submitted_at"),
         **({"review_response": response} if response else {}),
+        **await resolve_verified_fixes(client, owner, repo, response, review.get("id")),
     }
