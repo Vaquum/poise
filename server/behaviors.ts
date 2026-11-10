@@ -3474,7 +3474,7 @@ async function tickReviewNewPrs(): Promise<void> {
         if (bundle) prepared.push(bundle)
       } catch (err) {
         if (behaviorAborted()) return
-        console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+        if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
       }
@@ -3600,7 +3600,7 @@ async function tickReviewNewPrs(): Promise<void> {
               releasePhase2Leases()
               return
             }
-            console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+            if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
             if (err instanceof BehaviorLogFeedError) failure ??= err
             else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
             releaseLeases(ownedClaimId)
@@ -3643,7 +3643,7 @@ async function tickReviewNewPrs(): Promise<void> {
         // the preflight end like a checkout failure.
         captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
           outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
-        console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+        if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, `${target}:check`, { actingAccount: bundle.actor })
       }
@@ -3702,7 +3702,7 @@ async function tickReviewNewPrs(): Promise<void> {
           captureBehaviorOutcome({ nativeId: claimId, state: 'failed', activity: 'settled', stateSource: 'native',
             outcome: 'preflight_failed', head: bundle.expectedHead, completedAt: new Date().toISOString() })
         }
-        console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
+        if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] review-new-prs step failed for ${pr.repo}#${pr.number} (${slot}):`, err)
         if (err instanceof BehaviorLogFeedError) failure ??= err
         else recordBehaviorFailure('review-new-prs', 'operation', err, checkTarget, { actingAccount: bundle.actor })
       }
@@ -4892,7 +4892,7 @@ async function tickApprovePrs(): Promise<void> {
           }
         } catch (err) {
           if (behaviorAborted()) return
-          console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
+          if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
           recordBehaviorFailure('approve-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
         }
       }
@@ -4995,7 +4995,7 @@ async function tickApprovePrs(): Promise<void> {
             }
           } catch (err) {
             if (behaviorAborted()) return
-            console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
+            if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
             recordBehaviorFailure('approve-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
           }
         }
@@ -5072,7 +5072,7 @@ async function tickApprovePrs(): Promise<void> {
         } catch (err) {
           checked = false
           if (behaviorAborted()) return
-          console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
+          if (!(err instanceof BehaviorLogFeedError)) console.error(`[behaviors] approve-prs check/fire failed for ${pr.repo}#${pr.number}:`, err)
           if (err instanceof BehaviorLogFeedError) failure ??= err
           else recordBehaviorFailure('approve-prs', 'operation', err, checkTarget, { actingAccount: reviewer })
         } finally {
@@ -7115,8 +7115,8 @@ async function tickReviewNewIssues(): Promise<void> {
       }
     } catch (error) {
       if (behaviorAborted()) return
-      console.error(`[behaviors] review-new-issues step failed for ${target}:`, error)
       if (error instanceof BehaviorLogFeedError) throw error
+      console.error(`[behaviors] review-new-issues step failed for ${target}:`, error)
       recordBehaviorFailure(ISSUES_KEY, 'operation', error, checkTarget)
     }
   }
@@ -7565,7 +7565,7 @@ export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<vo
       if (lifecycle?.aborted === true || error instanceof BehaviorProcessLockContentionError || !enabled) throw error
       if (!isEnabled(key)) return
       recordBehaviorFailure(key, 'operation', error)
-      if (!staleDatastoreFailure(error)) console.error(`[behaviors] ${org.login} ${key} enable reconciliation failed:`, error)
+      if (!(error instanceof BehaviorLogFeedError) && !staleDatastoreFailure(error)) console.error(`[behaviors] ${org.login} ${key} enable reconciliation failed:`, error)
     }
   }))
   // Include removed accounts' existing work too. Disable is acknowledged only
@@ -7947,7 +7947,7 @@ async function runBehaviorCycle(
     }
     if (lifecycle?.aborted !== true) {
       recordBehaviorFailure(key, 'operation', error)
-      if (!staleDatastoreFailure(error)) console.error(`[behaviors] ${key} operation failed:`, error)
+      if (!(error instanceof BehaviorLogFeedError) && !staleDatastoreFailure(error)) console.error(`[behaviors] ${key} operation failed:`, error)
     }
   }
 }

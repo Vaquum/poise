@@ -6,6 +6,8 @@ import { diagnostic, diagnosticFailure, diagnosticPage, fatalDiagnostic, logging
 import { runFile } from '../server/process'
 import * as processes from '../server/process'
 import { credentialVariables } from './fixtures/cli-isolation'
+import { fetchAgentLogSnapshot, fetchRunningAgentLogSnapshot, resetAgentLogCache } from '../server/agent'
+import { withNoticeDiagnosticIdentity } from '../server/logging-context'
 
 let directory = ''
 afterEach(async () => { await stopLogging(); vi.restoreAllMocks(); vi.unstubAllEnvs(); if (directory) rmSync(directory, { recursive: true, force: true }) })
@@ -19,6 +21,56 @@ function start(blocked = false) {
 }
 
 describe('independent application capture', () => {
+  it('retains one history episode across failed shared reads, with bounded first evidence and explicit recovery', async () => {
+    start()
+    resetAgentLogCache()
+    vi.stubEnv('CALLER_BIN_ROOT', directory)
+    const state = join(directory, 'history-state')
+    writeFileSync(state, 'first precise timeout cause\nAuthorization: Bearer private-secret\n' + 'detail\n'.repeat(4000))
+    writeFileSync(join(directory, 'agent-interface'), `#!${process.execPath}
+const { readFileSync } = require('node:fs')
+const failure = readFileSync(${JSON.stringify(state)}, 'utf8')
+if (process.argv.includes('--status') || !failure) process.stdout.write('[]')
+else { process.stderr.write(failure); process.exitCode = 1 }
+`, { mode: 0o755 })
+    await withNoticeDiagnosticIdentity({ correlationId: 'first-waiter', behavior: 'review-new-issues',
+      repository: 'acme/first', target: 'acme/first#1', account: 'first-account' },
+    () => Promise.all(Array.from({ length: 7 }, () => fetchAgentLogSnapshot().catch(error => error))))
+    const events = () => {
+      loggingRuntime()!.flush()
+      return loggingRuntime()!.query(db => db.query({ workspace: 'alice', operator: false }, { source: 'poise' })).events
+    }
+    const first = events().filter(event => event.operation === 'agent.logs.history')
+    expect(first).toHaveLength(1)
+    expect(first[0]).toMatchObject({ occurrences: 1, exitCode: 1, truncated: true, repository: null, target: null, account: null,
+      stderr: expect.stringContaining('first precise timeout cause'), context: { failedReads: 1, timeoutMs: 30_000 } })
+    expect(Buffer.byteLength(first[0]!.stderr!)).toBeLessThanOrEqual(16_384)
+    expect(JSON.stringify(first)).not.toContain('private-secret')
+    expect(events().some(event => event.operation === 'agent-interface')).toBe(false)
+
+    await fetchRunningAgentLogSnapshot()
+    expect(events().some(event => event.operation === 'agent.logs.history.recovered')).toBe(false)
+    writeFileSync(state, 'second read cause')
+    await expect(withNoticeDiagnosticIdentity({ correlationId: 'later-waiter', behavior: 'approve-prs',
+      repository: 'acme/second', target: 'acme/second#2', account: 'second-account' },
+    () => fetchAgentLogSnapshot())).rejects.toThrow('Command failed (1)')
+    const repeated = events().filter(event => event.operation === 'agent.logs.history')
+    expect(repeated).toHaveLength(2)
+    expect(repeated.every(event => event.incidentId === first[0]!.incidentId && event.occurrences === 2)).toBe(true)
+    writeFileSync(state, '')
+    await fetchAgentLogSnapshot()
+    expect(events().find(event => event.operation === 'agent.logs.history.recovered')).toMatchObject({
+      correlationId: first[0]!.correlationId, context: { failedReads: 2, firstFailureAt: first[0]!.context.firstFailureAt },
+    })
+    writeFileSync(state, 'new episode')
+    await expect(fetchAgentLogSnapshot({ fresh: true })).rejects.toThrow('Command failed (1)')
+    expect(events().find(event => event.operation === 'agent.logs.history' && event.incidentId !== first[0]!.incidentId))
+      .toMatchObject({ occurrences: 1, context: { failedReads: 1 } })
+    writeFileSync(state, '')
+    await fetchAgentLogSnapshot({ fresh: true })
+    resetAgentLogCache()
+  })
+
   it.each([0, 8, 9])('persists completeness for an exception with %i underlying causes', (length) => {
     start()
     let error = new Error('cause-' + length)

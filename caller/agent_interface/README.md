@@ -579,6 +579,9 @@ Bare `--logs` retains its complete oldest-first array. `--logs --status running`
 uses the running-call index; `--logs --limit N [--cursor C]` returns a bounded
 insertion-order page with an opaque `nextCursor`. Insertion order is not a
 call's start time.
+The full-history read sorts positions through the existing covering index
+before loading each retained payload, keeping prompts and artifacts out of
+SQLite's temporary sort without omitting historical receipts.
 
 If a page's records are unreadable but its count and index still verify the
 requested scope, Caller returns the readable records and quarantines the

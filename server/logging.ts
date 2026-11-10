@@ -68,7 +68,7 @@ export function diagnostic(input: Omit<DiagnosticInput, 'source' | 'workspace'> 
   }
 }
 
-export function diagnosticFailure(operation: string, error: unknown, context: Record<string, unknown> = {}, options: { level?: 'error' | 'warning'; secrets?: readonly string[]; stderr?: boolean } = {}): string | null {
+export function diagnosticFailure(operation: string, error: unknown, context: Record<string, unknown> = {}, options: { level?: 'error' | 'warning'; secrets?: readonly string[]; stderr?: boolean; condition?: string } = {}): string | null {
   const value = error instanceof Error ? error : new Error(typeof error === 'string' ? error : 'Operation failed without an Error')
   const fields = error as { stderr?: unknown; code?: unknown; signal?: unknown; errno?: unknown; killed?: unknown } | null
   const cause: string[] = []
@@ -77,7 +77,7 @@ export function diagnosticFailure(operation: string, error: unknown, context: Re
   while (underlying instanceof Error && !seen.has(underlying) && cause.length < 8) { seen.add(underlying); cause.push(underlying.message); underlying = underlying.cause }
   context = { ...diagnosticIdentity(error), ...context }
   const identity = (key: string) => typeof context[key] === 'string' ? context[key] as string : null
-  return diagnostic({ level: options.level ?? 'error', operation, cause, truncated: underlying instanceof Error, account: identity('account'), repository: identity('repository'),
+  return diagnostic({ level: options.level ?? 'error', operation, condition: options.condition, cause, truncated: underlying instanceof Error, account: identity('account'), repository: identity('repository'),
     callId: identity('callId'), correlationId: identity('correlationId'), requestId: identity('requestId'), behavior: identity('behavior'), target: identity('target'), phase: identity('phase'),
     timeoutMs: typeof context.timeoutMs === 'number' ? context.timeoutMs : null, message: value.message, stack: value.stack,
     stderr: options.stderr === false ? null : typeof fields?.stderr === 'string' ? fields.stderr : null,

@@ -820,6 +820,12 @@ def _log_row(r) -> dict:
 
 _UNREADABLE_LOG_TEXT = object()
 
+# Sort only positions, not retained prompts/artifacts. LIMIT keeps SQLite
+# from flattening the ordered scan; CROSS JOIN keeps it ahead of row lookups.
+LOGS_HISTORY_QUERY = f"""select calls.rowid, {LOG_ROW_COLUMNS}
+    from (select rowid as position from calls order by started_at, rowid limit -1) as ordered
+    cross join calls on calls.rowid=ordered.position"""
+
 
 def _decode_history_text(value: bytes) -> object:
     try:
@@ -841,9 +847,8 @@ def logs(status: str | None = None):
         if status is None:
             conn.text_factory = _decode_history_text
         rows = conn.execute(
-            f"select rowid, {LOG_ROW_COLUMNS} from calls"
-            + (" where status='running'" if status else "")
-            + " order by started_at"
+            f"select rowid, {LOG_ROW_COLUMNS} from calls where status='running' order by started_at"
+            if status else LOGS_HISTORY_QUERY
         ).fetchall()
     if status:
         return [{**_log_row(row), "history_rowid": str(row["rowid"])} for row in rows]

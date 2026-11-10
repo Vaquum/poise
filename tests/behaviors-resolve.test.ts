@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mocks, HEAD_SHA, arrangeCli, loadModules } from './behaviors-runtime-fixture'
+import { mocks, HEAD_SHA, arrangeCli, loadModules, resetLogCache } from './behaviors-runtime-fixture'
 import type { ReviewActivityFixture } from './behaviors-runtime-fixture'
 
 const RESOLVE = '--resolve-nonblocking-conversations-if-ready'
@@ -24,6 +24,37 @@ async function enableResolve(reviewActivity: ReviewActivityFixture = {}) {
 }
 
 describe('resolve-unblocking run lineage', () => {
+  it('resolves an independent PR within one second while issue history is unavailable, retaining its original worker', async () => {
+    const { behaviors, database } = await enableResolve({ resolveResolvedCount: 2 })
+    const target = 'Vaquum/poise-test#500'
+    const claimId = database.claimSeenOwned('review-new-issues', target)!
+    expect(database.markBehaviorLaunchIntentOwned({ key: 'review-new-issues', target, claimId,
+      launchBehavior: 'issue_review', repo: 'Vaquum/poise-test', pr: 500, requestedAt: new Date().toISOString(),
+      expectedHead: '', actor: 'review-bot', source: 'poise:review-new-issues', correlationId: claimId })).toBe(true)
+    database.setMeta('behavior_review_new_issues_enabled', '1')
+    const original = mocks.runFile.getMockImplementation()!
+    let failRead!: (error: Error) => void
+    const unread = new Promise<never>((_, reject) => { failRead = reject })
+    mocks.runFile.mockImplementation((command, args, ...rest) => command === 'agent-interface' && args[0] === '--logs'
+      ? unread : original(command, args, ...rest))
+    await resetLogCache()
+    const tick = behaviors.runEnabledBehaviorsOnce()
+    try {
+      await expect.poll(() => resolveCalls().length, { timeout: 1000 }).toBe(1)
+      expect(database.db.prepare("SELECT outcome FROM behavior_runs WHERE behavior='resolve-unblocking'").get())
+        .toEqual({ outcome: 'resolved' })
+      expect(database.listBehaviorLaunchClaims('review-new-issues')[0]!.claimId).toBe(claimId)
+    } finally {
+      failRead(new Error('Command timed out after 30000ms'))
+      await tick
+    }
+    expect(database.listBehaviorLaunchClaims('review-new-issues')[0]).toMatchObject({
+      claimId, launchQuarantine: 'unreadable', launchQuarantineMayRun: true,
+    })
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining('review-new-issues operation failed:'), expect.anything())
+  })
+
   it('correlates the durable run with its firing and retains the resolve disposition', async () => {
     const { behaviors, database } = await enableResolve({ resolveResolvedCount: 2 })
     await behaviors.runEnabledBehaviorsOnce()

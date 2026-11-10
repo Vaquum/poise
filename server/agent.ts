@@ -27,7 +27,7 @@ import { HttpError } from './http'
 import { needsClaude, randomDrawStillValid, reviewChoice } from './review-model'
 import { claudeSubscriptionEnvironment, runFile, spawnDetached } from './process'
 import { withNoticeDiagnosticIdentity } from './logging-context'
-import { diagnostic } from './logging'
+import { diagnostic, diagnosticFailure } from './logging'
 import { getModelSettings, requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { resolveReviewCheckout } from './review-checkout'
@@ -113,6 +113,8 @@ const AGENT_LOG_SNAPSHOT_TTL_MS = 5_000
 const historyAgentLogLane: AgentLogLane = {
   args: ['--logs'], source: 'agent-interface --logs', running: null, queued: null, cached: null,
 }
+
+let historyReadFailure: { id: string, firstFailureAt: string, failedReads: number } | null = null
 
 const runningAgentLogLane: AgentLogLane = {
   args: ['--logs', '--status', 'running'], source: 'agent-interface --logs --status running',
@@ -264,8 +266,34 @@ function copyAgentLogError(error: unknown): unknown {
 }
 
 async function readHistoryAgentLogSnapshot(signal: AbortSignal): Promise<AgentLogSnapshot> {
-  const { stdout } = await spawnAgentLogRead(historyAgentLogLane.args, signal)
-  const snapshot = await decodeAgentLogSnapshot(stdout, historyAgentLogLane.source, signal)
+  const startedAt = Date.now()
+  let stdout: string
+  let snapshot: AgentLogSnapshot
+  try {
+    ({ stdout } = await spawnAgentLogRead(historyAgentLogLane.args, signal))
+    snapshot = await decodeAgentLogSnapshot(stdout, historyAgentLogLane.source, signal)
+  } catch (error) {
+    if (!signal.aborted) {
+      historyReadFailure ??= { id: randomUUID(), firstFailureAt: new Date().toISOString(), failedReads: 0 }
+      historyReadFailure.failedReads += 1
+      diagnosticFailure('agent.logs.history', error, {
+        behavior: 'agent-logs', correlationId: historyReadFailure.id,
+        repository: null, target: null, account: null,
+        firstFailureAt: historyReadFailure.firstFailureAt, failedReads: historyReadFailure.failedReads,
+        command: historyAgentLogLane.source, cwd: agentCwd(), maxOutputBytes: AGENT_LOG_READ_CAP_BYTES,
+        elapsedMs: Date.now() - startedAt, timeoutMs: 30_000,
+      }, { condition: historyReadFailure.id })
+    }
+    throw error
+  }
+  if (historyReadFailure) {
+    diagnostic({ level: 'warning', operation: 'agent.logs.history.recovered',
+      condition: historyReadFailure.id, correlationId: historyReadFailure.id,
+      behavior: 'agent-logs', repository: null, target: null, account: null,
+      message: 'Caller history read recovered; original Call evidence still governs reconciliation',
+      context: { ...historyReadFailure, recoveredAt: new Date().toISOString() } })
+    historyReadFailure = null
+  }
   observeAgentSnapshot(snapshot)
   warnAgentLogCap(stdout, snapshot.entries.length + snapshot.quarantined.length)
   return snapshot
@@ -298,6 +326,7 @@ function spawnAgentLogRead(args: readonly string[], signal: AbortSignal | undefi
     timeoutMs: 30_000,
     maxOutputBytes: AGENT_LOG_READ_CAP_BYTES,
     signal,
+    reportFailure: args !== historyAgentLogLane.args,
   }))
 }
 

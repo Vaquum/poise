@@ -46,6 +46,8 @@ tests/behaviors-approval.test.ts
 tests/behaviors-cutover.test.ts
 tests/behaviors-merge.test.ts
 tests/behaviors-outcomes.test.ts
+tests/behaviors-issue-review.test.ts
+tests/behaviors-resolve.test.ts
 tests/behaviors-stale-mirror.test.ts
 tests/behaviors-quota-budget.test.ts
 tests/behaviors-review-cap-api.test.ts
