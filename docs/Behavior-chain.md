@@ -215,9 +215,16 @@ An explicitly CI-only repair blocker retains the supplied head and failed
 check/job identities and URLs in its original native artifact. Its automatic
 hold records that invocation and head and stays eligible every two minutes,
 using the same scheduler. Once that original settles with `action: not_started`
-and positive resource-release proof, a fresh matching-head `checksState: SUCCESS`
-with no pending or failing checks records `ciRecovery` on the existing resume
-event. The normal decision path then rechecks review, approval and merge gates;
+and positive resource-release proof, fresh `checksState: SUCCESS` with no pending
+or failing checks can recover the same head or a verified direct base update.
+For an updated head, the failed head must be its first parent, its second parent
+must belong to the PR's current base history, and its tree must equal Git's clean
+merge of those parents. Extra merge edits, conflicting integrations and ambiguous
+or mismatched repository/PR/head evidence retain the hold. The CI read rechecks
+the live head and base after verifying the tree. The original failed Call and
+hold head remain unchanged; `chain.observed` records the updated head and the
+existing resume event records `ciRecovery`. The normal decision path then
+rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
 

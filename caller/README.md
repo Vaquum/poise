@@ -37,6 +37,12 @@ existing chain tick ([dependency evidence and recovery](../docs/Behavior-chain.m
 `github-interface --list-failing-ci PR --repository OWNER/REPO --ref SHA`
 includes the exact commit's checks, parent SHAs and workflow identities while
 retaining the current candidate head. `--ref base` reads the current base.
+`--base-update-from FAILED_SHA` also verifies whether the current head is a
+direct clean merge of the failed head and a commit in this PR's base history.
+It returns `base_update` with the source, base parent and verified merge tree,
+or null when the update is not proven. A head or base change during the proof
+fails the read. Git runs in an isolated temporary bare repository; no branch or
+checkout is changed.
 `--read-failing-ci-log JOB_ID --repository OWNER/REPO` reads the actual job log,
 following GitHub's download redirect without forwarding credentials across hosts.
 
@@ -57,8 +63,8 @@ its own supplied CI snapshot as `artifact.ci_blocker`, including the failed
 check and job IDs that identify the original run attempt. Other blockers remain
 strings and confer no automatic recovery authority. The
 [chain reconciler](../docs/Behavior-chain.md#bounded-reconciliation) checks the
-original no-publication receipt, resource release and fresh same-head CI before
-resuming the remaining gates.
+original no-publication receipt, resource release and fresh CI on the same head
+or a verified base-only update before resuming the remaining gates.
 
 ## Accounts
 

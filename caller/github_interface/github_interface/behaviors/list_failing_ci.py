@@ -1,7 +1,11 @@
+import asyncio
 import re
+import tempfile
 from typing import Any
 
+from github_interface.atoms.process_diagnostic import GitProcessError
 from github_interface.atoms.pulls import get_combined_status, get_pull, list_check_runs
+from github_interface.atoms.review_diff import _env, _git
 from github_interface.client import GitHubClient
 from github_interface.context import pull_number as parse_pull_number
 from github_interface.context import repository
@@ -17,6 +21,9 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     pull = await get_pull(client, owner, repo, pull_number)
     ref = pull["head"]["sha"]
     requested = payload.get("ref")
+    from_head = payload.get("base_update_from")
+    if from_head is not None and (not isinstance(from_head, str) or not re.fullmatch(r"[0-9a-f]{40}", from_head)):
+        raise ValueError("base update source must be a commit SHA")
     if requested:
         ref = (pull.get("base") or {}).get("sha") if requested == "base" else requested
         if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{40}", ref):
@@ -24,8 +31,10 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     checks = await list_check_runs(client, owner, repo, ref, **({"all_runs": True} if requested else {}))
     status = await get_combined_status(client, owner, repo, ref)
     evidence = {}
-    if requested:
+    if requested or from_head:
         commit = await client.get(f"/repos/{owner}/{repo}/commits/{ref}")
+        evidence = {"ref": ref, "parents": [parent["sha"] for parent in commit["parents"]]}
+    if requested:
         runs, page = [], 1
         while True:
             batch = await client.get(f"/repos/{owner}/{repo}/actions/runs",
@@ -34,10 +43,9 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
             if len(batch["workflow_runs"]) < 100:
                 break
             page += 1
-        evidence = {"ref": ref, "parents": [parent["sha"] for parent in commit["parents"]],
-                    "checks": [_check(check) for check in checks],
-                    "runs": [{key: run.get(key) for key in ("id", "event", "head_sha", "head_branch", "workflow_id", "run_attempt")}
-                             for run in runs]}
+        evidence.update({"checks": [_check(check) for check in checks],
+                         "runs": [{key: run.get(key) for key in ("id", "event", "head_sha", "head_branch", "workflow_id", "run_attempt")}
+                                  for run in runs]})
 
     failing_checks = [_check(check) for check in checks if _check_failing(check)]
     failing_statuses = [_status(item) for item in status.get("statuses", []) if item.get("state") != "success"]
@@ -48,6 +56,16 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     # treats that as no observation.
     user = pull.get("user") or {}
     base = pull.get("base") or {}
+    if from_head:
+        if ref != pull["head"]["sha"] or not re.fullmatch(r"[0-9a-f]{40}", str(base.get("sha"))):
+            raise ValueError("base update proof requires the current PR head and base")
+        if commit.get("sha") != ref:
+            raise RuntimeError("base update commit differs from the inspected head")
+        evidence["base_update"] = (None if failing_checks or failing_statuses else
+                                   await _base_update(client, owner, repo, ref, from_head, base["sha"], commit))
+        latest = await get_pull(client, owner, repo, pull_number)
+        if latest["head"]["sha"] != ref or latest["base"]["sha"] != base["sha"]:
+            raise RuntimeError("PR head or base changed during base update proof")
     return {
         "action": "list_failing_ci",
         "repository": f"{owner}/{repo}",
@@ -64,6 +82,31 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "state": pull.get("state"),
         "merged": pull.get("merged"),
     }
+
+
+async def _base_update(client, owner, repo, head, from_head, base, commit):
+    parents = [parent["sha"] for parent in commit["parents"]]
+    if len(parents) != 2 or parents[0] != from_head:
+        return None
+    env = _env(client.token)
+    with tempfile.TemporaryDirectory(prefix="caller-base-update-") as directory:
+        async def git(*args):
+            return await asyncio.to_thread(_git, directory, env, *args, timeout=20)
+
+        await git("init", "--bare", "--quiet", "--template=")
+        await git("remote", "add", "origin", f"https://github.com/{owner}/{repo}.git")
+        await git("config", "remote.origin.promisor", "true")
+        await git("config", "remote.origin.partialclonefilter", "blob:none")
+        await git("fetch", "--quiet", "--no-tags", "--filter=blob:none", "origin", head, base)
+        try:
+            await git("merge-base", "--is-ancestor", parents[1], base)
+            # Parents and ancestry cannot exclude edits made in the merge.
+            tree = (await git("merge-tree", "--write-tree", from_head, parents[1])).decode().strip()
+        except GitProcessError as error:
+            if error.diagnostic["outcome"] == "exit" and error.diagnostic["exit_code"] == 1:
+                return None  # Non-base parent or a conflicting integration.
+            raise
+    return {"from": from_head, "base": parents[1], "tree": tree} if tree == commit["commit"]["tree"]["sha"] else None
 
 
 def _check_failing(check: dict[str, Any]) -> bool:

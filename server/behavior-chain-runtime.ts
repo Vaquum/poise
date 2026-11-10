@@ -79,6 +79,7 @@ function sameReceipt(prior: Record<string, unknown> | null, next: Record<string,
 function ciOnlyHold(invocation: ChainInvocation, call: LogEntry): BehaviorChain['ciHold'] {
   const ci = call.artifact?.ci_blocker as Record<string, unknown> | undefined
   if (invocation.behavior !== 'repair-pr' || call.status !== 'failed' || call.action !== 'not_started'
+    || call.receipts != null || call.review_id != null || call.head_sha != null
     || call.error_code !== 'atomic_work_blocked' || call.artifact?.phase !== 'executing' || call.artifact.plan_sha
     || !ci || ci.action !== 'list_failing_ci' || ci.repository !== call.repo || ci.pull_number !== Number(call.pr_id)
     || ci.head_sha !== call.expected_head || ci.head_sha !== invocation.request.context?.head
@@ -100,11 +101,14 @@ function ciRecovered(chain: BehaviorChain, observation: ChainObservation, now: n
   return !!chain.held && !!hold && !chain.mergeSha && original?.id === hold.invocationId && original.state === 'settled'
     && original.callId === hold.callId && evidence?.status === 'failed' && evidence.error_code === 'atomic_work_blocked'
     && evidence.action === 'not_started' && artifact?.phase === 'executing' && !artifact.plan_sha && !evidence.publicationResume
+    && evidence.receipts == null && evidence.review_id == null && evidence.head_sha == null
     && resourceReleaseProven(evidence, true) && typeof evidence.completedAt === 'number'
     && Number.isFinite(observation.checkedAt) && observation.checkedAt >= evidence.completedAt
     && observation.checkedAt >= Date.parse(String(evidence.resources_settled_at))
     && observation.checkedAt <= now && now - observation.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
-    && !!pull && pull.state === 'open' && !pull.merged && pull.head === hold.head
+    && !!pull && pull.state === 'open' && !pull.merged
+    && (pull.head === hold.head || observation.ciBaseUpdate?.from === hold.head && observation.ciBaseUpdate.head === pull.head
+      && observation.publication.pull_number === pull.number && observation.publication.head_sha === pull.head)
     && pull.checksState === 'SUCCESS' && !pull.pending && pull.failing.length === 0
 }
 

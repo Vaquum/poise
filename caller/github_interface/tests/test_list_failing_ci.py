@@ -1,7 +1,10 @@
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from io import StringIO
+from pathlib import Path
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, patch
 
@@ -103,8 +106,108 @@ class TestListFailingCiCli(TestCase):
             cli.main()
         self.assertEqual(operation.call_args.args[0], {"pr": "#9", "repository": None, "token_user": None})
 
+    def test_base_update_proof_option_reaches_the_existing_ci_read(self):
+        operation = AsyncMock(return_value={"ok": True})
+        with patch("sys.argv", [*SERVER_ARGV, "--base-update-from", "d" * 40]), \
+                patch.object(cli, "list_failing_ci", operation), patch("sys.stdout", StringIO()):
+            cli.main()
+        self.assertEqual(operation.call_args.args[0]["base_update_from"], "d" * 40)
+
 
 class TestIntegrationCi(IsolatedAsyncioTestCase):
+    async def test_base_update_requires_the_clean_merge_tree_and_a_parent_from_the_pr_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=root, env=list_failing_ci._env("fixture-token"),
+                                               stderr=subprocess.STDOUT).decode().strip()
+
+            def commit(message):
+                git("add", ".")
+                git("commit", "--quiet", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init", "--quiet", "--initial-branch=main")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            path = root / "shared.txt"
+            path.write_text("start\n" + "unchanged\n" * 10 + "end\n")
+            original = commit("original base")
+            git("checkout", "--quiet", "-b", "repair")
+            path.write_text(path.read_text().replace("start", "repair"))
+            failed = commit("failed repair head")
+            git("checkout", "--quiet", "main")
+            path.write_text(path.read_text().replace("end", "base fix"))
+            base = commit("base fix")
+            git("checkout", "--quiet", "repair")
+            git("merge", "--quiet", "--no-ff", "main", "-m", "update branch")
+            updated, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
+            # Same parents and merge message, but with an extra branch edit.
+            (root / "extra.txt").write_text("unreviewed edit\n")
+            git("add", ".")
+            edited = git("commit-tree", git("write-tree"), "-p", failed, "-p", base, "-m", "update branch")
+            reversed_parents = git("commit-tree", tree, "-p", base, "-p", failed, "-m", "update branch")
+            ordinary_edit = git("commit-tree", tree, "-p", updated, "-m", "branch edit")
+            octopus = git("commit-tree", tree, "-p", failed, "-p", base, "-p", original, "-m", "update branch")
+            git("reset", "--hard", "--quiet", original)
+            path.write_text(path.read_text().replace("start", "conflicting base edit"))
+            conflicting_base = commit("conflicting base")
+            resolved = git("commit-tree", tree, "-p", failed, "-p", conflicting_base, "-m", "update branch")
+            # The base may have advanced after the clean update.
+            git("checkout", "--quiet", "main")
+            (root / "later.txt").write_text("later base change\n")
+            later_base = commit("later base")
+            original_git = list_failing_ci._git
+
+            def local_git(cwd, env, *args, **kwargs):
+                if args[:2] == ("remote", "add"):
+                    args = (*args[:-1], root.as_uri())
+                return original_git(cwd, env, *args, **kwargs)
+
+            for head, current_base, accepted in [(updated, base, True), (updated, later_base, True),
+                                                  (edited, base, False), (reversed_parents, base, False),
+                                                  (ordinary_edit, base, False), (octopus, base, False),
+                                                  (resolved, conflicting_base, False), (resolved, base, False)]:
+                with self.subTest(head=head, base=current_base):
+                    client = AsyncMock(token="fixture-token")
+                    client.get.return_value = {"sha": head, "parents": [{"sha": parent} for parent in git("show", "-s", "--format=%P", head).split()],
+                                               "commit": {"tree": {"sha": git("rev-parse", f"{head}^{{tree}}")}}}
+                    pull = {**PULL, "head": {"sha": head}, "base": {"ref": "main", "sha": current_base}}
+                    with patch.object(list_failing_ci, "_git", side_effect=local_git), \
+                            patch.object(list_failing_ci, "get_pull", AsyncMock(return_value=pull)) as pulls, \
+                            patch.object(list_failing_ci, "list_check_runs", AsyncMock(return_value=[])), \
+                            patch.object(list_failing_ci, "get_combined_status", AsyncMock(return_value={"statuses": []})):
+                        result = await list_failing_ci.run(client, {"repository": "acme/app", "pr": 9, "base_update_from": failed})
+                    self.assertEqual((result["head_sha"], result["ref"], result["base_sha"]), (head, head, current_base))
+                    self.assertEqual(result["base_update"], {"from": failed, "base": base, "tree": tree} if accepted else None)
+                    self.assertEqual(pulls.await_count, 2)
+
+    async def test_base_update_rejects_a_head_or_base_change_during_proof_reads(self):
+        base, failed = "c" * 40, "d" * 40
+        pull = {**PULL, "base": {"sha": base}}
+        for changed in ("head", "base"):
+            with self.subTest(changed=changed):
+                client = AsyncMock()
+                client.get.return_value = {"sha": HEAD, "parents": [{"sha": failed}, {"sha": base}]}
+                with patch.object(list_failing_ci, "get_pull", AsyncMock(side_effect=[pull, {**pull, changed: {"sha": "e" * 40}}])), \
+                        patch.object(list_failing_ci, "list_check_runs", AsyncMock(return_value=[])), \
+                        patch.object(list_failing_ci, "get_combined_status", AsyncMock(return_value={"statuses": []})), \
+                        patch.object(list_failing_ci, "_base_update", AsyncMock(return_value={"from": failed, "base": base, "tree": "f" * 40})):
+                    with self.assertRaisesRegex(RuntimeError, "head or base changed"):
+                        await list_failing_ci.run(client, {"repository": "acme/app", "pr": 9, "base_update_from": failed})
+
+    async def test_base_update_rejects_missing_or_mismatched_commit_identity(self):
+        for identity in (None, "e" * 40):
+            with self.subTest(identity=identity):
+                client = AsyncMock()
+                client.get.return_value = {"sha": identity, "parents": []}
+                with patch.object(list_failing_ci, "get_pull", AsyncMock(return_value={**PULL, "base": {"sha": "c" * 40}})), \
+                        patch.object(list_failing_ci, "list_check_runs", AsyncMock(return_value=[])), \
+                        patch.object(list_failing_ci, "get_combined_status", AsyncMock(return_value={"statuses": []})):
+                    with self.assertRaisesRegex(RuntimeError, "commit differs from the inspected head"):
+                        await list_failing_ci.run(client, {"repository": "acme/app", "pr": 9, "base_update_from": "d" * 40})
+
     async def test_exact_ref_retains_candidate_base_parents_and_paginated_workflow_identity(self):
         integration, base = "c" * 40, "d" * 40
         check = {**CHECKS[0], "head_sha": integration}

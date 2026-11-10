@@ -175,8 +175,10 @@ it('surfaces a real journal failure even when its message matches a revision con
   expect(diagnostics()).toEqual([])
 })
 
-it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause', 'missing failure identity'])(
+it.each(['recovery', 'base update', 'base update review', 'operator hold', 'uncertain publication', 'publication receipt',
+  'unreleased resources', 'ambiguous cause', 'missing failure identity'])(
   'rechecks a CI-only repair hold without duplicate work: %s', async mode => {
+    const recovers = ['recovery', 'base update', 'base update review'].includes(mode)
     const { db, journal } = setup()
     const obs = observation()
     obs.publication.state = 'open'; obs.publication.merged = false; obs.publication.merge_sha = null
@@ -196,7 +198,7 @@ it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause'
         url: 'https://github.com/acme/repo/actions/runs/40/job/44' }] }
     const call: LogEntry = { ...completedReviewCall(chain.repository, 17, obs.pull!.head, chain.author), id: 'a'.repeat(32),
       behavior: 'repair_pr', source: 'poise:behavior-chain', correlation_id: id, status: 'failed',
-      action: 'not_started', outcome: 'preflight_failed', head_sha: null, review_id: null,
+      action: 'not_started', outcome: 'preflight_failed', head_sha: null, review_id: mode === 'publication receipt' ? 91 : null,
       error_code: 'atomic_work_blocked', error: 'CI failed; repair cannot continue',
       artifact: { phase: 'executing', ...(mode === 'ambiguous cause' ? {} : { ci_blocker: ci }) },
       resource_ownership: { version: 1, roots: [], errors: [] }, resources_settled_at: null }
@@ -217,11 +219,11 @@ it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause'
       call.artifact = { ...call.artifact, phase: 'publishing', plan_sha: 'd'.repeat(64) }
     }
     vi.setSystemTime(NOW + 5000)
-    call.resources_settled_at = new Date().toISOString()
+    if (mode !== 'unreleased resources') call.resources_settled_at = new Date().toISOString()
     await runtime.run()
     chain = journal.read(chain.id)!
     expect(chain.held).toBe(call.error)
-    expect(chain.invocations[0].state).toBe(mode === 'uncertain publication' ? 'uncertain' : 'settled')
+    expect(chain.invocations[0].state).toBe(['uncertain publication', 'unreleased resources'].includes(mode) ? 'uncertain' : 'settled')
     const failedReceipt = structuredClone(chain.invocations[0])
     if (mode === 'operator hold') chain = record(journal, chain, { type: 'chain.held', reason: call.error })
     const history = journal.history(chain.id)
@@ -260,11 +262,17 @@ it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause'
       expect(journal.read(chain.id)!.held).toBe(call.error)
     }
     Object.assign(obs.pull!, { checksState: 'SUCCESS', head: ci.head_sha, pending: false, failing: [] })
-    if (mode === 'recovery') obs.issue.open = false
+    if (mode !== 'recovery') {
+      obs.pull!.head = 'e'.repeat(40)
+      obs.publication.head_sha = obs.pull!.head
+      obs.ciBaseUpdate = { from: ci.head_sha, head: obs.pull!.head, base: 'f'.repeat(40), tree: 'd'.repeat(40) }
+    }
+    if (mode === 'base update review') obs.prReviewers = [reviewer]
+    if (recovers) obs.issue.open = false
     vi.setSystemTime(Date.now() + 86_400_000)
     await runtime.run()
     chain = journal.read(chain.id)!
-    if (mode !== 'recovery') {
+    if (!recovers) {
       expect(chain.held).toBe(call.error)
       expect(chain.invocations).toHaveLength(1)
       expect(launch).not.toHaveBeenCalled()
@@ -274,7 +282,8 @@ it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause'
     expect(chain.ciHold).toBeUndefined()
     expect(chain.resumedAfterSequence).toBe(0)
     expect(chain.invocations[0]).toEqual(failedReceipt)
-    expect(chain.invocations.at(-1)!.behavior).toBe('approve-pr')
+    expect(chain.invocations.at(-1)!.behavior).toBe(mode === 'base update review' ? 'review-pr' : 'approve-pr')
+    expect(chain.observation).toMatchObject({ pull: { head: obs.pull!.head } })
     expect(launch).toHaveBeenCalledTimes(1)
     const recovery = journal.history(chain.id).map(row => JSON.parse(row.payload)).filter(event => event.ciRecovery)
     expect(recovery).toEqual([{ type: 'chain.resumed', ciRecovery: { invocationId: id, callId: call.id, head: ci.head_sha } }])
@@ -282,14 +291,15 @@ it.each(['recovery', 'operator hold', 'uncertain publication', 'ambiguous cause'
     runtime = new BehaviorChainRuntime(new BehaviorChainJournal(db), native)
     for (let tick = 0; tick < 3; tick++) await runtime.run()
     expect(launch).toHaveBeenCalledTimes(1)
+    if (mode === 'base update review') return
     vi.setSystemTime(Date.now() + 2000)
-    const approval: LogEntry = { ...completedReviewCall(chain.repository, 17, ci.head_sha, chain.reviewer),
+    const approval: LogEntry = { ...completedReviewCall(chain.repository, 17, obs.pull!.head, chain.reviewer),
       correlation_id: chain.invocations.at(-1)!.id, source: 'poise:behavior-chain', behavior: 'pr_approve',
       action: 'approved', outcome: 'approved', resources_settled_at: new Date().toISOString(),
       resource_ownership: { version: 1, roots: [], errors: [] } }
     calls.push(approval)
     Object.assign(obs.pull!, { approved: true, reviewIds: [approval.review_id!],
-      reviewReceipts: [{ id: approval.review_id!, head: ci.head_sha, state: 'APPROVED', invocation: approval.id,
+      reviewReceipts: [{ id: approval.review_id!, head: obs.pull!.head, state: 'APPROVED', invocation: approval.id,
         response: approval.artifact!.review_response, submittedAt: Date.now() }] })
     await runtime.run()
     expect(journal.read(chain.id)!.invocations.at(-1)).toMatchObject({ state: 'settled', outcome: 'approved' })

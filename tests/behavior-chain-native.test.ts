@@ -339,6 +339,58 @@ it.each(['failure', 'pending', 'missing', 'success', 'queue-success', 'reused-qu
     expect(conflict?.argv).toContain('--merge-base')
   })
 
+it.each(['verified', 'edited merge', 'missing proof', 'wrong ref', 'wrong head', 'wrong PR', 'wrong repository',
+  'wrong readiness PR', 'wrong readiness repository', 'wrong source', 'wrong parents', 'missing base', 'changed publication'])(
+  'binds CI hold base-update proof to the same repository, PR and head: %s', async mode => {
+    const failed = 'd'.repeat(40), base = 'c'.repeat(40), tree = 'f'.repeat(40)
+    const held = { ...chain, held: 'CI failed', ciHold: { invocationId: 'repair', callId: 'b'.repeat(32), head: failed } }
+    const update = { from: failed, base, tree }
+    const ci: Record<string, unknown> = { repository: chain.repository, head_sha: HEAD, ref: HEAD, base_sha: base,
+      pull_number: 21, parents: [failed, base], base_update: update, failing: [], mergeable: true, mergeable_state: 'clean' }
+    const readiness = { repository: chain.repository, pull_number: 21, head_sha: HEAD, draft: false,
+      checks_state: 'SUCCESS', reviewer_approved_current_head: false, unresolved_live_conversation_count: 0,
+      unresolved_outdated_conversation_count: 0, green: false, blockers: ['reviewer_not_approved_current_head'] }
+    if (mode === 'edited merge') ci.base_update = null
+    if (mode === 'missing proof') delete ci.base_update
+    if (mode === 'wrong ref') ci.ref = base
+    if (mode === 'wrong head') ci.head_sha = base
+    if (mode === 'wrong PR') ci.pull_number = 22
+    if (mode === 'wrong repository') ci.repository = 'other/repo'
+    if (mode === 'wrong readiness PR') readiness.pull_number = 22
+    if (mode === 'wrong readiness repository') readiness.repository = 'other/repo'
+    if (mode === 'wrong source') update.from = base
+    if (mode === 'wrong parents') ci.parents = [base, failed]
+    if (mode === 'missing base') delete ci.base_sha
+    const reads: string[][] = []
+    mocks.runFile.mockImplementation(async (_command: string, argv: string[]) => {
+      reads.push(argv)
+      const evidence: Record<string, unknown> = {
+        '--chain-seed': { repository: chain.repository, issue_number: 7, actor: 'author', branch: chain.branch,
+          issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
+          publication: { existing_pulls: [], pull_number: 21, head_sha: mode === 'changed publication' ? failed : HEAD,
+            head_invocation: null, state: 'open', merged: false, merge_sha: null } },
+        '--pull-action-state': { pull_number: 21, state: 'open', head_sha: HEAD, review_context: 'b'.repeat(64),
+          merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] },
+        '--pr-readiness': readiness,
+        '--list-failing-ci': ci,
+      }
+      if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
+      return { stdout: JSON.stringify(evidence[argv[0]]) }
+    })
+    const result = actionOperations().observe(held)
+    if (!['verified', 'edited merge'].includes(mode)) {
+      await expect(result).rejects.toThrow()
+      return
+    }
+    const observation = await result
+    expect(observation.pull).toMatchObject({ head: HEAD, checksState: 'SUCCESS', approved: false, ready: false })
+    expect(observation.ciBaseUpdate).toEqual(mode === 'verified' ? { ...update, head: HEAD } : undefined)
+    expect(held.ciHold.head).toBe(failed)
+    expect(reads.filter(argv => argv[0] === '--list-failing-ci')).toEqual([
+      ['--list-failing-ci', '21', '--base-update-from', failed, '--token-user', 'reviewer'],
+    ])
+  })
+
 const invoke = (behavior: string) => ({ kind: 'invoke', behavior })
 const gatesUnsatisfied = { kind: 'wait', reason: 'native repository readiness gates are not satisfied' }
 it.each([
