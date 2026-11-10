@@ -167,8 +167,8 @@ yield loop even when their item type or involvement does not match; only matchin
 records enter the report. A dense dated window therefore collects no complete ID
 list before its first possible yield. Merged
 PR sizes and merger identity come from one parse of each stored payload.
-The selected day and its baseline load first. The year request starts after
-the cards render, so its larger scan cannot delay their initial appearance.
+The selected day and its baseline load first. The year and 30-day history
+requests start after the cards render, so their scans cannot delay the initial appearance.
 Leaving Analytics stops its foreground reads: a late answer is discarded, and
 history and quota are not refreshed until it is chosen again. Day preparation
 continues on shared ticks only while the browser tab is visible.
@@ -337,19 +337,27 @@ Each chart's highest value is named above it; the redundant “52 weeks” and
 “Distribution” labels are omitted. Hovering for half a second, or
 focusing it and using the arrow keys, Home and End, shows a period's value,
 what it is made of (such as "8 merged" or "Mean of 8 PRs") and its dates.
-The readout explains the chart and its period boundaries. Below productivity and per-PR lines,
-ten equal-width bins show the distribution of known weekly values. Empty
-periods stay unknown for metrics that require observations; zero event
-counts remain zero. Hover or focus explains the distribution. There is no
-history table.
+The readout explains the chart and its period boundaries. Below Productivity and
+Per merged pull request lines, five equal-width bins span the chart and show
+the 30 completed calendar days preceding the selected day. Each day contributes
+one observation in the selected organization scope and Settings timezone,
+including 23/25-hour days across daylight-saving changes; the selected day is
+excluded. Event counts and changed lines use daily totals; durations and per-PR
+metrics use one daily median or share. Unknown daily values are excluded,
+including line totals and median sizes with partial coverage; real zero counts
+remain zero. Edge labels show the full bin range, and hover or focus explains
+the daily population and bin counts. Constant values occupy the first bin;
+no known observations leave five empty bins and a — marker. There is no history table.
 
 A period without merges has no time to merge, and one whose merged pull
 requests are not all sized has no lines total; the line breaks there instead
 of falling to zero, and a known value with unknown neighbours shows as a dot.
-The year is read once per day and account, separately from the day's numbers,
-and each chart keeps its place until it arrives. If it cannot be read, the
-charts keep an empty reserved space, the day's numbers stay, and the failure
-appears in Notifications.
+The year and daily distributions are read separately from the day's numbers,
+with one bounded 30-day history read shared by all affected cards. Each chart
+keeps its place until its read arrives. Read failures leave the corresponding
+chart space empty and appear in Notifications; a failed distribution read
+retains the weekly lines and the day's numbers. Day, organization and timezone
+changes cancel prior history reads and discard their late responses.
 
 ## Work and review
 
@@ -409,7 +417,7 @@ per-PR metrics. An unconfigured agent is explained with its missing value.
 No status paragraphs or account errors are rendered inside Analytics.
 
 Account, day, baseline, history and quota read failures go to the shared
-notification rail. Repeated account failures across the three Analytics reads
+notification rail. Repeated account failures across Analytics reads
 appear once. They remain accessible after navigating away, can be dismissed,
 and clear once all reporting reads recover. A recurrence after recovery is a
 new notification. These browser read failures are local to the tab and remain accessible in the rail when Notifications are off
@@ -483,7 +491,8 @@ missingReviews and rounds/PR-count distribution), and `changesRequested`
 (affected PRs, review count, dismissed count and available-summary count). Unavailable
 review aggregates remain null; older client payloads show unknown metrics.
 
-`GET /api/analytics/history?bounds=…&org=…` answers the past year. `bounds`
+`GET /api/analytics/history?bounds=…&org=…` answers the past year's weekly lines
+and, in a separate shared request with 31 daily edges, the 30-day histograms. `bounds`
 lists the period edges, comma-separated times with a timezone, increasing,
 2 to 80 of them; each period runs from one edge (inclusive) to the next
 (exclusive). The answer is `{ periods, errors }`: each period has `since`,

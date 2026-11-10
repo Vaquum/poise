@@ -610,26 +610,98 @@ describe('automatic PR binding through workspace branches', () => {
     expect(store.bindings(runtime.instance).some(b => b.target === PR)).toBe(false)
   })
 
-  it('keeps closing references working while an unreadable workspace pauses branch matching', async () => {
+  it('retains whole-sweep deferral, recovery and recurrence while preserving other bindings', async () => {
     const parent = await manager()
-    const { worker, checkout } = await workerWithCheckout(parent.id)
-    await pushBranch(checkout, 'fix/7-broken', 'acme/app')
-    const unreadable = join(checkout, 'unreadable')
+    const broken = await workerWithCheckout(parent.id)
+    const unreadable = join(broken.checkout, 'unreadable')
     await mkdir(unreadable, { recursive: true })
-    await chmod(unreadable, 0o000)
-    try {
-      await command(worker, { operation: 'bind', target: ISSUE })
-      // The closing list names the worker's issue; the head branch is the
-      // worker's own push, which the paused scan cannot see.
-      closingRefs.mockResolvedValue(branchListing('fix/7-broken', 'acme/app', [{ repo: 'acme/app', number: 7 }]))
-      clock += 61_000
+    const logging = await import('../server/logging')
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    const reported = () => {
+      logging.loggingRuntime()!.flush()
+      const found: ReturnType<typeof logging.diagnosticPage>['events'] = []
+      let cursor: string | null = null
+      for (let guard = 0; guard < 20; guard++) {
+        const page = logging.diagnosticPage(cursor)
+        found.push(...page.events.filter(event => event.target === 'workspace-branches'))
+        if (!page.hasMore) return found
+        cursor = page.cursor
+      }
+      throw new Error('diagnostic pages did not end')
+    }
+    const pass = async () => {
       await control.tick()
-      await until(() => store.bindings(runtime.instance).some(b => b.target === PR))
-      expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(worker)
+      await until(() => store.observation(runtime.instance, `behavior:${ISSUE}`)?.checked_at === clock)
+    }
+    try {
+      await chmod(unreadable, 0o000)
+      const pushed = await workerWithCheckout(parent.id)
+      await pushBranch(pushed.checkout, 'fix/7-pushed', 'acme/app')
+      await command(broken.worker, { operation: 'bind', target: ISSUE })
+      const branchOnly = 'https://github.com/acme/app/pull/13'
+      const explicit = 'https://github.com/acme/app/pull/14'
+      await command(parent.id, { operation: 'bind', target: explicit })
+      const branchPr = branchListing('fix/7-pushed').prs[0]
+      closingRefs.mockResolvedValue({ prs: [listingFor(7).prs[0],
+        { ...branchPr, number: 13, url: branchOnly }, { ...branchPr, number: 14, url: explicit }], truncated: false, more: false })
+      clock += 61_000
+      await pass()
+      expect(store.bindings(runtime.instance).find(b => b.target === PR)?.session).toBe(broken.worker)
+      expect(store.bindings(runtime.instance).some(b => b.target === branchOnly)).toBe(false)
+      expect(store.bindings(runtime.instance).find(b => b.target === explicit)?.session).toBe(parent.id)
+      expect(reported()).toHaveLength(1)
+      expect(reported()[0]).toMatchObject({ severity: 'warning', operation: 'chat.control.item_failed',
+        context: { kind: 'discovery', key: 'workspace-branches', sessionId: broken.worker, scope: 'whole-sweep',
+          causes: [{ path: 'unreadable', cause: 'lstat_git:EACCES' }], unreadableTruncated: 0,
+          lastSuccessfulDiscoveryAt: null, retryIntervalMs: 60_000 } })
+      expect(reported()[0].message).toContain('whole sweep')
+
+      const attempts = closingRefs.mock.calls.length
+      clock += 59_000
+      await pass()
+      expect(closingRefs).toHaveBeenCalledTimes(attempts)
+      clock += 2_000
+      await pass()
+      expect(closingRefs.mock.calls.length).toBeGreaterThan(attempts)
+      expect(reported()).toHaveLength(1)
+      expect(store.bindings(runtime.instance).some(b => b.target === branchOnly)).toBe(false)
+
+      await chmod(unreadable, 0o700)
+      clock += 61_000
+      await pass()
+      expect(store.bindings(runtime.instance).find(b => b.target === branchOnly)?.session).toBe(pushed.worker)
+      const successfulAt = new Date(clock).toISOString()
+      expect(reported()).toHaveLength(2)
+      expect(reported()[1]).toMatchObject({ severity: 'warning', operation: 'chat.control.item_recovered',
+        context: { scope: 'whole-sweep', lastSuccessfulDiscoveryAt: successfulAt } })
+
+      // Neither an unreadable nor a truncated listing is successful discovery.
+      closingRefs.mockRejectedValueOnce(new Error('fixture listing failure'))
+      clock += 61_000
+      await pass()
+      closingRefs.mockResolvedValueOnce({ prs: [], truncated: true, more: false })
+      clock += 61_000
+      await pass()
+      await chmod(unreadable, 0o000)
+      clock += 61_000
+      await pass()
+      expect(reported().map(event => event.operation)).toEqual([
+        'chat.control.item_failed', 'chat.control.item_recovered', 'chat.control.item_failed',
+      ])
+      expect(reported()[2].context).toMatchObject({ sessionId: broken.worker,
+        causes: [{ path: 'unreadable', cause: 'lstat_git:EACCES' }], lastSuccessfulDiscoveryAt: successfulAt })
+      expect(store.bindings(runtime.instance).find(b => b.target === branchOnly)?.session).toBe(pushed.worker)
+      expect(store.bindings(runtime.instance).find(b => b.target === explicit)?.session).toBe(parent.id)
+      expect(JSON.stringify(reported())).not.toContain('Fix the issue')
+      expect(JSON.stringify(reported())).not.toContain('Manager')
+      expect(JSON.stringify(reported())).not.toContain(broken.checkout)
     } finally {
       await chmod(unreadable, 0o700)
+      await logging.stopLogging()
+      stderr.mockRestore()
     }
-  })
+  }, 60_000)
 })
 
 describe('pushed branch evidence', () => {

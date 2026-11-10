@@ -118,6 +118,7 @@ def run(
     capped: bool = False,
     review_round: int | None = None,
     review_cap: int | None = None,
+    review_scope: str = "",
 ) -> str:
     if capped and (review_round is None or review_cap is None):
         raise ValueError("a capped approval round needs its round and cap numbers")
@@ -161,5 +162,5 @@ def run(
     return atoms.run_agent(
         pwd, SYSTEM, text, tools, "pr_approve", timeout_s,
         model=spec.identity, pr=pr, actor_name=actor, head=expected_head,
-        packet=packet_text, capped=capped, review_round=review_round, review_cap=review_cap,
+        packet=packet_text, note=note, capped=capped, review_round=review_round, review_cap=review_cap, review_scope=review_scope,
     )

@@ -44,20 +44,148 @@ require_docker() {
     || die "the Docker Compose plugin is missing ('docker compose' does not run). Install it: https://docs.docker.com/compose/install/linux/"
 }
 
-# The value deploy/.env gives NAME, as Compose reads a NAME=value line: without
-# surrounding quotes, or else without a trailing comment; empty when unset.
+# The image whose Node parses the resolved Compose JSON: the existing
+# runtime image when it is already on this host (it already contains Node 22),
+# otherwise the pinned Node base. This never builds or moves the live
+# workspace tags to decide the guard.
+guard_parser_image() {
+  local live
+  live=$(env_value POISE_RUNTIME_IMAGE)
+  live=${live:-poise-runtime:latest}
+  case $live in
+    *@*) live="poise-runtime:latest" ;;
+  esac
+  if docker image inspect "$live" >/dev/null 2>&1; then
+    printf '%s' "$live"
+  else
+    printf '%s' "node:22-bookworm-slim"
+  fi
+}
+
+# The gateway's effective POISE_WORKSPACE_RUNTIME from Compose's resolved JSON:
+# only services.gateway.environment, decoded with JSON.parse and trimmed with
+# the gateway's own trim (gateway/src/config.ts). Prints the trimmed value,
+# empty when absent. Fails when the configuration cannot be parsed.
+guard_desired_runtime() {
+  local config=$1 parser_image
+  parser_image=$(guard_parser_image)
+  printf '%s' "$config" | docker run --rm --network none -i --entrypoint node "$parser_image" --input-type=module -e '
+let chunks=[];
+process.stdin.on("data",(chunk)=>{chunks.push(chunk);}).on("end",()=>{
+try{
+const text=Buffer.concat(chunks).toString("utf8");
+const config=JSON.parse(text||"{}");
+const environment=config?.services?.gateway?.environment;
+let value="";
+if(Array.isArray(environment)){
+const entry=environment.find((item)=>typeof item==="string"&&item.startsWith("POISE_WORKSPACE_RUNTIME="));
+if(entry!==undefined)value=entry.slice("POISE_WORKSPACE_RUNTIME=".length);
+}else if(environment!=null&&typeof environment==="object"){
+const raw=environment.POISE_WORKSPACE_RUNTIME;
+if(raw!=null)value=String(raw);
+}
+process.stdout.write(value.trim());
+}catch(error){
+console.error(String(error&&error.message?error.message:error));
+process.exit(1);
+}
+});
+'
+}
+
+# A host service, independent of the gateway's readiness cache and Docker's
+# workspace restart policy. Inspect actual runtimes as well as future settings.
+# Call this before building the runtime image, publishing a rollout, or
+# starting workspaces: both live tags stay untouched until --check proves
+# protection, and a failed read or parse stops deployment before any of those.
+ensure_caller_guard() {
+  local status changed=false proof deadline=$((SECONDS + 180)) privilege=()
+  local desired ids runtimes runtime inspect_runtime=false config
+  # The gateway's effective runtime is Compose's resolved
+  # services.gateway.environment.POISE_WORKSPACE_RUNTIME (deploy/compose.yaml
+  # forwards ${POISE_WORKSPACE_RUNTIME:-} so quoting, comments and
+  # interpolation resolve as the gateway sees them). env_value cannot do
+  # Compose interpolation, so the guard reads the resolved configuration.
+  # A failed read or parse stops deployment; absent or trimmed-empty falls
+  # back to Docker's default. Only this nested field decides: labels or any
+  # other environment value never leak into the guard decision.
+  config=$(compose config --format json) || die "cannot read the gateway's resolved Compose configuration for the Caller SQLite guard."
+  desired=$(guard_desired_runtime "$config") || die "cannot parse the gateway's resolved Compose configuration for the Caller SQLite guard."
+  if [ -z "$desired" ]; then desired=$(docker info --format '{{.DefaultRuntime}}') || die "cannot read Docker's default runtime for the Caller SQLite guard."; fi
+  ids=$(docker ps --all --quiet --filter label=poise.managed=true) || die "cannot list workspaces for the Caller guard."
+  runtimes=''
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086 # one argument per container ID
+    runtimes=$(docker inspect --format '{{.HostConfig.Runtime}}' $ids) || die "cannot inspect workspace runtimes for the Caller guard."
+  fi
+  for runtime in "$desired" $runtimes; do
+    case $runtime in runc|io.containerd.runc.v2) ;; *) inspect_runtime=true ;; esac
+  done
+  [ "$inspect_runtime" = true ] || return 0
+  command -v python3 >/dev/null || die "Python 3.10+ is required on the host for the Caller SQLite guard."
+  if python3 "$deploy/caller-guard/guard.py" --needed --runtime "$desired"; then
+    :
+  else
+    status=$?
+    [ "$status" -eq 10 ] && return 0
+    die "cannot inspect the actual Docker runtimes for the Caller SQLite guard."
+  fi
+  if [ "$(id -u)" -ne 0 ]; then privilege=(sudo -n); fi
+  "${privilege[@]}" install -d -m 755 /opt/poise-caller-guard \
+    || die "installing the host Caller guard requires root or passwordless sudo."
+  if ! cmp -s "$deploy/caller-guard/guard.py" /opt/poise-caller-guard/guard.py \
+    || ! cmp -s "$deploy/caller-guard/poise-caller-guard.service" /etc/systemd/system/poise-caller-guard.service; then
+    changed=true
+    "${privilege[@]}" install -m 644 "$deploy/caller-guard/guard.py" /opt/poise-caller-guard/guard.py
+    "${privilege[@]}" install -m 644 "$deploy/caller-guard/poise-caller-guard.service" /etc/systemd/system/poise-caller-guard.service
+    "${privilege[@]}" systemctl daemon-reload
+  fi
+  "${privilege[@]}" systemctl enable poise-caller-guard.service
+  if [ "$changed" = true ]; then
+    "${privilege[@]}" systemctl restart poise-caller-guard.service
+  else
+    "${privilege[@]}" systemctl start poise-caller-guard.service
+  fi
+  while ! proof=$("${privilege[@]}" python3 /opt/poise-caller-guard/guard.py --check 2>&1); do
+    [ "$SECONDS" -lt "$deadline" ] || die "Caller host protection is not established: $proof. Inspect journalctl -u poise-caller-guard."
+    sleep 2
+  done
+  say "$proof"
+}
+
+# The value deploy/.env gives NAME, as Compose reads a NAME=value line:
+# surrounding quotes are stripped and a trailing ` # comment` is dropped
+# (`#` inside quotes is kept; unquoted `abc#def` keeps the `#`); empty when unset.
 env_value() {
-  local line value
+  local line value rest
   line=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$env_file" | tail -n 1) || true
   value=${line#*=}
   value=${value#"${value%%[![:space:]]*}"}
   case $value in
-    \"* | \'*) ;;
-    *) value=${value%%[[:space:]]#*} ;;
-  esac
-  value=${value%"${value##*[![:space:]]}"}
-  case $value in
-    \"*\" | \'*\') value=${value:1:${#value}-2} ;;
+    \"*)
+      rest=${value:1}
+      case $rest in
+        *\"*) value=${rest%%\"*} ;;
+        *)
+          value=${value%%[[:space:]]#*}
+          value=${value%"${value##*[![:space:]]}"}
+          ;;
+      esac
+      ;;
+    \'*)
+      rest=${value:1}
+      case $rest in
+        *\'*) value=${rest%%\'*} ;;
+        *)
+          value=${value%%[[:space:]]#*}
+          value=${value%"${value##*[![:space:]]}"}
+          ;;
+      esac
+      ;;
+    *)
+      value=${value%%[[:space:]]#*}
+      value=${value%"${value##*[![:space:]]}"}
+      ;;
   esac
   printf '%s' "$value"
 }
@@ -263,6 +391,127 @@ clear_workspace_proof() {
   rm -f "$workspace_proof_file" || die "cannot clear the completed workspace proof at $workspace_proof_file."
 }
 
+clear_rollout_store() {
+  rm -rf "$workspace_proof_file.rollouts" || die "cannot clear the rollout store at $workspace_proof_file.rollouts."
+}
+
+# Rollout records have six header lines (SHA, image ID, image tag, handles,
+# outcome, start time), followed by the last 32 timestamped observations.
+# They live beside the legacy handles-only proof so older checkouts ignore them.
+read_rollout() {
+  rollout_file=$1
+  if [ ! -f "$rollout_file" ] || [ ! -r "$rollout_file" ] || [ -L "$rollout_file" ]; then
+    die "cannot read the regular rollout record $rollout_file."
+  fi
+  {
+    IFS= read -r rollout_sha
+    IFS= read -r rollout_image_id
+    IFS= read -r rollout_image
+    IFS= read -r rollout_expected
+    IFS= read -r rollout_status
+    IFS= read -r rollout_started
+  } <"$rollout_file" || die "incomplete rollout record $rollout_file."
+  [[ $rollout_sha =~ ^[0-9a-f]{40}$ && $rollout_image_id =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "invalid target in rollout record $rollout_file."
+  [[ $rollout_expected =~ ^[a-z0-9[:space:]-]*$ ]] || die "invalid workspaces in rollout record $rollout_file."
+  case $rollout_status in
+    pending | complete | failed | superseded) ;;
+    *) die "invalid outcome in rollout record $rollout_file." ;;
+  esac
+}
+
+# Callers hold the store lock while replacing a record or its current pointer.
+write_rollout() {
+  local status=$1 detail=$2 temporary stamp
+  stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  temporary=$(mktemp "$rollout_file.XXXXXX") || die "cannot create a rollout record beside $rollout_file."
+  if ! {
+    printf '%s\n' "$rollout_sha" "$rollout_image_id" "$rollout_image" "$rollout_expected" "$status" "$rollout_started"
+    if [ -f "$rollout_file" ]; then tail -n +7 "$rollout_file" | tail -n 31; fi
+    printf '%s %s %s\n' "$stamp" "$status" "${detail//$'\n'/; }" | cut -b 1-4096
+  } >"$temporary" || ! chmod 600 "$temporary" || ! mv "$temporary" "$rollout_file"; then
+    rm -f "$temporary"
+    die "cannot retain the rollout record $rollout_file."
+  fi
+  rollout_status=$status
+}
+
+start_rollout() {
+  local sha=$1 image=$2 expected=$3 target image_id release previous handle temporary reuse=false
+  rollout_file=''
+  [ -n "$sha" ] || return 0
+  target=$(docker image inspect --format '{{.Id}} {{index .Config.Labels "poise.release"}}' "$image") \
+    || die "cannot read the workspace image $image."
+  read -r image_id release <<<"$target"
+  [[ $sha =~ ^[0-9a-f]{40}$ && $image_id =~ ^sha256:[0-9a-f]{64}$ && $release == "$sha" ]] \
+    || die "the workspace image $image does not identify release $sha."
+  (umask 077; mkdir -p "$workspace_proof_file.rollouts") || die "cannot create the rollout store."
+  {
+    flock --exclusive 9 || die "cannot lock the rollout store."
+    if [ -e "$workspace_proof_file.rollouts/current" ]; then
+      previous=$(cat "$workspace_proof_file.rollouts/current") || die "cannot read the current rollout."
+      [[ $previous =~ ^[0-9a-f]{40}\.[a-zA-Z0-9]{6}$ ]] || die "invalid current rollout."
+      read_rollout "$workspace_proof_file.rollouts/$previous"
+      if [ "$rollout_status" = pending ]; then
+        if [ "$rollout_sha" != "$sha" ] || [ "$rollout_image_id" != "$image_id" ]; then
+          write_rollout superseded "Deployment target replaced by $sha ($image_id)."
+        else
+          reuse=true
+        fi
+        for handle in $rollout_expected; do
+          if [[ " $expected" != *" $handle "* ]]; then expected="$expected$handle "; fi
+        done
+      fi
+    fi
+    if [ "$reuse" = false ]; then
+      rollout_file=$(mktemp "$workspace_proof_file.rollouts/$sha.XXXXXX") || die "cannot create a rollout record."
+      rollout_sha=$sha rollout_image_id=$image_id rollout_image=$image
+      rollout_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    fi
+    rollout_expected=$expected
+    write_rollout pending 'Image built; awaiting workspace verification.'
+    temporary=$(mktemp "$workspace_proof_file.rollouts/current.XXXXXX") || die "cannot create the current rollout pointer."
+    if ! printf '%s\n' "${rollout_file##*/}" >"$temporary" || ! mv "$temporary" "$workspace_proof_file.rollouts/current"; then
+      rm -f "$temporary"
+      die "cannot retain the current rollout pointer."
+    fi
+  } 9>"$workspace_proof_file.rollouts/.lock"
+  say "Rollout ${rollout_file##*/}: pending. Recheck without deploying: $deploy/verify.sh ${rollout_file##*/}"
+}
+
+record_rollout() {
+  [ -n "${rollout_file:-}" ] || return 0
+  local status=$1 detail=$2 expected=$3 handle
+  {
+    flock --exclusive 9 || die "cannot lock the rollout store."
+    read_rollout "$rollout_file"
+    # A verifier still running when another deploy replaces its target cannot
+    # overwrite the recorded supersession with a stale health observation.
+    if [ "$rollout_status" = pending ]; then
+      if [ "$status" = complete ]; then
+        for handle in $rollout_expected; do
+          if [[ " $expected" != *" $handle "* ]]; then
+            write_rollout pending "Workspace $handle was added during verification; recheck required."
+            return
+          fi
+        done
+      fi
+      for handle in $expected; do
+        if [[ " $rollout_expected" != *" $handle "* ]]; then rollout_expected="$rollout_expected$handle "; fi
+      done
+      write_rollout "$status" "$detail"
+      if [ "$status" = complete ] && [ "$(cat "$workspace_proof_file.rollouts/current")" = "${rollout_file##*/}" ]; then
+        clear_workspace_proof
+      fi
+    fi
+  } 9>"$workspace_proof_file.rollouts/.lock"
+}
+
+show_rollout() {
+  say "Rollout ${rollout_file##*/}: $rollout_status (release $rollout_sha, image $rollout_image_id)."
+  tail -n 1 "$rollout_file"
+}
+
 # Capture the expected handles before building/retagging the runtime image:
 # even the old gateway can notice that tag and start replacing containers.
 # Container IDs change during replacement; these workspace labels do not.
@@ -349,13 +598,25 @@ pending_line() {
 verify_workspaces() {
   [ $# -eq 3 ] || die "verify_workspaces needs the workspace handles captured before building the image."
   local sha=$1 image=$2 expected=$3
-  local image_id inventory ids lines pending waiting serving deadline announced observed
+  local image_id inventory ids lines pending waiting serving deadline announced observed failed failure
   local handle id running name health active desired installed has_installed since
   if [ -z "$sha" ]; then
     say "This is a development build, which reports no release; skipping workspace verification."
     return 0
   fi
-  image_id=$(docker image inspect --format '{{.Id}}' "$image") || die "cannot read the workspace image $image."
+  if [ -n "${rollout_file:-}" ]; then
+    read_rollout "$rollout_file"
+    [ "$sha" = "$rollout_sha" ] || die "rollout target does not match $sha."
+    image_id=$rollout_image_id
+    expected=$rollout_expected
+    if [ "$rollout_status" != pending ]; then
+      show_rollout
+      [ "$rollout_status" = complete ]
+      return
+    fi
+  else
+    image_id=$(docker image inspect --format '{{.Id}}' "$image") || die "cannot read the workspace image $image."
+  fi
   say "Waiting for every workspace to serve $sha."
   deadline=$((SECONDS + verify_timeout_seconds))
   announced=$SECONDS
@@ -364,6 +625,7 @@ verify_workspaces() {
     waiting=''
     serving=''
     observed=''
+    failed=''
     # The gateway replaces containers as it recreates them, so list them anew every poll.
     inventory=$(docker ps --all --filter label=poise.managed=true --format '{{.ID}} {{.Label "poise.workspace"}}') \
       || die "cannot list the managed workspaces."
@@ -377,6 +639,7 @@ verify_workspaces() {
         if [[ " $expected" != *" $handle "* ]]; then
           expected="$expected$handle "
           save_workspace_proof "$expected"
+          record_rollout pending 'Workspace inventory extended.' "$expected"
         fi
         ids="$ids$id "
       done <<<"$inventory"
@@ -403,6 +666,7 @@ verify_workspaces() {
         if [[ " $expected" != *" $handle "* ]]; then
           expected="$expected$handle "
           save_workspace_proof "$expected"
+          record_rollout pending 'Workspace inventory extended.' "$expected"
         fi
         if [ "$running" = true ]; then
           if health=$(docker exec "$name" curl -fsS --max-time 10 http://127.0.0.1:5555/api/service/health 2>/dev/null); then
@@ -410,6 +674,10 @@ verify_workspaces() {
             if [ "$active" = "$sha" ]; then
               serving="$serving$handle "
               continue
+            fi
+            if [ -n "${rollout_file:-}" ] && failure=$(docker exec "$name" sh -c \
+              'test -f "$HOME/.poise/releases/$1/failed" && head -c 1024 "$HOME/.poise/releases/$1/failed"' sh "$sha" 2>/dev/null); then
+              failed="$failed  $handle: release $sha failed: $failure\n"
             fi
             desired=$(health_field "$health" desiredRelease)
             if [ -z "$desired" ]; then desired=$(health_field "$health" switching); fi
@@ -435,17 +703,41 @@ verify_workspaces() {
         waiting="$waiting$handle "
       fi
     done
+    record_rollout pending "Verified: ${serving% }. $(printf '%b' "$pending")" "$expected"
+    if [ -n "${rollout_file:-}" ] && [ "$rollout_status" != pending ]; then
+      show_rollout
+      [ "$rollout_status" = complete ]
+      return
+    fi
+    if [ -n "$failed" ]; then
+      record_rollout failed "$(printf '%b' "$failed")" "$expected"
+      show_rollout
+      die "the deploy of $sha failed: $(printf '%b' "$failed")"
+    fi
     if [ -z "$expected" ] && [ -z "$pending" ]; then
-      clear_workspace_proof
+      if [ -n "${rollout_file:-}" ]; then
+        record_rollout complete 'No workspace exists yet.' "$expected"
+        show_rollout
+        [ "$rollout_status" = complete ] || return 1
+      else
+        clear_workspace_proof
+      fi
       say "No workspace exists yet."
       return 0
     fi
     if [ -z "$pending" ]; then
-      clear_workspace_proof
+      if [ -n "${rollout_file:-}" ]; then
+        record_rollout complete "Every workspace serves $sha: ${serving% }." "$expected"
+        show_rollout
+        [ "$rollout_status" = complete ] || return 1
+      else
+        clear_workspace_proof
+      fi
       say "Every workspace serves $sha: ${serving% }."
       return 0
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
+      if [ -n "${rollout_file:-}" ]; then show_rollout; fi
       die "the deploy of $sha is still pending after ${verify_timeout_seconds}s: these workspaces do not serve it yet:
 $(printf '%b' "$pending")"
     fi

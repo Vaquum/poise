@@ -1,11 +1,14 @@
 """One implementation or repair invocation, with no persistent model session."""
 import json
 import re
+import subprocess
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 
 from . import checkout_lock, issue_review, progress, review_budget, resource_ownership
 from .model_catalog import Model
+from .process_diagnostic import diagnostic_envelope
 
 UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended; report a blocker instead of inventing a human answer. Caller owns publication."
 
@@ -73,6 +76,30 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
             "allShared": len(used) == len(integration["failing"])}
 
 
+def _ci_only_blocker(ci: object) -> object:
+    # Durable CI-only evidence is the packet identity plus the failed
+    # check/job IDs that pin the original run attempt. Full check summaries
+    # can exceed the 128 KiB receipt limit and would turn an explicit CI-only
+    # blocker into an unrecoverable failure.
+    if not isinstance(ci, dict):
+        return ci
+    failing = ci.get("failing")
+    compact: list[object] = []
+    if isinstance(failing, list):
+        for entry in failing:
+            if isinstance(entry, dict):
+                compact.append({key: entry[key] for key in
+                                ("type", "name", "state", "conclusion", "check_run_id", "log_id", "url")
+                                if key in entry})
+    return {
+        "action": ci.get("action"),
+        "repository": ci.get("repository"),
+        "pull_number": ci.get("pull_number"),
+        "head_sha": ci.get("head_sha"),
+        "failing": compact,
+    }
+
+
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
         call_id: str, record: Callable[[dict], None], pull: int | None = None,
         expected_head: str | None = None, note: str = "", merge_base: bool = False, expected_issue_revision: str | None = None) -> dict:
@@ -96,10 +123,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         return prepared
     record({"phase": "prepared", "prepared": prepared})
     evidence = {}
+    required_reply_ids: set[int] = set()
     if pull is not None:
         evidence["ci"] = issue_review.interface("--list-failing-ci", str(pull), "--repository", repo, "--token-user", actor)
         evidence["review_packet"] = issue_review.interface("--pr-review", str(pull), "--expected-head", expected_head or "",
                                                           "--token-user", actor, cwd=checkout)
+        required_reply_ids = {thread["root_comment_id"] for thread in evidence["review_packet"]["review_threads"] if not thread["is_resolved"]}
         evidence["queue"] = issue_review.interface("--pull-action-state", str(pull), "--repository", repo,
                                                    "--token-user", actor, "--queue-evidence")
     seconds = review_budget.timeout(issue_review.TIMEOUT_SECONDS, reserve=issue_review.POST_RESERVE_SECONDS)
@@ -126,9 +155,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         f"Write JSON to {output}: {{\"commitMessage\":\"Conventional Commit subject\",\"title\":\"Conventional Commit PR title\","
         "\"body\":\"Concrete change, reason and actual checks, without a Closes footer\","
         "\"replies\":[{\"commentId\":123,\"body\":\"Your concrete answer to this actual review finding, including what changed or evidence for disagreement\"}],\"blocked\":null}}. "
-        "For a repair, include one substantive answer for every original actionable inline review comment, using its actual numeric id. "
+        f"For a repair, include one substantive answer for each of these required unresolved root comment IDs: {json.dumps(sorted(required_reply_ids))}. "
+        "This exact set includes outdated unresolved roots and roots that already have replies; answer each with concrete changes or evidence for disagreement. "
         "Do not reply to replies, invent comment ids, or use generic acknowledgements. For initial implementation replies must be empty. "
         "If unable to finish, set blocked to the concrete reason; do not claim the work complete. "
+        'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
+        "Use a string for every other blocker, including missing evidence, a product decision or uncertain publication. "
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
         f"Behavior note: {note}\nPreparation receipt:\n{json.dumps(prepared)}\nActual issue and comments:\n{json.dumps(data)}\nActual PR evidence:\n{json.dumps(evidence)}"
     )
@@ -139,7 +171,18 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         try:
             record({"phase": "executing", "prepared": prepared})
             progress.stage("waiting_provider", "Waiting for atomic behavior provider", timeout=seconds)
-            done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
+            started = monotonic()
+            try:
+                done = checkout_lock.run_gated(lease, args, input=stdin, cwd=str(checkout), timeout=seconds, env=env, provider=model.provider)
+            except subprocess.TimeoutExpired as error:
+                raise review_budget.ReviewLimitError(
+                    "Atomic behavior provider exhausted its execution budget; no publication attempted",
+                    "atomic_work_execution_budget_exhausted",
+                    diagnostic_envelope(operation="provider.atomic_work", phase="provider_execution", outcome="timed_out",
+                                        executable=model.provider, elapsed_ms=round((monotonic() - started) * 1000),
+                                        timeout_seconds=seconds, repository=repo, pr=pull, expected_head=expected_head,
+                                        behavior="repair_pr" if pull is not None else "implement_issue",
+                                        message=f"Seed issue {repo}#{number}", submission="none")) from error
             record({"phase": "resources_unknown", "prepared": prepared})
             issue_review.stop_leftovers(work)
             if issue_review._cwd_pids(work, require_complete=True) != []:
@@ -157,7 +200,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if not isinstance(publication, dict):
                 raise ValueError("atomic behavior blocked: invalid output")
             if publication.get("blocked"):
-                raise AtomicWorkBlocked(f"atomic behavior blocked: {publication['blocked']}")
+                blocked = publication["blocked"]
+                if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
+                        and blocked["cause"] == "ci_only" and isinstance(blocked["reason"], str) and blocked["reason"].strip():
+                    record({"phase": "executing", "prepared": prepared, "ci_blocker": _ci_only_blocker(evidence["ci"])})
+                    blocked = blocked["reason"]
+                raise AtomicWorkBlocked(f"atomic behavior blocked: {blocked}")
             dependency = None
             if publication.get("ciDependency") is not None:
                 if pull is None or not expected_head:
@@ -171,10 +219,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if not isinstance(replies, list) or (pull is None and replies):
                 raise ValueError("atomic behavior returned invalid review replies")
             if pull is not None:
-                required = {thread["root_comment_id"] for thread in evidence["review_packet"]["review_threads"] if not thread["is_resolved"]}
                 answered = {reply.get("commentId") for reply in replies if isinstance(reply, dict)}
-                if not required.issubset(answered):
-                    raise ValueError("repair did not answer every unresolved review finding")
+                missing = sorted(required_reply_ids - answered)
+                if missing:
+                    raise ValueError("repair did not answer every unresolved review finding: "
+                                     f"missing_root_comment_ids={json.dumps(missing[:20])}; "
+                                     f"missing_count={len(missing)}; required_count={len(required_reply_ids)}")
             # run_gated releases only after the complete worker group exits.
             # Publication is a separate bounded writer under the same lease.
             lease.acquire(checkout_lock.ACQUIRE_WAIT_SECONDS)

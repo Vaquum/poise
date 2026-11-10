@@ -16,7 +16,7 @@ export interface ChainObservation extends Record<string, unknown> {
   repairer: ChainReviewer
   approver: ChainReviewer
   publication: { pull_number: number | null, head_sha: string | null, head_invocation: string | null, state: string | null, merged: boolean, merge_sha: string | null }
-  reviewPublication?: { callId: string, complete: boolean, issueRevision: string,
+  reviewPublication?: { callId: string, planSha?: string, complete: boolean, issueRevision: string,
     receipts: Array<{ issue: string, comment_id: number, author: string, url: string | null }> }
   existingPulls: string[]
   workPublication?: { callId: string, repliesComplete: boolean, resumable?: boolean, planSha?: string }

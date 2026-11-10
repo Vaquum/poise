@@ -39,6 +39,25 @@ describe('the periods', () => {
     expect(bounds).toEqual(['2026-10-18T21:00:00.000Z', '2026-10-25T22:00:00.000Z', '2026-11-01T22:00:00.000Z'])
   })
 
+  it.each([
+    ['2026-03-31T12:00:00Z', '2026-02-28T22:00:00.000Z', '2026-03-30T21:00:00.000Z', 23],
+    ['2026-11-02T12:00:00Z', '2026-10-02T21:00:00.000Z', '2026-11-01T22:00:00.000Z', 25],
+  ])('bounds the 30 completed local days across DST at %s, excluding selection', (now, first, last, dstHours) => {
+    vi.useFakeTimers()
+    const anchor = new Date(now)
+    vi.setSystemTime(anchor)
+    setLocalSettings({ org: '', me: '', timezone: 'Europe/Helsinki' })
+    const bounds = analyticsDailyBounds(0, anchor, 30)
+    expect(bounds).toHaveLength(31)
+    expect([bounds[0], bounds.at(-1)]).toEqual([first, last])
+    expect(bounds.at(-1)).toBe(analyticsDay(0, anchor).since)
+    const hours = bounds.slice(1).map((edge, i) => (Date.parse(edge) - Date.parse(bounds[i])) / 3_600_000)
+    expect(hours.filter(h => h === dstHours)).toHaveLength(1)
+    expect(hours.filter(h => h === 24)).toHaveLength(29)
+    expect(analyticsDailyBounds(-1, anchor, 30).at(-1)).toBe(analyticsDay(-1, anchor).since)
+    expect(analyticsDailyBounds(0, anchor)).toHaveLength(8)
+  })
+
   it('names a period by its first and last day, with the year once unless it crosses one', () => {
     // ICU data names September "Sep" or "Sept" in en-GB, depending on its version.
     expect(periodLabel({ since: '2026-09-26T00:00:00.000Z', until: '2026-10-03T00:00:00.000Z' }, 'UTC')).toMatch(/^26 Sept? – 2 Oct 2026$/)
@@ -80,6 +99,25 @@ describe('the series', () => {
     expect(series[3].values).toEqual([null])
     expect(series[3].detail(period(0, { lines: { total: 500, median: 100, counted: 5 } }))).toBe('Sizes known for 5 of 7')
   })
+
+  it('uses daily totals for distributions and one daily median/share, retaining zeros and excluding unknown sizes', () => {
+    const all = historySeries({ periods: [
+      period(0),
+      period(1, { merged: 0, mergedByAgent: 0, lines: { total: null, median: null, counted: 0 }, medianTimeToMergeMs: null, medianCommentsPerPr: null, behaviors: { perPr: null, medianPerPr: null, approvals: 0, reviews: 0, changesRequested: 0 } }, { opened: 0, closed: 0 }),
+      period(2, { lines: { total: 500, median: 100, counted: 5 } }),
+    ], errors: [] }, 1)
+    expect(all.map(s => s.values[0])).toEqual([14, 7, 7, 700, 3_600_000, 14, 7, 60_000, 2, null, null, 100, 1, 3_600_000, 3 / 7 * 100])
+    const series = (label: string) => all.find(s => s.label === label)!
+    expect(series('Pull requests merged').values).toEqual([7, 0, 7])
+    expect(series('Pull requests merged').format(7)).toBe('7.0/day')
+    expect(series('Lines changed').values).toEqual([700, 0, null])
+    expect(series('Median lines').values).toEqual([100, null, null])
+    expect(series('Median time').values).toEqual([3_600_000, null, 3_600_000])
+    expect(series('Comments').values).toEqual([2, null, 2])
+    expect(series('Behaviors').values).toEqual([1, null, 1])
+    expect(series('Merged by agent').values).toEqual([3 / 7 * 100, null, 3 / 7 * 100])
+    expect(histogram(series('Lines changed').values).reduce((sum, bin) => sum + bin.count, 0)).toBe(2)
+  })
 })
 
 describe('the chart', () => {
@@ -101,15 +139,24 @@ describe('the chart', () => {
   })
 })
 
-describe('ten-bin distributions', () => {
+describe('five-bin distributions', () => {
   it('includes both boundaries, excludes unknowns, and preserves every observation', () => {
-    const bins = histogram([0, 1, 2, 9, 10, null])
-    expect(bins).toHaveLength(10)
-    expect(bins[0]).toEqual({ from: 0, until: 1, count: 1 })
-    expect(bins[9]).toEqual({ from: 9, until: 10, count: 2 })
-    expect(bins.reduce((sum, bin) => sum + bin.count, 0)).toBe(5)
-    expect(histogram([null]).every((bin) => bin.count === 0)).toBe(true)
-    expect(histogram([4, 4]).map((bin) => bin.count)).toEqual([2, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    const bins = histogram([0, 1, 2, 4, 6, 8, 9, 10, null, NaN, Infinity])
+    expect(bins).toEqual([
+      { from: 0, until: 2, count: 2 },
+      { from: 2, until: 4, count: 1 },
+      { from: 4, until: 6, count: 1 },
+      { from: 6, until: 8, count: 1 },
+      { from: 8, until: 10, count: 3 },
+    ])
+    expect(bins.reduce((sum, bin) => sum + bin.count, 0)).toBe(8)
+    const empty = histogram([null])
+    expect(empty).toHaveLength(5)
+    expect(empty.every((bin) => bin.count === 0 && bin.until > bin.from)).toBe(true)
+    expect(empty.at(-1)!.until).toBe(1)
+    const constant = histogram([4, 4])
+    expect(constant.map((bin) => bin.count)).toEqual([2, 0, 0, 0, 0])
+    expect(constant.at(-1)!.until).toBe(5)
   })
 
   it('provides all flow and per-PR series from the same periods', () => {

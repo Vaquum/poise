@@ -52,6 +52,8 @@ export interface Config {
   workspacePids: number
   /** Explicit native behavior budgets/reservations, forwarded to each workspace. */
   behaviorResourceEnv: string[]
+  /** Explicit repository allowlist for repair exhaustion reports; null leaves reporting disabled. */
+  repairExhaustionRepositories: string | null
   /** Where agents' test suites run (POISE_TEST_RENDER_API_KEY and POISE_TEST_WORKSPACE); null keeps them in the workspaces. */
   testRelay: TestRelayConfig | null
   workspaceRuntime: string | null
@@ -231,6 +233,10 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     return parsed
   }
   const workspacePids = wholeNumber('POISE_WORKSPACE_PIDS', 4096)
+  const repairExhaustionRepositories = read('POISE_REPAIR_EXHAUSTION_REPOSITORIES') ?? null
+  if (repairExhaustionRepositories !== null && repairExhaustionRepositories.split(',').some(value => !isReleaseRepo(value.trim()))) {
+    problems.push('POISE_REPAIR_EXHAUSTION_REPOSITORIES requires comma-separated owner/repo names')
+  }
   const behaviorResourceEnv: string[] = []
   for (const name of BEHAVIOR_RESOURCE_VARIABLES) {
     const value = read(name)
@@ -332,6 +338,7 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
     workspaceNanoCpus: Math.round(cpus * 1e9),
     workspacePids,
     behaviorResourceEnv,
+    repairExhaustionRepositories,
     testRelay,
     workspaceRuntime,
     workspaceDns,
