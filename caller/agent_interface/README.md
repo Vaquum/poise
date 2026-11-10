@@ -585,6 +585,12 @@ Production continues to use its packaged worker asset.
 An unsupported command or failed read marks dashboard history unavailable,
 rather than proving that a behavior has never run.
 
+Native resource maintenance selects at most 32 exact correlations with
+`resourceRecovery: true` and empty `latest` and `ids` arrays. Each indexed
+position is rechecked against the record's correlation. Unreadable positions
+return the requested correlation and a typed quarantine reason. An unavailable
+index fails the request. This mode leaves Call status reaping to maintenance.
+
 Before launching content, `--logs --watermark` returns an insertion `cursor`.
 `--logs --after CURSOR --session SESSION --behavior author_content --prompt TEXT`
 then returns at most two exact candidates inserted after that boundary,

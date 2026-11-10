@@ -21,9 +21,10 @@ type Invoke = Extract<ChainDecision, { kind: 'invoke' }>
 // Leave the outer client room for startup, receipt commits and teardown too.
 const NATIVE_ACTION_TIMEOUT_MS = 120_000
 
-export async function readNativeInvocations(ids: string[]) {
+export async function readNativeInvocations(ids: string[], mode: 'strict' | 'resource-recovery' = 'strict') {
   requireCallerReceipts()
-  const { stdout } = await runFile('agent-interface', ['--logs', '--select', JSON.stringify({ latest: [], ids: [], correlations: ids })],
+  const { stdout } = await runFile('agent-interface', ['--logs', '--select', JSON.stringify({ latest: [], ids: [], correlations: ids,
+    ...(mode === 'resource-recovery' ? { resourceRecovery: true } : {}) })],
     { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 16 * 1024 * 1024 })
   return parseAgentLogStdout(stdout, 'behavior chain native receipts')
 }

@@ -257,6 +257,25 @@ class LogsIncrementalCase(TestCase):
         self.assertEqual([row["status"] for row in json.loads(selected.stdout)], ["completed", "failed"])
         self.assertEqual(agent_interface.logs_session_since(agent_interface.logs_watermark(), "session", "author_content", "--topic"), [])
 
+    def test_resource_recovery_isolates_only_the_unreadable_correlations(self):
+        self.seed(3)
+        with agent_interface.db() as conn:
+            conn.execute("update calls set correlation_id='good' where rowid=1")
+            conn.execute("update calls set correlation_id='bad-text', progress=cast(x'ff' as text) where rowid=2")
+            conn.execute("update calls set correlation_id='bad-record', artifact='{' where rowid=3")
+
+        selection = {"latest": [], "ids": [], "correlations": ["bad-text", "good", "missing", "bad-record"]}
+        recovered = self.cli("--logs", "--select", json.dumps({**selection, "resourceRecovery": True}))
+        self.assertEqual((recovered.returncode, recovered.stderr), (0, ""), recovered.stderr)
+        rows = {row["correlation_id"]: row for row in json.loads(recovered.stdout)}
+        self.assertEqual(set(rows), {"good", "bad-text", "bad-record"})
+        self.assertEqual(rows["good"]["id"], "0" * 32)
+        self.assertEqual(rows["bad-text"], {"correlation_id": "bad-text", "history_read_error": "INVALID_UTF8"})
+        self.assertEqual(rows["bad-record"]["history_read_error"], "INVALID_RECORD")
+        self.assertNotEqual(self.cli("--logs", "--select", json.dumps(selection)).returncode, 0)
+        with self.assertRaises(ValueError):
+            agent_interface.logs_selected({**selection, "ids": ["0" * 32], "resourceRecovery": True})
+
     def test_selected_reads_fail_loud_on_malformed_or_oversized_needles(self):
         for selection in [None, {}, {"latest": [], "ids": ["partial"]},
                           {"latest": [{"behavior": "pr_review"}], "ids": []},
