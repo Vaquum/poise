@@ -94,7 +94,7 @@ describe('Caller calls still running', () => {
     let database = await import('../server/db')
     let settings = await import('../server/settings')
     let receipts = await import('../server/service/caller-calls')
-    const configured = { enabled: true, seedMode: 'label', label: 'recovered-work' }
+    const configured: { enabled: boolean, seedMode: 'label', label: string } = { enabled: true, seedMode: 'label', label: 'recovered-work' }
     database.setMeta('behavior_chain_settings', JSON.stringify(configured))
     const path = join(dir, 'calls.sqlite3')
     const store = new Database(path)
@@ -124,14 +124,35 @@ describe('Caller calls still running', () => {
       await writeFile(path, original)
       expect(() => receipts.requireCallerReceipts()).not.toThrow()
       expect(settings.getBehaviorChainSettings().enabled).toBe(false)
+      // A direct stored write cannot resume while the hold persists. This is
+      // the crash window: the hold was committed but the settings update was
+      // not, so the stored setting still reads enabled yet admissions stay
+      // fenced until an explicit resume.
+      const { BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY } = await import('../server/settings')
       database.setMeta('behavior_chain_settings', JSON.stringify(configured))
+      expect(database.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('1')
+      expect(settings.getBehaviorChainSettings()).toEqual({ ...configured, enabled: false })
+      database.closeDatabase()
+      vi.resetModules()
+      database = await import('../server/db')
+      settings = await import('../server/settings')
+      receipts = await import('../server/service/caller-calls')
+      expect(settings.getBehaviorChainSettings()).toEqual({ ...configured, enabled: false })
       const holder = new Database(path)
       holder.exec('BEGIN EXCLUSIVE')
       try {
         expect(() => receipts.requireCallerReceipts()).toThrow(expect.objectContaining({ kind: 'contention', code: 'SQLITE_BUSY' }))
-        expect(settings.getBehaviorChainSettings()).toEqual(configured)
+        expect(settings.getBehaviorChainSettings()).toEqual({ ...configured, enabled: false })
       } finally { holder.close() }
       expect(() => receipts.requireCallerReceipts()).not.toThrow()
+      expect(settings.getBehaviorChainSettings()).toEqual({ ...configured, enabled: false })
+      // Only an explicit Settings resume clears the hold and enables.
+      const { behaviorChainJournal } = await import('../server/behavior-chain-journal')
+      const journal = behaviorChainJournal()
+      journal.changeAdmission(journal.cutover().sequence, 'draining')
+      journal.changeAdmission(journal.cutover().sequence, 'v2', [])
+      settings.setSettings({ behaviorChain: configured })
+      expect(database.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('')
       expect(settings.getBehaviorChainSettings()).toEqual(configured)
     } finally { database.closeDatabase(); vi.resetModules() }
   })

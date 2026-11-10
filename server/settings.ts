@@ -61,11 +61,23 @@ function validateBehaviorChainSettings(value: unknown): BehaviorChainSettings {
   return { enabled: input.enabled, seedMode: input.seedMode as BehaviorChainSettings['seedMode'], label: input.label.trim() }
 }
 
+export function isBehaviorChainIntegrityHeld(): boolean {
+  return getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY) === '1'
+}
+
 export function getBehaviorChainSettings(): BehaviorChainSettings {
   const raw = getMeta('behavior_chain_settings')
-  if (raw === undefined || raw === null || raw === '') return { ...DEFAULT_BEHAVIOR_CHAIN_SETTINGS }
+  if (raw === undefined || raw === null || raw === '') {
+    // A hold with no saved setting still fences admissions until resume.
+    return { ...DEFAULT_BEHAVIOR_CHAIN_SETTINGS, enabled: false }
+  }
   // Corrupt authority cannot silently select broader intake or enable execution.
-  return validateBehaviorChainSettings(JSON.parse(raw))
+  const parsed = validateBehaviorChainSettings(JSON.parse(raw))
+  // A confirmed integrity hold fences admissions even when the stored setting
+  // still reads enabled (for example a stop between the hold write and the
+  // settings update). Only an explicit Settings save that enables clears it.
+  if (isBehaviorChainIntegrityHeld()) return { ...parsed, enabled: false }
+  return parsed
 }
 
 // Chat v1 (server/chat): the prefix of branches new sessions cut from the

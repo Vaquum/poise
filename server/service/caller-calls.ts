@@ -12,8 +12,8 @@ import { existsSync } from 'node:fs'
 import { BEHAVIOR_CALL_SOURCES, runningCallerLaunches } from '../process'
 import { callerDatabase } from '../caller-store'
 import { diagnosticFailure } from '../logging'
-import { setMeta } from '../db'
-import { BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY, getBehaviorChainSettings } from '../settings'
+import { getMeta, setMeta } from '../db'
+import { BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY } from '../settings'
 
 let debates = 0
 
@@ -82,9 +82,22 @@ function callerActivity(dataDir: string | undefined, behaviorOnly: boolean, reso
       // Narrow reads can recover before the store and original effects do.
       // The hold persists even when admissions are already disabled, so a
       // pending v2 cutover cannot re-enable them without an explicit resume.
+      // The hold alone fences effective settings, so a stop before the
+      // settings update still resumes fenced; read the stored (not effective)
+      // setting here so the pause is also persisted for display.
       setMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY, '1')
-      const settings = getBehaviorChainSettings()
-      if (settings.enabled) setMeta('behavior_chain_settings', JSON.stringify({ ...settings, enabled: false }))
+      try {
+        const raw = getMeta('behavior_chain_settings')
+        if (raw) {
+          const stored = JSON.parse(raw) as { enabled?: unknown, seedMode?: unknown, label?: unknown }
+          if (stored && typeof stored === 'object' && stored.enabled === true) {
+            setMeta('behavior_chain_settings', JSON.stringify({ ...stored, enabled: false }))
+          }
+        }
+      } catch {
+        // A corrupt stored setting already refuses broader intake or
+        // execution on read; the hold above still fences admissions.
+      }
     }
     return activity
   }
