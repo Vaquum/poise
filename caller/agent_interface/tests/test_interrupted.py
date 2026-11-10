@@ -181,7 +181,8 @@ class InterruptedCallsCase(TestCase):
             call = agent_interface.track("fixture-model", "native observer", repo="acme/app",
                                          behavior="pr_review", source="poise:behavior-chain")
             self.assertEqual(agent_interface.reap_interrupted(), 0)
-        with patch.object(identity, "epoch", return_value=inner), patch.object(identity, "_start") as start:
+        with patch.object(identity, "epoch", return_value=inner), patch.object(identity, "_start") as start, \
+                patch.object(agent_interface.caller_store, "observes_workspace_supervisor", return_value=False):
             entries = agent_interface.logs(status="running")
             start.assert_not_called()
         self.assertIn(call, {entry["id"] for entry in entries})
@@ -189,6 +190,20 @@ class InterruptedCallsCase(TestCase):
         with patch.object(identity, "epoch", return_value=outer), patch.object(identity, "_start", side_effect=FileNotFoundError):
             self.assertEqual(agent_interface.reap_interrupted(), 1)
         self.assertEqual(self.row(call)["error_code"], "interrupted")
+
+    def test_a_verified_workspace_observer_reaps_a_previous_epoch(self):
+        identity = agent_interface.process_identity
+        original = {"boot": "boot", "init_start": "10", "namespace_dev": 1, "namespace_ino": 2}
+        replacement = {**original, "init_start": "20", "namespace_ino": 3}
+        with patch.object(identity, "epoch", return_value=original), patch.object(identity, "_start", return_value="42"):
+            call = agent_interface.track("fixture-model", "workspace replacement", repo="acme/app",
+                                         behavior="pr_review", source="poise:behavior-chain")
+        with patch.object(identity, "epoch", return_value=replacement), patch.object(identity, "_start") as start, \
+                patch.object(agent_interface.caller_store, "observes_workspace_supervisor", return_value=True):
+            row = agent_interface.logs_selected({"latest": [], "ids": [call]})[0]
+            start.assert_not_called()
+        self.assertEqual((row["status"], row["error_code"]), ("failed", "interrupted"))
+        self.assertIsNone(row["resources_settled_at"])
 
     def test_a_forward_wall_clock_step_does_not_interrupt_or_release_a_live_native_supervisor(self):
         call = agent_interface.track("fixture-model", "native epoch contract", repo="acme/app", pr_id="7",
