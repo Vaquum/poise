@@ -435,6 +435,26 @@ test('chain and journal pagination retain prior results and display the actual w
   await expect(history).toContainText('CI evidence unavailable')
 })
 
+test('a refresh tick behind a pending More chains keeps the requested page', async ({ page }) => {
+  await workspace(page)
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/behavior-chains*', route => {
+    const query = new URL(route.request().url()).searchParams
+    if (query.has('after')) return gate.then(() => route.fulfill({ json: { chains: [row(2)], next: null, runtime: [],
+      cutover: { mode: 'v2', sequence: 2, legacyPulls: [], blockers: [] } } }))
+    return route.fulfill({ json: { chains: [row(1)], next: 'acme/repo#1', runtime: [],
+      cutover: { mode: 'v2', sequence: 2, legacyPulls: [], blockers: [] } } })
+  })
+  const controls = await logging(page)
+  const histories = controls.getByRole('button', { name: 'History', exact: true })
+  await expect(histories).toHaveCount(1)
+  await controls.getByRole('button', { name: 'More chains' }).click()
+  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+  release()
+  await expect(histories).toHaveCount(2)
+})
+
 test('implementation and repair rows expose independent active and pause controls with actual activity', async ({ page }) => {
   await workspace(page)
   const writes: Array<{ key: string, body: Record<string, unknown> }> = []
