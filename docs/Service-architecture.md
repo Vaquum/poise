@@ -213,7 +213,12 @@ client sent.
   - `admin`: the gateway itself; only `/api/service/*`.
   - `mcp`: a consented workspace read grant; only `POST /api/mcp/read`.
     That endpoint refuses browser, Link, admin and unsigned loopback requests.
-    It returns only workspace identity and capabilities through `poise_describe`.
+    It returns workspace identity and capabilities through `poise_describe`,
+    and bounded issue work trails through `poise_work`. Work reads select one
+    exact issue or repository/label keyset page, then only those targets' chain
+    projections and retained ledger pages. Continuations bind the owner grant,
+    resource, repository, label and limit. The gateway rechecks result scope;
+    source freshness and missing receipts remain independent evidence.
     The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
     PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
@@ -1350,6 +1355,9 @@ operation or authority; a deliberate wait keeps GitHub facets unknown without
 declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
+The same reconciliation can release a CI-only hold after a proven clean base
+update, retaining the original Call, resource-release proof and remaining gates
+as defined in [CI hold recovery](Behavior-chain.md#bounded-reconciliation).
 
 The first `/api/behavior-chains` list page also includes read-only `attention`
 across all active chain pages. It joins durable progress age, holds, exact-head
@@ -1358,6 +1366,13 @@ review obligations after merge. The existing journal history supplies the clock;
 unchanged polls cannot refresh it. Stale/incomplete evidence stays explicit.
 This adds no observation, scheduler, event type, scope or execution authority.
 [Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
+
+Logging incident details may independently read `/api/behavior-chains` with exact
+`callId` and/or `correlationId` selectors for a read-only work-impact annotation.
+This uses the existing owner workspace boundary and canonical journal, including
+completed chains. Ambiguous or missing matches remain unknown, as does a failed
+workspace read; central Logging queries and retained evidence remain independent.
+No gateway read, scope, ingestion or execution authority is added.
 
 Invocation summaries may also carry retained original publication-plan absence
 and recovery evidence. Settings displays the original Call and restoration
@@ -1505,6 +1520,7 @@ Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
 opt-in enables verified repair incomplete-reply, repair execution-budget
 or PR review-budget exhaustion, verified automatic implementation holds before a PR,
+open Poise seeds with a sole closed unmerged PR,
 and terminal uncertain merge submissions, including
 sources without an explicit hold, supplied by trusted service configuration or the
 environment in local mode. Scope is rechecked after verification before reserving
@@ -1517,7 +1533,10 @@ positive resource release and fresh open-seed inspection proving no publication.
 They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
 Durable creation intent prevents another POST after an uncertain result; the source state,
 label/intake blockers and generated-issue recursion boundary stay visible through
-the existing `waiting` field. It adds no gateway route, scope, journal event,
+the existing `waiting` field. Closed-PR continuations verify existing source/PR
+report links across causes and explicit manual successor relationships before
+creation. Original uncertain receipts and resources retain their execution fence.
+It adds no gateway route, scope, journal event,
 settings default or admission bypass. See
 [reporting verified repair exhaustion](Behavior-chain.md#reporting-verified-repair-exhaustion)
 for configuration, evidence and pending live acceptance.

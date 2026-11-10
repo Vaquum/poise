@@ -215,9 +215,16 @@ An explicitly CI-only repair blocker retains the supplied head and failed
 check/job identities and URLs in its original native artifact. Its automatic
 hold records that invocation and head and stays eligible every two minutes,
 using the same scheduler. Once that original settles with `action: not_started`
-and positive resource-release proof, a fresh matching-head `checksState: SUCCESS`
-with no pending or failing checks records `ciRecovery` on the existing resume
-event. The normal decision path then rechecks review, approval and merge gates;
+and positive resource-release proof, fresh `checksState: SUCCESS` with no pending
+or failing checks can recover the same head or a verified direct base update.
+For an updated head, the failed head must be its first parent, its second parent
+must belong to the PR's current base history, and its tree must equal Git's clean
+merge of those parents. Extra merge edits, conflicting integrations and ambiguous
+or mismatched repository/PR/head evidence retain the hold. The CI read rechecks
+the live head and base after verifying the tree. The original failed Call and
+hold head remain unchanged; `chain.observed` records the updated head and the
+existing resume event records `ciRecovery`. The normal decision path then
+rechecks review, approval and merge gates;
 overall readiness is not required to release this hold. A generic worker
 blocker, uncertain publication or a later operator Hold cannot auto-resume.
 
@@ -563,9 +570,10 @@ Reporting is off by default. An operator can set
 list of explicit `owner/repo` names, up to 8192 bytes so the workspace can echo
 it in health for gateway reconciliation. Enabled v2 chains check both new and existing
 repair holds, automatic implementation holds before a PR, and uncertain merge
-submissions during their ordinary bounded reconciliation; no Resume or extra
-poller is needed. Reporting preserves the source hold, uncertainty and ownership
-and does not perform recovery.
+submissions during their ordinary bounded reconciliation, including open `poise`
+seeds whose only PR closed unmerged; no Resume or extra poller is needed.
+Reporting preserves the source hold, uncertainty and ownership and does not
+perform recovery.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
 variable. The gateway reconciles it through trusted service configuration on
 compatible running workspaces, including when image and release already match.
@@ -628,6 +636,25 @@ process diagnostic facts, or explicitly states that historical diagnostics are
 missing. Its next action is to inspect and reconcile those original receipts and
 the PR/queue state before deciding how to proceed. It never retries the merge or
 asserts an unobserved external write.
+
+`pull_closed_unmerged` qualifies a fresh open seed whose only linked PR is
+confirmed closed without merge, after all original invocations and resources
+settle. It creates one actionable continuation through the same publisher and
+normal intake, naming the source issue, closed PR, reason and next action.
+A merge, closed seed or replacement PR cannot qualify. Missing or unreadable
+original receipts stay in runtime recovery with their invocation, hold and
+reservation; reporting never clears that fence to create replacement work.
+Before reserving a new intent, the reporter reconciles any durable source/PR
+report link across causes. Manual links in the source or PR body, or comments
+by the configured accounts, require an explicit `Continuation: #N`,
+`Replacement issue: #N`, `Continued in #N`, `Work moved to #N`, `Work continued to #N` or
+`Superseded by #N` relationship. The exact target must be an open `poise` issue
+in the same repository whose body references both the source and closed PR.
+Ordinary references, including original-outcome investigations, do not prove
+replacement-work coverage. Ambiguous or unavailable successor evidence stays
+pending. Existing links and uncertain creation intents are retained across
+restarts; the new cause uses the same source-issue/PR deduplication and
+single-POST rule below.
 
 Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the

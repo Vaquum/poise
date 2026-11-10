@@ -40,6 +40,10 @@ interface Issue { number: number, title: string, body: string, state: string, ht
 let remote: Issue[]
 let seedBody: string
 let seedState: string
+let seedLabels: { name: string }[]
+let priorBody: string
+let sourceComments: Array<{ author: string, body: string }>
+let priorComments: Array<{ author: string, body: string }>
 let dropLabels: boolean
 let denyLabels: boolean
 let loseCreation: boolean
@@ -61,16 +65,33 @@ function issue(number: number, body: string): Issue {
   return { number, body, title: 'Fixture issue', state: 'open', html_url: `https://github.com/acme/repo/issues/${number}`,
     user: { login: 'author' }, labels: [], created_at: new Date(NOW).toISOString(), updated_at: new Date(NOW).toISOString() }
 }
+function closedObservation(): ChainObservation {
+  const result = observation()
+  result.pull!.state = 'closed'; result.publication.state = 'closed'
+  return result
+}
 beforeEach(() => {
   vi.useFakeTimers(); vi.setSystemTime(NOW)
   vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', 'acme/repo')
   mocks.settings = { enabled: true, seedMode: 'label', label: 'poise' }
   mocks.accounts = { me: 'author', agentAccount: 'reviewer' }
-  remote = []; seedBody = 'Original work'; seedState = 'open'; dropLabels = false; denyLabels = false
+  remote = []; seedBody = 'Original work'; dropLabels = false; denyLabels = false
+  seedState = 'open'; seedLabels = [{ name: 'poise' }]; priorBody = 'Closes #7'
+  sourceComments = []; priorComments = []
   loseCreation = false; searchVisible = true; indexed = false; stale = false; fresh = observation()
   mocks.runFile.mockReset()
   mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
     const response = (value: unknown) => ({ stdout: JSON.stringify(value), stderr: '' })
+    if (command === 'github-interface') {
+      expect(argv.slice(2)).toEqual(['--repository', 'acme/repo', '--token-user', 'author'])
+      const number = Number(argv[1])
+      const result = { repository: 'acme/repo', issue_number: number }
+      if (argv[0] === '--issue-comments') return response({ ...result, comments: number === 7 ? sourceComments : priorComments })
+      if (argv[0] === '--read-issue') return response({ ...result, issue: number === 7
+        ? { ...issue(7, seedBody), state: seedState, labels: seedLabels }
+        : number === 21 ? { ...issue(21, priorBody), html_url: 'https://github.com/acme/repo/pull/21', state: 'closed', pull_request: {} }
+        : remote.find(row => row.number === number) })
+    }
     if (command === 'github-datastore') {
       if (argv[0] === 'health') {
         if (stale) throw new Error('github-datastore freshness gate failed: stale review datastore')
@@ -91,7 +112,7 @@ beforeEach(() => {
       if (loseCreation) throw new Error('Lost creation acknowledgement')
       return response(row)
     }
-    if (argv[1] === 'repos/acme/repo/issues/7') return response({ ...issue(7, seedBody), state: seedState })
+    if (argv[1] === 'repos/acme/repo/issues/7') return response({ ...issue(7, seedBody), state: seedState, labels: seedLabels })
     const row = remote.find(row => argv[1] === `repos/acme/repo/issues/${row.number}` || argv[1] === `repos/acme/repo/issues/${row.number}/labels`)
     if (row) {
       if (argv.includes('POST')) {
@@ -117,6 +138,10 @@ function setup(path = ':memory:') {
 }
 function record(journal: BehaviorChainJournal, chain: BehaviorChain, event: ChainEvent) {
   return journal.append(chain.id, `${chain.id}:${chain.sequence}`, chain.sequence, event, NOW - 60_000)
+}
+function openSeed(journal: BehaviorChainJournal) {
+  return journal.append('acme/repo#7', 'seed:7', 0, { type: 'chain.admitted', repository: 'acme/repo', issue: 7,
+    branch: 'poise/issue-7', author: 'author', reviewer: 'reviewer' }, NOW - 600_000)
 }
 function exhausted(journal: BehaviorChainJournal, errors = [LEGACY, LEGACY, LEGACY], seed = 7, pull = 21, errorCode = 'atomic_work_failed') {
   let chain = journal.read(`acme/repo#${seed}`) ?? journal.append(`acme/repo#${seed}`, `seed:${seed}`, 0, { type: 'chain.admitted', repository: 'acme/repo', issue: seed,
@@ -234,6 +259,193 @@ function operations(db: Database.Database, journal: BehaviorChainJournal, overri
 }
 const posts = () => mocks.runFile.mock.calls.filter(call => call[0] === 'gh' && call[1][1] === 'repos/acme/repo/issues')
 const reports = (db: Database.Database) => db.prepare("SELECT value FROM meta WHERE key LIKE 'behavior_chain_repair_report:%'").all() as { value: string }[]
+
+it('routes an open seed past its only closed unmerged PR through ordinary continuation intake', async () => {
+  const { db, journal } = setup()
+  const source = openSeed(journal)
+  fresh = closedObservation()
+  const runtime = new BehaviorChainRuntime(journal, operations(db, journal, {
+    observe: async chain => chain.issue === 7 ? { ...fresh, checkedAt: Date.now() } : { ...observation(), pull: null },
+  }))
+  await runtime.run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0]).toMatchObject({ title: 'fix: continue #7 after closed unmerged PR #21', labels: [{ name: 'poise' }] })
+  for (const text of ['https://github.com/acme/repo/issues/7', 'https://github.com/acme/repo/pull/21',
+    'Cause: pull_closed_unmerged', 'Next action: implement the remaining source issue work', REMEDIATION_SCOPE]) {
+    expect(remote[0].body).toContain(text)
+  }
+  expect(remote[0].body).toContain(`<!-- poise-repair-exhaustion:${chainBasis(['pull_closed_unmerged', source.id, 21])} -->`)
+  expect(journal.read(source.id)).toMatchObject({ held: 'pull request closed without a confirmed merge',
+    invocations: [], resumedAfterSequence: 0, waiting: expect.stringContaining('/issues/99') })
+  indexed = true
+  vi.setSystemTime(NOW + 86_400_000)
+  await runtime.run()
+  expect(journal.read('acme/repo#99')).not.toBeNull()
+  expect(journal.read(source.id)?.waiting).toContain('admitted as acme/repo#99')
+  journal.rebuild()
+  await runtime.run()
+  expect(posts()).toHaveLength(1)
+  expect(reports(db)).toHaveLength(1)
+})
+
+it.each(['source body', 'source comment', 'PR body', 'PR comment'])('verifies an explicit successor in the %s before creating intent', async location => {
+  const { db, journal } = setup()
+  const source = openSeed(journal)
+  fresh = closedObservation()
+  const declaration = 'Work moved to #44'
+  if (location === 'source body') seedBody = declaration
+  if (location === 'source comment') sourceComments = [{ author: 'author',
+    body: 'Continued in #44. The prior attempt was #21 and original receipt evidence remains in #1042.' }]
+  if (location === 'PR body') priorBody += '\n' + declaration
+  if (location === 'PR comment') priorComments = [{ author: 'reviewer', body: declaration }]
+  remote = [{ ...issue(44, 'Continue #7 after https://github.com/acme/repo/pull/21'), labels: [{ name: 'poise' }] }]
+  for (let pass = 0; pass < 2; pass++) {
+    await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+    journal.rebuild()
+    vi.setSystemTime(Date.now() + 86_400_000); fresh.checkedAt = Date.now()
+  }
+  expect(journal.read(source.id)?.waiting).toContain('https://github.com/acme/repo/issues/44: already tracks')
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
+})
+
+it.each(['Work continued today. No successor yet.', 'Work continued to fail. No successor yet.',
+  'Work continued to fail on #7. No successor yet.', 'Work continued to fail after #21. No successor yet.'])(
+  'ignores ordinary continuation-like words without a successor reference: %s', async body => {
+    const { db, journal } = setup()
+    openSeed(journal)
+    fresh = closedObservation()
+    seedBody = body
+    await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+    expect(posts()).toHaveLength(1)
+    expect(remote[0]).toMatchObject({ title: 'fix: continue #7 after closed unmerged PR #21' })
+    expect(reports(db)).toHaveLength(1)
+  })
+
+it('verifies a Markdown successor link without counting it twice', async () => {
+  const { db, journal } = setup()
+  const source = openSeed(journal)
+  fresh = closedObservation()
+  seedBody = 'Continuation: [#44](https://github.com/acme/repo/issues/44)'
+  remote = [{ ...issue(44, 'Continue #7 after https://github.com/acme/repo/pull/21'), labels: [{ name: 'poise' }] }]
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(journal.read(source.id)?.waiting).toContain('https://github.com/acme/repo/issues/44: already tracks')
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
+})
+
+it('verifies an explicit successor after ordinary prose on the same line', async () => {
+  const { db, journal } = setup()
+  const source = openSeed(journal)
+  fresh = closedObservation()
+  seedBody = 'Work continued to fail. Continuation: #44'
+  remote = [{ ...issue(44, 'Continue #7 after https://github.com/acme/repo/pull/21'), labels: [{ name: 'poise' }] }]
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(journal.read(source.id)?.waiting).toContain('https://github.com/acme/repo/issues/44: already tracks')
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
+})
+
+it('creates a closed-PR continuation past a historical receipt_unavailable settlement', async () => {
+  const { db, journal } = setup()
+  let source = openSeed(journal)
+  source = record(journal, source, { type: 'invocation.admitted', invocation: { id: 'receipt-blocked', behavior: 'implement-issue',
+    basis: 'original', actor: 'author', slot: 'primary', model: 'fixture', admittedAt: NOW - 500_000,
+    request: { command: 'github-interface', cwd: '/fixture', argv: ['--read-issue', '7'] } } })
+  source = record(journal, source, { type: 'invocation.settled', invocationId: 'receipt-blocked', callId: null,
+    outcome: 'receipt_unavailable', evidence: { status: 'deferred', action: 'not_started', outcome: 'receipt_unavailable',
+      error: 'CallerReceiptStoreError: could not reserve the command safely', completedAt: NOW - 400_000 } })
+  source = record(journal, source, { type: 'invocation.admitted', invocation: { id: 'later', behavior: 'implement-issue',
+    basis: 'original', actor: 'author', slot: 'primary', model: 'fixture', admittedAt: NOW - 300_000,
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--atomic-work', source.id] } } })
+  record(journal, source, { type: 'invocation.settled', invocationId: 'later', callId: chainBasis('later').slice(0, 32),
+    outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error: 'native failure', completedAt: NOW - 200_000, resources_settled_at: new Date(NOW - 100_000).toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] } } })
+  fresh = closedObservation()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0]).toMatchObject({ title: 'fix: continue #7 after closed unmerged PR #21' })
+  expect(reports(db)).toHaveLength(1)
+})
+
+it.each(['wrong coverage', 'ambiguous', 'unavailable', 'closed successor', 'missing label'])(
+  'keeps an unverified successor pending: %s', async change => {
+    const { db, journal } = setup()
+    const source = openSeed(journal)
+    fresh = closedObservation(); seedBody = 'Continuation: #44'
+    remote = [{ ...issue(44, 'Continue #7 after #21'), labels: [{ name: 'poise' }] }]
+    if (change === 'wrong coverage') remote[0].body = 'Original outcome evidence for #7; see #1042'
+    if (change === 'ambiguous') seedBody += ' or #45'
+    if (change === 'unavailable') remote = []
+    if (change === 'closed successor') remote[0].state = 'closed'
+    if (change === 'missing label') remote[0].labels = []
+    await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+    expect(journal.read(source.id)?.waiting).toMatch(/pending|no replacement will be created/)
+    expect(posts()).toHaveLength(0)
+    expect(reports(db)).toHaveLength(0)
+  })
+
+it.each(['merged', 'closed seed', 'replacement PR', 'unlabeled seed', 'stale observation', 'unavailable observation'])(
+  'does not create a continuation after fresh verification finds %s', async change => {
+    const { db, journal } = setup()
+    openSeed(journal)
+    fresh = closedObservation()
+    if (change === 'merged') Object.assign(fresh.pull!, { merged: true, mergeSha: 'b'.repeat(40) })
+    if (change === 'closed seed') seedState = 'closed'
+    if (change === 'replacement PR') fresh.existingPulls = ['https://github.com/acme/repo/pull/22']
+    if (change === 'unlabeled seed') seedLabels = []
+    if (change === 'stale observation') fresh.checkedAt = NOW - 120_001
+    const verify = async () => { if (change === 'unavailable observation') throw new Error('GitHub evidence unavailable'); return fresh }
+    await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => closedObservation(),
+      reportHold: chain => reportRepairExhaustion(db, journal, chain, verify, () => true) })).run()
+    expect(posts()).toHaveLength(0)
+    expect(reports(db)).toHaveLength(0)
+  })
+
+it.each(['missing', 'unreadable'])('retains the original invocation, hold and reservation with %s receipts through runtime recovery', async mode => {
+  const { db, journal } = setup()
+  let source = openSeed(journal)
+  source = record(journal, source, { type: 'chain.observed', observation: closedObservation() })
+  source = record(journal, source, { type: 'invocation.admitted', invocation: { id: 'original', behavior: 'implement-issue',
+    basis: 'original', actor: 'author', slot: 'primary', model: 'fixture', admittedAt: NOW - 60_000,
+    reservation: { memoryBytes: 8, diskBytes: 16 }, request: { command: 'agent-interface', cwd: '/fixture', argv: ['--atomic-work', source.id] } } })
+  source = record(journal, source, { type: 'invocation.started', invocationId: 'original' })
+  source = record(journal, source, { type: 'chain.held', reason: 'original outcome is unknown; reconcile its receipt' })
+  seedBody = 'Original uncertain receipt evidence remains in #1042.'
+  const forbidden = vi.fn(async () => { throw new Error('must not replay, publish or release original resources') })
+  const ops = operations(db, journal, { observe: async () => closedObservation(), request: forbidden, launch: forbidden,
+    perform: forbidden, resumePublication: forbidden, fenceClosedTarget: forbidden })
+  if (mode === 'unreadable') {
+    ops.readInvocations = async () => { throw new Error('original receipt is unreadable') }
+    await expect(new BehaviorChainRuntime(journal, ops).run()).rejects.toThrow('original receipt is unreadable')
+    ops.readInvocations = async () => ({ entries: [], quarantined: [] })
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    journal.rebuild()
+    await new BehaviorChainRuntime(journal, ops).run()
+    expect(journal.read(source.id)).toMatchObject({ held: source.held, resumedAfterSequence: 0,
+      invocations: [{ id: 'original', state: 'uncertain', callId: null, reservation: { memoryBytes: 8, diskBytes: 16 } }] })
+    expect(journal.reservedResources()).toEqual({ memoryBytes: 8, diskBytes: 16, unaccounted: 0 })
+  }
+  expect(posts()).toHaveLength(0)
+  expect(reports(db)).toHaveLength(0)
+  expect(forbidden).not.toHaveBeenCalled()
+})
+
+it('keeps a verified report under another cause when its source PR closes unmerged', async () => {
+  const { db, journal } = setup()
+  const source = exhausted(journal)
+  await new BehaviorChainRuntime(journal, operations(db, journal)).run()
+  const original = reports(db)
+  fresh = closedObservation()
+  vi.setSystemTime(NOW + 86_400_000); fresh.checkedAt = Date.now()
+  journal.rebuild()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(journal.read(source.id)?.waiting).toContain('https://github.com/acme/repo/issues/99')
+  expect(reports(db)).toEqual(original)
+  expect(posts()).toHaveLength(1)
+})
 
 it.each([false, true])('reports one verified implementation hold before a PR without relaunching it (diagnostic=%s)', async diagnostic => {
   const { db, journal } = setup()
@@ -875,13 +1087,15 @@ it('retains a partially labeled issue and exposes incompatible intake without as
   expect(posts()).toHaveLength(1)
 })
 
-it('never repeats an ambiguous POST across empty searches, restart or a closed matching issue', async () => {
+it.each(['repair exhaustion', 'closed PR'])('never repeats an ambiguous %s POST across empty searches, restart or a closed matching issue', async mode => {
   const root = mkdtempSync(join(tmpdir(), 'repair-report-')); roots.push(root)
   const path = join(root, 'journal.sqlite')
   const initial = setup(path)
-  const chain = exhausted(initial.journal)
+  const chain = mode === 'closed PR' ? openSeed(initial.journal) : exhausted(initial.journal)
+  if (mode === 'closed PR') fresh = closedObservation()
+  const overrides = mode === 'closed PR' ? { observe: async () => ({ ...fresh, checkedAt: Date.now() }) } : {}
   loseCreation = true
-  await new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal)).run()
+  await new BehaviorChainRuntime(initial.journal, operations(initial.db, initial.journal, overrides)).run()
   expect(posts()).toHaveLength(1)
   expect(JSON.parse(reports(initial.db)[0].value).issueNumber).toBeNull()
   initial.db.close(); databases.splice(databases.indexOf(initial.db), 1)
@@ -890,12 +1104,12 @@ it('never repeats an ambiguous POST across empty searches, restart or a closed m
   searchVisible = false
   for (let pass = 1; pass <= 3; pass++) {
     vi.setSystemTime(Date.now() + 86_400_000)
-    await new BehaviorChainRuntime(journal, operations(db, journal)).run()
+    await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
     expect(journal.read(chain.id)?.waiting).toContain('creation is unconfirmed')
   }
   searchVisible = true; remote[0].state = 'closed'
   vi.setSystemTime(Date.now() + 86_400_000)
-  await new BehaviorChainRuntime(journal, operations(db, journal)).run()
+  await new BehaviorChainRuntime(journal, operations(db, journal, overrides)).run()
   expect(journal.read(chain.id)?.waiting).toContain('is closed; no replacement')
   expect(JSON.parse(reports(db)[0].value).issueNumber).toBe(99)
   expect(posts()).toHaveLength(1)

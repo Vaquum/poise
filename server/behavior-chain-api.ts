@@ -6,7 +6,7 @@ import { getBehaviorChainSettings, getSettings } from './settings'
 import { getBehaviorChainCapacity, getBehaviorChainRuntimeHealth } from './behaviors'
 import { behaviorCutoverBlockers } from './behavior-cutover'
 import type { BehaviorChain, ChainEvent } from './behavior-chain-store'
-import { behaviorChainAttention, behaviorChainSummary } from './behavior-chain-summary'
+import { behaviorChainAttention, behaviorChainSummary, behaviorChainWorkImpact } from './behavior-chain-summary'
 import { nativeCleanupSupport, requireNativeCleanup } from './native-cleanup-support'
 
 function reply(res: ServerResponse, status: number, value: unknown): void {
@@ -21,6 +21,14 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
     const cutover = () => ({ ...journal.cutover(), support: nativeCleanupSupport(),
       blockers: journal.cutover().mode === 'draining' ? behaviorCutoverBlockers() : [] })
     if (req.method === 'GET') {
+      if (params.has('callId') || params.has('correlationId')) {
+        const callId = params.get('callId'), correlationId = params.get('correlationId')
+        if (callId !== null && !/^[a-f0-9]{32}$/i.test(callId)
+          || correlationId !== null && !/^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(correlationId)) {
+          throw new HttpError(400, 'valid Call or correlation identity is required')
+        }
+        return reply(res, 200, { impact: behaviorChainWorkImpact(journal, callId, correlationId) })
+      }
       const id = params.get('id')
       if (id) {
         const chain = journal.read(id)

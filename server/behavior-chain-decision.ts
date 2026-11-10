@@ -25,6 +25,7 @@ export interface ChainObservation extends Record<string, unknown> {
   greyRecovery?: { invocationId: string, receipt: Record<string, unknown> }
   ciDependency?: { invocationId: string, base: string, recovered: boolean }
   prerequisites?: { wait: string | null, base: string | null, evidence: Record<string, unknown>[] }
+  ciBaseUpdate?: { from: string, head: string, base: string, tree: string }
   fullSuite?: Record<string, unknown>
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,

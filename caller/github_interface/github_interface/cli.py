@@ -335,6 +335,8 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(prog="github-interface --list-failing-ci PR")
         parser.add_argument("--ref", default=argparse.SUPPRESS,
                             help="include checks, workflow identities and parents for an exact commit SHA or the current base")
+        parser.add_argument("--base-update-from", default=argparse.SUPPRESS,
+                            help="verify that the current head is a clean merge of this failed head and the PR base")
         _add_repository(parser)
         return parser
 

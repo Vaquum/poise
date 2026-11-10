@@ -662,7 +662,7 @@ def _select(db_path: str | Path, view_name: str, output: Output, filters: dict[s
 
     conn = _read_connect(db_path)
     try:
-        if label is not None and conn.execute("SELECT 1 FROM items WHERE item_type='issue' AND state='open' "
+        if label is not None and conn.execute("SELECT 1 FROM items WHERE item_type='issue' "
                                              "AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array' LIMIT 1").fetchone():
             raise RuntimeError('issue label evidence is incomplete; ordinary datastore synchronization must refresh the old snapshots')
         rows = conn.execute(sql, params).fetchall()
