@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
@@ -204,6 +205,45 @@ class LogsIncrementalCase(TestCase):
         self.assertEqual(rows[2], {
             "id": f"{2:032x}", "history_read_error": "INVALID_RECORD", "history_rowid": "3",
         })
+
+    def test_full_history_sorts_positions_before_loading_retained_payloads(self):
+        self.seed(6276, running=3)
+        now = 1762000000.0
+        receipt = [{"issue": "acme/other#12", "comment_id": 7, "url": None, "author": "reviewer"}]
+        with agent_interface.db() as conn:
+            conn.execute("update calls set prompt=?", ("retained prompt\n" * 960,))
+            conn.execute("update calls set behavior='issue_review', receipts=? where rowid=1", (json.dumps(receipt),))
+            # Insertion order, status and start order differ; equal starts keep row order.
+            conn.execute("update calls set started_at=1761000000 where rowid in (3,5)")
+            with patch.object(agent_interface, "time", return_value=now):
+                expected = [agent_interface._full_history_log_row(row) for row in conn.execute(
+                    f"select rowid, {agent_interface.LOG_ROW_COLUMNS} from calls order by started_at"
+                )]
+
+        queries = []
+        real_db = agent_interface.db
+
+        @contextmanager
+        def traced_db():
+            with real_db() as conn:
+                conn.set_trace_callback(queries.append)
+                yield conn
+
+        with patch.object(agent_interface, "db", traced_db), patch.object(agent_interface, "time", return_value=now):
+            actual = agent_interface.logs()
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual[0]["receipts"], receipt)
+        self.assertEqual(sum(row["status"] == "running" for row in actual), 3)
+        query = next(query for query in queries if "prompt" in query)
+        with agent_interface.db() as conn:
+            plan = [row[3] for row in conn.execute("explain query plan " + query)]
+        sorter = next(index for index, step in enumerate(plan) if "TEMP B-TREE" in step)
+        payload = next(index for index, step in enumerate(plan) if "SEARCH calls USING INTEGER PRIMARY KEY" in step)
+        self.assertLess(sorter, payload, plan)
+        self.assertTrue(any("COVERING INDEX" in step for step in plan[:sorter]), plan)
+        result = self.cli("--logs", now=now)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), actual)
 
     def test_exact_history_isolates_an_unreadable_running_row(self):
         self.seed(2, running=1)

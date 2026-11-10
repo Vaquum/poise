@@ -1,6 +1,8 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CheckSemaphore } from '../server/check-semaphore'
 import { CATALOG_STDOUT, PRE_ISSUE_REVIEW_CATALOG } from './model-catalog-fixture'
@@ -224,6 +226,88 @@ afterEach(async () => {
 })
 
 describe('Review New Issues', () => {
+  it('reconciles real retained Caller history after an outage without forgetting an older cross-repository receipt', async () => {
+    const childRepo = 'Vaquum/child'
+    const since = ago(60 * MINUTE)
+    const { behaviors, database } = await start({ repos: [{ repo: REPO, since }, { repo: childRepo, since }] })
+    issues = [issue(500), issue(501), issue(502)]
+    await behaviors.runEnabledBehaviorsOnce()
+    const running = issues.map(row => callFor(`${REPO}#${row.number}`))
+    const originalClaims = database.listBehaviorLaunchClaims(KEY).map(claim => claim.claimId)
+    const historical = { ...running[0], id: 'f'.repeat(32), correlation_id: 'older-parent', pr_id: '100',
+      started_at: ago(120 * MINUTE), completed_at: ago(119 * MINUTE), status: 'completed',
+      action: 'commented', outcome: 'commented',
+      receipts: [{ issue: `${childRepo}#600`, comment_id: 7, url: null, author: 'bit-mis' }] }
+    const seed = join(tempRoot, 'history-seed.json')
+    await writeFile(seed, JSON.stringify([historical, ...running]))
+    const python = promisify(execFile)
+    const env = { HOME: tempRoot, PATH: process.env.PATH, AGENT_INTERFACE_DATA_DIR: join(tempRoot, 'caller'),
+      PYTHONPATH: join(process.cwd(), 'caller/agent_interface') }
+    await python('python3', ['-c', `
+import agent_interface as api, json, sys
+from datetime import datetime
+from pathlib import Path
+from time import time
+with api.db() as conn:
+    conn.executemany("insert into calls (id,model,prompt,started_at,ended_at,status) values (?,?,?,?,?,?)",
+        ((f'{n+1000000:032x}', 'fixture', 'retained prompt\\n' * 960, time()-3600+n/10, time()-3500+n/10, 'completed') for n in range(6272)))
+    for row in json.loads(Path(sys.argv[1]).read_text()):
+        columns = ('id','model','prompt','started_at','ended_at','status','repo','pr_id','actor','behavior','source','correlation_id','receipts','action','outcome')
+        row['started_at'] = datetime.fromisoformat(row['started_at']).timestamp()
+        row['ended_at'] = datetime.fromisoformat(row['completed_at']).timestamp() if row['completed_at'] else None
+        row['receipts'] = json.dumps(row['receipts']) if row['receipts'] is not None else None
+        conn.execute('insert into calls ('+','.join(columns)+') values ('+','.join('?' for _ in columns)+')', [row.get(key) for key in columns])
+`, seed], { env, timeout: 30_000 })
+    const cli = mocks.runFile.getMockImplementation()!
+    let unavailable = false
+    let baseline = true
+    const reads: Array<{ ms: number, bytes: number }> = []
+    mocks.runFile.mockImplementation(async (command, args, ...rest) => {
+      if (command !== 'agent-interface' || args[0] !== '--logs') return cli(command, args, ...rest)
+      if (unavailable) throw new Error('Command timed out after 30000ms')
+      const started = performance.now()
+      const result = await python('python3', ['-c', 'import agent_interface; '
+        + (baseline ? 'agent_interface.LOGS_HISTORY_QUERY = "select rowid, " + agent_interface.LOG_ROW_COLUMNS + " from calls order by started_at"; ' : '')
+        + 'agent_interface.main()', '--logs'],
+        { env, timeout: 30_000, maxBuffer: 128 * 1024 * 1024 })
+      reads.push({ ms: performance.now() - started, bytes: Buffer.byteLength(result.stdout) })
+      return result
+    })
+    const beforeStarted = performance.now()
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    const beforeMs = performance.now() - beforeStarted
+    expect(database.listBehaviorLaunchClaims(KEY).map(claim => claim.launchCallId).sort()).toEqual(running.map(row => row.id).sort())
+    baseline = false
+    const afterStarted = performance.now()
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    const afterMs = performance.now() - afterStarted
+    expect(reads[0]!.bytes).toBeGreaterThan(96 * 1024 * 1024)
+    expect(reads[1]!.bytes).toBeGreaterThan(96 * 1024 * 1024)
+    expect(database.listBehaviorLaunchClaims(KEY).map(claim => claim.launchCallId).sort()).toEqual(running.map(row => row.id).sort())
+    console.info('issue-review isolated history comparison', { rows: 6276, activeClaims: 3, reads, beforeMs, afterMs })
+    unavailable = true
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(database.listBehaviorLaunchClaims(KEY).map(claim => claim.claimId)).toEqual(originalClaims)
+    expect(database.listBehaviorLaunchClaims(KEY).every(claim => claim.launchQuarantine === 'unreadable' && claim.launchQuarantineMayRun)).toBe(true)
+    expect(launches()).toHaveLength(3)
+    await python('python3', ['-c', `
+import agent_interface as api, sys
+api.finish(sys.argv[1], 'completed', action='commented', outcome='commented')
+`, String(running[0]!.id)], { env, timeout: 30_000 })
+    issues.push(issue(503), issue(600, { repo: childRepo, url: `https://github.com/${childRepo}/issues/600` }))
+    unavailable = false
+    await resetLogCache()
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(launches()).toHaveLength(4)
+    expect(launches().at(-1)![1]).toBe(`${REPO}#503`)
+    expect(database.hasSeen(KEY, `${childRepo}#600`)).toBe(true)
+    expect(database.listBehaviorLaunchClaims(KEY).some(claim => claim.claimId === originalClaims[0])).toBe(false)
+    expect(database.listBehaviorLaunchClaims(KEY).filter(claim => originalClaims.includes(claim.claimId))).toHaveLength(2)
+  }, 60_000)
+
   it('keeps configured applicable siblings in admission provenance during temporary sign-out', async () => {
     const { behaviors } = await start({ reviewers: 2 })
     issues = [issue(452)]

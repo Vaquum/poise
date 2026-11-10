@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   captureAdmission: vi.fn(), captureOutcome: vi.fn(), observeSnapshot: vi.fn(),
   diagnostic: vi.fn(),
+  diagnosticFailure: vi.fn(),
   runFile: vi.fn(),
   workerBuild: vi.fn<(outfile: string) => void>(),
   models: {} as import('../server/models').ModelSettings,
@@ -36,6 +37,7 @@ vi.mock('../server/behavior-ledger', () => ({
 
 vi.mock('../server/logging', () => ({
   diagnostic: mocks.diagnostic,
+  diagnosticFailure: mocks.diagnosticFailure,
 }))
 
 vi.mock('../server/process', () => ({
@@ -90,6 +92,7 @@ function logRow(overrides: Record<string, unknown> = {}): Record<string, unknown
 beforeEach(() => {
   mocks.captureAdmission.mockClear(); mocks.captureOutcome.mockClear(); mocks.observeSnapshot.mockClear()
   mocks.diagnostic.mockClear()
+  mocks.diagnosticFailure.mockClear()
   mocks.workerBuild.mockClear()
   resetAgentLogCache()
 })
@@ -467,6 +470,45 @@ describe('agent log snapshot sharing', () => {
   // Braces, not an expression body: vitest would run a returned function as
   // a teardown, calling the mock once more after every test.
   beforeEach(() => { mocks.runFile.mockReset() })
+
+  it('counts failed history reads once per episode, retaining the first cause until a new history success', async () => {
+    // Begin with a known successful read; dropping a cache is not recovery.
+    mocks.runFile.mockResolvedValue({ stdout: '[]', stderr: '' })
+    const cached = await fetchAgentLogSnapshot()
+    mocks.diagnostic.mockClear()
+    const first = Object.assign(new Error('Command timed out after 30000ms'), { stderr: 'first bounded cause', killed: true, signal: 'SIGKILL' })
+    mocks.runFile.mockRejectedValueOnce(first)
+    await expect(fetchAgentLogSnapshot({ fresh: true })).rejects.toThrow(first.message)
+    expect(mocks.diagnosticFailure).toHaveBeenCalledTimes(1)
+    const episode = mocks.diagnosticFailure.mock.calls[0]!
+    expect(episode).toEqual(['agent.logs.history', first, expect.objectContaining({
+      failedReads: 1, firstFailureAt: expect.any(String), timeoutMs: 30_000,
+    }), { condition: expect.any(String) }])
+    expect(mocks.runFile.mock.calls.at(-1)![2]).toMatchObject({ reportFailure: false })
+
+    await expect(fetchAgentLogSnapshot()).resolves.toBe(cached)
+    await fetchRunningAgentLogSnapshot()
+    expect(mocks.diagnostic).not.toHaveBeenCalled()
+    const second = new Error('another history timeout')
+    mocks.runFile.mockRejectedValueOnce(second)
+    resetAgentLogCache()
+    const failures = await Promise.all(Array.from({ length: 7 }, () => fetchAgentLogSnapshot().catch(error => error)))
+    expect(failures.every(error => error.message === second.message)).toBe(true)
+    expect(mocks.diagnosticFailure).toHaveBeenCalledTimes(2)
+    expect(mocks.diagnosticFailure.mock.calls[1]).toEqual(['agent.logs.history', second,
+      expect.objectContaining({ failedReads: 2, firstFailureAt: episode[2].firstFailureAt }), episode[3]])
+
+    await fetchAgentLogSnapshot({ fresh: true })
+    expect(mocks.diagnostic).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      operation: 'agent.logs.history.recovered', correlationId: episode[3].condition,
+      context: expect.objectContaining({ failedReads: 2, firstFailureAt: episode[2].firstFailureAt }),
+    }))
+    mocks.runFile.mockRejectedValueOnce(first)
+    await expect(fetchAgentLogSnapshot({ fresh: true })).rejects.toThrow(first.message)
+    expect(mocks.diagnosticFailure.mock.calls[2]![3].condition).not.toBe(episode[3].condition)
+    expect(mocks.diagnosticFailure.mock.calls[2]![2].failedReads).toBe(1)
+    await fetchAgentLogSnapshot({ fresh: true })
+  })
 
   it('shares one read across overlapping readers, and queues a fresh reader onto a follow-up', async () => {
     const releases: Array<(value: { stdout: string, stderr: string }) => void> = []

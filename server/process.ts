@@ -57,6 +57,9 @@ export interface RunFileOptions {
   maxOutputBytes?: number
   killSignal?: NodeJS.Signals
   signal?: AbortSignal
+  /** The caller owns failure diagnostics (including shared-read episodes).
+   *  Failures still reject with their complete evidence. */
+  reportFailure?: boolean
   /** Declare this call a probe: a matching exit rejects with `expected: true`
    *  and is not reported to the process-failure observer. */
   expected?: ExpectedFailure
@@ -491,7 +494,7 @@ export function runFile(
   return new Promise((resolve, reject) => {
     const startedAt = Date.now()
     const observe = (error: Error) => {
-      if (!processFailureObserver || options.signal?.aborted || args[0] === '--diagnostics') return
+      if (!processFailureObserver || options.reportFailure === false || options.signal?.aborted || args[0] === '--diagnostics') return
       try {
         processFailureObserver(error, { command, executable: resolveCommand(command),
           operation: command + (['auth', 'api', 'sync', 'health', 'build-user', '--refresh-models', '--pr-review'].includes(args[0]) ? '.' + args[0].replace(/^--/, '') : ''),

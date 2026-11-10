@@ -1008,4 +1008,24 @@ describe('approval eligibility and review activity', () => {
     ])
     expect(modules.database.listBehaviorDeadLetters()).toEqual([])
   })
+
+  it('keeps shared history failures out of approve diagnostics while holding the launch', async () => {
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA }, {
+      commits_after_request: 0,
+      author_commits_after_request: 0,
+      author_pr_comments_after_request: 1,
+    })
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation((command, args, ...rest) => command === 'agent-interface' && args[0] === '--logs'
+      ? Promise.reject(new Error('Command timed out after 30000ms')) : original(command, args, ...rest))
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining('approve-prs'), expect.anything())
+    expect(runtime.getBehaviorsRuntimeHealth().failures.length).toBeGreaterThan(0)
+  })
 })

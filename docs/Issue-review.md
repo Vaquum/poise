@@ -206,6 +206,17 @@ checkout* and *Posting review comments*.
 A held reviewer is listed in the Behaviors diagnostics until the issue closes
 or its repository is unticked; Replay in Swarm runs it again on purpose.
 
+An unavailable Caller history read retains the original review's ownership,
+potentially running capacity and sub-issue coverage. Issue admissions wait for
+readable history, including older parents' cross-repository comment receipts.
+Recovery reconciles the original Calls; a missing or contradictory Call stays
+held. Independent operations such as Resolve unblocking do not wait on this
+history read (the isolated regression resolves a ready PR within one second).
+History failures share one diagnostic episode, counted once per failed
+underlying read. The first failure retains its bounded cause and context.
+Only a new successful history read records recovery with the failed-read count;
+cached history, running-only reads and health checks cannot clear the episode.
+
 ## Trust
 
 The reviewers run as you, on this machine, with full access — the same as a
