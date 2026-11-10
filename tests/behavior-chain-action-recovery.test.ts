@@ -440,3 +440,94 @@ it.each(['matching', 'wrong-head', 'wrong-invocation', 'missing-flags'])('recove
   await new BehaviorChainRuntime(journal, operations(obs)).run()
   expect(journal.read(chain.id)!.invocations[0].state).toBe(variant === 'matching' ? 'settled' : 'uncertain')
 })
+
+it('settles a never-attempted direct action as deferred when receipts are unreadable, so recovery can admit a fresh attempt', async () => {
+  const { CallerReceiptStoreError } = await import('../server/service/caller-calls')
+  const { journal, chain } = setup('merge-pr', false)
+  const obs = observation()
+  reviewed(journal, chain, obs)
+  const receiptError = new CallerReceiptStoreError('/tmp', Object.assign(new Error('file is not a database'), { code: 'SQLITE_NOTADB' }))
+  const perform = vi.fn(async () => { throw receiptError })
+  const runtimeOperations = operations(obs, { perform, request: async () => ({ command: 'github-interface', cwd: '/fixture',
+    argv: ['--merge-if-ready', '21', '--expected-head', HEAD, '--token-user', 'reviewer'] }) })
+  await expect(new BehaviorChainRuntime(journal, runtimeOperations).run()).rejects.toBe(receiptError)
+  const current = journal.read(chain.id)!
+  const settled = current.invocations.at(-1)!
+  expect(perform).toHaveBeenCalledTimes(1)
+  expect(settled).toMatchObject({ state: 'settled', outcome: 'receipt_unavailable', callId: null })
+  expect(settled.evidence).toMatchObject({ status: 'deferred', action: 'not_started', outcome: 'receipt_unavailable' })
+  // A fresh attempt can be admitted after readability returns; an uncertain hold would block it.
+  expect(journal.admitInvocation(current, 'admit-next', { id: 'grey-retry', behavior: 'merge-pr', basis: 'exact-request',
+    actor: 'reviewer', model: null, slot: null, admittedAt: Date.now(),
+    request: { command: 'github-interface', cwd: '/fixture',
+      argv: ['--merge-if-ready', '21', '--expected-head', HEAD, '--token-user', 'reviewer'] } }, 2)).not.toBeNull()
+})
+
+it('releases contained direct-action capacity when receipts are unreadable before any Call', async () => {
+  const { CallerReceiptStoreError } = await import('../server/service/caller-calls')
+  const { journal, chain } = setup('merge-pr', false)
+  const obs = observation()
+  reviewed(journal, chain, obs)
+  const receiptError = new CallerReceiptStoreError('/tmp', Object.assign(new Error('file is not a database'), { code: 'SQLITE_NOTADB' }))
+  const perform = vi.fn(async () => { throw receiptError })
+  const runtimeOperations = operations(obs, { perform, request: async () => ({ command: 'github-interface', cwd: '/fixture',
+    nativeResources: 2 as const, argv: ['--merge-if-ready', '21', '--expected-head', HEAD, '--token-user', 'reviewer'] }) })
+  await expect(new BehaviorChainRuntime(journal, runtimeOperations).run()).rejects.toBe(receiptError)
+  const current = journal.read(chain.id)!
+  const settled = current.invocations.at(-1)!
+  expect(perform).toHaveBeenCalledTimes(1)
+  expect(settled).toMatchObject({ state: 'settled', outcome: 'receipt_unavailable', callId: null })
+  expect(settled.request.nativeResources).toBe(2)
+  // No Call was created and no resources were acquired, so no reservation is retained.
+  expect(journal.reservedResources()).toEqual({ memoryBytes: 0, diskBytes: 0, unaccounted: 0 })
+  // A fresh contained attempt can be admitted after readability returns; pending capacity would block it.
+  expect(journal.admitInvocation(current, 'admit-contained-next', { id: 'contained-retry', behavior: 'merge-pr',
+    basis: 'exact-request', actor: 'reviewer', model: null, slot: null, admittedAt: Date.now(),
+    reservation: { memoryBytes: 8, diskBytes: 16 },
+    request: { command: 'github-interface', cwd: '/fixture', nativeResources: 2 as const,
+      argv: ['--merge-if-ready', '21', '--expected-head', HEAD, '--token-user', 'reviewer'] } }, 2)).not.toBeNull()
+})
+
+it('clears a dangling publication correlation when receipts are unreadable, so recovery retries after readability returns', async () => {
+  const { CallerReceiptStoreError } = await import('../server/service/caller-calls')
+  const { journal, chain } = setup('merge-pr', false)
+  const callId = 'a'.repeat(32)
+  const pending: ChainAdmission = { id: 'original-repair', behavior: 'repair-pr', basis: 'repair-original', actor: chain.author,
+    model: 'fixture-model', slot: 'primary', admittedAt: Date.now() - 20_000, reservation: { memoryBytes: 8, diskBytes: 16 },
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--atomic-work', 'example/repo#7', '--model', 'fixture'] } }
+  let current = journal.append(chain.id, 'repair-admit', chain.sequence, { type: 'invocation.admitted', invocation: pending })
+  const call: LogEntry = { id: callId, correlation_id: pending.id, source: 'poise:behavior-chain', actor: chain.author,
+    repo: 'example/repo', behavior: 'repair_pr', status: 'failed', action: null, outcome: null, head_sha: null, expected_head: HEAD,
+    response: null, error: 'PR head confirmation timed out', pr_id: '21', model: 'fixture-model', session_id: null, prompt: '',
+    started_at: new Date().toISOString(), completed_at: new Date().toISOString(), time_elapsed: '1s',
+    resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] },
+    artifact: { phase: 'publishing', plan_sha: 'b'.repeat(64) } }
+  current = journal.append(current.id, 'repair-uncertain', current.sequence,
+    { type: 'invocation.uncertain', invocationId: pending.id, reason: 'publication acknowledgement lost' })
+  const obs = observation()
+  obs.publication.head_invocation = callId
+  obs.publication.head_sha = HEAD
+  obs.workPublication = { callId, repliesComplete: false, resumable: true, planSha: 'b'.repeat(64) }
+  const receiptError = new CallerReceiptStoreError('/tmp', Object.assign(new Error('file is not a database'), { code: 'SQLITE_NOTADB' }))
+  const resumePublication = vi.fn(async (_invocation: ChainInvocation, _head: string, _correlation: string): Promise<Record<string, unknown>> => { throw receiptError })
+  await expect(new BehaviorChainRuntime(journal, operations(obs, {
+    readInvocations: async () => ({ entries: [call], quarantined: [] }),
+    resumePublication, launch: async () => { throw new Error('must not launch a replacement worker') },
+  })).run()).rejects.toBe(receiptError)
+  expect(resumePublication).toHaveBeenCalledTimes(1)
+  const interrupted = journal.read(chain.id)!.invocations[0]
+  expect(interrupted.state).toBe('uncertain')
+  expect(interrupted.evidence?.publicationResume).toBeNull()
+  expect(String(interrupted.evidence?.publicationResumeError)).toContain('Caller receipt store')
+  // After readability returns, recovery retries with a fresh correlation instead of staying blocked on the dangling one.
+  const fresh = 'd'.repeat(32)
+  const retry = vi.fn(async (_invocation: ChainInvocation, _head: string, _correlation: string): Promise<Record<string, unknown>> => ({}))
+  await new BehaviorChainRuntime(journal, operations(obs, {
+    readInvocations: async () => ({ entries: [call], quarantined: [] }),
+    resumePublication: retry, launch: async () => { throw new Error('must not launch a replacement worker') },
+  })).run()
+  expect(retry).toHaveBeenCalledTimes(1)
+  expect(retry.mock.calls[0][2]).not.toBe(fresh)
+  expect(typeof retry.mock.calls[0][2]).toBe('string')
+  expect(journal.read(chain.id)!.invocations[0].evidence?.publicationResume).toMatchObject({ callId, head: HEAD })
+})

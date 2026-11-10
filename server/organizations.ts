@@ -71,6 +71,7 @@ db.transaction(() => {
 
 const RUNTIME_TICK_MS = 5_000
 const SYNC_INTERVAL_MS = 60_000
+const FRESHNESS_LIMIT_MS = 120_000
 // Match Caller's daily full reconciliation; incremental freshness stays per minute.
 const RECONCILE_INTERVAL_MS = 24 * 60 * 60_000
 const RECONCILE_BUDGET_SECONDS = 20
@@ -135,6 +136,7 @@ function fromRow(row: OrganizationRow): Organization {
   const me = getMeta('me')?.trim()
   const pendingUser = row.status === 'ready' && row.managed && row.indexed_user !== me
   const resetAt = row.managed && row.status !== 'error' ? cooldownUntil(me) : 0
+  const retryAt = Math.max(resetAt, row.sync_failures ? row.next_sync_at : 0)
   return {
     login: row.login,
     ...(row.datastore_path ? { datastorePath: row.datastore_path } : {}),
@@ -143,7 +145,7 @@ function fromRow(row: OrganizationRow): Organization {
     stage: resetAt ? 'rate-limited' : pendingUser ? 'building-user' : row.stage,
     error: resetAt ? rateLimitMessage(me!, resetAt) : row.error,
     activatedAt: row.activated_at,
-    retryAt: resetAt ? new Date(resetAt).toISOString() : null,
+    retryAt: retryAt ? new Date(retryAt).toISOString() : null,
   }
 }
 
@@ -401,7 +403,7 @@ function assertOrganization(path: string, login: string): boolean {
 }
 
 async function checkHealth(path: string, me: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<void> {
-  const result = JSON.parse(await caller(path, ['health', '--max-age-seconds', '120'], me, env, signal)) as Record<string, unknown>
+  const result = JSON.parse(await caller(path, ['health', '--max-age-seconds', String(FRESHNESS_LIMIT_MS / 1000)], me, env, signal)) as Record<string, unknown>
   if (result.healthy !== true || result.status !== 'healthy' || result.action !== 'health'
     || typeof result.database !== 'string' || resolve(result.database) !== resolve(path)) {
     throw new Error('Datastore health check did not confirm a fresh index.')
@@ -535,8 +537,8 @@ function launch(login: string): void {
       const directory = dirname(initial.datastore_path)
       mkdirSync(directory, { recursive: true, mode: 0o700 })
       chmodSync(directory, 0o700)
-      // Long enough that a busy machine isn't taken for another instance holding the lock: this job would give up until the next tick.
-      await withProcessLock({ path: `${initial.datastore_path}.lock`, timeoutMs: 500 }, async () => {
+      // Allow slow setup, then try ownership once; a busy mirror retains failure/backoff.
+      await withProcessLock({ path: `${initial.datastore_path}.lock`, timeoutMs: 0 }, async () => {
         const row = rowFor(login)
         controller.signal.throwIfAborted()
         // Recheck under the process lock: another Poise instance may have
@@ -555,32 +557,43 @@ function launch(login: string): void {
         else await activate(row, me!, controller.signal, env, generation)
       })
     } catch (error) {
-      if (controller.signal.aborted || error instanceof ProcessLockError) return
-      const failed = rowFor(login)
-      if (!failed || !publishAdmitted(login, generation)) return
-      const failures = error instanceof GitHubRateLimitError ? failed.sync_failures : failed.activated_at ? failed.sync_failures + 1 : 0
-      const retryAt = error instanceof GitHubRateLimitError ? error.resetAt : failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), MAX_SYNC_RETRY_MS) : 0
-      const failingSince = failures ? failed.sync_failing_since || Date.now() : 0
-      diagnosticFailure(failed.activated_at ? 'datastore.sync' : 'datastore.activate', error, {
-        correlationId: conditionCorrelation('datastore-sync', login.toLowerCase(), String(failingSince)),
-        account: login, databasePath: failed.datastore_path, phase: failed.stage,
-        lastSuccessfulSyncAt: failed.last_sync_at ? new Date(failed.last_sync_at).toISOString() : null,
-        ageMs: failed.last_sync_at ? Date.now() - failed.last_sync_at : null, freshnessLimitMs: SYNC_INTERVAL_MS,
-        retryCount: failures, nextRetryAt: retryAt || null,
-      }, { secrets: env?.GH_TOKEN ? [env.GH_TOKEN] : [], level: error instanceof GitHubRateLimitError ? 'warning' : 'error' })
-      if (error instanceof GitHubRateLimitError) {
+      if (controller.signal.aborted || (error instanceof ProcessLockError && !initial.activated_at)) return
+      db.transaction(() => {
+        const failed = rowFor(login)
+        if (!failed || !publishAdmitted(login, generation)) return
+        // Acquisition failed outside the mirror lock. A peer's successful sync,
+        // retry or identity change must win over this older attempt atomically.
+        if (error instanceof ProcessLockError && (failed.status !== 'ready'
+          || failed.datastore_path !== initial.datastore_path || failed.indexed_user !== initial.indexed_user
+          || getMeta('me')?.trim() !== me
+          || failed.last_sync_at !== initial.last_sync_at || failed.next_sync_at !== initial.next_sync_at
+          || failed.next_sync_at > Date.now()
+          || (failed.indexed_user === me && Date.now() - failed.last_sync_at < SYNC_INTERVAL_MS))) return
+        const failures = error instanceof GitHubRateLimitError ? failed.sync_failures : failed.activated_at ? failed.sync_failures + 1 : 0
+        const retryAt = error instanceof GitHubRateLimitError ? error.resetAt : failures ? Date.now() + Math.min(SYNC_INTERVAL_MS * 2 ** Math.min(failures - 1, 6), MAX_SYNC_RETRY_MS) : 0
+        const failingSince = failures ? failed.sync_failing_since || Date.now() : 0
+        diagnosticFailure(failed.activated_at ? 'datastore.sync' : 'datastore.activate', error, {
+          correlationId: conditionCorrelation('datastore-sync', login.toLowerCase(), String(failingSince)),
+          account: login, databasePath: failed.datastore_path, phase: error instanceof ProcessLockError ? 'acquisition' : failed.stage,
+          ...(error instanceof ProcessLockError ? { holderPid: null, holderIdentityVerified: false } : {}),
+          lastSuccessfulSyncAt: failed.last_sync_at ? new Date(failed.last_sync_at).toISOString() : null,
+          ageMs: failed.last_sync_at ? Date.now() - failed.last_sync_at : null, freshnessLimitMs: FRESHNESS_LIMIT_MS,
+          retryCount: failures, nextRetryAt: retryAt || null,
+        }, { secrets: env?.GH_TOKEN ? [env.GH_TOKEN] : [], level: error instanceof GitHubRateLimitError ? 'warning' : 'error' })
+        if (error instanceof GitHubRateLimitError) {
+          db.prepare(`
+            UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'initializing' ELSE 'ready' END,
+              stage = 'rate-limited', error = ?, next_sync_at = 0 WHERE login = ?
+          `).run(error.message, login)
+          return
+        }
         db.prepare(`
-          UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'initializing' ELSE 'ready' END,
-            stage = 'rate-limited', error = ?, next_sync_at = 0 WHERE login = ?
-        `).run(error.message, login)
-        return
-      }
-      db.prepare(`
-        UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'error' ELSE 'ready' END,
-          stage = CASE WHEN activated_at IS NULL THEN stage ELSE 'sync-error' END, error = ?,
-          next_sync_at = ?, sync_failures = ?, sync_failing_since = ? WHERE login = ?
-      `).run(safeError(error, env), retryAt, failures, failingSince, login)
-      if (failures) datastoreSyncFailed(login, failingSince)
+          UPDATE organizations SET status = CASE WHEN activated_at IS NULL THEN 'error' ELSE 'ready' END,
+            stage = CASE WHEN activated_at IS NULL THEN stage ELSE 'sync-error' END, error = ?,
+            next_sync_at = ?, sync_failures = ?, sync_failing_since = ? WHERE login = ?
+        `).run(safeError(error, env), retryAt, failures, failingSince, login)
+        if (failures) datastoreSyncFailed(login, failingSince)
+      }).immediate()
     }
   }).finally(() => { jobs.delete(key); releaseOperation() })
   jobs.set(key, { controller, promise })

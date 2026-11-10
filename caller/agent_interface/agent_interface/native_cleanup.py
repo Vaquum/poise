@@ -192,10 +192,13 @@ def recover(database: Path, *, limit: int = MAX_CALLS, seconds: int = PASS_SECON
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
             reason = str(error)[:2000]
             if token is not None:
+                _wait(database, call_id, token, reason)
                 with ownership._database(database) as conn:
                     pending = conn.execute("select resources_settled_at from calls where id=?", (call_id,)).fetchone()[0] is None
                 if pending:
-                    ownership.failure(database, call_id, reason)
-                _wait(database, call_id, token, reason)
+                    try:
+                        ownership.failure(database, call_id, reason)
+                    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as diagnostic_error:
+                        reason = f"{reason}; cleanup diagnostic could not be recorded: {diagnostic_error}"
             report["held"].append({"callId": call_id, "reason": reason})
     return report

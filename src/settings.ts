@@ -386,13 +386,14 @@ function renderOrganizations(): void {
   patchInformation(list, organizations.map((org, index) => {
     const paused = waiting[index]
     // With its second: GitHub's reset is not on the minute.
-    const resetTime = paused ? logTime(org.retryAt!, effectiveTimezone(), Date.now()) : ''
+    const resetTime = org.retryAt ? logTime(org.retryAt, effectiveTimezone(), Date.now()) : ''
     const state = paused ? 'Waiting for GitHub' : org.status === 'ready' ? org.error ? 'Sync failed' : 'Ready' : org.status === 'error' ? 'Activation failed' : 'Activating…'
     return `
     <div class="st-organization" data-org="${escapeHtml(org.login)}">
       <div class="st-organization-name">${escapeHtml(org.login)}<span class="st-org-state st-org-state-${paused ? 'initializing' : org.error ? 'error' : org.status}">${state}</span></div>
       ${paused ? `<div class="st-help st-help-info">GitHub API limit reached. ${org.activatedAt ? 'Sync' : 'Activation'} resumes automatically at ${escapeHtml(resetTime)}.</div>` : org.status === 'initializing' ? `<div class="st-help st-help-info">${escapeHtml(ORGANIZATION_STAGES[org.stage] || org.stage || 'Preparing account…')}</div>` : ''}
       ${!paused && (org.status === 'error' || org.error) ? `<div class="st-help st-help-error">${escapeHtml(org.error || 'Activation failed. Try again.')}</div>` : ''}
+      ${!paused && org.retryAt ? `<div class="st-help st-help-info">Sync retries automatically at ${escapeHtml(resetTime)}.</div>` : ''}
       ${org.status === 'error' || org.error || paused ? `<button type="button" class="st-clear" data-retry-org="${escapeHtml(org.login)}"${organizationAdding || paused ? ' disabled' : ''}>Retry</button>` : ''}
     </div>`
   }).join('') || '<div class="st-help st-help-info">No GitHub accounts added yet.</div>')

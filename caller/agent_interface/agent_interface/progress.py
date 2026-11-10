@@ -55,6 +55,14 @@ def warning() -> None:
                 current._event(message)
 
 
+def phase() -> str | None:
+    current = _current.get()
+    if current:
+        with current.lock:
+            return current.state["phase"]
+    return None
+
+
 def terminal(status: str) -> str | None:
     current = _current.get()
     if not current:
@@ -108,13 +116,18 @@ class Progress:
         self.thread.start()
         return self
 
-    def __exit__(self, exc_type, *_):
-        self.stop.set()
-        self.thread.join(timeout=1)
-        if not self.finished:
-            self.stage("interrupted" if exc_type else "finished", "Worker interrupted" if exc_type else "Worker finished")
-            self.flush()
-        _current.reset(self.token)
+    def __exit__(self, exc_type, error, _):
+        try:
+            if error is not None:
+                from . import retain_native_failure
+                retain_native_failure(self.call_id, error, phase=self.state["phase"], diagnostic=getattr(error, "diagnostic", None))
+        finally:
+            self.stop.set()
+            self.thread.join(timeout=1)
+            if not self.finished:
+                self.stage("interrupted" if exc_type else "finished", "Worker interrupted" if exc_type else "Worker finished")
+                self.flush()
+            _current.reset(self.token)
 
     def _event(self, message: str) -> None:
         self.state["events"].append({"at": stamp(), "message": message[:160]})

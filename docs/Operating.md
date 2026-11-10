@@ -134,6 +134,8 @@ signing key) in the volume `poise-gateway-data`.
 - 64-bit Linux with Docker Engine 24 or newer and its Compose plugin
   ([install Docker](https://docs.docker.com/engine/install/)), and `git`.
   The deployment is tested on Ubuntu on x86-64.
+- For gVisor deployments, Python 3.10+, systemd and root or passwordless sudo
+  on the host to install the Caller guard.
 - Ports 80 and 443 reachable from the internet, and nothing else listening on
   them, or a proxy already on them that will front Poise too
   ([Behind your own proxy](#behind-your-own-proxy)).
@@ -431,6 +433,13 @@ server: the checkout fetches with the run's own token, which expires with the
 run, and the settings reach the server over SSH alone, never on a command
 line.
 
+**Repair exhaustion reports.** Set `POISE_REPAIR_EXHAUSTION_REPOSITORIES` as an
+Actions repository variable to opt in explicit repositories. The gateway forwards
+it to workspaces; changing or removing it cooperatively replaces existing
+containers even when deploying settings on the same image. See
+[reporting verified repair exhaustion](Behavior-chain.md#reporting-verified-repair-exhaustion)
+for eligibility, deduplication and admission.
+
 **Google OAuth client settings.** To supply an optional Google client through
 Actions, add
 `POISE_GOOGLE_CLIENT_ID` as an Actions repository **variable** and
@@ -461,11 +470,26 @@ both of these:
 | `POISE_UPSTREAM_SYNC` | variable | `true` |
 | `POISE_SYNC_TOKEN` | secret | A fine-grained personal access token for the fork, made as below |
 
-The Sync workflow then merges autonomio/poise's main into the fork's main
-every five minutes, as the **Sync fork** button on the fork's page does, and
-what that brought in deploys once its CI passes, so a merged change reaches
-the server about ten to twenty-five minutes later. GitHub may start a
-scheduled run some minutes late when it is busy.
+The Sync workflow checks every five minutes. With `POISE_DEPLOY_HOST` set, it
+retains the fork's current main through both required push workflows (CI and
+Caller) and its gated, serialized Deploy attempt. Green CI alone does not
+release the candidate, nor does a successful Deploy that skipped its apply
+step. If the completion wake is missed after both required workflows pass,
+Sync dispatches the normal gated Deploy and retains the candidate for that
+tick, even with nothing new upstream. Queued or running Deploys suppress
+recovery, as does a successful run's `Deploy <sha>` step: a run recorded on an
+older head can deploy the current tip.
+Then Sync merges directly to the newest upstream main, coalescing changes
+that arrived during verification. Forks without deployment keep syncing every
+five minutes. GitHub may start a scheduled run some minutes late when it is busy.
+
+Missing verification, a failed or cancelled required workflow or Deploy attempt,
+or two hours since verification began lets the next sync admit a newer fix;
+it never permits deployment without that fix's own required CI. API errors stop
+the sync visibly. Sync's Actions summary names waiting, blocked and superseded
+SHAs and links the available runs. A completed Deploy attempt alone is not a
+serving claim: the existing [workspace verification](#upgrades) and
+`/api/service/health`'s `release` establish the commit actually serving.
 A change to Poise alone then reaches the running workspaces within five more
 minutes. A change to the system under `deploy/runtime/` first waits for their
 running work to finish, up to `POISE_DRAIN_TIMEOUT` ([Upgrades](#upgrades)).
@@ -719,6 +743,17 @@ run the tests. It exits with 125, or 124 at the time limit, and never falls back
 running in the workspace. Each that the gateway can see also reaches its diagnostics
 as `test_relay.run.failed`, naming the workspace, the command and the reason; every
 run is logged with its command, exit code and duration as `test_relay.run.finished`.
+An explicit gateway-restart failure is the one exception: the active command
+records an interrupted validation with its candidate digest, suite and run ID,
+with no test result. It waits at most 30 seconds for the existing authenticated
+run handshake and retries the whole suite once. Both attempts use one captured
+checkout archive, command, cwd and environment, including uncommitted edits.
+Capture, provisioning, upload, waiting and the complete rerun share a nine-minute
+command budget, capped by a shorter inherited `BASH_DEFAULT_TIMEOUT_MS`.
+Cancellation retires the active upload and lease and prevents recovery from
+starting a new suite. Only the fresh suite's complete exit is returned; a genuine
+suite exit (including 125), a broken stream or another relay cause never retries.
+A second restart or an unrecovered relay retains the no-result contract above.
 The time limit is under an agent's shell tool's default of ten minutes
 (`BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts`), so that the agent hears this
 from the box and not as a command its tool gave up on.
@@ -786,6 +821,35 @@ The private `deploy/.env.workspace-proof` retains unfinished obligations across
 failed deploys and retries, and is cleared after successful verification.
 It proves handles captured by these scripts; a workspace already absent before
 the first captured inventory cannot be inferred from that inventory.
+
+Each release deployment also prints a rollout ID and retains its full commit
+SHA, immutable image ID, expected workspace set and outcome under the private
+`deploy/.env.workspace-proof.rollouts/` directory. A retry of the same pending
+target reuses its receipt. After the verifier or its
+SSH/Actions process exits, recheck that ID with `deploy/verify.sh ROLLOUT`.
+For the most recently started rollout:
+
+```bash
+deploy/verify.sh "$(cat deploy/.env.workspace-proof.rollouts/current)"
+```
+
+This takes one observation using the same verifier, without pulling, building,
+applying Compose, starting a workspace or requesting a switch. It requires no
+current `deploy/.env`: the original target and inventory come from the record.
+Running workspaces must report that exact active SHA; stopped workspaces must
+use the original image ID, even if another build has retagged `latest`.
+Timeout, missing workspaces and unreadable health remain `pending`, and the
+command exits nonzero. Invoke it again later to observe activation. A different
+`desiredRelease` alone never establishes failure or supersession.
+
+The outcome becomes `complete` only after every expected workspace passes the
+proof. A supervisor `failed` marker for the exact target release establishes
+`failed`; a subsequent deployment replacing the target SHA or image establishes
+`superseded`. Terminal observations remain historical receipts when another
+rollout finishes; the command reads those without reclassifying them. Each
+record retains the latest 32 UTC-timestamped observations, at most 4096 bytes
+each, including evidence after completion. The historical Actions result is
+unchanged: a later `complete` observation does not turn its earlier timeout green.
 
 The gateway upgrades those workspaces by itself, when it starts and every
 five minutes. Most upgrades change Poise but not the system it runs on, and
@@ -886,9 +950,9 @@ deploy/backup.sh [DIRECTORY]
 
 It backs up the gateway's volume and every home volume into a new directory
 named after the time (UTC), in `DIRECTORY` or `deploy/backups`, while
-everything keeps running. Each volume becomes one gzipped tar beside a
-`SHA256SUMS` file. SQLite databases go in as snapshots taken with SQLite's
-online backup, so each is consistent even while Poise writes to it; their
+same-kernel (`runc`) containers keep running. Each volume becomes one gzipped
+tar beside a `SHA256SUMS` file. SQLite databases go in as snapshots taken with
+SQLite's online backup, so each is consistent even while Poise writes to it; their
 `-wal` and `-shm` files stay out. Everything else is archived as it is, with
 owners and permissions.
 
@@ -905,11 +969,132 @@ Not in a backup: `deploy/.env` (keep a copy somewhere safe; it holds the
 OAuth App's client secret), Caddy's certificates (it obtains new ones) and
 the images (the scripts build them).
 
-A workspace that runs under gVisor (`POISE_WORKSPACE_RUNTIME=runsc`) is
-outside the reach of SQLite's locks from the backup's container, so a busy
-one may be caught mid-write; `deploy/backup.sh` warns about each. Stop such a
-workspace on the admin page before the backup when you need a copy that is
-certainly consistent.
+A workspace that runs under gVisor (`POISE_WORKSPACE_RUNTIME=runsc`) has a
+different kernel from the backup helper, which always uses `runc`. Opening
+its live SQLite databases from that helper can crash the workspace's writer.
+`backup.sh` refuses running, paused or restarting consumers of an archived
+volume under any runtime other than `runc` or `io.containerd.runc.v2`,
+including consumers of the gateway volume and containers without workspace
+labels. A stopped gVisor workspace also requires the gateway to be stopped:
+**Stop** on the admin page is insufficient, because the next authenticated
+request can start the workspace again. A gateway configured to create
+workspaces under another runtime must be stopped even when the current
+workspace containers use `runc`. Quiesce native work through the
+existing drain and settlement gates before stopping such a workspace for backup.
+Never query its live SQLite files from the host or another kernel, including
+with `mode=ro` and `PRAGMA query_only=on`: those reads can change shared WAL
+state and disrupt a writer. Use the workspace kernel or a preserved offline copy.
+
+For an offline backup, stop the gateway first, then every affected workspace
+container (the error names it). For example, for `alice`:
+
+```bash
+docker stop poise-gateway
+# If paused, unpause the workspace before stopping it.
+docker stop poise-ws-alice
+deploy/backup.sh /var/backups/poise
+docker start poise-gateway
+```
+
+Keep the gateway and affected workspaces stopped until `backup.sh` finishes;
+do not start, replace or deploy containers during that interval. The gateway
+starts a stopped workspace on its owner's next visit. The script checks Docker's
+inventory before and after each volume. A failed inventory or safety check
+removes the entire new backup directory, including
+archives already completed. Live `runc` volumes still support the nightly command
+above without stopping the gateway. A busy or locked SQLite snapshot aborts the
+backup; it never falls back to copying that live database's files.
+
+## Live Caller diagnostics under gVisor
+
+Use Poise's History, Behaviors, Logging and workspace service health readers.
+Run any required Caller reader inside the workspace kernel, using its existing
+supervisor metadata reference. Host SQLite access is unsafe even with `mode=ro`
+or `PRAGMA query_only=on`: it can modify the guest's WAL shared-memory file.
+For offline SQL, first stop the workspace and preserve its database and sidecars.
+
+`deploy/install.sh` and `deploy/upgrade.sh` install and enable
+`poise-caller-guard.service` when the configured or an existing workspace runtime
+is gVisor. It runs on the host, independently of the gateway and workspace
+restart policies. It inspects each container's actual runtime (including aliases
+registered with a `runsc` executable), and fences only gVisor home volumes.
+Every five seconds, and on an explicit check, it discovers Caller stores and
+holds SQLite's Unix lock range on their exact host inodes. It retains locks on
+original inodes after ancestor renames, `calls.sqlite3.old` file renames and
+replacement, while that home still belongs to a gVisor workspace. A restarted
+guard rescans the home volume to find those originals. It never opens SQLite
+or WAL sidecars. Ordinary `runc` and `io.containerd.runc.v2` workspaces retain
+their normal SQLite locking.
+
+Check protection explicitly; an active service or live PID is insufficient:
+
+```sh
+sudo python3 /opt/poise-caller-guard/guard.py --check
+sudo systemctl status poise-caller-guard.service
+sudo journalctl -u poise-caller-guard.service
+```
+
+The check scans current stores and verifies every retained lock's owner, range
+and inode from a separate host process. Deployment fails if it cannot obtain
+that proof. Missing first stores, acquisition failures, unavailable Docker
+inventory and lock loss report protection unavailable in checks, the journal
+and the unit's status text. Existing locks remain held during inventory errors.
+The boot-enabled service restarts after guard death and rechecks after host,
+Docker or workspace restart. First store creation and newly replaced inodes
+are protected only after discovery and verified acquisition. Guard downtime
+and discovery intervals are not continuous protection; inspect the check after
+recovery before performing host maintenance. Unexpected lock loss requires
+repair and guard restart; it is never concealed by a surviving PID.
+If an existing ad hoc guard owns this range, deployment refuses acquisition;
+transfer protection to the packaged service through a controlled operator handoff.
+
+This is advisory protection for ordinary SQLite clients, not a boundary against
+privileged host access. Root or Docker administrators can stop the guard, remove
+its locks or modify files directly. SQLite's `immutable=1` and `nolock=1` bypass
+locking and are **not supported live diagnostic workarounds**. Do not use them
+on live stores. The guard does not establish receipt integrity or authorize
+store replacement; Caller's existing metadata identity checks still apply.
+
+### Caller receipt-store recovery
+
+`caller.receipts.integrity` diagnostics retain the first observed SQLite cause,
+time and workspace independently of Caller's damaged store. `SQLITE_NOTADB`
+and `SQLITE_CORRUPT` are integrity failures; busy/locked reads are contention,
+and other read failures remain unavailable. Health keeps `idle: false` and
+`unsettledNativeCalls: null` while unreadable. Managed chain admission and its
+final launch/action/publication boundaries refuse unavailable receipts.
+A successful health response or SQL read does not prove recovery completeness.
+
+1. Preserve the original main file, WAL (including deleted files held open by
+   original processes), shared-memory state, behavior journal and process/resource
+   identities before changing writers or storage. Use the workspace kernel for
+   live observations. A release restart leaves original workers alive; a zero
+   process-local count cannot establish quiescence.
+2. Retain the existing journal's `invocation.uncertain` holds for started work
+   whose receipts cannot be read or are absent. Check those holds before exposing
+   a partial recovery to normal reconciliation. Missing rows cannot authorize a
+   retry, a synthetic no-effect Call, or reservation release, even on a closed,
+   disabled or held chain. Never recreate missing receipt identities.
+3. Work on separate offline copies. Check SQLite integrity, foreign keys and the
+   unchanged application schema, then inventory missing and invalid receipts
+   against the preserved journal and actual GitHub effects. Structural integrity
+   alone cannot validate incomplete Call, publication or resource evidence.
+4. Quiesce original writers and verify their original namespace/resource witnesses
+   before any activation. Preserve settlement certificates before any lifecycle
+   change that destroys supervisor handles. Both Caller and Poise's bounded
+   health/maintenance reader pin the original database identity and reject a
+   replacement inode; verify recovery through both actual readers in the
+   workspace kernel. Do not bypass that identity check or destroy an unsettled
+   supervisor to make a replacement readable.
+5. Reconcile original Calls and GitHub artifacts through the existing receipt
+   checks. Missing or invalid evidence stays uncertain and retains capacity until
+   original resource release is proven. New work then passes the existing enable,
+   hold, identity, capacity and final receipt gates; readability alone clears no
+   invocation hold and authorizes no repeated effect.
+
+The #971 disposable reproduction established that cross-kernel read-only access
+can disrupt a guest writer. The exact production corruption transaction remains
+unverified; the backup refusal prevents the demonstrated unsafe access.
 
 ## Restore
 

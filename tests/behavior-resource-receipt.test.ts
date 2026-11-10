@@ -83,6 +83,12 @@ describe('native resource receipt boundary', () => {
     expect(parseResourceOwnership(value).roots[0].inode).toBe('18446744073709551615')
   })
 
+  it('retains a bounded receipt size after allowing large ancestor recovery inventories', () => {
+    const roots = Array.from({ length: 900 }, (_, index) => ({ ...ROOT, path: `/isolated/${index}/${'x'.repeat(500)}` }))
+    expect(Buffer.byteLength(JSON.stringify({ ...OWNED, roots }))).toBeGreaterThan(512 * 1024)
+    expect(() => parseResourceOwnership({ ...OWNED, roots })).toThrow('invalid native resource ownership')
+  })
+
   it.each([{ roots: [ROOT, ROOT] }, { roots: [{ ...ROOT, inode: -1 }] },
     { roots: [{ ...ROOT, reclaimed_at: null }] }, { roots: [{ ...ROOT, recovered_at: 11 }] },
     { errors: [{ cause: 'denied', path: '/foreign', at: 1 }] }, { process_pending: 'false' }, { recovered: true }])(

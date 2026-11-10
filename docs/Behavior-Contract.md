@@ -134,7 +134,11 @@ their existing independent retry handling.
 authoritative `reviewed_clean` outcome. `approve-prs` accepts one head-pinned
 approval or one atomic change request. An unresolved finding whose location became
 outdated can be reaffirmed without another inline comment when the reviewer
-confirms it still blocks the supplied head. A terminal review contract violation
+confirms it still blocks the supplied head. The same review body retains each
+reaffirmed thread's root-comment permalink and finding text, including alongside
+new inline findings. Distinct findings at the same location remain new inline
+comments. Referenced roots retain reply and resolution evidence for the active
+change request. A terminal review contract violation
 is held on unchanged input and model instead of repeatedly launching the same
 worker. When live GitHub state confirms the pull request already closed or
 merged, the obsolete firing settles natively superseded instead of holding:

@@ -189,12 +189,15 @@ test('updates organization filters after activation finishes while Settings is c
 })
 
 test('shows synchronization failures on previously activated organizations with a retry', async ({ page }) => {
-  const state = await setup(page, [organization('acme'), { ...organization('beta'), stage: 'sync-error', error: 'GitHub rate limit exceeded' }])
+  const state = await setup(page, [organization('acme'), {
+    ...organization('beta'), stage: 'sync-error', error: 'timed out waiting for process lock', retryAt: '2026-10-01T08:01:10Z',
+  }])
   await page.goto('/')
   await openSettings(page)
   const row = page.locator('.st-organization[data-org="beta"]')
   await expect(row).toContainText('Sync failed')
-  await expect(row).toContainText('GitHub rate limit exceeded')
+  await expect(row).toContainText('timed out waiting for process lock')
+  await expect(row).toContainText('Sync retries automatically at 08:01:10.')
   await row.getByRole('button', { name: 'Retry' }).click()
   await expect(row).toContainText('Syncing repositories…')
   expect(state.retries).toEqual(['beta'])

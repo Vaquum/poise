@@ -279,6 +279,7 @@ Environment the gateway passes:
 | `HOME` | `/home/poise` |
 | `POISE_DRAIN_TIMEOUT` | the gateway's own `POISE_DRAIN_TIMEOUT`, in seconds (default 5400), so both sides time a drain alike |
 | `POISE_BEHAVIOR_MEMORY_BUDGET_BYTES`, `POISE_BEHAVIOR_MEMORY_RESERVATION_BYTES`, `POISE_BEHAVIOR_DISK_BUDGET_BYTES`, `POISE_BEHAVIOR_DISK_RESERVATION_BYTES` | optional validated whole-byte native behavior settings from the gateway; unset remains unbounded ([configuration](../gateway/README.md)) |
+| `POISE_REPAIR_EXHAUSTION_REPOSITORIES` | optional explicit comma-separated `owner/repo` allowlist from the gateway; unset or empty keeps repair exhaustion reporting disabled |
 | `POISE_SKIP_CLI_BOOTSTRAP` | `1`, only when the gateway's `POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP` is `1` (end-to-end tests); otherwise unset |
 
 Beside each release, the gateway installs agents' test offload into the home
@@ -299,6 +300,9 @@ Changed or removed native behavior budget/reservation settings use that same
 replacement path and its existing native resource-settlement barrier. Existing
 invocations retain their original immutable ceilings; no setting changes an
 already-admitted booking.
+Adding, changing or removing the repair-report allowlist uses that same
+cooperative replacement path, including settings-only deployments on the same
+image; an in-place release switch cannot change a container's environment.
 
 The gateway reaches the workspace at `http://poise-ws-<handle>:5555`, over the
 workspace's network, which it joins by its own container name,
@@ -698,6 +702,20 @@ Removal aborts the account's activation or sync job, resolves its notices,
 and drops its repositories from the issue review selection and the Manager's
 scope. Nothing changes on GitHub, datastores are kept, and work bindings stay
 as history.
+
+An account's due sync makes one nonblocking SQLite lock attempt after filesystem
+setup, even when setup is slow. An activated account retains lock acquisition
+failures in its existing sync error and retry state. Retries back off from one
+minute to at most one hour, survive restart, and leave other accounts eligible. Five-second scheduler ticks
+do not acquire the lock or repeat diagnostics before that retry. SQLite contention
+and setup errors retain their actual causes; neither verifies a holder's process
+identity. A newer sync, retry, identity or registration wins over an old
+failed acquirer. Settings shows the error and automatic retry time immediately;
+diagnostics retain the failure start, last successful sync age (unknown without a
+timestamp), and the unchanged 120-second freshness limit. The existing per-account
+alert still starts after 15 minutes of failures and clears/rearms only after a
+validated sync. An activation lock conflict stays eligible for automatic
+activation rather than becoming a manual-retry error.
 
 `GET /api/github-quota` reads the configured user and automation accounts'
 stored credentials explicitly and returns their API budgets without secrets.
@@ -1101,8 +1119,27 @@ the checkout's commit as the build argument `POISE_SOURCE_SHA`, which
 `/api/service/health` reports as `version`.
 Upgrading is: pull, build, `docker compose up -d`. The gateway then drains and
 recreates any workspace whose image differs from `POISE_RUNTIME_IMAGE`, or
-whose `POISE_DRAIN_TIMEOUT` or configured native behavior budgets differ from
-its own, keeping its volume and respecting the native settlement barrier.
+whose `POISE_DRAIN_TIMEOUT`, configured native behavior budgets or repair-report
+allowlist differ from its own, keeping its volume and respecting the native
+settlement barrier.
+The operator scripts retain an exact-release rollout receipt beyond their
+bounded verification wait. `deploy/verify.sh ROLLOUT` reconciles a pending
+receipt through the existing workspace health/image proof without initiating
+another rollout; [Upgrades](Operating.md#upgrades) defines its outcomes and
+retained evidence. This adds no gateway or workspace API.
+
+For gVisor workspaces, install/upgrade also own the boot-enabled host
+`poise-caller-guard.service`. It selects actual Docker runtimes, holds host
+SQLite locks on current and retained original Caller inodes, and verifies
+acquisition from a separate process before deployment reports protection.
+Its independent scans cover workspace creation/replacement and host, Docker
+and guard restarts without relying on cached gateway readiness. Failure is
+visible through its check, journal and unit status; existing workspace readers
+and metadata identity checks remain unchanged. This advisory fence cannot
+prevent privileged host bypass and has recovery/discovery intervals.
+[Live Caller diagnostics](Operating.md#live-caller-diagnostics-under-gvisor)
+defines the supported readers and explicit protection check. Host backups
+refuse running separate-kernel workspaces and busy/locked SQLite snapshots.
 
 **Provider CLIs** are installed into each person's home volume on first start
 and update themselves there, as Poise already does before each launch. The
@@ -1266,10 +1303,17 @@ declaring a collector outage. No extra poller, gateway scope or event type is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 
+Invocation summaries may also carry retained original publication-plan absence
+and recovery evidence. Settings displays the original Call and restoration
+action even while its invocation is active. This diagnostic evidence grants no
+publication, retry or resource-release authority; [Behavior chain](Behavior-chain.md#authority-and-recovery)
+defines its reconciliation rules.
+
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
-started originals without a Call use the bounded native correlation-fence
-command before normal receipt reconciliation. Existing Calls and uncertain
+started originals without a Call remain uncertain without a retry or synthetic
+no-effect receipt, since partial recovery can lose the original unique correlation.
+Unreadable snapshots retain that hold in the existing journal. Existing Calls and uncertain
 resources are never released by closure alone. Merged-chain Hold/Resume writes
 return 409 and the GUI retains History and read-only reconciliation. No new
 endpoint, signal or journal event type is added; the Caller contract is in
@@ -1278,6 +1322,11 @@ Poise's existing log decoder validates the fence's exact terminal no-effect
 shape and native resource-release timestamp before the journal can settle its
 reservation. Closed-target native resource waits are separate from public
 GitHub recheck times; unrelated open-PR review/approval stays eligible.
+Managed native admissions recheck the bounded receipt reader at their final
+launch, action and publication boundaries. Its independent diagnostics retain
+the first typed SQLite cause and affected workspace; health keeps its existing
+unknown counters. Readability cannot clear missing original evidence. See
+[receipt-store recovery](Operating.md#caller-receipt-store-recovery).
 
 Native Caller receipts also carry append-only resource ownership outside
 publication artifacts. Normal cleanup acknowledges pinned directory identities;
@@ -1349,6 +1398,13 @@ replacement uses the existing service drain to finish native cleanup before
 destroying those witnesses. Neither a forced restart nor a changed inode after
 restart can authorize deletion or release; the abrupt-loss acceptance outcome
 is a visible hold, not reclaimed capacity.
+Before retrying registered child handles, each bounded cleanup pass commits
+coverage from verified original reclaimed ancestors. Coverage also runs after
+the pass's own reclamations, within the same 15-second budget. Later passes
+skip committed coverage and preserve the first deletion certificates. Allocated
+roots and unrelated siblings still require their own proof. Caller and Poise
+bound the unchanged resource receipt format at 512 KiB so hundreds of children
+can retain their paths, original errors and recovery evidence through release.
 The same supervisor holds the original Caller metadata directory, database
 and response-directory descriptors. Its private control configuration names
 them; Caller and health/maintenance readers verify and use the held originals
@@ -1368,6 +1424,31 @@ Fixed direct GitHub commands keep their original 30-second command deadline
 scope allows 60 seconds, and the outer client 120 seconds for interpreter/setup,
 durable receipts and teardown. The kernel emptiness deadline remains two
 seconds; these outer bounds do not extend the command or kernel deadlines.
+
+Native merge-admission failures retain their bounded, redacted v1 diagnostic in
+the original Call. Existing chain summaries and History expose that Call and
+diagnostic so the browser can show its cause and next action. Positive refusal
+evidence, unknown external outcomes and resource release remain separate; an
+empty queue cannot authorize another enqueue. See
+[native action receipts](Behavior-chain.md#native-action-receipts).
+Conversation-resolution summaries also expose the original Call's validated
+per-thread progress; partial progress retains the original action's uncertainty.
+
+Atomic provider deadlines propagate Caller's `atomic_work_execution_budget_exhausted`
+code and existing v1 diagnostic into chain receipts and History. The unchanged
+no-publication shape and retry requirements are defined in
+[Behavior chain](Behavior-chain.md#authority-and-recovery).
+
+Optional repair-exhaustion reporting uses the same held-chain reconciliation,
+configured-account issue publisher and datastore intake. An explicit per-repository
+environment opt-in enables verified repair incomplete-reply, repair execution-budget
+or PR review-budget exhaustion.
+Durable creation intent prevents another POST after an uncertain result; the source hold,
+label/intake blockers and generated-issue recursion boundary stay visible through
+the existing `waiting` field. It adds no gateway route, scope, journal event,
+settings default or admission bypass. See
+[reporting verified repair exhaustion](Behavior-chain.md#reporting-verified-repair-exhaustion)
+for configuration, evidence and pending live acceptance.
 
 ## Google document publishing
 

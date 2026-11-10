@@ -75,6 +75,12 @@ takes priority over new messages; unarmed waiting items and failed ones never
 hold ordinary delivery. Stop preserves pending messages and bindings.
 Dispatch preserves each recipient's message order while rotating across
 recipients, including those blocked behind a running turn or an armed queue.
+Deleting a chat retains its pending incoming ordinary messages with inbox state
+`recipient_deleted`, including self-sends. Recovery settles ordinary messages
+whose recipient no longer exists in the same instance, after retired-model
+purging; closed and paused chats keep theirs. Admitted messages retain their
+turn references. The deleted sender's pending outgoing messages to other chats
+are still dropped.
 
 A creating chat can explicitly steer its own worker or answer its pending
 question with known task data. Native answer validation still applies. The
@@ -400,8 +406,14 @@ matches a PR whose closing list is incomplete through that list, and never
 guesses between two chats: a PR matching several chats — through closing
 references, workspace branches, or one of each — stays unbound with one
 warning naming it, and one of those chats must bind it explicitly. A branch
-scan that cannot read a workspace pauses branch matching for that minute
-without touching closing references. A PR with an unknown head branch, or
+scan that hits its entry/deadline bound or cannot read a workspace defers
+branch matching for the whole sweep without touching existing bindings or
+closing references. Retained Logging warns once for an unchanged failure,
+with the affected chat, bounded relative paths and technical causes, overflow,
+and the last successful discovery time (unknown before one). Failed or
+deferred passes do not advance that time. The existing discovery pass rechecks;
+a complete scan records recovery and rearms the warning for a recurrence.
+These diagnostics contain no chat content. A PR with an unknown head branch, or
 one no chat's workspace pushed, still needs an explicit bind in the turn
 that opens it.
 

@@ -7,13 +7,14 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { build } from 'esbuild'
 import { BehaviorLedgerObserver, type BehaviorLedgerSnapshot } from '../server/behavior-ledger'
 import { runBehaviorLedgerCli } from '../server/behavior-ledger-cli'
 import { BehaviorLedgerStore } from '../server/behavior-ledger-store'
 import { ledgerHistory } from '../server/health'
-import type { LedgerAdmission, LedgerHealth } from '../server/behavior-ledger-contract'
+import type { LedgerAdmission, LedgerHealth, LedgerRecord } from '../server/behavior-ledger-contract'
 
 const execute = promisify(execFile)
 const roots: string[] = []
@@ -75,6 +76,79 @@ async function fixtureObserver(body: string): Promise<{ observer: BehaviorLedger
 }
 
 describe('ledger recovery boundaries', () => {
+  it('retains a finite steady-state backlog, including arrivals after the stall budget', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ledger-steady-state-'))
+    asyncRoots.push(directory)
+    const sqliteModule = createRequire(import.meta.url).resolve('better-sqlite3')
+    const worker = join(directory, 'ledger-worker.mjs')
+    await build({ entryPoints: ['server/behavior-ledger-worker.ts'], outfile: worker, bundle: true,
+      platform: 'node', format: 'esm', packages: 'external',
+      alias: { 'better-sqlite3': sqliteModule }, external: [sqliteModule], logLevel: 'silent' })
+    // Run the production worker/store with a reproducible 10ms commit cost.
+    // Only outer transactions pay it, modeling storage latency, not failed I/O.
+    const workerPath = join(directory, 'slow-commits.mjs')
+    await writeFile(workerPath, `
+      import Database from ${JSON.stringify(pathToFileURL(sqliteModule).href)};
+      const transaction=Database.prototype.transaction;
+      const clock=new Int32Array(new SharedArrayBuffer(4));
+      Database.prototype.transaction=function(fn) {
+        const run=transaction.call(this,fn), db=this;
+        return (...args)=>{
+          const nested=db.inTransaction;
+          const result=run(...args);
+          if(!nested) Atomics.wait(clock,0,0,10);
+          return result;
+        };
+      };
+      await import(${JSON.stringify(pathToFileURL(worker).href)});
+    `)
+    const observer = new BehaviorLedgerObserver({ path: join(directory, 'ledger.db'), workerPath })
+    observers.push(observer)
+    await observer.start()
+    const expected = new Set<string>()
+    const arrive = (count: number) => {
+      for (let i = 0; i < count; i++) {
+        const nativeId = `steady-${expected.size}`
+        expected.add(nativeId)
+        observer.capture(admission(nativeId, { number: expected.size }))
+        observer.capture({ type: 'result', nativeId, state: 'completed', activity: 'settled', outcome: 'clean', completedAt: stamp() })
+      }
+    }
+    arrive(1)
+    await vi.waitFor(() => expect(observer.snapshot().pending).toBe(0))
+    const warm = observer.snapshot()
+    expect(warm).toMatchObject({ ready: true, failed: false, health: { status: 'ok', dropped: 0, instances: 2 } })
+    const startedAt = performance.now()
+    arrive(1100)
+    for (let tick = 0; tick < 2; tick++) {
+      await new Promise(resolve => setTimeout(resolve, 250))
+      const backlog = observer.snapshot()
+      expect(backlog.pending).toBeGreaterThan(0)
+      expect(backlog.health.lastSequence).toBeGreaterThan(warm.health.lastSequence!)
+      arrive(100)
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, 10_200 - (performance.now() - startedAt))))
+    arrive(10)
+    // Stop arrivals, then prove retention through public reads after actual drain.
+    await vi.waitFor(() => expect(observer.snapshot().pending).toBe(0), { timeout: 45_000, interval: 50 })
+    const drained = await observer.read({ operation: 'health' })
+    expect.soft(drained.body.health).toMatchObject({ status: 'ok', pending: 0, dropped: warm.health.dropped, gaps: [], instances: expected.size * 2 })
+    const records: LedgerRecord[] = []
+    let cursor: string | undefined
+    do {
+      const page = await observer.read({ operation: 'list', limit: 100, cursor })
+      expect(page.status).toBe(200)
+      records.push(...page.body.records!)
+      cursor = page.body.nextCursor ?? undefined
+    } while (cursor)
+    expect(records).toHaveLength(expected.size * 2)
+    const identities = records.filter(record => record.kind === 'attempt').map(record => {
+      expect(record).toMatchObject({ state: 'completed', activity: 'settled', outcome: 'clean' })
+      return record.refs.find(ref => ref.kind === 'correlation')!.identity
+    })
+    expect(identities.sort()).toEqual([...expected].sort())
+  }, 60_000)
+
   it('drains every capture in a startup burst past the queue cap without loss', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'ledger-startup-burst-'))
     asyncRoots.push(directory)
