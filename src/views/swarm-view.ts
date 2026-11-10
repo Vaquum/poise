@@ -62,6 +62,7 @@ interface LogEntry {
 // not validated runs. Keep their diagnostics outside the actionable run table.
 interface QuarantinedLog {
   index: number
+  historyRowId?: string
   error: string
   id: string | null
   correlationId: string | null
@@ -214,13 +215,29 @@ function escapeHtml(s: string): string {
 }
 
 
+function quarantineKey(row: QuarantinedLog): string {
+  if (row.historyRowId) return `history:${row.historyRowId}`
+  if (row.id) return `call:${row.id}`
+  return `legacy:${row.index}:${row.error}`
+}
+
+function mergeQuarantined(previous: QuarantinedLog[], fresh: QuarantinedLog[]): QuarantinedLog[] {
+  const byKey = new Map(previous.map(row => [quarantineKey(row), row]))
+  for (const row of fresh) byKey.set(quarantineKey(row), row)
+  return [...byKey.values()]
+}
+
 function quarantineDescription(row: QuarantinedLog): string {
   const target = row.repo || row.prId
     ? `Reported target: ${row.repo || 'unknown repository'}${row.prId ? `#${row.prId}` : ''}`
     : row.sessionId ? `Reported session: ${row.sessionId}` : 'Target unknown'
+  const position = row.historyRowId ? `History row: ${row.historyRowId}` : `Log index: ${row.index}`
+  const error = row.historyRowId
+    ? row.error.replace(/^(Caller History|agent-interface log) row [0-9]+\b/, '$1 record')
+    : row.error
   return [target, `Call: ${row.id || 'unknown'}`, row.correlationId ? `Correlation: ${row.correlationId}` : '',
     row.behavior ? `Behavior: ${row.behavior}` : '', row.sessionId ? `Session: ${row.sessionId}` : '',
-    `Log index: ${row.index}`, row.error].filter(Boolean).join(' · ')
+    position, error].filter(Boolean).join(' · ')
 }
 
 // Status is a coloured icon and the status in a word. The status and outcome
@@ -1337,7 +1354,7 @@ async function applyFirstPage(data: LogFeed, total: number, cursor: string | nul
   entries = data.logs || []
   historyIds = new Set(entries.map((entry) => entry.id))
   pinnedIds = new Set(entries.map((entry) => entry.id))
-  quarantined = Array.isArray(data.quarantined) ? data.quarantined : []
+  quarantined = mergeQuarantined([], Array.isArray(data.quarantined) ? data.quarantined : [])
   totalMatching = total
   historyCursor = cursor
   historyComplete = cursor === null
@@ -1427,14 +1444,7 @@ function appendPage(data: LogFeed, cursor: string | null, current: () => boolean
     }
     entries = tail.length ? slotTail(merged, tail, stale) : merged
   }
-  const seenQuarantined = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}`))
-  for (const row of Array.isArray(data.quarantined) ? data.quarantined : []) {
-    const key = `${row.id || ''}:${row.index}`
-    if (!seenQuarantined.has(key)) {
-      seenQuarantined.add(key)
-      quarantined.push(row)
-    }
-  }
+  quarantined = mergeQuarantined(quarantined, Array.isArray(data.quarantined) ? data.quarantined : [])
   if (typeof data.total === 'number') totalMatching = data.total
   historyCursor = cursor
   historyComplete = cursor === null
@@ -1476,10 +1486,10 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
     if (!known.has(id)) arrivals = true
     known.set(id, entry)
   }
-  const knownBadBefore = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}:${row.error}`))
+  const knownBadBefore = new Set(quarantined.map(quarantineKey))
   if (!historyArrivals) {
     historyArrivals = (history.quarantined || [])
-      .some((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
+      .some((row) => !knownBadBefore.has(quarantineKey(row)))
   }
   // Overlap is read before the covered set is rewritten: a completed walk
   // stays complete while the fresh first page still touches it, so an
@@ -1495,11 +1505,8 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   // disjoint pages reset below; only net shrinkage can still mask growth.
   // Count distinct quarantine keys: a quarantined running row arrives in
   // both feeds, and counting it twice would mask one hidden match's growth.
-  const absorbedBad = new Set(
-    [...(history.quarantined || []), ...(running.quarantined || [])]
-      .filter((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
-      .map((row) => `${row.id || ''}:${row.index}:${row.error}`),
-  ).size
+  const freshBad = mergeQuarantined(running.quarantined || [], history.quarantined || [])
+  const absorbedBad = freshBad.filter(row => !knownBadBefore.has(quarantineKey(row))).length
   const hiddenGrowth = historyComplete && typeof history.total === 'number'
     && history.total - totalMatching > absorbedLogs + absorbedBad
   const keepComplete = historyComplete && (!historyArrivals || historyOverlaps) && !hiddenGrowth
@@ -1509,8 +1516,7 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
   // New unreadable calls shift page boundaries exactly like readable ones;
   // ignoring them would keep a stale cursor that skips the intervening range.
   if (!arrivals) {
-    arrivals = [...(history.quarantined || []), ...(running.quarantined || [])]
-      .some((row) => !knownBadBefore.has(`${row.id || ''}:${row.index}:${row.error}`))
+    arrivals = absorbedBad > 0
   }
   // Fresh first, then retained: the feeds arrive newest-first, and the
   // stable time sort keeps that server order for ties, so a new arrival
@@ -1519,16 +1525,7 @@ function mergeRefresh(history: LogFeed, running: LogFeed): void {
     .map((entry) => [startedAtMs(entry), entry] as const)
   withMs.sort((a, b) => b[0] - a[0])
   entries = withMs.map(([, entry]) => entry)
-  const seenQuarantined = new Set<string>()
-  const mergedQuarantined: QuarantinedLog[] = []
-  for (const row of [...(history.quarantined || []), ...(running.quarantined || []), ...quarantined]) {
-    const key = `${row.id || ''}:${row.index}:${row.error}`
-    if (!seenQuarantined.has(key)) {
-      seenQuarantined.add(key)
-      mergedQuarantined.push(row)
-    }
-  }
-  quarantined = mergedQuarantined
+  quarantined = mergeQuarantined(quarantined, freshBad)
   if (typeof history.total === 'number') totalMatching = history.total
   // New arrivals shift page boundaries: more than a page of them would leave
   // the retained cursor skipping the intervening calls, so follow the fresh
@@ -1608,7 +1605,7 @@ async function settleStaleRunning(freshIds: Set<string>, current: () => boolean)
     if (bad) {
       byId.delete(stale[index]!.id)
       changed = true
-      if (!quarantined.some((item) => item.id === bad.id && item.index === bad.index)) quarantined.push(bad)
+      quarantined = mergeQuarantined(quarantined, [bad])
     }
   }
   // Failed lookups keep their old running rows for the next refresh, but say
@@ -1671,17 +1668,8 @@ function pollOnce(chase = false): Promise<void> {
         // on first paint; waiting for a later refresh would omit them.
         const freshBad = running.quarantined || []
         if (freshBad.length) {
-          const seen = new Set(quarantined.map((row) => `${row.id || ''}:${row.index}:${row.error}`))
-          let added = false
-          for (const row of freshBad) {
-            const key = `${row.id || ''}:${row.index}:${row.error}`
-            if (!seen.has(key)) {
-              seen.add(key)
-              quarantined.push(row)
-              added = true
-            }
-          }
-          if (added) renderStaleBanner()
+          quarantined = mergeQuarantined(quarantined, freshBad)
+          renderStaleBanner()
         }
         if (chase && current()) await chaseHistoryFill(current, org, search)
       } else {

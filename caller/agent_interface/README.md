@@ -587,6 +587,11 @@ array; unavailable identity/index evidence fails the read. Swarm's exact Call
 lookup uses this History read without running interruption reconciliation.
 Ordinary selected receipt reads remain strict.
 
+Bounded pages, running reads and exact History reads include the stored
+`history_rowid` as a decimal string. Swarm uses it to count unreadable rows
+once across feeds, even when a Call ID cannot be decoded or its page index
+changes. It supplies no receipt or action evidence.
+
 `--logs --select '{"latest":[{"behavior":"pr_review","source":"poise:review-new-prs","owner":"autonomio"}],"ids":["FULL_CALL_ID"]}'`
 returns an oldest-first array containing one indexed latest-started call per
 behavior/source/owner needle plus exact call-ID lookups. Missing kinds return

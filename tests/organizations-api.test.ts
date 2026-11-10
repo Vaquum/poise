@@ -549,13 +549,13 @@ describe('global behavior settings API', () => {
 
   it.each(['INVALID_RECORD', 'INVALID_UTF8'])('serves a quarantined exact History lookup for %s', async reason => {
     const target = 'a'.repeat(32)
-    behaviorLogs = [{ id: target, history_read_error: reason }]
+    behaviorLogs = [{ id: target, history_read_error: reason, history_rowid: '9007199254740993' }]
     const response = await fetch(`${base}/api/agent-logs?id=${target}&org=Legacy`)
     expect(response.status).toBe(200)
     const data = await response.json()
     expect(data.logs).toEqual([])
     expect(data.quarantined).toMatchObject([{
-      id: target, error: `Caller History row 0 is unreadable (${reason})`,
+      id: target, historyRowId: '9007199254740993', error: `Caller History row 0 is unreadable (${reason})`,
     }])
     expect(mocks.runFile).toHaveBeenCalledWith('agent-interface', ['--logs', '--id', target], expect.anything())
   })
