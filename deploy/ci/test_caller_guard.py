@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import resource
 import shlex
 import subprocess
 import sys
@@ -123,6 +124,61 @@ else:
                                     capture_output=True, text=True, timeout=5)
             self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "SQLITE_BUSY\n", ""))
             self.assertEqual(sidecars(path), before, f"{mode} changed sidecars through connection cleanup")
+
+    def test_native_fixture_cleanup_does_not_exhaust_descriptors_after_ancestor_rename(self):
+        self.database()
+        self.start()
+        pid = self.process.pid
+        limit = 64
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, (limit, limit))
+        node = self.path.stat()
+        identity = [node.st_dev, node.st_ino]
+        original = self.path
+        for renamed in (False, True):
+            with self.subTest(renamed=renamed):
+                if renamed:
+                    self.path.parents[1].rename(self.home / ".poise-original")
+                    original = self.home / ".poise-original" / "agent-interface" / "calls.sqlite3"
+                    self.database()
+                guard.check(self.socket)
+                baseline = len(list(Path(f"/proc/{pid}/fd").iterdir()))
+                native = original.parent / "native-resources"
+                native.mkdir(exist_ok=True)
+                counts = []
+                for _ in range(5):
+                    with tempfile.TemporaryDirectory(dir=native) as work:
+                        for fixture in range(16):
+                            self.database(Path(work) / str(fixture) / ".poise" / "agent-interface" / "calls.sqlite3")
+                        snapshot = guard.check(self.socket)
+                        self.assertEqual(snapshot["pid"], pid)
+                        self.assertIn(identity, [entry["identity"] for entry in snapshot["locks"]])
+                        counts.append(len(list(Path(f"/proc/{pid}/fd").iterdir())))
+                    guard.check(self.socket)
+                    counts.append(len(list(Path(f"/proc/{pid}/fd").iterdir())))
+                self.assertGreater(5 * 16, limit)
+                # The control connection may still be closing when /proc is read.
+                self.assertLessEqual(max(counts), baseline + 1, counts)
+                self.assertEqual(len(snapshot["locks"]), 2 if renamed else 1)
+                self.assertIsNone(self.process.poll())
+                self.refused(original)
+                if renamed:
+                    self.refused(self.path)
+
+    def test_native_fixtures_cannot_stand_in_for_a_missing_original_even_after_restart(self):
+        fixture = self.path.parent / "native-resources" / ("a" * 32) / ".poise" / "agent-interface" / "calls.sqlite3"
+        self.database(fixture)
+        self.database(fixture.with_name("calls.sqlite3.old"))
+        self.start()
+        self.assertIn("first Caller store", self.check(False).stderr)
+        self.database()
+        snapshot = guard.check(self.socket)
+        self.path.unlink()
+        self.assertIn("first Caller store", self.check(False).stderr)
+        guard.verify(snapshot)  # Unlinking the original must not release its lock.
+        self.stop()
+        self.path.parents[1].rename(self.home / ".poise-original")
+        self.start()
+        self.assertIn("first Caller store", self.check(False).stderr)
 
     def test_rescans_retain_original_inode_and_alias_locks_across_replacement_and_guard_restart(self):
         self.database()

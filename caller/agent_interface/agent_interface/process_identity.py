@@ -35,13 +35,16 @@ def epoch() -> dict:
             "namespace_ino": namespace.st_ino}
 
 
-def capture(pid: int) -> str:
+def capture(pid: int, *, native: bool = False) -> str:
+    # Older reapers reject this version instead of acting on a native Call
+    # registered while both releases still share the workspace store.
+    version = 2 if native else 1
     try:
-        value = {"version": 1, "pid": pid, "start": _start(pid), "epoch": epoch()}
+        value = {"version": version, "pid": pid, "start": _start(pid), "epoch": epoch()}
     except (OSError, ValueError, IndexError) as error:
         # Local development without /proc may still run behaviors, but cannot
         # later authorize a signal or recovery from a numeric PID alone.
-        value = {"version": 1, "pid": pid, "unverified": str(error)[:500]}
+        value = {"version": version, "pid": pid, "unverified": str(error)[:500]}
     return json.dumps({**value, "owner_nonce": _OWNER_NONCE}, separators=(",", ":"))
 
 
@@ -70,22 +73,22 @@ def decode(encoded: str | None, pid: int) -> dict:
         value = json.loads(encoded or "null")
     except ValueError as error:
         raise RuntimeError("recorded process identity is unreadable; no signal authorized") from error
-    if not isinstance(value, dict) or value.get("version") != 1 or value.get("pid") != pid \
+    if not isinstance(value, dict) or value.get("version") not in (1, 2) or value.get("pid") != pid \
             or not isinstance(value.get("start"), str) or not value["start"].isdigit() \
             or not isinstance(value.get("epoch"), dict):
         raise RuntimeError("call lacks a verified process identity; no signal authorized")
     return value
 
 
-def state(encoded: str | None, pid: int) -> str:
-    """alive/gone/different; an unreadable inspection raises, never means gone."""
+def state(encoded: str | None, pid: int, same_epoch: bool = False) -> str:
+    """Observe a local identity. A required but different epoch is unobservable."""
     value = decode(encoded, pid)
     try:
         current_epoch = epoch()
     except (OSError, ValueError, IndexError) as error:
         raise RuntimeError(f"process epoch cannot be verified: {error}") from error
     if value["epoch"] != current_epoch:
-        return "different"
+        return "unobservable" if same_epoch else "different"
     try:
         return "alive" if value["start"] == _start(pid) else "different"
     except FileNotFoundError:

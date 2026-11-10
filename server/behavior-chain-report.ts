@@ -85,10 +85,9 @@ export function repairReportRepositories(db: Database): string {
 export function repairReportRepositoriesHealth(db: Database): string {
   const configured = repairReportRepositories(db)
   if (Buffer.byteLength(configured) <= MAX_REPAIR_REPORT_REPOSITORIES_BYTES) return configured
-  // A legacy or environment value beyond the cap truncates: the gateway sees
-  // a mismatch and posts its own (capped) value, which converges on the next
-  // probe instead of wedging every health answer past the gateway budget.
-  return Buffer.from(configured).subarray(0, MAX_REPAIR_REPORT_REPOSITORIES_BYTES).toString('utf8')
+  // This invalid value cannot match an accepted allowlist, even when a legacy
+  // value starts with the gateway's complete desired configuration.
+  return '[oversized]'
 }
 
 export function setRepairReportRepositories(db: Database, configured: unknown): void {

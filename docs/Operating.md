@@ -760,6 +760,18 @@ The time limit is under an agent's shell tool's default of ten minutes
 (`BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts`), so that the agent hears this
 from the box and not as a command its tool gave up on.
 
+For atomic implementation and repair, that final relay diagnostic for the command
+permits otherwise complete work to pass to Caller with complete publication metadata
+and `blocked: null`. Keep the exact candidate checkout and HEAD unchanged; record the
+command, diagnostic/reason, incomplete local verification and required CI in `body`.
+Caller validates and publishes through its normal PR path; required CI and review
+still gate merge. Exit 124/125 alone, a genuine suite failure, an interrupted attempt
+followed by a suite result, provider execution-budget exhaustion and other blockers
+do not authorize this handoff. A previously held Call stays failed. If its checkout
+was reclaimed before publication, resource release proves neither surviving edits
+nor a publication plan: use the existing **Resume** and a fresh invocation to produce
+a new candidate, including for #1039, rather than claim to publish the old one.
+
 **Where they meet.** A workspace dials the gateway at `/api/link/test-relay` on its
 host. A proxy with a sign-in of its own must let that through without one, as it
 does for Poise Link. Behind your own proxy a workspace dials `POISE_PROXY_LISTEN`
@@ -1025,7 +1037,10 @@ is gVisor. It runs on the host, independently of the gateway and workspace
 restart policies. It inspects each container's actual runtime (including aliases
 registered with a `runsc` executable), and fences only gVisor home volumes.
 Every five seconds, and on an explicit check, it discovers Caller stores and
-holds SQLite's Unix lock range on their exact host inodes. It retains locks on
+holds SQLite's Unix lock range on their exact host inodes. Discovery prunes
+`native-resources` work trees, including beneath renamed metadata ancestors:
+their disposable fixture stores are never opened or retained and cannot stand
+in for a missing workspace Caller store. It retains locks on
 original inodes after ancestor renames, `calls.sqlite3.old` file renames and
 replacement, while that home still belongs to a gVisor workspace. A restarted
 guard rescans the home volume to find those originals. It never opens SQLite
@@ -1069,7 +1084,17 @@ and `SQLITE_CORRUPT` are integrity failures; busy/locked reads are contention,
 and other read failures remain unavailable. Health keeps `idle: false` and
 `unsettledNativeCalls: null` while unreadable. Managed chain admission and its
 final launch/action/publication boundaries refuse unavailable receipts.
-A successful health response or SQL read does not prove recovery completeness.
+A confirmed integrity failure also persists the existing chain admission pause
+across server restarts. While the hold persists the effective chain setting
+reports disabled even when the stored setting still reads enabled (for example
+a stop between the hold write and the settings update). Successful health
+responses and narrow SQL reads cannot resume admissions, and an automatic v2
+cutover cannot re-enable them while the hold persists. Cleanup and
+original-receipt reconciliation continue; explicit resume through the existing
+behavior control follows the recovery checks below.
+Contention recovers automatically without pausing admissions. The first receipt
+diagnostic remains actionable; behavior sweeps omit its repetitive wrapper only
+after that exact failure was recorded, while separate failures remain reported.
 
 1. Preserve the original main file, WAL (including deleted files held open by
    original processes), shared-memory state, behavior journal and process/resource

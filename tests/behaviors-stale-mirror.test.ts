@@ -12,10 +12,11 @@ afterEach(async () => { await logging?.stopLogging(); logging = null; vi.unstubA
 type Probe = { code?: number, signal?: string, stdout: string, stderr?: string }
 const probes: Record<string, Probe> = {}
 
-function health(database: string, age = 150): Probe {
+function health(database: string, age = 150, lastSuccessAt = new Date(Date.now() - age * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')): Probe {
   return { code: age > 120 ? 1 : 0, stdout: JSON.stringify({ action: 'health', database,
     status: age > 120 ? 'stale' : 'healthy', healthy: age <= 120, max_age_seconds: 120,
-    age_seconds: age, last_success_at: new Date(Date.now() - age * 1000).toISOString() }) }
+    age_seconds: age, last_success_at: lastSuccessAt }),
+    stderr: age > 120 ? `datastore health stale: last successful sync ${lastSuccessAt}; age ${age}s exceeds maximum 120s\n` : '' }
 }
 
 function saveProbe(database: string, probe: Probe): void {
@@ -72,7 +73,7 @@ function events() {
 function episodes(database: typeof import('../server/db')) {
   return database.db.prepare("SELECT value FROM meta WHERE key LIKE 'datastore_stale:%'").all()
     .map((row) => JSON.parse((row as { value: string }).value)) as Array<{
-      id: string, database: string, startedAt: string, first: { ageSeconds: number }, latest: { ageSeconds: number }, behaviors: string[], recoveredAt: string | null,
+      id: string, database: string, startedAt: string, first: { ageSeconds: number }, latest: { ageSeconds: number, lastSuccessAt: string }, behaviors: string[], recoveredAt: string | null,
     }>
 }
 
@@ -94,8 +95,8 @@ it('reports concurrent refusals and changing ages once per mirror through the re
   const items = notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now())
   expect(new Set(items.map((item) => item.id)).size).toBe(2)
   expect(events().every((event) => event.operation === 'github-datastore.stale' && event.phase === 'opened' && event.occurrences === 1)).toBe(true)
-  saveProbe(path, health(path, 210))
-  saveProbe(beta, health(beta, 220))
+  saveProbe(path, health(path, 210, first.find((episode) => episode.database === path)!.latest.lastSuccessAt))
+  saveProbe(beta, health(beta, 220, first.find((episode) => episode.database === beta)!.latest.lastSuccessAt))
   await behaviors.runEnabledBehaviorsOnce()
   expect(episodes(database).map((episode) => [episode.id, episode.startedAt, episode.first])).toEqual(first.map((episode) => [episode.id, episode.startedAt, episode.first]))
   expect(episodes(database).map((episode) => episode.latest.ageSeconds).sort()).toEqual([210, 220])
@@ -115,7 +116,7 @@ it('keeps one diagnostic and notification when a stale replay refreshes age betw
   expect(before.failures).toHaveLength(3)
   expect(before.failures.every(failure => failure.error?.includes('age 150s'))).toBe(true)
 
-  saveProbe(path, health(path, 210))
+  saveProbe(path, health(path, 210, episode.latest.lastSuccessAt))
   await expect(behaviors.admitReplay('pr_review', 'Vaquum/poise-test', 17)).rejects.toThrow('age 210s exceeds 120s')
   const after = behaviors.getBehaviorsRuntimeHealth()
   expect(after.datastore).toMatchObject({ ageSeconds: 210, error: expect.stringContaining('age 210s') })
@@ -142,7 +143,7 @@ it('keeps a stale episode open across a crash and restart, and rearms only on va
   expect(events().filter((event) => event.operation === 'github-datastore.stale')).toHaveLength(1)
   expect(events().some((event) => event.signal === 'SIGTERM' && event.stderr === 'datastore crashed')).toBe(true)
   expect(behaviorDiagnosticGroups({ ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }).filter((group) => group.code === 'datastore_stale')).toHaveLength(1)
-  saveProbe(path, health(path, 240))
+  saveProbe(path, health(path, 240, first.latest.lastSuccessAt))
   await behaviors.runEnabledBehaviorsOnce()
   expect(events().filter((event) => event.operation === 'github-datastore.stale')).toHaveLength(1)
   await logging!.stopLogging()
@@ -163,9 +164,7 @@ it('keeps a stale episode open across a crash and restart, and rearms only on va
   // Syncs stopping after recovery re-arms on the same last_success_at with a
   // grown age; an older sync generation would be an outdated overlapping
   // probe and must not reopen.
-  const rearmed = JSON.parse(health(path, 180).stdout)
-  rearmed.last_success_at = JSON.parse(recoveredProbe.stdout).last_success_at
-  saveProbe(path, { code: 1, stdout: JSON.stringify(rearmed) })
+  saveProbe(path, health(path, 180, JSON.parse(recoveredProbe.stdout).last_success_at))
   await behaviors.runEnabledBehaviorsOnce()
   expect(episodes(database)[0].id).not.toBe(first.id)
   const [rearmedNotice] = notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now())
@@ -177,22 +176,89 @@ it('keeps a stale episode open across a crash and restart, and rearms only on va
   expect(mocks.spawnDetached).not.toHaveBeenCalled()
 })
 
-it('ignores a stale reading older than the recovered sync generation instead of reopening', async () => {
+it('retains the latest evidence when stale and healthy observations arrive out of order', async () => {
   const { database, behaviors, path } = await start()
+  const { runDatastoreHealth } = await import('../server/datastore-health')
+  const org = (await import('../server/organizations')).readyOrganizations()[0]
   await behaviors.runEnabledBehaviorsOnce()
   const [first] = episodes(database)
+  const [firstNotice] = notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now())
   const recoveredProbe = health(path, 1)
+  const syncA = JSON.parse(recoveredProbe.stdout).last_success_at as string
+  const syncB = new Date(Date.parse(syncA) + 1000).toISOString().replace(/\.\d{3}Z$/, 'Z')
   saveProbe(path, recoveredProbe)
   await behaviors.runEnabledBehaviorsOnce()
   expect(episodes(database)[0]).toMatchObject({ id: first.id, recoveredAt: expect.any(String) })
-  // An overlapping probe that observed the mirror before the recovery sync
-  // arrives late; its older last_success_at must not reopen the outage.
-  saveProbe(path, health(path, 150))
+  saveProbe(path, health(path, 0, syncB))
   await behaviors.runEnabledBehaviorsOnce()
+  const [recovered] = episodes(database)
+  expect(recovered.latest).toMatchObject({ lastSuccessAt: syncB, ageSeconds: 0 })
+  // Sync A's stale reading arrives after the later healthy sync B.
+  saveProbe(path, health(path, 150, syncA))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(episodes(database)).toEqual([recovered])
+  expect(events()).toHaveLength(2)
+  expect(behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', failures: [],
+    datastore: { status: 'healthy', lastSuccessAt: syncB, ageSeconds: 0 } })
+  expect(notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now())).toEqual([])
+  // Sync A's delayed healthy result arrives after the same recovery: it
+  // carries no news, so the freshness gate keeps the retained sync B
+  // evidence instead of overwriting it with sync A.
+  saveProbe(path, health(path, 1, syncA))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(episodes(database)).toEqual([recovered])
+  expect(events()).toHaveLength(2)
+  expect(behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', failures: [],
+    datastore: { status: 'healthy', lastSuccessAt: syncB, ageSeconds: 0 } })
+
+  saveProbe(path, health(path, 180, syncB))
+  await behaviors.runEnabledBehaviorsOnce()
+  const [second] = episodes(database)
+  const [secondNotice] = notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now())
+  expect(second.id).not.toBe(first.id)
+  expect(secondNotice.id).not.toBe(firstNotice.id)
+  // Neither an older sync nor an earlier healthy probe of this same sync
+  // can close the new incident: delayed healthy probes reject with the open
+  // episode so scans and replay stay refused. An older stale result also
+  // keeps its ID.
+  for (const delayed of [health(path, 1, syncA), health(path, 1, syncB), health(path, 150, syncB)]) {
+    saveProbe(path, delayed)
+    await expect(runDatastoreHealth(org)).rejects.toMatchObject({ episode: { id: second.id } })
+    expect(episodes(database)).toEqual([second])
+    expect(behaviors.getBehaviorsRuntimeHealth().datastore).toMatchObject({ status: 'unavailable', lastSuccessAt: syncB, ageSeconds: 180 })
+  }
+  // A delayed healthy probe from native discovery still records its blocked
+  // behavior without replacing the retained evidence.
+  saveProbe(path, health(path, 1, syncA))
+  await expect(runDatastoreHealth(org, {}, ['review-new-issues'])).rejects.toMatchObject({ episode: { id: second.id } })
+  expect(episodes(database)[0]).toMatchObject({ id: second.id, latest: { lastSuccessAt: syncB, ageSeconds: 180 } })
+  expect(episodes(database)[0].behaviors).toEqual(expect.arrayContaining(['review-new-issues']))
+  // An outdated stale probe still records a new blocked behavior without
+  // replacing the retained evidence or opening another episode.
+  saveProbe(path, health(path, 150, syncA))
+  await expect(runDatastoreHealth(org, {}, ['approve-pr'])).rejects.toMatchObject({ episode: { id: second.id } })
   expect(episodes(database)).toHaveLength(1)
-  expect(episodes(database)[0]).toMatchObject({ id: first.id, recoveredAt: expect.any(String) })
-  expect(events().filter((event) => event.operation === 'github-datastore.stale' && event.phase === 'opened')).toHaveLength(1)
-  expect(behaviors.getBehaviorsRuntimeHealth()).toMatchObject({ status: 'ok', failures: [] })
+  expect(episodes(database)[0]).toMatchObject({ id: second.id, latest: { lastSuccessAt: syncB, ageSeconds: 180 } })
+  expect(episodes(database)[0].behaviors).toEqual(expect.arrayContaining(['review-new-issues', 'approve-pr']))
+  expect(events().filter((event) => event.phase === 'opened')).toHaveLength(2)
+  // Outdated results through the normal freshness gate keep the retained
+  // sync B evidence instead of overwriting it with older observations.
+  for (const outdated of [health(path, 150, syncA), health(path, 1, syncA)]) {
+    saveProbe(path, outdated)
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(episodes(database)[0]).toMatchObject({ id: second.id, latest: { lastSuccessAt: syncB, ageSeconds: 180 } })
+    expect(behaviors.getBehaviorsRuntimeHealth().datastore).toMatchObject({ status: 'unavailable', lastSuccessAt: syncB, ageSeconds: 180 })
+  }
+  expect(events().filter((event) => event.phase === 'opened')).toHaveLength(2)
+  saveProbe(path, health(path, 210, syncB))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(episodes(database)[0]).toMatchObject({ id: second.id, recoveredAt: null, latest: { lastSuccessAt: syncB, ageSeconds: 210 } })
+  expect(events().filter((event) => event.phase === 'opened')).toHaveLength(2)
+  expect(events().filter((event) => event.phase === 'recovered')).toHaveLength(1)
+  expect(events()).toHaveLength(3)
+  expect(notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now())).toEqual([
+    expect.objectContaining({ id: secondNotice.id }),
+  ])
   expect(mocks.spawnDetached).not.toHaveBeenCalled()
 })
 
@@ -219,7 +285,7 @@ it('reports a stale review scope through the open episode without new faults on 
   expect(mocks.spawnDetached).not.toHaveBeenCalled()
 })
 
-it.each(['unavailable', 'malformed', 'mismatched', 'wrong-limit', 'invalid-age', 'failed-healthy', 'stale-with-fault-stderr'] as const)(
+it.each(['unavailable', 'malformed', 'mismatched', 'wrong-limit', 'invalid-age', 'failed-healthy', 'stale-with-fault-stderr', 'stale-with-extra-stderr'] as const)(
   'keeps %s health failures separate while a stale episode is open', async (kind) => {
     const { database, behaviors, path } = await start()
     await behaviors.runEnabledBehaviorsOnce()
@@ -233,7 +299,8 @@ it.each(['unavailable', 'malformed', 'mismatched', 'wrong-limit', 'invalid-age',
     if (kind === 'wrong-limit') data.max_age_seconds = 300
     if (kind === 'invalid-age') data.age_seconds = -1
     const probe = kind === 'failed-healthy' ? { ...health(path, 1), code: 1 }
-      : { code: 1, stdout: kind === 'malformed' ? '{invalid' : JSON.stringify(data), stderr: 'independent health fault' }
+      : { code: 1, stdout: kind === 'malformed' ? '{invalid' : JSON.stringify(data),
+        stderr: (kind === 'stale-with-extra-stderr' ? health(path).stderr : '') + 'independent health fault' }
     saveProbe(path, probe)
     await behaviors.runEnabledBehaviorsOnce()
     expect(episodes(database)[0]).toMatchObject({ id: first.id, recoveredAt: null })

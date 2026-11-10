@@ -33,6 +33,8 @@ child = subprocess.Popen([sys.executable, "-c",
     "import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
     "open(os.environ['WRITER_LOG'] + '.grandchild', 'w').write(str(os.getpid()))\\n"
     "time.sleep(120)"])
+while not os.path.exists(log + ".grandchild"):
+    time.sleep(0.01)
 with open(log + ".meta", "w") as meta:
     meta.write(f"{os.getpid()} {os.getpgid(0)} {os.getppid()} unset {child.pid}")
 sys.stdout.write("wrote")

@@ -172,6 +172,75 @@ class AtomicWorkLimits(TestCase):
         api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
                             correlation_id, "fixture-model", "poise/issue-7", pull=pull, expected_head=expected_head)
 
+    def test_verified_relay_no_result_instructions_hand_the_exact_candidate_to_normal_publication(self):
+        for pull, exit_code, reason in (
+            (None, 124, "the test offload exhausted its total time budget"),
+            (3, 125, "the connection to the test relay ended before the suite did"),
+        ):
+            with self.subTest(pull=pull, exit_code=exit_code):
+                modes, instructions = [], []
+                diagnostic = (f"[poise] no test result: {reason}. This says nothing about your code. "
+                              "Skip local tests for this work: don't retry, and don't run parts of it. "
+                              "Push your change and let CI run the tests.")
+                publication = {
+                    "commitMessage": "fix: seed", "title": "fix: seed", "replies": [], "blocked": None,
+                    "body": f"npm run check passed. npm run test:e2e exited {exit_code} after 52 of 99 Chromium tests. "
+                            f"{diagnostic} Local browser verification is incomplete; PR CI must complete it.",
+                }
+                candidate = None
+
+                def interface(*args, **_kwargs):
+                    nonlocal candidate
+                    if args[0] != "--issue-work":
+                        return {"review_threads": []}
+                    mode = args[args.index("--mode") + 1]
+                    modes.append(mode)
+                    if mode == "prepare":
+                        candidate = Path(args[args.index("--path") + 1])
+                        candidate.mkdir(parents=True)
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+                    self.assertEqual(Path(args[args.index("--path") + 1]), candidate)
+                    self.assertEqual(args[args.index("--starting-head") + 1], HEAD)
+                    self.assertEqual((candidate / "candidate.txt").read_text(), "completed candidate edits")
+                    self.assertEqual(args[args.index("--body") + 1], publication["body"])
+                    return {"outcome": "validated" if mode == "validate" else "published", "head_sha": HEAD}
+
+                def command(_model, instruction, *_args):
+                    instructions.append(instruction)
+                    return ["fixture"], "", {}
+
+                def worker(_lease, _args, **kwargs):
+                    self.assertEqual(Path(kwargs["cwd"]), candidate)
+                    (candidate / "candidate.txt").write_text("completed candidate edits")
+                    (candidate.parent / "publication.json").write_text(json.dumps(publication))
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                        patch.object(issue_review, "interface", side_effect=interface), \
+                        patch.object(issue_review, "command", side_effect=command), \
+                        patch.object(issue_review, "_terminal_failure", return_value=None), \
+                        patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                        patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                        patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), redirect_stdout(StringIO()):
+                    self.run_behavior(pull, HEAD if pull else None, f"relay-no-result-{exit_code}")
+                for clause in (
+                    'require the final relay diagnostic for that command saying "no test result:" and "Skip local tests for this work"',
+                    "Exit 124/125 alone or an interrupted attempt followed by a genuine suite result does not authorize this handoff",
+                    "Do not retry or run parts of the suite after that final diagnostic. If the work is otherwise complete",
+                    "preserve the exact candidate checkout and unchanged HEAD",
+                    "record the command, relay diagnostic/reason, incomplete local verification and required CI in body",
+                    "return complete publication metadata with blocked null so Caller can validate and publish normally",
+                    "Never report the incomplete check as passed. Required CI and review remain mandatory",
+                    "Genuine suite failures, provider execution-budget exhaustion and other blockers remain blockers",
+                ):
+                    self.assertIn(clause, instructions[0])
+                self.assertEqual(modes, ["prepare", "validate", "publish"])
+                with sqlite3.connect(self.path) as conn:
+                    status, action, plan = conn.execute(
+                        "select status,action,action_plan from calls order by rowid desc limit 1").fetchone()
+                self.assertEqual((status, action), ("completed", "published"))
+                self.assertEqual(json.loads(plan)["publication"], publication)
+
     def test_shared_ci_dependency_waits_without_publication_only_without_edits_and_mixed_or_unknown_failures_are_not_excused(self):
         base, integration = "c" * 40, "d" * 40
         excerpt = "AssertionError: expired notice fixture returned no handling rows"

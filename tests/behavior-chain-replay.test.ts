@@ -17,7 +17,8 @@ const opened: Database.Database[] = []
 const directories: string[] = []
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => process.cwd() }))
 vi.mock('../server/settings', () => ({ getSettings: () => ({ me: 'author', agentAccount: 'reviewer' }),
-  getBehaviorChainSettings: () => ({ enabled: true, seedMode: 'all', label: 'poise' }) }))
+  getBehaviorChainSettings: () => ({ enabled: true, seedMode: 'all', label: 'poise' }),
+  BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY: 'behavior_chain_integrity_hold' }))
 vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ login: 'historical' }) }))
 afterEach(() => {
   for (const db of opened.splice(0)) if (db.open) db.close()

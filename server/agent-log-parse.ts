@@ -106,6 +106,7 @@ export interface QuarantinedAgentLog {
   status?: string | null
   source?: string | null
   startedAt?: string | null
+  historyRowId?: string // Stable across feeds, unlike the page-local index.
   index: number
   error: string
   id: string | null
@@ -142,8 +143,10 @@ function quarantineLogEntry(value: unknown, index: number, error: unknown): Quar
     return !pattern || pattern.test(result) ? result : null
   }
   const started = row.started_at_precise ?? row.started_at
+  const historyRowId = text('history_rowid', /^[1-9][0-9]{0,18}$/)
   return {
     index,
+    ...(historyRowId ? { historyRowId } : {}),
     status: text('status', LOG_STATUS, true),
     source: text('source', /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/),
     startedAt: typeof started === 'string' && Number.isFinite(Date.parse(started)) ? started : null,

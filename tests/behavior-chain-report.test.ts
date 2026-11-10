@@ -18,7 +18,8 @@ const mocks = vi.hoisted(() => ({ runFile: vi.fn(), settings: { enabled: true, s
   accounts: { me: 'author', agentAccount: 'reviewer' } }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn(), MAX_PROCESS_ARG_BYTES: 64 * 1024 }))
 vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? mocks.accounts.me : null }))
-vi.mock('../server/settings', () => ({ getSettings: () => mocks.accounts, getBehaviorChainSettings: () => mocks.settings }))
+vi.mock('../server/settings', () => ({ getSettings: () => mocks.accounts, getBehaviorChainSettings: () => mocks.settings,
+  BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY: 'behavior_chain_integrity_hold' }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/fixture' }))
 vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ login: 'acme' }),
   organizationArgs: (_org: unknown, argv: string[]) => argv, getOrganizations: () => [{ login: 'acme', status: 'ready' }],
@@ -596,20 +597,34 @@ it('keeps an applied empty service allowlist disabled over the legacy environmen
   expect(journal.read(chain.id)).toEqual(chain)
 })
 
-it('rejects a reporting allowlist beyond the health echo budget', () => {
-  const { db } = setup()
-  const oversized = `${'a/b,'.repeat(2100)}a/b`
-  expect(Buffer.byteLength(oversized)).toBeGreaterThan(MAX_REPAIR_REPORT_REPOSITORIES_BYTES)
-  expect(() => setRepairReportRepositories(db, oversized)).toThrow('exceeds 8192 bytes')
-})
-
-it('truncates a legacy over-cap allowlist in the health echo while matching on the full value', () => {
+it('rejects a reporting allowlist beyond the health echo budget without changing the applied setting', () => {
   vi.stubEnv('POISE_MODE', 'service')
   const { db } = setup()
-  const oversized = `${'a/b,'.repeat(20000)}a/b`
-  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('service_repair_exhaustion_repositories', oversized)
+  const desired = `${'a/b,'.repeat(2047)}a/bb`
+  expect(Buffer.byteLength(desired)).toBe(MAX_REPAIR_REPORT_REPOSITORIES_BYTES)
+  setRepairReportRepositories(db, desired)
+  const oversized = `${desired},acme/revoked`
+  expect(Buffer.byteLength(oversized)).toBeGreaterThan(MAX_REPAIR_REPORT_REPOSITORIES_BYTES)
+  expect(() => setRepairReportRepositories(db, oversized)).toThrow('exceeds 8192 bytes')
+  expect(repairReportRepositories(db)).toBe(desired)
+  expect(repairReportRepositoriesHealth(db)).toBe(desired)
+  setRepairReportRepositories(db, '')
+  expect(repairReportRepositoriesHealth(db)).toBe('')
+})
+
+it.each(['stored', 'environment'])('distinguishes an oversized %s allowlist from an accepted prefix until corrected', source => {
+  vi.stubEnv('POISE_MODE', 'service')
+  const { db } = setup()
+  const desired = `${'a/b,'.repeat(2047)}a/bb`
+  const oversized = `${desired},acme/revoked`
+  if (source === 'stored') db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('service_repair_exhaustion_repositories', oversized)
+  else vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', oversized)
+  expect(repairReportRepositoriesHealth(db)).toBe('[oversized]')
   expect(Buffer.byteLength(repairReportRepositoriesHealth(db))).toBeLessThanOrEqual(MAX_REPAIR_REPORT_REPOSITORIES_BYTES)
   expect(repairReportRepositories(db)).toBe(oversized)
+  setRepairReportRepositories(db, desired)
+  expect(repairReportRepositories(db)).toBe(desired)
+  expect(repairReportRepositoriesHealth(db)).toBe(desired)
 })
 
 it('preserves local environment reporting independently of applied service configuration', async () => {
