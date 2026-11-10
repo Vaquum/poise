@@ -329,6 +329,47 @@ it('preserves the person hold rather than replacing it with a merge-verification
   expect(journal.read(chain.id)?.held).toBe('New invocations held by the person')
 })
 
+it('records an external merge after exhausted repairs without retrying or erasing their no-publication receipts', async () => {
+  const { journal } = setup()
+  vi.setSystemTime(NOW - 180_000)
+  let chain = seed(journal)
+  const before = observation()
+  Object.assign(before.publication, { head_sha: 'd'.repeat(40), state: 'open', merged: false, merge_sha: null })
+  Object.assign(before.pull!, { head: 'd'.repeat(40), state: 'open', merged: false, mergeSha: null, mergedAt: null,
+    changesRequested: true, reviewRevision: 'original-findings' })
+  chain = record(journal, chain, { type: 'chain.observed', observation: before })
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const id = `failed-repair-${attempt}`
+    chain = record(journal, chain, { type: 'invocation.admitted', invocation: { id, behavior: 'repair-pr',
+      actor: chain.author, model: reviewer.model, slot: reviewer.slot,
+      basis: chainBasis(['repair', before.pull!.head, before.pull!.reviewRevision]), admittedAt: Date.now(),
+      request: { command: 'agent-interface', cwd: '/fixture', argv: [],
+        context: { head: before.pull!.head, reviewRevision: before.pull!.reviewRevision } } } })
+    chain = record(journal, chain, { type: 'invocation.settled', invocationId: id, callId: chainBasis(id).slice(0, 32),
+      outcome: 'atomic_work_execution_budget_exhausted', evidence: { status: 'failed', action: 'not_started',
+        outcome: 'preflight_failed', error_code: 'atomic_work_execution_budget_exhausted', artifact: { phase: 'executing' },
+        resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } } })
+  }
+  const reason = 'repair-pr failed before publication three times: execution budget exhausted'
+  chain = record(journal, chain, { type: 'chain.held', reason })
+  const failures = structuredClone(chain.invocations)
+  const history = journal.history(chain.id)
+  vi.setSystemTime(NOW)
+  const merged = observation()
+  merged.pull!.approved = true
+  const native = operations({ enabled: () => true, available: () => true, permitted: () => true, observe: async () => merged })
+  await new BehaviorChainRuntime(journal, native).run()
+  const reconciled = journal.read(chain.id)!
+  expect(reconciled).toMatchObject({ mergeSha: MERGE, reviewPending: true, held: reason,
+    resumedAfterSequence: chain.resumedAfterSequence })
+  expect(reconciled.invocations).toEqual(failures)
+  expect(journal.history(chain.id).slice(0, history.length)).toEqual(history)
+  journal.rebuild()
+  expect(journal.read(chain.id)).toEqual(reconciled)
+  await new BehaviorChainRuntime(journal, native).run()
+  expect(journal.read(chain.id)).toEqual(reconciled)
+})
+
 it('retains the redacted observation cause and rechecks without launching work', async () => {
   const { journal } = setup()
   seed(journal)
