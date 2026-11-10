@@ -9,9 +9,24 @@ from typing import Callable
 
 from . import atoms, checkout_lock, issue_review, progress, review_budget, resource_ownership
 from .model_catalog import Model
-from .process_diagnostic import diagnostic_envelope
+from .process_diagnostic import diagnostic_envelope, escaped_failure
 
 UNATTENDED = "You are one atomic implementation/repair behavior. Work unattended; report a blocker instead of inventing a human answer. Caller owns publication."
+
+
+class AtomicWorkFailed(ValueError):
+    """A Caller-authored validation reason, safe to retain as diagnostic detail."""
+
+
+def failure_diagnostic(error: Exception) -> dict:
+    phase = progress.phase() or "preparing_issue"
+    evidence = escaped_failure(error, phase)
+    # External exception text can contain prompts, argv or provider output.
+    detail = str(error) if type(error) is AtomicWorkFailed else evidence["message"]
+    if isinstance(error, json.JSONDecodeError):
+        detail = f"invalid JSON at line {error.lineno}, column {error.colno}"
+    evidence["message"] = atoms.bounded_cause(f"atomic behavior failed during {phase}: {detail} ({evidence['operation']})")
+    return evidence
 
 
 class AtomicWorkBlocked(ValueError):
@@ -120,29 +135,29 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
     """Bind a worker's diagnosis to native integration and exact-base log evidence."""
     if not isinstance(value, dict) or value.get("head") != head \
             or not re.fullmatch(rf"https://github\.com/{re.escape(repo)}/(?:issues|pull)/[1-9][0-9]*", str(value.get("remediation"))):
-        raise ValueError("CI dependency lacks its candidate or remediation")
+        raise AtomicWorkFailed("CI dependency lacks its candidate or remediation")
     removals = queue.get("queue_removals", [])
     removal = removals[-1] if removals else None
     if queue.get("head_sha") != head or not removal or removal.get("reason") != "failed_checks" \
             or removal.get("id") != value.get("removal") \
             or (removal.get("beforeCommit") or {}).get("oid") != value.get("integration"):
-        raise ValueError("CI dependency does not identify the failed queue integration")
+        raise AtomicWorkFailed("CI dependency does not identify the failed queue integration")
     common = [str(pull), "--repository", repo, "--token-user", actor]
     integration = issue_review.interface("--list-failing-ci", *common, "--ref", str(value["integration"]))
     base = value.get("base")
     parents = integration.get("parents", [])
     if integration.get("head_sha") != head or integration.get("ref") != value["integration"] \
             or not parents or parents[0] != base or head not in parents[1:]:
-        raise ValueError("CI dependency integration does not contain the exact candidate and base")
+        raise AtomicWorkFailed("CI dependency integration does not contain the exact candidate and base")
     baseline = issue_review.interface("--list-failing-ci", *common, "--ref", str(base))
     failures = value.get("failures")
     if baseline.get("head_sha") != head or baseline.get("ref") != base \
             or not isinstance(failures, list) or not failures or len(failures) > 100:
-        raise ValueError("CI dependency lacks exact-base failure evidence")
+        raise AtomicWorkFailed("CI dependency lacks exact-base failure evidence")
     verified, used = [], set()
     for failure in failures:
         if not isinstance(failure, dict):
-            raise ValueError("CI dependency failure evidence is invalid")
+            raise AtomicWorkFailed("CI dependency failure evidence is invalid")
         check = next((item for item in integration["failing"] if item.get("check_run_id") == failure.get("check")), None)
         prior = next((item for item in baseline["failing"] if item.get("check_run_id") == failure.get("baselineCheck")), None)
         excerpt = failure.get("evidence")
@@ -151,26 +166,26 @@ def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: s
                 or check.get("state") != "completed" or check.get("conclusion") != "failure" \
                 or prior.get("state") != "completed" or prior.get("conclusion") != "failure" \
                 or not isinstance(excerpt, str) or not 20 <= len(excerpt.strip()) <= 2000:
-            raise ValueError("CI dependency requires matching completed failures and a specific cause excerpt")
+            raise AtomicWorkFailed("CI dependency requires matching completed failures and a specific cause excerpt")
         run = next((item for item in integration["runs"] if item.get("id") == check.get("run_id")), None)
         base_run = next((item for item in baseline["runs"] if item.get("id") == prior.get("run_id")), None)
         if not run or run.get("event") != "merge_group" or run.get("head_sha") != value["integration"] \
                 or not base_run or base_run.get("head_sha") != base or base_run.get("event") not in {"push", "workflow_dispatch", "schedule"} \
                 or not run.get("workflow_id") or run["workflow_id"] != base_run.get("workflow_id"):
-            raise ValueError("CI dependency workflow identities do not prove a baseline failure")
+            raise AtomicWorkFailed("CI dependency workflow identities do not prove a baseline failure")
         for item in (check, prior):
             if not item.get("log_id"):
-                raise ValueError("CI dependency has no readable job log")
+                raise AtomicWorkFailed("CI dependency has no readable job log")
             log = issue_review.interface("--read-failing-ci-log", str(item["log_id"]), "--repository", repo, "--token-user", actor)
             if log.get("repository", "").lower() != repo.lower() or excerpt not in log.get("log", ""):
-                raise ValueError("CI dependency cause is absent from its actual job logs")
+                raise AtomicWorkFailed("CI dependency cause is absent from its actual job logs")
         used.add(check["check_run_id"])
         verified.append({**failure, "name": check["name"], "run": run["id"], "workflow": run["workflow_id"],
                          "baselineRun": base_run["id"]})
     remediation = issue_review.interface("--read-issue", value["remediation"].rsplit("/", 1)[1],
                                          "--repository", repo, "--token-user", actor)
     if not remediation.get("issue"):
-        raise ValueError("CI dependency remediation could not be read")
+        raise AtomicWorkFailed("CI dependency remediation could not be read")
     return {**value, "failures": verified,
             "allShared": len(used) == len(integration["failing"])}
 
@@ -202,6 +217,7 @@ def _ci_only_blocker(ci: object) -> object:
 def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Path,
         call_id: str, record: Callable[[dict], None], pull: int | None = None,
         expected_head: str | None = None, note: str = "", merge_base: bool = False, expected_issue_revision: str | None = None) -> dict:
+    progress.stage("preparing_workspace", "Preparing the atomic workspace")
     work.mkdir(parents=True, exist_ok=True)
     checkout = work / "repo"
     output = work / "publication.json"
@@ -213,9 +229,10 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
     progress.stage("preparing_issue", "Reading the issue and its actual review comments")
     data = issue_review.packet(repo, number, actor)
     if data["issue"]["state"] != "open":
-        raise ValueError("seed issue is no longer open")
+        raise AtomicWorkFailed("seed issue is no longer open")
     if expected_issue_revision and issue_review.revision(data["issue"]) != expected_issue_revision:
-        raise ValueError("seed issue changed before implementation/repair")
+        raise AtomicWorkFailed("seed issue changed before implementation/repair")
+    progress.stage("preparing_checkout", "Preparing the implementation/repair checkout")
     prepared = issue_review.interface("--issue-work", *common, "--mode", "prepare", "--path", str(checkout),
                                       *(["--merge-base"] if merge_base else []), seconds=1800)
     if prepared.get("outcome") != "prepared":
@@ -224,6 +241,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
     evidence = {}
     required_reply_ids: set[int] = set()
     if pull is not None:
+        progress.stage("preparing_review_evidence", "Reading repair CI, reviews and queue evidence")
         evidence["ci"] = issue_review.interface("--list-failing-ci", str(pull), "--repository", repo, "--token-user", actor)
         evidence["review_packet"] = issue_review.interface("--pr-review", str(pull), "--expected-head", expected_head or "",
                                                           "--token-user", actor, cwd=checkout)
@@ -275,9 +293,11 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         f"You have {int(seconds)} seconds. This invocation ends after edits/checks and that file.\n"
         f"Behavior note: {note}\nPreparation receipt:\n{json.dumps(prepared)}\nActual issue and comments:\n{json.dumps(data)}\nActual PR evidence:\n{json.dumps(evidence)}"
     )
+    progress.stage("preparing_provider", "Preparing the atomic provider command")
     args, stdin, env = issue_review.command(model, instruction, checkout, work, seconds, UNATTENDED)
     lease = checkout_lock.Lease(str(checkout), call_id, f"atomic behavior {repo}#{number} ({call_id[:8]})", owner_kind="caller:repair-pr" if pull else "caller:implement-issue")
     with checkout_lock.interruptible():
+        progress.stage("acquiring_checkout", "Acquiring the atomic checkout lease")
         lease.acquire(checkout_lock.ACQUIRE_WAIT_SECONDS)
         try:
             record({"phase": "executing", "prepared": prepared})
@@ -294,6 +314,7 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                                         timeout_seconds=seconds, repository=repo, pr=pull, expected_head=expected_head,
                                         behavior="repair_pr" if pull is not None else "implement_issue",
                                         message=f"Seed issue {repo}#{number}", submission="none")) from error
+            progress.stage("settling_provider_resources", "Verifying atomic provider resource release")
             record({"phase": "resources_unknown", "prepared": prepared})
             issue_review.stop_leftovers(work)
             if issue_review._cwd_pids(work, require_complete=True) != []:
@@ -302,14 +323,17 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if bound is not None:
                 resource_ownership.process_check(*bound, complete=True)
             record({"phase": "executing", "prepared": prepared})
+            progress.stage("validating_provider_result", "Checking the atomic provider result")
             terminal = issue_review._terminal_failure(model.provider, done.stdout)
             if done.returncode or terminal:
                 raise RuntimeError(terminal or issue_review.provider_error(done.stdout, done.stderr) or f"provider exited {done.returncode}")
+            progress.stage("reading_publication", "Reading bounded publication metadata")
             if not output.is_file() or output.stat().st_size > 64 * 1024:
-                raise ValueError("atomic behavior returned no bounded publication metadata")
+                raise AtomicWorkFailed("atomic behavior returned no bounded publication metadata")
             publication = json.loads(output.read_text())
+            progress.stage("validating_publication", "Validating publication metadata and review replies")
             if not isinstance(publication, dict):
-                raise ValueError("atomic behavior blocked: invalid output")
+                raise AtomicWorkFailed("atomic behavior blocked: invalid output")
             if publication.get("blocked") is not None:
                 blocked = publication["blocked"]
                 if pull is not None and isinstance(blocked, dict) and set(blocked) == {"cause", "reason"} \
@@ -319,39 +343,44 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
                 raise AtomicWorkBlocked(blocked)
             dependency = None
             if publication.get("ciDependency") is not None:
+                progress.stage("verifying_ci_dependency", "Verifying exact-base CI dependency evidence")
                 if pull is None or not expected_head:
-                    raise ValueError("CI dependencies require an exact repair candidate")
+                    raise AtomicWorkFailed("CI dependencies require an exact repair candidate")
                 dependency = _verify_ci_dependency(publication["ciDependency"], repo, pull, expected_head, actor, evidence["queue"])
                 if dependency["remediation"] in {f"https://github.com/{repo}/issues/{number}", f"https://github.com/{repo}/pull/{pull}"}:
-                    raise ValueError("CI dependency cannot use its own repair as the external remediation")
+                    raise AtomicWorkFailed("CI dependency cannot use its own repair as the external remediation")
+            progress.stage("validating_publication", "Validating publication metadata and review replies")
             if any(not isinstance(publication.get(key), str) or not publication[key].strip() for key in ("commitMessage", "title", "body")):
-                raise ValueError("atomic behavior publication metadata is incomplete")
+                raise AtomicWorkFailed("atomic behavior publication metadata is incomplete")
             replies = publication.get("replies", [])
             if not isinstance(replies, list) or (pull is None and replies):
-                raise ValueError("atomic behavior returned invalid review replies")
+                raise AtomicWorkFailed("atomic behavior returned invalid review replies")
             if pull is not None:
                 answered = {reply.get("commentId") for reply in replies if isinstance(reply, dict)}
                 missing = sorted(required_reply_ids - answered)
                 if missing:
-                    raise ValueError("repair did not answer every unresolved review finding: "
+                    raise AtomicWorkFailed("repair did not answer every unresolved review finding: "
                                      f"missing_root_comment_ids={json.dumps(missing[:20])}; "
                                      f"missing_count={len(missing)}; required_count={len(required_reply_ids)}")
             # run_gated releases only after the complete worker group exits.
             # Publication is a separate bounded writer under the same lease.
+            progress.stage("acquiring_checkout", "Reacquiring the atomic checkout lease for publication")
             lease.acquire(checkout_lock.ACQUIRE_WAIT_SECONDS)
+            progress.stage("revalidating_issue", "Rechecking the seed issue before publication")
             if expected_issue_revision and issue_review.revision(issue_review._issue(repo, number, actor)) != expected_issue_revision:
-                raise ValueError("seed issue changed during implementation/repair; no publication attempted")
+                raise AtomicWorkFailed("seed issue changed during implementation/repair; no publication attempted")
             publication_args = ["--issue-work", *common, "--path", str(checkout),
                                 "--starting-head", prepared["checkout_head"], "--message", publication["commitMessage"],
                                 "--title", publication["title"], "--body", publication["body"], "--replies-json", json.dumps(replies)]
+            progress.stage("validating_publication", "Validating the candidate through github-interface")
             validated = issue_review.interface(*publication_args, "--mode", "validate", seconds=120)
             if validated.get("outcome") == "superseded":
                 return validated
             if validated.get("outcome") != "validated":
-                raise ValueError("publication validation returned no confirmation; no publication attempted")
+                raise AtomicWorkFailed("publication validation returned no confirmation; no publication attempted")
             if dependency is not None:
                 if type(validated.get("has_changes")) is not bool:
-                    raise ValueError("CI dependency requires a complete checkout validation")
+                    raise AtomicWorkFailed("CI dependency requires a complete checkout validation")
                 record({"phase": "executing", "prepared": prepared, "ci_dependency": dependency})
                 candidate_checks = [check for check in evidence["ci"].get("failing", [])
                                     if check.get("state") in {"failure", "error"}

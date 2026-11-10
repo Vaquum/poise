@@ -295,3 +295,37 @@ it('keeps local action feedback independent of read recovery, retains dismissal,
   feed.reportLocalNotices('editor', [])
   expect(feed.current.notices).toEqual([])
 })
+
+it('keeps one opted-in notice across body changes, restores its age, and still renews a plain report', async () => {
+  const feed = new NoticeFeed(vi.fn())
+  const failure = { key: 'swarm-records', title: 'Unreadable Swarm records', body: '2 rows', kind: 'read_failed' as const, preserveIdentity: true, since: iso(0), due: iso(0) }
+  feed.reportLocalNotices('swarm-records', [failure])
+  const first = feed.current.notices[0]
+  expect(first).toMatchObject({ since: iso(0), due: iso(0) })
+  // Reworded evidence updates the text but keeps the identity, age and dismissal.
+  feed.reportLocalNotices('swarm-records', [{ ...failure, body: '2 rows, reworded' }])
+  const kept = feed.current.notices[0]
+  expect(kept.body).toBe('2 rows, reworded')
+  expect(kept.id).toBe(first.id)
+  expect(kept.since).toBe(iso(0))
+  expect(feed.isLocalNoticeDismissed('swarm-records')).toBe(false)
+  await feed.dismiss(first.id)
+  expect(feed.current.notices).toEqual([])
+  expect(feed.isLocalNoticeDismissed('swarm-records')).toBe(true)
+  feed.reportLocalNotices('swarm-records', [{ ...failure, body: '2 rows, reworded again' }])
+  expect(feed.current.notices).toEqual([])
+  // A plain report without the flag renews the alert, as for every other source.
+  feed.reportLocalNotices('swarm-records', [{ key: 'swarm-records', title: 'Unreadable Swarm records', body: '3 rows', kind: 'read_failed' as const }])
+  expect(feed.current.notices).toHaveLength(1)
+  expect(feed.current.notices[0].id).not.toBe(first.id)
+  expect(feed.isLocalNoticeDismissed('swarm-records')).toBe(false)
+})
+
+it('ignores restored timestamps it cannot read', () => {
+  const feed = new NoticeFeed(vi.fn())
+  feed.reportLocalNotices('swarm-records', [{ key: 'swarm-records', title: 'Unreadable Swarm records', body: '2 rows',
+    kind: 'read_failed' as const, preserveIdentity: true, since: 'soon', due: '' }])
+  const [notice] = feed.current.notices
+  expect(Number.isFinite(Date.parse(notice.since))).toBe(true)
+  expect(Number.isFinite(Date.parse(notice.due))).toBe(true)
+})

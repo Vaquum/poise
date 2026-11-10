@@ -1,9 +1,11 @@
 import { viewDiagnostic, viewFeedback } from '../view-feedback'
+import { noticeFeed } from '../notices'
+import { loadRecordsCheckpoints, retainQuarantineIds, saveRecordsCheckpoints } from '../swarm-records'
 import { logTime } from '../clock'
 import { effectiveTimezone } from '../config'
 import { finishMotion, layout, retire, scrollToActor } from '../motion'
 import { patchContent, patchNode } from '../dom-patch'
-import { mountOrganizationFilter, organizationUrl, getSelectedOrganization, setSelectedOrganization } from '../organizations'
+import { ORGANIZATION_STORAGE_KEY, mountOrganizationFilter, organizationUrl, getSelectedOrganization, setSelectedOrganization } from '../organizations'
 // Swarm — log of agent calls. Identical finished calls share a row: model, prompt
 // (truncated), status, time elapsed, response (View → expand row to
 // reveal the full response text underneath).
@@ -238,6 +240,122 @@ function quarantineDescription(row: QuarantinedLog): string {
   return [target, `Call: ${row.id || 'unknown'}`, row.correlationId ? `Correlation: ${row.correlationId}` : '',
     row.behavior ? `Behavior: ${row.behavior}` : '', row.sessionId ? `Session: ${row.sessionId}` : '',
     position, error].filter(Boolean).join(' · ')
+}
+
+const SWARM_RECORDS_KEY = 'swarm-records'
+const SWARM_RECORDS_TITLE = 'Unreadable Swarm records'
+
+let recordsCheckpoints = loadRecordsCheckpoints()
+// The organization whose notice is currently showing, so entering another one
+// renews its showing instead of inheriting this one's age and dismissal.
+let lastReportedOrg: string | null = null
+
+function recordsBody(rows: QuarantinedLog[]): string {
+  return `${rows.length} unreadable worker log row(s) isolated. Other runs continue updating.\n`
+    + rows.map(quarantineDescription).join('\n')
+}
+
+function reportSwarmRecords(): void {
+  const org = getSelectedOrganization()
+  const checkpoint = recordsCheckpoints[org]
+  const fresh = quarantined
+  const freshKeys = fresh.map(quarantineKey)
+  // A complete, unfiltered, error-free read proves absence under this
+  // organization; any other empty read keeps the retained checkpoint.
+  const complete = historyComplete && !searchQuery && !lastLoadError
+  // Every showing carries explicit stamps: the checkpoint and the notice share
+  // this exact age, so a reload restores it instead of minting a new one.
+  const report = (body: string, since: string, due: string, preserve: boolean) => {
+    noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
+      title: SWARM_RECORDS_TITLE, body, kind: 'read_failed', preserveIdentity: preserve, since, due }])
+    lastReportedOrg = org
+  }
+  const clear = () => {
+    viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+    lastReportedOrg = org
+  }
+  if (!fresh.length && !checkpoint) {
+    clear()
+    return
+  }
+  if (!fresh.length && checkpoint) {
+    if (complete) {
+      delete recordsCheckpoints[org]
+      saveRecordsCheckpoints(recordsCheckpoints)
+      clear()
+      return
+    }
+    if (checkpoint.dismissed) {
+      clear()
+      return
+    }
+    report(checkpoint.body, checkpoint.since, checkpoint.due, org === lastReportedOrg)
+    return
+  }
+  const known = new Set(checkpoint?.ids ?? [])
+  const unseen = freshKeys.filter((key) => !known.has(key))
+  const ids = retainQuarantineIds(checkpoint?.ids ?? [], freshKeys, complete)
+  if (unseen.length) {
+    // A plain report: the changed body renews the alert with a new age, even
+    // when a new row replaces another and the count stays the same.
+    const at = new Date().toISOString()
+    const body = recordsBody(fresh)
+    recordsCheckpoints[org] = { ids, since: at, due: at, dismissed: false, body }
+    saveRecordsCheckpoints(recordsCheckpoints)
+    report(body, at, at, false)
+    return
+  }
+  const retained = recordsCheckpoints[org]
+  if (!retained || retained.dismissed) {
+    if (retained?.dismissed && complete) {
+      // A complete read proves absence even for a dismissed showing: forget
+      // repaired rows so their recurrence alerts anew instead of staying known.
+      recordsCheckpoints[org] = { ...retained, ids }
+      saveRecordsCheckpoints(recordsCheckpoints)
+    }
+    clear()
+    return
+  }
+  // Known rows, possibly reworded: update the text, keep the alert. A complete
+  // read also forgets repaired rows above, while a newly entered organization
+  // gets a new showing with its own kept age rather than this one's.
+  const body = recordsBody(fresh)
+  const sameIds = ids.length === retained.ids.length && ids.every((id, index) => id === retained.ids[index])
+  if (!sameIds || retained.body !== body) {
+    recordsCheckpoints[org] = { ...retained, ids, body }
+    saveRecordsCheckpoints(recordsCheckpoints)
+  }
+  report(body, retained.since, retained.due, org === lastReportedOrg)
+}
+
+// A dismissal persists at once, even when no further render runs before a
+// reload puts the retained rows back on screen. The dismissal check runs
+// first: resolving the organization needs loaded settings, which the
+// pre-mount report below does not have yet.
+noticeFeed.subscribe(() => {
+  if (!noticeFeed.isLocalNoticeDismissed(SWARM_RECORDS_KEY)) return
+  const org = getSelectedOrganization()
+  const checkpoint = recordsCheckpoints[org]
+  if (checkpoint && !checkpoint.dismissed) {
+    recordsCheckpoints[org] = { ...checkpoint, dismissed: true }
+    saveRecordsCheckpoints(recordsCheckpoints)
+  }
+})
+
+// Restored before the notification rail mounts, so its first update lists the
+// known notice with its kept age instead of announcing it as a new arrival.
+// Reads the stored selection directly: the validated selection needs loaded
+// settings and must not be touched this early.
+let storedOrg = ''
+try { storedOrg = localStorage.getItem(ORGANIZATION_STORAGE_KEY) || '' } catch { /* unavailable */ }
+{
+  const restored = recordsCheckpoints[storedOrg]
+  if (restored && !restored.dismissed && restored.ids.length) {
+    noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
+      title: SWARM_RECORDS_TITLE, body: restored.body,
+      kind: 'read_failed', preserveIdentity: true, since: restored.since, due: restored.due }])
+    lastReportedOrg = storedOrg
+  }
 }
 
 // Status is a coloured icon and the status in a word. The status and outcome
@@ -1737,10 +1855,7 @@ function renderStaleBanner(): void {
   const age = lastLoadedAt ? new Date(lastLoadedAt).toISOString() : 'none'
   viewFeedback('swarm-read', 'Swarm is not updating', lastLoadError
     ? `${lastLoadError}. Last successful read: ${age}. ${partial}` : '', 'read_failed')
-  viewFeedback('swarm-records', 'Unreadable Swarm records', quarantined.length
-    ? `${quarantined.length} unreadable worker log row(s) isolated. Other runs continue updating.\n`
-      + quarantined.map(quarantineDescription).join('\n')
-    : '', 'read_failed')
+  reportSwarmRecords()
 }
 
 // The Started column shows a relative time ("3m") computed at render.

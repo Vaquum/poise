@@ -45,8 +45,12 @@ describe('launch ownership and resolution', () => {
         // already includes the branch: this was the live duplicate-review race.
         if (args[0] === '--chain-seed') return Promise.resolve({ stdout: JSON.stringify({ repository: pr.repo, issue_number: 7,
           actor: 'poise-user', branch: 'poise/issue-7', issue: { title: 'Seed', body: '', state: 'open', labels: ['poise'] },
-          comments: [], publication: { existing_pulls: [], pull_number: null,
+          comments: [], publication: { existing_pulls: [], pull_number: null, base_sha: HEAD_SHA,
             head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } }), stderr: '' })
+      }
+      if (command === 'github-datastore' && args[args.indexOf('view') + 1] === 'issue-dependencies') {
+        return Promise.resolve({ stdout: JSON.stringify({ repo: pr.repo, number: 7,
+          found: true, complete: true, prerequisites: [] }), stderr: '' })
       }
       return inherited(command, args, options)
     })

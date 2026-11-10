@@ -5,7 +5,7 @@ import {
   LOGGING_LEVELS, LOGGING_SOURCES, LoggingApiError, loggingCallId, loggingErrorBounds, loggingEvent,
   loggingExport, loggingHealth, loggingHref, loggingPage, loggingParameters, loggingPullRequest,
   loggingRecord, parseLoggingLink, subscribeDiagnosticRefresh,
-  loggingWorkImpact,
+  loggingWorkImpacts,
 } from '../src/logging'
 
 const access = { endpoint: '/api/logging', isAdmin: false, owner: 'local' }
@@ -22,37 +22,57 @@ afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 
 it('keeps optional chain reads on the owner workspace boundary and leaves unavailable evidence explicit', async () => {
   const owned = { ...event, callId: '1'.repeat(32), correlationId: '2'.repeat(32) }
-  const fetch = respond({ impact: null })
-  expect(await loggingWorkImpact(access, owned, signal())).toBeNull()
-  expect(fetch).toHaveBeenCalledWith('/api/behavior-chains?callId=' + owned.callId + '&correlationId=' + owned.correlationId,
+  const fetch = respond({ impacts: [null] })
+  expect((await loggingWorkImpacts(access, [owned], signal())).get(owned.id)).toBeNull()
+  expect(fetch).toHaveBeenCalledWith('/api/behavior-chains?batch=1&callId=' + owned.callId + '&correlationId=' + owned.correlationId,
     expect.objectContaining({ credentials: 'same-origin', cache: 'no-store' }))
   fetch.mockClear()
-  for (const change of [{ source: 'gateway' }, { workspace: 'another-owner' }, { visibility: 'infrastructure' as const }, { callId: null, correlationId: null }]) {
-    expect(await loggingWorkImpact(access, { ...owned, ...change }, signal())).toBeNull()
+  for (const change of [{ source: 'gateway' }, { workspace: 'another-owner' }, { visibility: 'infrastructure' as const },
+    { callId: null, correlationId: null }, { callId: 'legacy-call' }, { correlationId: 'legacy-correlation' }]) {
+    expect((await loggingWorkImpacts(access, [{ ...owned, ...change }], signal())).get(owned.id)).toBeNull()
   }
   expect(fetch).not.toHaveBeenCalled()
   fetch.mockResolvedValue(new Response(JSON.stringify({ error: 'journal unreadable' }), { status: 503 }))
-  await expect(loggingWorkImpact(access, owned, signal())).rejects.toThrow('Workspace chain evidence is unavailable')
+  await expect(loggingWorkImpacts(access, [owned], signal())).rejects.toThrow('Workspace chain evidence is unavailable')
 })
 
 it('does not associate conflicting repository or behavior evidence despite matching invocation identities', async () => {
   const impact = { impact: 'blocked', recovered: false, invocationId: '2'.repeat(32), repository: 'acme/repo', behavior: 'repair-pr',
     callerBehavior: 'repair_pr', stage: 'repair-pr: failed', target: 'acme/repo#42', progressAt: 1000, retryAt: null,
     nextAction: 'Resolve the hold', journal: '/api/behavior-chains?id=acme%2Frepo%237' }
-  const fetch = respond({ impact })
+  const fetch = respond({ impacts: [impact] })
   const owned = { ...event, callId: '1'.repeat(32), correlationId: '2'.repeat(32), behavior: 'repair_pr' }
-  expect(await loggingWorkImpact(access, owned, signal())).toEqual(impact)
-  for (const change of [{ repository: 'another/repo' }, { behavior: 'review_pr' }]) {
-    fetch.mockResolvedValue(new Response(JSON.stringify({ impact })))
-    expect(await loggingWorkImpact(access, { ...owned, ...change }, signal())).toBeNull()
-  }
+  const duplicate = { ...owned, id: 'duplicate' }
+  const wrongRepo = { ...owned, id: 'wrong-repo', repository: 'another/repo' }
+  const wrongBehavior = { ...owned, id: 'wrong-behavior', behavior: 'review_pr' }
+  const legacy = { ...owned, id: 'legacy', correlationId: 'legacy-correlation' }
+  const values = await loggingWorkImpacts(access, [owned, duplicate, wrongRepo, wrongBehavior, legacy], signal())
+  expect(values).toEqual(new Map([[owned.id, impact], [duplicate.id, impact], [wrongRepo.id, null], [wrongBehavior.id, null], [legacy.id, null]]))
+  expect(fetch).toHaveBeenCalledTimes(1)
+  const params = new URL(String(fetch.mock.calls[0][0]), 'http://local').searchParams
+  expect(params.getAll('callId')).toEqual([owned.callId])
+  expect(params.getAll('correlationId')).toEqual([owned.correlationId])
   // Caller behavior names do not normalize by separator swap: issue_review is
   // review-issue, which underscore replacement would render issue-review.
   const renamed = { ...impact, behavior: 'review-issue', callerBehavior: 'issue_review' }
-  fetch.mockResolvedValue(new Response(JSON.stringify({ impact: renamed })))
-  expect(await loggingWorkImpact(access, { ...owned, behavior: 'issue_review' }, signal())).toEqual(renamed)
-  fetch.mockResolvedValue(new Response(JSON.stringify({ impact: renamed })))
-  expect(await loggingWorkImpact(access, { ...owned, behavior: 'pr_review' }, signal())).toBeNull()
+  fetch.mockResolvedValue(new Response(JSON.stringify({ impacts: [renamed] })))
+  expect((await loggingWorkImpacts(access, [{ ...owned, behavior: 'issue_review' }], signal())).get(owned.id)).toEqual(renamed)
+  fetch.mockResolvedValue(new Response(JSON.stringify({ impacts: [renamed] })))
+  expect((await loggingWorkImpacts(access, [{ ...owned, behavior: 'pr_review' }], signal())).get(owned.id)).toBeNull()
+})
+
+it('keeps batch results paired with their exact selectors and rejects incomplete evidence', async () => {
+  const first = { ...event, callId: '1'.repeat(32), correlationId: null }
+  const second = { ...event, id: 'second', callId: null, correlationId: '2'.repeat(32) }
+  const fetch = respond({ impacts: [null, null] })
+  expect(await loggingWorkImpacts(access, [first, second], signal())).toEqual(new Map([[first.id, null], [second.id, null]]))
+  const params = new URL(String(fetch.mock.calls[0][0]), 'http://local').searchParams
+  expect(params.getAll('callId')).toEqual([first.callId, ''])
+  expect(params.getAll('correlationId')).toEqual(['', second.correlationId])
+  for (const impacts of [[null], [null, {}]]) {
+    fetch.mockResolvedValue(new Response(JSON.stringify({ impacts })))
+    await expect(loggingWorkImpacts(access, [first, second], signal())).rejects.toMatchObject({ code: 'logging_incompatible' })
+  }
 })
 
 describe('canonical diagnostic browser contract', () => {

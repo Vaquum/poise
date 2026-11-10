@@ -286,6 +286,23 @@ describe('progress reports observations without inventing model activity', () =>
     expect(helpers.progressText(entry({ status: 'completed' }))).toBe('')
   })
 
+  it.each([
+    ['preparing_workspace', 'Preparing the atomic workspace'],
+    ['preparing_checkout', 'Preparing the implementation checkout'],
+    ['preparing_review_evidence', 'Reading repair evidence'],
+    ['preparing_provider', 'Preparing the provider command'],
+    ['acquiring_checkout', 'Acquiring the checkout lease'],
+    ['settling_provider_resources', 'Verifying resource release'],
+    ['validating_provider_result', 'Checking the provider result'],
+    ['reading_publication', 'Reading publication metadata'],
+    ['validating_publication', 'Validating the publication'],
+    ['verifying_ci_dependency', 'Verifying CI dependency evidence'],
+    ['revalidating_issue', 'Rechecking the seed issue'],
+    ['publishing', 'Publishing the verified checkout'],
+  ])('labels the atomic %s stage instead of losing its heartbeat', (phase, label) => {
+    expect(helpers.progressText(running({ phase }))).toContain(label)
+  })
+
   it('makes active runs expandable and escapes activity messages', () => {
     const row = running({ events: [{ at: new Date().toISOString(), message: '<img src=x onerror=alert(1)>' }] })
     expect(helpers.hasDetail(row)).toBe(true)

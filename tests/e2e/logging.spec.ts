@@ -114,7 +114,7 @@ test.beforeAll(() => {
   finally { db.close() }
 })
 
-test('incident details verify one target across duplicate errors, recovery, an independent hold and an unavailable journal', async ({ page }) => {
+test('rows and details share verified impact across duplicate errors, recovery, an independent hold and an unavailable journal', async ({ page }) => {
   const cache = new Database(resolve('test-results/e2e/cache.db'))
   const logs = new DiagnosticStore(storePath)
   const at = Date.now() - 10_000
@@ -128,11 +128,20 @@ test('incident details verify one target across duplicate errors, recovery, an i
   const records = ['first', 'duplicate'].map(id => normalize({ ...input, id: impactComponent + id, component: impactComponent })!)
   try {
     logs.append(records)
+    await trackLoggingPolls(page)
+    await page.clock.install()
     await ready(page)
-    await page.route('**/api/behavior-chains?*', route => route.continue())
+    let impactReads = 0
+    await page.route('**/api/behavior-chains?*', route => { impactReads++; return route.continue() })
     await exactFilter(page, 'component', impactComponent)
     await expect(rows(page)).toHaveCount(2)
-    await expect(rows(page).first().locator('.logging-number')).toHaveText('2')
+    const summary = rows(page).locator('.logging-cell-impact')
+    const target = fixture.chain.repository + '#107'
+    const stage = 'repair-pr: preflight_failed'
+    await expect(summary).toHaveText([`retrying · ${target} · ${stage}`, `retrying · ${target} · ${stage}`])
+    await expect(rows(page).locator('.logging-number')).toHaveText(['2', '2'])
+    const ids = await rows(page).evaluateAll(items => items.map(row => row.getAttribute('data-id')))
+    expect(impactReads).toBe(1)
     await rows(page).first().getByRole('button', { name: 'Toggle diagnostic evidence' }).click()
     const detail = page.locator('#logging-tbody > .agent-expand-row').first()
     const work = detail.getByRole('region', { name: 'Verified work impact' })
@@ -141,23 +150,43 @@ test('incident details verify one target across duplicate errors, recovery, an i
     await expect(work).toContainText('Last verified progress')
     await expect(work).toContainText('Next retry')
     await expect(detail).toContainText('original retained cause')
+    expect(impactReads).toBe(1)
+    fixture.append({ type: 'chain.held', reason: 'independent publication hold' }, at + 3500)
+    await action(page, 'refresh').click()
+    await expect(summary).toHaveText([`blocked · ${target} · ${stage}`, `blocked · ${target} · ${stage}`])
+    await expect(work.locator('dd').filter({ hasText: /^blocked$/ })).toHaveCount(1)
     const progress = structuredClone(fixture.observation)
     progress.checkedAt = at + 4000
     progress.pull!.head = progress.publication.head_sha = 'b'.repeat(40)
     fixture.append({ type: 'chain.observed', observation: progress }, at + 4000)
+    fixture.append({ type: 'chain.resumed' }, at + 4500)
+    // The existing watermark poll cannot update impact within the displayed snapshot.
+    const pollCount = (await loggingPolls(page)).length
+    await page.clock.runFor(30_000)
+    await expect.poll(async () => (await loggingPolls(page)).length).toBeGreaterThan(pollCount)
+    expect(impactReads).toBe(2)
+    await expect(summary).toHaveText([`blocked · ${target} · ${stage}`, `blocked · ${target} · ${stage}`])
     await action(page, 'refresh').click()
+    await expect(summary).toHaveText([`recovered · ${target} · ${stage}`, `recovered · ${target} · ${stage}`])
     await expect(work.locator('dd').filter({ hasText: /^recovered$/ })).toHaveCount(1)
+    expect(await rows(page).evaluateAll(items => items.map(row => row.getAttribute('data-id')))).toEqual(ids)
+    await expect(rows(page).locator('.logging-number')).toHaveText(['2', '2'])
     fixture.append({ type: 'chain.held', reason: 'independent publication hold' }, at + 5000)
     await action(page, 'refresh').click()
+    await expect(summary).toHaveText([`blocked · ${target} · ${stage}`, `blocked · ${target} · ${stage}`])
     await expect(work.locator('dd').filter({ hasText: /^blocked$/ })).toHaveCount(1)
     await expect(work).toContainText('Recovered; verified progress followed this invocation failure')
     await expect(work).toContainText('independent publication hold')
     // Service Logging remains a separate central read when the workspace fails.
-    await page.route('**/api/behavior-chains?*', route => route.fulfill({ status: 503, json: { error: 'journal unavailable' } }))
+    await page.route('**/api/behavior-chains?*', route => { impactReads++; return route.fulfill({ status: 503, json: { error: 'journal unavailable' } }) })
     await action(page, 'refresh').click()
+    await expect(summary).toHaveText(['unknown', 'unknown'])
     await expect(work).toContainText('Current impact: unknown')
     await expect(work).toContainText('Workspace chain evidence is unavailable')
     await expect(rows(page)).toHaveCount(2)
+    expect(await rows(page).evaluateAll(items => items.map(row => row.getAttribute('data-id')))).toEqual(ids)
+    expect(impactReads).toBe(5)
+    await expect(status(page)).toContainText('2 matching retained events')
     await expect(rows(page).first().locator('.agent-status')).toHaveText('Error')
     await expect(rows(page).first().locator('.logging-number')).toHaveText('2')
     await expect(detail).toContainText('original retained cause')

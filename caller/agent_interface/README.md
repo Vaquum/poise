@@ -125,6 +125,11 @@ Caller operation, with exception type, errno, deadline and exit/signal when
 observed. Ordinary exception text, subprocess arguments and captured output are
 excluded. Explicit implementation/repair blockers retain only their bounded,
 redacted reason as defined in [chain outcomes](../../docs/Behavior-chain.md#handoffs-and-outcomes).
+Generic atomic failures also identify the checkout, provider or publication
+validation step. Caller-authored validation reasons and JSON line/column details
+are retained in both the error and diagnostic message before cleanup; other
+exception text remains excluded. These failures keep `atomic_work_failed` and
+the existing result, resource-release and retry rules.
 The outer detached Caller records an explicit unknown cause and observed exit
 status when its inner continuation leaves no cause. These SQLite records survive
 Poise restarts; they authorize neither publication nor resource release.

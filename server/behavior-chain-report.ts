@@ -20,7 +20,11 @@ const IMPLEMENTATION_CAUSE = 'atomic_work_blocked'
 const CAUSES = ['repair_incomplete_replies', 'repair_execution_budget_exhausted', 'review_budget_exhausted', MERGE_CAUSE, CLOSED_CAUSE, IMPLEMENTATION_CAUSE] as const
 const PREFIX = 'behavior_chain_repair_report:'
 const REPOSITORIES_KEY = 'service_repair_exhaustion_repositories'
-const INCOMPLETE_REPLIES = /^repair did not answer every unresolved review finding(?:: missing_root_comment_ids=\[[0-9, ]*\]; missing_count=[1-9][0-9]*; required_count=[1-9][0-9]*)?$/
+// Caller retains validation reasons wrapped as `atomic behavior failed during
+// {phase}: {reason} ({operation})` and bounds them at 500 chars, so the
+// sentence is matched where it appears: the reason stays verbatim inside
+// the wrapper, and only this Caller-authored sentence matches it.
+const INCOMPLETE_REPLIES = /repair did not answer every unresolved review finding(?:: missing_root_comment_ids=\[[0-9, ]*\]; missing_count=[1-9][0-9]*; required_count=[1-9][0-9]*)?/
 const REPORT_MARKER = /<!-- poise-repair-exhaustion:[a-f0-9]{64} -->/
 
 interface RepairReport {

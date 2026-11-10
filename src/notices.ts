@@ -131,6 +131,15 @@ export function sendLatest<T>(send: (value: T) => Promise<void>, failed: (error:
 
 export interface LocalNotice extends ReadFailure {
   kind?: typeof LOCAL_NOTICE_KINDS[number]
+  /** Keep this notice's identity across body changes: the text updates in
+   *  place without renewing its age, dismissal or arrival. Opt-in per report;
+   *  a report without it follows the default body-comparison rule, so omitting
+   *  it renews the alert. Only `swarm-records` uses this today. */
+  preserveIdentity?: boolean
+  /** Restored timestamps for a recreated notice, used only when no notice for
+   *  the key exists yet. Invalid values fall back to now. */
+  since?: string
+  due?: string
 }
 
 type Listener = (state: NoticesState) => void
@@ -213,11 +222,13 @@ export class NoticeFeed {
     for (const [key, failure] of pending) {
       const existing = this.local.get(key)
       const kind = failure.kind ?? 'read_failed'
-      const previous = existing?.body === failure.body && existing.title === failure.title && existing.kind === kind ? existing : undefined
+      const preserved = failure.preserveIdentity === true ? existing : undefined
+      const previous = preserved ?? (existing?.body === failure.body && existing.title === failure.title && existing.kind === kind ? existing : undefined)
       if (existing && !previous) this.dismissedLocal.delete(existing.id)
       const at = new Date().toISOString()
+      const stamp = (value: string | undefined) => value !== undefined && Number.isFinite(Date.parse(value)) ? value : at
       this.local.set(key, { id: previous?.id ?? `read:${++this.localSequence}`, kind,
-        title: failure.title, body: failure.body, since: previous?.since ?? at, due: previous?.due ?? at,
+        title: failure.title, body: failure.body, since: previous?.since ?? stamp(failure.since), due: previous?.due ?? stamp(failure.due),
         silenceable: false, target: failure.target ?? null })
     }
     this.publish()
@@ -250,6 +261,12 @@ export class NoticeFeed {
     } catch {
       // Offline or restarting: the next read tries again.
     }
+  }
+
+  /** Whether the tab-local notice for `key` exists and is currently dismissed. */
+  isLocalNoticeDismissed(key: string): boolean {
+    const notice = this.local.get(key)
+    return !!notice && this.dismissedLocal.has(notice.id)
   }
 
   /** Puts a notice away here at once, then on the server, whose answer wins. */

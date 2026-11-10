@@ -683,10 +683,12 @@ it('never repeats an uncertain merge report POST after a lost acknowledgement, r
   expect(journal.read(chain.id)).toMatchObject({ held: null, invocations: [{ state: 'uncertain', callId: null }] })
 })
 
-it.each(['legacy', 'diagnostic omissions', 'execution budget'])('reports a pre-existing %s hold and verifies ordinary admission', async mode => {
+it.each(['legacy', 'diagnostic omissions', 'wrapped diagnostic', 'execution budget'])('reports a pre-existing %s hold and verifies ordinary admission', async mode => {
   const { db, journal } = setup()
   const budget = mode === 'execution budget'
-  const errors = budget ? BUDGET_ERRORS : mode === 'diagnostic omissions' ? [1, 2, 3].map(n => `${LEGACY}: missing_root_comment_ids=[${Array.from({ length: n }, (_, i) => n * 10 + i).join(', ')}]; missing_count=${n}; required_count=6`) : undefined
+  const omissions = [1, 2, 3].map(n => `${LEGACY}: missing_root_comment_ids=[${Array.from({ length: n }, (_, i) => n * 10 + i).join(', ')}]; missing_count=${n}; required_count=6`)
+  const errors = budget ? BUDGET_ERRORS : mode === 'diagnostic omissions' ? omissions
+    : mode === 'wrapped diagnostic' ? omissions.map(reason => `atomic behavior failed during validating_publication: ${reason} (agent_interface.atomic_work.run)`) : undefined
   const source = exhausted(journal, errors, 7, 21, budget ? BUDGET_CODE : 'atomic_work_failed')
   const runtime = new BehaviorChainRuntime(journal, operations(db, journal))
   await runtime.run()

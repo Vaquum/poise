@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,7 +18,11 @@ from agent_interface.model_catalog import CATALOG
 
 
 @pytest.fixture
-def database(tmp_path, monkeypatch):
+def database(tmp_path, monkeypatch, request):
+    if hasattr(request, "param"):
+        directory = TemporaryDirectory(dir=request.param)
+        request.addfinalizer(directory.cleanup)
+        tmp_path = Path(directory.name)
     monkeypatch.setattr(api, "DB", tmp_path / "calls.sqlite3")
     monkeypatch.setattr(api, "DATA_DIR", tmp_path)
     monkeypatch.setattr(api, "RESPONSES", tmp_path / "responses")
@@ -364,6 +368,97 @@ def decode_failure(database):
             return json.loads(read.stdout)[0], json.loads(decoded.stdout)
 
         yield decode
+
+
+# Real cleanup needs consistent file/directory device IDs on managed test boxes.
+@pytest.mark.parametrize("database", ["/dev/shm" if sys.platform == "linux" else None], indirect=True)
+@pytest.mark.parametrize("step,phase,detail,trip", [
+    ("checkout", "preparing_checkout", "ValueError", ""),
+    ("checkout", "preparing_checkout", "ValueError", "not signed in"),
+    ("checkout", "preparing_checkout", "ValueError", "status 429"),
+    ("json", "reading_publication", "invalid JSON at line 1, column 1", ""),
+    ("metadata", "validating_publication", "atomic behavior publication metadata is incomplete", ""),
+])
+def test_atomic_preflight_failure_survives_native_receipt_and_logging(database, monkeypatch, decode_failure, step, phase, detail, trip):
+    private = "private-provider-prompt ghp_private123 Authorization: Bearer header-secret " * 4000
+    original = ValueError(trip + " " + private)
+    modes = []
+    original_track = api.track
+
+    def track(*args, **kwargs):
+        # Only the physical namespace is a stand-in. Native Progress/finish
+        # retain the failure around the real atomic runner and resource cleanup.
+        with patch.object(api, "_native_cli", False):
+            return original_track(*args, **kwargs)
+
+    def interface(*args, **kwargs):
+        mode = args[args.index("--mode") + 1]
+        modes.append(mode)
+        assert mode == "prepare", "a failed preflight must not validate or publish"
+        if step == "checkout":
+            raise original
+        Path(args[args.index("--path") + 1]).mkdir()
+        return {"outcome": "prepared", "checkout_head": "b" * 40}
+
+    def worker(_lease, _args, **kwargs):
+        output = Path(kwargs["cwd"]).parent / "publication.json"
+        output.write_text(private[:2000] if step == "json" else json.dumps({"body": private[:2000]}))
+        return SimpleNamespace(returncode=0, stdout=private, stderr=private)
+
+    monkeypatch.setattr(api, "track", track)
+    monkeypatch.setattr(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _: SimpleNamespace(identity="fixture", provider="codex")))
+    monkeypatch.setattr(issue_review, "WORK_ROOT", database / "issue-review")
+    monkeypatch.setattr(issue_review, "packet", lambda *args: {"issue": {"state": "open"}})
+    monkeypatch.setattr(issue_review, "interface", interface)
+    monkeypatch.setattr(issue_review, "command", lambda *args: (["fixture", private], "", {}))
+    monkeypatch.setattr(issue_review, "stop_leftovers", lambda *args: None)
+    monkeypatch.setattr(issue_review, "_cwd_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(issue_review, "_terminal_failure", lambda *args: None)
+    monkeypatch.setattr(api.atomic_work.checkout_lock, "Lease", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(api.atomic_work.checkout_lock, "run_gated", worker)
+    monkeypatch.setattr(api, "_main", lambda: api.run_atomic_work("example/repo#7", "reviewer", "poise:behavior-chain",
+                                                               "original-native", "fixture", "poise/issue-7"))
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source", "poise:behavior-chain",
+                                      "--correlation-id", "original-native"])
+    with pytest.raises(ValueError) as caught:
+        api.main()
+    if step == "checkout":
+        assert caught.value is original and str(caught.value) == trip + " " + private
+    stored, decoded = decode_failure()
+    evidence = stored["diagnostic"]
+    assert (stored["status"], stored["error_code"], stored["action"], stored["outcome"], stored["head_sha"]) == (
+        "failed", "atomic_work_failed", "not_started", "preflight_failed", None)
+    assert evidence["phase"] == phase
+    assert detail in evidence["message"] and phase in stored["error"]
+    if trip:
+        assert stored["error"].startswith(trip + ": ")
+    assert stored["error"] == evidence["message"] == decoded["context"]["message"]
+    assert evidence["correlation_id"] == "original-native" and evidence["call_id"] == stored["id"]
+    assert len(stored["error"]) <= 501 and len(json.dumps(evidence)) < 2048
+    assert stored["resources_settled_at"] is not None, stored["resource_ownership"]
+    assert ownership.released(stored["resource_ownership"])
+    with api.db() as conn:
+        assert conn.execute("select action_plan from calls where id=?", (stored["id"],)).fetchone()[0] is None
+    assert modes == ["prepare"]
+    diagnostic, = api.diagnostics()["events"]
+    assert diagnostic["error"] == stored["error"] and diagnostic["diagnostic"] == evidence
+    for secret in ("private-provider", "ghp_private123", "header-secret"):
+        assert secret not in json.dumps(stored) + json.dumps(diagnostic)
+    # The ordinary Logging reader and chain reconciliation consume those same
+    # persisted bytes; diagnostics cannot hold retries or release pending work.
+    repo = Path(__file__).resolve().parents[3]
+    with TemporaryDirectory(prefix="atomic-failure-", dir=repo / "test-results") as work:
+        bundle, wire = Path(work) / "contract.mjs", Path(work) / "call.json"
+        environment = {"PATH": os.environ["PATH"], "HOME": str(database), "TMPDIR": work}
+        built = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"), str(repo / "tests/fixtures/behavior-fence-contract.ts"),
+                                "--bundle", "--platform=node", "--packages=external", "--format=esm", "--target=node22", f"--outfile={bundle}"],
+                               cwd=repo, env=environment, capture_output=True, text=True, timeout=30)
+        assert built.returncode == 0, built.stderr
+        wire.write_text(json.dumps([stored]))
+        consumed = subprocess.run(["node", str(bundle), str(wire), "atomic-work-failed"], cwd=repo, env=environment,
+                                  capture_output=True, text=True, timeout=30)
+        assert consumed.returncode == 0, consumed.stderr
+        assert json.loads(consumed.stdout) == {"accepted": 1, "settled": 1, "reservations": 0}
 
 
 @pytest.mark.parametrize("during_cleanup", [False, True])

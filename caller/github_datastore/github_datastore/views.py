@@ -346,6 +346,48 @@ def _node_ref(node: dict[str, Any]) -> tuple[str, int] | None:
     return (repo.lower(), number)
 
 
+def issue_dependencies(
+    *,
+    db_path: str | Path = DEFAULT_DB,
+    output: Output = "json",
+    repo: str | None = None,
+    number: int | None = None,
+) -> str:
+    """Explicit forward blockedBy edges only. Missing capture is not empty."""
+    if output != "json" or not repo or number is None:
+        raise ValueError("issue-dependencies needs json, a repo and a number")
+    conn = _read_connect(db_path)
+    try:
+        row = conn.execute(
+            """SELECT expanded_json FROM items
+               WHERE repo_full_name = ? COLLATE NOCASE AND number = ? AND item_type = 'issue'""",
+            (repo, number),
+        ).fetchone()
+        result = {"repo": repo, "number": number, "found": row is not None,
+                  "complete": False, "prerequisites": []}
+        if row is None:
+            return json.dumps(result)
+        expanded = json.loads(row["expanded_json"])
+        issue = expanded.get("issue") if isinstance(expanded, dict) else None
+        graph = issue.get("graphql") if isinstance(issue, dict) else None
+        connection = graph.get("blockedBy") if isinstance(graph, dict) else None
+        nodes, truncated = _connection_nodes(connection)
+        page = connection.get("pageInfo") if isinstance(connection, dict) else None
+        complete = nodes is not None and not truncated and isinstance(page, dict) and page.get("hasNextPage") is False
+        refs = []
+        for node in nodes or []:
+            ref = _node_ref(node)
+            if ref is None:
+                complete = False
+            elif ref[0] == repo.lower():
+                refs.append({"repo": ref[0], "number": ref[1]})
+        return json.dumps({**result, "complete": complete, "prerequisites": refs})
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"view query failed: issue-dependencies: {exc}") from exc
+    finally:
+        conn.close()
+
+
 def _head_ref(graphql: Any) -> tuple[str | None, str | None]:
     """(head branch, head repository) for a pull request, when the stored
     read tracked them. Rows synced before the sync fetched head refs, or

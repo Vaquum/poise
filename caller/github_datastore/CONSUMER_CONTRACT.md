@@ -110,6 +110,16 @@ payload_ref
 comments_count
 ```
 
+### `views.issue_dependencies(...)`
+
+`github-datastore view issue-dependencies --repo OWNER/REPO --number N` returns
+`found`, `complete` and `prerequisites` (repository and issue number) from the
+stored forward `blockedBy` connection, restricted to the same repository.
+Only an explicitly captured complete connection establishes an empty list;
+missing, malformed or truncated capture reports `complete: false`. Body
+references are excluded. This local view supplies no state or delivery proof;
+consumers retain the normal health gate and verify delivery separately.
+
 ### `views.user(...)`
 
 User footprint rows.

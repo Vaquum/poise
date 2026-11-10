@@ -40,6 +40,7 @@ function seed(journal: BehaviorChainJournal, repository = 'acme/repo', issue = 7
 }
 function observation(merged = true): ChainObservation {
   return { checkedAt: Date.now(), existingPulls: [], issue: { open: true, eligible: true, revision: 'seed', commentIds: [] },
+    prerequisites: { wait: null, base: 'a'.repeat(40), evidence: [] },
     issueReviewers: [], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer,
     publication: { pull_number: merged ? 17 : null, head_sha: merged ? 'a'.repeat(40) : null,
       head_invocation: null, state: merged ? 'closed' : null, merged, merge_sha: merged ? MERGE : null },
