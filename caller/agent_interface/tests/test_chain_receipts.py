@@ -748,15 +748,22 @@ class AtomicWorkLimits(TestCase):
             self.assertNotIn(private, json.dumps(blocked.diagnostic))
 
     def test_atomic_work_blocked_header_shaped_value_masks_leading_secret(self):
-        value = "opaque-prefix-12 Authorization: Bearer ok"
-        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
-            blocked = api.atomic_work.AtomicWorkBlocked(f"seen {value}")
-        message = str(blocked)
-        self.assertEqual(message, "atomic behavior blocked: seen [redacted] [redacted header]")
-        self.assertEqual(blocked.diagnostic["message"], message)
-        for private in (value, "opaque-prefix-12"):
-            self.assertNotIn(private, message)
-            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+        cases = [
+            ("opaque-prefix-12 Authorization: Bearer ok",
+             "atomic behavior blocked: seen [redacted] [redacted header]"),
+            ("opaque-prefix-12 ghp_a opaque-middle-34 Authorization: Bearer ok",
+             "atomic behavior blocked: seen [redacted] [redacted] [redacted] [redacted header]"),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"SERVICE_CREDENTIALS": value}, clear=True):
+                    blocked = api.atomic_work.AtomicWorkBlocked(f"seen {value}")
+                message = str(blocked)
+                self.assertEqual(message, expected)
+                self.assertEqual(blocked.diagnostic["message"], message)
+                for private in (value, "opaque-prefix-12", "ghp_a", "opaque-middle-34"):
+                    self.assertNotIn(private, message)
+                    self.assertNotIn(private, json.dumps(blocked.diagnostic))
 
     def test_atomic_work_blocked_leading_marker_value_masks_remainder(self):
         value = "[redacted] opaque-core-99"
