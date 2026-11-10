@@ -242,7 +242,7 @@ def track(
                 correlation_id,
                 None if runner else str(os.getpid()),
                 runner,
-                None if runner else process_identity.capture(os.getpid()),
+                None if runner else process_identity.capture(os.getpid(), native=source == "poise:behavior-chain"),
                 resource_ownership.initial(id_, correlation_id) if _native_cli and source == "poise:behavior-chain" and not runner
                 else resource_ownership.initial() if source == "poise:behavior-chain" and not runner else None,
                 json.dumps({"token": uuid4().hex, "owner": process_identity.capture(os.getpid()), "attempt_at": 0})

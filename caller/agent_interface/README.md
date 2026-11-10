@@ -43,6 +43,11 @@ Only a reader that can observe the current workspace supervisor can reconcile
 a previous workspace epoch. A reader in a private PID namespace cannot do so.
 Existing resource and publication receipts still govern recovery.
 
+New native registrations use process identity version 2. An older Caller
+still running through a workspace update cannot reap these registrations.
+The current Caller continues to read version 1 identities and settle their
+original Calls.
+
 Native per-Call resource receipts live in `resource_ownership`, outside the
 replaceable publication artifact. Directory registration precedes allocation;
 all PR attempt roots and copied credentials use a private recorded Call parent.
