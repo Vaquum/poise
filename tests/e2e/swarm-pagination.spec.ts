@@ -321,7 +321,7 @@ test('arrivals larger than a page merge into run order and keep newest-target se
   const quarantined = [
     { index: 1, error: 'invalid terminal outcome', id: 'b'.repeat(32),
       repo: 'o/r', prId: '2', correlationId: 'claim-2', behavior: 'pr_review', sessionId: null },
-    { index: 2, error: 'log row is not an object', id: null,
+    { index: 2, error: 'Caller History row 2 is unreadable (SQLITE_CORRUPT)', id: null,
       repo: null, prId: null, correlationId: null, behavior: null, sessionId: null },
   ]
   await page.route('**/api/agent-logs**', route => {
@@ -338,6 +338,7 @@ test('arrivals larger than a page merge into run order and keep newest-target se
   }
   await expect(page.locator('#swarm-page')).toHaveText('401–401 / 401')
   await expect(await feedback(page)).toContainText('2 unreadable worker log row(s) isolated')
+  await expect(await feedback(page)).toContainText('SQLITE_CORRUPT')
   for (const label of ['201–400 / 401', '1–200 / 401']) {
     await previous(page).click()
     await expect(page.locator('#swarm-page')).toHaveText(label)

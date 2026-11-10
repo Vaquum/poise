@@ -418,6 +418,17 @@ installed sync job matching the database and Caller binary, at most once per
 minute across gates and restarts. Recovery never kills a live sync or admits
 work before freshness is confirmed.
 
+Validated stale health opens one durable episode per mirror account/database.
+It retains the first detection, first and latest freshness evidence, and the
+union of behaviors whose gates refused work. Logging records its opening once;
+Behaviors groups those refusals under the same episode while keeping each
+behavior's refusal. Changing sync ages, later ticks and server restarts do not
+open another episode. Only a validated successful healthy probe records recovery
+and rearms the mirror. Native discovery and cutover probes share this reporting
+and retain their existing exit-based admission rules. Crashes, malformed or
+mismatched health, and failed recovery commands remain independent faults, even
+while a stale episode is open. The freshness limit remains 120 seconds.
+
 If Caller explicitly reports a missing local checkout, Poise can provision an
 owned checkout through Caller's existing checkout primitive, verify its origin,
 commit and clean state, and publish it atomically. Concurrent requests share

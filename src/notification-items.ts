@@ -142,7 +142,8 @@ export function notificationItems(notices: readonly Notice[], diagnostics: Behav
     if (!group.entries.length) continue
     const behaviors = [...new Set(group.entries.flatMap((entry) => entry.behavior ? [entry.behavior] : []))]
     items.push({
-      id: `diagnostic:${JSON.stringify([group.code, group.scope, group.message])}`,
+      id: `diagnostic:${JSON.stringify([group.code, group.scope,
+        group.code === 'datastore_stale' ? group.entries[0].correlationId : group.message])}`,
       ...SEVERITY_LOOK[group.severity], title: group.message, body: behaviors.map(behaviorLabel).join(', '),
       source: 'Behaviors', scope: group.scope, when: latest(group.entries), meta: '',
       details: group.entries, behaviors, notice: null,

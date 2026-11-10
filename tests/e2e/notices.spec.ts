@@ -683,6 +683,41 @@ test('folds a transient chain observation failure into automatic recovery and cl
   await expect(automatic).toHaveCount(0)
 })
 
+test('groups a stale mirror once while retaining every blocked behavior and an independent crash', async ({ page }) => {
+  const behaviors = ['review-new-prs', 'approve-prs', 'resolve-unblocking'] as const
+  const error = 'github-datastore freshness gate failed: Datastore stale: last successful sync 2026-10-09T10:00:00Z; age 150s exceeds 120s'
+  const state = await workspace(page, [], { diagnostics: diagnostics({ status: 'degraded',
+    datastore: { status: 'unavailable', checkedAt: iso(3), ageSeconds: 150, lastSuccessAt: iso(0), error },
+    failures: behaviors.map(behavior => ({ behavior, kind: 'operation', consecutiveFailures: 1,
+      lastFailureAt: iso(3), nextRetryAt: iso(4), error, correlationId: 'a'.repeat(32),
+      diagnostic: { severity: 'warning', code: 'datastore_stale' } })),
+  }) })
+  await page.goto('/')
+  await openRail(page)
+  const stale = rail(page).locator('.nr-card').filter({ hasText: 'GitHub mirror is stale.' })
+  await expect(stale).toHaveCount(1)
+  await expect(bell(page)).toHaveAccessibleName('Notifications, 1 open')
+  await stale.locator('.nr-card-head').click()
+  for (const behavior of behaviors) await expect(stale.locator('.nr-history')).toContainText(`${behavior}: ${error}`)
+  const identity = await stale.getAttribute('data-id')
+  state.diagnostics!.datastore.ageSeconds = 210
+  state.diagnostics!.datastore.error = error.replace('150s', '210s')
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(stale).toHaveAttribute('data-id', identity!)
+  await expect(stale.locator('.nr-history')).toContainText('age 150s')
+  await expect(rail(page).locator('.nr-card')).toHaveCount(1)
+  await expect(bell(page)).toHaveAccessibleName('Notifications, 1 open')
+  state.diagnostics!.datastore.error = 'Datastore process crashed independently.'
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(rail(page).locator('.nr-card')).toHaveCount(2)
+  await expect(rail(page)).toContainText('Datastore process crashed independently.')
+  await rail(page).getByRole('button', { name: 'Close notifications' }).click()
+  await page.locator('#top-nav').getByRole('button', { name: 'Behaviors', exact: true }).click()
+  for (const behavior of behaviors) {
+    await expect(page.locator(`tr[data-behavior="${behavior}"] .behavior-notifications`).getByRole('button', { name: '1 needs you' })).toBeVisible()
+  }
+})
+
 test('links a held repository to its access settings, naming the agent and the pending invitation', async ({ page }) => {
   await workspace(page, [], { diagnostics: diagnostics({ holds: [{ actor: 'octo-agent', repo: 'acme/api',
     error: 'GitHub 404: Not Found', heldAt: iso(0), nextRecheckAt: iso(60) }] }) })

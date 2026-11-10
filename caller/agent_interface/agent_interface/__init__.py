@@ -909,6 +909,41 @@ LOGS_SEARCH_SQL = """lower(
 ) like '%' || ? || '%' escape '\\'"""
 
 
+def _history_read_error(error: sqlite3.Error) -> str | None:
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xFF == sqlite3.SQLITE_CORRUPT:
+        return "SQLITE_CORRUPT"
+    if code == sqlite3.SQLITE_IOERR_SHORT_READ:
+        return "SQLITE_IOERR_SHORT_READ"
+    if isinstance(error, sqlite3.OperationalError) and str(error).startswith("Could not decode to UTF-8 column "):
+        return "INVALID_UTF8"
+    return None
+
+
+def _history_log_row(row: sqlite3.Row) -> dict:
+    try:
+        entry = _log_row(row)
+        json.dumps(entry, allow_nan=False)
+        return entry
+    except (TypeError, ValueError, OverflowError, OSError):
+        identity = {key: row[key] for key in ("id", "repo") if isinstance(row[key], str)}
+        return {**identity, "history_read_error": "INVALID_RECORD"}
+
+
+def _read_history_row(conn: sqlite3.Connection, rowid: int, where: str, params: list[object]) -> dict:
+    # Recheck the original scope on the exact read. A corrupt or short page
+    # can abort SQLite's read transaction, so isolation uses separate reads.
+    key_where = where + (" and" if where else " where") + " rowid=?"
+    try:
+        row = conn.execute(f"select {LOG_ROW_COLUMNS} from calls{key_where}", (*params, rowid)).fetchone()
+    except sqlite3.Error as error:
+        reason = _history_read_error(error)
+        if reason is None:
+            raise
+        return {"history_read_error": reason}
+    return _history_log_row(row) if row is not None else {"history_read_error": "MISSING_ROW"}
+
+
 def logs_page(limit: int, cursor: str | None = None, org: str | None = None, search: str | None = None) -> dict:
     """One bounded newest-first history page; rows stay oldest-first in it.
 
@@ -947,16 +982,24 @@ def logs_page(limit: int, cursor: str | None = None, org: str | None = None, sea
         total = conn.execute(f"select count(*) from calls{where}", params).fetchone()[0]
         page_where = where + (" and" if where else " where") + " rowid < ?" if bound is not None else where
         page_params = [*params, bound] if bound is not None else params
-        rows = conn.execute(
-            f"select rowid, {LOG_ROW_COLUMNS} from calls{page_where}"
-            + " order by rowid desc limit ?",
-            (*page_params, limit + 1),
-        ).fetchall()
-    page = rows[:limit]
-    oldest = page[-1]["rowid"] if page else None
+        tail = page_where + " order by rowid desc limit ?"
+        args = (*page_params, limit + 1)
+        try:
+            rows = conn.execute(f"select rowid, {LOG_ROW_COLUMNS} from calls{tail}", args).fetchall()
+        except sqlite3.Error as error:
+            if _history_read_error(error) is None:
+                raise
+            # The index can still certify page positions when a table page is
+            # damaged. A failed count or index read still fails the whole page.
+            index = "calls_owner" if org is not None else "sqlite_autoindex_calls_1"
+            keys = [row[0] for row in conn.execute(f"select rowid from calls indexed by {index}{tail}", args)]
+            page = [_read_history_row(conn, key, where, params) for key in keys[:limit]]
+        else:
+            keys = [row["rowid"] for row in rows]
+            page = [_history_log_row(row) for row in rows[:limit]]
     return {
-        "rows": [_log_row(r) for r in reversed(page)],
-        "nextCursor": str(oldest) if len(rows) > limit and oldest is not None else None,
+        "rows": list(reversed(page)),
+        "nextCursor": str(keys[limit - 1]) if len(keys) > limit else None,
         "total": total,
     }
 
@@ -1162,7 +1205,7 @@ def run_issue_review(
             except issue_review.InvalidReview as e:
                 fail(e, e.code)
             except issue_review.ProviderFailure as e:
-                fail(e, e.code)
+                fail(e, e.code, preflight=True)
             except subprocess.TimeoutExpired as e:
                 fail(review_budget.ReviewLimitError(
                     "Issue review reached its time limit; needs attention",
@@ -1262,6 +1305,10 @@ def _issue_review_with_recovery(spec, recovery, repo, number, data, actor, note,
         try:
             return recovery.identity, issue_review.review(recovery, repo, number, data, actor, note, run_dir / "attempt-2")
         except Exception as error:
+            # A credential rejection on the recovery route must keep its
+            # authentication_failed diagnostic so the sign-in condition can fire.
+            if isinstance(error, issue_review.ProviderFailure) and error.code == "authentication_failed":
+                raise
             raise review_budget.ReviewLimitError(
                 f"{recovery.identity} recovery failed; needs attention: {error}", "review_recovery_failed") from error
 

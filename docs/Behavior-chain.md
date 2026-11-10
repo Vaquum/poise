@@ -88,6 +88,29 @@ remains eligible; this fence does not change manual Chat binding controls.
 
 The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while General settings is open. Unavailable reads disable cutover controls instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
+**Work needing attention** joins each delayed or held admitted issue's step,
+progress age, hold, exact-head CI/review gates and next known action, with issue,
+PR and journal-evidence links. Held, uncertain and pending-original-review work
+appears immediately; other active work appears after 24 hours without a verified
+advance. Selection covers every active chain page, including unpublished issues
+and merged PRs with pending review evidence, sorted by oldest progress first.
+The clock starts at admission. Canonical history advances it on a newly verified
+PR head, posted issue-review comment, qualifying PR review, queue entry, confirmed
+merge, or recovery of an observed same-head CI/review/conflict gate. Unchanged
+polls, admission/start, failed attempts, holds and Resume do not reset it. Restart
+and projection rebuild derive the same clock without changing journal events.
+Fresh, stale, incomplete and unavailable evidence remain labelled. A known native
+failure backoff shows retry eligibility under existing admission gates; an unknown
+provider backoff has no invented deadline. Scheduled evidence rechecks never retry
+held work. CI or approval recovery cannot clear a hold or missing original receipt,
+and a queue entry cannot establish merge completion. Verified progress can remove
+a delayed entry; a durable hold remains until explicitly resumed, and a merged
+review obligation remains until its original evidence is verified. The first list
+page's optional `attention` projection is independent of the ordinary chain-list
+cursor/filter; later list pages retain the existing pagination contract. Failed
+refreshes label retained attention entries stale. These are read-only summaries
+on the existing refresh clock, with no new observation or execution authority.
+
 In v2, Review New Issues shows that saved seed scope instead of the inactive
 legacy repository filter. Its setting opens the existing General seed controls,
 using capacity data already returned by the Behaviors read.
@@ -128,6 +151,33 @@ still describes Manager worker Chats and their enhancement backlog; its Rhythm
 target does not govern atomic chain admissions. No new refresh loop is added.
 
 ### Bounded reconciliation
+
+For a reporter-owned full-suite failure, a closed seed can retire a redundant
+chain PR as **superseded**, independently of a merge. The seed observation
+retains the failing runs, recovery run, reported tests, covering merged PRs and
+duplicate head. GitHub must confirm completed full runs on main, and the test
+artifacts must show the reported failures and their successful recovery. The
+recovery commit must descend from the failure and contain the covering merges.
+Missing or expired artifacts leave the decision visible.
+
+Automatic coverage is conservative: every change in the latest duplicate must
+be a covered replacement inside the reported tests. The complete recovered
+test bodies retain their fixtures and assertions. A fixture-clock assertion
+repair with the same pure fixed-clock helper may use another `at(...)` instant, as in #940's `at(61)` and #946's
+`at(11)`; unrelated numeric changes, additional assertions, production edits,
+other linked PRs and unclear coverage require a decision and remain open.
+
+Original possible writes, review replies and positive native resource-release
+proof must reconcile before cleanup. Only the automatic closed-target hold can
+be cleared; a person's hold remains. The existing native action path journals
+`issue-work --mode retire`, revalidates coverage and rechecks the owned PR head
+before closing it on GitHub. Its accepted response and resource release are
+required for the `chain.superseded` event. A lost response stays uncertain;
+observing a closed PR cannot attribute that close or authorize a second one.
+Supersession retains the covering merge separately, keeps the duplicate's
+`mergeSha` unset, removes settled work from the active list, and leaves History
+and GitHub evidence links available. Rebuild and restart retain this terminal
+outcome and the original invocation ownership.
 
 The existing scheduler selects a normal-work page before a separate due
 reconciliation page under its existing pass budget. Quiescent held or merged
@@ -193,7 +243,13 @@ The existing authorized HTTP API supports interactive and headless controls: `GE
 ## Handoffs and outcomes
 
 An implementation or repair that explicitly reports a blocker records
-`atomic_work_blocked` and holds its chain with that reason. Cleanup still
+`atomic_work_blocked` and holds its chain with that reason. Caller masks
+credential patterns and known environment credentials before normalizing and
+limiting the explicit string reason to 500 characters plus a truncation ellipsis.
+The exception and retained diagnostic use the same safe message; empty or
+unsupported reasons retain `AtomicWorkBlocked`. Ordinary exception text and raw
+provider output remain excluded from native failure evidence. The reason grants
+no retry or resource-release authority. Cleanup still
 requires its original positive proof and does not restart blocked work. The
 hold survives journal rebuild and server replacement; the person can resume
 through the existing control after resolving the blocker.
@@ -215,6 +271,16 @@ Projection rebuild preserves historical invocation hashes across the resource-ad
 Admission-mode transitions use `admission.changed` events under the reserved `@behavior-admission` journal identity. They share the immutable log and hashes but are not fabricated issue chains and do not appear in chain pages. Rebuilding chain projections verifies and preserves this durable admission state.
 
 Native Call rows and immutable action plans record effect intent before controlled publication. They provide execution evidence to the journal, not a second phase controller. Unique native correlations prevent duplicate processes from executing the same admission. Worker resource settlement is required before a handoff; a terminal model result is insufficient. A restart or interrupted process is reconciled against the original invocation, pushed branch, posted comments and exact-head review receipts.
+
+Verified Codex sign-in recovery can retire issue-review retry accounting through
+the existing journal resume event. Every affected attempt must belong to that
+credential-rejection episode, prove `not_started` / `preflight_failed`, retain
+`receipts=null`, and have positively settled resources. Only the matching
+automatic three-failure hold is resumed; operator holds, other failures and
+uncertain publication remain held. A bounded page of these automatic holds is
+checked before their ordinary observation cadence, without another GitHub read.
+The provider's fresh recovery allowance is consumed by the existing reviewer
+probe admission, so repeated recovery reads cannot launch another probe.
 
 Native request digests use Caller's recursively sorted JSON encoding.
 Journal event/state and plan hashes keep their original serialization, while response
@@ -413,7 +479,18 @@ head/base recheck and independent approval verification still apply.
 
 Repair prompts name the exact unresolved root comment IDs from the head-verified
 review packet, including outdated threads and roots with earlier replies.
-Caller requires that same set before publication. Missing coverage records
+Caller requires that same set before publication. After checking the repaired
+code and current reviewer input, a repair can carry a still-applicable native
+reply verbatim, including its original `poise-reply` marker, in the existing
+`replies` plan. The publisher verifies the reply's author, root, exact body and
+marker against paginated GitHub comments and returns its existing receipt.
+Reviewer edits or follow-ups on that finding require a fresh answer, as do new
+findings or materially changed answers; a new Call/head or unrelated finding
+does not invalidate reuse. Prior replies remain in the current-head review
+packet and durable publication plan. Inspection/recovery verifies their proof
+again; missing or altered proof fails visibly and cannot count as coverage.
+Reuse changes neither exact-head review/approval nor conversation-resolution
+gates. Missing coverage records
 `atomic_work_failed`, `not_started` / `preflight_failed`, with the missing count,
 required count and at most 20 sorted missing IDs in the retained error field;
 comment text is not retained there. No publication plan exists at this point,
@@ -453,14 +530,18 @@ failure is a failed, unstarted action and retries with the existing backoff.
 
 Reporting is off by default. An operator can set
 `POISE_REPAIR_EXHAUSTION_REPOSITORIES` in Poise's environment to a comma-separated
-list of explicit `owner/repo` names. Enabled v2 chains check both new and existing
+list of explicit `owner/repo` names, up to 8192 bytes so the workspace can echo
+it in health for gateway reconciliation. Enabled v2 chains check both new and existing
 repair holds and uncertain merge submissions during their ordinary bounded
 reconciliation; no Resume or extra poller is needed. Reporting preserves the
 source hold, uncertainty and ownership and does not perform recovery.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
-variable. The gateway forwards it on install; adding, changing or removing it
-cooperatively replaces existing workspaces, even on the same image. Unset or
-empty opts out.
+variable. The gateway reconciles it through trusted service configuration on
+compatible running workspaces, including when image and release already match.
+Adding, changing or removing it needs no restart or container replacement and
+does not disturb native cleanup holds. Explicit empty durably overrides a legacy
+container environment after Poise restarts. Local mode keeps environment-based
+configuration. Unset or empty opts out.
 
 Reporting requires at least three settled original Caller receipts for the same
 phase, current head, review basis and slot after the last Resume, each with positive
@@ -483,6 +564,8 @@ new native observation must still require the same phase on that head and basis.
 Stale, unknown or changed findings, heads or PR review contexts leave reporting pending,
 including title, body or base changes on an unchanged head. Other causes remain
 visible in their ordinary holds without an issue report; mixed repair or review causes cannot qualify.
+Revoking repository scope during verification prevents publication and leaves the
+creation intent unconsumed, so re-enabling can still report once.
 
 `merge_submission_uncertain` separately qualifies the original pending `merge-pr`
 invocation after recovery rereads the journal, even without an explicit chain hold.

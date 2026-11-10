@@ -92,6 +92,7 @@ import { eventLoopDelayStats, type EventLoopDelayStats } from './event-loop-dela
 import { behaviorErrorMessage, behaviorIncidentDiagnostics } from './behavior-diagnostics'
 import { classifyBehaviorDiagnostic, diagnosticClassification, isRepoAccessDenied, isTimeoutCause, rateLimitRetryAtMs, type DiagnosticClassification, type DiagnosticOptions } from '../src/behavior-failure-cause'
 import { recoverLegacyDatastore } from './legacy-datastore-recovery'
+import { DATASTORE_MAX_AGE_SECONDS, datastoreFreshnessByOrganization, initialDatastoreFreshness, openStaleMirrors, recordStaleMirrorBlock, runDatastoreHealth, staleDatastoreFailure, staleMirrorMessage, type DatastoreFreshness, type StaleDatastoreError } from './datastore-health'
 import { resolveReviewCheckout } from './review-checkout'
 import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDetached } from './process'
 import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type CheckSlotStats } from './check-semaphore'
@@ -100,7 +101,8 @@ import { agentInterfaceRoot } from '../scripts/caller.mjs'
 import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, requireAgentAccount } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
-import { behaviorHeld } from './alerts/producers'
+import { behaviorHeld, providerSignInRejected, providerSignInVerified } from './alerts/producers'
+import { consumeProviderRecovery, providerRecoveryAvailable, providerSignInFailure, recordProviderRecovery } from './accounts/logins'
 import { getWorkerCapacity, type WorkerCapacity } from './worker-capacity'
 
 const DATASTORE = 'github-datastore'
@@ -109,7 +111,7 @@ const AGENT_INTERFACE = 'agent-interface'
 const LEGACY_REVIEW_SNAPSHOT_TARGET = '__snapshot_v2__'
 const REVIEW_SNAPSHOT_TARGET = '__snapshot_v3__'
 /** Sync age past this fails the datastore freshness gate. */
-export const DATASTORE_MAX_AGE_SECONDS = 120
+export { DATASTORE_MAX_AGE_SECONDS } from './datastore-health'
 const SHA_PATTERN = /^[0-9a-f]{40}$/
 const GITHUB_USERNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/
 
@@ -495,6 +497,8 @@ function recordBehaviorFailure(key: BehaviorKey, kind: 'worker', cause: unknown,
 function recordBehaviorFailure(key: BehaviorKey, kind: 'operation', cause?: unknown, target?: string, options?: DiagnosticOptions & { callId?: string, hold?: boolean, noBackoff?: boolean, actingAccount?: string }): void
 function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, cause?: unknown, target?: string, options: DiagnosticOptions & { callId?: string, hold?: boolean, noBackoff?: boolean, actingAccount?: string } = {}): void {
   if (!isEnabled(key)) return
+  const stale = staleDatastoreFailure(cause)
+  if (stale) recordStaleMirrorBlock(stale, key)
   const error = cause === undefined ? undefined : behaviorErrorMessage(cause)
   if (kind === 'operation' && target !== undefined && options.hold !== false && error !== undefined
     && isSkippableBehavior(key)) {
@@ -521,7 +525,7 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
     transient ? BEHAVIOR_RETRY_TRANSIENT_MAX_MS : BEHAVIOR_RETRY_MAX_MS,
   )
   const now = Date.now()
-  const diagnostic = classifyBehaviorDiagnostic(error ?? '', { held: kind === 'worker', ...options })
+  const diagnostic = stale ? diagnosticClassification('datastore_stale') : classifyBehaviorDiagnostic(error ?? '', { held: kind === 'worker', ...options })
   // A rate limit states its own reset: resume then, not on a backoff that
   // fires inside the blocked window or parks the check for an hour while
   // quota sits available. The reset only moves the retry inside today's
@@ -538,7 +542,8 @@ function recordBehaviorFailure(key: BehaviorKey, kind: BehaviorFailureKind, caus
     ...(error ? { error } : {}),
     diagnostic,
     ...(options.callId ? { callId: options.callId } : {}),
-    ...(diagnosticIdentity(cause)?.correlationId ? { correlationId: diagnosticIdentity(cause)!.correlationId } : {}),
+    ...(stale ? { correlationId: stale.episode.id }
+      : diagnosticIdentity(cause)?.correlationId ? { correlationId: diagnosticIdentity(cause)!.correlationId } : {}),
   } satisfies PersistedBehaviorFailure))
 }
 
@@ -861,7 +866,8 @@ export function reviewAccountFailure(call: LogEntry): ReviewAccountFailureKind |
     || /status\s+402\b/i.test(error)
     || /\b402\s+payment\b/i.test(error)
     || /http_status\D{0,8}402\b/i.test(error)) return 'balance'
-  if (/not\s+signed\s+in/i.test(error) || /missing\s+credentials/i.test(error)) return 'signin'
+  if (call.error_code === 'authentication_failed'
+    || !/github|\bgh:/i.test(error) && (/not\s+signed\s+in/i.test(error) || /missing\s+credentials/i.test(error))) return 'signin'
   return null
 }
 
@@ -928,6 +934,7 @@ export function reviewerTripKind(call: LogEntry): ReviewerTripKind | null {
 // the model that actually refused the work.
 function tripIdentity(call: LogEntry): string | null {
   if (call.error_code === 'review_recovery_failed') return call.recovery_model || null
+  if (call.error_code === 'authentication_failed' && call.recovery_model) return call.recovery_model
   return call.model || null
 }
 
@@ -939,9 +946,12 @@ function postedNothing(call: LogEntry): boolean {
 
 // A recovery report holds its target even as it trips the recovery model:
 // the primary hit its output limit and needs the recovery to proceed, so
-// releasing would relaunch it every tick.
+// releasing would relaunch it every tick. A credential rejection on the
+// recovery route keeps its authentication_failed code so the sign-in
+// condition can fire; it must hold like the wrapped recovery failure.
 function tripHoldsTarget(call: LogEntry): boolean {
   return call.error_code === 'review_recovery_failed'
+    || (call.error_code === 'authentication_failed' && !!call.recovery_model)
 }
 
 const REVIEWER_TRIP_TARGET_PREFIX = 'reviewer:'
@@ -953,7 +963,22 @@ function reviewerTripTarget(identity: string): string {
 type TripBehavior = PanelBehavior | 'approve-prs'
 const TRIP_BEHAVIORS: readonly TripBehavior[] = [...PANEL_BEHAVIORS, 'approve-prs']
 
+function observeProviderRejection(call: LogEntry): void {
+  if (call.status !== 'failed' || reviewAccountFailure(call) !== 'signin' || call.diagnostic?.operation !== 'provider.review') return
+  const identity = tripIdentity(call)
+  if (!identity) return
+  const provider = loadedCatalog()?.models.find(model => model.identity === identity)?.provider
+  if (provider !== 'codex') {
+    // Caller only writes authentication_failed for Codex. After a restart
+    // with an empty catalog cache, that code must not lose the rejection.
+    if (provider !== undefined || call.error_code !== 'authentication_failed') return
+  }
+  providerSignInRejected('codex', { callId: call.id, model: identity, rejectedAt: Date.parse(call.completed_at ?? ''),
+    phase: `${call.behavior} / ${call.diagnostic.phase}`, work: `${call.repo}#${call.pr_id}`, cause: call.error })
+}
+
 function tripReviewer(behavior: TripBehavior, identity: string, kind: ReviewerTripKind, callId: string): void {
+  if (kind === 'signin' && readBehaviorFailure(behavior, reviewerTripTarget(identity))?.callId === callId) return
   const message = kind === 'balance'
     ? `${identity} cannot review: its account is out of balance (402). Top up its credit; Poise retries automatically.`
     : kind === 'signin'
@@ -963,13 +988,21 @@ function tripReviewer(behavior: TripBehavior, identity: string, kind: ReviewerTr
         : kind === 'provider'
           ? `${identity} cannot review: its provider failed before the verdict. Poise retries automatically.`
           : `${identity} cannot review: it timed out before a verdict. Poise retries automatically.`
-  recordBehaviorFailure(behavior, 'operation', message, reviewerTripTarget(identity), { callId })
+  recordBehaviorFailure(behavior, 'operation', message, reviewerTripTarget(identity),
+    { callId, ...(kind === 'signin' ? { errorCode: 'authentication_failed' } : {}) })
+}
+
+function authTripRecovery(identity: string, trips: Array<PersistedBehaviorFailure | null>): boolean {
+  return trips.some(Boolean) && trips.every(trip => !trip || trip.diagnostic?.code === 'authentication')
+    && loadedCatalog()?.models.find(model => model.identity === identity)?.provider === 'codex'
+    && providerRecoveryAvailable('codex')
 }
 
 // A trip one behavior recorded gates the others too, until its backoff
 // comes due and one probe launch tests whether the reviewer works again.
 function reviewerTripped(identity: string): boolean {
-  return TRIP_BEHAVIORS.some((behavior) => !behaviorRetryDue(behavior, reviewerTripTarget(identity)))
+  const trips = TRIP_BEHAVIORS.map(behavior => readBehaviorFailure(behavior, reviewerTripTarget(identity)))
+  return trips.some(trip => trip && Date.now() < trip.nextRetryAtMs) && !authTripRecovery(identity, trips)
 }
 
 // Claims this launch as the backoff window's probe: bumps every due trip
@@ -979,27 +1012,52 @@ function reviewerTripped(identity: string): boolean {
 // backoff. True for a reviewer with no trip at all. Two racing ticks may
 // each claim one probe; anything more is serialized out.
 function claimReviewerTripProbe(identity: string): boolean {
-  const trips = TRIP_BEHAVIORS.map((behavior) => ({
-    behavior,
-    trip: readBehaviorFailure(behavior, reviewerTripTarget(identity)),
-  }))
-  if (trips.some(({ trip }) => trip && Date.now() < trip.nextRetryAtMs)) return false
-  for (const { behavior, trip } of trips) {
-    if (!trip) continue
-    recordBehaviorFailure(behavior, 'operation', trip.error ?? `${identity} cannot review`,
-      reviewerTripTarget(identity), trip.callId ? { callId: trip.callId } : undefined)
-  }
-  return true
+  return db.transaction(() => {
+    const trips = TRIP_BEHAVIORS.map((behavior) => ({ behavior, trip: readBehaviorFailure(behavior, reviewerTripTarget(identity)) }))
+    const recovering = authTripRecovery(identity, trips.map(({ trip }) => trip))
+    if (trips.some(({ trip }) => trip && Date.now() < trip.nextRetryAtMs) && !recovering) return false
+    if (recovering && !consumeProviderRecovery('codex')) return false
+    for (const { behavior, trip } of trips) {
+      if (!trip) continue
+      recordBehaviorFailure(behavior, 'operation', trip.error ?? `${identity} cannot review`, reviewerTripTarget(identity),
+        { callId: trip.callId, ...(trip.diagnostic?.code === 'authentication' ? { errorCode: 'authentication_failed' } : {}) })
+    }
+    return true
+  }).immediate()
 }
 
 function clearReviewerTrip(identity: string): void {
   for (const behavior of TRIP_BEHAVIORS) clearBehaviorFailure(behavior, reviewerTripTarget(identity))
 }
 
+function reviewerSucceeded(call: LogEntry): void {
+  const identity = call.recovery_model || call.model
+  const catalog = loadedCatalog()
+  if (catalog?.models.find(model => model.identity === identity)?.provider === 'codex') {
+    const failure = providerSignInFailure('codex')
+    if (failure) {
+      const startedAt = Date.parse(agentCallStartedAt(call))
+      if (!Number.isFinite(startedAt) || startedAt <= failure.rejectedAt) return
+      recordProviderRecovery('codex', failure.callId, startedAt)
+      providerSignInVerified('codex')
+      // A successful review after the bounded probe releases sibling auth
+      // trips for this provider. Quota and other causes keep their clocks.
+      for (const behavior of TRIP_BEHAVIORS) for (const target of behaviorFailureTargets(behavior)) {
+        if (!target.startsWith(REVIEWER_TRIP_TARGET_PREFIX)) continue
+        const model = target.slice(REVIEWER_TRIP_TARGET_PREFIX.length)
+        if (catalog.models.find(entry => entry.identity === model)?.provider === 'codex'
+          && readBehaviorFailure(behavior, target)?.diagnostic?.code === 'authentication') clearBehaviorFailure(behavior, target)
+      }
+    }
+  }
+  clearReviewerTrip(identity)
+}
+
 // Trips the reviewer when a failed call is a provider failure before a
 // verdict, and releases the target so the next slot runs on the next tick —
 // true when the claim was released and reconciliation moves on.
 function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, call: LogEntry): boolean {
+  observeProviderRejection(call)
   const kind = reviewerTripKind(call)
   const identity = kind ? tripIdentity(call) : null
   if (!kind || !identity || !postedNothing(call)) return false
@@ -2290,8 +2348,7 @@ async function reconcileBehaviorLaunchClaims(
       // A verified verdict proves the account works again, whatever behavior
       // launched it. A verdict recovered from an output limit proves the
       // recovery model, which Caller names in `recovery_model`.
-      const prover = call.recovery_model || call.model
-      if (prover) clearReviewerTrip(prover)
+      reviewerSucceeded(call)
       const completed = completeBehaviorLaunchOwned({
         key: claim.key,
         target: claim.target,
@@ -2355,24 +2412,6 @@ export interface DatastorePr extends PullRequestFacts {
   headRef: string | null
   headRepo: string | null
 }
-
-interface DatastoreFreshness {
-  status: 'unchecked' | 'healthy' | 'unavailable'
-  checkedAt: string
-  ageSeconds: number | null
-  lastSuccessAt: string | null
-  error: string | null
-}
-
-const initialDatastoreFreshness: DatastoreFreshness = {
-  status: 'unchecked',
-  checkedAt: new Date(0).toISOString(),
-  ageSeconds: null,
-  lastSuccessAt: null,
-  error: null,
-}
-
-const datastoreFreshnessByOrganization = new Map<string, DatastoreFreshness>()
 
 function datastoreFreshness(): DatastoreFreshness {
   return datastoreFreshnessByOrganization.get(operationKey('review-new-prs')) ?? initialDatastoreFreshness
@@ -2498,18 +2537,20 @@ async function requireFreshDatastore(): Promise<void> {
   try {
     let stdout: string
     let unhealthyExit: unknown
+    let stale: StaleDatastoreError | null = null
     try {
-      const result = await runFile(
-        DATASTORE,
-        datastoreArgs(['health', '--max-age-seconds', String(DATASTORE_MAX_AGE_SECONDS)]),
+      const result = await runDatastoreHealth(
+        currentOrganization(),
         { timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024, signal: behaviorSignal() },
       )
       stdout = result.stdout
+      stale = result.stale
     } catch (error) {
       const failure = error as { code?: unknown, stdout?: unknown }
       if (failure.code !== 1 || typeof failure.stdout !== 'string' || !failure.stdout.trim()) throw error
       stdout = failure.stdout
       unhealthyExit = error
+      stale = staleDatastoreFailure(error)
     }
     const data = objectValue(parseJson(stdout, 'github-datastore health'), 'github-datastore health')
     const org = currentOrganization()
@@ -2520,6 +2561,14 @@ async function requireFreshDatastore(): Promise<void> {
       && safeInteger(data.max_age_seconds, 'datastore max_age_seconds') === DATASTORE_MAX_AGE_SECONDS
       && safeInteger(data.age_seconds, 'datastore age_seconds') > DATASTORE_MAX_AGE_SECONDS
       && typeof data.last_success_at === 'string' && Number.isFinite(Date.parse(data.last_success_at))) {
+      // A stale-shaped reading with no episode is outdated: its sync
+      // generation predates the recovered one. A clean probe proceeds (the
+      // mirror is fresh); a faulted probe still surfaces its fault, only
+      // without opening a stale episode for it.
+      if (!stale) {
+        if (unhealthyExit) throw unhealthyExit
+        return
+      }
       const message = `Datastore stale: last successful sync ${data.last_success_at}; age ${data.age_seconds}s exceeds ${DATASTORE_MAX_AGE_SECONDS}s`
       datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
         status: 'unavailable', checkedAt, ageSeconds: Number(data.age_seconds),
@@ -2527,7 +2576,7 @@ async function requireFreshDatastore(): Promise<void> {
       })
       try { await recoverLegacyDatastore(org, behaviorSignal()) }
       catch (error) { console.error('[behaviors] legacy datastore sync recovery failed:', behaviorErrorMessage(error)) }
-      throw new Error(message)
+      throw stale ?? new Error(message)
     }
     if (unhealthyExit) throw unhealthyExit
     if (data.action !== 'health'
@@ -3000,7 +3049,7 @@ async function snapshotReviewNewPrs(): Promise<void> {
     setMeta(INITIAL_REVIEW_BASELINE_KEY, '')
   } catch (err) {
     releaseSeen('review-new-prs', snapshotTarget())
-    console.error('[behaviors] snapshot failed:', err)
+    if (!staleDatastoreFailure(err)) console.error('[behaviors] snapshot failed:', err)
     throw err
   }
 }
@@ -3416,7 +3465,7 @@ async function tickReviewNewPrs(): Promise<void> {
     })))
     if (failure) throw failure
   } catch (err) {
-    console.error('[behaviors] tick failed:', err)
+    if (!staleDatastoreFailure(err)) console.error('[behaviors] tick failed:', err)
     throw err
   }
 }
@@ -4615,7 +4664,7 @@ async function tickApprovePrs(): Promise<void> {
     }
     if (failure) throw failure
   } catch (err) {
-    console.error('[behaviors] approve-prs tick failed:', err)
+    if (!staleDatastoreFailure(err)) console.error('[behaviors] approve-prs tick failed:', err)
     throw err
   }
 }
@@ -5261,7 +5310,7 @@ async function tickResolveUnblocking(): Promise<void> {
     }
     await retireClosedResolveRecoveries(new Set(prs.map((pr) => `${pr.repo}#${pr.number}`)))
   } catch (err) {
-    console.error('[behaviors] resolve-unblocking tick failed:', err)
+    if (!staleDatastoreFailure(err)) console.error('[behaviors] resolve-unblocking tick failed:', err)
     throw err
   }
 }
@@ -6839,8 +6888,7 @@ async function reconcileIssueReviewClaims(): Promise<void> {
         quarantineClaim(claim, 'invalid_result', error, call.id, quarantineEvidence(snapshot, claim, call).mayRun)
         continue
       }
-      const prover = call.recovery_model || call.model
-      if (prover) clearReviewerTrip(prover)
+      reviewerSucceeded(call)
       dropActiveClaim(claim.claimId)
       if (completeIssueReviewLaunchOwned({
         key: claim.key,
@@ -7095,7 +7143,7 @@ export async function setEnabled(key: BehaviorKey, enabled: boolean): Promise<vo
       if (lifecycle?.aborted === true || error instanceof BehaviorProcessLockContentionError || !enabled) throw error
       if (!isEnabled(key)) return
       recordBehaviorFailure(key, 'operation', error)
-      console.error(`[behaviors] ${org.login} ${key} enable reconciliation failed:`, error)
+      if (!staleDatastoreFailure(error)) console.error(`[behaviors] ${org.login} ${key} enable reconciliation failed:`, error)
     }
   }))
   // Include removed accounts' existing work too. Disable is acknowledged only
@@ -7201,7 +7249,7 @@ export interface RunEnabledBehaviorsOptions {
 }
 
 const behaviorChains = new Map<string, BehaviorChainRuntime>()
-const behaviorChainHealth = new Map<string, { lastSweepAt: number, error: string | null }>()
+const behaviorChainHealth = new Map<string, { lastSweepAt: number, error: string | null, stale?: boolean }>()
 const behaviorChainOverlaps = new Map<string, { since: number, skips: number, warned: boolean }>()
 // Measure from the first overlap, independent of check-slot retry frequency.
 const CHAIN_SWEEP_PROGRESS_BUDGET_MS = 2 * BEHAVIOR_TICK_MS
@@ -7246,11 +7294,11 @@ export function getBehaviorChainCapacity(): BehaviorChainCapacity {
 
 export function getBehaviorChainRuntimeHealth() {
   return [...behaviorChainHealth].filter(([organization]) => organization !== '@cutover' || behaviorAdmissionDraining())
-    .map(([organization, health]) => ({ organization, ...health }))
+    .map(([organization, { lastSweepAt, error }]) => ({ organization, lastSweepAt, error }))
 }
 export function chainBehaviorKey(behavior: ChainBehavior): BehaviorKey | null {
   return ({ 'review-issue': 'review-new-issues', 'review-pr': 'review-new-prs', 'approve-pr': 'approve-prs',
-    'implement-issue': 'implement-issues', 'repair-pr': 'repair-prs',
+    'implement-issue': 'implement-issues', 'repair-pr': 'repair-prs', 'retire-pr': 'repair-prs',
     'resolve-threads': 'resolve-unblocking', 'merge-pr': 'merge-prs', 'rerun-grey-ci': 'rerun-grey-ci' } as Partial<Record<ChainBehavior, BehaviorKey>>)[behavior] ?? null
 }
 
@@ -7260,6 +7308,7 @@ async function runBehaviorChains(): Promise<void> {
     || !db.prepare('SELECT 1 FROM behavior_chain_current WHERE merged = 0 LIMIT 1').get())) return
   const org = currentOrganization()
   if (!org) return
+  if (!loadedCatalog() && providerSignInFailure('codex')?.verifiedAt != null) await loadCatalog()
   const cleanup = nativeCleanupSupport()
   if (behaviorChainJournal().cutover().mode === 'v2' && ['unsupported', 'unavailable'].includes(cleanup.status)) {
     behaviorChainHealth.set('@native-cleanup', { lastSweepAt: Date.now(), error: cleanup.error })
@@ -7341,15 +7390,51 @@ async function runBehaviorChains(): Promise<void> {
       },
       reviewScope: (chain, pull) => repairReportReviewScope(db, chain, pull.number),
       severity: (behavior) => getSetting(behavior === 'approve-pr' ? 'approve-prs' : 'review-new-prs'),
+      authenticationRejected(call) {
+        observeProviderRejection(call)
+        // The new signin trip needs provider evidence: local interface
+        // diagnostics must not trip the reviewer. (reviewAccountFailure
+        // itself stays unscoped: reviewerTripKind already excludes the
+        // local-inspection case and still trips balance on interface
+        // diagnostics in other phases.)
+        if (reviewAccountFailure(call) === 'signin' && call.action === 'not_started' && postedNothing(call)
+          && (!call.diagnostic || call.diagnostic.operation.startsWith('provider.'))) {
+          const identity = tripIdentity(call)
+          if (identity) tripReviewer(call.behavior === 'pr_review' || call.behavior === 'pr_approve' ? 'review-new-prs' : ISSUES_KEY,
+            identity, 'signin', call.id)
+        }
+      },
       received(invocation, call) {
+        observeProviderRejection(call)
         if (call.error_code === 'native_cleanup_failed') invalidateNativeCleanup(call.error || 'Native cleanup verification failed')
         if (invocation.model === null) return
         const identity = call.recovery_model || call.model
-        if (call.status === 'completed') clearReviewerTrip(identity)
+        if (call.status === 'completed') reviewerSucceeded(call)
         else {
           const kind = reviewerTripKind(call)
           if (kind) tripReviewer(invocation.behavior === 'review-pr' || invocation.behavior === 'approve-pr' ? 'review-new-prs' : ISSUES_KEY, identity, kind, call.id)
         }
+      },
+      authRecovered(invocation) {
+        const failure = providerSignInFailure('codex')
+        if (!failure) return false
+        const catalog = loadedCatalog()
+        const admittedProvider = catalog?.models.find(model => model.identity === invocation.model)?.provider
+        const rejectedProvider = catalog?.models.find(model => model.identity === failure.model)?.provider
+        // The recovery route still names the Claude primary on the admitted
+        // invocation while the rejection names the Codex recovery model.
+        // Caller only writes authentication_failed for Codex, so that code
+        // proves the route when the catalog is unavailable after a restart.
+        const isCodex = admittedProvider === 'codex' || rejectedProvider === 'codex'
+          || ((admittedProvider === undefined || rejectedProvider === undefined)
+            && invocation.evidence?.error_code === 'authentication_failed')
+        if (!isCodex) return false
+        const completedAt = invocation.evidence?.completedAt
+        const diagnostic = invocation.evidence?.diagnostic as LogEntry['diagnostic']
+        return !!failure && failure.verifiedAt !== null && failure.verifiedAt > failure.rejectedAt
+          && typeof completedAt === 'number' && completedAt >= failure.since && completedAt <= failure.rejectedAt
+          && diagnostic?.operation === 'provider.review' && diagnostic.context.submission === 'none'
+          && invocation.evidence?.error_code === 'authentication_failed'
       },
       async reviews(repository, number) {
         const { readWorkReviews } = await import('./chat/control')
@@ -7440,7 +7525,7 @@ async function runBehaviorCycle(
     }
     if (lifecycle?.aborted !== true) {
       recordBehaviorFailure(key, 'operation', error)
-      console.error(`[behaviors] ${key} operation failed:`, error)
+      if (!staleDatastoreFailure(error)) console.error(`[behaviors] ${key} operation failed:`, error)
     }
   }
 }
@@ -7464,7 +7549,7 @@ export async function runEnabledBehaviorsOnce(
         const organizations = getOrganizations()
         if (readyOrganizations().length !== organizations.length) throw new Error('Cutover waits for every followed organization to be ready')
         for (const org of organizations) {
-          await runFile('github-datastore', organizationArgs(org, ['health', '--max-age-seconds', '120']), { timeoutMs: 30_000 })
+          await runDatastoreHealth(org, { timeoutMs: 30_000 })
           let cursor: { repo: string, number: number } | undefined
           for (;;) {
             const page = await readOpenPrClosingRefs(org, cursor)
@@ -7532,12 +7617,15 @@ export async function runEnabledBehaviorsOnce(
         }
       } else {
         const message = behaviorErrorMessage(error)
-        behaviorChainHealth.set(organization, { lastSweepAt: Date.now(), error: message })
-        const code = classifyBehaviorDiagnostic(message).code
-        const transient = message.startsWith('behavior observation failed for ')
-          && ['upstream_unavailable', 'network_interruption'].includes(code)
-        const report = transient ? console.warn : console.error
-        report(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
+        const stale = !!staleDatastoreFailure(error)
+        behaviorChainHealth.set(organization, { lastSweepAt: Date.now(), error: message, stale })
+        if (!stale) {
+          const code = classifyBehaviorDiagnostic(message).code
+          const transient = message.startsWith('behavior observation failed for ')
+            && ['upstream_unavailable', 'network_interruption'].includes(code)
+          const report = transient ? console.warn : console.error
+          report(`[behaviors] behavior chain failed for ${org.login}: ${message}`)
+        }
       }
     }
     if (!sweepSkipped) {
@@ -7701,6 +7789,7 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
     || now - heartbeatAt > (2 * BEHAVIOR_TICK_MS) + BEHAVIOR_HEALTH_GRACE_MS
   const operationStale = busyEntries
     .some(([key, startedAt]) => now > (behaviorOperationClocks.get(key)?.expiresAt ?? startedAt + BEHAVIOR_OPERATION_TIMEOUT_MS) + BEHAVIOR_HEALTH_GRACE_MS)
+  const staleEpisodes = openStaleMirrors(currentOrganization())
   const failures = BEHAVIOR_KEYS.flatMap((behavior) => {
     if (!isEnabled(behavior)) return []
     return [undefined, ...behaviorFailureTargets(behavior)].flatMap((target) => {
@@ -7743,7 +7832,20 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
         ...(recovered ? { recovered: true } : {}),
       }] : []
     })
-  })
+  }).filter((failure) => failure.diagnostic?.code !== 'datastore_stale'
+    || staleEpisodes.some((episode) => episode.id === failure.correlationId))
+  // An unreadable/crashed probe cannot close a previously validated stale
+  // episode. Keep its blocked behaviors beside any newer, independent fault.
+  for (const episode of staleEpisodes) {
+    for (const behavior of episode.behaviors) {
+      if (!(BEHAVIOR_KEYS as readonly string[]).includes(behavior)
+        || !isEnabled(behavior as BehaviorKey)
+        || failures.some((failure) => failure.behavior === behavior && failure.correlationId === episode.id)) continue
+      failures.push({ behavior: behavior as BehaviorKey, kind: 'operation', consecutiveFailures: 1,
+        lastFailureAt: episode.startedAt, nextRetryAt: '', error: staleMirrorMessage(episode),
+        diagnostic: diagnosticClassification('datastore_stale'), correlationId: episode.id })
+    }
+  }
   const enabledForRuntime = (key: BehaviorKey) => isEnabled(key)
     && (key !== 'implement-issues' && key !== 'repair-prs' || getBehaviorChainSettings().enabled)
   const anyEnabled = BEHAVIOR_KEYS.some(enabledForRuntime)
@@ -7785,13 +7887,16 @@ function scopedBehaviorsRuntimeHealth(chainCapacity: BehaviorChainCapacity): Beh
   const datastoreUnavailable = anyEnabled && datastoreFreshness().status === 'unavailable'
   const organization = currentOrganization()?.login.toLowerCase() || ''
   const overlap = behaviorChainOverlaps.get(organization)
-  const chainError = behaviorChainHealth.get(organization)?.error
-    || (overlap && now - overlap.since > CHAIN_SWEEP_PROGRESS_BUDGET_MS
-      ? 'A behavior chain sweep overlap exceeded its progress budget.' : null)
+  const overlapError = overlap && now - overlap.since > CHAIN_SWEEP_PROGRESS_BUDGET_MS
+    ? 'A behavior chain sweep overlap exceeded its progress budget.' : null
+  const chainStale = behaviorChainHealth.get(organization)?.stale
+  const chainRawError = behaviorChainHealth.get(organization)?.error
+  const chainError = chainStale && staleEpisodes.length === 0 ? overlapError
+    : chainRawError || overlapError
   return {
     runtimeError: !tickerStarted ? 'The behavior scheduler has stopped.'
       : heartbeatStale ? 'The behavior scheduler is no longer responding.'
-        : operationStale ? 'A behavior operation exceeded its execution deadline.' : chainError || chainCapacity.error || null,
+        : operationStale ? 'A behavior operation exceeded its execution deadline.' : (!chainStale ? chainError : overlapError) || chainCapacity.error || null,
     status: tickerStarted
       && !heartbeatStale
       && !operationStale

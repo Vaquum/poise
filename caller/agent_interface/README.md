@@ -112,7 +112,9 @@ Native failures, including setup exceptions after Call registration, retain the
 first error in the existing v1 `diagnostic`, replacing an earlier preparation
 warning. Evidence keeps the original Call/correlation, execution phase and
 Caller operation, with exception type, errno, deadline and exit/signal when
-observed. Exception text, subprocess arguments and captured output are excluded.
+observed. Ordinary exception text, subprocess arguments and captured output are
+excluded. Explicit implementation/repair blockers retain only their bounded,
+redacted reason as defined in [chain outcomes](../../docs/Behavior-chain.md#handoffs-and-outcomes).
 The outer detached Caller records an explicit unknown cause and observed exit
 status when its inner continuation leaves no cause. These SQLite records survive
 Poise restarts; they authorize neither publication nor resource release.
@@ -566,6 +568,12 @@ Bare `--logs` retains its complete oldest-first array. `--logs --status running`
 uses the running-call index; `--logs --limit N [--cursor C]` returns a bounded
 insertion-order page with an opaque `nextCursor`. Insertion order is not a
 call's start time.
+
+If a page's records are unreadable but its count and index still verify the
+requested scope, Caller returns the readable records and quarantines the
+unreadable positions. Those positions count toward the page and preserve its
+cursor. Swarm reports them alongside the readable history. Receipt lookups
+retain their existing integrity checks.
 
 `--logs --select '{"latest":[{"behavior":"pr_review","source":"poise:review-new-prs","owner":"autonomio"}],"ids":["FULL_CALL_ID"]}'`
 returns an oldest-first array containing one indexed latest-started call per

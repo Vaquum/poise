@@ -306,7 +306,7 @@ describe('Poise in service mode', () => {
     const health = await send('GET', '/api/service/health')
     expect(health.status).toBe(200)
     // Background passes (the /content finalizer every two seconds) can count for a moment.
-    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: expect.any(Number), idle: expect.any(Boolean), draining: false, release: null, switching: null, eventLoop: expect.any(Object), desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
+    expect(health.json).toEqual({ ok: true, mode: 'service', version: null, activeChatTurns: 0, runningCallerCalls: 0, unsettledNativeCalls: 0, backgroundWork: expect.any(Number), idle: expect.any(Boolean), draining: false, release: null, switching: null, repairExhaustionRepositories: '', eventLoop: expect.any(Object), desiredRelease: null, installedRelease: null, pendingSince: null, switchWaitingOn: null })
     expect(health.json.idle).toBe(health.json.backgroundWork === 0)
     expect(await send('GET', '/api/service/health', fromGateway('admin'))).toMatchObject({ status: 200, json: { mode: 'service' } })
     expect((await send('GET', '/api/service/health', fromGateway('browser'))).status).toBe(403)
@@ -325,6 +325,32 @@ describe('Poise in service mode', () => {
     expect(await send('GET', '/api/service/health', gatewayCall)).toMatchObject({ status: 200, json: { mode: 'service', draining: false } })
     expect(await send('POST', '/api/service/drain', { ...gatewayCall, identity: signAssertion(gateway.privateKey, { scope: 'admin' }) })).toMatchObject({ status: 200, json: { draining: true } })
     expect(await send('POST', '/api/service/resume', { ...gatewayCall, identity: signAssertion(gateway.privateKey, { scope: 'admin' }) })).toMatchObject({ status: 200, json: { draining: false } })
+  })
+
+  it('accepts only trusted service reporting configuration and validates explicit repository scope', async () => {
+    const path = '/api/service/config'
+    const configuration = { repairExhaustionRepositories: 'acme/one, Acme/two' }
+    for (const [caller, status] of [
+      [fromGateway('browser'), 403], [fromGateway('link'), 403],
+      [{ peer: GATEWAY_PEER }, 401],
+      [fromGateway('admin', { iat: 1, exp: 61 }), 401],
+      [fromGateway('admin', { aud: 'workspace:another' }), 401],
+      [fromGateway('admin', { sub: 'another' }), 401],
+      [{ ...fromGateway('admin'), identity: signAssertion(gatewayKeys().privateKey, { scope: 'admin' }) }, 401],
+      [{ ...fromGateway('admin'), origin: 'https://foreign.test' }, 403],
+      [{ ...fromGateway('admin'), host: 'foreign.test' }, 403],
+    ] as const) expect((await send('POST', path, caller, configuration)).status).toBe(status)
+    expect((await send('GET', '/api/service/health')).json.repairExhaustionRepositories).toBe('')
+    expect((await send('GET', path, fromGateway('admin'))).status).toBe(405)
+    for (const value of [undefined, null, [], '*', 'acme', 'acme/*', 'acme/one,', 'https://github.com/acme/one']) {
+      expect((await send('POST', path, fromGateway('admin'), { repairExhaustionRepositories: value })).status).toBe(400)
+    }
+    // The gateway carries the public Host and its signed identity without a browser Origin.
+    expect(await send('POST', path, { ...fromGateway('admin'), origin: undefined }, configuration))
+      .toMatchObject({ status: 200, json: configuration })
+    expect((await send('GET', '/api/service/health')).json).toMatchObject(configuration)
+    expect(await send('POST', path, fromGateway('admin'), { repairExhaustionRepositories: '' }))
+      .toMatchObject({ status: 200, json: { repairExhaustionRepositories: '' } })
   })
 
   it('never takes a cookie or an Authorization header for an identity', async () => {
