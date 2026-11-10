@@ -138,6 +138,7 @@ describe('durable launch reconciliation', () => {
       actor: launched.actor, source: launched.source, expected_head: launched.expectedHead,
       correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorDeadLetters()).toHaveLength(1)
     expect(alerts()).toEqual([{
@@ -187,6 +188,7 @@ describe('durable launch reconciliation', () => {
       actor: launched.actor, source: launched.source, expected_head: launched.expectedHead,
       correlation_id: launched.correlationId,
     })]
+    await resetLogCache()
     await launched.behaviors.runEnabledBehaviorsOnce()
     expect(launched.database.listBehaviorDeadLetters()).toHaveLength(1)
     fixture.agentLogs.push({ id: fixture.agentLogs[0].id, corrupt: true })
