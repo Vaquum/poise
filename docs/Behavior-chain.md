@@ -563,9 +563,10 @@ Reporting is off by default. An operator can set
 list of explicit `owner/repo` names, up to 8192 bytes so the workspace can echo
 it in health for gateway reconciliation. Enabled v2 chains check both new and existing
 repair holds, automatic implementation holds before a PR, and uncertain merge
-submissions during their ordinary bounded reconciliation; no Resume or extra
-poller is needed. Reporting preserves the source hold, uncertainty and ownership
-and does not perform recovery.
+submissions during their ordinary bounded reconciliation, including open `poise`
+seeds whose only PR closed unmerged; no Resume or extra poller is needed.
+Reporting preserves the source hold, uncertainty and ownership and does not
+perform recovery.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
 variable. The gateway reconciles it through trusted service configuration on
 compatible running workspaces, including when image and release already match.
@@ -628,6 +629,25 @@ process diagnostic facts, or explicitly states that historical diagnostics are
 missing. Its next action is to inspect and reconcile those original receipts and
 the PR/queue state before deciding how to proceed. It never retries the merge or
 asserts an unobserved external write.
+
+`pull_closed_unmerged` qualifies a fresh open seed whose only linked PR is
+confirmed closed without merge, after all original invocations and resources
+settle. It creates one actionable continuation through the same publisher and
+normal intake, naming the source issue, closed PR, reason and next action.
+A merge, closed seed or replacement PR cannot qualify. Missing or unreadable
+original receipts stay in runtime recovery with their invocation, hold and
+reservation; reporting never clears that fence to create replacement work.
+Before reserving a new intent, the reporter reconciles any durable source/PR
+report link across causes. Manual links in the source or PR body, or comments
+by the configured accounts, require an explicit `Continuation: #N`,
+`Replacement issue: #N`, `Continued in #N`, `Work moved to #N`, `Work continued to #N` or
+`Superseded by #N` relationship. The exact target must be an open `poise` issue
+in the same repository whose body references both the source and closed PR.
+Ordinary references, including original-outcome investigations, do not prove
+replacement-work coverage. Ambiguous or unavailable successor evidence stays
+pending. Existing links and uncertain creation intents are retained across
+restarts; the new cause uses the same source-issue/PR deduplication and
+single-POST rule below.
 
 Poise creates the report as the configured main GitHub account through its
 existing issue publisher, requesting the `poise` label. The body records the
