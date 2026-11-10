@@ -62,9 +62,16 @@ incident/correlation reads use the applied time, severity and access scope,
 twenty events per page. Recorded Caller runs open Swarm; valid repository/PR
 pairs open GitHub. Unrecorded targets have no link.
 
-Incident details also read the owner's existing managed chain journal separately
-when a retained Poise/Caller record has an exact Call or correlation identity.
-Work impact shows the recorded stage and target, retrying/blocked/recovered/unknown,
+Each list snapshot also reads the owner's existing managed chain journal in one
+batch for retained Poise/Caller records with exact Call or correlation identities.
+The Work impact column leads with retrying/blocked/recovered/unknown, the verified
+target and stage. Duplicate diagnostics retain their event rows and identify the
+same work target; Count still measures retained diagnostic occurrences.
+Rows and expanded details share the same verified result. Impact is verified at
+the list snapshot read and replaced by Refresh or applying new diagnostics; the
+fifteen-second watermark poll does not update displayed impact. Returning to the
+cached first page restores its impact snapshot too.
+Details keep the recorded stage and target,
 last verified progress, and the next recorded retry or action. Progress must follow
 the exact matched failed invocation to establish recovery; unchanged polls and
 failed retries do not advance it. A recovered failure remains visible alongside

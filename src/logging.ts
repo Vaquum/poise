@@ -167,31 +167,49 @@ export async function loggingHealth(access: LoggingAccess, scope: LoggingQuery['
   return body as unknown as LoggingHealth
 }
 
-/** Optional workspace journal read; central Logging never depends on its availability. */
-export async function loggingWorkImpact(access: LoggingAccess, event: LoggingEvent, signal: AbortSignal): Promise<LoggingWorkImpact | null> {
-  if (!['poise', 'caller'].includes(event.source) || event.visibility !== 'workspace' || event.workspace !== access.owner
-    || !event.callId && !event.correlationId) return null
-  const params = new URLSearchParams()
-  if (event.callId) params.set('callId', event.callId)
-  if (event.correlationId) params.set('correlationId', event.correlationId)
+/** One optional journal read per list snapshot; duplicate diagnostics share their exact lookup. */
+export async function loggingWorkImpacts(access: LoggingAccess, events: readonly LoggingEvent[], signal: AbortSignal): Promise<Map<string, LoggingWorkImpact | null>> {
+  const result = new Map<string, LoggingWorkImpact | null>(events.map(event => [event.id, null]))
+  const groups = new Map<string, LoggingEvent[]>()
+  for (const event of events) {
+    if (!['poise', 'caller'].includes(event.source) || event.visibility !== 'workspace' || event.workspace !== access.owner
+      || !event.callId && !event.correlationId
+      || event.callId && !loggingCallId(event.callId.toLowerCase())
+      || event.correlationId && !/^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(event.correlationId)) continue
+    const key = JSON.stringify([event.callId, event.correlationId])
+    const group = groups.get(key)
+    if (group) group.push(event)
+    else groups.set(key, [event])
+  }
+  if (!groups.size) return result
+  const params = new URLSearchParams({ batch: '1' })
+  for (const [event] of groups.values()) {
+    params.append('callId', event.callId ?? '')
+    params.append('correlationId', event.correlationId ?? '')
+  }
   const response = await fetch('/api/behavior-chains?' + params, { cache: 'no-store', credentials: 'same-origin', signal })
   const body: unknown = await response.json()
   aborted(signal)
   if (!response.ok) throw new Error('Workspace chain evidence is unavailable.')
-  if (!object(body)) return protocol()
-  const value = body.impact
-  if (value === null) return null
-  if (!object(value) || !['retrying', 'blocked', 'recovered', 'unknown'].includes(String(value.impact))
-    || typeof value.recovered !== 'boolean' || typeof value.invocationId !== 'string'
-    || !['stage', 'target', 'journal', 'repository', 'behavior'].every(key => typeof value[key] === 'string')
-    || value.callerBehavior !== null && typeof value.callerBehavior !== 'string'
-    || typeof value.journal !== 'string' || !value.journal.startsWith('/api/behavior-chains?id=')
-    || !Number.isSafeInteger(value.progressAt) || Number(value.progressAt) < 0
-    || value.retryAt !== null && (!Number.isSafeInteger(value.retryAt) || Number(value.retryAt) < 0)
-    || value.nextAction !== null && typeof value.nextAction !== 'string') return protocol()
-  if (event.repository && event.repository.toLowerCase() !== String(value.repository).toLowerCase()
-    || event.behavior && value.callerBehavior && event.behavior !== value.callerBehavior) return null
-  return value as unknown as LoggingWorkImpact
+  if (!object(body) || !Array.isArray(body.impacts) || body.impacts.length !== groups.size) return protocol()
+  for (const [index, group] of [...groups.values()].entries()) {
+    const value: unknown = body.impacts[index]
+    if (value === null) continue
+    if (!object(value) || !['retrying', 'blocked', 'recovered', 'unknown'].includes(String(value.impact))
+      || typeof value.recovered !== 'boolean' || typeof value.invocationId !== 'string'
+      || !['stage', 'target', 'journal', 'repository', 'behavior'].every(key => typeof value[key] === 'string')
+      || value.callerBehavior !== null && typeof value.callerBehavior !== 'string'
+      || typeof value.journal !== 'string' || !value.journal.startsWith('/api/behavior-chains?id=')
+      || !Number.isSafeInteger(value.progressAt) || Number(value.progressAt) < 0
+      || value.retryAt !== null && (!Number.isSafeInteger(value.retryAt) || Number(value.retryAt) < 0)
+      || value.nextAction !== null && typeof value.nextAction !== 'string') return protocol()
+    for (const event of group) {
+      if (event.repository && event.repository.toLowerCase() !== String(value.repository).toLowerCase()
+        || event.behavior && value.callerBehavior && event.behavior !== value.callerBehavior) continue
+      result.set(event.id, value as unknown as LoggingWorkImpact)
+    }
+  }
+  return result
 }
 
 export async function loggingExport(access: LoggingAccess, query: LoggingQuery, signal: AbortSignal): Promise<Blob> {

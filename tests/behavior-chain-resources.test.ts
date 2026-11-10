@@ -45,6 +45,7 @@ function invocation(id: string, reservation?: ChainAdmission['reservation']): Ch
 }
 function observation(): ChainObservation {
   return { checkedAt: Date.now(), existingPulls: [],
+    prerequisites: { wait: null, base: 'a'.repeat(40), evidence: [] },
     issue: { open: true, eligible: true, revision: chainBasis(['title', 'body']), commentIds: [17] },
     issueReviewers: [REVIEWER], prReviewers: [REVIEWER], implementer: REVIEWER, repairer: REVIEWER, approver: REVIEWER,
     publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null }

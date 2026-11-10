@@ -21,13 +21,20 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
     const cutover = () => ({ ...journal.cutover(), support: nativeCleanupSupport(),
       blockers: journal.cutover().mode === 'draining' ? behaviorCutoverBlockers() : [] })
     if (req.method === 'GET') {
-      if (params.has('callId') || params.has('correlationId')) {
-        const callId = params.get('callId'), correlationId = params.get('correlationId')
-        if (callId !== null && !/^[a-f0-9]{32}$/i.test(callId)
-          || correlationId !== null && !/^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(correlationId)) {
+      if (params.has('batch') || params.has('callId') || params.has('correlationId')) {
+        const batch = params.get('batch') === '1'
+        const calls = batch ? params.getAll('callId').map(value => value || null) : [params.get('callId')]
+        const correlations = batch ? params.getAll('correlationId').map(value => value || null) : [params.get('correlationId')]
+        if (params.has('batch') && !batch || !calls.length || calls.length > 100 || calls.length !== correlations.length
+          || calls.some((callId, index) => {
+            const correlationId = correlations[index]
+            return !callId && !correlationId || callId !== null && !/^[a-f0-9]{32}$/i.test(callId)
+              || correlationId !== null && !/^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(correlationId)
+          })) {
           throw new HttpError(400, 'valid Call or correlation identity is required')
         }
-        return reply(res, 200, { impact: behaviorChainWorkImpact(journal, callId, correlationId) })
+        const impacts = calls.map((callId, index) => behaviorChainWorkImpact(journal, callId, correlations[index]))
+        return reply(res, 200, batch ? { impacts } : { impact: impacts[0] })
       }
       const id = params.get('id')
       if (id) {

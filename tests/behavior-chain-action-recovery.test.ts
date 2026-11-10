@@ -42,6 +42,7 @@ function setup(behavior: 'merge-pr' | 'resolve-threads' = 'merge-pr', pending = 
 function observation(): ChainObservation {
   const reviewer = { slot: 'primary', model: 'fixture', recovery: 'fixture' }
   return { checkedAt: Date.now(), issue: { open: true, revision: 'body', eligible: true, commentIds: [] },
+    prerequisites: { wait: null, base: HEAD, evidence: [] },
     issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer, existingPulls: [],
     publication: { pull_number: 21, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null },
     pull: { number: 21, head: HEAD, headSince: Date.now(), state: 'open', draft: false, merged: false, mergeSha: null,

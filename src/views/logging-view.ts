@@ -3,7 +3,7 @@ import { patchContent } from '../dom-patch'
 import { TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
 import {
   LOGGING_LEVELS, LOGGING_SOURCES, LoggingApiError, loggingAccess, loggingCallId, loggingErrorBounds, loggingEvent, loggingExport, loggingHealth,
-  loggingHref, loggingPage, loggingParameters, loggingPullRequest, loggingWorkImpact, parseLoggingLink, subscribeDiagnosticRefresh,
+  loggingHref, loggingPage, loggingParameters, loggingPullRequest, loggingWorkImpacts, parseLoggingLink, subscribeDiagnosticRefresh,
   type LoggingAccess, type LoggingEvent, type LoggingHealth, type LoggingLink, type LoggingPage, type LoggingQuery, type LoggingWorkImpact,
 } from '../logging'
 import { readLoggingTime } from '../../gateway/src/diagnostics/query-time'
@@ -14,16 +14,17 @@ const EXACT = [
   ['component', 'Component'], ['workspace', 'Workspace'], ['account', 'Account'], ['repository', 'Repository'],
   ['callId', 'Call ID'], ['correlationId', 'Correlation ID'], ['incidentId', 'Incident ID'],
 ] as const
-const COLUMNS = [['time', 'Time'], ['severity', 'Severity'], ['source', 'Source'], ...EXACT,
+const COLUMNS = [['time', 'Time'], ['impact', 'Work impact'], ['severity', 'Severity'], ['source', 'Source'], ...EXACT,
   ['target', 'Target'], ['message', 'Message'], ['occurrences', 'Count']] as const
 type Column = typeof COLUMNS[number][0]
 const OPTIONAL = EXACT.filter(([key]) => key !== 'component')
-const BASE_COLUMNS: Column[] = ['time', 'severity', 'source', 'component', 'repository', 'target', 'message', 'occurrences']
+const BASE_COLUMNS: Column[] = ['time', 'impact', 'severity', 'source', 'component', 'repository', 'target', 'message', 'occurrences']
 const FILTER_ICON = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 3h12L9.5 8v4l-3 1V8L2 3Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>'
 const DATA_ICON = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.2"/><path d="M8 7v4M8 4.5v.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>'
 type Exact = typeof EXACT[number][0]
 type Preferences = Record<Exact, string> & { columns: Column[]; severities: Array<typeof LOGGING_LEVELS[number]>; time: TimeRange | 'custom'; from: string; to: string; source: string; search: string; scope: 'workspace' | 'instance' }
 interface Related { loading: boolean; events: LoggingPage['events']; total: number; cursor: string | null; history: Array<string | null>; page: number; error: string; correlation: boolean; first: { events: LoggingPage['events']; total: number; cursor: string | null } | null }
+type WorkImpacts = Map<string, { value: LoggingWorkImpact | null; message: string }>
 
 const defaults = (): Preferences => ({ component: '', workspace: '', account: '', repository: '', callId: '', correlationId: '', incidentId: '',
   columns: [...BASE_COLUMNS], severities: [...LOGGING_LEVELS], time: 'all', from: '', to: '', source: '', search: '', scope: 'workspace' })
@@ -38,7 +39,7 @@ let preferences = defaults()
 let customDraft: { from: string; to: string } | null = null
 let access: LoggingAccess | null = null
 let page: LoggingPage | null = null
-let firstSnapshot: { page: LoggingPage; at: number } | null = null
+let firstSnapshot: { page: LoggingPage; at: number; impacts: WorkImpacts } | null = null
 let pageIndex = 0
 let cursors: Array<string | null> = [null]
 let applied: LoggingQuery | null = null
@@ -72,7 +73,7 @@ let stopTick: (() => void) | null = null
 const requests = new Set<AbortController>()
 const expanded = new Set<string>()
 const related = new Map<string, Related>()
-const impacts = new Map<string, { value: LoggingWorkImpact | null; message: string }>()
+let impacts: WorkImpacts = new Map()
 let formatter: { zone: string; value: Intl.DateTimeFormat } | null = null
 
 function date(value: string | null): string {
@@ -144,7 +145,6 @@ function invalidate(): number {
   generation++
   for (const request of requests) request.abort()
   requests.clear()
-  impacts.clear()
   for (const state of related.values()) if (state.loading) { state.loading = false; state.error = 'The related read was cancelled; request it again.' }
   if (debounce) clearTimeout(debounce)
   debounce = null
@@ -188,7 +188,7 @@ function detail(event: LoggingEvent): string {
       ${field('Last verified progress', date(new Date(impact.progressAt).toISOString()))}${field('Next retry', impact.retryAt === null ? null : date(new Date(impact.retryAt).toISOString()))}
       ${field('Next action', impact.nextAction)}${field('Matched invocation', impact.invocationId)}${impact.recovered ? field('Matched failure', 'Recovered; verified progress followed this invocation failure') : ''}</dl>
       <a href="${escape(impact.journal)}" target="_blank" rel="noopener noreferrer">Journal evidence</a>`
-    : `<p class="st-help">Current impact: unknown. ${escape(work?.message ?? 'Reading workspace chain evidence…')}</p>`}</section>`
+    : `<p class="st-help">Current impact: unknown. ${escape(work?.message ?? 'Workspace chain evidence has not been verified for this snapshot.')}</p>`}</section>`
   const relatedMarkup = r ? `<p class="st-help st-help-${!r.loading && r.error ? 'warn' : 'info'}" role="status">${escape(r.loading ? 'Loading related diagnostics…' : r.error || `${r.total.toLocaleString()} matching retained events · related snapshot`)}</p>
     <ul class="logging-related-list">${r.events.map((entry) => `<li><button type="button" data-action="related-event" data-event="${entry.id}">${escape(date(entry.eventTime ?? entry.ingestedAt))} · ${escape(entry.message)}</button></li>`).join('')}</ul>
     <div class="range-picker" role="group" aria-label="Related pages"><button type="button" data-action="related-previous" data-row="${event.id}" data-focus="related-previous-${event.id}" ${r.page === 0 || r.loading ? 'disabled' : ''}>Previous</button><button type="button" data-action="related-next" data-row="${event.id}" data-focus="related-next-${event.id}" ${!r.cursor || r.loading ? 'disabled' : ''}>Next 20</button></div>` : ''
@@ -327,6 +327,11 @@ function render(): void {
     const open = expanded.has(event.id)
     const cells = columns.map(([key]) => {
       if (key === 'time') return `<td class="started-cell"><time datetime="${escape(event.eventTime ?? event.ingestedAt)}" title="${escape((event.eventTime ? 'Source time' : 'Ingestion time; source time not recorded') + ' · ' + effectiveTimezone())}">${escape(date(event.eventTime ?? event.ingestedAt))}</time>${event.eventTime ? '' : '<span class="agent-status-note">Ingested</span>'}</td>`
+      if (key === 'impact') {
+        const work = impacts.get(event.id)?.value
+        const summary = work ? [work.impact, work.target, work.stage].filter(Boolean).join(' · ') : 'unknown'
+        return `<td class="logging-cell logging-cell-impact" title="${escape(summary)}">${escape(summary)}</td>`
+      }
       if (key === 'severity') return `<td><span class="agent-status ${event.severity === 'warning' ? 'warn' : 'bad'}"><span class="agent-status-label">${event.severity[0].toUpperCase() + event.severity.slice(1)}</span></span></td>`
       if (key === 'occurrences') return `<td class="logging-number" title="Retained event/occurrence count in this incident">${event.occurrences.toLocaleString()}</td>`
       const value = event[key] || '—'
@@ -444,11 +449,11 @@ async function loadPage(cursor: string | null = null, fresh = true, focusTarget 
       related.clear(); view.querySelector<HTMLElement>('.logging-table-wrap')!.scrollTop = 0
     }
     if (!fresh || pageIndex !== 0) view.querySelector<HTMLElement>('.logging-table-wrap')!.scrollTop = 0
-    page = value; applied = candidate; lastSuccess = Date.now(); loading = false; linkFailure = null; queryUnavailable = false
-    if (fresh) { firstSnapshot = { page: value, at: lastSuccess }; cursors = [null]; pageIndex = 0; newCount = 0; rangeChanged = false; failures = 0; retryAt = 0 }
+    page = value; impacts = new Map(); applied = candidate; lastSuccess = Date.now(); loading = false; linkFailure = null; queryUnavailable = false
+    if (fresh) { firstSnapshot = { page: value, at: lastSuccess, impacts }; cursors = [null]; pageIndex = 0; newCount = 0; rangeChanged = false; failures = 0; retryAt = 0 }
     else pageIndex = targetPage
     render()
-    for (const id of expanded) void readWorkImpact(id)
+    void readWorkImpacts()
     const targetId = linked?.id
     if (focusTarget && targetId) requestAnimationFrame(() => {
       if (!current(mine)) return
@@ -468,7 +473,7 @@ async function loadPage(cursor: string | null = null, fresh = true, focusTarget 
 async function initialRead(): Promise<void> {
   const mine = invalidate()
   customDraft = null
-  loading = true; page = null; firstSnapshot = null; health = null; healthReadAt = null; healthMessage = ''; queryUnavailable = false; applied = null; linked = null; link = null; linkFailure = null; linkBounds = null; setMessage(''); newCount = 0; pageIndex = 0; cursors = [null]; mountedSearch = location.search
+  loading = true; page = null; firstSnapshot = null; impacts = new Map(); health = null; healthReadAt = null; healthMessage = ''; queryUnavailable = false; applied = null; linked = null; link = null; linkFailure = null; linkBounds = null; setMessage(''); newCount = 0; pageIndex = 0; cursors = [null]; mountedSearch = location.search
   const request = controller()
   try {
     try { link = parseLoggingLink(location.search) }
@@ -574,23 +579,23 @@ async function readRelated(id: string, correlation = false, nextPage = 0, fresh 
   finally { requests.delete(request); if (current(mine) && related.get(id) === state) { state.loading = false; render() } }
 }
 
-async function readWorkImpact(id: string): Promise<void> {
-  if (!access || impacts.has(id)) return
-  const event = page?.events.find(event => event.id === id) ?? (linked?.id === id ? linked : null)
-  if (!event) return
-  const state = { value: null as LoggingWorkImpact | null, message: 'Reading workspace chain evidence…' }
-  impacts.set(id, state)
+async function readWorkImpacts(): Promise<void> {
+  if (!access || !page) return
+  const events: LoggingEvent[] = [...page.events]
+  if (linked && !events.some(event => event.id === linked!.id)) events.push(linked)
+  const state = impacts
   const mine = generation, request = controller()
   try {
-    const value = await loggingWorkImpact(access, event, request.signal)
-    if (!current(mine) || impacts.get(id) !== state) return
-    state.value = value
-    state.message = value ? '' : 'No unambiguous managed chain invocation matches this evidence.'
+    const values = await loggingWorkImpacts(access, events, request.signal)
+    if (!current(mine)) return
+    for (const [id, value] of values) state.set(id, { value, message: value ? '' : 'No unambiguous managed chain invocation matches this evidence.' })
   } catch (error) {
-    if (current(mine) && !request.signal.aborted) state.message = 'Workspace chain evidence is unavailable. ' + failure(error).message
+    if (current(mine) && !request.signal.aborted) {
+      for (const event of events) state.set(event.id, { value: null, message: 'Workspace chain evidence is unavailable. ' + failure(error).message })
+    }
   } finally {
     requests.delete(request)
-    if (current(mine) && impacts.get(id) === state) render()
+    if (current(mine)) render()
   }
 }
 
@@ -644,14 +649,14 @@ function onClick(event: Event): void {
       if (key) { preferences[key] = ''; filtersChanged(); view.querySelector<HTMLInputElement>('#logging-' + key)?.focus() }
       break
     }
-    case 'expand': if (id) { if (expanded.has(id)) { expanded.delete(id); related.delete(id); impacts.delete(id) } else { expanded.add(id); void readWorkImpact(id) } render() } break
+    case 'expand': if (id) { if (expanded.has(id)) { expanded.delete(id); related.delete(id) } else expanded.add(id); render() } break
     case 'refresh': case 'new': refreshCurrent(); break
     case 'export': if (button.getAttribute('aria-busy') !== 'true') void exportCurrent(); break
     case 'custom': applyCustom(); break
     case 'next': if (page?.nextCursor) { cursors[pageIndex + 1] = page.nextCursor; void loadPage(page.nextCursor, false, false, pageIndex + 1) } break
     case 'previous': if (pageIndex > 0) {
       const previous = pageIndex - 1
-      if (previous === 0 && firstSnapshot) { const mine = invalidate(); pageIndex = 0; page = firstSnapshot.page; lastSuccess = firstSnapshot.at; setMessage(''); stale = null; render(); for (const id of expanded) void readWorkImpact(id); void readHealth(mine) }
+      if (previous === 0 && firstSnapshot) { const mine = invalidate(); pageIndex = 0; page = firstSnapshot.page; impacts = firstSnapshot.impacts; lastSuccess = firstSnapshot.at; setMessage(''); stale = null; render(); void readHealth(mine) }
       else void loadPage(cursors[previous], false, false, previous)
     } break
     case 'related': if (id) void readRelated(id); break
@@ -704,7 +709,7 @@ function onChange(event: Event): void {
 function visibility(): void {
   if (!active) return
   if (document.hidden) { const pending = loading; invalidate(); if (pending && page) { stale = 'paused'; setMessage('The pending read was paused when this tab became hidden.', 'info') } syncPolling() }
-  else { render(); if (!page && !linkFailure) void initialRead(); else { syncPolling(); for (const id of expanded) void readWorkImpact(id); if (pageIndex === 0) void poll() } }
+  else { render(); if (!page && !linkFailure) void initialRead(); else { syncPolling(); if (pageIndex === 0) void poll() } }
 }
 
 export function initLoggingView(): void {

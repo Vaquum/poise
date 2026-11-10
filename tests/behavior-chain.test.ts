@@ -26,6 +26,7 @@ function setup(): { db: Database.Database, journal: BehaviorChainJournal, chain:
 }
 function observation(): ChainObservation {
   return { checkedAt: NOW, existingPulls: [], issue: { open: true, eligible: true, revision: chainBasis(['title', 'body']), commentIds: [17, 18, 19] },
+    prerequisites: { wait: null, base: HEAD, evidence: [] },
     issueReviewers: [REVIEWER], prReviewers: [REVIEWER], implementer: REVIEWER, repairer: REVIEWER, approver: REVIEWER,
     publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null }
 }

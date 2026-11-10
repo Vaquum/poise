@@ -1,6 +1,6 @@
 import { LOCAL_NOTICE_KINDS } from '../notices'
 import { evidenceReferences, type DiagnosticEvidence, type EvidenceAttachment } from '../../gateway/src/diagnostics/evidence-contract'
-import { loggingAccess, loggingEvent, loggingHref, loggingWorkImpact, type LoggingWorkImpact } from '../logging'
+import { loggingAccess, loggingEvent, loggingHref, loggingWorkImpacts, type LoggingEvent, type LoggingWorkImpact } from '../logging'
 import { cancelMotion, disclosure, layout, retire, scrollToActor, spring, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
 import { BEHAVIORS, getBehaviorDiagnostics, refreshState } from '../behaviors'
@@ -345,16 +345,27 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     for (const ref of refs) impacts.set(ref.eventId, { value: null, message: 'Reading workspace chain evidence…' })
     try {
       const access = await loggingAccess(request.signal)
-      // The existing Logging worker admits two reads per owner; keep these sequential.
+      // The existing Logging worker admits two reads per owner: event reads
+      // stay sequential, then one batch read covers them all.
+      const fetched = new Map<string, LoggingEvent>()
       for (const ref of refs) {
         if (request.signal.aborted) return
         try {
           const { event } = await loggingEvent(access, ref.eventId, 'workspace', request.signal)
-          const value = await loggingWorkImpact(access, event, request.signal)
-          if (!request.signal.aborted) impacts.set(ref.eventId, { value, message: 'No unambiguous managed chain invocation matches this evidence.' })
+          fetched.set(ref.eventId, event)
         } catch {
           if (!request.signal.aborted) impacts.set(ref.eventId, { value: null, message: 'Workspace chain evidence is unavailable.' })
         }
+      }
+      if (!fetched.size || request.signal.aborted) return
+      try {
+        const batch = await loggingWorkImpacts(access, [...fetched.values()], request.signal)
+        if (request.signal.aborted) return
+        for (const [eventId, event] of fetched) {
+          impacts.set(eventId, { value: batch.get(event.id) ?? null, message: 'No unambiguous managed chain invocation matches this evidence.' })
+        }
+      } catch {
+        if (!request.signal.aborted) for (const eventId of fetched.keys()) impacts.set(eventId, { value: null, message: 'Workspace chain evidence is unavailable.' })
       }
     } catch {
       if (!request.signal.aborted) for (const ref of refs) impacts.set(ref.eventId, { value: null, message: 'Workspace chain evidence is unavailable.' })

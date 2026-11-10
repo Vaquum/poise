@@ -19,7 +19,9 @@ vi.mock('../server/models', () => ({ agentInterfaceCwd: () => process.cwd() }))
 vi.mock('../server/settings', () => ({ getSettings: () => ({ me: 'author', agentAccount: 'reviewer' }),
   getBehaviorChainSettings: () => ({ enabled: true, seedMode: 'all', label: 'poise' }),
   BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY: 'behavior_chain_integrity_hold' }))
-vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ login: 'historical' }) }))
+vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ login: 'historical' }),
+  organizationArgs: (_org: unknown, argv: string[]) => argv }))
+vi.mock('../server/datastore-health', () => ({ runDatastoreHealth: async () => {} }))
 afterEach(() => {
   for (const db of opened.splice(0)) if (db.open) db.close()
   for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true })
@@ -82,7 +84,10 @@ if (op === '--read-action-plan') {
   output({ repository: 'Historical/Repo', issue_number: number, actor: 'author', branch: 'poise/issue-' + number,
     issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
     publication: { existing_pulls: [], pull_number: pull ? 21 : null, head_sha: pull ? ${JSON.stringify(head)} : null,
+      base_sha: ${JSON.stringify(head)},
       head_invocation: pull ? state.callId : null, state: pull ? 'open' : null, merged: false, merge_sha: null } });
+} else if (op === 'view' && args[1] === 'issue-dependencies') {
+  output({ repo: 'Historical/Repo', number: Number(args[args.indexOf('--number') + 1]), found: true, complete: true, prerequisites: [] });
 } else if (op === '--issue-work') output({ replies_complete: false });
 else if (op === '--pull-action-state') output({ pull_number: 21, state: 'open', head_sha: ${JSON.stringify(head)},
   review_context: 'b'.repeat(64), merged: false, queue_entry_id: null, queue_removals: [], my_reviews: [] });
@@ -92,7 +97,7 @@ else if (op === '--pr-readiness') output({ head_sha: ${JSON.stringify(head)}, dr
 else if (op === '--list-failing-ci') output({ pull_number: 21, head_sha: ${JSON.stringify(head)}, failing: [] });
 else { process.stderr.write('Forbidden fixture operation: ' + op); process.exit(3); }
 `
-  for (const command of ['agent-interface', 'github-interface']) writeFileSync(join(root, command), script, { mode: 0o700 })
+  for (const command of ['agent-interface', 'github-interface', 'github-datastore']) writeFileSync(join(root, command), script, { mode: 0o700 })
   vi.stubEnv('CALLER_BIN_ROOT', root)
   const path = join(root, 'journal.sqlite')
   let { db, journal } = database(path)

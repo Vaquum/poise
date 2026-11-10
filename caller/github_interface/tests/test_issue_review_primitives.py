@@ -248,6 +248,9 @@ class TestCli(TestCase):
         payload = self._payload(["--comment-issue", "3", "--body", "Review", "--repository", "o/r"], "comment_issue")
         self.assertEqual((payload["issue"], payload["body"], payload["repository"]), ("3", "Review", "o/r"))
         self.assertIsNone(self._payload(["--read-issue", "3"], "read_issue")["repository"])
+        payload = self._payload(["--read-issue", "#1100", "--delivery-base", "a" * 40,
+                                 "--repository", "autonomio/poise", "--token-user", "author"], "read_issue")
+        self.assertEqual((payload["issue"], payload["delivery_base"], payload["token_user"]), ("#1100", "a" * 40, "author"))
 
     def test_checkout_repo_takes_the_repository_and_a_path(self) -> None:
         payload = self._payload(["--checkout-repo", "Vaquum/Origo", "--path", "/tmp/x"], "checkout_repo")
