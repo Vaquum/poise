@@ -1,0 +1,26 @@
+# Request reconciliation, never a particular candidate. Sync owns the fork's
+# opt-in, coalescing and CI-to-Deploy handoff (docs/Operating.md).
+name: Wake production Sync
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  wake:
+    if: github.repository == 'autonomio/poise' && vars.POISE_PRODUCTION_FORK != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Request the fork's Sync workflow
+        env:
+          GH_TOKEN: ${{ secrets.POISE_SYNC_WAKE_TOKEN }}
+          FORK: ${{ vars.POISE_PRODUCTION_FORK }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Set POISE_SYNC_WAKE_TOKEN to a credential for $FORK with Actions: write."
+            exit 1
+          fi
+          gh workflow run sync-upstream.yml --repo "$FORK" --ref main
