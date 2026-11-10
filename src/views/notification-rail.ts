@@ -263,6 +263,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   const expanded = new Set<string>()
   const impacts = new Map<string, WorkImpactRead>()
   let impactRequest: AbortController | null = null
+  let quietImpactRender = false
   const announced = new Set<string>()
   const toastTimers = new Map<HTMLElement, number>()
 
@@ -336,13 +337,28 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
 
   async function readWorkImpacts(): Promise<void> {
     if (!opened || impactRequest) return
+    // A batch's own aftermath render never refetches: failures retry on the
+    // next external trigger, not in the same breath.
+    if (quietImpactRender) { quietImpactRender = false; return }
     const current = expandedImpactRefs(items, expanded)
     for (const id of [...impacts.keys()]) if (!current.has(id)) impacts.delete(id)
     const refs = [...current.values()].filter(ref => needsImpactRead(impacts, ref.eventId)).slice(0, 20)
     if (!refs.length) return
     const request = new AbortController()
     impactRequest = request
-    for (const ref of refs) impacts.set(ref.eventId, { value: null, message: 'Reading workspace chain evidence…' })
+    // Render only on changed outcomes: failed reads retry on later triggers,
+    // and an unconditional render here would refetch them in a tight loop.
+    const seen = new Map<string, string>()
+    const record = (eventId: string, value: LoggingWorkImpact | null, message: string): void => {
+      impacts.set(eventId, { value, message })
+      if (seen.get(eventId) !== `${value !== null}:${message}`) dirty = true
+    }
+    let dirty = false
+    for (const ref of refs) {
+      const previous = impacts.get(ref.eventId)
+      seen.set(ref.eventId, `${previous?.value != null}:${previous?.message}`)
+      impacts.set(ref.eventId, { value: null, message: 'Reading workspace chain evidence…' })
+    }
     try {
       const access = await loggingAccess(request.signal)
       // The existing Logging worker admits two reads per owner: event reads
@@ -354,7 +370,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
           const { event } = await loggingEvent(access, ref.eventId, 'workspace', request.signal)
           fetched.set(ref.eventId, event)
         } catch {
-          if (!request.signal.aborted) impacts.set(ref.eventId, { value: null, message: 'Workspace chain evidence is unavailable.' })
+          if (!request.signal.aborted) record(ref.eventId, null, 'Workspace chain evidence is unavailable.')
         }
       }
       if (!fetched.size || request.signal.aborted) return
@@ -362,15 +378,18 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
         const batch = await loggingWorkImpacts(access, [...fetched.values()], request.signal)
         if (request.signal.aborted) return
         for (const [eventId, event] of fetched) {
-          impacts.set(eventId, { value: batch.get(event.id) ?? null, message: 'No unambiguous managed chain invocation matches this evidence.' })
+          record(eventId, batch.get(event.id) ?? null, 'No unambiguous managed chain invocation matches this evidence.')
         }
       } catch {
-        if (!request.signal.aborted) for (const eventId of fetched.keys()) impacts.set(eventId, { value: null, message: 'Workspace chain evidence is unavailable.' })
+        if (!request.signal.aborted) for (const eventId of fetched.keys()) record(eventId, null, 'Workspace chain evidence is unavailable.')
       }
     } catch {
-      if (!request.signal.aborted) for (const ref of refs) impacts.set(ref.eventId, { value: null, message: 'Workspace chain evidence is unavailable.' })
+      if (!request.signal.aborted) for (const ref of refs) record(ref.eventId, null, 'Workspace chain evidence is unavailable.')
     } finally {
-      if (impactRequest === request) { impactRequest = null; if (opened) renderRail() }
+      if (impactRequest === request) {
+        impactRequest = null
+        if (dirty && opened) { quietImpactRender = true; renderRail() }
+      }
     }
   }
 
@@ -424,7 +443,10 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   function setOpen(next: boolean, focus: 'rail' | 'bell' | null = null): void {
     if (opened !== next) {
       opened = next
-      if (!next) abortWorkImpacts()
+      // A fresh display on every open: chain state may have moved while the
+      // rail was closed. Republish aborts (not opens) keep their cache.
+      if (next) impacts.clear()
+      else abortWorkImpacts()
       // watchPanel sets this too, but only once its observer runs: the rail
       // must take focus now.
       rail.inert = !next
