@@ -3,6 +3,7 @@ import { parseResolutionProgress } from './agent-log-parse'
 import { resourceReleaseContradicted } from './behavior-resource-receipt'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, lastChainQueueInvocation, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, reduceChain, type BehaviorChain, type BehaviorChainJournal, type ChainEvent } from './behavior-chain-store'
+import type { LoggingWorkImpact } from '../src/logging'
 
 export const CHAIN_ATTENTION_DELAY_MS = 24 * 60 * 60_000
 
@@ -109,16 +110,21 @@ function exactPull(observation: ChainObservation | null) {
 
 /** Derive the clock from immutable history, never the latest poll or attempt.
  * Replaying here leaves reducer state and historical hashes unchanged. */
-function chainProgress(journal: BehaviorChainJournal, id: string) {
+function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocation?: string) {
   let chain: BehaviorChain | null = null
   let at = 0, sequence = 0, after = 0
   let previous: ChainObservation['pull'] = null
   const verified = new Set<string>()
+  let failureSequence: number | null = null
+  let waitingSequence = 0
   for (;;) {
     const events = journal.history(id, after)
     for (const row of events) {
       const event = JSON.parse(row.payload) as ChainEvent
       chain = reduceChain(chain, event, row.sequence, id)
+      if (event.type === 'chain.waiting') waitingSequence = row.sequence
+      if ((event.type === 'invocation.settled' || event.type === 'invocation.reconciled')
+        && event.invocationId === failedInvocation && event.evidence.status === 'failed' && failureSequence === null) failureSequence = row.sequence
       let advanced = event.type === 'chain.admitted'
       const record = (key: string) => { if (!verified.has(key)) { verified.add(key); advanced = true } }
       if (event.type === 'chain.merged') record(`merge:${chain.mergeSha}:${chain.reviewPending}`)
@@ -168,7 +174,43 @@ function chainProgress(journal: BehaviorChainJournal, id: string) {
     after = events.at(-1)!.sequence
   }
   if (!chain) throw new Error(`behavior chain admission history is unavailable: ${id}`)
-  return { at, sequence }
+  return { at, sequence, failureSequence, waitingSequence }
+}
+
+/** Read-only incident annotation, independent of attention's age/active filters. */
+export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: string | null, correlationId: string | null): LoggingWorkImpact | null {
+  const match = journal.forInvocation(callId, correlationId)
+  if (!match) return null
+  const { chain, invocation } = match
+  const progress = chainProgress(journal, chain.id, invocation.id)
+  const recovered = progress.failureSequence !== null && progress.sequence > progress.failureSequence
+  const active = chain.invocations.find(item => item.state !== 'settled')
+  const last = chain.invocations.at(-1)
+  const waiting = progress.waitingSequence > progress.sequence ? chain.waiting : null
+  const contradicted = chain.invocations.some(item => !!item.evidence && resourceReleaseContradicted(item.evidence))
+  const blocked = !!chain.held || chain.reviewPending === true || active?.state === 'uncertain' || contradicted
+  let retryAt: number | null = null
+  if (!blocked && !active && last && waiting === `${last.behavior} is in native failure backoff`) {
+    const attempts = chain.invocations.filter(item => item.behavior === last.behavior && item.basis === last.basis
+      && item.slot === last.slot && item.state === 'settled' && item.evidence?.status !== 'deferred'
+      && item.admissionSequence > chain.resumedAfterSequence)
+    if (attempts.length > 0 && attempts.length < 3 && (last.evidence?.action === 'not_started' || last.evidence?.outcome === 'superseded')
+      && Number.isFinite(last.evidence?.completedAt)) retryAt = Number(last.evidence!.completedAt) + 60_000 * 2 ** (attempts.length - 1)
+  }
+  const impact: 'blocked' | 'recovered' | 'retrying' | 'unknown' = blocked ? 'blocked' : recovered ? 'recovered'
+    : active && active.admissionSequence > invocation.admissionSequence || retryAt !== null ? 'retrying' : 'unknown'
+  const publication = chain.observation?.publication as { pull_number?: number | null } | undefined
+  return { impact, recovered, invocationId: invocation.id, repository: chain.repository, behavior: invocation.behavior,
+    stage: active ? `${active.behavior}: ${active.state}` : chain.mergeSha ? 'Merged' : last ? `${last.behavior}: ${last.outcome ?? last.state}` : 'Issue admission',
+    target: `${chain.repository}#${publication?.pull_number ?? chain.issue}`,
+    progressAt: progress.at, retryAt,
+    nextAction: contradicted ? 'Reconcile contradictory original resource-release evidence'
+      : chain.held ? `Resolve the hold and explicitly resume: ${chain.held}`
+        : chain.reviewPending ? 'Reconcile original pre-merge review evidence'
+          : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
+            : active ? 'Await the original invocation outcome' : chain.mergeSha ? null
+              : retryAt !== null ? 'Automatic retry eligible after backoff, subject to existing admission gates' : waiting,
+    journal: `/api/behavior-chains?${new URLSearchParams({ id: chain.id, after: String(Math.max(0, progress.sequence - 1)) })}` }
 }
 
 /** Read-only attention across every active page, including unpublished issues

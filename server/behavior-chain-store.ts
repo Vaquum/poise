@@ -440,6 +440,23 @@ export class BehaviorChainJournal {
     return chain
   }
 
+  /** Exact retained identities only; target proximity cannot associate a diagnostic. */
+  forInvocation(callId: string | null, correlationId: string | null): { chain: BehaviorChain, invocation: ChainInvocation } | null {
+    if (!callId && !correlationId) return null
+    const rows = this.db.prepare(`SELECT c.chain_id, CAST(i.key AS INTEGER) AS position
+      FROM behavior_chain_current c, json_each(c.state, '$.invocations') i
+      WHERE json_extract(i.value, '$.id') = ? OR json_extract(i.value, '$.callId') = ?
+        OR json_extract(i.value, '$.evidence.nativeCallId') = ? OR json_extract(i.value, '$.evidence.callId') = ? LIMIT 2`)
+      .all(correlationId, callId, callId, callId) as Array<{ chain_id: string, position: number }>
+    if (rows.length !== 1) return null
+    const chain = this.read(rows[0].chain_id)!
+    const invocation = chain.invocations[rows[0].position]
+    const calls = new Set([invocation.callId, invocation.evidence?.nativeCallId, invocation.evidence?.callId].filter(value => typeof value === 'string'))
+    if (correlationId && invocation.id !== correlationId
+      || calls.size > 1 || callId && !calls.has(callId)) return null
+    return { chain, invocation }
+  }
+
   page(after = '', limit = 100, merged: boolean | null = null): BehaviorChain[] {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('behavior chain page must contain 1 to 100 records')
     // Closure only changes this view; incomplete or conflicting evidence stays visible.

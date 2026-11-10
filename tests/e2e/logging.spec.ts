@@ -3,6 +3,9 @@ import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
+import Database from 'better-sqlite3'
+import { BehaviorChainJournal } from '../../server/behavior-chain-store'
+import { loggingWorkFixture } from '../fixtures/logging-work-impact'
 import { normalize, type LogEvent } from '../../gateway/src/diagnostics/contract'
 import { callerDiagnostic } from '../../gateway/src/diagnostics/sources'
 import { DiagnosticStore, DEFAULT_LOG_POLICY } from '../../gateway/src/diagnostics/store'
@@ -109,6 +112,58 @@ test.beforeAll(() => {
   const db = new DiagnosticStore(storePath, DEFAULT_LOG_POLICY)
   try { for (let i = 0; i < fixtures.length; i += 100) db.append(fixtures.slice(i, i + 100)); db.append([foreign]) }
   finally { db.close() }
+})
+
+test('incident details verify one target across duplicate errors, recovery, an independent hold and an unavailable journal', async ({ page }) => {
+  const cache = new Database(resolve('test-results/e2e/cache.db'))
+  const logs = new DiagnosticStore(storePath)
+  const at = Date.now() - 10_000
+  const call = callId(130), correlation = callId(131)
+  const impactComponent = component + '-impact'
+  const journal = new BehaviorChainJournal(cache)
+  const fixture = loggingWorkFixture(journal, 'impact-' + run + '/repo', 7, correlation, call, at)
+  const input = callerDiagnostic({ id: call, correlation_id: correlation, completed_at: new Date(at + 3000).toISOString(),
+    behavior: 'repair_pr', repo: fixture.chain.repository, pr_id: '107', status: 'failed', error: 'fixture timeout',
+    diagnostic: { version: 1, severity: 'error', operation: 'fixture.timeout', stderr: 'original retained cause' } }, 'local')!
+  const records = ['first', 'duplicate'].map(id => normalize({ ...input, id: impactComponent + id, component: impactComponent })!)
+  try {
+    logs.append(records)
+    await ready(page)
+    await page.route('**/api/behavior-chains?*', route => route.continue())
+    await exactFilter(page, 'component', impactComponent)
+    await expect(rows(page)).toHaveCount(2)
+    await expect(rows(page).first().locator('.logging-number')).toHaveText('2')
+    await rows(page).first().getByRole('button', { name: 'Toggle diagnostic evidence' }).click()
+    const detail = page.locator('#logging-tbody > .agent-expand-row').first()
+    const work = detail.getByRole('region', { name: 'Verified work impact' })
+    await expect(work.locator('dd').filter({ hasText: /^retrying$/ })).toHaveCount(1)
+    await expect(work).toContainText(fixture.chain.repository + '#107')
+    await expect(work).toContainText('Last verified progress')
+    await expect(work).toContainText('Next retry')
+    await expect(detail).toContainText('original retained cause')
+    const progress = structuredClone(fixture.observation)
+    progress.checkedAt = at + 4000
+    progress.pull!.head = progress.publication.head_sha = 'b'.repeat(40)
+    fixture.append({ type: 'chain.observed', observation: progress }, at + 4000)
+    await action(page, 'refresh').click()
+    await expect(work.locator('dd').filter({ hasText: /^recovered$/ })).toHaveCount(1)
+    fixture.append({ type: 'chain.held', reason: 'independent publication hold' }, at + 5000)
+    await action(page, 'refresh').click()
+    await expect(work.locator('dd').filter({ hasText: /^blocked$/ })).toHaveCount(1)
+    await expect(work).toContainText('Recovered; verified progress followed this invocation failure')
+    await expect(work).toContainText('independent publication hold')
+    // Service Logging remains a separate central read when the workspace fails.
+    await page.route('**/api/behavior-chains?*', route => route.fulfill({ status: 503, json: { error: 'journal unavailable' } }))
+    await action(page, 'refresh').click()
+    await expect(work).toContainText('Current impact: unknown')
+    await expect(work).toContainText('Workspace chain evidence is unavailable')
+    await expect(rows(page)).toHaveCount(2)
+    await expect(rows(page).first().locator('.agent-status')).toHaveText('Error')
+    await expect(rows(page).first().locator('.logging-number')).toHaveText('2')
+    await expect(detail).toContainText('original retained cause')
+    await detail.getByRole('button', { name: 'Show incident', exact: true }).click()
+    await expect(detail.locator('.logging-related-list li')).toHaveCount(2)
+  } finally { logs.close(); cache.close() }
 })
 
 test('repair preflight refusals remain visible as warnings with their cause and Caller identity', async ({ page }) => {

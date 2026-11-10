@@ -62,6 +62,18 @@ incident/correlation reads use the applied time, severity and access scope,
 twenty events per page. Recorded Caller runs open Swarm; valid repository/PR
 pairs open GitHub. Unrecorded targets have no link.
 
+Incident details also read the owner's existing managed chain journal separately
+when a retained Poise/Caller record has an exact Call or correlation identity.
+Work impact shows the recorded stage and target, retrying/blocked/recovered/unknown,
+last verified progress, and the next recorded retry or action. Progress must follow
+the exact matched failed invocation to establish recovery; unchanged polls and
+failed retries do not advance it. A recovered failure remains visible alongside
+an independent hold, with current impact blocked. Missing, conflicting, legacy or
+unreadable associations show unknown. A failed workspace read leaves retained
+Logging evidence usable, including in service mode. Source severity and Count
+(retained event/occurrence count) keep their separate meanings. This annotation
+neither starts work nor changes execution or holds.
+
 Filters and the selected view survive reload. A mounted refresh preserves focus,
 scroll position and ID-keyed expansion. Only the visible first page checks for
 new ingestions every fifteen seconds; late older events count too. Apply the

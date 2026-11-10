@@ -3,8 +3,8 @@ import { patchContent } from '../dom-patch'
 import { TIME_RANGES, isTimeRange, timeRangeWindow, type TimeRange } from '../time-range'
 import {
   LOGGING_LEVELS, LOGGING_SOURCES, LoggingApiError, loggingAccess, loggingCallId, loggingErrorBounds, loggingEvent, loggingExport, loggingHealth,
-  loggingHref, loggingPage, loggingParameters, loggingPullRequest, parseLoggingLink, subscribeDiagnosticRefresh,
-  type LoggingAccess, type LoggingEvent, type LoggingHealth, type LoggingLink, type LoggingPage, type LoggingQuery,
+  loggingHref, loggingPage, loggingParameters, loggingPullRequest, loggingWorkImpact, parseLoggingLink, subscribeDiagnosticRefresh,
+  type LoggingAccess, type LoggingEvent, type LoggingHealth, type LoggingLink, type LoggingPage, type LoggingQuery, type LoggingWorkImpact,
 } from '../logging'
 import { readLoggingTime } from '../../gateway/src/diagnostics/query-time'
 import { currentCoverageStatus } from '../../gateway/src/diagnostics/query-contract'
@@ -72,6 +72,7 @@ let stopTick: (() => void) | null = null
 const requests = new Set<AbortController>()
 const expanded = new Set<string>()
 const related = new Map<string, Related>()
+const impacts = new Map<string, { value: LoggingWorkImpact | null; message: string }>()
 let formatter: { zone: string; value: Intl.DateTimeFormat } | null = null
 
 function date(value: string | null): string {
@@ -143,6 +144,7 @@ function invalidate(): number {
   generation++
   for (const request of requests) request.abort()
   requests.clear()
+  impacts.clear()
   for (const state of related.values()) if (state.loading) { state.loading = false; state.error = 'The related read was cancelled; request it again.' }
   if (debounce) clearTimeout(debounce)
   debounce = null
@@ -160,7 +162,7 @@ function clearLinkUrl(): void {
   history.replaceState(null, '', url)
   link = null; linked = null; linkFailure = null; linkBounds = null; linkMessage = ''; mountedSearch = location.search
 }
-function denied(): void { page = null; firstSnapshot = null; linked = null; health = null; access = null; related.clear(); expanded.clear(); newCount = 0 }
+function denied(): void { page = null; firstSnapshot = null; linked = null; health = null; access = null; related.clear(); expanded.clear(); impacts.clear(); newCount = 0 }
 
 function syncPolling(): void {
   const wanted = active && !document.hidden && pageIndex === 0 && !!page && !linkFailure
@@ -179,11 +181,20 @@ function detail(event: LoggingEvent): string {
     settings ? `<button type="button" data-action="settings" data-settings="${settings}">Open Settings</button>` : ''].filter(Boolean).join(' ')
   const pre = (label: string, value: string | null) => `<section class="logging-evidence"><h3 class="tp-group-label">${label}</h3><pre class="agent-response-body">${escape(absent(value) ? 'Not recorded' : value)}</pre></section>`
   const r = related.get(event.id)
+  const work = impacts.get(event.id)
+  const impact = work?.value
+  const impactMarkup = `<section aria-label="Verified work impact"><h3 class="tp-group-label">Work impact</h3>${impact
+    ? `<dl class="logging-facts">${field('Current impact', impact.impact)}${field('Work stage', impact.stage)}${field('Work target', impact.target)}
+      ${field('Last verified progress', date(new Date(impact.progressAt).toISOString()))}${field('Next retry', impact.retryAt === null ? null : date(new Date(impact.retryAt).toISOString()))}
+      ${field('Next action', impact.nextAction)}${field('Matched invocation', impact.invocationId)}${impact.recovered ? field('Matched failure', 'Recovered; verified progress followed this invocation failure') : ''}</dl>
+      <a href="${escape(impact.journal)}" target="_blank" rel="noopener noreferrer">Journal evidence</a>`
+    : `<p class="st-help">Current impact: unknown. ${escape(work?.message ?? 'Reading workspace chain evidence…')}</p>`}</section>`
   const relatedMarkup = r ? `<p class="st-help st-help-${!r.loading && r.error ? 'warn' : 'info'}" role="status">${escape(r.loading ? 'Loading related diagnostics…' : r.error || `${r.total.toLocaleString()} matching retained events · related snapshot`)}</p>
     <ul class="logging-related-list">${r.events.map((entry) => `<li><button type="button" data-action="related-event" data-event="${entry.id}">${escape(date(entry.eventTime ?? entry.ingestedAt))} · ${escape(entry.message)}</button></li>`).join('')}</ul>
     <div class="range-picker" role="group" aria-label="Related pages"><button type="button" data-action="related-previous" data-row="${event.id}" data-focus="related-previous-${event.id}" ${r.page === 0 || r.loading ? 'disabled' : ''}>Previous</button><button type="button" data-action="related-next" data-row="${event.id}" data-focus="related-next-${event.id}" ${!r.cursor || r.loading ? 'disabled' : ''}>Next 20</button></div>` : ''
   return `${event.truncated ? '<p class="st-help st-help-warn">Evidence is truncated; omitted details are not retained.</p>' : ''}
     <div class="range-picker logging-evidence-links" role="group" aria-label="Diagnostic destinations">${links || '<span class="st-help">No recorded navigation target.</span>'}</div>
+    ${impactMarkup}
     <dl class="logging-facts">${field('Component', event.component)}${field('Operation', event.operation)}${field('Phase', event.phase)}${field('Target', event.target)}
     ${field('Source severity', event.sourceLevel)}${field('Workspace', event.workspace)}${field('Instance', event.instance)}${field('Container', event.container)}${field('Release', event.release)}
     ${field('Source time', event.eventTime ? date(event.eventTime) : null)}${field('Ingestion time', date(event.ingestedAt))}${field('Account', event.account)}${field('Repository', event.repository)}
@@ -317,7 +328,7 @@ function render(): void {
     const cells = columns.map(([key]) => {
       if (key === 'time') return `<td class="started-cell"><time datetime="${escape(event.eventTime ?? event.ingestedAt)}" title="${escape((event.eventTime ? 'Source time' : 'Ingestion time; source time not recorded') + ' · ' + effectiveTimezone())}">${escape(date(event.eventTime ?? event.ingestedAt))}</time>${event.eventTime ? '' : '<span class="agent-status-note">Ingested</span>'}</td>`
       if (key === 'severity') return `<td><span class="agent-status ${event.severity === 'warning' ? 'warn' : 'bad'}"><span class="agent-status-label">${event.severity[0].toUpperCase() + event.severity.slice(1)}</span></span></td>`
-      if (key === 'occurrences') return `<td class="logging-number" title="Retained occurrences in this incident">${event.occurrences.toLocaleString()}</td>`
+      if (key === 'occurrences') return `<td class="logging-number" title="Retained event/occurrence count in this incident">${event.occurrences.toLocaleString()}</td>`
       const value = event[key] || '—'
       return `<td class="logging-cell logging-cell-${key}" title="${escape(value)}">${escape(value)}</td>`
     }).join('')
@@ -437,6 +448,7 @@ async function loadPage(cursor: string | null = null, fresh = true, focusTarget 
     if (fresh) { firstSnapshot = { page: value, at: lastSuccess }; cursors = [null]; pageIndex = 0; newCount = 0; rangeChanged = false; failures = 0; retryAt = 0 }
     else pageIndex = targetPage
     render()
+    for (const id of expanded) void readWorkImpact(id)
     const targetId = linked?.id
     if (focusTarget && targetId) requestAnimationFrame(() => {
       if (!current(mine)) return
@@ -562,6 +574,26 @@ async function readRelated(id: string, correlation = false, nextPage = 0, fresh 
   finally { requests.delete(request); if (current(mine) && related.get(id) === state) { state.loading = false; render() } }
 }
 
+async function readWorkImpact(id: string): Promise<void> {
+  if (!access || impacts.has(id)) return
+  const event = page?.events.find(event => event.id === id) ?? (linked?.id === id ? linked : null)
+  if (!event) return
+  const state = { value: null as LoggingWorkImpact | null, message: 'Reading workspace chain evidence…' }
+  impacts.set(id, state)
+  const mine = generation, request = controller()
+  try {
+    const value = await loggingWorkImpact(access, event, request.signal)
+    if (!current(mine) || impacts.get(id) !== state) return
+    state.value = value
+    state.message = value ? '' : 'No unambiguous managed chain invocation matches this evidence.'
+  } catch (error) {
+    if (current(mine) && !request.signal.aborted) state.message = 'Workspace chain evidence is unavailable. ' + failure(error).message
+  } finally {
+    requests.delete(request)
+    if (current(mine) && impacts.get(id) === state) render()
+  }
+}
+
 async function exportCurrent(): Promise<void> {
   if (!access || !page) return
   const mine = generation; const request = controller()
@@ -612,14 +644,14 @@ function onClick(event: Event): void {
       if (key) { preferences[key] = ''; filtersChanged(); view.querySelector<HTMLInputElement>('#logging-' + key)?.focus() }
       break
     }
-    case 'expand': if (id) { if (expanded.has(id)) { expanded.delete(id); related.delete(id) } else expanded.add(id); render() } break
+    case 'expand': if (id) { if (expanded.has(id)) { expanded.delete(id); related.delete(id); impacts.delete(id) } else { expanded.add(id); void readWorkImpact(id) } render() } break
     case 'refresh': case 'new': refreshCurrent(); break
     case 'export': if (button.getAttribute('aria-busy') !== 'true') void exportCurrent(); break
     case 'custom': applyCustom(); break
     case 'next': if (page?.nextCursor) { cursors[pageIndex + 1] = page.nextCursor; void loadPage(page.nextCursor, false, false, pageIndex + 1) } break
     case 'previous': if (pageIndex > 0) {
       const previous = pageIndex - 1
-      if (previous === 0 && firstSnapshot) { const mine = invalidate(); pageIndex = 0; page = firstSnapshot.page; lastSuccess = firstSnapshot.at; setMessage(''); stale = null; render(); void readHealth(mine) }
+      if (previous === 0 && firstSnapshot) { const mine = invalidate(); pageIndex = 0; page = firstSnapshot.page; lastSuccess = firstSnapshot.at; setMessage(''); stale = null; render(); for (const id of expanded) void readWorkImpact(id); void readHealth(mine) }
       else void loadPage(cursors[previous], false, false, previous)
     } break
     case 'related': if (id) void readRelated(id); break
@@ -672,7 +704,7 @@ function onChange(event: Event): void {
 function visibility(): void {
   if (!active) return
   if (document.hidden) { const pending = loading; invalidate(); if (pending && page) { stale = 'paused'; setMessage('The pending read was paused when this tab became hidden.', 'info') } syncPolling() }
-  else { render(); if (!page && !linkFailure) void initialRead(); else { syncPolling(); if (pageIndex === 0) void poll() } }
+  else { render(); if (!page && !linkFailure) void initialRead(); else { syncPolling(); for (const id of expanded) void readWorkImpact(id); if (pageIndex === 0) void poll() } }
 }
 
 export function initLoggingView(): void {

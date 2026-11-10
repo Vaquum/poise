@@ -12,6 +12,19 @@ export const loggingCallId = (value: string): boolean => /^[a-f0-9]{32}$/.test(v
 export type LoggingPage = CanonicalLoggingPage
 export type LoggingEvent = LogEvent & { occurrences?: number }
 export type LoggingQuery = LogFilter & { scope?: 'workspace' | 'instance' }
+export interface LoggingWorkImpact {
+  impact: 'retrying' | 'blocked' | 'recovered' | 'unknown'
+  recovered: boolean
+  invocationId: string
+  repository: string
+  behavior: string
+  stage: string
+  target: string
+  progressAt: number
+  retryAt: number | null
+  nextAction: string | null
+  journal: string
+}
 export interface LoggingAccess { endpoint: string; isAdmin: boolean; owner: string }
 export interface LoggingHealth {
   version: 1
@@ -151,6 +164,32 @@ export async function loggingHealth(access: LoggingAccess, scope: LoggingQuery['
     || !Array.isArray(body.collection.sources) || body.collection.sources.length > 256 || !body.collection.sources.every(coverage)
     || (body.bounds !== undefined && !bounds(body.bounds)) || !policy(body.policy)) return protocol()
   return body as unknown as LoggingHealth
+}
+
+/** Optional workspace journal read; central Logging never depends on its availability. */
+export async function loggingWorkImpact(access: LoggingAccess, event: LoggingEvent, signal: AbortSignal): Promise<LoggingWorkImpact | null> {
+  if (!['poise', 'caller'].includes(event.source) || event.visibility !== 'workspace' || event.workspace !== access.owner
+    || !event.callId && !event.correlationId) return null
+  const params = new URLSearchParams()
+  if (event.callId) params.set('callId', event.callId)
+  if (event.correlationId) params.set('correlationId', event.correlationId)
+  const response = await fetch('/api/behavior-chains?' + params, { cache: 'no-store', credentials: 'same-origin', signal })
+  const body: unknown = await response.json()
+  aborted(signal)
+  if (!response.ok) throw new Error('Workspace chain evidence is unavailable.')
+  if (!object(body)) return protocol()
+  const value = body.impact
+  if (value === null) return null
+  if (!object(value) || !['retrying', 'blocked', 'recovered', 'unknown'].includes(String(value.impact))
+    || typeof value.recovered !== 'boolean' || typeof value.invocationId !== 'string'
+    || !['stage', 'target', 'journal', 'repository', 'behavior'].every(key => typeof value[key] === 'string')
+    || typeof value.journal !== 'string' || !value.journal.startsWith('/api/behavior-chains?id=')
+    || !Number.isSafeInteger(value.progressAt) || Number(value.progressAt) < 0
+    || value.retryAt !== null && (!Number.isSafeInteger(value.retryAt) || Number(value.retryAt) < 0)
+    || value.nextAction !== null && typeof value.nextAction !== 'string') return protocol()
+  if (event.repository && event.repository.toLowerCase() !== String(value.repository).toLowerCase()
+    || event.behavior && event.behavior.replace(/_/g, '-') !== value.behavior) return null
+  return value as unknown as LoggingWorkImpact
 }
 
 export async function loggingExport(access: LoggingAccess, query: LoggingQuery, signal: AbortSignal): Promise<Blob> {
