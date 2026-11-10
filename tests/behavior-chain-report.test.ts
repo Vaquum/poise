@@ -293,6 +293,29 @@ it('ignores ordinary continuation-like words without a successor reference', asy
   expect(reports(db)).toHaveLength(1)
 })
 
+it('creates a closed-PR continuation past a historical receipt_unavailable settlement', async () => {
+  const { db, journal } = setup()
+  let source = openSeed(journal)
+  source = record(journal, source, { type: 'invocation.admitted', invocation: { id: 'receipt-blocked', behavior: 'implement-issue',
+    basis: 'original', actor: 'author', slot: 'primary', model: 'fixture', admittedAt: NOW - 500_000,
+    request: { command: 'github-interface', cwd: '/fixture', argv: ['--read-issue', '7'] } } })
+  source = record(journal, source, { type: 'invocation.settled', invocationId: 'receipt-blocked', callId: null,
+    outcome: 'receipt_unavailable', evidence: { status: 'deferred', action: 'not_started', outcome: 'receipt_unavailable',
+      error: 'CallerReceiptStoreError: could not reserve the command safely', completedAt: NOW - 400_000 } })
+  source = record(journal, source, { type: 'invocation.admitted', invocation: { id: 'later', behavior: 'implement-issue',
+    basis: 'original', actor: 'author', slot: 'primary', model: 'fixture', admittedAt: NOW - 300_000,
+    request: { command: 'agent-interface', cwd: '/fixture', argv: ['--atomic-work', source.id] } } })
+  record(journal, source, { type: 'invocation.settled', invocationId: 'later', callId: chainBasis('later').slice(0, 32),
+    outcome: 'preflight_failed', evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error: 'native failure', completedAt: NOW - 200_000, resources_settled_at: new Date(NOW - 100_000).toISOString(),
+      resource_ownership: { version: 1, roots: [], errors: [] } } })
+  fresh = closedObservation()
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0]).toMatchObject({ title: 'fix: continue #7 after closed unmerged PR #21' })
+  expect(reports(db)).toHaveLength(1)
+})
+
 it.each(['wrong coverage', 'ambiguous', 'unavailable', 'closed successor', 'missing label'])(
   'keeps an unverified successor pending: %s', async change => {
     const { db, journal } = setup()

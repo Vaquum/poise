@@ -1,7 +1,7 @@
 import type { Database } from 'better-sqlite3'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
 import { chainBasis, chainIdentity, type BehaviorChain, type BehaviorChainJournal } from './behavior-chain-store'
-import { resourceReleaseProven } from './behavior-resource-receipt'
+import { nativeResourcesPending, resourceReleaseProven } from './behavior-resource-receipt'
 import { runDatastoreHealth } from './datastore-health'
 import { handleGhBody, reconcileRepairReport } from './gh'
 import { HttpError } from './http'
@@ -178,7 +178,11 @@ function qualifyingClosedPull(chain: BehaviorChain, observation: ChainObservatio
     && observation.pull?.state === 'closed' && observation.pull.merged === false && observation.pull.mergeSha === null
     && observation.publication.pull_number === observation.pull.number && observation.publication.merged === false
     && observation.existingPulls.length === 0
-    && chain.invocations.every(invocation => invocation.state === 'settled' && resourceReleaseProven(invocation.evidence ?? {}, true))
+    // A receipt-store failure settles without a Call or resources and holds no
+    // reservation; it must not permanently fence a later continuation. Real
+    // pending or unproven Call resources still block, mirroring supersession.
+    && chain.invocations.every(invocation => invocation.state === 'settled' && !nativeResourcesPending({ ...invocation })
+      && (invocation.model === null || invocation.callId === null || resourceReleaseProven(invocation.evidence ?? {}, true)))
 }
 
 /** Only an explicit work-continuation relationship can cover the closed PR.
