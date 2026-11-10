@@ -15,6 +15,7 @@ import { BehaviorDeadline } from './behavior-deadline'
 import { startDirectBehaviorRun, finishDirectBehaviorRun, discardDirectBehaviorRun, reapAbandonedDirectBehaviorRuns } from './behavior-metrics'
 import { CLI_UPDATE_TIMEOUT_MS } from '../scripts/provider-cli-updates.mjs'
 import { releaseBackgroundPaused, trackReleaseBackground } from './release-background'
+import { CallerReceiptStoreError } from './service/caller-calls'
 // Server-side behavior runtime. Lives with the Poise HTTP server
 // so the toggle keeps working when the browser tab is closed,
 // reloaded, or backgrounded — none of which the original
@@ -7732,7 +7733,8 @@ export async function runEnabledBehaviorsOnce(
         const message = behaviorErrorMessage(error)
         const stale = !!staleDatastoreFailure(error)
         behaviorChainHealth.set(organization, { lastSweepAt: Date.now(), error: message, stale })
-        if (!stale) {
+        const recorded = error instanceof CallerReceiptStoreError && error.diagnosticRecorded
+        if (!stale && !recorded) {
           const code = classifyBehaviorDiagnostic(message).code
           const transient = message.startsWith('behavior observation failed for ')
             && ['upstream_unavailable', 'network_interruption'].includes(code)

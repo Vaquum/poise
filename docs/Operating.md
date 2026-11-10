@@ -1069,7 +1069,13 @@ and `SQLITE_CORRUPT` are integrity failures; busy/locked reads are contention,
 and other read failures remain unavailable. Health keeps `idle: false` and
 `unsettledNativeCalls: null` while unreadable. Managed chain admission and its
 final launch/action/publication boundaries refuse unavailable receipts.
-A successful health response or SQL read does not prove recovery completeness.
+A confirmed integrity failure also persists the existing chain admission pause
+across server restarts. Successful health responses and narrow SQL reads cannot
+resume admissions. Cleanup and original-receipt reconciliation continue; explicit
+resume through the existing behavior control follows the recovery checks below.
+Contention recovers automatically without pausing admissions. The first receipt
+diagnostic remains actionable; behavior sweeps omit its repetitive wrapper only
+after that exact failure was recorded, while separate failures remain reported.
 
 1. Preserve the original main file, WAL (including deleted files held open by
    original processes), shared-memory state, behavior journal and process/resource
