@@ -45,7 +45,7 @@ export function behaviorChainLogging() {
   const history = element.querySelector<HTMLElement>('[aria-label="Chain journal"]')!
   const historyMore = element.querySelector<HTMLButtonElement>('[data-history-more]')!
   let cutover: BehaviorCutoverState | null = null
-  let reading = false
+  let refreshGeneration = 0
   let next: string | null = null
   let rows: ChainRow[] = []
   let historyId = ''
@@ -89,13 +89,17 @@ export function behaviorChainLogging() {
     finally { if (generation === historyGeneration) historyMore.disabled = false }
   }
   async function refresh(append = false): Promise<void> {
-    if (reading) return
-    reading = true; more.disabled = true
+    // A Hold/Resume follow-up must never be skipped while an older refresh is
+    // pending: every pass fetches, and only the latest pass writes. Superseded
+    // passes return quietly instead of displaying stale hold state.
+    const generation = ++refreshGeneration
+    more.disabled = true
     const after = append ? next : null
     const previousCount = append ? 0 : rows.length
     try {
       const response = await fetch(`/api/behavior-chains${after ? `?after=${encodeURIComponent(after)}` : ''}`)
       const data = await response.json()
+      if (generation !== refreshGeneration) return
       if (!response.ok || !Array.isArray(data.chains)) throw new Error(data.error || `HTTP ${response.status}`)
       if (data.next !== null && (typeof data.next !== 'string' || data.next <= (after ?? ''))) throw new Error('Chain cursor did not advance')
       let chains = data.chains
@@ -105,12 +109,14 @@ export function behaviorChainLogging() {
       while (!append && chains.length < previousCount && cursor) {
         const page = await fetch(`/api/behavior-chains?after=${encodeURIComponent(cursor)}`)
         const paged = await page.json()
+        if (generation !== refreshGeneration) return
         if (!page.ok || !Array.isArray(paged.chains)) throw new Error(paged.error || `HTTP ${page.status}`)
         if (paged.next !== null && (typeof paged.next !== 'string' || paged.next <= cursor)) throw new Error('Chain cursor did not advance')
         cursor = paged.next
         chains = [...chains, ...paged.chains]
         if (paged.chains.length === 0) break
       }
+      if (generation !== refreshGeneration) return
       next = append ? data.next : cursor
       rows = append ? [...rows, ...data.chains] : chains
       more.hidden = !next
@@ -168,12 +174,13 @@ export function behaviorChainLogging() {
       const errors = Array.isArray(data.runtime) ? data.runtime.filter((entry: { error: string | null }) => entry.error).map((entry: { organization: string, error: string }) => `${entry.organization}: ${entry.error}`).join('; ') : ''
       status.textContent = `Read ${new Date().toLocaleTimeString()}${errors ? ` · ${errors}` : ''}`
     } catch (error) {
+      if (generation !== refreshGeneration) return
       cutover = null
       for (const button of list.querySelectorAll<HTMLButtonElement>('button[data-operation="hold"], button[data-operation="resume"]')) button.disabled = true
       element.querySelector('[data-chain-capacity]')!.textContent = 'Atomic behavior capacity unavailable.'
       element.querySelector('[data-cutover-status]')!.textContent = 'Admission state unavailable'
       status.textContent = `Chains could not be refreshed: ${(error as Error).message}`
-    } finally { reading = false; more.disabled = false }
+    } finally { if (generation === refreshGeneration) more.disabled = false }
   }
   return { element, refresh, readHistory }
 }
