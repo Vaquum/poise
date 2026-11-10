@@ -19,7 +19,8 @@ from test_deploy_verify import FAKE_DOCKER, IMAGE_ID, LIB, health
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
 ACTIONS = os.path.join(ROOT, 'deploy', 'actions')
-WORKFLOWS = [os.path.join(ROOT, '.github', 'workflows', name) for name in ('deploy.yml', 'sync-upstream.yml')]
+WORKFLOWS = [os.path.join(ROOT, '.github', 'workflows', name)
+             for name in ('deploy.yml', 'sync-upstream.yml', 'wake-production-sync.yml')]
 DEPLOY_INPUTS = ('VARS', 'REPO', 'SHA', 'DEPLOY_PATH', 'TOKEN')
 
 
@@ -417,7 +418,12 @@ class GateTest(unittest.TestCase):
     FAKE_GH = """#!/bin/sh
 # Serves canned API answers from $GH_FIXTURES; $GH_FAIL names files that fail.
 if [ "$1" = workflow ]; then
-  [ "$*" = "workflow run deploy.yml --repo $REPO --ref main" ] || exit 99
+  if [ "$3" = sync-upstream.yml ]; then
+    [ "$*" = "workflow run sync-upstream.yml --repo $REPO --ref main" ] || exit 99
+    [ "$GH_TOKEN" = wake-fixture ] || exit 99
+  else
+    [ "$*" = "workflow run deploy.yml --repo $REPO --ref main" ] || exit 99
+  fi
   printf '%s\\n' "$*" >>"$GH_CALLS"
   case " $GH_FAIL " in *" dispatch "*) echo "boom" >&2; exit 1;; esac
   exit 0
@@ -658,6 +664,48 @@ cat "$GH_FIXTURES/$file"
                                     capture_output=True, text=True, env=env)
         return result, outputs
 
+    def wake(self, token='wake-fixture', fail=''):
+        with open(WORKFLOWS[2]) as file:
+            command = textwrap.dedent(file.read().split('        run: |\n')[1])
+        env = clean_env(
+            HOME=self.work.name, PATH=f'{self.bin}{os.pathsep}{os.environ["PATH"]}',
+            GH_FIXTURES=self.fixtures, GH_CALLS=self.calls, GH_FAIL=fail,
+            GH_TOKEN=token, FORK=self.REPO, REPO=self.REPO,
+        )
+        return subprocess.run(['bash', '-euo', 'pipefail', '-c', command],
+                              capture_output=True, text=True, env=env)
+
+    def test_upstream_wake_requests_sync_and_failed_wakes_leave_scheduled_recovery(self):
+        self.green()
+        self.deploy_run(apply='success')
+        newest = 'c' * 40
+        self.fixture('upstream.json', {'sha': newest})
+        result = self.wake()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(self.calls) as file:
+            self.assertEqual(file.read().splitlines(), [
+                f'workflow run sync-upstream.yml --repo {self.REPO} --ref main'])
+
+        result = self.wake(token='')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('::error::Set POISE_SYNC_WAKE_TOKEN', result.stdout)
+        result = self.wake(fail='dispatch')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('boom', result.stderr)
+        with open(self.calls) as file:
+            self.assertEqual(len(file.read().splitlines()), 2)
+        with open(os.path.join(self.fixtures, 'tip.json')) as file:
+            self.assertEqual(json.load(file)['sha'], self.TIP)
+
+        # Cron enters the same Sync independently of the rejected/missed wake.
+        result, _ = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(os.path.join(self.fixtures, 'tip.json')) as file:
+            self.assertEqual(json.load(file)['sha'], newest)
+        result, _ = self.gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('no ci.yml run tested it', result.stderr)
+
     def deploy_run(self, run_id=301, apply='skipped', apply_sha=None, **changes):
         run = self.workflow_run(run_id, **{'event': 'workflow_run', 'created_at': self.verified_at, **changes})
         self.fixture('deploy-runs.json', {'workflow_runs': [run]})
@@ -796,6 +844,8 @@ cat "$GH_FIXTURES/$file"
         self.fixture('deploy-runs.json', {'workflow_runs': []})
         for upstream in (middle, newest):
             self.fixture('upstream.json', {'sha': upstream})
+            wake = self.wake()
+            self.assertEqual(wake.returncode, 0, wake.stderr)
             result, outputs = self.sync()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(outputs, {'proceed': 'false', 'sha': first})
@@ -807,6 +857,8 @@ cat "$GH_FIXTURES/$file"
         self.green()
         for status in ('completed', 'in_progress'):
             self.deploy_run(status=status, conclusion='success' if status == 'completed' else None)
+            wake = self.wake()
+            self.assertEqual(wake.returncode, 0, wake.stderr)
             result, outputs = self.sync()
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(outputs['proceed'], 'false')
@@ -822,6 +874,8 @@ cat "$GH_FIXTURES/$file"
         self.deploy_run(run_id=302)
         self.fixture('deploy-runs.json', {'workflow_runs': [
             self.workflow_run(302, event='workflow_run', created_at=self.verified_at), applied]})
+        wake = self.wake()
+        self.assertEqual(wake.returncode, 0, wake.stderr)
         result, outputs = self.sync()
         self.assertEqual(result.returncode, 0, result.stderr)
         with open(os.path.join(self.fixtures, 'tip.json')) as file:
@@ -848,6 +902,18 @@ cat "$GH_FIXTURES/$file"
             self.assertEqual(approved, {'proceed': 'true', 'sha': newest})
             self.assertEqual(self.workspace_proof(approved['sha'], first).returncode, 1)
             self.assertEqual(self.workspace_proof(approved['sha'], newest).returncode, 0)
+
+        # Repeated/stale upstream events after apply cannot request another Deploy.
+        self.deploy_run(303, apply='success')
+        for _ in range(2):
+            wake = self.wake()
+            self.assertEqual(wake.returncode, 0, wake.stderr)
+            result, _ = self.sync()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        with open(self.calls) as file:
+            self.assertEqual(file.read().count('workflow run deploy.yml'), 1)
+        with open(os.path.join(self.fixtures, 'tip.json')) as file:
+            self.assertEqual(json.load(file)['sha'], newest)
 
     def test_sync_admits_a_newer_fix_after_terminal_verification_or_deploy_failure(self):
         for workflow in ('ci.yml', 'caller.yml', 'deploy.yml'):
@@ -937,6 +1003,21 @@ class DeployWiringTest(unittest.TestCase):
     def workflow(self, name):
         with open(os.path.join(ROOT, '.github', 'workflows', name)) as file:
             return file.read()
+
+    def test_upstream_wake_preserves_the_forks_opt_in_and_serialized_reconciliation(self):
+        wake = self.workflow('wake-production-sync.yml')
+        self.assertIn('on:\n  push:\n    branches: [main]\n', wake)
+        self.assertIn('permissions: {}', wake)
+        self.assertIn("if: github.repository == 'autonomio/poise' && vars.POISE_PRODUCTION_FORK != ''", wake)
+        self.assertIn('GH_TOKEN: ${{ secrets.POISE_SYNC_WAKE_TOKEN }}', wake)
+        self.assertIn('FORK: ${{ vars.POISE_PRODUCTION_FORK }}', wake)
+        self.assertNotIn('github.token', wake)
+        self.assertNotIn('github.sha', wake)
+        sync = self.workflow('sync-upstream.yml')
+        self.assertIn('  workflow_dispatch:', sync)
+        self.assertIn("if: vars.POISE_UPSTREAM_SYNC == 'true'", sync)
+        self.assertIn("- cron: '2-59/5 * * * *'", sync)
+        self.assertIn('group: sync-upstream\n  cancel-in-progress: false', sync)
 
     def test_deploy_runs_on_ci_and_caller_completion_only(self):
         triggers = self.workflow('deploy.yml').split('permissions:')[0].split('\non:\n')[1]

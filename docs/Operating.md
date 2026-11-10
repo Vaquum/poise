@@ -472,7 +472,27 @@ both of these:
 | `POISE_UPSTREAM_SYNC` | variable | `true` |
 | `POISE_SYNC_TOKEN` | secret | A fine-grained personal access token for the fork, made as below |
 
-The Sync workflow checks every five minutes. With `POISE_DEPLOY_HOST` set, it
+For the production fork, upstream's **Wake production Sync** workflow requests
+the fork's existing Sync workflow on each push to `autonomio/poise`'s `main`,
+without waiting for cron. In **autonomio/poise**'s Actions settings, set
+`POISE_PRODUCTION_FORK` to `Vaquum/poise` (or the configured production fork's
+`owner/repo`) and add the repository secret `POISE_SYNC_WAKE_TOKEN`. Use a
+fine-grained personal access token restricted to **only that fork**, with
+**Actions: Write** (and GitHub's automatic Metadata: Read). The upstream
+[`GITHUB_TOKEN` is repository-scoped](https://docs.github.com/en/actions/concepts/security/github_token#about-the-github_token);
+cross-repository [workflow dispatch requires Actions: Write](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
+Keep this credential separate from the fork's Contents/Workflows merge token
+`POISE_SYNC_TOKEN`. An unset target disables the wake; a configured target with
+a missing, expired or rejected wake credential fails visibly in upstream Actions.
+The wake sends only `ref: main`, never a candidate SHA. The fork still requires
+`POISE_UPSTREAM_SYNC=true`; forks cannot dispatch the production wake themselves.
+
+Sync retains its five-minute schedule to reconcile missed or failed wakes.
+Duplicate or stale wakes enter the same serialized Sync, which reads current
+main: they introduce no additional deployment or rollback. This does not prevent
+an operator from reapplying settings through Deploy on the same green tip.
+Promptness applies to requesting Sync; a retained candidate can still wait for
+later reconciliation. With `POISE_DEPLOY_HOST` set, Sync
 retains the fork's current main through both required push workflows (CI and
 Caller) and its gated, serialized Deploy attempt. Green CI alone does not
 release the candidate, nor does a successful Deploy that skipped its apply
