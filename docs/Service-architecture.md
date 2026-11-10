@@ -1362,8 +1362,14 @@ unchanged polls cannot refresh it. Stale/incomplete evidence stays explicit.
 This adds no observation, scheduler, event type, scope or execution authority.
 [Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
 
-Logging incident details may independently read `/api/behavior-chains` with exact
-`callId` and/or `correlationId` selectors for a read-only work-impact annotation.
+Logging list snapshots may independently read `/api/behavior-chains` with exact
+`callId` and/or `correlationId` selectors for a read-only work-impact annotation
+shared with expanded details. `batch=1` accepts up to 100 paired, repeated
+`callId`/`correlationId` parameters (empty means absent, at least one per pair)
+and returns ordered `impacts` using the same single-invocation association and
+state calculation. The existing single lookup retains its `impact` response.
+Each displayed page uses one optional batch read, deduplicating exact selector
+pairs; Refresh replaces its results without a new polling loop or per-row reads.
 This uses the existing owner workspace boundary and canonical journal, including
 completed chains. Ambiguous or missing matches remain unknown, as does a failed
 workspace read; central Logging queries and retained evidence remain independent.

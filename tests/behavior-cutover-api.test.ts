@@ -3,8 +3,9 @@ import { afterAll, beforeEach, expect, it, vi } from 'vitest'
 import { db, getMeta, setMeta, closeDatabase } from '../server/db'
 import { behaviorChainJournal } from '../server/behavior-chain-journal'
 import type { BehaviorChain, ChainEvent } from '../server/behavior-chain-store'
-import { behaviorChainSummary } from '../server/behavior-chain-summary'
+import { behaviorChainSummary, behaviorChainWorkImpact } from '../server/behavior-chain-summary'
 import { chainSummaryFixture } from './fixtures/behavior-chain-summary'
+import { loggingWorkFixture } from './fixtures/logging-work-impact'
 import { parseProcessDiagnostic } from '../server/process-diagnostic'
 
 const native = vi.hoisted(() => ({ support: { status: 'supported', error: null as string | null } }))
@@ -285,4 +286,45 @@ it('pages a 10,000-event chain and 100 admitted chains without losing the curren
     expect(latest.events).toHaveLength(1)
     expect(latest.events[0]).toMatchObject({ type: 'chain.waiting', reason: 'checkpoint 9999' })
   } finally { await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())) }
+})
+
+it('batches exact work-impact lookups through the existing classifier without changing journal evidence', async () => {
+  const journal = behaviorChainJournal()
+  const at = Date.now() - 10_000
+  const call = '4'.repeat(32), correlation = '5'.repeat(32), other = '6'.repeat(32)
+  const fixture = loggingWorkFixture(journal, 'api/impact', 7, correlation, call, at)
+  fixture.append({ type: 'chain.held', reason: 'independent hold' }, at + 4000)
+  const completed = loggingWorkFixture(journal, 'api/impact', 8, other, other, at)
+  completed.append({ type: 'chain.merged', mergeSha: 'c'.repeat(40), evidence: { repository: 'api/impact', pull_number: 108,
+    merged: true, merge_sha: 'c'.repeat(40), review_complete: true } }, at + 4000)
+  const before = [journal.history(fixture.chain.id), journal.history(completed.chain.id)]
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  try {
+    const params = new URLSearchParams({ batch: '1' })
+    for (const [callId, correlationId] of [[call, correlation], ['', other], ['7'.repeat(32), ''], [call, other]]) {
+      params.append('callId', callId); params.append('correlationId', correlationId)
+    }
+    const response = await fetch(`${base}?${params}`)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ impacts: [behaviorChainWorkImpact(journal, call, correlation),
+      behaviorChainWorkImpact(journal, null, other), null, null] })
+    const single = await (await fetch(`${base}?callId=${call}&correlationId=${correlation}`)).json()
+    expect(single).toEqual({ impact: behaviorChainWorkImpact(journal, call, correlation) })
+    for (const query of ['batch=1', `batch=1&callId=${call}`, 'batch=1&callId=&correlationId=',
+      `batch=1&callId=${call}&correlationId=invalid`, `batch=invalid&callId=${call}`]) {
+      expect((await fetch(`${base}?${query}`)).status).toBe(400)
+    }
+    const bounded = new URLSearchParams({ batch: '1' })
+    for (let index = 0; index < 100; index++) { bounded.append('callId', call); bounded.append('correlationId', '') }
+    const full = await fetch(`${base}?${bounded}`)
+    expect(full.status).toBe(200)
+    expect((await full.json()).impacts).toHaveLength(100)
+    bounded.append('callId', call); bounded.append('correlationId', '')
+    expect((await fetch(`${base}?${bounded}`)).status).toBe(400)
+    expect([journal.history(fixture.chain.id), journal.history(completed.chain.id)]).toEqual(before)
+  } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })
