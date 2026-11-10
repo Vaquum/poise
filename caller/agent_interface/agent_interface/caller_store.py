@@ -4,8 +4,10 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import socket
 import sqlite3
 import stat
+import struct
 from pathlib import Path
 
 _reference: dict | None = None
@@ -103,6 +105,24 @@ def directory(path: Path, *, responses: bool = False) -> Path:
     fd = descriptors[1 if responses else 0]
     _identity(os.fstat(fd), reference["responses" if responses else "directory"], True)
     return Path(f"/proc/self/fd/{fd}")
+
+
+def observes_workspace_supervisor() -> bool:
+    """The verified controller's peer PID is invisible in a child PID namespace."""
+    store = _store()
+    if store is None:
+        return False
+    from .native_namespace import CONTROL_SECONDS, control_address
+    try:
+        address = control_address()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(CONTROL_SECONDS)
+            connection.connect(address["path"])
+            credentials = struct.Struct("iII")
+            pid, uid, _ = credentials.unpack(connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, credentials.size))
+    except (OSError, RuntimeError, AttributeError, struct.error):
+        return False
+    return pid > 0 and pid == store[0]["pid"] and uid == os.getuid()
 
 
 def connect(path: str | Path, *, timeout: float = 30) -> sqlite3.Connection:

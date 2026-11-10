@@ -12,6 +12,8 @@ import { existsSync } from 'node:fs'
 import { BEHAVIOR_CALL_SOURCES, runningCallerLaunches } from '../process'
 import { callerDatabase } from '../caller-store'
 import { diagnosticFailure } from '../logging'
+import { getMeta, setMeta } from '../db'
+import { BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY } from '../settings'
 
 let debates = 0
 
@@ -43,6 +45,7 @@ export class CallerReceiptStoreError extends Error {
   readonly code: string | null
   readonly kind: 'integrity' | 'contention' | 'unavailable'
   readonly firstObservedAt = new Date().toISOString()
+  diagnosticRecorded = false
 
   constructor(readonly dataDir: string | undefined, cause: unknown) {
     const code = cause && typeof cause === 'object' && 'code' in cause && typeof cause.code === 'string' ? cause.code : null
@@ -56,7 +59,6 @@ export class CallerReceiptStoreError extends Error {
 }
 
 let failure: CallerReceiptStoreError | null = null
-let failureRecorded = false
 
 /** Caller calls recorded as running whose process is alive, whichever server
  *  started them; null when the records exist but cannot be read. */
@@ -66,18 +68,37 @@ function callerActivity(dataDir: string | undefined, behaviorOnly: boolean, reso
     activity = callerDatabase(dataDir, path => readCallerActivity(path, behaviorOnly, resources))
     if (activity.pendingResources === null) throw activity.cause
     failure = null
-    failureRecorded = false
     return activity
   } catch (cause) {
     const next = new CallerReceiptStoreError(dataDir, cause)
     if (!failure || failure.dataDir !== dataDir || failure.kind !== next.kind || failure.code !== next.code) {
       failure = next
-      failureRecorded = false
     }
     // The independent diagnostic store retains the first observation even
     // when Caller cannot open its own receipts. Health remains bounded/unknown.
-    if (!failureRecorded) failureRecorded = diagnosticFailure(`caller.receipts.${failure.kind}`, failure,
+    if (!failure.diagnosticRecorded) failure.diagnosticRecorded = diagnosticFailure(`caller.receipts.${failure.kind}`, failure,
       { dataDir, firstObservedAt: failure.firstObservedAt }, { level: failure.kind === 'contention' ? 'warning' : 'error' }) !== null
+    if (failure.kind === 'integrity') {
+      // Narrow reads can recover before the store and original effects do.
+      // The hold persists even when admissions are already disabled, so a
+      // pending v2 cutover cannot re-enable them without an explicit resume.
+      // The hold alone fences effective settings, so a stop before the
+      // settings update still resumes fenced; read the stored (not effective)
+      // setting here so the pause is also persisted for display.
+      setMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY, '1')
+      try {
+        const raw = getMeta('behavior_chain_settings')
+        if (raw) {
+          const stored = JSON.parse(raw) as { enabled?: unknown, seedMode?: unknown, label?: unknown }
+          if (stored && typeof stored === 'object' && stored.enabled === true) {
+            setMeta('behavior_chain_settings', JSON.stringify({ ...stored, enabled: false }))
+          }
+        }
+      } catch {
+        // A corrupt stored setting already refuses broader intake or
+        // execution on read; the hold above still fences admissions.
+      }
+    }
     return activity
   }
 }

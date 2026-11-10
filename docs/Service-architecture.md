@@ -590,8 +590,10 @@ assertion may only resume, and anything else is refused with 403):
   - `version` is the commit the running bundle was built from, `null` for a
     development build.
   - `repairExhaustionRepositories` is the effective comma-separated reporting
-    allowlist, empty when disabled. Its absence identifies an older release
-    that cannot apply this setting through service configuration.
+    allowlist, empty when disabled. Legacy values over 8 KiB return `[oversized]`
+    so the gateway corrects them even when its desired value matches their prefix.
+    Its absence identifies an older release that cannot apply this setting
+    through service configuration.
   - `release` is the installed release the supervisor started this server on
     ([Updates in place](#updates-in-place)), `null` without one: the active
     SHA. A deploy is done only once it equals the deployed commit.
@@ -642,10 +644,11 @@ assertion may only resume, and anything else is refused with 403):
     paused, so an ordinary drain preserves original supervisor witnesses until
     their durable cleanup acknowledgement.
 - `POST /api/service/config` takes `{ repairExhaustionRepositories }`, a string
-  of explicit comma-separated `owner/repo` names or empty to disable reporting,
-  persists it in the workspace metadata store and returns health (200).
-  Invalid or missing values return 400. Only loopback or an `admin` assertion
-  may write it; browser and Link assertions are refused. This setting does not
+  of explicit comma-separated `owner/repo` names up to 8 KiB or empty to disable
+  reporting, persists it in the workspace metadata store and returns health (200).
+  Invalid or missing values return 400 without changing the previous setting.
+  Only loopback or an `admin` assertion may write it; browser and Link assertions
+  are refused. This setting does not
   alter existing native resource ownership or release/replacement safeguards.
 - `POST /api/service/drain` stops admitting new Chat turns and behavior
   launches, then returns the same fields with the drain on. The gateway treats
@@ -1372,8 +1375,10 @@ reservation. Closed-target native resource waits are separate from public
 GitHub recheck times; unrelated open-PR review/approval stays eligible.
 Managed native admissions recheck the bounded receipt reader at their final
 launch, action and publication boundaries. Its independent diagnostics retain
-the first typed SQLite cause and affected workspace; health keeps its existing
-unknown counters. Readability cannot clear missing original evidence. See
+the first typed SQLite cause and affected workspace; confirmed integrity failure
+persists the existing chain admission pause, including across an automatic v2
+cutover. Health keeps its existing unknown
+counters. Readability cannot clear that pause or missing original evidence. See
 [receipt-store recovery](Operating.md#caller-receipt-store-recovery).
 
 Native Caller receipts also carry append-only resource ownership outside

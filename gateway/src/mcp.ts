@@ -84,8 +84,9 @@ export class McpGateway {
       // redirect, so the consent page must allow the validated redirect origin.
       const redirectOrigin = new URL(authorization.redirect).origin
       const policy = String(ctx.pageHeaders['content-security-policy'] ?? '')
-      const authorizeHeaders = policy.includes(redirectOrigin) ? ctx.pageHeaders
-        : { ...ctx.pageHeaders, 'content-security-policy': policy.replace("form-action 'self'", `form-action 'self' ${redirectOrigin}`) }
+      const authorizeHeaders = { ...ctx.pageHeaders,
+        'content-security-policy': policy.replace("form-action 'self'", `form-action 'self' ${redirectOrigin}`),
+      }
       return sendHtml(res, 200, page('Connect Poise', html`<div class="card"><h1>Connect this agent to Poise?</h1>
         <p>Grant read access to ${principal.user.login}'s workspace at ${ctx.workspaceOrigin(principal.user.handle)}.</p>
         <p>Client ${authorization.client}. Return to ${authorization.redirect}. Allowed tool: poise_describe (workspace identity and capabilities only).</p>

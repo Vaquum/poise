@@ -249,6 +249,12 @@ cause as `diagnostic` (identity/process fields under `context`), and validated
 behavior incidents carry `processDiagnostic` alongside their classification;
 both pass through Poise's canonical redactor first, as Logging does.
 
+Unpaged `agent-interface --logs` history keeps readable calls available when
+an individual record has invalid UTF-8 or cannot be decoded as a log entry.
+The damaged row carries its position, readable identity fields and a
+quarantine reason in place of a receipt. Exact receipt selection and
+structural database failures still fail closed.
+
 The evidence records the actual Git subcommand after global options, exit or
 signal, deadline, elapsed time, configured/resolved executable, working path,
 repository/revision and call/correlation identity. Unobserved values are null.

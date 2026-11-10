@@ -182,6 +182,35 @@ describe('cutover launch boundary', () => {
     expect(discover).toHaveBeenCalledOnce()
     expect(mocks.spawnDetached).not.toHaveBeenCalled()
   })
+  it('completes cutover without re-enabling while a receipt integrity hold persists', async () => {
+    arrangeCli()
+    const { database: db, behaviors: runtime } = await loadModules()
+    const { BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY } = await import('../server/settings')
+    const native = await import('../server/behavior-chain-native')
+    const discover = vi.fn(async () => [])
+    const original = native.nativeChainOperations
+    vi.spyOn(native, 'nativeChainOperations').mockImplementation((org, hooks) => ({ ...original(org, hooks), discover }))
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_chain_settings', JSON.stringify({ enabled: false, seedMode: 'label', label: 'poise' }))
+    // A confirmed integrity failure during the pending cutover fences admissions.
+    db.setMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY, '1')
+    const journal = (await import('../server/behavior-chain-journal')).behaviorChainJournal()
+    journal.changeAdmission(0, 'draining')
+    const reader = await import('../server/chat/control')
+    const page = (number: number, more: boolean) => ({ prs: [{ repo: pr.repo, number, url: `https://github.com/${pr.repo}/pull/${number}`,
+      closing: [], closesVia: 'closing-references' as const, closingTruncated: false, headRef: `work-${number}`, headRepo: pr.repo }], truncated: more, more })
+    vi.spyOn(reader, 'readOpenPrClosingRefs').mockResolvedValueOnce(page(17, true)).mockResolvedValueOnce(page(18, false))
+    await runtime.runEnabledBehaviorsOnce()
+    expect(journal.cutover()).toMatchObject({ mode: 'v2', legacyPulls: [`${pr.repo}#17`.toLowerCase(), `${pr.repo}#18`.toLowerCase()] })
+    expect(JSON.parse(db.getMeta('behavior_chain_settings')!).enabled).toBe(false)
+    expect(db.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('1')
+    // An explicit Settings resume clears the hold and enables invocations.
+    const settings = await import('../server/settings')
+    settings.setSettings({ behaviorChain: { enabled: true, seedMode: 'label', label: 'poise' } })
+    expect(db.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('')
+    expect(JSON.parse(db.getMeta('behavior_chain_settings')!).enabled).toBe(true)
+  })
   it('fences an already preparing legacy review without cancelling it or starting its worker', async () => {
     arrangeCli()
     const { database: db, behaviors: runtime } = await loadModules()
