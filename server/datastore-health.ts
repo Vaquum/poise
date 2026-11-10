@@ -95,20 +95,20 @@ function observeHealth(org: Organization | null, health: Health, blockedBy: read
   const key = episodeKey(account, health.database)
   const transition = db.transaction(() => {
     const previous = readEpisode(key)
-    if (health.status === 'healthy') {
-      if (!previous || previous.recoveredAt) return null
-      const episode = { ...previous, latest: health.evidence, recoveredAt: health.evidence.checkedAt }
-      setMeta(key, JSON.stringify(episode))
-      return { episode, phase: 'recovered' as const }
+    if (previous) {
+      const incomingSync = Date.parse(health.evidence.lastSuccessAt)
+      const latestSync = Date.parse(previous.latest.lastSuccessAt)
+      // Sync generation orders observations first; within one generation,
+      // a smaller age is an earlier probe even if its result arrives later.
+      if (incomingSync < latestSync || (incomingSync === latestSync && health.evidence.ageSeconds < previous.latest.ageSeconds)) {
+        return { episode: previous, phase: null, ignored: true }
+      }
     }
-    if (previous?.recoveredAt && Date.parse(health.evidence.lastSuccessAt) < Date.parse(previous.latest.lastSuccessAt)) {
-      // Overlapping probes can straddle a successful sync: a stale reading
-      // from before the recovered sync generation must not reopen the outage
-      // under a new ID with another opening diagnostic and notification. A
-      // reading on the recovered generation or later is newer evidence, so it
-      // still reopens: syncs stopping after recovery re-arms on the same
-      // last_success_at with a grown age.
-      return null
+    if (health.status === 'healthy') {
+      if (!previous) return null
+      const episode = { ...previous, latest: health.evidence, recoveredAt: previous.recoveredAt ?? health.evidence.checkedAt }
+      setMeta(key, JSON.stringify(episode))
+      return { episode, phase: previous.recoveredAt ? null : 'recovered' as const }
     }
     const opened = !previous || previous.recoveredAt !== null
     const episode: StaleMirrorEpisode = opened ? {
@@ -118,7 +118,7 @@ function observeHealth(org: Organization | null, health: Health, blockedBy: read
     setMeta(key, JSON.stringify(episode))
     return { episode, phase: opened ? 'opened' as const : null }
   }).immediate()
-  if (health.status === 'stale' && !transition) return null
+  if (transition && 'ignored' in transition) return transition.episode.recoveredAt ? null : transition.episode
   datastoreFreshnessByOrganization.set(`${account}:review-new-prs`, {
     status: health.status === 'healthy' ? 'healthy' : 'unavailable', checkedAt: health.evidence.checkedAt,
     ageSeconds: health.evidence.ageSeconds, lastSuccessAt: health.evidence.lastSuccessAt,
@@ -167,7 +167,11 @@ export async function runDatastoreHealth(org: Organization | null, options: RunF
   let result: RunFileResult
   try {
     result = await runFile('github-datastore', org ? organizationArgs(org, args) : args, {
-      ...options, expected: { codes: [1], stderr: /^\s*$/, stdout: (stdout) => validatedHealth(stdout, org)?.status === 'stale' },
+      ...options, expected: {
+        codes: [1], stderr: [/^\s*$/,
+          /^datastore health stale: last successful sync \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z; age \d+s exceeds maximum 120s\r?\n?$/],
+        stdout: (stdout) => validatedHealth(stdout, org)?.status === 'stale',
+      },
     })
   } catch (error) {
     const failure = error as { code?: unknown, killed?: unknown, signal?: unknown, stdout?: unknown, stderr?: unknown }
