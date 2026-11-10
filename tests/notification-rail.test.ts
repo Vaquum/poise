@@ -5,8 +5,8 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { setLocalSettings } from '../src/config'
 import type { Notice } from '../src/notices'
-import { notificationItems } from '../src/notification-items'
-import { ago, itemHtml } from '../src/views/notification-rail'
+import { notificationItems, type NotificationItem } from '../src/notification-items'
+import { ago, expandedImpactRefs, itemHtml, needsImpactRead, type WorkImpactRead } from '../src/views/notification-rail'
 
 const T0 = Date.parse('2026-10-17T10:00:00.000Z')
 const iso = (minutes: number) => new Date(T0 + minutes * 60_000).toISOString()
@@ -157,5 +157,39 @@ describe('when its history happened', () => {
       deadLetters: [], holds: [],
     }, now)
     expect(itemHtml(failing, true, now)).not.toContain('next check')
+  })
+})
+
+describe('work-impact reads', () => {
+  const ref = (n: number) => {
+    const mid = n.toString(16).padStart(16, '0')
+    const tail = 'f'.repeat(64)
+    return { eventId: `evt_${mid}_${tail}`, incidentId: `inc_${mid}_${tail}`, from: iso(0), to: iso(1) }
+  }
+  const entry = (evidence: unknown) => ({ behavior: 'resolve-unblocking', target: 'acme/repo#107', evidence })
+  const itemWith = (id: string, details: unknown[], notice?: unknown) => ({ id, details, notice }) as NotificationItem
+  const impacts = (states: Record<string, WorkImpactRead>) => new Map(Object.entries(states))
+
+  it('reads expanded entries only, one first reference each', () => {
+    const items = [itemWith('a', [entry(ref(1)), entry(ref(2))]), itemWith('b', [entry(ref(3))])]
+    const refs = expandedImpactRefs(items, new Set(['a']))
+    expect([...refs.keys()]).toEqual([ref(1).eventId, ref(2).eventId])
+  })
+
+  it('falls back to a detail-less notice subject without borrowing siblings', () => {
+    const items = [itemWith('a', [], { subject: { behavior: 'r', target: 't' }, evidence: ref(1) }),
+      itemWith('b', [entry(null), entry(ref(2))])]
+    const refs = expandedImpactRefs(items, new Set(['a', 'b']))
+    expect([...refs.keys()]).toEqual([ref(1).eventId, ref(2).eventId])
+  })
+
+  it('retries placeholders and failures but never resolved impacts', () => {
+    const reads = impacts({ [ref(1).eventId]: { value: null, message: 'Reading workspace chain evidence…' },
+      [ref(2).eventId]: { value: null, message: 'Workspace chain evidence is unavailable.' },
+      [ref(3).eventId]: { value: { impact: 'blocked' } as WorkImpactRead['value'], message: '' } })
+    expect(needsImpactRead(reads, ref(1).eventId)).toBe(true)
+    expect(needsImpactRead(reads, ref(2).eventId)).toBe(true)
+    expect(needsImpactRead(reads, ref(3).eventId)).toBe(false)
+    expect(needsImpactRead(reads, ref(4).eventId)).toBe(true)
   })
 })

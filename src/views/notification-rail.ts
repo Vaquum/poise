@@ -1,5 +1,5 @@
 import { LOCAL_NOTICE_KINDS } from '../notices'
-import { evidenceReferences, type EvidenceAttachment } from '../../gateway/src/diagnostics/evidence-contract'
+import { evidenceReferences, type DiagnosticEvidence, type EvidenceAttachment } from '../../gateway/src/diagnostics/evidence-contract'
 import { loggingAccess, loggingEvent, loggingHref, loggingWorkImpact, type LoggingWorkImpact } from '../logging'
 import { cancelMotion, disclosure, layout, retire, scrollToActor, spring, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
@@ -139,7 +139,22 @@ function slug(id: string): string {
 
 const icon = (name: ItemIcon) => `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">${ICONS[name]}</svg>`
 
-type WorkImpactRead = { value: LoggingWorkImpact | null, message: string }
+export type WorkImpactRead = { value: LoggingWorkImpact | null, message: string }
+
+/** First evidence reference per expanded entry, keyed by event. An entry
+ *  never borrows another entry's link; a detail-less notice falls back to
+ *  its own subject. */
+export function expandedImpactRefs(items: readonly NotificationItem[], expanded: ReadonlySet<string>): Map<string, DiagnosticEvidence> {
+  return new Map(items.filter(item => expanded.has(item.id)).flatMap<EvidenceAttachment>(item =>
+    item.details.length ? item.details.filter(entry => entry.behavior && entry.target) : item.notice?.subject ? [item.notice] : [])
+    .flatMap(entry => evidenceReferences(entry).slice(0, 1)).map(ref => [ref.eventId, ref]))
+}
+
+/** Whether the event still needs a read: resolved impacts are stable until
+ *  their entry leaves, while placeholders and failed reads retry. */
+export function needsImpactRead(impacts: ReadonlyMap<string, WorkImpactRead>, eventId: string): boolean {
+  return !impacts.get(eventId)?.value
+}
 
 function workImpactHtml(entry: EvidenceAttachment, impacts: ReadonlyMap<string, WorkImpactRead>, now: number): string {
   const ref = evidenceReferences(entry)[0]
@@ -321,11 +336,9 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
 
   async function readWorkImpacts(): Promise<void> {
     if (!opened || impactRequest) return
-    // Never borrow the grouped item's first evidence link for another entry.
-    const refs = [...new Map(items.filter(item => expanded.has(item.id)).flatMap<EvidenceAttachment>(item =>
-      item.details.length ? item.details.filter(entry => entry.behavior && entry.target) : item.notice?.subject ? [item.notice] : [])
-      .flatMap(entry => evidenceReferences(entry).slice(0, 1)).map(ref => [ref.eventId, ref])).values()]
-      .filter(ref => !impacts.has(ref.eventId)).slice(0, 20)
+    const current = expandedImpactRefs(items, expanded)
+    for (const id of [...impacts.keys()]) if (!current.has(id)) impacts.delete(id)
+    const refs = [...current.values()].filter(ref => needsImpactRead(impacts, ref.eventId)).slice(0, 20)
     if (!refs.length) return
     const request = new AbortController()
     impactRequest = request
@@ -350,10 +363,12 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     }
   }
 
-  function clearWorkImpacts(): void {
+  // An aborted batch resumes from its unresolved refs on the next render:
+  // resolved reads stay (the feed republishes every 10s), stale entries are
+  // pruned when refs are collected, and placeholders retry.
+  function abortWorkImpacts(): void {
     impactRequest?.abort()
     impactRequest = null
-    impacts.clear()
   }
 
   function emptyHtml(): string {
@@ -362,7 +377,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   }
 
   function recompute(): void {
-    clearWorkImpacts()
+    abortWorkImpacts()
     const visible = notices.filter((notice) => (enabled || LOCAL_NOTICE_KINDS.some(kind => kind === notice.kind)) && (!notice.target || !actions.inView?.(notice.target)))
     items = notificationItems(visible, getBehaviorDiagnostics(), Date.now())
     for (const id of [...expanded]) if (!items.some((item) => item.id === id)) expanded.delete(id)
@@ -398,7 +413,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   function setOpen(next: boolean, focus: 'rail' | 'bell' | null = null): void {
     if (opened !== next) {
       opened = next
-      if (!next) clearWorkImpacts()
+      if (!next) abortWorkImpacts()
       // watchPanel sets this too, but only once its observer runs: the rail
       // must take focus now.
       rail.inert = !next
