@@ -71,4 +71,21 @@ describe('checkpoint storage', () => {
     store.set('poise:swarm-quarantine:v1', '[]')
     expect(loadRecordsCheckpoints()).toEqual({})
   })
+
+  it('reads hostile organization names as absent and writes them as plain data', () => {
+    const loaded = loadRecordsCheckpoints()
+    expect(Object.getPrototypeOf(loaded)).toBeNull()
+    expect(loaded['constructor']).toBeUndefined()
+    expect(loaded['__proto__']).toBeUndefined()
+    const entry = { ids: ['a'], since: 's', due: 'd', dismissed: false, body: 'b' }
+    const hostileJson = `{"constructor":${JSON.stringify(entry)},"__proto__":${JSON.stringify(entry)}}`
+    store.set('poise:swarm-quarantine:v1', hostileJson)
+    const hostile = loadRecordsCheckpoints()
+    expect(hostile['constructor']).toEqual(entry)
+    expect(hostile['__proto__']).toEqual(entry)
+    expect(Object.hasOwn(hostile, '__proto__')).toBe(true)
+    expect(({} as Record<string, unknown>)['ids']).toBeUndefined()
+    saveRecordsCheckpoints(hostile)
+    expect(loadRecordsCheckpoints()['__proto__']).toEqual(entry)
+  })
 })

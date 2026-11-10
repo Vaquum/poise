@@ -550,6 +550,44 @@ test('dismissed quarantines in one organization survive a clean organization and
   await expect(await card()).toHaveCount(0)
 })
 
+test('a dismissed showing forgets rows a complete read no longer carries', async ({ page }) => {
+  await workspace(page, 'current', undefined, { preserveOnReload: true }); await settled(page)
+  const logs = history().slice(0, 210)
+  const quarantine = (tag: string, call: string, historyRowId: string, index: number) => ({
+    historyRowId, index, error: `Caller History row ${index} is unreadable (${tag})`,
+    id: call, repo: null, prId: null, correlationId: null, behavior: null, sessionId: null,
+  })
+  let tags = ['INVALID_RECORD', 'SQLITE_CORRUPT']
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    const quarantined = tags.map(tag => tag === 'INVALID_RECORD'
+      ? quarantine(tag, 'a'.repeat(32), '500', 1) : quarantine(tag, 'b'.repeat(32), '499', 2))
+    return route.fulfill({ json: { ...paged(logs, url, 200), quarantined } })
+  })
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(200)
+  const card = () => feedback(page, 'Unreadable Swarm records')
+  await expect(await card()).toContainText('2 unreadable worker log row(s) isolated')
+  await (await card()).locator('.nr-card-head').click()
+  await (await card()).getByRole('button', { name: 'Dismiss' }).click()
+  await expect(await card()).toHaveCount(0)
+  // A complete read carrying only one row proves the other repaired: the
+  // dismissed checkpoint forgets it, so its return alerts anew. Ticks merge
+  // into the retained rows, so a reload takes the resetting first-page read.
+  tags = ['SQLITE_CORRUPT']
+  await page.reload(); await settled(page)
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–210 / 210')
+  await expect(await card()).toHaveCount(0)
+  tags = ['INVALID_RECORD', 'SQLITE_CORRUPT']
+  await refreshed(page, false)
+  await expect(await card()).toContainText('2 unreadable worker log row(s) isolated')
+  await expect(await card()).toContainText('INVALID_RECORD')
+})
+
 test('arrivals larger than a page merge into run order and keep newest-target selection', async ({ page }) => {
   await workspace(page); await settled(page)
   const old = history().slice(0, 401)

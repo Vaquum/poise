@@ -307,6 +307,12 @@ function reportSwarmRecords(): void {
   }
   const retained = recordsCheckpoints[org]
   if (!retained || retained.dismissed) {
+    if (retained?.dismissed && complete) {
+      // A complete read proves absence even for a dismissed showing: forget
+      // repaired rows so their recurrence alerts anew instead of staying known.
+      recordsCheckpoints[org] = { ...retained, ids }
+      saveRecordsCheckpoints(recordsCheckpoints)
+    }
     clear()
     return
   }

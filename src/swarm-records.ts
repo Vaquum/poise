@@ -40,17 +40,20 @@ function isCheckpoint(value: unknown): value is SwarmRecordsCheckpoint {
 }
 
 export function loadRecordsCheckpoints(): Record<string, SwarmRecordsCheckpoint> {
+  // Null-prototype: organization names are storage keys, so `constructor` or
+  // `__proto__` must read as absent and write as plain data, never through
+  // or onto Object.prototype.
+  const checkpoints: Record<string, SwarmRecordsCheckpoint> = Object.create(null)
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(CHECKPOINT_KEY) ?? 'null')
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
-    const checkpoints: Record<string, SwarmRecordsCheckpoint> = {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return checkpoints
     for (const [org, entry] of Object.entries(parsed)) {
       if (!isCheckpoint(entry)) continue
       checkpoints[org] = { ...entry, ids: capIds(entry.ids, new Set(entry.ids)) }
     }
     return checkpoints
   } catch {
-    return {}
+    return checkpoints
   }
 }
 
