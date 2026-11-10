@@ -739,6 +739,7 @@ describe('a suite on a test box', () => {
         branch: 'poise/issue-951', author: 'author', reviewer: 'reviewer' }, now)
       const append = (event: ChainEvent) => { chain = journal.append(chain.id, `event-${chain.sequence}`, chain.sequence, event, now) }
       const obs: ChainObservation = { checkedAt: now, existingPulls: [],
+        prerequisites: { wait: null, base: head, evidence: [] },
         issue: { open: true, eligible: true, revision: 'seed', commentIds: [] }, issueReviewers: [], prReviewers: [reviewer],
         implementer: reviewer, repairer: reviewer, approver: reviewer,
         publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null }

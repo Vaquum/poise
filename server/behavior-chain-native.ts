@@ -208,6 +208,37 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           issueRevision: plan.issue_revision, receipts }
       }
       const number = observation.publication.pull_number
+      if (number === null && observation.issue.open && !observation.publication.head_sha) {
+        await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['implement-issue'])
+        const { stdout } = await runFile('github-datastore', organizationArgs(org,
+          ['view', 'issue-dependencies', '--repo', chain.repository, '--number', String(chain.issue), '--format', 'json']),
+        { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
+        const dependencies = object(JSON.parse(stdout), 'issue prerequisites')
+        const base = typeof publication.base_sha === 'string' && /^[0-9a-f]{40}$/.test(publication.base_sha) ? publication.base_sha : null
+        const prerequisites: NonNullable<ChainObservation['prerequisites']> = { wait: null, base, evidence: [dependencies] }
+        observation.prerequisites = prerequisites
+        if (String(dependencies.repo).toLowerCase() !== chain.repository.toLowerCase() || dependencies.number !== chain.issue
+          || dependencies.found !== true || dependencies.complete !== true || !Array.isArray(dependencies.prerequisites)) {
+          prerequisites.wait = `GitHub blocked-by evidence is missing or incomplete for ${chain.id}`
+        } else if (!base) {
+          prerequisites.wait = `Implementation base evidence is missing for ${chain.id}`
+        } else {
+          for (const raw of dependencies.prerequisites) {
+            const dependency = object(raw, 'issue prerequisite')
+            if (String(dependency.repo).toLowerCase() !== chain.repository.toLowerCase()) throw new Error('issue prerequisite escaped its repository')
+            const issue = positive(dependency.number, 'issue prerequisite')
+            const delivery = await github(chain.repository, ['--read-issue', `#${issue}`, '--delivery-base', base, ...actor])
+            prerequisites.evidence.push(delivery)
+            if (String(delivery.repository).toLowerCase() !== chain.repository.toLowerCase()
+              || delivery.issue_number !== issue || delivery.base_sha !== base || delivery.state !== 'closed' || delivery.verified !== true
+              || typeof delivery.merge_sha !== 'string' || !/^[0-9a-f]{40}$/.test(delivery.merge_sha)
+              || typeof delivery.pull_number !== 'number' || !Number.isSafeInteger(delivery.pull_number) || delivery.pull_number < 1) {
+              prerequisites.wait = `Waiting for prerequisite ${chain.repository}#${issue}: ${String(delivery.reason || 'delivery is not verified on the implementation base')}`
+              break
+            }
+          }
+        }
+      }
       if (number === null) return observation
       const interruptedWork = chain.invocations.find((invocation) => invocation.state === 'uncertain' && invocation.behavior === 'repair-pr'
         && typeof invocation.evidence?.callId === 'string' && invocation.evidence.artifact)

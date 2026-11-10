@@ -24,6 +24,7 @@ export interface ChainObservation extends Record<string, unknown> {
   workPublication?: { callId: string, repliesComplete: boolean, resumable?: boolean, planSha?: string }
   greyRecovery?: { invocationId: string, receipt: Record<string, unknown> }
   ciDependency?: { invocationId: string, base: string, recovered: boolean }
+  prerequisites?: { wait: string | null, base: string | null, evidence: Record<string, unknown>[] }
   fullSuite?: Record<string, unknown>
   pull: null | {
     number: number, head: string, headSince: number, state: string, draft: boolean, merged: boolean, mergeSha: string | null,
@@ -230,6 +231,8 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     if (observation.publication.head_sha) return { kind: 'hold', reason: 'seed branch exists without this chain’s native publication receipt' }
     const noChange = settled(chain, 'implement-issue', issueBasis, observation.implementer.slot).find((invocation) => invocation.evidence?.outcome === 'no_changes')
     if (noChange) return { kind: 'hold', reason: 'implementation returned no changes and produced no pull request' }
+    if (observation.prerequisites?.wait !== null) return { kind: 'wait',
+      reason: observation.prerequisites?.wait || 'GitHub prerequisite evidence is missing' }
     return propose(chain, 'implement-issue', issueBasis, chain.author, observation.implementer,
       'all required issue review invocations posted their comments', now)
   }

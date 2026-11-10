@@ -1280,6 +1280,11 @@ variant or scope is introduced. See [Logging](Logging.md#notification-evidence).
 
 ## Workspace behavior observation
 
+New implementation admission also consumes Caller's captured forward GitHub
+prerequisites and verified delivery on the implementation base through the
+existing chain sweep. [Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the
+dependency wait; no gateway route, journal event or poller is added.
+
 The workspace's existing `/api/behavior-chains` controls also expose an explicit
 behavior-only admission cutover. One `switch-to-v2` request records a durable
 drain in the canonical behavior journal; `cancel-cutover` is permitted only

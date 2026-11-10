@@ -387,6 +387,8 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
 
     if behavior in {"--read-issue", "--assign-issue", "--issue-comments", "--sub-issues"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior} ISSUE")
+        if behavior == "--read-issue":
+            parser.add_argument("--delivery-base", help="Verify a linked closing PR's merge commit on this base SHA")
         if behavior == "--assign-issue":
             parser.add_argument("--user", dest="users", action="append", required=True)
         else:

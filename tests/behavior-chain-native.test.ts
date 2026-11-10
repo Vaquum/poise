@@ -4,19 +4,23 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { parseAgentLogList, type LogEntry } from '../server/agent-log-parse'
-import { chainBasis, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
+import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
+import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import type { Organization } from '../server/organizations'
 import type { NativeChainHooks } from '../server/behavior-chain-native'
+import { completedReviewCall } from './review-response-fixture'
 
-const mocks = vi.hoisted(() => ({ runFile: vi.fn() }))
+const mocks = vi.hoisted(() => ({ runFile: vi.fn(), health: vi.fn(async () => {}) }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn() }))
+vi.mock('../server/datastore-health', () => ({ runDatastoreHealth: mocks.health }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/interface' }))
 vi.mock('../server/settings', () => ({ getSettings: () => ({ me: 'author', agentAccount: 'reviewer' }),
   getBehaviorChainSettings: () => ({ enabled: true, seedMode: 'all', label: 'poise' }),
   BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY: 'behavior_chain_integrity_hold' }))
-vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ login: 'example' }), organizationArgs: vi.fn() }))
+vi.mock('../server/organizations', () => ({ organizationForRepository: (repo: string) => ({ login: repo.split('/')[0] }),
+  organizationArgs: (_org: unknown, argv: string[]) => argv }))
 const { nativeChainOperations } = await import('../server/behavior-chain-native')
 const { decideBehaviorChain } = await import('../server/behavior-chain-decision')
 const { CallerReceiptStoreError } = await import('../server/service/caller-calls')
@@ -389,6 +393,7 @@ it('reconciles planned review comments with and without the revision marker', as
         ],
         publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null } },
       '--read-action-plan': { id: callId, sha: digest, plan },
+      view: { repo: chain.repository, number: 7, found: true, complete: true, prerequisites: [] },
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
     return { stdout: JSON.stringify(evidence[argv[0]]) }
@@ -416,6 +421,7 @@ it('seeds roster draws and resolutions by the chain seed issue', async () => {
       '--chain-seed': { repository: 'example/repo', issue_number: 7, actor: 'author', branch: 'poise/issue-7',
         issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [],
         publication: { existing_pulls: [], pull_number: null, head_sha: null, head_invocation: null, state: 'open', merged: false, merge_sha: null } },
+      view: { repo: chain.repository, number: 7, found: true, complete: true, prerequisites: [] },
     }
     if (!(argv[0] in evidence)) throw new Error(`unexpected native operation ${argv[0]}`)
     return { stdout: JSON.stringify(evidence[argv[0]]) }
@@ -469,3 +475,107 @@ it.each([
   })
   await expect(operations.observe(chain)).rejects.toThrow('belongs to another chain or actor')
 })
+
+it('waits for captured #1100 prerequisites through Caller and native runtime, then launches each unheld dependent once', async () => {
+  directory = mkdtempSync(join(tmpdir(), 'poise-prerequisites-'))
+  const db = new Database(':memory:')
+  const journal = new BehaviorChainJournal(db)
+  const target = 'autonomio/poise'
+  const ids = [1104, 1105].map(issue => `${target}#${issue}`)
+  const revision = chainBasis(['Seed', ''])
+  for (const issue of [1104, 1105]) {
+    let current = journal.append(`${target}#${issue}`, `seed-${issue}`, 0, { type: 'chain.admitted', repository: target, issue,
+      branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' })
+    current = journal.append(current.id, `review-${issue}`, current.sequence, { type: 'invocation.admitted', invocation: {
+      id: `review-${issue}`, behavior: 'review-issue', actor: 'reviewer', model: 'fixture', slot: 'primary', admittedAt: Date.now(),
+      basis: chainBasis(['issue', revision]), request: { command: 'agent-interface', cwd: directory, argv: ['--model', 'fixture'] } } })
+    journal.append(current.id, `reviewed-${issue}`, current.sequence, { type: 'invocation.settled', invocationId: `review-${issue}`,
+      callId: `review-call-${issue}`, outcome: 'commented', evidence: { status: 'completed', action: 'commented', issue_revision: revision,
+        receipts: [{ issue: current.id, comment_id: 3, author: 'reviewer' }] } })
+  }
+  let mode = 'open'
+  const running: LogEntry[] = []
+  const launch = vi.fn<ChainRuntimeOperations['launch']>(async invocation => {
+    running.push({ ...completedReviewCall(target, Number(invocation.request.argv[1].split('#')[1]), HEAD, 'author'),
+      id: chainBasis(invocation.id).slice(0, 32), correlation_id: invocation.id, source: 'poise:behavior-chain', behavior: 'implement_issue',
+      model: 'fixture', status: 'running', action: null, outcome: null, head_sha: null, expected_head: null,
+      artifact: null, resources_settled_at: null, review_id: null })
+    return true
+  })
+  const reportHold = vi.fn(async () => null)
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    if (command === 'github-interface' && argv[0] === '--chain-seed') {
+      const issue = Number(argv[1].slice(1))
+      return { stdout: JSON.stringify({ repository: target, issue_number: issue, actor: 'author', branch: `poise/issue-${issue}`,
+        issue: { title: 'Seed', body: '', state: 'open', labels: [] }, comments: [{ id: 3 }],
+        publication: { existing_pulls: [], pull_number: null, head_sha: null, base_sha: HEAD,
+          head_invocation: null, state: null, merged: false, merge_sha: null } }) }
+    }
+    if (command === 'github-datastore' || command === 'github-interface' && argv[0] === '--read-issue') {
+      return { stdout: execFileSync('python3', ['tests/fixtures/issue-prerequisites.py'], {
+        input: JSON.stringify({ command, argv, mode, db: join(directory, 'capture.sqlite') }), encoding: 'utf8', timeout: 10_000,
+        env: { ...process.env, PYTHONPATH: [resolve('caller/github_datastore'), resolve('caller/github_interface'), process.env.PYTHONPATH].filter(Boolean).join(':') },
+      }) }
+    }
+    throw new Error(`Unexpected fixture command ${command} ${argv[0]}`)
+  })
+  const native = nativeChainOperations({ login: 'autonomio' } as Organization, {
+    roster: async () => ({ issueReviewers: [reviewer], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer }),
+    resolve: async () => reviewer, prepare: async () => ({}), borrow: () => () => {}, available: () => true,
+    capacity: () => 3, permitted: () => true, note: () => '', severity: () => 'p2', received: () => {},
+    reviews: async () => 'reviews', existing: async () => new Set(), wake: () => {},
+  })
+  const operations: ChainRuntimeOperations = { ...native, discover: async () => [],
+    readInvocations: async () => ({ entries: running, quarantined: [] }), launch, reportHold }
+  const runtime = new BehaviorChainRuntime(journal, operations)
+  try {
+    await runtime.run()
+    await runtime.run()
+    for (const id of ids) {
+      expect(journal.read(id)).toMatchObject({ held: null, waiting: expect.stringContaining(`${target}#1100: prerequisite is open`) })
+      expect(journal.history(id).filter(row => JSON.parse(row.payload).type === 'chain.waiting')).toHaveLength(1)
+      expect(journal.read(id)?.invocations).toHaveLength(1)
+    }
+    expect(launch).not.toHaveBeenCalled()
+    expect(reportHold).not.toHaveBeenCalled()
+    for (const incomplete of ['absent', 'truncated', 'missing-page', 'malformed', 'missing-item']) {
+      mode = incomplete
+      await expect(runtime.run()).resolves.toBeUndefined()
+      for (const id of ids) expect(journal.read(id)?.waiting).toContain('blocked-by evidence is missing or incomplete')
+    }
+    for (const undelivered of ['closed', 'queued', 'other-branch', 'off-base', 'truncated-delivery', 'missing-prerequisite']) {
+      mode = undelivered
+      await expect(runtime.run()).resolves.toBeUndefined()
+      for (const id of ids) expect(journal.read(id)?.waiting).toContain(`Waiting for prerequisite ${target}#1100`)
+    }
+    expect(launch).not.toHaveBeenCalled()
+    expect(reportHold).not.toHaveBeenCalled()
+    expect(ids.every(id => journal.read(id)?.held === null && journal.read(id)?.invocations.length === 1)).toBe(true)
+    for (const eligible of ['empty', 'cross-repo', 'integrated-branch']) {
+      mode = eligible
+      const observation = await native.observe(journal.read(ids[0])!)
+      expect(decideBehaviorChain(journal.read(ids[0])!, observation, Date.now())).toMatchObject({ kind: 'invoke', behavior: 'implement-issue' })
+      expect(observation.prerequisites).toMatchObject({ wait: null, base: HEAD })
+      delete observation.prerequisites
+      expect(decideBehaviorChain(journal.read(ids[0])!, observation, Date.now())).toEqual({ kind: 'wait', reason: 'GitHub prerequisite evidence is missing' })
+    }
+    mode = 'delivered'
+    const current = journal.read(ids[0])!
+    const observation = await native.observe(current)
+    expect(observation.prerequisites).toMatchObject({ wait: null, base: HEAD,
+      evidence: [expect.any(Object), { verified: true, state: 'closed', pull_number: 1101, merge_sha: 'b'.repeat(40) }] })
+    expect(decideBehaviorChain({ ...current, held: 'atomic implementation hold' }, observation, Date.now()))
+      .toEqual({ kind: 'wait', reason: 'atomic implementation hold' })
+    mocks.health.mockRejectedValueOnce(new Error('stale mirror'))
+    const reads = mocks.runFile.mock.calls.length
+    await expect(native.observe(current)).rejects.toThrow('stale mirror')
+    expect(mocks.runFile.mock.calls.slice(reads).some(([command]) => command === 'github-datastore')).toBe(false)
+    await runtime.run()
+    await runtime.run()
+    expect(launch).toHaveBeenCalledTimes(2)
+    expect(launch.mock.calls.map(([invocation]) => invocation.request.argv[1]).sort()).toEqual(ids)
+    expect(ids.every(id => journal.read(id)?.invocations.filter(item => item.behavior === 'implement-issue').length === 1)).toBe(true)
+    expect(reportHold).not.toHaveBeenCalled()
+    expect(mocks.health).toHaveBeenCalledWith(expect.objectContaining({ login: 'autonomio' }), { timeoutMs: 30_000 }, ['implement-issue'])
+  } finally { db.close() }
+}, 30_000)
