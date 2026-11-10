@@ -1,16 +1,21 @@
+import io
 import json
 import signal
 import subprocess
+import sys
 import tempfile
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+import agent_interface
 from agent_interface import atoms, pr_review, review_repository as rr, structured_review as sr
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
+from github_interface import cli, interface
+from github_interface.behaviors import checkout_review
 
 ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 HEAD, BASE = "a" * 40, "b" * 40
@@ -22,6 +27,81 @@ PACKET = json.dumps({"repository": "o/r", "head_sha": HEAD, "merge_base_sha": BA
 
 
 class TestRepositoryLifecycle(TestCase):
+    def test_checkout_drift_saves_superseded_without_invoking_a_provider(self):
+        saved = json.loads((Path(__file__).resolve().parents[3]
+                            / "tests/fixtures/review-checkout-superseded.json").read_text())
+        original_handler = signal.getsignal(signal.SIGTERM)
+        for phase, changed in (("before", "head"), ("before", "base"),
+                               ("during", "head"), ("during", "base"), ("during", "failure")):
+            pull = {"head": {"sha": HEAD}, "base": {"sha": BASE}}
+            latest = {**pull, changed: {"sha": saved["head_sha"]}}
+            client = AsyncMock()
+            client.get.side_effect = [{"merge_base_commit": {"sha": BASE}}, {"tree": []}, {"tree": []}]
+            roots = []
+
+            def checkout(*args):
+                args[5].mkdir()
+                if changed == "failure":
+                    raise RuntimeError("git checkout failed")
+                return {}
+
+            def command(args, **kwargs):
+                self.assertEqual(args[1], "--checkout-review")
+                roots.append(Path(args[args.index("--path") + 1]))
+                stdout, stderr = io.StringIO(), io.StringIO()
+                code = 0
+                with patch.object(sys, "argv", args), redirect_stdout(stdout), redirect_stderr(stderr):
+                    try:
+                        cli.main()
+                    except SystemExit as stopped:
+                        code = stopped.code
+                return SimpleNamespace(returncode=code, stdout=stdout.getvalue(), stderr=stderr.getvalue())
+
+            with self.subTest(phase=phase, changed=changed), tempfile.TemporaryDirectory() as work, \
+                    patch.object(agent_interface, "DB", Path(work) / "calls.sqlite3"), \
+                    patch.object(agent_interface, "RESPONSES", Path(work) / "responses"), \
+                    patch.object(agent_interface, "review_facts", return_value={}) as facts, \
+                    patch.object(atoms, "packet", return_value=PACKET), \
+                    patch.object(atoms, "run_agent") as provider, \
+                    patch.object(interface, "GitHubClient", return_value=client), \
+                    patch.object(checkout_review, "get_pull", AsyncMock(side_effect=[latest] if phase == "before" else [pull, latest])), \
+                    patch.object(checkout_review, "checkout", side_effect=checkout) as clone, \
+                    patch.object(rr.subprocess, "run", side_effect=command), redirect_stdout(io.StringIO()) as output:
+                agent_interface.init_db()
+                if changed == "failure":
+                    with self.assertRaises(SystemExit) as failed:
+                        agent_interface.run_pr_review(PR, "bot", HEAD, "poise:review-new-prs", "correlation", model="opus-5-high")
+                    self.assertEqual(failed.exception.code, 1)
+                else:
+                    agent_interface.run_pr_review(PR, "bot", HEAD, "poise:review-new-prs", "correlation", model="opus-5-high")
+                row = agent_interface.logs()[0]
+                self.assertEqual(facts.call_count, 1)
+                provider.assert_not_called()
+                self.assertEqual(clone.call_count, int(phase == "during"))
+                self.assertFalse(roots[0].parent.exists())
+                self.assertEqual(signal.getsignal(signal.SIGTERM), original_handler)
+                self.assertEqual((row["repo"], row["pr_id"], row["actor"], row["source"], row["correlation_id"], row["expected_head"]),
+                                 ("o/r", "12", "bot", "poise:review-new-prs", "correlation", HEAD))
+                if changed == "failure":
+                    self.assertEqual((row["status"], row["outcome"], row["action"]), ("failed", "preflight_failed", "not_started"))
+                    self.assertIn("git checkout failed", row["error"])
+                else:
+                    self.assertEqual({key: row[key] for key in saved},
+                                     {**saved, "head_sha": latest["head"]["sha"]})
+                    self.assertEqual(json.loads(output.getvalue())["outcome"], "superseded")
+
+    def test_superseded_checkout_requires_its_target_and_a_valid_observed_head(self):
+        for invalid in ({"action": "wrong"}, {"repository": "other/repo"}, {"path": "/other"},
+                        {"head_sha": None}, {"head_sha": "z" * 40}):
+            def command(args, **kwargs):
+                receipt = {"action": "checkout_review", "repository": "o/r", "outcome": "superseded",
+                           "head_sha": "c" * 40, "path": args[args.index("--path") + 1], **invalid}
+                return SimpleNamespace(returncode=0, stdout=json.dumps(receipt), stderr="")
+            with self.subTest(invalid=invalid), patch.object(rr.subprocess, "run", side_effect=command), \
+                    self.assertRaises(atoms.AgentPreflightError):
+                with rr.prepare("/repo", PR, "bot", HEAD, PACKET):
+                    self.fail("invalid supersession receipt yielded")
+
     def test_cancellation_during_preparation_cleans_checkout_and_restores_handler(self):
         roots = []
         original = signal.getsignal(signal.SIGTERM)

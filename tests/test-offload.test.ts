@@ -1106,6 +1106,8 @@ ${stderr}`
 
   it('tells a suite too big for its memory from one that failed, and sends the agent to CI', async () => {
     await startAll()
+    // The background sweep can warn before the run fails.
+    warnings.push({ event: 'test_relay.sweep.failed', error: 'unrelated sweep failure' })
     const script = `console.error('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory'); process.exit(134)`
     const { code, stderr } = await suite(repository(), [process.execPath, '-e', script]).done
     expect(code).toBe(125)
@@ -1115,7 +1117,7 @@ ${stderr}`
     // Choosing tests is no job of an agent's.
     expect(stderr).not.toContain('name a')
     // Poise hears of it too, with what it needs to find the suite.
-    const [warning] = warnings
+    const [warning] = warnings.filter(({ event }) => event === 'test_relay.run.failed')
     expect(warning.event).toBe('test_relay.run.failed')
     expect(warning.error).toContain('this suite is too big for its test box: it ran out of memory')
     expect(warning.error).toContain('workspace alice')
