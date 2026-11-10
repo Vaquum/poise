@@ -64,11 +64,15 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
     record({"phase": "prepared", "prepared": prepared})
     evidence = {}
     required_reply_ids: set[int] = set()
+    previously_answered: set[int] = set()
     if pull is not None:
         evidence["ci"] = issue_review.interface("--list-failing-ci", str(pull), "--repository", repo, "--token-user", actor)
         evidence["review_packet"] = issue_review.interface("--pr-review", str(pull), "--expected-head", expected_head or "",
                                                           "--token-user", actor, cwd=checkout)
-        required_reply_ids = {thread["root_comment_id"] for thread in evidence["review_packet"]["review_threads"] if not thread["is_resolved"]}
+        unresolved = [thread for thread in evidence["review_packet"]["review_threads"] if not thread["is_resolved"]]
+        previously_answered = {thread["root_comment_id"] for thread in unresolved
+                               if thread.get("repair_answer", {}).get("author", "").lower() == actor.lower()}
+        required_reply_ids = {thread["root_comment_id"] for thread in unresolved} - previously_answered
         evidence["queue"] = issue_review.interface("--pull-action-state", str(pull), "--repository", repo,
                                                    "--token-user", actor, "--queue-evidence")
     seconds = review_budget.timeout(issue_review.TIMEOUT_SECONDS, reserve=issue_review.POST_RESERVE_SECONDS)
@@ -86,7 +90,8 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "\"body\":\"Concrete change, reason and actual checks, without a Closes footer\","
         "\"replies\":[{\"commentId\":123,\"body\":\"Your concrete answer to this actual review finding, including what changed or evidence for disagreement\"}],\"blocked\":null}}. "
         f"For a repair, include one substantive answer for each of these required unresolved root comment IDs: {json.dumps(sorted(required_reply_ids))}. "
-        "This exact set includes outdated unresolved roots and roots that already have replies; answer each with concrete changes or evidence for disagreement. "
+        "Answer only those roots with concrete changes or evidence for disagreement. "
+        "Use existing repair answers as evidence and still address any remaining blocker on those threads. "
         "Do not reply to replies, invent comment ids, or use generic acknowledgements. For initial implementation replies must be empty. "
         "If unable to finish, set blocked to the concrete reason; do not claim the work complete. "
         'If a repair is blocked solely by failed CI on the supplied head, set blocked to {"cause":"ci_only","reason":"the concrete CI blocker"}. '
@@ -142,6 +147,8 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
             if not isinstance(replies, list) or (pull is None and replies):
                 raise ValueError("atomic behavior returned invalid review replies")
             if pull is not None:
+                replies = [reply for reply in replies if not isinstance(reply, dict) or reply.get("commentId") not in previously_answered]
+                publication["replies"] = replies
                 answered = {reply.get("commentId") for reply in replies if isinstance(reply, dict)}
                 missing = sorted(required_reply_ids - answered)
                 if missing:

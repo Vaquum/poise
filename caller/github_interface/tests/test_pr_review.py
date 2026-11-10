@@ -2,6 +2,7 @@ from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
 from github_interface.atoms import review_diff as rd
+from github_interface.atoms.pulls import _thread_summary
 from github_interface.behaviors import pr_review
 
 HEAD = "a" * 40
@@ -58,6 +59,30 @@ class TestReviewSummaries(IsolatedAsyncioTestCase):
                 ])
                 self.assertEqual(packet["review_threads"], [])
         self.client.paginate.assert_awaited_with("/repos/o/r/pulls/1/reviews")
+
+    async def test_only_current_answer_to_own_feedback_can_be_verified(self):
+        def thread(root, *, feedback_edited=False, more=False, reviewer="Reviewer"):
+            return _thread_summary({
+                "id": f"thread-{root}", "isResolved": False, "isOutdated": True,
+                "path": "fix.py", "line": None, "originalLine": root, "diffSide": "RIGHT",
+                "comments": {"pageInfo": {"hasNextPage": more}, "nodes": [
+                    {"databaseId": root, "body": "Blocking defect.", "author": {"login": reviewer},
+                     "createdAt": "2026-11-08T19:50:00Z",
+                     "updatedAt": "2026-11-08T19:53:00Z" if feedback_edited else "2026-11-08T19:50:00Z"},
+                    {"databaseId": root + 1000, "body": f"Fixed the defect.\n\n<!-- poise-reply {'a' * 32} {root} -->",
+                     "author": {"login": "Author"}, "createdAt": "2026-11-08T19:52:00Z",
+                     "updatedAt": "2026-11-08T19:52:00Z"},
+                ]},
+            })
+
+        threads = [thread(1), thread(2, feedback_edited=True), thread(3, more=True), thread(4, reviewer="Other")]
+        pull = {"head": {"sha": HEAD}, "base": {"sha": BASE}, "user": {"login": "Author"}}
+        with patch.object(pr_review, "get_pull", AsyncMock(return_value=pull)), \
+                patch.object(pr_review, "list_review_threads", AsyncMock(return_value=threads)):
+            packet = await pr_review.run(self.client, {"repository": "o/r", "pr": 1, "expected_head": HEAD,
+                                                       "token_user": "reviewer"})
+        self.assertEqual(packet["verification_candidates"], [1])
+        self.assertEqual([t["root_comment_id"] for t in packet["review_threads"] if "repair_answer" in t], [1, 4])
 
     async def test_review_read_failure_fails_the_packet(self):
         self.client.paginate.side_effect = RuntimeError("GitHub review read failed")

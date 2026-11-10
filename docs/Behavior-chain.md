@@ -411,9 +411,12 @@ original body, review ID, author, commit, submission time and URL. A later
 limit; an overflowing packet or failed review read fails visibly. The final
 head/base recheck and independent approval verification still apply.
 
-Repair prompts name the exact unresolved root comment IDs from the head-verified
-review packet, including outdated threads and roots with earlier replies.
-Caller requires that same set before publication. Missing coverage records
+Repair prompts name the unresolved root comment IDs that need a reply from
+the head-verified packet, including unanswered outdated threads. A prior
+native reply from the PR author covers the same feedback until a reviewer
+adds or edits it. Repairs still inspect every actionable finding. Caller
+requires the unanswered set before publication and omits repeat replies.
+Missing coverage records
 `atomic_work_failed`, `not_started` / `preflight_failed`, with the missing count,
 required count and at most 20 sorted missing IDs in the retained error field;
 comment text is not retained there. No publication plan exists at this point,
@@ -424,6 +427,14 @@ the fix for incomplete reply instructions, use **Resume** on the already-held
 chains for `autonomio/poise#893` (seed #887) and `autonomio/poise#900` (seed #896).
 Resume opens a new bounded attempt window using the current head and findings;
 it does not repeat an uncertain publication or release unsettled resources.
+
+An independent reviewer can explicitly verify its own answered findings on
+the current head while requesting changes elsewhere. After GitHub accepts
+that review, Caller rechecks the PR context and each selected thread's exact
+revision before resolving it without another reply. Changed threads and
+reaffirmed blockers stay open. The original review Call retains resolution
+attempts and acknowledgements separately from the submitted review. Merge
+still requires current-head approval, green checks, and resolved conversations.
 
 A repair push checkpoints its exact native head before bounded PR-head
 confirmation. If GitHub's PR projection still trails the push, the existing

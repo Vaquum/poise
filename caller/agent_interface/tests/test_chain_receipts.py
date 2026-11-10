@@ -311,6 +311,8 @@ class AtomicWorkLimits(TestCase):
             {"root_comment_id": 18, "is_resolved": False, "is_outdated": True, "bodies": ["private outdated finding", "earlier reply"]},
             {"root_comment_id": 19, "is_resolved": True, "is_outdated": False, "bodies": ["private resolved finding"]},
             {"root_comment_id": 20, "is_resolved": True, "is_outdated": True, "bodies": ["private resolved outdated finding"]},
+            {"root_comment_id": 21, "is_resolved": False, "is_outdated": True,
+             "repair_answer": {"author": "Author", "revision": "f" * 64}, "bodies": ["private already answered finding"]},
         ]
         for attempt, reply_ids in enumerate(([17], [17, 18]), 1):
             with self.subTest(reply_ids=reply_ids):
@@ -335,7 +337,7 @@ class AtomicWorkLimits(TestCase):
                     workspaces.append(workspace)
                     (workspace / "publication.json").write_text(json.dumps({
                         "commitMessage": "fix: repair seed", "title": "fix: repair seed", "body": "Concrete repair and checks.",
-                        "replies": replies, "blocked": None}))
+                        "replies": [*replies, {"commentId": 21, "body": "The fix remains in place."}], "blocked": None}))
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
                 with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
@@ -353,7 +355,7 @@ class AtomicWorkLimits(TestCase):
                 instruction = command.call_args.args[1]
                 self.assertIn("required unresolved root comment IDs: [17, 18]", instruction)
                 self.assertIn("outdated", instruction)
-                self.assertIn("already have replies", instruction)
+                self.assertIn("Use existing repair answers as evidence", instruction)
                 with sqlite3.connect(self.path) as conn:
                     row = conn.execute("select status,error_code,action,outcome,error,action_plan,artifact,resource_ownership from calls "
                                        "where correlation_id=?", (f"00000000-0000-4000-8000-{attempt:012d}",)).fetchone()

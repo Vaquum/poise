@@ -2,7 +2,7 @@ import os
 from typing import Any
 
 from github_interface.atoms.review_identity import require_other_author
-from github_interface.atoms.review_response import response_body, submission_response
+from github_interface.atoms.review_response import resolve_verified_fixes, response_body, submission_response
 from github_interface.atoms.pulls import (
     get_pull,
     list_inline_comments,
@@ -79,6 +79,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(
             f"GitHub recorded change request as {submitted_actor or 'missing'}, expected {actor}"
         )
+    blocked = {root for root, _ in findings}
+    if response and response.get("verified_fixes"):
+        locations = {(item["path"], item["line"], item["side"]) for item in accepted}
+        blocked.update(thread["root_comment_id"] for thread in threads if not thread["is_outdated"]
+                       and (thread["path"], thread["line"], thread["side"]) in locations)
     return {
         "action": "requested_changes",
         "repository": f"{owner}/{repo}",
@@ -92,6 +97,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "review_id": submitted.get("id"),
         "submitted_at": submitted.get("submitted_at"),
         **({"review_response": response} if response else {}),
+        **await resolve_verified_fixes(client, owner, repo, response, submitted.get("id"), blocked),
     }
 
 

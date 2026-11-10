@@ -1,3 +1,6 @@
+import json
+import re
+from hashlib import sha256
 from typing import Any
 
 import httpx
@@ -230,9 +233,12 @@ line
 originalLine
 diffSide
 comments(first: 100) {
+  pageInfo { hasNextPage }
   nodes {
     databaseId
     body
+    createdAt
+    updatedAt
     author { login }
   }
 }
@@ -249,6 +255,29 @@ async def list_review_threads(
         client, owner, repo, pull_number, "reviewThreads", REVIEW_THREAD_FIELDS, initial_page,
     )
     return [_thread_summary(thread) for thread in nodes]
+
+
+async def get_review_thread(client: GitHubClient, thread_id: str) -> dict[str, Any]:
+    query = f"""
+    query($id: ID!) {{
+      node(id: $id) {{
+        ... on PullRequestReviewThread {{
+          {REVIEW_THREAD_FIELDS}
+          viewerCanResolve
+          pullRequest {{
+            number state isDraft headRefOid baseRefOid title body
+            author {{ login }}
+            repository {{ nameWithOwner }}
+          }}
+        }}
+      }}
+    }}
+    """
+    node = (await client.graphql(query, {"id": thread_id}))["node"]
+    if not node:
+        raise RuntimeError("verified review thread is unavailable")
+    thread = {key: value for key, value in node.items() if key not in ("pullRequest", "viewerCanResolve")}
+    return {**_thread_summary(thread), "pull": node["pullRequest"], "can_resolve": node["viewerCanResolve"]}
 
 
 async def get_requested_review_state(
@@ -489,9 +518,34 @@ async def submit_change_request(
     )
 
 
+def _repair_answer(thread: dict[str, Any]) -> dict[str, str] | None:
+    connection = thread["comments"]
+    comments = connection["nodes"]
+    if thread["isResolved"] or len(comments) < 2 or connection.get("pageInfo", {}).get("hasNextPage"):
+        return None
+    root, reply = comments[0], comments[-1]
+    author = (reply.get("author") or {}).get("login")
+    created = reply.get("createdAt")
+    marker = re.search(r"\n\n<!-- poise-reply [0-9a-f]{32} ([1-9][0-9]*) -->\Z", reply["body"])
+    if not author or not created or not marker or int(marker[1]) != root.get("databaseId") \
+            or not reply["body"][:marker.start()].strip():
+        return None
+    # GitHub orders replies by creation. A later edit to earlier feedback
+    # invalidates the answer, even when the thread has no newer comment.
+    for comment in comments[:-1]:
+        if (comment.get("author") or {}).get("login", "").lower() == author.lower():
+            continue
+        updated = comment.get("updatedAt")
+        if not updated or updated > created or (updated == created and updated != comment.get("createdAt")):
+            return None
+    revision = sha256(json.dumps(thread, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return {"author": author, "revision": revision}
+
+
 def _thread_summary(thread: dict[str, Any]) -> dict[str, Any]:
     comments = thread["comments"]["nodes"]
     bodies = [comment["body"] for comment in comments]
+    answer = _repair_answer(thread)
     return {
         "id": thread["id"],
         "is_outdated": thread["isOutdated"],
@@ -502,4 +556,5 @@ def _thread_summary(thread: dict[str, Any]) -> dict[str, Any]:
         "line": thread["line"] or thread["originalLine"],
         "side": thread["diffSide"],
         "bodies": bodies,
+        **({"repair_answer": answer} if answer else {}),
     }

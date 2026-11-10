@@ -1,4 +1,5 @@
 """A run's outcome is the review it submitted, told apart from a sibling's by id."""
+import asyncio
 import io
 import json
 import os
@@ -10,13 +11,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import agent_interface as api
 from agent_interface import bash_guard, claude_acl, review_budget as budget, review_receipt, structured_review
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
+from github_interface.atoms import review_response
+from github_interface.behaviors import request_changes
 
 ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 HEAD = "a" * 40
@@ -238,6 +241,61 @@ class TestReceiptRecording(TestCase):
         receipt = review_receipt.parse(json.dumps({'action': 'reviewed_clean', 'review_id': 92,
             'head_sha': HEAD, 'review_response': response, 'submitted_at': '2026-10-31T00:00:00Z'}))
         self.assertEqual(receipt['review_response'], response)
+
+    def test_mixed_review_resolves_only_verified_unchanged_threads(self):
+        call_id = uuid4().hex
+        with sqlite3.connect(api.DB) as conn:
+            conn.execute("update calls set id=? where id='run'", (call_id,))
+        review_receipt.bind(api.DB, call_id)
+        pull = {"state": "open", "draft": False, "user": {"login": "author"}, "head": {"sha": HEAD},
+                "base": {"sha": "b" * 40}, "title": "Review ordering", "body": "Retain assessment."}
+        threads = [
+            {"id": f"thread-{root}", "root_comment_id": root, "author": "bit-mis", "path": "source.py",
+             "line": root, "side": "RIGHT", "is_outdated": False, "is_resolved": False,
+             "repair_answer": {"author": "author", "revision": "c" * 64}, "bodies": [f"Blocking finding {root}."]}
+            for root in (1, 2, 3, 4)
+        ]
+        review_receipt.prepare_response(json.dumps({"repository": "o/r", "pull_number": 12, "head_sha": HEAD, "pull": pull,
+                                                     "review_threads": threads, "verification_candidates": [1, 2, 3]}), "fixture")
+        latest = {"number": 12, "repository": {"nameWithOwner": "o/r"}, "state": "OPEN", "isDraft": False,
+                  "headRefOid": HEAD, "baseRefOid": pull["base"]["sha"], "author": pull["user"],
+                  "title": pull["title"], "body": pull["body"]}
+        visible = {"thread-1": {**threads[0], "pull": latest, "can_resolve": True},
+                   "thread-2": {**threads[1], "pull": latest, "can_resolve": True,
+                                "repair_answer": {"author": "author", "revision": "d" * 64}}}
+        client = AsyncMock()
+        client.get.return_value = pull
+        client.paginate.return_value = []
+        client.post.return_value = {"id": 91, "state": "CHANGES_REQUESTED", "commit_id": HEAD,
+                                    "user": {"login": "bit-mis"}, "submitted_at": "2026-11-10T09:30:00Z"}
+
+        async def resolve(_client, thread_id):
+            client.post.assert_awaited_once()
+            return {"id": thread_id, "isResolved": True}
+
+        env = {"AGENT_INTERFACE_RECEIPT_DB": str(api.DB), "AGENT_INTERFACE_RECEIPT_CALL": call_id}
+        with patch.dict(os.environ, env), \
+                patch.object(request_changes, "list_review_threads", AsyncMock(return_value=threads)), \
+                patch.object(review_response, "get_review_thread", AsyncMock(side_effect=lambda _client, key: visible[key])), \
+                patch.object(review_response, "resolve_conversation", AsyncMock(side_effect=resolve)) as mutation:
+            with self.assertRaisesRegex(ValueError, "original review packet"):
+                review_receipt.complete_response({**ASSESSMENT, "verified_fixes": [4]}, HEAD)
+            assessment = {**ASSESSMENT, "verified_fixes": [1, 2, 3]}
+            response = review_receipt.complete_response(assessment, HEAD)
+            outcome = asyncio.run(request_changes.run(client, {
+                "repository": "o/r", "pr": 12, "expected_head": HEAD, "token_user": "bit-mis",
+                "assessment": assessment, "comments": [{"path": "source.py", "line": 3, "body": "Blocking finding 3."}],
+            }))
+            mutation.assert_awaited_once_with(client, "thread-1")
+            client.post.assert_awaited_once()
+            with self.assertRaisesRegex(RuntimeError, "cannot replay"):
+                review_receipt.checkpoint_verified_resolution(response, 91, "thread-1")
+        self.assertEqual(outcome["thread_resolution"], {"resolved": [1], "skipped": [2, 3]})
+        self.assertEqual(outcome["outcome"], "changes_requested")
+        self.assertEqual(response["assessment"], ASSESSMENT)
+        with sqlite3.connect(api.DB) as conn:
+            artifact = json.loads(conn.execute("select artifact from calls where id=?", (call_id,)).fetchone()[0])
+        self.assertEqual(artifact["verified_resolution"], {"review_id": 91, "threads": {"thread-1": "resolved"}})
 
     def test_only_a_submission_reply_is_a_receipt(self):
         for text in ("not json", json.dumps({"action": "no_review", "review_id": 5}), json.dumps({"action": "reviewed_clean"}),
