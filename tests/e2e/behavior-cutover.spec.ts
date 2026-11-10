@@ -455,6 +455,33 @@ test('a refresh tick behind a pending More chains keeps the requested page', asy
   await expect(histories).toHaveCount(2)
 })
 
+test('a slow chain refresh is not superseded by its own ticks', async ({ page }) => {
+  await workspace(page)
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let gated = false
+  let reads = 0
+  await page.route('**/api/behavior-chains*', route => {
+    reads++
+    if (gated) return gate.then(() => route.fulfill({ json: { chains: [row(1)], next: null, runtime: [],
+      cutover: { mode: 'v2', sequence: 2, legacyPulls: [], blockers: [] } } }))
+    return route.fulfill({ json: { chains: [row(1)], next: null, runtime: [],
+      cutover: { mode: 'v2', sequence: 2, legacyPulls: [], blockers: [] } } })
+  })
+  const controls = await logging(page)
+  await expect(controls.getByRole('button', { name: 'History', exact: true })).toHaveCount(1)
+  gated = true
+  const baseline = reads
+  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+  await page.waitForTimeout(300)
+  // The second tick stands down while the first pass is still on its way;
+  // superseding it would discard every slow response in turn.
+  expect(reads - baseline).toBe(1)
+  release()
+  await expect(controls.locator('[data-chain-status]')).toContainText('Read ')
+})
+
 test('implementation and repair rows expose independent active and pause controls with actual activity', async ({ page }) => {
   await workspace(page)
   const writes: Array<{ key: string, body: Record<string, unknown> }> = []

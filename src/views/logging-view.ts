@@ -258,7 +258,7 @@ function shell(): void {
     </main>`
   chains = behaviorChainLogging()
   view.querySelector('main')!.append(chains.element)
-  window.addEventListener('poise:refresh-tick', () => { if (active && !document.hidden) void chains.refresh() })
+  window.addEventListener('poise:refresh-tick', () => { if (active && !document.hidden) void chains.refresh(false, true) })
   view.addEventListener('click', onClick)
   view.addEventListener('input', onInput)
   view.addEventListener('change', onChange)

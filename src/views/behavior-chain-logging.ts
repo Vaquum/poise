@@ -46,6 +46,7 @@ export function behaviorChainLogging() {
   const historyMore = element.querySelector<HTMLButtonElement>('[data-history-more]')!
   let cutover: BehaviorCutoverState | null = null
   let refreshGeneration = 0
+  let passesInFlight = 0
   let appendInFlight = 0
   let refreshQueued = false
   let next: string | null = null
@@ -90,15 +91,20 @@ export function behaviorChainLogging() {
     } catch (error) { if (generation === historyGeneration) status.textContent = `Journal could not be read: ${(error as Error).message}` }
     finally { if (generation === historyGeneration) historyMore.disabled = false }
   }
-  async function refresh(append = false): Promise<void> {
+  async function refresh(append = false, tick = false): Promise<void> {
     // A refresh tick must not supersede a pending More pass: the newer full
     // reload would cover only the previously displayed rows and silently drop
     // the requested page. Queue behind it instead; the follow-up still lands.
     if (!append && appendInFlight) { refreshQueued = true; return }
+    // A tick must not supersede a slow pass either: each tick would discard
+    // the previous response and the rows would never update. User follow-ups
+    // still supersede; the next tick refreshes after this pass lands.
+    if (tick && passesInFlight) return
     // A Hold/Resume follow-up must never be skipped while an older refresh is
     // pending: every pass fetches, and only the latest pass writes. Superseded
     // passes return quietly instead of displaying stale hold state.
     const generation = ++refreshGeneration
+    passesInFlight++
     if (append) appendInFlight = generation
     more.disabled = true
     const after = append ? next : null
@@ -188,6 +194,7 @@ export function behaviorChainLogging() {
       element.querySelector('[data-cutover-status]')!.textContent = 'Admission state unavailable'
       status.textContent = `Chains could not be refreshed: ${(error as Error).message}`
     } finally {
+      passesInFlight--
       if (generation === refreshGeneration) more.disabled = false
       if (append && appendInFlight === generation) {
         appendInFlight = 0
