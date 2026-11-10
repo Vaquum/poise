@@ -442,7 +442,7 @@ export async function fetchAgentLogById(
   options: { signal?: AbortSignal, fresh?: boolean } = {},
 ): Promise<AgentLogSnapshot> {
   if (!/^[0-9a-fA-F]{32}$/.test(id)) throw new Error('agent call id must be 32 hex characters')
-  const snapshot = await selectedAgentLogSnapshot(['--logs', '--select', JSON.stringify({ latest: [], ids: [id] })], options)
+  const snapshot = await selectedAgentLogSnapshot(['--logs', '--id', id], options)
   observeAgentSnapshot(snapshot)
   return snapshot
 }

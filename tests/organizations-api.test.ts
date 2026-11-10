@@ -119,20 +119,11 @@ async function cli(command: string, args: string[], options: RunFileOptions) {
       total,
     }), stderr: '' }
   }
-  // Single-id point reads filter to the requested call, like Caller's
-  // primary-key lookup. Other selections keep the full fixture for the
-  // behavior tests that rely on it.
-  if (command === 'agent-interface' && args[0] === '--logs' && args[1] === '--select') {
-    try {
-      const selection = JSON.parse(args[2]!) as { latest?: unknown[], ids?: unknown }
-      if (Array.isArray(selection.latest) && selection.latest.length === 0 && Array.isArray(selection.ids) && selection.ids.length === 1) {
-        const wanted = String(selection.ids[0]).toLowerCase()
-        const found = (behaviorLogs as Record<string, unknown>[]).filter((row) => String(row.id ?? '').toLowerCase() === wanted)
-        return { stdout: JSON.stringify(found), stderr: '' }
-      }
-    } catch {
-      // Fall through to the full fixture; the server validates instead.
-    }
+  // Exact History reads filter by primary key; receipt selections keep
+  // the full fixture for the behavior tests that rely on it.
+  if (command === 'agent-interface' && args[0] === '--logs' && args[1] === '--id') {
+    const found = (behaviorLogs as Record<string, unknown>[]).filter((row) => row.id === args[2])
+    return { stdout: JSON.stringify(found), stderr: '' }
   }
   if (command === 'agent-interface' && args[0] === '--logs') return { stdout: JSON.stringify(behaviorLogs), stderr: '' }
   if (command === 'github-interface' && args[0] === '--view-repos') {
@@ -533,11 +524,14 @@ describe('global behavior settings API', () => {
         prompt: '', actor: 'review-bot', status: 'running',
         started_at: '2026-10-01T12:00:00Z', completed_at: null, time_elapsed: '1m', outcome: null },
     ]
-    const data = await (await fetch(`${base}/api/agent-logs?id=${target}`)).json()
+    const response = await fetch(`${base}/api/agent-logs?id=${target}`)
+    expect(response.status).toBe(200)
+    const data = await response.json()
     expect(data.logs.map((entry: { id: string }) => entry.id)).toEqual([target])
     expect(data.quarantined).toEqual([])
-    const missing = await (await fetch(`${base}/api/agent-logs?id=${'c'.repeat(32)}`)).json()
-    expect(missing.logs).toEqual([])
+    const missing = await fetch(`${base}/api/agent-logs?id=${'c'.repeat(32)}`)
+    expect(missing.status).toBe(200)
+    expect(await missing.json()).toEqual({ logs: [], quarantined: [] })
     const scoped = await (await fetch(`${base}/api/agent-logs?id=${target}&org=Legacy`)).json()
     expect(scoped.logs.map((entry: { id: string }) => entry.id)).toEqual([target])
     const before = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs').length
@@ -547,9 +541,20 @@ describe('global behavior settings API', () => {
       expect(response.status).toBe(400)
     }
     expect(mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs')).toHaveLength(before)
-    const selected = mocks.runFile.mock.calls.filter(([, args]) => args[0] === '--logs' && args[1] === '--select')
-    expect(selected.length).toBeGreaterThan(0)
-    for (const [, args] of selected) expect(args.join(' ')).not.toContain('--limit')
+    expect(mocks.runFile).toHaveBeenCalledWith('agent-interface', ['--logs', '--id', target], expect.anything())
+  })
+
+  it.each(['INVALID_RECORD', 'INVALID_UTF8'])('serves a quarantined exact History lookup for %s', async reason => {
+    const target = 'a'.repeat(32)
+    behaviorLogs = [{ id: target, history_read_error: reason }]
+    const response = await fetch(`${base}/api/agent-logs?id=${target}&org=Legacy`)
+    expect(response.status).toBe(200)
+    const data = await response.json()
+    expect(data.logs).toEqual([])
+    expect(data.quarantined).toMatchObject([{
+      id: target, error: `Caller History row 0 is unreadable (${reason})`,
+    }])
+    expect(mocks.runFile).toHaveBeenCalledWith('agent-interface', ['--logs', '--id', target], expect.anything())
   })
 
   it('serves a running-only agent-log read for the Current accent', async () => {

@@ -576,6 +576,12 @@ unreadable positions. Those positions count toward the page and preserve its
 cursor. Swarm reports them alongside the readable history. Receipt lookups
 retain their existing integrity checks.
 
+`--logs --id CALL_ID` reads one exact History record. A primary-key index
+lookup first verifies the requested ID; an unreadable record returns that ID
+with the existing typed `history_read_error` cause. Missing IDs return an empty
+array; unavailable identity/index evidence fails the read. Swarm's exact Call
+lookup uses this History read. Ordinary selected receipt reads remain strict.
+
 `--logs --select '{"latest":[{"behavior":"pr_review","source":"poise:review-new-prs","owner":"autonomio"}],"ids":["FULL_CALL_ID"]}'`
 returns an oldest-first array containing one indexed latest-started call per
 behavior/source/owner needle plus exact call-ID lookups. Missing kinds return
