@@ -906,6 +906,8 @@ function isPreparationBudgetExhaustion(call: LogEntry): boolean {
   const phase = call.diagnostic?.phase
   return operation === 'issue.checkout' || phase === 'checking_out'
     || operation === 'issue.prepare' || phase === 'preparing_issue'
+    || (typeof phase === 'string' && ['preparing_workspace', 'preparing_checkout', 'preparing_review_evidence',
+      'preparing_provider', 'acquiring_checkout'].includes(phase))
 }
 
 // Any provider failure before a verdict trips, not just account failures: a
