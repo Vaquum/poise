@@ -63,7 +63,9 @@ def stores(path, parent=None):
             for entry in entries:
                 if entry.name in STORE_NAMES:
                     yield fd, str(path), entry.name
-                elif entry.is_dir(follow_symlinks=False):
+                # Native work trees contain disposable Caller fixtures, even
+                # beneath renamed metadata ancestors. Never open their stores.
+                elif entry.name != "native-resources" and entry.is_dir(follow_symlinks=False):
                     for directory_fd, relative, store in stores(entry.name, fd):
                         yield directory_fd, str(Path(path) / relative), store
     finally:
