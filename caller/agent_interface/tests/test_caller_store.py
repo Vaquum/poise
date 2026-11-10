@@ -1,10 +1,13 @@
 """Metadata reader boundaries with a controller-reader stand-in and real files."""
 import json
 import os
+import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 from contextlib import closing
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -64,6 +67,19 @@ def test_stale_or_missing_controller_metadata_refuses_before_opening_the_databas
     with pytest.raises(RuntimeError, match='original live controller handles'):
         caller_store.connect(root / 'calls.sqlite3')
     assert caller_store._descriptors is None
+
+
+@pytest.mark.parametrize(("pid", "uid", "expected"), [(123, 10001, True), (0, 10001, False),
+                                                       (124, 10001, False), (123, 10002, False)])
+def test_workspace_observer_requires_the_controller_peer_in_its_namespace(monkeypatch, pid, uid, expected):
+    monkeypatch.setattr(caller_store, "_store", lambda: ({"pid": 123}, (7, 8)))
+    monkeypatch.setattr(native_namespace, "control_address", lambda: {"path": "/test-only-controller"})
+    monkeypatch.setattr(os, "getuid", lambda: 10001)
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+    connection = MagicMock()
+    connection.__enter__.return_value.getsockopt.return_value = struct.pack("iII", pid, uid, 10001)
+    monkeypatch.setattr(socket, "socket", lambda *args: connection)
+    assert caller_store.observes_workspace_supervisor() is expected
 
 
 @pytest.mark.skipif(sys.platform != 'linux', reason='original directory handles require Linux procfs')
