@@ -139,7 +139,11 @@ function slug(id: string): string {
 
 const icon = (name: ItemIcon) => `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">${ICONS[name]}</svg>`
 
-export type WorkImpactRead = { value: LoggingWorkImpact | null, message: string }
+export type WorkImpactRead = { value: LoggingWorkImpact | null, message: string, at: number }
+
+/** Resolved impacts revalidate on this cadence: staleness stays bounded
+ *  while untried entries keep batch priority. */
+export const IMPACT_TTL_MS = 60_000
 
 /** First evidence reference per expanded entry, keyed by event. An entry
  *  never borrows another entry's link; a detail-less notice falls back to
@@ -150,22 +154,18 @@ export function expandedImpactRefs(items: readonly NotificationItem[], expanded:
     .flatMap(entry => evidenceReferences(entry).slice(0, 1)).map(ref => [ref.eventId, ref]))
 }
 
-/** Whether the event still needs a read: resolved impacts are stable until
- *  their entry leaves, while placeholders and failed reads retry. */
-export function needsImpactRead(impacts: ReadonlyMap<string, WorkImpactRead>, eventId: string): boolean {
-  return !impacts.get(eventId)?.value
-}
-
-/** Unresolved refs with never-tried ones first: retries keep leftover batch
- *  capacity instead of starving later unread entries behind the cap. */
-export function pendingImpactRefs(current: Map<string, DiagnosticEvidence>, impacts: ReadonlyMap<string, WorkImpactRead>): DiagnosticEvidence[] {
+/** Refs due for a read with never-tried ones first: retries and expired
+ *  resolutions keep leftover batch capacity instead of starving later unread
+ *  entries behind the cap, and no resolved impact reads older than its TTL. */
+export function pendingImpactRefs(current: Map<string, DiagnosticEvidence>, impacts: ReadonlyMap<string, WorkImpactRead>, now: number): DiagnosticEvidence[] {
   const fresh: DiagnosticEvidence[] = []
-  const retry: DiagnosticEvidence[] = []
+  const due: DiagnosticEvidence[] = []
   for (const ref of current.values()) {
-    if (!needsImpactRead(impacts, ref.eventId)) continue
-    (impacts.has(ref.eventId) ? retry : fresh).push(ref)
+    const known = impacts.get(ref.eventId)
+    if (!known) fresh.push(ref)
+    else if (known.value === null || now - known.at >= IMPACT_TTL_MS) due.push(ref)
   }
-  return [...fresh, ...retry]
+  return [...fresh, ...due]
 }
 
 function workImpactHtml(entry: EvidenceAttachment, impacts: ReadonlyMap<string, WorkImpactRead>, now: number): string {
@@ -354,7 +354,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     if (quietImpactRender) { quietImpactRender = false; return }
     const current = expandedImpactRefs(items, expanded)
     for (const id of [...impacts.keys()]) if (!current.has(id)) impacts.delete(id)
-    const refs = pendingImpactRefs(current, impacts).slice(0, 20)
+    const refs = pendingImpactRefs(current, impacts, Date.now()).slice(0, 20)
     if (!refs.length) return
     const request = new AbortController()
     impactRequest = request
@@ -362,14 +362,16 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     // and an unconditional render here would refetch them in a tight loop.
     const seen = new Map<string, string>()
     const record = (eventId: string, value: LoggingWorkImpact | null, message: string): void => {
-      impacts.set(eventId, { value, message })
+      impacts.set(eventId, { value, message, at: Date.now() })
       if (seen.get(eventId) !== `${value !== null}:${message}`) dirty = true
     }
     let dirty = false
     for (const ref of refs) {
       const previous = impacts.get(ref.eventId)
       seen.set(ref.eventId, `${previous?.value != null}:${previous?.message}`)
-      impacts.set(ref.eventId, { value: null, message: 'Reading workspace chain evidence…' })
+      // Stale-while-revalidate: only untried refs show a placeholder; known
+      // ones keep their display until the new outcome lands.
+      if (!previous) impacts.set(ref.eventId, { value: null, message: 'Reading workspace chain evidence…', at: 0 })
     }
     try {
       const access = await loggingAccess(request.signal)

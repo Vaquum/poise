@@ -127,7 +127,7 @@ describe('retained exact-key association', () => {
       const work = behaviorChainWorkImpact(journal, events[0].callId, correlationId)!
       const grouped = notificationItems([], state, Date.now())[0]
       expect(grouped.details).toHaveLength(3)
-      const html = itemHtml(grouped, true, Date.now(), new Map([[events[0].id, { value: work, message: '' }]]))
+      const html = itemHtml(grouped, true, Date.now(), new Map([[events[0].id, { value: work, message: '', at: Date.now() }]]))
       expect(html.match(/Current impact: blocked/g)).toHaveLength(1)
       expect(html.match(/Current impact: unknown/g)).toHaveLength(2)
       expect(html).toContain(`Work target: ${work.target}`)
