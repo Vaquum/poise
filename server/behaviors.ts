@@ -3709,7 +3709,7 @@ async function tickReviewNewPrs(): Promise<void> {
     })))
     if (failure) throw failure
   } catch (err) {
-    if (!staleDatastoreFailure(err)) console.error('[behaviors] tick failed:', err)
+    if (!(err instanceof BehaviorLogFeedError) && !staleDatastoreFailure(err)) console.error('[behaviors] tick failed:', err)
     throw err
   }
 }
@@ -5083,7 +5083,7 @@ async function tickApprovePrs(): Promise<void> {
     }
     if (failure) throw failure
   } catch (err) {
-    if (!staleDatastoreFailure(err)) console.error('[behaviors] approve-prs tick failed:', err)
+    if (!(err instanceof BehaviorLogFeedError) && !staleDatastoreFailure(err)) console.error('[behaviors] approve-prs tick failed:', err)
     throw err
   }
 }
