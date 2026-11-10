@@ -4,7 +4,7 @@ import type { LogEntry } from '../server/agent-log-parse'
 import { nativeActionReceipt, nativeRequestSha } from '../server/behavior-chain-action'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
-import { BehaviorChainJournal, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
+import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainInvocation } from '../server/behavior-chain-store'
 import { behaviorChainSummary } from '../server/behavior-chain-summary'
 import { completedReviewCall } from './review-response-fixture'
 
@@ -173,4 +173,33 @@ it('reconciles original possible publication and every reply before retiring a r
   await runtime.run()
   expect(journal.read(chain.id)?.supersession).toEqual(obs.fullSuite)
   expect(operations.perform).toHaveBeenCalledTimes(1)
+})
+
+it('holds an unconfirmed retirement on identical evidence instead of re-invoking in a loop', async () => {
+  const { journal, chain, obs } = setup()
+  const coverage = obs.fullSuite as Record<string, unknown>
+  let current = journal.append(chain.id, 'retire', chain.sequence, { type: 'invocation.admitted', invocation: {
+    id: 'retire-1', behavior: 'retire-pr', actor: chain.author, model: null, slot: null, basis: chainBasis(['retire', coverage]),
+    admittedAt: Date.now(), request: { command: 'github-interface', cwd: '/isolated', argv: ['--issue-work', '943'] } } })
+  current = journal.append(chain.id, 'started', current.sequence, { type: 'invocation.started', invocationId: 'retire-1' })
+  current = journal.append(chain.id, 'settled', current.sequence, { type: 'invocation.settled', invocationId: 'retire-1',
+    callId: null, outcome: 'not_ready', evidence: { status: 'failed', action: 'not_started', outcome: 'not_ready' } })
+  const decision = decideBehaviorChain(current, { ...obs, checkedAt: Date.now() }, Date.now())
+  expect(decision).toMatchObject({ kind: 'hold', reason: expect.stringContaining('redundant PR retirement needs a decision') })
+})
+
+it('re-invokes retirement when the duplicate head moved after an unconfirmed attempt', async () => {
+  const { journal, chain, obs } = setup()
+  const coverage = obs.fullSuite as Record<string, unknown>
+  let current = journal.append(chain.id, 'retire', chain.sequence, { type: 'invocation.admitted', invocation: {
+    id: 'retire-1', behavior: 'retire-pr', actor: chain.author, model: null, slot: null, basis: chainBasis(['retire', coverage]),
+    admittedAt: Date.now(), request: { command: 'github-interface', cwd: '/isolated', argv: ['--issue-work', '943'] } } })
+  current = journal.append(chain.id, 'started', current.sequence, { type: 'invocation.started', invocationId: 'retire-1' })
+  current = journal.append(chain.id, 'settled', current.sequence, { type: 'invocation.settled', invocationId: 'retire-1',
+    callId: null, outcome: 'not_ready', evidence: { status: 'failed', action: 'not_started', outcome: 'not_ready' } })
+  const moved = 'd'.repeat(40)
+  const fresh = { ...coverage, duplicate: { number: 946, head: moved } }
+  const decision = decideBehaviorChain(current, { ...obs, checkedAt: Date.now(), fullSuite: fresh,
+    pull: { ...obs.pull!, head: moved }, publication: { ...obs.publication, head_sha: moved } }, Date.now())
+  expect(decision).toMatchObject({ kind: 'invoke', behavior: 'retire-pr', basis: chainBasis(['retire', fresh]) })
 })

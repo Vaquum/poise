@@ -164,16 +164,16 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     return { kind: 'complete', mergeSha: pull.mergeSha }
   }
   const retired = chain.invocations.at(-1)
-  if (retired?.behavior === 'retire-pr') {
-    const proof = matchingNativeActionReceipt(chain, retired)
-    if (proof && ['closed', 'already_closed'].includes(String(proof.result.outcome))) {
-      if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation })
-        || invocation.model !== null && invocation.callId !== null && !resourceReleaseProven(invocation.evidence ?? {}, true))) return { kind: 'wait', reason: 'original native resource release must settle before supersession' }
-      if (chain.held && !automaticClosureHold(chain.held)) return { kind: 'wait', reason: chain.held }
-      return { kind: 'supersede', evidence: proof.result.coverage as Record<string, unknown> }
-    }
-    return { kind: 'hold', reason: `redundant PR retirement needs a decision: ${String(proof?.result.reason || 'the original close response did not confirm retirement')}` }
+  const retiredProof = retired?.behavior === 'retire-pr' ? matchingNativeActionReceipt(chain, retired) : null
+  if (retired?.behavior === 'retire-pr' && retiredProof && ['closed', 'already_closed'].includes(String(retiredProof.result.outcome))) {
+    if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation })
+      || invocation.model !== null && invocation.callId !== null && !resourceReleaseProven(invocation.evidence ?? {}, true))) return { kind: 'wait', reason: 'original native resource release must settle before supersession' }
+    if (chain.held && !automaticClosureHold(chain.held)) return { kind: 'wait', reason: chain.held }
+    return { kind: 'supersede', evidence: retiredProof.result.coverage as Record<string, unknown> }
   }
+  // An unconfirmed retirement falls through to fresh evidence below: the
+  // duplicate head may have moved since the attempt. Re-invocation is
+  // basis-guarded there so identical evidence holds instead of looping.
   if (!observation.issue.open && observation.fullSuite) {
     if (chain.held && !automaticClosureHold(chain.held)) return { kind: 'wait', reason: chain.held }
     if (observation.existingPulls.length) return { kind: 'hold', reason: `full-suite recovery needs a decision for linked work: ${observation.existingPulls.join(', ')}` }
@@ -185,6 +185,9 @@ export function decideBehaviorChain(chain: BehaviorChain, observation: ChainObse
     }
     if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation })
       || invocation.model !== null && invocation.callId !== null && !resourceReleaseProven(invocation.evidence ?? {}, true))) return { kind: 'wait', reason: 'original native resource release must settle before retirement' }
+    if (retired?.behavior === 'retire-pr' && retired.basis === chainBasis(['retire', coverage])) {
+      return { kind: 'hold', reason: `redundant PR retirement needs a decision: ${String(retiredProof?.result.reason || 'the original close response did not confirm retirement')}` }
+    }
     return { kind: 'invoke', behavior: 'retire-pr', basis: chainBasis(['retire', coverage]), actor: chain.author,
       reviewer: null, reason: 'close the verified redundant full-suite repair after original invocation settlement' }
   }
