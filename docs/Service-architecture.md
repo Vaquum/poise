@@ -1311,12 +1311,18 @@ rechecks while preserving the public active/merged filters, native resource
 settlement and immutable history. Confirmed closed seeds without remaining
 obligations leave the active list before pagination, retaining ownership and
 unfiltered/history reads as defined in [Behavior chain](Behavior-chain.md).
+Recovered full-suite repairs can instead end with verified supersession. The
+same journal retains failure/recovery runs, covering merges, the duplicate head
+and its native close receipt; summaries expose that evidence separately from
+`mergeSha`. Original writes and native resources must settle first. Unclear or
+independent work remains open with its decision visible. The existing Caller
+action performs head-checked retirement; a lost close response stays uncertain.
 The normal-work page precedes due quiescent
 reconciliation; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
 operation or authority; a deliberate wait keeps GitHub facets unknown without
-declaring a collector outage. No extra poller, gateway scope or event type is
+declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 

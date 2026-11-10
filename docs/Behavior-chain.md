@@ -152,6 +152,33 @@ target does not govern atomic chain admissions. No new refresh loop is added.
 
 ### Bounded reconciliation
 
+For a reporter-owned full-suite failure, a closed seed can retire a redundant
+chain PR as **superseded**, independently of a merge. The seed observation
+retains the failing runs, recovery run, reported tests, covering merged PRs and
+duplicate head. GitHub must confirm completed full runs on main, and the test
+artifacts must show the reported failures and their successful recovery. The
+recovery commit must descend from the failure and contain the covering merges.
+Missing or expired artifacts leave the decision visible.
+
+Automatic coverage is conservative: every change in the latest duplicate must
+be a covered replacement inside the reported tests. The complete recovered
+test bodies retain their fixtures and assertions. A fixture-clock assertion
+repair with the same pure fixed-clock helper may use another `at(...)` instant, as in #940's `at(61)` and #946's
+`at(11)`; unrelated numeric changes, additional assertions, production edits,
+other linked PRs and unclear coverage require a decision and remain open.
+
+Original possible writes, review replies and positive native resource-release
+proof must reconcile before cleanup. Only the automatic closed-target hold can
+be cleared; a person's hold remains. The existing native action path journals
+`issue-work --mode retire`, revalidates coverage and rechecks the owned PR head
+before closing it on GitHub. Its accepted response and resource release are
+required for the `chain.superseded` event. A lost response stays uncertain;
+observing a closed PR cannot attribute that close or authorize a second one.
+Supersession retains the covering merge separately, keeps the duplicate's
+`mergeSha` unset, removes settled work from the active list, and leaves History
+and GitHub evidence links available. Rebuild and restart retain this terminal
+outcome and the original invocation ownership.
+
 The existing scheduler selects a normal-work page before a separate due
 reconciliation page under its existing pass budget. Quiescent held or merged
 chains keep their original ownership, but cannot

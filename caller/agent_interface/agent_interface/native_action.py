@@ -64,8 +64,8 @@ def validate(argv: list[str], cwd: str, repository: str, actor: str, *, resource
     if not re.fullmatch(r"#?[1-9][0-9]*", argv[1]):
         raise ValueError("native action requires its original positive target number")
     head = atoms.expected_head(argument(argv, "--expected-head"))
-    if argv[0] == "--issue-work" and argument(argv, "--mode") != "complete":
-        raise ValueError("native action permits only the original issue publication completion")
+    if argv[0] == "--issue-work" and argument(argv, "--mode") not in {"complete", "retire"}:
+        raise ValueError("native action permits only issue publication completion or verified retirement")
     request = {"command": "github-interface", "cwd": cwd, "argv": argv}
     if resource_version:
         request["nativeResources"] = 2

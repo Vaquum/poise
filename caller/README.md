@@ -33,6 +33,17 @@ CALL_ID PLAN_SHA HEAD_SHA` continuation accepts only an original failed repair
 whose immutable plan, pushed head, unattempted replies and released worker
 resources are proven. It starts no model and cannot replace that plan.
 
+For a closed full-suite reporter seed, `--chain-seed` also reads the actual
+failing/recovery runs, test artifacts and covering merges. Conservative complete
+test-repair coverage permits `github-interface --issue-work ISSUE --mode retire
+--branch BRANCH --pull-number N --expected-head SHA --coverage-json JSON
+--token-user USER`. Retirement revalidates that evidence, preserves unrelated
+work and rechecks the owned head immediately before closing. It returns `closed`,
+`already_closed`, `not_ready` or `superseded`; a missing response proves none of
+them. The chain invokes it only through the original native action/resource
+path after settling prior writes and native ownership. See
+[full-suite reconciliation](../docs/Behavior-chain.md#bounded-reconciliation).
+
 An atomic repair blocked solely by the supplied head's failed CI can return
 `blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains
 its own supplied CI snapshot as `artifact.ci_blocker`, including the failed

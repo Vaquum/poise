@@ -14,6 +14,8 @@ from typing import Any
 from github_interface.behaviors import issue_comments, issue_work, read_issue
 from github_interface.client import GitHubClient
 from github_interface.context import issue_number, repository, token_user
+from github_interface import full_suite_repair
+from github_interface.atoms.pulls import get_pull
 
 REQUIRE_TOKEN_USER = True
 
@@ -31,7 +33,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         issue_comments.run(client, payload),
         issue_work.run(client, {**payload, "mode": "inspect"}),
     )
-    return {
+    result = {
         "action": "chain_seed",
         "repository": target,
         "issue_number": number,
@@ -41,3 +43,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "comments": comments["comments"],
         "publication": publication,
     }
+    if read["issue"].get("state") == "closed" and read["issue"].get("title") == full_suite_repair.TITLE:
+        pull = await get_pull(client, owner, repo, publication["pull_number"]) if publication["pull_number"] else None
+        result["full_suite"] = await full_suite_repair.inspect(client, target, read["issue"], comments["comments"], pull)
+    return result
