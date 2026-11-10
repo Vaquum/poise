@@ -3433,6 +3433,7 @@ tr:hover .stop-btn { opacity: 1; }
 #logging-table .logging-column-occurrences, #logging-table .logging-number { text-align: right; font-variant-numeric: tabular-nums; }
 #logging-table .logging-cell { max-width: 22ch; overflow: hidden; text-overflow: ellipsis; }
 #logging-table .logging-cell-message { min-width: 28ch; max-width: 50ch; }
+#logging-table .logging-cell-impact { min-width: 32ch; max-width: 48ch; white-space: normal; }
 #logging-table :is(.logging-cell-callId, .logging-cell-correlationId, .logging-cell-incidentId) { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: .75rem; max-width: 18ch; }
 #logging-table .started-cell .agent-status-note { display: block; }
 .logging-column-button { display: inline-flex; align-items: center; justify-content: space-between; gap: var(--sp-2); width: 100%; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; text-align: left; cursor: pointer; }
