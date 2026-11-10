@@ -1499,13 +1499,17 @@ no-publication shape and retry requirements are defined in
 Optional work-failure reporting uses the same chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
 opt-in enables verified repair incomplete-reply, repair execution-budget
-or PR review-budget exhaustion, and terminal uncertain merge submissions, including
+or PR review-budget exhaustion, verified automatic implementation holds before a PR,
+and terminal uncertain merge submissions, including
 sources without an explicit hold, supplied by trusted service configuration or the
 environment in local mode. Scope is rechecked after verification before reserving
 creation intent and publishing; revocation during those reads leaves the creation
 intent available.
 Merge reports revalidate the open seed/PR, original pinned head and absent queue
 entry after recovery, retaining the original invocation's uncertainty and ownership.
+Implementation reports require the current automatic hold's settled blocked receipt,
+positive resource release and fresh open-seed inspection proving no publication.
+They retain the hold and distinguish worker-reported blockers from Caller diagnostic facts.
 Durable creation intent prevents another POST after an uncertain result; the source state,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. It adds no gateway route, scope, journal event,
