@@ -2587,14 +2587,23 @@ async function requireFreshDatastore(): Promise<void> {
         if (unhealthyExit) throw unhealthyExit
         return
       }
-      const message = `Datastore stale: last successful sync ${data.last_success_at}; age ${data.age_seconds}s exceeds ${DATASTORE_MAX_AGE_SECONDS}s`
+      const message = stale ? staleMirrorMessage(stale.episode) : `Datastore stale: last successful sync ${data.last_success_at}; age ${data.age_seconds}s exceeds ${DATASTORE_MAX_AGE_SECONDS}s`
+      const latest = stale?.episode.latest
       datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
-        status: 'unavailable', checkedAt, ageSeconds: Number(data.age_seconds),
-        lastSuccessAt: data.last_success_at, error: message,
+        status: 'unavailable', checkedAt, ageSeconds: latest ? latest.ageSeconds : Number(data.age_seconds),
+        lastSuccessAt: latest ? latest.lastSuccessAt : String(data.last_success_at), error: message,
       })
       try { await recoverLegacyDatastore(org, behaviorSignal()) }
       catch (error) { console.error('[behaviors] legacy datastore sync recovery failed:', behaviorErrorMessage(error)) }
       throw stale ?? new Error(message)
+    }
+    if (stale) {
+      const message = staleMirrorMessage(stale.episode)
+      datastoreFreshnessByOrganization.set(operationKey('review-new-prs'), {
+        status: 'unavailable', checkedAt, ageSeconds: stale.episode.latest.ageSeconds,
+        lastSuccessAt: stale.episode.latest.lastSuccessAt, error: message,
+      })
+      throw stale
     }
     if (unhealthyExit) throw unhealthyExit
     if (data.action !== 'health'

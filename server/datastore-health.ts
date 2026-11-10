@@ -101,7 +101,7 @@ function observeHealth(org: Organization | null, health: Health, blockedBy: read
       // Sync generation orders observations first; within one generation,
       // a smaller age is an earlier probe even if its result arrives later.
       if (incomingSync < latestSync || (incomingSync === latestSync && health.evidence.ageSeconds < previous.latest.ageSeconds)) {
-        if (health.status === 'stale' && previous.recoveredAt === null && blockedBy.length > 0) {
+        if (previous.recoveredAt === null && blockedBy.length > 0) {
           const behaviors = [...new Set([...previous.behaviors, ...blockedBy])]
           if (behaviors.length !== previous.behaviors.length) {
             const merged = { ...previous, behaviors }
@@ -215,7 +215,7 @@ export async function runDatastoreHealth(org: Organization | null, options: RunF
     diagnostic({ level: 'error', operation: 'github-datastore.health', exitCode: 0,
       account: org?.login ?? null, target: org?.datastorePath ?? null, message })
   }
-  const episode = health ? observeHealth(org, health, []) : null
+  const episode = health ? observeHealth(org, health, blockedBy) : null
   if (episode) {
     // An outdated healthy probe leaves the newer stale episode open: refuse
     // like a stale probe instead of resolving healthy with stale attached.

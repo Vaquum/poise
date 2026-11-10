@@ -218,13 +218,28 @@ it('retains the latest evidence when stale and healthy observations arrive out o
     expect(episodes(database)).toEqual([second])
     expect(behaviors.getBehaviorsRuntimeHealth().datastore).toMatchObject({ status: 'unavailable', lastSuccessAt: syncB, ageSeconds: 180 })
   }
+  // A delayed healthy probe from native discovery still records its blocked
+  // behavior without replacing the retained evidence.
+  saveProbe(path, health(path, 1, syncA))
+  await expect(runDatastoreHealth(org, {}, ['review-new-issues'])).rejects.toMatchObject({ episode: { id: second.id } })
+  expect(episodes(database)[0]).toMatchObject({ id: second.id, latest: { lastSuccessAt: syncB, ageSeconds: 180 } })
+  expect(episodes(database)[0].behaviors).toEqual(expect.arrayContaining(['review-new-issues']))
   // An outdated stale probe still records a new blocked behavior without
   // replacing the retained evidence or opening another episode.
   saveProbe(path, health(path, 150, syncA))
-  await expect(runDatastoreHealth(org, {}, ['review-new-issues'])).rejects.toMatchObject({ episode: { id: second.id } })
+  await expect(runDatastoreHealth(org, {}, ['approve-pr'])).rejects.toMatchObject({ episode: { id: second.id } })
   expect(episodes(database)).toHaveLength(1)
   expect(episodes(database)[0]).toMatchObject({ id: second.id, latest: { lastSuccessAt: syncB, ageSeconds: 180 } })
-  expect(episodes(database)[0].behaviors).toEqual(expect.arrayContaining(['review-new-issues']))
+  expect(episodes(database)[0].behaviors).toEqual(expect.arrayContaining(['review-new-issues', 'approve-pr']))
+  expect(events().filter((event) => event.phase === 'opened')).toHaveLength(2)
+  // Outdated results through the normal freshness gate keep the retained
+  // sync B evidence instead of overwriting it with older observations.
+  for (const outdated of [health(path, 150, syncA), health(path, 1, syncA)]) {
+    saveProbe(path, outdated)
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(episodes(database)[0]).toMatchObject({ id: second.id, latest: { lastSuccessAt: syncB, ageSeconds: 180 } })
+    expect(behaviors.getBehaviorsRuntimeHealth().datastore).toMatchObject({ status: 'unavailable', lastSuccessAt: syncB, ageSeconds: 180 })
+  }
   expect(events().filter((event) => event.phase === 'opened')).toHaveLength(2)
   saveProbe(path, health(path, 210, syncB))
   await behaviors.runEnabledBehaviorsOnce()
