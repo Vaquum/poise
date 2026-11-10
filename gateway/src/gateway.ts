@@ -14,6 +14,7 @@ import { rejectUpgrade } from './proxy.js'
 import { publicPolicyPage } from './public-pages.js'
 import { TEST_RELAY_PATH } from './test-relay.js'
 import { workspaceRequest, workspaceUpgrade } from './workspace.js'
+import { isMcpPath } from './mcp.js'
 
 type Handler = (ctx: Context, req: IncomingMessage, res: ServerResponse, url: URL) => void | Promise<void>
 
@@ -123,6 +124,10 @@ async function handle(ctx: Context, req: IncomingMessage, res: ServerResponse): 
     return ctx.deps.testRelay.handle(req, res, url)
   }
   if (host.kind === 'apex') {
+    if (isMcpPath(url.pathname)) {
+      if (!ctx.deps.config.mcpEnabled || (req.url ?? '/').split('?')[0] !== url.pathname) return answer(ctx, req, res, 404, 'There is nothing at this address.')
+      return ctx.mcp.handle(req, res, url)
+    }
     if (ctx.publicPages && ['/', '/privacy', '/terms'].includes(url.pathname) && (req.url ?? '/').split('?')[0] !== url.pathname) return answer(ctx, req, res, 404, 'There is nothing at this address.')
     if (!ctx.publicPages && (url.pathname === '/privacy' || url.pathname === '/terms')) return answer(ctx, req, res, 404, 'There is nothing at this address.')
     const route = APEX_ROUTES[url.pathname]
@@ -212,6 +217,7 @@ export function createGateway(deps: GatewayDeps): Gateway {
         // Only after the server stopped: destroying the pool first would reset in-flight proxied answers.
         ctx.agent.destroy()
         ctx.closeGoogleConnections()
+        ctx.closeMcp()
       }
     },
   }

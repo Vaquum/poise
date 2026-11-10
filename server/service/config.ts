@@ -11,6 +11,8 @@ export interface ServiceConfig {
   handle: string
   /** The owner's GitHub login, in GitHub's case. */
   owner: string
+  /** Immutable GitHub account id; older containers without it cannot admit MCP reads. */
+  ownerId?: number
   /** `https://<handle>.<domain>`, exactly as a browser sends it in Origin. */
   publicOrigin: string
   /** `https:`, or `http:` for a local end-to-end run (see `publicOrigin()`). */
@@ -118,6 +120,8 @@ export function readServiceConfig(env: NodeJS.ProcessEnv = process.env): Service
   const problems: string[] = []
   const handle = env.POISE_WORKSPACE_HANDLE ?? ''
   const owner = env.POISE_WORKSPACE_OWNER ?? ''
+  const ownerId = env.POISE_WORKSPACE_OWNER_ID
+  if (ownerId !== undefined && (!/^[1-9][0-9]*$/.test(ownerId) || !Number.isSafeInteger(Number(ownerId)))) problems.push('POISE_WORKSPACE_OWNER_ID must be a positive immutable GitHub account id')
   if (!handle) problems.push('POISE_WORKSPACE_HANDLE is required')
   else if (!HANDLE.test(handle)) problems.push(`POISE_WORKSPACE_HANDLE must be a GitHub login in lower case; it is "${handle}"`)
   if (!owner) problems.push('POISE_WORKSPACE_OWNER is required')
@@ -135,7 +139,7 @@ export function readServiceConfig(env: NodeJS.ProcessEnv = process.env): Service
     throw new Error(`Poise cannot start in service mode: ${problems.join('; ')}`)
   }
   return {
-    handle, owner, publicOrigin: origin.origin, publicProtocol: origin.protocol === 'http:' ? 'http:' : 'https:',
+    handle, owner, ...(ownerId === undefined ? {} : { ownerId: Number(ownerId) }), publicOrigin: origin.origin, publicProtocol: origin.protocol === 'http:' ? 'http:' : 'https:',
     publicHost: origin.host, gatewayKey: key, drainTimeoutSeconds,
   }
 }
