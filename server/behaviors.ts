@@ -854,7 +854,6 @@ function reviewSlotOfTarget(target: string): ReviewerSlot {
 export type ReviewAccountFailureKind = 'balance' | 'signin'
 
 export function reviewAccountFailure(call: LogEntry): ReviewAccountFailureKind | null {
-  if (call.diagnostic && !call.diagnostic.operation.startsWith('provider.')) return null
   const error = String(call.error || '')
   // A bare 402 also matches pull/issue numbers and line numbers in wrapped
   // exceptions, so only the HTTP status reading trips: Caller's
@@ -7397,7 +7396,13 @@ async function runBehaviorChains(): Promise<void> {
       severity: (behavior) => getSetting(behavior === 'approve-pr' ? 'approve-prs' : 'review-new-prs'),
       authenticationRejected(call) {
         observeProviderRejection(call)
-        if (reviewAccountFailure(call) === 'signin' && call.action === 'not_started' && postedNothing(call)) {
+        // The new signin trip needs provider evidence: local interface
+        // diagnostics must not trip the reviewer. (reviewAccountFailure
+        // itself stays unscoped: reviewerTripKind already excludes the
+        // local-inspection case and still trips balance on interface
+        // diagnostics in other phases.)
+        if (reviewAccountFailure(call) === 'signin' && call.action === 'not_started' && postedNothing(call)
+          && (!call.diagnostic || call.diagnostic.operation.startsWith('provider.'))) {
           const identity = tripIdentity(call)
           if (identity) tripReviewer(call.behavior === 'pr_review' || call.behavior === 'pr_approve' ? 'review-new-prs' : ISSUES_KEY,
             identity, 'signin', call.id)
