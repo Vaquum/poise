@@ -1102,6 +1102,27 @@ The #971 disposable reproduction established that cross-kernel read-only access
 can disrupt a guest writer. The exact production corruption transaction remains
 unverified; the backup refusal prevents the demonstrated unsafe access.
 
+The active release's `caller/agent_interface/agent_interface/recover_store.py`
+is the operator activation command for a reviewed candidate. Run it as the
+workspace user inside the original workspace kernel. Pass the private staging
+directory, `--service-pid` with the active Poise server PID and `--apply-manifest`
+with the reviewed SHA-256 of `verification.json`. The staging directory lives
+under `~/.poise/incident-recovery` and contains the preserved `source-calls.sqlite3`
+and any captured WAL and SHM, the `recovered.sqlite3` candidate and the manifest.
+Record the original inode, archive and candidate digests, row counts and exact
+omitted row identities and causes in the manifest. Verify those omissions
+against the live journal and keep unsettled effects and resources fenced.
+
+Before activation, pause behavior admissions and use the existing service drain
+to stop new Chat turns and Caller launches. The command requires the original
+supervisor, no running writers, the same Caller schema and every readable
+original record. It rechecks any omitted terminal managed record and refuses
+changed evidence or a changed rowid watermark. SQLite holds the write lock
+across verification and backup to preserve the original inode. Keep the drain
+and admission pause through post-activation validation. Resume through the
+existing service and behavior controls after the bounded and exact readers
+work and the original holds are verified.
+
 ## Restore
 
 ```bash
