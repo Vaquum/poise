@@ -1168,15 +1168,15 @@ describe('updates in place', () => {
     expect(containerEnv(h, 'alice')).toContain(`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`)
   })
 
-  it.each(['added', 'changed', 'removed'].flatMap(change => [false, true].map(sameImage => ({ change, sameImage }))))(
+  it.each(['added', 'changed', 'removed', 'oversized legacy'].flatMap(change => [false, true].map(sameImage => ({ change, sameImage }))))(
     'applies the $change report allowlist in place while native cleanup remains held (same image=$sameImage)', async ({ change, sameImage }) => {
-      const desired = change === 'removed' ? '' : 'acme/one,acme/two'
+      const desired = change === 'oversized legacy' ? `${'a/b,'.repeat(2047)}a/bb` : change === 'removed' ? '' : 'acme/one,acme/two'
       await start({ repairRepositories: desired })
       const container = h.docker.containers.get('poise-ws-alice')!
-      const previous = change === 'added' ? '' : 'acme/old'
+      const previous = change === 'oversized legacy' ? `${desired},acme/revoked` : change === 'added' ? '' : 'acme/old'
       container.spec = { ...container.spec, Env: [`POISE_DRAIN_TIMEOUT=${h.config.drainTimeoutSeconds}`,
         ...(previous ? [`POISE_REPAIR_EXHAUSTION_REPOSITORIES=${previous}`] : [])] }
-      h.workspace.health.repairExhaustionRepositories = previous
+      h.workspace.health.repairExhaustionRepositories = change === 'oversized legacy' ? '[oversized]' : previous
       if (sameImage) {
         container.imageId = CURRENT_IMAGE_ID
         h.workspace.health.release = 'new-release'
