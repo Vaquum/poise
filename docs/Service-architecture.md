@@ -1362,6 +1362,13 @@ unchanged polls cannot refresh it. Stale/incomplete evidence stays explicit.
 This adds no observation, scheduler, event type, scope or execution authority.
 [Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
 
+Logging incident details may independently read `/api/behavior-chains` with exact
+`callId` and/or `correlationId` selectors for a read-only work-impact annotation.
+This uses the existing owner workspace boundary and canonical journal, including
+completed chains. Ambiguous or missing matches remain unknown, as does a failed
+workspace read; central Logging queries and retained evidence remain independent.
+No gateway read, scope, ingestion or execution authority is added.
+
 Invocation summaries may also carry retained original publication-plan absence
 and recovery evidence. Settings displays the original Call and restoration
 action even while its invocation is active. This diagnostic evidence grants no

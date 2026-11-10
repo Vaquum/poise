@@ -5,6 +5,7 @@ import {
   LOGGING_LEVELS, LOGGING_SOURCES, LoggingApiError, loggingCallId, loggingErrorBounds, loggingEvent,
   loggingExport, loggingHealth, loggingHref, loggingPage, loggingParameters, loggingPullRequest,
   loggingRecord, parseLoggingLink, subscribeDiagnosticRefresh,
+  loggingWorkImpact,
 } from '../src/logging'
 
 const access = { endpoint: '/api/logging', isAdmin: false, owner: 'local' }
@@ -18,6 +19,41 @@ const health = { version: 1, status: 'partial', collection: { status: 'unavailab
 const signal = () => new AbortController().signal
 const respond = (value: unknown, status = 200) => vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(value), { status }))
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
+
+it('keeps optional chain reads on the owner workspace boundary and leaves unavailable evidence explicit', async () => {
+  const owned = { ...event, callId: '1'.repeat(32), correlationId: '2'.repeat(32) }
+  const fetch = respond({ impact: null })
+  expect(await loggingWorkImpact(access, owned, signal())).toBeNull()
+  expect(fetch).toHaveBeenCalledWith('/api/behavior-chains?callId=' + owned.callId + '&correlationId=' + owned.correlationId,
+    expect.objectContaining({ credentials: 'same-origin', cache: 'no-store' }))
+  fetch.mockClear()
+  for (const change of [{ source: 'gateway' }, { workspace: 'another-owner' }, { visibility: 'infrastructure' as const }, { callId: null, correlationId: null }]) {
+    expect(await loggingWorkImpact(access, { ...owned, ...change }, signal())).toBeNull()
+  }
+  expect(fetch).not.toHaveBeenCalled()
+  fetch.mockResolvedValue(new Response(JSON.stringify({ error: 'journal unreadable' }), { status: 503 }))
+  await expect(loggingWorkImpact(access, owned, signal())).rejects.toThrow('Workspace chain evidence is unavailable')
+})
+
+it('does not associate conflicting repository or behavior evidence despite matching invocation identities', async () => {
+  const impact = { impact: 'blocked', recovered: false, invocationId: '2'.repeat(32), repository: 'acme/repo', behavior: 'repair-pr',
+    callerBehavior: 'repair_pr', stage: 'repair-pr: failed', target: 'acme/repo#42', progressAt: 1000, retryAt: null,
+    nextAction: 'Resolve the hold', journal: '/api/behavior-chains?id=acme%2Frepo%237' }
+  const fetch = respond({ impact })
+  const owned = { ...event, callId: '1'.repeat(32), correlationId: '2'.repeat(32), behavior: 'repair_pr' }
+  expect(await loggingWorkImpact(access, owned, signal())).toEqual(impact)
+  for (const change of [{ repository: 'another/repo' }, { behavior: 'review_pr' }]) {
+    fetch.mockResolvedValue(new Response(JSON.stringify({ impact })))
+    expect(await loggingWorkImpact(access, { ...owned, ...change }, signal())).toBeNull()
+  }
+  // Caller behavior names do not normalize by separator swap: issue_review is
+  // review-issue, which underscore replacement would render issue-review.
+  const renamed = { ...impact, behavior: 'review-issue', callerBehavior: 'issue_review' }
+  fetch.mockResolvedValue(new Response(JSON.stringify({ impact: renamed })))
+  expect(await loggingWorkImpact(access, { ...owned, behavior: 'issue_review' }, signal())).toEqual(renamed)
+  fetch.mockResolvedValue(new Response(JSON.stringify({ impact: renamed })))
+  expect(await loggingWorkImpact(access, { ...owned, behavior: 'pr_review' }, signal())).toBeNull()
+})
 
 describe('canonical diagnostic browser contract', () => {
   it('shares the canonical severities and sources and preserves missing evidence', () => {
