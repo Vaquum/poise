@@ -3,6 +3,8 @@ import { environmentSecrets, redact } from '../gateway/src/diagnostics/redaction
 import type { fetchAgentLogSnapshot } from './agent'
 import type { BehaviorDeadLetter, BehaviorLaunchClaim } from './db'
 
+export const REVIEW_BUDGET_STOPPED = 'Automatic retries stopped after two review timeouts on this PR, head and model. Change the head or model, or retry explicitly.'
+
 // Retained audit incidents outlive active failure summaries. Classify their
 // exact validated Caller evidence independently; never alter retry ownership.
 export function behaviorIncidentDiagnostics(incidents: BehaviorDeadLetter[], snapshot: Awaited<ReturnType<typeof fetchAgentLogSnapshot>> | null, launches: BehaviorLaunchClaim[] = []) {
@@ -32,9 +34,10 @@ export function behaviorIncidentDiagnostics(incidents: BehaviorDeadLetter[], sna
       && /^[a-f0-9]{32}$/.test(incident.callId ?? '') && /^[a-f0-9]{40}$/.test(call.expected_head ?? '')
       && ['failed', 'error', 'cancelled', 'canceled', 'timed_out', 'timeout'].includes(call.status.toLowerCase())
       && !call.head_sha && call.review_id == null && call.receipts == null && !call.review_comments
-    const error = behaviorErrorMessage(fault ? launch?.launchError || incident.error : exact ? call.error || incident.error : incident.error)
+    const stopped = incident.error === REVIEW_BUDGET_STOPPED
+    const error = behaviorErrorMessage(fault ? launch?.launchError || incident.error : stopped ? incident.error : exact ? call.error || incident.error : incident.error)
     return { ...incident, error, processDiagnostic: exact ? call.diagnostic ?? null : null, diagnostic: fault ? diagnosticClassification('invalid_agent_result') : classifyBehaviorDiagnostic(error, {
-      held: !noAction, errorCode: exact ? call.error_code : null,
+      held: stopped || !noAction, errorCode: stopped ? 'review_budget_exhausted' : exact ? call.error_code : null,
     }) }
   })
 }

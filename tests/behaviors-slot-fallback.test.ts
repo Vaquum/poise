@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { LogEntry } from '../server/agent'
 import type { ReviewerTripKind } from '../server/behaviors'
-import { mocks, pr, loadModules, resetLogCache, arrangeCli, agentLog, fixture } from './behaviors-runtime-fixture'
+import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, recordCompletedInitialReview, fixture } from './behaviors-runtime-fixture'
 
 const RATE_LIMIT_ERROR = 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)'
 const GROK_ANALYSIS_LIMIT_ERROR = 'grok review reached its analysis time limit; handing off so the next model can run instead'
@@ -330,3 +330,188 @@ describe('approval fallback through the slots', () => {
     }
   })
 })
+
+it.each(['initial review', 'approval', 'dismissed approval'] as const)(
+  'stops matching legacy %s timeouts across backoff, restart and other PR success', async (lane) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-10T12:00:00Z'))
+    const initial = lane === 'initial review'
+    const dismissed = lane === 'dismissed approval'
+    const behavior = initial ? 'review-new-prs' : 'approve-prs'
+    const launchBehavior = initial ? 'pr_review' : 'pr_approve'
+    const model = 'opus-5-xhigh'
+    const key = `${pr.repo}#${pr.number}`
+    const failureKey = `behavior_${behavior.replace(/-/g, '_')}_failure:`
+    const arrange = (head = HEAD_SHA, responses = 1) => arrangeCli(!initial && !dismissed, false, {
+      headSha: head, reviewerReviewIdsSince: [], latestActivityAt: new Date().toISOString(),
+      ...(dismissed ? { reviewerLatestState: 'DISMISSED', reviewerLatestCommit: NEXT_HEAD_SHA } : {}),
+    }, { commits_after_request: 0, author_commits_after_request: 0, author_pr_comments_after_request: !initial && !dismissed ? responses : 0,
+      response_count: !initial && !dismissed ? responses : 0,
+      ...(dismissed ? { reviewer_latest_state: 'DISMISSED' } : {}) })
+    arrange()
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    let { database: db, behaviors: runtime } = await loadModules()
+    db.setMeta('me', 'poise-user')
+    db.setMeta(`behavior_${behavior.replace(/-/g, '_')}_enabled`, '1')
+    db.setMeta('models', JSON.stringify({ slots: { primary: model, secondary: model, tertiary: model },
+      places: { [launchBehavior]: { slot: 'primary' } } }))
+    if (initial) {
+      db.setMeta('behavior_review_new_prs_keyver', '3')
+      db.recordSeen(behavior, '__snapshot_v3__')
+      db.setMeta('behavior_review_new_prs_reviewers', '2')
+      // An admitted sibling waits while the primary uses its two attempts.
+      db.setMeta(`${failureKey}${key}:secondary`, JSON.stringify({ kind: 'operation', consecutiveFailures: 1,
+        lastFailureAtMs: Date.now(), nextRetryAtMs: Date.now() + 86_400_000, error: 'sibling waiting' }))
+    }
+    const basis = (pull: typeof pr) => {
+      if (dismissed) recordCompletedInitialReview(db, { pull, target: `${pull.repo}#${pull.number}:tertiary`,
+        outcome: 'changes_requested', headSha: NEXT_HEAD_SHA, callId: String(pull.number).padStart(32, '0') })
+    }
+    basis(pr)
+    runtime.startBehaviorsRuntime()
+    const tick = async () => { await resetLogCache(); await runtime.runEnabledBehaviorsOnce() }
+    const expireBackoff = () => vi.setSystemTime(Date.now() + 3_600_001)
+    let receiptId = 100
+    const receipt = (number = pr.number, overrides: Record<string, unknown> = {}) => {
+      const claim = db.listBehaviorLaunchClaims(behavior).find((row) => row.launchPr === number)!
+      return agentLog({ id: (++receiptId).toString(16).padStart(32, '0'), behavior: launchBehavior,
+        repo: pr.repo, pr_id: String(number), model, status: 'failed',
+        started_at: claim.launchRequestedAt, started_at_precise: claim.launchRequestedAt,
+        completed_at: new Date().toISOString(), expected_head: claim.launchExpectedHead,
+        actor: claim.launchActor, source: claim.launchSource, correlation_id: claim.launchCorrelationId,
+        action: 'not_started', outcome: 'preflight_failed', review_policy: 'bounded-v1',
+        error_code: 'review_budget_exhausted', error: 'Review reached its total time limit; needs attention', ...overrides })
+    }
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    const first = receipt()
+    const otherEvidence = [
+      { model: 'gpt-6-astra-ultra' }, { expected_head: NEXT_HEAD_SHA }, { source: 'poise:replay' },
+      { actor: 'other-bot' }, { behavior: initial ? 'pr_approve' : 'pr_review' }, { pr_id: '99' },
+      { review_id: 91 }, { error: 'Review timed out; could not prove a safe recovery' },
+      { correlation_id: 'duplicate' }, { correlation_id: 'duplicate' },
+    ].map((change, index) => ({ ...first, id: (index + 200).toString(16).padStart(32, '0'),
+      correlation_id: `other-${index}`, ...change }))
+    fixture.agentLogs.push(first, ...otherEvidence)
+    await tick()
+    await tick()
+    // Re-reading one failed receipt does not use up the second attempt.
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    fixture.agentLogs = fixture.agentLogs.filter((call) => !otherEvidence.some((row) => row.id === call.id))
+    expireBackoff()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    const heldTarget = db.listBehaviorLaunchClaims(behavior)[0].target
+    const second = receipt(pr.number, { error: GROK_ANALYSIS_LIMIT_ERROR })
+    fixture.agentLogs.push(second)
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    expect(db.getFailedBehaviorLaunch(behavior, heldTarget)?.launchCallId).toBe(second.id)
+
+    // A retained legacy clock must not advertise another automatic retry.
+    db.setMeta(`${failureKey}${heldTarget}`, JSON.stringify({ kind: 'worker', consecutiveFailures: 2,
+      lastFailureAtMs: Date.now(), nextRetryAtMs: Date.now() + 60_000, error: second.error, callId: second.id }))
+
+    const visibleStop = async () => {
+      const snapshot = await (await import('../server/agent')).fetchAgentLogSnapshot()
+      for (const evidence of [snapshot, null]) {
+        const incident = runtime.getBehaviorDiagnosticIncidents(evidence).find((row) => row.callId === second.id)!
+        expect(incident.error).toContain('Automatic retries stopped after two review timeouts')
+        expect(incident.diagnostic).toEqual({ severity: 'warning', code: 'review_budget_exhausted' })
+        expect(incident.nextRetryAt).toBeUndefined()
+      }
+    }
+    await visibleStop()
+    expireBackoff()
+    ;({ database: db, behaviors: runtime } = await restartModules())
+    runtime.startBehaviorsRuntime()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
+    await visibleStop()
+
+    const readable = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--logs') throw new Error('Caller history unavailable')
+      return readable(command, args, options)
+    })
+    await tick()
+    expect(runtime.getBehaviorDiagnosticIncidents(null).find((row) => row.callId === second.id)?.error)
+      .toContain('Automatic retries stopped after two review timeouts')
+    arrange()
+    await tick()
+    await visibleStop()
+
+    // The same reviewer succeeds elsewhere, clearing its provider trip.
+    if (initial) db.setMeta('behavior_review_new_prs_reviewers', '1')
+    const other = { ...pr, number: 18, url: `https://github.com/${pr.repo}/pull/18` }
+    fixture.listedPrs = [pr, other]
+    basis(other)
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    expect(mocks.spawnDetached.mock.calls[2][1]).toEqual(expect.arrayContaining(['#18', '--model', model]))
+    fixture.agentLogs.push(receipt(18, { status: 'completed', action: initial ? 'reviewed_clean' : 'approved',
+      outcome: initial ? 'clean' : 'approved', head_sha: HEAD_SHA, error: '', error_code: undefined }))
+    await tick()
+    expect(runtime.getBehaviorsRuntimeHealth().failures.some((failure) => failure.target === `reviewer:${model}`)).toBe(false)
+    fixture.listedPrs = [pr]
+    await visibleStop()
+
+    // A different slot or approval context cannot evade the PR/head/model stop.
+    if (initial) {
+      db.setMeta('behavior_review_new_prs_reviewers', '2')
+      db.setMeta(`${failureKey}${key}:secondary`, '')
+    } else if (dismissed) {
+      const base = mocks.runFile.getMockImplementation()!
+      mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+        const result = await base(command, args, options)
+        if (args[0] !== '--review-activity-since') return result
+        const data = JSON.parse(result.stdout)
+        if (data.records) for (const row of data.records) row.review_context = 'f'.repeat(64)
+        else data.review_context = 'f'.repeat(64)
+        return { ...result, stdout: JSON.stringify(data) }
+      })
+    } else arrange(HEAD_SHA, 2)
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    expect(db.getFailedBehaviorLaunch(behavior, heldTarget)?.launchCallId).toBe(second.id)
+    const history = fixture.agentLogs
+    fixture.agentLogs = []
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(3)
+    expect(runtime.getBehaviorDiagnosticIncidents(null).find((row) => row.callId === second.id)?.error)
+      .toContain('Automatic retries stopped after two review timeouts')
+    fixture.agentLogs = history
+
+    // Verified explicit retry grants one successful launch, even if spawning fails first.
+    arrange()
+    if (initial) db.setMeta('behavior_review_new_prs_reviewers', '1')
+    await resetLogCache()
+    await expect(runtime.retryFailedPrReviews([second.id])).resolves.toEqual({ ok: true, targets: [heldTarget] })
+    const retryKey = `behavior_operator_retry:${second.id}`
+    mocks.spawnDetached.mockRejectedValueOnce(new Error('launcher unavailable'))
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(4)
+    expect(db.getMeta(retryKey)).toContain(second.correlation_id)
+    expireBackoff()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(5)
+    expect(db.getMeta(retryKey)).toBe('')
+    fixture.agentLogs.push(receipt())
+    await tick()
+    expireBackoff()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(5)
+
+    // New input remains eligible; uncertain publication on it still holds.
+    arrange('c'.repeat(40))
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
+    fixture.agentLogs.push(receipt(pr.number, { error: 'Review timed out; could not prove a safe recovery' }))
+    await tick()
+    expireBackoff()
+    ;({ database: db, behaviors: runtime } = await restartModules())
+    runtime.startBehaviorsRuntime()
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(6)
+  },
+)

@@ -136,7 +136,7 @@ Current `status: 'ok'` does not meet this definition (G4).
 
 | Existing state | Contract column |
 | --- | --- |
-| Caller `model_output_limit`, `review_budget_exhausted`, `review_recovery_failed`, `review_contract_violation`, `review_provider_blocked`, `stopped` | Bounded same-head/model hold until head, model or operator changes it (`boundedReviewFailure`); budget-exhausted with proven no-action retries on backoff (`budgetExhaustedProvenNoAction`, prose-coupled in G2). |
+| Caller `model_output_limit`, `review_budget_exhausted`, `review_recovery_failed`, `review_contract_violation`, `review_provider_blocked`, `stopped` | Bounded same-head/model hold until head, model or operator changes it (`boundedReviewFailure`); legacy budget-exhausted with proven no-action retries on backoff until two matching automatic timeouts ([retry stop](Behavior-Contract.md), `budgetExhaustedProvenNoAction`, prose-coupled in G2). |
 | Caller `review_provider_error`, `review_provider_exit` | Reviewer trip, provider kind, before a verdict with nothing posted. |
 | Caller `review_packet_too_large` | Held on unchanged input and model; oversized packets do not retry blindly. |
 | Caller `review_submission_failed`, `submission: uncertain`, duplicate-verdict and malformed-verdict paths | Uncertain: reconcile from live receipts before any retry; contract violations hold. |
