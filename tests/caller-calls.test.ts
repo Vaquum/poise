@@ -136,6 +136,58 @@ describe('Caller calls still running', () => {
     } finally { database.closeDatabase(); vi.resetModules() }
   })
 
+  it('persists an integrity hold when admissions are already disabled, until an explicit Settings resume', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'poise-caller-calls-'))
+    vi.stubEnv('POISE_DB', join(dir, 'cache.db'))
+    vi.stubEnv('AGENT_INTERFACE_DATA_DIR', dir)
+    vi.resetModules()
+    let database = await import('../server/db')
+    let settings = await import('../server/settings')
+    let receipts = await import('../server/service/caller-calls')
+    const { BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY } = await import('../server/settings')
+    // Draining-like: admissions already disabled before the integrity failure.
+    database.setMeta('behavior_chain_settings', JSON.stringify({ enabled: false, seedMode: 'label', label: 'poise' }))
+    const path = join(dir, 'calls.sqlite3')
+    await writeFile(path, 'preserved invalid database header')
+    try {
+      expect(() => receipts.requireCallerReceipts()).toThrow(expect.objectContaining({ kind: 'integrity', code: 'SQLITE_NOTADB' }))
+      expect(database.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('1')
+      expect(settings.getBehaviorChainSettings().enabled).toBe(false)
+      database.closeDatabase()
+      vi.resetModules()
+      database = await import('../server/db')
+      settings = await import('../server/settings')
+      receipts = await import('../server/service/caller-calls')
+      expect(database.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('1')
+      expect(settings.getBehaviorChainSettings().enabled).toBe(false)
+      // A fully readable store still requires an explicit admission resume.
+      await rm(path)
+      const valid = new Database(path)
+      valid.exec('CREATE TABLE calls (status text, pid integer, runner text, source text, resources_settled_at real, resource_cleanup text)')
+      valid.prepare('INSERT INTO calls VALUES (?, ?, NULL, ?, NULL, NULL)').run('running', process.pid, 'poise:behavior-chain')
+      valid.close()
+      expect(() => receipts.requireCallerReceipts()).not.toThrow()
+      expect(database.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('1')
+      expect(settings.getBehaviorChainSettings().enabled).toBe(false)
+      // Contention neither clears the hold nor resumes admissions.
+      const holder = new Database(path)
+      holder.exec('BEGIN EXCLUSIVE')
+      try {
+        expect(() => receipts.requireCallerReceipts()).toThrow(expect.objectContaining({ kind: 'contention', code: 'SQLITE_BUSY' }))
+        expect(database.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('1')
+        expect(settings.getBehaviorChainSettings().enabled).toBe(false)
+      } finally { holder.close() }
+      // An explicit Settings resume clears the hold and enables invocations.
+      const { behaviorChainJournal } = await import('../server/behavior-chain-journal')
+      const journal = behaviorChainJournal()
+      journal.changeAdmission(journal.cutover().sequence, 'draining')
+      journal.changeAdmission(journal.cutover().sequence, 'v2', [])
+      settings.setSettings({ behaviorChain: { enabled: true, seedMode: 'label', label: 'poise' } })
+      expect(database.getMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY)).toBe('')
+      expect(settings.getBehaviorChainSettings().enabled).toBe(true)
+    } finally { database.closeDatabase(); vi.resetModules() }
+  })
+
   it('suppresses sweep wrappers only for the exact recorded receipt failure, retaining health and independent errors', async () => {
     dir = await mkdtemp(join(tmpdir(), 'poise-caller-calls-'))
     vi.stubEnv('POISE_DB', join(dir, 'cache.db'))

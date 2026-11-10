@@ -18,7 +18,8 @@ const mocks = vi.hoisted(() => ({ runFile: vi.fn(), settings: { enabled: true, s
   accounts: { me: 'author', agentAccount: 'reviewer' } }))
 vi.mock('../server/process', () => ({ runFile: mocks.runFile, spawnDetached: vi.fn(), MAX_PROCESS_ARG_BYTES: 64 * 1024 }))
 vi.mock('../server/db', () => ({ getMeta: (key: string) => key === 'me' ? mocks.accounts.me : null }))
-vi.mock('../server/settings', () => ({ getSettings: () => mocks.accounts, getBehaviorChainSettings: () => mocks.settings }))
+vi.mock('../server/settings', () => ({ getSettings: () => mocks.accounts, getBehaviorChainSettings: () => mocks.settings,
+  BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY: 'behavior_chain_integrity_hold' }))
 vi.mock('../server/models', () => ({ agentInterfaceCwd: () => '/fixture' }))
 vi.mock('../server/organizations', () => ({ organizationForRepository: () => ({ login: 'acme' }),
   organizationArgs: (_org: unknown, argv: string[]) => argv, getOrganizations: () => [{ login: 'acme', status: 'ready' }],

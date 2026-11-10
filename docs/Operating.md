@@ -1071,7 +1071,8 @@ and other read failures remain unavailable. Health keeps `idle: false` and
 final launch/action/publication boundaries refuse unavailable receipts.
 A confirmed integrity failure also persists the existing chain admission pause
 across server restarts. Successful health responses and narrow SQL reads cannot
-resume admissions. Cleanup and original-receipt reconciliation continue; explicit
+resume admissions, and an automatic v2 cutover cannot re-enable them while the
+hold persists. Cleanup and original-receipt reconciliation continue; explicit
 resume through the existing behavior control follows the recovery checks below.
 Contention recovers automatically without pausing admissions. The first receipt
 diagnostic remains actionable; behavior sweeps omit its repetitive wrapper only

@@ -46,6 +46,12 @@ export interface Settings {
 export interface BehaviorChainSettings { enabled: boolean, seedMode: 'label' | 'all', label: string }
 export const DEFAULT_BEHAVIOR_CHAIN_SETTINGS: BehaviorChainSettings = { enabled: false, seedMode: 'label', label: 'poise' }
 
+/** Persisted while a confirmed Caller receipt integrity failure fences admissions.
+ *  Set on integrity even when admissions are already disabled (for example during
+ *  a pending v2 cutover), so the automatic cutover commit cannot re-enable them.
+ *  Cleared only by an explicit Settings save that enables chain invocations. */
+export const BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY = 'behavior_chain_integrity_hold'
+
 function validateBehaviorChainSettings(value: unknown): BehaviorChainSettings {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('behavior chain settings must be an object')
   const input = value as Record<string, unknown>
@@ -383,6 +389,8 @@ const saveSettings = db.transaction((partial: Partial<Settings>, catalog: Catalo
   if (chat) setMeta('chat_settings', JSON.stringify(chat))
   if (notifications) setMeta('notification_settings', JSON.stringify(notifications))
   if (behaviorChain) setMeta('behavior_chain_settings', JSON.stringify(behaviorChain))
+  // An explicit save that enables invocations is the person's recovery resume.
+  if (behaviorChain?.enabled) setMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY, '')
   setMeta('manager_settings', JSON.stringify(manager))
   return { settings: getSettings(), orgChanged }
 })

@@ -13,7 +13,7 @@ import { BEHAVIOR_CALL_SOURCES, runningCallerLaunches } from '../process'
 import { callerDatabase } from '../caller-store'
 import { diagnosticFailure } from '../logging'
 import { setMeta } from '../db'
-import { getBehaviorChainSettings } from '../settings'
+import { BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY, getBehaviorChainSettings } from '../settings'
 
 let debates = 0
 
@@ -80,6 +80,9 @@ function callerActivity(dataDir: string | undefined, behaviorOnly: boolean, reso
       { dataDir, firstObservedAt: failure.firstObservedAt }, { level: failure.kind === 'contention' ? 'warning' : 'error' }) !== null
     if (failure.kind === 'integrity') {
       // Narrow reads can recover before the store and original effects do.
+      // The hold persists even when admissions are already disabled, so a
+      // pending v2 cutover cannot re-enable them without an explicit resume.
+      setMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY, '1')
       const settings = getBehaviorChainSettings()
       if (settings.enabled) setMeta('behavior_chain_settings', JSON.stringify({ ...settings, enabled: false }))
     }

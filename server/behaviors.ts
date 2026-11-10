@@ -100,7 +100,7 @@ import { claudeSubscriptionEnvironment, runFile, runningCallerLaunches, spawnDet
 import { CheckSemaphore, DEFAULT_CHECK_SLOT_CAP, checkSlotsBusyError, type CheckSlotStats } from './check-semaphore'
 import { ProcessLockError, withProcessLock } from './process-lock'
 import { agentInterfaceRoot } from '../scripts/caller.mjs'
-import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, requireAgentAccount } from './settings'
+import { agentAccount, getSettings, getBehaviorChainSettings, getModelSettings, requireAgentAccount, BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY } from './settings'
 import { prAccounts, prAccountsMatch, prReviewer } from './pr-accounts'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
 import { behaviorHeld, providerSignInRejected, providerSignInVerified } from './alerts/producers'
@@ -7679,6 +7679,9 @@ export async function runEnabledBehaviorsOnce(
         return pulls
       }, behaviorCutoverBlockers, () => {
         if (configuration() !== expectedConfiguration) throw new Error('Cutover accounts or organizations changed during discovery; waiting for a fresh boundary')
+        // A confirmed integrity failure fences admissions until an explicit resume.
+        // The cutover may still complete, but it must not re-enable invocations.
+        if (databaseGetMeta(BEHAVIOR_CHAIN_INTEGRITY_HOLD_KEY) === '1') return
         databaseSetMeta('behavior_chain_settings', JSON.stringify({ ...getBehaviorChainSettings(), enabled: true }))
       })
         behaviorChainHealth.delete('@cutover')

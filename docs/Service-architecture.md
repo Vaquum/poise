@@ -1373,7 +1373,8 @@ GitHub recheck times; unrelated open-PR review/approval stays eligible.
 Managed native admissions recheck the bounded receipt reader at their final
 launch, action and publication boundaries. Its independent diagnostics retain
 the first typed SQLite cause and affected workspace; confirmed integrity failure
-persists the existing chain admission pause. Health keeps its existing unknown
+persists the existing chain admission pause, including across an automatic v2
+cutover. Health keeps its existing unknown
 counters. Readability cannot clear that pause or missing original evidence. See
 [receipt-store recovery](Operating.md#caller-receipt-store-recovery).
 
