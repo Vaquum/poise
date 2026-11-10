@@ -149,6 +149,47 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(restored['issue']['labels'], [{'node_id': 'L1', 'name': 'poise'}])
             self.assertEqual(restored['issue']['updated_at'], stub['updated_at'])
 
+    def test_regular_sync_backfills_closed_label_evidence(self) -> None:
+        stub = {'id': 100, 'number': 1, 'item_kind': 'issue', 'updated_at': '2026-01-02T00:00:00Z'}
+
+        class ClosedLabelReader(BatchReader):
+            def __init__(self):
+                self.full_calls = []
+
+            def list_org_repos(self, _org):
+                return [repo_row()]
+
+            def list_repo_issues(self, full_name):
+                self.full_calls.append(full_name)
+                return [stub]
+
+            def list_repo_changed_items(self, *_args):
+                raise AssertionError('old closed snapshot needs the existing full-refresh path')
+
+            def expand_issue_or_pr(self, _repo, _item):
+                current = base_expanded('', [])
+                current['issue'] = dict(current['issue'], state='closed')
+                current['issue']['labels'] = [{'node_id': 'L1', 'name': 'poise'}]
+                return current
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / 'db.sqlite'
+            initialize_sync_state(db_path, '2026-08-29T12:00:00Z')
+            conn = connect(db_path)
+            legacy = base_expanded('', [])
+            legacy['issue'] = dict(legacy['issue'], state='closed')
+            del legacy['issue']['labels']
+            store_expanded(conn, legacy); conn.close()
+            reader = ClosedLabelReader()
+            with patch('github_datastore.store.GitHubOrgReader', return_value=reader):
+                sync_once(db_path, workers=1)
+            conn = connect(db_path)
+            restored = json.loads(conn.execute('SELECT expanded_json FROM items WHERE item_id=100').fetchone()[0])
+            conn.close()
+            self.assertEqual(reader.full_calls, ['Vaquum/Test'])
+            self.assertEqual(restored['issue']['labels'], [{'node_id': 'L1', 'name': 'poise'}])
+            self.assertEqual(restored['issue']['state'], 'closed')
+
     def test_sync_routes_local_pr_snapshot_to_existing_repo_poller(self) -> None:
         previous_watermark = "2026-08-29T12:00:00Z"
 

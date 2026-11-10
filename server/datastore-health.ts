@@ -49,7 +49,7 @@ interface Health {
 
 // Only the documented, account-bound freshness result establishes staleness
 // or recovery. In particular, an arbitrary exit 1 is still a process fault.
-function validatedHealth(stdout: string, org: Organization | null): Health | null {
+export function validatedHealth(stdout: string, org: Organization | null): Health | null {
   let data: Record<string, unknown>
   try { data = JSON.parse(stdout) } catch { return null }
   if (!data || typeof data !== 'object' || Array.isArray(data)

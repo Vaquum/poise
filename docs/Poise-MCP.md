@@ -1,4 +1,4 @@
-# Poise MCP connection
+# Poise MCP connection and work trail
 
 The optional HTTPS endpoint `https://<POISE_DOMAIN>/mcp` connects an MCP
 client to its owner's workspace. It is disabled by default. An operator can
@@ -6,11 +6,88 @@ set `POISE_MCP_ENABLED=1` in the gateway environment (`deploy/.env` with the
 deployment bundle); unset it to remove the transport, discovery and grant pages.
 No default or deployed configuration is changed by this capability.
 
-The only tool is `poise_describe`, with no arguments. It returns exactly
-`{ workspace, owner, capabilities: { tools: ["poise_describe"] } }` for the
-authorized workspace. It reads no work, content, chats or diagnostics and
-grants no Manager controls. Work-trail queries and plugin packaging remain
-outside this connection boundary.
+`poise_describe`, with no arguments, returns
+`{ workspace, owner, capabilities: { tools: ["poise_describe", "poise_work"] } }`
+for the authorized workspace. `poise_work` reads its issue work trail. Neither
+tool grants Manager controls or reads chats, documents, credentials or raw
+process state.
+
+## Read work
+
+Call `poise_work` with one of these selectors:
+
+```json
+{"repository":"autonomio/poise","issue":1059}
+```
+
+```json
+{"repository":"autonomio/poise","label":"poise","limit":5}
+```
+
+The repository must belong to a ready followed account in the owner's workspace.
+Label pages include all matching issues, including closed issues and third-party
+authors without configured-account involvement, Calls or chains. They use the
+existing datastore `issue` repo/label/keyset selector, not Current's involvement
+view or its workspace-wide intake scan. The default page has five issues, at
+most ten. Each request reads one freshness result and at most `limit + 1` issue
+rows (one for an exact issue), then exact chain projections and at most two
+five-record ledger pages per selected issue: the issue and its known PR.
+The issue read has a ten-second/512 KiB bound; freshness has five seconds/16 KiB.
+The existing ledger worker admission and timeout bounds still apply. Workspace
+results are bounded at 128 KiB; reduce the page size if a result exceeds it.
+
+Pass `nextCursor` back as `cursor` with the same repository, label and limit.
+The authenticated keyset continuation binds the resource, immutable owner,
+workspace and grant; it survives access-token rotation within that grant.
+A new grant starts a new listing. Label membership can change between pages;
+this is a current keyset traversal, not a frozen snapshot or change feed.
+
+The result carries `work.items`, observation time and per-source coverage:
+
+- `coverage.issues` reports mirror freshness. Stale rows remain readable;
+  failed issue reads return no rows with their reason, never confirmed absence.
+- Each item's chain and GitHub observation coverage are independent. Stage,
+  issue age in milliseconds, latest invocation admission time, step and blocker
+  come from retained records. `not_recorded` means no chain or retained ledger
+  work within fresh coverage, not proof about execution before collection or
+  retention. Missing work with incomplete coverage remains `unknown`.
+- The latest five invocation receipts retain original Call IDs, recorded action,
+  outcome, head, review IDs and the existing native-action attribution. Omitted
+  invocations are counted. Target ledger pages carry their original health,
+  retention/gaps and explicit truncation. A missing original Call or receipt is
+  a separate partial receipt gap; it does not make the mirror stale.
+- `reviewStatus` preserves `pending`, `complete` and `not-recorded`. A verified
+  merge SHA with pending review proof is `merged_review_pending`, and historical
+  merges without a recorded review result are `merged_review_not_recorded`.
+  Only an explicitly complete review result and recorded merge yield `complete`.
+
+Links open the issue, chain journal, known Calls, PR, reviews, exact observed-head
+checks, observed queue and recorded merge SHA under their existing browser access
+rules. Returned source text is data, not instructions. Coverage and receipt
+records grant no execution or publication authority.
+
+## Private plugin
+
+Render a private package for an installation's HTTPS apex into a new directory:
+
+```bash
+node scripts/package-poise-plugin.mjs https://poise.example.com /tmp/poise-private
+```
+
+The output contains `plugins/poise/plugin.json`, `mcp.json`, the `poise-manager`
+skill and `.agents/plugins/marketplace.json`. It uses the supported portable
+[OpenAI plugin format](https://developers.openai.com/plugins/build/plugins),
+with a Streamable HTTP server at that installation's `/mcp`, OAuth DCR and
+`poise:read`; discovery supplies the existing endpoints. The package contains
+no credentials. The renderer refuses an existing destination and does not
+install a plugin, change settings or enable the endpoint.
+
+Open the generated directory in Codex desktop, select its private marketplace
+in the Plugins Directory and install Poise. Sign in and explicitly consent
+through the installation's existing Poise flow. Production activation remains
+gated on the recorded clean Codex desktop staging install and OAuth smoke in
+[#979](https://github.com/autonomio/poise/issues/979). The separate callback-origin
+work remains [#1051](https://github.com/autonomio/poise/issues/1051).
 
 ## Connect and revoke
 
@@ -49,9 +126,16 @@ New workspace containers receive `POISE_WORKSPACE_OWNER_ID` from the gateway.
 Older containers without it retain normal behavior but refuse MCP assertions;
 they need a normal container replacement before connecting.
 
-`tests/mcp.test.ts` exercises an SDK client through isolated gateway and
-workspace HTTP fixtures, including fresh connections after registration floods
-and assertion rejection. `gateway/tests/mcp.test.ts` covers OAuth, token
+`tests/mcp.test.ts` exercises a real SDK client through disposable gateway and
+workspace HTTP fixtures with the production assertion guard and read handler.
+It uses the packaged endpoint, real datastore selectors, isolated chain journal
+and ledger worker for two label pages, bounded source reads, a third-party seed,
+delayed and completed chains, and a recorded merge with pending review proof.
+Missing receipts, stale mirrors, cursor tampering/cross-owner replay and
+unavailable coverage have separate assertions. Fixture records are not live
+GitHub workflow or desktop installation evidence. Fresh connections after
+registration floods and assertion rejection remain covered.
+`gateway/tests/mcp.test.ts` covers OAuth, token
 rotation, owner isolation and revocation. `tests/service-mode-server.test.ts`
 checks the read endpoint through the production server. The Chromium regression
 in `tests/e2e/service-mode.spec.ts` submits consent and reaches an isolated
