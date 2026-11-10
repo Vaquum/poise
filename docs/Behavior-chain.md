@@ -55,7 +55,7 @@ The existing reviewer count, model slots, severity, behavior notes, switches, pa
 
 **Switch to v2** is one action in Settings → General → Behavior chain. It records a durable `draining` admission state before any asynchronous work. The existing cooperative release barrier counts behavior operations separately; late legacy launches and prepared chain admissions recheck the durable gate. Running invocations finish, Chats remain usable, and unreadable Caller activity refuses readiness. The existing behavior tick then verifies fresh, complete PR observations across all followed organizations and commits the legacy PR boundary and enabled v2 setting in the same transaction. No new polling system is added.
 
-Cutover also requires the displayed native-cleanup setup check to pass. Hosts
+Cutover also requires the native-cleanup setup check to pass. Hosts
 that cannot provide the [native process boundary](Service-architecture.md#workspace-behavior-observation)
 stay on v1; checking, unsupported or unavailable evidence disables Switch to v2.
 Cancel remains available during a drain even if the check subsequently fails.
@@ -86,11 +86,11 @@ the journal already records as merged. This uses the existing bounded journal
 status reader. A later standalone PR on a completed chain's retired branch
 remains eligible; this fence does not change manual Chat binding controls.
 
-The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while General settings is open. Unavailable reads disable cutover controls instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
+General contains the chain preference fields, their save/reload actions and the guarded Switch to v2 or Cancel cutover action while applicable. Operational output lives in Logging: cutover state and legacy ownership, capacity, the chain list and per-chain journal. The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. Hold/Resume retains the current journal sequence check. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while Logging is open. Unavailable reads disable writes instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
-**Work needing attention** joins each delayed or held admitted issue's step,
+Notifications lists each delayed or held admitted issue's step,
 progress age, hold, exact-head CI/review gates and next known action, with issue,
-PR and journal-evidence links. Held, uncertain and pending-original-review work
+PR links and a Journal evidence action that opens the same journal in Logging. Held, uncertain and pending-original-review work
 appears immediately; other active work appears after 24 hours without a verified
 advance. Selection covers every active chain page, including unpublished issues
 and merged PRs with pending review evidence, sorted by oldest progress first.
@@ -135,8 +135,8 @@ and ID/history reads retain closed chains. Failed refreshes disable
 the retained row's write controls until a successful read. Native action summaries
 distinguish original accepted responses, observed no-action results and uncertain
 or unrecorded attribution without returning the full receipt. Quiescent evidence
-checks use the bounded reconciliation described below. Chain settings also
-show workspace-wide durable model admissions and their behavior-lane ceiling,
+checks use the bounded reconciliation described below. Logging also
+shows workspace-wide durable model admissions and their behavior-lane ceiling,
 the durable mode, effective all-issues/label intake or inactive saved intake,
 and admission pause. Configured resource budgets, reservations and unaccounted
 ownership are exposed in the same snapshot without headroom probes. This count survives a
@@ -231,7 +231,7 @@ blocker, uncertain publication or a later operator Hold cannot auto-resume.
 Merged `merge-pr` and `resolve-threads` uncertainty uses original journal
 receipts only. A missing original response schedules no GitHub read; retaining
 that response makes its original settlement eligible without another mutation.
-Settings and API/status summaries show the scheduled evidence check or the
+Logging and API/status summaries show the scheduled evidence check or the
 missing original response. Intentionally deferred observation is not a
 collector outage, and old GitHub facets remain unverified. The chain summary's
 `reconciliation.nextObservationAt` is epoch milliseconds (`0` means eligible
@@ -297,7 +297,7 @@ reconciliation never rewrites historical events to make a digest match.
 When reconciliation confirms that an uncertain original Call has no durable
 publication plan, its invocation retains one `original_publication_plan_missing`
 condition in `invocation.reconciled` evidence. Repeated absence, including after
-runtime replacement, keeps that episode while due reads continue. Settings shows
+runtime replacement, keeps that episode while due reads continue. Logging shows
 the original Call, the evidence gap and the action to restore its original Caller
 plan. A matching Call, digest and validated plan records recovery; a different
 read, parse or validation failure remains an observation error and cannot clear

@@ -9,7 +9,7 @@ import { effectiveTimezone } from '../config'
 import { shortTime } from '../clock'
 import {
   GROUPS, behaviorCounts, countItems, headTone, notificationItems, openLabel,
-  type ItemCounts, type ItemGroup, type ItemIcon, type NotificationItem,
+  type ChainAttentionRow, type ItemCounts, type ItemGroup, type ItemIcon, type NotificationItem,
 } from '../notification-items'
 import type { Notice, NoticeFeed, NoticesState, NoticeTarget } from '../notices'
 // The notification rail: what needs the person and what Behaviors is doing, in
@@ -161,7 +161,7 @@ export function itemHtml(item: NotificationItem, opened: boolean, now: number): 
   const evidenceState = item.evidenceStatus === 'unavailable' ? 'Retained diagnostics are unavailable.'
     : item.evidenceStatus === 'pending' ? 'No matching retained evidence is available yet.' : ''
   const evidenceNote = `${evidenceState}${item.evidenceMore ? ' Additional retained history is available in Logging.' : ''}`
-  const actions = primaryActions + diagnosticActions
+  const actions = primaryActions + diagnosticActions + (item.chainJournal ? '<button type="button" class="nr-btn" data-action="chain-journal">Journal evidence</button>' : '')
   return `<article class="nr-card${opened ? ' is-open' : ''}${item.group === 'auto' ? ' is-auto' : ''}" data-id="${escapeHtml(item.id)}" data-tone="${item.tone}">`
     + `<button type="button" class="nr-card-head" data-action="expand" aria-expanded="${opened}" aria-controls="${id}">`
     + `<span class="nr-chip">${icon(item.icon)}</span>`
@@ -227,6 +227,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   let notices: Notice[] = []
   let enabled = false
   let items: NotificationItem[] = []
+  let chainAttention: ChainAttentionRow[] = []
   let opened = false
   let filter: Filter = 'all'
   let behavior: string | null = null
@@ -312,7 +313,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
 
   function recompute(): void {
     const visible = notices.filter((notice) => (enabled || LOCAL_NOTICE_KINDS.some(kind => kind === notice.kind)) && (!notice.target || !actions.inView?.(notice.target)))
-    items = notificationItems(visible, getBehaviorDiagnostics(), Date.now())
+    items = notificationItems(visible, getBehaviorDiagnostics(), Date.now(), chainAttention)
     for (const id of [...expanded]) if (!items.some((item) => item.id === id)) expanded.delete(id)
     renderBell()
     if (opened) renderRail()
@@ -351,6 +352,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
       rail.inert = !next
       rail.classList.toggle('open', next)
       if (next) {
+        window.dispatchEvent(new CustomEvent('poise:panel-opening', { detail: { id: rail.id } }))
         renderRail()
         for (const toast of [...toasts.children] as HTMLElement[]) dropToast(toast)
         void refreshDiagnostics()
@@ -364,8 +366,27 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   }
 
   let refreshing: Promise<void> | null = null
+  let readingAttention = false
+  async function refreshAttention(): Promise<void> {
+    if (readingAttention) return
+    readingAttention = true
+    try {
+      const response = await fetch('/api/behavior-chains')
+      const data = await response.json()
+      if (!response.ok || !Array.isArray(data.attention)) throw new Error(data.error || 'Attention evidence unavailable.')
+      chainAttention = data.attention
+      feed.reportLocalNotices('chain-attention', [])
+    } catch (error) {
+      feed.reportLocalNotices('chain-attention', [{ key: 'chain-attention', title: 'Attention evidence unavailable',
+        body: `Any retained entries are stale. ${(error as Error).message}` }])
+    } finally { readingAttention = false; recompute() }
+  }
   function refreshDiagnostics(): Promise<void> {
-    refreshing ??= refreshState().finally(() => { refreshing = null })
+    rail.setAttribute('aria-busy', 'true')
+    refreshing ??= Promise.all([refreshState(), refreshAttention()]).then(() => {}).finally(() => {
+      refreshing = null
+      rail.setAttribute('aria-busy', 'false')
+    })
     return refreshing
   }
 
@@ -488,6 +509,17 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     }
     const card = button.closest<HTMLElement>('.nr-card')
     if (!card) return
+    if (action === 'chain-journal') {
+      const journal = items.find((entry) => entry.id === card.dataset.id)?.chainJournal
+      if (!journal) return
+      const params = new URL(journal, location.origin).searchParams
+      const id = params.get('id')
+      const after = Number(params.get('after') ?? 0)
+      if (!id || !Number.isSafeInteger(after) || after < 0) return
+      if (opened && !dockedNow()) setOpen(false)
+      window.dispatchEvent(new CustomEvent('poise:open-chain-journal', { detail: { id, after } }))
+      return
+    }
     if (action === 'logging') {
       const item = items.find((entry) => entry.id === card.dataset.id)
       const ref = item && evidenceReferences(item)[Number(button.dataset.evidence)]
@@ -545,6 +577,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     if (!opened) return
     // Behaviors reads the same state on the same tick while it is on screen.
     if (document.getElementById('view-behaviors')?.hidden !== false) void refreshDiagnostics()
+    else void refreshAttention()
     renderRail()
   })
   // A reminder's "for N min" and the entries' ages keep counting between reads.
@@ -558,7 +591,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
 
   return {
     start: () => {
-      window.setTimeout(() => { if (!getBehaviorDiagnostics()) void refreshDiagnostics() }, FIRST_READ_DELAY_MS)
+      window.setTimeout(() => { if (!getBehaviorDiagnostics()) void refreshDiagnostics(); else void refreshAttention() }, FIRST_READ_DELAY_MS)
     },
   }
 }

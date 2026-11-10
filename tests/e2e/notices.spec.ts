@@ -106,6 +106,7 @@ async function workspace(page: Page, notices: Notice[], options: { enabled?: boo
       diagnostics: state.diagnostics,
     } })
     if (pathname === '/api/current') return route.fulfill({ json: { cards: [] } })
+    if (pathname === '/api/behavior-chains') return route.fulfill({ json: { chains: [], attention: [], next: null, runtime: [] } })
     if (pathname === '/api/workspace') return route.fulfill({ json: { mode: 'local' } })
     if (pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (pathname === '/api/agent-logs') return route.fulfill({ json: { logs: [failedRun()] } })

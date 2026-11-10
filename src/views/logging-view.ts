@@ -8,6 +8,7 @@ import {
 } from '../logging'
 import { readLoggingTime } from '../../gateway/src/diagnostics/query-time'
 import { currentCoverageStatus } from '../../gateway/src/diagnostics/query-contract'
+import { behaviorChainLogging } from './behavior-chain-logging'
 
 const STORAGE = 'poise-logging-filters'
 const EXACT = [
@@ -33,6 +34,7 @@ const CHEVRON = '<svg class="chev" width="12" height="12" viewBox="0 0 12 12" fi
 const absent = (value: unknown) => value === null || value === undefined || value === ''
 
 let view: HTMLElement
+let chains: ReturnType<typeof behaviorChainLogging>
 let initialized = false
 let active = false
 let preferences = defaults()
@@ -265,6 +267,9 @@ function shell(): void {
     <div id="logging-columns" class="logging-popover" popover="auto" role="group" aria-label="Diagnostic columns" data-trigger="logging-columns-button"><div class="logging-popover-title">Columns</div>${OPTIONAL.map(([key, label]) => `<label class="logging-column-option"><input type="checkbox" data-column="${key}">${label}</label>`).join('')}</div>
     <div id="logging-data" class="logging-popover logging-data" popover="auto" role="region" aria-label="Diagnostic data" data-trigger="logging-data-button"><div class="logging-popover-title">Data and collection</div><div id="logging-health"></div></div>
     </main>`
+  chains = behaviorChainLogging()
+  view.querySelector('main')!.append(chains.element)
+  window.addEventListener('poise:refresh-tick', () => { if (active && !document.hidden) void chains.refresh(false, true) })
   view.addEventListener('click', onClick)
   view.addEventListener('input', onInput)
   view.addEventListener('change', onChange)
@@ -714,13 +719,18 @@ function visibility(): void {
 
 export function initLoggingView(): void {
   if (!initialized) { view = document.getElementById('view-logging')!; shell(); initialized = true }
+  void chains.refresh()
+  const params = new URLSearchParams(location.search)
+  const chain = params.get('chain')
+  const after = Number(params.get('after') ?? 0)
+  if (chain && Number.isSafeInteger(after) && after >= 0) void chains.readHistory(chain, false, after)
   if (active) { if (mountedSearch !== location.search) { preferences = loadPreferences(); void initialRead() } else refreshCurrent(); return }
   active = true; preferences = loadPreferences(); access = null; expanded.clear(); related.clear()
   document.addEventListener('visibilitychange', visibility)
   void initialRead()
   requestAnimationFrame(() => { if (active && !link?.event && !link?.incident && !linkFailure) view.querySelector<HTMLElement>('.view-header')?.focus({ preventScroll: true }) })
 }
-export function refreshLoggingView(): void { if (active) refreshCurrent() }
+export function refreshLoggingView(): void { if (active) { refreshCurrent(); void chains.refresh() } }
 export function stopLoggingRefresh(): void {
   if (!active) return
   closePopovers(); active = false; invalidate(); document.removeEventListener('visibilitychange', visibility)

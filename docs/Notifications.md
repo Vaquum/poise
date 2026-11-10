@@ -82,6 +82,14 @@ is on screen already says what its notice would, so its notice is not listed.
 Behaviors' diagnostics are listed too, with the classification and details
 described in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
 
+Delayed, held and uncertain native-chain work uses the existing `attention`
+records as Needs you cards, including progress age, exact-head gates and the
+known next action. Issue/PR links retain their targets; Journal evidence opens
+the recorded journal cursor in Logging, where Hold/Resume and pagination remain
+available. Failed reads retain cards with an explicit stale-evidence notice.
+This follows the existing diagnostics refresh clock and remains accessible with
+Notifications off; it adds no alert record or execution authority.
+
 A failed behavior's notice and its diagnostic are one entry. The notice says
 what can be done; the diagnostic says what happened and how it is classified,
 which also decides its group. Each Behaviors row shows that behavior's counts:
