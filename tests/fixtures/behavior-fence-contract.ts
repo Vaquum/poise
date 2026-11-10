@@ -2,7 +2,12 @@
 // creates no GitHub artifact, provider process or live workflow evidence.
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import Database from 'better-sqlite3'
+import { normalize } from '../../gateway/src/diagnostics/contract'
+import { executeLoggingRead } from '../../gateway/src/diagnostics/query-worker'
+import { callerDiagnostic } from '../../gateway/src/diagnostics/sources'
+import { DEFAULT_LOG_POLICY, DiagnosticStore } from '../../gateway/src/diagnostics/store'
 import { parseAgentLogStdout } from '../../server/agent-log-parse'
 import { BehaviorChainJournal, chainIdentity, type ChainBehavior } from '../../server/behavior-chain-store'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../../server/behavior-chain-runtime'
@@ -10,9 +15,10 @@ import { BehaviorResourceRecovery } from '../../server/behavior-chain-resource-r
 
 const wire = readFileSync(process.argv[2], 'utf8')
 const mode = process.argv[3] ?? 'fence'
-assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked', 'ancestor-recovery'].includes(mode))
+assert.ok(['fence', 'pending', 'released', 'recovered', 'namespace-no-effect', 'namespace-interrupted-pending', 'namespace-interrupted-released', 'namespace-physical-only', 'resource-guard', 'atomic-provider-timeout', 'atomic-preflight-timeout', 'atomic-work-blocked', 'atomic-work-failed', 'ancestor-recovery'].includes(mode))
 const atomic = mode.startsWith('atomic-')
 const blocked = mode === 'atomic-work-blocked'
+const open = blocked || mode === 'atomic-work-failed'
 const ancestorRecovery = mode === 'ancestor-recovery'
 const physical = mode === 'namespace-physical-only'
 const interrupted = mode.startsWith('namespace-interrupted-') || physical
@@ -48,7 +54,7 @@ try {
   const reviewer = { slot: 'primary', model: call.model, recovery: call.model }
   const operations: ChainRuntimeOperations = { enabled: () => blocked, accounts: () => ({ author: 'author', reviewer: 'reviewer' }),
     discover: async () => [], ownsRepository: () => true, readInvocations: async () => parseAgentLogStdout(wire, 'actual native receipt'),
-    observe: async () => ({ checkedAt: Date.now(), existingPulls: [], issue: { open: blocked, eligible: blocked, revision: 'closed', commentIds: [] },
+    observe: async () => ({ checkedAt: Date.now(), existingPulls: [], issue: { open, eligible: open, revision: 'closed', commentIds: [] },
       issueReviewers: [reviewer], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer,
       publication: { pull_number: null, head_sha: null, head_invocation: null, state: null, merged: false, merge_sha: null }, pull: null }),
     available: () => blocked, capacity: () => 1, permitted: () => blocked, received: () => {}, request: forbidden, launch: forbidden,
@@ -125,6 +131,22 @@ try {
     const settled = events.map(row => JSON.parse(row.payload)).find(event => event.type === 'invocation.settled')
     assert.equal(settled.outcome, outcome)
     assert.deepEqual(settled.evidence.diagnostic ?? null, call.diagnostic)
+    if (mode === 'atomic-work-failed') {
+      assert.equal(current.held, null)
+      assert.equal(call.error_code, 'atomic_work_failed')
+      const now = Date.now(), path = join(dirname(process.argv[2]), 'logging.sqlite3')
+      const event = normalize(callerDiagnostic(JSON.parse(wire)[0], 'alice')!, now)!
+      const store = new DiagnosticStore(path, DEFAULT_LOG_POLICY, () => now)
+      try { store.append([event]) } finally { store.close() }
+      const reply = executeLoggingRead({ path, policy: DEFAULT_LOG_POLICY, now, operation: 'list',
+        access: { workspace: 'alice', operator: false }, filter: { callId: call.id } })
+      assert.equal(reply.status, 200)
+      const page = JSON.parse(reply.body)
+      assert.equal(page.total, 1)
+      assert.equal(page.events[0].message, call.error)
+      assert.equal(page.events[0].phase, call.diagnostic!.phase)
+      assert.equal(page.events[0].correlationId, call.correlation_id)
+    }
     if (blocked) {
       assert.equal(current.held, call.error)
       assert.equal(settled.evidence.error, call.error)

@@ -1672,13 +1672,24 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
                 raise RuntimeError("atomic behavior no longer owns its durable call")
 
     previous_sigterm = signal.signal(signal.SIGTERM, review_watch_interrupted)
+    failure = None
     try:
         with review_budget.ReviewBudget(issue_review.TIMEOUT_SECONDS, cap=issue_review.TIMEOUT_SECONDS), \
                 progress.Progress(DB, id_, "preparing_issue", "Preparing an atomic behavior"), \
                 review_receipt.invocation_environment(DB, id_, source == 'poise:behavior-chain'):
             record(artifact)
             with review_receipt.managed_resources(run_dir):
-                result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
+                try:
+                    result = atomic_work.run(spec, repo, number, branch, actor, run_dir, id_, record, pull, expected_head, note, merge_base, expected_issue_revision)
+                except Exception as error:
+                    if getattr(error, "diagnostic", None) is None:
+                        failure = atomic_work.failure_diagnostic(error)
+                        original_error = str(error)[:2000]
+                        trip = _retained_account_signal(original_error) or _retained_rate_limit_signal(original_error)
+                        if trip:
+                            failure["message"] = atoms.bounded_cause(f"{trip}: {failure['message']}")
+                        failure = retain_native_failure(id_, error, diagnostic=failure)
+                    raise
             outcome = result.get("outcome")
             if outcome not in {"published", "no_changes", "superseded"}:
                 raise RuntimeError("atomic behavior returned no publication outcome")
@@ -1696,11 +1707,11 @@ def run_atomic_work(issue: str, actor: str, source: str, correlation_id: str, mo
             row = conn.execute("select error_code from calls where id=?", (id_,)).fetchone()
         stopped = row is not None and row["error_code"] in {"stopping", "stopped"}
         no_publication = artifact.get("phase") in {"preparing", "prepared", "executing", "waiting_baseline"}
-        finish(id_, "failed", error="Stopped by user" if stopped else str(error)[:2000] or INTERRUPTED_ERROR,
+        finish(id_, "failed", error="Stopped by user" if stopped else failure["message"] if failure else str(error)[:2000] or INTERRUPTED_ERROR,
                error_code="stopped" if stopped else "interrupted" if not isinstance(error, Exception) else getattr(error, "code", "atomic_work_failed"),
                action="not_started" if no_publication else None,
                outcome="preflight_failed" if no_publication else None,
-               diagnostic=getattr(error, "diagnostic", None))
+               diagnostic=failure or getattr(error, "diagnostic", None))
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)

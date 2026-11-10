@@ -435,7 +435,8 @@ class AtomicWorkLimits(TestCase):
                         provider.assert_called_once()
                     else:
                         self.assertEqual(call["error_code"], "atomic_work_failed")
-                        self.assertIsNone(call["diagnostic"])
+                        self.assertEqual(call["diagnostic"]["phase"], "preparing_checkout")
+                        self.assertEqual(call["diagnostic"]["outcome"], "timed_out")
                         provider.assert_not_called()
                     wire = root / f"{phase}.json"
                     wire.write_text(json.dumps([call]))
@@ -795,7 +796,7 @@ class AtomicWorkLimits(TestCase):
             (None, "", "AtomicWorkBlocked"),
             (None, " \n\t", "AtomicWorkBlocked"),
             (None, False, "AtomicWorkBlocked"),
-            (None, None, "RuntimeError"),
+            (None, None, "atomic behavior failed during validating_provider_result: RuntimeError (agent_interface.atomic_work.run)"),
         ]
         original_track = api.track
 
