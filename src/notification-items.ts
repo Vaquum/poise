@@ -43,6 +43,14 @@ export interface NotificationItem extends EvidenceAttachment {
   behaviors: string[]
   /** The notice behind it, which can be opened, put away or silenced. */
   notice: Notice | null
+  chainJournal?: string
+}
+
+export interface ChainAttentionRow {
+  id: string, repository: string, issue: number, pullNumber: number | null, step: string, progressAt: number, ageMs: number,
+  blocker: string, evidence: { state: string, checkedAt: number | null, gates: string[] },
+  nextAction: string, retryAt: number | null, journal: string,
+  reconciliation: { nextObservationAt: number | null, waitingForResourceRelease: boolean }
 }
 
 export type ItemCounts = Record<ItemGroup, number> & { open: number }
@@ -112,7 +120,7 @@ function latest(entries: readonly DiagnosticEntry[]): string | null {
 
 /** The rail's list: notices first within each group, in the server's order,
  *  then the diagnostics no notice already shows. */
-export function notificationItems(notices: readonly Notice[], diagnostics: BehaviorDiagnostics | null, now: number): NotificationItem[] {
+export function notificationItems(notices: readonly Notice[], diagnostics: BehaviorDiagnostics | null, now: number, attention: readonly ChainAttentionRow[] = []): NotificationItem[] {
   const groups = diagnostics ? behaviorDiagnosticGroups(diagnostics) : []
   const items: NotificationItem[] = notices.map((notice) => {
     const item: NotificationItem = {
@@ -148,6 +156,23 @@ export function notificationItems(notices: readonly Notice[], diagnostics: Behav
       source: 'Behaviors', scope: group.scope, when: latest(group.entries), meta: '',
       details: group.entries, behaviors, notice: null,
     })
+  }
+  for (const entry of attention) {
+    const age = Math.floor(entry.ageMs / 60_000)
+    const duration = age >= 1440 ? `${Math.floor(age / 1440)}d ${Math.floor(age % 1440 / 60)}h` : age >= 60 ? `${Math.floor(age / 60)}h ${age % 60}m` : `${age}m`
+    const recheck = entry.reconciliation.waitingForResourceRelease ? 'Original native resource release remains unverified; Caller reconciliation continues.'
+      : entry.reconciliation.nextObservationAt === null ? 'No GitHub evidence recheck scheduled.'
+        : entry.reconciliation.nextObservationAt > now ? `Evidence recheck: ${new Date(entry.reconciliation.nextObservationAt).toLocaleString()}. This does not retry held work.`
+          : 'Evidence recheck eligible on the existing scheduler; this does not retry held work.'
+    const detail = (text: string, link?: DiagnosticEntry['link']): DiagnosticEntry => ({ behavior: null, target: entry.id, at: null, next: null, detail: text, link })
+    items.push({ id: `chain:${entry.id}`, group: 'needs', tone: 'amber', icon: 'held', source: 'Behavior chain',
+      title: `${entry.id} · ${entry.step}`, body: entry.blocker, scope: null,
+      when: new Date(entry.progressAt).toISOString(), meta: `No verified advance for ${duration}`,
+      details: [detail(`No verified advance since ${new Date(entry.progressAt).toLocaleString()}.`, { label: `#${entry.issue}`, url: `https://github.com/${entry.repository}/issues/${entry.issue}` }),
+        detail(`PR evidence: ${entry.evidence.state}${entry.evidence.checkedAt !== null ? ` · observed ${new Date(entry.evidence.checkedAt).toLocaleString()}` : ''}. ${entry.evidence.gates.join('; ')}`,
+          entry.pullNumber ? { label: `PR #${entry.pullNumber}`, url: `https://github.com/${entry.repository}/pull/${entry.pullNumber}` } : undefined),
+        detail(`Next: ${entry.nextAction}${entry.retryAt !== null ? ` · ${new Date(entry.retryAt).toLocaleString()}` : ''}. ${recheck}`)],
+      behaviors: [], notice: null, chainJournal: entry.journal })
   }
   for (const item of items) {
     const attachments = [...(item.notice ? [item.notice] : []), ...item.details]

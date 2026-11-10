@@ -28,6 +28,7 @@ export async function workspace(page: Page, view = 'current', fontResponse?: Pro
     if (path === '/api/agent-logs') return route.fulfill({ json: { logs: [] } })
     if (path === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
     if (path === '/api/notices') return route.fulfill({ json: { enabled: false, notices: [] } })
+    if (path === '/api/behavior-chains') return route.fulfill({ json: { chains: [], attention: [], next: null, runtime: [] } })
     if (path === '/api/publishing/sites') return route.fulfill({ json: { sites: [] } })
     if (path === '/api/google/accounts') return route.fulfill({ json: { configured: false, accounts: [] } })
     if (/^\/api\/editor\/doc\/[^/]+\/reviews(?:\/sync)?$/.test(path)) return route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } })

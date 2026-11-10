@@ -99,8 +99,9 @@ test('chain intake and individual holds use explicit settings and current journa
   let held: string | null = null
   await page.route('**/api/behavior-chains', async (route) => {
     if (route.request().method() === 'POST') {
-      controls.push(route.request().postDataJSON())
-      held = 'New invocations held by the person'
+      const body = route.request().postDataJSON()
+      controls.push(body)
+      held = body.operation === 'hold' ? 'New invocations held by the person' : null
       return route.fulfill({ json: {} })
     }
     return route.fulfill({ json: { cutover: { sequence: 0, mode: 'v1', requestedAt: null, legacyPulls: [], blockers: [] }, chains: [{ id: 'acme/repo#7', repository: 'acme/repo', issue: 7, sequence: held ? 12 : 11,
@@ -115,10 +116,18 @@ test('chain intake and individual holds use explicit settings and current journa
   await expect(chain.getByLabel('Issue label', { exact: true })).toBeDisabled()
   await chain.getByRole('button', { name: 'Save chain settings' }).click()
   await expect.poll(() => state.posts.at(-1)).toEqual({ behaviorChain: { ...defaults, seedMode: 'all' }, expect: { behaviorChain: defaults } })
-  await chain.getByRole('button', { name: 'Refresh chains' }).click()
-  await chain.getByRole('button', { name: 'Hold new invocations' }).click()
+  await expect(chain.locator('[data-chain-list], [data-chain-capacity], [data-legacy], [data-history]')).toHaveCount(0)
+  await expect(chain).not.toContainText('exact-head CI is still running')
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover [data-action="logging"]').click()
+  const evidence = page.getByRole('region', { name: 'Behavior chain evidence' })
+  await expect(evidence).toContainText('exact-head CI is still running')
+  await evidence.getByRole('button', { name: 'Hold new invocations' }).click()
   await expect.poll(() => controls).toEqual([{ id: 'acme/repo#7', sequence: 11, operation: 'hold' }])
-  await expect(chain.getByRole('button', { name: 'Resume', exact: true })).toBeVisible()
+  await evidence.getByRole('button', { name: 'Resume', exact: true }).click()
+  await expect.poll(() => controls).toEqual([{ id: 'acme/repo#7', sequence: 11, operation: 'hold' },
+    { id: 'acme/repo#7', sequence: 12, operation: 'resume' }])
 })
 
 test('a models save sends only the edited place and leaves general drafts alone', async ({ page }) => {

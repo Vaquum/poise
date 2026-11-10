@@ -8,12 +8,60 @@ import { chainSummaryFixture, delayedChainFixture } from '../fixtures/behavior-c
 import { parseProcessDiagnostic } from '../../server/process-diagnostic'
 
 async function general(page: Page) {
-  await page.getByRole('button', { name: 'Menu', exact: true }).click()
-  await page.locator('#menu-popover [data-settings="general"]').click()
+  if (!await page.locator('#settings-panel.open').count()) {
+    await page.getByRole('button', { name: 'Menu', exact: true }).click()
+    await page.locator('#menu-popover [data-settings="general"]').click()
+  }
   return page.getByRole('region', { name: 'Behavior chain settings' })
+}
+async function logging(page: Page) {
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.locator('#menu-popover [data-action="logging"]').click()
+  return page.getByRole('region', { name: 'Behavior chain evidence' })
+}
+async function notifications(page: Page) {
+  if (await page.locator('#notification-bell').getAttribute('aria-expanded') === 'false') await page.locator('#notification-bell').click()
+  else await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+  const rail = page.getByRole('complementary', { name: 'Notifications' })
+  await expect(rail).toHaveAttribute('aria-busy', 'false')
+  return rail
 }
 const row = (number: number) => ({ id: `acme/repo#${number}`, repository: 'acme/repo', issue: number, sequence: number,
   held: null, waiting: 'exact-head CI is running', mergeSha: null, pullNumber: number + 10, invocations: [] })
+
+test('populated General keeps preferences and saves without operational chain output', async ({ page }) => {
+  await workspace(page)
+  const snapshot = chainSummaryFixture('pending-active')
+  snapshot.cutover.legacyPulls = ['acme/repo#99']
+  const posts: unknown[] = []
+  let settings = { org: 'acme', me: 'octocat', timezone: 'UTC', behaviorChain: snapshot.settings }
+  await page.route('**/api/settings', route => {
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON()
+      posts.push(body)
+      settings = { ...settings, ...body }
+    }
+    return route.fulfill({ json: settings })
+  })
+  await page.route('**/api/behavior-chains', route => route.fulfill({ json: snapshot }))
+  const controls = await general(page)
+  await expect(controls.getByLabel('Issue label', { exact: true })).toHaveValue('work-ready')
+  await expect(controls.locator('[data-cutover]')).toBeHidden()
+  const panel = page.locator('#settings-panel')
+  await expect(panel.locator('[data-chain-list], [data-chain-attention], [data-chain-capacity], [data-legacy], [data-cutover-status], [data-history]')).toHaveCount(0)
+  for (const output of ['repair-pr: uncertain', 'original response missing', 'v2 owns new work', 'durable model admission', 'acme/repo#99', 'Work needing attention', 'v2 journal']) {
+    await expect(panel).not.toContainText(output)
+  }
+  await page.locator('#st-timezone').selectOption('Europe/Helsinki')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('.st-status')).toHaveText('Saved.')
+  expect(posts).toEqual([{ timezone: 'Europe/Helsinki', expect: { timezone: 'UTC' } }])
+  const evidence = await logging(page)
+  await expect(evidence).toContainText('repair-pr: uncertain')
+  await evidence.locator('[data-legacy] summary').click()
+  await expect(evidence.getByRole('link', { name: 'acme/repo#99', exact: true })).toHaveAttribute('href', 'https://github.com/acme/repo/pull/99')
+})
 
 test('an active uncertain invocation displays its original missing plan and validated recovery', async ({ page }) => {
   await workspace(page)
@@ -22,7 +70,7 @@ test('an active uncertain invocation displays its original missing plan and vali
   await page.route('**/api/behavior-chains', route => route.fulfill({ json: chainSummaryFixture('pending-active', {
     code: 'original_publication_plan_missing', callId, planSha: 'd'.repeat(64), missingAt: 1, recoveredAt,
   }) }))
-  const controls = await general(page)
+  const controls = await logging(page)
   const list = controls.locator('[data-chain-list]')
   await expect(list).toContainText('repair-pr: uncertain')
   await expect(list).toContainText(`Original Call ${callId}: original publication plan is missing`)
@@ -47,7 +95,7 @@ for (const submission of ['none', 'rejected', 'uncertain']) {
     await page.route('**/api/behavior-chains*', route => route.fulfill({ json: new URL(route.request().url()).searchParams.has('id')
       ? { events: [{ sequence: 3, at: Date.now(), type: 'invocation.reconciled', callId, evidence: { diagnostic } }], next: null }
       : snapshot }))
-    const controls = await general(page)
+    const controls = await logging(page)
     const list = controls.locator('[data-chain-list]')
     const outcome = submission === 'none' ? 'Request not sent' : submission === 'rejected' ? 'Request rejected' : 'Action outcome unknown'
     const next = submission === 'uncertain' ? 'reconcile the original Call response; do not enqueue again'
@@ -87,15 +135,16 @@ for (const width of [390, 1280]) {
       journalAfters.push(new URL(route.request().url()).searchParams.get('after'))
       return route.fulfill({ json: { events, next: null } })
     })
-    const controls = await general(page)
-    const attention = controls.getByRole('region', { name: 'Work needing attention' })
-    const entries = attention.locator('li')
+    await general(page)
+    const attention = await notifications(page)
+    const entries = attention.locator('.nr-card[data-id^="chain:"]')
     await expect(entries).toHaveCount(3)
     for (const [index, [issue, pull]] of [[887, 893], [896, 900], [898, 901]].entries()) {
       const entry = entries.nth(index)
+      await entry.locator('.nr-card-head').click()
       await expect(entry.getByRole('link', { name: `#${issue}`, exact: true })).toHaveAttribute('href', `https://github.com/autonomio/poise/issues/${issue}`)
       await expect(entry.getByRole('link', { name: `PR #${pull}`, exact: true })).toHaveAttribute('href', `https://github.com/autonomio/poise/pull/${pull}`)
-      await expect(entry.getByRole('link', { name: 'Journal evidence' })).toHaveAttribute('href', /\/api\/behavior-chains\?id=.*&after=/)
+      await expect(entry.getByRole('button', { name: 'Journal evidence' })).toBeVisible()
       await expect(entry).toContainText(`No verified advance for 2d ${23 - index}h`)
       await expect(entry).toContainText('repair-pr: preflight_failed')
       await expect(entry).toContainText('Current-head approval required')
@@ -104,44 +153,40 @@ for (const width of [390, 1280]) {
       await expect(entry).toContainText(index < 2 ? 'Required CI passed; Review changes requested' : 'CI failing: Unit/integration (2/2):failure')
       await expect(entry).toContainText(index < 2 ? 'incomplete review replies' : 'required CI shard failed')
     }
-    await attention.scrollIntoViewIfNeeded()
     await expect.poll(() => attention.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true)
     await page.screenshot({ path: `test-results/behavior-chain-attention-${width}.png`, fullPage: true })
-    const journalHref = await entries.first().getByRole('link', { name: 'Journal evidence' }).getAttribute('href')
-    const expectedAfter = new URL(journalHref!, 'http://localhost').searchParams.get('after')
-    await entries.first().getByRole('link', { name: 'Journal evidence' }).click()
+    const expectedAfter = new URL(snapshot.attention[0].journal, 'http://localhost').searchParams.get('after')
+    await entries.first().getByRole('button', { name: 'Journal evidence' }).click()
     await expect.poll(() => journalAfters.at(-1)).toBe(expectedAfter)
+    const controls = page.getByRole('region', { name: 'Behavior chain evidence' })
+    await expect(controls).toBeVisible()
+    await expect(page.locator('#settings-panel')).not.toHaveClass(/open/)
     await expect(controls.getByRole('region', { name: 'Chain journal' })).toContainText('incomplete review replies')
-    // data-chain-more carries hidden while empty, so query by attribute: the
-    // role query cannot see it until it is shown.
-    const moreChains = controls.locator('[data-chain-more]')
-    const refreshed = page.waitForResponse(response => response.url().includes('/api/behavior-chains') && !response.url().includes('id='))
-    await controls.getByRole('button', { name: 'Refresh chains' }).click()
-    await refreshed
-    // Refresh renders after the response arrives; More chains re-enables in the
-    // same finally block that releases the reading guard, so this proves the
-    // refresh completed instead of passing on pre-refresh DOM.
-    await expect(moreChains).toBeEnabled()
+    const beforeReload = journalAfters.length
+    await page.reload()
+    await expect.poll(() => journalAfters.length).toBeGreaterThan(beforeReload)
+    expect(journalAfters.at(-1)).toBe(expectedAfter)
+    await expect(controls.getByRole('region', { name: 'Chain journal' })).toContainText('incomplete review replies')
+    await notifications(page)
     await expect(entries.first()).toContainText('No verified advance for 2d 23h')
     unavailable = true
-    const unavailableRefresh = page.waitForResponse(response => response.url().includes('/api/behavior-chains') && !response.url().includes('id='))
-    await controls.getByRole('button', { name: 'Refresh chains' }).click()
-    await unavailableRefresh
-    await expect(moreChains).toBeEnabled()
-    await expect(attention).toContainText('Attention evidence unavailable; any retained entries are stale')
+    await notifications(page)
+    await expect(attention).toContainText('Attention evidence unavailable')
+    await expect(attention).toContainText('Any retained entries are stale')
+    await expect(entries).toHaveCount(3)
     expect(writes).toEqual([])
   })
 }
 
 for (const width of [390, 1280]) {
-  test(`uncertain resource paths wrap within settings at ${width}px`, async ({ page }) => {
+  test(`uncertain resource paths wrap within Logging at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 })
     await workspace(page)
     const snapshot = chainSummaryFixture('pending-active')
     snapshot.chains[0].invocations[0].outcome = 'native invocation ended without proof that its worker resources were released; '
       + 'allocated directory at /home/poise/.poise/agent-interface/native-resources/df387febe8b346f8bb17b05927b7844a lacks a reclamation receipt'
     await page.route('**/api/behavior-chains', route => route.fulfill({ json: snapshot }))
-    const controls = await general(page)
+    const controls = await logging(page)
     const list = controls.locator('[data-chain-list]')
     await expect(list).toContainText('lacks a reclamation receipt')
     await list.scrollIntoViewIfNeeded()
@@ -200,14 +245,14 @@ test('unsupported cleanup refuses v2 while v1 controls stay available, including
   const controls = await general(page)
   await expect(controls.locator('[data-native-support]')).toHaveText('This setup cannot run v2. v1 remains available.')
   await expect(controls.getByRole('button', { name: 'Switch to v2', exact: true })).toBeDisabled()
-  await expect(controls.locator('[data-cutover-status]')).toHaveText('v1 owns new work')
+  await expect(controls.getByRole('button', { name: 'Switch to v2', exact: true })).toBeVisible()
   expect(writes).toEqual([])
   draining = true
-  await controls.getByRole('button', { name: 'Refresh chains' }).click()
+  await controls.getByRole('button', { name: 'Refresh availability' }).click()
   await expect(controls.getByRole('button', { name: 'Cancel cutover', exact: true })).toBeEnabled()
   await controls.getByRole('button', { name: 'Cancel cutover', exact: true }).click()
   await expect.poll(() => writes).toEqual([{ operation: 'cancel-cutover', sequence: 1 }])
-  await expect(controls.locator('[data-cutover-status]')).toHaveText('v1 owns new work')
+  await expect(controls.getByRole('button', { name: 'Switch to v2', exact: true })).toBeVisible()
 })
 
 test('merged chains retain open obligations as reconciliation-only and stale reads disable admission writes', async ({ page }) => {
@@ -217,13 +262,15 @@ test('merged chains retain open obligations as reconciliation-only and stale rea
   await page.route('**/api/behavior-chains', route => unavailable
     ? route.fulfill({ status: 503, json: { error: 'journal unavailable' } })
     : route.fulfill({ json: chainSummaryFixture(complete ? 'complete' : 'pending-active') }))
-  const controls = await general(page)
+  const controls = await logging(page)
   const list = controls.locator('[data-chain-list]')
   await expect(list).toContainText('Merged: aaaaaaaaaaaa')
   await expect(list).toContainText('Review evidence pending')
-  const attention = controls.getByRole('region', { name: 'Work needing attention' })
+  const attention = await notifications(page)
   await expect(attention).toContainText('original response missing')
+  await attention.locator('.nr-card[data-id^="chain:"] .nr-card-head').click()
   await expect(attention).toContainText('original pre-merge review evidence')
+  await page.keyboard.press('Escape')
   await expect(list).toContainText('repair-pr: uncertain')
   await expect(list).toContainText('Original native resource release is unverified; Caller reconciliation continues while GitHub observations are deferred')
   await expect(list.getByRole('button', { name: 'Hold new invocations' })).toHaveCount(0)
@@ -237,13 +284,15 @@ test('merged chains retain open obligations as reconciliation-only and stale rea
   await page.screenshot({ path: 'test-results/behavior-v2-obligations.png', fullPage: true })
   unavailable = true
   await controls.getByRole('button', { name: 'Refresh chains' }).click()
-  await expect(controls.getByRole('button', { name: 'v2 active', exact: true })).toBeDisabled()
+  await expect(controls.locator('[data-cutover-status]')).toHaveText('Admission state unavailable')
   await expect(controls.locator('[data-chain-capacity]')).toHaveText('Atomic behavior capacity unavailable.')
   unavailable = false
   complete = true
   await controls.getByRole('button', { name: 'Refresh chains' }).click()
   await expect(list).not.toContainText('Review evidence pending')
-  await expect(attention).toContainText('No delayed or held work')
+  await notifications(page)
+  await expect(attention.locator('.nr-card[data-id^="chain:"]')).toHaveCount(0)
+  await page.keyboard.press('Escape')
   await expect(list.getByRole('button', { name: 'Hold new invocations' })).toHaveCount(0)
   await expect(list).toContainText('Merged: aaaaaaaaaaaa')
 })
@@ -254,7 +303,7 @@ test('unmerged ownership retains its Hold control and unavailable reads disable 
   await page.route('**/api/behavior-chains', route => unavailable
     ? route.fulfill({ status: 503, json: { error: 'journal unavailable' } })
     : route.fulfill({ json: chainSummaryFixture('unmerged') }))
-  const controls = await general(page)
+  const controls = await logging(page)
   const hold = controls.getByRole('button', { name: 'Hold new invocations' })
   await expect(hold).toBeEnabled()
   unavailable = true
@@ -268,7 +317,7 @@ test('supersession links the covering merge and both runs without claiming the d
   snapshot.chains[0].supersession = { verified: true, covering: [{ number: 940, mergeSha: 'b'.repeat(40) }],
     failures: [{ id: 1 }], recovery: { id: 2 }, duplicate: { number: 17, head: 'a'.repeat(40) } }
   await page.route('**/api/behavior-chains', route => route.fulfill({ json: snapshot }))
-  const controls = await general(page)
+  const controls = await logging(page)
   const list = controls.locator('[data-chain-list]')
   await expect(list).toContainText('Superseded; duplicate PR closed')
   await expect(list).not.toContainText('Merged:')
@@ -283,7 +332,7 @@ for (const state of ['pending-admitted', 'pending-no-invocation', 'pending-origi
   test(`merged chain controls reflect canonical ${state} evidence without creating review authority`, async ({ page }) => {
     await workspace(page)
     await page.route('**/api/behavior-chains', route => route.fulfill({ json: chainSummaryFixture(state) }))
-    const controls = await general(page)
+    const controls = await logging(page)
     const list = controls.locator('[data-chain-list]')
     await list.scrollIntoViewIfNeeded()
     await expect(list).toContainText('Merged: aaaaaaaaaaaa')
@@ -316,19 +365,21 @@ test('one cutover action reports drain, survives reload and reflects actual comp
       settings: { enabled: cutover.mode === 'v2', seedMode: 'label', label: 'poise' } } })
   })
   const controls = await general(page)
-  await expect(controls.getByText('v1 owns new work', { exact: true })).toBeVisible()
+  await expect(controls.getByRole('button', { name: 'Switch to v2', exact: true })).toBeEnabled()
   await expect(controls.getByLabel('Run the issue-to-merge chain')).toBeDisabled()
   await controls.getByRole('button', { name: 'Switch to v2', exact: true }).click()
   await expect.poll(() => writes).toEqual([{ operation: 'switch-to-v2', sequence: 0 }])
-  await expect(controls.locator('[data-cutover-status]')).toContainText('1 native Caller')
+  await expect(controls.locator('[data-cutover-status]')).toHaveCount(0)
   await expect(controls.getByRole('button', { name: 'Cancel cutover' })).toBeEnabled()
   await page.reload()
   const reloaded = await general(page)
-  await expect(reloaded.locator('[data-cutover-status]')).toContainText('Draining behaviors')
+  await expect(reloaded.getByRole('button', { name: 'Cancel cutover' })).toBeEnabled()
+  const evidence = await logging(page)
+  await expect(evidence.locator('[data-cutover-status]')).toContainText('1 native Caller')
+  await general(page)
   cutover = { ...cutover, sequence: 2, mode: 'v2', legacyPulls: ['acme/repo#9'] }
-  await reloaded.getByRole('button', { name: 'Refresh chains' }).click()
-  await expect(reloaded.locator('[data-cutover-status]')).toContainText('v2 owns new work')
-  await expect(reloaded.getByRole('button', { name: 'v2 active', exact: true })).toBeDisabled()
+  await reloaded.getByRole('button', { name: 'Refresh availability' }).click()
+  await expect(reloaded.locator('[data-cutover]')).toBeHidden()
   await expect(reloaded.getByLabel('Run the issue-to-merge chain')).toBeChecked()
   await page.screenshot({ path: 'test-results/behavior-cutover.png', fullPage: true })
   expect(writes).toHaveLength(1)
@@ -343,25 +394,29 @@ test('stale cutover and unavailable reads never show a successful activation', a
       : route.fulfill({ json: { chains: [], next: null, runtime: [], cutover: { mode: 'v1', sequence: 0, legacyPulls: [], blockers: [], support: { status: 'supported', error: null } } } }))
   const controls = await general(page)
   await controls.getByRole('button', { name: 'Switch to v2', exact: true }).click()
-  await expect(controls.locator('[data-chain-status]')).toContainText('Cutover was not applied')
-  await expect(controls.locator('[data-cutover-status]')).toHaveText('v1 owns new work')
+  await expect(await notifications(page)).toContainText('Cutover was not applied')
+  await page.keyboard.press('Escape')
+  await general(page)
+  await expect(controls.getByRole('button', { name: 'Switch to v2', exact: true })).toBeVisible()
   unavailable = true
-  await controls.getByRole('button', { name: 'Refresh chains' }).click()
-  await expect(controls.locator('[data-cutover-status]')).toHaveText('Admission state unavailable')
+  await controls.getByRole('button', { name: 'Refresh availability' }).click()
+  await expect(controls.getByRole('button', { name: 'Save chain settings' })).toBeDisabled()
   await expect(controls.getByRole('button', { name: 'Switch to v2', exact: true })).toBeDisabled()
 })
 
 test('chain and journal pagination retain prior results and display the actual waiting reason', async ({ page }) => {
   await workspace(page)
+  let unavailable = false
   await page.route('**/api/behavior-chains*', route => {
     const query = new URL(route.request().url()).searchParams
+    if (query.has('id') && unavailable) return route.fulfill({ status: 503, json: { error: 'journal unavailable' } })
     if (query.has('id')) return route.fulfill({ json: { events: query.get('after') === '0'
       ? [{ sequence: 1, at: Date.now(), type: 'chain.admitted' }] : [{ sequence: 2, at: Date.now(), type: 'chain.waiting', reason: 'CI evidence unavailable' }],
     next: query.get('after') === '0' ? 1 : null } })
     return route.fulfill({ json: { chains: [row(query.has('after') ? 2 : 1)], next: query.has('after') ? null : 'acme/repo#1', runtime: [],
       cutover: { mode: 'v2', sequence: 2, legacyPulls: [], blockers: [] } } })
   })
-  const controls = await general(page)
+  const controls = await logging(page)
   await expect(controls.locator('[data-chain-list]')).toContainText('exact-head CI is running')
   await controls.getByRole('button', { name: 'More chains' }).click()
   await expect(controls.getByRole('button', { name: 'History', exact: true })).toHaveCount(2)
@@ -371,6 +426,11 @@ test('chain and journal pagination retain prior results and display the actual w
   const history = controls.getByRole('region', { name: 'Chain journal' })
   await expect(history).toContainText('chain.admitted')
   await history.getByRole('button', { name: 'More events' }).click()
+  await expect(history).toContainText('chain.admitted')
+  await expect(history).toContainText('CI evidence unavailable')
+  unavailable = true
+  await controls.getByRole('button', { name: 'History', exact: true }).first().click()
+  await expect(controls.locator('[data-chain-status]')).toHaveText('Journal could not be read: journal unavailable')
   await expect(history).toContainText('chain.admitted')
   await expect(history).toContainText('CI evidence unavailable')
 })

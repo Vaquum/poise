@@ -1355,7 +1355,7 @@ This adds no observation, scheduler, event type, scope or execution authority.
 [Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
 
 Invocation summaries may also carry retained original publication-plan absence
-and recovery evidence. Settings displays the original Call and restoration
+and recovery evidence. Logging displays the original Call and restoration
 action even while its invocation is active. This diagnostic evidence grants no
 publication, retry or resource-release authority; [Behavior chain](Behavior-chain.md#authority-and-recovery)
 defines its reconciliation rules.
@@ -1409,8 +1409,8 @@ the reservation; the first positive settlement time is never refreshed.
 
 The existing behavior request/tick performs a bounded internal capability
 check, with at most one setup probe and no new timer. Cutover and native
-admission require its positive result; Settings exposes checking, supported,
-unsupported or unavailable. An unsupported setup stays on v1. A v2 setup that
+admission require its positive result; Settings guards the controls and explains
+unsupported or unavailable setups. An unsupported setup stays on v1. A v2 setup that
 loses support pauses new admissions rather than reopening v1 ownership.
 Mac development and default Docker security settings remain supported for v1;
 this does not change the gateway's optional runtime setting or any production

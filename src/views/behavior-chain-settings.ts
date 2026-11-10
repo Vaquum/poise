@@ -1,82 +1,34 @@
 import { getSettings, setLocalSettings, type AppSettings } from '../config'
-import { escapeHtml } from '../markdown'
+import { viewFeedback } from '../view-feedback'
 import type { BehaviorCutoverState } from '../behavior-cutover'
-import type { ProcessDiagnostic } from '../../server/process-diagnostic'
 
 type Settings = NonNullable<AppSettings['behaviorChain']>
-interface FailureEvidence {
-  diagnostic?: ProcessDiagnostic
-  publicationPlan?: { callId: string, recoveredAt: number | null }
-}
-interface ChainRow {
-  id: string, repository: string, issue: number, sequence: number, held: string | null, waiting: string | null,
-  mergeSha: string | null, reviewPending?: boolean | null, reviewStatus?: 'pending' | 'complete' | 'not-recorded', pullNumber: number | null,
-  supersession?: { covering: Array<{ number: number, mergeSha: string }>, failures: Array<{ id: number }>, recovery: { id: number } } | null,
-  reconciliation?: { nextObservationAt: number | null, waitingForOriginalResponse: boolean, waitingForResourceRelease?: boolean } | null,
-  invocations: Array<{ behavior: string, state: string, outcome?: string | null, callId?: string | null, evidence?: FailureEvidence | null,
-    nativeAction?: { attribution: string, outcome: string | null } | null }>
-}
-interface JournalEvent { sequence: number, at: number, type: string, reason?: string, outcome?: string, callId?: string | null, evidence?: FailureEvidence }
-interface AttentionRow {
-  id: string, repository: string, issue: number, pullNumber: number | null, step: string, progressAt: number, ageMs: number,
-  blocker: string, evidence: { state: string, checkedAt: number | null, gates: string[] },
-  nextAction: string, retryAt: number | null, journal: string,
-  reconciliation: { nextObservationAt: number | null, waitingForResourceRelease: boolean }
-}
 const defaults: Settings = { enabled: false, seedMode: 'label', label: 'poise' }
-
-function failureDetails(callId?: string | null, evidence?: FailureEvidence | null): string {
-  const call = callId ? ` · Call ${callId}` : ''
-  const diagnostic = evidence?.diagnostic
-  if (!diagnostic || (diagnostic.operation !== 'merge_if_ready' && diagnostic.phase !== 'native_action')) return call
-  const submission = diagnostic.context.submission
-  const known = submission === 'none' || submission === 'rejected'
-  return `${call} · ${submission === 'none' ? 'Request not sent' : submission === 'rejected' ? 'Request rejected' : 'Action outcome unknown'} · Cause: ${diagnostic.stderr || diagnostic.context.message || 'cause unknown'} · Next: ${known
-    ? 'address the cause; normal admission checks and retry backoff still apply.'
-    : 'reconcile the original Call response; do not enqueue again.'}`
-}
 
 export function behaviorChainSettings() {
   const element = document.createElement('section')
   element.className = 'tp-section'
   element.setAttribute('aria-label', 'Behavior chain settings')
   element.innerHTML = `<div class="tp-group-label">Behavior chain</div>
-    <p role="status" data-cutover-status>Reading behavior admission state…</p>
     <button type="button" class="st-clear" data-cutover disabled>Switch to v2</button>
-    <p role="status" data-native-support>Checking whether this setup supports v2…</p>
+    <p class="st-help" data-native-support hidden></p>
     <p class="st-help">Switching drains current behavior invocations, then assigns new work to v2. Existing legacy PRs keep their ownership. Chats remain available.</p>
     <label class="tp-label"><input type="checkbox" data-chain-enabled disabled> Run the issue-to-merge chain</label>
     <label class="tp-label" for="chain-seed-mode">Seed issues</label><select id="chain-seed-mode" class="st-select"><option value="label">Issues with the selected label</option><option value="all">All issues in followed organizations</option></select>
     <label class="tp-label" for="chain-seed-label">Issue label</label><input id="chain-seed-label" class="st-input" maxlength="50" spellcheck="false" autocomplete="off">
     <p class="st-help">This intake controls v2. Repository/author triggers and the approval-round cap in the Behaviors table apply to legacy work. Existing reviewer counts, phase switches, pauses, notes and PR exclusions still apply to v2.</p>
-    <button type="button" class="st-clear" data-chain-save disabled>Save chain settings</button> <button type="button" class="st-clear" data-chain-reload>Reload saved settings</button> <button type="button" class="st-clear" data-chain-refresh>Refresh chains</button>
-    <p class="st-help">Hold pauses future invocations; it does not stop a running worker. Use its existing Stop control to stop it.</p>
-    <p role="status" data-chain-status></p><p data-chain-capacity>Atomic behavior capacity has not been read.</p><details data-legacy hidden><summary>Legacy PR ownership retained at cutover</summary><ul></ul></details>
-    <section aria-label="Work needing attention"><div class="tp-group-label">Work needing attention</div>
-      <p class="st-help">Held or uncertain work appears immediately; other work appears after 24 hours without a verified advance. Oldest progress first.</p>
-      <p role="status" data-attention-status>Attention evidence has not been read.</p><ul data-chain-attention></ul></section><ul data-chain-list></ul>
-    <button type="button" class="st-clear" data-chain-more hidden>More chains</button>
-    <section aria-label="Chain journal" hidden><p data-history-title></p><ol data-history></ol><button type="button" class="st-clear" data-history-more hidden>More events</button></section>`
+    <button type="button" class="st-clear" data-chain-save disabled>Save chain settings</button> <button type="button" class="st-clear" data-chain-reload>Reload saved settings</button> <button type="button" class="st-clear" data-chain-refresh>Refresh availability</button>
+    <p role="status" data-chain-status></p>`
   const enabled = element.querySelector<HTMLInputElement>('[data-chain-enabled]')!
   const mode = element.querySelector<HTMLSelectElement>('#chain-seed-mode')!
   const label = element.querySelector<HTMLInputElement>('#chain-seed-label')!
   const status = element.querySelector<HTMLElement>('[data-chain-status]')!
-  const list = element.querySelector<HTMLElement>('[data-chain-list]')!
-  const attention = element.querySelector<HTMLElement>('[data-chain-attention]')!
   const save = element.querySelector<HTMLButtonElement>('[data-chain-save]')!
   const cutoverButton = element.querySelector<HTMLButtonElement>('[data-cutover]')!
-  const more = element.querySelector<HTMLButtonElement>('[data-chain-more]')!
-  const history = element.querySelector<HTMLElement>('[aria-label="Chain journal"]')!
-  const historyMore = element.querySelector<HTMLButtonElement>('[data-history-more]')!
   let current: Settings = { ...defaults }
   let cutover: BehaviorCutoverState | null = null
   let dirty = false
   let reading = false
-  let next: string | null = null
-  let rows: ChainRow[] = []
-  let historyId = ''
-  let historyNext: number | null = null
-  let historyGeneration = 0
 
   function update(settings: AppSettings): void {
     if (dirty) return
@@ -95,7 +47,7 @@ export function behaviorChainSettings() {
       const data = await response.json()
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`)
       setLocalSettings(data); dirty = false; update(data)
-      status.textContent = next.enabled ? 'Chain invocations enabled. Phase switches and holds still apply.' : 'New chain invocations paused. Ownership and receipts are retained.'
+      status.textContent = 'Chain settings saved.'
     } catch (error) { status.textContent = `Settings were not saved: ${(error as Error).message}` }
     finally { save.disabled = cutover === null }
   })() })
@@ -108,11 +60,11 @@ export function behaviorChainSettings() {
         body: JSON.stringify({ sequence: cutover.sequence, operation: cutover.mode === 'draining' ? 'cancel-cutover' : 'switch-to-v2' }) })
       const data = await response.json()
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`)
+      viewFeedback('behavior-cutover', 'Behavior cutover needs attention', '')
       await refresh()
-    } catch (error) { status.textContent = `Cutover was not applied: ${(error as Error).message}`; cutoverButton.disabled = false }
+    } catch (error) { viewFeedback('behavior-cutover', 'Behavior cutover needs attention', `Cutover was not applied: ${(error as Error).message}`); cutoverButton.disabled = false }
   })() })
   element.querySelector('[data-chain-refresh]')!.addEventListener('click', () => { void refresh() })
-  more.addEventListener('click', () => { void refresh(true) })
   element.querySelector('[data-chain-reload]')!.addEventListener('click', () => { void (async () => {
     try {
       const response = await fetch('/api/settings')
@@ -121,168 +73,31 @@ export function behaviorChainSettings() {
       dirty = false; setLocalSettings(settings); update(settings); status.textContent = 'Saved settings reloaded.'
     } catch (error) { status.textContent = `Settings could not be reloaded: ${(error as Error).message}` }
   })() })
-  list.addEventListener('click', (event) => { void (async () => {
-    const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-chain-id]')
-    if (!button) return
-    if (button.dataset.operation === 'history') { await readHistory(button.dataset.chainId!); return }
-    if (!cutover) { status.textContent = 'Refresh chains before changing their controls.'; return }
-    button.disabled = true
-    try {
-      const response = await fetch('/api/behavior-chains', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: button.dataset.chainId, sequence: Number(button.dataset.sequence), operation: button.dataset.operation }) })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`)
-      await refresh()
-    } catch (error) { status.textContent = `Chain control was not applied: ${(error as Error).message}`; button.disabled = false }
-  })() })
-  historyMore.addEventListener('click', () => { void readHistory(historyId, true) })
-  attention.addEventListener('click', event => {
-    const link = (event.target as HTMLElement).closest<HTMLAnchorElement>('a[data-chain-journal]')
-    if (!link) return
-    event.preventDefault()
-    const afterParam = new URL(link.href, window.location.origin).searchParams.get('after')
-    const startAfter = afterParam !== null && /^\d+$/.test(afterParam) ? Number(afterParam) : undefined
-    void readHistory(link.dataset.chainJournal!, false, startAfter)
-  })
-  async function readHistory(id: string, append = false, startAfter?: number): Promise<void> {
-    const generation = ++historyGeneration
-    const after = append ? historyNext : (startAfter ?? 0)
-    historyMore.disabled = true
-    try {
-      const response = await fetch(`/api/behavior-chains?${new URLSearchParams({ id, after: String(after ?? 0) })}`)
-      const data = await response.json()
-      if (!response.ok || !Array.isArray(data.events)) throw new Error(data.error || `HTTP ${response.status}`)
-      if (generation !== historyGeneration) return
-      if (data.next !== null && (!Number.isSafeInteger(data.next) || data.next <= (after ?? 0))) throw new Error('Journal cursor did not advance')
-      historyId = id; historyNext = data.next; history.hidden = false
-      history.querySelector('[data-history-title]')!.textContent = `v2 journal · ${id}`
-      const html = data.events.map((event: JournalEvent) => `<li>${escapeHtml(new Date(event.at).toLocaleString())} · ${escapeHtml(event.type)}${event.reason || event.outcome ? ` · ${escapeHtml(event.reason || event.outcome || '')}` : ''}${escapeHtml(failureDetails(event.callId, event.evidence))}</li>`).join('')
-      const events = history.querySelector('[data-history]')!
-      if (append) events.insertAdjacentHTML('beforeend', html); else events.innerHTML = html || '<li>No journal events.</li>'
-      historyMore.hidden = historyNext === null
-    } catch (error) { if (generation === historyGeneration) status.textContent = `Journal could not be read: ${(error as Error).message}` }
-    finally { if (generation === historyGeneration) historyMore.disabled = false }
-  }
-  async function refresh(append = false): Promise<void> {
+  async function refresh(): Promise<void> {
     if (reading) return
-    reading = true; more.disabled = true
-    const after = append ? next : null
-    const previousCount = append ? 0 : rows.length
+    reading = true
     try {
-      const response = await fetch(`/api/behavior-chains${after ? `?after=${encodeURIComponent(after)}` : ''}`)
+      const response = await fetch('/api/behavior-chains')
       const data = await response.json()
       if (!response.ok || !Array.isArray(data.chains)) throw new Error(data.error || `HTTP ${response.status}`)
-      if (data.next !== null && (typeof data.next !== 'string' || data.next <= (after ?? ''))) throw new Error('Chain cursor did not advance')
-      let chains = data.chains
-      let cursor = data.next
-      // A refresh must not drop pages loaded through More chains: re-read
-      // until the fresh list covers what was shown.
-      while (!append && chains.length < previousCount && cursor) {
-        const page = await fetch(`/api/behavior-chains?after=${encodeURIComponent(cursor)}`)
-        const paged = await page.json()
-        if (!page.ok || !Array.isArray(paged.chains)) throw new Error(paged.error || `HTTP ${page.status}`)
-        if (paged.next !== null && (typeof paged.next !== 'string' || paged.next <= cursor)) throw new Error('Chain cursor did not advance')
-        cursor = paged.next
-        chains = [...chains, ...paged.chains]
-        if (paged.chains.length === 0) break
-      }
-      next = append ? data.next : cursor
-      rows = append ? [...rows, ...data.chains] : chains
-      more.hidden = !next
-      if (!append) {
-        element.querySelector('[data-attention-status]')!.textContent = Array.isArray(data.attention)
-          ? 'All admitted active chains; age since the last verified advance.' : 'Attention evidence unavailable.'
-        attention.innerHTML = Array.isArray(data.attention) ? (data.attention as AttentionRow[]).map(entry => {
-          const age = Math.floor(entry.ageMs / 60_000)
-          const duration = age >= 1440 ? `${Math.floor(age / 1440)}d ${Math.floor(age % 1440 / 60)}h` : age >= 60 ? `${Math.floor(age / 60)}h ${age % 60}m` : `${age}m`
-          const base = `https://github.com/${entry.repository}`
-          const recheck = entry.reconciliation.waitingForResourceRelease ? 'Original native resource release remains unverified; Caller reconciliation continues.'
-            : entry.reconciliation.nextObservationAt === null ? 'No GitHub evidence recheck scheduled.'
-              : entry.reconciliation.nextObservationAt > Date.now() ? `Evidence recheck: ${new Date(entry.reconciliation.nextObservationAt).toLocaleString()}. This does not retry held work.`
-                : 'Evidence recheck eligible on the existing scheduler; this does not retry held work.'
-          return `<li><a href="${escapeHtml(base)}/issues/${Number(entry.issue)}">#${Number(entry.issue)}</a>${entry.pullNumber ? ` → <a href="${escapeHtml(base)}/pull/${Number(entry.pullNumber)}">PR #${Number(entry.pullNumber)}</a>` : ''}
-            · ${escapeHtml(entry.step)} · No verified advance for ${duration} (since ${escapeHtml(new Date(entry.progressAt).toLocaleString())}).
-            <p>${escapeHtml(entry.blocker)}</p><p>PR evidence: ${escapeHtml(entry.evidence.state)}${entry.evidence.checkedAt !== null ? ` · observed ${escapeHtml(new Date(entry.evidence.checkedAt).toLocaleString())}` : ''}. ${escapeHtml(entry.evidence.gates.join('; '))}</p>
-            <p>Next: ${escapeHtml(entry.nextAction)}${entry.retryAt !== null ? ` · ${escapeHtml(new Date(entry.retryAt).toLocaleString())}` : ''}. ${escapeHtml(recheck)}</p>
-            <a href="${escapeHtml(entry.journal)}" data-chain-journal="${escapeHtml(entry.id)}">Journal evidence</a></li>`
-        }).join('') || '<li>No delayed or held work.</li>' : ''
-      }
       if (data.settings) update({ ...getSettings(), behaviorChain: data.settings })
       cutover = data.cutover ?? null
       save.disabled = cutover === null
-      cutoverButton.disabled = !cutover || cutover.mode === 'v2'
-        || (cutover.mode !== 'draining' && cutover.support?.status !== 'supported')
-      cutoverButton.textContent = cutover?.mode === 'draining' ? 'Cancel cutover' : cutover?.mode === 'v2' ? 'v2 active' : 'Switch to v2'
+      cutoverButton.hidden = cutover?.mode === 'v2'
+      cutoverButton.disabled = !cutover || (cutover.mode !== 'draining' && cutover.support?.status !== 'supported')
+      cutoverButton.textContent = cutover?.mode === 'draining' ? 'Cancel cutover' : 'Switch to v2'
       enabled.disabled = cutover?.mode !== 'v2' || cutover.support?.status !== 'supported'
       const support = cutover?.support
-      element.querySelector('[data-native-support]')!.textContent = support?.status === 'supported'
-        ? 'This setup supports v2 worker cleanup.'
-        : support?.status === 'unsupported' ? (cutover?.mode === 'v2'
-          ? 'v2 is paused: this setup cannot verify worker cleanup.' : 'This setup cannot run v2. v1 remains available.')
-          : support?.status === 'unavailable' ? 'The v2 setup check is unavailable. Switching is disabled.'
-            : 'Checking whether this setup supports v2…'
-      const legacy = element.querySelector<HTMLDetailsElement>('[data-legacy]')!
-      legacy.hidden = !cutover?.legacyPulls.length
-      legacy.querySelector('ul')!.innerHTML = (cutover?.legacyPulls ?? []).map((target) => {
-        const match = /^([-A-Za-z0-9_.]+\/[-A-Za-z0-9_.]+)#([1-9][0-9]*)$/.exec(target)
-        return `<li>v1 · ${match ? `<a href="https://github.com/${escapeHtml(match[1])}/pull/${match[2]}">${escapeHtml(target)}</a>` : escapeHtml(target)}</li>`
-      }).join('')
-      element.querySelector('[data-cutover-status]')!.textContent = !cutover ? 'Admission state unavailable' : cutover.mode === 'v2'
-        ? `v2 owns new work · legacy PRs at cutover: ${cutover.legacyPulls.length}`
-        : cutover.mode === 'draining' ? `Draining behaviors · ${(data.cutover.blockers as string[]).join('; ') || 'Verifying the legacy ownership boundary'}` : 'v1 owns new work'
-      const capacity = data.capacity
-      element.querySelector('[data-chain-capacity]')!.textContent = capacity?.status === 'available'
-        ? `v2 chains: ${capacity.reservedModelInvocations} durable model admission(s) reserved · ceiling ${capacity.modelInvocationLimit} (shared with other heavy work).${capacity.processLocal ? ` Process-local behavior runs: ${capacity.processLocal.behaviorRunning}; these counts are not additive.` : ''} Mode: ${capacity.mode ?? 'not recorded'}. ${capacity.enabled ? 'Effective intake' : 'Saved intake (inactive)'}: ${capacity.intake?.seedMode === 'all' ? 'all issues' : `label ${capacity.intake?.label}`}. ${capacity.enabled ? 'Admissions enabled.' : 'Admissions paused.'} Manager worker-Chat capacity is separate.`
-        : `Atomic behavior capacity unavailable${capacity?.error ? `: ${capacity.error}` : '.'}`
-      list.innerHTML = rows.map((chain) => {
-        const active = chain.invocations.find(invocation => invocation.state !== 'settled')
-        const last = chain.invocations[chain.invocations.length - 1]
-        const plan = (active ?? last)?.evidence?.publicationPlan
-        const planStatus = !plan ? '' : plan.recoveredAt === null
-          ? ` · Original Call ${plan.callId}: original publication plan is missing; publication evidence remains unverified. Restore the original Caller plan and let reconciliation validate it; do not retry publication.`
-          : ` · Original publication plan recovered for Call ${plan.callId}; publication and resource-release checks still apply.`
-        const githubTarget = /^[-A-Za-z0-9_.]+\/[-A-Za-z0-9_.]+$/.test(chain.repository) && Number.isSafeInteger(chain.issue)
-        const github = githubTarget
-          ? `<a href="https://github.com/${escapeHtml(chain.repository)}/issues/${chain.issue}">#${chain.issue}</a>` : escapeHtml(chain.id)
-        const complete = !!chain.supersession || !!chain.mergeSha && !chain.reviewPending
-        const progress = active ? `${active.behavior}: ${active.state}${active.outcome ? ` · ${active.outcome}` : ''}`
-          : chain.waiting || 'Awaiting the next observation'
-        const state = [chain.supersession ? 'Superseded; duplicate PR closed' : '', chain.mergeSha ? `Merged: ${chain.mergeSha.slice(0, 12)}` : '',
-          chain.reviewPending ? 'Review evidence pending' : '',
-          chain.mergeSha && (chain.reviewStatus === 'not-recorded' || chain.reviewPending == null) ? 'Pre-merge review completion not recorded' : '',
-          !complete && chain.held ? `Held: ${chain.held}` : '', !complete ? progress : ''].filter(Boolean).join(' · ')
-        const control = chain.mergeSha || chain.supersession ? '' : ` <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-sequence="${Number(chain.sequence)}" data-operation="${chain.held ? 'resume' : 'hold'}"${!cutover ? ' disabled' : ''}>${chain.held ? 'Resume' : 'Hold new invocations'}</button>`
-        const supersession = chain.supersession && githubTarget ? [
-          ...chain.supersession.covering.map(pull => `<a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(pull.number)}">Covering PR #${Number(pull.number)} (${escapeHtml(pull.mergeSha.slice(0, 12))})</a>`),
-          ...chain.supersession.failures.map(run => `<a href="https://github.com/${escapeHtml(chain.repository)}/actions/runs/${Number(run.id)}">Failing run</a>`),
-          `<a href="https://github.com/${escapeHtml(chain.repository)}/actions/runs/${Number(chain.supersession.recovery.id)}">Recovery run</a>`,
-        ].join(' · ') : ''
-        const attribution = last?.nativeAction?.attribution === 'accepted-response' ? ' · original action response accepted'
-          : last?.nativeAction?.attribution === 'observed-no-action' ? ' · observed; mutation not attributed'
-            : last?.nativeAction?.attribution === 'not-recorded' ? ' · action attribution not recorded' : ''
-        const obligation = chain.mergeSha && chain.reviewPending && !active
-          ? ' · Awaiting original pre-merge review evidence; no new invocation can start after merge.' : ''
-        const recheck = chain.reconciliation?.waitingForResourceRelease ? ' · Original native resource release is unverified; Caller reconciliation continues while GitHub observations are deferred.'
-          : chain.reconciliation?.waitingForOriginalResponse ? ' · Original action response required; GitHub reads cannot settle this invocation.'
-          : chain.reconciliation?.nextObservationAt && chain.reconciliation.nextObservationAt > Date.now()
-            ? ` · Next original-evidence observation: ${new Date(chain.reconciliation.nextObservationAt).toLocaleString()}.` : ''
-        const failure = active ?? last
-        const details = failure?.behavior === 'merge-pr' ? failureDetails(failure.callId,
-          failure.nativeAction?.attribution === 'accepted-response' ? null : failure.evidence) : ''
-        return `<li>v2 · ${github}${chain.pullNumber ? ` → <a href="https://github.com/${escapeHtml(chain.repository)}/pull/${Number(chain.pullNumber)}">PR #${Number(chain.pullNumber)}</a>` : ''}: ${escapeHtml(state)}${supersession ? ` · ${supersession}` : ''}${escapeHtml(planStatus)}${escapeHtml(obligation)}${escapeHtml(recheck)}${!active && last ? ` · Last: ${escapeHtml(last.behavior)} (${escapeHtml(last.outcome || last.state)}${escapeHtml(attribution)})` : ''}${escapeHtml(details)}${control} <button type="button" class="st-clear" data-chain-id="${escapeHtml(chain.id)}" data-operation="history">History</button></li>`
-      }).join('') || '<li>No behavior chains.</li>'
-      const errors = Array.isArray(data.runtime) ? data.runtime.filter((entry: { error: string | null }) => entry.error).map((entry: { organization: string, error: string }) => `${entry.organization}: ${entry.error}`).join('; ') : ''
-      status.textContent = `Read ${new Date().toLocaleTimeString()}${errors ? ` · ${errors}` : ''}`
+      const help = element.querySelector<HTMLElement>('[data-native-support]')!
+      help.hidden = support?.status === 'supported'
+      help.textContent = support?.status === 'unsupported' ? (cutover?.mode === 'v2'
+        ? 'v2 is paused: this setup cannot verify worker cleanup.' : 'This setup cannot run v2. v1 remains available.')
+        : 'The v2 setup check is unavailable. Switching is disabled.'
+      viewFeedback('behavior-chain-settings', 'Behavior chain controls unavailable', '')
     } catch (error) {
-      cutover = null; cutoverButton.disabled = true; enabled.disabled = true
-      save.disabled = true
-      for (const button of list.querySelectorAll<HTMLButtonElement>('button[data-operation="hold"], button[data-operation="resume"]')) button.disabled = true
-      element.querySelector('[data-chain-capacity]')!.textContent = 'Atomic behavior capacity unavailable.'
-      element.querySelector('[data-cutover-status]')!.textContent = 'Admission state unavailable'
-      element.querySelector('[data-native-support]')!.textContent = 'The v2 setup check is unavailable.'
-      element.querySelector('[data-attention-status]')!.textContent = 'Attention evidence unavailable; any retained entries are stale.'
-      status.textContent = `Chains could not be refreshed: ${(error as Error).message}`
-    } finally { reading = false; more.disabled = false }
+      cutover = null; cutoverButton.hidden = false; cutoverButton.disabled = true; enabled.disabled = true; save.disabled = true
+      viewFeedback('behavior-chain-settings', 'Behavior chain controls unavailable', (error as Error).message)
+    } finally { reading = false }
   }
   update(getSettings())
   return { element, update, refresh }

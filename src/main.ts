@@ -56,7 +56,7 @@ function showView(v: ViewSlug) {
   if (v !== 'logging') {
     const url = new URL(location.href)
     if (url.searchParams.get('view') === 'logging') {
-      for (const key of ['view', 'event', 'incident', 'from', 'to']) url.searchParams.delete(key)
+      for (const key of ['view', 'event', 'incident', 'from', 'to', 'chain', 'after']) url.searchParams.delete(key)
       history.replaceState(null, '', url)
     }
   }
@@ -321,6 +321,13 @@ window.addEventListener('poise:open-logging', (event) => {
   const href = loggingHref((event as CustomEvent<LoggingLink>).detail ?? {})
   if (!href) return
   history.pushState(null, '', href)
+  menu.switchTo('logging')
+})
+window.addEventListener('poise:open-chain-journal', (event) => {
+  const { id, after } = (event as CustomEvent<{ id: string, after: number }>).detail
+  if (!id || !Number.isSafeInteger(after) || after < 0) return
+  history.pushState(null, '', '/?' + new URLSearchParams({ view: 'logging', chain: id, after: String(after) }))
+  closeSettingsPanel(); closeTypographyPanel()
   menu.switchTo('logging')
 })
 window.addEventListener('popstate', () => {

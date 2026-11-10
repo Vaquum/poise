@@ -52,6 +52,14 @@ week use civil boundaries in that timezone. Custom intervals require UTC offsets
 Settings → Navigation can drag Logging into the top bar, arrange its shortcut,
 or hide it on either surface. Hiding shortcuts preserves diagnostic deep links.
 
+Logging also contains the existing behavior-chain evidence panel: cutover and
+legacy ownership, capacity, active/held work, sequence-checked Hold/Resume and
+paginated journal history. Notifications' Journal evidence action opens its
+recorded journal cursor here, including after reload. These are reads of the
+canonical chain journal, separate from the severity-filtered diagnostic table;
+they create no new Logging events or severity mapping. General keeps only chain
+preferences and guarded cutover controls.
+
 Column headers own the severity, time, source and exact identity filters. Columns selects optional workspace/account/repository/call/correlation/incident fields; an active filter keeps its field visible until cleared. Search and the event count remain in the native toolbar. Filters stay usable after a failed query.
 
 The normal view contains no retention, snapshot or coverage prose. Data and collection opens a structured inspection panel with retention bounds, timezone, snapshot/read times, current source observation and expandable historical gaps. Current connectivity is independent of historical completeness: a recovered source can be connected now while its retained coverage remains partial. Legacy partial records without current evidence remain unknown until observed again. Historical gaps and normal filtering metadata do not create notifications; genuine collection failures retain their diagnostic evidence.
