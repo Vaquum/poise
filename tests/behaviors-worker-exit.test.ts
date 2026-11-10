@@ -74,6 +74,41 @@ describe('review worker exit diagnostics', () => {
     } finally { await worker.logging.stopLogging() }
   })
 
+  it('keeps one Caller timeout when its error exceeds periodic truncation', async () => {
+    const worker = await reviewWorker()
+    try {
+      const fullError = `Review reached its total time limit; needs attention ${'x'.repeat(9000)}`
+      worker.timeout.error = fullError
+      fixture.agentLogs = [worker.timeout]
+      await worker.exit({ code: 1, signal: null })
+
+      const errors = worker.events().filter((event) => event.severity === 'error')
+      expect(errors).toHaveLength(1)
+      expect(errors[0]).toMatchObject({ source: 'caller', callId: worker.timeout.id,
+        correlationId: worker.claim.launchCorrelationId })
+      expect(errors[0].message).toBe(fullError.slice(0, 2048))
+      const incidentId = (errors[0] as { incidentId: string }).incidentId
+      expect(worker.database.listBehaviorLaunchClaims('review-new-prs')).toEqual([
+        expect.objectContaining({ claimId: worker.claim.claimId,
+          launchError: 'worker exited exit 1; awaiting durable agent result',
+          leaseUntil: expect.any(Number) }),
+      ])
+
+      // Periodic --diagnostics truncates the same error to 8,192 characters.
+      worker.collector.events = [{ ...worker.timeout, error: fullError.slice(0, 8192) }]
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await worker.logging.stopLogging()
+      writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
+      worker.logging.startLogging()
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
+      const replayed = worker.events().filter((event) => event.severity === 'error')
+      expect(replayed).toHaveLength(1)
+      expect((replayed[0] as { incidentId: string }).incidentId).toBe(incidentId)
+      expect(worker.logging.loggingRuntime()!.health().rejected).toBe(0)
+    } finally { await worker.logging.stopLogging() }
+  })
+
   it.each([
     'missing result', 'unreadable logs', 'malformed diagnostic', 'unavailable evidence', 'foreign invocation',
     'different head', 'different reviewer', 'different source', 'older result', 'unfinished result',

@@ -2994,8 +2994,10 @@ function settleClaimAfterExit(
           && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
           && Date.parse(call.completed_at ?? '') >= Date.parse(agentCallStartedAt(call))) {
           const row = objectValue(rows[0], 'worker exit Caller evidence')
-          // Use the original metadata and stable Caller identity so delayed collection replays exactly.
-          const input = row.evidence_unavailable == null ? callerDiagnostic(row, loggingWorkspace()) : null
+          // Match periodic --diagnostics truncation (substr(c.error, 1, 8192)) so delayed collection replays exactly.
+          const truncatedRow = typeof row.error === 'string' && row.error.length > 8192
+            ? { ...row, error: row.error.slice(0, 8192) } : row
+          const input = row.evidence_unavailable == null ? callerDiagnostic(truncatedRow, loggingWorkspace()) : null
           if (input?.level === 'error' && diagnostic(input)) return
         }
       } catch (cause) {
