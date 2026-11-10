@@ -16,6 +16,7 @@ import { LoggingQueryPool } from './diagnostics/query-pool.js'
 import { GoogleConnections } from './google.js'
 import { loadPublicPages, type PublicPages } from './public-pages.js'
 import type { TestRelay } from './test-relay.js'
+import { McpGateway } from './mcp.js'
 
 export const APEX_COOKIE = 'poise_gw'
 export const WORKSPACE_COOKIE = 'poise_ws'
@@ -51,6 +52,9 @@ export interface Principal {
 
 /** What every route needs: dependencies, the public origins and the session rules. */
 export class Context {
+  private mcpGateway: McpGateway | null = null
+  get mcp(): McpGateway { return this.mcpGateway ??= new McpGateway(this) }
+  closeMcp(): void { this.mcpGateway?.close() }
   private googleBroker: GoogleConnections | null = null
   get googleConnections(): GoogleConnections { return this.googleBroker ??= new GoogleConnections(this) }
   closeGoogleConnections(): void { this.googleBroker?.close() }

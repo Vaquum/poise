@@ -3,6 +3,7 @@
 // verified with node:crypto alone.
 
 import { verify, type KeyObject } from 'node:crypto'
+import { MCP_READ_PATH, type McpGrantScope } from '../../gateway/src/mcp-contract'
 
 export const IDENTITY_HEADER = 'x-poise-identity'
 export const ASSERTION_ISSUER = 'poise-gateway'
@@ -12,19 +13,22 @@ const MAX_ASSERTION_BYTES = 4096
 const ED25519_SIGNATURE_BYTES = 64
 const SEGMENT = /^[A-Za-z0-9_-]+$/
 
-export const ASSERTION_SCOPES = ['browser', 'link', 'admin'] as const
+export const ASSERTION_SCOPES = ['browser', 'link', 'admin', 'mcp'] as const
 export type AssertionScope = typeof ASSERTION_SCOPES[number]
 
 export interface IdentityAssertion {
   subject: string
   scope: AssertionScope
   gatewayPort?: number
+  mcp?: McpGrantScope
 }
 
 export interface AssertionExpectation {
   key: KeyObject
   handle: string
   owner: string
+  ownerId?: number
+  resource?: string
 }
 
 export type AssertionResult =
@@ -74,12 +78,22 @@ export function verifyIdentityAssertion(token: string, expected: AssertionExpect
   if (iat > nowSeconds + ASSERTION_SKEW_SECONDS) return refuse('the identity assertion is issued in the future')
   if (nowSeconds >= exp + ASSERTION_SKEW_SECONDS) return refuse('the identity assertion has expired')
   if (claims.gport !== undefined && (claims.scope !== 'browser' || typeof claims.gport !== 'number' || !Number.isInteger(claims.gport) || claims.gport < 1 || claims.gport > 65535)) return refuse('the identity assertion has an invalid gateway port')
-  return { ok: true, assertion: { subject: claims.sub, scope: claims.scope as AssertionScope, ...(typeof claims.gport === 'number' ? { gatewayPort: claims.gport } : {}) } }
+  let mcp: McpGrantScope | undefined
+  if (claims.scope === 'mcp') {
+    const value = claims.mcp as Partial<McpGrantScope> | undefined
+    if (!value || !expected.resource || value.resource !== expected.resource || value.handle !== expected.handle
+      || !Number.isSafeInteger(value.ownerId) || Number(value.ownerId) < 1 || value.ownerId !== expected.ownerId || typeof value.grantId !== 'string'
+      || !/^[a-f0-9-]{36}$/.test(value.grantId)) return refuse('the MCP assertion has an invalid grant or resource audience')
+    mcp = value as McpGrantScope
+  } else if (claims.mcp !== undefined) return refuse('the identity assertion has an invalid MCP grant')
+  return { ok: true, assertion: { subject: claims.sub, scope: claims.scope as AssertionScope, ...(mcp ? { mcp } : {}), ...(typeof claims.gport === 'number' ? { gatewayPort: claims.gport } : {}) } }
 }
 
-/** Scopes by route: the browser reaches everything, a paired Poise Link only
- *  the Link API, the gateway itself only the service endpoints. */
+/** MCP reads require their dedicated scope. Ordinary routes retain browser,
+ *  Link API and gateway service authority. */
 export function scopeAllowsPath(scope: AssertionScope, path: string): boolean {
+  if (path === MCP_READ_PATH) return scope === 'mcp'
+  if (scope === 'mcp') return false
   if (scope === 'browser') return true
   const prefix = scope === 'link' ? '/api/link/' : '/api/service/'
   // The raw path is what routes match; the resolved one is what dot segments

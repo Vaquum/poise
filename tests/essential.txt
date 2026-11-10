@@ -109,6 +109,7 @@ tests/stop-gate-runtime.test.mjs
 tests/tool-cache-config.test.ts
 
 # Whole-repository wiring and repeat catches, which an import link cannot reach.
+tests/mcp.test.ts
 tests/behaviors-preparation.test.ts
 tests/behaviors-repo-skips-api.test.ts
 tests/notification-evidence.test.ts

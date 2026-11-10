@@ -193,11 +193,12 @@ client sent.
   | `iss` | `poise-gateway` |
   | `aud` | `workspace:<handle>` |
   | `sub` | the GitHub login, in GitHub's case |
-  | `scope` | `browser`, `link` or `admin` |
+  | `scope` | `browser`, `link`, `admin` or `mcp` |
   | `iat`, `exp` | seconds; `exp` is `iat + 60` |
   | `jti` | random, unique per assertion |
   | `sid` | browser only: opaque hash reference to the authenticated workspace session |
   | `gport` | browser only: gateway listening port for private Google delegation |
+  | `mcp` | MCP only: `{ resource, ownerId, handle, grantId }`, bound to the exact apex `/mcp` resource and immutable workspace owner ID |
 
 - The gateway generates its key pair on first start and keeps it in its data
   volume. Workspaces receive the public key as `POISE_GATEWAY_PUBLIC_KEY`, the
@@ -207,9 +208,14 @@ client sent.
   most 5 seconds in the future, `exp` has not passed (5 seconds of skew), and
   `exp - iat` is at most 120.
 - Scopes:
-  - `browser`: the owner's browser; every route.
+  - `browser`: the owner's browser; ordinary workspace routes.
   - `link`: a paired Poise Link device; only `/api/link/*`.
   - `admin`: the gateway itself; only `/api/service/*`.
+  - `mcp`: a consented workspace read grant; only `POST /api/mcp/read`.
+    That endpoint refuses browser, Link, admin and unsigned loopback requests.
+    It returns only workspace identity and capabilities through `poise_describe`.
+    The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
+    PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
   `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers. It
   forwards no `Cookie` header at all: neither its own cookies (`poise_gw`,
@@ -272,6 +278,7 @@ Environment the gateway passes:
 | `POISE_MODE` | `service` |
 | `POISE_WORKSPACE_HANDLE` | `<handle>` |
 | `POISE_WORKSPACE_OWNER` | the GitHub login |
+| `POISE_WORKSPACE_OWNER_ID` | immutable GitHub account ID; optional for older containers, which refuse MCP assertions without it |
 | `POISE_PUBLIC_ORIGIN` | `https://<handle>.<POISE_DOMAIN>` |
 | `POISE_GATEWAY_PUBLIC_KEY` | see above |
 | `POISE_HOST` | `0.0.0.0` |

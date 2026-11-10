@@ -25,6 +25,7 @@ describe('configuration', () => {
     expect(loadConfig(BASE)).toEqual({
       domain: 'poise.example.com',
       insecureHttp: false,
+      mcpEnabled: false,
       githubClientId: 'id',
       githubClientSecret: 'secret',
       google: null,
