@@ -4510,6 +4510,13 @@ async function fireApprove(
     }
     return false
   }
+  // The history read above awaits: the account pair or approval model may
+  // have changed while it was out, so revalidate ownership and selection
+  // after it instead of launching on the pre-read gates.
+  const reselected = stored === 'random' ? null : (await approvalSlot())?.model
+  const drawStillValid = stored === 'random' ? await randomDrawStillValid('pr_approve', model) : reselected === model
+  if (!prAccountsMatch(accounts) || !drawStillValid
+    || admittedReviewer && configuredReviewer(pr.author).toLowerCase() !== admittedReviewer.toLowerCase()) return false
   // At most one probe per backoff window: a sibling that already claimed it
   // makes this launch wait for the verdict instead of doubling the probe.
   if (!claimReviewerTripProbe(model)) return false

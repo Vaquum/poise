@@ -3,6 +3,17 @@ import type { LogEntry } from '../server/agent'
 import type { ReviewerTripKind } from '../server/behaviors'
 import { mocks, pr, HEAD_SHA, NEXT_HEAD_SHA, loadModules, restartModules, resetLogCache, arrangeCli, agentLog, recordCompletedInitialReview, fixture } from './behaviors-runtime-fixture'
 
+const historyHook = vi.hoisted(() => ({ count: 0, ordinal: 0, mutate: null as null | (() => void) }))
+vi.mock('../server/agent', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../server/agent')>()
+  return { ...actual,
+    fetchAgentLogSnapshot: async (...args: Parameters<typeof actual.fetchAgentLogSnapshot>) => {
+      historyHook.count++
+      if (historyHook.mutate && historyHook.count === historyHook.ordinal) historyHook.mutate()
+      return actual.fetchAgentLogSnapshot(...args)
+    } }
+})
+
 const RATE_LIMIT_ERROR = 'codex review failed: Reconnecting... 2/5 (exceeded retry limit, last status: 429 Too Many Requests)'
 const GROK_ANALYSIS_LIMIT_ERROR = 'grok review reached its analysis time limit; handing off so the next model can run instead'
 
@@ -722,3 +733,44 @@ it('heals a budget stop that lost its incident before the dead-letter write', as
   await resetLogCache()
   await expect(runtime.retryFailedPrReviews([secondId])).resolves.toEqual({ ok: true, targets: [heldTarget] })
 })
+
+it.each(['accounts', 'model'] as const)(
+  'sheds an approval launch when %s change during the history read', async (mode) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-10T12:00:00Z'))
+    const model = 'opus-5-xhigh'
+    arrangeCli(true, false, {
+      headSha: HEAD_SHA, reviewerReviewIdsSince: [], latestActivityAt: new Date().toISOString(),
+    }, { commits_after_request: 0, author_commits_after_request: 0,
+      author_pr_comments_after_request: 1, response_count: 1 })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    const models = () => JSON.stringify({ slots: { primary: model, secondary: model, tertiary: model },
+      places: { pr_approve: { slot: 'primary' } } })
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    db.setMeta('models', models())
+    runtime.startBehaviorsRuntime()
+    // Mutate inside fireApprove's history read: the pre-read gates already
+    // passed, so only the post-read revalidation can shed the launch.
+    historyHook.count = 0
+    historyHook.ordinal = 2
+    historyHook.mutate = () => {
+      if (mode === 'model') {
+        db.setMeta('models', JSON.stringify({ slots: { primary: 'changed-model', secondary: model, tertiary: model },
+          places: { pr_approve: { slot: 'primary' } } }))
+      } else {
+        db.setMeta('agentAccount', 'changed-agent')
+      }
+    }
+    const tick = async () => { await resetLogCache(); await runtime.runEnabledBehaviorsOnce() }
+    await tick()
+    expect(historyHook.count).toBeGreaterThanOrEqual(2)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    // Restored settings launch normally: only the mid-flight change blocked.
+    historyHook.mutate = null
+    db.setMeta('agentAccount', 'review-bot')
+    db.setMeta('models', models())
+    await tick()
+    expect(mocks.spawnDetached).toHaveBeenCalledTimes(1)
+  })
