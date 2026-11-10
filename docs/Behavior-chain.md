@@ -152,6 +152,33 @@ target does not govern atomic chain admissions. No new refresh loop is added.
 
 ### Bounded reconciliation
 
+For a reporter-owned full-suite failure, a closed seed can retire a redundant
+chain PR as **superseded**, independently of a merge. The seed observation
+retains the failing runs, recovery run, reported tests, covering merged PRs and
+duplicate head. GitHub must confirm completed full runs on main, and the test
+artifacts must show the reported failures and their successful recovery. The
+recovery commit must descend from the failure and contain the covering merges.
+Missing or expired artifacts leave the decision visible.
+
+Automatic coverage is conservative: every change in the latest duplicate must
+be a covered replacement inside the reported tests. The complete recovered
+test bodies retain their fixtures and assertions. A fixture-clock assertion
+repair with the same pure fixed-clock helper may use another `at(...)` instant, as in #940's `at(61)` and #946's
+`at(11)`; unrelated numeric changes, additional assertions, production edits,
+other linked PRs and unclear coverage require a decision and remain open.
+
+Original possible writes, review replies and positive native resource-release
+proof must reconcile before cleanup. Only the automatic closed-target hold can
+be cleared; a person's hold remains. The existing native action path journals
+`issue-work --mode retire`, revalidates coverage and rechecks the owned PR head
+before closing it on GitHub. Its accepted response and resource release are
+required for the `chain.superseded` event. A lost response stays uncertain;
+observing a closed PR cannot attribute that close or authorize a second one.
+Supersession retains the covering merge separately, keeps the duplicate's
+`mergeSha` unset, removes settled work from the active list, and leaves History
+and GitHub evidence links available. Rebuild and restart retain this terminal
+outcome and the original invocation ownership.
+
 The existing scheduler selects a normal-work page before a separate due
 reconciliation page under its existing pass budget. Quiescent held or merged
 chains keep their original ownership, but cannot
@@ -216,7 +243,13 @@ The existing authorized HTTP API supports interactive and headless controls: `GE
 ## Handoffs and outcomes
 
 An implementation or repair that explicitly reports a blocker records
-`atomic_work_blocked` and holds its chain with that reason. Cleanup still
+`atomic_work_blocked` and holds its chain with that reason. Caller masks
+credential patterns and known environment credentials before normalizing and
+limiting the explicit string reason to 500 characters plus a truncation ellipsis.
+The exception and retained diagnostic use the same safe message; empty or
+unsupported reasons retain `AtomicWorkBlocked`. Ordinary exception text and raw
+provider output remain excluded from native failure evidence. The reason grants
+no retry or resource-release authority. Cleanup still
 requires its original positive proof and does not restart blocked work. The
 hold survives journal rebuild and server replacement; the person can resume
 through the existing control after resolving the blocker.
@@ -446,7 +479,18 @@ head/base recheck and independent approval verification still apply.
 
 Repair prompts name the exact unresolved root comment IDs from the head-verified
 review packet, including outdated threads and roots with earlier replies.
-Caller requires that same set before publication. Missing coverage records
+Caller requires that same set before publication. After checking the repaired
+code and current reviewer input, a repair can carry a still-applicable native
+reply verbatim, including its original `poise-reply` marker, in the existing
+`replies` plan. The publisher verifies the reply's author, root, exact body and
+marker against paginated GitHub comments and returns its existing receipt.
+Reviewer edits or follow-ups on that finding require a fresh answer, as do new
+findings or materially changed answers; a new Call/head or unrelated finding
+does not invalidate reuse. Prior replies remain in the current-head review
+packet and durable publication plan. Inspection/recovery verifies their proof
+again; missing or altered proof fails visibly and cannot count as coverage.
+Reuse changes neither exact-head review/approval nor conversation-resolution
+gates. Missing coverage records
 `atomic_work_failed`, `not_started` / `preflight_failed`, with the missing count,
 required count and at most 20 sorted missing IDs in the retained error field;
 comment text is not retained there. No publication plan exists at this point,

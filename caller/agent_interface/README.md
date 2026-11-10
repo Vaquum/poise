@@ -112,7 +112,9 @@ Native failures, including setup exceptions after Call registration, retain the
 first error in the existing v1 `diagnostic`, replacing an earlier preparation
 warning. Evidence keeps the original Call/correlation, execution phase and
 Caller operation, with exception type, errno, deadline and exit/signal when
-observed. Exception text, subprocess arguments and captured output are excluded.
+observed. Ordinary exception text, subprocess arguments and captured output are
+excluded. Explicit implementation/repair blockers retain only their bounded,
+redacted reason as defined in [chain outcomes](../../docs/Behavior-chain.md#handoffs-and-outcomes).
 The outer detached Caller records an explicit unknown cause and observed exit
 status when its inner continuation leaves no cause. These SQLite records survive
 Poise restarts; they authorize neither publication nor resource release.

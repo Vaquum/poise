@@ -91,6 +91,19 @@ class TestClientRetrySemantics(IsolatedAsyncioTestCase):
         self.assertEqual(text, "log line")
         self.assertEqual(len(self.calls), 2)
 
+    async def test_artifact_download_retains_binary_bytes_and_retries_only_the_read(self) -> None:
+        content = b"PK\x03\x04\xff\x00"
+        response = httpx.Response(200, content=content, request=httpx.Request("GET", "https://api.github.com/artifact"))
+        self.script.extend([_response(503), response])
+        self.assertEqual(await self.client.download("/repos/o/r/actions/artifacts/1/zip"), content)
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_artifact_download_refuses_oversized_evidence(self) -> None:
+        self.script.append(httpx.Response(200, content=b"x" * (8 * 1024 * 1024 + 1),
+                                         request=httpx.Request("GET", "https://api.github.com/artifact")))
+        with self.assertRaisesRegex(ValueError, "exceeds 8 MiB"):
+            await self.client.download("/repos/o/r/actions/artifacts/1/zip")
+
     async def test_post_is_single_attempt_on_transport_error(self) -> None:
         self.script.extend([httpx.ConnectError("boom"), _response(200)])
 

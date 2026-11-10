@@ -16,7 +16,7 @@ export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org:
   const active = chain.invocations.find((invocation) => invocation.state !== 'settled')
   const waitingForResourceRelease = chainWaitsForResourceRelease(chain)
   const ownedWorking = !!active && active.model !== null && active.state !== 'uncertain' && !active.evidence?.resources_settled_at
-  const scheduled = recheckAt !== undefined && !!(chain.held || chain.mergeSha || waitingForResourceRelease) && (recheckAt === null || recheckAt > now)
+  const scheduled = recheckAt !== undefined && !!(chain.held || chain.mergeSha || chain.supersession || waitingForResourceRelease) && (recheckAt === null || recheckAt > now)
   const observationState = !observation ? 'missing' : fresh ? 'fresh'
     : (ownedWorking || scheduled) && Number.isFinite(observation.checkedAt) && observation.checkedAt <= now ? 'skipped-while-owned'
       : !pull ? 'missing' : 'stale'
@@ -66,7 +66,8 @@ export function projectChainPrStatus(chain: BehaviorChain, pr: DatastorePr, org:
   let line = 'v2 observation unavailable; awaiting a canonical chain observation'
   let key = 'observation'
   const set = (nextId: PrBlockerId, nextLine: string, nextKey: string) => { id = nextId; line = nextLine; key = nextKey }
-  if (chain.reviewPending) set('held', `v2 merged ${chain.mergeSha?.slice(0, 12)}; review evidence pending${active ? `; ${active.behavior} ${active.state}` : ''}`, 'review-pending')
+  if (chain.supersession) set('blocked', 'v2 repair superseded; duplicate PR closed', 'superseded')
+  else if (chain.reviewPending) set('held', `v2 merged ${chain.mergeSha?.slice(0, 12)}; review evidence pending${active ? `; ${active.behavior} ${active.state}` : ''}`, 'review-pending')
   else if (active?.state === 'uncertain') set('held', `v2 ${active.behavior} uncertain: ${active.outcome ?? 'original response unavailable'}`, `uncertain:${active.id}`)
   else if (chain.held) set('held', `v2 held: ${chain.held}`, `held:${chain.held}`)
   else if (active) set(['review-pr', 'approve-pr'].includes(active.behavior) ? 'review_running' : 'blocked',

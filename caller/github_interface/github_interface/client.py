@@ -131,6 +131,19 @@ class GitHubClient:
     async def get_text(self, path: str, accept: str, **kwargs: Any) -> str:
         return await self.request_text("GET", path, accept, **kwargs)
 
+    async def download(self, path: str) -> bytes:
+        response = await self._request("GET", path, {
+            "Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }, True, True)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            _raise_for_response(response, error)
+        if len(response.content) > 8 * 1024 * 1024:
+            raise ValueError("GitHub evidence download exceeds 8 MiB")
+        return response.content
+
     async def post(self, path: str, **kwargs: Any) -> Any:
         return await self.request("POST", path, **kwargs)
 

@@ -39,6 +39,17 @@ def row(call):
         return dict(conn.execute("select * from calls where id=?", (call,)).fetchone())
 
 
+def test_retirement_uses_the_fixed_original_native_request_and_resource_boundary():
+    argv = ["--issue-work", "943", "--mode", "retire", "--branch", "poise/issue-943", "--pull-number", "946",
+            "--coverage-json", '{"verified":true}', "--expected-head", "a" * 40, "--token-user", "author"]
+    request, number, head = native_action.validate(argv, "/isolated/example/repo", "example/repo", "author", resource_version=True)
+    assert request == {"command": "github-interface", "cwd": "/isolated/example/repo", "argv": argv, "nativeResources": 2}
+    assert number == "943" and head == "a" * 40
+    for mode in ("prepare", "publish", "validate"):
+        with pytest.raises(ValueError, match="permits only"):
+            native_action.validate([*argv[:3], mode, *argv[4:]], request["cwd"], "example/repo", "author", resource_version=True)
+
+
 def test_response_is_durable_before_terminal_status_and_not_rewritten(database, monkeypatch):
     call, digest = original()
     response = '{"outcome":"enqueued","queueEntryId":"actual-response"}'

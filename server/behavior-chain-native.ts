@@ -171,6 +171,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           head_sha: publication.head_sha === null ? null : sha(publication.head_sha, 'publication'), head_invocation: typeof publication.head_invocation === 'string' ? publication.head_invocation : null,
           state: typeof publication.state === 'string' ? publication.state : null, merged: publication.merged === true,
           merge_sha: publication.merge_sha === null ? null : sha(publication.merge_sha, 'publication') }, pull: null }
+      if (seed.full_suite) observation.fullSuite = object(seed.full_suite, 'full-suite recovery')
       const pendingReview = chain.invocations.find((invocation) => invocation.state === 'uncertain' && invocation.behavior === 'review-issue')
       if (pendingReview && typeof pendingReview.evidence?.callId === 'string') {
         const artifact = object(pendingReview.evidence.artifact, 'issue review publication receipt')
@@ -341,6 +342,9 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       }
       if (!pull) throw new Error('native PR action requires a verified pull request')
       const fixed = ['--expected-head', pull.head, '--token-user', decision.actor]
+      if (decision.behavior === 'retire-pr') return { command: 'github-interface', cwd, nativeResources: 2,
+        argv: ['--issue-work', String(chain.issue), '--mode', 'retire', '--branch', chain.branch, '--pull-number', String(pull.number),
+          '--coverage-json', JSON.stringify(observation.fullSuite), ...fixed] }
       if (decision.behavior === 'resolve-threads') return { command: 'github-interface', cwd, nativeResources: 2, argv: ['--resolve-nonblocking-conversations-if-ready', String(pull.number), '--username', chain.reviewer, ...fixed] }
       if (decision.behavior === 'rerun-grey-ci') {
         const run = pull.greyRuns[0]
