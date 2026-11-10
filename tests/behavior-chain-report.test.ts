@@ -8,7 +8,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { decideBehaviorChain, type ChainObservation } from '../server/behavior-chain-decision'
 import { BehaviorChainRuntime, type ChainRuntimeOperations } from '../server/behavior-chain-runtime'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
-import { REMEDIATION_SCOPE, repairReportRepositories, repairReportReviewScope, reportRepairExhaustion, setRepairReportRepositories } from '../server/behavior-chain-report'
+import { MAX_REPAIR_REPORT_REPOSITORIES_BYTES, REMEDIATION_SCOPE, repairReportRepositories, repairReportRepositoriesHealth, repairReportReviewScope, reportRepairExhaustion, setRepairReportRepositories } from '../server/behavior-chain-report'
 import { nativeChainOperations } from '../server/behavior-chain-native'
 import type { Organization } from '../server/organizations'
 
@@ -377,6 +377,22 @@ it('keeps an applied empty service allowlist disabled over the legacy environmen
   await operations(db, journal).reportHold!(journal.read(chain.id)!)
   expect(posts()).toHaveLength(1)
   expect(journal.read(chain.id)).toEqual(chain)
+})
+
+it('rejects a reporting allowlist beyond the health echo budget', () => {
+  const { db } = setup()
+  const oversized = `${'a/b,'.repeat(2100)}a/b`
+  expect(Buffer.byteLength(oversized)).toBeGreaterThan(MAX_REPAIR_REPORT_REPOSITORIES_BYTES)
+  expect(() => setRepairReportRepositories(db, oversized)).toThrow('exceeds 8192 bytes')
+})
+
+it('truncates a legacy over-cap allowlist in the health echo while matching on the full value', () => {
+  vi.stubEnv('POISE_MODE', 'service')
+  const { db } = setup()
+  const oversized = `${'a/b,'.repeat(20000)}a/b`
+  db.prepare('INSERT INTO meta(key, value) VALUES (?, ?)').run('service_repair_exhaustion_repositories', oversized)
+  expect(Buffer.byteLength(repairReportRepositoriesHealth(db))).toBeLessThanOrEqual(MAX_REPAIR_REPORT_REPOSITORIES_BYTES)
+  expect(repairReportRepositories(db)).toBe(oversized)
 })
 
 it('preserves local environment reporting independently of applied service configuration', async () => {

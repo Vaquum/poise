@@ -13,7 +13,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { BUILD_SHA } from '../build-identity'
-import { repairReportRepositories, setRepairReportRepositories } from '../behavior-chain-report'
+import { repairReportRepositoriesHealth, setRepairReportRepositories } from '../behavior-chain-report'
 import type { ChatRuntime } from '../chat/runtime'
 import { findEvent, getOpenTurn, listOpenTurns } from '../chat/storage'
 import { db } from '../db'
@@ -182,7 +182,7 @@ export class ServiceControl {
       draining: this.drainOn,
       release,
       switching,
-      repairExhaustionRepositories: repairReportRepositories(db),
+      repairExhaustionRepositories: repairReportRepositoriesHealth(db),
       eventLoop: eventLoopDelayStats(),
       desiredRelease,
       installedRelease: desiredRelease !== null && this.releaseInstalled(desiredRelease) ? desiredRelease : null,

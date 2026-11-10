@@ -257,6 +257,12 @@ describe('configuration', () => {
   })
 })
 
+it('rejects a reporting allowlist beyond the health echo budget', () => {
+  const oversized = `${'a/b,'.repeat(2100)}a/b`
+  expect(problems({ ...BASE, POISE_REPAIR_EXHAUSTION_REPOSITORIES: oversized })).toContainEqual(
+    expect.stringContaining('exceeds 8192 bytes'))
+})
+
 it('configures Google only as a complete deployment pair and never repeats secret values in errors', () => {
   expect(loadConfig({ ...BASE, POISE_GOOGLE_CLIENT_ID: 'poise.apps.googleusercontent.com', POISE_GOOGLE_CLIENT_SECRET: 'private-google-secret' }).google).toEqual({ clientId: 'poise.apps.googleusercontent.com', clientSecret: 'private-google-secret' })
   for (const values of [{ POISE_GOOGLE_CLIENT_ID: 'poise.apps.googleusercontent.com' }, { POISE_GOOGLE_CLIENT_SECRET: 'private-google-secret' }, { POISE_GOOGLE_CLIENT_ID: 'invalid-client', POISE_GOOGLE_CLIENT_SECRET: 'private-google-secret' }]) {

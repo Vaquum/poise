@@ -65,6 +65,9 @@ function repositoryNames(configured: string): string[] {
   return repositories
 }
 
+/** Health answers must fit the gateway's 64 KiB service-answer budget with room for every other field. */
+export const MAX_REPAIR_REPORT_REPOSITORIES_BYTES = 8 * 1024
+
 export function repairReportRepositories(db: Database): string {
   // An applied empty value must survive restart over a legacy container environment.
   const applied = isServiceMode()
@@ -73,8 +76,19 @@ export function repairReportRepositories(db: Database): string {
   return applied?.value ?? process.env.POISE_REPAIR_EXHAUSTION_REPOSITORIES ?? ''
 }
 
+export function repairReportRepositoriesHealth(db: Database): string {
+  const configured = repairReportRepositories(db)
+  if (Buffer.byteLength(configured) <= MAX_REPAIR_REPORT_REPOSITORIES_BYTES) return configured
+  // A legacy or environment value beyond the cap truncates: the gateway sees
+  // a mismatch and posts its own (capped) value, which converges on the next
+  // probe instead of wedging every health answer past the gateway budget.
+  return Buffer.from(configured).subarray(0, MAX_REPAIR_REPORT_REPOSITORIES_BYTES).toString('utf8')
+}
+
 export function setRepairReportRepositories(db: Database, configured: unknown): void {
   if (typeof configured !== 'string') throw new HttpError(400, 'repairExhaustionRepositories must be a string; empty disables reporting')
+  if (Buffer.byteLength(configured) > MAX_REPAIR_REPORT_REPOSITORIES_BYTES) throw new HttpError(400,
+    `repairExhaustionRepositories exceeds ${MAX_REPAIR_REPORT_REPOSITORIES_BYTES} bytes; the gateway cannot reconcile a larger health answer`)
   try { repositoryNames(configured) }
   catch { throw new HttpError(400, 'repairExhaustionRepositories requires comma-separated owner/repo names') }
   if (db.pragma('synchronous', { simple: true }) !== 2) db.pragma('synchronous = FULL')

@@ -99,6 +99,18 @@ function call(method: string, path: string, authority: RequestAuthority, service
 }
 
 describe('service health', () => {
+  it('bounds an over-cap environment allowlist in the health echo', () => {
+    const { service } = serviceOf()
+    vi.stubEnv('POISE_MODE', undefined)
+    vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', `${'a/b,'.repeat(20000)}a/b`)
+    try {
+      const health = service.health()
+      expect(Buffer.byteLength(health.repairExhaustionRepositories)).toBeLessThanOrEqual(8192)
+      expect(Buffer.byteLength(JSON.stringify(health))).toBeLessThan(64 * 1024)
+    } finally {
+      vi.stubEnv('POISE_REPAIR_EXHAUSTION_REPOSITORIES', undefined)
+    }
+  })
   it('retains pending native cleanup through drain until its durable release and claim retirement', async () => {
     const { service } = serviceOf()
     const records = join(root, 'native-cleanup-records')

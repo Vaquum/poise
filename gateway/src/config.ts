@@ -237,6 +237,12 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   if (repairExhaustionRepositories !== null && repairExhaustionRepositories.split(',').some(value => !isReleaseRepo(value.trim()))) {
     problems.push('POISE_REPAIR_EXHAUSTION_REPOSITORIES requires comma-separated owner/repo names')
   }
+  // Must agree with the workspace's MAX_REPAIR_REPORT_REPOSITORIES_BYTES: the
+  // workspace echoes its applied value in health, which must fit the service
+  // answer budget for reconciliation to converge.
+  if (repairExhaustionRepositories !== null && Buffer.byteLength(repairExhaustionRepositories) > 8 * 1024) {
+    problems.push('POISE_REPAIR_EXHAUSTION_REPOSITORIES exceeds 8192 bytes; the workspace cannot echo a larger health answer')
+  }
   const behaviorResourceEnv: string[] = []
   for (const name of BEHAVIOR_RESOURCE_VARIABLES) {
     const value = read(name)
