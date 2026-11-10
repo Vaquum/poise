@@ -5,8 +5,8 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { setLocalSettings } from '../src/config'
 import type { Notice } from '../src/notices'
-import { notificationItems } from '../src/notification-items'
-import { ago, itemHtml } from '../src/views/notification-rail'
+import { notificationItems, type NotificationItem } from '../src/notification-items'
+import { ago, expandedImpactRefs, itemHtml, pendingImpactRefs, IMPACT_TTL_MS, type WorkImpactRead } from '../src/views/notification-rail'
 
 const T0 = Date.parse('2026-10-17T10:00:00.000Z')
 const iso = (minutes: number) => new Date(T0 + minutes * 60_000).toISOString()
@@ -49,7 +49,8 @@ describe('an entry', () => {
       holds: [],
     }, T0)
     const html = itemHtml(diagnostic, true, T0)
-    expect(html).toContain('<ol class="nr-history"><li><span>review-new-prs acme/api#9: head changed &lt;script&gt; (2 attempts)</span></li></ol>')
+    expect(html).toContain('<ol class="nr-history"><li><span>review-new-prs acme/api#9: head changed &lt;script&gt; (2 attempts)')
+    expect(html).toContain('Current impact: unknown.')
     expect(html).not.toContain('data-action="open"')
     expect(html).not.toContain('data-action="dismiss"')
     expect(html).toContain('is-auto')
@@ -140,7 +141,7 @@ describe('when its history happened', () => {
       deadLetters: [], holds: [],
     }, now)
     const html = itemHtml(failing, true, now)
-    expect(html).toContain('; next check 19:43</span>')
+    expect(html).toContain('; next check 19:43')
     expect(html).not.toContain('2026-10-17T16:43:00.000Z')
   })
 
@@ -156,5 +157,88 @@ describe('when its history happened', () => {
       deadLetters: [], holds: [],
     }, now)
     expect(itemHtml(failing, true, now)).not.toContain('next check')
+  })
+})
+
+describe('work-impact reads', () => {
+  const ref = (n: number) => {
+    const mid = n.toString(16).padStart(16, '0')
+    const tail = 'f'.repeat(64)
+    return { eventId: `evt_${mid}_${tail}`, incidentId: `inc_${mid}_${tail}`, from: iso(0), to: iso(1) }
+  }
+  const entry = (evidence: unknown) => ({ behavior: 'resolve-unblocking', target: 'acme/repo#107', evidence })
+  const itemWith = (id: string, details: unknown[], notice?: unknown) => ({ id, details, notice }) as NotificationItem
+  const impacts = (states: Record<string, WorkImpactRead>) => new Map(Object.entries(states))
+
+  it('reads expanded entries only, one first reference each', () => {
+    const items = [itemWith('a', [entry(ref(1)), entry(ref(2))]), itemWith('b', [entry(ref(3))])]
+    const refs = expandedImpactRefs(items, new Set(['a']))
+    expect([...refs.keys()]).toEqual([ref(1).eventId, ref(2).eventId])
+  })
+
+  it('falls back to a detail-less notice subject without borrowing siblings', () => {
+    const items = [itemWith('a', [], { subject: { behavior: 'r', target: 't' }, evidence: ref(1) }),
+      itemWith('b', [entry(null), entry(ref(2))])]
+    const refs = expandedImpactRefs(items, new Set(['a', 'b']))
+    expect([...refs.keys()]).toEqual([ref(1).eventId, ref(2).eventId])
+  })
+
+  it('retries placeholders but backs off recent failures and resolutions', () => {
+    const now = 1_000_000
+    const reads = impacts({ [ref(1).eventId]: { value: null, message: 'Reading workspace chain evidence…', at: 0 },
+      [ref(2).eventId]: { value: null, message: 'Workspace chain evidence is unavailable.', at: now },
+      [ref(3).eventId]: { value: { impact: 'blocked' } as WorkImpactRead['value'], message: '', at: now } })
+    const current = new Map([1, 2, 3, 4].map(n => [ref(n).eventId, ref(n)]))
+    expect(pendingImpactRefs(current, reads, now).refs.map(entry => entry.eventId)).toEqual(
+      [ref(4).eventId, ref(1).eventId])
+  })
+
+  it('retries failures past their TTL alongside expired resolutions', () => {
+    const now = 1_000_000
+    const value = { impact: 'blocked' } as WorkImpactRead['value']
+    const reads = impacts({ [ref(1).eventId]: { value: null, message: 'Workspace chain evidence is unavailable.', at: now - IMPACT_TTL_MS },
+      [ref(2).eventId]: { value, message: '', at: now - IMPACT_TTL_MS } })
+    const current = new Map([1, 2, 3].map(n => [ref(n).eventId, ref(n)]))
+    expect(pendingImpactRefs(current, reads, now).refs.map(entry => entry.eventId)).toEqual(
+      [ref(3).eventId, ref(1).eventId, ref(2).eventId])
+  })
+
+  it('revalidates resolutions past their TTL behind never-tried entries', () => {
+    const now = 1_000_000
+    const value = { impact: 'blocked' } as WorkImpactRead['value']
+    const reads = impacts({ [ref(1).eventId]: { value, message: '', at: now - IMPACT_TTL_MS },
+      [ref(2).eventId]: { value, message: '', at: now - IMPACT_TTL_MS + 1 } })
+    const current = new Map([1, 2, 3].map(n => [ref(n).eventId, ref(n)]))
+    expect(pendingImpactRefs(current, reads, now).refs.map(entry => entry.eventId)).toEqual(
+      [ref(3).eventId, ref(1).eventId])
+  })
+
+  it('reads never-tried entries before retrying failures behind the cap', () => {
+    const events = Array.from({ length: 25 }, (_, index) => ref(index + 1))
+    const current = new Map(events.map(entry => [entry.eventId, entry]))
+    const failed: Record<string, WorkImpactRead> = {}
+    for (const entry of events.slice(0, 20)) failed[entry.eventId] = { value: null, message: 'Workspace chain evidence is unavailable.', at: 1_000_000 - IMPACT_TTL_MS }
+    const pending = pendingImpactRefs(current, impacts(failed), 1_000_000)
+    expect(pending.refs.slice(0, 5).map(entry => entry.eventId)).toEqual(events.slice(20).map(entry => entry.eventId))
+    expect(pending.refs).toHaveLength(20)
+    const resolved = impacts({ [events[20].eventId]: { value: { impact: 'blocked' } as WorkImpactRead['value'], message: '', at: 1_000_000 } })
+    expect(pendingImpactRefs(current, resolved, 1_000_000).refs.map(entry => entry.eventId)).not.toContain(events[20].eventId)
+  })
+
+  it('rotates the due window so failures cannot starve an expired resolution', () => {
+    const now = 1_000_000
+    const value = { impact: 'blocked' } as WorkImpactRead['value']
+    const events = Array.from({ length: 25 }, (_, index) => ref(index + 1))
+    const current = new Map(events.map(entry => [entry.eventId, entry]))
+    const states: Record<string, WorkImpactRead> = {}
+    for (const entry of events.slice(0, 20)) states[entry.eventId] = { value: null, message: 'Workspace chain evidence is unavailable.', at: now - IMPACT_TTL_MS }
+    for (const entry of events.slice(20)) states[entry.eventId] = { value, message: '', at: now - IMPACT_TTL_MS }
+    const reads = impacts(states)
+    const first = pendingImpactRefs(current, reads, now, 0)
+    expect(first.refs).toHaveLength(20)
+    expect(first.cursor).toBe(20)
+    const second = pendingImpactRefs(current, reads, now, first.cursor)
+    expect(second.refs.slice(0, 5).map(entry => entry.eventId)).toEqual(events.slice(20).map(entry => entry.eventId))
+    expect(second.refs).toHaveLength(20)
   })
 })

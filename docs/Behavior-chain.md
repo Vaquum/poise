@@ -574,6 +574,14 @@ submissions during their ordinary bounded reconciliation, including open `poise`
 seeds whose only PR closed unmerged; no Resume or extra poller is needed.
 Reporting preserves the source hold, uncertainty and ownership and does not
 perform recovery.
+The initial report body includes a dated snapshot of the same
+[verified work impact](Logging.md#native-logging-view) used by Logging and existing
+Notifications. It names the work, stage, last verified progress and known retry or
+action, with journal evidence linked on the owning workspace when its service
+origin is configured; local reports retain the workspace-relative journal path.
+These destinations retain their normal access checks. Missing or unavailable
+optional annotation is explicit and cannot prevent an otherwise eligible report
+from filing. Later recovery never rewrites the snapshot or files another report.
 In service deployments, set it in `deploy/.env` or as a fork's Actions repository
 variable. The gateway reconciles it through trusted service configuration on
 compatible running workspaces, including when image and release already match.

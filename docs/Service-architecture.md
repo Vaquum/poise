@@ -1373,7 +1373,7 @@ unchanged polls cannot refresh it. Stale/incomplete evidence stays explicit.
 This adds no observation, scheduler, event type, scope or execution authority.
 [Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
 
-Logging list snapshots may independently read `/api/behavior-chains` with exact
+Logging incident details, list snapshots and existing browser Notification entries may independently read `/api/behavior-chains` with exact
 `callId` and/or `correlationId` selectors for a read-only work-impact annotation
 shared with expanded details. `batch=1` accepts up to 100 paired, repeated
 `callId`/`correlationId` parameters (empty means absent, at least one per pair)
@@ -1385,6 +1385,9 @@ This uses the existing owner workspace boundary and canonical journal, including
 completed chains. Ambiguous or missing matches remain unknown, as does a failed
 workspace read; central Logging queries and retained evidence remain independent.
 No gateway read, scope, ingestion or execution authority is added.
+Initial remediation report bodies retain a dated snapshot of this projection;
+later recovery does not rewrite it. Optional annotation failure leaves impact
+unknown and does not consume the report's creation attempt.
 
 Invocation summaries may also carry retained original publication-plan absence
 and recovery evidence. Logging displays the original Call and restoration

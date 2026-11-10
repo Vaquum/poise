@@ -1,6 +1,6 @@
 import { LOCAL_NOTICE_KINDS } from '../notices'
-import { evidenceReferences } from '../../gateway/src/diagnostics/evidence-contract'
-import { loggingHref } from '../logging'
+import { evidenceReferences, type DiagnosticEvidence, type EvidenceAttachment } from '../../gateway/src/diagnostics/evidence-contract'
+import { loggingAccess, loggingEvent, loggingHref, loggingWorkImpacts, type LoggingEvent, type LoggingWorkImpact } from '../logging'
 import { cancelMotion, disclosure, layout, retire, scrollToActor, spring, watchPanel } from '../motion'
 import { patchContent } from '../dom-patch'
 import { BEHAVIORS, getBehaviorDiagnostics, refreshState } from '../behaviors'
@@ -139,15 +139,60 @@ function slug(id: string): string {
 
 const icon = (name: ItemIcon) => `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">${ICONS[name]}</svg>`
 
+export type WorkImpactRead = { value: LoggingWorkImpact | null, message: string, at: number }
+
+/** Resolved impacts revalidate on this cadence: staleness stays bounded
+ *  while untried entries keep batch priority. */
+export const IMPACT_TTL_MS = 60_000
+
+/** First evidence reference per expanded entry, keyed by event. An entry
+ *  never borrows another entry's link; a detail-less notice falls back to
+ *  its own subject. */
+export function expandedImpactRefs(items: readonly NotificationItem[], expanded: ReadonlySet<string>): Map<string, DiagnosticEvidence> {
+  return new Map(items.filter(item => expanded.has(item.id)).flatMap<EvidenceAttachment>(item =>
+    item.details.length ? item.details.filter(entry => entry.behavior && entry.target) : item.notice?.subject ? [item.notice] : [])
+    .flatMap(entry => evidenceReferences(entry).slice(0, 1)).map(ref => [ref.eventId, ref]))
+}
+
+/** Batch order with a rotating due window: never-tried refs first, then
+ *  TTL-due revalidations (failures and expired resolutions alike) from a
+ *  cursor that advances past every taken ref, so no entry waits behind the
+ *  cap indefinitely while any batch runs. Failures back off on the same
+ *  cadence instead of retrying immediately ahead of expired resolutions.
+ *  Returns the refs and the advanced cursor. */
+export function pendingImpactRefs(current: Map<string, DiagnosticEvidence>, impacts: ReadonlyMap<string, WorkImpactRead>, now: number, cursor = 0): { refs: DiagnosticEvidence[], cursor: number } {
+  const fresh: DiagnosticEvidence[] = []
+  const due: DiagnosticEvidence[] = []
+  for (const ref of current.values()) {
+    const known = impacts.get(ref.eventId)
+    if (!known) fresh.push(ref)
+    else if (now - known.at >= IMPACT_TTL_MS) due.push(ref)
+  }
+  const start = due.length ? cursor % due.length : 0
+  const rotated = [...due.slice(start), ...due.slice(0, start)]
+  const refs = [...fresh, ...rotated].slice(0, 20)
+  const taken = refs.length - Math.min(fresh.length, 20)
+  return { refs, cursor: due.length ? (cursor + taken) % due.length : 0 }
+}
+
+function workImpactHtml(entry: EvidenceAttachment, impacts: ReadonlyMap<string, WorkImpactRead>, now: number): string {
+  const ref = evidenceReferences(entry)[0]
+  const state = ref ? impacts.get(ref.eventId) : null
+  const work = state?.value
+  return `<span class="nr-work-impact" role="region" aria-label="Verified work impact">${work
+    ? `Current impact: ${escapeHtml(work.impact)}. Work target: ${escapeHtml(work.target)}. Work stage: ${escapeHtml(work.stage)}. Last verified progress: <time datetime="${new Date(work.progressAt).toISOString()}">${clock(new Date(work.progressAt).toISOString(), now)}</time>. ${work.retryAt === null ? '' : `Next retry: <time datetime="${new Date(work.retryAt).toISOString()}">${clock(new Date(work.retryAt).toISOString(), now)}</time>. `}${work.nextAction ? `Next action: ${escapeHtml(work.nextAction)}. ` : ''}${work.recovered ? 'Matched failure recovered; verified progress followed this invocation failure. ' : ''}<a class="nr-link" href="${escapeHtml(work.journal)}" target="_blank" rel="noopener noreferrer">Journal evidence</a>`
+    : `Current impact: unknown. ${escapeHtml(state?.message ?? (ref ? 'Reading workspace chain evidence…' : 'No exact managed-work association is available.'))}`}</span>`
+}
+
 /** One entry as the rail lays it out; `opened` says whether it is expanded. */
-export function itemHtml(item: NotificationItem, opened: boolean, now: number): string {
+export function itemHtml(item: NotificationItem, opened: boolean, now: number, impacts: ReadonlyMap<string, WorkImpactRead> = new Map()): string {
   const id = `nr-details-${slug(item.id)}`
   // A Poise-wide condition's scope can repeat its source: "Behaviors · Behaviors".
   const meta = [item.source, item.scope === item.source ? null : item.scope, item.meta].filter(Boolean).map((part) => escapeHtml(part!)).join(' · ')
   const when = item.when && Number.isFinite(Date.parse(item.when)) ? `<time datetime="${escapeHtml(item.when)}">${ago(item.when, now)}</time>` : ''
   const linked = new Set<string>()
   const history = item.details.length
-    ? `<ol class="nr-history">${item.details.map((entry) => `<li>${entry.at && Number.isFinite(Date.parse(entry.at)) ? `<time datetime="${escapeHtml(entry.at)}">${clock(entry.at, now)}</time>` : ''}<span>${escapeHtml(entry.detail)}${nextCheck(entry, now)}${entryLink(entry, linked)}</span></li>`).join('')}</ol>`
+    ? `<ol class="nr-history">${item.details.map((entry) => `<li>${entry.at && Number.isFinite(Date.parse(entry.at)) ? `<time datetime="${escapeHtml(entry.at)}">${clock(entry.at, now)}</time>` : ''}<span>${escapeHtml(entry.detail)}${nextCheck(entry, now)}${entryLink(entry, linked)}${entry.behavior && entry.target ? workImpactHtml(entry, impacts, now) : ''}</span></li>`).join('')}</ol>`
     : ''
   const notice = item.notice
   const label = notice?.target ? openLabel(notice.target) : null
@@ -167,7 +212,7 @@ export function itemHtml(item: NotificationItem, opened: boolean, now: number): 
     + `<span class="nr-chip">${icon(item.icon)}</span>`
     + `<span class="nr-card-text"><span class="nr-card-title">${escapeHtml(item.title)}</span>${item.body ? `<span class="nr-card-body">${escapeHtml(item.body)}</span>` : ''}<span class="nr-card-meta">${meta}</span></span>`
     + `<span class="nr-card-side">${when}<span class="nr-chev">${ICON_DOWN}</span></span></button>`
-    + `<div class="nr-details" id="${id}"${opened ? '' : ' hidden'}>${history}${evidenceNote ? `<p class="nr-evidence-note">${escapeHtml(evidenceNote)}</p>` : ''}${actions ? `<div class="nr-actions">${actions}</div>` : ''}</div>`
+    + `<div class="nr-details" id="${id}"${opened ? '' : ' hidden'}>${history}${notice?.subject && !item.details.length ? workImpactHtml(notice, impacts, now) : ''}${evidenceNote ? `<p class="nr-evidence-note">${escapeHtml(evidenceNote)}</p>` : ''}${actions ? `<div class="nr-actions">${actions}</div>` : ''}</div>`
     + '</article>'
 }
 
@@ -236,6 +281,10 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   // are counted by the bell; only later ones arrive as cards.
   let primed = false
   const expanded = new Set<string>()
+  const impacts = new Map<string, WorkImpactRead>()
+  let impactRequest: AbortController | null = null
+  let quietImpactRender = false
+  let dueCursor = 0
   const announced = new Set<string>()
   const toastTimers = new Map<HTMLElement, number>()
 
@@ -275,7 +324,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
 
   function groupHtml(group: typeof GROUPS[number], list: readonly NotificationItem[], now: number): string {
     const label = `<span class="nr-group-name">${group.label}</span><span class="nr-group-count">${list.length}</span><span class="nr-group-note">${group.note}</span>`
-    const cards = list.map((item) => itemHtml(item, expanded.has(item.id), now)).join('')
+    const cards = list.map((item) => itemHtml(item, expanded.has(item.id), now, impacts)).join('')
     // Automatic recovery stays folded behind its count while anything else is listed.
     const folds = group.key === 'auto' && filter === 'all' && scoped().some((item) => item.group !== 'auto')
     if (!folds) return `<section class="nr-group" data-key="group-${group.key}" data-group="${group.key}" aria-label="${group.label}"><h3 class="nr-group-label">${label}</h3>${cards}</section>`
@@ -304,6 +353,79 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
       for (const card of [...body.querySelectorAll<HTMLElement>('.nr-card')]) if (!staying.has(card.dataset.id!)) retire(card)
       patchContent(body, sections || emptyHtml(), retire)
     }, '.nr-card, .nr-group-label, .nr-empty')
+    void readWorkImpacts()
+  }
+
+  async function readWorkImpacts(): Promise<void> {
+    if (!opened || impactRequest) return
+    // A batch's own aftermath render never refetches: failures retry on the
+    // next external trigger, not in the same breath.
+    if (quietImpactRender) { quietImpactRender = false; return }
+    const current = expandedImpactRefs(items, expanded)
+    for (const id of [...impacts.keys()]) if (!current.has(id)) impacts.delete(id)
+    const pending = pendingImpactRefs(current, impacts, Date.now(), dueCursor)
+    dueCursor = pending.cursor
+    const refs = pending.refs
+    if (!refs.length) return
+    const request = new AbortController()
+    impactRequest = request
+    // Render only on changed outcomes: failed reads retry on later triggers,
+    // and an unconditional render here would refetch them in a tight loop.
+    const seen = new Map<string, string>()
+    const record = (eventId: string, value: LoggingWorkImpact | null, message: string): void => {
+      impacts.set(eventId, { value, message, at: Date.now() })
+      if (seen.get(eventId) !== `${value !== null}:${message}`) dirty = true
+    }
+    let dirty = false
+    for (const ref of refs) {
+      const previous = impacts.get(ref.eventId)
+      seen.set(ref.eventId, `${previous?.value != null}:${previous?.message}`)
+      // Stale-while-revalidate: only untried refs show a placeholder; known
+      // ones keep their display until the new outcome lands.
+      if (!previous) impacts.set(ref.eventId, { value: null, message: 'Reading workspace chain evidence…', at: 0 })
+    }
+    try {
+      const access = await loggingAccess(request.signal)
+      // The existing Logging worker admits two reads per owner: event reads
+      // stay sequential, then one batch read covers them all.
+      const fetched = new Map<string, LoggingEvent>()
+      for (const ref of refs) {
+        if (request.signal.aborted) return
+        try {
+          const { event } = await loggingEvent(access, ref.eventId, 'workspace', request.signal)
+          fetched.set(ref.eventId, event)
+        } catch {
+          if (!request.signal.aborted) record(ref.eventId, null, 'Workspace chain evidence is unavailable.')
+        }
+      }
+      if (!fetched.size || request.signal.aborted) return
+      try {
+        const batch = await loggingWorkImpacts(access, [...fetched.values()], request.signal)
+        if (request.signal.aborted) return
+        for (const [eventId, event] of fetched) {
+          record(eventId, batch.get(event.id) ?? null, 'No unambiguous managed chain invocation matches this evidence.')
+        }
+      } catch {
+        if (!request.signal.aborted) for (const eventId of fetched.keys()) record(eventId, null, 'Workspace chain evidence is unavailable.')
+      }
+    } catch {
+      if (!request.signal.aborted) for (const ref of refs) record(ref.eventId, null, 'Workspace chain evidence is unavailable.')
+    } finally {
+      if (impactRequest === request) {
+        impactRequest = null
+        if (dirty && opened) { quietImpactRender = true; renderRail() }
+      }
+    }
+  }
+
+  // Only closing aborts a batch: the feed republishes unchanged results
+  // every 10 seconds, so aborting there would restart a sequential batch
+  // from its first reference and starve later entries. An in-flight batch
+  // runs to completion across republishes; the next render picks up the
+  // remaining refs.
+  function abortWorkImpacts(): void {
+    impactRequest?.abort()
+    impactRequest = null
   }
 
   function emptyHtml(): string {
@@ -347,6 +469,10 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
   function setOpen(next: boolean, focus: 'rail' | 'bell' | null = null): void {
     if (opened !== next) {
       opened = next
+      // A fresh display on every open: chain state may have moved while the
+      // rail was closed. Republishes keep their cache; only opens reset it.
+      if (next) { impacts.clear(); dueCursor = 0 }
+      else abortWorkImpacts()
       // watchPanel sets this too, but only once its observer runs: the rail
       // must take focus now.
       rail.inert = !next
@@ -398,6 +524,7 @@ export function mountNotificationRail(feed: NoticeFeed, actions: RailActions): N
     card.classList.toggle('is-open', open)
     card.querySelector<HTMLElement>('.nr-card-head')!.setAttribute('aria-expanded', String(open))
     disclosure(details, open)
+    if (open) void readWorkImpacts()
   }
 
   function act(action: string, id: string, toast: HTMLElement | null): void {
