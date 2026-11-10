@@ -23,6 +23,7 @@ beforeAll(async () => {
 beforeEach(() => {
   database.db.prepare('DELETE FROM alerts').run()
   database.setMeta('account_logins', '{}')
+  database.setMeta('account_runtime_rejection:codex', '')
 })
 
 const AT = '2026-10-20T06:00:00.000Z'
@@ -50,6 +51,30 @@ const held = (login: string, signedIn = true): GhAccount => ({ login, active: fa
 const nobody = { me: '', agentAccount: '' }
 
 describe('sign-in alerts from Connected accounts', () => {
+  it('keeps a runtime rejection with its stage, work and redacted cause until a later native request succeeds', async () => {
+    const logins = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 1000
+    const failure = { callId: 'a'.repeat(32), model: 'gpt-6-astra-ultra', rejectedAt,
+      phase: 'issue_review / provider_execution', work: 'example/repo#7',
+      cause: 'Your refresh token was already used.\nAuthorization: Bearer private-value' }
+    producers.providerSignInRejected('codex', failure)
+    producers.providerSignInRejected('codex', failure)
+    producers.accountsChecked([cli('codex', true)], nobody)
+    expect(open()).toEqual(['sign-in:codex'])
+    expect(rows()).toHaveLength(1)
+    expect(rows()[0].body).toContain('issue_review / provider_execution for example/repo#7')
+    expect(rows()[0].body).toContain('already used')
+    expect(rows()[0].body).not.toContain('private-value')
+    logins.recordProviderRecovery('codex', failure.callId, rejectedAt - 1)
+    producers.accountsChecked([cli('codex', true)], nobody)
+    expect(open()).toEqual(['sign-in:codex'])
+    logins.recordProviderRecovery('codex', failure.callId, Date.now())
+    producers.accountsChecked([cli('codex', true)], nobody)
+    expect(open()).toEqual([])
+    producers.providerSignInRejected('codex', failure)
+    expect(open()).toEqual([])
+  })
+
   it('alert once for a configured CLI that says it is not signed in, until it says it is', () => {
     configured({ codex: AT })
     producers.accountsChecked([cli('codex', false)], nobody)

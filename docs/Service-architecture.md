@@ -768,10 +768,20 @@ not use the gateway's discarded OAuth token.
     the person's own account and the GitHub automation account while gh does
     not hold it signed in. A provider with no configuration record raises no
     sign-in demand, and a stale demand clears once the provider reads as
-    unconfigured. Each clears once signed in again; Claude's alert stays its
+    unconfigured. Status-based conditions clear once signed in again; Claude's alert stays its
     auth monitor's, gated on the same participation. In service mode Poise
     also reads the accounts every 15 minutes, so the alerts come while the
     browser is closed. They open `/?settings=accounts`, Settings → Accounts.
+    A native Codex credential rejection raises the same condition immediately,
+    retaining the affected stage, issue and redacted cause. It survives a status
+    poll that still reports signed in. After a fresh successful Connect,
+    Accounts attempts one native verification (30 seconds, 64 KiB), forcing the
+    review's ChatGPT login route and removing API-key/base-URL overrides.
+    A successful response after the latest rejection clears the condition and
+    permits one early review probe through existing admission. Failed
+    verification requires another Connect; a failed review probe cannot reuse
+    old recovery evidence. Successful native reviews on that route also prove
+    recovery. Quota backoff and uncertain publication retain their own gates.
   - Participation: a provider takes part in model maintenance when
     `account_logins` records it, or when its live status positively verifies
     a usable sign-in (Claude/Codex; the observation is then recorded, so a

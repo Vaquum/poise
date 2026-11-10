@@ -216,6 +216,16 @@ Admission-mode transitions use `admission.changed` events under the reserved `@b
 
 Native Call rows and immutable action plans record effect intent before controlled publication. They provide execution evidence to the journal, not a second phase controller. Unique native correlations prevent duplicate processes from executing the same admission. Worker resource settlement is required before a handoff; a terminal model result is insufficient. A restart or interrupted process is reconciled against the original invocation, pushed branch, posted comments and exact-head review receipts.
 
+Verified Codex sign-in recovery can retire issue-review retry accounting through
+the existing journal resume event. Every affected attempt must belong to that
+credential-rejection episode, prove `not_started` / `preflight_failed`, retain
+`receipts=null`, and have positively settled resources. Only the matching
+automatic three-failure hold is resumed; operator holds, other failures and
+uncertain publication remain held. A bounded page of these automatic holds is
+checked before their ordinary observation cadence, without another GitHub read.
+The provider's fresh recovery allowance is consumed by the existing reviewer
+probe admission, so repeated recovery reads cannot launch another probe.
+
 Native request digests use Caller's recursively sorted JSON encoding.
 Journal event/state and plan hashes keep their original serialization, while response
 digests verify the original retained bytes. These are separate contracts;

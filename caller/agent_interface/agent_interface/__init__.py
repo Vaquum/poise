@@ -1205,7 +1205,7 @@ def run_issue_review(
             except issue_review.InvalidReview as e:
                 fail(e, e.code)
             except issue_review.ProviderFailure as e:
-                fail(e, e.code)
+                fail(e, e.code, preflight=True)
             except subprocess.TimeoutExpired as e:
                 fail(review_budget.ReviewLimitError(
                     "Issue review reached its time limit; needs attention",
@@ -1305,6 +1305,10 @@ def _issue_review_with_recovery(spec, recovery, repo, number, data, actor, note,
         try:
             return recovery.identity, issue_review.review(recovery, repo, number, data, actor, note, run_dir / "attempt-2")
         except Exception as error:
+            # A credential rejection on the recovery route must keep its
+            # authentication_failed diagnostic so the sign-in condition can fire.
+            if isinstance(error, issue_review.ProviderFailure) and error.code == "authentication_failed":
+                raise
             raise review_budget.ReviewLimitError(
                 f"{recovery.identity} recovery failed; needs attention: {error}", "review_recovery_failed") from error
 

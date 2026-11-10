@@ -21,6 +21,8 @@ export interface ChainRuntimeOperations {
   reportHold?(chain: BehaviorChain): Promise<string | null>
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
+  authenticationRejected?(call: LogEntry): void
+  authRecovered?(invocation: ChainInvocation): boolean
   available(): boolean
   capacity(): number
   /** Override for the synchronous admission-boundary probe; production and
@@ -117,6 +119,7 @@ export class BehaviorChainRuntime {
   private running = false
   private cursor = ''
   private reconciliationCursor = ''
+  private authenticationCursor = ''
 
   constructor(readonly journal: BehaviorChainJournal, private readonly operations: ChainRuntimeOperations) {}
 
@@ -216,6 +219,17 @@ export class BehaviorChainRuntime {
         console.error('[behavior-chain] intake failed; admitted chains continue', intakeError)
       }
       const began = Date.now()
+      // Auth-only automatic holds need no new GitHub read to retire their
+      // retry boundary. Do this before the ordinary held-chain cadence.
+      let authHolds = this.journal.authenticationHolds(this.authenticationCursor)
+      if (!authHolds.length && this.authenticationCursor) {
+        this.authenticationCursor = ''
+        authHolds = this.journal.authenticationHolds('')
+      }
+      for (const held of authHolds) {
+        this.authenticationCursor = held.id
+        if (this.operations.ownsRepository(held.repository)) this.recoverAuthentication(held)
+      }
       let observationError: Error | null = null
       const conflicted = new Set<string>()
       for (const deferred of [false, true]) {
@@ -261,6 +275,7 @@ export class BehaviorChainRuntime {
                 continue
               }
               chain = await this.reconcile(chain, chainSnapshot)
+              chain = this.recoverAuthentication(chain)
               const direct = chain.invocations.find((invocation) => invocation.state !== 'settled' && attributedNativeAction(invocation))
               if (chain.mergeSha && direct && this.recoverNativeAction(chain, direct)) continue
               const owned = chain.invocations.find((invocation) => invocation.state !== 'settled'
@@ -525,6 +540,9 @@ export class BehaviorChainRuntime {
       throw new Error(`native action target conflicts with behavior admission ${invocation.id}`)
     }
     if (call.status === 'running') return chain
+    // Authentication is actionable even while native cleanup still owns the
+    // reservation. Reconciliation below continues to require release proof.
+    if (invocation.evidence?.callId !== call.id) this.operations.authenticationRejected?.(call)
     const stopped = ['stopped', 'stopping'].includes(call.error_code || '')
     const resourceStopped = ['resource_memory_exceeded', 'resource_disk_exceeded', 'resource_measurement_unavailable', 'resource_receipt_unavailable'].includes(call.error_code || '')
     const workBlocked = call.error_code === 'atomic_work_blocked'
@@ -606,7 +624,9 @@ export class BehaviorChainRuntime {
       this.operations.wake()
       return this.current(chain)
     }
-    if (call.status === 'failed' && call.action !== 'not_started' && ['implement-issue', 'repair-pr', 'review-issue', 'review-pr', 'approve-pr'].includes(invocation.behavior)) {
+    const possibleWrite = call.action !== 'not_started' || invocation.behavior === 'review-issue'
+      && (call.receipts != null || call.review_id != null || call.head_sha != null)
+    if (call.status === 'failed' && possibleWrite && ['implement-issue', 'repair-pr', 'review-issue', 'review-pr', 'approve-pr'].includes(invocation.behavior)) {
       if (invocation.state === 'uncertain' && invocation.evidence?.callId === call.id) {
         const evidence = { ...receipt(call), callId: call.id }
         if (!resourceReleaseProven(invocation.evidence, true)) this.operations.received(invocation, call)
@@ -626,6 +646,30 @@ export class BehaviorChainRuntime {
     if (call.status === 'failed' && call.action !== 'not_started') return this.append(chain, { type: 'chain.held',
       reason: `behavior invocation ${invocation.id} failed after a possible write; its artifact needs reconciliation` })
     return chain
+  }
+
+  private recoverAuthentication(chain: BehaviorChain): BehaviorChain {
+    if (chain.mergeSha || chain.invocations.some(invocation => invocation.state !== 'settled')) return chain
+    const attempts = chain.invocations.filter(invocation => invocation.admissionSequence > chain.resumedAfterSequence
+      && invocation.evidence?.status !== 'completed' && invocation.evidence?.status !== 'deferred')
+    if (!attempts.length) return chain
+    const last = attempts.at(-1)!
+    // Only the trailing episode on this slot can own the automatic hold: an
+    // earlier slot's failed invocation (even after its own success, which the
+    // filter above already drops) must not block a later slot's recovery.
+    let start = attempts.length - 1
+    while (start > 0 && attempts[start - 1].basis === last.basis && attempts[start - 1].slot === last.slot) start--
+    const episode = attempts.slice(start)
+    if (!episode.length || episode.some(invocation => invocation.behavior !== 'review-issue'
+      || invocation.evidence?.status !== 'failed' || invocation.evidence.action !== 'not_started'
+      || invocation.evidence.outcome !== 'preflight_failed' || invocation.evidence.receipts !== null
+      || invocation.evidence.review_id != null || invocation.evidence.head_sha != null
+      || !resourceReleaseProven(invocation.evidence, true) || !this.operations.authRecovered?.(invocation))) return chain
+    const automaticHold = `review-issue failed before publication three times: ${String(last.evidence?.error || 'native failure')}`
+    if (chain.held && (episode.length !== 3 || chain.held !== automaticHold)) return chain
+    // The existing journal resume moves the retry boundary. Old failures,
+    // publication evidence and resource receipts remain immutable.
+    return this.append(chain, { type: 'chain.resumed' })
   }
 
   private async start(chain: BehaviorChain, invocation: ChainInvocation): Promise<void> {

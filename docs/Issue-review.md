@@ -191,6 +191,14 @@ checkout* and *Posting review comments*.
   the next configured reviewer takes its place, or the review waits when none
   is healthy. The trip retries on the usual backoff and clears when the
   reviewer succeeds again.
+- A confirmed Codex credential rejection retains its redacted native cause and
+  records `authentication_failed`, `not_started` / `preflight_failed` before
+  posting. It immediately raises the existing Accounts sign-in condition with
+  the stage and issue. A status command still saying signed in cannot clear it.
+  After a fresh successful Connect, Accounts makes one bounded native ChatGPT
+  request with the review's credential route and no API-key overrides. Success
+  permits one early reviewer probe; another failure cannot reuse that evidence.
+  Unrelated quota and rate-limit backoff keeps its existing retry time.
 - A worker whose launch was never recorded — the process died in between — is
   taken over by a later scan after five minutes. One that has not yet
   registered its run is not relaunched while it is still alive.
