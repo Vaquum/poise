@@ -211,7 +211,7 @@ class TestIssueReviewRun(IssueReviewCase):
 
     def test_a_run_that_fails_before_posting_records_no_receipts(self):
         row, printed = self.run_review(FakeGitHub(), agent_writes(None, code=1), expect_exit=True)
-        self.assertEqual((row["status"], row["action"], row["outcome"]), ("failed", None, None))
+        self.assertEqual((row["status"], row["action"], row["outcome"]), ("failed", "not_started", "preflight_failed"))
         self.assertIsNone(self.exported(row)["receipts"])
         self.assertIn("provider failed", row["error"])
         self.assertFalse((issue_review.WORK_ROOT / row["id"]).exists())
@@ -310,6 +310,27 @@ class TestIssueReviewRun(IssueReviewCase):
         with patch.object(issue_review, "review", side_effect=review):
             row, _ = self.run_review(FakeGitHub(), agent_writes(None), recovery="gpt-6-astra-ultra", expect_exit=True)
         self.assertEqual((row["status"], row["error_code"], row["recovery_model"]), ("failed", "review_budget_exhausted", None))
+
+    def test_a_credential_rejection_on_the_recovery_route_keeps_its_sign_in_condition(self):
+        attempts = []
+
+        def review(model, repo, number, data, actor, note, work):
+            attempts.append(model.identity)
+            if len(attempts) == 1:
+                raise review_budget.ReviewLimitError("Claude's response exceeded the 64000 output token maximum")
+            raise issue_review.ProviderFailure("Your refresh token was already used", "authentication_failed",
+                {"version": 1, "source": "caller", "severity": "error", "operation": "provider.review",
+                 "phase": "provider_execution", "outcome": "exit", "stderr": "refresh already used",
+                 "stderr_truncated": False, "provider": "codex", "submission": "none"})
+
+        with patch.object(issue_review, "review", side_effect=review):
+            row, _ = self.run_review(FakeGitHub(), agent_writes(None), recovery="gpt-6-astra-ultra", expect_exit=True)
+        self.assertEqual(attempts, ["opus-5-max", "gpt-6-astra-ultra"])
+        self.assertEqual((row["status"], row["error_code"], row["action"], row["outcome"], row["recovery_model"]),
+                         ("failed", "authentication_failed", "not_started", "preflight_failed", "gpt-6-astra-ultra"))
+        exported = self.exported(row)
+        self.assertEqual(exported["diagnostic"]["operation"], "provider.review")
+        self.assertIsNone(exported["receipts"])
 
 
 class TestRevisionBoundReview(IssueReviewCase):
@@ -1014,6 +1035,16 @@ class TestVerifiedResultsOrExplicitFailures(IssueReviewCase):
             (1, "", "review_provider_exit", "claim-1", "provider failed"),
             (0, json.dumps({"type": "turn.failed", "message": "boom"}) + "\n", "review_provider_error",
              "claim-2", "boom"),
+            (1, json.dumps({"type": "error", "message": "stream disconnected"}) + "\n"
+             + json.dumps({"type": "turn.failed", "error": {"message":
+                 "Your refresh token could not be refreshed because it was already used. Authorization: Bearer secret"}}) + "\n",
+             "authentication_failed", "claim-3", "not be refreshed because it was already used."),
+            (1, json.dumps({"type": "turn.failed", "error": {"message": "refresh token request failed: connection reset by peer"}}),
+             "review_provider_exit", "claim-4", "connection reset by peer"),
+            (1, json.dumps({"type": "turn.failed", "error": {"message": "HTTP 429 Too Many Requests"}}),
+             "review_provider_exit", "claim-5", "HTTP 429 Too Many Requests"),
+            (1, json.dumps({"type": "turn.failed", "error": {"message": "GitHub 401 Unauthorized"}}),
+             "review_provider_exit", "claim-6", "GitHub 401 Unauthorized"),
         )
         for code, stdout, expected_code, claim, expected_error in cases:
             with self.subTest(expected_code=expected_code):
@@ -1031,10 +1062,14 @@ class TestVerifiedResultsOrExplicitFailures(IssueReviewCase):
                 self.assertEqual(exported["status"], "failed")
                 self.assertEqual(exported["error_code"], expected_code)
                 self.assertIn(expected_error, exported["error"])
+                self.assertEqual((exported["action"], exported["outcome"]), ("not_started", "preflight_failed"))
+                self.assertNotIn("secret", exported["error"])
                 diagnostic = exported["diagnostic"]
                 self.assertEqual(diagnostic["provider"], "codex")
                 self.assertEqual(diagnostic["phase"], "provider_execution")
                 self.assertEqual(diagnostic["submission"], "none")
+                self.assertIn(expected_error, diagnostic["stderr"])
+                self.assertNotIn("secret", diagnostic["stderr"])
                 self.assertTrue(diagnostic["artifact"]["present"])
                 self.assertIsNone(exported["receipts"])
                 self.assertNotIn("--comment-issue", [call[0] for call in github.calls])

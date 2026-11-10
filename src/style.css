@@ -1195,7 +1195,7 @@ tr:hover .review-btn { opacity: 1; }
   margin-bottom: 16px;
 }
 
-#menu-surface [data-chain-list], #menu-surface [data-history] {
+#menu-surface [data-chain-list], #menu-surface [data-chain-attention], #menu-surface [data-history] {
   overflow-wrap: anywhere;
 }
 

@@ -521,7 +521,7 @@ async def submit_change_request(
 def _repair_answer(thread: dict[str, Any]) -> dict[str, str] | None:
     connection = thread["comments"]
     comments = connection["nodes"]
-    if thread["isResolved"] or len(comments) < 2 or connection.get("pageInfo", {}).get("hasNextPage"):
+    if thread["isResolved"] or len(comments) < 2 or connection.get("pageInfo", {}).get("hasNextPage") is not False:
         return None
     root, reply = comments[0], comments[-1]
     author = (reply.get("author") or {}).get("login")
@@ -536,7 +536,7 @@ def _repair_answer(thread: dict[str, Any]) -> dict[str, str] | None:
         if (comment.get("author") or {}).get("login", "").lower() == author.lower():
             continue
         updated = comment.get("updatedAt")
-        if not updated or updated > created or (updated == created and updated != comment.get("createdAt")):
+        if not updated or updated >= created:
             return None
     revision = sha256(json.dumps(thread, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     return {"author": author, "revision": revision}

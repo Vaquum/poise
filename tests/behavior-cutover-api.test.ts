@@ -93,6 +93,8 @@ it('keeps a confirmed merge with an open review obligation readable while refusi
   try {
     const active = await (await fetch(`${base}?state=active`)).json()
     expect(active.chains).toEqual([expect.objectContaining({ id: pending.id, mergeSha: 'a'.repeat(40), reviewPending: true })])
+    expect(active.attention).toEqual([expect.objectContaining({ id: pending.id, nextAction:
+      'Reconcile original pre-merge review evidence; no new invocation can start after merge' })])
     const merged = await (await fetch(`${base}?state=merged`)).json()
     expect(merged.chains).toEqual([expect.objectContaining({ id: complete.id, mergeSha: 'b'.repeat(40), reviewPending: null, reviewStatus: 'not-recorded' })])
     expect(journal.read(complete.id)).not.toHaveProperty('reviewPending')

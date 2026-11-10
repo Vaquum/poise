@@ -61,21 +61,22 @@ class TestReviewSummaries(IsolatedAsyncioTestCase):
         self.client.paginate.assert_awaited_with("/repos/o/r/pulls/1/reviews")
 
     async def test_only_current_answer_to_own_feedback_can_be_verified(self):
-        def thread(root, *, feedback_edited=False, more=False, reviewer="Reviewer"):
+        def thread(root, *, edited_at=None, more=False, reviewer="Reviewer"):
             return _thread_summary({
                 "id": f"thread-{root}", "isResolved": False, "isOutdated": True,
                 "path": "fix.py", "line": None, "originalLine": root, "diffSide": "RIGHT",
                 "comments": {"pageInfo": {"hasNextPage": more}, "nodes": [
                     {"databaseId": root, "body": "Blocking defect.", "author": {"login": reviewer},
                      "createdAt": "2026-11-08T19:50:00Z",
-                     "updatedAt": "2026-11-08T19:53:00Z" if feedback_edited else "2026-11-08T19:50:00Z"},
+                     "updatedAt": edited_at or "2026-11-08T19:50:00Z"},
                     {"databaseId": root + 1000, "body": f"Fixed the defect.\n\n<!-- poise-reply {'a' * 32} {root} -->",
                      "author": {"login": "Author"}, "createdAt": "2026-11-08T19:52:00Z",
                      "updatedAt": "2026-11-08T19:52:00Z"},
                 ]},
             })
 
-        threads = [thread(1), thread(2, feedback_edited=True), thread(3, more=True), thread(4, reviewer="Other")]
+        threads = [thread(1), thread(2, edited_at="2026-11-08T19:53:00Z"), thread(3, more=True),
+                   thread(4, reviewer="Other"), thread(5, edited_at="2026-11-08T19:52:00Z")]
         pull = {"head": {"sha": HEAD}, "base": {"sha": BASE}, "user": {"login": "Author"}}
         with patch.object(pr_review, "get_pull", AsyncMock(return_value=pull)), \
                 patch.object(pr_review, "list_review_threads", AsyncMock(return_value=threads)):

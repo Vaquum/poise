@@ -168,9 +168,9 @@ class AtomicWorkLimits(TestCase):
         patch.object(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _identity: SimpleNamespace(identity="fixture-model", provider="codex"))).start()
         api.init_db()
 
-    def run_behavior(self, pull=None, expected_head=None):
+    def run_behavior(self, pull=None, expected_head=None, correlation_id="00000000-0000-4000-8000-000000000001"):
         api.run_atomic_work("example/repo#7", "author", "poise:behavior-chain",
-                            "00000000-0000-4000-8000-000000000001", "fixture-model", "poise/issue-7", pull=pull, expected_head=expected_head)
+                            correlation_id, "fixture-model", "poise/issue-7", pull=pull, expected_head=expected_head)
 
     def test_implementation_receives_its_requested_hour_instead_of_the_pr_review_cap(self):
         remaining = []
@@ -306,13 +306,12 @@ class AtomicWorkLimits(TestCase):
         self.assertIsNone(plan)
 
     def test_repair_prompts_exact_roots_and_keeps_missing_ids_after_cleanup(self):
+        earlier_answer = f"Verified the outdated finding against the repair and its regression.\n\n<!-- poise-reply {CALL} 18 -->"
         threads = [
             {"root_comment_id": 17, "is_resolved": False, "is_outdated": False, "bodies": ["private current finding"]},
-            {"root_comment_id": 18, "is_resolved": False, "is_outdated": True, "bodies": ["private outdated finding", "earlier reply"]},
+            {"root_comment_id": 18, "is_resolved": False, "is_outdated": True, "bodies": ["private outdated finding", earlier_answer]},
             {"root_comment_id": 19, "is_resolved": True, "is_outdated": False, "bodies": ["private resolved finding"]},
             {"root_comment_id": 20, "is_resolved": True, "is_outdated": True, "bodies": ["private resolved outdated finding"]},
-            {"root_comment_id": 21, "is_resolved": False, "is_outdated": True,
-             "repair_answer": {"author": "Author", "revision": "f" * 64}, "bodies": ["private already answered finding"]},
         ]
         for attempt, reply_ids in enumerate(([17], [17, 18]), 1):
             with self.subTest(reply_ids=reply_ids):
@@ -330,14 +329,15 @@ class AtomicWorkLimits(TestCase):
                     self.assertEqual(json.loads(args[args.index("--replies-json") + 1]), replies)
                     return {"outcome": "validated" if mode == "validate" else "published", "head_sha": HEAD}
 
-                replies = [{"commentId": root, "body": "Verified the finding against the repair and its regression."} for root in reply_ids]
+                replies = [{"commentId": root, "body": earlier_answer if root == 18 else "Verified the finding against the repair and its regression."}
+                           for root in reply_ids]
 
                 def worker(_lease, _args, **kwargs):
                     workspace = Path(kwargs["cwd"]).parent
                     workspaces.append(workspace)
                     (workspace / "publication.json").write_text(json.dumps({
                         "commitMessage": "fix: repair seed", "title": "fix: repair seed", "body": "Concrete repair and checks.",
-                        "replies": [*replies, {"commentId": 21, "body": "The fix remains in place."}], "blocked": None}))
+                        "replies": replies, "blocked": None}))
                     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
                 with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
@@ -355,7 +355,11 @@ class AtomicWorkLimits(TestCase):
                 instruction = command.call_args.args[1]
                 self.assertIn("required unresolved root comment IDs: [17, 18]", instruction)
                 self.assertIn("outdated", instruction)
-                self.assertIn("Use existing repair answers as evidence", instruction)
+                self.assertIn("already have replies", instruction)
+                self.assertIn("verbatim", instruction)
+                self.assertIn("original", instruction)
+                self.assertIn("changed reviewer input", instruction)
+                self.assertIn(earlier_answer, json.loads(instruction.split("Actual PR evidence:\n", 1)[1])["review_packet"]["review_threads"][1]["bodies"])
                 with sqlite3.connect(self.path) as conn:
                     row = conn.execute("select status,error_code,action,outcome,error,action_plan,artifact,resource_ownership from calls "
                                        "where correlation_id=?", (f"00000000-0000-4000-8000-{attempt:012d}",)).fetchone()
@@ -376,6 +380,7 @@ class AtomicWorkLimits(TestCase):
                 else:
                     self.assertEqual(modes, ["prepare", "validate", "publish"])
                     self.assertEqual((status, action, outcome), ("completed", "published", "published"))
+                    self.assertEqual(json.loads(plan)["publication"]["replies"], replies)
 
     def test_summary_only_change_request_reaches_repair_prompt_without_required_replies(self):
         review = {"id": 91, "state": "CHANGES_REQUESTED", "commit_id": HEAD, "user": {"login": "reviewer"},
@@ -431,32 +436,265 @@ class AtomicWorkLimits(TestCase):
         self.assertIn("Run the repository's required checks", instruction)
         self.assertEqual(modes, ["prepare", "validate", "publish"])
 
+    def test_atomic_work_blocked_masks_env_value_before_pattern_redaction(self):
+        credential = '{"token":"ghp_abc123","password":"opaque-secret"}'
+        reason = f"blocked by check; SERVICE_CREDENTIALS={credential}"
+        with patch.dict(os.environ, {"SERVICE_CREDENTIALS": credential}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked(reason)
+        message = str(blocked)
+        self.assertIn("[redacted]", message)
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (credential, "ghp_abc123", "opaque-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_short_env_value_keeps_header_redaction(self):
+        with patch.dict(os.environ, {"TEST_KEY": "a"}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("Authorization: Bearer my-secret")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: [redacted header]")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in ("my-secret", "Authoriz[redacted]", "Be[redacted]"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+        with patch.dict(os.environ, {"TEST_KEY": "a"}, clear=True):
+            bare = api.atomic_work.AtomicWorkBlocked("fatal: a")
+        self.assertEqual(str(bare), "atomic behavior blocked: fatal: [redacted]")
+
+    def test_atomic_work_blocked_short_env_values_masked_after_pattern_redaction(self):
+        with patch.dict(os.environ, {"TEST_KEY": "opaque-secret"}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("prefixopaque-secretsuffix and token my-secret")
+        message = str(blocked)
+        self.assertIn("[redacted]", message)
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in ("opaque-secret", "prefixopaque-secretsuffix", "my-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+        with patch.dict(os.environ, {"TEST_KEY": "token"}, clear=True):
+            masked = api.atomic_work.AtomicWorkBlocked("token my-secret")
+        self.assertEqual(str(masked), "atomic behavior blocked: [redacted credential]")
+        self.assertEqual(masked.diagnostic["message"], str(masked))
+        self.assertNotIn("my-secret", str(masked))
+        self.assertNotIn("my-secret", json.dumps(masked.diagnostic))
+
+    def test_atomic_work_blocked_overlapping_env_and_pattern_values_stay_masked(self):
+        with patch.dict(os.environ, {"TEST_KEY": "Authorization: Bearer"}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("Authorization: Bearer my-secret")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: [redacted header]")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in ("Authorization: Bearer", "my-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+        credential = "ghp_a:opaque-secret"
+        with patch.dict(os.environ, {"SERVICE_CREDENTIALS": credential}, clear=True):
+            fragmented = api.atomic_work.AtomicWorkBlocked(f"blocked {credential} end")
+        masked = str(fragmented)
+        self.assertEqual(masked, "atomic behavior blocked: blocked [redacted] end")
+        self.assertEqual(fragmented.diagnostic["message"], masked)
+        for private in (credential, "ghp_a", "opaque-secret"):
+            self.assertNotIn(private, masked)
+            self.assertNotIn(private, json.dumps(fragmented.diagnostic))
+
+    def test_atomic_work_blocked_prefix_value_keeps_header_redaction(self):
+        value = "prefix Authorization: Bearer"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("prefix Authorization: Bearer my-secret")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: prefix [redacted header]")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "my-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_env_values_match_across_whitespace_normalization(self):
+        cases = [
+            ("line1\nline2", "reason line1 line2 end"),
+            ("line1\tline2", "reason line1 line2 end"),
+            ("a  b", "reason a b end"),
+            ("  secret  ", "reason secret end"),
+            ("secret\n", "reason secret end"),
+        ]
+        for value, reason in cases:
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+                    blocked = api.atomic_work.AtomicWorkBlocked(reason)
+                message = str(blocked)
+                self.assertEqual(blocked.diagnostic["message"], message)
+                self.assertIn("[redacted]", message)
+                for private in ("line1", "line2", "a b", "secret"):
+                    if private in " ".join(value.split()) or private in value:
+                        self.assertNotIn(private, message)
+                        self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_keyword_ending_and_whitespace_variant_values_stay_masked(self):
+        with patch.dict(os.environ, {"TEST_KEY": "ghp_a Bearer"}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("ghp_a Bearer my-secret")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: [redacted] [redacted credential]")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in ("ghp_a Bearer", "ghp_a", "my-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+        credential = "ghp_a:\nopaque-secret"
+        with patch.dict(os.environ, {"SERVICE_CREDENTIALS": credential}, clear=True):
+            fragmented = api.atomic_work.AtomicWorkBlocked("blocked ghp_a: opaque-secret end")
+        masked = str(fragmented)
+        self.assertEqual(masked, "atomic behavior blocked: blocked [redacted] end")
+        self.assertEqual(fragmented.diagnostic["message"], masked)
+        for private in (credential, "ghp_a: opaque-secret", "ghp_a", "opaque-secret"):
+            self.assertNotIn(private, masked)
+            self.assertNotIn(private, json.dumps(fragmented.diagnostic))
+
+    def test_atomic_work_blocked_credential_shaped_env_value_masks_whole_before_patterns(self):
+        credential = '{"auth":"Bearer abc","password":"opaque-secret"}'
+        with patch.dict(os.environ, {"SERVICE_CREDENTIALS": credential}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked(f"blocked {credential} end")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: blocked [redacted] end")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (credential, "Bearer abc", "opaque-secret"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_trailing_keyword_value_masks_secret_prefix(self):
+        value = "opaque-prefix-12 Bearer"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("blocked opaque-prefix-12 Bearer [REDACTED] end")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: blocked [redacted] [redacted credential] end")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "opaque-prefix-12"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_keyword_wrapped_value_survives_credential_repairing(self):
+        value = "Bearer opaque-core-99 Bearer"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked(f"{value} {value}")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: [redacted credential] [redacted credential] [redacted] Bearer")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "opaque-core-99"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_header_shaped_value_masks_leading_secret(self):
+        value = "opaque-prefix-12 Authorization: Bearer ok"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked(f"seen {value}")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: seen [redacted] [redacted header]")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "opaque-prefix-12"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
+    def test_atomic_work_blocked_leading_marker_value_masks_remainder(self):
+        value = "[redacted] opaque-core-99"
+        with patch.dict(os.environ, {"TEST_KEY": value}, clear=True):
+            blocked = api.atomic_work.AtomicWorkBlocked("saw [redacted] opaque-core-99 here")
+        message = str(blocked)
+        self.assertEqual(message, "atomic behavior blocked: saw [redacted] [redacted] here")
+        self.assertEqual(blocked.diagnostic["message"], message)
+        for private in (value, "opaque-core-99"):
+            self.assertNotIn(private, message)
+            self.assertNotIn(private, json.dumps(blocked.diagnostic))
+
     def test_explicit_work_blocker_keeps_its_own_code_without_attempting_publication(self):
-        modes = []
         reason = "Review requires a product decision before implementation can continue"
+        secret = "opaque-environment-credential-crossing-cutoff"
+        shaped = "ghp_" + "s" * 40
+        prefix = "atomic behavior blocked: "
+        long_reason = "Decision needed " + "x" * 474 + secret + " tail" * 200
+        self.assertLess(long_reason.index(secret), 500)
+        self.assertGreater(long_reason.index(secret) + len(secret), 500)
+        cases = [
+            (None, reason, prefix + reason),
+            (3, reason, prefix + reason),
+            (3, {"cause": "ci_only", "reason": reason}, prefix + reason),
+            (None, f"{reason}; {shaped}; {secret}\nAuthorization: Bearer header-secret",
+             prefix + reason + "; [redacted]; [redacted] [redacted header]"),
+            (None, long_reason, prefix + ("Decision needed " + "x" * 474 + "[redacted]") + "…"),
+            (None, {"private": "unsupported reason"}, "AtomicWorkBlocked"),
+            (None, "", "AtomicWorkBlocked"),
+            (None, " \n\t", "AtomicWorkBlocked"),
+            (None, False, "AtomicWorkBlocked"),
+            (None, None, "RuntimeError"),
+        ]
+        original_track = api.track
 
-        def interface(*args, **_kwargs):
-            modes.append(args[args.index("--mode") + 1])
-            return {"outcome": "prepared", "checkout_head": HEAD}
+        def track(*args, **kwargs):
+            # Stand in for the kernel boundary with the existing v1 resource
+            # path; native Progress/finish/main retention still runs normally.
+            with patch.object(api, "_native_cli", False):
+                return original_track(*args, **kwargs)
 
-        def worker(_lease, _args, **kwargs):
-            (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({"blocked": reason}))
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        repo = Path(__file__).resolve().parents[3]
+        output = repo / "test-results"
+        output.mkdir(exist_ok=True)
+        with TemporaryDirectory(prefix="atomic-blocker-contract-", dir=output) as work:
+            root = Path(work)
+            env = {"PATH": os.environ["PATH"], "HOME": str(self.path.parent), "TMPDIR": work}
+            build = subprocess.run([str(repo / "node_modules/esbuild/bin/esbuild"),
+                                    str(repo / "tests/fixtures/behavior-fence-contract.ts"), "--bundle", "--platform=node",
+                                    "--packages=external", "--format=esm", "--target=node22", f"--outfile={root / 'contract.mjs'}"],
+                                   cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            for index, (pull, blocked, message) in enumerate(cases):
+                with self.subTest(pull=pull, case=index):
+                    modes = []
+                    correlation = f"explicit-blocker-{index}"
 
-        with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
-                patch.object(issue_review, "interface", side_effect=interface), \
-                patch.object(issue_review, "command", return_value=(["fixture"], "", {})), \
-                patch.object(issue_review, "_terminal_failure", return_value=None), \
-                patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
-                patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
-                patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
-                self.assertRaisesRegex(ValueError, reason):
-            self.run_behavior()
-        with sqlite3.connect(self.path) as conn:
-            status, code, action, outcome, plan = conn.execute("select status,error_code,action,outcome,action_plan from calls").fetchone()
-        self.assertEqual(modes, ["prepare"])
-        self.assertEqual((status, code, action, outcome), ("failed", "atomic_work_blocked", "not_started", "preflight_failed"))
-        self.assertIsNone(plan)
+                    def interface(*args, **_kwargs):
+                        if args[0] != "--issue-work":
+                            return {"review_threads": []}
+                        modes.append(args[args.index("--mode") + 1])
+                        return {"outcome": "prepared", "checkout_head": HEAD}
+
+                    def worker(_lease, _args, **kwargs):
+                        (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps({"blocked": blocked}))
+                        return SimpleNamespace(returncode=int(blocked is None), stdout="private provider output", stderr="private provider stderr")
+
+                    expected = RuntimeError if blocked is None else api.atomic_work.AtomicWorkBlocked
+                    with patch.object(issue_review, "packet", return_value={"issue": {"state": "open"}}), \
+                            patch.object(issue_review, "interface", side_effect=interface), \
+                            patch.object(issue_review, "command", return_value=(["fixture", "private prompt"], "", {})), \
+                            patch.object(issue_review, "_terminal_failure", return_value=None), \
+                            patch.object(issue_review, "stop_leftovers"), patch.object(issue_review, "_cwd_pids", return_value=[]), \
+                            patch.object(api.atomic_work.checkout_lock, "Lease", return_value=MagicMock()), \
+                            patch.object(api.atomic_work.checkout_lock, "run_gated", side_effect=worker), \
+                            patch.object(api, "track", side_effect=track), \
+                            patch.dict(os.environ, {"TEST_API_KEY": secret}, clear=True), \
+                            patch.object(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source",
+                                                      "poise:behavior-chain", "--correlation-id", correlation]), \
+                            patch.object(api, "_main", side_effect=lambda: self.run_behavior(pull, HEAD if pull else None, correlation)), \
+                            self.assertRaises(expected) as caught:
+                        api.main()
+                    call, = [row for row in api.logs() if row["correlation_id"] == correlation]
+                    self.assertEqual(modes, ["prepare"])
+                    self.assertEqual((call["status"], call["action"], call["outcome"]), ("failed", "not_started", "preflight_failed"))
+                    self.assertEqual(call["error_code"], "atomic_work_failed" if blocked is None else "atomic_work_blocked")
+                    self.assertEqual(call["error"], message)
+                    self.assertEqual(call["diagnostic"]["message"], message)
+                    self.assertIsNone(call["head_sha"])
+                    self.assertIsNotNone(call["resources_settled_at"])
+                    with api.db() as conn:
+                        self.assertIsNone(conn.execute("select action_plan from calls where id=?", (call["id"],)).fetchone()[0])
+                    if blocked is not None:
+                        self.assertEqual(str(caught.exception), message)
+                        self.assertEqual(call["diagnostic"]["submission"], "none")
+                        self.assertLessEqual(len(message), len(prefix) + 501)
+                    for private in (secret, "opaque-environment-", shaped, "header-secret", "private provider", "private prompt", "unsupported reason"):
+                        self.assertNotIn(private, json.dumps(call))
+                    diagnostic, = [event for event in api.diagnostics(limit=10)["events"] if event["id"] == call["id"]]
+                    self.assertEqual((diagnostic["error"], diagnostic["diagnostic"]["message"]), (message, message))
+                    if blocked is not None:
+                        wire = root / "call.json"
+                        wire.write_text(json.dumps([call]))
+                        consumed = subprocess.run(["node", str(root / "contract.mjs"), str(wire), "atomic-work-blocked"],
+                                                  cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+                        self.assertEqual(consumed.returncode, 0, consumed.stderr)
 
     def test_ci_only_blocker_retains_the_supplied_head_and_failed_job_attempt_without_publication(self):
         ci = {"action": "list_failing_ci", "repository": "example/repo", "pull_number": 3, "head_sha": HEAD,

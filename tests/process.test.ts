@@ -1153,6 +1153,22 @@ describe('Agent tool CPU defaults', () => {
     }
   })
 
+  it('gives direct Codex its home and proxy route without API-key overrides', () => {
+    vi.stubEnv('CODEX_HOME', '/tmp/poise-codex-home')
+    vi.stubEnv('HTTPS_PROXY', 'https://proxy.invalid')
+    vi.stubEnv('ALL_PROXY', 'https://all-proxy.invalid')
+    vi.stubEnv('OPENAI_API_KEY', 'metered-key')
+    vi.stubEnv('CODEX_API_KEY', 'metered-codex-key')
+    for (const command of ['codex', 'codex.js']) {
+      const env = scrubbedChildEnvironment(command)
+      expect(env.CODEX_HOME, command).toBe('/tmp/poise-codex-home')
+      expect(env.HTTPS_PROXY, command).toBe('https://proxy.invalid')
+      expect(env.ALL_PROXY, command).toBe('https://all-proxy.invalid')
+      expect(env.OPENAI_API_KEY, command).toBeUndefined()
+      expect(env.CODEX_API_KEY, command).toBeUndefined()
+    }
+  })
+
   it('keeps an explicitly configured GOMAXPROCS', () => {
     vi.stubEnv('GOMAXPROCS', '8')
     expect(scrubbedChildEnvironment('agent-interface').GOMAXPROCS).toBe('8')

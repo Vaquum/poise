@@ -193,11 +193,12 @@ client sent.
   | `iss` | `poise-gateway` |
   | `aud` | `workspace:<handle>` |
   | `sub` | the GitHub login, in GitHub's case |
-  | `scope` | `browser`, `link` or `admin` |
+  | `scope` | `browser`, `link`, `admin` or `mcp` |
   | `iat`, `exp` | seconds; `exp` is `iat + 60` |
   | `jti` | random, unique per assertion |
   | `sid` | browser only: opaque hash reference to the authenticated workspace session |
   | `gport` | browser only: gateway listening port for private Google delegation |
+  | `mcp` | MCP only: `{ resource, ownerId, handle, grantId }`, bound to the exact apex `/mcp` resource and immutable workspace owner ID |
 
 - The gateway generates its key pair on first start and keeps it in its data
   volume. Workspaces receive the public key as `POISE_GATEWAY_PUBLIC_KEY`, the
@@ -207,9 +208,14 @@ client sent.
   most 5 seconds in the future, `exp` has not passed (5 seconds of skew), and
   `exp - iat` is at most 120.
 - Scopes:
-  - `browser`: the owner's browser; every route.
+  - `browser`: the owner's browser; ordinary workspace routes.
   - `link`: a paired Poise Link device; only `/api/link/*`.
   - `admin`: the gateway itself; only `/api/service/*`.
+  - `mcp`: a consented workspace read grant; only `POST /api/mcp/read`.
+    That endpoint refuses browser, Link, admin and unsigned loopback requests.
+    It returns only workspace identity and capabilities through `poise_describe`.
+    The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
+    PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
   `X-Forwarded-Host`, and keeps the browser's `Host` and `Origin` headers. It
   forwards no `Cookie` header at all: neither its own cookies (`poise_gw`,
@@ -272,6 +278,7 @@ Environment the gateway passes:
 | `POISE_MODE` | `service` |
 | `POISE_WORKSPACE_HANDLE` | `<handle>` |
 | `POISE_WORKSPACE_OWNER` | the GitHub login |
+| `POISE_WORKSPACE_OWNER_ID` | immutable GitHub account ID; optional for older containers, which refuse MCP assertions without it |
 | `POISE_PUBLIC_ORIGIN` | `https://<handle>.<POISE_DOMAIN>` |
 | `POISE_GATEWAY_PUBLIC_KEY` | see above |
 | `POISE_HOST` | `0.0.0.0` |
@@ -761,10 +768,20 @@ not use the gateway's discarded OAuth token.
     the person's own account and the GitHub automation account while gh does
     not hold it signed in. A provider with no configuration record raises no
     sign-in demand, and a stale demand clears once the provider reads as
-    unconfigured. Each clears once signed in again; Claude's alert stays its
+    unconfigured. Status-based conditions clear once signed in again; Claude's alert stays its
     auth monitor's, gated on the same participation. In service mode Poise
     also reads the accounts every 15 minutes, so the alerts come while the
     browser is closed. They open `/?settings=accounts`, Settings → Accounts.
+    A native Codex credential rejection raises the same condition immediately,
+    retaining the affected stage, issue and redacted cause. It survives a status
+    poll that still reports signed in. After a fresh successful Connect,
+    Accounts attempts one native verification (30 seconds, 64 KiB), forcing the
+    review's ChatGPT login route and removing API-key/base-URL overrides.
+    A successful response after the latest rejection clears the condition and
+    permits one early review probe through existing admission. Failed
+    verification requires another Connect; a failed review probe cannot reuse
+    old recovery evidence. Successful native reviews on that route also prove
+    recovery. Quota backoff and uncertain publication retain their own gates.
   - Participation: a provider takes part in model maintenance when
     `account_logins` records it, or when its live status positively verifies
     a usable sign-in (Claude/Codex; the observation is then recorded, so a
@@ -1294,14 +1311,28 @@ rechecks while preserving the public active/merged filters, native resource
 settlement and immutable history. Confirmed closed seeds without remaining
 obligations leave the active list before pagination, retaining ownership and
 unfiltered/history reads as defined in [Behavior chain](Behavior-chain.md).
+Recovered full-suite repairs can instead end with verified supersession. The
+same journal retains failure/recovery runs, covering merges, the duplicate head
+and its native close receipt; summaries expose that evidence separately from
+`mergeSha`. Original writes and native resources must settle first. Unclear or
+independent work remains open with its decision visible. The existing Caller
+action performs head-checked retirement; a lost close response stays uncertain.
 The normal-work page precedes due quiescent
 reconciliation; observation failures remain reported after unrelated progress.
 Merged direct-action recovery reads original journal responses without another
 GitHub observation. The optional `reconciliation` read fields add no write
 operation or authority; a deliberate wait keeps GitHub facets unknown without
-declaring a collector outage. No extra poller, gateway scope or event type is
+declaring a collector outage. No extra poller or gateway scope is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
+
+The first `/api/behavior-chains` list page also includes read-only `attention`
+across all active chain pages. It joins durable progress age, holds, exact-head
+merge gates and the next known retry/intervention, including pending original
+review obligations after merge. The existing journal history supplies the clock;
+unchanged polls cannot refresh it. Stale/incomplete evidence stays explicit.
+This adds no observation, scheduler, event type, scope or execution authority.
+[Behavior chain](Behavior-chain.md#intake-and-controls) defines selection and resets.
 
 Invocation summaries may also carry retained original publication-plan absence
 and recovery evidence. Settings displays the original Call and restoration

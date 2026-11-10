@@ -129,6 +129,7 @@ const LOG_STATUS = /^(?:pending|queued|running|in_progress|completed|superseded|
 const LOG_PR_ID = /^[1-9][0-9]*$/
 const LOG_REPO = /^[^/\s]+(?:\/[^/\s]+)?$/
 const LOG_CORRELATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const HISTORY_READ_ERRORS = new Set(['SQLITE_CORRUPT', 'SQLITE_IOERR_SHORT_READ', 'INVALID_UTF8', 'INVALID_RECORD', 'MISSING_ROW'])
 
 function quarantineLogEntry(value: unknown, index: number, error: unknown): QuarantinedAgentLog {
   const row = value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -188,6 +189,11 @@ function validateLogEntry(value: unknown, index: number): LogEntry {
     throw new Error(`agent-interface log row ${index} is not an object`)
   }
   const row = value as Record<string, unknown>
+  if ('history_read_error' in row) {
+    const reason = typeof row.history_read_error === 'string' && HISTORY_READ_ERRORS.has(row.history_read_error)
+      ? row.history_read_error : 'unknown read error'
+    throw new Error(`Caller History row ${index} is unreadable (${reason})`)
+  }
   // An absent field and an explicit null both mean "this row does not have
   // one". Only `null` was accepted, so a row written before agent-interface
   // added a field — `expected_head`, `source`, `correlation_id`, `action` —
