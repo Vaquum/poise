@@ -240,12 +240,12 @@ async function callerCalls(): Promise<Array<{ args: string[], dataDir: string | 
 }
 
 describe('Poise in service mode', () => {
-  it('serves only workspace identity and capabilities through the dedicated MCP assertion', async () => {
+  it('serves workspace identity and read capabilities through the dedicated MCP assertion', async () => {
     const mcp = { resource: 'https://poise.example.test/mcp', ownerId: 1001, handle: 'octocat', grantId: '12345678-1234-1234-1234-123456789abc' }
     const read = { name: 'poise_describe', arguments: {} }
     const description = await send('POST', '/api/mcp/read', fromGateway('mcp', { mcp }), read)
     expect(description.status).toBe(200)
-    expect(description.json).toEqual({ workspace: 'octocat', owner: OWNER, capabilities: { tools: ['poise_describe'] } })
+    expect(description.json).toEqual({ workspace: 'octocat', owner: OWNER, capabilities: { tools: ['poise_describe', 'poise_work'] } })
     for (const scope of ['browser', 'link', 'admin']) {
       expect((await send('POST', '/api/mcp/read', fromGateway(scope), read)).status).toBe(403)
     }

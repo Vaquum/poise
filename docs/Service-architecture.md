@@ -213,7 +213,12 @@ client sent.
   - `admin`: the gateway itself; only `/api/service/*`.
   - `mcp`: a consented workspace read grant; only `POST /api/mcp/read`.
     That endpoint refuses browser, Link, admin and unsigned loopback requests.
-    It returns only workspace identity and capabilities through `poise_describe`.
+    It returns workspace identity and capabilities through `poise_describe`,
+    and bounded issue work trails through `poise_work`. Work reads select one
+    exact issue or repository/label keyset page, then only those targets' chain
+    projections and retained ledger pages. Continuations bind the owner grant,
+    resource, repository, label and limit. The gateway rechecks result scope;
+    source freshness and missing receipts remain independent evidence.
     The gateway's disabled-by-default HTTPS transport, OAuth discovery, S256
     PKCE consent and revocation are defined in [Poise MCP](Poise-MCP.md).
 - The gateway also sets `X-Forwarded-For`, `X-Forwarded-Proto: https` and
