@@ -1,10 +1,11 @@
 import { viewDiagnostic, viewFeedback } from '../view-feedback'
 import { noticeFeed } from '../notices'
+import { loadRecordsCheckpoints, retainQuarantineIds, saveRecordsCheckpoints } from '../swarm-records'
 import { logTime } from '../clock'
 import { effectiveTimezone } from '../config'
 import { finishMotion, layout, retire, scrollToActor } from '../motion'
 import { patchContent, patchNode } from '../dom-patch'
-import { mountOrganizationFilter, organizationUrl, getSelectedOrganization, setSelectedOrganization } from '../organizations'
+import { ORGANIZATION_STORAGE_KEY, mountOrganizationFilter, organizationUrl, getSelectedOrganization, setSelectedOrganization } from '../organizations'
 // Swarm — log of agent calls. Identical finished calls share a row: model, prompt
 // (truncated), status, time elapsed, response (View → expand row to
 // reveal the full response text underneath).
@@ -241,50 +242,13 @@ function quarantineDescription(row: QuarantinedLog): string {
     position, error].filter(Boolean).join(' · ')
 }
 
-// Stable alert identity for unreadable rows across refreshes, pages, searches,
-// organization switches and reloads. The feed renews a tab-local notice
-// whenever its body changes and forgets its dismissal when a report goes
-// empty; Swarm rebuilds this body from whatever rows are currently loaded and
-// empties it on every search or organization reset, so known rows re-alerted
-// as "now" and undismissed themselves. The checkpoint retains the observed
-// record identities, the notice's age and its dismissal independently of the
-// loaded rows: only an unseen identity renews the alert. A genuinely empty,
-// complete, unfiltered read clears it, so recovered evidence still clears; a
-// subset, an empty filtered page or a failed read never does. Storage is read
-// once and written only when the identities, text, age or dismissal actually
-// change, so the search and pagination hot paths never touch it.
 const SWARM_RECORDS_KEY = 'swarm-records'
 const SWARM_RECORDS_TITLE = 'Unreadable Swarm records'
-const SWARM_RECORDS_CHECKPOINT = 'poise:swarm-quarantine:v1'
-const SWARM_RECORDS_CHECKPOINT_LIMIT = 500
 
-interface SwarmRecordsCheckpoint { ids: string[], since: string, due: string, dismissed: boolean, body: string }
-
-function readRecordsCheckpoint(): SwarmRecordsCheckpoint | null {
-  try {
-    const raw = localStorage.getItem(SWARM_RECORDS_CHECKPOINT)
-    if (!raw) return null
-    const parsed = JSON.parse(raw) as Partial<SwarmRecordsCheckpoint>
-    if (!Array.isArray(parsed.ids) || !parsed.ids.every((id) => typeof id === 'string')
-      || typeof parsed.since !== 'string' || typeof parsed.due !== 'string'
-      || typeof parsed.dismissed !== 'boolean' || typeof parsed.body !== 'string') return null
-    return { ids: parsed.ids.slice(-SWARM_RECORDS_CHECKPOINT_LIMIT), since: parsed.since, due: parsed.due, dismissed: parsed.dismissed, body: parsed.body }
-  } catch {
-    return null
-  }
-}
-
-let recordsCheckpoint = readRecordsCheckpoint()
-
-function saveRecordsCheckpoint(): void {
-  try {
-    if (!recordsCheckpoint) localStorage.removeItem(SWARM_RECORDS_CHECKPOINT)
-    else localStorage.setItem(SWARM_RECORDS_CHECKPOINT, JSON.stringify(recordsCheckpoint))
-  } catch {
-    // Private browsing keeps session-only behavior: the in-memory checkpoint
-    // still stabilizes this tab, it just does not survive a reload.
-  }
-}
+let recordsCheckpoints = loadRecordsCheckpoints()
+// The organization whose notice is currently showing, so entering another one
+// renews its showing instead of inheriting this one's age and dismissal.
+let lastReportedOrg: string | null = null
 
 function recordsBody(rows: QuarantinedLog[]): string {
   return `${rows.length} unreadable worker log row(s) isolated. Other runs continue updating.\n`
@@ -292,75 +256,100 @@ function recordsBody(rows: QuarantinedLog[]): string {
 }
 
 function reportSwarmRecords(): void {
+  const org = getSelectedOrganization()
+  const checkpoint = recordsCheckpoints[org]
   const fresh = quarantined
-  const checkpoint = recordsCheckpoint
-  if (!fresh.length && !checkpoint) {
+  const freshKeys = fresh.map(quarantineKey)
+  // A complete, unfiltered, error-free read proves absence under this
+  // organization; any other empty read keeps the retained checkpoint.
+  const complete = historyComplete && !searchQuery && !lastLoadError
+  // Every showing carries explicit stamps: the checkpoint and the notice share
+  // this exact age, so a reload restores it instead of minting a new one.
+  const report = (body: string, since: string, due: string, preserve: boolean) => {
+    noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
+      title: SWARM_RECORDS_TITLE, body, kind: 'read_failed', preserveIdentity: preserve, since, due }])
+    lastReportedOrg = org
+  }
+  const clear = () => {
     viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+    lastReportedOrg = org
+  }
+  if (!fresh.length && !checkpoint) {
+    clear()
     return
   }
   if (!fresh.length && checkpoint) {
-    // Empty reads are ambiguous: only a complete, unfiltered, error-free read
-    // proves recovery, whether or not readable rows came with it. Anything
-    // else — a subset page, an empty filtered page, a reset awaiting its poll,
-    // a failed read — keeps the retained evidence and identity.
-    const recovered = historyComplete && !searchQuery && !lastLoadError
-    if (recovered) {
-      recordsCheckpoint = null
-      saveRecordsCheckpoint()
-      viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+    if (complete) {
+      delete recordsCheckpoints[org]
+      saveRecordsCheckpoints(recordsCheckpoints)
+      clear()
       return
     }
     if (checkpoint.dismissed) {
-      viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+      clear()
       return
     }
-    noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
-      title: SWARM_RECORDS_TITLE, body: checkpoint.body,
-      kind: 'read_failed', preserveIdentity: true, since: checkpoint.since, due: checkpoint.due }])
+    report(checkpoint.body, checkpoint.since, checkpoint.due, org === lastReportedOrg)
     return
   }
   const known = new Set(checkpoint?.ids ?? [])
-  const unseen = fresh.map(quarantineKey).filter((key) => !known.has(key))
+  const unseen = freshKeys.filter((key) => !known.has(key))
+  const ids = retainQuarantineIds(checkpoint?.ids ?? [], freshKeys, complete)
   if (unseen.length) {
-    const at = new Date().toISOString()
-    const body = recordsBody(fresh)
-    recordsCheckpoint = { ids: [...(checkpoint?.ids ?? []), ...unseen].slice(-SWARM_RECORDS_CHECKPOINT_LIMIT), since: at, due: at, dismissed: false, body }
-    saveRecordsCheckpoint()
     // A plain report: the changed body renews the alert with a new age, even
     // when a new row replaces another and the count stays the same.
-    viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, body)
+    const at = new Date().toISOString()
+    const body = recordsBody(fresh)
+    recordsCheckpoints[org] = { ids, since: at, due: at, dismissed: false, body }
+    saveRecordsCheckpoints(recordsCheckpoints)
+    report(body, at, at, false)
     return
   }
-  const retained = recordsCheckpoint
+  const retained = recordsCheckpoints[org]
   if (!retained || retained.dismissed) {
-    viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+    clear()
     return
   }
-  // Known rows, possibly reworded: update the text, keep the alert.
+  // Known rows, possibly reworded: update the text, keep the alert. A complete
+  // read also forgets repaired rows above, while a newly entered organization
+  // gets a new showing with its own kept age rather than this one's.
   const body = recordsBody(fresh)
-  if (retained.body !== body) {
-    recordsCheckpoint = { ...retained, body }
-    saveRecordsCheckpoint()
+  const sameIds = ids.length === retained.ids.length && ids.every((id, index) => id === retained.ids[index])
+  if (!sameIds || retained.body !== body) {
+    recordsCheckpoints[org] = { ...retained, ids, body }
+    saveRecordsCheckpoints(recordsCheckpoints)
   }
-  noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
-    title: SWARM_RECORDS_TITLE, body, kind: 'read_failed', preserveIdentity: true, since: retained.since, due: retained.due }])
+  report(body, retained.since, retained.due, org === lastReportedOrg)
 }
 
 // A dismissal persists at once, even when no further render runs before a
-// reload puts the retained rows back on screen.
+// reload puts the retained rows back on screen. The dismissal check runs
+// first: resolving the organization needs loaded settings, which the
+// pre-mount report below does not have yet.
 noticeFeed.subscribe(() => {
-  if (recordsCheckpoint && !recordsCheckpoint.dismissed && noticeFeed.isLocalNoticeDismissed(SWARM_RECORDS_KEY)) {
-    recordsCheckpoint = { ...recordsCheckpoint, dismissed: true }
-    saveRecordsCheckpoint()
+  if (!noticeFeed.isLocalNoticeDismissed(SWARM_RECORDS_KEY)) return
+  const org = getSelectedOrganization()
+  const checkpoint = recordsCheckpoints[org]
+  if (checkpoint && !checkpoint.dismissed) {
+    recordsCheckpoints[org] = { ...checkpoint, dismissed: true }
+    saveRecordsCheckpoints(recordsCheckpoints)
   }
 })
 
 // Restored before the notification rail mounts, so its first update lists the
 // known notice with its kept age instead of announcing it as a new arrival.
-if (recordsCheckpoint && !recordsCheckpoint.dismissed && recordsCheckpoint.ids.length) {
-  noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
-    title: SWARM_RECORDS_TITLE, body: recordsCheckpoint.body,
-    kind: 'read_failed', preserveIdentity: true, since: recordsCheckpoint.since, due: recordsCheckpoint.due }])
+// Reads the stored selection directly: the validated selection needs loaded
+// settings and must not be touched this early.
+let storedOrg = ''
+try { storedOrg = localStorage.getItem(ORGANIZATION_STORAGE_KEY) || '' } catch { /* unavailable */ }
+{
+  const restored = recordsCheckpoints[storedOrg]
+  if (restored && !restored.dismissed && restored.ids.length) {
+    noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
+      title: SWARM_RECORDS_TITLE, body: restored.body,
+      kind: 'read_failed', preserveIdentity: true, since: restored.since, due: restored.due }])
+    lastReportedOrg = storedOrg
+  }
 }
 
 // Status is a coloured icon and the status in a word. The status and outcome

@@ -513,6 +513,43 @@ test('known unreadable rows keep their alert age and dismissal across refresh, s
   await expect(recovered.locator('.nr-card')).toHaveCount(0)
 })
 
+test('dismissed quarantines in one organization survive a clean organization and back', async ({ page }) => {
+  await workspace(page); await settled(page)
+  const organizations = ['acme', 'beta'].map(login => ({ login, managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: null }))
+  await page.route('**/api/settings', route => route.fulfill({ json: { org: 'acme', me: 'octocat', timezone: 'UTC', organizations, models: {} } }))
+  await page.route('**/api/organizations', route => route.fulfill({ json: { organizations } }))
+  const logs = history().slice(0, 210)
+  await page.route('**/api/agent-logs**', route => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    const quarantined = url.searchParams.get('org') === 'beta' ? [] : [{
+      historyRowId: '500', index: 1, error: 'Caller History row 1 is unreadable (INVALID_RECORD)',
+      id: 'a'.repeat(32), repo: null, prId: null, correlationId: null, behavior: null, sessionId: null,
+    }]
+    return route.fulfill({ json: { ...paged(logs, url, 200), quarantined } })
+  })
+  await page.reload(); await settled(page)
+  await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+  await expect(page.locator(rows)).toHaveCount(200)
+  const filter = page.locator('#view-swarm').getByLabel('Organization filter')
+  await filter.selectOption('acme')
+  const card = () => feedback(page, 'Unreadable Swarm records')
+  await expect(await card()).toContainText('1 unreadable worker log row(s) isolated')
+  await (await card()).locator('.nr-card-head').click()
+  await (await card()).getByRole('button', { name: 'Dismiss' }).click()
+  await expect(await card()).toHaveCount(0)
+  // A clean, fully loaded organization must not erase the other one's
+  // checkpoint: returning to it stays dismissed instead of alerting again.
+  await filter.selectOption('beta')
+  await expect(page.locator(rows)).toHaveCount(200)
+  await next(page).click()
+  await expect(page.locator('#swarm-page')).toHaveText('201–210 / 210')
+  await expect(await card()).toHaveCount(0)
+  await filter.selectOption('acme')
+  await expect(page.locator(rows)).toHaveCount(200)
+  await expect(await card()).toHaveCount(0)
+})
+
 test('arrivals larger than a page merge into run order and keep newest-target selection', async ({ page }) => {
   await workspace(page); await settled(page)
   const old = history().slice(0, 401)
