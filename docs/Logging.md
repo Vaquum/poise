@@ -183,6 +183,15 @@ code, access refusal or local failure still retains Error evidence; an explicit
 Caller diagnostic keeps its source severity. This classification never retries
 a mutation or clears an uncertain publication hold.
 
+A legacy PR review worker's exit 1 keeps its exit state in the launch claim.
+When a readable failed timeout matches that invocation's launch provenance and
+its Caller Error is accepted by Logging, the callback omits the generic worker
+Error. It uses the same Caller event identity as periodic collection, including
+timeouts with no process diagnostic object, so delayed collection and replay
+retain one occurrence. Missing or unreadable results, rejected capture and
+independent process errors or signals keep the worker failure visible. Retry
+and publication rules are unchanged.
+
 Claude auth status probes from the auth monitor and Connected accounts treat a
 recognized sign-in requirement returned with exit 1 as an ongoing condition,
 without another process error. The existing sign-in notice stays until the

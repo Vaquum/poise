@@ -1,4 +1,7 @@
 import { diagnosticIdentity, withNoticeDiagnosticIdentity } from './logging-context'
+import { diagnostic, loggingWorkspace } from './logging'
+import { callerDiagnostic } from '../gateway/src/diagnostics/sources'
+import { parseAgentLogList } from './agent-log-parse'
 import { captureBehaviorAdmission, captureBehaviorOutcome, behaviorLedgerHeartbeat } from './behavior-ledger'
 import type { LedgerReference } from './behavior-ledger-contract'
 import { behaviorChainForPull, behaviorChainJournal, behaviorChainOwner, behaviorChainOwnsRepository } from './behavior-chain-journal'
@@ -2955,12 +2958,46 @@ async function currentHeadSha(
   return headSha
 }
 
+// SQLite substr and Python slices count Unicode code points while JS slice
+// counts UTF-16 units; Array.from keeps supplementary characters whole.
+function truncateCodePoints(value: string, limit: number): string {
+  if (value.length <= limit) return value
+  const chars = Array.from(value)
+  return chars.length > limit ? chars.slice(0, limit).join('') : value
+}
+
+// Length of Python json.dumps(entry, allow_nan=False).encode() without
+// running Python: JS separators gain one space each and non-ASCII becomes
+// ASCII escapes, the only systematic differences for finite JSON.
+function pythonJsonByteLength(value: unknown): number {
+  const js = JSON.stringify(value) ?? 'null'
+  let separators = 0
+  let extra = 0
+  let inString = false
+  let escaped = false
+  for (const char of js) {
+    if (inString) {
+      if (escaped) { escaped = false; continue }
+      if (char === '\\') { escaped = true; continue }
+      if (char === '"') { inString = false; continue }
+      const code = char.codePointAt(0)!
+      if (code > 127) extra += (code > 0xffff ? 12 : 6) - Buffer.byteLength(char)
+      continue
+    }
+    if (char === '"') { inString = true; continue }
+    if (char === ':' || char === ',') separators += 1
+  }
+  return Buffer.byteLength(js) + separators + extra
+}
+
 function settleClaimAfterExit(
   behavior: ActiveClaim['behavior'],
   target: string,
   claimId: string,
-): (result: { code: number | null, signal: NodeJS.Signals | null, error?: Error }) => void {
-  return ({ code, signal, error }) => {
+): (result: { code: number | null, signal: NodeJS.Signals | null, error?: Error }) => Promise<void> {
+  const claim = behavior === 'review-new-prs'
+    ? listBehaviorLaunchClaims(behavior).find((row) => row.target === target && row.claimId === claimId) : undefined
+  return async ({ code, signal, error }) => {
     if (!error && signal === null && code === 0) {
       dropActiveClaim(claimId)
       setBehaviorLaunchErrorOwned(
@@ -2983,7 +3020,66 @@ function settleClaimAfterExit(
     )
     renewSeenOwned(behavior, target, claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
     renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
-    console.error(`[behaviors] ${behavior} worker exited for ${target}; awaiting durable result (${outcome})`)
+    const message = `[behaviors] ${behavior} worker exited for ${target}; awaiting durable result (${outcome})`
+    if (behavior === 'review-new-prs' && !error && signal === null && code === 1 && claim && !claim.launchQuarantine) {
+      try {
+        const { stdout } = await runFile(AGENT_INTERFACE, ['--logs', '--select', JSON.stringify({ latest: [],
+          ids: claim.launchCallId ? [claim.launchCallId] : [], correlations: [claimId] })],
+        { cwd: agentInterfaceCwd(), timeoutMs: 30_000, maxOutputBytes: 1 * 1024 * 1024 })
+        const rows = parseJson(stdout, 'worker exit Caller evidence')
+        if (!Array.isArray(rows)) throw new Error('worker exit Caller evidence is not an array')
+        const snapshot = parseAgentLogList(rows)
+        const call = snapshot.entries[0]
+        if (rows.length === 1 && snapshot.quarantined.length === 0
+          && call.status === 'failed' && call.error_code === 'review_budget_exhausted'
+          && call.behavior === 'pr_review' && call.behavior === claim.launchBehavior
+          && call.repo === claim.launchRepo && call.pr_id === String(claim.launchPr)
+          && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
+          && call.source === claim.launchSource && call.source === 'poise:review-new-prs'
+          && call.correlation_id === claimId && claim.launchCorrelationId === claimId
+          && (!claim.launchCallId || call.id === claim.launchCallId)
+          && call.expected_head === claim.launchExpectedHead
+          && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
+          && Date.parse(call.completed_at ?? '') >= Date.parse(agentCallStartedAt(call))) {
+          const row = objectValue(rows[0], 'worker exit Caller evidence') as Record<string, unknown>
+          // Match periodic --diagnostics truncation and its 64 KiB envelope
+          // fallback so delayed collection replays exactly.
+          let error = typeof row.error === 'string' ? truncateCodePoints(row.error, 8192) : row.error
+          let entryDiagnostic: unknown = row.diagnostic
+          let evidence: unknown = row.evidence_unavailable
+          if (entryDiagnostic != null && pythonJsonByteLength(entryDiagnostic) > 65536) {
+            entryDiagnostic = null
+            evidence = 'Stored process diagnostic is malformed, unsupported, non-finite or exceeds bounded decoding limits'
+          }
+          let truncatedRow: Record<string, unknown> = { ...row, error, diagnostic: entryDiagnostic,
+            ...(evidence != null ? { evidence_unavailable: evidence } : {}) }
+          const fields = ['id', 'model', 'status', 'pr_id', 'repo', 'actor', 'behavior', 'outcome',
+            'head_sha', 'expected_head', 'source', 'correlation_id', 'action', 'error_code'] as const
+          const candidate: Record<string, unknown> = { seq: 0 }
+          for (const field of fields) {
+            const value = row[field]
+            candidate[field] = typeof value === 'string' ? truncateCodePoints(value, 512) : value
+          }
+          candidate.error = error
+          candidate.started_at_precise = row.started_at_precise
+          candidate.completed_at = row.completed_at
+          candidate.diagnostic = entryDiagnostic
+          if (evidence != null) candidate.evidence_unavailable = evidence
+          if (pythonJsonByteLength(candidate) > 64 * 1024) {
+            error = typeof error === 'string' ? truncateCodePoints(error, 2048) : error
+            entryDiagnostic = null
+            evidence = 'Stored process diagnostic exceeds the bounded metadata envelope'
+            truncatedRow = { ...row, error, diagnostic: null, evidence_unavailable: evidence }
+          }
+          const input = row.evidence_unavailable == null ? callerDiagnostic(truncatedRow, loggingWorkspace()) : null
+          if (input?.level === 'error' && diagnostic(input)) return
+        }
+      } catch (cause) {
+        console.error(message, cause)
+        return
+      }
+    }
+    console.error(message)
   }
 }
 
