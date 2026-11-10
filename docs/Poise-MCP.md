@@ -53,5 +53,7 @@ they need a normal container replacement before connecting.
 workspace HTTP fixtures, including fresh connections after registration floods
 and assertion rejection. `gateway/tests/mcp.test.ts` covers OAuth, token
 rotation, owner isolation and revocation. `tests/service-mode-server.test.ts`
-checks the read endpoint through the production server. These fixtures do not
-establish staging desktop activation.
+checks the read endpoint through the production server. The Chromium regression
+in `tests/e2e/service-mode.spec.ts` submits consent and reaches an isolated
+registered callback with code and state, including when its origin is also a
+font source in the CSP. These fixtures do not establish staging desktop activation.
