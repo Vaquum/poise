@@ -5,6 +5,7 @@ from github_interface.atoms.pulls import (
     get_pull,
     list_inline_comments,
     list_review_threads,
+    list_reviews,
 )
 from github_interface.atoms.review_diff import review_diff
 from github_interface.client import GitHubClient
@@ -32,6 +33,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     rest_comments = await list_inline_comments(client, owner, repo, pull_number)
     public_comments = await issue_comments(client, owner, repo, pull_number)
     threads = await list_review_threads(client, owner, repo, pull_number)
+    reviews = await list_reviews(client, owner, repo, pull_number)
     issues = await linked_issues(client, owner, repo, pull_number)
 
     context = {
@@ -46,6 +48,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         "author_pr_comments": _author_comment_summary(public_comments, pull),
         "review_threads": threads,
         "resolved_threads": [thread for thread in threads if thread["is_resolved"]],
+        "change_request_reviews": _change_request_summary(reviews, required_head),
         "linked_issues": issues,
     }
     packet_diff = await review_diff(client, owner, repo, pull, context, since=since)
@@ -105,52 +108,52 @@ def _author_comment_summary(comments: list[dict[str, Any]], pull: dict[str, Any]
     ]
 
 
+def _change_request_summary(reviews: list[dict[str, Any]], head: str) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for review in sorted(reviews, key=lambda item: str(item.get("submitted_at") or "")):
+        if review.get("state") not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+            continue
+        login = str((review.get("user") or {}).get("login") or "").lower()
+        if login:
+            latest[login] = review
+    return [
+        {
+            "id": review["id"],
+            "user": review["user"]["login"],
+            "state": review["state"],
+            "commit_id": review["commit_id"],
+            "submitted_at": review["submitted_at"],
+            "url": review["html_url"],
+            "body": review["body"],
+        }
+        for review in latest.values()
+        if review["state"] == "CHANGES_REQUESTED"
+        and str(review.get("commit_id") or "").lower() == head
+        and str(review.get("body") or "").strip()
+    ]
+
+
 def accepted_inline_comments(
     comments: list[dict[str, Any]],
     rest_comments: list[dict[str, Any]],
     threads: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    # A resolved finding does not reserve its location for every future defect.
-    # Keep its body in duplicate detection, but remove its root and replies
-    # from location-only detection. GraphQL ids identify the exact REST thread.
-    resolved_roots = {
-        thread["root_comment_id"]
-        for thread in threads
-        if thread["is_resolved"] and thread.get("root_comment_id") is not None
-    }
-    existing_keys = _existing_keys([
-        comment for comment in rest_comments
-        if comment.get("id") not in resolved_roots
-        and comment.get("in_reply_to_id") not in resolved_roots
-    ])
-    existing_keys.update({
-        _key(thread["path"], thread["line"], thread["side"])
-        for thread in threads
-        if not thread["is_resolved"] and not thread["is_outdated"] and thread["line"]
-    })
     existing_bodies = {_normalize(comment["body"]) for comment in _comment_summary(rest_comments) if comment.get("body")}
     for thread in threads:
         existing_bodies.update(_normalize(body) for body in thread["bodies"])
 
     accepted = []
     skipped = []
-    seen_keys = set()
     seen_bodies = set()
 
     for comment in comments:
         inline = _inline_comment(comment)
-        key = _key(inline["path"], inline["line"], inline["side"])
         body = _normalize(inline["body"])
 
-        if key in existing_keys:
-            skipped.append({"reason": "already_commented_or_resolved", "comment": comment})
-        elif body in existing_bodies or body in seen_bodies:
+        if body in existing_bodies or body in seen_bodies:
             skipped.append({"reason": "repeat", "comment": comment})
-        elif key in seen_keys:
-            skipped.append({"reason": "one_comment_per_issue", "comment": comment})
         else:
             accepted.append(inline)
-            seen_keys.add(key)
             seen_bodies.add(body)
 
     return accepted, skipped
@@ -174,21 +177,6 @@ def _inline_comment(comment: dict[str, Any]) -> dict[str, Any]:
     if not inline["body"]:
         raise ValueError("inline comment body cannot be empty")
     return inline
-
-
-def _existing_keys(comments: list[dict[str, Any]]) -> set[tuple[str, int, str]]:
-    keys = set()
-    for comment in comments:
-        line = comment.get("line") or comment.get("original_line")
-        path = comment.get("path")
-        side = comment.get("side") or "RIGHT"
-        if path and line:
-            keys.add(_key(path, line, side))
-    return keys
-
-
-def _key(path: str, line: int, side: str) -> tuple[str, int, str]:
-    return str(path), int(line), str(side).upper()
 
 
 def _normalize(body: str) -> str:

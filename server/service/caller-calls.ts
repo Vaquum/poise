@@ -11,6 +11,7 @@ import Database from 'better-sqlite3'
 import { existsSync } from 'node:fs'
 import { BEHAVIOR_CALL_SOURCES, runningCallerLaunches } from '../process'
 import { callerDatabase } from '../caller-store'
+import { diagnosticFailure } from '../logging'
 
 let debates = 0
 
@@ -38,14 +39,50 @@ function alive(pid: number): boolean {
  *  former worst case. Unknown stays safe: health reports idle false. */
 export const CALLER_CALLS_READ_TIMEOUT_MS = 100
 
+export class CallerReceiptStoreError extends Error {
+  readonly code: string | null
+  readonly kind: 'integrity' | 'contention' | 'unavailable'
+  readonly firstObservedAt = new Date().toISOString()
+
+  constructor(readonly dataDir: string | undefined, cause: unknown) {
+    const code = cause && typeof cause === 'object' && 'code' in cause && typeof cause.code === 'string' ? cause.code : null
+    const kind = /^SQLITE_(?:CORRUPT|NOTADB)(?:_|$)/.test(code ?? '') ? 'integrity'
+      : /^SQLITE_(?:BUSY|LOCKED)(?:_|$)/.test(code ?? '') ? 'contention' : 'unavailable'
+    super(`Caller receipt store ${kind} failure${code ? ` (${code})` : ''}`, { cause })
+    this.name = 'CallerReceiptStoreError'
+    this.code = code
+    this.kind = kind
+  }
+}
+
+let failure: CallerReceiptStoreError | null = null
+let failureRecorded = false
+
 /** Caller calls recorded as running whose process is alive, whichever server
  *  started them; null when the records exist but cannot be read. */
 function callerActivity(dataDir: string | undefined, behaviorOnly: boolean, resources: boolean): { live: number, pendingResources: number | null } | null {
-  try { return callerDatabase(dataDir, path => readCallerActivity(path, behaviorOnly, resources)) }
-  catch { return null }
+  let activity: { live: number, pendingResources: number | null, cause?: unknown } | null = null
+  try {
+    activity = callerDatabase(dataDir, path => readCallerActivity(path, behaviorOnly, resources))
+    if (activity.pendingResources === null) throw activity.cause
+    failure = null
+    failureRecorded = false
+    return activity
+  } catch (cause) {
+    const next = new CallerReceiptStoreError(dataDir, cause)
+    if (!failure || failure.dataDir !== dataDir || failure.kind !== next.kind || failure.code !== next.code) {
+      failure = next
+      failureRecorded = false
+    }
+    // The independent diagnostic store retains the first observation even
+    // when Caller cannot open its own receipts. Health remains bounded/unknown.
+    if (!failureRecorded) failureRecorded = diagnosticFailure(`caller.receipts.${failure.kind}`, failure,
+      { dataDir, firstObservedAt: failure.firstObservedAt }, { level: failure.kind === 'contention' ? 'warning' : 'error' }) !== null
+    return activity
+  }
 }
 
-function readCallerActivity(path: string, behaviorOnly: boolean, resources: boolean): { live: number, pendingResources: number | null } | null {
+function readCallerActivity(path: string, behaviorOnly: boolean, resources: boolean): { live: number, pendingResources: number | null, cause?: unknown } {
   if (!path || !existsSync(path)) return { live: 0, pendingResources: 0 }
   let db: InstanceType<typeof Database> | undefined
   try {
@@ -55,21 +92,24 @@ function readCallerActivity(path: string, behaviorOnly: boolean, resources: bool
     const rows = db.prepare("select pid from calls where status = 'running' and pid is not null and runner is null"
       + (behaviorOnly ? ` and (source is null or source in (${BEHAVIOR_CALL_SOURCES.map(() => '?').join(',')}))` : ''))
       .all(...(behaviorOnly ? BEHAVIOR_CALL_SOURCES : [])) as Array<{ pid: unknown }>
-    let pendingResources: number | null = 0
+    const live = rows.filter(({ pid }) => Number.isSafeInteger(Number(pid)) && Number(pid) > 0 && alive(Number(pid))).length
+    let pendingResources = 0
     if (resources) {
       try {
         const pending = db.prepare("select count(*) as count from calls where source='poise:behavior-chain' and (resources_settled_at is null or resource_cleanup is not null)").get() as { count: number }
         pendingResources = pending.count
-      } catch { pendingResources = null }
+      } catch (cause) { return { live, pendingResources: null, cause } }
     }
-    return { live: rows.filter(({ pid }) => Number.isSafeInteger(Number(pid)) && Number(pid) > 0 && alive(Number(pid))).length,
-      pendingResources }
-  } catch {
-    // Unknown, not none: calls an earlier server started may be running unseen.
-    return null
+    return { live, pendingResources }
   } finally {
     db?.close()
   }
+}
+
+/** Rechecked by managed work at its existing final admission boundaries. */
+export function requireCallerReceipts(): void {
+  callerActivity(process.env.AGENT_INTERFACE_DATA_DIR, false, true)
+  if (failure) throw failure
 }
 
 export function liveCallerCalls(dataDir = process.env.AGENT_INTERFACE_DATA_DIR, behaviorOnly = false): number | null {

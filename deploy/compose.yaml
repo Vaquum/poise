@@ -52,6 +52,7 @@ services:
     environment:
       POISE_GATEWAY_CONTAINER: poise-gateway
       POISE_RUNTIME_IMAGE: ${POISE_RUNTIME_IMAGE:-poise-runtime:latest}
+      POISE_WORKSPACE_RUNTIME: ${POISE_WORKSPACE_RUNTIME:-}
       POISE_GATEWAY_DATA: /data
       POISE_DOCKER_SOCKET: /var/run/docker.sock
       PORT: "8080"

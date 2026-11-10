@@ -32,7 +32,9 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
           return { sequence: row.sequence, at: row.at, type: event.type,
             ...('invocationId' in event ? { invocationId: event.invocationId } : {}),
             ...('reason' in event ? { reason: event.reason } : {}),
-            ...('outcome' in event ? { outcome: event.outcome } : {}) }
+            ...('outcome' in event ? { outcome: event.outcome } : {}),
+            ...('evidence' in event ? { callId: 'callId' in event ? event.callId : event.evidence.nativeCallId ?? event.evidence.callId ?? null,
+              evidence: { diagnostic: event.evidence.diagnostic } } : {}) }
         })
         return reply(res, 200, { chain: summary(chain), events, next: rows.length === 20 ? rows.at(-1)!.sequence : null,
           cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })

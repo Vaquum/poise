@@ -9,8 +9,9 @@ export function nativeRequestSha(value: unknown): string {
 }
 
 const SHA = /^[a-f0-9]{40}$/i
-// The existing journal event limit is 256 KiB. Leave room for its envelope
-// and the small settlement summary without duplicating resolved thread IDs.
+// Native actions keep their tighter bound inside the larger journal event
+// limit. Leave room for its envelope and the small settlement summary
+// without duplicating resolved thread IDs.
 const MAX_RECEIPT_BYTES = 256 * 1024 - 4096
 const RESULT_FIELDS = ['action', 'repository', 'pull_number', 'head_sha', 'outcome', 'merge_sha', 'merge_method', 'queue_entry_id',
   'current_head_sha', 'ready_except_conversations', 'resolved_count', 'unresolved_count', 'issue_number', 'coverage'] as const

@@ -50,6 +50,19 @@ describe('reviewer trip classification', () => {
     const { behaviors } = await loadModules()
     expect(behaviors.reviewerTripKind({ error, error_code: code, diagnostic } as LogEntry)).toBeNull()
   })
+
+  it.each(['review_budget_exhausted', 'review_inspection_timeout', 'review_provider_error', 'review_provider_exit'])(
+    'excludes local inspection evidence before every provider classifier (%s)', async code => {
+      const { behaviors } = await loadModules()
+      const call = { error: 'rate limit; not signed in; status 402 Payment Required', error_code: code,
+        diagnostic: { operation: 'github-interface', phase: 'inspection', outcome: 'timed_out' } } as LogEntry
+      expect(behaviors.reviewerTripKind(call)).toBeNull()
+      for (const diagnostic of [undefined, { operation: 'provider.review', phase: 'inspection', outcome: 'timed_out' },
+        { operation: 'github-interface', phase: 'provider_execution', outcome: 'timed_out' },
+        { operation: 'github-interface', phase: 'inspection', outcome: 'exit' }]) {
+        expect(behaviors.reviewerTripKind({ ...call, diagnostic } as LogEntry)).toBe('balance')
+      }
+    })
 })
 
 async function startPrReviews(slots: { primary: string, secondary: string, tertiary: string }) {

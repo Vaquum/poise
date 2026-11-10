@@ -9,6 +9,7 @@ from threading import current_thread, main_thread
 
 from . import atoms, progress, review_budget, resource_ownership
 from .process_diagnostic import command_failure, diagnostic_from_stderr, diagnostic_message
+from .review_watch import ReviewSuperseded
 
 INSPECTION_RULE = "Bash(github-interface --review-context --requests-json *)"
 POLICY = (
@@ -45,8 +46,10 @@ class Repository:
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             diagnostic = command_failure(error, "inspection", str(self.root), limit)
-            raise atoms.AgentPreflightError(f"cannot inspect review repository: {error}",
-                                            "review_budget_exhausted" if isinstance(error, subprocess.TimeoutExpired) else None,
+            message = (f"Local review repository inspection timed out after {limit:g} seconds"
+                       if isinstance(error, subprocess.TimeoutExpired) else f"cannot inspect review repository: {error}")
+            raise atoms.AgentPreflightError(message,
+                                            "review_inspection_timeout" if isinstance(error, subprocess.TimeoutExpired) else None,
                                             diagnostic) from error
         if done.returncode:
             message = (done.stderr or done.stdout).strip() or "repository inspection failed"
@@ -101,8 +104,11 @@ def prepare(pwd: str, pr: str, actor: str, head: str, packet: str):
                 raise ValueError((done.stderr or done.stdout).strip() or "checkout command failed")
             info = json.loads(done.stdout)
             if (info.get("action") != "checkout_review" or info.get("repository") != repo
-                    or info.get("head_sha") != head or info.get("merge_base_sha") != merge_base
                     or info.get("path") != str(root)):
+                raise ValueError("checkout receipt differs from the pinned PR packet")
+            if info.get("outcome") == "superseded":
+                raise ReviewSuperseded(info.get("head_sha"))
+            if info.get("head_sha") != head or info.get("merge_base_sha") != merge_base:
                 raise ValueError("checkout receipt differs from the pinned PR packet")
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             message = str(error)

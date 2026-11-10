@@ -17,6 +17,10 @@ from time import monotonic, time
 from uuid import uuid4
 
 
+MAX_RECEIPT_BYTES = 512 * 1024
+MAX_ERROR_CHARACTERS = 512
+
+
 def initial(call_id: str | None = None, correlation: str | None = None) -> str:
     value = {"version": 1, "roots": [], "errors": []}
     if call_id is not None or correlation is not None:
@@ -50,9 +54,61 @@ def read(conn: sqlite3.Connection, call_id: str) -> dict:
     return value
 
 
-def _write(conn: sqlite3.Connection, call_id: str, value: dict) -> None:
+def _settlement_size(value: dict) -> int:
+    # Size-only placeholders cover full-width kernel identities and timestamps.
+    # Include both possible certificates for an incomplete registration, plus
+    # one bounded terminal blocker. The blocker uses an astral character so the
+    # reserve covers the worst-case JSON escaping (12 bytes per character).
+    # None of this projection is persisted.
+    stamp = "9" * 24
+    settled = {**value, "process_pending": False, "roots": [], "errors": [
+        {**error, "recovered_at": stamp} for error in value["errors"]]}
+    if value["version"] == 2:
+        settled["namespace"] = {**value["namespace"], "state": "settled", "settled_at": stamp}
+    for root in value["roots"]:
+        reclaimed = {**root, "state": "reclaimed", "reclaimed_at": stamp, "recovered_at": stamp}
+        if root["state"] == "registered":
+            reclaimed.update({key: "9" * 20 for key in ("device", "inode", "parent_device", "parent_inode")})
+            covered = {**root, "state": "covered", "covered_by": root["path"], "reclaimed_at": stamp}
+            reclaimed = max((reclaimed, covered), key=lambda entry: len(json.dumps(entry, separators=(",", ":")).encode()))
+        elif root["state"] == "covered":
+            reclaimed = {**root, "reclaimed_at": stamp}
+        settled["roots"].append(reclaimed)
+    settled["errors"].append({"cause": "\U0001F600" * MAX_ERROR_CHARACTERS, "path": None, "at": stamp, "recovered_at": stamp})
+    return len(json.dumps(settled, separators=(",", ":")).encode())
+
+
+def _consolidate_errors(value: dict) -> None:
+    errors = value["errors"]
+    if not errors:
+        return
+    if value["version"] == 1:
+        # Historical release depends on the path, failure kind and latest time.
+        latest = {}
+        for error in sorted(errors, key=lambda item: item["at"]):
+            latest[(error["path"], error["cause"] == "resources_unknown")] = error
+        value["errors"] = list(latest.values())
+        return
+    latest = max(errors, key=lambda item: item["at"])
+    summary = {"cause": latest["cause"], "path": None, "at": latest["at"]}
+    recovered = min(error.get("recovered_at", 0) for error in errors)
+    namespace = value["namespace"]
+    if namespace["state"] == "settled" and recovered >= max(
+            summary["at"], namespace["settled_at"],
+            *(root.get("reclaimed_at", float("inf")) for root in value["roots"])):
+        summary["recovered_at"] = max(error["recovered_at"] for error in errors)
+    # A namespace-wide blocker cannot borrow an individual path's recovery or
+    # let an earlier acknowledgement cover a later failure.
+    value["errors"] = [summary]
+
+
+def _write(conn: sqlite3.Connection, call_id: str, value: dict, *, reserve: bool = False) -> None:
+    for error in value["errors"]:
+        error["cause"] = error["cause"][:MAX_ERROR_CHARACTERS]
+    if _settlement_size(value) > MAX_RECEIPT_BYTES:
+        _consolidate_errors(value)
     encoded = json.dumps(value, separators=(",", ":"))
-    if len(encoded.encode()) > 128 * 1024:
+    if len(encoded.encode()) > MAX_RECEIPT_BYTES or reserve and _settlement_size(value) > MAX_RECEIPT_BYTES:
         raise RuntimeError("native resource ownership receipt exceeds its size limit")
     if conn.execute("update calls set resource_ownership=? where id=? and resources_settled_at is null",
                     (encoded, call_id)).rowcount != 1:
@@ -186,7 +242,7 @@ def allocate(database: Path, call_id: str, root: Path) -> Path:
         if any(entry["path"] == str(root) for entry in value["roots"]):
             raise RuntimeError("native resource directory was already registered")
         value["roots"].append({"path": str(root), "state": "registered"})
-        _write(conn, call_id, value)
+        _write(conn, call_id, value, reserve=True)
     # A crash before the next transaction retains the registered, incomplete
     # root. No cleaner may infer that incomplete registration means no disk.
     if value["version"] == 2:
@@ -219,9 +275,13 @@ def failure(database: Path, call_id: str, cause: str, root: Path | None = None) 
     with _database(database) as conn:
         conn.execute("begin immediate")
         value = read(conn, call_id)
-        evidence = {"cause": cause, "path": str(root) if root else None}
-        if not any(all(item.get(key) == val for key, val in evidence.items()) for item in value["errors"]):
+        evidence = {"cause": cause[:MAX_ERROR_CHARACTERS], "path": str(root) if root else None}
+        previous = next((item for item in value["errors"] if all(item.get(key) == val for key, val in evidence.items())), None)
+        if previous is None:
             value["errors"].append({**evidence, "at": time()})
+        else:
+            previous["at"] = time()
+            previous.pop("recovered_at", None)
         _write(conn, call_id, value)
 
 
@@ -443,7 +503,9 @@ def acknowledge_recovery(database: Path, call_id: str) -> None:
         row = conn.execute("select artifact from calls where id=?", (call_id,)).fetchone()
         artifact = json.loads(row[0] or "{}")
         if artifact.get("resource_error") or artifact.get("phase") == "resources_unknown":
-            artifact.setdefault("resource_recovered_at", stamp)
+            recovered = max(error["recovered_at"] for error in current["errors"])
+            if artifact.get("resource_recovered_at", 0) < recovered:
+                artifact["resource_recovered_at"] = recovered
             conn.execute("update calls set artifact=? where id=?", (json.dumps(artifact), call_id))
 
 
@@ -472,35 +534,51 @@ def temporary_directory(prefix: str):
 
 
 def cleanup_remaining(database: Path, call_id: str, *, claim: str | None = None, deadline: float | None = None) -> None:
-    with _database(database) as conn:
-        value = read(conn, call_id)
-    # Nested temporary directories are acknowledged before their Call parent.
-    for entry in sorted(value["roots"], key=lambda item: len(Path(item["path"]).parts), reverse=True):
-        if deadline is not None and monotonic() >= deadline:
-            return
-        if entry["state"] not in {"reclaimed", "covered"}:
-            cleanup(database, call_id, Path(entry["path"]), claim=claim, deadline=deadline)
-    with _database(database) as conn:
-        value = read(conn, call_id)
-    if value["version"] != 2 or value["namespace"]["state"] != "settled":
-        return
-    for entry in value["roots"]:
-        if entry["state"] != "registered":
-            continue
-        ancestors = [root for root in value["roots"] if root["state"] == "reclaimed"
-                     and entry["path"].startswith(root["path"] + "/")]
-        if not ancestors:
-            continue
-        ancestor = max(ancestors, key=lambda root: len(root["path"]))
-        proof = original_scope(database, call_id, value).resource("read-root", Path(ancestor["path"]))
-        if proof["state"] != "reclaimed" or any(ancestor.get(key) != proof[key]
-                for key in ("device", "inode", "parent_device", "parent_inode", "reclaimed_at")):
-            raise RuntimeError("incomplete native allocation lacks its original ancestor proof")
+    from . import native_namespace, process_identity
+    # Use retained proof before retrying children, then cover parents reclaimed
+    # during this pass. Each acknowledgement survives a bounded pass yielding.
+    for cover in (True, False, True):
         with _database(database) as conn:
-            conn.execute("begin immediate")
-            current = read(conn, call_id)
-            kept = next(root for root in current["roots"] if root["path"] == entry["path"])
-            if kept != entry:
-                raise RuntimeError("native allocation changed before ancestor coverage acknowledgement")
-            kept.update(state="covered", covered_by=ancestor["path"], reclaimed_at=proof["reclaimed_at"])
-            _write(conn, call_id, current)
+            value = read(conn, call_id)
+        if not cover:
+            # Nested temporary directories are acknowledged before their Call parent.
+            for entry in sorted(value["roots"], key=lambda item: len(Path(item["path"]).parts), reverse=True):
+                if entry["state"] in {"reclaimed", "covered"}:
+                    continue
+                if deadline is not None and monotonic() >= deadline:
+                    return
+                cleanup(database, call_id, Path(entry["path"]), claim=claim, deadline=deadline)
+            continue
+        if value["version"] != 2 or value["namespace"]["state"] != "settled" or value.get("process_pending"):
+            continue
+        for entry in value["roots"]:
+            if entry["state"] != "registered":
+                continue
+            if deadline is not None and monotonic() >= deadline:
+                return
+            ancestors = [root for root in value["roots"] if root["state"] == "reclaimed"
+                         and entry["path"].startswith(root["path"] + "/")]
+            if not ancestors:
+                continue
+            ancestor = max(ancestors, key=lambda root: len(root["path"]))
+            scope = original_scope(database, call_id, value)
+            if not scope.read()["empty"]:
+                raise RuntimeError("original native namespace is not empty")
+            proof = scope.resource("read-root", Path(ancestor["path"]))
+            if proof["state"] != "reclaimed" or any(ancestor.get(key) != proof[key]
+                    for key in ("device", "inode", "parent_device", "parent_inode", "reclaimed_at")):
+                raise RuntimeError("incomplete native allocation lacks its original ancestor proof")
+            with _database(database) as conn:
+                conn.execute("begin immediate")
+                current = read(conn, call_id)
+                row = conn.execute("select process_identity,resource_cleanup from calls where id=?", (call_id,)).fetchone()
+                cleaner = json.loads(row[1] or "null")
+                if native_namespace.active() is not scope and not process_identity.owns_registration(row[0]) \
+                        and (not isinstance(cleaner, dict) or cleaner.get("token") != claim
+                             or not process_identity.owns_registration(cleaner.get("owner"))):
+                    raise RuntimeError("native cleanup lacks its original owner or current cleanup claim")
+                kept = next(root for root in current["roots"] if root["path"] == entry["path"])
+                if kept != entry:
+                    raise RuntimeError("native allocation changed before ancestor coverage acknowledgement")
+                kept.update(state="covered", covered_by=ancestor["path"], reclaimed_at=proof["reclaimed_at"])
+                _write(conn, call_id, current)

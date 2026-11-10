@@ -254,6 +254,7 @@ export class Orchestrator {
         'HOME=/home/poise',
         this.drainTimeoutEnv(),
         ...config.behaviorResourceEnv,
+        ...(config.repairExhaustionRepositories ? [`POISE_REPAIR_EXHAUSTION_REPOSITORIES=${config.repairExhaustionRepositories}`] : []),
         ...(config.workspaceSkipCliBootstrap ? ['POISE_SKIP_CLI_BOOTSTRAP=1'] : []),
       ],
       Labels: {
@@ -1153,6 +1154,9 @@ export class Orchestrator {
   /** A container setting that differs from what the gateway would create now; only a new container applies it. */
   private changedSetting(details: ContainerDetails): string | null {
     if (!(details.Config.Env ?? []).includes(this.drainTimeoutEnv())) return 'changed drain timeout'
+    const reportRepositories = (details.Config.Env ?? []).find(value => value.startsWith('POISE_REPAIR_EXHAUSTION_REPOSITORIES='))
+      ?.slice('POISE_REPAIR_EXHAUSTION_REPOSITORIES='.length) ?? ''
+    if (reportRepositories !== (this.deps.config.repairExhaustionRepositories ?? '')) return 'changed repair exhaustion repositories'
     for (const name of BEHAVIOR_RESOURCE_VARIABLES) {
       const actual = (details.Config.Env ?? []).filter(value => value.startsWith(`${name}=`))
       const expected = this.deps.config.behaviorResourceEnv.find(value => value.startsWith(`${name}=`))

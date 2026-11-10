@@ -1,4 +1,4 @@
-// The past year of the Analytics topline, one point per 7-day period, from
+// Analytics weekly lines and daily distributions, from
 // /api/analytics/history (server/analytics.ts). Kept free of the DOM so the
 // numbers and the chart geometry are testable.
 
@@ -28,23 +28,21 @@ export interface HistorySeries {
   detail: (period: AnalyticsPeriod) => string
 }
 
-const PERIOD_DAYS = 7
-
 function perDay(value: number | null): string {
   return value === null ? '—' : `${formatRate(value)}/day`
 }
 
-/** All metric figures over the periods: counts as daily averages, time to merge as each period's median. */
-export function historySeries(history: AnalyticsHistory): HistorySeries[] {
+/** Counts per calendar day, with one median/share per period for duration and per-PR metrics. */
+export function historySeries(history: AnalyticsHistory, periodDays = 7): HistorySeries[] {
   const { periods } = history
   return [
-    { label: 'Issues opened', values: periods.map((p) => p.issues.opened / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.issues.opened)} opened` },
-    { label: 'Issues closed', values: periods.map((p) => p.issues.closed / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.issues.closed)} closed` },
-    { label: 'Pull requests merged', values: periods.map((p) => p.pullRequests.merged / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.pullRequests.merged)} merged` },
+    { label: 'Issues opened', values: periods.map((p) => p.issues.opened / periodDays), format: perDay, detail: (p) => `${formatCount(p.issues.opened)} opened` },
+    { label: 'Issues closed', values: periods.map((p) => p.issues.closed / periodDays), format: perDay, detail: (p) => `${formatCount(p.issues.closed)} closed` },
+    { label: 'Pull requests merged', values: periods.map((p) => p.pullRequests.merged / periodDays), format: perDay, detail: (p) => `${formatCount(p.pullRequests.merged)} merged` },
     {
       label: 'Lines changed',
       // A period whose merged pull requests are not all sized has an unknown total.
-      values: periods.map(({ pullRequests: pr }) => pr.merged === 0 ? 0 : pr.lines.counted < pr.merged || pr.lines.total === null ? null : pr.lines.total / PERIOD_DAYS),
+      values: periods.map(({ pullRequests: pr }) => pr.merged === 0 ? 0 : pr.lines.counted < pr.merged || pr.lines.total === null ? null : pr.lines.total / periodDays),
       format: (value) => value === null ? '—' : `${formatCount(Math.round(value))}/day`,
       detail: ({ pullRequests: pr }) => pr.lines.counted < pr.merged
         ? `Sizes known for ${formatCount(pr.lines.counted)} of ${formatCount(pr.merged)}`
@@ -56,8 +54,8 @@ export function historySeries(history: AnalyticsHistory): HistorySeries[] {
       format: formatDuration,
       detail: ({ pullRequests: pr }) => pr.merged ? `Median of ${formatCount(pr.merged)} ${pr.merged === 1 ? 'PR' : 'PRs'}` : 'No merges',
     },
-    { label: 'Pull requests opened', values: periods.map((p) => p.pullRequests.opened / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.pullRequests.opened)} opened` },
-    { label: 'Closed without merging', values: periods.map((p) => p.pullRequests.closedUnmerged / PERIOD_DAYS), format: perDay, detail: (p) => `${formatCount(p.pullRequests.closedUnmerged)} closed unmerged` },
+    { label: 'Pull requests opened', values: periods.map((p) => p.pullRequests.opened / periodDays), format: perDay, detail: (p) => `${formatCount(p.pullRequests.opened)} opened` },
+    { label: 'Closed without merging', values: periods.map((p) => p.pullRequests.closedUnmerged / periodDays), format: perDay, detail: (p) => `${formatCount(p.pullRequests.closedUnmerged)} closed unmerged` },
     { label: 'Time to first review', values: periods.map((p) => p.pullRequests.firstReview.medianMs), format: formatShortDuration, detail: (p) => `Median of ${formatCount(p.pullRequests.firstReview.count)} first reviews` },
     ...[
       { label: 'Comments', value: (pr: AnalyticsPeriod['pullRequests']) => pr.medianCommentsPerPr ?? null, format: formatRate },
@@ -135,8 +133,8 @@ export function histogram(values: Array<number | null>, min?: number, max?: numb
   const known = values.filter((n): n is number => n !== null && Number.isFinite(n))
   const low = min ?? (known.length ? Math.min(...known) : 0)
   const high = max ?? (known.length ? Math.max(...known) : 0)
-  const width = (high - low || Math.max(1, Math.abs(low) * 0.1)) / 10
-  const bins = Array.from({ length: 10 }, (_, i) => ({ from: low + width * i, until: low + width * (i + 1), count: 0 }))
-  for (const n of known) bins[Math.max(0, Math.min(9, Math.floor((n - low) / width)))].count++
+  const width = (high - low || Math.max(1, Math.abs(low) * 0.1)) / 5
+  const bins = Array.from({ length: 5 }, (_, i) => ({ from: low + width * i, until: low + width * (i + 1), count: 0 }))
+  for (const n of known) bins[Math.max(0, Math.min(bins.length - 1, Math.floor((n - low) / width)))].count++
   return bins
 }

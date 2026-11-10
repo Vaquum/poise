@@ -696,7 +696,7 @@ describe('durable timers that wake chats', () => {
     } finally { release() }
   }, 60_000)
 
-  it('waits through maintenance, reopening, model choice and release switches', async () => {
+  it.each(['before', 'after'] as const)('waits through maintenance, reopening, model choice and release switches (delivery %s reopening observation)', async (delivery) => {
     const release = await import('../server/release-background')
     const m = await workspaceManager(), p = await manager('Worker')
     const created = (await command(m.id, { operation: 'timer', sessionId: p.id, label: 'T', message: 'Ping', everyMinutes: 30 })).timer as { id: string }
@@ -738,25 +738,67 @@ describe('durable timers that wake chats', () => {
     finishes.get(p.id)!({ stopReason: 'end_turn' })
     await until(() => runtime.get(p.id)?.status === 'idle')
     prompts.delete(p.id)
-    // Reopening: a fired row on a closed chat waits, the tick reopens to
-    // idle, and the next tick admits once.
+    // Reopening and admission can both finish before the test observes them.
     runtime.prompt(p.id, { text: 'Busy', attachments: [], mentions: [] })
     await until(() => prompts.has(p.id))
     prompts.delete(p.id)
     clock += 30 * 60_000
     await control.tick()
-    await runtime.close(p.id)
-    await until(() => runtime.get(p.id)?.status === 'closed')
-    // A background tick may already have begun the reopen; either way the
-    // firing waits for the resume rather than delivering into a closed chat.
-    expect(['reopening', 'starting']).toContain(await waitsFor())
-    await control.tick()
-    await until(() => runtime.get(p.id)?.status === 'idle')
-    await control.tick()
-    await until(() => prompts.has(p.id))
-    finishes.get(p.id)!({ stopReason: 'end_turn' })
-    await until(() => runtime.get(p.id)?.status === 'idle')
-    prompts.delete(p.id)
+    const pending = store.timerPendingRow(instance, created.id)!
+    expect(pending).toBeDefined()
+    const beforeReopen = starts(p.id).length
+    const resume = runtime.resume.bind(runtime)
+    let releaseResume!: () => void
+    const held = new Promise<void>(resolve => { releaseResume = resolve })
+    const attempts = vi.spyOn(runtime, 'resume').mockImplementation(async id => {
+      if (id === p.id) await held
+      return resume(id)
+    })
+    try {
+      await runtime.close(p.id)
+      expect(runtime.get(p.id)?.status).toBe('closed')
+      const afterClose = runtime.get(p.id)!.lastSeq
+      const reopened = () => runtime.events(p.id, afterClose).events.some(e => e.event.type === 'session.resumed')
+      await control.tick()
+      expect(attempts).toHaveBeenCalledExactlyOnceWith(p.id)
+      // Hold the real resume through the HTTP read so neither reopening nor
+      // admission can race the pending-row/wait-cause assertions.
+      expect(await waitsFor()).toBe('reopening')
+      expect(store.timerPendingRow(instance, created.id)).toEqual(pending)
+      expect(starts(p.id)).toHaveLength(beforeReopen)
+      expect(prompts.has(p.id)).toBe(false)
+      if (delivery === 'before') {
+        releaseResume()
+        await until(() => prompts.has(p.id))
+      } else {
+        await holdingTimers(async () => {
+          releaseResume()
+          await until(reopened)
+          expect(starts(p.id)).toHaveLength(beforeReopen)
+          expect(prompts.has(p.id)).toBe(false)
+          expect(store.timerPendingRow(instance, created.id)).toEqual(pending)
+        })
+      }
+      await until(reopened)
+      await control.tick()
+      await until(() => prompts.has(p.id))
+      const delivered = starts(p.id).slice(beforeReopen)
+      expect(delivered).toHaveLength(1)
+      expect(delivered[0]!.source).toMatchObject({ kind: 'timer', timerId: created.id, seq: pending.seq })
+      expect(prompts.get(p.id)).toHaveLength(1)
+      expect(prompts.get(p.id)![0]!.text).toContain(`[Poise timer ${created.id} `)
+      expect(store.inbox(instance, p.id).find(row => row.seq === pending.seq)).toMatchObject({
+        timer_id: created.id, state: 'admitted', turn_id: delivered[0]!.turnId,
+      })
+      expect(store.timerPendingRow(instance, created.id)).toBeUndefined()
+      finishes.get(p.id)!({ stopReason: 'end_turn' })
+      await until(() => runtime.get(p.id)?.status === 'idle')
+      await control.tick()
+      expect(starts(p.id).slice(beforeReopen)).toEqual(delivered)
+      expect(prompts.get(p.id)).toHaveLength(1)
+      expect(store.timerPendingRow(instance, created.id)).toBeUndefined()
+      prompts.delete(p.id)
+    } finally { releaseResume(); attempts.mockRestore() }
     // A release switch in waiting holds fire and admission with its own cause.
     release.markReleaseSwitch(true)
     try {

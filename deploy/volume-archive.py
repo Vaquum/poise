@@ -48,11 +48,15 @@ def walk(top):
 
 def snapshot(database, copy):
     """Copies the database into copy in one online-backup step, so the copy is one consistent state."""
-    source = sqlite3.connect(f'file:{urllib.parse.quote(database)}?mode=ro', uri=True, timeout=60)
+    def progress(status, _remaining, _total):
+        if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise RuntimeError(f'{database}: SQLite snapshot is busy or locked; refusing an unsafe live-file copy')
+
+    source = sqlite3.connect(f'file:{urllib.parse.quote(database)}?mode=ro', uri=True, timeout=0)
     try:
         target = sqlite3.connect(copy)
         try:
-            source.backup(target)
+            source.backup(target, progress=progress)
         finally:
             target.close()
     finally:
@@ -94,6 +98,8 @@ def add_file(tar, path, name, staging, skipped):
             try:
                 snapshot(path, copy)
             except sqlite3.Error as error:
+                if getattr(error, 'sqlite_errorcode', 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise RuntimeError(f'{path}: SQLite snapshot is busy or locked; refusing an unsafe live-file copy') from error
                 note(f'{path}: SQLite cannot read it ({error}), so it is archived as it is, with its -wal and -shm files')
             else:
                 skipped.update(path + suffix for suffix in COMPANIONS)

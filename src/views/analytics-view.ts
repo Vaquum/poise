@@ -2,7 +2,7 @@ import { reveal } from '../motion'
 import { analyticsLayout } from '../analytics-layout'
 // Day, history and live quota retain independent read ownership on one card board.
 import { analyticsGroups, formatCount, formatRate, type AnalyticsGroup, type AnalyticsReport, type AnalyticsTile } from '../analytics-format'
-import { analyticsDay, analyticsDayProgress, analyticsHistoryBounds } from '../analytics-day'
+import { analyticsDay, analyticsDayProgress, analyticsDailyBounds, analyticsHistoryBounds } from '../analytics-day'
 import { analyticsSnapshotScope, hasNewAccountFailure, preparedAnalytics, readAnalyticsSnapshot, type AnalyticsSnapshot } from '../analytics-snapshot'
 import { HISTORY_BASELINE, historyChart, histogram, historySeries, periodLabel, type AnalyticsHistory, type HistorySeries } from '../analytics-history'
 import { mountOrganizationFilter, organizationUrl } from '../organizations'
@@ -79,6 +79,7 @@ let quotaTimer: ReturnType<typeof setInterval> | undefined
 // its own: until then each headline tile holds its chart's place.
 let shown: { report: AnalyticsReport, baseline: AnalyticsReport, progress: number | undefined, snapshotTime: string | undefined } | null = null
 let history: { data: AnalyticsHistory | null, error: string } = { data: null, error: '' }
+let dailyHistory: { data: AnalyticsHistory | null, error: string } = { data: null, error: '' }
 let historyScope = ''
 let historyReadAt = 0
 // The period a chart's cursor rests on, by tile, while hovered or focused.
@@ -120,10 +121,11 @@ function histogramMarkup(series: Pick<HistorySeries, 'label' | 'values' | 'forma
   const count = bins.reduce((sum, bin) => sum + bin.count, 0)
   const help = rounds
     ? `Review rounds: distribution of exact round counts for ${distribution?.counted ?? 0} of ${tile.population ?? 0} merged PRs on the selected day. Unknown counts are excluded.`
-    : `${series.label}: distribution of ${count} known weekly values over the past year in 10 equal-width bins. Unknown periods are excluded.`
+    : `${series.label}: distribution of ${count} known daily values over the 30 completed calendar days before the selected day in Settings timezone and selected organization scope, in ${bins.length} equal-width bins. Unknown daily values are excluded.`
+  const step = 100 / bins.length
   return `<div class="analytics-histogram" tabindex="0" role="img" aria-label="${escapeHtml(help)}" data-help="${escapeHtml(help)}">
-    <svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">${bins.map((bin, i) => `<rect x="${i * 10 + 1}" y="${39 - bin.count / max * 36}" width="8" height="${bin.count / max * 36}" data-help="${escapeHtml(`${series.format(bin.from)} – ${series.format(bin.until)}: ${bin.count} ${rounds ? 'PRs' : 'periods'}`)}"/>`).join('')}</svg>
-    <span class="analytics-chart-axis"><span>${escapeHtml(series.format(bins[0].from))}</span><span>${count ? '' : '—'}</span><span>${escapeHtml(series.format(bins[9].until))}</span></span>
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">${bins.map((bin, i) => `<rect x="${i * step + 1}" y="${39 - bin.count / max * 36}" width="${step - 2}" height="${bin.count / max * 36}" data-help="${escapeHtml(`${series.format(bin.from)} – ${series.format(bin.until)}: ${bin.count} ${rounds ? 'PRs' : bin.count === 1 ? 'day' : 'days'}`)}"/>`).join('')}</svg>
+    <span class="analytics-chart-axis"><span>${escapeHtml(series.format(bins[0].from))}</span><span>${count ? '' : '—'}</span><span>${escapeHtml(series.format(bins[bins.length - 1].until))}</span></span>
   </div>`
 }
 
@@ -221,10 +223,14 @@ function accountFailures(data: { errors: Array<{ org: string, error: string, sta
   return data.errors.map(({ org, error, stale }) => ({ key: `account:${org.toLowerCase()}`, title: `GitHub data for ${org} ${stale ? 'is not updating' : 'is unavailable'}`, body: error }))
 }
 
-function historyMarkup(tile: AnalyticsTile, all: HistorySeries[] | null, compact = false): string {
+function historyMarkup(tile: AnalyticsTile, all: HistorySeries[] | null, daily: HistorySeries[] | null, compact = false): string {
   const { label } = tile
-  if (history.error) return '<dd class="analytics-history" aria-label="History unavailable"></dd>'
-  if (!all) return `<dd class="analytics-history" aria-busy="true"><span class="analytics-history-max"></span><div class="analytics-history-plot" aria-busy="true"></div>${compact ? '' : '<div class="analytics-histogram"></div>'}</dd>`
+  const dailySeries = daily?.find((s) => s.label === label)
+  const distribution = compact ? '' : dailyHistory.error
+    ? '<div class="analytics-histogram" aria-label="Histogram unavailable"></div>'
+    : dailySeries ? histogramMarkup(dailySeries, tile) : '<div class="analytics-histogram" aria-busy="true"></div>'
+  if (history.error) return `<dd class="analytics-history" aria-label="History unavailable"><span class="analytics-history-max"></span><div class="analytics-history-plot"></div>${distribution}</dd>`
+  if (!all) return `<dd class="analytics-history" aria-busy="true"><span class="analytics-history-max"></span><div class="analytics-history-plot" aria-busy="true"></div>${distribution}</dd>`
   const series = all.find((s) => s.label === label)
   if (!series) return ''
   const chart = historyChart(series.values)
@@ -242,7 +248,7 @@ function historyMarkup(tile: AnalyticsTile, all: HistorySeries[] | null, compact
       ${chart.isolated.map((point) => `<span class="analytics-history-dot" style="${at(point)}"></span>`).join('')}
       ${latest ? `<span class="analytics-history-latest" style="${at(latest)}"></span>` : ''}
     </div>
-    ${compact ? '' : histogramMarkup(series, tile)}
+    ${distribution}
   </dd>`
 }
 
@@ -276,6 +282,7 @@ function workTypeMarkup(tile: AnalyticsTile): string {
 
 function groupMarkup(group: AnalyticsGroup): string {
   const series = history.data ? historySeries(history.data) : null
+  const daily = dailyHistory.data ? historySeries(dailyHistory.data, 1) : null
   return `
         ${group.tiles.map((tile) => `
           <article class="analytics-panel${tile.workTypes ? ' analytics-work-panel' : ''}" data-id="metric:${escapeHtml(group.id)}:${escapeHtml(tile.label)}" data-group="${group.id}" data-size="${group.id === 'productivity' ? 'tall' : 'short'}" data-label="${escapeHtml(tile.label)}" aria-label="${escapeHtml(tile.label)}${group.id === 'per-merged-pr' ? ' per merged pull request' : ''}">
@@ -285,7 +292,7 @@ function groupMarkup(group: AnalyticsGroup): string {
               <div class="analytics-value-row"><span class="analytics-value" data-help="${escapeHtml([measurementHelp[tile.label], tile.note].filter(Boolean).join(' '))}" tabindex="0">${escapeHtml(tile.value)}</span>${tile.valueLabel ? `<span class="analytics-work-label">${escapeHtml(tile.valueLabel)}</span>` : ''}${tile.trend ? `<span class="analytics-arrow" role="img" aria-label="${escapeHtml(tile.trend.description)}" data-help="${escapeHtml(tile.trend.caption)}" tabindex="0">${escapeHtml(tile.trend.text.slice(0, 1))}</span>` : ''}</div>
               ${tile.workTypes ? '' : `<div class="analytics-trend">${tile.trend ? `<span class="analytics-delta" data-help="${escapeHtml(tile.trend.description)}" tabindex="0">${escapeHtml(tile.trend.text.slice(2))}</span>` : ''}<span class="analytics-note">${tile.comparison && tile.comparison !== 'No agent account in Settings' ? escapeHtml(tile.comparison.replace(' · No baseline', '')) : ''}</span></div>`}
             </dd>
-            ${tile.workTypes ? workTypeMarkup(tile) : historyMarkup(tile, series, group.id === 'work-review')}
+            ${tile.workTypes ? workTypeMarkup(tile) : historyMarkup(tile, series, daily, group.id === 'work-review')}
           </dl></article>`).join('')}`
 }
 
@@ -412,26 +419,38 @@ async function readHistory(bounds: string[]): Promise<void> {
   const controller = new AbortController()
   historyRead = controller
   history = { data: null, error: '' }
+  dailyHistory = { data: null, error: '' }
   cursors.clear()
   cancelHover()
   hoveredSeries = null
   try {
-    const res = await fetch(organizationUrl(`/api/analytics/history?${new URLSearchParams({ bounds: bounds.join(',') })}`), { signal: controller.signal })
-    const data = await res.json().catch(() => null)
-    if (!res.ok || !Array.isArray(data?.periods)) throw new Error(data?.error || `The past year could not be read (HTTP ${res.status})`)
-    if (generation !== historyGeneration) return
-    history = { data: data as AnalyticsHistory, error: '' }
-    historyScope = scope
-    historyReadAt = Date.now()
-    noticeFeed.reportReadErrors('analytics-history', accountFailures(data))
-  } catch (error) {
-    if (generation !== historyGeneration) return
-    history = { data: null, error: error instanceof Error ? error.message : String(error) }
-    noticeFeed.reportReadErrors('analytics-history', [readFailure('Analytics history is unavailable', error)])
+    await Promise.all([bounds, analyticsDailyBounds(dayOffset, dayAnchor, 30)].map(async (edges, index) => {
+      const daily = index === 1
+      const source = daily ? 'analytics-histograms' : 'analytics-history'
+      const title = daily ? 'Analytics histograms are unavailable' : 'Analytics history is unavailable'
+      try {
+        const res = await fetch(organizationUrl(`/api/analytics/history?${new URLSearchParams({ bounds: edges.join(',') })}`), { signal: controller.signal })
+        const data = await res.json().catch(() => null)
+        if (!res.ok || !Array.isArray(data?.periods)) throw new Error(data?.error || `${title} (HTTP ${res.status})`)
+        if (generation !== historyGeneration) return
+        const result = { data: data as AnalyticsHistory, error: '' }
+        if (daily) dailyHistory = result
+        else history = result
+        historyScope = scope
+        historyReadAt = Date.now()
+        noticeFeed.reportReadErrors(source, accountFailures(data))
+      } catch (error) {
+        if (generation !== historyGeneration) return
+        const result = { data: null, error: error instanceof Error ? error.message : String(error) }
+        if (daily) dailyHistory = result
+        else history = result
+        noticeFeed.reportReadErrors(source, [readFailure(title, error)])
+      }
+      render()
+    }))
   } finally {
     if (historyRead === controller) historyRead = null
   }
-  render()
 }
 
 async function readAnalytics(background = false): Promise<void> {
@@ -452,6 +471,7 @@ async function readAnalytics(background = false): Promise<void> {
     historyRead?.abort()
     historyRead = null
     history = { data: null, error: '' }
+    dailyHistory = { data: null, error: '' }
     cursors.clear()
     cancelHover()
     hoveredSeries = null
@@ -596,9 +616,9 @@ export function initAnalyticsView(): void {
   const snapshot = preparedAnalytics(dayOffset, dayAnchor)
   if (snapshot) {
     const reopening = shown?.report === snapshot.report && shown.baseline === snapshot.baseline
-    const keepHistory = history.data && historyScope === analyticsSnapshotScope(dayOffset, dayAnchor) && Date.now() - historyReadAt <= getRefreshRateMs()
-    if (!keepHistory) { history = { data: null, error: '' }; cursors.clear() }
-    historyPending = !keepHistory || !!history.data?.errors.length
+    const keepHistory = history.data && dailyHistory.data && historyScope === analyticsSnapshotScope(dayOffset, dayAnchor) && Date.now() - historyReadAt <= getRefreshRateMs()
+    if (!keepHistory) { history = { data: null, error: '' }; dailyHistory = { data: null, error: '' }; cursors.clear() }
+    historyPending = !keepHistory || !!history.data?.errors.length || !!dailyHistory.data?.errors.length
     showSnapshot(snapshot)
     noticeFeed.reportReadErrors('analytics-day', [...accountFailures(snapshot.report), ...accountFailures(snapshot.baseline)])
     if (reopening && (snapshot.report.errors.length || snapshot.baseline.errors.length)) void readAnalytics(true)

@@ -63,6 +63,7 @@ def run(
     timeout_s: int = 3600,
     p: str | None = None,
     model: str | None = None,
+    review_scope: str = "",
 ) -> str:
     spec = atoms.CATALOG.review_model("pr_review", model)
     tools = allowed(pr, actor, expected_head) if spec.provider == "claude" else []
@@ -75,5 +76,5 @@ def run(
         return atoms.run_agent(
             pwd, SYSTEM + " " + review_repository.POLICY, text, tools, "pr_review", timeout_s,
             model=spec.identity, pr=pr, actor_name=actor, head=expected_head, repository=repository,
-            packet=packet,
+            packet=packet, note=note, review_scope=review_scope,
         )

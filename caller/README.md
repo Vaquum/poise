@@ -44,6 +44,15 @@ them. The chain invokes it only through the original native action/resource
 path after settling prior writes and native ownership. See
 [full-suite reconciliation](../docs/Behavior-chain.md#bounded-reconciliation).
 
+An atomic repair blocked solely by the supplied head's failed CI can return
+`blocked: {"cause":"ci_only","reason":"concrete CI blocker"}`. Caller retains
+its own supplied CI snapshot as `artifact.ci_blocker`, including the failed
+check and job IDs that identify the original run attempt. Other blockers remain
+strings and confer no automatic recovery authority. The
+[chain reconciler](../docs/Behavior-chain.md#bounded-reconciliation) checks the
+original no-publication receipt, resource release and fresh same-head CI before
+resuming the remaining gates.
+
 ## Accounts
 
 No GitHub account is fixed in Caller. Each `github-interface` behavior acts as
@@ -106,6 +115,11 @@ in `docs/Behavior-Contract.md`.
 this request performed the mutation. API errors fail visibly; a lost merge
 response can be reconciled by the next read without merging twice. This
 operation requires an explicit acting account.
+
+Merge-admission failures emit the existing bounded, redacted `caller_diagnostic`
+v1 envelope. Native Caller retains it with the original Call; the
+[native action receipt contract](../docs/Behavior-chain.md#native-action-receipts)
+defines refusal evidence, uncertainty and the chain's displayed next action.
 
 `github-interface --update-branch-if-behind '#7' --expected-head SHA --author
 USER --token-user AGENT` updates only the named author's open, non-draft head

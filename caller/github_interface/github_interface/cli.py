@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .interface import issue_work
+from .behaviors.merge_if_ready import MergeAdmissionError
 
 from .interface import chain_seed, checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, grey_ci_candidates, rerun_grey_ci_if_ready, merge_candidates, merge_if_ready, merge_pr, pull_action_state, update_branch_if_behind, mergeable, post_pr_comment, prune_mirrors, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
 
@@ -171,6 +172,8 @@ def main() -> None:
         result = asyncio.run(behavior(payload))
     except (RuntimeError, ValueError) as error:
         diagnostic = getattr(error, "diagnostic", None)
+        if argv[0] == "--merge-if-ready" and not diagnostic:
+            diagnostic = MergeAdmissionError(error).diagnostic
         print("caller_diagnostic: " + json.dumps(diagnostic) if diagnostic else f"error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
     print(json.dumps(result, separators=(",", ":")) if argv[0] == "--pr-review" else json.dumps(result, indent=2))

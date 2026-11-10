@@ -12,8 +12,7 @@ _reference: dict | None = None
 _descriptors: tuple[int, int] | None = None
 
 
-def _identity(fd: int, expected: dict, directory: bool) -> None:
-    node = os.fstat(fd)
+def _identity(node: os.stat_result, expected: dict, directory: bool) -> None:
     if (not stat.S_ISDIR(node.st_mode) if directory else not stat.S_ISREG(node.st_mode)) \
             or node.st_uid != os.getuid() \
             or {"device": str(node.st_dev), "inode": str(node.st_ino)} != expected:
@@ -73,7 +72,7 @@ def _store() -> tuple[dict, tuple[int, int]] | None:
                 try:
                     # Following this procfs link duplicates the original held inode.
                     fd = os.open(f"/proc/{reference['pid']}/fd/{reference[key]}", os.O_RDONLY | os.O_DIRECTORY)
-                    _identity(fd, reference[name], True)
+                    _identity(os.fstat(fd), reference[name], True)
                 except (FileNotFoundError, PermissionError, NotADirectoryError, RuntimeError):
                     if fd is not None:
                         os.close(fd)
@@ -84,7 +83,7 @@ def _store() -> tuple[dict, tuple[int, int]] | None:
                     # original inode are both required before using its name.
                     fd = os.open(fallback, flags)
                 opened.append(fd)
-                _identity(fd, reference[name], True)
+                _identity(os.fstat(fd), reference[name], True)
             _reference, _descriptors = reference, (opened[0], opened[1])
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             for fd in opened:
@@ -102,7 +101,7 @@ def directory(path: Path, *, responses: bool = False) -> Path:
     if path.absolute() != expected:
         raise RuntimeError("Caller metadata path differs from its configured workspace")
     fd = descriptors[1 if responses else 0]
-    _identity(fd, reference["responses" if responses else "directory"], True)
+    _identity(os.fstat(fd), reference["responses" if responses else "directory"], True)
     return Path(f"/proc/self/fd/{fd}")
 
 
@@ -114,13 +113,11 @@ def connect(path: str | Path, *, timeout: float = 30) -> sqlite3.Connection:
     reference, _ = store
     if path.name != "calls.sqlite3":
         raise RuntimeError("Caller metadata database name differs")
-    root = directory(path.parent)
-    fd = os.open(root / path.name, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        _identity(fd, reference["database"], False)
-        return sqlite3.connect(root / path.name, timeout=timeout)
-    finally:
-        os.close(fd)
+    database = directory(path.parent) / path.name
+    # Closing an ordinary file descriptor would release SQLite's POSIX locks
+    # on this inode throughout the process, including other live connections.
+    _identity(database.lstat(), reference["database"], False)
+    return sqlite3.connect(f"{database.as_uri()}?mode=rw", timeout=timeout, uri=True)
 
 
 def require_current_path(path: Path) -> None:
@@ -132,7 +129,7 @@ def require_current_path(path: Path) -> None:
         raise RuntimeError("Caller allocation path differs from its original metadata directory")
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        _identity(fd, reference["directory"], True)
+        _identity(os.fstat(fd), reference["directory"], True)
     finally:
         os.close(fd)
 

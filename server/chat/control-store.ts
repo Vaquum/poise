@@ -229,7 +229,7 @@ export function children(instance: string): Array<{ child: string, manager: stri
 
 export interface InternalMessage {
   seq: number, recipient: string, sender: string, event_key: string, body: string, created_at: number,
-  state: 'pending' | 'admitted', turn_id: string | null, sender_title: string | null, sender_role: 'manager' | 'worker' | null,
+  state: 'pending' | 'admitted' | 'recipient_deleted', turn_id: string | null, sender_title: string | null, sender_role: 'manager' | 'worker' | null,
   timer_id: string | null, timer_missed: number
 }
 const INBOX_COLUMNS = 'seq, recipient, sender, event_key, body, created_at, state, turn_id, sender_title, sender_role, timer_id, timer_missed'
@@ -241,6 +241,12 @@ export function message(instance: string, recipient: string, sender: string, bod
 export function inbox(instance: string, recipient: string, after = 0): InternalMessage[] {
   return db.prepare(`SELECT ${INBOX_COLUMNS} FROM chat_control_inbox
     WHERE instance = ? AND recipient = ? AND seq > ? ORDER BY seq LIMIT 100`).all(instance, recipient, after) as InternalMessage[]
+}
+export function settleOrphanedMessages(instance: string): void {
+  db.prepare(`UPDATE chat_control_inbox SET state = 'recipient_deleted'
+    WHERE instance = ? AND state = 'pending' AND timer_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM chat_sessions
+        WHERE id = chat_control_inbox.recipient AND instance = chat_control_inbox.instance)`).run(instance)
 }
 /** Per recipient, two candidates: the oldest pending ordinary row and the
  *  oldest pending timer row. A hold excludes the recipient from both: while
@@ -324,8 +330,11 @@ export const forgetSession = db.transaction((instance: string, session: string, 
   db.prepare('DELETE FROM chat_work_bindings WHERE instance = ? AND session = ?').run(instance, session)
   db.prepare('UPDATE chat_control_watches SET enabled = 0 WHERE instance = ? AND owner = ?').run(instance, session)
   db.prepare('DELETE FROM chat_control_children WHERE instance = ? AND (child = ? OR manager = ?)').run(instance, session, session)
-  // A deleted chat's undelivered messages go with it; delivered ones stay
-  // in the recipients' transcripts.
+  // Settle incoming notices before sender cleanup so self-sends survive too.
+  db.prepare(`UPDATE chat_control_inbox SET state = 'recipient_deleted'
+    WHERE instance = ? AND recipient = ? AND state = 'pending' AND timer_id IS NULL`).run(instance, session)
+  // A deleted chat's remaining undelivered outgoing messages go with it;
+  // delivered ones stay in the recipients' transcripts.
   db.prepare(`DELETE FROM chat_control_inbox WHERE instance = ? AND sender = ? AND state = 'pending'`).run(instance, session)
   const targets = (db.prepare(`SELECT id FROM chat_control_timers WHERE instance = ? AND target = ?
     AND state IN ('active','held','tripped')`).all(instance, session) as Array<{ id: string }>)

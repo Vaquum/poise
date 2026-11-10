@@ -136,6 +136,7 @@ POISE_INSECURE_HTTP=1
 POISE_GITHUB_URL=$github
 POISE_GITHUB_API_URL=$github
 POISE_WORKSPACE_SKIP_CLI_BOOTSTRAP=1
+POISE_REPAIR_EXHAUSTION_REPOSITORIES=acme/repair-test
 EOF
   "$deploy/install.sh" | tee "$work/install.log"
   grep --quiet --fixed-strings "$apex/auth/callback" "$work/install.log" || fail "install.sh did not print the OAuth App's callback URL"
@@ -168,6 +169,7 @@ open_workspace() {
   expect 200 "Poise's script, through alice's workspace host" "$alice" "http://alice.$domain$script"
   [ "$(workspace_version)" = "$(git -C "$root" rev-parse HEAD)" ] || fail "the workspace reports version $(workspace_version), not the commit it was built from"
   pass "the workspace reports the commit it was built from"
+  [ "$(in_workspace printenv POISE_REPAIR_EXHAUSTION_REPOSITORIES)" = acme/repair-test ] || fail "install did not forward the repair report allowlist to the workspace"
   expect 200 "the admin page, for alice" "$alice" "$apex/admin"
 }
 
@@ -478,6 +480,7 @@ check_upgrade() {
   done
   [ "$version" = "$sha" ] || fail "alice's workspace did not come back on $sha within 7.5 minutes; it reports '$version'"
   [ "$(docker inspect --format '{{.Id}}' poise-ws-alice)" = "$before" ] || fail "the gateway replaced alice's container instead of updating it in place"
+  [ "$(in_workspace printenv POISE_REPAIR_EXHAUSTION_REPOSITORIES)" = acme/repair-test ] || fail "upgrade lost the repair report allowlist"
   in_workspace pgrep -f 'sleep 3600' >/dev/null || fail "a process running in alice's workspace did not survive the update"
   docker logs poise-gateway 2>&1 | grep '"handle":"alice"' | grep --quiet '"event":"workspace.update.requested"' \
     || fail "the gateway did not log the switch it asked for"

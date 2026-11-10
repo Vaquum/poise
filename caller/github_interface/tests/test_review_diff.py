@@ -121,6 +121,7 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
                     patch.object(pr_review, 'review_diff', AsyncMock(return_value={})), \
                     patch.object(pr_review, 'list_inline_comments', AsyncMock(return_value=[])), \
                     patch.object(pr_review, 'list_review_threads', AsyncMock(return_value=[])), \
+                    patch.object(pr_review, 'list_reviews', AsyncMock(return_value=[])), \
                     patch.object(pr_review, 'linked_issues', AsyncMock(return_value=[])):
                 with self.assertRaisesRegex(RuntimeError, 'head or base changed'):
                     await pr_review.run(AsyncMock(), {'repository': 'o/r', 'pr': 1, 'expected_head': head})
@@ -364,6 +365,7 @@ class TestSinceHeadDiff(IsolatedAsyncioTestCase):
                 patch.object(pr_review, 'list_inline_comments', AsyncMock(return_value=[])), \
                 patch.object(pr_review, 'issue_comments', AsyncMock(return_value=[])), \
                 patch.object(pr_review, 'list_review_threads', AsyncMock(return_value=[])), \
+                patch.object(pr_review, 'list_reviews', AsyncMock(return_value=[])), \
                 patch.object(pr_review, 'linked_issues', AsyncMock(return_value=[])):
             await pr_review.run(client, {'repository': 'o/r', 'pr': 1, 'expected_head': head,
                                          'since_head': since})

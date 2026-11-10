@@ -143,14 +143,16 @@ class TestMergeIfReady(IsolatedAsyncioTestCase):
 
     async def test_missing_readiness_and_api_failures_do_not_claim_success(self):
         self.readiness.side_effect = RuntimeError('GitHub unavailable')
-        with self.assertRaisesRegex(RuntimeError, 'GitHub unavailable'):
+        with self.assertRaisesRegex(RuntimeError, 'GitHub unavailable') as refused:
             await merge_if_ready.run(self.client, PAYLOAD)
+        self.assertEqual(refused.exception.diagnostic['submission'], 'none')
         self.client.request.assert_not_awaited()
         self.readiness.side_effect = None
         self.readiness.return_value = READY
         self.client.request.return_value = {'merged': False, 'message': 'blocked'}
-        with self.assertRaisesRegex(RuntimeError, 'did not merge'):
+        with self.assertRaisesRegex(RuntimeError, 'did not merge') as rejected:
             await merge_if_ready.run(self.client, PAYLOAD)
+        self.assertEqual(rejected.exception.diagnostic['submission'], 'rejected')
 
     async def test_missing_author_or_head_is_refused(self):
         for key in ['author', 'expected_head']:

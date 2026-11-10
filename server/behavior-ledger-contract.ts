@@ -163,8 +163,10 @@ export interface LedgerWorkerRequest {
   id: number
   operation: 'capture' | 'read' | 'pending' | 'close'
   observation?: LedgerObservation
+  observations?: LedgerObservation[]
   request?: LedgerRead
 }
+export const LEDGER_CAPTURE_BATCH_LIMIT = 32
 export interface LedgerWorkerReply {
   id: number
   status: number
