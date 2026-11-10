@@ -282,6 +282,17 @@ it.each(['source body', 'source comment', 'PR body', 'PR comment'])('verifies an
   expect(reports(db)).toHaveLength(0)
 })
 
+it('ignores ordinary continuation-like words without a successor reference', async () => {
+  const { db, journal } = setup()
+  openSeed(journal)
+  fresh = closedObservation()
+  seedBody = 'Work continued today. No successor yet.'
+  await new BehaviorChainRuntime(journal, operations(db, journal, { observe: async () => fresh })).run()
+  expect(posts()).toHaveLength(1)
+  expect(remote[0]).toMatchObject({ title: 'fix: continue #7 after closed unmerged PR #21' })
+  expect(reports(db)).toHaveLength(1)
+})
+
 it.each(['wrong coverage', 'ambiguous', 'unavailable', 'closed successor', 'missing label'])(
   'keeps an unverified successor pending: %s', async change => {
     const { db, journal } = setup()
