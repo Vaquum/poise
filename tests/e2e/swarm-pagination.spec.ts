@@ -345,6 +345,174 @@ test('quarantine counts follow stored records across refresh and pagination', as
   await expect(notice).toContainText('4 unreadable worker log row(s) isolated')
 })
 
+test('known unreadable rows keep their alert age and dismissal across refresh, search, navigation and reload', async ({ page }) => {
+  await workspace(page, 'current', undefined, { preserveOnReload: true }); await settled(page)
+  await page.route('**/api/notices', route => route.fulfill({ json: { enabled: true, notices: [] } }))
+  const logs = history().slice(0, 401)
+  const quarantine = (historyRowId: string, index: number, error: string, call: string | null) => ({
+    historyRowId, index, error, id: call, repo: null, prId: null, correlationId: null, behavior: null, sessionId: null,
+  })
+  const A = 'a'.repeat(32), B = 'b'.repeat(32), C = 'c'.repeat(32)
+  let offset = 0
+  let mode: 'AB' | 'AC' = 'AB'
+  let failReads = false
+  await page.route('**/api/agent-logs**', route => {
+    if (failReads) return route.fulfill({ status: 502, json: { error: 'History offline' } })
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('status') === 'running') return route.fulfill({ json: { logs: [] } })
+    const search = url.searchParams.get('search')
+    if (search === 'nothing-matches-this') return route.fulfill({ json: { logs: [], total: 0, nextCursor: null, quarantined: [] } })
+    if (search) return route.fulfill({ json: { logs: logs.slice(0, 1), total: 1, nextCursor: null,
+      quarantined: [quarantine('500', 1 + offset, `Caller History row ${1 + offset} is unreadable (INVALID_RECORD)`, A)] } })
+    const second = mode === 'AB'
+      ? quarantine('499', 2 + offset, `payload fault ${offset} (INVALID_RECORD)`, B)
+      : quarantine('501', 2 + offset, `payload fault ${offset} (INVALID_RECORD)`, C)
+    const quarantined = [
+      quarantine('500', 1 + offset, `Caller History row ${1 + offset} is unreadable (INVALID_RECORD)`, A),
+      second,
+      quarantine('502', 3 + offset, `agent-interface log row ${3 + offset} is unreadable (INVALID_UTF8)`, null),
+    ]
+    return route.fulfill({ json: { ...paged(logs, url, 200), quarantined } })
+  })
+  await page.reload(); await settled(page)
+  const card = () => feedback(page, 'Unreadable Swarm records')
+  const age = () => card().then(notice => notice.locator('time').getAttribute('datetime'))
+  // A toast only shows while the rail is closed; asserting none with it open
+  // would prove nothing. Leaving cards are already on their way out.
+  const liveToasts = page.locator('.nr-toast:not([data-leaving="true"])')
+  const closeRail = async () => {
+    if (await page.locator('#notification-bell').getAttribute('aria-expanded') === 'true') await page.keyboard.press('Escape')
+    await expect(page.locator('#notification-bell')).toHaveAttribute('aria-expanded', 'false')
+  }
+  const showSwarm = async () => {
+    if (await page.locator('#view-swarm').isHidden()) await page.getByRole('button', { name: 'Swarm', exact: true }).click()
+    await expect(page.locator('#view-swarm')).toBeVisible()
+  }
+  // Toast assertions always run before opening the rail: opening it drops
+  // toasts, so asserting after would prove nothing.
+  await showSwarm()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(1)
+  await expect(liveToasts.locator('.nr-toast-title')).toHaveText('Unreadable Swarm records')
+  await expect(await card()).toContainText('3 unreadable worker log row(s) isolated')
+  await expect(await card()).toContainText('Call: unknown')
+  const firstAge = await age()
+  // Shifted indexes and reworded evidence update the text, not the alert.
+  offset = 4
+  await refreshed(page, true)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toContainText('payload fault 4')
+  await expect.poll(age).toBe(firstAge)
+  // A known undismissed notice reloads with its age and stays silent.
+  await page.reload(); await settled(page)
+  await showSwarm()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toContainText('payload fault 4')
+  await expect.poll(age).toBe(firstAge)
+  // Dismissed rows stay dismissed across refresh, subset and empty searches.
+  await (await card()).locator('.nr-card-head').click()
+  await (await card()).getByRole('button', { name: 'Dismiss' }).click()
+  await expect(await card()).toHaveCount(0)
+  await closeRail()
+  offset = 9
+  await refreshed(page, true)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toHaveCount(0)
+  const searched = page.waitForResponse(response => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/agent-logs' && url.searchParams.has('search')
+  })
+  await page.locator('#swarm-search').fill('Run 1')
+  await (await searched).finished()
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toHaveCount(0)
+  const emptied = page.waitForResponse(response => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/agent-logs' && url.searchParams.get('search') === 'nothing-matches-this'
+  })
+  await page.locator('#swarm-search').fill('nothing-matches-this')
+  await (await emptied).finished()
+  await expect(page.locator(rows)).toHaveCount(0)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toHaveCount(0)
+  const cleared = page.waitForResponse(response => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/agent-logs' && !url.searchParams.has('search') && !url.searchParams.has('status')
+  })
+  await page.locator('#swarm-search').fill('')
+  await (await cleared).finished()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toHaveCount(0)
+  // Navigation away and back, then a reload, keep the dismissal.
+  await page.getByRole('button', { name: 'Current', exact: true }).click()
+  await expect(page.locator('#view-current')).toBeVisible()
+  await showSwarm()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toHaveCount(0)
+  await page.reload(); await settled(page)
+  await showSwarm()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toHaveCount(0)
+  // A new row replacing another at the same count alerts once, with a new age.
+  mode = 'AC'
+  // Boot anywhere but Swarm: the feed starts after the first view, so a poll
+  // on boot would renew before the rail can announce it.
+  await page.evaluate(() => localStorage.setItem('poise-view', 'current'))
+  const announced = page.waitForResponse(response => new URL(response.url()).pathname === '/api/notices')
+  await page.reload()
+  await announced
+  await settled(page)
+  await showSwarm()
+  await expect(page.locator(rows)).toHaveCount(200)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(1)
+  await expect(liveToasts.locator('.nr-toast-title')).toHaveText('Unreadable Swarm records')
+  await expect(await card()).toContainText('3 unreadable worker log row(s) isolated')
+  await expect(await card()).toContainText(`Call: ${C}`)
+  const renewedAge = await age()
+  expect(renewedAge).not.toBe(firstAge)
+  // After dismissing the new row, returning to the known rows stays quiet.
+  await (await card()).locator('.nr-card-head').click()
+  await (await card()).getByRole('button', { name: 'Dismiss' }).click()
+  await expect(await card()).toHaveCount(0)
+  await closeRail()
+  mode = 'AB'
+  await refreshed(page, true)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  await expect(await card()).toHaveCount(0)
+  // A failed read warns separately without disturbing the retained dismissal.
+  await closeRail()
+  failReads = true
+  await refreshed(page, false)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(1)
+  await expect(liveToasts.locator('.nr-toast-title')).toHaveText('Swarm is not updating')
+  const rail = await feedback(page)
+  await expect(rail.locator('.nr-card').filter({ hasText: 'Swarm is not updating' })).toHaveCount(1)
+  await expect(await card()).toHaveCount(0)
+  await closeRail()
+  failReads = false
+  await refreshed(page, true)
+  await closeRail()
+  await expect(liveToasts).toHaveCount(0)
+  const recovered = await feedback(page)
+  await expect(recovered.locator('.nr-card')).toHaveCount(0)
+})
+
 test('arrivals larger than a page merge into run order and keep newest-target selection', async ({ page }) => {
   await workspace(page); await settled(page)
   const old = history().slice(0, 401)

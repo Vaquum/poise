@@ -1,4 +1,5 @@
 import { viewDiagnostic, viewFeedback } from '../view-feedback'
+import { noticeFeed } from '../notices'
 import { logTime } from '../clock'
 import { effectiveTimezone } from '../config'
 import { finishMotion, layout, retire, scrollToActor } from '../motion'
@@ -238,6 +239,128 @@ function quarantineDescription(row: QuarantinedLog): string {
   return [target, `Call: ${row.id || 'unknown'}`, row.correlationId ? `Correlation: ${row.correlationId}` : '',
     row.behavior ? `Behavior: ${row.behavior}` : '', row.sessionId ? `Session: ${row.sessionId}` : '',
     position, error].filter(Boolean).join(' · ')
+}
+
+// Stable alert identity for unreadable rows across refreshes, pages, searches,
+// organization switches and reloads. The feed renews a tab-local notice
+// whenever its body changes and forgets its dismissal when a report goes
+// empty; Swarm rebuilds this body from whatever rows are currently loaded and
+// empties it on every search or organization reset, so known rows re-alerted
+// as "now" and undismissed themselves. The checkpoint retains the observed
+// record identities, the notice's age and its dismissal independently of the
+// loaded rows: only an unseen identity renews the alert. A genuinely empty,
+// complete, unfiltered read clears it, so recovered evidence still clears; a
+// subset, an empty filtered page or a failed read never does. Storage is read
+// once and written only when the identities, text, age or dismissal actually
+// change, so the search and pagination hot paths never touch it.
+const SWARM_RECORDS_KEY = 'swarm-records'
+const SWARM_RECORDS_TITLE = 'Unreadable Swarm records'
+const SWARM_RECORDS_CHECKPOINT = 'poise:swarm-quarantine:v1'
+const SWARM_RECORDS_CHECKPOINT_LIMIT = 500
+
+interface SwarmRecordsCheckpoint { ids: string[], since: string, due: string, dismissed: boolean, body: string }
+
+function readRecordsCheckpoint(): SwarmRecordsCheckpoint | null {
+  try {
+    const raw = localStorage.getItem(SWARM_RECORDS_CHECKPOINT)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<SwarmRecordsCheckpoint>
+    if (!Array.isArray(parsed.ids) || !parsed.ids.every((id) => typeof id === 'string')
+      || typeof parsed.since !== 'string' || typeof parsed.due !== 'string'
+      || typeof parsed.dismissed !== 'boolean' || typeof parsed.body !== 'string') return null
+    return { ids: parsed.ids.slice(-SWARM_RECORDS_CHECKPOINT_LIMIT), since: parsed.since, due: parsed.due, dismissed: parsed.dismissed, body: parsed.body }
+  } catch {
+    return null
+  }
+}
+
+let recordsCheckpoint = readRecordsCheckpoint()
+
+function saveRecordsCheckpoint(): void {
+  try {
+    if (!recordsCheckpoint) localStorage.removeItem(SWARM_RECORDS_CHECKPOINT)
+    else localStorage.setItem(SWARM_RECORDS_CHECKPOINT, JSON.stringify(recordsCheckpoint))
+  } catch {
+    // Private browsing keeps session-only behavior: the in-memory checkpoint
+    // still stabilizes this tab, it just does not survive a reload.
+  }
+}
+
+function recordsBody(rows: QuarantinedLog[]): string {
+  return `${rows.length} unreadable worker log row(s) isolated. Other runs continue updating.\n`
+    + rows.map(quarantineDescription).join('\n')
+}
+
+function reportSwarmRecords(): void {
+  const fresh = quarantined
+  const checkpoint = recordsCheckpoint
+  if (!fresh.length && !checkpoint) {
+    viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+    return
+  }
+  if (!fresh.length && checkpoint) {
+    // Empty reads are ambiguous: only a complete, unfiltered, error-free read
+    // proves recovery, whether or not readable rows came with it. Anything
+    // else — a subset page, an empty filtered page, a reset awaiting its poll,
+    // a failed read — keeps the retained evidence and identity.
+    const recovered = historyComplete && !searchQuery && !lastLoadError
+    if (recovered) {
+      recordsCheckpoint = null
+      saveRecordsCheckpoint()
+      viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+      return
+    }
+    if (checkpoint.dismissed) {
+      viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+      return
+    }
+    noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
+      title: SWARM_RECORDS_TITLE, body: checkpoint.body,
+      kind: 'read_failed', preserveIdentity: true, since: checkpoint.since, due: checkpoint.due }])
+    return
+  }
+  const known = new Set(checkpoint?.ids ?? [])
+  const unseen = fresh.map(quarantineKey).filter((key) => !known.has(key))
+  if (unseen.length) {
+    const at = new Date().toISOString()
+    const body = recordsBody(fresh)
+    recordsCheckpoint = { ids: [...(checkpoint?.ids ?? []), ...unseen].slice(-SWARM_RECORDS_CHECKPOINT_LIMIT), since: at, due: at, dismissed: false, body }
+    saveRecordsCheckpoint()
+    // A plain report: the changed body renews the alert with a new age, even
+    // when a new row replaces another and the count stays the same.
+    viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, body)
+    return
+  }
+  const retained = recordsCheckpoint
+  if (!retained || retained.dismissed) {
+    viewFeedback(SWARM_RECORDS_KEY, SWARM_RECORDS_TITLE, '')
+    return
+  }
+  // Known rows, possibly reworded: update the text, keep the alert.
+  const body = recordsBody(fresh)
+  if (retained.body !== body) {
+    recordsCheckpoint = { ...retained, body }
+    saveRecordsCheckpoint()
+  }
+  noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
+    title: SWARM_RECORDS_TITLE, body, kind: 'read_failed', preserveIdentity: true, since: retained.since, due: retained.due }])
+}
+
+// A dismissal persists at once, even when no further render runs before a
+// reload puts the retained rows back on screen.
+noticeFeed.subscribe(() => {
+  if (recordsCheckpoint && !recordsCheckpoint.dismissed && noticeFeed.isLocalNoticeDismissed(SWARM_RECORDS_KEY)) {
+    recordsCheckpoint = { ...recordsCheckpoint, dismissed: true }
+    saveRecordsCheckpoint()
+  }
+})
+
+// Restored before the notification rail mounts, so its first update lists the
+// known notice with its kept age instead of announcing it as a new arrival.
+if (recordsCheckpoint && !recordsCheckpoint.dismissed && recordsCheckpoint.ids.length) {
+  noticeFeed.reportLocalNotices(SWARM_RECORDS_KEY, [{ key: SWARM_RECORDS_KEY,
+    title: SWARM_RECORDS_TITLE, body: recordsCheckpoint.body,
+    kind: 'read_failed', preserveIdentity: true, since: recordsCheckpoint.since, due: recordsCheckpoint.due }])
 }
 
 // Status is a coloured icon and the status in a word. The status and outcome
@@ -1737,10 +1860,7 @@ function renderStaleBanner(): void {
   const age = lastLoadedAt ? new Date(lastLoadedAt).toISOString() : 'none'
   viewFeedback('swarm-read', 'Swarm is not updating', lastLoadError
     ? `${lastLoadError}. Last successful read: ${age}. ${partial}` : '', 'read_failed')
-  viewFeedback('swarm-records', 'Unreadable Swarm records', quarantined.length
-    ? `${quarantined.length} unreadable worker log row(s) isolated. Other runs continue updating.\n`
-      + quarantined.map(quarantineDescription).join('\n')
-    : '', 'read_failed')
+  reportSwarmRecords()
 }
 
 // The Started column shows a relative time ("3m") computed at render.
