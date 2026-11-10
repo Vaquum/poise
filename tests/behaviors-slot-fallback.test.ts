@@ -408,6 +408,11 @@ it.each(['initial review', 'approval', 'dismissed approval'] as const)(
     expect(mocks.spawnDetached).toHaveBeenCalledTimes(2)
     expect(db.getFailedBehaviorLaunch(behavior, heldTarget)?.launchCallId).toBe(second.id)
 
+    // The stopping timeout still re-trips the model so other PRs keep the backoff.
+    const reviewerFailure = runtime.getBehaviorsRuntimeHealth().failures
+      .find((failure) => failure.target === `reviewer:${model}`)
+    expect(reviewerFailure?.callId).toBe(second.id)
+
     // A retained legacy clock must not advertise another automatic retry.
     db.setMeta(`${failureKey}${heldTarget}`, JSON.stringify({ kind: 'worker', consecutiveFailures: 2,
       lastFailureAtMs: Date.now(), nextRetryAtMs: Date.now() + 60_000, error: second.error, callId: second.id }))

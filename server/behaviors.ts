@@ -1062,10 +1062,10 @@ function reviewerSucceeded(call: LogEntry): void {
   clearReviewerTrip(identity)
 }
 
-// Trips the reviewer when a failed call is a provider failure before a
-// verdict, and releases the target so the next slot runs on the next tick —
-// true when the claim was released and reconciliation moves on.
-function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, call: LogEntry): boolean {
+// Trips the reviewer for a provider failure before a verdict, without
+// releasing the target. The retained stop keeps this PR/head held while the
+// fresh trip keeps the existing timeout backoff for other PRs.
+function tripReviewerForCall(behavior: TripBehavior, call: LogEntry): boolean {
   observeProviderRejection(call)
   const kind = reviewerTripKind(call)
   const identity = kind ? tripIdentity(call) : null
@@ -1075,6 +1075,14 @@ function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, 
   // instead of risking a duplicate verdict.
   if (call.review_comments != null || /could not prove a safe recovery/.test(call.error || '')) return false
   tripReviewer(behavior, identity, kind, call.id)
+  return true
+}
+
+// Trips the reviewer when a failed call is a provider failure before a
+// verdict, and releases the target so the next slot runs on the next tick —
+// true when the claim was released and reconciliation moves on.
+function releaseTrippedCall(behavior: TripBehavior, claim: BehaviorLaunchClaim, call: LogEntry): boolean {
+  if (!tripReviewerForCall(behavior, call)) return false
   if (tripHoldsTarget(call)) return false
   releaseOwnedClaim(behavior, claim.target, claim.claimId)
   return true
@@ -2308,6 +2316,7 @@ async function reconcileBehaviorLaunchClaims(
     if (FAILED_AGENT_STATUSES.has(status) && boundedReviewFailure(call)) {
       if (budgetExhaustedProvenNoAction(call) && prReviewRetryState(snapshot, behavior, claim.launchRepo,
         claim.launchPr, claim.launchExpectedHead, claim.launchActor, call.model, claim.target).stopped) {
+        tripReviewerForCall(behavior, call)
         deadLetterClaim(claim, REVIEW_BUDGET_STOPPED)
         continue
       }
@@ -4133,7 +4142,8 @@ async function releaseFailedBehaviorIfNoAction(
   if (prReviewRetryState(snapshot, behavior, repo, number, failed.launchExpectedHead,
     failed.launchActor, configuredModel ?? call.model, target).stopped
     && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
-  if (boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call) && call.model === configuredModel
+  if (boundedReviewFailure(call) && !budgetExhaustedProvenNoAction(call)
+    && (configuredModel == null || call.model === configuredModel)
     && await currentHeadSha(repo, number, failed.launchActor) === failed.launchExpectedHead) return false
   const blockedPacket = call.action === 'not_started'
     && call.outcome === 'preflight_failed'
