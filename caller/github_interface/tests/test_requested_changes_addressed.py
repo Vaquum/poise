@@ -109,6 +109,49 @@ class TestRequestedChangesAddressed(IsolatedAsyncioTestCase):
                       latest_request_at="2026-09-17T11:00:00+00:00", resolved_request_threads=1, response_count=1)
         self.assertEqual(await requested_changes_addressed.run(client, PAYLOAD), wanted)
 
+    async def test_referenced_roots_retain_resolution_evidence_in_summary_and_mixed_reviews(self):
+        body = ("The assessment still reports blockers.\n\n" + REAFFIRM_BODY
+                + "\n\n[Thread 10](https://github.com/owner/repo/pull/7#discussion_r10):\n\n> finding")
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                client = FakeClient([review("COMMENTED"), review("CHANGES_REQUESTED", 2, body, submitted_at=REPLIED_AT)])
+                client.inline = [{"id": identifier, "pull_request_review_id": 1, "user": {"login": "reviewer"}}
+                                 for identifier in (10, 30)]
+                client.threads = [thread(10, resolved=False), thread(30)]
+                if mixed:
+                    client.inline.append({"id": 20, "pull_request_review_id": 2, "user": {"login": "reviewer"}})
+                    client.threads.append(thread(20))
+                result = await requested_changes_addressed.run(client, PAYLOAD)
+                self.assertFalse(result["status"])
+                self.assertEqual(result["resolved_request_threads"], 0)
+
+                client.threads[0]["isResolved"] = True
+                # An unrelated unresolved root cannot hold this review's findings.
+                client.threads[1]["isResolved"] = False
+                result = await requested_changes_addressed.run(client, PAYLOAD)
+                self.assertTrue(result["status"])
+                self.assertEqual(result["resolved_request_threads"], 2 if mixed else 1)
+
+    async def test_referenced_root_retains_author_reply_evidence(self):
+        body = (REAFFIRM_BODY
+                + "\n\n[Thread 10](https://github.com/owner/repo/pull/7#discussion_r10):\n\n> finding")
+        client = FakeClient([review("CHANGES_REQUESTED", body=body)])
+        client.inline = [{"id": 11, "in_reply_to_id": 10, "pull_request_review_id": 2,
+                          "user": {"login": "author"}, "created_at": REPLIED_AT}]
+        client.threads = [thread(10, resolved=False)]
+
+        result = await requested_changes_addressed.run(client, PAYLOAD)
+
+        self.assertTrue(result["status"])
+        self.assertEqual(result["author_inline_replies_after_request"], 1)
+
+    async def test_missing_referenced_root_still_fails(self):
+        body = (REAFFIRM_BODY
+                + "\n\n[Thread 10](https://github.com/owner/repo/pull/7#discussion_r10):\n\n> finding")
+        client = FakeClient([review("CHANGES_REQUESTED", body=body)])
+        with self.assertRaisesRegex(RuntimeError, "missing change-request root comments"):
+            await requested_changes_addressed.run(client, PAYLOAD)
+
     async def test_missing_active_request_thread_still_fails(self):
         client = FakeClient([review("CHANGES_REQUESTED")])
         client.inline = [{"id": 10, "pull_request_review_id": 1, "user": {"login": "reviewer"}}]

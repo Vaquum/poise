@@ -1142,6 +1142,19 @@ receipt through the existing workspace health/image proof without initiating
 another rollout; [Upgrades](Operating.md#upgrades) defines its outcomes and
 retained evidence. This adds no gateway or workspace API.
 
+For gVisor workspaces, install/upgrade also own the boot-enabled host
+`poise-caller-guard.service`. It selects actual Docker runtimes, holds host
+SQLite locks on current and retained original Caller inodes, and verifies
+acquisition from a separate process before deployment reports protection.
+Its independent scans cover workspace creation/replacement and host, Docker
+and guard restarts without relying on cached gateway readiness. Failure is
+visible through its check, journal and unit status; existing workspace readers
+and metadata identity checks remain unchanged. This advisory fence cannot
+prevent privileged host bypass and has recovery/discovery intervals.
+[Live Caller diagnostics](Operating.md#live-caller-diagnostics-under-gvisor)
+defines the supported readers and explicit protection check. Host backups
+refuse running separate-kernel workspaces and busy/locked SQLite snapshots.
+
 **Provider CLIs** are installed into each person's home volume on first start
 and update themselves there, as Poise already does before each launch. The
 image carries everything else: Node 22, Python 3.13, Caller, `gh`, `git`,
@@ -1304,6 +1317,12 @@ declaring a collector outage. No extra poller, gateway scope or event type is
 introduced. [Bounded reconciliation](Behavior-chain.md#bounded-reconciliation)
 defines the cadence and timestamp units.
 
+Invocation summaries may also carry retained original publication-plan absence
+and recovery evidence. Settings displays the original Call and restoration
+action even while its invocation is active. This diagnostic evidence grants no
+publication, retry or resource-release authority; [Behavior chain](Behavior-chain.md#authority-and-recovery)
+defines its reconciliation rules.
+
 Known closed targets cannot start or restart a model behavior or continue
 publication. Never-started admissions settle with explicit no-effect evidence;
 started originals without a Call remain uncertain without a retry or synthetic
@@ -1436,10 +1455,11 @@ no-publication shape and retry requirements are defined in
 
 Optional repair-exhaustion reporting uses the same held-chain reconciliation,
 configured-account issue publisher and datastore intake. An explicit per-repository
-opt-in enables verified incomplete-reply or execution-budget exhaustion, supplied
-by trusted service configuration or the environment in local mode. Scope is
-rechecked after verification before reserving creation intent and publishing;
-revocation during those reads leaves the creation intent available.
+opt-in enables verified incomplete-reply, execution-budget or PR review-budget
+exhaustion, supplied by trusted service configuration or the environment in
+local mode. Scope is rechecked after verification before reserving creation
+intent and publishing; revocation during those reads leaves the creation intent
+available.
 Durable creation intent prevents another POST after an uncertain result; the source hold,
 label/intake blockers and generated-issue recursion boundary stay visible through
 the existing `waiting` field. It adds no gateway route, scope, journal event,

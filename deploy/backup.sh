@@ -35,6 +35,7 @@ offline_procedure="Stop $gateway first, then the affected workspace containers w
 
 # A stopped gVisor workspace is not offline while the gateway can start it.
 # Inspect all consumers, including unlabelled ones and the gateway volume.
+# io.containerd.runc.v2 shares the host kernel like runc, as ensure_caller_guard treats it.
 check_backup_safety() {
   local containers container details inspected name runtime status workspace_runtime mounts end mounted volume
   local gateway_status=absent gateway_runtime=$default_runtime
@@ -63,7 +64,8 @@ check_backup_safety() {
     fi
     for mounted in $mounts; do
       for volume in "${volumes[@]}"; do
-        if [ "$mounted" != "$volume" ] || [ "$runtime" = runc ]; then continue; fi
+        if [ "$mounted" != "$volume" ]; then continue; fi
+        case $runtime in runc|io.containerd.runc.v2) continue;; esac
         offline_reason="${name#/} uses $runtime with $volume"
         case $status in
           created|exited|dead) ;;
@@ -73,8 +75,8 @@ check_backup_safety() {
     done
   done
   # Also fence replacements of current runc workspaces with another runtime.
-  if [ -z "$offline_reason" ] && [ "$gateway_runtime" != runc ] && [ ${#volumes[@]} -gt 1 ]; then
-    offline_reason="${volumes[*]:1} can be started under $gateway_runtime by $gateway"
+  if [ -z "$offline_reason" ] && [ ${#volumes[@]} -gt 1 ]; then
+    case $gateway_runtime in runc|io.containerd.runc.v2) ;; *) offline_reason="${volumes[*]:1} can be started under $gateway_runtime by $gateway";; esac
   fi
   if [ -n "$offline_reason" ]; then
     case $gateway_status in

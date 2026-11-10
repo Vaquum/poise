@@ -44,11 +44,20 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     rest_comments = await list_inline_comments(client, owner, repo, pull_number)
     threads = await list_review_threads(client, owner, repo, pull_number)
     accepted, skipped = accepted_inline_comments(comments, rest_comments, threads)
-    reaffirmed = not accepted and _has_unresolved_finding(comments, threads)
+    findings = _unresolved_findings(comments, threads)
+    reaffirmed = bool(findings)
     if not accepted and not reaffirmed:
         return {"action": "no_review", "repository": f"{owner}/{repo}", "pull_number": pull_number, "skipped": skipped}
     response = submission_response(payload, pull, f"{owner}/{repo}", pull_number, required_head, actor) \
         if payload.get("assessment") or os.environ.get("AGENT_INTERFACE_RECEIPT_CALL") else None
+    body = response_body(response) if response else REVIEW_BODY if accepted else ""
+    if reaffirmed:
+        references = [
+            f"[Thread {root}](https://github.com/{owner}/{repo}/pull/{pull_number}#discussion_r{root}):\n\n> "
+            + finding.replace("\n", "\n> ")
+            for root, finding in findings
+        ]
+        body = "\n\n".join(part for part in (body, REAFFIRM_BODY, *references) if part)
     submitted = await submit_change_request(
         client,
         owner,
@@ -56,7 +65,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
         pull_number,
         required_head,
         accepted,
-        response_body(response) if response else REAFFIRM_BODY if reaffirmed else REVIEW_BODY,
+        body,
     )
     submitted_head = str(submitted.get("commit_id") or "").lower()
     submitted_actor = str((submitted.get("user") or {}).get("login") or "")
@@ -86,33 +95,27 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _has_unresolved_finding(
+def _unresolved_findings(
     comments: list[dict[str, Any]],
     threads: list[dict[str, Any]],
-) -> bool:
-    active = [
-        thread
-        for thread in threads
-        if not thread["is_resolved"]
-    ]
-    keys = {
-        (str(thread["path"]), int(thread["line"]), str(thread["side"]).upper())
-        for thread in active
-        if not thread["is_outdated"] and thread["path"] and thread["line"]
+) -> list[tuple[int, str]]:
+    submitted = {
+        (str(comment["path"]), int(comment["line"]), str(comment.get("side", "RIGHT")).upper(),
+         " ".join(str(comment["body"]).lower().split()))
+        for comment in comments
     }
-    bodies = {
-        (str(thread["path"]), " ".join(str(body).lower().split()))
-        for thread in active
-        for body in thread["bodies"]
-        if body
-    }
-    for comment in comments:
-        path = str(comment.get("path") or "")
-        line = comment.get("line")
-        side = str(comment.get("side") or "RIGHT").upper()
-        body = " ".join(str(comment.get("body") or "").lower().split())
-        if line and (path, int(line), side) in keys:
-            return True
-        if body and (path, body) in bodies:
-            return True
-    return False
+    findings = []
+    for thread in threads:
+        if thread["is_resolved"]:
+            continue
+        for body in thread["bodies"]:
+            normalized = " ".join(str(body).lower().split())
+            if any(path == thread["path"] and text == normalized
+                   and (thread["is_outdated"] or (line == thread["line"] and side == thread["side"]))
+                   for path, line, side, text in submitted):
+                root = thread.get("root_comment_id")
+                if not isinstance(root, int) or root <= 0:
+                    raise RuntimeError("GitHub review-thread inventory is missing reaffirmed root comment IDs")
+                findings.append((root, body))
+                break
+    return findings

@@ -138,47 +138,22 @@ def accepted_inline_comments(
     rest_comments: list[dict[str, Any]],
     threads: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    # A resolved finding does not reserve its location for every future defect.
-    # Keep its body in duplicate detection, but remove its root and replies
-    # from location-only detection. GraphQL ids identify the exact REST thread.
-    resolved_roots = {
-        thread["root_comment_id"]
-        for thread in threads
-        if thread["is_resolved"] and thread.get("root_comment_id") is not None
-    }
-    existing_keys = _existing_keys([
-        comment for comment in rest_comments
-        if comment.get("id") not in resolved_roots
-        and comment.get("in_reply_to_id") not in resolved_roots
-    ])
-    existing_keys.update({
-        _key(thread["path"], thread["line"], thread["side"])
-        for thread in threads
-        if not thread["is_resolved"] and not thread["is_outdated"] and thread["line"]
-    })
     existing_bodies = {_normalize(comment["body"]) for comment in _comment_summary(rest_comments) if comment.get("body")}
     for thread in threads:
         existing_bodies.update(_normalize(body) for body in thread["bodies"])
 
     accepted = []
     skipped = []
-    seen_keys = set()
     seen_bodies = set()
 
     for comment in comments:
         inline = _inline_comment(comment)
-        key = _key(inline["path"], inline["line"], inline["side"])
         body = _normalize(inline["body"])
 
-        if key in existing_keys:
-            skipped.append({"reason": "already_commented_or_resolved", "comment": comment})
-        elif body in existing_bodies or body in seen_bodies:
+        if body in existing_bodies or body in seen_bodies:
             skipped.append({"reason": "repeat", "comment": comment})
-        elif key in seen_keys:
-            skipped.append({"reason": "one_comment_per_issue", "comment": comment})
         else:
             accepted.append(inline)
-            seen_keys.add(key)
             seen_bodies.add(body)
 
     return accepted, skipped
@@ -202,21 +177,6 @@ def _inline_comment(comment: dict[str, Any]) -> dict[str, Any]:
     if not inline["body"]:
         raise ValueError("inline comment body cannot be empty")
     return inline
-
-
-def _existing_keys(comments: list[dict[str, Any]]) -> set[tuple[str, int, str]]:
-    keys = set()
-    for comment in comments:
-        line = comment.get("line") or comment.get("original_line")
-        path = comment.get("path")
-        side = comment.get("side") or "RIGHT"
-        if path and line:
-            keys.add(_key(path, line, side))
-    return keys
-
-
-def _key(path: str, line: int, side: str) -> tuple[str, int, str]:
-    return str(path), int(line), str(side).upper()
 
 
 def _normalize(body: str) -> str:

@@ -1,4 +1,5 @@
 from datetime import datetime
+import re
 from typing import Any
 
 from github_interface.atoms.issues import issue_comments
@@ -82,6 +83,11 @@ async def read_request(
         and _time(commit["commit"]["committer"]["date"]) > latest_request_at
     ]
     request_thread_ids = {comment.get("in_reply_to_id") or comment.get("id") for comment in request_comments if comment.get("in_reply_to_id") or comment.get("id")}
+    if request_review:
+        permalink = re.escape(f"https://github.com/{owner}/{repo}/pull/{pull_number}#discussion_r")
+        request_thread_ids.update(int(root) for root in re.findall(
+            r"^\[Thread (\d+)\]\(" + permalink + r"\1\):$", request_review.get("body") or "", re.MULTILINE | re.IGNORECASE,
+        ))
     author_replies = [
         comment
         for comment in comments
@@ -98,9 +104,9 @@ async def read_request(
         and _time(comment["created_at"]) > latest_request_at
     ]
     # Resolution has no timestamp in GitHub's thread state. Match the active
-    # request's exact root comments instead of treating old resolved threads as
-    # responses. A summary-only reaffirmation can repeat a COMMENTED finding
-    # as well as a change request, ending at an approval or dismissal.
+    # request's new and referenced roots instead of unrelated resolved threads.
+    # Older summary-only reaffirmations did not identify roots, so retain their
+    # COMMENTED/change-request findings back to an approval or dismissal.
     resolution_review_ids = set(request_ids)
     if request_review and not request_comments and request_review.get("body") == REAFFIRM_BODY:
         for review in reversed(actor_reviews):
@@ -108,7 +114,7 @@ async def read_request(
                 break
             if review["state"] in {"CHANGES_REQUESTED", "COMMENTED"}:
                 resolution_review_ids.add(review["id"])
-    resolution_thread_ids = {
+    resolution_thread_ids = request_thread_ids | {
         comment.get("in_reply_to_id") or comment["id"]
         for comment in comments
         if comment.get("pull_request_review_id") in resolution_review_ids

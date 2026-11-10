@@ -1,12 +1,12 @@
 import Database from 'better-sqlite3'
-import { BehaviorChainJournal } from '../../server/behavior-chain-store'
+import { BehaviorChainJournal, type PublicationPlanCondition } from '../../server/behavior-chain-store'
 import { behaviorChainSummary } from '../../server/behavior-chain-summary'
 import { CheckSemaphore } from '../../server/check-semaphore'
 import type { ChainObservation } from '../../server/behavior-chain-decision'
 
 /** UI regression fixture: real isolated journal and production wire mapper,
  * never a behavior run or acceptance artifact. No global server DB is imported. */
-export function chainSummaryFixture(state: 'unmerged' | 'pending-active' | 'pending-admitted' | 'pending-no-invocation' | 'pending-original-response' | 'complete' | 'historical') {
+export function chainSummaryFixture(state: 'unmerged' | 'pending-active' | 'pending-admitted' | 'pending-no-invocation' | 'pending-original-response' | 'complete' | 'historical', publicationPlan?: PublicationPlanCondition) {
   const db = new Database(':memory:')
   try {
     const journal = new BehaviorChainJournal(db)
@@ -39,6 +39,8 @@ export function chainSummaryFixture(state: 'unmerged' | 'pending-active' | 'pend
           : ['--atomic-work', 'acme/repo#7', '--model', 'fixture'] } } })
       if (state !== 'pending-admitted') chain = journal.append(chain.id, 'uncertain', chain.sequence, {
         type: 'invocation.uncertain', invocationId: 'original-work', reason: 'original response missing' })
+      if (publicationPlan) chain = journal.append(chain.id, 'plan-condition', chain.sequence, {
+        type: 'invocation.reconciled', invocationId: 'original-work', evidence: { publicationPlan } })
     }
     const pending = state.startsWith('pending')
     if (state !== 'unmerged') chain = journal.append(chain.id, 'merge', chain.sequence, { type: 'chain.merged', mergeSha: 'a'.repeat(40),

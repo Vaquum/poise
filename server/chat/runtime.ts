@@ -4702,17 +4702,18 @@ export class ChatRuntime extends EventEmitter {
    *  path, or when the entry budget or the deadline stopped the scan, so
    *  callers keep their previous state instead of inventing a clean one.
    *  `unreadable` names where the scan could not go — capped like repos,
-   *  the rest counted — so the wake can say so. Stall tracking and
+   *  the rest counted — and `causes` retains the bound or filesystem
+   *  operation/code for each path. Stall tracking and
    *  work-binding discovery share this set: both reason about the same
    *  task repos. */
-  async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean, unreadable: string[], unreadableTruncated: number }> {
+  async nestedTaskRepos(checkout: string): Promise<{ dirs: string[], complete: boolean, unreadable: string[], unreadableTruncated: number, causes: Array<{ path: string, cause: string }> }> {
     const root = this.options.localWorkspaceRoot ?? LOCAL_CHAT_ROOT
-    if (!workerWorkspaceRef(root, checkout)) return { dirs: [], complete: true, unreadable: [], unreadableTruncated: 0 }
+    if (!workerWorkspaceRef(root, checkout)) return { dirs: [], complete: true, unreadable: [], unreadableTruncated: 0, causes: [] }
     const found: string[] = []
-    const gaps: string[] = []
+    const gaps: Array<{ path: string, cause: string }> = []
     let gapOverflow = 0
-    const noteGap = (dir: string): void => {
-      if (gaps.length < MAX_STALL_REPOS) gaps.push(tailClip(relative(checkout, dir) || '.', MAX_NOTICE_PATH_BYTES))
+    const noteGap = (dir: string, cause: string): void => {
+      if (gaps.length < MAX_STALL_REPOS) gaps.push({ path: tailClip(relative(checkout, dir) || '.', MAX_NOTICE_PATH_BYTES), cause: cause.slice(0, 80) })
       else gapOverflow += 1
     }
     const startedAt = Date.now()
@@ -4722,9 +4723,9 @@ export class ChatRuntime extends EventEmitter {
     /** The scan stops at the first bound it hits, naming the directory
      *  it stopped in; a stopped scan is incomplete, never silently clean. */
     const stop = (dir: string): boolean => {
-      if (!stopped && (Date.now() - startedAt > DISCOVERY_DEADLINE_MS || entries > MAX_DISCOVERY_ENTRIES)) {
-        noteGap(dir)
-        stopped = true
+      if (!stopped) {
+        const cause = Date.now() - startedAt > DISCOVERY_DEADLINE_MS ? 'deadline' : entries > MAX_DISCOVERY_ENTRIES ? 'entry_limit' : null
+        if (cause) { noteGap(dir, cause); stopped = true }
       }
       return stopped
     }
@@ -4736,9 +4737,10 @@ export class ChatRuntime extends EventEmitter {
       let names: string[]
       try {
         names = await readdir(dir)
-      } catch (error: any) {
-        if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') continue
-        noteGap(dir)
+      } catch (error) {
+        const { code } = error as NodeJS.ErrnoException
+        if (code === 'ENOENT' || code === 'ENOTDIR') continue
+        noteGap(dir, `readdir:${code ?? 'unknown'}`)
         continue
       }
       entries += names.length
@@ -4750,23 +4752,25 @@ export class ChatRuntime extends EventEmitter {
         let info
         try {
           info = await lstat(child)
-        } catch (error: any) {
-          if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') continue
-          noteGap(child)
+        } catch (error) {
+          const { code } = error as NodeJS.ErrnoException
+          if (code === 'ENOENT' || code === 'ENOTDIR') continue
+          noteGap(child, `lstat:${code ?? 'unknown'}`)
           continue
         }
         if (!info.isDirectory() || info.isSymbolicLink()) continue
         try {
           const gitInfo = await lstat(join(child, '.git'))
           if (gitInfo.isDirectory() || gitInfo.isFile()) found.push(child)
-        } catch (error: any) {
-          if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') { noteGap(child); continue }
+        } catch (error) {
+          const { code } = error as NodeJS.ErrnoException
+          if (code !== 'ENOENT' && code !== 'ENOTDIR') { noteGap(child, `lstat_git:${code ?? 'unknown'}`); continue }
         }
         stack.push(child)
       }
     }
-    gaps.sort()
-    return { dirs: found.sort(), complete: gaps.length === 0, unreadable: gaps, unreadableTruncated: gapOverflow }
+    gaps.sort((a, b) => a.path.localeCompare(b.path))
+    return { dirs: found.sort(), complete: gaps.length === 0, unreadable: gaps.map(gap => gap.path), unreadableTruncated: gapOverflow, causes: gaps }
   }
 
   /** Live linked worktrees registered on a discovered repo — the only way

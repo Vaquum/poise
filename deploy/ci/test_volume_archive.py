@@ -3,6 +3,7 @@
     python3 -m unittest discover --start-directory deploy/ci --pattern 'test_*.py'
 """
 
+import fcntl
 import os
 import shutil
 import socket
@@ -162,6 +163,20 @@ class VolumeArchiveTest(unittest.TestCase):
         self.assertIn(f'{path}: SQLite cannot read it', result.stderr)
         with open(os.path.join(self.out, 'broken.db'), 'rb') as file:
             self.assertEqual(file.read(), b'SQLite format 3\x00' + b'\xff' * 200)
+
+    def test_refuses_a_host_fenced_database_instead_of_copying_live_files(self):
+        path = os.path.join(self.volume, 'calls.sqlite3')
+        database = sqlite3.connect(path)
+        database.execute('CREATE TABLE notes (n INTEGER)')
+        database.commit()
+        database.close()
+        with open(path, 'r+b') as holder:
+            fcntl.lockf(holder, fcntl.LOCK_EX | fcntl.LOCK_NB, 512, 0x40000000)
+            result = subprocess.run([sys.executable, ARCHIVER, self.volume, self.archive, OWNER],
+                                    capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('refusing an unsafe live-file copy', result.stderr)
+        self.assertFalse(os.path.exists(self.archive))
 
     def test_refuses_to_run_without_its_three_arguments(self):
         result = subprocess.run([sys.executable, ARCHIVER, self.volume], capture_output=True, text=True)

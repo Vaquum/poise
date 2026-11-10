@@ -1339,6 +1339,8 @@ describe('turn stall detection and waking', () => {
     vi.mocked(readdir).mockImplementation(((path: string, options: never) => path === bulk
       ? Promise.resolve(Array.from({ length: 100_005 }, (_, n) => `d${n}`))
       : actual.readdir(path, options)) as never)
+    expect(await runtime.nestedTaskRepos(session.checkout)).toMatchObject({ complete: false,
+      causes: [{ path: 'bulk', cause: 'entry_limit' }], unreadableTruncated: 0 })
     store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
     runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
     await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)
@@ -1349,6 +1351,28 @@ describe('turn stall detection and waking', () => {
     expect(stalled?.repos).toEqual([])
     expect(stalled?.truncatedRepos).toBe(1)
     expect(stalled?.unreadablePaths).toEqual(['bulk'])
+    await runtime.stop({ handover: false })
+  }, 40_000)
+
+  it('retains the deadline cause when a workspace scan stops', async () => {
+    const owned: FakeControls = { hosts: [], adapters: [], prompts: [] }
+    const { runtime, events } = makeRuntime('poise-turn-stall-deadline:db', owned)
+    const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
+    await waitFor(() => lastStatus(events, session.id) === 'idle')
+    const bulk = join(session.checkout, 'slow')
+    await mkdir(bulk)
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
+    const startedAt = Date.now()
+    const now = vi.spyOn(Date, 'now').mockReturnValue(startedAt)
+    vi.mocked(readdir).mockImplementation(((path: string, options: never) => {
+      if (path !== bulk) return actual.readdir(path, options)
+      now.mockReturnValue(startedAt + 10_001)
+      return Promise.resolve([])
+    }) as never)
+    try {
+      expect(await runtime.nestedTaskRepos(session.checkout)).toMatchObject({ complete: false,
+        causes: [{ path: 'slow', cause: 'deadline' }], unreadable: ['slow'], unreadableTruncated: 0 })
+    } finally { now.mockRestore() }
     await runtime.stop({ handover: false })
   }, 40_000)
 
@@ -1398,10 +1422,10 @@ describe('turn stall detection and waking', () => {
     const { runtime, events } = makeRuntime('poise-turn-stall-unreadable-long:db', owned)
     const session = await runtime.create({ agent: 'grok', model: 'grok-4.6-xhigh' })
     await waitFor(() => lastStatus(events, session.id) === 'idle')
-    // Twenty ~1KB-deep gap paths: serialized in full twice, the notice
+    // Twenty-two ~1KB-deep gap paths: serialized in full twice, the notice
     // would pass the 32 KiB inbox bound and the wake would throw.
     const deep: string[] = []
-    for (let n = 0; n < 20; n++) {
+    for (let n = 0; n < 22; n++) {
       const top = join(session.checkout, `t${String(n).padStart(2, '0')}`)
       let dir = top
       for (const leaf of ['x'.repeat(250), 'x'.repeat(250), 'x'.repeat(250), `${'x'.repeat(246)}-e${String(n).padStart(2, '0')}`]) {
@@ -1412,6 +1436,14 @@ describe('turn stall detection and waking', () => {
       deep.push(dir)
     }
     try {
+      const scan = await runtime.nestedTaskRepos(session.checkout)
+      expect(scan).toMatchObject({ complete: false, unreadableTruncated: 2 })
+      expect(scan.causes).toHaveLength(20)
+      expect(scan.causes.map(gap => gap.path)).toEqual(scan.unreadable)
+      for (const gap of scan.causes) {
+        expect(gap.cause).toBe('lstat_git:EACCES')
+        expect(Buffer.byteLength(gap.path)).toBeLessThanOrEqual(200)
+      }
       store.bindWork(runtime.instance, session.id, 'https://github.com/acme/repo/issues/618')
       runtime.prompt(session.id, { text: 'do the work', attachments: [], mentions: [] })
       await waitFor(() => ofType(events, session.id, 'turn.finished').length === 1)

@@ -1315,6 +1315,8 @@ export class ChatControl {
   }
 
   private lastDiscovery = 0
+  private lastSuccessfulDiscoveryAt: string | null = null
+  private workspaceDiscoveryFailure: string | null = null
   private readonly reportedAmbiguous = new Set<string>()
 
   /** Bind each open PR that closes a bound issue to that issue's chat, and
@@ -1349,10 +1351,14 @@ export class ChatControl {
     if (branches && branches.repos.size > 0) {
       for (const org of readyOrganizations()) orgs.set(org.login.toLowerCase(), org)
     }
-    if (orgs.size === 0) return
+    if (orgs.size === 0) {
+      if (branches) this.workspaceDiscoveryRecovered()
+      return
+    }
     // The window opens only when listings were actually read, so an empty
     // sweep never starves the pass that first has something to discover.
     this.lastDiscovery = now
+    let complete = branches !== null
     const read = this.options.closingRefs ?? readOpenPrClosingRefs
     const ambiguous = new Map<string, 'closing' | 'branch' | 'both'>()
     for (const org of orgs.values()) {
@@ -1365,10 +1371,10 @@ export class ChatControl {
         let listed: OpenPrClosingList | null
         try {
           listed = await read(org, after)
-        } catch (error) { this.itemFailed('discovery', org.login, error); break }
+        } catch (error) { complete = false; this.itemFailed('discovery', org.login, error); break }
         if (this.stopped) return
-        if (!listed) { this.itemFailed('discovery', org.login, new Error('the open-PR listing could not be read')); break }
-        if (listed.truncated) this.itemFailed('discovery', org.login, new Error('the open-PR listing was truncated; some PRs were not considered'))
+        if (!listed) { complete = false; this.itemFailed('discovery', org.login, new Error('the open-PR listing could not be read')); break }
+        if (listed.truncated) { complete = false; this.itemFailed('discovery', org.login, new Error('the open-PR listing was truncated; some PRs were not considered')) }
         // Re-snapshot after the read: an issue released and reclaimed while
         // the listing was in flight resolves to its current owner, and the
         // match-to-claim below holds no awaits.
@@ -1423,8 +1429,9 @@ export class ChatControl {
         const last = listed.prs.at(-1)
         // The (repository, number) cursor always moves; a page that makes
         // no progress ends the sweep instead of spinning.
-        if (!listed.more || last === undefined
-          || (after !== undefined && (last.repo < after.repo || (last.repo === after.repo && last.number <= after.number)))) break
+        if (!listed.more) break
+        if (last === undefined
+          || (after !== undefined && (last.repo < after.repo || (last.repo === after.repo && last.number <= after.number)))) { complete = false; break }
         after = { repo: last.repo, number: last.number }
       }
     }
@@ -1440,6 +1447,16 @@ export class ChatControl {
         context: { target: url } })
     }
     for (const url of [...this.reportedAmbiguous]) if (!ambiguous.has(url)) this.reportedAmbiguous.delete(url)
+    if (complete) this.lastSuccessfulDiscoveryAt = new Date((this.options.now ?? Date.now)()).toISOString()
+    if (branches) this.workspaceDiscoveryRecovered()
+  }
+
+  private workspaceDiscoveryRecovered(): void {
+    if (this.workspaceDiscoveryFailure === null) return
+    this.workspaceDiscoveryFailure = null
+    diagnostic({ level: 'warning', operation: 'chat.control.item_recovered', target: 'workspace-branches',
+      message: 'Workspace scanning recovered; branch matching is no longer deferred for the whole sweep',
+      context: { kind: 'discovery', key: 'workspace-branches', scope: 'whole-sweep', lastSuccessfulDiscoveryAt: this.lastSuccessfulDiscoveryAt } })
   }
 
   /** Branches each live chat pushed from its workspace: the session's own
@@ -1463,19 +1480,26 @@ export class ChatControl {
     // Sessions that share one checkout (a handoff's source and target)
     // scan it once; each keeps its own session-branch evidence.
     const scanned = new Map<string, Array<{ repo: string, branch: string }>>()
+    let sessionId: string | null = null
+    let scanContext: Record<string, unknown> = {}
     try {
       for (const session of this.runtime.list()) {
         // Local reads resolve fast; still give requests an I/O turn between chats.
         await setImmediate()
         if (this.stopped) return null
         if (session.status === 'closed') continue
+        sessionId = session.id
         if (session.repo) add(session.repo, session.branch.name, session.id)
         let evidence = scanned.get(session.checkout)
         if (evidence === undefined) {
           evidence = []
           scanned.set(session.checkout, evidence)
           const found = await this.runtime.nestedTaskRepos(session.checkout)
-          if (!found.complete) throw new Error(`workspace discovery incomplete for chat ${session.id}`)
+          if (!found.complete) {
+            // Diagnostic facts retain at most 16 array items; count the rest.
+            scanContext = { causes: found.causes.slice(0, 16), unreadableTruncated: found.unreadableTruncated + Math.max(0, found.causes.length - 16) }
+            throw new Error('Workspace scan is incomplete')
+          }
           for (const dir of found.dirs) {
             for (const pushed of await pushedBranches(dir)) evidence.push(pushed)
           }
@@ -1483,7 +1507,15 @@ export class ChatControl {
         for (const pushed of evidence) add(pushed.repo, pushed.branch, session.id)
       }
     } catch (error) {
-      this.itemFailed('discovery', 'workspace-branches', error)
+      const message = error instanceof Error ? error.message : String(error)
+      const signature = JSON.stringify([sessionId, message, scanContext])
+      if (signature !== this.workspaceDiscoveryFailure) {
+        this.workspaceDiscoveryFailure = signature
+        diagnostic({ level: 'warning', operation: 'chat.control.item_failed', target: 'workspace-branches',
+          message: 'Branch-linked PR discovery is deferred for the whole sweep; check the workspace scan cause. The existing discovery pass will recheck',
+          context: { kind: 'discovery', key: 'workspace-branches', sessionId, scope: 'whole-sweep', error: message,
+            ...scanContext, lastSuccessfulDiscoveryAt: this.lastSuccessfulDiscoveryAt, retryIntervalMs: DISCOVERY_INTERVAL } })
+      }
       return null
     }
     return { owners, repos }
