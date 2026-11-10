@@ -127,9 +127,15 @@ def workspace_proof(deploy, candidate, remembered=frozenset()):
         container, handle = line.split()
         expected.add(handle)
         ids.append(container)
-    lines = command(['docker', 'inspect', '--format',
-                     '{{index .Config.Labels "poise.workspace"}} {{.Image}} {{.State.Running}} {{.Name}}',
-                     *ids]) if ids else ''
+    try:
+        lines = command(['docker', 'inspect', '--format',
+                         '{{index .Config.Labels "poise.workspace"}} {{.Image}} {{.State.Running}} {{.Name}}',
+                         *ids]) if ids else ''
+    except subprocess.SubprocessError:
+        # A container may vanish between ps and inspect; every handle ps
+        # discovered is already expected, so leaving them all unobserved keeps
+        # the episode open without dropping the vanished workspace.
+        lines = ''
     observed, proven, running, switching, lag = set(), set(), 0, False, False
     for line in lines.splitlines():
         handle, actual_image, active, name = line.split()
