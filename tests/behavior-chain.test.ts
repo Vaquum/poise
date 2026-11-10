@@ -399,6 +399,124 @@ describe('native admission and recovery', () => {
     expect(launched).toEqual(['approve-pr'])
   })
 
+  it.each(['recovered', 'operator hold', 'posting began', 'resources unknown', 'unrelated failure'])('reconciles only a proved auth hold: %s', async mode => {
+    const { journal, chain } = setup()
+    const obs = { ...observation(), checkedAt: Date.now() }
+    const basis = chainBasis(['issue', obs.issue.revision])
+    let current = chain
+    for (let index = 0; index < 3; index++) current = finish(journal, current, `rejected-${index}`, 'review-issue', basis,
+      { status: 'failed', action: 'not_started', outcome: 'preflight_failed', error_code: 'authentication_failed',
+        error: 'Refresh credential was rejected', completedAt: Date.now(), receipts: mode === 'posting began' && index === 2 ? [] : null,
+        review_id: null, head_sha: null, resources_settled_at: mode === 'resources unknown' && index === 2 ? null : new Date().toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] } })
+    const reason = 'review-issue failed before publication three times: Refresh credential was rejected'
+    current = record(journal, current, { type: 'chain.held', reason: mode === 'operator hold' ? 'New invocations held by the person' : reason })
+    // Held observations would ordinarily be deferred, even after sign-in.
+    current = record(journal, current, { type: 'chain.observed', observation: obs })
+    let recovered = false
+    const launched: ChainInvocation[] = []
+    const calls: LogEntry[] = []
+    const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => ({ ...obs, checkedAt: Date.now() }),
+      readInvocations: async () => ({ entries: calls, quarantined: [] }),
+      authRecovered: () => recovered && mode !== 'unrelated failure',
+      launch: async invocation => { launched.push(invocation); return true } }))
+    await runtime.run()
+    expect(launched).toHaveLength(0)
+    recovered = true
+    await runtime.run()
+    await runtime.run()
+    const after = journal.read(chain.id)!
+    if (mode === 'recovered') {
+      expect(after.held).toBeNull()
+      expect(after.resumedAfterSequence).toBeGreaterThan(current.sequence)
+      expect(launched).toHaveLength(1)
+      expect(launched[0].behavior).toBe('review-issue')
+      expect(after.invocations).toHaveLength(4)
+      const resumes = journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'chain.resumed')
+      expect(resumes).toHaveLength(1)
+      const review = launched[0]
+      calls.push({ id: 'a'.repeat(32), correlation_id: review.id, source: 'poise:behavior-chain', actor: 'reviewer',
+        pr_id: '7', model: 'fixture-model', session_id: null, prompt: '', started_at: new Date(review.admittedAt).toISOString(),
+        completed_at: new Date().toISOString(), time_elapsed: '1s', head_sha: null, expected_head: null, response: null,
+        error: '', repo: 'Example/Repo', behavior: 'issue_review', status: 'completed', action: 'commented', outcome: 'commented',
+        issue_revision: obs.issue.revision, resources_settled_at: new Date().toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] },
+        receipts: [{ issue: 'Example/Repo#7', comment_id: 17, author: 'reviewer', url: null }] })
+      await runtime.run()
+      await runtime.run()
+      expect(launched.map(invocation => invocation.behavior)).toEqual(['review-issue', 'implement-issue'])
+      const advanced = journal.read(chain.id)!
+      expect(advanced.invocations.filter(invocation => invocation.evidence?.action === 'commented')).toHaveLength(1)
+      expect(journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'chain.resumed')).toHaveLength(1)
+      journal.rebuild()
+      expect(journal.read(chain.id)).toEqual(advanced)
+    } else {
+      expect(after.held).toBe(current.held)
+      expect(after.resumedAfterSequence).toBe(0)
+      expect(launched).toHaveLength(0)
+    }
+  })
+
+  it('recovers a later slot despite an earlier slot failure and success', async () => {
+    const { journal, chain } = setup()
+    const obs = { ...observation(), checkedAt: Date.now() }
+    const basis = chainBasis(['issue', obs.issue.revision])
+    let current = chain
+    current = finish(journal, current, 'earlier-failed', 'review-issue', basis,
+      { status: 'failed', action: 'not_started', outcome: 'preflight_failed', error_code: 'review_provider_exit',
+        error: 'provider died', completedAt: Date.now(), receipts: null, review_id: null, head_sha: null,
+        resources_settled_at: new Date().toISOString(), resource_ownership: { version: 1, roots: [], errors: [] } }, 'secondary')
+    current = finish(journal, current, 'earlier-ok', 'review-issue', basis,
+      { status: 'completed', action: 'commented', outcome: 'commented', completedAt: Date.now(),
+        receipts: [{ issue: 'Example/Repo#7', comment_id: 17, author: 'reviewer' }] }, 'secondary')
+    for (let index = 0; index < 3; index++) current = finish(journal, current, `rejected-${index}`, 'review-issue', basis,
+      { status: 'failed', action: 'not_started', outcome: 'preflight_failed', error_code: 'authentication_failed',
+        error: 'Refresh credential was rejected', completedAt: Date.now(), receipts: null,
+        review_id: null, head_sha: null, resources_settled_at: new Date().toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] } })
+    const reason = 'review-issue failed before publication three times: Refresh credential was rejected'
+    current = record(journal, current, { type: 'chain.held', reason })
+    current = record(journal, current, { type: 'chain.observed', observation: obs })
+    const launched: ChainInvocation[] = []
+    const calls: LogEntry[] = []
+    const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => ({ ...obs, checkedAt: Date.now() }),
+      readInvocations: async () => ({ entries: calls, quarantined: [] }),
+      authRecovered: () => true,
+      launch: async invocation => { launched.push(invocation); return true } }))
+    await runtime.run()
+    await runtime.run()
+    const after = journal.read(chain.id)!
+    expect(after.held).toBeNull()
+    expect(after.resumedAfterSequence).toBeGreaterThan(current.sequence)
+    expect(launched).toHaveLength(1)
+  })
+
+  it.each([{ receipts: null }, { receipts: [] }])('requires original resource settlement and preserves posting receipts $receipts', async ({ receipts }) => {
+    const { journal, chain } = setup(); const obs = observation()
+    const pending = invocation('rejected-review', 'review-issue', chainBasis(['issue', obs.issue.revision]))
+    record(journal, chain, { type: 'invocation.admitted', invocation: pending })
+    const call: LogEntry = { id: 'a'.repeat(32), correlation_id: pending.id, source: 'poise:behavior-chain', actor: 'reviewer',
+      pr_id: '7', model: 'fixture-model', session_id: null, prompt: '', started_at: new Date(NOW).toISOString(),
+      completed_at: new Date().toISOString(), time_elapsed: '1s', head_sha: null, expected_head: null, response: null,
+      repo: 'Example/Repo', behavior: 'issue_review', status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error: 'refresh rejected', error_code: 'authentication_failed', receipts,
+      resources_settled_at: null, resource_ownership: { version: 1, roots: [], errors: [] } }
+    let notified = 0
+    const launched: ChainInvocation[] = []
+    const runtime = new BehaviorChainRuntime(journal, operations({ readInvocations: async () => ({ entries: [call], quarantined: [] }),
+      authenticationRejected: () => { notified++ }, authRecovered: () => true,
+      launch: async invocation => { launched.push(invocation); return true } }))
+    await runtime.run()
+    expect(notified).toBe(1)
+    expect(journal.read(chain.id)!.invocations[0].state).toBe('uncertain')
+    expect(launched).toHaveLength(0)
+    call.resources_settled_at = new Date().toISOString()
+    await runtime.run()
+    await runtime.run()
+    expect(journal.read(chain.id)!.invocations[0].state).toBe(receipts === null ? 'settled' : 'uncertain')
+    expect(launched).toHaveLength(receipts === null ? 1 : 0)
+  })
+
   it('deduplicates provider waits across runtime replacement without skipping changed blockers, recovery or retries', async () => {
     const { db, journal, chain } = setup(); const obs = observation()
     let blocked = true

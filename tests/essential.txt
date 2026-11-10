@@ -34,6 +34,9 @@ tests/ssh-keys.test.ts
 tests/terminal.test.ts
 
 # Agent spend and PR actions: quotas, budgets, account routing, approving and merging.
+tests/account-alerts.test.ts
+tests/accounts.test.ts
+tests/behavior-chain.test.ts
 tests/behavior-resource-receipt.test.ts
 tests/behavior-chain-merge-basis.test.ts
 tests/behavior-chain-reconciliation.test.ts
@@ -46,6 +49,7 @@ tests/behaviors-quota-budget.test.ts
 tests/behaviors-review-cap-api.test.ts
 tests/behaviors-review-cap-client.test.ts
 tests/behaviors-review-cap.test.ts
+tests/behaviors-reviewer-trips.test.ts
 tests/behaviors-slot-fallback.test.ts
 tests/chat/auto-merge.test.ts
 tests/gh-merge-order.test.ts
@@ -110,6 +114,7 @@ tests/stop-gate-runtime.test.mjs
 tests/tool-cache-config.test.ts
 
 # Whole-repository wiring and repeat catches, which an import link cannot reach.
+tests/mcp.test.ts
 tests/behaviors-preparation.test.ts
 tests/behaviors-repo-skips-api.test.ts
 tests/notification-evidence.test.ts

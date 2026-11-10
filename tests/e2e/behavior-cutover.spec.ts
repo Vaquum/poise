@@ -1,8 +1,10 @@
 import { expect, test, type Page } from '@playwright/test'
+import Database from 'better-sqlite3'
 import { workspace } from './fixtures/workspace'
 import { BEHAVIORS } from '../../src/behaviors'
 import type { BehaviorCutoverState } from '../../src/behavior-cutover'
-import { chainSummaryFixture } from '../fixtures/behavior-chain-summary'
+import { BehaviorChainJournal } from '../../server/behavior-chain-store'
+import { chainSummaryFixture, delayedChainFixture } from '../fixtures/behavior-chain-summary'
 import { parseProcessDiagnostic } from '../../server/process-diagnostic'
 
 async function general(page: Page) {
@@ -60,6 +62,74 @@ for (const submission of ['none', 'rejected', 'uncertain']) {
     await expect(history).toContainText(outcome)
     await expect(history).toContainText(next)
     await expect(controls.locator('private-markup')).toHaveCount(0)
+  })
+}
+
+for (const width of [390, 1280]) {
+  test(`attention joins durable holds, progress age and exact-head gates at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 })
+    await workspace(page)
+    const db = new Database(':memory:')
+    const journal = new BehaviorChainJournal(db)
+    const snapshot = delayedChainFixture(journal, Date.now())
+    const events = journal.history('autonomio/poise#887').map(row => ({ sequence: row.sequence, at: row.at,
+      type: JSON.parse(row.payload).type, reason: JSON.parse(row.payload).reason }))
+    db.close()
+    let unavailable = false
+    const writes: string[] = []
+    page.on('request', request => {
+      if (request.method() === 'POST' && /\/api\/(?:behaviors|behavior-chains|settings)(?:\/|$)/.test(new URL(request.url()).pathname)) writes.push(request.url())
+    })
+    await page.route('**/api/behavior-chains', route => unavailable
+      ? route.fulfill({ status: 503, json: { error: 'journal unavailable' } }) : route.fulfill({ json: snapshot }))
+    const journalAfters: Array<string | null> = []
+    await page.route('**/api/behavior-chains?*', route => {
+      journalAfters.push(new URL(route.request().url()).searchParams.get('after'))
+      return route.fulfill({ json: { events, next: null } })
+    })
+    const controls = await general(page)
+    const attention = controls.getByRole('region', { name: 'Work needing attention' })
+    const entries = attention.locator('li')
+    await expect(entries).toHaveCount(3)
+    for (const [index, [issue, pull]] of [[887, 893], [896, 900], [898, 901]].entries()) {
+      const entry = entries.nth(index)
+      await expect(entry.getByRole('link', { name: `#${issue}`, exact: true })).toHaveAttribute('href', `https://github.com/autonomio/poise/issues/${issue}`)
+      await expect(entry.getByRole('link', { name: `PR #${pull}`, exact: true })).toHaveAttribute('href', `https://github.com/autonomio/poise/pull/${pull}`)
+      await expect(entry.getByRole('link', { name: 'Journal evidence' })).toHaveAttribute('href', /\/api\/behavior-chains\?id=.*&after=/)
+      await expect(entry).toContainText(`No verified advance for 2d ${23 - index}h`)
+      await expect(entry).toContainText('repair-pr: preflight_failed')
+      await expect(entry).toContainText('Current-head approval required')
+      await expect(entry).toContainText('explicitly resume the chain')
+      await expect(entry).toContainText('This does not retry held work')
+      await expect(entry).toContainText(index < 2 ? 'Required CI passed; Review changes requested' : 'CI failing: Unit/integration (2/2):failure')
+      await expect(entry).toContainText(index < 2 ? 'incomplete review replies' : 'required CI shard failed')
+    }
+    await attention.scrollIntoViewIfNeeded()
+    await expect.poll(() => attention.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true)
+    await page.screenshot({ path: `test-results/behavior-chain-attention-${width}.png`, fullPage: true })
+    const journalHref = await entries.first().getByRole('link', { name: 'Journal evidence' }).getAttribute('href')
+    const expectedAfter = new URL(journalHref!, 'http://localhost').searchParams.get('after')
+    await entries.first().getByRole('link', { name: 'Journal evidence' }).click()
+    await expect.poll(() => journalAfters.at(-1)).toBe(expectedAfter)
+    await expect(controls.getByRole('region', { name: 'Chain journal' })).toContainText('incomplete review replies')
+    // data-chain-more carries hidden while empty, so query by attribute: the
+    // role query cannot see it until it is shown.
+    const moreChains = controls.locator('[data-chain-more]')
+    const refreshed = page.waitForResponse(response => response.url().includes('/api/behavior-chains') && !response.url().includes('id='))
+    await controls.getByRole('button', { name: 'Refresh chains' }).click()
+    await refreshed
+    // Refresh renders after the response arrives; More chains re-enables in the
+    // same finally block that releases the reading guard, so this proves the
+    // refresh completed instead of passing on pre-refresh DOM.
+    await expect(moreChains).toBeEnabled()
+    await expect(entries.first()).toContainText('No verified advance for 2d 23h')
+    unavailable = true
+    const unavailableRefresh = page.waitForResponse(response => response.url().includes('/api/behavior-chains') && !response.url().includes('id='))
+    await controls.getByRole('button', { name: 'Refresh chains' }).click()
+    await unavailableRefresh
+    await expect(moreChains).toBeEnabled()
+    await expect(attention).toContainText('Attention evidence unavailable; any retained entries are stale')
+    expect(writes).toEqual([])
   })
 }
 
@@ -151,6 +221,9 @@ test('merged chains retain open obligations as reconciliation-only and stale rea
   const list = controls.locator('[data-chain-list]')
   await expect(list).toContainText('Merged: aaaaaaaaaaaa')
   await expect(list).toContainText('Review evidence pending')
+  const attention = controls.getByRole('region', { name: 'Work needing attention' })
+  await expect(attention).toContainText('original response missing')
+  await expect(attention).toContainText('original pre-merge review evidence')
   await expect(list).toContainText('repair-pr: uncertain')
   await expect(list).toContainText('Original native resource release is unverified; Caller reconciliation continues while GitHub observations are deferred')
   await expect(list.getByRole('button', { name: 'Hold new invocations' })).toHaveCount(0)
@@ -170,6 +243,7 @@ test('merged chains retain open obligations as reconciliation-only and stale rea
   complete = true
   await controls.getByRole('button', { name: 'Refresh chains' }).click()
   await expect(list).not.toContainText('Review evidence pending')
+  await expect(attention).toContainText('No delayed or held work')
   await expect(list.getByRole('button', { name: 'Hold new invocations' })).toHaveCount(0)
   await expect(list).toContainText('Merged: aaaaaaaaaaaa')
 })

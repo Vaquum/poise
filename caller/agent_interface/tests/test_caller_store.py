@@ -2,7 +2,9 @@
 import json
 import os
 import sqlite3
+import subprocess
 import sys
+from contextlib import closing
 
 import pytest
 
@@ -74,3 +76,36 @@ def test_response_directory_identity_and_database_inode_stay_bound_to_the_origin
     with pytest.raises(RuntimeError, match='differs from its original'):
         caller_store.connect(root / 'calls.sqlite3')
     assert (root / 'calls.sqlite3').read_text() == 'foreign database sentinel'
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='original directory handles require Linux procfs')
+def test_managed_connections_preserve_an_existing_sqlite_lock(store):
+    root, _ = store
+    path = root / 'calls.sqlite3'
+
+    def try_external_transaction():
+        script = "import sqlite3, sys; sqlite3.connect(sys.argv[1], timeout=0).execute('begin exclusive')"
+        return subprocess.run([sys.executable, '-c', script, str(path)], capture_output=True, text=True, check=False)
+
+    with closing(caller_store.connect(path)) as first:
+        first.execute('begin exclusive')
+        blocked = try_external_transaction()
+        assert blocked.returncode != 0 and 'database is locked' in blocked.stderr
+        with closing(caller_store.connect(path)):
+            blocked = try_external_transaction()
+            assert blocked.returncode != 0 and 'database is locked' in blocked.stderr
+        first.rollback()
+    available = try_external_transaction()
+    assert available.returncode == 0, available.stderr
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='original directory handles require Linux procfs')
+def test_managed_database_refuses_a_symlink_even_to_the_original_inode(store):
+    root, _ = store
+    path = root / 'calls.sqlite3'
+    retained = root / 'retained.sqlite3'
+    path.rename(retained)
+    path.symlink_to(retained)
+
+    with pytest.raises(RuntimeError, match='differs from its original'):
+        caller_store.connect(path)

@@ -351,6 +351,13 @@ export class BehaviorChainJournal {
     return this.page(after, limit, false)
   }
 
+  authenticationHolds(after: string): BehaviorChain[] {
+    const rows = this.db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE merged = 0 AND chain_id > ?
+      AND json_extract(state, '$.held') LIKE 'review-issue failed before publication three times:%'
+      ORDER BY chain_id LIMIT 100`).all(after) as Array<{ chain_id: string }>
+    return rows.map(row => this.read(row.chain_id)!)
+  }
+
   /** Ownership pages stay unchanged. Quiescent history cannot consume the
    * normal-work page, including when its scheduled recheck becomes due. */
   reconcilable(after: string, now: number, deferred: boolean, limit = 100): BehaviorChain[] {
