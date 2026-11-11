@@ -1,5 +1,6 @@
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 from uuid import uuid4
@@ -8,13 +9,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch, Mock
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 
 import agent_interface as api
-from agent_interface import review_budget as budget, atoms, progress
+from agent_interface import review_budget as budget, atoms, pr_approve, progress, structured_review
 from agent_interface.model_catalog import CATALOG
 
 HEAD = 'a' * 40
+APPROVAL = json.dumps({
+    'action': 'approve', 'comments': [],
+    'assessment': {'verdict': 'The changed validation paths have no remaining blocking defects.',
+                   'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.',
+                   'limitations': 'Provider fixture; no application test execution.'}})
 
 def facts(**updates):
     value = dict(state='OPEN', draft=False, head_sha=HEAD,
@@ -43,6 +49,10 @@ def context_refusal():
         'review submission rejected: retained review response differs from the current PR context',
         'review_contract_violation',
         diagnostic_envelope(operation='provider.review', phase='submitting', outcome='exit', submission='rejected'))
+
+def verdict_error():
+    return atoms.ReviewVerdictError('invalid corrected verdict', 'review_contract_violation',
+                                   {'submission': 'none', 'phase': 'validating'})
 
 def stored_response(call_id):
     with api.db() as conn:
@@ -109,7 +119,7 @@ class TestRecovery(TestCase):
         api.init_db()
         self.mod = SimpleNamespace(pr_number=lambda _: '1', repo_name=lambda *_: 'o/r', run=Mock())
 
-    def execute(self, runs, checks, model='opus-5-high'):
+    def execute(self, runs, checks, model='opus-5-high', behavior='pr_approve'):
         steps = iter(runs if isinstance(runs, list) else [runs])
 
         def dispatch(*args, **kwargs):
@@ -120,10 +130,173 @@ class TestRecovery(TestCase):
         self.mod.run.side_effect = dispatch
         with patch.object(api, 'review_facts', side_effect=checks), redirect_stdout(io.StringIO()):
             try:
-                api.run_governed_behavior(self.mod, 'pr_approve', 'https://github.com/o/r/pull/1',
+                api.run_governed_behavior(self.mod, behavior, 'https://github.com/o/r/pull/1',
                     'bit-mis', HEAD, 'poise:approve-prs', uuid4().hex, pwd=self.directory.name, model=model)
             except SystemExit: pass
         return api.logs()[-1]
+
+    def execute_verdicts(self, replies, checks, submission=None):
+        packet = json.dumps({'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD,
+                             'pull': {'title': 'Pinned approval target', 'base': {'sha': 'b' * 40}}})
+        replies = iter(replies)
+        self.verdict_snapshots = []
+
+        def ask(*args):
+            database, call_id = api.review_receipt._call.get()
+            self.assertEqual(database, api.DB)
+            with api.db() as conn:
+                row = dict(conn.execute('select * from calls where id=?', (call_id,)).fetchone())
+            self.verdict_snapshots.append((row, budget._current.get().deadline))
+            return next(replies)
+
+        def github(args, **kwargs):
+            self.assertEqual(args[args.index('--token-user') + 1], 'bit-mis')
+            if args[1] == '--review-activity-since':
+                return SimpleNamespace(returncode=0, stdout=json.dumps({'reviewer_latest_commit': HEAD}), stderr='')
+            self.assertEqual(args[args.index('--expected-head') + 1], HEAD)
+            if args[1] == '--pr-review':
+                return SimpleNamespace(returncode=0, stdout=packet, stderr='')
+            self.assertEqual(args[1], '--approve-pr')
+            if isinstance(submission, BaseException):
+                raise submission
+            return submission or SimpleNamespace(returncode=0, stderr='', stdout=json.dumps(
+                {'action': 'approved_pr', 'review_id': 93, 'head_sha': HEAD}))
+
+        with patch.dict(structured_review.ASK, {'codex': Mock(side_effect=ask)}) as providers, \
+                patch.object(structured_review, 'ReviewWatch', return_value=nullcontext()), \
+                patch.object(subprocess, 'run', side_effect=github) as self.verdict_github:
+            self.verdict_ask = providers['codex']
+            return self.execute([pr_approve.run, pr_approve.run], checks, model='gpt-6-astra-ultra')
+
+    def test_exhausted_verdict_correction_recovers_on_unchanged_approval_input(self):
+        before = facts(review_context='c' * 64, reviewer_reviews_since_items=[])
+        after = approved()
+        after['review_context'] = before['review_context']
+        after['reviewer_reviews_since_items'] = [{'id': 93, 'state': 'APPROVED', 'commit': HEAD,
+                                                 'submitted_at': '2026-09-13T10:00:00Z'}]
+        row = self.execute_verdicts(['{}', '{}', APPROVAL], [before, before, after])
+        self.assertEqual((row['status'], row['action'], row['outcome'], row['review_id']),
+                         ('completed', 'approved', 'approved', 93))
+        self.assertEqual((row['model'], row['recovery_model']), ('gpt-6-astra-ultra', 'gpt-6-astra-ultra'))
+        asks = self.verdict_ask.call_args_list
+        self.assertEqual(len(asks), 3, 'the first verdict must exhaust its correction before recovery')
+        self.assertEqual([call.args[1].identity for call in asks], ['gpt-6-astra-ultra'] * 3)
+        self.assertIn('previous review response was rejected', asks[1].args[3])
+        self.assertEqual(asks[0].args[3], asks[2].args[3])
+        snapshots, deadlines = zip(*self.verdict_snapshots)
+        self.assertEqual({snapshot['id'] for snapshot in snapshots}, {row['id']})
+        self.assertEqual({snapshot['actor'] for snapshot in snapshots}, {'bit-mis'})
+        self.assertEqual({snapshot['expected_head'] for snapshot in snapshots}, {HEAD})
+        self.assertEqual({snapshot['review_policy'] for snapshot in snapshots}, {'bounded-v1'})
+        self.assertEqual([snapshot['recovery_model'] for snapshot in snapshots], [None, None, row['model']])
+        self.assertEqual(len(set(deadlines)), 1)
+        commands = [call.args[0][1] for call in self.verdict_github.call_args_list]
+        self.assertEqual(commands.count('--pr-review'), 1, 'recovery must reuse the immutable packet')
+        self.assertEqual(commands.count('--approve-pr'), 1)
+        self.assertEqual(api.review_receipt.get()['review_id'], row['review_id'])
+        self.assertIn('review verdict must contain', stored_response(row['id']))
+
+    def test_failed_verdict_recovery_stays_held_without_another_launch(self):
+        before = facts(reviewer_reviews_since_items=[])
+        row = self.execute_verdicts(['{}', '{}', 'invalid JSON', 'invalid JSON'], [before] * 3)
+        self.assertEqual((row['status'], row['error_code']), ('failed', 'review_recovery_failed'))
+        self.assertEqual(row['recovery_model'], 'gpt-6-astra-ultra')
+        self.assertEqual(self.verdict_ask.call_count, 4)
+        self.assertEqual(self.mod.run.call_count, 2)
+        self.assertIsNone(row['review_id'])
+        self.assertIsNone(row['action'])
+        self.assertIn('Expecting value', row['error'])
+        self.assertIn('prior: codex review produced no submitted verdict: review verdict must contain', row['error'])
+        api.init_db()
+        with self.assertRaises(sqlite3.IntegrityError):
+            api.run_governed_behavior(self.mod, 'pr_approve', 'https://github.com/o/r/pull/1', 'bit-mis', HEAD,
+                                      row['source'], row['correlation_id'], pwd=self.directory.name, model=row['model'])
+        self.assertEqual(self.mod.run.call_count, 2)
+        self.assertEqual(len(api.logs()), 1)
+
+    def test_verdict_recovery_requires_quiet_live_review_inventory(self):
+        before = facts(review_context='c' * 64, reviewer_reviews_since_items=[])
+        for change in ({'reviewer_pending_reviews': 1}, {'reviewer_reviews_since_items': [{'id': 99}]}):
+            with self.subTest(change=change), patch.object(api, 'sleep'):
+                self.mod.run.reset_mock()
+                row = self.execute_verdicts(['{}', '{}'], [before, {**before, **change}])
+                self.assertEqual(self.mod.run.call_count, 1)
+                self.assertEqual(self.verdict_ask.call_count, 2)
+                self.assertEqual((row['status'], row['error_code']), ('failed', 'review_contract_violation'))
+                self.assertIn('could not prove a safe recovery', row['error'])
+                self.assertIsNone(row['recovery_model'])
+                self.assertIsNone(row['review_id'])
+
+    def test_verdict_recovery_requires_unchanged_head_and_context(self):
+        before = facts(review_context='c' * 64, reviewer_reviews_since_items=[])
+        for change in ({'head_sha': 'b' * 40}, {'review_context': 'd' * 64}):
+            with self.subTest(change=change):
+                self.mod.run.reset_mock()
+                row = self.execute_verdicts(['{}', '{}'], [before, {**before, **change}])
+                self.assertEqual(self.mod.run.call_count, 1)
+                self.assertEqual(row['outcome'], 'superseded')
+                self.assertEqual(row['error_code'], 'review_contract_violation')
+                self.assertIn('review verdict must contain', row['error'])
+                self.assertIsNone(row['recovery_model'])
+
+    def test_verdict_recovery_does_not_replay_an_uncertain_submission(self):
+        before = facts(reviewer_reviews_since_items=[])
+        unclaimed = approved()
+        unclaimed['reviewer_reviews_since_items'] = [{'id': 99, 'state': 'APPROVED', 'commit': HEAD,
+                                                     'submitted_at': '2026-09-13T10:00:00Z'}]
+        with patch.object(api, 'sleep'):
+            row = self.execute_verdicts(['{}', '{}', APPROVAL], [before, before, unclaimed],
+                                        submission=subprocess.TimeoutExpired('github-interface', 1))
+        self.assertEqual((row['status'], row['error_code']), ('failed', 'review_recovery_failed'))
+        self.assertEqual(self.mod.run.call_count, 2)
+        self.assertEqual(self.verdict_ask.call_count, 3)
+        self.assertIsNone(row['review_id'])
+        self.assertIsNone(row['action'])
+        self.assertIn('publication uncertain', row['error'])
+        self.assertIn('prior: codex review produced no submitted verdict', row['error'])
+
+    def test_packet_and_position_contract_errors_do_not_reverdict(self):
+        from agent_interface import review_stages
+        for target, method, error in ((review_stages, 'stage_count', review_stages.StageError('invalid packet stages')),
+                                      (structured_review, '_validate_since_positions', structured_review.InvalidVerdict('outside since diff'))):
+            with self.subTest(method=method), patch.object(target, method, side_effect=error):
+                self.mod.run.reset_mock()
+                row = self.execute_verdicts([APPROVAL], [facts()])
+                self.assertEqual(self.mod.run.call_count, 1)
+                self.assertEqual(row['error_code'], 'review_contract_violation')
+                self.assertEqual(row['action'], 'not_started')
+                self.assertIsNone(row['recovery_model'])
+
+    def test_verdict_recovery_uses_the_remaining_deadline(self):
+        with patch.object(budget, 'monotonic', return_value=100) as clock:
+            def exhausted(*args, **kwargs):
+                clock.return_value = 1514
+                raise verdict_error()
+            row = self.execute(exhausted, [facts(), facts()], model='gpt-6-astra-ultra')
+        self.assertEqual(row['error_code'], 'review_budget_exhausted')
+        self.assertIsNone(row['recovery_model'])
+        self.assertEqual(self.mod.run.call_count, 1)
+
+    def test_consumed_verdict_recovery_guard_survives_a_restart(self):
+        model = CATALOG.resolve('gpt-6-astra-ultra')
+        call_id = api.track(model.identity, '', '1', 'o/r', 'bit-mis', 'pr_approve', expected_head=HEAD)
+        with api.db() as conn:
+            conn.execute('update calls set recovery_model=? where id=?', (model.identity, call_id))
+        for _ in range(2):
+            api.init_db()
+            self.mod.run.side_effect = verdict_error()
+            with patch.object(api, 'review_facts', return_value=facts()), self.assertRaises(budget.ReviewLimitError) as failure:
+                api._run_review_with_recovery(self.mod, 'pr_approve', 'https://github.com/o/r/pull/1', self.directory.name,
+                                              'bit-mis', HEAD, '', 60, None, model, model, facts(), call_id)
+            self.assertEqual(failure.exception.code, 'review_recovery_failed')
+            self.assertIn('Recovery was already attempted', str(failure.exception))
+        self.assertEqual(self.mod.run.call_count, 2, 'neither invocation may launch a recovery')
+
+    def test_invalid_pr_review_does_not_gain_approval_recovery(self):
+        row = self.execute(verdict_error(), [facts()], model='gpt-6-astra-ultra', behavior='pr_review')
+        self.assertEqual((row['status'], row['action'], row['outcome']), ('failed', 'not_started', 'preflight_failed'))
+        self.assertEqual(row['error_code'], 'review_contract_violation')
+        self.assertIsNone(row['recovery_model'])
 
     def test_output_limit_recovers_once_and_records_actual_github_outcome(self):
         from agent_interface import review_receipt

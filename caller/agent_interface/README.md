@@ -239,7 +239,10 @@ after proving no reviewer action. Uncorrected invalid, missing, duplicate or con
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
 GitHub reviews are `review_contract_violation` and held. A repeat-only
 `no_review` refusal first recovers once with the recovery model; anything
-still failing is held. Claude runs persist the refusal through the guard's
+still failing is held. For `pr_approve`, a structured verdict that remains invalid
+after its correction attempt first gets one fresh verdict from the admitted model.
+Packet, staging, position and submission errors do not qualify for this verdict recovery.
+Claude runs persist the refusal through the guard's
 `.refused` sidecar, since they submit outside the structured runner; a receipt
 from a later accepted submission wins over the stale marker. An approval the
 unresolved-conversation guard refuses is
@@ -430,6 +433,10 @@ providers and Grok issue reviews are unchanged.
 
 On an Opus output-limit error or a repeat-only publication refusal, Caller can recover
 once with the recovery model using the same immutable packet and remaining budget.
+An approval's exhausted structured-verdict correction can recover once with its
+original model under that same Call, packet, policy and deadline. The existing durable
+`recovery_model` guard is consumed before launch, including when it names the original
+model, so a restart cannot grant another recovery.
 Claude Code reports the output-limit error only on a fourth cut. At about 110 tokens per
 second, Opus's rate measured on 2026-11-04, the budget ends first, so a review whose
 responses keep reaching the limit ends at the time limit and does not recover.

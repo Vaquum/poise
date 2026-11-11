@@ -21,7 +21,7 @@ from uuid import UUID
 from pathlib import Path
 from time import monotonic
 
-from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, actor, bounded_cause, expected_head, pr_ref, provider_blocked
+from .atoms import AgentPreflightError, MAX_GOVERNED_PROMPT_BYTES, ReviewVerdictError, actor, bounded_cause, expected_head, pr_ref, provider_blocked
 from .atoms import packet as fetch_packet
 from .model_catalog import Model
 from .process_diagnostic import diagnostic_envelope
@@ -451,7 +451,12 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                                         "comments": step["comments"], "assessment": step["assessment"]}), behavior)
         except (InvalidVerdict, json.JSONDecodeError) as error:
             if correction_attempted:
-                raise
+                cause = bounded_cause(str(error) or "invalid review verdict")
+                raise ReviewVerdictError(
+                    f"{model.provider} review produced no submitted verdict: {cause}",
+                    "review_contract_violation",
+                    diagnostic_envelope(operation="provider.review", phase="validating", outcome="invalid_output",
+                                        stderr=cause, provider=model.provider, submission="none")) from error
             correction_attempted = True
             context += (f"\n\nYour previous review response was rejected:\n{raw}"
                         f"\nValidation error: {error}\nReturn a corrected JSON response matching the review contract, "
