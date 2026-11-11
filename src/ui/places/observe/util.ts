@@ -50,7 +50,9 @@ export async function failureOf(response: Response): Promise<string> {
     const body = JSON.parse(text) as { error?: unknown, message?: unknown }
     if (typeof body.error === 'string' && body.error) return typeof body.message === 'string' && body.message ? body.message : body.error
   } catch { /* not JSON: its text below */ }
-  return text ? `${response.status}: ${text.slice(0, 200)}` : `HTTP ${response.status}`
+  // A page in place of an answer (a proxy's error page, say) says nothing a person can use.
+  const page = /^\s*</.test(text) || (response.headers.get('content-type') ?? '').includes('text/html')
+  return text && !page ? `${response.status}: ${text.slice(0, 200)}` : `HTTP ${response.status}`
 }
 
 /** A GET whose failure carries the server's reason. */
