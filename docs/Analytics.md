@@ -6,12 +6,62 @@ focus to the burger. Settings → Navigation can place it in the top bar too.
 The shortcut on either surface marks Analytics as the current page. A reload
 stays on Analytics, and choosing another view leaves it.
 
-Analytics is one board of cards, with no section headings. The default order
+Analytics starts with a compact **System health · Live** strip, followed by
+the existing board of cards. **Pull requests merged**, its selected-day display
+and the board's histogram settings are unchanged. The default board order
 is eight productivity cards (two rows of four in a wide window), Work type,
 Review rounds and Change-request share, five per-PR cards, then live GitHub API
 account cards. Productivity and API cards share the taller height; Work & review
 and per-PR cards share the shorter height. Each family expands together when
 text or typography needs more space. Narrow windows reduce columns.
+
+## System health
+
+The five cards use verified v2 chain ownership, retaining the original seed
+identity after PR publication. They refresh with the existing Analytics tick
+and organization selection, independently of the selected calendar day. The
+read-only `/api/analytics/system-health` projection uses the existing journal,
+original Caller receipts, GitHub observations and coverage history; it starts
+no polling or work. Each card opens Logging, and counted items link to their
+existing chain journal evidence.
+
+- **Errors per completed work item** divides distinct work-error incidents over
+  each completed item's lifetime by distinct seeds merged in the trailing 24
+  hours. The cohort uses original verified GitHub `mergedAt`, never observation
+  or later review-reconciliation time. Error-free completions count too.
+  Execution failures include authentication and transport warnings; successful
+  preparation warnings, ordinary review/CI feedback, stopped, superseded and
+  closed-target no-effect outcomes do not count. Repeated incident observations
+  count once per item. Both known counts remain visible, but the rate is
+  unavailable for an empty or incomplete cohort, including missing lifetime
+  coverage before the trailing window.
+- **Work blocked** counts held, uncertain or overdue seeds, including those
+  without a PR, with oldest verified progress age and the largest stage.
+  Known healthy waits, including draft and queue waits older than 24 hours,
+  take precedence over age unless independently held, uncertain or verified
+  overdue. Re-reading unchanged evidence does not advance progress.
+- **Auto recovery** counts each seed once per outcome in the last 24 hours.
+  A recorded automatic retry needs a successful original receipt and verified
+  forward progress. Outside intervention uses its action time and retains
+  failure-linked reconnect/provider verification or a recorded operator Resume
+  followed by verified retry progress. Resume, retry launch or merge alone
+  proves no recovery. A later merge preserves resolving outside help; old
+  ambiguous origins remain unknown. Evidence names the failed Call, action,
+  origin and resumed progress time.
+- **Time since last work error** uses the same failure rule, including active
+  work. It includes the occurrence timestamp and says **Last observed error**
+  when subsequent coverage is incomplete. Without errors it shows the covered
+  interval with no observed error, or unavailable when coverage is unknown.
+- **Evidence coverage** separates current source status from retained history.
+  Caller coverage bars distinguish covered time, gaps and unknown intervals;
+  journal and account sources without measured interval coverage show status
+  without a numeric bar. Rows name scope/interval and last successful read.
+  Instance-wide dependencies, excluded legacy work and unavailable or
+  initializing accounts remain explicit limits. A failed refresh visibly marks
+  retained values stale with their original read time and scope. A successful
+  refresh does not clear historical coverage gaps.
+
+Five cards share one row where space permits and wrap on narrower screens.
 
 Drag a card's top bar to move it anywhere on the board. The held card follows
 the pointer directly; other cards make room with the shared Tactile spring.

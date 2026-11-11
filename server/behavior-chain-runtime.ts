@@ -4,7 +4,7 @@ import type { AgentLogSnapshot, LogEntry } from './agent-log-parse'
 import { resourceReleaseContradicted, resourceReleaseProven } from './behavior-resource-receipt'
 import type { DetachedProcessExit } from './process'
 import { automaticClosureHold, CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, closedChainTarget, decideBehaviorChain, type ChainDecision, type ChainObservation } from './behavior-chain-decision'
-import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
+import { BehaviorChainJournal, BehaviorChainRevisionConflict, chainBasis, chainIdentity, type BehaviorChain, type ChainEvent, type ChainInvocation, type ChainRecoveryOrigin } from './behavior-chain-store'
 import { budgetShortfall, executionLimits, headroomShortfall, measureBehaviorHeadroom, readBehaviorResourceAdmission,
   type BehaviorResourceAdmission, type BehaviorResourceHeadroom } from './behavior-resources'
 import { attributedNativeAction, matchingNativeActionReceipt, nativeActionReceipt, nativeActionSettlement, nativeRequestSha } from './behavior-chain-action'
@@ -25,7 +25,7 @@ export interface ChainRuntimeOperations {
   readInvocations(ids: string[]): Promise<AgentLogSnapshot>
   received(invocation: ChainInvocation, call: LogEntry): void
   authenticationRejected?(call: LogEntry): void
-  authRecovered?(invocation: ChainInvocation): boolean
+  authRecovered?(invocation: ChainInvocation): boolean | ChainRecoveryOrigin
   available(): boolean
   capacity(): number
   /** Override for the synchronous admission-boundary probe; production and
@@ -692,12 +692,17 @@ export class BehaviorChainRuntime {
       || invocation.evidence?.status !== 'failed' || invocation.evidence.action !== 'not_started'
       || invocation.evidence.outcome !== 'preflight_failed' || invocation.evidence.receipts !== null
       || invocation.evidence.review_id != null || invocation.evidence.head_sha != null
-      || !resourceReleaseProven(invocation.evidence, true) || !this.operations.authRecovered?.(invocation))) return chain
+      || !resourceReleaseProven(invocation.evidence, true))) return chain
+    const origins = episode.map(invocation => this.operations.authRecovered?.(invocation))
+    if (origins.some(origin => !origin)) return chain
     const automaticHold = `review-issue failed before publication three times: ${String(last.evidence?.error || 'native failure')}`
     if (chain.held && (episode.length !== 3 || chain.held !== automaticHold)) return chain
     // The existing journal resume moves the retry boundary. Old failures,
     // publication evidence and resource receipts remain immutable.
-    return this.append(chain, { type: 'chain.resumed' })
+    const recovery = origins.find(origin => typeof origin === 'object' && origin.origin === 'operator')
+      || origins.find(origin => typeof origin === 'object' && origin.origin === 'unknown')
+      || (origins.every(origin => typeof origin === 'object' && origin.origin === 'automatic') ? { origin: 'automatic' as const } : { origin: 'unknown' as const })
+    return this.append(chain, { type: 'chain.resumed', recovery: typeof recovery === 'object' ? recovery : { origin: 'unknown' } })
   }
 
   private async start(chain: BehaviorChain, invocation: ChainInvocation): Promise<void> {

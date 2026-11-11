@@ -48,6 +48,7 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
             ...('invocationId' in event ? { invocationId: event.invocationId } : {}),
             ...('reason' in event ? { reason: event.reason } : {}),
             ...('outcome' in event ? { outcome: event.outcome } : {}),
+            ...(event.type === 'chain.resumed' ? { recovery: event.recovery ?? null } : {}),
             ...('evidence' in event ? { callId: 'callId' in event ? event.callId : event.evidence.nativeCallId ?? event.evidence.callId ?? null,
               evidence: { diagnostic: event.evidence.diagnostic } } : {}) }
         })
@@ -79,7 +80,7 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
     if (chain.supersession) throw new HttpError(409, 'Superseded chains are terminal; new invocations cannot resume')
     const operation = body.operation
     const next = journal.append(chain.id, randomUUID(), Number(body.sequence), operation === 'hold'
-      ? { type: 'chain.held', reason: 'New invocations held by the person' } : { type: 'chain.resumed' })
+      ? { type: 'chain.held', reason: 'New invocations held by the person' } : { type: 'chain.resumed', recovery: { origin: 'operator' } })
     return reply(res, 200, { chain: summary(next) })
   } catch (error) {
     return reply(res, httpStatus(error, 409), { error: error instanceof Error ? error.message : String(error) })

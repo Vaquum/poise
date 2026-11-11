@@ -14,7 +14,8 @@ interface ChainRow {
   invocations: Array<{ behavior: string, state: string, outcome?: string | null, callId?: string | null, evidence?: FailureEvidence | null,
     nativeAction?: { attribution: string, outcome: string | null } | null }>
 }
-interface JournalEvent { sequence: number, at: number, type: string, reason?: string, outcome?: string, callId?: string | null, evidence?: FailureEvidence }
+interface JournalEvent { sequence: number, at: number, type: string, reason?: string, outcome?: string, callId?: string | null, evidence?: FailureEvidence,
+  recovery?: { origin: string, intervention?: { callId: string, at: number, verifiedAt: number } } | null }
 
 function failureDetails(callId?: string | null, evidence?: FailureEvidence | null): string {
   const call = callId ? ` · Call ${callId}` : ''
@@ -83,7 +84,7 @@ export function behaviorChainLogging() {
       if (data.next !== null && (!Number.isSafeInteger(data.next) || data.next <= (after ?? 0))) throw new Error('Journal cursor did not advance')
       historyId = id; historyNext = data.next; history.hidden = false
       history.querySelector('[data-history-title]')!.textContent = `v2 journal · ${id}`
-      const html = data.events.map((event: JournalEvent) => `<li>${escapeHtml(new Date(event.at).toLocaleString())} · ${escapeHtml(event.type)}${event.reason || event.outcome ? ` · ${escapeHtml(event.reason || event.outcome || '')}` : ''}${escapeHtml(failureDetails(event.callId, event.evidence))}</li>`).join('')
+      const html = data.events.map((event: JournalEvent) => `<li>${escapeHtml(new Date(event.at).toLocaleString())} · ${escapeHtml(event.type)}${event.reason || event.outcome ? ` · ${escapeHtml(event.reason || event.outcome || '')}` : ''}${escapeHtml(failureDetails(event.callId, event.evidence))}${event.recovery ? ` · Recovery origin: ${escapeHtml(event.recovery.origin)}${event.recovery.intervention ? ` · Resolving reconnect ${escapeHtml(new Date(event.recovery.intervention.at).toLocaleString())}; provider verified ${escapeHtml(new Date(event.recovery.intervention.verifiedAt).toLocaleString())}; failed Call ${escapeHtml(event.recovery.intervention.callId)}` : ''}` : ''}</li>`).join('')
       const events = history.querySelector('[data-history]')!
       if (append) events.insertAdjacentHTML('beforeend', html); else events.innerHTML = html || '<li>No journal events.</li>'
       historyMore.hidden = historyNext === null

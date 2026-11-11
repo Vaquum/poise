@@ -56,12 +56,16 @@ export interface BehaviorChain {
 /** Admission payload: the reservation is optional so admissions that predate
  *  resource budgets and quick native actions without an agent stay valid. */
 export type ChainAdmission = Omit<ChainInvocation, 'state' | 'callId' | 'outcome' | 'evidence' | 'admissionSequence' | 'reservation'> & { reservation?: BehaviorResourceReservation | null }
+export interface ChainRecoveryOrigin {
+  origin: 'automatic' | 'operator' | 'unknown'
+  intervention?: { callId: string, at: number, verifiedAt: number }
+}
 export type ChainEvent =
   | { type: 'chain.admitted', repository: string, issue: number, branch: string, author: string, reviewer: string }
   | { type: 'chain.observed', observation: Record<string, unknown> }
   | { type: 'chain.held', reason: string, ciHold?: BehaviorChain['ciHold'] }
   | { type: 'chain.waiting', reason: string }
-  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'] }
+  | { type: 'chain.resumed', ciRecovery?: BehaviorChain['ciHold'], recovery?: ChainRecoveryOrigin }
   | { type: 'chain.merged', mergeSha: string, evidence: Record<string, unknown> }
   | { type: 'chain.superseded', evidence: Record<string, unknown> }
   | { type: 'invocation.admitted', invocation: ChainAdmission }

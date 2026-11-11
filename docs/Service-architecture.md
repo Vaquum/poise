@@ -1291,6 +1291,17 @@ variant or scope is introduced. See [Logging](Logging.md#notification-evidence).
 
 ## Workspace behavior observation
 
+Analytics adds a guarded, read-only `GET /api/analytics/system-health?org=LOGIN`
+projection of canonical v2 work, original Caller receipts, existing GitHub
+observations and ledger coverage history. It preserves seed identity, original
+merge times and historical gaps, and labels unavailable accounts and
+instance-wide coverage. The existing Analytics refresh reads it; it adds no
+poller, Caller/GitHub observation, gateway scope or execution authority.
+Existing `chain.resumed` producers may retain recovery origin and failure-linked
+reconnect/provider-verification evidence; these optional fields do not change
+reducer state or old event hashes. Ambiguous older events stay unknown. See
+[System health](Analytics.md#system-health).
+
 New implementation admission also consumes Caller's captured forward GitHub
 prerequisites and verified delivery on the implementation base through the
 existing chain sweep. [Behavior chain](Behavior-chain.md#handoffs-and-outcomes) defines the

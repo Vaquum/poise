@@ -1,5 +1,6 @@
 import { reveal } from '../motion'
 import { analyticsLayout } from '../analytics-layout'
+import { analyticsHealthView } from '../analytics-health'
 // Day, history and live quota retain independent read ownership on one card board.
 import { analyticsGroups, formatCount, formatRate, type AnalyticsGroup, type AnalyticsReport, type AnalyticsTile } from '../analytics-format'
 import { analyticsDay, analyticsDayProgress, analyticsDailyBounds, analyticsHistoryBounds } from '../analytics-day'
@@ -14,6 +15,7 @@ import { GITHUB_QUOTA_REFRESH_MS, quotaRiskTone, quotaHours, type GithubQuotaRep
 let viewEl: HTMLElement
 let initialized = false
 let cardLayout: ReturnType<typeof analyticsLayout>
+let systemHealth: ReturnType<typeof analyticsHealthView>
 let metricMarkup = ''
 let quotaMarkup = ''
 let foregroundPending = false
@@ -104,6 +106,7 @@ function renderShell(): string {
       </div>
     </header>
     <main>
+      <section class="system-health" aria-label="System health"></section>
       <div class="analytics-loader loader" role="status" aria-label="Loading analytics" hidden><span></span><span></span><span></span></div>
       <span class="analytics-sr" id="analytics-drag-help">Drag a card header to move it. Or press Space, use arrow keys, then Space to drop. Escape cancels.</span>
       <span class="analytics-sr" id="analytics-quota-help">Live quota, independent of the selected day and organization.</span>
@@ -209,6 +212,7 @@ function refreshQuota(): void {
 
 function refreshAnalytics(): void {
   if (document.visibilityState === 'visible' && active) {
+    void systemHealth.refresh()
     render()
     void readAnalytics(true)
   }
@@ -562,6 +566,7 @@ export function initAnalyticsView(): void {
   if (!initialized) {
     initialized = true
     viewEl.innerHTML = renderShell()
+    systemHealth = analyticsHealthView(viewEl.querySelector<HTMLElement>('.system-health')!)
     cardLayout = analyticsLayout(viewEl.querySelector<HTMLElement>('.analytics-board')!, viewEl.querySelector<HTMLElement>('#analytics-layout-status')!, () => {
       for (const [label, index] of cursors) showCursor(label, index, false)
     })
@@ -572,7 +577,7 @@ export function initAnalyticsView(): void {
       dayOffset += Number(button.dataset.day)
       void readAnalytics()
     })
-    window.addEventListener('poise:organization-filter-changed', () => { if (active) void readAnalytics() })
+    window.addEventListener('poise:organization-filter-changed', () => { if (active) { void readAnalytics(); void systemHealth.refresh() } })
     const groups = viewEl.querySelector<HTMLElement>('.analytics-groups')!
     groups.addEventListener('pointermove', onPlotPointer)
     groups.addEventListener('pointerout', (event) => {
@@ -613,6 +618,7 @@ export function initAnalyticsView(): void {
     quotaTimer = setInterval(refreshQuota, GITHUB_QUOTA_REFRESH_MS)
   }
   scheduleMidnightRead()
+  void systemHealth.refresh()
   const snapshot = preparedAnalytics(dayOffset, dayAnchor)
   if (snapshot) {
     const reopening = shown?.report === snapshot.report && shown.baseline === snapshot.baseline
@@ -630,6 +636,7 @@ export function initAnalyticsView(): void {
 export function stopAnalyticsRefresh(): void {
   if (!active) return
   active = false
+  systemHealth.stop()
   foregroundPending = false
   initialQuotaPending = false
   historyPending = false

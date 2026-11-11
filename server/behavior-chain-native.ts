@@ -43,7 +43,7 @@ export interface NativeChainHooks {
   severity(behavior: ChainBehavior): string
   received(invocation: ChainInvocation, call: LogEntry): void
   authenticationRejected?(call: LogEntry): void
-  authRecovered?(invocation: ChainInvocation): boolean
+  authRecovered?: ChainRuntimeOperations['authRecovered']
   reviews(repository: string, number: number): Promise<string>
   existing(seeds: ChainSeed[]): Promise<Set<string>>
   wake(): void

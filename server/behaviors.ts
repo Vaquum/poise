@@ -7855,10 +7855,14 @@ async function runBehaviorChains(): Promise<void> {
         if (!isCodex) return false
         const completedAt = invocation.evidence?.completedAt
         const diagnostic = invocation.evidence?.diagnostic as LogEntry['diagnostic']
-        return !!failure && failure.verifiedAt !== null && failure.verifiedAt > failure.rejectedAt
+        const recovered = failure.verifiedAt !== null && failure.verifiedAt > failure.rejectedAt
           && typeof completedAt === 'number' && completedAt >= failure.since && completedAt <= failure.rejectedAt
           && diagnostic?.operation === 'provider.review' && diagnostic.context.submission === 'none'
           && invocation.evidence?.error_code === 'authentication_failed'
+        if (!recovered) return false
+        return failure.reconnectedAt !== null && failure.reconnectedAt > failure.rejectedAt && failure.reconnectedAt <= failure.verifiedAt!
+          ? { origin: 'operator', intervention: { callId: failure.callId, at: failure.reconnectedAt, verifiedAt: failure.verifiedAt! } }
+          : { origin: 'unknown' }
       },
       async reviews(repository, number) {
         const { readWorkReviews } = await import('./chat/control')
