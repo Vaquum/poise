@@ -41,11 +41,31 @@ interface RepairReport {
   issueNumber: number | null
 }
 
-export async function repairReportReviewScope(db: Database, chain: Pick<BehaviorChain, 'repository' | 'issue'>, pull: number): Promise<string> {
+const SCOPE_DIRECTIVE = 'Include this exact paragraph in the linked PR review.'
+
+async function seedScopeDirective(repository: string, issue: number, author: string): Promise<boolean> {
+  let result: { repository?: unknown, issue_number?: unknown,
+    issue?: { number?: unknown, body?: unknown, pull_request?: unknown } }
+  try {
+    const { stdout } = await runFile('github-interface', ['--read-issue', String(issue), '--repository', repository,
+      '--token-user', author], { timeoutMs: 30_000, maxOutputBytes: 2 * 1024 * 1024 })
+    result = JSON.parse(stdout)
+  } catch (error) {
+    throw new Error(`Review scope seed read failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (typeof result.repository !== 'string' || result.repository.toLowerCase() !== repository.toLowerCase()
+    || result.issue_number !== issue || !result.issue || result.issue.number !== issue
+    || (result.issue.body !== null && typeof result.issue.body !== 'string') || result.issue.pull_request) {
+    throw new Error('Review scope seed read is incomplete')
+  }
+  return typeof result.issue.body === 'string' && result.issue.body.includes(`${REMEDIATION_SCOPE}\n\n${SCOPE_DIRECTIVE}`)
+}
+
+export async function repairReportReviewScope(db: Database, chain: Pick<BehaviorChain, 'repository' | 'issue' | 'author'>, pull: number): Promise<string> {
   const { repository, issue } = chain
   const report = db.prepare(`SELECT 1 FROM meta WHERE key GLOB ? AND json_extract(value, '$.source') GLOB ?
     AND json_extract(value, '$.issueNumber') = ? LIMIT 1`).get(PREFIX + '*', repository.toLowerCase() + '#*', issue)
-  if (!report) return ''
+  if (!report && !(await seedScopeDirective(repository, issue, chain.author))) return ''
   const org = organizationForRepository(repository)
   if (!org) throw new Error('Repair report review requires its followed organization')
   // Episode-aware: a raw health gate would emit fresh process and runtime

@@ -361,6 +361,13 @@ function arrangeCli(
         stderr: '',
       }
     }
+    if (command === 'github-interface' && args[0] === '--read-issue') {
+      const issueNumber = Number(String(args[1] || '').replace(/^#/, ''))
+      const repository = args[args.indexOf('--repository') + 1]
+      return { stdout: JSON.stringify({ action: 'read_issue', repository, issue_number: issueNumber,
+        issue: { number: issueNumber, html_url: `https://github.com/${repository}/issues/${issueNumber}`,
+          body: 'An ordinary unmarked seed', state: 'open', labels: [{ name: 'poise' }] } }), stderr: '' }
+    }
     if (command === 'agent-interface' && args[0] === '--logs') {
       return { stdout: JSON.stringify(agentLogs), stderr: '' }
     }

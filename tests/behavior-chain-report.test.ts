@@ -914,6 +914,13 @@ it.each(['incomplete replies', 'execution budget', 'review budget', 'implementat
       return { stdout: JSON.stringify({ prs: prs.filter(pr => pr.number === number)
         .map(pr => ({ ...pr, repo: 'acme/repo', closes_via: closesVia, closing_truncated: false })), truncated: false, more: false }), stderr: '' }
     }
+    if (command === 'github-interface' && argv[0] === '--read-issue') {
+      const repo = argv[argv.indexOf('--repository') + 1]
+      const number = Number(argv[1])
+      return { stdout: JSON.stringify({ repository: repo, issue_number: number,
+        issue: { number, html_url: `https://github.com/${repo}/issues/${number}`, body: 'An ordinary unmarked seed',
+          state: 'open', labels: [{ name: 'poise' }] } }), stderr: '' }
+    }
     return existingRun(command, argv)
   })
   expect(prs[1].body).toContain('Closes #99')
@@ -924,7 +931,7 @@ it.each(['incomplete replies', 'execution budget', 'review budget', 'implementat
   expect(await repairReportReviewScope(db, unrelated, 22)).toBe('')
   expect(await repairReportReviewScope(db, unrelated, 24)).toBe('')
   expect(await repairReportReviewScope(db, { ...chain, repository: 'other/repo' }, 22)).toBe('')
-  expect(mocks.runFile.mock.calls).toHaveLength(beforeUnrelated)
+  expect(mocks.runFile.mock.calls).toHaveLength(beforeUnrelated + 3)
   stale = false
   expect(await repairReportReviewScope(db, chain, 21)).toBe('')
   expect(await repairReportReviewScope(db, chain, 23)).toBe('')
@@ -988,7 +995,7 @@ with tempfile.TemporaryDirectory() as root:
       basis: 'fixture', reason: 'Inspect unrelated work' }, 'review-unrelated')
     expect(unrelatedRequest!.argv).not.toContain('--review-scope')
     expect(unrelatedRequest!.argv[unrelatedRequest!.argv.indexOf('--note') + 1]).toContain(configuredNote)
-    expect(mocks.runFile.mock.calls).toHaveLength(beforeUnrelatedRequest)
+    expect(mocks.runFile.mock.calls).toHaveLength(beforeUnrelatedRequest + 1)
     stale = false
   }
   stale = true
@@ -997,6 +1004,88 @@ with tempfile.TemporaryDirectory() as root:
   await expect(repairReportReviewScope(db, chain, 24)).rejects.toThrow('awaits indexed PR closing references')
   await runtime.run()
   expect(posts()).toHaveLength(1)
+})
+
+it('carries an explicitly marked seed scope to its closing PR without repair-report metadata', async () => {
+  const { db, journal } = setup()
+  const chain = exhausted(journal)
+  expect(reports(db)).toHaveLength(0)
+  const invocations = chain.invocations.length
+  const existingRun = mocks.runFile.getMockImplementation()!
+  let closesVia = 'closing-references'
+  let closingIssue = 7
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    if (command === 'github-datastore' && argv[1] === 'pr-closing') {
+      const number = Number(argv[argv.indexOf('--after-number') + 1]) + 1
+      const prs = number === 22
+        ? [{ repo: 'acme/repo', number: 22, author: 'maintainer', branch: 'hotfix', closes_via: closesVia,
+          closing_truncated: false, closing: [{ repo: 'acme/repo', number: closingIssue }] }]
+        : []
+      return { stdout: JSON.stringify({ prs, truncated: false, more: false }), stderr: '' }
+    }
+    return existingRun(command, argv)
+  })
+  seedBody = `Do the work\n\n${REMEDIATION_SCOPE}\n\nInclude this exact paragraph in the linked PR review.`
+  expect(await repairReportReviewScope(db, chain, 22)).toBe(REMEDIATION_SCOPE)
+  seedBody = 'Original work'
+  expect(await repairReportReviewScope(db, chain, 22)).toBe('')
+  seedBody = `Do the work\n\n${REMEDIATION_SCOPE}\n\nInclude this exact paragraph in the linked PR review.`
+  closingIssue = 100
+  expect(await repairReportReviewScope(db, chain, 22)).toBe('')
+  closingIssue = 7
+  closesVia = 'body-keywords'
+  await expect(repairReportReviewScope(db, chain, 22)).rejects.toThrow('incomplete PR closing references')
+  closesVia = 'closing-references'
+  const prClosingRun = mocks.runFile.getMockImplementation()!
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    if (command === 'github-interface' && argv[0] === '--read-issue') throw new Error('issue store offline')
+    return prClosingRun(command, argv)
+  })
+  await expect(repairReportReviewScope(db, chain, 22)).rejects.toThrow('Review scope seed read failed')
+  mocks.runFile.mockImplementation(prClosingRun)
+  const native = nativeChainOperations({ login: 'acme' } as Organization, {
+    roster: async () => ({ issueReviewers: [], prReviewers: [reviewer], implementer: reviewer, repairer: reviewer, approver: reviewer }),
+    resolve: async () => reviewer, prepare: async () => ({}), borrow: () => null, available: () => true, capacity: () => 3,
+    permitted: () => true, severity: () => 'p2', received: () => {}, reviews: async () => '', existing: async () => new Set(), wake: () => {},
+    note: () => '', reviewScope: (target, pull) => repairReportReviewScope(db, target, pull.number),
+  })
+  for (const behavior of ['review-pr', 'approve-pr'] as const) {
+    const observed = observation(22)
+    const request = await native.request(chain, observed, { kind: 'invoke', behavior, actor: 'reviewer', reviewer,
+      basis: 'fixture', reason: 'Inspect the marked seed remediation' }, 'review-marked')
+    expect(request?.argv[request?.argv.indexOf('--review-scope') + 1]).toBe(REMEDIATION_SCOPE)
+    const reviewed = JSON.parse(execFileSync('python3', ['-c', `
+import json, os, sqlite3, sys, tempfile
+from pathlib import Path
+from unittest.mock import patch
+import agent_interface as api
+from agent_interface import atoms, review_receipt
+data = json.load(sys.stdin)
+with tempfile.TemporaryDirectory() as root:
+    api.DB = Path(root) / 'calls.sqlite3'
+    api.RESPONSES = Path(root) / 'responses'
+    api.init_db()
+    call = 'c' * 32
+    os.environ.update(AGENT_INTERFACE_RECEIPT_DB=str(api.DB), AGENT_INTERFACE_RECEIPT_CALL=call)
+    with sqlite3.connect(api.DB) as conn:
+        conn.execute("insert into calls(id,started_at,status,actor,behavior,artifact) values (?,0,'running','reviewer','pr_review',?)", (call, json.dumps({'phase':'reviewing'})))
+    review_receipt.bind(api.DB, call)
+    packet = json.dumps({'repository':'acme/repo','pull_number':22,'head_sha':data['head'],
+        'pull':{'base':{'sha':'b'*40},'title':'Marked seed','body':'Closes #7'}})
+    with patch.object(api, 'run_governed_behavior') as run:
+        sys.argv = ['agent-interface', *data['argv']]
+        api._main()
+    review_receipt.prepare_response(packet, 'fixture', run.call_args.kwargs['review_scope'])
+    assessment = {'verdict':'The marked remediation was inspected.',
+        'reviewed_context':'Inspected the immutable diff and affected callers.','limitations':'Isolated fixture only.'}
+    review_receipt.complete_response(assessment, data['head'])
+    print(json.dumps({'body':review_receipt.begin_submission(assessment['verdict'], data['head'])}))
+`], { input: JSON.stringify({ head: HEAD, argv: request!.argv }), encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, PYTHONPATH: resolve('caller/agent_interface') } })) as { body: string }
+    expect(reviewed.body.split(REMEDIATION_SCOPE)).toHaveLength(2)
+  }
+  expect(journal.read(chain.id)!.invocations).toHaveLength(invocations)
+  expect(posts()).toHaveLength(0)
 })
 
 it.each(['mixed causes', 'generic failure', 'uncertain receipt', 'pending resources', 'publication', 'only two'])('does not report unverified execution exhaustion: %s', async change => {
