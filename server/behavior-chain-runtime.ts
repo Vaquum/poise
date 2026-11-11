@@ -648,7 +648,9 @@ export class BehaviorChainRuntime {
         evidence = { ...result, status: 'deferred', action: 'not_started', completedAt: Date.now() }
       }
       this.append(chain, { type: 'invocation.settled', invocationId: invocation.id, callId: call.id,
-        outcome: String(evidence.outcome || evidence.action), evidence: { ...physical, nativeCallStatus: call.status, status: 'completed', ...evidence } })
+        outcome: String(evidence.outcome || evidence.action), evidence: { ...physical, nativeCallStatus: call.status, status: 'completed', ...evidence,
+          completedAt: typeof physical.completedAt === 'number' && Number.isFinite(physical.completedAt)
+            ? physical.completedAt : (evidence as Record<string, unknown>).completedAt } })
       this.operations.wake()
       return this.current(chain)
     }

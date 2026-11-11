@@ -5,10 +5,10 @@ import { normalize } from '../gateway/src/diagnostics/contract'
 import { behaviorChainJournal } from './behavior-chain-journal'
 import { chainProgress } from './behavior-chain-summary'
 import { CHAIN_OBSERVATION_MAX_AGE_MS, chainReviewResponse, decideBehaviorChain, type ChainObservation } from './behavior-chain-decision'
-import { matchingNativeActionReceipt } from './behavior-chain-action'
+import { matchingNativeActionReceipt, nativeActionSettlement } from './behavior-chain-action'
 import { nativeBehavior } from './behavior-chain-runtime'
 import { type BehaviorChain, type BehaviorChainJournal, type ChainEvent, type ChainInvocation } from './behavior-chain-store'
-import { resourceReleaseContradicted } from './behavior-resource-receipt'
+import { nativeResourcesPending, resourceReleaseContradicted } from './behavior-resource-receipt'
 import { dependencySnapshot, type LedgerHistory, type Dependencies } from './health'
 import { getOrganizations, type Organization } from './organizations'
 import { HttpError } from './http'
@@ -83,8 +83,15 @@ export function retryProven(chain: BehaviorChain, retry: ChainInvocation, observ
   if (retry.behavior === 'publish-issue') {
     const argv = retry.request.argv
     const invocationId = argv.includes('--invocation-id') ? argv[argv.indexOf('--invocation-id') + 1] : null
-    return evidence.action === 'published' && typeof evidence.head_sha === 'string'
-      && observation.pull?.head === evidence.head_sha && observation.publication.head_sha === evidence.head_sha
+    const result = (evidence.nativeActionResult as Record<string, unknown> | undefined) ?? evidence
+    const action = typeof evidence.action === 'string' ? evidence.action
+      : typeof result.action === 'string' ? result.action : null
+    const outcome = typeof evidence.outcome === 'string' ? evidence.outcome
+      : typeof result.outcome === 'string' ? result.outcome : null
+    const head = typeof evidence.head_sha === 'string' ? evidence.head_sha
+      : typeof result.head_sha === 'string' ? result.head_sha : null
+    return (action === 'published' || action === 'issue_work') && outcome === 'published' && typeof head === 'string'
+      && observation.pull?.head === head && observation.publication.head_sha === head
       && observation.publication.head_invocation === invocationId
   }
   if (retry.behavior === 'implement-issue' || retry.behavior === 'repair-pr') {
@@ -93,11 +100,40 @@ export function retryProven(chain: BehaviorChain, retry: ChainInvocation, observ
       && observation.publication.head_invocation === retry.callId
   }
   if (retry.behavior === 'rerun-grey-ci') {
-    return observation.greyRecovery?.invocationId === retry.id
-      && String((observation.greyRecovery.receipt as Record<string, unknown>).outcome) === 'rerun_observed'
+    if (observation.greyRecovery?.invocationId === retry.id
+      && String((observation.greyRecovery.receipt as Record<string, unknown>).outcome) === 'rerun_observed') return true
+    // Settled retries retain their native receipt in evidence after the
+    // observation no longer carries greyRecovery (e.g. at merge time).
+    const argv = retry.request.argv
+    const runId = argv.includes('--run-id') ? Number(argv[argv.indexOf('--run-id') + 1]) : null
+    const attempt = argv.includes('--run-attempt') ? Number(argv[argv.indexOf('--run-attempt') + 1]) : null
+    const expected = argv.includes('--expected-head') ? argv[argv.indexOf('--expected-head') + 1] : null
+    const outcome = (evidence as Record<string, unknown>).outcome
+    const head = (evidence as Record<string, unknown>).head_sha
+    return evidence.status === 'completed' && String(outcome) === 'rerun_observed' && typeof head === 'string'
+      && observation.pull?.head === head && head === expected
+      && (evidence as Record<string, unknown>).run_id === runId
+      && (evidence as Record<string, unknown>).run_attempt === attempt
   }
   const receipt = matchingNativeActionReceipt(chain, retry)
-  return !!receipt && receipt.observedAt <= at && ['enqueued', 'merged', 'resolved'].includes(String(receipt.result.outcome))
+  if (!receipt || receipt.observedAt > at) return false
+  return ['enqueued', 'merged', 'resolved'].includes(String(nativeActionSettlement(receipt).outcome))
+}
+
+/** Confirmed closed seeds mirror journal.page(false): issue closed with no
+ * existing pulls, settled ownership and no merged publication/PR. */
+function isConfirmedClosed(chain: BehaviorChain): boolean {
+  const observation = chain.observation as ChainObservation | null
+  if (!observation || observation.issue.open !== false) return false
+  if (!Array.isArray(observation.existingPulls) || observation.existingPulls.length !== 0) return false
+  if (chain.invocations.some(invocation => invocation.state !== 'settled')) return false
+  if (chain.invocations.some(invocation => nativeResourcesPending({ ...invocation }))) return false
+  if (chain.reviewPending === true) return false
+  if (observation.publication.merged !== false || observation.publication.merge_sha != null) return false
+  const pull = observation.pull
+  if (pull === null) return observation.publication.pull_number === null && observation.publication.state === null
+  return pull.state === 'closed' && observation.publication.state === 'closed'
+    && pull.number === observation.publication.pull_number && pull.merged === false && pull.mergeSha == null
 }
 
 /** Only canonical v2 ownership enters this population. Nothing here observes
@@ -160,7 +196,13 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
       if (chain.mergeSha && !verifiedMerge) { complete = false; addLimit(`${chain.id}: original GitHub merge time unavailable`) }
       if (verifiedMerge && mergedAt! >= since) {
         result.rate.completed++
-        const incidents = new Set(errors.filter(error => error.at <= mergedAt!).map(error => error.incident))
+        // Delayed reconciliation can stamp a pre-merge failure after merging;
+        // the admitted attempt still proves the incident belongs to the lifetime.
+        const incidents = new Set(errors.filter(error => {
+          if (error.at <= mergedAt!) return true
+          const failed = chain.invocations.find(invocation => invocation.id === error.invocation)!
+          return failed.admittedAt <= mergedAt!
+        }).map(error => error.incident))
         result.rate.errors += incidents.size
         result.rate.items.push({ work: chain.id, journal: journalHref(chain.id), summary: `${incidents.size} errors; merged ${new Date(mergedAt!).toISOString()}` })
         lifetimeStart = Math.min(lifetimeStart, admittedAt)
@@ -171,7 +213,7 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
           addLimit(`${chain.id}: incomplete lifetime evidence ${new Date(admittedAt).toISOString()} – ${new Date(mergedAt!).toISOString()}`)
         }
       }
-      if (!chain.supersession && (!chain.mergeSha || chain.reviewPending)) {
+      if (!chain.supersession && !isConfirmedClosed(chain) && (!chain.mergeSha || chain.reviewPending)) {
         const active = chain.invocations.find(invocation => invocation.state !== 'settled')
         const current = chain.observation as ChainObservation | null
         const fresh = !!current && current.checkedAt <= now && now - current.checkedAt <= CHAIN_OBSERVATION_MAX_AGE_MS
