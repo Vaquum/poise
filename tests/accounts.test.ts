@@ -133,6 +133,26 @@ describe('GET /api/accounts', () => {
     expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt, verifiedAt })
   })
 
+  it('preserves the first Connect when a second lands after Call completion but before reconcile', async () => {
+    const { recordProviderRecovery } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    // A successful review Call completes after the first Connect; its receipt
+    // is reconciled later, so verifiedAt is still null when the second Connect
+    // lands. Saving call.completed_at must still read as operator help.
+    const completedAt = firstAt + 1
+    while (Date.now() <= completedAt) await new Promise(resolve => setTimeout(resolve, 1))
+    recordLogin('codex', 0)
+    expect(providerSignInFailure('codex')!.reconnectedAt).toBe(firstAt)
+    recordProviderRecovery('codex', 'a'.repeat(32), completedAt)
+    const failure = providerSignInFailure('codex')!
+    expect(failure).toMatchObject({ reconnectedAt: firstAt, verifiedAt: completedAt })
+    expect(failure.reconnectedAt!).toBeLessThanOrEqual(failure.verifiedAt!)
+  })
+
   it('records verification completion when a second Connect lands during verification', async () => {
     await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
     vi.spyOn(models, 'loadCatalog').mockResolvedValue(JSON.parse(CATALOG_STDOUT))

@@ -145,7 +145,13 @@ export function recordLogin(preset: string, code: number): void {
   const completedAt = Date.now()
   setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [id]: new Date(completedAt).toISOString() }))
   const failure = providerSignInFailure(id)
-  if (failure && completedAt > failure.rejectedAt && failure.verifiedAt === null) {
+  // First resolving Connect wins while no verification claim exists: a later
+  // Connect after physical Call completion but before its receipt is
+  // reconciled must not clobber the help that verification will confirm.
+  // A fresh Connect after a claim still replaces it so a failed verification
+  // can be retried once per Connect.
+  if (failure && completedAt > failure.rejectedAt && failure.verifiedAt === null
+    && (failure.reconnectedAt === null || failure.verificationLogin !== null)) {
     setMeta(rejectionKey(id), JSON.stringify({ ...failure, reconnectedAt: completedAt }))
   }
 }
