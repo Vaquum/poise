@@ -4,7 +4,8 @@
 // Its output and exit code are what the agent gets, so everything that goes wrong here says so and exits with 125.
 'use strict'
 const { spawn, spawnSync } = require('node:child_process')
-const { chmodSync, openSync, readFileSync } = require('node:fs')
+const { accessSync, chmodSync, constants: { W_OK }, existsSync, openSync, readFileSync } = require('node:fs')
+const { dirname, join } = require('node:path')
 const { constants } = require('node:os')
 const { setTimeout: sleep } = require('node:timers/promises')
 
@@ -76,15 +77,44 @@ function suiteEnvironment(spec) {
   return env
 }
 
+function writable(dir) {
+  while (!existsSync(dir)) dir = dirname(dir)
+  try {
+    accessSync(dir, W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether a job's unpacking went through the whole archive and missed only files for folders of the image that the
+ * job's user may not write. The image is the workspace's, so the suite runs with what those folders hold, as with the
+ * image's files. A tar that stopped any other way, a signal included, ends the run without a result.
+ */
+function onlyImageFolders(code, errors, into = root) {
+  const end = 'tar: Exiting with failure status due to previous errors'
+  const lines = errors.trim().split('\n')
+  if (code !== 2 || lines.at(-1) !== end) return false
+  return lines.length > 1 && lines.slice(0, -1).every((line) => {
+    // As `Cannot mkdir`, `Cannot open` or `Cannot create symlink to 'x'`, for one folder's new files and what is in them.
+    const name = /^tar: (.+?): Cannot [^:]*: (?:Permission denied|No such file or directory)$/.exec(line)?.[1]
+    return name !== undefined && !writable(dirname(join(into, name)))
+  })
+}
+
 /** Not spawnSync: Docker starts alongside, and its wait must keep running. Answers with what went wrong, or null. */
 function unpack(whole) {
   return new Promise((resolve) => {
     let errors = ''
     const keep = asJob && onBox ? JOB_UNPACK : []
     const tar = spawn('tar', ['-xzf', whole, '-C', root, '--no-same-owner', ...keep], { stdio: ['ignore', 'ignore', 'pipe'], ...asUser })
-    tar.stderr.on('data', (chunk) => { errors = (errors + chunk).slice(-300) })
+    tar.stderr.on('data', (chunk) => { errors += chunk })
     tar.once('error', (error) => resolve(error.message))
-    tar.once('close', (code) => resolve(code === 0 ? null : errors.trim() || `tar exited with ${code}`))
+    tar.once('close', (code) => {
+      if (code === 0 || (asJob && onBox && onlyImageFolders(code, errors))) resolve(null)
+      else resolve(errors.trim().slice(-300) || `tar exited with ${code}`)
+    })
   })
 }
 
@@ -144,4 +174,4 @@ async function main() {
 
 // Started as a script on a box; tests require it for what it unpacks with.
 if (require.main === module) main().catch((error) => fail(error.message))
-module.exports = { JOB_UNPACK }
+module.exports = { JOB_UNPACK, onlyImageFolders }

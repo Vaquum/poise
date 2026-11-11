@@ -766,8 +766,10 @@ once. A suite that only checks whether a `docker` exists stays on the job. Witho
 `POISE_TEST_BASE_SERVICE`, every suite goes to a sandbox.
 
 **What a box has.** A job has what the workspace image has, without a sign-in, and
-runs the suite as that image's user, so files of the image's own that a checkout's
-paths also name stay as they are. A sandbox has Docker, running and open to the
+runs the suite as that image's user. So the image's own files stay as they are, and
+so does what its folders hold that this user may not write: a suite started with the
+workspace's own Python runs with the job image's copy of it, which can lag the
+workspace's until that image is deployed again. A sandbox has Docker, running and open to the
 suite, and the tools of the workspace image at the same paths: Node 22, `git`, a
 build toolchain and the Chromium of this repository's Playwright.
 `gateway/src/test-box-setup.sh` builds those once, in about a minute, and the
