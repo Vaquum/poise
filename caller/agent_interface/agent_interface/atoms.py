@@ -38,6 +38,10 @@ class AgentPreflightError(RuntimeError):
         self.diagnostic = diagnostic
 
 
+class ReviewVerdictError(AgentPreflightError):
+    """A structured verdict failed its correction before any submission."""
+
+
 # A provider that refused the work or an account it cannot use: running the
 # same input again cannot succeed until a person acts.
 PROVIDER_BLOCKS = (
