@@ -3,23 +3,19 @@
 // GitHub, Board and the other parts, and reading an answer's error.
 import { effectiveTimezone, getOrganizations } from '../../../config'
 import { fullTime, shortTime } from '../../../clock'
-import { CURRENT_FILTER_KEY } from '../../../time-range'
-import { esc, store } from '../../dom'
+import { getSelectedOrganization, setSelectedOrganization } from '../../../organizations'
+import { esc } from '../../dom'
 import { placeHref, type Part } from '../../address'
 import type { StateKey } from './chains'
 
-// ---------- Scope: one organization, or all, the same choice as Board's ----------
-const filters = (): Record<string, unknown> => {
-  const value = store.get<unknown>(CURRENT_FILTER_KEY, {})
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
-}
+// ---------- Scope: one organization, or all, the same choice as Board's and Overview's ----------
 export const readyOrganizations = (): string[] => getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login)
 /** The saved scope, when it is still an organization that is ready; otherwise all of them. */
 export function savedScope(): string {
-  const org = filters().org
-  return typeof org === 'string' && readyOrganizations().includes(org) ? org : ''
+  const org = getSelectedOrganization()
+  return readyOrganizations().includes(org) ? org : ''
 }
-export function saveScope(org: string): void { store.set(CURRENT_FILTER_KEY, { ...filters(), org }) }
+export function saveScope(org: string): void { setSelectedOrganization(org) }
 
 // ---------- Times on Poise's clock, in the zone from General ----------
 export const clockTime = (at: number | string, now = Date.now()): string => {

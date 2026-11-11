@@ -15,6 +15,7 @@ import { placeHref } from '../address'
 import type { MountPlace } from '../router'
 import { getOrganizations, loadSettings, startRefreshTicker } from '../../config'
 import { CURRENT_FILTER_KEY, timeRangeWindow, type TimeRange } from '../../time-range'
+import { ORGANIZATION_STORAGE_KEY, setSelectedOrganization } from '../../organizations'
 import { noticeFeed } from '../../notices'
 import { registerReloadGuard } from '../../self-update-guards'
 import { chatSidePane } from '../../views/chat-side-pane'
@@ -66,7 +67,8 @@ function readFilters(): Filters {
   return {
     status: saved.status === 'open' ? 'open' : 'any',
     time: pick(saved.time, ['all', 'today', 'yesterday', 'week'] as const, 'all'),
-    org: typeof saved.org === 'string' ? saved.org : '',
+    // The organization is Poise's one choice, shared with Overview and Observe; read before settings load.
+    org: (() => { try { return localStorage.getItem(ORGANIZATION_STORAGE_KEY) || '' } catch { return '' } })(),
     layout: pick(own.layout, ['lanes', 'list'] as const, 'lanes'),
     by: pick(own.by, ['updated', 'opened'] as const, 'updated'),
     who: pick(own.who, ['any', 'poise', 'other'] as const, 'any'),
@@ -105,9 +107,10 @@ export const mount: MountPlace = (ctx) => {
     if (v) linkTo(k, v as never)
   }
   const saveFilters = () => {
-    const { layout, by, who, ...kept } = { ...F, ...linked }
+    const { layout, by, who, org, ...kept } = { ...F, ...linked }
     store.set(CURRENT_FILTER_KEY, { ...store.get<Record<string, unknown>>(CURRENT_FILTER_KEY, {}), ...kept, status: kept.status === 'open' ? 'open' : 'all' })
     store.set(BOARD_KEY, { layout, by, who })
+    setSelectedOrganization(org)
   }
   const choose = (patch: Partial<Filters>) => {
     for (const [k, v] of Object.entries(patch)) { (F as unknown as Record<string, unknown>)[k] = v; delete (linked as Record<string, unknown>)[k] }
