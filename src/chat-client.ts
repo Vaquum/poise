@@ -102,6 +102,8 @@ export interface ChatClientEvents {
   restart: () => void
   /** The Switchboard's state changed; its pane reads it again. */
   switchboard: (revision: number) => void
+  /** Open chat requests changed; whoever lists them reads them again. */
+  chatRequests: (revision: number) => void
 }
 
 const BACKOFF_MIN_MS = 500
@@ -167,6 +169,7 @@ export class ChatClient {
     connection: new Set(),
     restart: new Set(),
     switchboard: new Set(),
+    chatRequests: new Set(),
   }
   /** Gap refills in flight, so one slow subscriber does not fan out fetches. */
   private refilling = new Set<string>()
@@ -309,6 +312,10 @@ export class ChatClient {
       }
       case 'switchboard.updated': {
         if (Number.isSafeInteger(frame.revision)) for (const fn of this.listeners.switchboard) fn(frame.revision)
+        return
+      }
+      case 'chatRequests.updated': {
+        if (Number.isSafeInteger(frame.revision)) for (const fn of this.listeners.chatRequests) fn(frame.revision)
         return
       }
       case 'session.created':

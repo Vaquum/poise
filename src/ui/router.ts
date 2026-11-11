@@ -24,12 +24,12 @@ export type MountPlace = (ctx: PlaceContext) => void | (() => void) | Promise<vo
 
 type PlaceModule = { mount: MountPlace }
 const PLACES: Record<Place, () => Promise<PlaceModule>> = {
-  overview: () => import('./places/placeholder'),
+  overview: () => import('./places/overview'),
   board: () => import('./places/placeholder'),
   chat: () => import('./places/placeholder'),
   manager: () => import('./places/placeholder'),
   editor: () => import('./places/placeholder'),
-  observe: () => import('./places/placeholder'),
+  observe: () => import('./places/observe'),
   settings: () => import('./places/placeholder'),
 }
 // As classic's: Chat, the Manager and the Editor only fade in.
