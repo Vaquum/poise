@@ -273,8 +273,17 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         const retry = later ?? fallback
         const success = retry && rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
           && row.event.invocationId === retry.id && row.sequence > failure.sequence && row.event.evidence.status === 'completed')
+        // Same-invocation publication retries launch via a recorded
+        // publicationResume before their success settles. An operator
+        // Hold/Resume while that automatic retry runs must not relabel it.
+        const launch = retry && retry.admissionSequence <= failure.sequence ? rows.find(row => row.sequence > failure.sequence
+          && (!success || row.sequence < success.sequence) && row.event.type === 'invocation.reconciled' && row.event.invocationId === retry.id
+          && typeof (row.event.evidence as Record<string, unknown> | null)?.publicationResume === 'object'
+          && (row.event.evidence as Record<string, unknown> | null)?.publicationResume !== null
+          && typeof (((row.event.evidence as Record<string, unknown>).publicationResume as Record<string, unknown>).correlation) === 'string') : undefined
         const resumed = rows.filter(row => row.sequence > failure.sequence && row.event.type === 'chain.resumed'
-          && (!retry || (retry.admissionSequence > failure.sequence ? row.sequence < retry.admissionSequence : !success || row.sequence < success.sequence)))
+          && (!retry || (retry.admissionSequence > failure.sequence ? row.sequence < retry.admissionSequence
+            : launch ? row.sequence < launch.sequence : !success || row.sequence < success.sequence)))
         const operator = resumed.filter(row => row.event.type === 'chain.resumed' && row.event.recovery?.origin === 'operator').at(-1)
         // A runtime CI recovery carries its own ciRecovery evidence and is not
         // an ambiguous operator resume.
