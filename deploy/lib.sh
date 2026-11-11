@@ -286,20 +286,52 @@ build_runtime_image() {
     --build-arg "POISE_RELEASE=$release" --build-arg "POISE_BASE=$(runtime_base)" "${tags[@]}" "$root"
 }
 
+# Render's API for the test jobs' image, through Node in the image this deploy
+# built: the host promises only Docker and git. The key goes in on stdin, never
+# on a command line. `built` prints the commit of the service's newest build that
+# did not fail; `build SHA` has Render build that commit.
+test_job_render() {
+  printf '%s' "$1" | docker run --rm -i --entrypoint node "$(guard_parser_image)" --input-type=module -e '
+let key = ""
+for await (const chunk of process.stdin) key += chunk
+const [api, service, action, sha] = process.argv.slice(1)
+const deploys = `${api}/services/${service}/deploys`
+const call = async (url, init = {}) => {
+  const response = await fetch(url, {
+    ...init,
+    headers: { authorization: `Bearer ${key.trim()}`, accept: "application/json", "content-type": "application/json" },
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (!response.ok) throw new Error(`Render answered with HTTP ${response.status}`)
+  return response.json()
+}
+try {
+  if (action === "built") {
+    const going = ["created", "build_in_progress", "update_in_progress", "pre_deploy_in_progress", "live"]
+    const deploy = (await call(`${deploys}?limit=20`)).map((item) => item.deploy).find((item) => going.includes(item.status))
+    process.stdout.write(deploy?.commit?.id ?? "")
+  } else {
+    await call(deploys, { method: "POST", body: JSON.stringify({ commitId: sha }) })
+  }
+} catch (error) {
+  process.stderr.write(`${error.message}\n`)
+  process.exit(1)
+}' "$render_api" "$2" "$3" "${4:-}"
+}
+
 # The test jobs' image (docs/Operating.md, "Agents' test suites") is this
 # workspace image, which Render builds from the same commit. A deploy has Render
 # build it again when what a job runs with changed since the commit Render last
 # built: the image's own files, Caller or the package lock, which pins
 # Playwright. A build at every deploy would spend Render's build minutes for
-# nothing. The key never reaches a command line. Nothing here stops a deploy.
+# nothing. Nothing here stops a deploy.
+render_api=https://api.render.com/v1
 refresh_test_job_image() {
-  local sha=$1 key service api=https://api.render.com/v1 built
+  local sha=$1 key service built
   key=$(env_value POISE_TEST_RENDER_API_KEY)
   service=$(env_value POISE_TEST_BASE_SERVICE)
   [ -n "$key" ] && [ -n "$service" ] && [ -n "$sha" ] || return 0
-  if ! built=$(curl --fail --silent --show-error --max-time 30 --header @<(printf 'Authorization: Bearer %s\n' "$key") \
-    "$api/services/$service/deploys?limit=20" \
-    | jq -er '[.[].deploy | select(.status | IN("created", "build_in_progress", "update_in_progress", "pre_deploy_in_progress", "live"))][0].commit.id // ""'); then
+  if ! built=$(test_job_render "$key" "$service" built); then
     warn "Render did not say which commit the test jobs' image was built from, so it stays as it is"
     return 0
   fi
@@ -308,8 +340,7 @@ refresh_test_job_image() {
     return 0
   fi
   say "Having Render build the test jobs' image at $sha."
-  curl --fail --silent --show-error --max-time 30 --header @<(printf 'Authorization: Bearer %s\n' "$key") \
-    --header 'Content-Type: application/json' --data "{\"commitId\":\"$sha\"}" "$api/services/$service/deploys" >/dev/null \
+  test_job_render "$key" "$service" build "$sha" \
     || warn "Render did not take a new build of the test jobs' image, so jobs keep the image of ${built:-an unknown commit}"
 }
 
