@@ -92,7 +92,7 @@ export const mount: MountPlace = async (ctx: PlaceContext) => {
     }).join('')
       + '<span class="t-micro set-else">Beside your work</span>'
       + `<button type="button" class="set-go" data-style-open data-ref="set.style">${icon('palette', 'sm')}<span class="t">Style panel</span></button>`
-      + `<a class="set-go" href="${esc(placeHref('manager', { back: 'settings' }))}" data-ref="set.manager">${icon('sliders', 'sm')}<span class="t">The Manager</span></a>`
+      + `<a class="set-go" href="${esc(placeHref('manager', { back: 'settings' }))}" data-ref="set.manager-place">${icon('sliders', 'sm')}<span class="t">The Manager</span></a>`
     hydrateIcons(secsEl)
   }
 

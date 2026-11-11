@@ -216,3 +216,6 @@
 .set-col:has(> .set-body[data-section="behaviors"]), .set-col:has(> .set-body[data-section="extensions"]), .set-col:has(> .set-body[data-section="snippets"]) { max-width: none; }
 .set-body #view-behaviors main, .set-body #view-extensions main { margin-inline: 0; }
 .set-body .view > .view-header { position: static; inset: auto; height: auto; padding: 0 0 var(--sp-3); background: none; border: 0; }
+
+/* Runs, minutes and success live in Overview (#556): Settings → Behaviors keeps the switches. */
+#view-behaviors #behaviors-filters, #view-behaviors .col-last, #view-behaviors .behavior-last-cell, #view-behaviors .behavior-metric { display: none; }
