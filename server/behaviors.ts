@@ -1050,9 +1050,11 @@ function reviewerSucceeded(call: LogEntry): void {
   if (catalog?.models.find(model => model.identity === identity)?.provider === 'codex') {
     const failure = providerSignInFailure('codex')
     if (failure) {
-      const startedAt = Date.parse(agentCallStartedAt(call))
-      if (!Number.isFinite(startedAt) || startedAt <= failure.rejectedAt) return
-      recordProviderRecovery('codex', failure.callId, startedAt)
+      // Record completion, not request start: a second Connect during the
+      // successful request must still read as older than its verification.
+      const completedAt = Date.parse(call.completed_at ?? '')
+      if (!Number.isFinite(completedAt) || completedAt <= failure.rejectedAt) return
+      recordProviderRecovery('codex', failure.callId, completedAt)
       providerSignInVerified('codex')
       // A successful review after the bounded probe releases sibling auth
       // trips for this provider. Quota and other causes keep their clocks.

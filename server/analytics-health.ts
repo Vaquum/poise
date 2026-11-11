@@ -265,7 +265,10 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         const resumed = rows.filter(row => row.sequence > failure.sequence && row.event.type === 'chain.resumed'
           && (!retry || row.sequence < retry.admissionSequence))
         const operator = resumed.filter(row => row.event.type === 'chain.resumed' && row.event.recovery?.origin === 'operator').at(-1)
-        const ambiguous = resumed.some(row => row.event.type === 'chain.resumed' && (!row.event.recovery || row.event.recovery.origin === 'unknown'))
+        // A runtime CI recovery carries its own ciRecovery evidence and is not
+        // an ambiguous operator resume.
+        const ambiguous = resumed.some(row => row.event.type === 'chain.resumed' && !row.event.ciRecovery
+          && (!row.event.recovery || row.event.recovery.origin === 'unknown'))
         const action = operator ?? resumed.at(-1)
         const origin = operator ? 'operator' : ambiguous ? 'unknown' : 'automatic'
         const success = retry && rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')

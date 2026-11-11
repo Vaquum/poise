@@ -133,6 +133,33 @@ describe('GET /api/accounts', () => {
     expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt, verifiedAt })
   })
 
+  it('records verification completion when a second Connect lands during verification', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
+    vi.spyOn(models, 'loadCatalog').mockResolvedValue(JSON.parse(CATALOG_STDOUT))
+    const actualRun = processes.runFile
+    const native = vi.fn(async () => {
+      const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+      while (Date.now() <= firstAt) await new Promise(resolve => setTimeout(resolve, 1))
+      recordLogin('codex', 0)
+      return { stdout: '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}\n{"type":"turn.completed"}\n', stderr: '' }
+    })
+    vi.spyOn(processes, 'runFile').mockImplementation((command, args, options) => args[0] === 'exec'
+      ? native() : actualRun(command, args, options))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    await listAccounts('codex')
+    expect(native).toHaveBeenCalledTimes(1)
+    const failure = providerSignInFailure('codex')!
+    // Completion, not request start: must be at or after the second Connect.
+    expect(failure.verifiedAt).toBeGreaterThanOrEqual(failure.reconnectedAt!)
+    expect(failure.reconnectedAt).toBeGreaterThanOrEqual(firstAt)
+    expect(failure.reconnectedAt).toBeLessThanOrEqual(failure.verifiedAt!)
+  })
+
   it('reads a fast account independently of a pending provider', async () => {
     let release!: () => void
     const held = new Promise<void>(resolve => { release = resolve })

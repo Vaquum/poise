@@ -82,7 +82,6 @@ async function verifyCodexRecovery(): Promise<void> {
   try {
     const model = (await loadCatalog()).models.find(model => model.identity === failure.model && model.provider === 'codex')
     if (!model) throw new Error('The rejected Codex model is absent from the catalog')
-    const startedAt = Date.now()
     // Match issue review's ChatGPT route, ignoring configuration and API-key
     // overrides. A login status response is not a successful provider request.
     const { stdout } = await runFile(process.env.CODEX_CLI || 'codex', ['exec', '--ignore-user-config', '--ignore-rules',
@@ -100,7 +99,9 @@ async function verifyCodexRecovery(): Promise<void> {
         && 'type' in event.item && event.item.type === 'agent_message' && 'text' in event.item && event.item.text === 'OK')) {
       throw new Error('Codex did not complete the native sign-in verification')
     }
-    recordProviderRecovery('codex', failure.callId, startedAt)
+    // Record completion, not request start: a second Connect during verification
+    // must still read as older than the verification it did not cause.
+    recordProviderRecovery('codex', failure.callId, Date.now())
   } catch (error) {
     console.error('[accounts] native Codex sign-in verification failed:', redact(String(error), environmentSecrets()))
   }

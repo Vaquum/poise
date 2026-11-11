@@ -409,6 +409,19 @@ it('counts a grey-CI recovery whose verified CI success precedes its settlement'
   expect(report.recovery.unknown).toBe(0)
 })
 
+it('counts automatic recovery through a ciRecovery resume without a recovery field', async () => {
+  const f = setup()
+  let chain = f.observe(f.seed(1), NOW - 5 * HOUR)
+  chain = f.fail(chain, 'failure', NOW - 4 * HOUR)
+  chain = f.append(chain, { type: 'chain.resumed', ciRecovery: { invocationId: 'i'.repeat(8), callId: 'c'.repeat(32), head: HEAD } }, NOW - 3 * HOUR)
+  chain = f.succeed(chain, 'retry', NOW - 2 * HOUR)
+  chain = f.observe(chain, NOW - 2 * HOUR + 1000, null, [17])
+  f.merge(chain, NOW - HOUR)
+  const report = await f.read()
+  expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
+  expect(report.recovery.unknown).toBe(0)
+})
+
 it('counts failed native_publication Calls stored under publicationReceipt', async () => {
   const f = setup()
   const nativeCall = 'd'.repeat(32)
