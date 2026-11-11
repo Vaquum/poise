@@ -531,7 +531,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       sessionStorage.setItem(QUESTION_DRAFTS, JSON.stringify(saved))
     } catch { /* nothing to clear */ }
   }
-  const draftTyped = () => current.some((entry) => entry.request?.kind === 'question' && questionDraft(entry).size > 0
+  const draftTyped = () => [...replyDrafts.values()].some((value) => !!value.trim()) || current.some((entry) => entry.request?.kind === 'question' && questionDraft(entry).size > 0
     && [...questionDraft(entry).values()].some((input) => input.type === 'text' ? !!input.value.trim() : input.checked))
 
   // An answer on its way, or a Dismiss or Silence still waiting in the tab, is
