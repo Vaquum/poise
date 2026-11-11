@@ -35,6 +35,12 @@ export function paintTerms(scope: ParentNode = document): void {
 // ---------- Tooltip ----------
 function placeNear(box: HTMLElement, el: HTMLElement): void {
   const r = el.getBoundingClientRect(), b = box.getBoundingClientRect(), gap = token('--sp-2', 8)
+  // In a vertical list (Settings' sections) a tip below would cover the next item: beside it instead.
+  if (el.closest('[data-tip-side="right"]') && r.right + gap + b.width <= innerWidth - gap) {
+    box.style.top = `${Math.max(gap, Math.min(r.top + r.height / 2 - b.height / 2, innerHeight - b.height - gap))}px`
+    box.style.left = `${r.right + gap}px`
+    return
+  }
   let top = r.bottom + gap
   if (top + b.height > innerHeight - gap) top = r.top - b.height - gap
   let left = r.left + r.width / 2 - b.width / 2

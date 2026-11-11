@@ -1,0 +1,218 @@
+/* Settings (#556), from the mocks' settings.css: a sections column and one
+   section at a time. Each setting is one row: what it is and does on the left,
+   its control and saved state on the right. The section scrolls inside the
+   view, so the top bar never moves. */
+.set { display: grid; grid-template-columns: var(--w-list) minmax(0, 1fr); height: calc(100vh - var(--size-topbar) - var(--foot-h)); min-height: 0; }
+
+/* ---------- The sections column ---------- */
+.set-nav { display: flex; flex-direction: column; gap: var(--sp-half); min-height: 0; overflow-y: auto; padding: var(--sp-4) var(--sp-3); background: var(--c-surface); border-right: var(--line-hair) solid var(--c-line); }
+.set-find { position: relative; margin-bottom: var(--sp-3); }
+.set-find .search { width: 100%; height: var(--size-control); padding-right: var(--sp-8); font-size: var(--fs-row); }
+.set-find .kbd { position: absolute; right: var(--sp-3); top: 50%; transform: translateY(-50%); pointer-events: none; }
+.set-secs { display: flex; flex-direction: column; gap: var(--sp-half); }
+.set-go { width: 100%; display: flex; align-items: center; gap: var(--sp-2); height: var(--size-control); padding: 0 var(--sp-3); border-radius: var(--r-card); font-size: var(--fs-row); color: var(--c-text-soft); text-align: left; }
+.set-go:hover, .set-go[aria-current="page"] { background: var(--c-line); color: var(--c-text); }
+.set-go .n { margin-left: auto; font-size: var(--fs-micro); color: var(--c-text-muted); }
+.set-else { margin: var(--sp-5) var(--sp-3) var(--sp-1); font-size: var(--fs-tiny); }
+.set-results { display: flex; flex-direction: column; gap: var(--sp-half); }
+.set-results .res { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-half); padding: var(--sp-2) var(--sp-3); border-radius: var(--r-card); text-align: left; }
+.set-results .res .t { font-size: var(--fs-row); color: var(--c-text); }
+.set-results .res:hover, .set-results .res[aria-selected="true"] { background: var(--c-line); }
+.set-results .none { padding: var(--sp-2) var(--sp-3); font-size: var(--fs-row); line-height: var(--lh-body); color: var(--c-text-muted); }
+
+/* ---------- The section ---------- */
+.set-main { min-height: 0; overflow-y: auto; }
+.set-col { max-width: var(--w-read); padding: var(--sp-6) var(--sp-8) var(--sp-16); }
+.set-head { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-1); }
+.set-head .back { margin-bottom: var(--sp-3); }
+.set-head h1 { font-size: var(--fs-lead); font-weight: var(--fw-strong); line-height: var(--lh-tight); color: var(--c-text); }
+.set-head p { font-size: var(--fs-row); line-height: var(--lh-body); color: var(--c-text-soft); }
+.sgrp { padding-top: var(--sp-8); }
+.sgrp > h2 { font-size: var(--fs-tiny); padding-bottom: var(--sp-2); border-bottom: var(--line-hair) solid var(--c-line); }
+
+/* ---------- One setting ---------- */
+.srow { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--sp-2) var(--sp-8); padding: var(--sp-4) 0; border-bottom: var(--line-hair) solid var(--c-line); border-radius: var(--r-card); transition: background var(--dur-settle) var(--ease-out), box-shadow var(--dur-settle) var(--ease-out); }
+.sgrp .srow:last-child { border-bottom: 0; }
+.srow.is-lit { background: var(--c-surface); box-shadow: 0 0 0 var(--sp-2) var(--c-surface); }
+.srow-l { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
+.slabel { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.slabel label { font-size: var(--fs-ui); font-weight: var(--fw-strong); color: var(--c-text); }
+.slabel .chip { height: calc(var(--size-chip) * 0.8); font-size: var(--fs-tiny); }
+.srow .gloss { font-size: var(--fs-row); line-height: var(--lh-body); color: var(--c-text-muted); }
+.srow-r { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); min-width: 0; }
+
+/* Controls */
+.sfield { display: inline-flex; align-items: center; gap: var(--sp-2); max-width: 100%; }
+.sinput, .sselect select { height: var(--size-control); width: calc(var(--sp-unit) * 64); max-width: 100%; padding: 0 var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-edge); background: var(--c-canvas); color: var(--c-text); font-size: var(--fs-row); transition: border-color var(--dur-feedback) var(--ease-out); }
+.sinput.t-mono { font-size: var(--fs-row); }
+.sinput.is-short { width: calc(var(--sp-unit) * 20); }
+.sinput:hover, .sselect select:hover { border-color: var(--c-edge-strong); }
+.sinput::placeholder { color: var(--c-text-faint); }
+.sinput[aria-invalid="true"] { border-color: var(--c-failed-edge); }
+.sfield .unit { font-size: var(--fs-row); color: var(--c-text-muted); }
+.sselect { position: relative; display: inline-flex; max-width: 100%; }
+.sselect select { appearance: none; padding-right: var(--sp-8); cursor: pointer; }
+.sselect::after { content: ""; position: absolute; right: var(--sp-3); top: 50%; width: var(--sp-1); height: var(--sp-1); margin-top: calc(var(--sp-1) * -0.75); border-right: var(--cap-stroke) solid var(--c-text-muted); border-bottom: var(--cap-stroke) solid var(--c-text-muted); transform: rotate(45deg); pointer-events: none; }
+.srow .seg { height: var(--size-control); }
+.srow .seg button { font-size: var(--fs-row); font-weight: var(--fw-regular); padding: 0 var(--sp-4); }
+.srow .seg button[aria-disabled="true"] { color: var(--c-text-faint); cursor: not-allowed; }
+.sswitch { display: inline-flex; align-items: center; gap: var(--sp-2); height: var(--size-control); font-size: var(--fs-row); color: var(--c-text-soft); }
+.srow-r > .btn-ghost { height: var(--size-control); font-size: var(--fs-row); font-weight: var(--fw-regular); }
+
+/* Saved state: one line, always reserved, so a save never moves the page */
+.sstat { min-height: calc(var(--fs-micro) * var(--lh-ui)); display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-1); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-muted); }
+.sstat .t-mono { font-size: inherit; color: var(--c-text-soft); }
+.sdot { width: var(--size-dot); height: var(--size-dot); border-radius: 50%; background: var(--c-text-faint); flex: none; }
+.sdot.is-saved { background: var(--c-done); }
+
+/* Lists: items inside one row, each saying where it stands */
+.flist { width: 100%; display: flex; flex-direction: column; }
+.frow { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1) var(--sp-3); min-height: var(--size-control); padding: var(--sp-2) 0; border-bottom: var(--line-hair) solid var(--c-line); }
+.fmain { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-half); }
+.frow .name { font-size: var(--fs-row); color: var(--c-text); }
+.frow .name .chip { height: calc(var(--size-chip) * 0.8); margin-left: var(--sp-1); font-size: var(--fs-tiny); vertical-align: middle; }
+.fsub { font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-muted); }
+.fstate { flex: none; display: inline-flex; align-items: center; gap: var(--sp-2); }
+.facts { flex: none; display: inline-flex; gap: var(--sp-2); }
+.facts:empty { display: none; }
+.fnote { font-size: var(--fs-micro); color: var(--c-text-muted); }
+.frow .ib { opacity: 0; transition: opacity var(--dur-feedback) var(--ease-out); }
+.frow:hover .ib, .frow .ib:focus-visible, .frow .ib.is-armed { opacity: 1; }
+.frow .ib.is-armed { width: auto; padding: 0 var(--sp-2); border: var(--line-hair) solid var(--c-failed-edge); background: var(--c-failed-tint); color: var(--c-failed-on); font-size: var(--fs-micro); font-weight: var(--fw-strong); }
+.frow.is-gone .name { color: var(--c-text-muted); text-decoration: line-through; }
+.frow.is-gone .lnk { font-size: var(--fs-micro); }
+.funder { flex-basis: 100%; display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-1) 0 var(--sp-2); }
+.fnone { padding: var(--sp-2) 0; font-size: var(--fs-row); color: var(--c-text-muted); }
+.fextra { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); }
+.fextra:empty { display: none; }
+.fadd { width: 100%; display: flex; gap: var(--sp-2); margin-top: var(--sp-1); }
+.fadd .sinput { flex: 1; width: auto; min-width: 0; }
+.fadd .btn-ghost, .sfield .btn-ghost, .cline .btn-ghost { height: var(--size-control); }
+.fbtns { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.fwarn { font-size: var(--fs-micro); line-height: var(--lh-ui); }
+.srow .is-attn { color: var(--c-attention-on); }
+.srow .is-err { color: var(--c-failed-on); }
+.smeta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-muted); }
+.smeta:empty { display: none; }
+.sunder { width: 100%; }
+.sunder:empty { display: none; }
+
+/* Wide rows: the explanation above, the controls across */
+.srow.is-wide { grid-template-columns: minmax(0, 1fr); }
+.srow.is-wide .srow-l { max-width: calc(var(--w-read) * 0.8); }
+
+/* A terminal, and a command to copy */
+.term { width: 100%; display: flex; flex-direction: column; gap: var(--sp-half); padding: var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-line); background: var(--c-canvas); font-family: var(--font-mono); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-soft); }
+.term .cmd { color: var(--c-text); }
+.term .ok { color: var(--c-done-on); }
+.code { width: 100%; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-line); background: var(--c-canvas); }
+.code code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; color: var(--c-text); }
+.cline { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); }
+.sinput.is-code { width: calc(var(--sp-unit) * 30); text-transform: uppercase; letter-spacing: var(--ls-micro); }
+.sarea { width: 100%; padding: var(--sp-2) var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-edge); background: var(--c-canvas); color: var(--c-text); font-size: var(--fs-row); line-height: var(--lh-body); resize: vertical; }
+.sarea.t-mono { font-size: var(--fs-micro); line-height: var(--lh-ui); }
+.sarea:hover { border-color: var(--c-edge-strong); }
+
+/* Models: a place's choices */
+.pgrid { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-2) var(--sp-4); }
+.pl { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
+.pl .sselect, .pl .sselect select { width: 100%; }
+
+/* Behaviors: a switch, then its own settings as small labelled fields */
+.bctl { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-3); }
+.bfields { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(calc(var(--sp-unit) * 80), 1fr)); gap: var(--sp-2) var(--sp-6); }
+.bfields:empty { display: none; }
+.bf { min-width: 0; display: grid; grid-template-columns: calc(var(--sp-unit) * 22) minmax(0, 1fr) auto; align-items: center; gap: var(--sp-2); }
+.bf.wide { grid-template-columns: minmax(0, 1fr); }
+.bf > .t-micro { font-size: var(--fs-tiny); }
+.bf > .seg, .bf > .sselect { justify-self: start; }
+.bf .lnk { font-size: var(--fs-micro); }
+.bval { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-row); color: var(--c-text-soft); }
+.bval.t-mono { font-size: var(--fs-micro); }
+.bval.is-wrap { white-space: normal; overflow: visible; }
+.srow .cline .lnk { font-size: var(--fs-micro); }
+.bpanel { width: 100%; display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-line); background: var(--c-surface); }
+.checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(calc(var(--sp-unit) * 64), 1fr)); gap: var(--sp-1) var(--sp-4); }
+.check { display: flex; align-items: center; gap: var(--sp-2); color: var(--c-text-soft); }
+.check input { accent-color: var(--c-text-soft); }
+
+/* Snippets: the editor under a snippet */
+.sned { display: flex; flex-direction: column; gap: var(--sp-2); }
+.sned .pre { font-size: var(--fs-row); color: var(--c-text-muted); }
+
+
+
+/* Style: a slider that shows its value, and choice cards */
+.srange { width: 100%; display: flex; align-items: center; gap: var(--sp-3); }
+.srange input { flex: 1; min-width: 0; accent-color: var(--c-text-soft); }
+.srange output { flex: none; min-width: calc(var(--sp-unit) * 26); font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--c-text-soft); text-align: right; }
+.srow .choices { width: 100%; display: grid; grid-template-columns: repeat(auto-fill, minmax(calc(var(--sp-unit) * 44), 1fr)); padding: 0; }
+.srow .choices.is-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.srow .choices.is-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.srow .choice { min-width: 0; }
+.srow .choice:hover { border-color: var(--c-edge-strong); }
+
+/* Manager: the sentence, Rhythm and the five-stop controls */
+.seffect { width: 100%; display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4); border-radius: var(--r-panel); border: var(--line-hair) solid var(--c-line); background: var(--c-surface); }
+.seffect .sentence { font-size: var(--fs-body); line-height: var(--lh-body); color: var(--c-text); }
+.srow .rhythm { width: 100%; margin-top: 0; }
+.srow .stops { width: 100%; }
+.spolicy { margin-top: var(--sp-3); font-size: var(--fs-micro); line-height: var(--lh-body); color: var(--c-text-soft); }
+.spolicy b { font-weight: var(--fw-strong); color: var(--c-text); }
+.spolicy .t-micro { display: block; margin-top: var(--sp-2); font-size: var(--fs-tiny); }
+
+/* Storage: one line a category, and a reading that says how old it is */
+.kvs { width: 100%; display: flex; flex-direction: column; gap: var(--sp-half); }
+.kv { display: flex; justify-content: space-between; gap: var(--sp-3); padding-block: var(--sp-half); border-bottom: var(--line-hair) solid var(--c-line); font-size: var(--fs-micro); color: var(--c-text-soft); }
+.kv .t-mono { color: var(--c-text); }
+
+/* Behaviors: who acted, and the list the engine keeps */
+.srow details.fsub { font-size: var(--fs-micro); color: var(--c-text-muted); }
+.srow details.fsub summary { cursor: pointer; }
+.srow details.fsub ul { margin: var(--sp-1) 0 0; padding-left: var(--sp-4); }
+
+/* Extensions: servers by workspace, one switch a cell */
+.xgrid { width: 100%; display: flex; flex-direction: column; border: var(--line-hair) solid var(--c-line); border-radius: var(--r-card); background: var(--c-surface); }
+.xrow { display: grid; grid-template-columns: minmax(0, 1fr) repeat(4, calc(var(--sp-unit) * 17)) calc(var(--sp-unit) * 40); align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); border-top: var(--line-hair) solid var(--c-line); }
+.xrow:first-child { border-top: 0; }
+.xrow.xhead { font-size: var(--fs-tiny); color: var(--c-text-muted); }
+.xrow.xhead > span { min-width: 0; overflow-wrap: anywhere; line-height: var(--lh-ui); }
+.xrow.xhead > span:not(:first-child) { text-align: center; }
+.xrow.is-gone { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); color: var(--c-text-muted); }
+.xname { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-half); }
+.xname b { font-weight: var(--fw-strong); color: var(--c-text); }
+.xstat { min-width: 0; font-size: var(--fs-micro); }
+.xcell { justify-self: center; display: inline-flex; align-items: center; padding: var(--sp-1); border: 0; border-radius: var(--r-pill); background: transparent; cursor: pointer; }
+.xcell:hover .switch { outline: var(--line-hair) solid var(--c-edge-strong); }
+.xacts { display: flex; align-items: center; gap: var(--sp-2); justify-content: flex-end; white-space: nowrap; }
+.xdetails { grid-column: 1 / -1; display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-2) 0 var(--sp-1); }
+.xdetails > .seg, .xfield > .seg, .xpreview > .seg, .xform > .seg { align-self: flex-start; }
+.xact { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: var(--sp-half); font-size: var(--fs-micro); color: var(--c-text-soft); }
+.xact .t-mono { color: var(--c-text-muted); margin-right: var(--sp-2); }
+[data-xgrid], [data-dlist] { width: 100%; }
+.chip.is-off { color: var(--c-text-faint); border-style: dashed; }
+.xsetup { flex-basis: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); padding: var(--sp-2) 0 var(--sp-1); }
+.xform { display: flex; flex-direction: column; gap: var(--sp-3); width: 100%; }
+.xfield { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-1); }
+.xfield > .lnk { font-size: var(--fs-micro); }
+.xpair { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.xpick[aria-pressed="true"] { border-color: var(--c-edge-strong); background: var(--c-row-selected); color: var(--c-text); }
+.xpreview { width: 100%; display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-2); padding-top: var(--sp-3); border-top: var(--line-hair) solid var(--c-line); }
+.xcode { width: 100%; margin: 0; padding: var(--sp-3); overflow-x: auto; border-radius: var(--r-card); border: var(--line-hair) solid var(--c-line); background: var(--c-canvas); font-family: var(--font-mono); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-soft); white-space: pre; }
+.xcode .xdim { color: var(--c-text-faint); }
+.xcode .xsecret { color: var(--c-text-strong); font-weight: var(--fw-strong); }
+.xcode .xwarn { color: var(--c-text); }
+
+/* In the new interface: the place's own pieces the mock drew elsewhere */
+.set-loading { padding: var(--sp-6) 0; }
+.set-body > .is-err { padding: var(--sp-6) 0; color: var(--c-failed-on); }
+.set-head .back[hidden] { display: none; }
+.set-term:empty { display: none; }
+.set-term { width: 100%; }
+.set-chain { padding-top: var(--sp-8); }
+.set-acc { width: 100%; }
+
+/* Classic's wide views (Behaviors, Extensions, Snippets) take the section's full width here, instead of the page's. */
+.set-col:has(> .set-body[data-section="behaviors"]), .set-col:has(> .set-body[data-section="extensions"]), .set-col:has(> .set-body[data-section="snippets"]) { max-width: none; }
+.set-body #view-behaviors main, .set-body #view-extensions main { margin-inline: 0; }
+.set-body .view > .view-header { position: static; inset: auto; height: auto; padding: 0 0 var(--sp-3); background: none; border: 0; }

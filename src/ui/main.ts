@@ -21,7 +21,8 @@ import { installStates } from './states'
 import { go, startRouter } from './router'
 import { listenOpenChat } from './open-chat'
 import { listenIntents } from './intents'
-import { placeHref } from './address'
+import { placeHref, readAddress } from './address'
+import { startSetup } from './setup'
 
 // 1. Before anything asks the server: an answer the gateway marks as updating
 // dims the page, a sign-in that ended says so once, and the self-update watch
@@ -55,6 +56,13 @@ installIcons()
   listenIntents(go)
   initClaudeAuth()
   noticeFeed.start()
+  // What the address asked for, before the router writes it in full.
+  const entry = readAddress(location.search).address
   startRouter(placeRoot)
   if (extension) toast(extension.text, extension.tone === 'error' ? 'failed' : 'done')
+
+  // 4. A workspace that still has to be set up opens first-run setup over the
+  // place, at pairing when Poise Link sent the person here.
+  if (extension || google) return
+  await startSetup(entry.section === 'link' ? 'link' : null)
 })()
