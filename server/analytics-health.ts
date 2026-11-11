@@ -110,7 +110,7 @@ export function retryProven(chain: BehaviorChain, retry: ChainInvocation, observ
     const expected = argv.includes('--expected-head') ? argv[argv.indexOf('--expected-head') + 1] : null
     const outcome = (evidence as Record<string, unknown>).outcome
     const head = (evidence as Record<string, unknown>).head_sha
-    return evidence.status === 'completed' && String(outcome) === 'rerun_observed' && typeof head === 'string'
+    return evidence.status === 'completed' && ['rerun_observed', 'rerun_requested'].includes(String(outcome)) && typeof head === 'string'
       && observation.pull?.head === head && head === expected
       && (evidence as Record<string, unknown>).run_id === runId
       && (evidence as Record<string, unknown>).run_attempt === attempt
@@ -244,7 +244,8 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
       for (const error of errors) {
         const failed = chain.invocations.find(invocation => invocation.id === error.invocation)!
         const failure = rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
-          && row.event.invocationId === failed.id && row.event.evidence.status === 'failed')
+          && row.event.invocationId === failed.id && (row.event.evidence.status === 'failed'
+            || (row.event.evidence as Record<string, unknown> | null)?.nativeCallStatus === 'failed'))
         if (!failure) continue
         const retry = chain.invocations.find(invocation => invocation.admissionSequence > failure.sequence
           && invocation.behavior === failed.behavior && invocation.basis === failed.basis && invocation.slot === failed.slot
@@ -258,7 +259,7 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         const success = retry && rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
           && row.event.invocationId === retry.id && row.event.evidence.status === 'completed')
         const advanced = retry && success && progress.advances.find(point => {
-          if (point.sequence < success.sequence || point.at < Number(retry.evidence?.completedAt) || point.at < error.at) return false
+          if (point.sequence < failure.sequence || point.at < Number(retry.evidence?.completedAt) || point.at < error.at) return false
           const observed = rows.filter(row => row.sequence <= point.sequence && row.event.type === 'chain.observed').at(-1)
           return observed?.event.type === 'chain.observed' && retryProven(chain, retry, observed.event.observation as ChainObservation, point.at)
         })

@@ -604,7 +604,7 @@ export class BehaviorChainRuntime {
     }
     if (invocation.model === null) {
       this.operations.received(invocation, call)
-      const physical = { ...receipt(call), nativeCallId: call.id }
+      const physical: Record<string, unknown> = { ...receipt(call), nativeCallId: call.id }
       if (call.artifact?.request_sha && call.artifact.request_sha !== nativeRequestSha(invocation.request)) {
         throw new Error('native action Call conflicts with its immutable journal request')
       }

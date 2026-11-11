@@ -283,6 +283,20 @@ it('proves rerun-grey-ci retries from settled evidence after the observation dro
   expect(retryProven(chain, { ...retry, evidence: { ...retry.evidence, head_sha: 'c'.repeat(40) } } as unknown as ChainInvocation, observation, NOW)).toBe(false)
 })
 
+it('proves rerun-grey-ci retries from a normal rerun_requested receipt with verified CI progress', () => {
+  const f = setup()
+  const chain = f.observe(f.seed(1), NOW - HOUR)
+  const argv = ['--rerun-grey-ci-if-ready', '1', '--run-id', '123', '--run-attempt', '2', '--expected-head', HEAD]
+  const retry = { id: 'retry-grey', behavior: 'rerun-grey-ci', callId: null,
+    request: { command: 'github-interface', argv, cwd: '/fixture' },
+    evidence: { status: 'completed', outcome: 'rerun_requested', head_sha: HEAD, run_id: 123, run_attempt: 2 } } as unknown as ChainInvocation
+  const pull = { ...((chain.observation as ChainObservation).pull!), head: HEAD }
+  const observation = { ...(chain.observation as ChainObservation), checkedAt: NOW, pull } as unknown as ChainObservation
+  delete (observation as Record<string, unknown>).greyRecovery
+  expect(retryProven(chain, retry, observation, NOW)).toBe(true)
+  expect(retryProven(chain, { ...retry, evidence: { ...retry.evidence, outcome: 'not_ready' } } as unknown as ChainInvocation, observation, NOW)).toBe(false)
+})
+
 it('proves resolve-threads retries through settlement when the receipt carries no outcome', () => {
   const f = setup()
   let chain = f.seed(1)
@@ -335,4 +349,62 @@ it('counts a pre-merge failure reconciled after merging via its admitted attempt
     evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed', error_code: 'authentication_failed', error: 'delayed', completedAt: NOW } }, NOW)
   const report = await f.read()
   expect(report.rate).toMatchObject({ completed: 1, errors: 1 })
+})
+
+it('counts a deferred native failure with failed nativeCallStatus toward its verified retry recovery', async () => {
+  const f = setup()
+  let chain = f.observe(f.seed(11), NOW - 5 * HOUR)
+  const failedId = chainBasis(`${chain.id}:deferred-fail`).slice(0, 32)
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { id: failedId, behavior: 'review-issue', actor: 'reviewer', slot: 'primary',
+    basis: 'issue', model: 'fixture', admittedAt: NOW - 4 * HOUR, request: { command: 'agent-interface', argv: [], cwd: '/fixture' } } }, NOW - 4 * HOUR)
+  chain = f.append(chain, { type: 'invocation.started', invocationId: failedId }, NOW - 4 * HOUR + 500)
+  chain = f.append(chain, { type: 'invocation.settled', invocationId: failedId, callId: failedId, outcome: 'preflight_failed',
+    evidence: { status: 'deferred', nativeCallStatus: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'authentication_failed', error: 'Refresh credential rejected', completedAt: NOW - 4 * HOUR } }, NOW - 4 * HOUR)
+  chain = f.succeed(chain, 'retry', NOW - 2 * HOUR)
+  chain = f.observe(chain, NOW - 2 * HOUR + 1000, null, [17])
+  f.merge(chain, NOW - HOUR)
+  const report = await f.read()
+  expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#11'])
+  expect(report.recovery.unknown).toBe(0)
+})
+
+it('counts a grey-CI recovery whose verified CI success precedes its settlement', async () => {
+  const f = setup()
+  const reviewer = { model: 'fixture', slot: 'primary', recovery: 'fixture' }
+  const openPull = (at: number, pending: boolean, checksState: string | null): ChainObservation => ({
+    checkedAt: at, existingPulls: [], issue: { open: true, eligible: true, revision: 'issue', commentIds: [] },
+    issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer,
+    prerequisites: { wait: null, base: HEAD, evidence: [] },
+    publication: { pull_number: 111, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null },
+    pull: { number: 111, head: HEAD, headSince: NOW - 5 * HOUR, state: 'open', draft: false, merged: false, mergeSha: null,
+      mergedAt: null, queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
+      reviewIds: [], reviewRevision: 'review', greyRuns: [], pending, failing: [], conflict: false, behind: false, checksState } })
+  let chain = f.seed(12)
+  chain = f.append(chain, { type: 'chain.observed', observation: openPull(NOW - 5 * HOUR, true, 'PENDING') }, NOW - 5 * HOUR)
+  const basis = chainBasis(['grey', HEAD, 123, 2])
+  const failedId = chainBasis(`${chain.id}:grey-fail`).slice(0, 32)
+  const failedAt = NOW - 4 * HOUR
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { id: failedId, behavior: 'rerun-grey-ci', actor: 'reviewer', slot: null,
+    basis, model: null, admittedAt: failedAt, request: { command: 'github-interface',
+      argv: ['--rerun-grey-ci-if-ready', '12', '--run-id', '123', '--run-attempt', '2', '--expected-head', HEAD], cwd: '/fixture' } } }, failedAt)
+  chain = f.append(chain, { type: 'invocation.settled', invocationId: failedId, callId: failedId, outcome: 'read_failed',
+    evidence: { status: 'failed', action: 'not_started', outcome: 'read_failed', error: 'grey workflow read failed',
+      head_sha: HEAD, run_id: 123, run_attempt: 2, completedAt: failedAt } }, failedAt)
+  const retryId = chainBasis(`${chain.id}:grey-retry`).slice(0, 32)
+  const retryAdmittedAt = NOW - 3 * HOUR
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { id: retryId, behavior: 'rerun-grey-ci', actor: 'reviewer', slot: null,
+    basis, model: null, admittedAt: retryAdmittedAt, request: { command: 'github-interface',
+      argv: ['--rerun-grey-ci-if-ready', '12', '--run-id', '123', '--run-attempt', '2', '--expected-head', HEAD], cwd: '/fixture' } } }, retryAdmittedAt)
+  const observedAt = NOW - 2 * HOUR
+  const proving = openPull(observedAt, false, 'SUCCESS') as ChainObservation & { greyRecovery: { invocationId: string, receipt: Record<string, unknown> } }
+  proving.greyRecovery = { invocationId: retryId, receipt: { outcome: 'rerun_observed', action: 'rerun_grey_ci_if_ready',
+    repository: 'acme/repo', pull_number: 12, head_sha: HEAD, run_id: 123, run_attempt: 2, observed_run_attempt: 3 } }
+  chain = f.append(chain, { type: 'chain.observed', observation: proving }, observedAt)
+  const settledAt = NOW - 2 * HOUR + 500
+  chain = f.append(chain, { type: 'invocation.settled', invocationId: retryId, callId: null, outcome: 'rerun_observed',
+    evidence: { status: 'completed', outcome: 'rerun_observed', head_sha: HEAD, run_id: 123, run_attempt: 2 } }, settledAt)
+  const report = await f.read()
+  expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#12'])
+  expect(report.recovery.unknown).toBe(0)
 })
