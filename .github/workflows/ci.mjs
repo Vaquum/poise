@@ -3,8 +3,15 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { join, posix } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-const smoke = ['smoke', 'service-mode', 'independent-startup']
+const smoke = ['smoke', 'service-mode', 'independent-startup', 'ui-frame']
 const areas = [
+  // The new interface's places (#556), each with its own specs.
+  [/^src\/ui\/places\/(?:chat|manager)(?:\.ts$|\/)/, /^ui-chat/],
+  [/^src\/ui\/places\/editor(?:\.ts$|\/)/, /^ui-(?:editor-|article-reviews$)/],
+  [/^src\/ui\/places\/board(?:\.(?:ts|css)$|\/)/, /^ui-board$/],
+  [/^src\/ui\/places\/overview(?:\.(?:ts|css)$|\/)/, /^ui-overview$/],
+  [/^src\/ui\/places\/observe(?:\.(?:ts|css)$|\/)/, /^ui-observe$/],
+  [/^src\/ui\/(?:places\/settings|setup)(?:\.ts$|\/)/, /^ui-settings$/],
   [/^src\/(?:views\/chat[^/]*|chat-[^/]+)\.(?:ts|css)$/, /^(?:chat|current-chat)/],
   [/^src\/(?:views\/(?:admin-settings|connected-accounts)|settings-[^/]+)\.(?:ts|css)$/, /^(?:navigation-settings|settings-save|storage-settings|service-settings|connected-accounts)$/],
   [/^src\/(?:views\/analytics-view|analytics-[^/]+)\.(?:ts|css)$/, /^(?:analytics|behavior-metrics)$/],
@@ -43,6 +50,15 @@ export function selectBrowserTests(paths, browserFiles) {
   }
   if (!smoke.every(name => selected.has(`tests/e2e/${name}.spec.ts`))) throw new Error('Missing core browser smoke suite')
   return [...selected].sort()
+}
+
+// A selected run's browser shards finish beside its unit tests: about 80 declared
+// tests (some two and a half minutes on CI) to a shard, up to a full run's six.
+const fullBrowserShards = 6
+const shardList = count => Array.from({ length: count }, (_, index) => index + 1)
+export function browserShards(files, read) {
+  const tests = files.reduce((count, file) => count + (read(file).match(/^\s*test\(/gm)?.length ?? 0), 0)
+  return shardList(Math.min(fullBrowserShards, Math.max(1, Math.ceil(tests / 80))))
 }
 
 export function selectTests(event, paths, browserFiles) {
@@ -196,7 +212,7 @@ export async function plan(workflow) {
     unit_files: workflow === 'ci.yml' && selection.mode === 'essential' ? essentialUnitTests(paths) : [],
     browser_image: `mcr.microsoft.com/playwright:v${version}-noble`,
     unit_shards: mode === 'full' ? [1, 2] : [1],
-    browser_shards: mode === 'full' ? [1, 2, 3, 4, 5, 6] : [1],
+    browser_shards: mode === 'full' ? shardList(fullBrowserShards) : browserShards(selection.browserFiles, file => readFileSync(file, 'utf8')),
     reuse_url: reused?.html_url ?? '',
     run: !reused && (event !== 'pull_request' || callerAffected(paths)),
   }
@@ -221,10 +237,12 @@ function runTests(kind) {
   const mode = process.env.CI_TEST_MODE
   if (!['full', 'essential'].includes(mode)) throw new Error(`Cannot run tests in mode ${mode}`)
   const shard = Number(process.env.CI_TEST_SHARD)
-  if (!Number.isInteger(shard) || shard < 1 || shard > (kind === 'unit' ? 2 : 6)) throw new Error('Invalid test shard')
+  // A browser shard takes its run's shard count from the job matrix.
+  const shards = kind === 'unit' ? (mode === 'full' ? 2 : 1) : Number(process.env.CI_TEST_SHARDS ?? (mode === 'full' ? fullBrowserShards : 1))
+  if (![shard, shards].every(Number.isInteger) || shard < 1 || shard > shards || shards > fullBrowserShards) throw new Error('Invalid test shard')
   const args = kind === 'unit'
-    ? ['test:full', '--', `--shard=${shard}/${mode === 'full' ? 2 : 1}`, '--maxWorkers=1', '--reporter=default', '--reporter=json', '--outputFile=test-results/vitest.json']
-    : ['test:e2e:full', '--', `--shard=${shard}/${mode === 'full' ? 6 : 1}`, '--workers=1']
+    ? ['test:full', '--', `--shard=${shard}/${shards}`, '--maxWorkers=1', '--reporter=default', '--reporter=json', '--outputFile=test-results/vitest.json']
+    : ['test:e2e:full', '--', `--shard=${shard}/${shards}`, '--workers=1']
   // A full run on main speaks for many merges, so a test must fail twice to count.
   // Playwright's own CI retries already do this for the browser tests.
   if (kind === 'unit' && ['push', 'workflow_dispatch'].includes(process.env.GITHUB_EVENT_NAME)) args.push('--retry=1')

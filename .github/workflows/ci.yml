@@ -178,6 +178,7 @@ jobs:
         env:
           CI_TEST_MODE: ${{ needs.plan.outputs.mode }}
           CI_TEST_SHARD: ${{ matrix.shard }}
+          CI_TEST_SHARDS: ${{ strategy.job-total }}
           CI_BROWSER_FILES: ${{ needs.plan.outputs.browser_files }}
           POISE_E2E_PREBUILT: '1'
       - uses: actions/upload-artifact@v4
