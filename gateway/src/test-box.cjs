@@ -88,13 +88,15 @@ function writable(dir) {
 }
 
 /**
- * Whether every error of a job's unpacking is a file for a folder of the image that the job's user may not write. The
- * image is the workspace's, so the suite runs with what that folder holds, as with the image's files. Any other
- * error ends the run without a result.
+ * Whether a job's unpacking went through the whole archive and missed only files for folders of the image that the
+ * job's user may not write. The image is the workspace's, so the suite runs with what those folders hold, as with the
+ * image's files. A tar that stopped any other way, a signal included, ends the run without a result.
  */
-function onlyImageFolders(errors, into = root) {
-  const lines = errors.trim().split('\n').filter((line) => line !== 'tar: Exiting with failure status due to previous errors')
-  return lines.length > 0 && lines.every((line) => {
+function onlyImageFolders(code, errors, into = root) {
+  const end = 'tar: Exiting with failure status due to previous errors'
+  const lines = errors.trim().split('\n')
+  if (code !== 2 || lines.at(-1) !== end) return false
+  return lines.length > 1 && lines.slice(0, -1).every((line) => {
     // As `Cannot mkdir`, `Cannot open` or `Cannot create symlink to 'x'`, for one folder's new files and what is in them.
     const name = /^tar: (.+?): Cannot [^:]*: (?:Permission denied|No such file or directory)$/.exec(line)?.[1]
     return name !== undefined && !writable(dirname(join(into, name)))
@@ -110,7 +112,7 @@ function unpack(whole) {
     tar.stderr.on('data', (chunk) => { errors += chunk })
     tar.once('error', (error) => resolve(error.message))
     tar.once('close', (code) => {
-      if (code === 0 || (asJob && onBox && onlyImageFolders(errors))) resolve(null)
+      if (code === 0 || (asJob && onBox && onlyImageFolders(code, errors))) resolve(null)
       else resolve(errors.trim().slice(-300) || `tar exited with ${code}`)
     })
   })

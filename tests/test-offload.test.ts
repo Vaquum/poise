@@ -1519,7 +1519,7 @@ describe('a job unpacking', () => {
 
   // Root may write anywhere, so only another user meets a folder it may not write.
   it.runIf(gnuTar && process.getuid?.() !== 0)('leaves what the image\'s folders hold to the image, and fails on anything else', () => {
-    const { JOB_UNPACK, onlyImageFolders } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as { JOB_UNPACK: string[]; onlyImageFolders: (errors: string, into: string) => boolean }
+    const { JOB_UNPACK, onlyImageFolders } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as { JOB_UNPACK: string[]; onlyImageFolders: (code: number | null, errors: string, into: string) => boolean }
     const from = temp()
     const to = temp()
     mkdirSync(join(from, 'image', 'lib', 'newer'), { recursive: true })
@@ -1533,10 +1533,14 @@ describe('a job unpacking', () => {
     try {
       const result = spawnSync('tar', ['-xzf', join(from, 'tree.tgz'), '-C', to, '--no-same-owner', ...JOB_UNPACK], { encoding: 'utf8' })
       expect(result.status).toBe(2)
-      expect(onlyImageFolders(result.stderr, to)).toBe(true)
+      expect(onlyImageFolders(result.status, result.stderr, to)).toBe(true)
       expect(readFileSync(join(to, 'checkout', 'file'), 'utf8')).toBe('sent')
-      expect(onlyImageFolders(`${result.stderr}tar: checkout/other: Cannot write: No space left on device\n`, to)).toBe(false)
-      expect(onlyImageFolders('tar: checkout/x: Cannot open: Permission denied\n', to)).toBe(false)
+      const [allowed, end] = [result.stderr.trim().split('\n').slice(0, -1).join('\n'), 'tar: Exiting with failure status due to previous errors']
+      expect(onlyImageFolders(2, `${allowed}\ntar: checkout/other: Cannot write: No space left on device\n${end}\n`, to)).toBe(false)
+      expect(onlyImageFolders(2, `tar: checkout/x: Cannot open: Permission denied\n${end}\n`, to)).toBe(false)
+      // A tar stopped by a signal, or before its last word, has not gone through the archive.
+      expect(onlyImageFolders(null, result.stderr, to)).toBe(false)
+      expect(onlyImageFolders(2, `${allowed}\n`, to)).toBe(false)
     } finally {
       chmodSync(join(to, 'image', 'lib'), 0o755)
     }
