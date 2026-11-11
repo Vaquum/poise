@@ -488,9 +488,13 @@ A structured review whose packet exceeds one provider call's reliable size
 runs in file-group stages targeting at most 8 files or 200,000 diff bytes each.
 Individual files stay intact and can exceed the byte target. All groups share
 the same head watch and total time budget; retaining more code can increase
-review duration and usage. Every stage's findings combine into the
-single verdict the harness submits; a packet that fits in one group runs
-exactly as before. A follow-up (`--pr-approve`) round reviews the diff since
+review duration and usage. Codex keeps one native conversation across file
+groups and inspection rounds, retaining earlier analysis and inspected source.
+Structured reviews reserve 60 seconds for submission and another 60 seconds
+for the authoritative outcome lookup. Submission keeps that verification
+reserve even when it is slow. Every stage's findings combine into the single
+verdict the harness submits; a packet that fits in one group needs no staging.
+A follow-up (`--pr-approve`) round reviews the diff since
 the reviewer's last submitted review instead of the whole PR again: new
 findings on current lines stay on current-head lines, while a defect caused
 by a removal is commented on the removed line and validated against the full

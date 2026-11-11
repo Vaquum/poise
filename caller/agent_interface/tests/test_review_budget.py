@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -506,6 +507,197 @@ class TestRecovery(TestCase):
         row = self.execute([budget.ReviewLimitError('deadline', 'review_budget_exhausted')], [facts(), facts()])
         self.assertEqual(self.mod.run.call_count, 1)
         self.assertEqual(row['error_code'], 'review_budget_exhausted')
+
+    def _staged_review(self, files, *, publication='normal', stalled=False):
+        from hashlib import sha256
+
+        from agent_interface import pr_review, review_stages
+
+        # Bounded analogues of #1137 (three groups) and #1146 (sixteen).
+        # Retained Calls 88a0b19a/f8ae3f13 and 9815e6e8/4ca0c9ec show
+        # repeated inspection, then an interrupted provider, not submission.
+        # Latencies are bounded fixture costs, not measured production timings.
+        paths = [f'src/f{i:03d}.py' for i in range(files)]
+        packet = {'repository': 'o/r', 'pull_number': 1, 'head_sha': HEAD,
+                  'merge_base_sha': 'b' * 40,
+                  'pull': {'title': 'Pinned staged review', 'body': 'Review every group',
+                           'base': {'sha': 'b' * 40}},
+                  'files': [{'filename': path} for path in paths],
+                  'diff': '\n'.join(f'diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n'
+                                    '@@ -1 +1 @@\n-old\n+new' for path in paths)}
+        packet_text = json.dumps(packet)
+        total = review_stages.stage_count(packet_text)
+        context = sha256(json.dumps(['b' * 40, packet['pull']['title'], packet['pull']['body']],
+                                    separators=(',', ':')).encode()).hexdigest()
+        clock = SimpleNamespace(now=0.0)
+        observed = SimpleNamespace(groups={}, inspected=set(), submissions=[], lookups=[], timeline=[],
+                                   threads={}, commands=[], guidance_reads=0, review_id=93 + len(api.logs()))
+        common = ['AGENTS.md', 'CLAUDE.md', 'AUTONOMIO_PR_GUIDELINE.md', 'POISE_REPO_SPECIFICS.md']
+        published = []
+
+        def spend(phase, duration, timeout):
+            observed.timeline.append((phase, duration, timeout))
+            clock.now += min(duration, timeout)
+            if duration > timeout:
+                raise subprocess.TimeoutExpired(phase, timeout)
+
+        def command(argv, *, timeout, **kwargs):
+            flag = argv[1]
+            self.assertIn(flag, ('--review-activity-since', '--pr-review', '--checkout-review',
+                                 '--review-context', '--request-changes'))
+            if flag != '--review-context':
+                self.assertEqual(argv[argv.index('--token-user') + 1], 'bit-mis')
+            if flag == '--review-activity-since':
+                observed.lookups.append(len(published))
+                spend('verification' if len(observed.lookups) > 1 else 'preparation',
+                      45 if len(observed.lookups) > 1 else 15, timeout)
+                value = facts(action='review_activity_since', repository='o/r', pull_number=1,
+                              username='bit-mis', review_context=context,
+                              reviewer_reviews_since_items=list(published),
+                              reviewer_reviews_since=len(published),
+                              reviewer_change_requests_since=len(published))
+            elif flag == '--pr-review':
+                spend('packet', 25, timeout)
+                self.assertEqual(argv[argv.index('--expected-head') + 1], HEAD)
+                value = packet
+            elif flag == '--checkout-review':
+                spend('checkout', 45, timeout)
+                root = Path(argv[argv.index('--path') + 1]); root.mkdir()
+                self.assertEqual(argv[argv.index('--expected-head') + 1], HEAD)
+                value = {'action': 'checkout_review', 'repository': 'o/r', 'path': str(root),
+                         'head_sha': HEAD, 'merge_base_sha': 'b' * 40}
+            elif flag == '--review-context':
+                requests = json.loads(argv[argv.index('--requests-json') + 1])
+                spend('listing' if requests[0]['operation'] == 'list' else 'inspection',
+                      10 if requests[0]['operation'] == 'list' else 1, timeout)
+                observed.inspected.update(r['path'] for r in requests if r['path'] in paths)
+                observed.guidance_reads += sum(r['path'] == 'AGENTS.md' for r in requests)
+                value = {'action': 'review_context', 'head_sha': HEAD,
+                         'results': [{'request': r, 'content': 'Pinned consumer and guidance evidence'}
+                                     for r in requests]}
+            else:
+                observed.submissions.append(argv)
+                self.assertEqual(argv[argv.index('--expected-head') + 1], HEAD)
+                response = api.review_receipt.retained_response()
+                self.assertEqual(response['head_sha'], HEAD)
+                self.assertEqual(response['context_sha'], context)
+                spend('publication', timeout - 1 if publication == 'slow' else 55, timeout)
+                published.append({'id': observed.review_id, 'state': 'CHANGES_REQUESTED', 'commit': HEAD,
+                                  'submitted_at': '2026-11-11T10:00:00Z'})
+                if publication == 'uncertain':
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                value = {'action': 'requested_changes', 'review_id': observed.review_id, 'head_sha': HEAD}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(value), stderr='')
+
+        def provider(argv, *, input, timeout, **kwargs):
+            observed.commands.append(argv)
+            if 'resume' in argv:
+                thread_id = argv[-2]
+                history = observed.threads[thread_id]
+            else:
+                thread_id = str(uuid4())
+                history = SimpleNamespace(common=False, inspected=set(), pending=None, stage=None)
+                observed.threads[thread_id] = history
+            if history.pending is not None:
+                kind, group, requests = history.pending
+                self.assertIn('Pinned consumer and guidance evidence', input)
+                for request in requests:
+                    self.assertIn(request['path'], input)
+                if kind == 'common':
+                    history.common = True
+                else:
+                    history.inspected.add(group)
+                history.pending = None
+            if 'PR packet:\n' in input:
+                history.stage, _ = json.JSONDecoder().raw_decode(input.split('PR packet:\n', 1)[1])
+            stage = history.stage
+            group = int(re.search(r'file group (\d+) of', stage['review_scope'])[1])
+            self.assertEqual(stage['head_sha'], HEAD)
+            self.assertEqual(stage['pull'], packet['pull'])
+            self.assertEqual(stage['repository'], 'o/r')
+            observed.groups[group] = observed.groups.get(group, 0) + 1
+            requests = []
+            if not history.common:
+                seconds = 0 if publication == 'slow' else 225 if total == 16 else 400
+                requests = [{'operation': 'read', 'path': path, 'query': '', 'start_line': 1} for path in common]
+                history.pending = ('common', group, requests)
+            else:
+                seconds = 198 if publication == 'slow' else 25
+                if group not in history.inspected:
+                    requests = [{'operation': 'read', 'path': f['filename'], 'query': '', 'start_line': 1}
+                                for f in stage['files']]
+                    history.pending = ('group', group, requests)
+            spend('provider', float('inf') if stalled else seconds, timeout)
+            finding = {'path': stage['files'][0]['filename'], 'line': 1, 'side': 'RIGHT',
+                       'body': f'[p1] Blocking defect in file group {group}.'}
+            reply = {'action': 'inspect' if requests else 'request_changes', 'comments': [finding],
+                     'assessment': json.loads(APPROVAL)['assessment'], 'requests': requests}
+            Path(argv[argv.index('--output-last-message') + 1]).write_text(json.dumps(reply))
+            return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps(
+                {'type': 'thread.started', 'thread_id': thread_id}))
+
+        self.mod.run.reset_mock()
+        self.mod.run.side_effect = pr_review.run
+        with patch.object(budget, 'monotonic', lambda: clock.now), \
+                patch.object(structured_review, 'monotonic', lambda: clock.now), \
+                patch.object(structured_review, 'ReviewWatch', return_value=nullcontext(SimpleNamespace(run=provider))), \
+                patch.object(structured_review, 'codex_environment', return_value={}), \
+                patch.object(subprocess, 'run', side_effect=command), \
+                patch.object(api, 'sleep'), redirect_stdout(io.StringIO()):
+            try:
+                api.run_governed_behavior(self.mod, 'pr_review', 'https://github.com/o/r/pull/1',
+                    'bit-mis', HEAD, 'poise:review-new-prs', uuid4().hex, pwd=self.directory.name,
+                    model='gpt-6-astra-ultra')
+            except SystemExit:
+                pass
+        observed.elapsed = clock.now
+        observed.paths = paths
+        observed.total = total
+        return api.logs()[-1], observed
+
+    def test_staged_inspection_finishes_through_independent_outer_verification(self):
+        for files in (19, 128):
+            with self.subTest(files=files):
+                row, run = self._staged_review(files)
+                self.assertEqual((row['status'], row['outcome'], row['review_id']),
+                                 ('completed', 'changes_requested', run.review_id), (row['error'], run.timeline))
+                self.assertEqual(set(run.groups), set(range(1, run.total + 1)))
+                self.assertEqual(run.inspected, set(run.paths))
+                self.assertEqual(run.lookups, [0, 1])
+                self.assertEqual(len(run.submissions), 1)
+                self.assertEqual(len(run.threads), 1)
+                self.assertEqual(run.guidance_reads, 1)
+                self.assertNotIn('resume', run.commands[0])
+                self.assertTrue(all('resume' in argv for argv in run.commands[1:]))
+                argv = run.submissions[0]
+                self.assertEqual(len(json.loads(argv[argv.index('--comments-json') + 1])), run.total)
+                self.assertEqual(run.elapsed, 749 if files == 19 else 1237)
+                self.assertLess(run.elapsed, 1413)
+                self.assertEqual(row['progress']['budget']['total_seconds'], 1413)
+                self.assertEqual(row['expected_head'], HEAD)
+                self.assertIsNone(row['recovery_model'])
+
+    def test_submission_leaves_time_for_authoritative_outcome_lookup(self):
+        row, run = self._staged_review(19, publication='slow')
+        self.assertEqual((row['status'], row['outcome'], row['review_id']),
+                         ('completed', 'changes_requested', run.review_id), row['error'])
+        self.assertEqual(run.lookups, [0, 1])
+        self.assertEqual(len(run.submissions), 1)
+        self.assertEqual(run.inspected, set(run.paths))
+        self.assertEqual(run.elapsed, 1397)
+        self.assertLess(run.elapsed, 1413)
+
+    def test_staged_exhaustion_and_uncertain_publication_do_not_retry(self):
+        for kwargs, code in (({'stalled': True}, 'review_budget_exhausted'),
+                             ({'publication': 'uncertain'}, 'review_submission_failed')):
+            with self.subTest(kwargs=kwargs):
+                row, run = self._staged_review(19, **kwargs)
+                self.assertEqual((row['status'], row['error_code']), ('failed', code), row['error'])
+                self.assertIsNone(row['review_id'])
+                self.assertIsNone(row['recovery_model'])
+                self.assertEqual(self.mod.run.call_count, 1)
+                self.assertEqual(len(run.submissions), 0 if kwargs.get('stalled') else 1)
+                self.assertLess(run.elapsed, 1413)
 
     def test_failed_recovery_does_not_loop_or_claim_preflight(self):
         row = self.execute([budget.ReviewLimitError('output token maximum'), atoms.AgentPreflightError('codex failed')], [facts(), facts(), facts()])

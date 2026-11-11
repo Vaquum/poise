@@ -31,6 +31,8 @@ from . import review_cap as followup
 
 
 MAX_INSPECTION_ROUNDS = 12
+SUBMISSION_RESERVE_SECONDS = 60
+VERIFICATION_RESERVE_SECONDS = 60
 CODEX_MAX_INPUT_CHARS = 1_048_576
 # A review with no verdict by this point stops, so its PR moves to the next slot
 # instead of waiting out the shared budget. Six of Grok's 15 completed PR reviews
@@ -392,7 +394,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
     round_number = 0
     correction_attempted = False
     while round_number <= MAX_INSPECTION_ROUNDS:
-        timeout = review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS)
+        timeout = review_budget.timeout(timeout_s, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
         if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS or correction_attempted:
             timeout = min(deadline - monotonic(), timeout)
         if timeout <= 0:
@@ -563,7 +565,7 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
         args.extend(["--comments-json", json.dumps(verdict["comments"])])
     review_receipt.complete_response(verdict["assessment"], head)
     args.extend(["--assessment-json", json.dumps(verdict["assessment"], ensure_ascii=False)])
-    limit = review_budget.timeout(600)
+    limit = review_budget.timeout(600, reserve=VERIFICATION_RESERVE_SECONDS)
     progress.stage("submitting", "Submitting GitHub review", timeout=limit)
     try:
         done = subprocess.run([*args, *fixed], cwd=pwd, text=True, capture_output=True, timeout=limit)
@@ -645,7 +647,7 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
     prompt = f"{system}\n\n{text}"
     state_path = root / "codex-session.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else None
-    resume = (state is not None and state["prefix_digest"] == sha256(prompt[:state["prefix_length"]].encode()).hexdigest())
+    same_prefix = (state is not None and state["prefix_digest"] == sha256(prompt[:state["prefix_length"]].encode()).hexdigest())
     args = [
         os.getenv("CODEX_CLI", "codex"), "exec",
         "--ignore-user-config", "--ignore-rules",
@@ -671,14 +673,16 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
     # Each review owns one fresh native conversation. Resume that exact ID
     # with only newly supplied inspection evidence, retaining the provider's
     # prior analysis instead of recomputing the whole packet each round.
-    message = prompt[state["prefix_length"]:] if resume else prompt
+    message = prompt[state["prefix_length"]:] if same_prefix else prompt
     fragments = [message]
     if len(message) > CODEX_MAX_INPUT_CHARS:
         # Keep the input intact in one native conversation. Intermediate
         # turns only acknowledge receipt; only the last can return a verdict.
         width = CODEX_MAX_INPUT_CHARS - 1024
         fragments = [message[start:start + width] for start in range(0, len(message), width)]
-    thread_id = state["thread_id"] if resume else None
+    # A new file group needs its full prompt, but keeps the earlier groups'
+    # analysis and inspection in this review's native conversation.
+    thread_id = state["thread_id"] if state is not None else None
     deadline = monotonic() + timeout
     for index, fragment in enumerate(fragments, 1):
         final = index == len(fragments)
