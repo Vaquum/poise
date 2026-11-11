@@ -26,8 +26,8 @@ type PlaceModule = { mount: MountPlace }
 const PLACES: Record<Place, () => Promise<PlaceModule>> = {
   overview: () => import('./places/overview'),
   board: () => import('./places/board'),
-  chat: () => import('./places/placeholder'),
-  manager: () => import('./places/placeholder'),
+  chat: () => import('./places/chat'),
+  manager: () => import('./places/manager'),
   editor: () => import('./places/placeholder'),
   observe: () => import('./places/observe'),
   settings: () => import('./places/placeholder'),

@@ -3,6 +3,9 @@
 // board.html and current.js, on the endpoints classic's Current uses
 // (src/views/current-view.ts); docs/design/interface/poise-ds/CURRENT.md says why.
 import './board.css'
+// A card's chat opens in classic's side pane, styled with Chat's sheet.
+import './chat/classic.css'
+import './chat/chat.css'
 import { $, $$, esc, store } from '../dom'
 import { hydrateIcons, icon } from '../icons'
 import { term } from '../registry'
