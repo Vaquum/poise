@@ -80,23 +80,30 @@ function checkoutFiles(top) {
 }
 
 /**
- * Every link met on the way to `path`, each where it really lives, then where `path` really is. A
- * virtualenv's interpreter reaches its base through links, and a box needs them at the same paths. A
- * link at the top, as `/bin` is on a merged /usr, belongs to the system, which every box has of its own.
+ * Every link met on the way to `path`, each where it really lives, then where `path` really is: resolved one name
+ * at a time, as the system does, so a `..` after a link goes up from where the link leads. A virtualenv's
+ * interpreter reaches its base through links, and a box needs them at the same paths.
  */
 function wayTo(path) {
   const links = []
   let done = '/'
-  const rest = resolve(path).split('/').filter(Boolean)
+  const rest = path.split('/').filter(Boolean)
   while (rest.length > 0) {
-    const next = join(done, rest.shift())
+    const name = rest.shift()
+    if (name === '.') continue
+    if (name === '..') {
+      done = dirname(done)
+      continue
+    }
+    const next = join(done, name)
     if (!lstatSync(next).isSymbolicLink()) {
       done = next
       continue
     }
-    if (done !== '/') links.push(next)
-    rest.unshift(...resolve(done, readlinkSync(next)).split('/').filter(Boolean))
-    done = '/'
+    links.push(next)
+    const target = readlinkSync(next)
+    if (target.startsWith('/')) done = '/'
+    rest.unshift(...target.split('/').filter(Boolean))
   }
   return [...links, done]
 }

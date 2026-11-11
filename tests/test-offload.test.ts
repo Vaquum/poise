@@ -218,6 +218,22 @@ describe('what reaches a test box', () => {
     expect(paths.filter((path: string) => path.startsWith(`${link}/`))).toEqual([])
   })
 
+  it('sends a link to a whole folder, and follows a link before the `..` after it, as the system does', () => {
+    const repo = checkout()
+    const elsewhere = temp()
+    mkdirSync(join(elsewhere, 'env', 'bin'), { recursive: true })
+    writeFileSync(join(elsewhere, 'env', 'bin', 'python'), '')
+    symlinkSync(join(elsewhere, 'env'), join(elsewhere, 'venv'))
+    expect(filesToSend(repo, [join(elsewhere, 'venv', 'bin', 'python')], {}, '/nowhere')).toEqual(expect.arrayContaining([join(elsewhere, 'venv'), join(elsewhere, 'env', 'bin', 'python')]))
+    mkdirSync(join(elsewhere, 'bin'))
+    mkdirSync(join(elsewhere, 'libexec', 'nested'), { recursive: true })
+    writeFileSync(join(elsewhere, 'libexec', 'python3.13'), '')
+    symlinkSync('../libexec/nested', join(elsewhere, 'bin', 'alt'))
+    symlinkSync('alt/../python3.13', join(elsewhere, 'bin', 'python3'))
+    const paths = filesToSend(repo, [join(elsewhere, 'bin', 'python3')], {}, '/nowhere')
+    expect(paths).toEqual(expect.arrayContaining([join(elsewhere, 'bin', 'python3'), join(elsewhere, 'bin', 'alt'), join(elsewhere, 'libexec', 'python3.13')]))
+  })
+
   it('refuses to send an interpreter\'s folder with the home or the run\'s temporary files in it', () => {
     const repo = checkout()
     const home = temp()
