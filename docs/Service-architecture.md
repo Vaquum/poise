@@ -1347,6 +1347,10 @@ rechecks while preserving the public active/merged filters, native resource
 settlement and immutable history. Confirmed closed seeds without remaining
 obligations leave the active list before pagination, retaining ownership and
 unfiltered/history reads as defined in [Behavior chain](Behavior-chain.md).
+For a closed seed without an owned PR, Caller's seed read can identify a sole
+merged closing PR on the expected base repository and default branch. The normal
+PR read confirms its merge SHA before reconciliation records the external outcome;
+missing original review evidence remains pending and publication ownership is unchanged.
 Recovered full-suite repairs can instead end with verified supersession. The
 same journal retains failure/recovery runs, covering merges, the duplicate head
 and its native close receipt; summaries expose that evidence separately from
