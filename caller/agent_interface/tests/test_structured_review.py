@@ -297,10 +297,11 @@ class TestStructuredVerdict(TestCase):
         self.assertEqual(failure.exception.diagnostic["submission"], "none")
 
     def test_correction_uses_only_the_remaining_review_time(self):
-        for allowance, durations, expected in ((60, [40, 5], [45, 5]),
-                                                (60, [40, 10], [45, 5]),
-                                                (60, [45], [45]),
-                                                (120, [40, 25], [60, 20])):
+        # Leave 60 seconds each for submission and outer verification.
+        for allowance, durations, expected in ((165, [40, 5], [45, 5]),
+                                                (165, [40, 10], [45, 5]),
+                                                (165, [45], [45]),
+                                                (225, [40, 25], [60, 20])):
             with self.subTest(allowance=allowance, durations=durations):
                 clock = SimpleNamespace(now=1000.0)
                 pending = iter(durations)
@@ -681,7 +682,7 @@ class TestGrokAnalysisCeiling(TestCase):
         run.submit.assert_called_once()
 
     def test_a_smaller_budget_still_bounds_grok(self):
-        for name, kwargs, expected in (("whole budget", {"budget_seconds": 300}, [285, 235]),
+        for name, kwargs, expected in (("whole budget", {"budget_seconds": 300}, [180, 130]),
                                        ("granted time", {"timeout_s": 60}, [60, 10])):
             with self.subTest(name):
                 run = self._replay(CATALOG.resolve("grok-4.6-xhigh"), [50, NEVER_RETURNS], INSPECT,
@@ -689,15 +690,15 @@ class TestGrokAnalysisCeiling(TestCase):
                 self.assertEqual(run.launches, expected)
                 self.assertEqual(run.error.code, "review_budget_exhausted")
 
-    def test_other_providers_keep_the_whole_budget(self):
+    def test_other_providers_keep_the_remaining_analysis_budget(self):
         for name, turns, reply, repository, expected in (
-                ("inspection rounds", repeat(531), INSPECT, INSPECTED, [1398, 867, 336]),
+                ("inspection rounds", repeat(531), INSPECT, INSPECTED, [1293, 762, 231]),
                 ("one turn", [NEVER_RETURNS], {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []},
-                 None, [1398])):
+                 None, [1293])):
             with self.subTest(name):
                 run = self._replay(CATALOG.resolve("gpt-6-astra-ultra"), turns, reply, repository=repository)
                 self.assertEqual(run.launches, expected)
-                self.assertEqual(run.elapsed, 1398)
+                self.assertEqual(run.elapsed, 1293)
                 self.assertEqual(run.error.code, "review_budget_exhausted")
                 self.assertEqual(str(run.error), "Review reached its total time limit; needs attention")
 
