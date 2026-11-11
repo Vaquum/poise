@@ -287,7 +287,7 @@ test("replaces another chat's timer controls while its new pane is loading", asy
   await expect(pane.locator('.chat-timer-label')).toHaveText('Next chat timer')
   sock.ack(sock.framesOf('timer.cancel')[0], false, 'Old chat cancellation failed')
   sock.push('s2', { type: 'session.updated', session: { ...state.sessions.find(item => item.id === 's2')!, status: 'running' } })
-  await expect(page.locator('.chat-h-status')).toHaveText('running')
+  await expect(page.locator('.chat-h-status')).toHaveText('Running')
   await expect(pane.getByRole('alert')).toBeHidden()
   expect(sock.framesOf('timer.create')).toHaveLength(0)
   expect(sock.framesOf('chat.hold')).toHaveLength(0)

@@ -275,18 +275,10 @@ function stallSummary(stall: StallState): string {
   return `Stalled — the last turn left ${parts.join(', ')}.`
 }
 
-function statusText(s: SessionRecord): string {
-  switch (s.status) {
-    case 'starting': return s.cliChecking ? 'checking CLI…' : 'starting…'
-    case 'idle': return s.stall ? 'stalled' : 'idle'
-    case 'queued': return queuedStatusText(s.queuedBehind)
-    case 'running': return 'running'
-    case 'waiting': return 'waiting for you'
-    case 'stopping': return 'stopping…'
-    case 'interrupted': return 'interrupted'
-    case 'closed': return 'closed'
-    case 'error': return 'error'
-  }
+/** A chat's state in the registry's words, as Overview and Board say them (#556's vocabulary). */
+function stateWords(s: SessionRecord): string {
+  const placed = chatState(s)
+  return `${term(`state.${placed.state}`)}${placed.note ? ` · ${placed.note}` : ''}`
 }
 
 function isRunning(status: SessionStatus): boolean {
@@ -773,9 +765,8 @@ function sidebarHtml(): string {
     const armed = armedDelete?.id === id && armedDelete.until > Date.now()
     const bulkArmed = armed && armedDelete!.bulk && armedDelete!.bulk.length > 1 ? armedDelete!.bulk : null
     const confirm = armed ? (bulkArmed ? deleteBulkConfirmCopy(bulkArmed.length) : deleteConfirmCopy(s, records)) : null
-    // The seven states, in the registry's words, as Overview and Board say them.
     const placed = chatState(s)
-    const said = `${term(`state.${placed.state}`)}${placed.note ? ` · ${placed.note}` : ''}`
+    const said = stateWords(s)
     const pinned = pins.has(id) && s.role !== 'manager'
     const selected = selectedIds.has(id)
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}${pinned ? ' pinned' : ''}${selected ? ' selected' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0" draggable="${s.role !== 'manager'}">`
@@ -2538,7 +2529,7 @@ function headerHtml(): string {
   // answered, but its model, settings and messages are not the person's to change.
   if (!listed(s.id)) {
     return `<div class="chat-h-row"><span class="chat-pill chat-h-agent">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)}</span><span class="chat-h-model">${escapeHtml(s.model)}</span>`
-      + `<span class="chat-h-status" data-status="${s.status}">${escapeHtml(statusText(s))}</span> ${sinceHtml(e, s)}<span class="chat-controls-spacer"></span>`
+      + `<span class="chat-h-status" data-status="${s.status}">${escapeHtml(stateWords(s))}</span> ${sinceHtml(e, s)}<span class="chat-controls-spacer"></span>`
       + `${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" title="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}</div>`
       + '<div class="st-help st-help-info chat-observer-note">Poise runs this chat for the Switchboard pane. It takes no messages; answer here only what it asks you.</div>'
   }
@@ -2564,7 +2555,7 @@ function headerHtml(): string {
       </span>
       <span class="chat-h-repo" title="${escapeHtml(s.checkout || '')}">${s.workspaceKind === 'poise-local' ? '<span>Poise · local</span>' : s.workspaceKind === 'poise-change' ? `<span>Poise · change</span> · <code>${escapeHtml(s.branch?.name || '')}</code>` : `<code>${escapeHtml(s.repo || 'local')}</code> · <code>${escapeHtml(s.branch?.name || '')}</code>`}${ws.text ? ` <span class="chat-h-ws ${ws.cls}">${escapeHtml(ws.text)}</span>` : ''}</span>
       ${modeSel}
-      <span class="chat-h-status" data-status="${s.status}">${escapeHtml(statusText(s))}</span>
+      <span class="chat-h-status" data-status="${s.status}">${escapeHtml(stateWords(s))}</span>
       ${sinceHtml(e, s)}
       <span class="chat-controls-spacer"></span>
       ${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" title="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}

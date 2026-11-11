@@ -46,12 +46,13 @@ export async function mountChatView(root: HTMLElement, signal: AbortSignal, plac
   // Times are on Poise's clock, in Settings' time zone, as classic reads them.
   await loadSettings().catch(() => undefined)
   const started = initChatView()
-  await new Promise((done) => requestAnimationFrame(done))
-  await Promise.all([started, openRequested(chat)])
-  foldListWhenNarrow()
-  // The route back sits first in the chat's own header, never over its controls.
+  // The shell is drawn by now: the route back sits first in the chat's own
+  // header, never over its controls, and a narrow window starts with the list folded.
   const back: HTMLElement = $('[data-back]', root)
   view.querySelector(':scope > .view-header')?.prepend(back)
+  foldListWhenNarrow()
+  await new Promise((done) => requestAnimationFrame(done))
+  await Promise.all([started, openRequested(chat)])
   document.addEventListener('poise:open-chat-pending', () => { void openRequested(null) }, { signal })
   return () => {
     back.remove()
