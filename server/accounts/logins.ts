@@ -145,7 +145,7 @@ export function recordLogin(preset: string, code: number): void {
   const completedAt = Date.now()
   setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [id]: new Date(completedAt).toISOString() }))
   const failure = providerSignInFailure(id)
-  if (failure && completedAt > failure.rejectedAt) {
+  if (failure && completedAt > failure.rejectedAt && failure.verifiedAt === null) {
     setMeta(rejectionKey(id), JSON.stringify({ ...failure, reconnectedAt: completedAt }))
   }
 }

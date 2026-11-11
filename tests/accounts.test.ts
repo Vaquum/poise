@@ -119,6 +119,20 @@ describe('GET /api/accounts', () => {
     expect(providerSignInFailure('codex')).toMatchObject({ since, rejectedAt: secondAt, verifiedAt: null })
   })
 
+  it('preserves a verified reconnect when a later Connect succeeds', async () => {
+    const { recordProviderRecovery } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const reconnectedAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(reconnectedAt).toBeGreaterThan(rejectedAt)
+    recordProviderRecovery('codex', 'a'.repeat(32), reconnectedAt + 1)
+    const verifiedAt = providerSignInFailure('codex')!.verifiedAt!
+    while (Date.now() <= reconnectedAt) await new Promise(resolve => setTimeout(resolve, 1))
+    recordLogin('codex', 0)
+    expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt, verifiedAt })
+  })
+
   it('reads a fast account independently of a pending provider', async () => {
     let release!: () => void
     const held = new Promise<void>(resolve => { release = resolve })

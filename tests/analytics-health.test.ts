@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3'
 import { afterEach, expect, it } from 'vitest'
-import { projectAnalyticsHealth, healthIntervals, workError } from '../server/analytics-health'
-import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
+import { projectAnalyticsHealth, healthIntervals, workError, retryProven } from '../server/analytics-health'
+import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent, type ChainInvocation } from '../server/behavior-chain-store'
 import type { ChainObservation } from '../server/behavior-chain-decision'
 import type { Dependencies, LedgerHistory } from '../server/health'
 
@@ -191,4 +191,58 @@ it('reports covered error-free intervals, unknown coverage, excluded legacy work
   expect(report.rate).toMatchObject({ completed: 1, perItem: null })
   expect(report.coverage.find(source => source.name === 'GitHub')!.status).toBe('error')
   expect(report.limits.join(' ')).toContain('uncorrelated legacy work excluded')
+})
+
+it('counts a failed native Call whose accepted response settled as completed via nativeCallStatus', () => {
+  const f = setup()
+  const chain = f.fail(f.seed(1), 'auth', NOW - HOUR)
+  const invocation = chain.invocations[0]
+  const settled = { ...invocation, evidence: { ...invocation.evidence, status: 'completed', nativeCallStatus: 'failed' } } as ChainInvocation
+  expect(workError(chain, settled)).toMatchObject({ at: NOW - HOUR })
+  const clean = { ...invocation, evidence: { ...invocation.evidence, status: 'completed', nativeCallStatus: 'completed' } } as ChainInvocation
+  expect(workError(chain, clean)).toBeNull()
+})
+
+it('proves publish-issue retries through --invocation-id and rerun-grey-ci through greyRecovery', () => {
+  const f = setup()
+  const chain = f.observe(f.seed(1), NOW - HOUR)
+  const original = 'a'.repeat(32)
+  const publishRetry = { id: 'retry-publish', behavior: 'publish-issue', callId: null,
+    request: { command: 'github-interface', argv: ['--issue-work', '1', '--invocation-id', original, '--expected-head', HEAD], cwd: '/fixture' },
+    evidence: { action: 'published', head_sha: HEAD } } as unknown as ChainInvocation
+  const publication = { ...(chain.observation as ChainObservation).publication, head_sha: HEAD, head_invocation: original }
+  const pull = { ...((chain.observation as ChainObservation).pull!), head: HEAD }
+  const observation = { ...(chain.observation as ChainObservation), checkedAt: NOW, publication, pull } as ChainObservation
+  expect(retryProven(chain, publishRetry, observation, NOW)).toBe(true)
+  expect(retryProven(chain, { ...publishRetry, callId: 'b'.repeat(32) } as ChainInvocation,
+    { ...observation, publication: { ...publication, head_invocation: 'b'.repeat(32) } } as ChainObservation, NOW)).toBe(false)
+  const greyRetry = { id: 'retry-grey', behavior: 'rerun-grey-ci', callId: null,
+    request: { command: 'github-interface', argv: [], cwd: '/fixture' },
+    evidence: { status: 'completed' } } as unknown as ChainInvocation
+  expect(retryProven(chain, greyRetry, { ...observation, greyRecovery: { invocationId: 'retry-grey', receipt: { outcome: 'rerun_observed' } } }, NOW)).toBe(true)
+  expect(retryProven(chain, greyRetry, { ...observation, greyRecovery: { invocationId: 'other', receipt: { outcome: 'rerun_observed' } } }, NOW)).toBe(false)
+})
+
+it('uses the latest operator resume and accepts cross-chain reconnect evidence', async () => {
+  const f = setup()
+  let first = f.observe(f.seed(1), NOW - 32 * HOUR)
+  first = f.fail(first, 'failure', NOW - 30 * HOUR)
+  const sameCall = first.invocations.at(-1)!.callId!
+  first = f.append(first, { type: 'chain.resumed', recovery: { origin: 'operator', intervention: {
+    callId: sameCall, at: NOW - 28 * HOUR, verifiedAt: NOW - 28 * HOUR + 1000 } } }, NOW - 28 * HOUR + 2000)
+  first = f.append(first, { type: 'chain.resumed', recovery: { origin: 'operator', intervention: {
+    callId: sameCall, at: NOW - 3 * HOUR, verifiedAt: NOW - 3 * HOUR + 1000 } } }, NOW - 3 * HOUR + 2000)
+  first = f.succeed(first, 'retry', NOW - 2 * HOUR)
+  first = f.observe(first, NOW - 2 * HOUR + 1000, null, [17])
+  f.merge(first, NOW - HOUR)
+  let second = f.observe(f.seed(2), NOW - 5 * HOUR)
+  second = f.fail(second, 'failure', NOW - 4 * HOUR)
+  second = f.append(second, { type: 'chain.resumed', recovery: { origin: 'operator', intervention: {
+    callId: 'c'.repeat(32), at: NOW - 3 * HOUR, verifiedAt: NOW - 3 * HOUR + 1000 } } }, NOW - 3 * HOUR + 2000)
+  second = f.succeed(second, 'retry', NOW - 2 * HOUR)
+  second = f.observe(second, NOW - 2 * HOUR + 1000, null, [17])
+  f.merge(second, NOW - HOUR)
+  const report = await f.read()
+  expect(report.recovery.intervention.map(item => item.work).sort()).toEqual(['acme/repo#1', 'acme/repo#2'])
+  expect(report.recovery.intervention.find(item => item.work === 'acme/repo#1')).toMatchObject({ interventionAt: NOW - 3 * HOUR })
 })

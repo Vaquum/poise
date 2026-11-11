@@ -53,7 +53,8 @@ export function workError(chain: BehaviorChain, invocation: ChainInvocation): Wo
   const evidence = invocation.evidence
   const callId = typeof evidence?.callId === 'string' ? evidence.callId
     : typeof evidence?.nativeCallId === 'string' ? evidence.nativeCallId : invocation.callId
-  if (!evidence || evidence.status !== 'failed' || !callId || !Number.isFinite(evidence.completedAt)
+  const failed = evidence?.status === 'failed' || (evidence as Record<string, unknown> | null)?.nativeCallStatus === 'failed'
+  if (!evidence || !failed || !callId || !Number.isFinite(evidence.completedAt)
     || evidence.outcome === 'target_closed' || evidence.action === 'no_changes' || evidence.error_code === 'atomic_work_blocked') return null
   const at = Number(evidence.completedAt)
   const input = callerDiagnostic({ ...evidence, id: callId, repo: chain.repository,
@@ -70,7 +71,7 @@ interface HealthInput {
   signal?: AbortSignal
 }
 
-function retryProven(chain: BehaviorChain, retry: ChainInvocation, observation: ChainObservation | null, at: number): boolean {
+export function retryProven(chain: BehaviorChain, retry: ChainInvocation, observation: ChainObservation | null, at: number): boolean {
   if (!observation || !Number.isFinite(observation.checkedAt) || observation.checkedAt > at
     || at - observation.checkedAt > CHAIN_OBSERVATION_MAX_AGE_MS) return false
   const evidence = retry.evidence!
@@ -79,10 +80,21 @@ function retryProven(chain: BehaviorChain, retry: ChainInvocation, observation: 
       receipt.issue?.toLowerCase() === chain.id && receipt.author?.toLowerCase() === chain.reviewer.toLowerCase()
       && observation.issue.commentIds.includes(receipt.comment_id))
   if (retry.behavior === 'review-pr' || retry.behavior === 'approve-pr') return !!chainReviewResponse(chain, retry, observation, at)
-  if (retry.behavior === 'implement-issue' || retry.behavior === 'repair-pr' || retry.behavior === 'publish-issue') {
+  if (retry.behavior === 'publish-issue') {
+    const argv = retry.request.argv
+    const invocationId = argv.includes('--invocation-id') ? argv[argv.indexOf('--invocation-id') + 1] : null
+    return evidence.action === 'published' && typeof evidence.head_sha === 'string'
+      && observation.pull?.head === evidence.head_sha && observation.publication.head_sha === evidence.head_sha
+      && observation.publication.head_invocation === invocationId
+  }
+  if (retry.behavior === 'implement-issue' || retry.behavior === 'repair-pr') {
     return evidence.action === 'published' && typeof evidence.head_sha === 'string'
       && observation.pull?.head === evidence.head_sha && observation.publication.head_sha === evidence.head_sha
       && observation.publication.head_invocation === retry.callId
+  }
+  if (retry.behavior === 'rerun-grey-ci') {
+    return observation.greyRecovery?.invocationId === retry.id
+      && String((observation.greyRecovery.receipt as Record<string, unknown>).outcome) === 'rerun_observed'
   }
   const receipt = matchingNativeActionReceipt(chain, retry)
   return !!receipt && receipt.observedAt <= at && ['enqueued', 'merged', 'resolved'].includes(String(receipt.result.outcome))
@@ -197,7 +209,7 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
           && invocation.evidence?.status === 'completed')
         const resumed = rows.filter(row => row.sequence > failure.sequence && row.event.type === 'chain.resumed'
           && (!retry || row.sequence < retry.admissionSequence))
-        const operator = resumed.find(row => row.event.type === 'chain.resumed' && row.event.recovery?.origin === 'operator')
+        const operator = resumed.filter(row => row.event.type === 'chain.resumed' && row.event.recovery?.origin === 'operator').at(-1)
         const ambiguous = resumed.some(row => row.event.type === 'chain.resumed' && (!row.event.recovery || row.event.recovery.origin === 'unknown'))
         const action = operator ?? resumed.at(-1)
         const origin = operator ? 'operator' : ambiguous ? 'unknown' : 'automatic'
@@ -212,7 +224,6 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         const interventionAt = recovery?.intervention?.at ?? (operator && advanced ? operator.at : null)
         const verifiedHelp = !!recovery?.intervention && recovery.intervention.at > error.at
           && recovery.intervention.verifiedAt >= recovery.intervention.at
-          && chain.invocations.some(invocation => invocation.callId === recovery.intervention!.callId)
         const outcomeAt = origin === 'operator' ? interventionAt : advanced?.at
         if (origin === 'unknown' || !advanced || recovery?.intervention && !verifiedHelp) {
           if (error.at >= since || advanced && advanced.at >= since) unknownRecovery = true
