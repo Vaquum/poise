@@ -4,7 +4,7 @@
 import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { generateKeyPairSync } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -1515,6 +1515,31 @@ describe('a job unpacking', () => {
     expect(result.status).toBe(0)
     expect(readFileSync(join(to, 'dir', 'new'), 'utf8')).toBe('sent')
     expect(readFileSync(join(to, 'dir', 'kept'), 'utf8')).toBe('the image\'s')
+  })
+
+  // Root may write anywhere, so only another user meets a folder it may not write.
+  it.runIf(gnuTar && process.getuid?.() !== 0)('leaves what the image\'s folders hold to the image, and fails on anything else', () => {
+    const { JOB_UNPACK, onlyImageFolders } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as { JOB_UNPACK: string[]; onlyImageFolders: (errors: string, into: string) => boolean }
+    const from = temp()
+    const to = temp()
+    mkdirSync(join(from, 'image', 'lib', 'newer'), { recursive: true })
+    writeFileSync(join(from, 'image', 'lib', 'newer', 'file'), 'sent')
+    symlinkSync('newer/file', join(from, 'image', 'lib', 'link'))
+    mkdirSync(join(from, 'checkout'))
+    writeFileSync(join(from, 'checkout', 'file'), 'sent')
+    execFileSync('tar', ['-czf', join(from, 'tree.tgz'), '-C', from, 'image', 'checkout'])
+    mkdirSync(join(to, 'image', 'lib'), { recursive: true })
+    chmodSync(join(to, 'image', 'lib'), 0o555)
+    try {
+      const result = spawnSync('tar', ['-xzf', join(from, 'tree.tgz'), '-C', to, '--no-same-owner', ...JOB_UNPACK], { encoding: 'utf8' })
+      expect(result.status).toBe(2)
+      expect(onlyImageFolders(result.stderr, to)).toBe(true)
+      expect(readFileSync(join(to, 'checkout', 'file'), 'utf8')).toBe('sent')
+      expect(onlyImageFolders(`${result.stderr}tar: checkout/other: Cannot write: No space left on device\n`, to)).toBe(false)
+      expect(onlyImageFolders('tar: checkout/x: Cannot open: Permission denied\n', to)).toBe(false)
+    } finally {
+      chmodSync(join(to, 'image', 'lib'), 0o755)
+    }
   })
 })
 
