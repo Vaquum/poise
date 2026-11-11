@@ -24,7 +24,7 @@ import { railHTML } from './observe/tasks'
 import { BOARD_REF } from './board/registry'
 import { register } from '../registry'
 import {
-  STATES, ago, canAssign, dwell, isNew, itemKey, phaseOf, sortItems, toItem,
+  STATES, ago, canAssign, dwell, isNew, isSettled, itemKey, phaseOf, sortItems, toItem,
   type Item, type Lane, type MineLane, type Order, type StateKey,
 } from './board/model'
 import {
@@ -56,17 +56,20 @@ type Layout = 'lanes' | 'list'
 interface Filters { status: Status, time: TimeRange, org: string, layout: Layout, by: By, who: WhoFilter }
 type FilterKey = keyof Filters
 
-/** Classic's Current keeps `status` as all|open in the same key; Board reads and writes it that way. */
+/** Classic's Current keeps `status` as all|open in the same key; Board reads and writes it that way.
+ *  Board's view, what its time means and Who are its own (`poise-board`). */
+const BOARD_KEY = 'poise-board'
 function readFilters(): Filters {
   const saved = store.get<Record<string, unknown>>(CURRENT_FILTER_KEY, {})
+  const own = { ...saved, ...store.get<Record<string, unknown>>(BOARD_KEY, {}) }
   const pick = <T extends string>(value: unknown, allowed: readonly T[], fallback: T): T => (allowed as readonly unknown[]).includes(value) ? value as T : fallback
   return {
     status: saved.status === 'open' ? 'open' : 'any',
     time: pick(saved.time, ['all', 'today', 'yesterday', 'week'] as const, 'all'),
     org: typeof saved.org === 'string' ? saved.org : '',
-    layout: pick(saved.layout, ['lanes', 'list'] as const, 'lanes'),
-    by: pick(saved.by, ['updated', 'opened'] as const, 'updated'),
-    who: pick(saved.who, ['any', 'poise', 'other'] as const, 'any'),
+    layout: pick(own.layout, ['lanes', 'list'] as const, 'lanes'),
+    by: pick(own.by, ['updated', 'opened'] as const, 'updated'),
+    who: pick(own.who, ['any', 'poise', 'other'] as const, 'any'),
   }
 }
 
@@ -102,8 +105,9 @@ export const mount: MountPlace = (ctx) => {
     if (v) linkTo(k, v as never)
   }
   const saveFilters = () => {
-    const kept = { ...F, ...linked }
+    const { layout, by, who, ...kept } = { ...F, ...linked }
     store.set(CURRENT_FILTER_KEY, { ...store.get<Record<string, unknown>>(CURRENT_FILTER_KEY, {}), ...kept, status: kept.status === 'open' ? 'open' : 'all' })
+    store.set(BOARD_KEY, { layout, by, who })
   }
   const choose = (patch: Partial<Filters>) => {
     for (const [k, v] of Object.entries(patch)) { (F as unknown as Record<string, unknown>)[k] = v; delete (linked as Record<string, unknown>)[k] }
@@ -180,7 +184,7 @@ export const mount: MountPlace = (ctx) => {
   const allItems = (): Item[] => [...items, ...[...pending.values()].filter((p) => !items.some((it) => it.id === p.id))]
   const shown = (): Item[] => allItems().filter((it) => inOrg(it.repo)
     && (F.by === 'opened' ? inWindow(it.openedAt) : true)
-    && (F.status === 'any' || it.state !== 'done')
+    && (F.status === 'any' || !isSettled(it))
     && matches(it.title, it.repo, `#${it.num}`, it.chain ? `#${it.chain.issue}` : '')
     && (F.who === 'any' || (F.who === 'poise') === (it.who?.kind === 'poise')))
   const byId = (id: string): Item | undefined => allItems().find((it) => it.id === id)
@@ -234,7 +238,7 @@ export const mount: MountPlace = (ctx) => {
   }
 
   const intakeHTML = (it: Item): string => {
-    if (!intake || it.lane !== 'issue' || it.chain || it.state === 'done') return ''
+    if (!intake || it.lane !== 'issue' || it.chain || isSettled(it)) return ''
     const prs = it.closing ?? []
     return prs.length
       ? prs.map((p) => `<a class="intake" href="${esc(p.url)}" target="_blank" rel="noopener" data-ref="card.intake" title="An open pull request that closes this issue. The chain does not take an issue that has one.">PR #${p.number}</a>`).join('')
@@ -248,25 +252,28 @@ export const mount: MountPlace = (ctx) => {
     if (it.chain) return railHTML(it.chain)
     const p = phaseOf(it)
     if (p.index === null) return `<span class="rail-w">${esc(p.word)}</span>`
-    return `<span class="rail" data-ref="task.rail" role="img" aria-label="${esc(`Phase: ${p.word}`)}">${Array.from({ length: 7 }, (_, i) => `<i class="${i < p.index! ? 'p' : i === p.index ? 'c' : ''}"${i === p.index ? ` data-state="${it.state}"` : ''}></i>`).join('')}</span><span class="rail-w">${esc(p.word)}</span>`
+    return `<span class="rail" data-ref="task.rail" role="img" aria-label="${esc(`Phase: ${p.word}`)}">${Array.from({ length: 7 }, (_, i) => `<i class="${i < p.index! ? 'p' : i === p.index ? 'c' : ''}"${i === p.index ? ` data-state="${it.state ?? ''}"` : ''}></i>`).join('')}</span><span class="rail-w">${esc(p.word)}</span>`
   }
 
+  /** The state's dot and word; nothing when its status could not be read. */
+  const stateHTML = (it: Item): string => it.state ? `<span class="sc" data-state="${it.state}"></span><b>${term(`state.${it.state}`)}</b>` : ''
+
   function liveHTML(it: Item): string {
-    const settled = it.state === 'done', list = F.layout === 'list', w = who(it)
+    const settled = isSettled(it), list = F.layout === 'list', w = who(it)
     const d = dwell(it, now())
-    const detail = it.state === 'done' ? (it.record.state === 'merged' ? 'merged' : 'closed') : it.detail
+    const detail = settled ? (it.record.state === 'merged' ? 'merged' : 'closed') : it.detail
     const said = list ? esc(detail) : detail ? `${esc(detail)}${d.stuck ? ` · <span class="stuck" data-ref="card.stuck">${esc(d.text)}</span>` : ''}` : ''
     const refusal = assignErrors.get(it.id)
     const stateRow = list || assignable(it) || it.state !== 'idle' || detail || w
-      ? `<div class="card-state" data-ref="card.state"><span class="sc" data-state="${it.state}"></span><b>${term(`state.${it.state}`)}</b>${said ? `<span class="detail"${it.lane === 'pr' && !settled ? ' data-ref="card.blocker"' : ''}>${said}</span>` : ''}${list ? `<span class="dwell" data-ref="card.dwell">${d.stuck ? `<span class="stuck" data-ref="card.stuck">${esc(d.text)}</span>` : esc(d.text)}</span>` : ''}${w ? `<a class="wk${w.kind === 'poise' ? ' is-mgr' : w.kind === 'worker' ? '' : ' is-own'}" href="${esc(whoHref(it))}" data-ref="${w.kind === 'poise' ? 'card.chain' : 'card.worker'}">${esc(w.tag)}</a>` : ''}${assignHTML(it)}</div>${refusal ? `<p class="card-refusal" role="alert" data-ref="card.assign">${esc(refusal)}</p>` : ''}`
+      ? `<div class="card-state" data-ref="card.state">${stateHTML(it)}${said ? `<span class="detail"${it.lane === 'pr' && !settled ? ' data-ref="card.blocker"' : ''}>${said}</span>` : ''}${list ? `<span class="dwell" data-ref="card.dwell">${d.stuck ? `<span class="stuck" data-ref="card.stuck">${esc(d.text)}</span>` : esc(d.text)}</span>` : ''}${w ? `<a class="wk${w.kind === 'poise' ? ' is-mgr' : w.kind === 'worker' ? '' : ' is-own'}" href="${esc(whoHref(it))}" data-ref="${w.kind === 'poise' ? 'card.chain' : 'card.worker'}">${esc(w.tag)}</a>` : ''}${assignHTML(it)}</div>${refusal ? `<p class="card-refusal" role="alert" data-ref="card.assign">${esc(refusal)}</p>` : ''}`
       : ''
     const rail = list || it.chain ? `<div class="card-rail">${railFor(it)}</div>` : ''
     const reviewWhy = settled ? `This pull request is ${it.record.state}: there is nothing to review.` : ''
     const primary = it.lane === 'pr'
       ? `<button class="ib" data-act="review" aria-label="Run PR review" data-ref="card.review"${settled ? ` aria-disabled="true" data-why="${esc(reviewWhy)}"` : ''}>${icon('play', 'sm')}</button>`
-      : (it.state !== 'done' ? `<button class="ib" data-act="edit-issue" aria-label="Edit issue" data-ref="composer.labels">${icon('edit', 'sm')}</button>` : '')
+      : (!settled ? `<button class="ib" data-act="edit-issue" aria-label="Edit issue" data-ref="card.edit-issue">${icon('edit', 'sm')}</button>` : '')
     const num = it.chain && it.chain.pullNumber && it.lane === 'pr' ? `#${it.chain.issue} → #${it.num}` : `#${it.num}`
-    return `<article class="card" data-id="${esc(it.id)}" data-kind="live" data-state="${it.state}" tabindex="0" data-ref="card.live" aria-label="${it.lane === 'pr' ? 'Pull request' : 'Issue'} #${it.num}: ${esc(it.title)}">`
+    return `<article class="card" data-id="${esc(it.id)}" data-kind="live" data-state="${it.state ?? ''}" tabindex="0" data-ref="card.live" aria-label="${it.lane === 'pr' ? 'Pull request' : 'Issue'} #${it.num}: ${esc(it.title)}">`
       + `<a class="card-title" href="${esc(it.url)}" target="_blank" rel="noopener" data-ref="card.link">${esc(it.title)}</a>`
       + `<div class="card-meta"><span class="repo">${esc(it.repo)}</span><span class="num">${num}</span>${isNew(it, now()) ? '<span class="new" data-ref="card.new">New</span>' : ''}${intakeHTML(it)}<time>${list ? `opened ${ago(minutesSince(it.record.created_at))} · changed ${ago(minutesSince(it.record.updated_at))}` : ago(minutesSince(it.record.updated_at))}</time></div>`
       + `${rail}${stateRow}${lifeEl(it.id)}<div class="card-acts"><button class="ib" data-act="copy" aria-label="Copy" data-ref="card.copy">${icon('copy', 'sm')}</button><button class="ib" data-act="chat" aria-label="Chat about this, beside the board" data-ref="card.chat">${icon('chat', 'sm')}</button>${it.chain ? `<button class="ib" data-act="task" aria-label="Open its timeline" data-ref="card.timeline">${icon('chev', 'sm')}</button>` : ''}<button class="ib" data-act="open-chat" aria-label="Open in Chat" data-ref="card.open-chat">${icon('session', 'sm')}</button>${primary}</div></article>`
@@ -305,8 +312,8 @@ export const mount: MountPlace = (ctx) => {
     if (live) {
       const all = shown().filter((it) => it.lane === lane.key && (!only || it.state === only))
       const fresh = all.filter((it) => pending.has(it.id))
-      open = [...fresh, ...sortItems(all.filter((it) => it.state !== 'done' && !pending.has(it.id)), order)]
-      done = sortItems(all.filter((it) => it.state === 'done' && !pending.has(it.id)), 'recent')
+      open = [...fresh, ...sortItems(all.filter((it) => !isSettled(it) && !pending.has(it.id)), order)]
+      done = sortItems(all.filter((it) => isSettled(it) && !pending.has(it.id)), 'recent')
     } else {
       open = cards.filter((c) => c.lane === lane.key && inOrg(c.repo) && matches(c.text, c.repo)).sort((a, b) => a.position - b.position)
     }
@@ -330,7 +337,7 @@ export const mount: MountPlace = (ctx) => {
 
   function summary(): void {
     const counts = Object.fromEntries(STATES.map((s) => [s, 0])) as Record<StateKey, number>
-    for (const it of shown()) counts[it.state]++
+    for (const it of shown()) if (it.state) counts[it.state]++
     sumEl.innerHTML = `<span class="t-micro" data-ref="cur.summary">In motion</span>${STATES.map((s) => `<button class="st" data-state="${s}" data-n="${counts[s]}" aria-pressed="${only === s}" data-act="state" data-ref="cur.count"><span data-term="state.${s}">${term(`state.${s}`)}</span><span class="n">${counts[s]}</span></button>`).join('')}${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}`
     sumEl.classList.toggle('is-filtered', !!only)
   }
@@ -408,6 +415,8 @@ export const mount: MountPlace = (ctx) => {
 
   // ---------- Reading ----------
   let generation = 0
+  /** The last status read: a failed read keeps it rather than guessing. */
+  let statusesRead: Awaited<ReturnType<typeof readPrStatus>> | undefined
   async function settle<T>(key: string, what: string, read: Promise<T>): Promise<T | undefined> {
     try {
       const value = await read
@@ -438,13 +447,14 @@ export const mount: MountPlace = (ctx) => {
     } else if (failures.has('intake')) intake = null
     if (chainsRead) capacity = chainsRead.capacity
     if (chatsRead) chats = chatsRead
+    if (statuses) statusesRead = statuses
     if (live) {
       truncated = live.truncated
       const before = new Map(items.map((it) => [it.id, `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`]))
       items = live.records.map((record) => {
         const key = itemKey(record.repo, record.number)
         return toItem({
-          record, status: statuses?.get(key) ?? null, chain: chainsRead?.byItem.get(key) ?? null, run: running?.get(key) ?? null,
+          record, status: statuses ? statuses.get(key) ?? null : statusesRead?.get(key), chain: chainsRead?.byItem.get(key) ?? null, run: running?.get(key) ?? null,
           labelled: !!intake?.labelled.has(key) || assigned.has(key), closing: intake ? intake.prs[key] ?? [] : null,
         })
       })
@@ -741,7 +751,7 @@ export const mount: MountPlace = (ctx) => {
   }
   function openInChat(it: Item): void {
     const w = who(it)
-    if (w && w.kind !== 'poise' && w.kind !== 'run') { location.assign(whoHref(it)); return }
+    if (w && w.kind !== 'poise' && w.kind !== 'run') { document.dispatchEvent(new CustomEvent('poise:go', { detail: { href: whoHref(it) } })); return }
     window.dispatchEvent(new CustomEvent('poise:open-chat-session', { detail: { subject: cardSubject(it, null), prefill: `${it.title}\n${it.url}` } }))
   }
 
@@ -811,15 +821,15 @@ export const mount: MountPlace = (ctx) => {
     const w = who(it), refusal = assignErrors.get(it.id)
     const owner = w
       ? `<span class="t-gloss">${w.kind === 'poise' ? 'With Poise: the chain carries it.' : 'Carried by'}</span>${w.kind === 'poise' ? '' : `<a class="wk${w.kind === 'worker' ? '' : ' is-own'}" href="${esc(whoHref(it))}">${esc(w.tag)}</a>`}`
-      : it.lane === 'issue' && it.state !== 'done'
+      : it.lane === 'issue' && !isSettled(it)
         ? `<span class="t-gloss">Not with Poise.</span>${assignHTML(it, 'btn btn-primary')}<span class="t-gloss">${!intake ? 'Which issues are assigned to Poise could not be read, so Assign waits until it can be.' : everyIssueEnters() ? 'Every open issue enters the chain, so it takes this one by itself.' : chainOff() ? 'The chain is off: assigning adds the label, and the chain takes the issue once it is on.' : ASSIGN_WHAT}</span>${(it.closing ?? []).length ? '<span class="t-gloss">An open pull request closes it, so the chain does not take it while that is open.</span>' : ''}`
-        : `<span class="t-gloss">Not with Poise.${it.lane === 'pr' && it.state !== 'done' ? ' The chain starts from an issue, so a pull request opened elsewhere stays outside it.' : ''}</span>`
+        : `<span class="t-gloss">Not with Poise.${it.lane === 'pr' && !isSettled(it) ? ' The chain starts from an issue, so a pull request opened elsewhere stays outside it.' : ''}</span>`
     const d = dwell(it, now())
-    return `<div class="bside-h"><span class="t-micro" data-ref="side.about">${it.lane === 'pr' ? 'Pull request' : 'Issue'}</span><button class="ib" data-act="side-close" aria-label="Close" data-ref="side.close">${icon('cross', 'sm')}</button></div><h3>${esc(it.title)}</h3><p class="t-mono t-gloss">${esc(it.repo)}#${it.num} · opened ${ago(minutesSince(it.record.created_at))} · changed ${ago(minutesSince(it.record.updated_at))}</p><div class="bside-rail">${railFor(it)}</div><div class="card-state"><span class="sc" data-state="${it.state}"></span><b>${term(`state.${it.state}`)}</b><span class="detail">${esc(it.detail || '')}</span>${d.text ? `<span class="dwell">${esc(d.text)}</span>` : ''}</div><div class="bside-owner" data-ref="card.chain">${owner}</div>${refusal ? `<p class="card-refusal" role="alert">${esc(refusal)}</p>` : ''}${sameWork(it)}`
+    return `<div class="bside-h"><span class="t-micro" data-ref="side.about">${it.lane === 'pr' ? 'Pull request' : 'Issue'}</span><button class="ib" data-act="side-close" aria-label="Close" data-ref="side.close">${icon('cross', 'sm')}</button></div><h3>${esc(it.title)}</h3><p class="t-mono t-gloss">${esc(it.repo)}#${it.num} · opened ${ago(minutesSince(it.record.created_at))} · changed ${ago(minutesSince(it.record.updated_at))}</p><div class="bside-rail">${railFor(it)}</div><div class="card-state">${stateHTML(it)}<span class="detail">${esc(it.detail || '')}</span>${d.text ? `<span class="dwell">${esc(d.text)}</span>` : ''}</div><div class="bside-owner" data-ref="card.chain">${owner}</div>${refusal ? `<p class="card-refusal" role="alert">${esc(refusal)}</p>` : ''}${sameWork(it)}`
   }
   function taskHTML(it: Item, chain: ChainRow): string {
     const held = !!chain.held
-    return `<div class="bside-h"><span class="t-micro">Task</span><button class="ib" data-act="side-close" aria-label="Close" data-ref="side.close">${icon('cross', 'sm')}</button></div><h3>${esc(it.title)}</h3><p class="t-mono t-gloss">${esc(chain.repository)}#${chain.issue}${chain.pullNumber ? ` → #${chain.pullNumber}` : ''}</p><div class="bside-rail">${railHTML(chain)}</div><div class="card-state"><span class="sc" data-state="${it.state}"></span><b>${term(`state.${it.state}`)}</b><span class="detail">${esc(it.detail)}</span></div><div class="bside-acts"><button class="btn btn-line" data-act="side-hold" data-id="${esc(it.id)}" data-ref="${held ? 'task.resume' : 'task.hold'}">${held ? 'Resume' : 'Hold new invocations'}</button><a class="btn btn-line" href="${esc(placeHref('observe', { part: 'tasks', chain: chain.id, back: 'board' }))}" data-ref="task.open">Open in Observe</a></div><div class="bside-tl" data-ref="side.timeline"><span class="t-micro">Timeline</span><ol class="tl" data-tl><li class="t-gloss">Reading its steps…</li></ol></div>${sameWork(it)}`
+    return `<div class="bside-h"><span class="t-micro">Task</span><button class="ib" data-act="side-close" aria-label="Close" data-ref="side.close">${icon('cross', 'sm')}</button></div><h3>${esc(it.title)}</h3><p class="t-mono t-gloss">${esc(chain.repository)}#${chain.issue}${chain.pullNumber ? ` → #${chain.pullNumber}` : ''}</p><div class="bside-rail">${railHTML(chain)}</div><div class="card-state">${stateHTML(it)}<span class="detail">${esc(it.detail)}</span></div><div class="bside-acts"><button class="btn btn-line" data-act="side-hold" data-id="${esc(it.id)}" data-ref="${held ? 'task.resume' : 'task.hold'}">${held ? 'Resume' : 'Hold new invocations'}</button><a class="btn btn-line" href="${esc(placeHref('observe', { part: 'tasks', chain: chain.id, back: 'board' }))}" data-ref="task.open">Open in Observe</a></div><div class="bside-tl" data-ref="side.timeline"><span class="t-micro">Timeline</span><ol class="tl" data-tl><li class="t-gloss">Reading its steps…</li></ol></div>${sameWork(it)}`
   }
   async function timeline(chain: ChainRow): Promise<void> {
     const box = $('[data-tl]', sideEl)
@@ -1060,18 +1070,27 @@ export const mount: MountPlace = (ctx) => {
     void readRepos(F.org).then((r) => { repos = r.repos; if (r.warning) failures.set('repos', r.warning); else failures.delete('repos') }).catch((error) => { failures.set('repos', `Could not load your repositories: ${(error as Error).message}.`) })
     await load(true)
     const item = address.item
-    if (item) focusItem(item)
+    if (item) await focusItem(item)
   })()
 
   /** A link's item: open it, widening a filter that hides it, for this visit only. */
-  function focusItem(item: string): void {
-    const it = allItems().find((x) => x.id.toLowerCase() === item.toLowerCase())
+  async function focusItem(item: string): Promise<void> {
+    const find = () => allItems().find((x) => x.id.toLowerCase() === item.toLowerCase())
+    let it = find()
+    // The time window and the scope decide what is read: a link widens them and reads again.
+    if (!it && (F.time !== 'all' || F.org)) {
+      if (F.time !== 'all') linkTo('time', 'all')
+      if (F.org) linkTo('org', '')
+      await load()
+      if (signal.aborted) return
+      it = find()
+    }
     if (!it) { toast(`${item} is not among the items Board has loaded.`, 'waiting'); return }
-    if (F.status === 'open' && it.state === 'done') linkTo('status', 'any')
+    if (F.status === 'open' && isSettled(it)) linkTo('status', 'any')
     if (F.who !== 'any') linkTo('who', 'any')
     if (only && it.state !== only) only = null
     if (search && !matches(it.title, it.repo, `#${it.num}`)) { search = ''; $('[data-search]', root).value = '' }
-    if (F.layout === 'lanes' && it.state === 'done') folds[it.lane] = true
+    if (F.layout === 'lanes' && isSettled(it)) folds[it.lane] = true
     render(false)
     const el = $(`.card[data-id="${CSS.escape(it.id)}"]`, lanesEl)
     el?.scrollIntoView({ block: 'center' })

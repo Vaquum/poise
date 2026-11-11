@@ -40,6 +40,9 @@
   /* Board: lanes scroll inside themselves, and a card's chat takes the place */
   .cur { position: relative; }
   .cur-head { padding-inline: var(--sp-3); }
+  .cur-filters .push { margin-left: 0; }
+  .cur-head .fgrp, .cur-sumrow, .cur-sum { flex-wrap: wrap; min-width: 0; max-width: 100%; }
+  .cur-partial { overflow-wrap: anywhere; }
   .lanes { padding-inline: var(--sp-3); scroll-snap-type: x proximity; }
   .lane { scroll-snap-align: start; }
   .bside { position: absolute; top: 0; right: 0; bottom: 0; left: 0; z-index: var(--z-panel); border-left: 0; }
