@@ -76,16 +76,17 @@ export function claimProviderVerification(id: AccountId): ProviderSignInFailure 
 }
 
 /** A Connect-triggered verification failed or timed out: release its claim so a
- *  later Connect can be recorded and verified. The retained reconnect would
- *  otherwise stay equal to verificationLogin, keeping the first-wins guard and
- *  the claim check closed and leaving authentication-held chains blocked. Only
- *  the matching outstanding claim is released. */
+ *  later Connect can be recorded and verified. Only reconnectedAt is cleared;
+ *  verificationLogin keeps the resolving Connect so a successful review Call
+ *  that completed before the failure but whose receipt is reconciled later
+ *  still verifies as operator help instead of unknown. Only the matching
+ *  outstanding claim is released. */
 export function releaseProviderVerification(id: AccountId, login: string | null): void {
   if (login === null) return
   db.transaction(() => {
     const failure = providerSignInFailure(id)
     if (!failure || failure.verifiedAt !== null || failure.verificationLogin !== login) return
-    setMeta(rejectionKey(id), JSON.stringify({ ...failure, verificationLogin: null, reconnectedAt: null }))
+    setMeta(rejectionKey(id), JSON.stringify({ ...failure, reconnectedAt: null }))
   }).immediate()
 }
 
