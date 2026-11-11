@@ -769,7 +769,7 @@ once. A suite that only checks whether a `docker` exists stays on the job. Witho
 runs the suite as that image's user. So the image's own files stay as they are, and
 so does what its folders hold that this user may not write: a suite started with the
 workspace's own Python runs with the job image's copy of it, which can lag the
-workspace's until that image is deployed again. A sandbox has Docker, running and open to the
+workspace's for the few minutes Render takes to build that image again. A sandbox has Docker, running and open to the
 suite, and the tools of the workspace image at the same paths: Node 22, `git`, a
 build toolchain and the Chromium of this repository's Playwright.
 `gateway/src/test-box-setup.sh` builds those once, in about a minute, and the
@@ -866,10 +866,11 @@ workspace and region with no other live service, because a job can reach its
 neighbours on Render's private network, a **cron job** named `poise-test-instance`:
 the Docker runtime, this repository, Dockerfile `deploy/runtime/Dockerfile`, build
 context `.`, command `true`, a yearly schedule, auto-deploy off, and no environment
-variables, since each job inherits them. It runs nothing and holds the image. Deploy
-it again when `deploy/runtime/` or Playwright's version changes; an image that lags
-shows as suites failing loudly on a job, not as wrong results. Give the gateway its
-service ID:
+variables, since each job inherits them. It runs nothing and holds the image. Each
+`deploy/upgrade.sh` has Render build it again, at the commit just deployed, when
+`deploy/runtime/`, `caller/` or `package-lock.json` changed since the commit Render
+last built; other deploys spend no build minutes on it. A deploy never waits for that
+build or stops for Render. Give the gateway its service ID:
 
 | Setting | Required | Default | What it is |
 | --- | --- | --- | --- |
