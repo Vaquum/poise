@@ -42,6 +42,7 @@ let child = null
 let exitCode = null
 let stderrTail = ''
 let wantsDocker = false
+let posted = 0
 
 function enqueue(type, payload) {
   if (wantsDocker) return
@@ -70,10 +71,12 @@ function takeBatch() {
 
 /** One POST, retried over a passing hiccup. A relay that stays away or disowns the run ends this job. */
 async function post(path, body) {
+  // Output is numbered once, so a post the relay took before its answer was lost is not taken twice.
+  const target = path.startsWith('output') ? `${path}${path.includes('?') ? '&' : '?'}seq=${(posted += 1)}` : path
   for (let attempt = 1; ; attempt += 1) {
     let problem
     try {
-      const response = await fetch(`${relay}/runs/${id}/${path}`, { method: 'POST', headers, body })
+      const response = await fetch(`${relay}/runs/${id}/${target}`, { method: 'POST', headers, body })
       if (response.ok) return
       problem = `HTTP ${response.status}`
       if (response.status < 500) attempt = ATTEMPTS
@@ -147,7 +150,8 @@ async function main() {
   writeFileSync(boxScript, Buffer.from(await (await fetchFrom('instance/box')).arrayBuffer()))
   const spec = await (await fetchFrom(`runs/${id}/spec`, { headers })).json()
   spec.env = { ...spec.env, PATH: [trap.bin, spec.env.PATH].filter(Boolean).join(':') }
-  spec.env.DOCKER_HOST ??= `unix://${trap.socket}`
+  // No socket here is Docker's, so one the agent's environment named is the trap too. A remote engine may still be reached.
+  if (!/^(tcp|ssh|https?):/.test(spec.env.DOCKER_HOST ?? '')) spec.env.DOCKER_HOST = `unix://${trap.socket}`
   const specPath = join(work, 'spec.json')
   writeFileSync(specPath, JSON.stringify(spec))
   const tree = join(work, 'tree')

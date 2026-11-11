@@ -80,8 +80,12 @@ describe('where a workspace reaches the relay', () => {
 })
 
 describe('the gateway image', () => {
-  it('ships what a box runs beside the relay that sends it', () => {
+  it('ships every file the relay reads beside itself, what a box and a job run', () => {
     const { scripts } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { scripts: { build: string } }
-    expect(scripts.build).toContain('cp src/test-box.cjs src/test-box-setup.sh dist/')
+    const source = readFileSync(new URL('../src/test-relay.ts', import.meta.url), 'utf8')
+    const read = [...source.matchAll(/new URL\('\.\/([^']+)', import\.meta\.url\)/g)].map((match) => match[1])
+    expect(read).toEqual(expect.arrayContaining(['test-box.cjs', 'test-box-setup.sh', 'test-instance.cjs']))
+    const copied = [...scripts.build.matchAll(/ src\/(\S+)/g)].map((match) => match[1])
+    for (const file of read) expect(copied).toContain(file)
   })
 })

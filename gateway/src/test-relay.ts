@@ -65,6 +65,8 @@ interface Run {
   output: ServerResponse | null
   /** A job's request for the checkout, which the workspace's parts go down. */
   tree: ServerResponse | null
+  /** The last of a job's numbered output posts that was taken: one retried after a lost answer is not taken twice. */
+  received: number
   parts: number
 }
 
@@ -96,7 +98,8 @@ const MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 const MAX_TREE_PART_BYTES = 64 * 1024 * 1024
 const UPLOAD_ATTEMPTS = 3
 const RUN_ID = /^[0-9a-f]{32}$/
-const JOB_OWNER = /\/instance ([0-9a-f]{32}) /
+// A job's start command names the relay it reports to, and its run.
+const JOB_OWNER = / (\S+)\/instance ([0-9a-f]{32}) /
 // Fetches and runs test-instance.cjs. Render splits a start command at spaces and mangles quotes, so this has
 // neither, and needs no file in the image: the gateway always serves the matching script.
 const INSTANCE_BOOTSTRAP = 'fetch(process.argv[1]).then(r=>r.text()).then(eval)'
@@ -414,8 +417,8 @@ export class TestRelay {
       // A job names its run in its start command, from the moment it exists.
       for (const job of listed) {
         alive.add(job.id)
-        const owner = JOB_OWNER.exec(job.startCommand)?.[1]
-        if (!owner || !this.runs.has(owner)) void this.cancel(job.id)
+        const owner = this.jobRun(job.startCommand)
+        if (owner !== null && !this.runs.has(owner)) void this.cancel(job.id)
       }
     }
     const listGrace = this.deps.listGraceMs ?? LIST_GRACE_MS
@@ -423,6 +426,13 @@ export class TestRelay {
       const listedHere = run.job ? Boolean(this.deps.config.baseService) : this.group !== null
       if (run.boxId && listedHere && !alive.has(run.boxId) && now - run.boxCreated > listGrace) this.kill(run, `its box ${run.boxId} ended without reporting a result`)
     }
+  }
+
+  /** The run a job of this deployment names; null for a job of another deployment sharing the service, which is that one's to end. */
+  private jobRun(startCommand: string): string | null {
+    const [, relay, run] = JOB_OWNER.exec(startCommand) ?? []
+    const handle = /^https?:\/\/([^./:]+)/.exec(relay ?? '')?.[1]
+    return handle !== undefined && relay === `${this.deps.origin(handle)}${TEST_RELAY_PATH}` ? run : null
   }
 
   private async provision(run: Run): Promise<void> {
@@ -482,7 +492,7 @@ export class TestRelay {
     // A job costs less, and moves its suite to a sandbox once it reaches for Docker; a checkout known to do so goes there at once.
     const job = this.deps.config.baseService !== null && spec.docker !== true && !this.dockerRepos.has(`${handle} ${spec.repo}`)
     const run: Run = {
-      id: randomBytes(16).toString('hex'), handle, spec, token: randomBytes(32).toString('hex'), created: now, lease: now, boxId: null, job, boxCreated: 0, ready: false, output: null, tree: null, parts: 0,
+      id: randomBytes(16).toString('hex'), handle, spec, token: randomBytes(32).toString('hex'), created: now, lease: now, boxId: null, job, boxCreated: 0, ready: false, output: null, tree: null, received: 0, parts: 0,
     }
     this.runs.set(run.id, run)
     return run
@@ -587,6 +597,12 @@ export class TestRelay {
       this.kill(run, USES_DOCKER)
     } else {
       const body = await readLimited(req, MAX_OUTPUT_BYTES)
+      const seq = Number(url.searchParams.get('seq'))
+      if (!(seq > run.received)) {
+        res.writeHead(204).end()
+        return
+      }
+      run.received = seq
       // A run that was ended has ended its response too, and writing to that would bring down the gateway.
       if (this.runs.has(run.id) && run.output && body.length) await write(run.output, body)
       if (url.searchParams.get('end') === '1' && this.runs.delete(run.id)) {

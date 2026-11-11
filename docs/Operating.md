@@ -758,8 +758,8 @@ A box has one CPU and 2 GB, and Node may use 80% of the memory.
 **Which box.** A suite starts on a job, a Render one-off job of the workspace image,
 so its tools are the workspace's own at the same paths. A job has no Docker. The
 moment the suite reaches for it there, by the `docker` or `docker-compose` command
-or by the socket `DOCKER_HOST` names (a job sets it when the agent's environment
-does not), the job ends and the agent's command starts the same captured suite
+or by the socket `DOCKER_HOST` names (on a job, its own, unless the agent's
+environment names a remote engine), the job ends and the agent's command starts the same captured suite
 again on a sandbox, saying so. The gateway remembers that checkout's history for
 that workspace until it restarts, so the checkout's next suites go to a sandbox at
 once. A suite that only checks whether a `docker` exists stays on the job. Without

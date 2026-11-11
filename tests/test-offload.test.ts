@@ -457,6 +457,7 @@ describe('a suite on a test box', () => {
   let setupMs: number
   let listLagMs: number
   let runBoxes: boolean
+  let runJobs: boolean
   let warnings: Record<string, unknown>[]
   let events: Record<string, unknown>[]
   let runners: { child: ChildProcess; done: Promise<unknown> }[]
@@ -504,6 +505,7 @@ describe('a suite on a test box', () => {
 
   // A job runs the real instance script, fetched as its start command fetches it, and unpacks where these tests look.
   function startJob(job: Job): void {
+    if (!runJobs) return
     const [, code, url, run, token] = / node -e (\S+) (\S+) (\S+) (\S+)$/.exec(job.startCommand) ?? []
     job.child = spawn(process.execPath, ['-e', code, url, run, token, unpacked], { stdio: ['ignore', 'ignore', 'inherit'] })
     job.child.on('exit', () => { if (job.status === 'running') job.status = 'succeeded' })
@@ -633,6 +635,7 @@ describe('a suite on a test box', () => {
     events = []
     runners = []
     runBoxes = true
+    runJobs = true
     render = startRender()
     relayServer = undefined as unknown as Server
   })
@@ -725,6 +728,49 @@ describe('a suite on a test box', () => {
     expect(second.stderr).not.toContain('reached for Docker')
     expect(jobs.size).toBe(1)
     expect(suiteBoxes()).toHaveLength(2)
+  })
+
+  it('moves a suite whose Docker socket the agent\'s environment named, which a job has not either', async () => {
+    await startAll({ baseService: 'crn-test' })
+    // A sandbox runs it with the agent's value; a job, with its own stand-in.
+    const script = `const path = process.env.DOCKER_HOST.replace(/^unix:\\/\\//, '')
+      if (path === '/nonexistent/docker.sock') { console.log('with Docker'); process.exit(0) }
+      require('net').connect(path).on('error', () => {})
+      setTimeout(() => process.exit(9), 30_000)`
+    const { code, stdout, stderr } = await suite(repository(), [process.execPath, '-e', script], { DOCKER_HOST: 'unix:///nonexistent/docker.sock' }).done
+    expect(code).toBe(0)
+    expect(stdout).toBe('with Docker\n')
+    expect(stderr).toContain('reached for Docker')
+  })
+
+  it('takes a job\'s output once, though a post whose answer was lost comes again', async () => {
+    runJobs = false
+    await startAll({ baseService: 'crn-test' })
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
+    const { id } = await created.json() as { id: string }
+    const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers: { authorization: `Bearer ${KEY}` } })
+    await until(() => jobs.size === 1, 'the job to be created')
+    const token = (/ ([0-9a-f]{64})$/.exec([...jobs.values()][0].startCommand) ?? [])[1]
+    const post = (query: string, body: Buffer) => fetch(`${relayUrl}/runs/${id}/output?${query}`, { method: 'POST', body: new Uint8Array(body), headers: { authorization: `Bearer ${token}` } })
+    const said = Buffer.concat([Buffer.from([1, 0, 0, 0, 4]), Buffer.from('once')])
+    expect((await post('seq=1', said)).status).toBe(204)
+    expect((await post('seq=1', said)).status).toBe(204)
+    expect((await post('end=1&exit=0&seq=2', Buffer.concat([Buffer.from([3, 0, 0, 0, 1]), Buffer.from('0')]))).status).toBe(204)
+    const frames: [number, string][] = []
+    const read = frameReader((type: number, payload: Buffer) => { frames.push([type, payload.toString()]) })
+    for await (const chunk of output.body as unknown as AsyncIterable<Uint8Array>) read(Buffer.from(chunk))
+    expect(frames.filter(([type]) => type === 1 || type === 3)).toEqual([[1, 'once'], [3, '0']])
+  })
+
+  it('ends a job of its own that no run wants, and leaves another deployment\'s on the same service alone', async () => {
+    runJobs = false
+    await startAll({ baseService: 'crn-test' })
+    const job = (id: string, relay: string): Job => ({ id, service: 'crn-test', startCommand: `tini -- timeout -k 10 3660 node -e x ${relay}/instance ${'a'.repeat(32)} ${'b'.repeat(64)}`, planId: 'plan-crn-005', status: 'running', child: null })
+    jobs.set('job-mine', job('job-mine', relayUrl))
+    jobs.set('job-theirs', job('job-theirs', `https://alice.elsewhere.example${TEST_RELAY_PATH}`))
+    await until(() => jobs.get('job-mine')?.status === 'canceled', 'its own orphan to be cancelled')
+    await new Promise((done) => setTimeout(done, 300))
+    expect(jobs.get('job-theirs')?.status).toBe('running')
   })
 
   it('moves a suite that runs docker to a sandbox', async () => {
