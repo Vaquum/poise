@@ -90,7 +90,7 @@ describe('where a notice’s target opens in the new places', () => {
     expect(targetOpening({ pullRequest: 'https://github.com/acme/site/pull/14' })).toEqual({ href: '?view=board&item=acme%2Fsite%2314&back=overview', label: 'Open its card on Board' })
   })
 
-  it('opens a worker and the Manager in the Manager place', () => {
+  it('opens a worker in Chat and the Manager in the Manager place', () => {
     expect(targetOpening({ chat: 'w1' }, () => 'worker').href).toBe('?view=chat&chat=w1&back=overview')
     expect(chatOpening('m1', 'manager').href).toBe('?view=manager&back=overview')
   })

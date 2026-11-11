@@ -3631,6 +3631,29 @@ test('CLI refresh: the model menu follows a moving console without another resiz
   await page.keyboard.press('Escape'); await expect(picker).toBeHidden()
 })
 
+// ---------- Narrow windows (#556: no page overflow at 375, 768 and 1000; the composer stays in reach) ----------
+
+for (const width of [375, 768, 1000]) {
+  test(`nothing overflows Chat or the Manager place at ${width} pixels, and the composer stays in reach`, async ({ page }) => {
+    const state = makeState([session({ id: 's1', title: 'First' })], { s1: [] })
+    await installRoutes(page, state)
+    await installSocket(page, state)
+    await page.setViewportSize({ width, height: 800 })
+    const overflow = () => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    await page.goto('/?view=chat&chat=s1')
+    await expect(page.locator('#view-chat .chat-layout')).toBeVisible()
+    expect(await overflow()).toBeLessThanOrEqual(0)
+    // Nothing lies over the composer: what is under the middle of its input is the input itself.
+    await settled(page)
+    const input = page.locator('.chat-input:visible')
+    const box = (await input.boundingBox())!
+    expect(await input.evaluate((el, [x, y]) => document.elementFromPoint(x, y) === el, [box.x + box.width / 2, box.y + box.height / 2])).toBe(true)
+    await page.goto('/?view=manager')
+    await expect(page.locator('#view-chat .chat-layout')).toBeVisible()
+    expect(await overflow()).toBeLessThanOrEqual(0)
+  })
+}
+
 // ---------- Entry points of the new interface (#556 PR 3) ----------
 
 test('a chat link opens that chat', async ({ page }) => {

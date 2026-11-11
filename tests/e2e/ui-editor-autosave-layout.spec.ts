@@ -173,3 +173,12 @@ test('a failed autosave reaches the notice feed without moving the editor', asyn
   expect(Math.abs(after.docTop - before.docTop)).toBeLessThanOrEqual(1)
   expect(after.barH).toBe(before.barH)
 })
+
+// #556: nothing overflows the Editor at 375, 768 and 1000 pixels.
+for (const width of [375, 768, 1000]) {
+  test(`nothing overflows the Editor at ${width} pixels`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 })
+    await openEditor(page, 'Draft', 'ok')
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0)
+  })
+}

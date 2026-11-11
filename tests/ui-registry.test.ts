@@ -38,6 +38,16 @@ describe('the new interface has one vocabulary', () => {
     expect([...keys].filter((key) => !registered()[key])).toEqual([])
   })
 
+  // A row's reference is its ref, or set.<its key>; Style's token list (key, prop) is not a row.
+  it('explains every Settings row, keyed by its ref or by set.<its key>', () => {
+    const keys = new Set<string>()
+    for (const file of walk(join('src', 'ui', 'places', 'settings')).filter((f) => f.endsWith('.ts'))) {
+      for (const [, key, ref] of readFileSync(file, 'utf8').matchAll(/\{ key: '([\w.-]+)'(?:, ref: '([\w.-]+)')?(?!, prop:)/g)) keys.add(ref || `set.${key}`)
+    }
+    expect(keys.size).toBeGreaterThan(10)
+    expect([...keys].filter((key) => !registered()[key])).toEqual([])
+  })
+
   it('puts the registry’s words on screen', () => {
     expect(term('state.needs-you')).toBe('Needs you')
     expect(term('no.such.key')).toBe('no.such.key')
