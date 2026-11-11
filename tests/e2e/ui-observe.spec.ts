@@ -1,0 +1,306 @@
+import { expect, test, type Page, type Route } from './fixtures/ui'
+
+// Observe in the new interface (#556): Tasks with the chain's evidence,
+// Behaviors, GitHub and Logging, on main's endpoints. The isolated server has
+// no chains, runs, history or diagnostics, so each test serves them here.
+
+const NOW = Date.now()
+const minutes = (n: number) => n * 60_000
+const iso = (at: number) => new Date(at).toISOString()
+const hex = (length: number, seed: string) => seed.repeat(length).slice(0, length)
+const eventId = (seed: string) => `evt_${hex(16, seed)}_${hex(64, seed)}`
+const incidentId = (seed: string) => `inc_${hex(16, seed)}_${hex(64, seed)}`
+const CALL = hex(32, 'c')
+
+// ---------- The chain ----------
+interface Invocation { id: string, behavior: string, state: string, callId?: string | null, model?: string | null, slot?: string | null, outcome?: string | null }
+function chain(issue: number, over: Record<string, unknown> = {}, invocations: Invocation[] = []) {
+  return { id: `acme/site#${issue}`, repository: 'acme/site', issue, branch: `poise/${issue}`, author: 'me', reviewer: 'bot', sequence: 400 + issue,
+    held: null, waiting: null, mergeSha: null, supersession: null, reviewPending: null, reviewStatus: 'not-recorded',
+    reconciliation: { nextObservationAt: null, waitingForOriginalResponse: false }, pullNumber: issue + 1, invocationCount: invocations.length,
+    invocations: invocations.map((i) => ({ callId: null, model: 'Opus 5', slot: 'primary', outcome: null, admittedAt: NOW - minutes(30), nativeAction: null, evidence: null, ...i })), ...over }
+}
+const CHAINS = [
+  chain(488, {}, [{ id: 'i488a', behavior: 'review-pr', state: 'started' }]),
+  chain(493, { pullNumber: null, sequence: 260, waiting: 'exact-head CI is still running' }, [{ id: 'i493a', behavior: 'review-issue', state: 'settled', outcome: 'commented', callId: CALL }]),
+  chain(495, {}, [{ id: 'i495a', behavior: 'repair-pr', state: 'uncertain', outcome: 'a reply may have posted' }]),
+  chain(501, { held: 'queue removal requires a decision: manual (q86)' }, [{ id: 'i501a', behavior: 'merge-pr', state: 'settled', outcome: 'enqueued' }]),
+]
+const attention = (c: ReturnType<typeof chain>, progressAgo: number, blocker: string) => ({
+  id: c.id, repository: c.repository, issue: c.issue, pullNumber: c.pullNumber, step: 'step', progressAt: NOW - progressAgo, ageMs: progressAgo, blocker,
+  evidence: { state: 'fresh', checkedAt: NOW - minutes(2), gates: ['Head 2aa6f19', 'Required CI passed'] }, nextAction: 'Resolve the durable hold, then explicitly resume the chain',
+  retryAt: null, reconciliation: { nextObservationAt: null, waitingForResourceRelease: false }, journal: `/api/behavior-chains?id=${encodeURIComponent(c.id)}&after=${c.sequence - 1}`,
+})
+// Served out of order: the page orders Needs attention by the oldest verified progress itself.
+const ATTENTION = [attention(CHAINS[3], minutes(36), 'queue removal requires a decision'), attention(CHAINS[1], minutes(26 * 60), 'No verified progress for at least 24 hours'), attention(CHAINS[2], minutes(15), 'a reply may have posted')]
+const JOURNAL = [
+  { sequence: 100, at: NOW - minutes(26 * 60 + 30), type: 'chain.admitted' },
+  { sequence: 130, at: NOW - minutes(26 * 60 + 20), type: 'chain.observed' },
+  { sequence: 160, at: NOW - minutes(26 * 60), type: 'invocation.settled', invocationId: 'i493a', outcome: 'commented', callId: CALL },
+  ...Array.from({ length: 6 }, (_, i) => ({ sequence: 190 + i * 10, at: NOW - minutes(60 - i), type: 'chain.observed' })),
+  { sequence: 260, at: NOW - minutes(20), type: 'chain.waiting', reason: 'exact-head CI is still running' },
+]
+
+interface Served { chainsFail?: boolean, posts?: unknown[] }
+async function serveChains(page: Page, served: Served = {}): Promise<void> {
+  await page.route((url) => url.pathname === '/api/behavior-chains', async (route: Route) => {
+    const url = new URL(route.request().url())
+    if (route.request().method() === 'POST') {
+      const body = route.request().postDataJSON() as { id: string, operation: string }
+      served.posts?.push(body)
+      const held = CHAINS.find((c) => c.id === body.id)!
+      return route.fulfill({ json: { chain: { ...held, held: body.operation === 'hold' ? 'New invocations held by the person' : null, sequence: held.sequence + 1 } } })
+    }
+    if (served.chainsFail) return route.fulfill({ status: 502, json: { error: 'GitHub returned 502 reading the journal' } })
+    if (url.searchParams.get('batch') === '1') {
+      return route.fulfill({ json: { impacts: url.searchParams.getAll('callId').map((call) => call === CALL ? {
+        impact: 'blocked', recovered: false, invocationId: 'i495a', repository: 'acme/site', behavior: 'repair-pr', callerBehavior: null,
+        stage: 'repair-pr: uncertain', target: 'acme/site#496', progressAt: NOW - minutes(15), retryAt: null,
+        nextAction: 'Reconcile the original invocation receipt before retrying', journal: '/api/behavior-chains?id=acme%2Fsite%23493&after=159',
+      } : null) } })
+    }
+    const meta = { cutover: { sequence: 1, mode: 'v2', requestedAt: null, legacyPulls: ['acme/site#471'], support: { status: 'supported', error: null }, blockers: [] },
+      settings: { enabled: true, seedMode: 'label', label: 'poise' }, runtime: [],
+      capacity: { status: 'available', error: null, modelInvocationLimit: 8, reservedModelInvocations: 3, mode: 'v2', enabled: true, intake: { seedMode: 'label', label: 'poise' } } }
+    const id = url.searchParams.get('id')
+    if (id) {
+      const after = Number(url.searchParams.get('after') ?? 0)
+      const events = (id === 'acme/site#493' ? JOURNAL : []).filter((e) => e.sequence > after).slice(0, 20)
+      return route.fulfill({ json: { chain: CHAINS.find((c) => c.id === id) ?? null, events, next: events.length === 20 ? events[19].sequence : null, ...meta } })
+    }
+    return route.fulfill({ json: { chains: CHAINS, next: null, attention: ATTENTION, ...meta } })
+  })
+}
+
+// ---------- Logging ----------
+function diagnostic(seed: string, over: Record<string, unknown> = {}) {
+  return { version: 1, id: eventId(seed), incidentId: incidentId(seed), severity: 'error', visibility: 'workspace', source: 'poise', sourceLevel: 'error',
+    component: 'behavior-chain', operation: 'repair', phase: null, target: 'acme/site#496', workspace: 'local', instance: null, container: null, release: null,
+    account: null, repository: 'acme/site', pr: '496', behavior: null, reviewer: null, callId: null, requestId: null, correlationId: null,
+    message: `Repair could not prove its reply (${seed})`, cause: [], stderr: null, stack: null, context: {}, resources: {}, truncated: false,
+    eventTime: iso(NOW - minutes(15)), ingestedAt: iso(NOW - minutes(14)), exitCode: null, signal: null, errno: null, timeoutMs: null, occurrences: 1, ...over }
+}
+const LINKED = diagnostic('a', { callId: CALL })
+const OTHER = diagnostic('b', { severity: 'warning', message: 'Quota forecast is close to its limit', eventTime: iso(NOW - minutes(50)) })
+const bounds = { retentionAfter: iso(NOW - minutes(60 * 24 * 14)), from: iso(NOW - minutes(60 * 24)), to: iso(NOW) }
+const policy = { retentionMs: 1_209_600_000, maxBytes: 1_000_000, maxEvents: 100_000 }
+
+async function serveLogging(page: Page, queries: URLSearchParams[] = []): Promise<void> {
+  await page.route((url) => url.pathname === '/api/workspace', (route) => route.fulfill({ json: { mode: 'local' } }))
+  await page.route((url) => url.pathname.startsWith('/api/logging'), (route) => {
+    const url = new URL(route.request().url())
+    if (url.pathname === '/api/logging/health') {
+      return route.fulfill({ json: { version: 1, status: 'connected', collection: { status: 'connected', checkedAt: iso(NOW), sources: [], lossObserved: false }, query: { status: 'connected' }, policy } })
+    }
+    if (url.pathname.startsWith('/api/logging/events/')) {
+      const id = decodeURIComponent(url.pathname.split('/').pop()!)
+      return id === LINKED.id ? route.fulfill({ json: { version: 1, event: LINKED, bounds } }) : route.fulfill({ status: 404, json: { error: 'logging_event_unavailable', message: 'No permitted retained evidence.' } })
+    }
+    queries.push(url.searchParams)
+    const incident = url.searchParams.get('incidentId')
+    const events = url.searchParams.has('after') ? [] : incident ? [LINKED, OTHER].filter((e) => e.incidentId === incident) : [LINKED, OTHER]
+    return route.fulfill({ json: { version: 1, countKind: 'events', total: events.length, events, coverage: [], bounds, policy, watermark: 'w1', nextCursor: null } })
+  })
+}
+
+// ---------- Runs and history ----------
+function run(id: string, over: Record<string, unknown> = {}) {
+  return { id, pr_id: '488', repo: 'acme/site', actor: 'bot', model: 'Claude Code · Opus 5', behavior: 'pr_review', session_id: null, source: null, prompt: '',
+    started_at: iso(NOW - minutes(40)).slice(0, 19), started_at_precise: iso(NOW - minutes(40)), completed_at: iso(NOW - minutes(37)), time_elapsed: '3m 2s',
+    status: 'completed', outcome: 'approved', response: null, error: '', ...over }
+}
+const RUNS = [
+  run(hex(32, 'd'), { status: 'running', completed_at: null, outcome: null, started_at_precise: iso(NOW - minutes(2)) }),
+  run(CALL, { pr_id: '493', behavior: 'issue_review', outcome: 'commented', response: 'Posted two comments.' }),
+  run(hex(32, 'e'), { model: 'native-action', behavior: 'native_action', prompt: '--merge-if-ready', outcome: null, pr_id: '502' }),
+]
+async function serveRuns(page: Page): Promise<void> {
+  await page.route((url) => url.pathname === '/api/agent-logs', (route) => {
+    const url = new URL(route.request().url())
+    const id = url.searchParams.get('id')
+    const logs = id ? RUNS.filter((r) => r.id === id) : url.searchParams.get('status') === 'running' ? RUNS.filter((r) => r.status === 'running') : RUNS
+    return route.fulfill({ json: { logs, quarantined: [], total: logs.length, nextCursor: null } })
+  })
+  await page.route((url) => url.pathname === '/api/behavior-estimates', (route) => route.fulfill({ json: { estimates: [] } }))
+  await page.route((url) => url.pathname.startsWith('/api/agent-response/'), (route) => route.fulfill({ json: { body: 'Posted two comments.' } }))
+}
+async function serveHistory(page: Page): Promise<void> {
+  await page.route((url) => url.pathname === '/api/gh', (route) => {
+    const body = route.request().postDataJSON() as { operation: string, record_type?: string, count_only?: boolean }
+    const record = (kind: string, number: number, title: string, state: string) => ({ kind, repo: 'acme/site', number, title, url: `https://github.com/acme/site/${kind === 'pr' ? 'pull' : kind === 'issue' ? 'issues' : 'actions/runs'}/${number}`,
+      author: 'me', state, owner_login: null, owner_avatar: null, updated_at: iso(NOW - minutes(number % 50)), merged_at: null, branch: kind === 'action' ? 'main' : undefined })
+    const records = body.operation === 'actions' ? [record('action', 9121, 'CI · browser shard 3', 'failure')]
+      : body.record_type === 'pull_request' ? [record('pr', 496, 'Settings: say which slot a place runs', 'open')] : [record('issue', 495, 'Settings: say which slot a place runs', 'open')]
+    return route.fulfill({ json: body.count_only ? { count: records.length, errors: [] } : { records, count: records.length, errors: [] } })
+  })
+}
+
+async function open(page: Page, address: string, served: Served = {}): Promise<void> {
+  await page.route(/https:\/\/(?:fonts\.googleapis\.com|fonts\.gstatic\.com)\//, (route) => route.abort())
+  await page.route((url) => url.pathname === '/api/claude-auth', (route) => route.fulfill({ json: { status: 'authenticated', reason: null, checkedAt: null, verifiedAt: null, authMethod: null, subscriptionType: null, loginInProgress: false } }))
+  await page.route((url) => url.pathname === '/api/notices', (route) => route.fulfill({ json: { enabled: true, notices: [] } }))
+  await page.route((url) => url.pathname === '/api/settings', (route) => route.fulfill({ json: { org: 'acme', me: 'me', agentAccount: 'bot', timezone: 'UTC',
+    organizations: ['acme', 'umbrella'].map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })) } }))
+  await serveChains(page, served)
+  await serveLogging(page)
+  await serveRuns(page)
+  await serveHistory(page)
+  await page.goto(address)
+  await expect(page.locator('.obv-tabs')).toBeVisible()
+}
+const query = (page: Page) => Object.fromEntries(new URL(page.url()).searchParams)
+const tasks = (page: Page) => page.locator('[data-panel="tasks"]')
+const logging = (page: Page) => page.locator('[data-panel="logging"]')
+
+test('Needs attention lists held, unconfirmed and stalled tasks at once, oldest progress first, each saying how long', async ({ page }) => {
+  await open(page, '/?view=observe&part=tasks')
+  await expect(tasks(page).locator('[data-ref="tk.status"]')).toContainText('v2 owns new work · 3 of 8 model runs in use, shared with other heavy work')
+  await expect(tasks(page).locator('[data-ref="tk.legacy"]')).toContainText('1 pull request kept by v1 at cutover')
+  await expect(tasks(page).locator('.tk-row')).toHaveCount(4)
+  await tasks(page).getByRole('button', { name: 'Needs attention 3' }).click()
+  const rows = tasks(page).locator('.tk-row')
+  await expect(rows).toHaveCount(3)
+  await expect(rows.nth(0)).toContainText('acme/site#493')
+  await expect(rows.nth(0)).toContainText('no verified advance for 1d 2h')
+  await expect(rows.nth(1)).toContainText('acme/site#501 → #502')
+  await expect(rows.nth(1)).toContainText('Needs you')
+  await expect(rows.nth(2)).toContainText('acme/site#495')
+  await expect(rows.nth(2)).toContainText('Blocked')
+  await expect(rows.nth(2)).toContainText('Not confirmed: a reply may have posted')
+  await rows.nth(1).click()
+  const head = tasks(page).locator('[data-tk-head]')
+  await expect(head.locator('[data-ref="tk.evidence"]')).toContainText('Last verified advance')
+  await expect(head.locator('[data-ref="tk.evidence"]')).toContainText('Required CI passed')
+  await expect(head.locator('[data-ref="side.hold"]')).toContainText('Queue removal requires a decision')
+  expect(query(page).chain).toBe('acme/site#501')
+})
+
+test('a notice’s journal link opens the task’s timeline at its step, newest first, with Resume where the hold is', async ({ page }) => {
+  const posts: unknown[] = []
+  await open(page, '/?view=logging&chain=acme%2Fsite%23493&after=159', { posts })
+  expect(query(page)).toMatchObject({ view: 'observe', part: 'tasks', chain: 'acme/site#493', after: '159' })
+  const timeline = tasks(page).locator('[data-ref="side.timeline"]')
+  await expect(timeline).toBeVisible()
+  const from = timeline.locator('[data-ref="tk.from"]')
+  await expect(from).toContainText('Issue review settled: commented')
+  await expect(from.getByRole('link', { name: /^run cccccccc/ })).toHaveAttribute('href', `?view=observe&part=behaviors&call=${CALL}`)
+  // Newest first: the wait is above the step, and the observations between them fold into one line.
+  await expect(timeline.locator('li').first()).toContainText('Waiting: CI is still running on its head')
+  await expect(timeline.locator('[data-ref="tk.observed"]')).toContainText('×6')
+  await expect(tasks(page).getByRole('button', { name: 'Later events' })).toBeHidden()
+  await expect(tasks(page).getByRole('button', { name: 'More events' })).toBeVisible()
+  await tasks(page).getByRole('button', { name: 'More events' }).click()
+  await expect(timeline.locator('li').last()).toContainText('Entered the chain')
+
+  await tasks(page).locator('.tk-row', { hasText: 'acme/site#501' }).click()
+  await tasks(page).getByRole('button', { name: 'Resume' }).click()
+  await expect(tasks(page).locator('.tk-act-note')).toContainText('Resumed.')
+  expect(posts).toEqual([{ id: 'acme/site#501', sequence: 901, operation: 'resume' }])
+})
+
+test('a failed read keeps what was read, says when, and stops Hold and Resume until a read succeeds', async ({ page }) => {
+  const served: Served = {}
+  await open(page, '/?view=observe&part=tasks&chain=acme%2Fsite%23488', served)
+  const hold = tasks(page).getByRole('button', { name: 'Hold new invocations' })
+  await expect(hold).toBeEnabled()
+  await expect(hold).not.toHaveAttribute('aria-disabled', 'true')
+  served.chainsFail = true
+  await page.evaluate(() => dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(tasks(page).locator('[data-ref="tk.status"]')).toContainText('Tasks could not be refreshed: GitHub returned 502 reading the journal. Showing what was read at')
+  await expect(tasks(page).locator('.tk-row')).toHaveCount(4)
+  await expect(hold).toHaveAttribute('aria-disabled', 'true')
+  served.chainsFail = false
+  await page.evaluate(() => dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(tasks(page).locator('[data-ref="tk.status"]')).toContainText('v2 owns new work')
+  await expect(hold).not.toHaveAttribute('aria-disabled', 'true')
+})
+
+test('Logging’s entry addresses open the exact diagnostic, an incident or say the link is invalid', async ({ page }) => {
+  const from = iso(NOW - minutes(30)), to = iso(NOW)
+  await open(page, `/?view=logging&event=${LINKED.id}&from=${from}&to=${to}`)
+  expect(query(page)).toMatchObject({ view: 'observe', part: 'logging', event: LINKED.id, from, to })
+  await expect(logging(page).locator('[data-ref="lg.linked"]')).toContainText('Linked diagnostic.')
+  await expect(logging(page).locator(`tr[data-ev="${LINKED.id}"]`)).toHaveClass(/is-linked/)
+  await expect(logging(page).locator(`#lg-detail-${LINKED.id}`)).toBeVisible()
+
+  await page.goto(`/?view=logging&incident=${LINKED.incidentId}`)
+  await expect(logging(page).locator('[data-ref="lg.linked"]')).toContainText('Linked diagnostic')
+  await expect(logging(page).locator(`#lg-detail-${LINKED.id}`)).toBeVisible()
+
+  await page.goto('/?view=logging&event=evt_nope')
+  await expect(logging(page).locator('[data-ref="lg.linked"]')).toContainText('The diagnostic link is invalid.')
+})
+
+test('Logging’s Work impact shows on the row and in the detail, and opens its task at that step; Back returns with the interval and filters intact', async ({ page }) => {
+  const saved = { component: '', workspace: '', account: '', repository: '', callId: '', correlationId: '', incidentId: '', columns: ['time', 'impact', 'severity', 'source', 'component', 'repository', 'target', 'message', 'occurrences'],
+    severities: ['critical', 'error'], time: 'week', from: '', to: '', source: '', search: '', scope: 'workspace' }
+  await page.addInitScript((value) => { if (!sessionStorage.getItem('seeded')) { localStorage.setItem('poise-logging-filters', JSON.stringify(value)); sessionStorage.setItem('seeded', '1') } }, saved)
+  const from = iso(NOW - minutes(40)), to = iso(NOW - minutes(5))
+  await open(page, `/?view=observe&part=logging&event=${LINKED.id}&from=${from}&to=${to}&back=overview`)
+  const row = logging(page).locator(`tr[data-ev="${LINKED.id}"]`)
+  await expect(row.locator('[data-ref="lg.impact"]')).toHaveText('blocked · acme/site#496 · repair-pr: uncertain')
+  await expect(logging(page).locator(`tr[data-ev="${OTHER.id}"] [data-ref="lg.impact"]`)).toHaveText('unknown')
+  const impact = logging(page).locator(`#lg-detail-${LINKED.id} [data-ref="lg.workimpact"]`)
+  await expect(impact).toContainText('Reconcile the original invocation receipt before retrying')
+  const task = impact.getByRole('link', { name: 'Open its task at this step' })
+  await expect(task).toHaveAttribute('href', '?view=observe&part=tasks&chain=acme%2Fsite%23493&after=159&back=overview')
+  // The link's interval is applied, and the saved filters stay as they were.
+  await expect(logging(page).locator('#lg-filter-button-time')).toHaveClass(/is-on/)
+  expect(JSON.parse(await page.evaluate(() => localStorage.getItem('poise-logging-filters') ?? '{}'))).toMatchObject({ time: 'week', severities: ['critical', 'error'] })
+
+  await task.click()
+  await expect(tasks(page).locator('[data-ref="tk.from"]')).toContainText('Issue review settled')
+  await expect(page.getByRole('link', { name: 'Back to Overview' })).toBeVisible()
+  await page.goBack()
+  expect(query(page)).toMatchObject({ part: 'logging', event: LINKED.id, from, to, back: 'overview' })
+  await expect(logging(page).locator('[data-ref="lg.linked"]')).toContainText('Linked diagnostic.')
+  await expect(logging(page).locator('#lg-filter-button-time')).toHaveClass(/is-on/)
+  await logging(page).getByRole('button', { name: 'Restore saved filters' }).click()
+  await expect(logging(page).locator('[data-ref="lg.linked"]')).toBeHidden()
+  expect(query(page).event).toBeUndefined()
+  await page.getByRole('link', { name: 'Back to Overview' }).click()
+  expect(query(page).view).toBe('overview')
+  expect(JSON.parse(await page.evaluate(() => localStorage.getItem('poise-logging-filters') ?? '{}'))).toMatchObject({ time: 'week', severities: ['critical', 'error'] })
+})
+
+test('a run link opens that run unfolded in Behaviors, and a chain’s own GitHub action names what it did with no model', async ({ page }) => {
+  await open(page, `/?view=observe&part=behaviors&call=${CALL}`)
+  const behaviors = page.locator('[data-panel="behaviors"]')
+  const row = behaviors.locator(`tr[data-run="${CALL}"]`)
+  await expect(row.locator('[data-ref="bh.status"]')).toContainText('Done · Commented')
+  await expect(behaviors.locator(`tr[data-detail-for="${CALL}"]`)).toContainText('Posted two comments.')
+  await expect(behaviors.locator(`tr[data-detail-for="${CALL}"]`).getByRole('link', { name: 'See it on Board' })).toHaveAttribute('href', '?view=board&item=acme%2Fsite%23493&back=observe')
+  const native = behaviors.locator(`tr[data-run="${hex(32, 'e')}"]`)
+  await expect(native.locator('[data-ref="bh.behavior"]')).toHaveText('Merge if ready')
+  await expect(native.locator('[data-ref="bh.model"]')).toHaveText('—')
+  // Stop asks Sure? first.
+  const running = behaviors.locator(`tr[data-run="${hex(32, 'd')}"]`)
+  await running.getByRole('button', { name: 'Stop this run' }).click()
+  await expect(running.getByRole('button', { name: 'Confirm stopping this run' })).toHaveText('Sure?')
+})
+
+test('a GitHub link opens its row, widening the filters for that visit only', async ({ page }) => {
+  await page.addInitScript(() => { localStorage.setItem('poise-observe-github', JSON.stringify({ types: ['action'], ci: 'failed', status: 'open', time: 'today' })) })
+  await open(page, '/?view=observe&part=github&item=acme/site%23496')
+  const github = page.locator('[data-panel="github"]')
+  await expect(github.locator('tr[data-key="acme/site#496"]')).toBeVisible()
+  await expect(github.locator('tr[data-key="acme/site#496"] [data-ref="gh.board"]')).toHaveAttribute('href', '?view=board&item=acme%2Fsite%23496&back=observe')
+  expect(JSON.parse(await page.evaluate(() => localStorage.getItem('poise-observe-github') ?? '{}'))).toEqual({ types: ['action'], ci: 'failed', status: 'open', time: 'today' })
+})
+
+for (const width of [375, 768, 1000]) {
+  test(`no part of Observe overflows the page at ${width} pixels`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 })
+    await open(page, '/?view=observe&part=tasks&chain=acme%2Fsite%23493')
+    for (const part of ['Tasks', 'Behaviors', 'GitHub', 'Logging']) {
+      await page.getByRole('tab', { name: new RegExp(`^${part}`) }).click()
+      await expect(page.locator(`[data-panel="${part.toLowerCase()}"]`)).toBeVisible()
+      await page.waitForTimeout(150)
+      const overflow = await page.evaluate(() => Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - innerWidth)
+      expect(overflow, `${part} at ${width}`).toBeLessThanOrEqual(0)
+    }
+    // The part chosen last is remembered when the address names none.
+    await page.goto('/?view=observe')
+    await expect(page.getByRole('tab', { name: /^Logging/ })).toHaveAttribute('aria-selected', 'true')
+  })
+}

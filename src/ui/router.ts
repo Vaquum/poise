@@ -29,7 +29,7 @@ const PLACES: Record<Place, () => Promise<PlaceModule>> = {
   chat: () => import('./places/placeholder'),
   manager: () => import('./places/placeholder'),
   editor: () => import('./places/placeholder'),
-  observe: () => import('./places/placeholder'),
+  observe: () => import('./places/observe'),
   settings: () => import('./places/placeholder'),
 }
 // As classic's: Chat, the Manager and the Editor only fade in.
