@@ -301,10 +301,13 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         // head advance observed before publicationResume. Require progress
         // after the launch that actually succeeds; a verified published head
         // journaled after that launch but before its success settlement still
-        // counts. Later-admission retries keep the preceding-observation
-        // proof (e.g. grey CI success observed before its settlement).
+        // counts. Without a launch (e.g. publish-issue settled from the
+        // observation), require progress after the failure instead of the
+        // later success settlement. Later-admission retries keep the
+        // preceding-observation proof (e.g. grey CI success observed before
+        // its settlement).
         const sameInvocation = !!retry && !!success && retry.admissionSequence <= failure.sequence
-        const bound = sameInvocation ? (launch ?? success) : undefined
+        const bound = sameInvocation ? (launch ?? failure) : undefined
         const retryAt = bound ? bound.at : Number(retry?.evidence?.completedAt)
         const advanced = retry && success && progress.advances.find(point => {
           if (point.sequence < failure.sequence || point.at < retryAt || point.at < error.at) return false
