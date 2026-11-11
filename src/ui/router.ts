@@ -24,7 +24,7 @@ export type MountPlace = (ctx: PlaceContext) => void | (() => void) | Promise<vo
 
 type PlaceModule = { mount: MountPlace }
 const PLACES: Record<Place, () => Promise<PlaceModule>> = {
-  overview: () => import('./places/placeholder'),
+  overview: () => import('./places/overview'),
   board: () => import('./places/placeholder'),
   chat: () => import('./places/placeholder'),
   manager: () => import('./places/placeholder'),

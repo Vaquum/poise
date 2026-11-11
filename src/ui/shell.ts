@@ -7,6 +7,7 @@ import { icon, hydrateIcons } from './icons'
 import { noticeFeed, READ_INTERVAL_MS } from '../notices'
 import { PLACE_NAMES, placeHref, type Address, type Place } from './address'
 import { styleSettingsHref } from './style-panel'
+import { bellTally, onBellChange } from './places/overview/level'
 
 // ---------- Motion read from tokens ----------
 let probe: HTMLElement | null = null
@@ -173,18 +174,20 @@ function watchConnection(el: HTMLElement | null): void {
 }
 
 // ---------- The bell: what needs you, opening Overview's Answer here ----------
+// It counts what Overview's level shows, in its colour (places/overview/level.ts).
 let bellBack: Place = 'overview'
 function watchBell(btn: HTMLElement | null): void {
   const badge = btn?.querySelector<HTMLElement>('[data-bell]')
   if (!btn || !badge) return
   const paint = () => {
-    const count = noticeFeed.current.notices.length
+    const { count, tone } = bellTally(noticeFeed.current.notices)
     badge.textContent = String(count)
     badge.hidden = !count
-    badge.dataset.tone = 'needs-you'
+    if (tone) badge.dataset.tone = tone; else delete badge.dataset.tone
     btn.setAttribute('aria-label', `Notifications, ${count} open. Opens Answer here in Overview.`)
   }
   noticeFeed.subscribe(paint)
+  onBellChange(paint)
   paint()
   btn.addEventListener('click', () => {
     const href = `${placeHref('overview', { back: bellBack === 'overview' ? null : bellBack })}#answer`
