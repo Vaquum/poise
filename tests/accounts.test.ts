@@ -291,10 +291,13 @@ describe('GET /api/accounts', () => {
     await listAccounts('codex')
     expect(native).toHaveBeenCalledTimes(1)
     const failure = providerSignInFailure('codex')!
-    // Completion, not request start: must be at or after the second Connect.
-    expect(failure.verifiedAt).toBeGreaterThanOrEqual(failure.reconnectedAt!)
-    expect(failure.reconnectedAt).toBeGreaterThanOrEqual(firstAt)
-    expect(failure.reconnectedAt).toBeLessThanOrEqual(failure.verifiedAt!)
+    // Completion, not request start: first-wins keeps reconnectedAt at firstAt,
+    // so compare against the second Connect's login time. Old start-time code
+    // records startedAt below that Connect and fails this guard.
+    const pendingAt = Date.parse(accountLogins().codex!)
+    expect(pendingAt).toBeGreaterThan(firstAt)
+    expect(failure.reconnectedAt).toBe(firstAt)
+    expect(failure.verifiedAt).toBeGreaterThanOrEqual(pendingAt)
   })
 
   it('reads a fast account independently of a pending provider', async () => {
