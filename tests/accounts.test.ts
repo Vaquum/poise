@@ -138,8 +138,9 @@ describe('GET /api/accounts', () => {
     vi.spyOn(models, 'loadCatalog').mockResolvedValue(JSON.parse(CATALOG_STDOUT))
     const actualRun = processes.runFile
     const native = vi.fn(async () => {
+      const enteredAt = Date.now()
       const firstAt = providerSignInFailure('codex')!.reconnectedAt!
-      while (Date.now() <= firstAt) await new Promise(resolve => setTimeout(resolve, 1))
+      while (Date.now() <= Math.max(firstAt, enteredAt)) await new Promise(resolve => setTimeout(resolve, 1))
       recordLogin('codex', 0)
       return { stdout: '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}\n{"type":"turn.completed"}\n', stderr: '' }
     })
@@ -151,6 +152,7 @@ describe('GET /api/accounts', () => {
     recordLogin('codex', 0)
     const firstAt = providerSignInFailure('codex')!.reconnectedAt!
     expect(firstAt).toBeGreaterThan(rejectedAt)
+    while (Date.now() <= firstAt) await new Promise(resolve => setTimeout(resolve, 1))
     await listAccounts('codex')
     expect(native).toHaveBeenCalledTimes(1)
     const failure = providerSignInFailure('codex')!

@@ -299,14 +299,16 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         // Same-invocation continuations preserve the failed Call's
         // completedAt through recover(), so the stale stamp would accept a
         // head advance observed before publicationResume. Require progress
-        // after the success settlement for those retries. Later-admission
-        // retries keep the preceding-observation proof (e.g. grey CI success
-        // observed before its settlement).
+        // after the launch that actually succeeds; a verified published head
+        // journaled after that launch but before its success settlement still
+        // counts. Later-admission retries keep the preceding-observation
+        // proof (e.g. grey CI success observed before its settlement).
         const sameInvocation = !!retry && !!success && retry.admissionSequence <= failure.sequence
-        const retryAt = sameInvocation ? success.at : Number(retry?.evidence?.completedAt)
+        const bound = sameInvocation ? (launch ?? success) : undefined
+        const retryAt = bound ? bound.at : Number(retry?.evidence?.completedAt)
         const advanced = retry && success && progress.advances.find(point => {
           if (point.sequence < failure.sequence || point.at < retryAt || point.at < error.at) return false
-          if (sameInvocation && point.sequence < success.sequence) return false
+          if (sameInvocation && bound && point.sequence < bound.sequence) return false
           const observed = rows.filter(row => row.sequence <= point.sequence && row.event.type === 'chain.observed').at(-1)
           return observed?.event.type === 'chain.observed' && retryProven(chain, retry, observed.event.observation as ChainObservation, point.at)
         })
