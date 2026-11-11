@@ -19,6 +19,8 @@ import { installReference } from './reference'
 import { mountFrame, toast } from './shell'
 import { installStates } from './states'
 import { go, startRouter } from './router'
+import { listenOpenChat } from './open-chat'
+import { listenIntents } from './intents'
 import { placeHref } from './address'
 
 // 1. Before anything asks the server: an answer the gateway marks as updating
@@ -49,6 +51,8 @@ installIcons()
   installReference()
   installStylePanel(placeHref('settings', { settings: 'style' }))
   installStates(go)
+  listenOpenChat(go)
+  listenIntents(go)
   initClaudeAuth()
   noticeFeed.start()
   startRouter(placeRoot)

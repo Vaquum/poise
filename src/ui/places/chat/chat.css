@@ -1,0 +1,20 @@
+/* Chat in the new interface (#556): what classic.css does not carry over. */
+
+/* The Switchboard's tones, by the kind of each row (from chat-switchboard.css). */
+#view-chat [data-kind="decision"] { --sb-tone: var(--c-attention); --sb-tint: var(--c-attention-tint); }
+#view-chat [data-kind="blocked"] { --sb-tone: var(--c-failed); --sb-tint: var(--c-failed-tint); }
+#view-chat [data-kind="progress"] { --sb-tone: var(--c-running); --sb-tint: var(--c-running-tint); }
+#view-chat [data-kind="done"] { --sb-tone: var(--c-done); --sb-tint: var(--c-done-tint); }
+#view-chat [data-kind="quiet"] { --sb-tone: var(--c-text-muted); --sb-tint: transparent; }
+
+/* The place: classic's view header and shell fill the area under the frame's top bar. */
+.chat-place { min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); }
+#view-chat { height: calc(100vh - var(--size-topbar) - var(--foot-h)); display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; }
+#view-chat > .view-header { position: static; inset: auto; z-index: auto; height: auto; display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-4); border-bottom: var(--line-hair) solid var(--c-line); background: var(--c-canvas); }
+#view-chat > .chat-shell { min-height: 0; height: 100%; }
+.chat-place > .chat-back { position: absolute; left: var(--sp-4); top: calc(var(--size-topbar) + var(--sp-2)); z-index: var(--z-raise); }
+#view-chat .chat-layout { height: 100%; min-height: 0; }
+
+/* Floating over a narrow chat, the right-hand panes start under the chat's header, so its controls stay in reach. */
+#view-chat .chat-layout { --chat-head-h: 0; }
+@media (max-width: 1000px) { #view-chat .chat-switchboard-pane, #view-chat .chat-memories-pane { top: var(--chat-head-h); } }

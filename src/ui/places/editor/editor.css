@@ -1,0 +1,8 @@
+/* The Editor in the new interface (#556): classic's view under the frame's top bar. */
+.editor-place { min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr); }
+#view-editor { height: calc(100vh - var(--size-topbar) - var(--foot-h)); min-height: 0; overflow: auto; }
+#view-editor > .view-header { position: static; inset: auto; z-index: auto; height: auto; padding: var(--sp-2) var(--sp-4); border-bottom: var(--line-hair) solid var(--c-line); background: var(--c-canvas); }
+.editor-place > .editor-back { position: absolute; left: var(--sp-4); top: calc(var(--size-topbar) + var(--sp-2)); z-index: var(--z-raise); }
+/* The document chat opens beside the document, under the Editor's toolbar, not over it. */
+#view-editor > .view-header { box-sizing: border-box; height: calc(var(--sp-unit) * 12); }
+body:has(#view-editor:not([hidden])) #chat-side-pane { top: calc(var(--size-topbar) + var(--sp-unit) * 12); height: calc(100vh - var(--size-topbar) - var(--sp-unit) * 12 - var(--foot-h)); }
