@@ -455,7 +455,8 @@ on each deployment, so configure them in Actions rather than editing that file.
 **Test relay settings.** To run agents' test suites on disposable boxes
 ([Agents' test suites](#agents-test-suites)), add `POISE_TEST_WORKSPACE` as an
 Actions repository **variable** and `POISE_TEST_RENDER_API_KEY` as an Actions
-repository **secret**, under the same rules as the Google client's pair.
+repository **secret**, under the same rules as the Google client's pair, and
+`POISE_TEST_BASE_SERVICE` as a variable to start suites on jobs.
 
 **Serving the fork's own releases.** Set `POISE_RELEASE_REPO` to the fork,
 as an Actions variable like the settings above. The gateway then serves the
@@ -729,10 +730,11 @@ container and the volume: `docker rm poise-ws-<handle>` and
 
 Agents run the test suites of the repositories they work on, often several at
 once and all on one workspace's CPUs. That can starve Poise itself. Set up as
-below, those suites run on disposable [Render Sandboxes](https://render.com/docs/sandboxes)
-instead, and only the agent's command stays in the workspace: it still prints
-the suite's output and ends with its exit code, as if it had run there. Without
-that setup, suites run in the workspace.
+below, those suites run on disposable test boxes instead: a Render one-off job,
+or a [Render Sandbox](https://render.com/docs/sandboxes), which costs more but has
+Docker, for a suite that reaches for Docker. Only the agent's command stays in the
+workspace: it still prints the suite's output and ends with its exit code, as if it
+had run there. Without that setup, suites run in the workspace.
 
 **What moves.** Poise starts everything with two hooks, on `PYTHONPATH` and
 `NODE_OPTIONS`, so whichever provider's agent asks and however it reaches the
@@ -745,22 +747,35 @@ version or help stays in the workspace, and so do `npm run build`, `dev` and
 are. A command that replaces `PYTHONPATH` or `NODE_OPTIONS` outright, as in
 `PYTHONPATH=src python -m pytest`, removes the hook and runs in the workspace. So
 do runners the hooks don't know, such as `go test` or `cargo test`. The mechanism
-is `scripts/test-offload/`, `gateway/src/test-relay.ts` and `gateway/src/test-box.cjs`.
+is `scripts/test-offload/`, `gateway/src/test-relay.ts`, `gateway/src/test-instance.cjs`
+and `gateway/src/test-box.cjs`.
 
 **What runs.** Exactly what the agent typed, in the same folder, as uid 10001. Agents
 need nothing new, and nothing narrows or skips anything: the repository decides what
 its commands mean, as Poise's `npm test` does with [the essential tests](Testing.md#the-essential-tests).
 A box has one CPU and 2 GB, and Node may use 80% of the memory.
 
-**What a box has.** Docker, running and open to the suite. The tools of the
-workspace image at the same paths: Node 22, `git`, a build toolchain and the
-Chromium of this repository's Playwright. `/tmp` is its own, whatever temporary
-folder the agent has, because that can be too long for a Unix socket made under
-it. `gateway/src/test-box-setup.sh` builds all this once, in about a minute, and
-the gateway keeps the result as a Render snapshot named after that file's
-contents, so a change there builds a new one. Boxes live in a sandbox group of their
-own, one per `POISE_DOMAIN`, so deployments sharing a Render workspace leave each
-other's alone. Nothing else needs setting up.
+**Which box.** A suite starts on a job, a Render one-off job of the workspace image,
+so its tools are the workspace's own at the same paths. A job has no Docker. The
+moment the suite reaches for it there, by the `docker` or `docker-compose` command
+or by the socket `DOCKER_HOST` names (on a job, its own, unless the agent's
+environment names a remote engine), the job ends and the agent's command starts the same captured suite
+again on a sandbox, saying so. The gateway remembers that checkout's history for
+that workspace until it restarts, so the checkout's next suites go to a sandbox at
+once. A suite that only checks whether a `docker` exists stays on the job. Without
+`POISE_TEST_BASE_SERVICE`, every suite goes to a sandbox.
+
+**What a box has.** A job has what the workspace image has, without a sign-in, and
+runs the suite as that image's user, so files of the image's own that a checkout's
+paths also name stay as they are. A sandbox has Docker, running and open to the
+suite, and the tools of the workspace image at the same paths: Node 22, `git`, a
+build toolchain and the Chromium of this repository's Playwright.
+`gateway/src/test-box-setup.sh` builds those once, in about a minute, and the
+gateway keeps the result as a Render snapshot named after that file's contents, so
+a change there builds a new one. Sandboxes live in a sandbox group of their own,
+one per `POISE_DOMAIN`, so deployments sharing a Render workspace leave each
+other's alone. On either, `/tmp` is its own, whatever temporary folder the agent
+has, because that can be too long for a Unix socket made under it.
 
 **What a box gets.** Only what the suite needs, at the same paths: the
 checkout's tracked and untracked files without what git ignores, its
@@ -774,18 +789,19 @@ is refused. A box holds no sign-in, so a test that needs a secret or an ignored
 file fails there. What the suite changes stays on the box and goes with it, so
 update snapshots with the runner on your own machine if you need them back.
 
-**How it dies.** A box is created for one suite and terminated when it ends. That
-happens in each of these cases, and none depends on the others:
+**How it dies.** A box is created for one suite and ended when it ends: a sandbox
+is terminated, a job cancelled. That happens in each of these cases, and none
+depends on the others:
 
-- The suite ends: the gateway passes on its exit code and terminates the box.
+- The suite ends: the gateway passes on its exit code and ends the box.
 - The time limit passes (`POISE_TEST_LIMIT_SECONDS`, nine minutes by default): the
-  gateway terminates the box, and Render ends it a minute later if the gateway
-  could not.
+  gateway ends the box, and a minute later Render ends a sandbox, and `timeout`
+  a job, if the gateway could not.
 - The agent's command is stopped or killed, or stops renewing its lease for 45
-  seconds: the gateway terminates the box.
-- The gateway disappears: Render ends the box at the same time limit. A gateway
-  that restarts terminates every box it finds no run for, and does so again every
-  15 seconds.
+  seconds: the gateway ends the box.
+- The gateway disappears: Render ends a sandbox at the same time limit, and a job
+  ends itself within seconds of its next message going unanswered. A gateway that
+  restarts ends every box it finds no run for, and does so again every 15 seconds.
 
 **When there is no result.** A suite can be too big for its box, by running out of
 memory or passing the time limit, and the box can also fail to start, the checkout
@@ -826,25 +842,40 @@ a new candidate, including for #1039, rather than claim to publish the old one.
 **Where they meet.** A workspace dials the gateway at `/api/link/test-relay` on its
 host. A proxy with a sign-in of its own must let that through without one, as it
 does for Poise Link. Behind your own proxy a workspace dials `POISE_PROXY_LISTEN`
-instead, so that address must be reachable from workspaces. The gateway starts
-each box and passes the checkout and the output between the two. It holds the
+instead, so that address must be reachable from workspaces. A job dials the
+gateway too, at the same path on the workspace's public host, so that must be
+reachable from Render. The gateway starts each box and passes the checkout and the
+output between the two. It holds the
 Render API key, which reaches the whole Render account, so no workspace and no
 box ever does. A workspace presents its own key, which the gateway signs and
 installs for it; an agent can read that key, which lets it start suites and
 nothing else.
 
-**What it costs.** Render charges $0.12 per CPU hour actually used, plus $0.038 an
-hour for the 2 GB, for as long as a box lives, and $0.08 per GB a month for the
+**What it costs.** A job costs its plan's price for as long as it lives: about
+$0.035 an hour for one CPU and 2 GB (`plan-crn-005`), and $1 a month for the cron job
+that holds the image. A sandbox costs $0.12 per CPU hour actually used, plus $0.038
+an hour for the 2 GB, for as long as it lives, and $0.08 per GB a month for the
 snapshot. See [Render's pricing](https://render.com/pricing).
 
 **Setting it up.** Render Sandboxes are in beta and run in Oregon only. Give the
-gateway a Render API key and the ID of the Render workspace, and it does the rest:
+gateway a Render API key and the ID of the Render workspace, and it does the rest
+for sandboxes. To start suites on jobs, which cost less, also create, in a Render
+workspace and region with no other live service, because a job can reach its
+neighbours on Render's private network, a **cron job** named `poise-test-instance`:
+the Docker runtime, this repository, Dockerfile `deploy/runtime/Dockerfile`, build
+context `.`, command `true`, a yearly schedule, auto-deploy off, and no environment
+variables, since each job inherits them. It runs nothing and holds the image. Deploy
+it again when `deploy/runtime/` or Playwright's version changes; an image that lags
+shows as suites failing loudly on a job, not as wrong results. Give the gateway its
+service ID:
 
 | Setting | Required | Default | What it is |
 | --- | --- | --- | --- |
 | `POISE_TEST_RENDER_API_KEY` | yes | | A Render API key. Set both of these, or neither |
 | `POISE_TEST_WORKSPACE` | yes | | The Render workspace's ID, `tea-…` |
-| `POISE_TEST_BOX_PLAN` | | `1c-2g` | The boxes' size |
+| `POISE_TEST_BOX_PLAN` | | `1c-2g` | The sandboxes' size |
+| `POISE_TEST_BASE_SERVICE` | | | The cron job's service ID, `crn-…`: suites then start on its jobs. Unset, every suite goes to a sandbox |
+| `POISE_TEST_PLAN` | | `plan-crn-005` | The jobs' size: one CPU and 2 GB |
 | `POISE_TEST_LIMIT_SECONDS` | | `540` | The time limit, from starting a box to the suite's end; keep it under `BASH_DEFAULT_TIMEOUT_MS` in `server/process.ts` |
 | `POISE_TEST_MAX_RUNS` | | `30` | Suites at once; past it an agent's command fails loudly |
 

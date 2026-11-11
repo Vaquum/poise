@@ -1,4 +1,4 @@
-import { createHash, createPublicKey, sign, randomBytes, verify, type KeyObject } from 'node:crypto'
+import { createHash, createPublicKey, sign, randomBytes, timingSafeEqual, verify, type KeyObject } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Writable } from 'node:stream'
@@ -6,8 +6,9 @@ import type { Logger } from './log.js'
 
 /**
  * Where agents' test suites leave a workspace (docs/Operating.md, "Agents' test suites"). This starts a disposable
- * Render sandbox for each suite, passes the checkout to it and the output back, and destroys it. It holds the Render
- * API key, so no workspace and no box ever does.
+ * test box for each suite, passes the checkout to it and the output back, and destroys it: a Render one-off job of the
+ * workspace image, or a Render sandbox, which costs more but has Docker, for a suite that reaches for Docker. It holds
+ * the Render API key, so no workspace and no box ever does.
  */
 // Under /api/link/ because a proxy with a sign-in of its own already lets that through: like Poise Link, a workspace
 // has no session with it, and the gateway checks the keys itself (docs/Operating.md).
@@ -19,7 +20,12 @@ export interface TestRelayConfig {
   workspace: string
   /** This deployment's name: several may share a Render workspace, and each leaves the others' boxes alone. */
   deployment: string
+  /** The sandboxes' plan. */
   plan: string
+  /** The cron job whose image the one-off jobs run; null sends every suite to a sandbox. */
+  baseService: string | null
+  /** The jobs' plan. */
+  jobPlan: string
   limitSeconds: number
   maxRuns: number
 }
@@ -27,6 +33,8 @@ export interface TestRelayConfig {
 export interface TestRelayDeps {
   config: TestRelayConfig
   privateKey: KeyObject
+  /** The origin a job of this workspace reaches this gateway at. */
+  origin: (handle: string) => string
   log: Logger
   now: () => number
   /** Whether a handle names a workspace whose owner may use it; one removed or disabled since it got its key is refused. */
@@ -43,13 +51,22 @@ export interface TestRelayDeps {
 interface Run {
   id: string
   handle: string
-  spec: { argv: string[]; cwd: string; env: Record<string, string> }
+  /** `repo` names the checkout's history and `docker` asks for a sandbox. */
+  spec: { argv: string[]; cwd: string; env: Record<string, string>; repo?: string; docker?: boolean }
+  /** What a job presents. */
+  token: string
   created: number
   lease: number
+  /** A sandbox's ID, or a job's. */
   boxId: string | null
+  job: boolean
   boxCreated: number
   ready: boolean
   output: ServerResponse | null
+  /** A job's request for the checkout, which the workspace's parts go down. */
+  tree: ServerResponse | null
+  /** The last of a job's numbered output posts that was taken: one retried after a lost answer is not taken twice. */
+  received: number
   parts: number
 }
 
@@ -77,9 +94,17 @@ const SETUP_LIMIT_SECONDS = 30 * 60
 const SNAPSHOT_LIFE_MS = 365 * 24 * 3_600_000
 const SNAPSHOT_RENEW_MS = 7 * 24 * 3_600_000
 const MAX_SPEC_BYTES = 1024 * 1024
+const MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 const MAX_TREE_PART_BYTES = 64 * 1024 * 1024
 const UPLOAD_ATTEMPTS = 3
 const RUN_ID = /^[0-9a-f]{32}$/
+// A job's start command names the relay it reports to, and its run.
+const JOB_OWNER = / (\S+)\/instance ([0-9a-f]{32}) /
+// Fetches and runs test-instance.cjs. Render splits a start command at spaces and mangles quotes, so this has
+// neither, and needs no file in the image: the gateway always serves the matching script.
+const INSTANCE_BOOTSTRAP = 'fetch(process.argv[1]).then(r=>r.text()).then(eval)'
+// What a run that moves to a sandbox ends with; scripts/test-offload/run.mjs starts it again there.
+export const USES_DOCKER = 'this suite uses Docker'
 const GROUP_PREFIX = 'poise-test-boxes'
 const RUNNER_FAILED = 125
 const OUTPUT_TAIL_CHARS = 2_000
@@ -171,6 +196,9 @@ export class TestRelay {
   private readonly renderHeaders: Record<string, string>
   private readonly boxScript: Buffer
   private readonly setupScript: Buffer
+  private readonly instanceScript: Buffer
+  /** The checkouts whose suites reached for Docker, by workspace: theirs go to a sandbox at once. */
+  private readonly dockerRepos = new Set<string>()
   private timer: NodeJS.Timeout | null = null
   private lastRenderSweep = 0
   private base: Promise<{ group: string; snapshot: string }> | null = null
@@ -184,6 +212,7 @@ export class TestRelay {
     this.renderHeaders = { authorization: `Bearer ${deps.config.renderApiKey}`, 'content-type': 'application/json', accept: 'application/json' }
     this.boxScript = readFileSync(new URL('./test-box.cjs', import.meta.url))
     this.setupScript = readFileSync(new URL('./test-box-setup.sh', import.meta.url))
+    this.instanceScript = readFileSync(new URL('./test-instance.cjs', import.meta.url))
   }
 
   /** Starts the sweep, which also ends what an earlier gateway left running, and gets the first box's base ready. */
@@ -218,6 +247,13 @@ export class TestRelay {
     return fetch(`${this.api}/sandboxes/${boxId}/terminate?${this.owner}`, { method: 'POST', headers: this.renderHeaders }).then(
       (response) => { this.deps.log.info('test_relay.box.terminate', { boxId, status: response.status }) },
       (error: unknown) => { this.deps.log.warn('test_relay.box.terminate.failed', { boxId, error: errorMessage(error) }) },
+    )
+  }
+
+  private cancel(jobId: string): Promise<void> {
+    return fetch(`${this.api}/services/${this.deps.config.baseService}/jobs/${jobId}/cancel`, { method: 'POST', headers: this.renderHeaders }).then(
+      (response) => { this.deps.log.info('test_relay.job.cancel', { jobId, status: response.status }) },
+      (error: unknown) => { this.deps.log.warn('test_relay.job.cancel.failed', { jobId, error: errorMessage(error) }) },
     )
   }
 
@@ -344,15 +380,16 @@ export class TestRelay {
   /** Ends a run that will report nothing more. The sweep terminates its box again if this fails. */
   private kill(run: Run, why: string, code = 125): void {
     if (!this.runs.delete(run.id)) return
-    // What an agent or a restart stopped is no failure of the runner.
-    const failure = code !== 143 && why !== 'the gateway restarted' && why !== 'the workspace went away'
+    // What an agent or a restart stopped, or a move to a sandbox, is no failure of the runner.
+    const failure = code !== 143 && why !== 'the gateway restarted' && why !== 'the workspace went away' && why !== USES_DOCKER
     if (failure) this.runFailed(run, why)
     else this.deps.log.info('test_relay.run.killed', { id: run.id, handle: run.handle, boxId: run.boxId, command: commandLabel(run.spec.argv), error: why })
     if (run.output) {
       run.output.write(frame(FRAME.fail, Buffer.concat([Buffer.from([code]), Buffer.from(why)])))
       run.output.end()
     }
-    if (run.boxId) void this.terminate(run.boxId)
+    run.tree?.destroy()
+    if (run.boxId) void (run.job ? this.cancel(run.boxId) : this.terminate(run.boxId))
   }
 
   private async sweep(now: number, withRender: boolean): Promise<void> {
@@ -363,22 +400,64 @@ export class TestRelay {
       else if (now - run.created > limitSeconds * 1000) this.kill(run, `this suite is too big for its test box: it passed the ${limitSeconds} s time limit`, 124)
       else run.output?.write(frame(FRAME.heartbeat))
     }
-    if (!withRender || !this.group) return
-    const listed = (await this.render<{ sandbox: { id: string; createdAt: string } }[]>('GET', `/sandboxes?${this.owner}&sandboxGroupId=${this.group}&status=running&status=creating&limit=100`)).map((item) => item.sandbox)
-    const owned = new Set([...this.runs.values()].map((run) => run.boxId))
-    const grace = this.deps.orphanGraceMs ?? ORPHAN_GRACE_MS
-    // Nothing runs unless a live run wants it: this is also what ends the boxes a restart left behind.
-    for (const box of listed) {
-      if (!owned.has(box.id) && box.id !== this.builder && now - Date.parse(box.createdAt) > grace) void this.terminate(box.id)
+    if (!withRender) return
+    const alive = new Set<string>()
+    if (this.group) {
+      const listed = (await this.render<{ sandbox: { id: string; createdAt: string } }[]>('GET', `/sandboxes?${this.owner}&sandboxGroupId=${this.group}&status=running&status=creating&limit=100`)).map((item) => item.sandbox)
+      const owned = new Set([...this.runs.values()].map((run) => run.boxId))
+      const grace = this.deps.orphanGraceMs ?? ORPHAN_GRACE_MS
+      // Nothing runs unless a live run wants it: this is also what ends the boxes a restart left behind.
+      for (const box of listed) {
+        alive.add(box.id)
+        if (!owned.has(box.id) && box.id !== this.builder && now - Date.parse(box.createdAt) > grace) void this.terminate(box.id)
+      }
     }
-    const alive = new Set(listed.map((box) => box.id))
+    if (this.deps.config.baseService) {
+      const listed = (await this.render<{ job: { id: string; startCommand: string } }[]>('GET', `/services/${this.deps.config.baseService}/jobs?status=pending,running&limit=100`)).map((item) => item.job)
+      // A job names its run in its start command, from the moment it exists.
+      for (const job of listed) {
+        alive.add(job.id)
+        const owner = this.jobRun(job.startCommand)
+        if (owner !== null && !this.runs.has(owner)) void this.cancel(job.id)
+      }
+    }
     const listGrace = this.deps.listGraceMs ?? LIST_GRACE_MS
     for (const run of this.runs.values()) {
-      if (run.boxId && !alive.has(run.boxId) && now - run.boxCreated > listGrace) this.kill(run, `its box ${run.boxId} ended without reporting a result`)
+      const listedHere = run.job ? Boolean(this.deps.config.baseService) : this.group !== null
+      if (run.boxId && listedHere && !alive.has(run.boxId) && now - run.boxCreated > listGrace) this.kill(run, `its box ${run.boxId} ended without reporting a result`)
     }
   }
 
+  /** The run a job of this deployment names; null for a job of another deployment sharing the service, which is that one's to end. */
+  private jobRun(startCommand: string): string | null {
+    const [, relay, run] = JOB_OWNER.exec(startCommand) ?? []
+    const handle = /^https?:\/\/([^./:]+)/.exec(relay ?? '')?.[1]
+    return handle !== undefined && relay === `${this.deps.origin(handle)}${TEST_RELAY_PATH}` ? run : null
+  }
+
   private async provision(run: Run): Promise<void> {
+    if (run.job) await this.startJob(run)
+    else await this.startBox(run)
+  }
+
+  /** The job asks for the checkout once it is up, and that makes the run ready. */
+  private async startJob(run: Run): Promise<void> {
+    const { baseService, jobPlan, limitSeconds } = this.deps.config
+    const relay = `${this.deps.origin(run.handle)}${TEST_RELAY_PATH}`
+    // Ends the job whatever the suite does, and whether or not this gateway still lives. tini as PID 1 reaps what the
+    // suite kills: `timeout` there would not, and a suite checking that a killed process is gone would fail.
+    const startCommand = `tini -- timeout -k 10 ${limitSeconds + 60} node -e ${INSTANCE_BOOTSTRAP} ${relay}/instance ${run.id} ${run.token}`
+    const job = await this.render<{ id: string }>('POST', `/services/${baseService}/jobs`, { startCommand, planId: jobPlan })
+    run.boxId = job.id
+    run.boxCreated = this.deps.now()
+    if (!this.runs.has(run.id)) {
+      void this.cancel(job.id)
+      return
+    }
+    this.deps.log.info('test_relay.run.created', { id: run.id, handle: run.handle, jobId: job.id, command: commandLabel(run.spec.argv) })
+  }
+
+  private async startBox(run: Run): Promise<void> {
     const { limitSeconds } = this.deps.config
     // Ends the box whatever the suite does, and whether or not this gateway still lives.
     const start = ({ group, snapshot }: { group: string; snapshot: string }): Promise<{ id: string }> => this.createBox({ sandboxGroupId: group, snapshotName: snapshot, timeoutSeconds: limitSeconds + 60 })
@@ -410,7 +489,11 @@ export class TestRelay {
       throw new RelayError(400, 'a run names argv, cwd and env')
     }
     const now = this.deps.now()
-    const run: Run = { id: randomBytes(16).toString('hex'), handle, spec, created: now, lease: now, boxId: null, boxCreated: 0, ready: false, output: null, parts: 0 }
+    // A job costs less, and moves its suite to a sandbox once it reaches for Docker; a checkout known to do so goes there at once.
+    const job = this.deps.config.baseService !== null && spec.docker !== true && !this.dockerRepos.has(`${handle} ${spec.repo}`)
+    const run: Run = {
+      id: randomBytes(16).toString('hex'), handle, spec, token: randomBytes(32).toString('hex'), created: now, lease: now, boxId: null, job, boxCreated: 0, ready: false, output: null, tree: null, received: 0, parts: 0,
+    }
     this.runs.set(run.id, run)
     return run
   }
@@ -437,9 +520,28 @@ export class TestRelay {
     }
   }
 
+  private isJob(req: IncomingMessage, run: Run): boolean {
+    const digest = (value: string): Buffer => createHash('sha256').update(value).digest()
+    return run.job && timingSafeEqual(digest(bearer(req)), digest(run.token))
+  }
+
   private async route(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const [resource, id, part] = url.pathname.slice(TEST_RELAY_PATH.length + 1).split('/')
+    if (req.method === 'GET' && resource === 'instance' && this.deps.config.baseService) {
+      if (!id) res.writeHead(200, { 'content-type': 'text/javascript' }).end(this.instanceScript)
+      else if (id === 'box') res.writeHead(200, { 'content-type': 'text/javascript' }).end(this.boxScript)
+      else throw new RelayError(404, 'There is nothing at this address.')
+      return
+    }
     if (resource !== 'runs') throw new RelayError(404, 'There is nothing at this address.')
+    const fromJob = (req.method === 'GET' && (part === 'spec' || part === 'tree')) || (req.method === 'POST' && (part === 'output' || part === 'docker'))
+    if (fromJob) {
+      const run = RUN_ID.test(id ?? '') ? this.runs.get(id) : undefined
+      // Unknown and ended look alike to a job, which stops at this answer.
+      if (!run || !this.isJob(req, run)) throw new RelayError(410, 'this run is over')
+      await this.fromJob(req, res, url, run, part)
+      return
+    }
     const handle = this.presentedHandle(req)
     if (handle === null) throw new RelayError(401, 'this key is not a workspace\'s')
 
@@ -464,6 +566,12 @@ export class TestRelay {
     } else if (req.method === 'POST' && part === 'lease') {
       run.lease = this.deps.now()
       res.writeHead(204).end()
+    } else if (req.method === 'POST' && part === 'tree' && run.job) {
+      const tree = run.tree
+      if (!tree) throw new RelayError(409, 'the test box is not ready')
+      for await (const chunk of req) await write(tree, chunk as Buffer)
+      if (url.searchParams.get('end') === '1') tree.end()
+      res.writeHead(204).end()
     } else if (req.method === 'POST' && part === 'tree') {
       await this.receiveTree(req, url, run)
       res.writeHead(204).end()
@@ -472,6 +580,41 @@ export class TestRelay {
       res.writeHead(204).end()
     } else {
       throw new RelayError(404, 'There is nothing at this address.')
+    }
+  }
+
+  private async fromJob(req: IncomingMessage, res: ServerResponse, url: URL, run: Run, part: string): Promise<void> {
+    if (part === 'spec') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(run.spec))
+    } else if (part === 'tree') {
+      startStream(res)
+      run.tree = res
+      run.ready = true
+      run.output?.write(frame(FRAME.ready))
+    } else if (part === 'docker') {
+      if (run.spec.repo) this.dockerRepos.add(`${run.handle} ${run.spec.repo}`)
+      res.writeHead(204).end()
+      this.kill(run, USES_DOCKER)
+    } else {
+      const body = await readLimited(req, MAX_OUTPUT_BYTES)
+      const seq = Number(url.searchParams.get('seq'))
+      if (!(seq > run.received)) {
+        res.writeHead(204).end()
+        return
+      }
+      run.received = seq
+      // A run that was ended has ended its response too, and writing to that would bring down the gateway.
+      if (this.runs.has(run.id) && run.output && body.length) await write(run.output, body)
+      if (url.searchParams.get('end') === '1' && this.runs.delete(run.id)) {
+        const code = Number(url.searchParams.get('exit'))
+        const noResult = url.searchParams.get('why')
+        if (noResult) this.runFailed(run, noResult)
+        this.deps.log.info('test_relay.run.finished', {
+          id: run.id, handle: run.handle, jobId: run.boxId, command: commandLabel(run.spec.argv), exit: code, seconds: Math.round((this.deps.now() - run.created) / 1000),
+        })
+        run.output?.end()
+      }
+      res.writeHead(204).end()
     }
   }
 

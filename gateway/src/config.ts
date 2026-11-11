@@ -261,12 +261,18 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>>): C
   if ((renderApiKey === undefined) !== (workspace === undefined)) {
     problems.push('POISE_TEST_RENDER_API_KEY and POISE_TEST_WORKSPACE must be set together, or both left unset')
   }
+  const baseService = read('POISE_TEST_BASE_SERVICE')
+  if (baseService !== undefined && workspace === undefined) {
+    problems.push('POISE_TEST_BASE_SERVICE needs POISE_TEST_RENDER_API_KEY and POISE_TEST_WORKSPACE: a suite that reaches for Docker moves to a sandbox')
+  }
   const testRelay = renderApiKey !== undefined && workspace !== undefined
     ? {
       renderApiKey,
       workspace,
       deployment: domain,
       plan: read('POISE_TEST_BOX_PLAN') ?? '1c-2g',
+      baseService: baseService ?? null,
+      jobPlan: read('POISE_TEST_PLAN') ?? 'plan-crn-005',
       limitSeconds: wholeNumber('POISE_TEST_LIMIT_SECONDS', 540),
       maxRuns: wholeNumber('POISE_TEST_MAX_RUNS', 30),
     }
