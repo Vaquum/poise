@@ -225,6 +225,11 @@ without another process error. The existing sign-in notice stays until the
 monitor verifies recovery with its canary. Status JSON must contain a boolean
 `loggedIn`; unrecognized output (including exit 0), other exit-1 failures,
 start failures and timeouts remain diagnostic errors.
+The live canary owns its failure diagnostic, retaining a fixed recognized reason
+from bounded probe evidence, or `cause unavailable`, with the process outcome.
+It retains no provider output. Unchanged reason/outcome repeats are suppressed;
+a changed cause or outcome, or a recurrence after successful live verification,
+is retained again. This recognition changes neither readiness nor retry policy.
 
 The gateway retains its separate central `logging.db` in `poise-gateway-data`.
 Existing volume backup/restore snapshots it with the other SQLite databases.

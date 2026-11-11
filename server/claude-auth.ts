@@ -8,7 +8,7 @@ import {
 } from './process'
 import { canaryClaudeModel, loadCatalog } from './models'
 import { HttpError } from './http'
-import { diagnosticFailure } from './logging'
+import { diagnostic, diagnosticFailure } from './logging'
 
 export const CLAUDE_AUTH_POLL_MS = 60_000
 export const CLAUDE_AUTH_LOGIN_TIMEOUT_MS = 10 * 60_000
@@ -176,6 +176,31 @@ function isQuotaExhaustion(error: unknown): boolean {
     || /out of[^\n]{0,20}credits?/i.test(text)
 }
 
+function liveFailureDiagnostic(error: unknown) {
+  const fields = error && typeof error === 'object' ? error as Record<string, unknown> : {}
+  // Recognition is diagnostic-only. Never retain the provider text or feed
+  // these descriptions into the auth/quota classifiers.
+  const text = ['message', 'stderr', 'stdout'].map((key) => {
+    const value = fields[key]
+    return typeof value === 'string' ? value.slice(0, MAX_AUTH_OUTPUT_BYTES)
+      : Buffer.isBuffer(value) ? value.subarray(0, MAX_AUTH_OUTPUT_BYTES).toString('utf8') : ''
+  }).join('\n')
+  let reason = 'cause unavailable'
+  if (/\bmonthly\s+spend(?:ing)?\s+limit\b/i.test(text)) reason = 'monthly spend limit reached'
+  else if (/\brate[_ -]limit(?:_error)?\b|\busage[_ -]limit\b|\bquota (?:exhausted|exceeded)\b/i.test(text)) reason = 'quota or rate limit reached'
+  else if (/\bauthentication_error\b|\boauth token (?:has )?expired\b|\binvalid (?:x-)?api[- ]?key\b/i.test(text)) reason = 'authentication rejected'
+  else if (/\bbad gateway\b|\bservice unavailable\b|\bgateway timeout\b|\boverloaded_error\b/i.test(text)) reason = 'provider unavailable'
+  return {
+    level: 'error', operation: 'claude.auth.verify',
+    message: `Claude subscription verification failed: ${reason}.`,
+    exitCode: typeof fields.code === 'number' ? fields.code : null,
+    signal: typeof fields.signal === 'string' ? fields.signal : null,
+    errno: typeof fields.errno === 'string' || typeof fields.errno === 'number' ? fields.errno : null,
+    timeoutMs: LIVE_TIMEOUT_MS,
+    context: { code: typeof fields.code === 'string' ? fields.code : null, killed: fields.killed === true },
+  }
+}
+
 async function defaultCanaryModel(): Promise<{ selector: string, effort: string }> {
   const model = canaryClaudeModel(await loadCatalog())
   if (!model) throw new Error('the model catalog names no Claude model for the sign-in check')
@@ -205,6 +230,7 @@ export class ClaudeAuthMonitor {
   private stopped = false
   private liveFailureCount = 0
   private nextLiveAttemptAtMs: number | null = null
+  private lastLiveFailure: string | null = null
 
   constructor(options: ClaudeAuthMonitorOptions = {}) {
     this.run = options.runFile ?? defaultRunFile
@@ -534,6 +560,7 @@ export class ClaudeAuthMonitor {
           timeoutMs: LIVE_TIMEOUT_MS,
           maxOutputBytes: MAX_AUTH_OUTPUT_BYTES,
           signal,
+          reportFailure: false,
         },
       )
       if (generation === this.stateGeneration) {
@@ -541,9 +568,15 @@ export class ClaudeAuthMonitor {
         this.status = 'authenticated'
         this.liveFailureCount = 0
         this.nextLiveAttemptAtMs = null
+        this.lastLiveFailure = null
       }
     } catch (error) {
       if (generation === this.stateGeneration) {
+        if (!signal.aborted) {
+          const failure = liveFailureDiagnostic(error)
+          const signature = JSON.stringify(failure)
+          if (signature !== this.lastLiveFailure && diagnostic(failure)) this.lastLiveFailure = signature
+        }
         if (isDefinitiveAuthFailure(error)) {
           this.status = 'reauth_required'
           this.authMethod = null
