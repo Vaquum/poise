@@ -7,9 +7,9 @@ import { tmpdir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { parse } from 'yaml'
-import { callerAffected, drawsFullRun, failedTests, failureReport, reusableRun, selectTests, selectUnitTests, verify } from '../.github/workflows/ci.mjs'
+import { browserShards, callerAffected, drawsFullRun, failedTests, failureReport, reusableRun, selectTests, selectUnitTests, verify } from '../.github/workflows/ci.mjs'
 
-const core = ['independent-startup', 'service-mode', 'smoke'].map(name => `tests/e2e/${name}.spec.ts`)
+const core = ['independent-startup', 'service-mode', 'smoke', 'ui-frame'].map(name => `tests/e2e/${name}.spec.ts`)
 const browsers = [...core, 'tests/e2e/swarm-loading.spec.ts', 'tests/e2e/swarm-pagination.spec.ts', 'tests/e2e/analytics.spec.ts', 'tests/e2e/settings-save.spec.ts', 'tests/e2e/chat.spec.ts', 'tests/e2e/notices.spec.ts']
 const select = (paths, event = 'pull_request') => selectTests(event, paths, browsers)
 const ciScript = resolve('.github/workflows/ci.mjs')
@@ -31,6 +31,29 @@ describe('what runs every time', () => {
     })
     expect(select(['src/analytics-history.ts', 'src/settings-save.ts'], event).browserFiles)
       .toEqual(expect.arrayContaining(['tests/e2e/analytics.spec.ts', 'tests/e2e/settings-save.spec.ts']))
+  })
+
+  it("runs a place's own specs when the new interface's place changes, and only the core journeys for its frame", () => {
+    const places = ['ui-board', 'ui-chat', 'ui-chat-queue', 'ui-editor-chat', 'ui-article-reviews', 'ui-overview', 'ui-observe', 'ui-settings'].map(name => `tests/e2e/${name}.spec.ts`)
+    const run = path => selectTests('pull_request', [path], [...browsers, ...places]).browserFiles.filter(file => !core.includes(file)).map(file => file.slice(10, -8))
+    expect(run('src/ui/places/chat/view.ts')).toEqual(['ui-chat-queue', 'ui-chat'])
+    expect(run('src/ui/places/manager.ts')).toEqual(['ui-chat-queue', 'ui-chat'])
+    expect(run('src/ui/places/editor/classic.css')).toEqual(['ui-article-reviews', 'ui-editor-chat'])
+    expect(run('src/ui/places/board.css')).toEqual(['ui-board'])
+    expect(run('src/ui/places/overview/tiles.ts')).toEqual(['ui-overview'])
+    expect(run('src/ui/places/observe.ts')).toEqual(['ui-observe'])
+    expect(run('src/ui/places/settings/rows.ts')).toEqual(['ui-settings'])
+    expect(run('src/ui/setup/onboarding.ts')).toEqual(['ui-settings'])
+    expect(run('src/ui/shell.ts')).toEqual([])
+  })
+
+  it('splits selected browser tests into shards of about 80, up to a full run', () => {
+    const tests = count => '\n'.repeat(2) + "test('x', () => {})\n  test('y', () => {})\n".repeat(count / 2)
+    expect(browserShards([], () => '')).toEqual([1])
+    expect(browserShards(['a', 'b'], file => tests(file === 'a' ? 40 : 40))).toEqual([1])
+    expect(browserShards(['a', 'b'], file => tests(file === 'a' ? 80 : 2))).toEqual([1, 2])
+    expect(browserShards(['a'], () => `${tests(160)}test.describe('d', () => {})\n// test(\n`)).toEqual([1, 2])
+    expect(browserShards(['a'], () => tests(2000))).toEqual([1, 2, 3, 4, 5, 6])
   })
 
   it('includes edited browser regressions alongside the core journeys', () => {
@@ -221,6 +244,8 @@ describe('how CI and the commands reach the choice', () => {
     expect(step('plan', 'Fetch comparison base').if).toContain("'merge_group'")
     expect(ci.jobs.plan.outputs.unit_files).toContain('steps.plan.outputs.unit_files')
     expect(step('unit', 'Run unit and integration shard with timings').env.CI_UNIT_FILES).toContain('needs.plan.outputs.unit_files')
+    expect(step('browser', 'Run browser shard against the production build').env).toMatchObject({
+      CI_TEST_SHARD: '${{ matrix.shard }}', CI_TEST_SHARDS: '${{ strategy.job-total }}' })
   })
 
   it('never lets a merge cancel a full run here, and leaves a fork superseding its pushes', () => {
@@ -566,6 +591,7 @@ describe('the commands that run the tests', () => {
     await ci(repo.root, ['unit'], { ...shard, GITHUB_EVENT_NAME: 'workflow_dispatch', CI_TEST_MODE: 'full' }, { path: npm.path })
     await ci(repo.root, ['browser'], { ...shard, GITHUB_EVENT_NAME: 'push', CI_TEST_MODE: 'full' }, { path: npm.path })
     await ci(repo.root, ['browser'], { ...shard, GITHUB_EVENT_NAME: 'merge_group', CI_TEST_MODE: 'essential', CI_BROWSER_FILES: JSON.stringify(core) }, { path: npm.path })
+    await ci(repo.root, ['browser'], { CI_TEST_SHARD: '2', CI_TEST_SHARDS: '3', GITHUB_EVENT_NAME: 'pull_request', CI_TEST_MODE: 'essential', CI_BROWSER_FILES: JSON.stringify(core) }, { path: npm.path })
     const reporters = '--maxWorkers=1 --reporter=default --reporter=json --outputFile=test-results/vitest.json'
     expect(npm.calls()).toEqual([
       `run test:full -- --shard=1/1 ${reporters} tests/guard.test.ts`,
@@ -574,7 +600,17 @@ describe('the commands that run the tests', () => {
       `run test:full -- --shard=1/2 ${reporters} --retry=1`,
       'run test:e2e:full -- --shard=1/6 --workers=1',
       `run test:e2e:full -- --shard=1/1 --workers=1 ${core.join(' ')}`,
+      `run test:e2e:full -- --shard=2/3 --workers=1 ${core.join(' ')}`,
     ])
+  })
+
+  it('refuses a browser shard outside its run', async () => {
+    const npm = fakeNpm()
+    for (const [shard, shards] of [['3', '2'], ['1', '7'], ['1', 'x']]) {
+      const { code } = await ci(repo.root, ['browser'], { CI_TEST_SHARD: shard, CI_TEST_SHARDS: shards, GITHUB_EVENT_NAME: 'pull_request', CI_TEST_MODE: 'essential', CI_BROWSER_FILES: JSON.stringify(core) }, { path: npm.path })
+      expect(code, `${shard}/${shards}`).not.toBe(0)
+    }
+    expect(npm.calls()).toEqual([])
   })
 
   it('refuses a planned file list it cannot trust', async () => {

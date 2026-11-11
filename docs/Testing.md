@@ -36,15 +36,19 @@ Agents, PR checks and merge-queue candidates run the same set, which
   not edit it.
 - Any test the change edits, and any test that directly imports a changed file.
   One step only: following imports further selects most of the suite.
-- The core browser journeys (`smoke`, `service-mode`, `independent-startup`),
-  any spec the change edits, and the browser suites mapped to a changed frontend
-  area. A path outside those areas adds no browser suite.
+- The core browser journeys (`smoke`, `service-mode`, `independent-startup`,
+  and `ui-frame` for the new interface), any spec the change edits, and the
+  browser suites mapped to a changed frontend area. Each place of the new
+  interface (`src/ui/places/`, and setup) maps to its own `ui-` specs. A path
+  outside those areas adds no browser suite.
 
-CI compares a PR or queue candidate with its base and uses one unit and one
-browser shard. Locally the comparison is with `origin/main`, including
-uncommitted and untracked work, and the command stops with a message if it
-cannot reach `origin/main`. While `main` is being merged in, the comparison is
-with its side, so what it brings does not count as the change.
+CI compares a PR or queue candidate with its base and uses one unit shard,
+and one browser shard for about every 80 selected browser tests, up to six, so
+the browser tests finish beside the unit tests. Locally the comparison is with
+`origin/main`, including uncommitted and untracked work, and the command
+stops with a message if it cannot reach `origin/main`. While `main` is being
+merged in, the comparison is with its side, so what it brings does not count as
+the change.
 
 A change to dependencies, test or build configuration, CI or
 `tests/essential.txt` runs everything in CI, because it can change what every
@@ -100,7 +104,7 @@ fork.
 ### How CI runs them
 
 A full run has independent lint/types/audit and production-build jobs, two
-unit/integration shards and four Chromium shards. Browser shards consume the
+unit/integration shards and six Chromium shards. Browser shards consume the
 same run's build artifact without rebuilding it. Each owns its runner, server,
 databases and fixtures, and retains one browser worker because some real-API
 fixtures share server state within a shard. The queue admits at most two

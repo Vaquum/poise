@@ -618,7 +618,7 @@ caller/.venv/bin/python -m pytest caller/agent_interface/tests caller/github_int
 ```
 
 CI uses Node 22 for every Poise gate: lint/types/audit, production build, two
-unit/integration shards and four Chromium shards. Browser shards reuse the
+unit/integration shards and six Chromium shards. Browser shards reuse the
 production build. `Verify (Node 22)` requires every job to pass. Per-shard timing
 reports support profiling; see [Testing](docs/Testing.md). The Caller workflow
 runs Caller's tests on Python 3.13.
