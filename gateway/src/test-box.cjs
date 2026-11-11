@@ -22,6 +22,9 @@ const OUTPUT_TAIL_CHARS = 64 * 1024
 const QUIET_MS = 2_000
 const DOCKER_WAIT_MS = 30_000
 const HEAP_SHARE = 0.8
+// A job is the workspace image already, whose files and folders its user may not replace, and needs not. GNU tar's
+// --skip-old-files leaves them, folders' modes included, and refuses --no-overwrite-dir beside it.
+const JOB_UNPACK = ['--skip-old-files']
 
 function fail(why) {
   process.stderr.write(`[poise] no test result: ${why}. This says nothing about your code. Skip local tests for this work: don't retry, and don't run parts of it. Push your change and let CI run the tests.\n`, () => process.exit(RUNNER_FAILED))
@@ -77,8 +80,7 @@ function suiteEnvironment(spec) {
 function unpack(whole) {
   return new Promise((resolve) => {
     let errors = ''
-    // A job is the workspace image already, whose folders and files its user may not replace, and needs not.
-    const keep = asJob && onBox ? ['--skip-old-files', '--no-overwrite-dir'] : []
+    const keep = asJob && onBox ? JOB_UNPACK : []
     const tar = spawn('tar', ['-xzf', whole, '-C', root, '--no-same-owner', ...keep], { stdio: ['ignore', 'ignore', 'pipe'], ...asUser })
     tar.stderr.on('data', (chunk) => { errors = (errors + chunk).slice(-300) })
     tar.once('error', (error) => resolve(error.message))
@@ -140,4 +142,6 @@ async function main() {
   runSuite(spec, env)
 }
 
-main().catch((error) => fail(error.message))
+// Started as a script on a box; tests require it for what it unpacks with.
+if (require.main === module) main().catch((error) => fail(error.message))
+module.exports = { JOB_UNPACK }

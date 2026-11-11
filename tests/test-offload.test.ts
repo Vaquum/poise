@@ -1496,6 +1496,28 @@ ${stderr}`
   })
 })
 
+describe('a job unpacking', () => {
+  // A job is the workspace image, whose tar is GNU's; elsewhere its flags mean nothing.
+  const gnuTar = spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout?.includes('GNU tar') ?? false
+
+  it.runIf(gnuTar)('unpacks with flags GNU tar takes, and leaves what is already there', () => {
+    const { JOB_UNPACK } = createRequire(import.meta.url)('../gateway/src/test-box.cjs') as { JOB_UNPACK: string[] }
+    const from = temp()
+    const to = temp()
+    mkdirSync(join(from, 'dir'))
+    writeFileSync(join(from, 'dir', 'new'), 'sent')
+    writeFileSync(join(from, 'dir', 'kept'), 'sent')
+    execFileSync('tar', ['-czf', join(from, 'tree.tgz'), '-C', from, 'dir'])
+    mkdirSync(join(to, 'dir'))
+    writeFileSync(join(to, 'dir', 'kept'), 'the image\'s')
+    const result = spawnSync('tar', ['-xzf', join(from, 'tree.tgz'), '-C', to, '--no-same-owner', ...JOB_UNPACK], { encoding: 'utf8' })
+    expect(result.stderr).toBe('')
+    expect(result.status).toBe(0)
+    expect(readFileSync(join(to, 'dir', 'new'), 'utf8')).toBe('sent')
+    expect(readFileSync(join(to, 'dir', 'kept'), 'utf8')).toBe('the image\'s')
+  })
+})
+
 describe('what a box starts from', () => {
   it('has the Chromium this repository\'s Playwright expects', () => {
     const lock = JSON.parse(readFileSync('package-lock.json', 'utf8')) as { packages: Record<string, { version: string }> }
