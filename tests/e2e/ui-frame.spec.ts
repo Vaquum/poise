@@ -156,6 +156,7 @@ test('Motion off reaches the motion runtime; Copy as CSS says whether it copied;
 test('the bell counts what needs you and opens Answer here with a route back', async ({ page }) => {
   const at = new Date().toISOString()
   const notice = (id: string) => ({ id, kind: 'pr_ready', title: `acme/site#${id} is ready to merge`, body: 'Checks passed.', since: at, due: at, silenceable: true, target: null })
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
   await open(page, '/?view=board', { notices: [notice('1'), notice('2')] })
   const bell = page.getByRole('button', { name: /^Notifications/ })
   await expect(bell.locator('[data-bell]')).toHaveText('2')
