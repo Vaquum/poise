@@ -231,6 +231,58 @@ it('preserves actual review identities, responses and times after an external me
   expect(decideBehaviorChain(reviewed, observation, Date.now())).toMatchObject({ kind: 'hold' })
 })
 
+it('discovers a verified external merge for a closed held seed without binding or publishing a PR', async () => {
+  vi.useFakeTimers(); vi.setSystemTime(Date.parse('2026-11-11T00:00:00Z'))
+  const db = new Database(':memory:')
+  const journal = new BehaviorChainJournal(db)
+  let current = journal.append(chain.id, 'seed', 0, { type: 'chain.admitted', repository: chain.repository,
+    issue: chain.issue, branch: chain.branch, author: chain.author, reviewer: chain.reviewer })
+  const closureHold = 'seed issue closed without a confirmed merged pull request'
+  current = journal.append(current.id, 'held', current.sequence, { type: 'chain.held', reason: closureHold })
+  let mode = 'unmatched'
+  mocks.runFile.mockImplementation(async (command: string, argv: string[]) => {
+    expect(command).toBe('github-interface')
+    return { stdout: execFileSync('python3', ['tests/fixtures/closed-seed-merge.py'], {
+      input: JSON.stringify({ argv, mode }), encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, PYTHONPATH: [resolve('caller/github_interface'), process.env.PYTHONPATH].filter(Boolean).join(':') },
+    }) }
+  })
+  const effect = vi.fn(async () => { throw new Error('closed seed must not start work or publication') })
+  const native = actionOperations()
+  const operations: ChainRuntimeOperations = { ...native, discover: async () => [],
+    readInvocations: async () => ({ entries: [], quarantined: [] }), request: effect, launch: effect,
+    perform: effect, resumePublication: effect, fenceClosedTarget: effect }
+  const runtime = new BehaviorChainRuntime(journal, operations)
+  const due = () => vi.setSystemTime(Math.max(Date.now(), journal.reconciliationAt(journal.read(chain.id)!)!))
+  try {
+    for (mode of ['unmatched', 'unmerged', 'wrong-repository', 'wrong-branch', 'ambiguous']) {
+      due()
+      await runtime.run()
+      expect(journal.read(chain.id)).toMatchObject({ mergeSha: null, held: closureHold, invocations: [],
+        observation: { issue: { open: false }, pull: null, publication: { pull_number: null, head_sha: null } } })
+    }
+    for (mode of ['incomplete', 'unavailable', 'missing-sha', 'contradictory']) {
+      due()
+      await expect(runtime.run()).rejects.toThrow('behavior observation failed for example/repo#7')
+      expect(journal.read(chain.id)).toMatchObject({ mergeSha: null, held: closureHold, invocations: [] })
+    }
+    mode = 'verified'; due()
+    await runtime.run()
+    const reconciled = journal.read(chain.id)!
+    expect(reconciled).toMatchObject({ mergeSha: 'd'.repeat(40), reviewPending: true, invocations: [],
+      held: expect.stringContaining('original pre-merge review basis is missing'),
+      observation: { publication: { pull_number: null, head_sha: null, head_invocation: null },
+        pull: { number: 21, head: HEAD, merged: true, mergeSha: 'd'.repeat(40) } } })
+    expect(journal.history(chain.id).map(row => JSON.parse(row.payload)).filter(event => event.type === 'chain.merged'))
+      .toEqual([{ type: 'chain.merged', mergeSha: 'd'.repeat(40), evidence: { repository: chain.repository,
+        pull_number: 21, merged: true, merge_sha: 'd'.repeat(40), review_complete: false } }])
+    journal.rebuild()
+    await new BehaviorChainRuntime(journal, operations).run()
+    expect(journal.read(chain.id)).toEqual(reconciled)
+    expect(effect).not.toHaveBeenCalled()
+  } finally { db.close(); vi.useRealTimers() }
+}, 30_000)
+
 it.each([
   { blockers: [], mergeable: true, expected: 'approve-pr' },
   { blockers: ['merge_state_not_clean'], mergeable: true, expected: 'repair-pr' },

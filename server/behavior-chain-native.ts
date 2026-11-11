@@ -207,7 +207,7 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
         observation.reviewPublication = { callId: pendingReview.evidence.callId, planSha: String(artifact.plan_sha), complete: receipts.length === plan.posts.length,
           issueRevision: plan.issue_revision, receipts }
       }
-      const number = observation.publication.pull_number
+      let number = observation.publication.pull_number
       if (number === null && observation.issue.open && !observation.publication.head_sha) {
         await runDatastoreHealth(org, { timeoutMs: 30_000 }, ['implement-issue'])
         const { stdout } = await runFile('github-datastore', organizationArgs(org,
@@ -239,6 +239,9 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
           }
         }
       }
+      const external = number === null && !observation.issue.open && seed.external_merge
+        ? object(seed.external_merge, 'external merge') : null
+      if (external) number = positive(external.pull_number, 'external merge')
       if (number === null) return observation
       const interruptedWork = chain.invocations.find((invocation) => invocation.state === 'uncertain' && invocation.behavior === 'repair-pr'
         && typeof invocation.evidence?.callId === 'string' && invocation.evidence.artifact)
@@ -258,6 +261,10 @@ export function nativeChainOperations(org: Organization, hooks: NativeChainHooks
       const reviewer = ['--token-user', chain.reviewer]
       const state = await github(chain.repository, ['--pull-action-state', String(number), '--queue-evidence', ...reviewer])
       if (state.pull_number !== number || !['open', 'closed'].includes(String(state.state))) throw new Error('native pull state is incomplete')
+      if (external && (state.state !== 'closed' || state.merged !== true
+        || sha(state.merge_sha, 'merged pull') !== sha(external.merge_sha, 'external merge'))) {
+        throw new Error('external merge differs from its closing PR evidence')
+      }
       const head = sha(state.head_sha, 'pull state')
       const uncertainGrey = chain.invocations.find((invocation) => invocation.behavior === 'rerun-grey-ci' && invocation.state === 'uncertain')
       if (uncertainGrey) {

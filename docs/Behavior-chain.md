@@ -10,6 +10,10 @@ Merge and queue admission revalidate the retained response against the current
 PR and its published review while preserving the normal CI and thread gates.
 A confirmed external merge is recorded separately: without qualifying pre-merge
 review evidence its review obligation remains open through journal recovery.
+A closed seed without a bound PR also discovers exactly one merged GitHub closing
+reference on the expected base repository and default branch, confirming its merge
+SHA through the normal PR read. Missing, ambiguous or contradictory evidence keeps
+the closure hold; discovery grants no publication ownership or new invocation.
 
 After a confirmed merge, review reconciliation uses the last canonical
 pre-merge observation recorded before both the actual merge time and the first
