@@ -408,3 +408,28 @@ it('counts a grey-CI recovery whose verified CI success precedes its settlement'
   expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#12'])
   expect(report.recovery.unknown).toBe(0)
 })
+
+it('counts failed native_publication Calls stored under publicationReceipt', async () => {
+  const f = setup()
+  const nativeCall = 'd'.repeat(32)
+  const failedReceipt = { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+    error_code: 'authentication_failed', error: 'Refresh credential rejected',
+    completedAt: NOW - 3 * HOUR, callId: nativeCall }
+  const template = f.fail(f.seed(9), 'template', NOW - 4 * HOUR)
+  const invocation = template.invocations[0]
+  expect(workError(template, { ...invocation, evidence: { publicationReceipt: failedReceipt } } as unknown as ChainInvocation))
+    .toMatchObject({ callId: nativeCall, at: NOW - 3 * HOUR })
+  expect(workError(template, { ...invocation, evidence: { status: 'completed', publicationReceipt: { ...failedReceipt, status: 'completed' } } } as unknown as ChainInvocation))
+    .toBeNull()
+  let chain = f.seed(1)
+  const id = chainBasis(`${chain.id}:publication-fail`).slice(0, 32)
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { id, behavior: 'review-issue', actor: 'reviewer', slot: 'primary',
+    basis: 'issue', model: 'fixture', admittedAt: NOW - 4 * HOUR, request: { command: 'agent-interface', argv: [], cwd: '/fixture' } } }, NOW - 4 * HOUR)
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: { publicationReceipt: failedReceipt } }, NOW - 3 * HOUR)
+  chain = f.observe(chain, NOW - HOUR, NOW - HOUR)
+  chain = f.append(chain, { type: 'chain.merged', mergeSha: MERGE,
+    evidence: { repository: chain.repository, pull_number: chain.issue + 100, merged: true, merge_sha: MERGE, review_complete: false } }, NOW - HOUR)
+  const report = await f.read()
+  expect(report.rate).toMatchObject({ completed: 1, errors: 1, perItem: 1 })
+  expect(report.lastError.error).toMatchObject({ work: chain.id, callId: nativeCall, at: NOW - 3 * HOUR })
+})

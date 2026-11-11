@@ -48,9 +48,22 @@ function journalHref(id: string, sequence = 1): string {
 }
 
 /** Failures count by the same incident identity as Logging, regardless of severity.
- * Successful preparation warnings and routine/no-effect outcomes are excluded. */
+ * Successful preparation warnings and routine/no-effect outcomes are excluded.
+ * Reconciled `native_publication` failures arrive nested as `publicationReceipt`. */
+function failureRecord(evidence: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return null
+  if (evidence.status === 'failed' || evidence.nativeCallStatus === 'failed') return evidence
+  const nested = evidence.publicationReceipt
+  if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+    const record = nested as Record<string, unknown>
+    if (record.status === 'failed' || record.nativeCallStatus === 'failed') return record
+  }
+  return null
+}
+
 export function workError(chain: BehaviorChain, invocation: ChainInvocation): WorkError | null {
-  const evidence = invocation.evidence
+  const evidence = failureRecord(invocation.evidence as Record<string, unknown> | null | undefined)
+    ?? (invocation.evidence as Record<string, unknown> | null | undefined)
   const callId = typeof evidence?.callId === 'string' ? evidence.callId
     : typeof evidence?.nativeCallId === 'string' ? evidence.nativeCallId : invocation.callId
   const failed = evidence?.status === 'failed' || (evidence as Record<string, unknown> | null)?.nativeCallStatus === 'failed'
@@ -244,8 +257,7 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
       for (const error of errors) {
         const failed = chain.invocations.find(invocation => invocation.id === error.invocation)!
         const failure = rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
-          && row.event.invocationId === failed.id && (row.event.evidence.status === 'failed'
-            || (row.event.evidence as Record<string, unknown> | null)?.nativeCallStatus === 'failed'))
+          && row.event.invocationId === failed.id && failureRecord(row.event.evidence as Record<string, unknown> | null) !== null)
         if (!failure) continue
         const retry = chain.invocations.find(invocation => invocation.admissionSequence > failure.sequence
           && invocation.behavior === failed.behavior && invocation.basis === failed.basis && invocation.slot === failed.slot
