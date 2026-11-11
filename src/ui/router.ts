@@ -28,7 +28,7 @@ const PLACES: Record<Place, () => Promise<PlaceModule>> = {
   board: () => import('./places/board'),
   chat: () => import('./places/chat'),
   manager: () => import('./places/manager'),
-  editor: () => import('./places/placeholder'),
+  editor: () => import('./places/editor'),
   observe: () => import('./places/observe'),
   settings: () => import('./places/placeholder'),
 }

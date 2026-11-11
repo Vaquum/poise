@@ -221,3 +221,5 @@
 .bside-tl .tl .k { font-weight: var(--fw-strong); color: var(--c-text); }
 /* A card that offers Assign keeps its state row clear: its actions show at the top. */
 .card:has(.card-state .card-assign) .card-acts { bottom: auto; top: var(--sp-1); }
+/* A card's chat opens beside the board, on its right, as the mock's side pane does. */
+body:has([data-place-root][data-place="board"]) #chat-side-pane { left: auto; right: 0; height: calc(100vh - var(--size-topbar) - var(--foot-h)); border-right: 0; border-left: var(--line-hair) solid var(--c-edge); }

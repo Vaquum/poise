@@ -35,8 +35,9 @@ async function openRequested(chat: string | null): Promise<void> {
   else if (chat) await openChatSession(chat)
 }
 
-/** Mounts the chat view under the place; returns what to do as it leaves. */
-export async function mountChatView(root: HTMLElement, signal: AbortSignal, place: 'chat' | 'manager'): Promise<() => void> {
+/** Mounts the chat view under the place, opening `chat` or a pending request
+ *  as classic does: a frame after Chat starts, while its sessions load. */
+export async function mountChatView(root: HTMLElement, signal: AbortSignal, place: 'chat' | 'manager', chat: string | null = null): Promise<() => void> {
   const main: HTMLElement = $('main', root)
   const view = chatView()
   main.append(view)
@@ -44,7 +45,9 @@ export async function mountChatView(root: HTMLElement, signal: AbortSignal, plac
   view.dataset.place = place
   // Times are on Poise's clock, in Settings' time zone, as classic reads them.
   await loadSettings().catch(() => undefined)
-  await initChatView()
+  const started = initChatView()
+  await new Promise((done) => requestAnimationFrame(done))
+  await Promise.all([started, openRequested(chat)])
   document.addEventListener('poise:open-chat-pending', () => { void openRequested(null) }, { signal })
   return () => {
     stopChatRefresh()
@@ -61,7 +64,5 @@ export async function mountChatView(root: HTMLElement, signal: AbortSignal, plac
 export const mount: MountPlace = async ({ root, address, query, signal }) => {
   root.innerHTML = '<main class="chat-place"><a class="back chat-back" href="#" data-back hidden data-ref="back"></a></main>'
   routeBack($('[data-back]', root), address)
-  const leave = await mountChatView(root, signal, 'chat')
-  await openRequested(query.get('chat'))
-  return leave
+  return mountChatView(root, signal, 'chat', query.get('chat'))
 }
