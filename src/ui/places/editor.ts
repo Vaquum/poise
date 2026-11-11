@@ -19,7 +19,7 @@ import { installIconTooltips } from '../../icon-tooltips'
 let viewEl: HTMLElement | null = null
 let keep: HTMLElement | null = null
 
-export const mount: MountPlace = async ({ root, address }) => {
+export const mount: MountPlace = async ({ root, address, query }) => {
   root.innerHTML = '<main class="editor-place"><a class="back editor-back" href="#" data-back hidden data-ref="back"></a></main>'
   routeBack($('[data-back]', root), address)
   if (!viewEl) {
@@ -32,10 +32,15 @@ export const mount: MountPlace = async ({ root, address }) => {
   viewEl.hidden = false
   await loadSettings().catch(() => undefined)
   await initEditorView()
+  // The route back sits first in the Editor's own header, never over its controls.
+  const back: HTMLElement = $('[data-back]', root)
+  viewEl.querySelector(':scope > .view-header')?.prepend(back)
   // A document another place asked for opens once the Editor is up.
-  const doc = takeEditorDoc()
+  const slug = query.get('doc')
+  const doc = takeEditorDoc() ?? (slug ? { slug } : null)
   if (doc) window.dispatchEvent(new CustomEvent('poise:editor-load-doc', { detail: doc }))
   return () => {
+    back.remove()
     stopEditorRefresh()
     // As classic's views do on leaving: the document chat closes, releasing its
     // hold on the chat, so Chat reads the conversation whole if it opens next.

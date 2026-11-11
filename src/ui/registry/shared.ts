@@ -198,7 +198,7 @@ export const SHARED: Registry = {
   'composer.send': { name: 'Send', kind: 'Action', what: 'Sends your message. Shortcut Enter.', shows: 'Your message appears with its progress: accepted, queued, executing, completed.', unavailable: (el: any) => el.dataset.why || 'Nothing to send yet.' },
   'composer.model': { name: 'Model for this chat', kind: 'Control', what: 'The agent, model and effort the new chat starts with.', when: 'On your first send.' },
   'set.style': { name: 'Style panel', kind: 'Settings', what: 'Every visual choice in Poise: type, scale, shape, motion and the meaning colours.', does: 'Opens the Style panel. Changes apply at once, everywhere, and are kept in this browser.', source: 'Poise’s design tokens, with your choices kept in this browser.' },
-  'set.manager': { name: 'Manager’s controls', kind: 'Settings', what: 'Rhythm, Stability ↔ Expansion, Autonomy, scope and standing instructions.', does: 'Opens the Manager place with its controls over the work table. They are the same settings as Settings → Manager.' },
+  'set.manager': { name: 'Manager’s controls', kind: 'Settings', what: 'Rhythm, Stability ↔ Expansion, Autonomy, scope and standing instructions.', does: 'Opens Settings → Manager, where they live.' },
   /* Fields shared by every place that opens an issue */
   'composer.repo': { name: 'Repository', kind: 'Control', what: 'Links a card to a repository, or picks where a new issue opens.', values: [['No repository', 'Cards only: not linked.'], ['owner/name', 'Any repository in your organizations.']] },
   'composer.title': { name: 'Issue title', kind: 'Control', what: 'The new issue’s title. Required.' },

@@ -9,7 +9,7 @@ import { $ } from '../dom'
 import { routeBack } from '../shell'
 import { takeOpenChat } from '../open-chat'
 import type { MountPlace } from '../router'
-import { initChatView, openChatForSubject, openChatSession, stopChatRefresh } from './chat/view'
+import { foldListWhenNarrow, initChatView, openChatForSubject, openChatSession, stopChatRefresh } from './chat/view'
 import { loadSettings } from '../../config'
 import { installIconTooltips } from '../../icon-tooltips'
 
@@ -48,8 +48,13 @@ export async function mountChatView(root: HTMLElement, signal: AbortSignal, plac
   const started = initChatView()
   await new Promise((done) => requestAnimationFrame(done))
   await Promise.all([started, openRequested(chat)])
+  foldListWhenNarrow()
+  // The route back sits first in the chat's own header, never over its controls.
+  const back: HTMLElement = $('[data-back]', root)
+  view.querySelector(':scope > .view-header')?.prepend(back)
   document.addEventListener('poise:open-chat-pending', () => { void openRequested(null) }, { signal })
   return () => {
+    back.remove()
     stopChatRefresh()
     view.hidden = true
     if (!keep) {

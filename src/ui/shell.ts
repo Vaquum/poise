@@ -143,7 +143,7 @@ export function showPlace(address: Address): void {
   settings?.classList.toggle('on', here === 'settings')
   if (here === 'settings') settings?.setAttribute('aria-current', 'page'); else settings?.removeAttribute('aria-current')
   const back = here === 'settings' ? address.back : here
-  $('[data-menu-manager]')?.setAttribute('href', placeHref('manager', { pane: 'controls', back: here === 'manager' ? address.back : back }))
+  $('[data-menu-manager]')?.setAttribute('href', placeHref('settings', { settings: 'manager', back }))
   $$('[data-menu-section]').forEach((a: HTMLElement) => {
     a.setAttribute('href', placeHref('settings', { settings: a.dataset.menuSection, back }))
     if (here === 'settings' && address.section === a.dataset.menuSection) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current')

@@ -58,7 +58,9 @@ import { createFilePreview } from '../../../views/chat-file-preview'
 import { ICON_FORK, ICON_HANDOFF, ICON_ACTIVITY, ICON_TOOLS, ICON_AUTO_MERGE, ICON_MEMORIES, ICON_SAFE_MODE, ICON_REASONING, ICON_PIN } from '../../../views/chat-icons'
 import { WAKE_OPTIONS, wakeStatusText, type ManagerWakeView, type WakeMinutes } from '../../../chat-manager-settings-types'
 import { deriveSessionTitle } from '../../../chat-title'
-import { applyWorklogOrder, compareWorklog, sessionDot } from '../../../chat-worklog'
+import { applyWorklogOrder, compareWorklog } from '../../../chat-worklog'
+import { term } from '../../registry'
+import { chatState } from '../overview/states'
 import { shortElapsed } from '../../../chat-turn-time'
 import { createDeployCard, type DeployCard, type LocalPendingChange } from '../../../views/chat-deploy-card'
 import { recognisePoiseRequest } from '../../../poise-request-intent'
@@ -765,15 +767,15 @@ function sidebarHtml(): string {
     return '<div class="chat-empty chat-sidebar-empty">No sessions yet.</div>'
   }
   const records = order.map((id) => sessions.get(id)!.record)
-  const now = Date.now()
-  const zone = effectiveTimezone()
   return visible.map((id) => {
     const e = sessions.get(id)!
     const s = e.record
     const armed = armedDelete?.id === id && armedDelete.until > Date.now()
     const bulkArmed = armed && armedDelete!.bulk && armedDelete!.bulk.length > 1 ? armedDelete!.bulk : null
     const confirm = armed ? (bulkArmed ? deleteBulkConfirmCopy(bulkArmed.length) : deleteConfirmCopy(s, records)) : null
-    const dot = sessionDot(s, now, zone)
+    // The seven states, in the registry's words, as Overview and Board say them.
+    const placed = chatState(s)
+    const said = `${term(`state.${placed.state}`)}${placed.note ? ` · ${placed.note}` : ''}`
     const pinned = pins.has(id) && s.role !== 'manager'
     const selected = selectedIds.has(id)
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}${pinned ? ' pinned' : ''}${selected ? ' selected' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0" draggable="${s.role !== 'manager'}">`
@@ -784,8 +786,8 @@ function sidebarHtml(): string {
       + (s.role === 'manager' ? `<span class="chat-pill chat-pill-manager">Manager</span>` : '')
       + (s.role === 'worker' ? `<span class="chat-pill chat-pill-worker">Worker</span>` : '')
       + `<span class="chat-pill">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)} · ${escapeHtml(s.model)}</span>`
-      + `<span class="chat-session-dot" data-state="${dot.state}" title="${escapeHtml(dot.label)}" aria-hidden="true"></span>`
-      + `<span class="chat-session-state" title="${escapeHtml(dot.label)}">${escapeHtml(dot.label)}</span>`
+      + `<span class="sc" data-state="${placed.state}" aria-hidden="true"></span>`
+      + `<span class="chat-session-state" title="${escapeHtml(said)}">${escapeHtml(said)}</span>`
       + `<span class="chat-session-date">${escapeHtml(dateLabel(s.createdAt))}</span>`
       + `</div>`
       + (pinned ? `<button type="button" class="chat-session-pin" title="Unpin — return to automatic order" aria-label="Unpin chat">${ICON_PIN}</button>` : '')
@@ -1213,10 +1215,18 @@ async function deleteSessions(ids: string[]): Promise<void> {
 
 // ── Selecting and loading a session ────────────────────────────────────────
 
+// On a narrow window the list floats over the chat (ui/narrow.css): Chat opens with it
+// folded, and opening a chat folds it away again.
+export function foldListWhenNarrow(): void {
+  if (viewEl?.isConnected && matchMedia('(max-width: 760px)').matches && !viewEl.classList.contains('chat-sidebar-collapsed')) viewEl.querySelector<HTMLButtonElement>('.chat-sidebar-toggle')?.click()
+}
+if (typeof window !== 'undefined') matchMedia('(max-width: 760px)').addEventListener('change', (e) => { if (e.matches) foldListWhenNarrow() })
+
 async function selectSession(id: string, restoring = false): Promise<void> {
   if (!restoring) jev?.leave(); mainEl?.classList.remove('jev-mode')
   const e = sessions.get(id)
   if (!e || deleting.has(id)) return
+  foldListWhenNarrow()
   if (!activeId) freshDraft = composer.getDraft()
   if (activeId && activeId !== id) {
     const prev = sessions.get(activeId)

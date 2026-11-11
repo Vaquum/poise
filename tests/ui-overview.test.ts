@@ -91,7 +91,7 @@ describe('where a notice’s target opens in the new places', () => {
   })
 
   it('opens a worker and the Manager in the Manager place', () => {
-    expect(targetOpening({ chat: 'w1' }, () => 'worker').href).toBe('?view=manager&peek=w1&back=overview')
+    expect(targetOpening({ chat: 'w1' }, () => 'worker').href).toBe('?view=chat&chat=w1&back=overview')
     expect(chatOpening('m1', 'manager').href).toBe('?view=manager&back=overview')
   })
 
@@ -213,7 +213,7 @@ describe('Answer here’s entries', () => {
     ], role)
     expect(entry.options.map((o) => o.key)).toEqual(['b', 'a'])
     expect(entry.freeText?.label).toBe('Something else…')
-    expect(entry.open?.href).toBe('?view=manager&peek=w1&back=overview')
+    expect(entry.open?.href).toBe('?view=chat&chat=w1&back=overview')
   })
 })
 

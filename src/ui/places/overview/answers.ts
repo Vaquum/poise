@@ -104,7 +104,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       ...reviewed,
     ]))
   }
-  const editorHref = (slugName: string) => placeHref('editor', { doc: slugName, tab: 'reviews', back: 'overview' })
+  const editorHref = (slugName: string) => placeHref('editor', { doc: slugName, back: 'overview' })
 
   /** Open at the level: not settled here, not waiting to be sent away. */
   const isOpen = (entry: Entry) => !done.has(entry.id) && !progress.get(entry.id)?.settled

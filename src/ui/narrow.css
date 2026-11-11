@@ -12,30 +12,13 @@
   .foot-copy { flex-basis: 80%; }
 }
 @media (max-width: 760px) {
-  /* Chat: the list floats, and a chosen row folds it away */
-  .chat-layout { position: relative; grid-template-columns: minmax(0, 1fr); }
-  .chat-layout .list { position: absolute; top: 0; bottom: 0; left: 0; z-index: var(--z-panel); max-width: 100%; }
-  .chat-layout:not(.list-hidden) .list { box-shadow: var(--shadow-dialog); }
-  .chat-layout .list-resize { display: none; }
-  .chat-layout > .convo { grid-column: 1; grid-row: 1; grid-template-columns: minmax(0, 1fr); min-width: 0; }
-  .mgr-layout > * { grid-column: 1; }
-  .mgr-layout > .convo, .mgr-layout > .work { grid-row: 2; }
-  .chat-layout:not(.pane-open) .side { display: none; }
-  .chat-layout.pane-open .side { width: 100%; }
-  .sbtn { white-space: nowrap; }
+  /* Chat: the list floats over the chat, and a chosen row folds it away (places/chat/view.ts) */
+  #view-chat .chat-layout { position: relative; }
+  #view-chat .chat-sidebar { position: absolute; top: 0; bottom: 0; left: 0; z-index: var(--z-panel); max-width: 100%; }
+  #view-chat:not(.chat-sidebar-collapsed) .chat-sidebar { box-shadow: var(--shadow-dialog); }
+  #view-chat .chat-sidebar-resize { display: none; }
   .jev-title { flex-basis: 100%; order: -1; }
   .chat-head { padding-inline: var(--sp-3); }
-  .head-1 .title { flex-basis: 100%; white-space: normal; }
-  .dock, .scroll > .col { padding-inline: var(--sp-3); }
-
-  /* The Manager: its chat and the work table take turns; the Switchboard floats over them */
-  .chat-layout.mgr-layout, .mgr-layout.sb-hidden { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-  .mgr-layout .mgr-panes { display: inline-flex; justify-self: start; margin: var(--sp-2) var(--sp-3); }
-  .mgr-layout .work { display: none; }
-  .mgr-layout.show-work .work { display: flex; }
-  .mgr-layout.show-work .convo { display: none; }
-  .mgr-layout .convo { border-right: 0; }
-  .mgr-layout.sb-float .sb { width: 100%; }
 
   /* Board: lanes scroll inside themselves, and a card's chat takes the place */
   .cur { position: relative; }
@@ -54,15 +37,6 @@
   .ova-list { overflow: visible; padding-bottom: var(--sp-4); }
   .ova-tiles, .ova-small { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ova-three, .ova-counts { grid-template-columns: minmax(0, 1fr); }
-
-  /* Editor: the side pane takes the place */
-  .ed-body { position: relative; grid-template-columns: minmax(0, 1fr); }
-  .ed-col, .ed-pane { grid-column: 1; grid-row: 1; }
-  .pane-open .ed-pane { position: absolute; top: 0; right: 0; bottom: 0; z-index: var(--z-panel); width: 100%; border-left-width: 0; }
-  .ed-head { padding-inline: var(--sp-3); }
-  .ed-groups { margin-left: 0; gap: var(--sp-2) var(--sp-3); }
-  .ed-groups .t-micro { display: none; }
-  .ed-paper { padding: var(--sp-5) var(--sp-4) var(--sp-12); }
 
   /* Observe: the tables scroll inside themselves */
   .obv-head { padding-inline: var(--sp-3); }
