@@ -196,7 +196,7 @@ export async function plan(workflow) {
     unit_files: workflow === 'ci.yml' && selection.mode === 'essential' ? essentialUnitTests(paths) : [],
     browser_image: `mcr.microsoft.com/playwright:v${version}-noble`,
     unit_shards: mode === 'full' ? [1, 2] : [1],
-    browser_shards: mode === 'full' ? [1, 2, 3, 4] : [1],
+    browser_shards: mode === 'full' ? [1, 2, 3, 4, 5, 6] : [1],
     reuse_url: reused?.html_url ?? '',
     run: !reused && (event !== 'pull_request' || callerAffected(paths)),
   }
@@ -221,10 +221,10 @@ function runTests(kind) {
   const mode = process.env.CI_TEST_MODE
   if (!['full', 'essential'].includes(mode)) throw new Error(`Cannot run tests in mode ${mode}`)
   const shard = Number(process.env.CI_TEST_SHARD)
-  if (!Number.isInteger(shard) || shard < 1 || shard > (kind === 'unit' ? 2 : 4)) throw new Error('Invalid test shard')
+  if (!Number.isInteger(shard) || shard < 1 || shard > (kind === 'unit' ? 2 : 6)) throw new Error('Invalid test shard')
   const args = kind === 'unit'
     ? ['test:full', '--', `--shard=${shard}/${mode === 'full' ? 2 : 1}`, '--maxWorkers=1', '--reporter=default', '--reporter=json', '--outputFile=test-results/vitest.json']
-    : ['test:e2e:full', '--', `--shard=${shard}/${mode === 'full' ? 4 : 1}`, '--workers=1']
+    : ['test:e2e:full', '--', `--shard=${shard}/${mode === 'full' ? 6 : 1}`, '--workers=1']
   // A full run on main speaks for many merges, so a test must fail twice to count.
   // Playwright's own CI retries already do this for the browser tests.
   if (kind === 'unit' && ['push', 'workflow_dispatch'].includes(process.env.GITHUB_EVENT_NAME)) args.push('--retry=1')

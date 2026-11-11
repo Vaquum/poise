@@ -399,7 +399,7 @@ describe('the plan each CI event gets', () => {
   it('runs everything by hand', async () => {
     const { code, outputs } = await ci(repo.root, ['plan', 'ci.yml'], { GITHUB_EVENT_NAME: 'workflow_dispatch' })
     expect(code).toBe(0)
-    expect(outputs).toMatchObject({ mode: 'full', unit_shards: [1, 2], browser_shards: [1, 2, 3, 4], unit_files: [] })
+    expect(outputs).toMatchObject({ mode: 'full', unit_shards: [1, 2], browser_shards: [1, 2, 3, 4, 5, 6], unit_files: [] })
   })
 
   const evidence = sha => ({ workflow_runs: [{ ...success, head_sha: sha }] })
@@ -416,7 +416,7 @@ describe('the plan each CI event gets', () => {
     const api = await github({ 'GET actions/workflows/ci.yml/runs': evidence(drawn) })
     const { code, outputs } = await ci(repo.root, ['plan', 'ci.yml'], { GITHUB_EVENT_NAME: 'push', GITHUB_SHA: drawn, ...api.env })
     expect(code).toBe(0)
-    expect(outputs).toMatchObject({ mode: 'full', unit_shards: [1, 2], browser_shards: [1, 2, 3, 4] })
+    expect(outputs).toMatchObject({ mode: 'full', unit_shards: [1, 2], browser_shards: [1, 2, 3, 4, 5, 6] })
     expect(api.requests).toEqual([])
   })
 
@@ -572,7 +572,7 @@ describe('the commands that run the tests', () => {
       `run test:full -- --shard=1/2 ${reporters}`,
       `run test:full -- --shard=1/2 ${reporters} --retry=1`,
       `run test:full -- --shard=1/2 ${reporters} --retry=1`,
-      'run test:e2e:full -- --shard=1/4 --workers=1',
+      'run test:e2e:full -- --shard=1/6 --workers=1',
       `run test:e2e:full -- --shard=1/1 --workers=1 ${core.join(' ')}`,
     ])
   })
