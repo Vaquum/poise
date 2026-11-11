@@ -1,0 +1,272 @@
+/* ==========================================================================
+   Poise tokens — the only file allowed to hold raw values.
+
+   Three layers, each reading only from the one above it:
+     1. Controls  --ctl-*   the knobs a person turns in the Style panel
+     2. Primitives --p-*    the raw palette, families and curves
+     3. Semantic  --c-* --font-* --fs-* --sp-* --size-* --r-* --dur-* …
+                            the only names components and views may use
+   tools/lint_tokens.py enforces this: components may not use hex, rgb,
+   lengths, durations, weights or line heights, and may not read --ctl-* or
+   --p-* directly.
+   ========================================================================== */
+
+:root {
+  /* ---------- 1. Controls ---------- */
+  --ctl-base-size: 15px;        /* type and component scale root */
+  --ctl-density: 1;             /* 0.8 compact · 1 calm · 1.2 comfortable */
+  --ctl-radius: 1;              /* 0 square · 1 Poise · 2 round */
+  --ctl-line: 1;                /* route lines and capsule stations */
+  --ctl-motion: 1;              /* 0 still · 1 Tactile spring */
+  --ctl-tint: 22%;              /* strength of status tints */
+  --ctl-leading: 1;             /* line height of reading and body text */
+  --ctl-measure: 1;             /* reading width of a page of text */
+  --ctl-heading: 1;             /* size of a document's headings, and the space around them */
+  --ctl-paragraph: 0;           /* extra space after a paragraph, in lines */
+  --ctl-font-ui: "IBM Plex Sans";
+  --ctl-font-display: "Zen Maru Gothic";
+  --ctl-font-mono: "IBM Plex Mono";
+
+  /* ---------- 2. Primitives ---------- */
+  /* Neutrals: the Poise dark stack, proven in all-day use */
+  --p-n0: #161A20;
+  --p-n1: #1C2129;
+  --p-n2: #2F353D;
+  --p-n3: #5C636D;
+  --p-n4: #8E959E;
+  --p-n5: #C5CBD1;
+  --p-n6: #DEE2E6;
+  --p-n7: #F7F8F9;
+  --p-white: #FFFFFF;
+  --p-black: #000000;
+  /* Accents: hold in dark; each one is a meaning, never a decoration */
+  --p-blue: #3A72B0;
+  --p-teal: #3D8E84;
+  --p-green: #4A8E5E;
+  --p-amber: #A8792B;
+  --p-red: #B85048;
+  --p-rose: #B0537B;
+  --p-violet: #7560A8;
+  --p-slate: #6E7886;
+  /* Families with their fallbacks */
+  --p-fallback-sans: -apple-system, BlinkMacSystemFont, sans-serif;
+  --p-fallback-mono: "SF Mono", Menlo, monospace;
+  /* The Tactile spring: src/motion.ts's initMotion() writes --flow-* onto :root
+     from gateway/src/motion-model.ts, the one source the classic page reads too. */
+  --p-spring: var(--flow-spring, ease-out);
+
+  /* ---------- 3. Semantic: colour ---------- */
+  --c-canvas: var(--p-n0);
+  --c-surface: var(--p-n1);
+  --c-inset: var(--p-n0);
+  --c-line: var(--p-n2);
+  --c-edge: var(--p-n3);
+  --c-edge-strong: var(--p-n4);
+  --c-text: var(--p-n6);
+  --c-text-strong: var(--p-n7);
+  --c-text-soft: var(--p-n5);
+  --c-text-muted: var(--p-n4);
+  --c-text-faint: var(--p-n3);
+  --c-action: var(--p-n5);
+  --c-action-hover: var(--p-n6);
+  --c-on-action: var(--p-n0);
+  --c-on-color: var(--p-white);
+  --c-focus: var(--p-blue);
+  --c-scrim: color-mix(in srgb, var(--p-black) 45%, transparent);
+
+  /* Meanings. Change one and its tint and text follow. */
+  --c-agent: var(--p-blue);        /* an agent, information, focus */
+  --c-running: var(--p-teal);      /* working now */
+  --c-done: var(--p-green);        /* done, ready, merged */
+  --c-attention: var(--p-amber);   /* needs you, pending, caution */
+  --c-failed: var(--p-red);        /* failed, destructive */
+  --c-risk: var(--p-rose);         /* risk, exception */
+  --c-special: var(--p-violet);    /* Poise acting on its own: the Manager, Poise changing itself, JEV */
+  --c-other: var(--p-slate);       /* neutral category, the route */
+  --c-route: var(--c-other);
+
+  --c-agent-tint: color-mix(in srgb, var(--c-agent) var(--ctl-tint), transparent);
+  --c-running-tint: color-mix(in srgb, var(--c-running) var(--ctl-tint), transparent);
+  --c-done-tint: color-mix(in srgb, var(--c-done) var(--ctl-tint), transparent);
+  --c-attention-tint: color-mix(in srgb, var(--c-attention) var(--ctl-tint), transparent);
+  --c-failed-tint: color-mix(in srgb, var(--c-failed) var(--ctl-tint), transparent);
+  --c-special-tint: color-mix(in srgb, var(--c-special) var(--ctl-tint), transparent);
+  --c-attention-wash: color-mix(in srgb, var(--c-attention) 7%, var(--c-canvas));
+  --c-attention-edge: color-mix(in srgb, var(--c-attention) 55%, var(--c-line));
+  --c-failed-edge: color-mix(in srgb, var(--c-failed) 55%, var(--c-line));
+  --c-running-edge: color-mix(in srgb, var(--c-running) 45%, var(--c-line));
+  --c-done-edge: color-mix(in srgb, var(--c-done) 45%, var(--c-line));
+  --c-risk-edge: color-mix(in srgb, var(--c-risk) 55%, var(--c-line));
+  --c-special-edge: color-mix(in srgb, var(--c-special) 55%, var(--c-line));
+  --c-agent-on: color-mix(in srgb, var(--c-agent) 55%, var(--p-white));
+  --c-running-on: color-mix(in srgb, var(--c-running) 55%, var(--p-white));
+  --c-done-on: color-mix(in srgb, var(--c-done) 55%, var(--p-white));
+  --c-attention-on: color-mix(in srgb, var(--c-attention) 55%, var(--p-white));
+  --c-failed-on: color-mix(in srgb, var(--c-failed) 55%, var(--p-white));
+  --c-special-on: color-mix(in srgb, var(--c-special) 55%, var(--p-white));
+  --c-risk-tint: color-mix(in srgb, var(--c-risk) var(--ctl-tint), transparent);
+  --c-risk-on: color-mix(in srgb, var(--c-risk) 55%, var(--p-white));
+  --c-other-tint: color-mix(in srgb, var(--c-other) var(--ctl-tint), transparent);
+  --c-other-on: color-mix(in srgb, var(--c-other) 55%, var(--p-white));
+  --c-row-hover: color-mix(in srgb, var(--c-surface) 55%, transparent);
+  --c-row-selected: var(--c-canvas);
+
+  /* States: one vocabulary, one colour each (the words live in refdefs.js) */
+  --c-state-running: var(--c-running);
+  --c-state-needs-you: var(--c-attention);
+  --c-state-waiting: var(--c-other);
+  --c-state-blocked: var(--c-risk);
+  --c-state-idle: var(--c-edge);
+  --c-state-done: var(--c-done);
+  --c-state-failed: var(--c-failed);
+  --c-row-attention: color-mix(in srgb, var(--c-attention) 7%, transparent);
+
+  /* ---------- 3. Semantic: type ---------- */
+  --font-ui: var(--ctl-font-ui), var(--p-fallback-sans);
+  --font-display: var(--ctl-font-display), var(--ctl-font-ui), var(--p-fallback-sans);
+  --font-mono: var(--ctl-font-mono), var(--p-fallback-mono);
+  --fw-regular: 400;
+  --fw-strong: 600;
+  --fw-display: 700;
+  --fs-tiny: calc(var(--ctl-base-size) * 0.7);
+  --fs-micro: calc(var(--ctl-base-size) * 0.75);
+  --fs-row: calc(var(--ctl-base-size) * 0.8125);
+  --fs-ui: calc(var(--ctl-base-size) * 0.875);
+  --fs-body: calc(var(--ctl-base-size) * 0.9375);
+  --fs-read: var(--ctl-base-size);
+  --fs-lead: calc(var(--ctl-base-size) * 1.2);
+  --fs-h3: calc(var(--ctl-base-size) * 1.6);
+  --fs-h2: calc(var(--ctl-base-size) * 2.4);
+  --fs-h1: calc(var(--ctl-base-size) * 3.4);
+  --fs-doc-h1: calc(var(--ctl-base-size) * 2.4 * var(--ctl-heading));
+  --fs-doc-h2: calc(var(--ctl-base-size) * 1.6 * var(--ctl-heading));
+  --sp-doc-heading: calc(var(--sp-unit) * var(--ctl-heading));
+  --sp-paragraph: calc(var(--ctl-base-size) * 1.7 * var(--ctl-leading) * var(--ctl-paragraph));
+  --lh-tight: 1.15;
+  --lh-ui: 1.4;
+  --lh-body: calc(1.55 * var(--ctl-leading));
+  --lh-read: calc(1.7 * var(--ctl-leading));
+  --ls-micro: 0.06em;
+  --ls-display: -0.01em;
+  --ls-none: 0;
+
+  /* ---------- 3. Semantic: space and size (4-base, times density) ---------- */
+  --sp-unit: calc(4px * var(--ctl-density));
+  --sp-half: calc(var(--sp-unit) * 0.5);
+  --sp-1: var(--sp-unit);
+  --sp-2: calc(var(--sp-unit) * 2);
+  --sp-3: calc(var(--sp-unit) * 3);
+  --sp-4: calc(var(--sp-unit) * 4);
+  --sp-5: calc(var(--sp-unit) * 5);
+  --sp-6: calc(var(--sp-unit) * 6);
+  --sp-8: calc(var(--sp-unit) * 8);
+  --sp-10: calc(var(--sp-unit) * 10);
+  --sp-12: calc(var(--sp-unit) * 12);
+  --sp-16: calc(var(--sp-unit) * 16);
+  --size-row: calc(var(--sp-unit) * 11);
+  --size-row-tall: calc(var(--sp-unit) * 13);
+  --size-control: calc(var(--sp-unit) * 7);
+  --size-control-sm: calc(var(--sp-unit) * 6);
+  --size-control-lg: calc(var(--sp-unit) * 10);
+  --size-chip: calc(var(--sp-unit) * 5.5);
+  --size-avatar: calc(var(--sp-unit) * 5.5);
+  --size-icon: calc(var(--ctl-base-size) * 1.0667);
+  --size-icon-sm: calc(var(--ctl-base-size) * 0.8667);
+  --size-dot: calc(var(--ctl-base-size) * 0.4);
+  --size-topbar: calc(var(--sp-unit) * 13);
+  --icon-stroke: 1.5;
+  --line-hair: 1px;
+  --line-focus: 2px;
+
+  /* Route language: lines and capsule stations */
+  --route-w: calc(6px * var(--ctl-line));
+  --route-w-minor: calc(2px * var(--ctl-line));
+  --cap-w: calc(16px * var(--ctl-line));
+  --cap-h: calc(10px * var(--ctl-line));
+  --cap-stroke: calc(2px * var(--ctl-line));
+  --cap-w-lg: calc(38px * var(--ctl-line));
+  --cap-h-lg: calc(24px * var(--ctl-line));
+  --cap-stroke-lg: calc(3px * var(--ctl-line));
+
+  /* ---------- 3. Semantic: shape, depth, motion, layers ---------- */
+  --r-unit: calc(4px * var(--ctl-radius));
+  --r-card: var(--r-unit);
+  --r-panel: calc(var(--r-unit) * 2);
+  --r-pill: 999px;
+  --shadow-hover: 0 1px 2px color-mix(in srgb, var(--p-black) 35%, transparent), 0 2px 4px color-mix(in srgb, var(--p-black) 25%, transparent);
+  --shadow-menu: 0 4px 8px color-mix(in srgb, var(--p-black) 45%, transparent), 0 2px 4px color-mix(in srgb, var(--p-black) 30%, transparent);
+  --shadow-dialog: 0 12px 24px color-mix(in srgb, var(--p-black) 55%, transparent), 0 4px 8px color-mix(in srgb, var(--p-black) 35%, transparent);
+  --dur-feedback: calc(var(--flow-feedback, 100ms) * var(--ctl-motion));
+  --dur-settle: calc(var(--flow-settle, 664ms) * var(--ctl-motion));
+  --dur-tip: 500ms;             /* reference delay: a reading aid, not motion */
+  --dur-tip-hide: 160ms;
+  --ease-spring: var(--p-spring);
+  --ease-out: ease-out;
+  --foot-h: 0px; /* the foot strips' height while they show; src/ui/states.ts measures it */
+  --z-raise: 1;
+  --z-sticky: 5;
+  --z-panel: 20;
+  --z-menu: 40;
+  --z-dialog: 50;
+  --z-tip: 55;
+  --z-ref: 60;
+
+  /* Layout widths */
+  --w-sidebar: 268px;
+  --w-side: 360px;
+  --w-menu: 240px;
+  --w-style: 380px;
+  --w-lane-min: 220px;
+  --w-list: 288px;
+  --w-pane: 384px;
+  --w-tip: 300px;
+  --w-ref: 580px;
+  --w-read: calc(760px * var(--ctl-measure));
+}
+
+/* Reduced motion is a control too: it sets motion to zero. */
+@media (prefers-reduced-motion: reduce) {
+  :root { --ctl-motion: 0; }
+}
+
+/* ---------- The motion runtime's own rules ----------
+   Copied from src/motion.css, which src/motion.ts's actors rely on. Importing
+   that file here would split classic's stylesheet, and its raw lengths belong
+   with the other raw values, here. */
+/* Spatial motion composes with native transforms, including full-bleed layout. */
+/* Per-actor offsets must not invalidate every descendant on each frame. */
+@property --flow-layout-x { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-layout-y { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-enter-x { syntax: "<length>"; inherits: false; initial-value: 0px; }
+@property --flow-enter-y { syntax: "<length>"; inherits: false; initial-value: 0px; }
+[data-flow-enter], [data-flow-layout] {
+  --flow-layout-x: 0px;
+  --flow-layout-y: 0px;
+  --flow-enter-x: 0px;
+  --flow-enter-y: 0px;
+  translate: calc(var(--flow-layout-x, 0px) + var(--flow-enter-x, 0px)) calc(var(--flow-layout-y, 0px) + var(--flow-enter-y, 0px));
+}
+[data-flow-retained][hidden], [data-flow-panel-retained] { display: var(--flow-display, block) !important; pointer-events: none; }
+[data-flow-retiring] { animation: none !important; transition: none !important; }
+[data-motion-running] { animation: none !important; transition: none !important; }
+details[data-flow-details] > [data-flow-disclosure] { display: var(--flow-display, block) !important; }
+/* Native modal focus/cancel semantics occur before these optional visuals. */
+@supports (transition-behavior: allow-discrete) {
+  dialog {
+    opacity: 0;
+    translate: 0 20px;
+    transition: opacity var(--flow-settle) var(--flow-spring), translate var(--flow-settle) var(--flow-spring), display var(--flow-settle) allow-discrete, overlay var(--flow-settle) allow-discrete;
+  }
+  dialog[open] { opacity: 1; translate: 0 0; }
+  @starting-style { dialog[open] { opacity: 0; translate: 0 20px; } }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+@media print {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

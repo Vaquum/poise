@@ -527,8 +527,9 @@ async function buildCleanRelease(): Promise<ReleaseFixture> {
     cwd: root, env: { ...process.env, POISE_RELEASE_SHA: sha }, stdio: ['ignore', 'pipe', 'pipe'],
   })
   const clientRoot = resolve(root, 'dist/client')
-  const bundle = readdirSync(resolve(clientRoot, 'assets')).find((f) => /^index-.*\.js$/.test(f))!
-  if (!readFileSync(resolve(clientRoot, 'assets', bundle), 'utf8').includes(sha)) throw new Error('the release bundle does not carry its own SHA')
+  // The build shares what both pages use in a chunk the bundler names: the SHA is in one of them.
+  const bundles = readdirSync(resolve(clientRoot, 'assets')).filter((f) => f.endsWith('.js'))
+  if (!bundles.some((f) => readFileSync(resolve(clientRoot, 'assets', f), 'utf8').includes(sha))) throw new Error('the release bundle does not carry its own SHA')
   const types: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml', '.json': 'application/json', '.woff2': 'font/woff2' }
   const server: Server = createServer((req, res) => {
     const path = decodeURIComponent(new URL(req.url || '/', 'http://127.0.0.1').pathname)

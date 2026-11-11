@@ -14,9 +14,10 @@ test('a page left over from the previous release reloads once when its lazy chun
   // page's own entry are gone from the new release. Only the staleness check
   // must see the switch; the reload itself loads fine.
   let entryReads = 0
-  await page.route('**/assets/index-*.js', async route => {
-    if (++entryReads === 1) return route.fulfill({ status: 404, contentType: 'application/json', body: '{"error":"not found"}' })
-    return route.continue()
+  // The staleness probe reads its own chunk, whichever the bundler put it in; the page's module loads are not fetches.
+  await page.route('**/assets/*.js', async route => {
+    if (route.request().resourceType() === 'fetch' && ++entryReads === 1) return route.fulfill({ status: 404, contentType: 'application/json', body: '{"error":"not found"}' })
+    return route.fallback()
   })
   await page.route('**/*terminal-panel*.js', route => route.fulfill({ status: 404, contentType: 'application/json', body: '{"error":"not found"}' }))
   let loads = 0
