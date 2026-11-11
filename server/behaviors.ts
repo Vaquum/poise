@@ -7865,13 +7865,17 @@ async function runBehaviorChains(): Promise<void> {
           && diagnostic?.operation === 'provider.review' && diagnostic.context.submission === 'none'
           && invocation.evidence?.error_code === 'authentication_failed'
         if (!recovered) return false
-        // A failed Connect-triggered verification clears reconnectedAt but keeps
-        // its verificationLogin: a successful review Call that completed before
-        // the failure and is reconciled later must still read as operator help.
+        // A failed Connect-triggered verification retains its resolving Connect
+        // separately: a successful review Call that completed before the
+        // failure and is reconciled later must still read as operator help
+        // even after a newer Connect overwrites verificationLogin.
         const claimedAt = failure.verificationLogin !== null ? Number(failure.verificationLogin) : null
+        const retainedRaw = (failure as { retainedVerificationLogin?: string | null }).retainedVerificationLogin ?? null
+        const retainedAt = retainedRaw !== null ? Number(retainedRaw) : null
         const reconnectAt = failure.reconnectedAt !== null && failure.reconnectedAt > failure.rejectedAt
           && failure.reconnectedAt <= failure.verifiedAt! ? failure.reconnectedAt
-          : claimedAt !== null && Number.isSafeInteger(claimedAt) && claimedAt > failure.rejectedAt && claimedAt <= failure.verifiedAt! ? claimedAt : null
+          : claimedAt !== null && Number.isSafeInteger(claimedAt) && claimedAt > failure.rejectedAt && claimedAt <= failure.verifiedAt! ? claimedAt
+          : retainedAt !== null && Number.isSafeInteger(retainedAt) && retainedAt > failure.rejectedAt && retainedAt <= failure.verifiedAt! ? retainedAt : null
         return reconnectAt !== null
           ? { origin: 'operator', intervention: { callId: failure.callId, at: reconnectAt, verifiedAt: failure.verifiedAt! } }
           : { origin: 'unknown' }
