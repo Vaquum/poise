@@ -1,0 +1,24 @@
+/* The page's states, drawn on the DOM of the watchers this page reuses:
+   src/updating.ts and src/signed-out.ts (a dimmed page under one card),
+   src/claude-auth.ts (Claude's subscription) and src/self-update-watch.ts
+   (a new build). components.css draws .up-backdrop, .up-card, .up-title and
+   .up-detail; these are the rest, in the mocks' look. */
+.up-backdrop { opacity: 0; transition: opacity var(--dur-settle) var(--ease-out); }
+.up-backdrop.up-visible { opacity: 1; }
+.up-spinner { width: var(--size-icon); height: var(--size-icon); border-radius: 50%; border: var(--route-w-minor) solid var(--c-running-tint); border-top-color: var(--c-running); animation: spin calc(var(--dur-settle) * 1.4) linear infinite; }
+.up-action { height: var(--size-control); padding: 0 var(--sp-4); border-radius: var(--r-pill); display: inline-flex; align-items: center; font-size: var(--fs-micro); font-weight: var(--fw-strong); background: var(--c-action); color: var(--c-on-action); }
+.up-action:hover { background: var(--c-action-hover); }
+
+/* The foot strips stack at the foot of every place, and the page makes room:
+   states.ts gathers them into .foot and sets --foot-h to its height. */
+.foot { position: fixed; left: 0; right: 0; bottom: 0; z-index: var(--z-panel); display: flex; flex-direction: column; }
+.foot:empty { display: none; }
+#claude-auth-banner, .self-update-banner { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) var(--sp-4); border-top: var(--line-hair) solid var(--c-edge); background: var(--c-surface); }
+#claude-auth-banner::before, .self-update-banner::before { content: ""; flex: none; align-self: stretch; width: var(--size-dot); border-radius: var(--r-pill); background: var(--c-attention); }
+#claude-auth-banner[data-status="reauth_required"]::before { background: var(--c-failed); }
+.self-update-banner::before { background: var(--c-text-muted); }
+.claude-auth-copy, .self-update-banner-text { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-half) var(--sp-3); font-size: var(--fs-micro); line-height: var(--lh-body); color: var(--c-text-soft); }
+.claude-auth-title { font-size: var(--fs-row); font-weight: var(--fw-strong); color: var(--c-text); }
+.claude-auth-login, .self-update-refresh { height: var(--size-control-sm); padding: 0 var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-edge); background: var(--c-surface); color: var(--c-text-soft); font-size: var(--fs-micro); font-weight: var(--fw-strong); display: inline-flex; align-items: center; gap: var(--sp-2); }
+.claude-auth-login:hover, .self-update-refresh:hover { border-color: var(--c-edge-strong); color: var(--c-text); }
+.self-update-refresh:disabled { opacity: 0.6; cursor: default; }

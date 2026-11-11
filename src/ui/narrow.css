@@ -1,0 +1,81 @@
+/* Narrow windows. Nothing overflows the page: the top bar's places scroll, panes float or take turns,
+   and tables scroll inside themselves. The breakpoints are main's: 820 where headers wrap, 760 where columns stack. */
+@media (max-width: 820px) {
+  .topbar { gap: var(--sp-2); padding-inline: var(--sp-2); }
+  .topbar .ia { flex: 1; overflow-x: auto; scrollbar-width: none; }
+  .topbar .ia::-webkit-scrollbar { display: none; }
+  .topbar .ia > * { flex: none; }
+  .topbar .ia a, .topbar .ia button.nav { padding-inline: var(--sp-2); }
+  .topbar .right { flex: none; margin-left: 0; gap: var(--sp-2); }
+  .live { gap: 0; font-size: 0; }
+  .foot-card { flex-wrap: wrap; }
+  .foot-copy { flex-basis: 80%; }
+}
+@media (max-width: 760px) {
+  /* Chat: the list floats, and a chosen row folds it away */
+  .chat-layout { position: relative; grid-template-columns: minmax(0, 1fr); }
+  .chat-layout .list { position: absolute; top: 0; bottom: 0; left: 0; z-index: var(--z-panel); max-width: 100%; }
+  .chat-layout:not(.list-hidden) .list { box-shadow: var(--shadow-dialog); }
+  .chat-layout .list-resize { display: none; }
+  .chat-layout > .convo { grid-column: 1; grid-row: 1; grid-template-columns: minmax(0, 1fr); min-width: 0; }
+  .mgr-layout > * { grid-column: 1; }
+  .mgr-layout > .convo, .mgr-layout > .work { grid-row: 2; }
+  .chat-layout:not(.pane-open) .side { display: none; }
+  .chat-layout.pane-open .side { width: 100%; }
+  .sbtn { white-space: nowrap; }
+  .jev-title { flex-basis: 100%; order: -1; }
+  .chat-head { padding-inline: var(--sp-3); }
+  .head-1 .title { flex-basis: 100%; white-space: normal; }
+  .dock, .scroll > .col { padding-inline: var(--sp-3); }
+
+  /* The Manager: its chat and the work table take turns; the Switchboard floats over them */
+  .chat-layout.mgr-layout, .mgr-layout.sb-hidden { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .mgr-layout .mgr-panes { display: inline-flex; justify-self: start; margin: var(--sp-2) var(--sp-3); }
+  .mgr-layout .work { display: none; }
+  .mgr-layout.show-work .work { display: flex; }
+  .mgr-layout.show-work .convo { display: none; }
+  .mgr-layout .convo { border-right: 0; }
+  .mgr-layout.sb-float .sb { width: 100%; }
+
+  /* Board: lanes scroll inside themselves, and a card's chat takes the place */
+  .cur { position: relative; }
+  .cur-head { padding-inline: var(--sp-3); }
+  .lanes { padding-inline: var(--sp-3); scroll-snap-type: x proximity; }
+  .lane { scroll-snap-align: start; }
+  .bside { position: absolute; top: 0; right: 0; bottom: 0; left: 0; z-index: var(--z-panel); border-left: 0; }
+
+  /* Overview: Answer here, then the rest, in one column */
+  .ova { grid-template-columns: minmax(0, 1fr); overflow-y: auto; }
+  .ova > * { min-height: auto; overflow: visible; }
+  .ova-answer { border-right: 0; border-bottom: var(--line-hair) solid var(--c-line); }
+  .ova-list { overflow: visible; padding-bottom: var(--sp-4); }
+  .ova-tiles, .ova-small { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ova-three, .ova-counts { grid-template-columns: minmax(0, 1fr); }
+
+  /* Editor: the side pane takes the place */
+  .ed-body { position: relative; grid-template-columns: minmax(0, 1fr); }
+  .ed-col, .ed-pane { grid-column: 1; grid-row: 1; }
+  .pane-open .ed-pane { position: absolute; top: 0; right: 0; bottom: 0; z-index: var(--z-panel); width: 100%; border-left-width: 0; }
+  .ed-head { padding-inline: var(--sp-3); }
+  .ed-groups { margin-left: 0; gap: var(--sp-2) var(--sp-3); }
+  .ed-groups .t-micro { display: none; }
+  .ed-paper { padding: var(--sp-5) var(--sp-4) var(--sp-12); }
+
+  /* Observe: the tables scroll inside themselves */
+  .obv-head { padding-inline: var(--sp-3); }
+  .obv-gloss { display: none; }
+  .obv-tabs { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+  .obv-tabs > * { flex: none; }
+
+  /* Settings: its sections scroll across the top, and a row stacks */
+  .set { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .set-nav { padding: var(--sp-2) var(--sp-3); border-right: 0; border-bottom: var(--line-hair) solid var(--c-line); overflow: visible; }
+  .set-secs { flex-direction: row; overflow-x: auto; scrollbar-width: none; }
+  .set-secs > * { flex: none; width: auto; }
+  .set-go > :not(.t) { display: none; }
+  .srow { grid-template-columns: minmax(0, 1fr); }
+
+  /* Setup */
+  .ob-scrim { padding: var(--sp-2); }
+  .ob-head, .ob-body { padding-inline: var(--sp-4); }
+}

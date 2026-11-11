@@ -55,6 +55,13 @@ export default defineConfig(({ mode }) => {
     define: { __POISE_BUILD_SHA__: JSON.stringify(buildSourceSha()) },
     build: {
       outDir: 'dist/client',
+      // Classic and the new interface (#556) are two pages of one build.
+      rollupOptions: {
+        input: {
+          index: resolve(process.cwd(), 'index.html'),
+          ui: resolve(process.cwd(), 'ui.html'),
+        },
+      },
     },
     optimizeDeps: {
       exclude: ['better-sqlite3'],
