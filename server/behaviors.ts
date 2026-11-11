@@ -1052,8 +1052,11 @@ function reviewerSucceeded(call: LogEntry): void {
     if (failure) {
       // Record completion, not request start: a second Connect during the
       // successful request must still read as older than its verification.
+      // A Call started before the latest rejection must not verify even
+      // when it completes afterward without post-rejection sign-in.
+      const startedAt = Date.parse(agentCallStartedAt(call))
       const completedAt = Date.parse(call.completed_at ?? '')
-      if (!Number.isFinite(completedAt) || completedAt <= failure.rejectedAt) return
+      if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt) || startedAt <= failure.rejectedAt || completedAt <= failure.rejectedAt) return
       recordProviderRecovery('codex', failure.callId, completedAt)
       providerSignInVerified('codex')
       // A successful review after the bounded probe releases sibling auth

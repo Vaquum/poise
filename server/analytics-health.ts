@@ -259,11 +259,22 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         const failure = rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
           && row.event.invocationId === failed.id && failureRecord(row.event.evidence as Record<string, unknown> | null) !== null)
         if (!failure) continue
-        const retry = chain.invocations.find(invocation => invocation.admissionSequence > failure.sequence
+        const later = chain.invocations.find(invocation => invocation.admissionSequence > failure.sequence
           && invocation.behavior === failed.behavior && invocation.basis === failed.basis && invocation.slot === failed.slot
           && invocation.evidence?.status === 'completed')
+        // recover() settles verified native publication success on the
+        // original invocation instead of admitting a later retry: the retry
+        // may share the failure's admission or predate its settlement.
+        const fallback = !later ? chain.invocations.find(invocation => invocation.behavior === failed.behavior
+          && invocation.basis === failed.basis && invocation.slot === failed.slot && invocation.evidence?.status === 'completed'
+          && rows.some(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
+            && row.event.invocationId === invocation.id && row.sequence > failure.sequence
+            && (row.event.evidence as Record<string, unknown>).status === 'completed') ) : undefined
+        const retry = later ?? fallback
+        const success = retry && rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
+          && row.event.invocationId === retry.id && row.sequence > failure.sequence && row.event.evidence.status === 'completed')
         const resumed = rows.filter(row => row.sequence > failure.sequence && row.event.type === 'chain.resumed'
-          && (!retry || row.sequence < retry.admissionSequence))
+          && (!retry || (retry.admissionSequence > failure.sequence ? row.sequence < retry.admissionSequence : !success || row.sequence < success.sequence)))
         const operator = resumed.filter(row => row.event.type === 'chain.resumed' && row.event.recovery?.origin === 'operator').at(-1)
         // A runtime CI recovery carries its own ciRecovery evidence and is not
         // an ambiguous operator resume.
@@ -271,8 +282,6 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
           && (!row.event.recovery || row.event.recovery.origin === 'unknown'))
         const action = operator ?? resumed.at(-1)
         const origin = operator ? 'operator' : ambiguous ? 'unknown' : 'automatic'
-        const success = retry && rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
-          && row.event.invocationId === retry.id && row.event.evidence.status === 'completed')
         const advanced = retry && success && progress.advances.find(point => {
           if (point.sequence < failure.sequence || point.at < Number(retry.evidence?.completedAt) || point.at < error.at) return false
           const observed = rows.filter(row => row.sequence <= point.sequence && row.event.type === 'chain.observed').at(-1)
@@ -289,8 +298,9 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         }
         if (outcomeAt === null || outcomeAt === undefined || outcomeAt < since || outcomeAt > now || outcomes.has(origin)) continue
         outcomes.set(origin, { work: chain.id, journal: journalHref(chain.id, failure.sequence), summary: error.summary,
-          failedCall: error.callId, origin, actionSequence: action?.sequence ?? retry!.admissionSequence,
-          actionAt: action?.at ?? retry!.admittedAt, progressAt: advanced.at,
+          failedCall: error.callId, origin,
+          actionSequence: action?.sequence ?? (retry!.admissionSequence > failure.sequence || !success ? retry!.admissionSequence : success.sequence),
+          actionAt: action?.at ?? (retry!.admissionSequence > failure.sequence || !success ? retry!.admittedAt : success.at), progressAt: advanced.at,
           interventionAt: origin === 'operator' ? interventionAt : null })
       }
       if (unknownRecovery) result.recovery.unknown++

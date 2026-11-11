@@ -449,6 +449,36 @@ describe('reviewer account trips', () => {
       .toEqual(['reviewer:opus-5-xhigh'])
   })
 
+  it('does not verify a Codex Call started before the latest rejection', async () => {
+    const { db, runtime } = await startPrReviews({
+      primary: 'gpt-6-astra-ultra', secondary: 'opus-5-xhigh', tertiary: 'grok-4.6-xhigh',
+    })
+    await runtime.runEnabledBehaviorsOnce()
+    const probe = db.listBehaviorLaunchClaims('review-new-prs')[0]
+    const logins = await import('../server/accounts/logins')
+    const requestedAt = Date.parse(probe.launchRequestedAt)
+    const rejectedAt = requestedAt + 5_000
+    logins.recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    fixture.agentLogs = [agentLog({
+      id: 'b'.repeat(32),
+      model: 'gpt-6-astra-ultra',
+      started_at: probe.launchRequestedAt,
+      started_at_precise: probe.launchRequestedAt,
+      status: 'completed',
+      completed_at: new Date(rejectedAt + 5_000).toISOString(),
+      action: 'reviewed_clean',
+      outcome: 'clean',
+      head_sha: HEAD_SHA,
+      expected_head: probe.launchExpectedHead,
+      actor: probe.launchActor,
+      source: probe.launchSource,
+      correlation_id: probe.launchCorrelationId,
+    })]
+    await resetLogCache()
+    await runtime.runEnabledBehaviorsOnce()
+    expect(logins.providerSignInFailure('codex')?.verifiedAt).toBeNull()
+  })
+
   it('holds a target whose run posted before its account error, without tripping', async () => {
     const { db, runtime } = await startPrReviews({
       primary: 'grok-4.6-xhigh', secondary: 'opus-5-xhigh', tertiary: 'gpt-6-astra-ultra',

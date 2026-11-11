@@ -446,3 +446,25 @@ it('counts failed native_publication Calls stored under publicationReceipt', asy
   expect(report.rate).toMatchObject({ completed: 1, errors: 1, perItem: 1 })
   expect(report.lastError.error).toMatchObject({ work: chain.id, callId: nativeCall, at: NOW - 3 * HOUR })
 })
+
+it('counts automatic recovery when recover() settles the original invocation after a reconciled failure', async () => {
+  const f = setup()
+  let chain = f.observe(f.seed(1), NOW - 5 * HOUR)
+  const id = chainBasis(`${chain.id}:same-retry`).slice(0, 32)
+  const admittedAt = NOW - 4 * HOUR
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { id, behavior: 'review-issue', actor: 'reviewer', slot: 'primary',
+    basis: 'issue', model: 'fixture', admittedAt, request: { command: 'agent-interface', argv: [], cwd: '/fixture' } } }, admittedAt)
+  chain = f.append(chain, { type: 'invocation.started', invocationId: id }, admittedAt + 500)
+  const failedCall = 'e'.repeat(32)
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: { status: 'failed', action: 'not_started',
+    outcome: 'preflight_failed', error_code: 'authentication_failed', error: 'Refresh credential rejected',
+    completedAt: NOW - 4 * HOUR, callId: failedCall } }, NOW - 4 * HOUR)
+  chain = f.append(chain, { type: 'invocation.settled', invocationId: id, callId: failedCall, outcome: 'commented', evidence: {
+    status: 'completed', action: 'commented', outcome: 'commented', completedAt: NOW - 2 * HOUR,
+    issue_revision: 'issue', error: '', receipts: [{ issue: chain.id, author: 'reviewer', comment_id: 17 }] } }, NOW - 2 * HOUR)
+  chain = f.observe(chain, NOW - 2 * HOUR + 1000, null, [17])
+  f.merge(chain, NOW - HOUR)
+  const report = await f.read()
+  expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
+  expect(report.recovery.unknown).toBe(0)
+})
