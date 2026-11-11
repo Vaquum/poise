@@ -681,7 +681,10 @@ describe('Claude status diagnostics through the process helper', () => {
       await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: { stderr: '502 Bad Gateway', code: 2 } })
       await expect(monitor.check()).resolves.toMatchObject({ status: 'reauth_required', verifiedAt: null })
       expect(openAlerts()).toEqual([notice])
-      expect(failures()).toMatchObject([{ exitCode: 2, stderr: '502 Bad Gateway' }, { exitCode: 1 }])
+      expect(failures()).toMatchObject([
+        { exitCode: 2, stderr: null, message: 'Claude subscription verification failed: provider unavailable.' },
+        { exitCode: 1 },
+      ])
 
       await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: OK })
       clock.advance(CLAUDE_AUTH_RETRY_BASE_MS)
@@ -693,6 +696,112 @@ describe('Claude status diagnostics through the process helper', () => {
       unsubscribe()
       await monitor.stop()
       database.closeDatabase()
+    }
+  })
+
+  it('retains stdout-only canary failure reasons once per reason/outcome until live recovery', async () => {
+    const clock = new FakeClock()
+    const monitor = new ClaudeAuthMonitor({ canaryModel: async () => ({ selector: 'haiku', effort: 'low' }), clock })
+    const stdout = 'You have reached your monthly spend limit.\nprovider-private-text sk-ant-private-probe-credential'
+    const monthlyLimit = { stdout, stderr: '', code: 1 }
+    const canaryCalls = async () => (await fakeCalls(home)).filter((call) => call.args[0] === '--print').length
+    try {
+      await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: monthlyLimit })
+      await expect(monitor.check({ forceLive: true })).resolves.toMatchObject({
+        status: 'degraded', verifiedAt: null, authMethod: 'claude.ai', subscriptionType: 'max',
+      })
+      expect(failures()).toMatchObject([{
+        operation: 'claude.auth.verify',
+        message: 'Claude subscription verification failed: monthly spend limit reached.',
+        exitCode: 1, signal: null, stderr: null, cause: [], timeoutMs: 90_000,
+        context: { code: null, killed: false },
+      }])
+      await expect(monitor.requireReady()).rejects.toMatchObject({
+        statusCode: 503, code: 'CLAUDE_AUTH_NOT_READY', authStatus: 'degraded',
+      })
+      expect(await canaryCalls()).toBe(1)
+
+      // Different raw text for the same recognized condition is still one event.
+      await setScript(home, 'claude', {
+        ...script('claude', STATUS.claudeSubscription),
+        [canaryArgs]: { ...monthlyLimit, stdout: stdout + '\nmore-private-provider-text' },
+      })
+      clock.advance(CLAUDE_AUTH_RETRY_BASE_MS)
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'degraded', verifiedAt: null })
+      expect(await canaryCalls()).toBe(2)
+      expect(failures()).toHaveLength(1)
+      clock.advance(CLAUDE_AUTH_RETRY_BASE_MS)
+      await monitor.check()
+      expect(await canaryCalls()).toBe(2)
+
+      await setScript(home, 'claude', {
+        ...script('claude', STATUS.claudeSubscription),
+        [canaryArgs]: { stdout: 'unrecognized-private-answer', stderr: 'private-stderr sk-ant-private-stderr-credential', code: 1 },
+      })
+      clock.advance(CLAUDE_AUTH_RETRY_BASE_MS)
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'degraded', verifiedAt: null })
+      expect(failures()).toHaveLength(2)
+      expect(failures()[0]).toMatchObject({ message: 'Claude subscription verification failed: cause unavailable.', exitCode: 1, stderr: null })
+
+      // No evidence has the same unknown cause; a changed exit is new evidence.
+      await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: { code: 1 } })
+      clock.advance(4 * CLAUDE_AUTH_RETRY_BASE_MS)
+      await monitor.check()
+      expect(failures()).toHaveLength(2)
+      await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: { code: 2 } })
+      clock.advance(8 * CLAUDE_AUTH_RETRY_BASE_MS)
+      await monitor.check()
+      expect(failures()).toHaveLength(3)
+      expect(failures()[0]).toMatchObject({ message: 'Claude subscription verification failed: cause unavailable.', exitCode: 2 })
+
+      await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: OK })
+      clock.advance(16 * CLAUDE_AUTH_RETRY_BASE_MS)
+      await expect(monitor.check()).resolves.toMatchObject({ status: 'authenticated', verifiedAt: new Date(clock.now()).toISOString() })
+      await expect(monitor.requireReady()).resolves.toBeUndefined()
+      expect(failures()).toHaveLength(3)
+      await setScript(home, 'claude', { ...script('claude', STATUS.claudeSubscription), [canaryArgs]: monthlyLimit })
+      await expect(monitor.check({ forceLive: true })).resolves.toMatchObject({ status: 'degraded' })
+      expect(failures()).toHaveLength(4)
+      expect(failures()[0]).toMatchObject({ message: 'Claude subscription verification failed: monthly spend limit reached.', exitCode: 1 })
+      expect(await canaryCalls()).toBe(7)
+
+      const retained = JSON.stringify(failures()) + JSON.stringify(vi.mocked(process.stderr.write).mock.calls)
+      for (const raw of ['You have reached', 'provider-private-text', 'sk-ant-private-probe-credential', 'more-private-provider-text', 'unrecognized-private-answer', 'private-stderr', 'sk-ant-private-stderr-credential']) {
+        expect(retained).not.toContain(raw)
+      }
+    } finally {
+      await monitor.stop()
+    }
+  })
+
+  it.each(['stop', 'stale'] as const)('omits a late live-probe diagnostic after %s', async (action) => {
+    await setScript(home, 'claude', {
+      ...script('claude', STATUS.claudeSubscription),
+      [canaryArgs]: { stdout: 'You have reached your monthly spend limit.', code: 1 },
+    })
+    const failed = deferred<void>()
+    const release = deferred<void>()
+    const monitor = new ClaudeAuthMonitor({
+      canaryModel: async () => ({ selector: 'haiku', effort: 'low' }), clock: new FakeClock(),
+      runFile: async (command, args, options) => {
+        try { return await runFile(command, args, options) } catch (error) {
+          failed.resolve()
+          await release.promise
+          throw error
+        }
+      },
+    })
+    try {
+      const pending = monitor.check({ forceLive: true })
+      await failed.promise
+      if (action === 'stop') void monitor.stop()
+      else monitor.observeProcessFailure(new Error('401 authentication_error'))
+      release.resolve()
+      await pending
+      expect(failures()).toEqual([])
+    } finally {
+      release.resolve()
+      await monitor.stop()
     }
   })
 
