@@ -119,6 +119,187 @@ describe('GET /api/accounts', () => {
     expect(providerSignInFailure('codex')).toMatchObject({ since, rejectedAt: secondAt, verifiedAt: null })
   })
 
+  it('preserves a verified reconnect when a later Connect succeeds', async () => {
+    const { recordProviderRecovery } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const reconnectedAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(reconnectedAt).toBeGreaterThan(rejectedAt)
+    recordProviderRecovery('codex', 'a'.repeat(32), reconnectedAt + 1)
+    const verifiedAt = providerSignInFailure('codex')!.verifiedAt!
+    while (Date.now() <= reconnectedAt) await new Promise(resolve => setTimeout(resolve, 1))
+    recordLogin('codex', 0)
+    expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt, verifiedAt })
+  })
+
+  it('preserves the first Connect when a second lands after Call completion but before reconcile', async () => {
+    const { recordProviderRecovery } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    // A successful review Call completes after the first Connect; its receipt
+    // is reconciled later, so verifiedAt is still null when the second Connect
+    // lands. Saving call.completed_at must still read as operator help.
+    const completedAt = firstAt + 1
+    while (Date.now() <= completedAt) await new Promise(resolve => setTimeout(resolve, 1))
+    recordLogin('codex', 0)
+    expect(providerSignInFailure('codex')!.reconnectedAt).toBe(firstAt)
+    recordProviderRecovery('codex', 'a'.repeat(32), completedAt)
+    const failure = providerSignInFailure('codex')!
+    expect(failure).toMatchObject({ reconnectedAt: firstAt, verifiedAt: completedAt })
+    expect(failure.reconnectedAt!).toBeLessThanOrEqual(failure.verifiedAt!)
+  })
+
+  it('preserves the first Connect when a second lands after Call completion with a claim in flight', async () => {
+    const { claimProviderVerification, recordProviderRecovery } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    // A verification claim is already in flight when the successful review
+    // Call completes; its receipt is reconciled later, so verifiedAt is still
+    // null when the second Connect lands. Saving call.completed_at must still
+    // read as operator help instead of unknown.
+    expect(claimProviderVerification('codex')).not.toBeNull()
+    const completedAt = firstAt + 1
+    while (Date.now() <= completedAt) await new Promise(resolve => setTimeout(resolve, 1))
+    recordLogin('codex', 0)
+    expect(providerSignInFailure('codex')!.reconnectedAt).toBe(firstAt)
+    recordProviderRecovery('codex', 'a'.repeat(32), completedAt)
+    const failure = providerSignInFailure('codex')!
+    expect(failure).toMatchObject({ reconnectedAt: firstAt, verifiedAt: completedAt })
+    expect(failure.reconnectedAt!).toBeLessThanOrEqual(failure.verifiedAt!)
+  })
+
+  it('releases a failed verification claim so a later Connect can be verified', async () => {
+    const { claimProviderVerification, releaseProviderVerification } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    // A Connect-triggered verification starts; a second Connect while the
+    // claim is held must not replace the reconnect being verified.
+    expect(claimProviderVerification('codex')).not.toBeNull()
+    while (Date.now() <= firstAt) await new Promise(resolve => setTimeout(resolve, 1))
+    recordLogin('codex', 0)
+    const pendingAt = Date.parse((await import('../server/accounts/logins')).accountLogins().codex!)
+    expect(pendingAt).toBeGreaterThan(firstAt)
+    expect(providerSignInFailure('codex')!.reconnectedAt).toBe(firstAt)
+    expect(claimProviderVerification('codex')).toBeNull()
+    // The verification fails: only the matching claim is released. A fresh
+    // Connect that completed while the claim was held is promoted so the next
+    // read can claim it without another Connect, while the resolving Connect
+    // is retained for a late review-Call verification. A foreign login never
+    // releases the held claim.
+    releaseProviderVerification('codex', 'not-the-claim')
+    expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt: firstAt, verificationLogin: firstAt.toString() })
+    releaseProviderVerification('codex', firstAt.toString())
+    const released = providerSignInFailure('codex')!
+    expect(released).toMatchObject({ reconnectedAt: pendingAt, verificationLogin: firstAt.toString(),
+      retainedVerificationLogin: firstAt.toString(), verifiedAt: null })
+    expect(claimProviderVerification('codex')).not.toBeNull()
+    expect(providerSignInFailure('codex')).toMatchObject({ verificationLogin: pendingAt.toString(),
+      retainedVerificationLogin: firstAt.toString() })
+  })
+
+  it('preserves operator proof when verification fails after a review Call completes but before reconcile', async () => {
+    const { claimProviderVerification, releaseProviderVerification, recordProviderRecovery } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    expect(claimProviderVerification('codex')).not.toBeNull()
+    // A successful review Call completes after the resolving Connect; its receipt
+    // is reconciled later, so verifiedAt is still null when the Connect-triggered
+    // verification fails.
+    const completedAt = firstAt + 1
+    while (Date.now() <= completedAt) await new Promise(resolve => setTimeout(resolve, 1))
+    releaseProviderVerification('codex', firstAt.toString())
+    // Clearing reconnectedAt must not erase the resolving Connect: the retained
+    // verificationLogin still proves operator help once reviewerSucceeded records
+    // the completed Call. Old code cleared both and read as unknown.
+    expect(providerSignInFailure('codex')!.reconnectedAt).toBeNull()
+    expect(providerSignInFailure('codex')!.verificationLogin).toBe(firstAt.toString())
+    recordProviderRecovery('codex', 'a'.repeat(32), completedAt)
+    const failure = providerSignInFailure('codex')!
+    expect(failure).toMatchObject({ reconnectedAt: null, verificationLogin: firstAt.toString(), verifiedAt: completedAt })
+    expect(Number(failure.verificationLogin)).toBeGreaterThan(rejectedAt)
+    expect(Number(failure.verificationLogin)).toBeLessThanOrEqual(failure.verifiedAt!)
+  })
+
+  it('retains the resolving Connect when a newer Connect overwrites the claim before reconcile', async () => {
+    const { accountLogins, claimProviderVerification, releaseProviderVerification, recordProviderRecovery } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    expect(claimProviderVerification('codex')).not.toBeNull()
+    // A successful review Call completes after the resolving Connect; its
+    // receipt is reconciled later, so verifiedAt is still null when the
+    // Connect-triggered verification fails and a newer Connect is claimed.
+    const completedAt = firstAt + 1
+    while (Date.now() <= completedAt) await new Promise(resolve => setTimeout(resolve, 1))
+    releaseProviderVerification('codex', firstAt.toString())
+    expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt: null,
+      verificationLogin: firstAt.toString(), retainedVerificationLogin: firstAt.toString() })
+    while (Date.now() <= completedAt) await new Promise(resolve => setTimeout(resolve, 1))
+    recordLogin('codex', 0)
+    const laterAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(laterAt).toBeGreaterThan(completedAt)
+    expect(claimProviderVerification('codex')).not.toBeNull()
+    // The newer claim overwrites verificationLogin, but the resolving Connect
+    // survives in retainedVerificationLogin for the late reconciliation.
+    expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt: laterAt,
+      verificationLogin: laterAt.toString(), retainedVerificationLogin: firstAt.toString() })
+    recordProviderRecovery('codex', 'a'.repeat(32), completedAt)
+    const failure = providerSignInFailure('codex')!
+    expect(failure.verifiedAt).toBe(completedAt)
+    const retainedAt = Number(failure.retainedVerificationLogin)
+    expect(retainedAt).toBe(firstAt)
+    expect(retainedAt).toBeGreaterThan(rejectedAt)
+    expect(retainedAt).toBeLessThanOrEqual(failure.verifiedAt!)
+    expect(Number(accountLogins().codex && Date.parse(accountLogins().codex!))).toBeGreaterThanOrEqual(laterAt)
+  })
+
+  it('records verification completion when a second Connect lands during verification', async () => {
+    await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
+    vi.spyOn(models, 'loadCatalog').mockResolvedValue(JSON.parse(CATALOG_STDOUT))
+    const actualRun = processes.runFile
+    const native = vi.fn(async () => {
+      const enteredAt = Date.now()
+      const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+      while (Date.now() <= Math.max(firstAt, enteredAt)) await new Promise(resolve => setTimeout(resolve, 1))
+      recordLogin('codex', 0)
+      return { stdout: '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}\n{"type":"turn.completed"}\n', stderr: '' }
+    })
+    vi.spyOn(processes, 'runFile').mockImplementation((command, args, options) => args[0] === 'exec'
+      ? native() : actualRun(command, args, options))
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    while (Date.now() <= firstAt) await new Promise(resolve => setTimeout(resolve, 1))
+    await listAccounts('codex')
+    expect(native).toHaveBeenCalledTimes(1)
+    const failure = providerSignInFailure('codex')!
+    // Completion, not request start: first-wins keeps reconnectedAt at firstAt,
+    // so compare against the second Connect's login time. Old start-time code
+    // records startedAt below that Connect and fails this guard.
+    const pendingAt = Date.parse(accountLogins().codex!)
+    expect(pendingAt).toBeGreaterThan(firstAt)
+    expect(failure.reconnectedAt).toBe(firstAt)
+    expect(failure.verifiedAt).toBeGreaterThanOrEqual(pendingAt)
+  })
+
   it('reads a fast account independently of a pending provider', async () => {
     let release!: () => void
     const held = new Promise<void>(resolve => { release = resolve })

@@ -400,7 +400,7 @@ describe('native admission and recovery', () => {
     expect(launched).toEqual(['approve-pr'])
   })
 
-  it.each(['recovered', 'operator hold', 'posting began', 'resources unknown', 'unrelated failure'])('reconciles only a proved auth hold: %s', async mode => {
+  it.each(['recovered', 'operator recovery', 'operator hold', 'posting began', 'resources unknown', 'unrelated failure'])('reconciles only a proved auth hold: %s', async mode => {
     const { journal, chain } = setup()
     const obs = { ...observation(), checkedAt: Date.now() }
     const basis = chainBasis(['issue', obs.issue.revision])
@@ -419,7 +419,8 @@ describe('native admission and recovery', () => {
     const calls: LogEntry[] = []
     const runtime = new BehaviorChainRuntime(journal, operations({ observe: async () => ({ ...obs, checkedAt: Date.now() }),
       readInvocations: async () => ({ entries: calls, quarantined: [] }),
-      authRecovered: () => recovered && mode !== 'unrelated failure',
+      authRecovered: () => recovered && mode !== 'unrelated failure' && (mode === 'operator recovery'
+        ? { origin: 'operator', intervention: { callId: 'rejected-2', at: Date.now(), verifiedAt: Date.now() } } : true),
       launch: async invocation => { launched.push(invocation); return true } }))
     await runtime.run()
     expect(launched).toHaveLength(0)
@@ -427,7 +428,7 @@ describe('native admission and recovery', () => {
     await runtime.run()
     await runtime.run()
     const after = journal.read(chain.id)!
-    if (mode === 'recovered') {
+    if (mode === 'recovered' || mode === 'operator recovery') {
       expect(after.held).toBeNull()
       expect(after.resumedAfterSequence).toBeGreaterThan(current.sequence)
       expect(launched).toHaveLength(1)
@@ -435,6 +436,7 @@ describe('native admission and recovery', () => {
       expect(after.invocations).toHaveLength(4)
       const resumes = journal.history(chain.id).filter(row => JSON.parse(row.payload).type === 'chain.resumed')
       expect(resumes).toHaveLength(1)
+      expect(JSON.parse(resumes[0].payload).recovery).toMatchObject({ origin: mode === 'operator recovery' ? 'operator' : 'unknown' })
       const review = launched[0]
       calls.push({ id: 'a'.repeat(32), correlation_id: review.id, source: 'poise:behavior-chain', actor: 'reviewer',
         pr_id: '7', model: 'fixture-model', session_id: null, prompt: '', started_at: new Date(review.admittedAt).toISOString(),

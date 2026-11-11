@@ -21,6 +21,7 @@ interface ProviderSignInFailure {
   consumedAt: number | null
   reconnectedAt: number | null
   verificationLogin: string | null
+  retainedVerificationLogin?: string | null
 }
 const rejectionKey = (id: AccountId) => `account_runtime_rejection:${id}`
 
@@ -31,7 +32,9 @@ export function providerSignInFailure(id: AccountId): ProviderSignInFailure | nu
   if (!value || typeof value.callId !== 'string' || typeof value.model !== 'string'
     || !Number.isSafeInteger(value.since) || !Number.isSafeInteger(value.rejectedAt) || value.since > value.rejectedAt
     || ![value.verifiedAt, value.consumedAt, value.reconnectedAt].every(at => at === null || Number.isSafeInteger(at))
-    || !(value.verificationLogin === null || typeof value.verificationLogin === 'string')) {
+    || !(value.verificationLogin === null || typeof value.verificationLogin === 'string')
+    || !(value.retainedVerificationLogin === undefined || value.retainedVerificationLogin === null
+      || typeof value.retainedVerificationLogin === 'string')) {
     throw new Error(`The ${id} runtime sign-in evidence is corrupt`)
   }
   return value
@@ -58,7 +61,8 @@ export function recordProviderRejection(id: AccountId, callId: string, model: st
     // still needs its older failures eligible for a later verification.
     setMeta(rejectionKey(id), JSON.stringify({ callId, model, rejectedAt,
       since: !previous ? rejectedAt : previous.since,
-      verifiedAt: null, consumedAt: null, reconnectedAt, verificationLogin: null } satisfies ProviderSignInFailure))
+      verifiedAt: null, consumedAt: null, reconnectedAt, verificationLogin: null,
+      retainedVerificationLogin: null } satisfies ProviderSignInFailure))
   }).immediate()
 }
 
@@ -72,6 +76,28 @@ export function claimProviderVerification(id: AccountId): ProviderSignInFailure 
       || failure.verificationLogin === login) return null
     setMeta(rejectionKey(id), JSON.stringify({ ...failure, verificationLogin: login }))
     return failure
+  }).immediate()
+}
+
+/** A Connect-triggered verification failed or timed out: release its claim so a
+ *  later Connect can be recorded and verified. The resolving Connect is
+ *  retained separately so a successful review Call that completed before the
+ *  failure but whose receipt is reconciled later still verifies as operator
+ *  help even after a newer Connect overwrites verificationLogin. A Connect
+ *  that completed while the verification was pending is promoted from the
+ *  login record so subsequent reads can claim it without another Connect.
+ *  Only the matching outstanding claim is released. */
+export function releaseProviderVerification(id: AccountId, login: string | null): void {
+  if (login === null) return
+  db.transaction(() => {
+    const failure = providerSignInFailure(id)
+    if (!failure || failure.verifiedAt !== null || failure.verificationLogin !== login) return
+    let reconnectedAt: number | null = null
+    const loginAt = accountLogins()[id]
+    const loginMs = typeof loginAt === 'string' ? Date.parse(loginAt) : NaN
+    if (Number.isSafeInteger(loginMs) && loginMs > failure.rejectedAt && loginMs.toString() !== login) reconnectedAt = loginMs
+    setMeta(rejectionKey(id), JSON.stringify({ ...failure, reconnectedAt,
+      retainedVerificationLogin: failure.retainedVerificationLogin ?? login }))
   }).immediate()
 }
 
@@ -145,7 +171,13 @@ export function recordLogin(preset: string, code: number): void {
   const completedAt = Date.now()
   setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [id]: new Date(completedAt).toISOString() }))
   const failure = providerSignInFailure(id)
-  if (failure && completedAt > failure.rejectedAt) {
+  // First resolving Connect wins while unverified: a later Connect after
+  // physical Call completion but before its receipt is reconciled must not
+  // clobber the help that verification will confirm, even when a verification
+  // claim is already in flight. Retry of the same failure happens through the
+  // review-Call verification path or a later rejection, not by replacing.
+  if (failure && completedAt > failure.rejectedAt && failure.verifiedAt === null
+    && failure.reconnectedAt === null) {
     setMeta(rejectionKey(id), JSON.stringify({ ...failure, reconnectedAt: completedAt }))
   }
 }

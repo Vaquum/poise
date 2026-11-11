@@ -25,6 +25,7 @@ import { getCallerReleaseHealth } from './caller-release'
 import { getProductionUpdateHealth } from './production-update'
 import { listCards, createCard, setCardText, setCardRepo, moveCard, removeCard, type Lane } from './current'
 import { parseBounds, parseWindow, readAnalytics, readAnalyticsHistory } from './analytics'
+import { readAnalyticsHealth } from './analytics-health'
 import { checkGithubQuota, readGithubQuota, startGithubQuotaRuntime, stopGithubQuotaRuntime } from './github-quota'
 import { dependencySnapshot, livenessSnapshot } from './health'
 import { handleGhBody, listOrgRepos, listOrganizationsRepos, selectOrganizations, repoBelongsTo, requireConfiguredRepository } from './gh'
@@ -1234,14 +1235,15 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         }
 
         // ── Analytics day and history; abandoned reads release their worker ──
-        if ((path === '/api/analytics' || path === '/api/analytics/history') && req.method === 'GET') {
+        if ((path === '/api/analytics' || path === '/api/analytics/history' || path === '/api/analytics/system-health') && req.method === 'GET') {
           const controller = new AbortController()
           const close = () => controller.abort(new Error('Analytics client disconnected'))
           res.once('close', close)
           if (res.destroyed) close()
           try {
             const query = new URLSearchParams(url.split('?')[1] || '')
-            const report = path === '/api/analytics/history'
+            const report = path === '/api/analytics/system-health' ? await readAnalyticsHealth(selectedOrg, controller.signal)
+              : path === '/api/analytics/history'
               ? await readAnalyticsHistory(parseBounds(query.get('bounds')), selectedOrg, controller.signal)
               : await readAnalytics(parseWindow(query.get('since'), query.get('until')), selectedOrg, query.has('dailyBounds') ? parseBounds(query.get('dailyBounds')) : undefined, controller.signal)
             if (!res.destroyed) return json(res, 200, report)

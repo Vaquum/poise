@@ -4,6 +4,7 @@ import type { AnalyticsHistory } from '../../src/analytics-history'
 import type { GithubQuotaReport } from '../../src/github-quota'
 import { WORK_TYPES } from '../../src/analytics-work-review'
 import { freeze, resume, settled } from './fixtures/motion'
+import { analyticsHealthReport } from './fixtures/analytics'
 
 test('reorders the card board by its headers, persists across reads and reload, and supports cancellation and reduced motion', async ({ page }) => {
   await workspace(page)
@@ -564,6 +565,7 @@ async function workspace(page: Page, timezone = 'UTC'): Promise<Workspace> {
   const organizations = ['acme', 'beta'].map((login) => ({ login, managed: true, status: 'ready', stage: 'ready', error: null, activatedAt: '2026-10-01T08:00:00Z' }))
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
+    if (url.pathname === '/api/analytics/system-health') return route.fulfill({ json: analyticsHealthReport(url.searchParams.get('org') ?? '') })
     if (url.pathname === '/api/analytics/history') {
       const bounds = url.searchParams.get('bounds')!.split(',')
       const reads = bounds.length === 31 ? state.histogramReads : state.historyReads
@@ -2294,4 +2296,66 @@ test('notifies a shared failed read once outside Analytics and clears it after r
   await page.locator('.nr-bell').click()
   await expect(page.locator('.nr-rail')).toBeVisible()
   await expect(notices).toHaveCount(0)
+})
+
+test('shows five live health cards with evidence, stale retained reads, historical gaps and responsive scope', async ({ page }) => {
+  await workspace(page)
+  const api = await page.request.get('/api/analytics/system-health')
+  expect(api.status()).toBe(200)
+  const actual = await api.json()
+  expect(actual.rate.completed).toBeGreaterThanOrEqual(0)
+  expect(actual.limits.join(' ')).toContain('v2-only')
+  expect(actual.coverage.some((source: { name: string }) => source.name === 'Chain journal')).toBe(true)
+  let fails = false, healthReads = 0
+  await page.route('**/api/analytics/system-health*', route => {
+    healthReads++
+    expect(route.request().method()).toBe('GET')
+    return fails ? route.fulfill({ status: 502, json: { error: 'Caller evidence unavailable' } })
+      : route.fulfill({ json: analyticsHealthReport(new URL(route.request().url()).searchParams.get('org') ?? '') })
+  })
+  await page.setViewportSize({ width: 1600, height: 1000 })
+  await page.goto('/')
+  await openAnalytics(page)
+  const strip = page.getByRole('region', { name: 'System health', exact: true })
+  const cards = strip.locator('.system-health-card')
+  await expect(cards).toHaveCount(5)
+  await expect(strip).toContainText('System health · Live')
+  await expect(strip).toContainText('Trailing 24 hours')
+  await expect(cards.nth(0)).toContainText('Unavailable')
+  await expect(cards.nth(0)).toContainText('1 known errors / 2 completed items')
+  await expect(cards.nth(1)).toContainText('Oldest progress 2h ago · Issue admission: 1')
+  await expect(cards.nth(2)).toContainText('1 required outside intervention · 1 unknown outcomes')
+  await expect(cards.nth(3)).toContainText('Last observed error')
+  await expect(cards.nth(4).locator('.system-health-bar .gap')).toHaveCount(1)
+  await expect(cards.nth(4).locator('.system-health-bar .unknown')).toHaveCount(1)
+  await expect(cards.nth(4).locator('.system-health-source')).toHaveCount(3)
+  expect(await cards.evaluateAll(cards => new Set(cards.map(card => Math.round(card.getBoundingClientRect().top))).size)).toBe(1)
+  await expect(value(page, 'Pull requests merged')).toHaveText('4')
+  await expect(page.locator('.analytics-board .analytics-histogram')).not.toHaveCount(0)
+  await cards.nth(2).getByText('Evidence (1)', { exact: true }).click()
+  await expect(cards.nth(2)).toContainText('failed Call ' + 'a'.repeat(32))
+  await expect(cards.nth(2)).toContainText('verified progress')
+  await expect(cards.nth(2).getByRole('link', { name: 'acme/repo#7', exact: true })).toHaveAttribute('href', /view=logging.*chain=/)
+  for (const card of await cards.all()) await expect(card.getByRole('link').first()).toHaveAttribute('href', '/?view=logging')
+  const firstRead = await strip.locator('.system-health-status').textContent()
+  fails = true
+  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+  await expect(strip.getByRole('status')).toContainText('Stale · Last successful read')
+  await expect(strip.getByRole('status')).toContainText('Caller evidence unavailable')
+  await expect(cards.nth(1)).toContainText('Oldest progress 2h ago')
+  fails = false
+  await page.evaluate(() => window.dispatchEvent(new Event('poise:refresh-tick')))
+  await expect(strip.locator('.system-health-status')).toHaveText(firstRead!)
+  await expect(cards.nth(4).locator('.system-health-bar .gap')).toHaveCount(1)
+  await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('acme')
+  await expect(strip.getByRole('status')).toContainText('acme · Read')
+  await expect(strip).toContainText('Instance-wide coverage history')
+  for (const width of [736, 360]) {
+    await page.setViewportSize({ width, height: 1000 })
+    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+  }
+  const reads = healthReads
+  await page.getByRole('button', { name: 'Previous day', exact: true }).click()
+  await expect(value(page, 'Pull requests merged')).toHaveText('0')
+  expect(healthReads).toBe(reads)
 })

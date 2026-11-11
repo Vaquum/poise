@@ -111,7 +111,7 @@ function exactPull(observation: ChainObservation | null) {
 
 /** Derive the clock from immutable history, never the latest poll or attempt.
  * Replaying here leaves reducer state and historical hashes unchanged. */
-function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocation?: string) {
+export function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocation?: string, trackAdvances = false) {
   let chain: BehaviorChain | null = null
   let at = 0, sequence = 0, after = 0
   let previous: ChainObservation['pull'] = null
@@ -119,6 +119,7 @@ function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocati
   let failureSequence: number | null = null
   let waitingSequence = 0
   let waitingHead: string | null = null
+  const advances: Array<{ at: number, sequence: number }> = []
   for (;;) {
     const events = journal.history(id, after)
     for (const row of events) {
@@ -173,13 +174,16 @@ function chainProgress(journal: BehaviorChainJournal, id: string, failedInvocati
           }
         }
       }
-      if (advanced) { at = row.at; sequence = row.sequence }
+      if (advanced) {
+        at = row.at; sequence = row.sequence
+        if (trackAdvances && event.type !== 'chain.admitted') advances.push({ at, sequence })
+      }
     }
     if (events.length < 100) break
     after = events.at(-1)!.sequence
   }
   if (!chain) throw new Error(`behavior chain admission history is unavailable: ${id}`)
-  return { at, sequence, failureSequence, waitingSequence, waitingHead }
+  return { at, sequence, failureSequence, waitingSequence, waitingHead, advances }
 }
 
 /** Read-only incident annotation, independent of attention's age/active filters. */

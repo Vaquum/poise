@@ -1050,9 +1050,14 @@ function reviewerSucceeded(call: LogEntry): void {
   if (catalog?.models.find(model => model.identity === identity)?.provider === 'codex') {
     const failure = providerSignInFailure('codex')
     if (failure) {
+      // Record completion, not request start: a second Connect during the
+      // successful request must still read as older than its verification.
+      // A Call started before the latest rejection must not verify even
+      // when it completes afterward without post-rejection sign-in.
       const startedAt = Date.parse(agentCallStartedAt(call))
-      if (!Number.isFinite(startedAt) || startedAt <= failure.rejectedAt) return
-      recordProviderRecovery('codex', failure.callId, startedAt)
+      const completedAt = Date.parse(call.completed_at ?? '')
+      if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt) || startedAt <= failure.rejectedAt || completedAt <= failure.rejectedAt) return
+      recordProviderRecovery('codex', failure.callId, completedAt)
       providerSignInVerified('codex')
       // A successful review after the bounded probe releases sibling auth
       // trips for this provider. Quota and other causes keep their clocks.
@@ -7855,10 +7860,25 @@ async function runBehaviorChains(): Promise<void> {
         if (!isCodex) return false
         const completedAt = invocation.evidence?.completedAt
         const diagnostic = invocation.evidence?.diagnostic as LogEntry['diagnostic']
-        return !!failure && failure.verifiedAt !== null && failure.verifiedAt > failure.rejectedAt
+        const recovered = failure.verifiedAt !== null && failure.verifiedAt > failure.rejectedAt
           && typeof completedAt === 'number' && completedAt >= failure.since && completedAt <= failure.rejectedAt
           && diagnostic?.operation === 'provider.review' && diagnostic.context.submission === 'none'
           && invocation.evidence?.error_code === 'authentication_failed'
+        if (!recovered) return false
+        // A failed Connect-triggered verification retains its resolving Connect
+        // separately: a successful review Call that completed before the
+        // failure and is reconciled later must still read as operator help
+        // even after a newer Connect overwrites verificationLogin.
+        const claimedAt = failure.verificationLogin !== null ? Number(failure.verificationLogin) : null
+        const retainedRaw = (failure as { retainedVerificationLogin?: string | null }).retainedVerificationLogin ?? null
+        const retainedAt = retainedRaw !== null ? Number(retainedRaw) : null
+        const reconnectAt = failure.reconnectedAt !== null && failure.reconnectedAt > failure.rejectedAt
+          && failure.reconnectedAt <= failure.verifiedAt! ? failure.reconnectedAt
+          : claimedAt !== null && Number.isSafeInteger(claimedAt) && claimedAt > failure.rejectedAt && claimedAt <= failure.verifiedAt! ? claimedAt
+          : retainedAt !== null && Number.isSafeInteger(retainedAt) && retainedAt > failure.rejectedAt && retainedAt <= failure.verifiedAt! ? retainedAt : null
+        return reconnectAt !== null
+          ? { origin: 'operator', intervention: { callId: failure.callId, at: reconnectAt, verifiedAt: failure.verifiedAt! } }
+          : { origin: 'unknown' }
       },
       async reviews(repository, number) {
         const { readWorkReviews } = await import('./chat/control')

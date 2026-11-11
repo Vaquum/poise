@@ -999,6 +999,23 @@ tr:hover .review-btn { opacity: 1; }
   container: analytics / inline-size;
 }
 .analytics-date { display: flex; align-items: center; justify-content: center; min-width: 7.5em; padding: var(--sp-1) var(--sp-3); border: var(--b-base); border-right: none; background: var(--surface); color: var(--text); font-size: .75rem; font-weight: 600; white-space: nowrap; }
+.system-health { margin-bottom: var(--sp-5); }
+.system-health-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--sp-2); font-size: .75rem; color: var(--text-secondary); }
+.system-health-status, .system-health-limits { font-size: .6875rem; color: var(--text-secondary); margin-block: var(--sp-2); }
+.system-health-cards { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: var(--sp-3); }
+.system-health-card { min-width: 0; padding: var(--sp-3); border: var(--b-base); border-radius: var(--r-sm); background: var(--surface); overflow-wrap: anywhere; }
+.system-health-card > .analytics-label { display: block; color: var(--text-secondary); }
+.system-health-value { margin: var(--sp-2) 0; font-size: 1.25rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.system-health-card details, .system-health-source { font-size: .625rem; margin-top: var(--sp-2); }
+.system-health-card ul, .system-health-limits ul { padding-left: 1.25em; }
+.system-health-source small { display: block; color: var(--text-secondary); }
+.system-health-bar { display: flex; height: 5px; margin-block: var(--sp-1); background: var(--hairline); }
+.system-health-bar .covered { background: var(--green); }
+.system-health-bar .gap { background: var(--red); }
+.system-health-bar .unknown { background: var(--n5); }
+@container analytics (max-width: 1099px) { .system-health-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container analytics (max-width: 639px) { .system-health-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@container analytics (max-width: 449px) { .system-health-cards { grid-template-columns: minmax(0, 1fr); } }
 .analytics-day button:disabled { opacity: .4; cursor: default; }
 .analytics-day button:disabled:hover { color: var(--text-secondary); background: var(--surface); }
 .analytics-group, .github-quota-section { margin-bottom: var(--sp-7); }
