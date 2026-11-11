@@ -46,11 +46,10 @@ def main():
             return
     if not os.path.exists(os.path.join(here, "relay")) or not test_command(argv[1:]):
         return
+    # The interpreter itself too: a virtualenv's reaches its base through links the box needs.
+    also = ["--also", sys.prefix, "--also", sys.base_prefix, "--also", sys.executable]
     try:
-        os.execvp(
-            "node",
-            ["node", os.path.join(here, "run.mjs"), "--also", sys.prefix, "--also", sys.base_prefix, "--"] + argv,
-        )
+        os.execvp("node", ["node", os.path.join(here, "run.mjs")] + also + ["--"] + argv)
     except OSError as error:
         # site swallows what this module raises and would run the suite here.
         sys.stderr.write("[poise] cannot start the test box: %s\n" % error)

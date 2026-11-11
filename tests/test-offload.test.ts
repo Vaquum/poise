@@ -201,6 +201,39 @@ describe('what reaches a test box', () => {
     expect(paths.filter((path: string) => path.startsWith('/usr'))).toEqual([])
   })
 
+  it('sends every link on the way to an interpreter, as a virtualenv\'s reaches its base through one', () => {
+    const repo = checkout()
+    const elsewhere = temp()
+    const base = join(elsewhere, 'cpython-3.13.16')
+    const link = join(elsewhere, 'cpython-3.13')
+    mkdirSync(join(base, 'bin'), { recursive: true })
+    writeFileSync(join(base, 'bin', 'python3.13'), '')
+    symlinkSync('python3.13', join(base, 'bin', 'python3'))
+    symlinkSync(base, link)
+    const python = join(repo, '.venv', 'bin', 'python3')
+    symlinkSync(join(link, 'bin', 'python3'), python)
+    const paths = filesToSend(repo, [join(repo, '.venv'), base, python], {}, '/nowhere')
+    expect(paths).toEqual(expect.arrayContaining([python, link, join(base, 'bin', 'python3'), join(base, 'bin', 'python3.13'), base]))
+    // Through the link it would arrive as a folder of its own, and the link could not be made.
+    expect(paths.filter((path: string) => path.startsWith(`${link}/`))).toEqual([])
+  })
+
+  it('sends a link to a whole folder, and follows a link before the `..` after it, as the system does', () => {
+    const repo = checkout()
+    const elsewhere = temp()
+    mkdirSync(join(elsewhere, 'env', 'bin'), { recursive: true })
+    writeFileSync(join(elsewhere, 'env', 'bin', 'python'), '')
+    symlinkSync(join(elsewhere, 'env'), join(elsewhere, 'venv'))
+    expect(filesToSend(repo, [join(elsewhere, 'venv', 'bin', 'python')], {}, '/nowhere')).toEqual(expect.arrayContaining([join(elsewhere, 'venv'), join(elsewhere, 'env', 'bin', 'python')]))
+    mkdirSync(join(elsewhere, 'bin'))
+    mkdirSync(join(elsewhere, 'libexec', 'nested'), { recursive: true })
+    writeFileSync(join(elsewhere, 'libexec', 'python3.13'), '')
+    symlinkSync('../libexec/nested', join(elsewhere, 'bin', 'alt'))
+    symlinkSync('alt/../python3.13', join(elsewhere, 'bin', 'python3'))
+    const paths = filesToSend(repo, [join(elsewhere, 'bin', 'python3')], {}, '/nowhere')
+    expect(paths).toEqual(expect.arrayContaining([join(elsewhere, 'bin', 'python3'), join(elsewhere, 'bin', 'alt'), join(elsewhere, 'libexec', 'python3.13')]))
+  })
+
   it('refuses to send an interpreter\'s folder with the home or the run\'s temporary files in it', () => {
     const repo = checkout()
     const home = temp()
@@ -337,6 +370,18 @@ describe('the hooks at work', () => {
     expect(result.status).toBe(125)
     expect(result.stderr).toContain('[poise]')
     expect(existsSync(marker)).toBe(false)
+  })
+
+  it('send the Python that started a suite with its prefixes, so the links a virtualenv\'s takes to its base go too', () => {
+    const { hooks } = hooked(true)
+    // Says what it was asked to send, in the place of the real sender.
+    writeFileSync(join(hooks, 'run.mjs'), 'console.log(JSON.stringify(process.argv.slice(2)))')
+    const env = { ...process.env, PYTHONPATH: hooks }
+    const result = spawnSync('python3', ['-m', 'pytest', '-q'], { cwd: temp(), encoding: 'utf8', env })
+    const args = JSON.parse(result.stdout) as string[]
+    // Asked with the same PYTHONPATH: a sitecustomize of Python's own, as Homebrew's, can change these.
+    const python = JSON.parse(execFileSync('python3', ['-c', 'import json, sys; print(json.dumps([sys.prefix, sys.base_prefix, sys.executable]))'], { env }).toString()) as string[]
+    expect(args.slice(0, args.indexOf('--')).filter((arg) => arg !== '--also')).toEqual(python)
   })
 })
 
