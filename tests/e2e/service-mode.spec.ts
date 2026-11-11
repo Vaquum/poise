@@ -139,7 +139,9 @@ test('submits MCP consent to a registered callback whose origin is also a font s
   const upstream = () => ({ host: 'unused.poise.invalid', port: 5555 })
   const deps = { config, store, keys, docker, log, now: Date.now, upstream }
   const gateway = createGateway({ ...deps, github: new GitHubClient(config), orchestrator: new Orchestrator(deps) })
+  // The classic fixture's route belongs to the context, so it goes too.
   await page.unrouteAll()
+  await context.unrouteAll()
   const cdp = await context.newCDPSession(page)
   try {
     await new Promise<void>(resolve => gateway.server.listen(0, '127.0.0.1', resolve))
