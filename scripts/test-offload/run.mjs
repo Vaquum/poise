@@ -18,6 +18,8 @@ const LEASE_MS = 10_000
 const LIMIT_MS = 9 * 60_000
 const RECOVERY_MS = 30_000
 const GATEWAY_RESTART = 'the gateway restarted'
+// A suite that reached for Docker on a job, which has none: it starts again on a sandbox, which has.
+const USES_DOCKER = 'this suite uses Docker'
 const CHUNK_BYTES = 8 * 1024 * 1024
 // The first bytes go at once: a proxy gives up on a download that stays silent for long.
 const FIRST_CHUNK_BYTES = 64 * 1024
@@ -174,7 +176,11 @@ async function main(args) {
   const [relay, key] = readFileSync(join(HERE, 'relay'), 'utf8').split('\n')
   const headers = { authorization: `Bearer ${key}` }
   const cwd = process.cwd()
-  const spec = JSON.stringify({ argv: command, cwd, env: testEnvironment(process.env) })
+  // Names the checkout's history, so a repository whose suites use Docker goes to a sandbox at once.
+  const repo = git(cwd, 'rev-list', '--max-parents=0', 'HEAD')?.toString().split('\n')[0] || undefined
+  const request = { argv: command, cwd, env: testEnvironment(process.env), repo }
+  const spec = JSON.stringify(request)
+  let docker = false
   // One clock includes capture, provisioning, upload, recovery and the complete rerun.
   const shellLimit = Number(process.env.BASH_DEFAULT_TIMEOUT_MS)
   const limit = shellLimit > 0 ? Math.min(LIMIT_MS, shellLimit) : LIMIT_MS
@@ -252,7 +258,7 @@ async function main(args) {
   }
 
   const createRun = async (signal = lifetime.signal) => {
-    const created = await call('POST', '/runs', spec, signal)
+    const created = await call('POST', '/runs', docker ? JSON.stringify({ ...request, docker }) : spec, signal)
     const { id } = await created.json()
     if (!/^[0-9a-f]{32}$/.test(id)) throw new Error('the test relay did not name the new run')
     return id
@@ -345,6 +351,13 @@ async function main(args) {
       }
       current = null
       if (failure?.code === 143) { finish(143); return }
+      if (failure?.code === 125 && failure.message === USES_DOCKER && !docker) {
+        say('the suite reached for Docker, which this box has not: running it again on a box with Docker.')
+        docker = true
+        // Not a restart, so the one rerun a restart may have is still there.
+        attempt -= 1
+        continue
+      }
       if (failure?.code === 125 && failure.message === GATEWAY_RESTART) {
         say(`interrupted validation: candidate ${candidate}, suite ${suite}, run ${id}: no test result: ${failure.message}`)
         if (attempt === 0) {

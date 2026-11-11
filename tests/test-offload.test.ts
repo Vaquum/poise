@@ -444,7 +444,9 @@ describe('Poise', () => {
 describe('a suite on a test box', () => {
   interface Box { id: string; plan: string; group: string; snapshotName: string | null; timeoutSeconds: number; idleTimeoutSeconds: number; createdAt: string; status: string; child: ChildProcess | null; dir: string }
   interface Snapshot { id: string; name: string; status: string; expiresAt: string; sandboxGroupId: string }
+  interface Job { id: string; service: string; startCommand: string; planId: string; status: string; child: ChildProcess | null }
   let render: Server
+  let jobs: Map<string, Job>
   let renderOrigin: string
   let boxes: Map<string, Box>
   let snapshots: Map<string, Snapshot>
@@ -460,6 +462,7 @@ describe('a suite on a test box', () => {
   let runners: { child: ChildProcess; done: Promise<unknown> }[]
   let relay: TestRelay
   let relayServer: Server
+  let relayOrigin: string
   let relayUrl: string
   let hooks: string
   let unpacked: string
@@ -499,6 +502,13 @@ describe('a suite on a test box', () => {
     })
   }
 
+  // A job runs the real instance script, fetched as its start command fetches it, and unpacks where these tests look.
+  function startJob(job: Job): void {
+    const [, code, url, run, token] = / node -e (\S+) (\S+) (\S+) (\S+)$/.exec(job.startCommand) ?? []
+    job.child = spawn(process.execPath, ['-e', code, url, run, token, unpacked], { stdio: ['ignore', 'ignore', 'inherit'] })
+    job.child.on('exit', () => { if (job.status === 'running') job.status = 'succeeded' })
+  }
+
   // Render, as far as the relay sees it.
   function startRender(): Server {
     return createServer(async (req, res) => {
@@ -523,6 +533,28 @@ describe('a suite on a test box', () => {
         return
       }
       if (req.headers.authorization !== 'Bearer render-key') { res.writeHead(401).end('no such key'); return }
+      const [, service, jobId, jobAction] = /^\/v1\/services\/([^/]+)\/jobs\/?([^/]*)\/?(.*)$/.exec(path) ?? []
+      if (service && req.method === 'GET') {
+        const listed = [...jobs.values()].filter((job) => job.service === service && job.status === 'running')
+        json(res, 200, listed.map(({ id, startCommand }) => ({ cursor: 'c', job: { id, startCommand } })))
+        return
+      }
+      if (service && !jobId) {
+        const job: Job = { id: `job-${jobs.size + 1}`, service, startCommand: body.startCommand as string, planId: body.planId as string, status: 'running', child: null }
+        jobs.set(job.id, job)
+        startJob(job)
+        json(res, 201, { id: job.id })
+        return
+      }
+      if (service && jobAction === 'cancel') {
+        const job = jobs.get(jobId)
+        if (job) {
+          job.status = 'canceled'
+          job.child?.kill('SIGKILL')
+        }
+        res.writeHead(job ? 200 : 404).end()
+        return
+      }
       const [, id, action, operation] = /^\/v1\/sandboxes\/([^/]+)\/?([^/]*)\/?(.*)$/.exec(path) ?? []
       const box = id ? boxes.get(id) : undefined
       if (path === '/v1/sandbox-groups' && req.method === 'GET') json(res, 200, groups.map((name, index) => ({ cursor: 'c', sandboxGroup: { id: `sbg-${index}`, name } })))
@@ -560,11 +592,12 @@ describe('a suite on a test box', () => {
   }
 
   async function startAll(overrides: Partial<TestRelayDeps['config']> & Partial<TestRelayDeps> = {}): Promise<void> {
-    const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, deployment = 'poise.example.com', ...deps } = overrides
+    const { renderApiKey = 'render-key', limitSeconds = 3600, maxRuns = 5, deployment = 'poise.example.com', baseService = null, jobPlan = 'plan-crn-005', ...deps } = overrides
     renderOrigin = `http://127.0.0.1:${await listen(render)}`
     relay = new TestRelay({
-      config: { renderApiKey, workspace: 'tea-test', deployment, plan: '1c-2g', limitSeconds, maxRuns },
+      config: { renderApiKey, workspace: 'tea-test', deployment, plan: '1c-2g', baseService, jobPlan, limitSeconds, maxRuns },
       privateKey,
+      origin: () => relayOrigin,
       log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: (_event: string, fields: Record<string, unknown>) => { warnings.push({ event: _event, ...fields }) }, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
@@ -577,7 +610,8 @@ describe('a suite on a test box', () => {
       ...deps,
     })
     relayServer = createServer((req, res) => { void relay.handle(req, res, new URL(req.url ?? '/', 'http://relay')) })
-    relayUrl = `http://127.0.0.1:${await listen(relayServer)}${TEST_RELAY_PATH}`
+    relayOrigin = `http://127.0.0.1:${await listen(relayServer)}`
+    relayUrl = `${relayOrigin}${TEST_RELAY_PATH}`
     relay.start()
     hooks = temp()
     for (const file of ['run.mjs', 'hook.cjs', 'sitecustomize.py']) copyFileSync(join(SOURCE, file), join(hooks, file))
@@ -587,6 +621,7 @@ describe('a suite on a test box', () => {
 
   beforeEach(() => {
     boxes = new Map()
+    jobs = new Map()
     snapshots = new Map()
     groups = []
     terminated = []
@@ -606,6 +641,7 @@ describe('a suite on a test box', () => {
     for (const runner of runners) if (runner.child.exitCode === null) runner.child.kill('SIGTERM')
     await Promise.all(runners.map((runner) => runner.done))
     for (const box of boxes.values()) box.child?.kill('SIGKILL')
+    for (const job of jobs.values()) job.child?.kill('SIGKILL')
     relay?.stop()
     for (const server of [relayServer, render]) {
       server?.closeAllConnections()
@@ -642,6 +678,66 @@ describe('a suite on a test box', () => {
   }
 
   const runBox = () => [...boxes.values()].find((box) => box.snapshotName !== null) as Box
+  const suiteBoxes = () => [...boxes.values()].filter((box) => box.snapshotName !== null)
+
+  function committed(): string {
+    const repo = repository()
+    execFileSync('git', ['-C', repo, 'add', '.'])
+    execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'first'])
+    return repo
+  }
+
+  it('starts a suite on a job of the base service, which costs less, and gives the agent its output and exit code', async () => {
+    await startAll({ baseService: 'crn-test' })
+    const repo = repository()
+    const script = 'console.log("on a job " + process.cwd()); console.error("to stderr"); process.exit(3)'
+    const { code, stdout, stderr } = await suite(repo, [process.execPath, '-e', script]).done
+    expect(code).toBe(3)
+    expect(stdout).toBe(`on a job ${repo}\n`)
+    expect(stderr).toContain('to stderr\n')
+    expect(readFileSync(join(unpacked, repo, 'tracked.txt'), 'utf8')).toBe('checked out\n')
+    const [job] = jobs.values()
+    expect(job).toMatchObject({ service: 'crn-test', planId: 'plan-crn-005' })
+    // Render splits a start command at spaces and mangles quotes.
+    expect(job.startCommand).toMatch(/^tini -- timeout -k 10 3660 node -e \S+ \S+\/instance [0-9a-f]{32} [0-9a-f]{64}$/)
+    expect(suiteBoxes()).toEqual([])
+    await until(() => relay.runs.size === 0, 'the run to end')
+    expect(events).toContainEqual(expect.objectContaining({ event: 'test_relay.run.finished', jobId: job.id, exit: 3 }))
+  })
+
+  it('moves a suite that reaches for the Docker socket to a sandbox, and sends that checkout\'s next suite there at once', async () => {
+    await startAll({ baseService: 'crn-test' })
+    const repo = committed()
+    // On a job, DOCKER_HOST names the job's stand-in; a sandbox's Docker needs none.
+    const script = `const host = process.env.DOCKER_HOST
+      if (!host) { console.log('with Docker'); process.exit(0) }
+      require('net').connect(host.replace(/^unix:\\/\\//, '')).on('error', () => {})
+      setTimeout(() => process.exit(9), 30_000)`
+    const first = await suite(repo, [process.execPath, '-e', script], { DOCKER_HOST: '' }).done
+    expect(first.code).toBe(0)
+    expect(first.stdout).toBe('with Docker\n')
+    expect(first.stderr).toContain('reached for Docker')
+    expect(jobs.size).toBe(1)
+    expect(suiteBoxes()).toHaveLength(1)
+    expect(warnings.filter((warning) => warning.event === 'test_relay.run.failed')).toEqual([])
+    const second = await suite(repo, [process.execPath, '-e', script], { DOCKER_HOST: '' }).done
+    expect(second).toMatchObject({ code: 0, stdout: 'with Docker\n' })
+    expect(second.stderr).not.toContain('reached for Docker')
+    expect(jobs.size).toBe(1)
+    expect(suiteBoxes()).toHaveLength(2)
+  })
+
+  it('moves a suite that runs docker to a sandbox', async () => {
+    await startAll({ baseService: 'crn-test' })
+    const script = `if (!process.env.DOCKER_HOST) { console.log('with Docker'); process.exit(0) }
+      require('child_process').execFileSync('docker', ['info'], { stdio: 'inherit' })
+      process.exit(9)`
+    const { code, stdout, stderr } = await suite(repository(), [process.execPath, '-e', script], { DOCKER_HOST: '' }).done
+    expect(code).toBe(0)
+    expect(stdout).toBe('with Docker\n')
+    expect(stderr).toContain('reached for Docker')
+    await until(() => [...jobs.values()].every((job) => job.status !== 'running'), 'the job to end')
+  })
 
   it('gives the agent the output and exit code, and the box ends with the suite', async () => {
     await startAll()
@@ -1284,8 +1380,9 @@ ${stderr}`
     const port = Number(new URL(relayUrl).port)
     await new Promise((done) => { relayServer.close(done) })
     relay = new TestRelay({
-      config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', limitSeconds: 3600, maxRuns },
+      config: { renderApiKey: 'render-key', workspace: 'tea-test', deployment: 'poise.example.com', plan: '1c-2g', baseService: null, jobPlan: 'plan-crn-005', limitSeconds: 3600, maxRuns },
       privateKey,
+      origin: () => relayOrigin,
       log: { info: (event: string, fields: Record<string, unknown>) => { events.push({ event, ...fields }) }, warn: () => {}, error: () => {} } as unknown as TestRelayDeps['log'],
       now: Date.now,
       isWorkspace: (handle) => handle === 'alice' || handle === 'bob',
@@ -1333,7 +1430,23 @@ ${stderr}`
     expect((await fetch(`${relayUrl}/runs/${id}`, { method: 'DELETE', headers: { authorization: bob } })).status).toBe(403)
     expect((await post(`/runs/${id}/lease`)).status).toBe(401)
     expect((await post('/runs', `Bearer ${KEY}`, '{"argv":[]}')).status).toBe(400)
+    // A workspace's key reads nothing a job reads, and with no jobs there is no job's script either.
+    expect((await fetch(`${relayUrl}/runs/${id}/spec`, { headers: { authorization: `Bearer ${KEY}` } })).status).toBe(410)
     expect((await fetch(`${relayUrl}/instance`)).status).toBe(404)
+  })
+
+  it('answers a job\'s requests only with that job\'s token, and serves its scripts where jobs run', async () => {
+    runBoxes = false
+    await startAll({ baseService: 'crn-test' })
+    const created = await fetch(`${relayUrl}/runs`, { method: 'POST', body: '{"argv":["x"],"cwd":"/","env":{}}', headers: { authorization: `Bearer ${KEY}` } })
+    const { id } = await created.json() as { id: string }
+    for (const authorization of [`Bearer ${KEY}`, `Bearer ${'0'.repeat(64)}`, '']) {
+      expect((await fetch(`${relayUrl}/runs/${id}/spec`, { headers: { authorization } })).status).toBe(410)
+      expect((await fetch(`${relayUrl}/runs/${id}/docker`, { method: 'POST', headers: { authorization } })).status).toBe(410)
+    }
+    expect(relay.runs.has(id)).toBe(true)
+    expect((await fetch(`${relayUrl}/instance`)).status).toBe(200)
+    expect(await (await fetch(`${relayUrl}/instance/box`)).text()).toBe(readFileSync('gateway/src/test-box.cjs', 'utf8'))
   })
 })
 

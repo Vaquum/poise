@@ -1,5 +1,6 @@
 // Runs on a disposable test box, as root: starts Docker, unpacks the checkout and runs the suite exactly as it was
-// typed, as the workspace's user. test-relay.ts uploads and starts this. docs/Operating.md, "Agents' test suites".
+// typed, as the workspace's user. test-relay.ts uploads and starts this on a sandbox. On a job, test-instance.cjs starts
+// it as the workspace's user, and Docker is not there to start. docs/Operating.md, "Agents' test suites".
 // Its output and exit code are what the agent gets, so everything that goes wrong here says so and exits with 125.
 'use strict'
 const { spawn, spawnSync } = require('node:child_process')
@@ -10,6 +11,7 @@ const { setTimeout: sleep } = require('node:timers/promises')
 const [specPath, treePath, root = '/'] = process.argv.slice(2)
 // A real box unpacks at the root and has a system to start. Tests name a folder instead.
 const onBox = root === '/'
+const asJob = Boolean(process.env.POISE_TEST_JOB)
 const asUser = onBox ? { uid: 10001, gid: 10001 } : {}
 const RUNNER_FAILED = 125
 // What only a runtime that ran out says, not a test that talks about memory.
@@ -45,10 +47,11 @@ async function startDocker() {
 
 /** Node keeps its heap to about half of the memory unless told. A suite here has the box to itself. */
 function nodeOptions(inherited) {
-  const total = /^MemTotal:\s+(\d+) kB/m.exec(tryRead('/proc/meminfo'))?.[1]
-  if (!total) return inherited
+  // A job's container shows the host's memory, and its own only in its cgroup.
+  const kB = Number(tryRead('/sys/fs/cgroup/memory.max')) / 1024 || Number(/^MemTotal:\s+(\d+) kB/m.exec(tryRead('/proc/meminfo'))?.[1])
+  if (!kB) return inherited
   // First, so a value the suite sets for itself wins.
-  return [`--max-old-space-size=${Math.floor(Number(total) * HEAP_SHARE / 1024)}`, inherited].filter(Boolean).join(' ')
+  return [`--max-old-space-size=${Math.floor(kB * HEAP_SHARE / 1024)}`, inherited].filter(Boolean).join(' ')
 }
 
 function tryRead(path) {
@@ -74,11 +77,19 @@ function suiteEnvironment(spec) {
 function unpack(whole) {
   return new Promise((resolve) => {
     let errors = ''
-    const tar = spawn('tar', ['-xzf', whole, '-C', root, '--no-same-owner'], { stdio: ['ignore', 'ignore', 'pipe'], ...asUser })
+    // A job is the workspace image already, whose folders and files its user may not replace, and needs not.
+    const keep = asJob && onBox ? ['--skip-old-files', '--no-overwrite-dir'] : []
+    const tar = spawn('tar', ['-xzf', whole, '-C', root, '--no-same-owner', ...keep], { stdio: ['ignore', 'ignore', 'pipe'], ...asUser })
     tar.stderr.on('data', (chunk) => { errors = (errors + chunk).slice(-300) })
     tar.once('error', (error) => resolve(error.message))
     tar.once('close', (code) => resolve(code === 0 ? null : errors.trim() || `tar exited with ${code}`))
   })
+}
+
+/** The kernel killed for want of memory: a job's container counts it, and a sandbox's kernel says it. */
+function ranOutOfMemory() {
+  if (asJob) return /^oom_kill [1-9]/m.test(tryRead('/sys/fs/cgroup/memory.events'))
+  return BOX_OUT_OF_MEMORY.test(spawnSync('dmesg', { encoding: 'utf8' }).stdout ?? '')
 }
 
 function runSuite(spec, env) {
@@ -105,7 +116,7 @@ function runSuite(spec, env) {
       child.once('close', () => { closed = true })
       while (!closed && Date.now() - lastOutput < QUIET_MS) await sleep(50)
       const status = code ?? 128 + (constants.signals[signal] ?? 0)
-      if (status !== 0 && (OUT_OF_MEMORY.test(tail) || (onBox && BOX_OUT_OF_MEMORY.test(spawnSync('dmesg', { encoding: 'utf8' }).stdout ?? '')))) fail('this suite is too big for its test box: it ran out of memory')
+      if (status !== 0 && (OUT_OF_MEMORY.test(tail) || (onBox && ranOutOfMemory()))) fail('this suite is too big for its test box: it ran out of memory')
       else process.stdout.write('', () => process.stderr.write('', () => process.exit(status)))
     })()
   })
@@ -113,7 +124,7 @@ function runSuite(spec, env) {
 
 async function main() {
   const spec = JSON.parse(readFileSync(specPath, 'utf8'))
-  const docker = onBox ? startDocker() : Promise.resolve()
+  const docker = onBox && !asJob ? startDocker() : Promise.resolve()
   const env = suiteEnvironment(spec)
   // It arrives in parts, numbered in order.
   const whole = `${treePath}.tgz`
