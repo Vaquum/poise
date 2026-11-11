@@ -103,7 +103,9 @@ export function retryProven(chain: BehaviorChain, retry: ChainInvocation, observ
       : typeof result.outcome === 'string' ? result.outcome : null
     const head = typeof evidence.head_sha === 'string' ? evidence.head_sha
       : typeof result.head_sha === 'string' ? result.head_sha : null
-    return (action === 'published' || action === 'issue_work') && outcome === 'published' && typeof head === 'string'
+    // A reconciled lost-response retry keeps action null while recover()
+    // adds outcome published with verified publication fields.
+    return (action === 'published' || action === 'issue_work' || action === null) && outcome === 'published' && typeof head === 'string'
       && observation.pull?.head === head && observation.publication.head_sha === head
       && observation.publication.head_invocation === invocationId
   }
@@ -276,11 +278,14 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         // Same-invocation publication retries launch via a recorded
         // publicationResume before their success settles. An operator
         // Hold/Resume while that automatic retry runs must not relabel it.
-        const launch = retry && retry.admissionSequence <= failure.sequence ? rows.find(row => row.sequence > failure.sequence
+        // A cleared launch (CallerReceiptStoreError) may precede the launch
+        // that actually succeeds; use the latest launch before success so an
+        // operator Resume between them is not excluded.
+        const launch = retry && retry.admissionSequence <= failure.sequence ? rows.filter(row => row.sequence > failure.sequence
           && (!success || row.sequence < success.sequence) && row.event.type === 'invocation.reconciled' && row.event.invocationId === retry.id
           && typeof (row.event.evidence as Record<string, unknown> | null)?.publicationResume === 'object'
           && (row.event.evidence as Record<string, unknown> | null)?.publicationResume !== null
-          && typeof (((row.event.evidence as Record<string, unknown>).publicationResume as Record<string, unknown>).correlation) === 'string') : undefined
+          && typeof (((row.event.evidence as Record<string, unknown>).publicationResume as Record<string, unknown>).correlation) === 'string').at(-1) : undefined
         const resumed = rows.filter(row => row.sequence > failure.sequence && row.event.type === 'chain.resumed'
           && (!retry || (retry.admissionSequence > failure.sequence ? row.sequence < retry.admissionSequence
             : launch ? row.sequence < launch.sequence : !success || row.sequence < success.sequence)))
@@ -291,8 +296,17 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
           && (!row.event.recovery || row.event.recovery.origin === 'unknown'))
         const action = operator ?? resumed.at(-1)
         const origin = operator ? 'operator' : ambiguous ? 'unknown' : 'automatic'
+        // Same-invocation continuations preserve the failed Call's
+        // completedAt through recover(), so the stale stamp would accept a
+        // head advance observed before publicationResume. Require progress
+        // after the success settlement for those retries. Later-admission
+        // retries keep the preceding-observation proof (e.g. grey CI success
+        // observed before its settlement).
+        const sameInvocation = !!retry && !!success && retry.admissionSequence <= failure.sequence
+        const retryAt = sameInvocation ? success.at : Number(retry?.evidence?.completedAt)
         const advanced = retry && success && progress.advances.find(point => {
-          if (point.sequence < failure.sequence || point.at < Number(retry.evidence?.completedAt) || point.at < error.at) return false
+          if (point.sequence < failure.sequence || point.at < retryAt || point.at < error.at) return false
+          if (sameInvocation && point.sequence < success.sequence) return false
           const observed = rows.filter(row => row.sequence <= point.sequence && row.event.type === 'chain.observed').at(-1)
           return observed?.event.type === 'chain.observed' && retryProven(chain, retry, observed.event.observation as ChainObservation, point.at)
         })

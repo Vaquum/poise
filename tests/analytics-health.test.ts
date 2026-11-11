@@ -474,6 +474,99 @@ it('ignores an operator resume after a same-invocation publicationResume launch'
   expect(report.recovery.unknown).toBe(0)
 })
 
+it('proves publish-issue retries reconciled after a lost response with null action', () => {
+  const f = setup()
+  const chain = f.observe(f.seed(1), NOW - HOUR)
+  const original = 'a'.repeat(32)
+  const publication = { ...(chain.observation as ChainObservation).publication, head_sha: HEAD, head_invocation: original }
+  const pull = { ...((chain.observation as ChainObservation).pull!), head: HEAD }
+  const observation = { ...(chain.observation as ChainObservation), checkedAt: NOW, publication, pull } as ChainObservation
+  const argv = ['--issue-work', '1', '--invocation-id', original, '--expected-head', HEAD]
+  // recover() settles a lost-response retry with outcome published while the
+  // reconciled placeholder keeps action null; verified heads still prove it.
+  const reconciled = { id: 'retry-publish', behavior: 'publish-issue', callId: null,
+    request: { command: 'github-interface', argv, cwd: '/fixture' },
+    evidence: { status: 'completed', action: null, outcome: 'published', head_sha: HEAD } } as unknown as ChainInvocation
+  expect(retryProven(chain, reconciled, observation, NOW)).toBe(true)
+  const wrongAction = { ...reconciled, evidence: { ...reconciled.evidence, action: 'not_started' } } as unknown as ChainInvocation
+  expect(retryProven(chain, wrongAction, observation, NOW)).toBe(false)
+})
+
+it('uses the latest publicationResume launch when an earlier launch was cleared', async () => {
+  const f = setup()
+  let chain = f.observe(f.seed(1), NOW - 5 * HOUR)
+  const id = chainBasis(`${chain.id}:cleared-launch`).slice(0, 32)
+  const admittedAt = NOW - 4 * HOUR
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { id, behavior: 'review-issue', actor: 'reviewer', slot: 'primary',
+    basis: 'issue', model: 'fixture', admittedAt, request: { command: 'agent-interface', argv: [], cwd: '/fixture' } } }, admittedAt)
+  chain = f.append(chain, { type: 'invocation.started', invocationId: id }, admittedAt + 500)
+  const failedCall = 'f'.repeat(32)
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: { status: 'failed', action: 'not_started',
+    outcome: 'preflight_failed', error_code: 'authentication_failed', error: 'Refresh credential rejected',
+    completedAt: NOW - 4 * HOUR, callId: failedCall } }, NOW - 4 * HOUR)
+  // Abandoned launch cleared after a CallerReceiptStoreError.
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: { publicationResume: {
+    callId: failedCall, head: HEAD, plan: 'plan', correlation: 'corr-abandoned' }, publicationReceipt: null } }, NOW - 3 * HOUR)
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: {
+    publicationResume: null, publicationResumeError: 'CallerReceiptStoreError: readable' } }, NOW - 3 * HOUR + 500)
+  // Operator help arrives before the retry that actually succeeds.
+  chain = f.append(chain, { type: 'chain.resumed', recovery: { origin: 'operator', intervention: {
+    callId: failedCall, at: NOW - 2 * HOUR - 30 * 60_000, verifiedAt: NOW - 2 * HOUR - 30 * 60_000 + 1000 } } }, NOW - 2 * HOUR - 30 * 60_000 + 2000)
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: { publicationResume: {
+    callId: failedCall, head: HEAD, plan: 'plan', correlation: 'corr-success' }, publicationReceipt: null } }, NOW - 2 * HOUR - HOUR / 2)
+  chain = f.append(chain, { type: 'invocation.settled', invocationId: id, callId: failedCall, outcome: 'commented', evidence: {
+    status: 'completed', action: 'commented', outcome: 'commented', completedAt: NOW - 2 * HOUR,
+    issue_revision: 'issue', error: '', receipts: [{ issue: chain.id, author: 'reviewer', comment_id: 17 }] } }, NOW - 2 * HOUR)
+  chain = f.observe(chain, NOW - 2 * HOUR + 1000, null, [17])
+  f.merge(chain, NOW - HOUR)
+  const report = await f.read()
+  expect(report.recovery.intervention.map(item => item.work)).toEqual(['acme/repo#1'])
+  expect(report.recovery.automatic).toEqual([])
+  expect(report.recovery.unknown).toBe(0)
+})
+
+it('requires same-invocation progress after the success settlement, not a pre-launch head', async () => {
+  const f = setup()
+  const HEAD2 = 'c'.repeat(40)
+  const failedCall = 'e'.repeat(32)
+  const reviewer = { model: 'fixture', slot: 'primary', recovery: 'fixture' }
+  const makeObservation = (at: number, head: string, merged: boolean): ChainObservation => ({
+    checkedAt: at, existingPulls: [], issue: { open: true, eligible: true, revision: 'issue', commentIds: [] },
+    issueReviewers: [], prReviewers: [], implementer: reviewer, repairer: reviewer, approver: reviewer,
+    prerequisites: { wait: null, base: HEAD, evidence: [] },
+    publication: { pull_number: 101, head_sha: head, head_invocation: failedCall,
+      state: merged ? 'closed' : 'open', merged, merge_sha: merged ? MERGE : null },
+    pull: { number: 101, head, headSince: at, state: merged ? 'closed' : 'open', draft: false, merged,
+      mergeSha: merged ? MERGE : null, mergedAt: merged ? NOW - HOUR : null, queueEntry: null, queueRemoval: null,
+      changesRequested: false, unresolved: 0, approved: false, ready: true,
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'review', greyRuns: [], pending: false, failing: [], conflict: false, behind: false, checksState: 'SUCCESS' } })
+  let chain = f.seed(1, NOW - 48 * HOUR)
+  chain = f.append(chain, { type: 'chain.observed', observation: makeObservation(NOW - 35 * HOUR, HEAD, false) }, NOW - 35 * HOUR)
+  const id = chainBasis(`${chain.id}:repair-continuation`).slice(0, 32)
+  const admittedAt = NOW - 30 * HOUR
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { id, behavior: 'repair-pr', actor: 'reviewer', slot: 'primary',
+    basis: 'issue', model: 'fixture', admittedAt, request: { command: 'agent-interface', argv: [], cwd: '/fixture' } } }, admittedAt)
+  chain = f.append(chain, { type: 'invocation.started', invocationId: id }, admittedAt + 500)
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: { status: 'failed', action: 'not_started',
+    outcome: 'preflight_failed', error_code: 'authentication_failed', error: 'Refresh credential rejected',
+    completedAt: NOW - 30 * HOUR, callId: failedCall } }, NOW - 30 * HOUR)
+  // New head observed before the retry launches: stale completedAt would
+  // otherwise accept it as recovery progress outside the 24-hour window.
+  chain = f.append(chain, { type: 'chain.observed', observation: makeObservation(NOW - 29 * HOUR, HEAD2, false) }, NOW - 29 * HOUR)
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: { publicationResume: {
+    callId: failedCall, head: HEAD2, plan: 'plan', correlation: 'corr-launch' }, publicationReceipt: null } }, NOW - 28 * HOUR)
+  // recover() preserves the failed Call completedAt on the same invocation.
+  chain = f.append(chain, { type: 'invocation.settled', invocationId: id, callId: failedCall, outcome: 'published', evidence: {
+    status: 'completed', action: 'published', outcome: 'published', head_sha: HEAD2, completedAt: NOW - 30 * HOUR } }, NOW - 2 * HOUR)
+  chain = f.append(chain, { type: 'chain.observed', observation: makeObservation(NOW - 2 * HOUR + 1000, HEAD2, false) }, NOW - 2 * HOUR + 1000)
+  chain = f.append(chain, { type: 'chain.observed', observation: makeObservation(NOW - HOUR, HEAD2, true) }, NOW - HOUR)
+  chain = f.append(chain, { type: 'chain.merged', mergeSha: MERGE,
+    evidence: { repository: chain.repository, pull_number: 101, merged: true, merge_sha: MERGE, review_complete: true } }, NOW - HOUR)
+  const report = await f.read()
+  expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
+  expect(report.recovery.unknown).toBe(0)
+})
+
 it('counts automatic recovery when recover() settles the original invocation after a reconciled failure', async () => {
   const f = setup()
   let chain = f.observe(f.seed(1), NOW - 5 * HOUR)
