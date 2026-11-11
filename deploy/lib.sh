@@ -286,6 +286,33 @@ build_runtime_image() {
     --build-arg "POISE_RELEASE=$release" --build-arg "POISE_BASE=$(runtime_base)" "${tags[@]}" "$root"
 }
 
+# The test jobs' image (docs/Operating.md, "Agents' test suites") is this
+# workspace image, which Render builds from the same commit. A deploy has Render
+# build it again when what a job runs with changed since the commit Render last
+# built: the image's own files, Caller or the package lock, which pins
+# Playwright. A build at every deploy would spend Render's build minutes for
+# nothing. The key never reaches a command line. Nothing here stops a deploy.
+refresh_test_job_image() {
+  local sha=$1 key service api=https://api.render.com/v1 built
+  key=$(env_value POISE_TEST_RENDER_API_KEY)
+  service=$(env_value POISE_TEST_BASE_SERVICE)
+  [ -n "$key" ] && [ -n "$service" ] && [ -n "$sha" ] || return 0
+  if ! built=$(curl --fail --silent --show-error --max-time 30 --header @<(printf 'Authorization: Bearer %s\n' "$key") \
+    "$api/services/$service/deploys?limit=20" \
+    | jq -er '[.[].deploy | select(.status | IN("created", "build_in_progress", "update_in_progress", "pre_deploy_in_progress", "live"))][0].commit.id // ""'); then
+    warn "Render did not say which commit the test jobs' image was built from, so it stays as it is"
+    return 0
+  fi
+  if [ -n "$built" ] && git -C "$root" cat-file -e "$built^{commit}" 2>/dev/null \
+    && git -C "$root" diff --quiet "$built" "$sha" -- deploy/runtime caller package-lock.json; then
+    return 0
+  fi
+  say "Having Render build the test jobs' image at $sha."
+  curl --fail --silent --show-error --max-time 30 --header @<(printf 'Authorization: Bearer %s\n' "$key") \
+    --header 'Content-Type: application/json' --data "{\"commitId\":\"$sha\"}" "$api/services/$service/deploys" >/dev/null \
+    || warn "Render did not take a new build of the test jobs' image, so jobs keep the image of ${built:-an unknown commit}"
+}
+
 # Docker's build cache may keep this much once a deploy finishes: the layers
 # the next build reuses. The cache is shared with the server's other builds.
 build_cache_limit=5GB
