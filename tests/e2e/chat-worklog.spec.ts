@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import { session, installRoutes, installSocket, env, makeState } from './fixtures/chat'
 
 // The sessions pane as a live work log: the tools toggle, the working

@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { build } from 'esbuild'
 import { workspace } from './fixtures/workspace'
 import { freeze, settled } from './fixtures/motion'

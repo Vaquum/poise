@@ -1,5 +1,5 @@
 import { feedback } from './fixtures/view-feedback'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 
 // Skip repositories in the Behaviors view, and a replay refused in Swarm. The
 // API is played by the test so the stored state survives a reload.

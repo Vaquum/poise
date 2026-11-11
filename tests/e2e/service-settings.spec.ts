@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import type { AdminOverview, GatewayAccount, PairedDevice } from '../../src/gateway-client'
 import { adminPage, type AdminView } from '../../gateway/src/pages'
 

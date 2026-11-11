@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
+import { expect, test, type Page, type Route, type WebSocketRoute } from './fixtures/classic'
 import { execFileSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'

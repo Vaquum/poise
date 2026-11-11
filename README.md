@@ -24,17 +24,20 @@ and `deploy/restore.sh` back it up and restore it.
 
 ## Capabilities
 
-- **Current** — manual idea/concept/plan cards beside live issues and PRs.
-- **Swarm** — agent run status, live review activity, responses, and safe replay controls.
-- **Chat** — native coding-agent sessions with streaming, tools, permissions and checkout-bound work.
-- **Archive** — failed GitHub Actions by default, plus searchable issue and PR history. Full-width tables follow Swarm, with separate linked Org and Repo columns.
-- **Behaviors** — scheduled review, approval, unblocking, and issue-review automations.
-- **Snippets** — simple Espanso trigger management, and Import from an existing Espanso file.
+The interface is one page with a fixed top bar: Overview, Board, Chat, Editor,
+Observe and Settings. Every element explains itself on hover, keyboard focus or
+`?`. See [Interface](docs/Interface.md); the previous interface stays at
+`/classic.html` until it is removed.
+
+- **Overview** — *Answer here* lists what needs you, with the answer on each entry: a failed behavior, a sign-in, a chat waiting for you, a Switchboard decision, a review thread, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. *In motion* shows the work in seven states; beside it, the day's numbers against their pace and year, Behaviors' runs and the GitHub API quota. The bell on every place opens it. See [Notifications](docs/Notifications.md) and [Analytics](docs/Analytics.md).
+- **Board** — idea, concept and plan cards beside live issues and pull requests, a chained issue and its pull request as one task, and a List of the same work with its phase, owner and *Assign to Poise*.
+- **Chat** — native coding-agent sessions with streaming, tools, permissions and checkout-bound work; the Manager, its workers and the Switchboard in the Manager's place.
 - **Editor** — atomic Markdown storage, annotations, and agent-backed chat.
 - **Publishing** — an Editor document published as a pull request to one or more websites kept in GitHub repositories, each described by its own `publish.yaml`. See [Publishing](docs/Publishing.md).
-- **Analytics** — a full view from the burger menu, one day at a time against a seven-day baseline. Reorder cards for productivity, work type and review friction, per merged pull request and live GitHub API quota by dragging their headers or using the keyboard. The browser remembers their order; two shared heights and the Tactile spring keep the layout consistent. See [Analytics](docs/Analytics.md) for layout and measurement definitions.
-- **Extensions** — MCP servers for Chat, from the burger menu: a directory mirrored from the official MCP Registry, custom remote or local servers, and a switch per workspace. Claude, Codex, Muse and Grok chats get the servers switched on for their repository from their next turn; secrets stay write-only and out of logs and transcripts. See [Extensions](docs/Extensions.md).
-- **Notifications** — what needs you and what Behaviors is doing, in a rail that docks beside the page on a wide window. It covers a failed behavior, a sign-in or a Chat waiting for you, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. See [Notifications](docs/Notifications.md).
+- **Observe** — Tasks (the behavior chain's evidence, Hold and Resume), Behaviors (agent run status, live review activity, responses and safe replay controls), GitHub (failed Actions, searchable issue and PR history) and Logging. See [Logging](docs/Logging.md).
+- **Behaviors** — scheduled review, approval, unblocking, and issue-review automations, switched in Settings → Behaviors.
+- **Snippets** — simple Espanso trigger management, and Import from an existing Espanso file, in Settings → Snippets.
+- **Extensions** — MCP servers for Chat, in Settings → Extensions: a directory mirrored from the official MCP Registry, custom remote or local servers, and a switch per workspace. Claude, Codex, Muse and Grok chats get the servers switched on for their repository from their next turn; secrets stay write-only and out of logs and transcripts. See [Extensions](docs/Extensions.md).
 
 Settings reads only the selected section's expensive data. Accounts shows each
 CLI result independently, with pending checks and failures named alongside it.

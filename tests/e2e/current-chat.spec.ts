@@ -1,6 +1,6 @@
 // A Current card's chat runs as that card's Chat session in the side pane:
 // resolve on open, create on the first message, adopt when it exists.
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { installRoutes, installSocket, makeState, session, env, NOW } from './fixtures/chat'
 import type { ChatSubject } from '../../server/chat/protocol'
 type ChatSocket = Awaited<ReturnType<typeof installSocket>>

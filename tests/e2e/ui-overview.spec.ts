@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route, type WebSocketRoute } from './fixtures/ui'
+import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
 
 // Overview in the new interface (#556, PRD Support → Tests): Answer here with
 // a request answered elsewhere while held or focused, several requests at

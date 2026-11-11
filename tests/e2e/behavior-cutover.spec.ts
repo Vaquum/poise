@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import Database from 'better-sqlite3'
 import { workspace } from './fixtures/workspace'
 import { BEHAVIORS } from '../../src/behaviors'

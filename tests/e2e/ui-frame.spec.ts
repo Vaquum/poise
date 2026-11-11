@@ -1,4 +1,4 @@
-import { expect, test, type Page } from './fixtures/ui'
+import { expect, test, type Page } from '@playwright/test'
 
 // The frame of the new interface (#556 PR 1): the top bar, addresses, the
 // Settings menu, the Style panel, the reference, the bell and the page's states.

@@ -1,6 +1,6 @@
 // The scenarios of chat-switchboard.spec.ts, in the new interface's Chat (#556 PR 3): the same
 // mocked service and socket, opened at /?view=chat.
-import { expect, test, type Page } from './fixtures/ui'
+import { expect, test, type Page } from '@playwright/test'
 import type { SwitchboardItem, SwitchboardState } from '../../server/chat/protocol'
 import { NOW, session, installRoutes, installSocket, makeState, switchboardState } from './fixtures/chat'
 

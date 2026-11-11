@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import { workspace } from './fixtures/workspace'
 
 const NOW = '2026-09-18T09:00:00.000Z'

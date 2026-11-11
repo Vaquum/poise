@@ -1,4 +1,4 @@
-import { expect, test, type Page, type TestInfo } from '@playwright/test'
+import { expect, test, type Page, type TestInfo } from './fixtures/classic'
 import { build } from 'esbuild'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'

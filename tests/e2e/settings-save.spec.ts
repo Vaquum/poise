@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { CATALOG } from '../model-catalog-fixture'
 
 // Settings saves carry only the active section's drafts, with the values the

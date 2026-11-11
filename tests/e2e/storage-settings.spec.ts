@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { workspace } from './fixtures/workspace'
 
 // Settings → General shows the workspace storage breakdown, and runs

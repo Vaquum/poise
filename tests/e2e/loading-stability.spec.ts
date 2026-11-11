@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { ACCOUNT_IDS, ACCOUNT_LOGINS } from '../../server/accounts/types'
 import { workspace } from './fixtures/workspace'
 import { settled } from './fixtures/motion'

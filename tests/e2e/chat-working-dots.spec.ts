@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { installRoutes, installSocket, makeState, session } from './fixtures/chat'
 import { settled } from './fixtures/motion'
 

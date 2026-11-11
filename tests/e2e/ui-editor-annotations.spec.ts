@@ -1,6 +1,6 @@
 // The scenarios of editor-annotations.spec.ts, in the new interface's editor place (#556): the same
 // mocked service, opened at /?view=editor through the new interface's fixture.
-import { expect, test, type Locator, type Page } from './fixtures/ui'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import { workspace as classicWorkspace } from './fixtures/workspace'
 
 // classic's views, by their new places

@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
+import { expect, test, type Page, type Route } from './fixtures/classic'
 import { HISTORY_BYTE_BUDGET } from '../../src/editor-history'
 import { settled } from './fixtures/motion'
 import { feedback } from './fixtures/view-feedback'

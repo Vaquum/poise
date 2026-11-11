@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 
 test('automatic merging starts off, persists opt-in and skips, and links its last merge', async ({ page }) => {
   let enabled = false

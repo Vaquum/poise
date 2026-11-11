@@ -4,7 +4,7 @@
 // The registry, the OAuth provider and the remote MCP server are this
 // spec's own local server; the directory entries are real registry entries.
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server } from 'node:http'
@@ -127,9 +127,15 @@ test('adds a custom local server, checks it, keeps its secret out of the page, a
   await expect(page.locator('.ext-matrix tbody tr', { hasText: 'Fixture tools' }).getByLabel('Fixture tools in Poise · local')).not.toBeChecked()
 })
 
-test('adds a directory server and signs in to it through the browser', async ({ page }) => {
-  await open(page)
+// Since the flip (#556) the browser's return, /extensions/oauth, opens the new
+// interface, which finishes the sign-in first and shows Settings → Extensions.
+// The case stays here, beside the registry and OAuth server it shares.
+test('adds a directory server and signs in to it through the browser, back to Settings → Extensions', async ({ page }) => {
+  await workspace(page, 'current', undefined, { realExtensions: true, preserveOnReload: true })
+  await page.goto('/index.html?view=settings&settings=extensions')
+  await expect(page.locator('#view-extensions')).toBeVisible()
   await removeAll(page)
+  await page.reload()
   await page.getByRole('tab', { name: 'Directory' }).click()
   await page.getByLabel('Search the directory').fill('exa')
   await expect(page.locator('.ext-directory-status')).toContainText(/updated (\d{1,2} [A-Z][a-z]{2,3} (\d{4} )?)?\d{2}:\d{2}\./)
@@ -140,8 +146,8 @@ test('adds a directory server and signs in to it through the browser', async ({ 
   await expect(row.locator('.ext-state')).toHaveText('Needs sign-in', { timeout: 30_000 })
 
   await row.getByRole('button', { name: 'Sign in' }).click()
-  await page.waitForURL((url) => url.pathname === '/' && !url.search.includes('code='))
-  await expect(page.locator('.ext-notice')).toHaveText('Signed in to exa. Chats pick it up from their next turn.')
+  await page.waitForURL((url) => url.pathname === '/' && url.searchParams.get('settings') === 'extensions' && !url.search.includes('code='))
+  await expect(page.locator('.toast')).toHaveText('Signed in to exa. Chats pick it up from their next turn.')
   await expect(page.locator('.ext-matrix tbody tr', { hasText: 'exa' }).locator('.ext-state')).toHaveText('Connected · 1 tool', { timeout: 30_000 })
   expect(await page.content()).not.toContain('e2e-access-token')
 })
