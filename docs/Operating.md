@@ -864,13 +864,15 @@ gateway a Render API key and the ID of the Render workspace, and it does the res
 for sandboxes. To start suites on jobs, which cost less, also create, in a Render
 workspace and region with no other live service, because a job can reach its
 neighbours on Render's private network, a **cron job** named `poise-test-instance`:
-the Docker runtime, this repository, Dockerfile `deploy/runtime/Dockerfile`, build
-context `.`, command `true`, a yearly schedule, auto-deploy off, and no environment
-variables, since each job inherits them. It runs nothing and holds the image. Each
-`deploy/upgrade.sh` has Render build it again, at the commit just deployed, when
+the Docker runtime, this repository and the branch you deploy, Dockerfile
+`deploy/runtime/Dockerfile`, build context `.`, command `true`, a yearly schedule,
+auto-deploy off, and no environment variables, since each job inherits them. It runs
+nothing and holds the image. Each `deploy/upgrade.sh` has Render build it again when
 `deploy/runtime/`, `caller/` or `package-lock.json` changed since the commit Render
-last built; other deploys spend no build minutes on it. A deploy never waits for that
-build or stops for Render. Give the gateway its service ID:
+last built; other deploys spend no build minutes on it. Render builds a cron job only
+at its branch's newest commit, so the image can be a few commits past the one just
+deployed. A deploy never waits for that build or stops for Render; when Render
+refuses, the deploy's output shows Render's answer. Give the gateway its service ID:
 
 | Setting | Required | Default | What it is |
 | --- | --- | --- | --- |

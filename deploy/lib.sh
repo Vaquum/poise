@@ -289,12 +289,13 @@ build_runtime_image() {
 # Render's API for the test jobs' image, through Node in the image this deploy
 # built: the host promises only Docker and git. The key goes in on stdin, never
 # on a command line. `built` prints the commit of the service's newest build that
-# did not fail; `build SHA` has Render build that commit.
+# did not fail; `build` has Render build the newest commit of the service's
+# branch, the only commit Render builds a cron job at.
 test_job_render() {
   printf '%s' "$1" | docker run --rm -i --entrypoint node "$(guard_parser_image)" --input-type=module -e '
 let key = ""
 for await (const chunk of process.stdin) key += chunk
-const [api, service, action, sha] = process.argv.slice(1)
+const [api, service, action] = process.argv.slice(1)
 const deploys = `${api}/services/${service}/deploys`
 const call = async (url, init = {}) => {
   const response = await fetch(url, {
@@ -302,7 +303,7 @@ const call = async (url, init = {}) => {
     headers: { authorization: `Bearer ${key.trim()}`, accept: "application/json", "content-type": "application/json" },
     signal: AbortSignal.timeout(30_000),
   })
-  if (!response.ok) throw new Error(`Render answered with HTTP ${response.status}`)
+  if (!response.ok) throw new Error(`Render answered with HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`)
   return response.json()
 }
 try {
@@ -311,16 +312,16 @@ try {
     const deploy = (await call(`${deploys}?limit=20`)).map((item) => item.deploy).find((item) => going.includes(item.status))
     process.stdout.write(deploy?.commit?.id ?? "")
   } else {
-    await call(deploys, { method: "POST", body: JSON.stringify({ commitId: sha }) })
+    await call(deploys, { method: "POST", body: "{}" })
   }
 } catch (error) {
   process.stderr.write(`${error.message}\n`)
   process.exit(1)
-}' "$render_api" "$2" "$3" "${4:-}"
+}' "$render_api" "$2" "$3"
 }
 
 # The test jobs' image (docs/Operating.md, "Agents' test suites") is this
-# workspace image, which Render builds from the same commit. A deploy has Render
+# workspace image, built by Render from the branch deployed. A deploy has Render
 # build it again when what a job runs with changed since the commit Render last
 # built: the image's own files, Caller or the package lock, which pins
 # Playwright. A build at every deploy would spend Render's build minutes for
@@ -339,8 +340,8 @@ refresh_test_job_image() {
     && git -C "$root" diff --quiet "$built" "$sha" -- deploy/runtime caller package-lock.json; then
     return 0
   fi
-  say "Having Render build the test jobs' image at $sha."
-  test_job_render "$key" "$service" build "$sha" \
+  say "Having Render build the test jobs' image again, from the newest commit of its branch."
+  test_job_render "$key" "$service" build \
     || warn "Render did not take a new build of the test jobs' image, so jobs keep the image of ${built:-an unknown commit}"
 }
 

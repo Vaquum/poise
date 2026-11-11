@@ -36,11 +36,11 @@ sys.exit(1)
 
 
 class RenderServer(ThreadingHTTPServer):
-    """Render's deploys of one service, as far as these calls see them."""
+    """Render's deploys of one cron job service, as far as these calls see them."""
 
     def __init__(self):
         super().__init__(('127.0.0.1', 0), Render)
-        self.state = {'deploys': [], 'calls': [], 'fail': False}
+        self.state = {'deploys': [], 'calls': [], 'fail': False, 'refuse': False}
 
 
 class Render(BaseHTTPRequestHandler):
@@ -66,7 +66,13 @@ class Render(BaseHTTPRequestHandler):
         state = self.server.state
         body = self.rfile.read(int(self.headers.get('content-length', 0))).decode()
         state['calls'].append({'method': 'POST', 'path': self.path, 'authorization': self.headers.get('authorization'), 'body': json.loads(body)})
-        self.answer(503 if state['fail'] else 201, {'id': 'dep-new', 'status': 'created'})
+        if 'commitId' in json.loads(body):
+            # Render's own answer: a cron job builds only its branch's newest commit.
+            self.answer(400, {'message': 'cannot deploy cron job service crn-test by commit reference ID'})
+        elif state['fail'] or state['refuse']:
+            self.answer(503, {'message': 'unavailable'})
+        else:
+            self.answer(201, {'id': 'dep-new', 'status': 'created'})
 
     def log_message(self, format, *args):
         pass
@@ -105,11 +111,11 @@ class RefreshTestJobImageTest(unittest.TestCase):
     def git(self, *args, cwd=None):
         return subprocess.run(['git', *args], cwd=cwd or self.repo, capture_output=True, text=True, check=True)
 
-    def refresh(self, sha, deploys, settings=True, fail=False):
+    def refresh(self, sha, deploys, settings=True, fail=False, refuse=False):
         with open(self.env_file, 'w') as file:
             if settings:
                 file.write('POISE_TEST_RENDER_API_KEY=render-secret\nPOISE_TEST_BASE_SERVICE=crn-test\n')
-        self.server.state.update(deploys=deploys, calls=[], fail=fail)
+        self.server.state.update(deploys=deploys, calls=[], fail=fail, refuse=refuse)
         open(self.docker_log, 'w').close()
         env = {name: value for name, value in os.environ.items() if not name.startswith('POISE_')}
         env.update(PATH=f'{self.bin}{os.pathsep}{env["PATH"]}', FAKE_DOCKER_LOG=self.docker_log)
@@ -127,14 +133,15 @@ class RefreshTestJobImageTest(unittest.TestCase):
         self.assertIn('finished', result.stdout, result.stderr)
         self.assertEqual([call['method'] for call in calls], ['GET'])
 
-    def test_builds_at_the_deployed_commit_when_the_image_caller_or_the_lock_changed(self):
+    def test_builds_the_branch_when_the_image_caller_or_the_lock_changed(self):
         for since, sha in [('poise', 'caller'), ('caller', 'runtime'), ('runtime', 'lock')]:
             with self.subTest(since=since, sha=sha):
                 result, calls = self.refresh(self.commits[sha], [self.built(self.commits[since])])
                 self.assertIn('finished', result.stdout, result.stderr)
+                self.assertNotIn('warning', result.stderr)
                 self.assertEqual(calls[-1]['method'], 'POST')
                 self.assertEqual(calls[-1]['path'], '/services/crn-test/deploys')
-                self.assertEqual(calls[-1]['body'], {'commitId': self.commits[sha]})
+                self.assertEqual(calls[-1]['body'], {})
 
     def test_goes_by_the_last_build_that_did_not_fail(self):
         _, calls = self.refresh(self.commits['poise'], [self.built('f' * 40, 'build_failed'), self.built(self.commits['first'])])
@@ -146,18 +153,24 @@ class RefreshTestJobImageTest(unittest.TestCase):
         for deploys in ([], [self.built('a' * 40)]):
             with self.subTest(deploys=deploys):
                 _, calls = self.refresh(self.commits['poise'], deploys)
-                self.assertEqual(calls[-1]['body'], {'commitId': self.commits['poise']})
+                self.assertEqual(calls[-1]['body'], {})
 
     def test_asks_render_nothing_without_the_settings(self):
         result, calls = self.refresh(self.commits['poise'], [], settings=False)
         self.assertIn('finished', result.stdout)
         self.assertEqual(calls, [])
 
-    def test_a_render_that_fails_only_warns(self):
+    def test_a_render_that_fails_only_warns_with_its_answer(self):
         result, calls = self.refresh(self.commits['poise'], [], fail=True)
         self.assertIn('finished', result.stdout)
+        self.assertIn('Render answered with HTTP 503: {"message": "unavailable"}', result.stderr)
         self.assertIn('stays as it is', result.stderr)
         self.assertEqual(len(calls), 1)
+        result, calls = self.refresh(self.commits['caller'], [self.built(self.commits['poise'])], refuse=True)
+        self.assertIn('finished', result.stdout)
+        self.assertIn('Render answered with HTTP 503: {"message": "unavailable"}', result.stderr)
+        self.assertIn(f'jobs keep the image of {self.commits["poise"]}', result.stderr)
+        self.assertEqual([call['method'] for call in calls], ['GET', 'POST'])
 
     def test_runs_with_docker_alone_and_the_key_never_on_a_command_line(self):
         _, calls = self.refresh(self.commits['caller'], [self.built(self.commits['poise'])])
