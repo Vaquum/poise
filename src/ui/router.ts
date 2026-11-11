@@ -3,7 +3,7 @@
 // Back and Forward work; a place's listeners, timers and polling stop when it
 // leaves, and it arrives through the motion runtime, once per mount.
 import { reveal } from '../motion'
-import { readAddress, type Address, type Place } from './address'
+import { PLACE_NAMES, readAddress, type Address, type Place } from './address'
 import { closeMenus, showPlace } from './shell'
 import { closeRef, paintTerms } from './reference'
 
@@ -52,6 +52,7 @@ async function mountAddress(): Promise<void> {
     current = null
   }
   showPlace(address)
+  document.title = `Poise — ${PLACE_NAMES[address.place]}`
   const module = await PLACES[address.place]()
   if (mine !== sequence) return
   const controller = new AbortController()

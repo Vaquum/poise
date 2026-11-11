@@ -70,13 +70,13 @@ describe('the level', () => {
     expect(noticeGroup('chat_turn_finished')).toBe('ready')
   })
 
-  it('has the bell count the notices elsewhere, and Overview’s own entries while it is mounted', () => {
-    const notices = [notice('pr_ready'), notice('chat_turn_finished'), notice('ledger_queue_stalled')]
-    expect(bellTally(notices)).toEqual({ count: 3, tone: 'failed' })
+  it('has the bell count what the level shows: the same sources elsewhere, Overview’s own entries while it is mounted', () => {
+    const away = () => [notice('pr_ready'), notice('chat_turn_finished'), notice('ledger_queue_stalled')].map((value) => noticeGroup(value.kind))
+    expect(bellTally(away)).toEqual({ count: 3, tone: 'failed' })
     saveLevel(0)
-    expect(bellTally(notices)).toEqual({ count: 1, tone: 'needs-you' })
+    expect(bellTally(away)).toEqual({ count: 1, tone: 'needs-you' })
     setAnswerGroups(() => ['needs-you', 'needs-you', 'needs-you'])
-    expect(bellTally(notices)).toEqual({ count: 3, tone: 'needs-you' })
+    expect(bellTally(away)).toEqual({ count: 3, tone: 'needs-you' })
   })
 })
 

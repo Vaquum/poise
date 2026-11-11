@@ -10,7 +10,7 @@ const STATE_WORDS: any = {
 export const SHARED: Registry = {
   /* ---------- Concepts ---------- */
   'term.chat': { name: 'Chat', kind: 'Concept', what: 'A conversation with one agent, kept until you delete it: its transcript, its settings and its workspace.', does: 'Holds everything said and done in it. A chat you start is run by you; a chat the Manager starts is a worker.' },
-  'term.worker': { name: 'Worker', kind: 'Concept', what: 'A chat the Manager started and runs to do one piece of work. A worker is a chat; “worker” is its role.', does: 'Takes a slot while its turn is active and gives it back when the turn ends.' },
+  'term.worker': { name: 'Worker', kind: 'Concept', what: 'A chat the Manager started and runs to do one piece of work. A worker is a chat; “worker” is its role.', does: 'Holds a slot from the moment it takes a task until its chat is closed, between turns too.' },
   'term.manager': { name: 'Manager', kind: 'Concept', what: 'The agent that plans work across workers, starts them within your Rhythm, and brings decisions to you according to Autonomy.', does: 'Watches every chat, starts and resumes workers, records new issues, and answers routine questions for you.' },
   'term.turn': { name: 'Turn', kind: 'Concept', what: 'One round in a chat: an instruction and everything the agent does until it stops.' },
   'term.active-turn': { name: 'Active turn', kind: 'Concept', what: 'A turn that has started and not yet ended, including one paused for your answer.' },
@@ -45,10 +45,10 @@ export const SHARED: Registry = {
 
   /* ---------- Navigation ---------- */
   'nav.overview': { name: 'Overview', kind: 'Place', what: 'The command center: what needs your answer, with the answer right there; what is moving, failing or waiting; and how the work is going, from Analytics and the behaviors.', does: 'Opens the Overview. Most days you can do everything from it.' },
-  'nav.current': { name: 'Board', kind: 'Place', what: 'Ideas, plans, issues and pull requests on one line.' },
+  'nav.current': { name: 'Board', kind: 'Place', what: 'Ideas, plans, issues and pull requests on one line. Called Current until 23 October.' },
   'nav.editor': { name: 'Editor', kind: 'Place', what: 'Long-form writing, with comments, agents and publishing.' },
   'nav.chat': { name: 'Chat', kind: 'Place', what: 'Conversations with agents, including the Manager and its workers.' },
-  'nav.observe': { name: 'Observe', kind: 'Place', what: 'Status, history and evidence in one place: Behaviors, GitHub and Logging, which were Swarm, Archive and Logging. Analytics is part of Overview.' },
+  'nav.observe': { name: 'Observe', kind: 'Place', what: 'Status, history and evidence in one place: Tasks, Behaviors, GitHub and Logging. Behaviors and GitHub were Swarm and Archive. Analytics is part of Overview.' },
   'nav.settings': { name: 'Settings', kind: 'Place', what: 'Every configuration in one home: General, Accounts, Models and the rest, with Style and the Manager’s controls a step away.', does: 'Opens a menu: Style and the Manager’s controls directly, or any section of Settings, with a route back to where you were. Controls you use while working also appear where you work, on the same setting.' },
   'gw.signin': { name: 'Sign in with GitHub', kind: 'Action', what: 'Signs you in to the gateway in front of your workspace with your GitHub account.', does: 'Brings you to your workspace, or back to the page you were on.' },
   'gw.open': { name: 'Open your workspace', kind: 'Action', what: 'Opens your Poise at its own address. If it is stopped, it starts first.' },
