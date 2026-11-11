@@ -145,13 +145,13 @@ export function recordLogin(preset: string, code: number): void {
   const completedAt = Date.now()
   setMeta(LOGINS_KEY, JSON.stringify({ ...accountLogins(), [id]: new Date(completedAt).toISOString() }))
   const failure = providerSignInFailure(id)
-  // First resolving Connect wins while no verification claim exists: a later
-  // Connect after physical Call completion but before its receipt is
-  // reconciled must not clobber the help that verification will confirm.
-  // A fresh Connect after a claim still replaces it so a failed verification
-  // can be retried once per Connect.
+  // First resolving Connect wins while unverified: a later Connect after
+  // physical Call completion but before its receipt is reconciled must not
+  // clobber the help that verification will confirm, even when a verification
+  // claim is already in flight. Retry of the same failure happens through the
+  // review-Call verification path or a later rejection, not by replacing.
   if (failure && completedAt > failure.rejectedAt && failure.verifiedAt === null
-    && (failure.reconnectedAt === null || failure.verificationLogin !== null)) {
+    && failure.reconnectedAt === null) {
     setMeta(rejectionKey(id), JSON.stringify({ ...failure, reconnectedAt: completedAt }))
   }
 }
