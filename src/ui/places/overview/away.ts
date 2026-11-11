@@ -1,20 +1,25 @@
 // The bell away from Overview (#556: the bell on every view counts what the
 // level shows). On Overview, Answer here hands over its own entries; on every
 // other place this reads the same sources, once a minute while the tab is in
-// front, and counts them the way Answer here does. A failed read keeps the last.
+// front, and counts them the way Answer here does. A failed read keeps the last
+// and says so under Answer here's own words, so the count is never silently stale.
 import { getBehaviorDiagnostics, refreshState } from '../../../behaviors'
 import { chatClient } from '../../../chat-client'
 import { LOCAL_NOTICE_KINDS, noticeFeed } from '../../../notices'
 import { notificationItems, type ChainAttentionRow } from '../../../notification-items'
 import { decisionEntries, foldWaiting, itemEntries, requestEntries, requestsFrom, type DecisionItem, type OpenRequest } from './entries'
 import type { Group } from './level'
-import { json } from './util'
+import { json, reason } from './util'
 
 let requests: readonly OpenRequest[] = []
 let decisions: readonly DecisionItem[] = []
 let threads = 0
 let attention: ChainAttentionRow[] = []
 let chains: ReadonlyMap<string, { sequence: number, held: string | null }> = new Map()
+
+/** A failed read under Overview's own source and words; Overview's reads and these replace each other. */
+const report = (source: string, title: string, error: string): void =>
+  noticeFeed.reportReadErrors(source, error ? [{ key: source, title, body: `${error.replace(/\.$/, '')}. The bell may count what was last read.` }] : [])
 
 /** Where an entry opens does not change what it counts. */
 const noRole = (): undefined => undefined
@@ -43,13 +48,23 @@ export function watchAway(away: () => boolean, changed: () => void): () => void 
       refreshState(),
     ])
     reading = false
-    if (r.status === 'fulfilled') requests = requestsFrom(r.value)?.requests ?? requests
-    if (b.status === 'fulfilled') { const items = (b.value as { items?: unknown } | null)?.items; if (Array.isArray(items)) decisions = items as DecisionItem[] }
-    if (v.status === 'fulfilled' && Array.isArray(v.value.publications)) threads = v.value.publications.reduce((sum, publication) => sum + (publication.openThreads ?? 0), 0)
-    if (c.status === 'fulfilled' && Array.isArray(c.value.chains) && Array.isArray(c.value.attention)) {
-      chains = new Map(c.value.chains.map((chain) => [chain.id, { sequence: chain.sequence, held: chain.held }]))
-      attention = c.value.attention
+    const unread = 'the service answered with something this page cannot read'
+    const failed = (result: PromiseSettledResult<unknown>, ok: boolean): string => result.status === 'rejected' ? reason(result.reason) : ok ? '' : unread
+    const requestsRead = r.status === 'fulfilled' ? requestsFrom(r.value) : null
+    if (requestsRead) requests = requestsRead.requests
+    const items = b.status === 'fulfilled' ? (b.value as { items?: unknown } | null)?.items : null
+    if (Array.isArray(items)) decisions = items as DecisionItem[]
+    const publications = v.status === 'fulfilled' ? v.value.publications : null
+    if (Array.isArray(publications)) threads = publications.reduce((sum, publication) => sum + (publication.openThreads ?? 0), 0)
+    const chainsRead = c.status === 'fulfilled' && Array.isArray(c.value.chains) && Array.isArray(c.value.attention) ? c.value : null
+    if (chainsRead) {
+      chains = new Map(chainsRead.chains!.map((chain) => [chain.id, { sequence: chain.sequence, held: chain.held }]))
+      attention = chainsRead.attention!
     }
+    report('overview-requests', 'Your chats’ requests could not be read', failed(r, !!requestsRead))
+    report('overview-switchboard', 'The Switchboard’s decisions could not be read', failed(b, Array.isArray(items)))
+    report('overview-reviews', 'Review threads could not be read', failed(v, Array.isArray(publications)))
+    report('overview-chains', 'Attention evidence unavailable', failed(c, !!chainsRead))
     changed()
   }
   setInterval(() => { void read() }, 60_000)

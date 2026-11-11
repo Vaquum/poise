@@ -160,13 +160,16 @@ test('a failed autosave reaches the notice feed without moving the editor', asyn
   await page.setViewportSize({ width: 900, height: 800 })
   await page.waitForTimeout(400)
   const before = await geometry(page)
+  // The bell also counts its other sources' reads, which this mock leaves unread: compare.
+  const bell = page.getByRole('button', { name: /^Notifications/ })
+  const open = async (): Promise<number> => Number(/Notifications, (\d+) open/.exec((await bell.getAttribute('aria-label')) ?? '')?.[1] ?? 0)
+  const counted = await open()
   await editor.doc.click()
   await page.keyboard.press('End')
   await page.keyboard.type(' x')
   await expect.poll(() => editor.saveCount(), { timeout: 10_000 }).toBeGreaterThan(0)
-  // The failure is real and surfaced: the bell counts it while the rail is
-  // closed, and the rail card carries the message once opened.
-  await expect(page.getByRole('button', { name: /^Notifications/ })).toHaveAccessibleName(/^Notifications, 1 open/, { timeout: 10_000 })
+  // The failure is real and surfaced: the bell counts it while the rail is closed.
+  await expect.poll(open, { timeout: 10_000 }).toBe(counted + 1)
   await page.waitForTimeout(400)
   const after = await geometry(page)
   expect(Math.abs(after.headerH - before.headerH)).toBeLessThanOrEqual(1)

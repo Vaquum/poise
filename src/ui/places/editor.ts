@@ -21,7 +21,9 @@ let keep: HTMLElement | null = null
 
 export const mount: MountPlace = async ({ root, address, query }) => {
   root.innerHTML = '<main class="editor-place"><a class="back editor-back" href="#" data-back hidden data-ref="back"></a></main>'
-  routeBack($('[data-back]', root), address)
+  // This mount's own route back, taken before any wait: a newer place may own the root by then.
+  const back: HTMLAnchorElement = $('[data-back]', root)
+  routeBack(back, address)
   if (!viewEl) {
     viewEl = document.createElement('section')
     viewEl.id = 'view-editor'
@@ -33,7 +35,6 @@ export const mount: MountPlace = async ({ root, address, query }) => {
   await loadSettings().catch(() => undefined)
   await initEditorView()
   // The route back sits first in the Editor's own header, never over its controls.
-  const back: HTMLElement = $('[data-back]', root)
   viewEl.querySelector(':scope > .view-header')?.prepend(back)
   // A document another place asked for opens once the Editor is up.
   const slug = query.get('doc')

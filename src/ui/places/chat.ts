@@ -39,6 +39,8 @@ async function openRequested(chat: string | null): Promise<void> {
  *  as classic does: a frame after Chat starts, while its sessions load. */
 export async function mountChatView(root: HTMLElement, signal: AbortSignal, place: 'chat' | 'manager', chat: string | null = null): Promise<() => void> {
   const main: HTMLElement = $('main', root)
+  // This mount's own route back, taken before any wait: a newer place may own the root by then.
+  const back: HTMLElement = $('[data-back]', root)
   const view = chatView()
   main.append(view)
   view.hidden = false
@@ -48,7 +50,6 @@ export async function mountChatView(root: HTMLElement, signal: AbortSignal, plac
   const started = initChatView()
   // The shell is drawn by now: the route back sits first in the chat's own
   // header, never over its controls, and a narrow window starts with the list folded.
-  const back: HTMLElement = $('[data-back]', root)
   view.querySelector(':scope > .view-header')?.prepend(back)
   foldListWhenNarrow()
   await new Promise((done) => requestAnimationFrame(done))

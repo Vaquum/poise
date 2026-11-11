@@ -122,10 +122,18 @@ export function mountFrame(host: HTMLElement): HTMLElement {
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && openFor) { const a = openFor; closeMenus(); a.focus() } })
   watchConnection($('[data-ref="conn"]', host))
   watchBell($('[data-ref="bell"]', host))
-  // Admin is listed for the gateway's admins only, as Settings shows it.
-  void workspaceMode().then((mode) => mode.service ? fetchGatewayAccount() : null).then((account) => {
-    if (account?.isAdmin) $('[data-menu-section="admin"]', host).hidden = false
-  }).catch(() => {})
+  // Admin is listed for the gateway's admins only, as Settings shows it; a
+  // lookup that fails is asked again each time the menu opens.
+  let adminKnown = false
+  const checkAdmin = (): void => {
+    if (adminKnown) return
+    void workspaceMode().then((mode) => mode.service ? fetchGatewayAccount() : null).then((account) => {
+      adminKnown = true
+      if (account?.isAdmin) $('[data-menu-section="admin"]', host).hidden = false
+    }).catch(() => {})
+  }
+  checkAdmin()
+  $('[data-menu-open]', host).addEventListener('click', checkAdmin)
   return $('[data-place-root]', host)
 }
 

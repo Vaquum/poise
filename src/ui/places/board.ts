@@ -1090,6 +1090,7 @@ export const mount: MountPlace = (ctx) => {
     }
     if (!it) { toast(`${item} is not among the items Board has loaded.`, 'waiting'); return }
     if (F.status === 'open' && isSettled(it)) linkTo('status', 'any')
+    if (F.by === 'opened' && !inWindow(it.openedAt)) linkTo('time', 'all')
     if (F.who !== 'any') linkTo('who', 'any')
     if (only && it.state !== only) only = null
     if (search && !matches(it.title, it.repo, `#${it.num}`)) { search = ''; $('[data-search]', root).value = '' }

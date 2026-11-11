@@ -38,13 +38,14 @@ describe('the new interface has one vocabulary', () => {
     expect([...keys].filter((key) => !registered()[key])).toEqual([])
   })
 
-  // A row's reference is its ref, or set.<its key>; Style's token list (key, prop) is not a row.
+  // A row is a key, perhaps a ref, then its group, on one line or several; its reference is the ref or set.<key>.
   it('explains every Settings row, keyed by its ref or by set.<its key>', () => {
     const keys = new Set<string>()
     for (const file of walk(join('src', 'ui', 'places', 'settings')).filter((f) => f.endsWith('.ts'))) {
-      for (const [, key, ref] of readFileSync(file, 'utf8').matchAll(/\{ key: '([\w.-]+)'(?:, ref: '([\w.-]+)')?(?!, prop:)/g)) keys.add(ref || `set.${key}`)
+      for (const [, key, ref] of readFileSync(file, 'utf8').matchAll(/\{\s*key: '([\w.-]+)',(?:\s*ref: '([\w.-]+)',)?\s*group:/g)) keys.add(ref || `set.${key}`)
     }
-    expect(keys.size).toBeGreaterThan(10)
+    expect(keys.size).toBeGreaterThan(20)
+    expect(keys).toContain('set.models.slots')
     expect([...keys].filter((key) => !registered()[key])).toEqual([])
   })
 
