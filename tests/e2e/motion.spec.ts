@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import { workspace } from './fixtures/workspace'
 import { session, makeState, installRoutes, installSocket, input, env } from './fixtures/chat'
 import { freeze, resume, settled, stableLanding } from './fixtures/motion'

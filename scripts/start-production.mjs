@@ -32,6 +32,7 @@ const projectRoot = fileURLToPath(new URL('..', import.meta.url))
 const SOURCE_DIRECTORIES = ['src', 'server', 'gateway/src/diagnostics']
 const SOURCE_FILES = [
   'index.html',
+  'classic.html',
   'package.json',
   'package-lock.json',
   'vite.config.ts',

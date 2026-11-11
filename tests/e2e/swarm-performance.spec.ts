@@ -1,5 +1,5 @@
 import { feedback } from './fixtures/view-feedback'
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import { workspace } from './fixtures/workspace'
 import { settled } from './fixtures/motion'
 

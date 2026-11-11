@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { loadConfig } from '../../gateway/src/config'
 import { DockerClient } from '../../gateway/src/docker'
 import { createGateway } from '../../gateway/src/gateway'
@@ -139,7 +139,9 @@ test('submits MCP consent to a registered callback whose origin is also a font s
   const upstream = () => ({ host: 'unused.poise.invalid', port: 5555 })
   const deps = { config, store, keys, docker, log, now: Date.now, upstream }
   const gateway = createGateway({ ...deps, github: new GitHubClient(config), orchestrator: new Orchestrator(deps) })
+  // The classic fixture's route belongs to the context, so it goes too.
   await page.unrouteAll()
+  await context.unrouteAll()
   const cdp = await context.newCDPSession(page)
   try {
     await new Promise<void>(resolve => gateway.server.listen(0, '127.0.0.1', resolve))

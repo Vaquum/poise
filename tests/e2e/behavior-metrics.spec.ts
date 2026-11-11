@@ -1,5 +1,5 @@
 import { feedback } from './fixtures/view-feedback'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { BEHAVIORS } from '../../src/behaviors'
 
 async function workspace(page: Page, longSettings = false) {

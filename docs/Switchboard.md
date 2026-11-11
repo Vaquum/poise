@@ -84,12 +84,12 @@ fifty.
 
 ## The pane
 
-The pane opens at one third of the Chat view. Drag its left edge to resize it.
+The pane opens at one third of Chat. Drag its left edge to resize it.
 It snaps at one third and at one half, and a double-click goes back to one
 third. With its edge focused, the arrow keys resize it (Shift for larger
 steps) and Home and End go to the limits. The chat keeps at least 320 px, the
 same floor the sessions pane leaves it. The width is remembered as a share of
-the view, so Manager and Switchboard half and half, with the sessions list and
+Chat, so Manager and Switchboard half and half, with the sessions list and
 Memories hidden, stay half and half on any window. A window 1000 px wide or
 less shows the pane floating over the chat, as Memories does; there, opening
 one of the two closes the other, and Escape closes the one that is open.
@@ -187,7 +187,7 @@ creates a new one.
   the question as the Switchboard's summary. You decide; it does not.
 - **Cost.** A check runs at most every ten minutes and only when a chat has
   news, covers at most 100 chats and 1,000 events per chat, and three
-  unfinished checks stop it. Its turns appear in Swarm like any chat's.
+  unfinished checks stop it. Its turns appear in Observe → Behaviors like any chat's.
 
 ## From the agent-tooling role
 

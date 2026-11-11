@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import type { ArticleReview, ArticleReviews } from '../../src/publishing-review'
 import { REVIEW_INTERVAL_MS } from '../../src/publishing-review'
 import { workspace } from './fixtures/workspace'

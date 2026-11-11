@@ -1,50 +1,48 @@
 # Notifications
 
-What needs you, and what Behaviors is doing, is in one place: the notification
-rail. A bell at the end of the control bar, in every view, counts what is open
-and opens the rail. When nothing needs you, the bell shows no count.
+What needs you, and what Behaviors is doing, is in one place: Overview's
+Answer here. A bell at the end of the top bar, on every place, counts what is
+open and opens Answer here, with a route back to where you were. When nothing
+needs you, the bell shows no count.
+
+Classic, at `/classic.html` until it is removed (#556), keeps its notification
+rail as it was.
 
 ## The bell
 
-The count is what needs you, Poise faults and what is ready for you. What Poise
-handles on its own is not counted. The badge is:
+The count is what Answer here shows at its default level: what needs you, Poise
+faults and what is done for you to see. What Poise handles on its own is not
+counted. The badge is:
 
 - red while Poise has a fault;
 - amber while something needs you;
-- green when everything open is ready for you.
+- green when everything open is done for you to see.
 
-## The rail
+## Answer here
 
-The rail opens under the control bar, on the right, at full height.
+Answer here lists everything that wants you, each entry with its answers on
+it: questions and permissions from chats, the Switchboard's decisions, review
+threads, sign-ins, merges and faults. Show sets how much it lists, each level
+including the ones before it:
 
-- **Docked.** On a window at least 1400px wide the rail docks. The page ends
-  where the rail begins, including full-width Archive, Swarm, Current and
-  Chat, so the rail covers nothing. It can stay open while you work, across
-  views and reloads. The dock button in its header turns docking off and on.
-- **Floating.** On a narrower window, or with docking off, it floats over the
-  page. It closes on a click outside it or on Escape.
+- **Only you:** what only you can do.
+- **+ Faults:** also what Poise itself needs repaired.
+- **+ Done:** also what has finished, for you to see. The default, and what the
+  bell counts.
+- **Everything:** also what Poise is handling on its own.
 
-Everything is listed by who acts:
-
-- **Needs you:** what only you can do.
-- **Poise faults:** Poise itself needs repair.
-- **Ready:** done and waiting for you.
-- **Handled automatically:** Poise is retrying, and there is nothing to do.
-  This group is folded behind its count while anything else is listed.
-
-The filter above the list shows one group at a time. Each entry expands in
-place to its full words, what happened and what can be done. An expanded entry
-stays expanded through refreshes. Each line of what happened carries its time
-on Poise's clock: 24-hour in the time zone from Settings, whatever the browser's
-language, with the date for another day and the year for another year. The
-times sit in one aligned column, and a failing behavior's line also names its
-next check on the same clock.
+Each entry expands in place to its full words, what happened and what can be
+done. Each line of what happened carries its time on Poise's clock: 24-hour in
+the time zone from Settings, whatever the browser's language, with the date for
+another day and the year for another year.
 
 ## What shows
 
 Server notices are unresolved alerts, the same alerts
-[Poise Link](Poise-Link.md) shows on the desktop. Swarm, Current, Archive, Behaviors, Snippets, Editor and Analytics report browser
-read failures here as tab-local Poise faults. Failed writes and conflicts also
+[Poise Link](Poise-Link.md) shows on the desktop. In the new interface a failed
+read shows on the element it belongs to, where it happened. In classic, Swarm,
+Current, Archive, Behaviors, Snippets, Editor and Analytics report browser
+read failures in the rail as tab-local Poise faults. Failed writes and conflicts also
 appear here, classified as faults or actions needing the person. Changed failures
 receive a fresh notice; repeating the same failure keeps its dismissal. Unreadable
 Swarm records are tracked by stable record identity instead: reworded evidence for
@@ -83,20 +81,20 @@ Behaviors' diagnostics are listed too, with the classification and details
 described in [Behavior integration contract](Behavior-Contract.md#diagnostic-severity).
 
 Delayed, held and uncertain native-chain work uses the existing `attention`
-records as Needs you cards, including progress age, exact-head gates and the
+records as Needs you entries, including progress age, exact-head gates and the
 known next action. Issue/PR links retain their targets; Journal evidence opens
-the recorded journal cursor in Logging, where Hold/Resume and pagination remain
-available. Failed reads retain cards with an explicit stale-evidence notice.
+the recorded journal cursor in Observe → Tasks, where Hold/Resume and pagination
+remain available. Failed reads retain entries with an explicit stale-evidence notice.
 This follows the existing diagnostics refresh clock and remains accessible with
 Notifications off; it adds no alert record or execution authority.
 
 A failed behavior's notice and its diagnostic are one entry. The notice says
 what can be done; the diagnostic says what happened and how it is classified,
-which also decides its group. Each Behaviors row shows that behavior's counts:
-Poise faults, needs you and automatic. A count opens the rail on that behavior
-with its first entry in that group expanded.
+which also decides its group. In classic, each Behaviors row shows that
+behavior's counts: Poise faults, needs you and automatic; a count opens the rail
+on that behavior with its first entry in that group expanded.
 
-Existing managed-work entries also show [verified work impact](Logging.md#native-logging-view)
+Existing managed-work entries also show [verified work impact](Logging.md#observe--logging)
 from each entry's own retained evidence: current impact, work target and stage,
 last verified progress, and the next known retry or action. An unmatched entry
 stays unknown even when a grouped sibling matches. These optional reads preserve
@@ -113,8 +111,8 @@ in the same reset window raises an amber `github_quota_warning`. Zero remaining 
 `github_quota_exhausted` error, including after a dismissed warning. The notice
 names the account, API budget, usage and reset time. The reset time is on Poise's
 clock with its zone, as in `Resets at 16:00 EEST.`, in the time zone from
-Settings, or in UTC while none is set. Errors appear in the rail's faults group
-and turn the bell red.
+Settings, or in UTC while none is set. Errors appear among Poise faults and turn
+the bell red.
 
 Each account/budget/reset condition alerts once. Continuing warnings update
 their numbers without undoing a dismissal or issuing another arrival. A
@@ -144,16 +142,16 @@ store resolves the previous store's loss alert. A standing loss alert refreshes
 its totals without issuing another arrival. Like quota alerts, these raise only
 while notifications are enabled. Resolution continues while off, and unraised
 loss accumulates instead of being consumed, so re-enabling surfaces what was
-lost. They open the Behaviors view.
+lost. They open Observe → Behaviors.
 
 ## Pull requests ready to merge
 
 Every two minutes Poise checks your own open pull requests, the ones your
-GitHub account or the agent account opened, with the rule Current uses for
-green: the merge button is green, no check fails or is still running, and no
+GitHub account or the agent account opened, with the rule classic's Current
+uses for green: the merge button is green, no check fails or is still running, and no
 conversation is unresolved.
 
-Current and notifications share a simultaneous check of the same pull request
+Classic's Current and notifications share a simultaneous check of the same pull request
 when both use the same agent GitHub account. Its answer is cached for 60 seconds
 from the start of the check; a different agent account gets its own check.
 
@@ -210,16 +208,14 @@ diagnostics and General settings; it does not depend on notices or add a poller.
 
 ## Acting on a notice
 
-- **Open** goes to what the notice is about and puts the notice away. That is
-  Swarm, Settings (Accounts or General), the Chat session, or the pull request
-  on GitHub in a new tab.
-  - A failed behavior scrolls to its exact run in Swarm, briefly highlights it,
-    and opens the failure detail, including when Swarm is already on screen.
-    Search and account filters that hide the run are cleared, and a collapsed
-    group opens to reveal it.
+- **Open** goes to what the notice is about and puts the notice away, with a
+  route back: the run in Observe → Behaviors, Settings → Accounts or General,
+  the chat in Chat or the Manager place, or the pull request's card on Board,
+  with GitHub a click away.
+  - A failed behavior opens its exact run in Observe → Behaviors with its
+    failure detail. A filter that hides the run is cleared for that visit only.
   - A failed behavior without a recorded agent call has nothing to open. Its
     diagnostic is in the entry itself.
-  - A floating rail closes when it opens something; a docked rail stays open.
 - **Dismiss** puts it away: for good, or for a ready pull request or idle
   worker slots until its next reminder.
 - **Silence reminders**, on a ready pull request, a requested review, or idle
@@ -228,24 +224,17 @@ diagnostics and General settings; it does not depend on notices or add a poller.
   removed, and nothing more about idle slots until a slot fills or a ticket
   is labelled.
 
-Behaviors' conditions cannot be put away. They leave the rail when the
+Behaviors' conditions cannot be put away. They leave Answer here when the
 condition clears.
 
 ## Arrivals
 
-A notice that arrives while the rail is closed shows for six seconds as a card
-under the control bar. The card has Open (when the notice has somewhere to go),
-Show, which opens the rail on it, and dismiss. Pointing at the card or focusing
-it keeps it on screen. Then it tucks into the bell. A ready pull request's
-reminder arrives the same way. While the rail is open, a new entry is
-highlighted in place instead.
+A notice that arrives while you are elsewhere raises the bell's count. One that
+arrives while your pointer or focus is in Answer here waits, counted as new with
+Show now, so nothing moves under you; leaving the list brings it in. A screen
+reader reads each new notice once.
 
-What stood before the page loaded, or before notifications were turned on, is
-counted by the bell, not shown as a card. Cards take no focus and make no
-sound; a screen reader reads each new notice once.
-
-What one tab puts away, the others drop within ten seconds. The bell, the rail
-and arrival cards are hidden in the Editor's writer mode.
+What one tab puts away, the others drop within ten seconds.
 
 ## Reading Behaviors' diagnostics
 
@@ -253,7 +242,7 @@ Reading Behaviors' diagnostics runs `agent-interface --logs` on the server, so
 the page reads them only:
 
 - once, 15 seconds after it loads, unless something below has read them first;
-- when the rail opens, and while it is open, on each refresh tick;
+- when Answer here opens, and while it is open, on each refresh tick;
 - whenever Behaviors refreshes on screen.
 
 Until that first read, the bell counts only notices.
@@ -261,7 +250,7 @@ Until that first read, the bell counts only notices.
 ## Turning them off
 
 Settings → General → Notifications. Off stops notices and the check of pull
-requests at once. Behaviors' diagnostics stay in the rail, and Poise Link's
+requests at once. Behaviors' diagnostics stay in Answer here, and Poise Link's
 other alerts go on as before.
 
 ## API
@@ -288,13 +277,14 @@ other alerts go on as before.
 
 The page reads `GET /api/notices` every ten seconds while it is in front, and
 at once when it comes back to the front. The code is `server/alerts/notices.ts`
-on the server; in the page it is `src/views/notification-rail.ts`, with what it
-lists in `src/notification-items.ts`.
+on the server. In the page, Answer here is `src/ui/places/overview/` and the
+bell `src/ui/shell.ts`; classic's rail is `src/views/notification-rail.ts`, with
+what it lists in `src/notification-items.ts`.
 
 ## Retained evidence
 
-Expanded rail entries, including diagnostic-only conditions, show **View in
-Logging** when exact retained evidence is available. Distinct attempts keep their
+In classic, expanded rail entries, including diagnostic-only conditions, show
+**View in Logging** when exact retained evidence is available. Distinct attempts keep their
 own references; additional retained history is labelled. Pending collection and
 unavailable diagnostics remain explicit. A missing record never borrows another
 review's failure. [Logging](Logging.md#notification-evidence) defines identity and

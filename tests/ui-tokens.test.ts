@@ -86,7 +86,7 @@ describe('the new interface keeps its token contract', () => {
 
   it('builds only data into inline styles, and no style blocks or raw SVG colours', () => {
     const problems: string[] = []
-    for (const file of [...files.filter((f) => f.endsWith('.ts')), 'ui.html']) {
+    for (const file of [...files.filter((f) => f.endsWith('.ts')), 'index.html']) {
       const source = readFileSync(file, 'utf8')
       for (const [, style] of source.matchAll(/style="([^"]*)"/g)) {
         for (const declaration of style.split(';').map((d) => d.trim()).filter(Boolean)) {

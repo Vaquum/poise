@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import { NOW, session, installRoutes, installSocket, makeState, input } from './fixtures/chat'
 
 test.beforeEach(async ({ page }) => {

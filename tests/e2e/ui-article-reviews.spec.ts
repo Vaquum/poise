@@ -1,6 +1,6 @@
 // The scenarios of article-reviews.spec.ts, in the new interface's editor place (#556): the same
 // mocked service, opened at /?view=editor through the new interface's fixture.
-import { expect, test, type Page } from './fixtures/ui'
+import { expect, test, type Page } from '@playwright/test'
 import type { ArticleReview, ArticleReviews } from '../../src/publishing-review'
 import { REVIEW_INTERVAL_MS } from '../../src/publishing-review'
 import { workspace as classicWorkspace } from './fixtures/workspace'

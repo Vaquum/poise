@@ -1,6 +1,6 @@
 // The scenarios of chat-queue.spec.ts, in the new interface's Chat (#556 PR 3): the same
 // mocked service and socket, opened at /?view=chat.
-import { expect, test } from './fixtures/ui'
+import { expect, test } from '@playwright/test'
 import { build } from 'esbuild'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdir } from 'node:fs/promises'

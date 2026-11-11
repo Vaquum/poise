@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import { input, installRoutes, installSocket, makeState, session } from './fixtures/chat'
 
 test('Chat paints its catalogue before global settings and preserves the draft after they arrive', async ({ page }) => {

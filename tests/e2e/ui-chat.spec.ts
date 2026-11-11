@@ -1,7 +1,7 @@
 // The scenarios of chat.spec.ts, in the new interface's Chat (#556 PR 3): the same
 // mocked service and socket, opened at /?view=chat.
 import type { ChatSwitches } from '../../src/chat-switches'
-import { expect, test, type Page } from './fixtures/ui'
+import { expect, test, type Page } from '@playwright/test'
 import type { ChatEnvelope, ChatEvent } from '../../server/chat/protocol'
 import { NOW, AGENTS, session, installRoutes, installSocket, env, makeState, input } from './fixtures/chat'
 import { settled } from './fixtures/motion'

@@ -2,7 +2,7 @@
 // pane: edit proposals render as cards, Accept saves through the Editor save
 // route before the decision is recorded, and highlighted text travels as a
 // quote with the next message.
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { workspace } from './fixtures/workspace'
 import { installRoutes, installSocket, makeState, session, env, NOW } from './fixtures/chat'
 import { feedback } from './fixtures/view-feedback'

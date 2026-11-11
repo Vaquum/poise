@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from './fixtures/ui'
+import { expect, test, type Page, type Route } from '@playwright/test'
 
 // Board in the new interface (#556 PR 3): Lanes and List over the live work,
 // Assign to Poise, your cards, and what sits beside the board. GitHub, the PR

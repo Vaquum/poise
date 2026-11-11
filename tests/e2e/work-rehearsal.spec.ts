@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import type { RehearsalTableData } from '../../src/views/work-rehearsal-table'
 import { plan, pull, HEAD } from '../fixtures/work-rehearsal'
 import { input, installRoutes, installSocket, makeState, session, switchboardState, timersData } from './fixtures/chat'

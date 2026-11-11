@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import { NOW, input, installRoutes, installSocket, makeState, session, timersData, timerView } from './fixtures/chat'
 import type { TimerSummary } from '../../server/chat/protocol'
 

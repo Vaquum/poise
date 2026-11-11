@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import type { SwitchboardItem, SwitchboardState } from '../../server/chat/protocol'
 import { NOW, session, installRoutes, installSocket, makeState, switchboardState } from './fixtures/chat'
 

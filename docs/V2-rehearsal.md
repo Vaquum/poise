@@ -44,9 +44,9 @@ checks on these exact PR candidates:
 
 [The refreshed element review](design/interface/review.json) preserves #556's
 original row identities, vocabulary, destinations, decisions and reasons. The
-recovered artifact actually contains 390 rows, 321 with live IDs and 274
-distinct live IDs, including later additions; the old PRD's “270” is not its
-current count. Its SHA-256 pins the original input. Group entries map retained
+review now follows the mocks #556 pins in `docs/design/interface/poise-ds/`:
+494 rows, 369 with live IDs and 318 distinct live IDs, read against `main` at
+`bb30bb3`. Its SHA-256 pins that input. Group entries map retained
 v1 capabilities to the same shared component and existing executable suites.
 Mock-only additions and old mock removal decisions are explicitly design
 history, not functionality silently added or removed here. #556's frontend

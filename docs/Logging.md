@@ -40,9 +40,9 @@ fields recursively. Strings and nested context are bounded; truncation is
 explicit. The source adapters select Caller metadata without reading prompt or
 response fields, and preserve its exact process evidence when available.
 
-## Native Logging view
+## Observe → Logging
 
-By default, Menu → Logging opens a server-paged table of retained events, with all three
+By default, Observe → Logging opens a server-paged table of retained events, with all three
 severities and Any time selected initially. Filters cover the full permitted
 store; the count is matching events, while each row's occurrence count describes
 its retained incident. Source time is displayed in Settings' timezone; missing
@@ -67,7 +67,7 @@ The normal view contains no retention, snapshot or coverage prose. Data and coll
 Expand a row with its evidence button (Enter or Space). Cause, stderr, stack,
 resource units/measurement time and truncation are shown as recorded. Related
 incident/correlation reads use the applied time, severity and access scope,
-twenty events per page. Recorded Caller runs open Swarm; valid repository/PR
+twenty events per page. Recorded Caller runs open Observe → Behaviors; valid repository/PR
 pairs open GitHub. Unrecorded targets have no link.
 
 Each list snapshot also reads the owner's existing managed chain journal in one

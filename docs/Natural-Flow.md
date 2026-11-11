@@ -21,7 +21,10 @@ entry or layout offset into their own translation.
 
 Keyed reconciliation retains controls, drafts, selections, native details and
 active motion styles. View entrances run once per mounted view; returning to
-cached content is immediate.
+cached content is immediate. In the interface at `/` ([Interface](Interface.md)),
+the top bar never re-renders and each place's entrance runs once per mount:
+Overview, Board, Observe and Settings rise, Chat, the Manager and the Editor
+only fade. Its tokens read the spring and durations from the same model.
 Structural layout measures every destination before writing animation styles;
 frame visibility and target reads precede animation writes. View departure
 batches presentation reads before settling channels. Only actors whose

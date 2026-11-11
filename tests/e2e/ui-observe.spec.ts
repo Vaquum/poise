@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from './fixtures/ui'
+import { expect, test, type Page, type Route } from '@playwright/test'
 
 // Observe in the new interface (#556): Tasks with the chain's evidence,
 // Behaviors, GitHub and Logging, on main's endpoints. The isolated server has

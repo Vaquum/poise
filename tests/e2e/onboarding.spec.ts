@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { organization, setupWorkspace } from './onboarding-fixture'
 
 // First-run setup in a workspace behind the gateway, with Poise's API and the

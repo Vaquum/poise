@@ -1,5 +1,5 @@
 import { feedback } from './fixtures/view-feedback'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { settled } from './fixtures/motion'
 import { emptyAnalyticsReport } from './fixtures/analytics'
 import type { Organization } from '../../src/config'

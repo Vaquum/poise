@@ -510,7 +510,7 @@ progress is normal conversation there.
 
 Work changes also enter the existing structured diagnostic log with the target,
 repository and responsible chat. The native `api` operation reaches Poise's
-normal local API for Current, Swarm, Behaviors, Editor, snippets, settings,
+normal local API for Board, Observe, Behaviors, Editor, snippets, settings,
 models and analytics; existing route validation and drain policy still apply.
 It never obtains a gateway/admin identity or access to another workspace.
 

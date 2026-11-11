@@ -1,5 +1,5 @@
 import { feedback } from './fixtures/view-feedback'
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures/classic'
 import { build } from 'esbuild'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdir } from 'node:fs/promises'

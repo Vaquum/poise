@@ -1,7 +1,7 @@
 // Passage chats open inline under their passage: the thread pushes the text
 // below it down without entering the saved document, closed chats show
 // margin markers, and chats move to the side pane and back with their draft.
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { workspace } from './fixtures/workspace'
 import { installRoutes, installSocket, makeState, session, env, NOW } from './fixtures/chat'
 import type { ChatEnvelope, ChatSubject } from '../../server/chat/protocol'

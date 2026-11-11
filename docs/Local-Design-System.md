@@ -1,11 +1,13 @@
 # Local Design System v1
 
-The visual contract for Poise. Every view should resolve through these
-tokens — never raw hex values, never one-off shadows, never mid-weights
-of sans, never italics.
+The visual contract for the previous interface, at `/classic.html` until it is
+removed. Every one of its views should resolve through these tokens — never raw
+hex values, never one-off shadows, never mid-weights of sans, never italics.
 
 The CSS implementation lives in [`src/style.css`](../src/style.css)
-under `:root` (search for `Design System v1`).
+under `:root` (search for `Design System v1`). The interface at `/` has its own
+tokens in [`src/ui/tokens.css`](../src/ui/tokens.css), described in
+[Interface](Interface.md#tokens-and-style).
 
 ---
 

@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 
 // The first line of the burger menu: the commit Poise runs, linked to it on
 // autonomio/poise, and since when. Poise's API is stood in for.

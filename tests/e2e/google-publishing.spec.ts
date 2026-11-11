@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 import { workspace } from './fixtures/workspace'
 import { installRoutes, installSocket, makeState } from './fixtures/chat'
 type ServerState = ReturnType<typeof makeState>

@@ -1,6 +1,6 @@
 // The scenarios of editor-history.spec.ts, in the new interface's editor place (#556): the same
 // mocked service, opened at /?view=editor through the new interface's fixture.
-import { expect, test, type Page, type Route } from './fixtures/ui'
+import { expect, test, type Page, type Route } from '@playwright/test'
 import { HISTORY_BYTE_BUDGET } from '../../src/editor-history'
 import { settled } from './fixtures/motion'
 import { workspace as classicWorkspace } from './fixtures/workspace'

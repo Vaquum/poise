@@ -4,7 +4,7 @@
 // pane: edit proposals render as cards, Accept saves through the Editor save
 // route before the decision is recorded, and highlighted text travels as a
 // quote with the next message.
-import { expect, test, type Page } from './fixtures/ui'
+import { expect, test, type Page } from '@playwright/test'
 import { workspace as classicWorkspace } from './fixtures/workspace'
 import { installRoutes, installSocket, makeState, session, env, NOW } from './fixtures/chat'
 import type { ChatEnvelope, ChatSubject } from '../../server/chat/protocol'

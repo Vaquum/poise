@@ -1,5 +1,5 @@
 import { feedback } from './fixtures/view-feedback'
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 
 // Snippets → Import against the real server: an Espanso file's plain pairs
 // join the library, the view lists what was skipped and why, and the desktop

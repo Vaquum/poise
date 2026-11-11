@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 
 // The review-round cap in the Behaviors view: Approve Pull Requests chooses
 // the round from which a run files its findings as one follow-up issue and

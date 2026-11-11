@@ -1,6 +1,6 @@
 // The scenarios of chat-timers.spec.ts, in the new interface's Chat (#556 PR 3): the same
 // mocked service and socket, opened at /?view=chat.
-import { expect, test } from './fixtures/ui'
+import { expect, test } from '@playwright/test'
 import { NOW, input, installRoutes, installSocket, makeState, session, timersData, timerView } from './fixtures/chat'
 import type { TimerSummary } from '../../server/chat/protocol'
 

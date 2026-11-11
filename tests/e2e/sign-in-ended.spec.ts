@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page } from './fixtures/classic'
 
 // What a person sees in a workspace once the sign-in in front of it has ended
 // (src/signed-out.ts): the gateway's own session turning the page's requests

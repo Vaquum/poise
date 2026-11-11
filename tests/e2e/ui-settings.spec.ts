@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from './fixtures/ui'
+import { expect, test, type Page, type Route } from '@playwright/test'
 import type { AdminOverview, GatewayAccount, PairedDevice } from '../../src/gateway-client'
 import { BEHAVIORS } from '../../src/behaviors'
 

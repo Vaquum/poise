@@ -1,8 +1,7 @@
 # Extensions
 
-Extensions are the MCP servers Poise chats can use. Open them from the burger
-menu (Extensions is a view of its own, placed in the menu by default; move it
-to the top bar under Settings → Navigation).
+Extensions are the MCP servers Poise chats can use. Open them in Settings →
+Extensions (`?view=settings&settings=extensions`).
 
 ## Installed
 
@@ -96,7 +95,7 @@ its own origin); otherwise the check fails asking for a token or headers.
 the authorization server from the server's protected-resource metadata,
 registers itself as a public client, and sends the browser to the provider
 with PKCE. The provider returns the browser to `/extensions/oauth` on this
-Poise, which finishes the exchange and opens Extensions on the server (it is a
+Poise, which finishes the exchange and opens Settings → Extensions (it is a
 page, not an API route, because the API refuses cross-site navigations). The
 return is accepted once, within ten minutes, only for a flow Poise started,
 and only from an HTTPS origin or HTTP on localhost. Signing in again starts a
@@ -181,4 +180,5 @@ names.
 - `tests/chat/adapter-extensions.test.ts`: what each adapter sends.
 - `tests/chat/runtime.test.ts`: next-turn resumes, notices and scrubbing.
 - `tests/e2e/extensions.spec.ts`: the view against the real server, including
-  a browser OAuth sign-in.
+  a browser OAuth sign-in that returns to the new interface's Settings →
+  Extensions.
