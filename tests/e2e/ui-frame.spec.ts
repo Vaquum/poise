@@ -97,6 +97,62 @@ test('the reference names what the pointer rests on, and explains it in full on 
   expect(query(page).get('view')).toBe('overview')
 })
 
+test('the reference is modal and fits a phone; a cancelled long press leaves the next tap alone', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 760 })
+  await open(page)
+  await nav(page).getByRole('link', { name: 'Board' }).focus()
+  await page.keyboard.press('?')
+  const card = page.getByRole('dialog', { name: 'Board' })
+  await expect(card).toBeVisible()
+  const box = (await card.boundingBox())!
+  expect(box.x).toBeGreaterThanOrEqual(0)
+  expect(box.x + box.width).toBeLessThanOrEqual(375)
+  // The page behind cannot be reached: Tab goes round the card.
+  await expect(page.locator('#ui')).toHaveJSProperty('inert', true)
+  for (let i = 0; i < 4; i++) {
+    await page.keyboard.press('Tab')
+    expect(await page.evaluate(() => !!document.activeElement?.closest('.ref-card'))).toBe(true)
+  }
+  await page.keyboard.press('Escape')
+  await expect(card).toBeHidden()
+  await expect(page.locator('#ui')).toHaveJSProperty('inert', false)
+
+  // A long press shows the tip; cancelled, it leaves no click to swallow.
+  await page.evaluate(async () => {
+    const link = document.querySelector('nav[aria-label="Poise"] a[href*="view=board"]')!
+    link.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'touch', bubbles: true }))
+    await new Promise((r) => setTimeout(r, 900))
+    link.dispatchEvent(new PointerEvent('pointercancel', { pointerType: 'touch', bubbles: true }))
+  })
+  await nav(page).getByRole('link', { name: 'Chat' }).click()
+  await expect(nav(page).getByRole('link', { name: 'Chat' })).toHaveAttribute('aria-current', 'page')
+})
+
+test('Motion off reaches the motion runtime; Copy as CSS says whether it copied; another tab’s typeface brings its fonts', async ({ page, context }) => {
+  await open(page)
+  const reduced = () => page.evaluate(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+  expect(await reduced()).toBe(false)
+  await nav(page).getByRole('button', { name: 'Settings' }).click()
+  await page.getByRole('menu', { name: 'Settings' }).getByRole('menuitem', { name: 'Style panel' }).click()
+  const panel = page.getByRole('complementary', { name: 'Style' })
+  await panel.getByRole('button', { name: 'Motion' }).click()
+  expect(await reduced()).toBe(true)
+
+  await page.evaluate(() => { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => Promise.reject(new Error('denied')) } }) })
+  await panel.getByRole('button', { name: 'Copy as CSS' }).click()
+  await expect(panel.getByRole('button', { name: 'Not copied: the browser refused' })).toBeVisible()
+  await page.evaluate(() => { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: () => Promise.resolve() } }) })
+  await expect(panel.getByRole('button', { name: 'Copy as CSS' })).toBeVisible()
+  await panel.getByRole('button', { name: 'Copy as CSS' }).click()
+  await expect(panel.getByRole('button', { name: 'Copied' })).toBeVisible()
+
+  const other = await context.newPage()
+  await other.goto('/?view=overview')
+  await expect(other.locator('.topbar')).toBeVisible()
+  await page.evaluate(() => { localStorage.setItem('poise-style', JSON.stringify({ '--archetype': '"minimalist"', '--ctl-font-ui': '"Manrope"', '--ctl-font-display': '"Space Grotesk"', '--ctl-font-mono': '"JetBrains Mono"' })) })
+  await expect.poll(() => other.evaluate(() => document.getElementById('style-fonts')?.getAttribute('href') ?? '')).toContain('family=Manrope')
+})
+
 test('the bell counts what needs you and opens Answer here with a route back', async ({ page }) => {
   const at = new Date().toISOString()
   const notice = (id: string) => ({ id, kind: 'pr_ready', title: `acme/site#${id} is ready to merge`, body: 'Checks passed.', since: at, due: at, silenceable: true, target: null })

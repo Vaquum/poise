@@ -18,6 +18,8 @@ let tip: HTMLElement | null = null
 let tipFor: HTMLElement | null = null
 let showTimer = 0, hideTimer = 0, touchTimer = 0
 let suppressClick = false
+/** The page behind the open reference, made inert while it is open. */
+let inerted: HTMLElement[] = []
 let layer: HTMLElement | null = null
 let layerFor: HTMLElement | null = null
 let layerKey = ''
@@ -118,6 +120,9 @@ export function openRef(el: HTMLElement): void {
       <p class="ref-foot"><span class="kbd">Esc</span> closes and returns you to ${esc(d.name)} <span class="t-mono">· ${esc(el.dataset.ref)}</span></p>
     </section>`
   document.body.appendChild(layer)
+  // Modal: what is behind it cannot be reached until it closes.
+  inerted = [...document.body.children].filter((n): n is HTMLElement => n instanceof HTMLElement && n !== layer && !n.inert)
+  for (const n of inerted) n.inert = true
   el.scrollIntoView({ block: 'nearest', inline: 'nearest' })
   layerFor = el
   layerKey = el.dataset.ref ?? ''
@@ -198,6 +203,8 @@ export function closeRef(): void {
   layer.remove()
   layer = null
   layerFor = null
+  for (const n of inerted) n.inert = false
+  inerted = []
   savedScroll.forEach(([s, t]) => { if (s) s.scrollTop = t })
   if (lastFocus?.isConnected) lastFocus.focus({ preventScroll: true })
   document.dispatchEvent(new CustomEvent('poise:ref', { detail: { open: false } }))
@@ -244,10 +251,23 @@ export function installReference(): void {
     if (!el) return
     touchTimer = window.setTimeout(() => { suppressClick = true; showTip(el) }, token('--dur-tip', 500))
   })
-  for (const type of ['pointerup', 'pointercancel']) document.addEventListener(type, () => clearTimeout(touchTimer))
+  // A long press released gives one click to swallow, at once; a cancelled one gives none.
+  document.addEventListener('pointerup', () => { clearTimeout(touchTimer); if (suppressClick) window.setTimeout(() => { suppressClick = false }) })
+  document.addEventListener('pointercancel', () => { clearTimeout(touchTimer); suppressClick = false })
   document.addEventListener('click', (e) => { if (suppressClick) { e.preventDefault(); e.stopPropagation(); suppressClick = false } }, true)
   document.addEventListener('keydown', (e) => {
-    if (layer) { if (e.key === 'Escape') { e.preventDefault(); closeRef() } return }
+    if (layer) {
+      if (e.key === 'Escape') { e.preventDefault(); closeRef() }
+      // Tab goes round the card's own controls.
+      if (e.key === 'Tab') {
+        const card = layer.querySelector<HTMLElement>('.ref-card')!
+        const stops = [card, ...card.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+        const at = stops.indexOf(document.activeElement as HTMLElement)
+        e.preventDefault()
+        stops[(at + (e.shiftKey ? stops.length - 1 : 1) + stops.length) % stops.length].focus()
+      }
+      return
+    }
     if (e.key === 'Escape' && tip) { hideTip(); return }
     // Outside text fields only: a field, a select or an editable page takes the key as typing.
     const focused = document.activeElement as HTMLElement | null

@@ -12,7 +12,8 @@ import { initClaudeAuth } from '../claude-auth'
 import { finishGoogleConnection } from '../google'
 import { noticeFeed } from '../notices'
 import { finishExtensionSignIn } from './extension-return'
-import { applySavedStyle, installStylePanel } from './style-panel'
+import { applySavedStyle, installStylePanel, styleToken } from './style-panel'
+import { installMotionSwitch } from './motion-switch'
 import { installIcons } from './icons'
 import { installReference } from './reference'
 import { mountFrame, toast } from './shell'
@@ -27,8 +28,11 @@ watchForUpdates()
 watchForSignOut()
 installSelfUpdateWatch()
 
+// The Style panel's Motion switch answers the motion runtime's one question, so it is in place first.
+const motionTurned = installMotionSwitch(() => styleToken('--ctl-motion') === '0')
 initMotion()
 applySavedStyle()
+document.addEventListener('poise:style', motionTurned)
 installIcons()
 
 ;(async () => {

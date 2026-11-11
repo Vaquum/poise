@@ -81,6 +81,8 @@ export function applySavedStyle(): void {
     for (const k of Object.keys(saved)) root.style.removeProperty(k)
     saved = read()
     apply(saved)
+    const a = savedArchetype()
+    if (a) loadFonts(a)
     sync()
   })
 }
@@ -159,11 +161,24 @@ function build(settingsHref: string): HTMLElement {
     if (t.dataset.arch) setArchetype(t.dataset.arch)
     if (t.hasAttribute('data-motion')) set('--ctl-motion', styleToken('--ctl-motion') === '0' ? '1' : '0')
     if (t.hasAttribute('data-style-reset')) { for (const k of Object.keys(saved)) root.style.removeProperty(k); saved = {}; write(saved); sync() }
-    if (t.hasAttribute('data-style-copy')) { void navigator.clipboard?.writeText(css()); t.textContent = 'Copied'; setTimeout(() => { t.textContent = 'Copy as CSS' }, 1400) }
+    if (t.hasAttribute('data-style-copy')) void copyCss(t)
     if (t.hasAttribute('data-style-close')) toggleStylePanel(false)
     if (t.hasAttribute('data-style-settings')) toggleStylePanel(false)
   })
   return panel
+}
+
+/** Copies the choices as CSS, and says on the button whether the browser took them. */
+async function copyCss(button: HTMLElement): Promise<void> {
+  let said = 'Copied'
+  try {
+    if (!navigator.clipboard) throw new Error('no clipboard')
+    await navigator.clipboard.writeText(css())
+  } catch {
+    said = 'Not copied: the browser refused'
+  }
+  button.textContent = said
+  setTimeout(() => { button.textContent = 'Copy as CSS' }, 1400)
 }
 
 function sync(): void {

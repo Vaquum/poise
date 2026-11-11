@@ -184,7 +184,7 @@ svg.i.solid { fill: currentColor; stroke: none; }
 .ref-wire { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .ref-wire line { stroke: var(--c-focus); stroke-width: var(--route-w-minor); stroke-dasharray: 4 4; }
 .ref-wire circle { fill: var(--c-focus); }
-.ref-card { position: fixed; width: var(--w-ref); max-height: 82vh; overflow-y: auto; background: var(--c-surface); border: var(--line-hair) solid var(--c-edge); border-radius: var(--r-panel); box-shadow: var(--shadow-dialog); padding: var(--sp-5) var(--sp-6) var(--sp-6); animation: settle var(--dur-settle) var(--ease-spring) both; }
+.ref-card { position: fixed; width: var(--w-ref); max-width: calc(100vw - var(--sp-6) * 2); max-height: 82vh; overflow-y: auto; background: var(--c-surface); border: var(--line-hair) solid var(--c-edge); border-radius: var(--r-panel); box-shadow: var(--shadow-dialog); padding: var(--sp-5) var(--sp-6) var(--sp-6); animation: settle var(--dur-settle) var(--ease-spring) both; }
 .ref-card:focus { outline: none; }
 .ref-head { display: flex; align-items: flex-start; gap: var(--sp-3); }
 .ref-head h3 { font-family: var(--font-display); font-weight: var(--fw-display); font-size: var(--fs-h3); line-height: var(--lh-tight); color: var(--c-text); }
