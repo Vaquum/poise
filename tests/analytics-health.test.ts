@@ -379,7 +379,7 @@ it('counts a grey-CI recovery whose verified CI success precedes its settlement'
     publication: { pull_number: 111, head_sha: HEAD, head_invocation: null, state: 'open', merged: false, merge_sha: null },
     pull: { number: 111, head: HEAD, headSince: NOW - 5 * HOUR, state: 'open', draft: false, merged: false, mergeSha: null,
       mergedAt: null, queueEntry: null, queueRemoval: null, changesRequested: false, unresolved: 0, approved: false, ready: false,
-      reviewIds: [], reviewRevision: 'review', greyRuns: [], pending, failing: [], conflict: false, behind: false, checksState } })
+      reviewIds: [], reviewReceipts: [], reviewRevision: 'review', greyRuns: [], pending, failing: [], conflict: false, behind: false, checksState } })
   let chain = f.seed(12)
   chain = f.append(chain, { type: 'chain.observed', observation: openPull(NOW - 5 * HOUR, true, 'PENDING') }, NOW - 5 * HOUR)
   const basis = chainBasis(['grey', HEAD, 123, 2])
