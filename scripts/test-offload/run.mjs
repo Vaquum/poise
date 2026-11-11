@@ -5,7 +5,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -80,9 +80,32 @@ function checkoutFiles(top) {
 }
 
 /**
+ * Every link met on the way to `path`, each where it really lives, then where `path` really is. A
+ * virtualenv's interpreter reaches its base through links, and a box needs them at the same paths. A
+ * link at the top, as `/bin` is on a merged /usr, belongs to the system, which every box has of its own.
+ */
+function wayTo(path) {
+  const links = []
+  let done = '/'
+  const rest = resolve(path).split('/').filter(Boolean)
+  while (rest.length > 0) {
+    const next = join(done, rest.shift())
+    if (!lstatSync(next).isSymbolicLink()) {
+      done = next
+      continue
+    }
+    if (done !== '/') links.push(next)
+    rest.unshift(...resolve(done, readlinkSync(next)).split('/').filter(Boolean))
+    done = '/'
+  }
+  return [...links, done]
+}
+
+/**
  * What a suite started in `cwd` needs, as absolute paths: the checkout's own files without what git
- * ignores, its dependencies, its .git, and the interpreter's folders `also` names when no test box has
- * them. Throws when that would carry something that must stay here.
+ * ignores, its dependencies, its .git, and the interpreter's folders and files `also` names, with every
+ * link on the way to them, when no test box has them. Throws when that would carry something that must
+ * stay here.
  */
 export function filesToSend(cwd, also = [], env = process.env, home = homedir()) {
   const paths = []
@@ -98,7 +121,10 @@ export function filesToSend(cwd, also = [], env = process.env, home = homedir())
   for (const path of also) {
     if (/^\/usr(\/|$)/.test(path) || !existsSync(path)) continue
     if (holdsSecrets(path)) throw new Error(`${path} holds what must not reach a test box`)
-    paths.push(path, realpathSync(path))
+    // Through a link a path would arrive as a folder of its own: the link goes, and where it leads.
+    const steps = wayTo(path)
+    if (holdsSecrets(steps.at(-1))) throw new Error(`${path} holds what must not reach a test box`)
+    paths.push(...steps.filter((step) => !/^\/usr(\/|$)/.test(step)))
   }
   return [...new Set(paths)].filter((path) => {
     try { return Boolean(lstatSync(path)) } catch { return false }

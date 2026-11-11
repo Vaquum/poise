@@ -765,8 +765,9 @@ other's alone. Nothing else needs setting up.
 **What a box gets.** Only what the suite needs, at the same paths: the
 checkout's tracked and untracked files without what git ignores, its
 `node_modules`, `.venv` and `venv` folders, its `.git`, the virtualenv and Python
-of the interpreter when they live outside the checkout, and the Node and npm that
-started the suite when they aren't the system's. The environment
+of the interpreter when they live outside the checkout, with every link on the way
+from the interpreter to its base, and the Node and npm that started the suite when
+they aren't the system's. The environment
 loses every variable named like a credential or belonging to a provider CLI,
 git or GitHub, and the hooks. A checkout whose `.git/config` holds a credential
 is refused. A box holds no sign-in, so a test that needs a secret or an ignored
