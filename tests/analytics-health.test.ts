@@ -671,3 +671,35 @@ it('counts a publish-issue retry settled from the observation without a publicat
   expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
   expect(report.recovery.unknown).toBe(0)
 })
+
+it('anchors each recovery to its own failure when one invocation fails twice', async () => {
+  const f = setup()
+  let chain = f.observe(f.seed(1), NOW - 31 * HOUR)
+  const id = chainBasis(`${chain.id}:repair-twice`).slice(0, 32)
+  const admittedAt = NOW - 30 * HOUR
+  chain = f.append(chain, { type: 'invocation.admitted', invocation: { id, behavior: 'review-issue', actor: 'reviewer', slot: 'primary',
+    basis: 'issue', model: 'fixture', admittedAt, request: { command: 'agent-interface', argv: [], cwd: '/fixture' } } }, admittedAt)
+  chain = f.append(chain, { type: 'invocation.started', invocationId: id }, admittedAt + 500)
+  const firstCall = 'f'.repeat(32)
+  chain = f.append(chain, { type: 'invocation.reconciled', invocationId: id, evidence: { status: 'failed', action: 'not_started',
+    outcome: 'preflight_failed', error_code: 'authentication_failed', error: 'Refresh credential rejected',
+    completedAt: NOW - 30 * HOUR, callId: firstCall } }, NOW - 30 * HOUR)
+  // An out-of-window operator Resume lands before the later publication Call
+  // fails on the same invocation.
+  chain = f.append(chain, { type: 'chain.resumed', recovery: { origin: 'operator', intervention: {
+    callId: firstCall, at: NOW - 28 * HOUR, verifiedAt: NOW - 28 * HOUR + 1000 } } }, NOW - 28 * HOUR + 2000)
+  const secondCall = 'e'.repeat(32)
+  chain = f.append(chain, { type: 'invocation.settled', invocationId: id, callId: secondCall, outcome: 'preflight_failed',
+    evidence: { status: 'failed', action: 'not_started', outcome: 'preflight_failed',
+      error_code: 'authentication_failed', error: 'Refresh credential rejected', completedAt: NOW - 5 * HOUR } }, NOW - 5 * HOUR)
+  chain = f.succeed(chain, 'retry', NOW - 2 * HOUR)
+  chain = f.observe(chain, NOW - 2 * HOUR + 1000, null, [17])
+  f.merge(chain, NOW - HOUR)
+  const report = await f.read()
+  // The later publication failure anchors after the old operator Resume, so
+  // its in-window verified retry counts as automatic instead of being
+  // suppressed by the out-of-window intervention.
+  expect(report.recovery.automatic.map(item => item.work)).toEqual(['acme/repo#1'])
+  expect(report.recovery.intervention).toEqual([])
+  expect(report.recovery.unknown).toBe(0)
+})

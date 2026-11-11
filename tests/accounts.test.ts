@@ -175,6 +175,33 @@ describe('GET /api/accounts', () => {
     expect(failure.reconnectedAt!).toBeLessThanOrEqual(failure.verifiedAt!)
   })
 
+  it('releases a failed verification claim so a later Connect can be verified', async () => {
+    const { claimProviderVerification, releaseProviderVerification } = await import('../server/accounts/logins')
+    const rejectedAt = Date.now() - 10_000
+    recordProviderRejection('codex', 'a'.repeat(32), 'gpt-6-astra-ultra', rejectedAt)
+    recordLogin('codex', 0)
+    const firstAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(firstAt).toBeGreaterThan(rejectedAt)
+    // A Connect-triggered verification starts; a second Connect while the
+    // claim is held must not replace the reconnect being verified.
+    expect(claimProviderVerification('codex')).not.toBeNull()
+    recordLogin('codex', 0)
+    expect(providerSignInFailure('codex')!.reconnectedAt).toBe(firstAt)
+    expect(claimProviderVerification('codex')).toBeNull()
+    // The verification fails: only the matching claim is released, so the
+    // failure keeps no stale reconnect and a later Connect can claim anew.
+    // A foreign login never releases the held claim.
+    releaseProviderVerification('codex', 'not-the-claim')
+    expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt: firstAt, verificationLogin: firstAt.toString() })
+    releaseProviderVerification('codex', firstAt.toString())
+    expect(providerSignInFailure('codex')).toMatchObject({ reconnectedAt: null, verificationLogin: null, verifiedAt: null })
+    while (Date.now() <= firstAt) await new Promise(resolve => setTimeout(resolve, 1))
+    recordLogin('codex', 0)
+    const secondAt = providerSignInFailure('codex')!.reconnectedAt!
+    expect(secondAt).toBeGreaterThan(firstAt)
+    expect(claimProviderVerification('codex')).not.toBeNull()
+  })
+
   it('records verification completion when a second Connect lands during verification', async () => {
     await writeFakeClis(bin, home, { codex: script('codex', STATUS.codexChatGpt) })
     vi.spyOn(models, 'loadCatalog').mockResolvedValue(JSON.parse(CATALOG_STDOUT))

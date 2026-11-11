@@ -7,7 +7,7 @@ import { runFile } from '../process'
 import { loadCatalog } from '../models'
 import { environmentSecrets, redact } from '../../gateway/src/diagnostics/redaction.mjs'
 import { probeAccount } from './status'
-import { accountLogins, claimProviderVerification, recordObservedSignIn, recordProviderRecovery } from './logins'
+import { accountLogins, claimProviderVerification, recordObservedSignIn, recordProviderRecovery, releaseProviderVerification } from './logins'
 import { ACCOUNT_IDS, hasRecordedSignIn, type AccountId, type ConnectedAccount } from './types'
 
 export const ACCOUNTS_CACHE_MS = 15_000
@@ -79,6 +79,9 @@ export async function listAccounts(id?: AccountId): Promise<ConnectedAccount[]> 
 async function verifyCodexRecovery(): Promise<void> {
   const failure = claimProviderVerification('codex')
   if (!failure) return
+  // The claim reserves this reconnect; a failed or timed-out verification
+  // must release it so a later Connect can be recorded and verified anew.
+  const login = failure.reconnectedAt?.toString() ?? null
   try {
     const model = (await loadCatalog()).models.find(model => model.identity === failure.model && model.provider === 'codex')
     if (!model) throw new Error('The rejected Codex model is absent from the catalog')
@@ -104,6 +107,7 @@ async function verifyCodexRecovery(): Promise<void> {
     recordProviderRecovery('codex', failure.callId, Date.now())
   } catch (error) {
     console.error('[accounts] native Codex sign-in verification failed:', redact(String(error), environmentSecrets()))
+    releaseProviderVerification('codex', login)
   }
 }
 

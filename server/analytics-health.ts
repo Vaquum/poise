@@ -188,6 +188,10 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
       // Original failure receipts remain in the immutable journal, including
       // failed Calls whose resource/publication outcome is still uncertain.
       const errors: WorkError[] = []
+      // Each error recovers against the failure row that produced it: one
+      // invocation can fail an original Call and later a publication Call, and
+      // the first failure row is the wrong window for the later incident.
+      const failureByError = new Map<WorkError, typeof rows[number]>()
       const seenErrors = new Set<string>()
       for (const row of rows) {
         const event = row.event
@@ -198,6 +202,7 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
         if (!error || error.at > now || seenErrors.has(`${error.callId}:${error.incident}`)) continue
         seenErrors.add(`${error.callId}:${error.incident}`)
         errors.push(error)
+        failureByError.set(error, row)
       }
       for (const error of errors) if (!result.lastError.error || error.at > result.lastError.error.at) result.lastError.error = error
       const merged = rows.find(row => row.event.type === 'chain.observed' && row.event.observation.pull
@@ -258,8 +263,7 @@ export async function projectAnalyticsHealth(journal: BehaviorChainJournal, inpu
       let unknownRecovery = false
       for (const error of errors) {
         const failed = chain.invocations.find(invocation => invocation.id === error.invocation)!
-        const failure = rows.find(row => (row.event.type === 'invocation.settled' || row.event.type === 'invocation.reconciled')
-          && row.event.invocationId === failed.id && failureRecord(row.event.evidence as Record<string, unknown> | null) !== null)
+        const failure = failureByError.get(error)
         if (!failure) continue
         const later = chain.invocations.find(invocation => invocation.admissionSequence > failure.sequence
           && invocation.behavior === failed.behavior && invocation.basis === failed.basis && invocation.slot === failed.slot
