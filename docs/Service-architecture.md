@@ -933,7 +933,7 @@ Optional quarantine source/start hints limit reporting uncertainty; they never
 change execution or replay authority. [Run analytics](Behavior-Contract.md#run-analytics)
 defines historical diagnostic compatibility and scoped metric availability.
 
-The notification rail lists Behaviors' diagnostics: red Poise faults, amber
+Overview's *Answer here* lists Behaviors' diagnostics: red Poise faults, amber
 conditions that need the person and folded grey automatic recovery, with grouped
 target/cause details ([Notifications](Notifications.md)).
 The API carries an explicit `runtimeError` for scheduler faults and classifies
@@ -1070,8 +1070,8 @@ alerts once, and again only after it has cleared:
 - a pull request of the person's own has become ready to merge, while
   notifications are on ([Notifications](Notifications.md)).
 
-With the browser open, the page shows the unresolved alerts too, one at a time
-at its top.
+With the browser open, Overview's *Answer here* shows the unresolved alerts too,
+and the bell on every place counts them.
 
 **Poise Link** runs on macOS, Windows and Linux from one Tauri codebase.
 - **First run:** asks for the server address, runs device pairing, keeps the

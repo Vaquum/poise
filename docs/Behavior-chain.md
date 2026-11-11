@@ -51,7 +51,7 @@ never skips or fails it. Any other sweep error is reported in runtime health as 
 
 ## Intake and controls
 
-Settings → General → Behavior chain selects either issues bearing the configured label (default `poise`) or all open issues in followed organizations. Label intake includes old issues that acquire the label. Existing Chat bindings and linked open PRs prevent new ownership; active work is not migrated. The author and review account must be distinct and remain fixed for an admitted chain.
+Settings → Behaviors → Issue to merge selects either issues bearing the configured label (default `poise`) or all open issues in followed organizations. Label intake includes old issues that acquire the label. Existing Chat bindings and linked open PRs prevent new ownership; active work is not migrated. The author and review account must be distinct and remain fixed for an admitted chain.
 
 Downstream reuse of this lifecycle for already-created PRs is decided separately: [Downstream-lifecycle.md](Downstream-lifecycle.md) records the scope decision, the exact existing routes and the contracts a follow-up must settle. There is no supported enrollment of an existing PR into a chain at this revision.
 
@@ -90,11 +90,11 @@ the journal already records as merged. This uses the existing bounded journal
 status reader. A later standalone PR on a completed chain's retired branch
 remains eligible; this fence does not change manual Chat binding controls.
 
-General contains the chain preference fields, their save/reload actions and the guarded Switch to v2 or Cancel cutover action while applicable. Operational output lives in Logging: cutover state and legacy ownership, capacity, the chain list and per-chain journal. The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. Hold/Resume retains the current journal sequence check. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while Logging is open. Unavailable reads disable writes instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
+Settings → Behaviors contains the chain preference fields, their save/reload actions and the guarded Switch to v2 or Cancel cutover action while applicable. Operational output lives in Observe → Tasks: cutover state and legacy ownership, capacity, the chain list and per-chain journal. The chain list displays v2 ownership, actual phase/wait/hold/uncertainty, last recorded outcome and confirmed merge SHA, with links to the issue and PR. Hold/Resume retains the current journal sequence check. More chains and per-chain History/More events page through the existing journal readers. It refreshes on the application's existing refresh clock while Tasks is open. Unavailable reads disable writes instead of displaying a confident engine state. Repository/author triggers and the approval-round escape remain explicitly legacy-only; v2 uses its selected label/all-issues intake and never escapes unresolved blockers by approving.
 
 Notifications lists each delayed or held admitted issue's step,
 progress age, hold, exact-head CI/review gates and next known action, with issue,
-PR links and a Journal evidence action that opens the same journal in Logging. Held, uncertain and pending-original-review work
+PR links and a Journal evidence action that opens the same journal in Observe → Tasks. Held, uncertain and pending-original-review work
 appears immediately; other active work appears after 24 hours without a verified
 advance. Selection covers every active chain page, including unpublished issues
 and merged PRs with pending review evidence, sorted by oldest progress first.
@@ -139,7 +139,7 @@ and ID/history reads retain closed chains. Failed refreshes disable
 the retained row's write controls until a successful read. Native action summaries
 distinguish original accepted responses, observed no-action results and uncertain
 or unrecorded attribution without returning the full receipt. Quiescent evidence
-checks use the bounded reconciliation described below. Logging also
+checks use the bounded reconciliation described below. Observe → Tasks also
 shows workspace-wide durable model admissions and their behavior-lane ceiling,
 the durable mode, effective all-issues/label intake or inactive saved intake,
 and admission pause. Configured resource budgets, reservations and unaccounted
@@ -235,7 +235,7 @@ blocker, uncertain publication or a later operator Hold cannot auto-resume.
 Merged `merge-pr` and `resolve-threads` uncertainty uses original journal
 receipts only. A missing original response schedules no GitHub read; retaining
 that response makes its original settlement eligible without another mutation.
-Logging and API/status summaries show the scheduled evidence check or the
+Observe → Tasks and API/status summaries show the scheduled evidence check or the
 missing original response. Intentionally deferred observation is not a
 collector outage, and old GitHub facets remain unverified. The chain summary's
 `reconciliation.nextObservationAt` is epoch milliseconds (`0` means eligible

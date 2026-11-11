@@ -12,7 +12,7 @@ See [Chat orchestration](Chat-orchestration.md).
 
 ## Scope and migration
 
-Chat is a full view alongside Current, Swarm and Editor. Its sidebar stores
+Chat is a place alongside Board, Observe and Editor. Its sidebar stores
 named sessions, each with when it was created on Poise's clock: the time today
 (`19:38`), the date alone on another day (`20 Oct`) and in another year
 (`31 Dec 2025`). The transcript renders streamed prose, thinking when exposed,
@@ -21,15 +21,16 @@ attachments, checkout-file mentions, advertised commands, draft preservation,
 steering during a turn and Stop. Capabilities belong to each native session:
 unsupported optional controls are not simulated.
 
-Current cards, Swarm rows and Editor documents can hand off into Chat. A pending
-legacy-row lookup is cancelled by leaving Swarm or choosing another row. Failed
+Board cards, Observe → Behaviors rows and Editor documents can hand off into
+Chat. A pending legacy-row lookup is cancelled by leaving Observe → Behaviors or
+choosing another row. Failed
 lookups and unreadable responses retain the session link for retry and show a
 read failure. A successful lookup contains either a session with a nonempty ID
 or explicit `session: null`; only that null marks a conversation never opened
 in Chat. Changing the agent creates a new native session with a labelled context
 handoff, not a pretence that one vendor's session migrated to another. Each
-Current card has one Chat session of its own, opened from the side pane or from
-Open in Chat in the Chat view; the pane shows the card's earlier conversation
+Board card has one Chat session of its own, opened from the side pane or from
+Open in Chat in Chat; the pane shows the card's earlier conversation
 until the first message creates the session. `/content` and `/consensus` run
 as Chat composer commands with transcript cards. Every Editor chat — the
 document's own chat, passage threads on annotations, review threads — runs as
@@ -457,8 +458,8 @@ silently switch to a billed API credential.
 
 Chat requires the companion Caller additions: `--record-turn start/finish`,
 external `poise:chat` rows, and the shared checkout lease around writing work.
-Caller records the ledger but launches no process for a Chat turn. Swarm's
-Stop routes these rows back to ChatRuntime rather than to Caller's one-shot
+Caller records the ledger but launches no process for a Chat turn. Observe →
+Behaviors' Stop routes these rows back to ChatRuntime rather than to Caller's one-shot
 process stopping path. Other behavior rows keep their existing semantics.
 
 The companion implementation is developed separately from the user's live

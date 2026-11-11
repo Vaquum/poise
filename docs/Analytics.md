@@ -1,10 +1,17 @@
 # Analytics
 
-**Analytics** opens a view of its own, like Current or Behaviors. By default,
-its shortcut is in the burger menu; choosing it closes the menu and returns
-focus to the burger. Settings → Navigation can place it in the top bar too.
-The shortcut on either surface marks Analytics as the current page. A reload
-stays on Analytics, and choosing another view leaves it.
+In the new interface, Analytics is Overview's tiles: the day's eight numbers
+with their pace and year, under each year the 30 days before it in five bins,
+then the five per merged pull request, work type and review. Drag a tile to
+reorder them; the order is kept in this browser. Each tile reads the same
+metrics this page defines.
+
+Classic, at `/classic.html` until it is removed (#556), keeps **Analytics** as
+a view of its own, as the rest of this page describes. Its shortcut is in the
+burger menu; choosing it closes the menu and returns focus to the burger.
+Settings → Navigation can place it in the top bar too. The shortcut on either
+surface marks Analytics as the current page. A reload stays on Analytics, and
+choosing another view leaves it.
 
 Analytics is one board of cards, with no section headings. The default order
 is eight productivity cards (two rows of four in a wide window), Work type,
