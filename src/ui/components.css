@@ -30,8 +30,6 @@ svg.i.solid { fill: currentColor; stroke: none; }
 /* ---------- Frame and top bar ---------- */
 .frame { min-height: calc(100vh - var(--foot-h)); display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: var(--size-topbar) minmax(0, 1fr); }
 /* The place under the top bar: what router.ts mounts, and what arrives. */
-/* Until each place is built (#556 PRs 2 to 4). */
-.placeholder { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-8) var(--sp-6); }
 .place { min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 .topbar { position: sticky; top: 0; z-index: var(--z-sticky); display: flex; align-items: center; gap: var(--sp-2); padding: 0 var(--sp-4); background: var(--c-canvas); border-bottom: var(--line-hair) solid var(--c-line); }
 .topbar .rooms { margin-left: auto; display: flex; align-items: center; gap: var(--sp-half); }

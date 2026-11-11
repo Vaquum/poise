@@ -30,7 +30,7 @@ const PLACES: Record<Place, () => Promise<PlaceModule>> = {
   manager: () => import('./places/manager'),
   editor: () => import('./places/editor'),
   observe: () => import('./places/observe'),
-  settings: () => import('./places/placeholder'),
+  settings: () => import('./places/settings'),
 }
 // As classic's: Chat, the Manager and the Editor only fade in.
 const FADE_ONLY = new Set<Place>(['chat', 'manager', 'editor'])
