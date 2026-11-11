@@ -16,11 +16,11 @@ It is drawn once; moving between places mounts the place under it.
 
 | Place | What it holds |
 | --- | --- |
-| **Overview** | *Answer here*: everything that wants you, with the answer on each entry, from notices, open chat requests, the Switchboard's decisions and review threads. *In motion*: the work in the seven states. The day's numbers with their pace and year, the 30 days before in five bins under each year, Behaviors' runs, minutes and success, and System health. The bell on every place counts what Overview's level shows and opens *Answer here*. |
+| **Overview** | *Answer here*: everything that wants you, with the answer on each entry, from notices, open chat requests, the Switchboard's decisions and review threads. *In motion*: the work in the seven states. The day's numbers with their pace and year, the 30 days before in five bins under each year, Behaviors' runs, minutes and success, and System health, marked Planned until #1101 serves it. The bell on every place counts what Overview's level shows and opens *Answer here*. |
 | **Board** | Ideas, plans, issues and pull requests in the seven states. A chained issue and its pull request are one task card; a card's chat opens beside the board. **List** shows the same work as rows, with its phase, whether Poise owns it, what is happening and *Assign to Poise*. Board keeps the view you left. |
-| **Chat** | Conversations with agents, the Manager and its workers: a situation line, each instruction's progress (accepted, queued, executing, completed), the open chat's timers in its side pane. JEV is in Chat. |
-| **Manager** | Reached from Chat and from Settings → *Manager's controls*: the Manager's chat, the work table, the Switchboard, its wake-up interval and its standing instructions. |
-| **Editor** | Long-form writing with a status line and one side pane for Comments, Reviews, Publish and the document chat. Passage and review threads stay inline. |
+| **Chat** | Conversations with agents, the Manager and its workers, on classic's chat: the list in the seven states, the conversation and its composer, the open chat's timers, and the Switchboard pane. JEV is in Chat. |
+| **Manager** | Reached from Chat and from Settings → *The Manager*: the Manager's chat beside the Switchboard, with its wake-up interval in its header. Its controls are in Settings → Manager. |
+| **Editor** | Long-form writing on classic's Editor, with its own panels for Comments, Reviews and Publish and the document chat beside it. Passage and review threads stay inline. |
 | **Observe** | **Tasks** (the chain's evidence: its state line, Needs attention, each task's timeline, Hold and Resume), **Behaviors** (every run), **GitHub** (issues and pull requests) and **Logging** (diagnostics, with Work impact). |
 | **Settings** | General, Accounts, Models, Extensions, Publishing, Behaviors, Snippets, Admin, Style and Manager, each at its own address, with Find. Each setting saves itself on its row and says when it applies. |
 
@@ -47,8 +47,10 @@ The service's and notices' links keep working (`src/ui/address.ts`):
 
 ## Vocabulary and the seven states
 
-Every word on screen, every tooltip and the full reference read from one registry,
-`src/ui/registry/`, so they cannot drift apart. Chats, runs, issues and pull
+The frame, Overview, Board, Observe and Settings' own rows take every word, tooltip
+and full reference from one registry, `src/ui/registry/`, so they cannot drift
+apart; Chat, the Manager place, the Editor and Settings' sections built on
+classic's views keep classic's words for now. Chats, runs, issues and pull
 requests share seven states, each with one meaning and one colour:
 
 | State | Meaning |
