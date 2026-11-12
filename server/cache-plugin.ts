@@ -1231,7 +1231,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
 
         if (path === '/api/github-quota' && req.method === 'GET') {
           try {
-            return json(res, 200, await readGithubQuota())
+            return json(res, 200, await readGithubQuota({ lastObserved: true }))
           } catch (error: unknown) {
             return json(res, 502, { error: error instanceof Error ? error.message : String(error) })
           }
