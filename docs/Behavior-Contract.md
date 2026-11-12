@@ -289,6 +289,13 @@ the reviews it managed to prepare, and an `approve-prs` sweep still fires the
 approvals it managed to prepare; the next sweep prepares the rest. Git
 verification uses the same 30-second CLI budget as other review reads, and the
 rail names a timed-out sweep as stalled instead of repeating the timeout text.
+An approval cycle failure retains its organization, last known phase, live
+effective deadline and observed check/launch counts in diagnostic context before
+clock cleanup, including a tick that returns on abort. Pending checks include
+unread or failed reads; read counts do not prove completed evaluation, and a
+launch does not prove publication. The existing cycle failure remains visible
+while publication is unverified; ownership and retry gates still govern later
+sweeps.
 
 Process-lock contenders within one server queue by normalized path, so only
 the local owner polls SQLite for cross-process ownership. Queueing and SQLite

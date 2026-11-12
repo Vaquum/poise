@@ -4801,8 +4801,13 @@ async function tickApprovePrs(): Promise<void> {
   // Reconciliation already ran before this tick; a pause holds the new
   // launches below, and the ledger keeps them for the resume.
   if (isPaused('approve-prs')) return
+  const context = diagnosticIdentity()
+  const progress = { eligiblePrs: null as number | null, checksPending: null as number | null,
+    changeChecksRead: 0, activityChecksRead: 0, launched: 0, publication: 'unverified' }
+  if (context) context.phase = 'listing'
   try {
     const prs = await listEligiblePrs('approve-prs', author)
+    progress.eligiblePrs = prs.length
     // Backed-off PRs don't spend batch capacity, and the cursor rotates
     // coverage so a sweep cut short by its deadline resumes beyond the
     // blocked batch. Every filter logs its reason once (#559), so a
@@ -4862,13 +4867,18 @@ async function tickApprovePrs(): Promise<void> {
       recordApproveCheck(pr, snapshots.get(`${pr.repo}#${pr.number}`)!)
       logApproveSkip(pr, `parked: ${reason}`)
     }
+    progress.checksPending = stage1.length
     for (const { reviewer, batch } of reviewBatches(stage1, PR_READ_BATCH_SIZE)) {
       if (!isEnabled('approve-prs') || behaviorAborted()) return
       const last = batch[batch.length - 1]!
       setMeta('behavior_approve_prs_cursor', `${last.repo}#${last.number}`)
       let records: BatchRead<ChangesAddressedResult>[]
       try {
+        if (context) context.phase = 'changes-addressed'
         records = await readChangesAddressedBatch(batch, reviewer)
+        const read = records.filter((record) => record.error === null).length
+        progress.changeChecksRead += read
+        progress.checksPending -= read
       } catch (err) {
         if (behaviorAborted()) return
         console.error('[behaviors] approve-prs batch check failed:', err)
@@ -4957,7 +4967,9 @@ async function tickApprovePrs(): Promise<void> {
         const activityBatch = checks.slice(sub, sub + PR_READ_BATCH_SIZE)
         let activityRecords: BatchRead<ReviewActivityResult>[]
         try {
+          if (context) context.phase = 'review-activity'
           activityRecords = await readReviewActivityBatch(activityBatch, reviewer)
+          progress.activityChecksRead += activityRecords.filter((record) => record.error === null).length
         } catch (err) {
           if (behaviorAborted()) return
           console.error('[behaviors] approve-prs batch activity check failed:', err)
@@ -5054,6 +5066,7 @@ async function tickApprovePrs(): Promise<void> {
       }
       // Launches run in a small pool: preparations overlap the way the
       // provider layer expects, while the sweep stays bounded.
+      if (context) context.phase = 'launch'
       await forEachPool(launches, APPROVE_FIRE_CONCURRENCY, async (launch) => {
         if (!isRunnable('approve-prs') || behaviorAborted()) return
         const { pr, expectedHead, seenTarget, firedReason, admittedReviewer, dismissedRecovery } = launch
@@ -5114,6 +5127,7 @@ async function tickApprovePrs(): Promise<void> {
               return
             }
             launched = true
+            progress.launched++
             checked = true
           } catch (err) {
             releaseOwnedClaim('approve-prs', seenTarget, claimId)
@@ -5134,9 +5148,8 @@ async function tickApprovePrs(): Promise<void> {
       })
     }
     if (failure) throw failure
-  } catch (err) {
-    if (!(err instanceof BehaviorLogFeedError) && !staleDatastoreFailure(err)) console.error('[behaviors] approve-prs tick failed:', err)
-    throw err
+  } finally {
+    if (context) context.progress = progress
   }
 }
 
@@ -7694,11 +7707,16 @@ function serializeBehaviorOperation<T>(
     const lifecycle = behaviorAbortController?.signal
     const signal = lifecycle ? AbortSignal.any([lifecycle, deadline]) : deadline
     behaviorOperationDeadline.set(signal, clock)
+    const context = key === 'approve-prs' ? diagnosticIdentity() : undefined
+    if (context) context.deadline = clock.expiresAt
     try {
       const result = await behaviorOperationSignal.run(signal, operation)
       if (signal.aborted) throw signal.reason
       return result
     } finally {
+      // Provider preparation moves the effective deadline. Keep its live value
+      // before cleanup, including when the tick returned on an aborted signal.
+      if (context) context.deadline = clock.expiresAt
       clock.close()
       if (behaviorOperationStartedAt.get(scopeKey) === startedAt) {
         behaviorOperationStartedAt.delete(scopeKey)
@@ -7999,24 +8017,30 @@ async function runBehaviorCycle(
   key: BehaviorKey,
   operation: () => Promise<boolean>,
 ): Promise<void> {
-  const lifecycle = behaviorAbortController?.signal
-  if (readBehaviorFailure(key)?.kind === 'worker') clearBehaviorFailure(key)
-  try {
-    const recovered = await serializeBehaviorOperation(key, operation)
-    if (recovered || readBehaviorFailure(key)?.kind === 'operation') {
-      clearBehaviorFailure(key)
-    }
-    clearBehaviorDeferral(key)
-  } catch (error) {
-    if (error instanceof BehaviorProcessLockContentionError) {
-      recordBehaviorDeferral(key, error)
-      return
-    }
-    if (lifecycle?.aborted !== true) {
-      recordBehaviorFailure(key, 'operation', error)
-      if (!(error instanceof BehaviorLogFeedError) && !staleDatastoreFailure(error)) console.error(`[behaviors] ${key} operation failed:`, error)
+  const cycle = async () => {
+    const lifecycle = behaviorAbortController?.signal
+    if (readBehaviorFailure(key)?.kind === 'worker') clearBehaviorFailure(key)
+    try {
+      const recovered = await serializeBehaviorOperation(key, operation)
+      if (recovered || readBehaviorFailure(key)?.kind === 'operation') {
+        clearBehaviorFailure(key)
+      }
+      clearBehaviorDeferral(key)
+    } catch (error) {
+      if (error instanceof BehaviorProcessLockContentionError) {
+        recordBehaviorDeferral(key, error)
+        return
+      }
+      if (lifecycle?.aborted !== true) {
+        recordBehaviorFailure(key, 'operation', error)
+        if (!(error instanceof BehaviorLogFeedError) && !staleDatastoreFailure(error)) console.error(`[behaviors] ${key} operation failed:`, error)
+      }
     }
   }
+  return key === 'approve-prs' ? withNoticeDiagnosticIdentity({
+    correlationId: randomUUID(), behavior: key, target: null, repository: null, account: null,
+    organization: currentOrganization()?.login, phase: 'reconciliation',
+  }, cycle) : cycle()
 }
 
 export async function runEnabledBehaviorsOnce(

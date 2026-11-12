@@ -2,7 +2,13 @@ import { createHash } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 
 /** Causal identity for existing capture, with no new diagnostic occurrence. */
-export interface NoticeDiagnosticIdentity { correlationId: string; behavior: string; target: string | null; repository: string | null; account: string | null }
+export interface NoticeDiagnosticIdentity {
+  correlationId: string; behavior: string; target: string | null; repository: string | null; account: string | null
+  organization?: string
+  phase?: string
+  deadline?: number
+  progress?: Record<string, string | number | null>
+}
 const context = new AsyncLocalStorage<NoticeDiagnosticIdentity>()
 const failures = new WeakMap<object, NoticeDiagnosticIdentity>()
 export function diagnosticIdentity(error?: unknown): NoticeDiagnosticIdentity | undefined {
