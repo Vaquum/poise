@@ -1,19 +1,20 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
+import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
 import type { DetachedProcessExit, DetachedSpawnOptions } from '../server/process'
-import { agentLog, fixture, launchReviewBeforeCrash, mocks } from './behaviors-runtime-fixture'
+import { agentLog, fixture, launchApprovalBeforeCrash, launchReviewBeforeCrash, mocks } from './behaviors-runtime-fixture'
 
-async function reviewWorker() {
+async function reviewWorker(behavior: 'review-new-prs' | 'approve-prs' = 'review-new-prs') {
   vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
   vi.setSystemTime(new Date('2026-11-10T16:54:00.000Z'))
-  const launched = await launchReviewBeforeCrash()
+  const launched = await (behavior === 'review-new-prs' ? launchReviewBeforeCrash() : launchApprovalBeforeCrash())
   await launched.behaviors.stopBehaviorsRuntime()
-  const claim = launched.database.listBehaviorLaunchClaims('review-new-prs')[0]
+  const claim = launched.database.listBehaviorLaunchClaims(behavior)[0]
   const timeout = agentLog({
     status: 'failed', completed_at: new Date().toISOString(), error_code: 'review_budget_exhausted',
     error: 'Review reached its total time limit; needs attention', diagnostic: null,
-    actor: claim.launchActor, source: claim.launchSource, correlation_id: claim.launchCorrelationId,
+    behavior: claim.launchBehavior, actor: claim.launchActor, source: claim.launchSource, correlation_id: claim.launchCorrelationId,
     expected_head: claim.launchExpectedHead,
   })
   const exit = (mocks.spawnDetached.mock.calls[0][2] as DetachedSpawnOptions).onExit!
@@ -24,6 +25,11 @@ async function reviewWorker() {
     if (command === 'agent-interface' && args[0] === '--diagnostics') return {
       stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: collector.events,
         cursor: collector.events.length, hasMore: false, backfillPending: false }), stderr: '',
+    }
+    if (command === 'agent-interface' && args[0] === '--logs' && args[1] === '--select') {
+      const selection = JSON.parse(args[2]) as { ids: string[], correlations: string[] }
+      return { stdout: JSON.stringify(fixture.agentLogs.filter((row) => selection.ids.includes(String(row.id))
+        || selection.correlations.includes(String(row.correlation_id)))), stderr: '' }
     }
     return cli(command, args, ...rest)
   })
@@ -179,44 +185,158 @@ describe('review worker exit diagnostics', () => {
   })
 
   it.each([
-    'missing result', 'unreadable logs', 'malformed diagnostic', 'unavailable evidence', 'foreign invocation',
-    'different head', 'different reviewer', 'different source', 'older result', 'unfinished result',
-    'different failure', 'signal', 'process error', 'different exit', 'rejected capture',
-  ])('keeps a visible worker failure for %s', async (scenario) => {
-    const worker = await reviewWorker()
+    ['review-new-prs', null], ['approve-prs', null],
+    ['review-new-prs', 'warning'], ['approve-prs', 'warning'],
+    ['review-new-prs', 'error'], ['approve-prs', 'error'],
+  ] as const)('correlates a retryable preflight GitHub 503 for %s through collection and replay (diagnostic %s)', async (behavior, severity) => {
+    const worker = await reviewWorker(behavior)
     try {
-      fixture.agentLogs = [worker.timeout]
-      const result: DetachedProcessExit = { code: 1, signal: null }
-      if (scenario === 'missing result') fixture.agentLogs = []
-      if (scenario === 'unreadable logs') {
-        const cli = mocks.runFile.getMockImplementation()!
-        mocks.runFile.mockImplementation(async (command, args, ...rest) => {
-          if (command === 'agent-interface' && args[0] === '--logs') throw new Error('Caller evidence read failed')
-          return cli(command, args, ...rest)
-        })
-      }
-      if (scenario === 'malformed diagnostic') worker.timeout.diagnostic = { version: 99 }
-      if (scenario === 'unavailable evidence') worker.timeout.evidence_unavailable = 'Stored diagnostic is unreadable'
-      if (scenario === 'foreign invocation') worker.timeout.correlation_id = 'another-invocation'
-      if (scenario === 'different head') worker.timeout.expected_head = 'b'.repeat(40)
-      if (scenario === 'different reviewer') worker.timeout.actor = 'other-reviewer'
-      if (scenario === 'different source') worker.timeout.source = 'poise:manual-review'
-      if (scenario === 'older result') worker.timeout.started_at_precise = '2026-11-09T16:54:00.000Z'
-      if (scenario === 'unfinished result') worker.timeout.completed_at = null
-      if (scenario === 'different failure') worker.timeout.error_code = 'review_submission_failed'
-      if (scenario === 'signal') { result.code = null; result.signal = 'SIGTERM' }
-      if (scenario === 'process error') result.error = new Error('independent process failure')
-      if (scenario === 'different exit') result.code = 7
-      if (scenario === 'rejected capture') vi.spyOn(worker.logging, 'diagnostic').mockReturnValue(null)
+      const call = worker.timeout
+      Object.assign(call, { error_code: null, error: 'error: GitHub 503: Service Unavailable',
+        action: 'not_started', outcome: 'preflight_failed', review_policy: 'bounded-v1',
+        diagnostic: severity ? { version: 1, source: 'caller', severity, operation: 'github-interface', phase: 'preflight' } : null })
+      // The launch cached empty history. One earlier timeout leaves retry
+      // budget, but is outside the selected invocation's completion read.
+      fixture.agentLogs = [agentLog({ ...call, id: 'e'.repeat(32), correlation_id: 'prior-timeout', diagnostic: null,
+        error_code: 'review_budget_exhausted', error: 'Review reached its total time limit; needs attention',
+        started_at: '2026-11-10T16:50:00.000Z', started_at_precise: '2026-11-10T16:50:00.000Z',
+        completed_at: '2026-11-10T16:51:00.000Z' }), call]
+      const originalCalls = structuredClone(fixture.agentLogs)
+      const meta = () => worker.database.db.prepare('SELECT * FROM meta ORDER BY key').all()
+      const originalMeta = meta()
+      const claims = () => worker.database.db.prepare('SELECT * FROM behavior_seen ORDER BY key, target').all() as Record<string, unknown>[]
+      const originalClaims = claims()
+      await worker.exit({ code: 1, signal: null })
 
-      await worker.exit(result)
-
-      expect(worker.events()).toContainEqual(expect.objectContaining({ severity: 'error', source: 'poise',
-        ...(scenario === 'unreadable logs'
-          ? { message: 'Caller evidence read failed', context: expect.objectContaining({ componentMessage: expect.stringContaining('worker exited for ' + worker.target) }) }
-          : { message: expect.stringContaining('worker exited for ' + worker.target) }) }))
-      expect(worker.database.listBehaviorLaunchClaims('review-new-prs')[0].launchError).toContain('awaiting durable agent result')
+      const retained = worker.events()
+      expect(retained).toEqual([expect.objectContaining({ severity: severity ?? 'warning', source: 'caller', callId: call.id,
+        correlationId: worker.claim.launchCorrelationId, message: call.error, component: worker.claim.launchBehavior,
+        context: expect.objectContaining({ action: 'not_started', outcome: 'preflight_failed', errorCode: null }) })])
+      expect(fixture.agentLogs).toEqual(originalCalls)
+      expect(meta()).toEqual(originalMeta)
+      expect(claims()).toEqual(originalClaims.map((row) => row.claim_id === worker.claim.claimId
+        ? { ...row, lease_until: Date.now() + 2 * 60 * 60_000,
+          ...(row.key === behavior ? { launch_error: 'worker exited exit 1; awaiting durable agent result' } : {}) }
+        : row))
+      expect(worker.behaviors.getBehaviorsRuntimeHealth().failures).toEqual([])
       expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+
+      worker.collector.events = [call]
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1)
+      await worker.logging.stopLogging()
+      writeFileSync(worker.checkpoint, JSON.stringify({ version: 1, streamId: 'a'.repeat(32), cursor: 0 }))
+      worker.logging.startLogging()
+      await vi.waitFor(() => expect(JSON.parse(readFileSync(worker.checkpoint, 'utf8')).cursor).toBe(1))
+      expect(worker.events()).toEqual(retained)
+      expect(worker.logging.loggingRuntime()!.health().rejected).toBe(0)
     } finally { await worker.logging.stopLogging() }
+  })
+
+  describe.each([
+    ['review-new-prs', 'timeout'], ['review-new-prs', '503'], ['approve-prs', '503'],
+  ] as const)('%s %s', (behavior, failure) => {
+    it.each([
+      'missing result', 'unreadable logs', 'malformed diagnostic', 'unavailable evidence', 'foreign invocation',
+      'different head', 'different reviewer', 'different source', 'older result', 'unfinished result',
+      'different failure', 'different behavior', 'different repository', 'different PR', 'ambiguous result',
+      'signal', 'process error', 'different exit', 'rejected capture',
+      ...(failure === '503' ? ['publication 503', 'missing action', 'missing outcome', 'executed head', 'review ID',
+        'review comments', 'receipts', 'malformed receipt', 'other 5xx', 'network failure', 'HTTP 503', 'nested 503',
+        'paused retry', 'disabled retry', 'quarantined claim', 'exhausted retry', 'retained retry stop', 'packet hold', 'access hold',
+        'unreadable retry history', 'missing retry history', 'changed retry evidence', 'ambiguous retry history', 'quarantined retry history'] : []),
+    ])('keeps a visible worker failure for %s', async (scenario) => {
+      const worker = await reviewWorker(behavior)
+      try {
+        if (failure === '503') Object.assign(worker.timeout, { error_code: null,
+          error: 'error: GitHub 503: Service Unavailable', action: 'not_started', outcome: 'preflight_failed', review_policy: 'bounded-v1' })
+        fixture.agentLogs = [worker.timeout]
+        const result: DetachedProcessExit = { code: 1, signal: null }
+        if (scenario === 'missing result') fixture.agentLogs = []
+        if (scenario === 'unreadable logs') {
+          const cli = mocks.runFile.getMockImplementation()!
+          mocks.runFile.mockImplementation(async (command, args, ...rest) => {
+            if (command === 'agent-interface' && args[0] === '--logs') throw new Error('Caller evidence read failed')
+            return cli(command, args, ...rest)
+          })
+        }
+        if (scenario === 'malformed diagnostic') worker.timeout.diagnostic = { version: 99 }
+        if (scenario === 'unavailable evidence') worker.timeout.evidence_unavailable = 'Stored diagnostic is unreadable'
+        if (scenario === 'foreign invocation') worker.timeout.correlation_id = 'another-invocation'
+        if (scenario === 'different head') worker.timeout.expected_head = 'b'.repeat(40)
+        if (scenario === 'different reviewer') worker.timeout.actor = 'other-reviewer'
+        if (scenario === 'different source') worker.timeout.source = 'poise:manual-review'
+        if (scenario === 'older result') worker.timeout.started_at_precise = '2026-11-09T16:54:00.000Z'
+        if (scenario === 'unfinished result') worker.timeout.completed_at = null
+        if (scenario === 'different failure') worker.timeout.error_code = 'review_submission_failed'
+        if (scenario === 'different behavior') worker.timeout.behavior = behavior === 'review-new-prs' ? 'pr_approve' : 'pr_review'
+        if (scenario === 'different repository') worker.timeout.repo = 'Vaquum/other'
+        if (scenario === 'different PR') worker.timeout.pr_id = '18'
+        if (scenario === 'ambiguous result') fixture.agentLogs.push({ ...worker.timeout, id: 'd'.repeat(32) })
+        if (scenario === 'signal') { result.code = null; result.signal = 'SIGTERM' }
+        if (scenario === 'process error') result.error = new Error('independent process failure')
+        if (scenario === 'different exit') result.code = 7
+        if (scenario === 'rejected capture') vi.spyOn(worker.logging, 'diagnostic').mockReturnValue(null)
+        if (scenario === 'publication 503') Object.assign(worker.timeout, { error_code: 'review_submission_failed', action: null, outcome: null })
+        if (scenario === 'missing action') worker.timeout.action = null
+        if (scenario === 'missing outcome') worker.timeout.outcome = null
+        if (scenario === 'executed head') worker.timeout.head_sha = worker.claim.launchExpectedHead
+        if (scenario === 'review ID') worker.timeout.review_id = 91
+        if (scenario === 'review comments') worker.timeout.review_comments = 0
+        if (scenario === 'receipts') worker.timeout.receipts = []
+        if (scenario === 'malformed receipt') worker.timeout.review_id = 'unreadable'
+        if (scenario === 'other 5xx') worker.timeout.error = 'error: GitHub 502: Bad Gateway'
+        if (scenario === 'network failure') worker.timeout.error = 'httpx.ReadTimeout'
+        if (scenario === 'HTTP 503') worker.timeout.error = 'HTTP 503: Service Unavailable'
+        if (scenario === 'nested 503') worker.timeout.error = 'error: GitHub 403: denied\nGitHub 503: nested body text'
+        if (scenario === 'paused retry') worker.database.setMeta(`behavior_${behavior.replace(/-/g, '_')}_paused_until`, '2026-11-11T00:00:00Z')
+        if (scenario === 'disabled retry') worker.database.setMeta(`behavior_${behavior.replace(/-/g, '_')}_enabled`, '0')
+        if (scenario === 'quarantined claim') worker.database.quarantineBehaviorLaunchOwned(behavior, worker.target, worker.claim.claimId,
+          'invalid_result', 'retained hold', false)
+        if (scenario === 'packet hold') worker.database.setMeta(`packet_block:${behavior}:${worker.claim.launchRepo}#${worker.claim.launchPr}`, worker.claim.launchExpectedHead)
+        if (scenario === 'access hold') worker.database.setMeta(`behavior_repo_hold:${worker.claim.launchActor}:${worker.claim.launchRepo.toLowerCase()}`,
+          JSON.stringify({ repo: worker.claim.launchRepo, actor: worker.claim.launchActor, error: 'GitHub 404',
+            heldAtMs: Date.now(), nextRecheckAtMs: Date.now() + 60_000 }))
+        if (['exhausted retry', 'retained retry stop', 'ambiguous retry history', 'quarantined retry history'].includes(scenario)) {
+          const prior = agentLog({ ...worker.timeout, id: 'e'.repeat(32), correlation_id: 'prior-timeout',
+            error_code: 'review_budget_exhausted', error: 'Review reached its total time limit; needs attention' })
+          fixture.agentLogs.push(prior, { ...prior, id: 'd'.repeat(32), correlation_id: scenario === 'ambiguous retry history' ? 'prior-timeout' : 'second-timeout' })
+          if (scenario === 'quarantined retry history') prior.diagnostic = { version: 99 }
+          if (scenario === 'retained retry stop') {
+            fixture.agentLogs = [worker.timeout]
+            worker.database.db.prepare(`INSERT INTO behavior_seen(key, target, seen_at, claim_id, launch_behavior, launch_repo, launch_pr,
+              launch_requested_at, launch_call_id, launch_error, launch_expected_head, launch_actor, launch_source, launch_correlation_id)
+              VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(behavior, worker.target + ':prior', new Date().toISOString(),
+              worker.claim.launchBehavior, worker.claim.launchRepo, worker.claim.launchPr, worker.claim.launchRequestedAt,
+              prior.id, REVIEW_BUDGET_STOPPED, worker.claim.launchExpectedHead,
+              worker.claim.launchActor, worker.claim.launchSource, prior.correlation_id)
+          }
+        }
+        if (['unreadable retry history', 'missing retry history', 'changed retry evidence'].includes(scenario)) {
+          const cli = mocks.runFile.getMockImplementation()!
+          mocks.runFile.mockImplementation(async (command, args, ...rest) => {
+            if (command === 'agent-interface' && args.length === 1 && args[0] === '--logs') {
+              if (scenario === 'unreadable retry history') throw new Error('Caller retry history read failed')
+              return { stdout: JSON.stringify(scenario === 'missing retry history' ? [] : [{ ...worker.timeout, review_id: 91 }]), stderr: '' }
+            }
+            return cli(command, args, ...rest)
+          })
+        }
+        const originalCalls = structuredClone(fixture.agentLogs)
+        const originalMeta = worker.database.db.prepare('SELECT * FROM meta ORDER BY key').all()
+
+        await worker.exit(result)
+
+        expect(worker.events()).toContainEqual(expect.objectContaining({ severity: 'error', source: 'poise',
+          ...(['unreadable logs', 'unreadable retry history'].includes(scenario)
+            ? { message: scenario === 'unreadable logs' ? 'Caller evidence read failed' : 'Caller retry history read failed',
+              context: expect.objectContaining({ componentMessage: expect.stringContaining('worker exited for ' + worker.target) }) }
+            : { message: expect.stringContaining('worker exited for ' + worker.target) }) }))
+        expect(worker.database.listBehaviorLaunchClaims(behavior)[0].launchError).toContain(scenario === 'quarantined claim' ? 'retained hold' : 'awaiting durable agent result')
+        expect(fixture.agentLogs).toEqual(originalCalls)
+        expect(worker.database.db.prepare('SELECT * FROM meta ORDER BY key').all()).toEqual(originalMeta)
+        expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+      } finally { await worker.logging.stopLogging() }
+    })
   })
 })

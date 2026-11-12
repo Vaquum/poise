@@ -216,6 +216,15 @@ retain one occurrence. Missing or unreadable results, rejected capture and
 independent process errors or signals keep the worker failure visible. Retry
 and publication rules are unchanged.
 
+The same correlation covers initial-review and approval workers that exit 1
+after a matching GitHub 503 explicitly recorded as `not_started / preflight_failed`,
+with no executed head, review ID, comments or receipts. A fresh readable Caller
+history must confirm the original Call and remaining retry budget, with no
+ambiguous evidence or retained hold and the behavior still runnable. Logging
+accepts that Call's diagnostic at its adapter severity, including Warning, before
+omitting the duplicate worker Error. Publication-time 503s, exhausted or held
+retries and unverifiable evidence retain the worker failure and original Call.
+
 Claude auth status probes from the auth monitor and Connected accounts treat a
 recognized sign-in requirement returned with exit 1 as an ongoing condition,
 without another process error. The existing sign-in notice stays until the

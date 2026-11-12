@@ -39,6 +39,7 @@ import { dirname, join, resolve } from 'node:path'
 import { tmpdir, homedir } from 'node:os'
 import { mkdir } from 'node:fs/promises'
 import { MessageChannel } from 'node:worker_threads'
+import { isDeepStrictEqual } from 'node:util'
 import { ISSUE_REVIEW_BEHAVIOR, fetchAgentLogSnapshot, quarantinedLogMayMatch, type LogEntry } from './agent'
 import { claudeAuth, ClaudeAuthReadinessError } from './claude-auth'
 import { REVIEW_POLICY, needsClaude, randomDrawStillValid, reviewChoice, reviewPanel, type ReviewPanel, type ReviewPlace } from './review-model'
@@ -3002,7 +3003,7 @@ function settleClaimAfterExit(
   target: string,
   claimId: string,
 ): (result: { code: number | null, signal: NodeJS.Signals | null, error?: Error }) => Promise<void> {
-  const claim = behavior === 'review-new-prs'
+  const claim = behavior === 'review-new-prs' || behavior === 'approve-prs'
     ? listBehaviorLaunchClaims(behavior).find((row) => row.target === target && row.claimId === claimId) : undefined
   return async ({ code, signal, error }) => {
     if (!error && signal === null && code === 0) {
@@ -3028,7 +3029,7 @@ function settleClaimAfterExit(
     renewSeenOwned(behavior, target, claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
     renewPrOperationOwned(claimId, BEHAVIOR_CLAIM_RENEWAL_MS)
     const message = `[behaviors] ${behavior} worker exited for ${target}; awaiting durable result (${outcome})`
-    if (behavior === 'review-new-prs' && !error && signal === null && code === 1 && claim && !claim.launchQuarantine) {
+    if ((behavior === 'review-new-prs' || behavior === 'approve-prs') && !error && signal === null && code === 1 && claim && !claim.launchQuarantine) {
       try {
         const { stdout } = await runFile(AGENT_INTERFACE, ['--logs', '--select', JSON.stringify({ latest: [],
           ids: claim.launchCallId ? [claim.launchCallId] : [], correlations: [claimId] })],
@@ -3038,17 +3039,44 @@ function settleClaimAfterExit(
         const snapshot = parseAgentLogList(rows)
         const call = snapshot.entries[0]
         if (rows.length === 1 && snapshot.quarantined.length === 0
-          && call.status === 'failed' && call.error_code === 'review_budget_exhausted'
-          && call.behavior === 'pr_review' && call.behavior === claim.launchBehavior
+          && call.status === 'failed'
+          && call.behavior === upstreamBehavior(behavior) && call.behavior === claim.launchBehavior
           && call.repo === claim.launchRepo && call.pr_id === String(claim.launchPr)
           && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
-          && call.source === claim.launchSource && call.source === 'poise:review-new-prs'
+          && call.source === claim.launchSource && call.source === `poise:${behavior}`
           && call.correlation_id === claimId && claim.launchCorrelationId === claimId
           && (!claim.launchCallId || call.id === claim.launchCallId)
           && call.expected_head === claim.launchExpectedHead
           && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
           && Date.parse(call.completed_at ?? '') >= Date.parse(agentCallStartedAt(call))) {
           const row = objectValue(rows[0], 'worker exit Caller evidence') as Record<string, unknown>
+          const timeout = behavior === 'review-new-prs' && call.error_code === 'review_budget_exhausted'
+          const preflight503 = !call.error_code && /^(?:error: )?GitHub 503\b/.test(call.error)
+            && call.action === 'not_started' && call.outcome === 'preflight_failed'
+            && row.head_sha == null && row.review_id == null && row.review_comments == null && row.receipts == null
+          let retryable503 = false
+          if (preflight503) {
+            // A single completion cannot prove remaining retry budget. Read
+            // existing authority without releasing claims or consuming retries.
+            const history = await fetchAgentLogSnapshot({ fresh: true })
+            const current = listBehaviorLaunchClaims(behavior).find((entry) => entry.target === target && entry.claimId === claimId)
+            const retry = prReviewRetryState(history, behavior, claim.launchRepo, claim.launchPr,
+              claim.launchExpectedHead, claim.launchActor, call.model, target)
+            retryable503 = isRunnable(behavior) && !!current && !current.launchQuarantine
+              && (!current.launchCallId || current.launchCallId === call.id)
+              && isDeepStrictEqual(history.entries.find((entry) => entry.id === call.id), call)
+              && !logQuarantine(history, { repo: claim.launchRepo, prId: String(claim.launchPr), behavior: claim.launchBehavior })
+              && !history.entries.some((entry) => entry.repo === claim.launchRepo && entry.pr_id === String(claim.launchPr)
+                && entry.behavior === claim.launchBehavior && !unambiguousAgentCall(history, entry))
+              && (!retry.stopped || !!retry.operatorRetryKey)
+              && !invalidPrResultHoldDetail(claim.launchRepo, claim.launchPr)
+              && !retainedFailedLaunchesForPr(behavior, claim.launchRepo, claim.launchPr)
+                .some((entry) => entry.launchExpectedHead === claim.launchExpectedHead)
+              && getMeta(packetBlockKey(behavior, claim.launchRepo, claim.launchPr)) !== claim.launchExpectedHead
+              && !getMeta(repoHoldKey(claim.launchRepo, claim.launchActor))
+              && !getMeta(`${REPO_ACCESS_HOLD_PREFIX}${claim.launchRepo.toLowerCase()}`)
+          }
+          if (!timeout && !retryable503) { console.error(message); return }
           // Match periodic --diagnostics truncation and its 64 KiB envelope
           // fallback so delayed collection replays exactly.
           let error = typeof row.error === 'string' ? truncateCodePoints(row.error, 8192) : row.error
@@ -3079,7 +3107,7 @@ function settleClaimAfterExit(
             truncatedRow = { ...row, error, diagnostic: null, evidence_unavailable: evidence }
           }
           const input = row.evidence_unavailable == null ? callerDiagnostic(truncatedRow, loggingWorkspace()) : null
-          if (input?.level === 'error' && diagnostic(input)) return
+          if (input && (input.level === 'error' || retryable503 && input.level === 'warning') && diagnostic(input)) return
         }
       } catch (cause) {
         console.error(message, cause)
