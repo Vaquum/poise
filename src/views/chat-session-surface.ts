@@ -445,14 +445,15 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
   }
 
   let seenSeq = 0
-  /** While "Show earlier turns" reads the history again, what this pane already
-   *  showed still counts as seen: closing it then raises no false New reply. */
+  /** While this pane reads the same session again (Show earlier turns, or its
+   *  fallback to the last turns), what it already showed still counts as seen:
+   *  closing it then raises no false New reply. */
   let shownBefore = 0
   let adopting: ChatEnvelope[] | null = null
   let subscribed: string | null = null
   /** Adopt a session: a first open reads its last turns; `whole` reads all of it. */
   async function adopt(session: SessionRecord, whole = false): Promise<void> {
-    shownBefore = whole && record?.id === session.id ? Math.max(seenSeq, shownBefore) : 0
+    shownBefore = record?.id === session.id ? Math.max(seenSeq, shownBefore) : 0
     if (subscribed) { chatClient.unsubscribe(subscribed); subscribed = null }
     const pending: ChatEnvelope[] = []
     adopting = pending
