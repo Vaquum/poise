@@ -159,6 +159,9 @@ function refusedCommand(text: string): string | null {
   return head ? head[2].toLowerCase() : null
 }
 
+/** Turns a surface's first open reads, as in Chat; "Show earlier turns" reads the rest. */
+const OPEN_TURNS = 10
+
 export function mountSessionSurface(container: HTMLElement, options: SurfaceOptions): SessionSurface {
   const subject = options.subject
   let record: SessionRecord | null = null
@@ -196,6 +199,7 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     onSuggestedReply: (text) => {
       container.dispatchEvent(new CustomEvent('chat:use-suggested-reply', { bubbles: true, detail: { subject, text } }))
     },
+    onEarlier: () => { if (record && !adopting) void adopt(record, true) },
   })
   transcriptEl.addEventListener('chat:rerender', render)
 
@@ -443,7 +447,8 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
   let seenSeq = 0
   let adopting: ChatEnvelope[] | null = null
   let subscribed: string | null = null
-  async function adopt(session: SessionRecord): Promise<void> {
+  /** Adopt a session: a first open reads its last turns; `whole` reads all of it. */
+  async function adopt(session: SessionRecord, whole = false): Promise<void> {
     if (subscribed) { chatClient.unsubscribe(subscribed); subscribed = null }
     const pending: ChatEnvelope[] = []
     adopting = pending
@@ -459,10 +464,17 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     // Owners must retain the session even if they close while history loads.
     state()
     try {
+      // A first open reads the last turns; "Show earlier turns" adopts again with all of them.
+      let turns = whole ? undefined : OPEN_TURNS
       for (let guard = 0; guard < 100; guard++) {
-        const page = await chatClient.fetchSession(session.id, seenSeq)
+        const page = await chatClient.fetchSession(session.id, seenSeq, turns)
         if (destroyed || adopting !== pending) return
         record = page.session
+        if (turns && page.from) {
+          seenSeq = page.from
+          model.blocks.unshift({ kind: 'earlier', key: 'earlier', rev: 0 })
+        }
+        turns = undefined
         for (const envelope of page.events) applyEnvelope(envelope)
         if (!page.truncated || !page.events.length) break
       }

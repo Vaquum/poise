@@ -541,6 +541,30 @@ test("opens the document's own chat from Chat about this document", async ({ pag
   expect(created?.body).toMatchObject({ subject: SUBJECT })
 })
 
+test('a long document chat opens on its last ten turns, and Show earlier turns reads the rest', async ({ page }) => {
+  const { state, sock } = await editor(page)
+  state.sessions.unshift(session({ id: 's-doc', subject: SUBJECT, status: 'idle' }))
+  state.history['s-doc'] = Array.from({ length: 14 }, (_, i) => [
+    env('s-doc', i * 2 + 1, { type: 'turn.started', turnId: `doc-${i}`, prompt: { text: `Message ${i + 1}.`, attachments: [], mentions: [] } }),
+    env('s-doc', i * 2 + 2, { type: 'turn.finished', turnId: `doc-${i}`, stopReason: 'end_turn' }),
+  ]).flat()
+  await openDocChat(page)
+  await expect(paneTranscript(page)).toContainText('Message 14.')
+  await expect(paneTranscript(page)).toContainText('Message 5.')
+  await expect(paneTranscript(page)).not.toContainText('Message 4.')
+  expect(state.reads).toEqual([{ id: 's-doc', after: 0, turns: 10 }])
+  await paneTranscript(page).getByRole('button', { name: 'Show earlier turns' }).click()
+  await expect(paneTranscript(page)).toContainText('Message 1.')
+  await expect(paneTranscript(page)).toContainText('Message 14.')
+  await expect(paneTranscript(page).getByRole('button', { name: 'Show earlier turns' })).toHaveCount(0)
+  expect(state.reads).toEqual([{ id: 's-doc', after: 0, turns: 10 }, { id: 's-doc', after: 0, turns: 0 }])
+  // The live subscription goes on: a new turn lands once.
+  await sock.subscribed('s-doc')
+  sock.seq = 28
+  sock.push('s-doc', { type: 'turn.started', turnId: 'doc-live', prompt: { text: 'Message live.', attachments: [], mentions: [] } })
+  await expect(paneTranscript(page).getByText('Message live.')).toHaveCount(1)
+})
+
 test("shows a document's earlier conversation and continues it", async ({ page }) => {
   const { state, sock } = await editor(page)
   const seeded = session({ id: 's-doc', subject: SUBJECT, importedFrom: 'editor-draft-1760000000000', status: 'idle' })

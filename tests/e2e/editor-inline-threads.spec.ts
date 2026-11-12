@@ -385,7 +385,7 @@ test('tracks replies and every request when closed during initial history loadin
   let started!: () => void
   const held = new Promise<void>((resolve) => { release = resolve })
   const requested = new Promise<void>((resolve) => { started = resolve })
-  await page.route(`**/api/chat/sessions/${passage.id}?after=0`, async (route) => {
+  await page.route(`**/api/chat/sessions/${passage.id}?after=0*`, async (route) => {
     started()
     await held
     await route.fulfill({ json: { session: passage, events: [] } })
@@ -424,7 +424,7 @@ for (const destination of ['another view', 'the Editor again', 'another document
     let started!: () => void
     const held = new Promise<void>((resolve) => { release = resolve })
     const requested = new Promise<void>((resolve) => { started = resolve })
-    await page.route('**/api/chat/sessions/s-passage?after=0', async route => {
+    await page.route('**/api/chat/sessions/s-passage?after=0*', async route => {
       started()
       await held
       await route.fulfill({ json: { session: passage, events: [] } })
@@ -600,7 +600,7 @@ test('keeps a buffered pane reply marked new when closed before history is shown
   let started!: () => void
   const held = new Promise<void>((resolve) => { release = resolve })
   const requested = new Promise<void>((resolve) => { started = resolve })
-  await page.route(`**/api/chat/sessions/${id}?after=0`, async (route) => {
+  await page.route(`**/api/chat/sessions/${id}?after=0*`, async (route) => {
     started()
     await held
     await route.fulfill({ json: { session: created, events: earlier } })
@@ -639,7 +639,7 @@ test('keeps history and live replies when moving a passage chat while its histor
   let started!: () => void
   const held = new Promise<void>((resolve) => { release = resolve })
   const requested = new Promise<void>((resolve) => { started = resolve })
-  await page.route(`**/api/chat/sessions/${id}?after=0`, async (route) => {
+  await page.route(`**/api/chat/sessions/${id}?after=0*`, async (route) => {
     started()
     await held
     await route.fulfill({ json: { session: state.sessions.find((s) => s.id === id), events: earlier } })
