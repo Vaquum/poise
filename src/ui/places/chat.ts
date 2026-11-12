@@ -9,8 +9,8 @@ import { $ } from '../dom'
 import { routeBack } from '../shell'
 import { takeOpenChat } from '../open-chat'
 import type { MountPlace } from '../router'
-import { foldListWhenNarrow, initChatView, openChatForSubject, openChatSession, stopChatRefresh } from './chat/view'
-import { loadSettings } from '../../config'
+import { foldListWhenNarrow, initChatView, openChatForSubject, openChatSession, openSwitchboardPane, stopChatRefresh } from './chat/view'
+import { placeSettings } from '../../config'
 import { installIconTooltips } from '../../icon-tooltips'
 
 let viewEl: HTMLElement | null = null
@@ -46,12 +46,14 @@ export async function mountChatView(root: HTMLElement, signal: AbortSignal, plac
   view.hidden = false
   view.dataset.place = place
   // Times are on Poise's clock, in Settings' time zone, as classic reads them.
-  await loadSettings().catch(() => undefined)
+  await placeSettings().catch(() => undefined)
   const started = initChatView()
   // The shell is drawn by now: the route back sits first in the chat's own
   // header, never over its controls, and a narrow window starts with the list folded.
   view.querySelector(':scope > .view-header')?.prepend(back)
   foldListWhenNarrow()
+  // The Manager place arrives with the Switchboard open: at its width before any transcript, so nothing re-wraps.
+  if (place === 'manager') openSwitchboardPane()
   await new Promise((done) => requestAnimationFrame(done))
   await Promise.all([started, openRequested(chat)])
   document.addEventListener('poise:open-chat-pending', () => { void openRequested(null) }, { signal })

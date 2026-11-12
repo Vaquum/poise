@@ -60,6 +60,8 @@ export function countPair(label: string, report: AnalyticsReport, baseline: Anal
 }
 
 interface Shown { snapshot: AnalyticsSnapshot, progress: number | undefined, snapshotTime: string | undefined }
+/** Today's last numbers, kept across visits: a return paints them at once, then reads again. */
+let lastDay: { key: string, shown: Shown, day: Read<true>, history: Read<AnalyticsHistory>, daily: Read<AnalyticsHistory> } | null = null
 
 export function mountDay(ctx: PartContext, main: HTMLElement): void {
   const { signal } = ctx
@@ -210,7 +212,11 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
     if (when) when.textContent = new Intl.DateTimeFormat('en-GB', { timeZone: effectiveTimezone(), weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())
   }
 
-  const paint = () => { paintDay(); paintTiles(); paintSmall() }
+  const dayKey = () => `${getSelectedOrganization()}|${analyticsDay(0, anchor).since}`
+  const paint = () => {
+    if (offset === 0 && shown) lastDay = { key: dayKey(), shown, day, history, daily }
+    paintDay(); paintTiles(); paintSmall()
+  }
   // Typical by now moves with the clock; nothing redraws under the pointer or focus.
   const quiet = () => tiles.matches(':hover') || tiles.contains(document.activeElement) || detail.matches(':hover') || detail.contains(document.activeElement)
   function repaint(): void {
@@ -339,8 +345,10 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
   }, { signal })
 
   // ---------- Live ----------
+  // A return paints today's last numbers at once, so nothing below moves; the read refreshes them in place.
+  if (lastDay?.key === dayKey()) ({ shown, day, history, daily } = lastDay)
   paint()
-  void readDay(false)
+  void readDay(!!shown)
   ctx.every(getRefreshRateMs(), () => { if (document.visibilityState === 'visible') void readDay(true) })
   // A new day begins at midnight in Settings' zone: Today reads again.
   const midnight = () => {

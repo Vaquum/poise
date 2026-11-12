@@ -3679,3 +3679,24 @@ test('a request from another place to open a card’s chat opens it in Chat, wit
   await expect(page.locator('.chat-v-composer .chat-input')).toHaveValue(/Broken logout/)
   expect(new URL(page.url()).searchParams.get('back')).toBe('board')
 })
+
+test('Chat looks the same whichever places’ stylesheets have loaded', async ({ page }) => {
+  await installRoutes(page, makeState([]))
+  await installSocket(page)
+  await page.goto('/?view=chat')
+  // Once idle, the page preloads every place, and with them their stylesheets.
+  const foreign = /\/(?:overview|board|editor|observe|settings)-[^/]*\.css$/
+  await expect.poll(() => page.evaluate((source) => [...document.styleSheets].filter((s) => new RegExp(source).test(s.href ?? '')).length, foreign.source)).toBe(5)
+  const changed = await page.evaluate((source) => {
+    const sheets = [...document.styleSheets].filter((s) => new RegExp(source).test(s.href ?? ''))
+    const els = [...document.querySelectorAll('#view-chat, #view-chat *')]
+    const props = ['display', 'width', 'height', 'padding-top', 'padding-left', 'margin-top', 'border-top-width', 'gap', 'font-size', 'color']
+    const snap = () => els.map((el) => { const cs = getComputedStyle(el); return props.map((p) => cs.getPropertyValue(p)).join('|') })
+    const withThem = snap()
+    for (const s of sheets) s.disabled = true
+    const without = snap()
+    for (const s of sheets) s.disabled = false
+    return els.flatMap((el, i) => withThem[i] === without[i] ? [] : [`${el.className}: ${without[i]} -> ${withThem[i]}`])
+  }, foreign.source)
+  expect(changed).toEqual([])
+})
