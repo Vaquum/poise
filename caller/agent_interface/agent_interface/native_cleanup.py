@@ -31,13 +31,19 @@ def _claim(database: Path, call_id: str) -> tuple[str | None, str | None]:
     with ownership._database(database) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("begin immediate")
-        row = conn.execute("select pid,process_identity,resource_cleanup from calls where id=? "
+        row = conn.execute("select pid,process_identity,resources_settled_at,resource_cleanup from calls where id=? "
                            "and source='poise:behavior-chain'", (call_id,)).fetchone()
         if row is None:
             raise RuntimeError("native cleanup Call is unavailable")
+        # The candidate list can predate another worker's settlement or retry.
+        if row["resources_settled_at"] is not None and row["resource_cleanup"] is None:
+            return None, None
         previous = json.loads(row["resource_cleanup"] or "{}")
         if not isinstance(previous, dict) or len(json.dumps(previous).encode()) > 8192:
             raise RuntimeError("native cleanup claim is invalid")
+        next_attempt = previous.get("next_attempt_at")
+        if next_attempt is not None and next_attempt > time():
+            return None, None
         reason = None
         try:
             if previous.get("owner") is not None:
@@ -165,19 +171,21 @@ def recover(database: Path, *, limit: int = MAX_CALLS, seconds: int = PASS_SECON
     for (call_id,) in rows:
         if monotonic() >= deadline:
             break
-        report["examined"] += 1
         token = None
         try:
-            with ownership._database(database) as conn:
-                value = ownership.read(conn, call_id)
-                completed = conn.execute("select resources_settled_at from calls where id=?", (call_id,)).fetchone()[0] is not None
             if dry_run:
+                with ownership._database(database) as conn:
+                    ownership.read(conn, call_id)
                 report["held"].append({"callId": call_id, "reason": "dry run retains original native resource ownership"})
                 continue
             token, reason = _claim(database, call_id)
             if token is None:
-                report["held"].append({"callId": call_id, "reason": reason})
+                if reason is not None:
+                    report["held"].append({"callId": call_id, "reason": reason})
                 continue
+            with ownership._database(database) as conn:
+                value = ownership.read(conn, call_id)
+                completed = conn.execute("select resources_settled_at from calls where id=?", (call_id,)).fetchone()[0] is not None
             if not completed:
                 if not ownership.released(value):
                     _settle_process(database, call_id)
@@ -201,4 +209,5 @@ def recover(database: Path, *, limit: int = MAX_CALLS, seconds: int = PASS_SECON
                     except (OSError, RuntimeError, ValueError, TypeError, KeyError) as diagnostic_error:
                         reason = f"{reason}; cleanup diagnostic could not be recorded: {diagnostic_error}"
             report["held"].append({"callId": call_id, "reason": reason})
+    report["examined"] = len(report["released"]) + len(report["held"])
     return report

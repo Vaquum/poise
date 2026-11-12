@@ -82,6 +82,29 @@ def test_live_original_finalizer_keeps_its_initial_claim(database, monkeypatch):
         assert db.execute("select resource_ownership from calls where id=?", (call,)).fetchone()[0] == before
 
 
+@pytest.mark.parametrize("settled", [True, False])
+def test_recovery_rechecks_eligibility_after_selecting_a_call(database, monkeypatch, settled):
+    path, call = database
+    backoff = json.dumps({"last_error": "original witness unavailable", "next_attempt_at": 200})
+    claim = cleanup._claim
+    monkeypatch.setattr(cleanup, "time", lambda: 100)
+    monkeypatch.setattr(process_identity, "state", lambda encoded, pid: "alive")
+
+    def interleaved_claim(database, call_id):
+        assert call_id == call
+        with api.db() as db:
+            db.execute("update calls set resources_settled_at=?,resource_cleanup=? where id=?",
+                       ("90" if settled else None, None if settled else backoff, call))
+        return claim(database, call_id)
+
+    monkeypatch.setattr(cleanup, "_claim", interleaved_claim)
+    assert cleanup.recover(path) == {"version": 1, "examined": 0, "released": [], "held": []}
+    with api.db() as db:
+        row = db.execute("select resources_settled_at,resource_cleanup from calls where id=?", (call,)).fetchone()
+        assert tuple(row) == (("90", None) if settled else (None, backoff))
+    assert cleanup.recover(path)["examined"] == 0
+
+
 def test_dry_run_does_not_claim_or_reap_and_skips_legacy_and_fenced_rows(database):
     path, call = database
     with api.db() as db:
@@ -197,6 +220,31 @@ def retained_inventory(database, monkeypatch):
     monkeypatch.setattr(native_namespace, "control_request", control)
     monkeypatch.setattr(ownership, "monotonic", lambda: clock[0])
     return path, call, value, proofs, reads, clock
+
+
+def test_recovery_retires_a_claim_using_settlement_committed_during_selection(retained_inventory, monkeypatch):
+    path, call, value, *_ = retained_inventory
+    claim = cleanup._claim
+    error = {"cause": "original cleanup interrupted", "path": None, "at": 25}
+    value.update(roots=value["roots"][:2], errors=[error])
+    with api.db() as db:
+        ownership._write(db, call, value)
+
+    def interleaved_claim(database, call_id):
+        assert call_id == call
+        with api.db() as db:
+            ownership._write(db, call, {**value, "errors": [{**error, "recovered_at": 31}]})
+            db.execute("update calls set resources_settled_at=?,resource_cleanup=? where id=?",
+                       ("31.125", json.dumps({"attempt_at": 30}), call))
+        return claim(database, call_id)
+
+    monkeypatch.setattr(cleanup, "_claim", interleaved_claim)
+    with patch.object(cleanup, "_settle_process", wraps=cleanup._settle_process) as settle:
+        assert cleanup.recover(path)["released"] == [call]
+    settle.assert_not_called()
+    with api.db() as db:
+        row = db.execute("select resources_settled_at,resource_cleanup from calls where id=?", (call,)).fetchone()
+        assert tuple(row) == ("31.125", None)
 
 
 def test_retained_ancestor_coverage_yields_and_recovers_the_original_large_call(retained_inventory, tmp_path):
