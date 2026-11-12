@@ -849,6 +849,8 @@ run the tests. It exits with 125, or 124 at the time limit, and never falls back
 running in the workspace. Each that the gateway can see also reaches its diagnostics
 as `test_relay.run.failed`, naming the workspace, the command and the reason; every
 run is logged with its command, exit code and duration as `test_relay.run.finished`.
+The runner prints the captured-candidate digest and suite, then the existing run ID
+at each admission, so observed failures can name the attempt that produced them.
 An explicit gateway-restart failure is the one exception: the active command
 records an interrupted validation with its candidate digest, suite and run ID,
 with no test result. It waits at most 30 seconds for the existing authenticated
@@ -871,7 +873,11 @@ command, diagnostic/reason, incomplete local verification and required CI in `bo
 Caller validates and publishes through its normal PR path; required CI and review
 still gate merge. Exit 124/125 alone, a genuine suite failure, an interrupted attempt
 followed by a suite result, provider execution-budget exhaustion and other blockers
-do not authorize this handoff. A previously held Call stays failed. If its checkout
+do not authorize this handoff. An observed test failure stays blocked even if the
+relay later times out; retain its first assertion/failure excerpt, suite/test and
+available captured-candidate and producing-run identities in `blocked` as defined
+in [chain outcomes](Behavior-chain.md#handoffs-and-outcomes). A previously held Call
+stays failed. If its checkout
 was reclaimed before publication, resource release proves neither surviving edits
 nor a publication plan: use the existing **Resume** and a fresh invocation to produce
 a new candidate, including for #1039, rather than claim to publish the old one.
