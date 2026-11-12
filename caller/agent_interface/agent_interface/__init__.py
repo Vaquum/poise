@@ -1192,8 +1192,8 @@ def run_pr_review(
 
 def record_cleanup_failure(call_id: str) -> None:
     """A run directory that survived deletion keeps its resources unsettled:
-    the failure is durable and visible, and the still-present directory stays
-    retryable by the next sweep without repeating any external action."""
+    the failure is durable and visible. A legacy sweep cannot retry deletion
+    without original ownership and process-termination proof."""
     try:
         with db() as conn:
             conn.execute("update calls set artifact=json_set(coalesce(artifact,'{}'),'$.resource_error','cleanup_failed') where id=?",

@@ -352,9 +352,14 @@ checkout coordination and isolated Codex/Muse history inside those roots.
 An unreadable identity, incomplete proof or a new epoch without positive
 original lifecycle evidence stays held. Removing a named
 directory is not a supported way to manufacture a release. A one-slot lane can
-remain held after such a failure. #806 retains
-forced-container lifecycle proof, measured budget enforcement and real fault/load
-acceptance. The [retention policy](Operating.md#storage-maintenance) keeps older
+remain held after such a failure; loss of the original witnesses does not
+guarantee eventual reclamation. #822 (`17d06d9f`) delivered native lease and
+Codex-history reclamation with explicit retention of older shared state;
+#824 (`11331d75`) delivered execution limits. #806 remains open for complete
+resource-lifecycle proof and the frozen matched real fault/load campaign,
+including repairs at every concurrency level and unexercised provider/platform
+cases. Later fault/repair cohorts cannot fill a frozen candidate's missing cells.
+The [retention policy](Operating.md#storage-maintenance) keeps older
 shared metadata/history measured and protected; it does not establish zero
 provider residue or complete resource readiness.
 
