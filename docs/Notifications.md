@@ -154,6 +154,10 @@ conversation is unresolved.
 Classic's Current and notifications share a simultaneous check of the same pull request
 when both use the same agent GitHub account. Its answer is cached for 60 seconds
 from the start of the check; a different agent account gets its own check.
+Showing the checks (Overview, and classic's Current) answers with a check up to
+five minutes past those 60 seconds and reads it again behind the answer, five
+at a time; with none that recent, it waits. This check always waits for a
+fresh one.
 
 - A pull request that becomes ready is noticed at once, and Poise Link shows
   it once.
