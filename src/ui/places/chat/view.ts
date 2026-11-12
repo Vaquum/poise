@@ -771,7 +771,7 @@ function sidebarHtml(): string {
     const selected = selectedIds.has(id)
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}${pinned ? ' pinned' : ''}${selected ? ' selected' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0" draggable="${s.role !== 'manager'}">`
       + `<div class="chat-session-title" title="${escapeHtml(sessionTitle(s))}">${escapeHtml(sessionTitle(s))}</div>`
-      + (s.subject ? `<div class="chat-session-subject">From Current · ${escapeHtml(s.subject.label)}</div>` : '')
+      + (s.subject ? `<div class="chat-session-subject">From Board · ${escapeHtml(s.subject.label)}</div>` : '')
       + creatorHtml(s)
       + `<div class="chat-session-meta">`
       + (s.role === 'manager' ? `<span class="chat-pill chat-pill-manager">Manager</span>` : '')
@@ -1539,7 +1539,7 @@ async function startPoiseChange(cmd: PoiseCommand, draft: ComposerDraft): Promis
   // put back synchronously would be wiped, so give it that turn first.
   await Promise.resolve()
   if (!cmd.request) {
-    setNotice('Type the change after /poise — for example: /poise Add a Stop button to the Swarm header', 'info')
+    setNotice('Type the change after /poise — for example: /poise Add a Stop button to the Behaviors header', 'info')
     keepDraft(activeId, draft)
     return
   }
