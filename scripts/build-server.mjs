@@ -38,3 +38,8 @@ await build({
   entryPoints: ['server/analytics-worker.ts'], bundle: true, platform: 'node',
   format: 'esm', packages: 'external', outfile: 'dist/analytics-worker.js', logLevel: 'info',
 })
+
+await build({
+  entryPoints: ['server/process-worker.ts'], bundle: true, platform: 'node',
+  format: 'esm', packages: 'external', outfile: 'dist/process-worker.js', logLevel: 'info',
+})

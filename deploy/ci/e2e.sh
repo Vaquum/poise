@@ -598,37 +598,83 @@ check_proxy_mode() {
   expect 401 "external proxy policy exception excludes workspace hosts" "$nobody" "http://127.0.0.1:8081/privacy" --header "Host: alice.$domain"
   # The production topology: traffic through the server's own proxy while the published gateway is
   # replaced. The proxy retries dials, so every answer is 200, never a 502 for a refused connection.
-  local traffic=$work/proxy-traffic.log loop code before after
+  local traffic=$work/proxy-traffic.log code before after get post
   # install.sh's file set: the run's own two files omit compose.proxy.yaml, which publishes
   # the gateway on $listen, so recreating with them would drop the published port.
   local proxy_files=compose.yaml:ci/compose.yaml:compose.proxy.yaml
   before=$(docker inspect --format '{{.Id}}' poise-gateway)
-  : >"$traffic"
-  (
-    while :; do
-      code=$(curl --silent --max-time 60 --cookie "$alice" --output /dev/null --write-out '%{http_code}' "${navigate[@]}" "http://alice.$domain/" 2>/dev/null) || code="curl:$?"
-      printf '%s %s\n' "$(date -u +%FT%TZ)" "$code" >>"$traffic"
-      sleep 0.2
-    done
-  ) &
-  loop=$!
   COMPOSE_FILE="$proxy_files" compose stop gateway
   code=$(docker inspect --format '{{.State.ExitCode}}' poise-gateway)
-  if [ "$code" != 0 ]; then kill $loop 2>/dev/null || true; fail "the replaced gateway exited $code, not 0"; fi
+  [ "$code" = 0 ] || fail "the replaced gateway exited $code, not 0"
+  if curl --silent --max-time 2 "http://$listen/_gateway/tls-ask?domain=alice.$domain"; then
+    fail "the stopped gateway still has a listener at $listen"
+  fi
+  # Both requests start with no gateway listener. Retain their completed outcomes,
+  # even if readiness returns before the proxy finishes its in-flight request.
+  curl --silent --show-error --max-time 40 --cookie "$alice" --output "$work/proxy-gap-body" \
+    --write-out '%{http_code}\n' "${navigate[@]}" "http://alice.$domain/" >"$traffic" &
+  get=$!
+  curl --silent --show-error --max-time 40 --request POST --user-agent poise-e2e-replacement \
+    --output "$work/proxy-gap-post-body" --write-out '%{http_code}\n' "$apex/link/device/code" >"$work/proxy-post-status" &
+  post=$!
+  sleep 2
+  if [ -s "$traffic" ] || [ -s "$work/proxy-post-status" ]; then
+    fail "the proxy completed a request before the gateway listener returned"
+  fi
   COMPOSE_FILE="$proxy_files" compose up --detach --force-recreate gateway
   for _ in $(seq 1 60); do
     if [ "$(curl --silent --max-time 5 "http://$listen/_gateway/tls-ask?domain=alice.$domain" 2>/dev/null)" = ok ]; then break; fi
     sleep 2
   done
   [ "$(curl --silent --max-time 10 "http://$listen/_gateway/tls-ask?domain=alice.$domain")" = ok ] \
-    || { kill $loop 2>/dev/null || true; fail "the recreated gateway does not answer at $listen"; }
-  kill $loop 2>/dev/null || true
-  wait $loop 2>/dev/null || true
+    || fail "the recreated gateway does not answer at $listen"
+  wait "$get" || fail "the public GET started in the listener gap did not complete"
+  wait "$post" || fail "the public POST started in the listener gap did not complete"
   after=$(docker inspect --format '{{.Id}}' poise-gateway)
   [ "$before" != "$after" ] || fail "the gateway container did not change"
-  grep --quiet ' 200$' "$traffic" || fail "no traffic reached the workspace during replacement: $(cat "$traffic")"
-  if grep --quiet -v ' 200$' "$traffic"; then fail "traffic through the server's own proxy saw non-200: $(grep -v ' 200$' "$traffic" | head -n 5)"; fi
-  pass "traffic through the server's own proxy saw zero 502s and zero connection failures ($(wc -l <"$traffic") requests)"
+  [ "$(cat "$traffic")" = 200 ] || fail "the public gap GET answered $(cat "$traffic")"
+  grep --quiet '<title>Poise</title>' "$work/proxy-gap-body" || fail "the successor did not serve Poise"
+  [ "$(cat "$work/proxy-post-status")" = 200 ] || fail "the public gap POST answered $(cat "$work/proxy-post-status")"
+  code=$(docker exec poise-gateway node --input-type=module --eval "import Database from 'better-sqlite3'; const db=new Database('/data/gateway.db',{readonly:true}); console.log(db.prepare('SELECT count(*) AS n FROM device_codes WHERE label = ?').get('poise-e2e-replacement').n); db.close()")
+  [ "$code" = 1 ] || fail "the gap POST was handled $code times, not once"
+  pass "gateway $before -> $after: public gap GET 200 and POST 200, handled once"
+
+  COMPOSE_FILE="$proxy_files" compose stop gateway
+  node --input-type=module - "$listen" <<'NODE'
+import assert from 'node:assert/strict'
+import http from 'node:http'
+
+const upstream = new URL(`http://${process.argv[2]}`)
+const request = (path, method = 'GET') => fetch(`http://poise.test${path}`, { method, signal: AbortSignal.timeout(40_000) })
+const started = performance.now()
+assert.equal((await request('/')).status, 502)
+assert.ok(performance.now() - started >= 29_000, 'connection refusal exhausted before the 30-second budget')
+
+let errors = 0, mutations = 0
+const server = http.createServer((req, res) => {
+  if (req.method === 'POST') {
+    mutations++
+    req.socket.destroy() // The mutation happened, but its response was lost.
+  } else {
+    errors++
+    res.writeHead(502).end('upstream HTTP 502')
+  }
+})
+await new Promise(resolve => server.listen(Number(upstream.port), upstream.hostname, resolve))
+try {
+  const response = await request('/upstream-error')
+  assert.equal(response.status, 502)
+  assert.equal(await response.text(), 'upstream HTTP 502')
+  assert.equal(errors, 1, 'an upstream HTTP 502 was retried')
+  assert.equal((await request('/mutation', 'POST')).status, 502)
+  assert.equal(mutations, 1, 'an ambiguously dispatched POST was replayed')
+} finally {
+  await new Promise(resolve => server.close(resolve))
+}
+NODE
+  pass "external proxy retains exhausted connection failures and upstream 502s without replaying mutations"
+  COMPOSE_FILE="$proxy_files" compose start gateway
+  wait_for_poise "$alice" alice
   docker rm --force poise-e2e-proxy >/dev/null
 
   sed -i '/^POISE_PROXY_LISTEN=/d' "$deploy/.env"

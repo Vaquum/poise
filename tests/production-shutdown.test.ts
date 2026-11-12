@@ -245,7 +245,8 @@ describe('production shutdown', () => {
     expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
   })
 
-  it('retains database-close rejection as a shutdown failure', async () => {
+  it('retains database-close rejection on the existing runtime base', async () => {
+    vi.stubEnv('POISE_SHUTDOWN_DIAGNOSTIC_ID', undefined)
     mocks.stopPoiseRuntime.mockResolvedValue(undefined)
     mocks.closeDatabase.mockImplementation(() => { throw new Error('SQLite close refused') })
     const production = await import('../server/production')

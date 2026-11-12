@@ -94,6 +94,8 @@ names that reclaimed ancestor; it carries no invented child device/inode.
 Allocated roots, preparation siblings and unknown older ownership require
 their own proof. Original and recovery cleanup use the same private claim;
 PID loss, a new epoch or a deadline never grants takeover by itself.
+The claim transaction rechecks whether the Call still needs cleanup and is due.
+Recovery reads the current settlement only after claiming the Call.
 The supervisor pins Caller's original data directory, database and response
 directory. Caller metadata reads/writes and service drain counts use those
 handles after an ancestor rename; a replacement directory never becomes the
@@ -239,7 +241,11 @@ bounded redacted cause and known (`none`, `rejected`, `noop`, `blocked`) or
 unknown submission state. Structured provider exits and signals are `review_provider_exit`,
 provider-reported error terminals are `review_provider_error`; both keep
 `not_started` / `preflight_failed` with no receipt, so Poise can safely retry
-after proving no reviewer action. Uncorrected invalid, missing, duplicate or contradictory
+after proving no reviewer action. On a nonzero Codex exit, the cause prefers the
+last usable `error` / `turn.failed` message, then a recognizable stderr failure;
+startup warnings alone report cause unavailable with the observed exit or signal.
+Malformed event lines cannot replace that process failure with invalid output.
+Uncorrected invalid, missing, duplicate or contradictory
 verdicts, submission rejections (including `no_review` no-ops) and duplicate
 GitHub reviews are `review_contract_violation` and held. A repeat-only
 `no_review` refusal first recovers once with the recovery model; anything

@@ -463,10 +463,14 @@ export class Orchestrator {
         try {
           // A running workspace on the same base takes a new release in place: only Poise restarts, and the
           // agents it started keep running. Anything else needs a new container.
+          let fallback: ImageRelease | null = null
           if (reason === 'outdated image' && details.State.Running && target && this.changedSetting(details) === null
-            && imageRelease(await docker.imageLabels(details.Image))?.base === target.base
-            && await this.updateInPlace(handle, login, target)) continue
-          await this.upgrade(handle, login, imageId, reason, target)
+            && imageRelease(await docker.imageLabels(details.Image))?.base === target.base) {
+            const updated = await this.updateInPlace(handle, login, target)
+            if (updated === true) continue
+            if (updated === 'unreachable') fallback = target
+          }
+          await this.upgrade(handle, login, imageId, reason, target, fallback)
         } catch (error) {
           log.error('workspace.upgrade.failed', { handle, error: errorMessage(error) })
           store.noteWorkspaceError(handle, `upgrade failed: ${errorMessage(error)}`)
@@ -481,9 +485,10 @@ export class Orchestrator {
    * Installs the target release into the workspace's home volume and asks Poise to switch to it, which it
    * does once no Chat turn and no work of its own runs; detached agent calls carry on. Asked again on later
    * passes until the workspace runs it, since the request is idempotent. False when the workspace runs
-   * without a release supervisor and needs a new container instead.
+   * without a release supervisor and needs a new container instead; 'unreachable' when only a failed
+   * health probe selected replacement, so fresh replies during the drain can reconsider it.
    */
-  private async updateInPlace(handle: string, login: string, target: ImageRelease): Promise<boolean> {
+  private async updateInPlace(handle: string, login: string, target: ImageRelease): Promise<boolean | 'unreachable'> {
     let health: ServiceHealth
     try {
       health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
@@ -495,7 +500,7 @@ export class Orchestrator {
       // moment — so until the grace passes a later pass asks again instead of starting a drain.
       if (this.withinUnreachableGrace(handle, target.release)) return true
       this.deps.log.warn('workspace.update.unreachable', { handle, error: errorMessage(error) })
-      return false
+      return 'unreachable'
     }
     this.unreachableSince.delete(handle)
     if (health.release === null) return false
@@ -710,7 +715,7 @@ export class Orchestrator {
     return 'switching'
   }
 
-  private async upgrade(handle: string, login: string, imageId: string, reason: string, target: ImageRelease | null): Promise<void> {
+  private async upgrade(handle: string, login: string, imageId: string, reason: string, target: ImageRelease | null, fallback: ImageRelease | null): Promise<void> {
     this.lifecycle('workspace.upgrade.started', handle, { image: imageId, reason })
     // One budget for the whole workspace operation: every drain, recheck and re-drain shares it.
     const deadline = this.deps.now() + this.deps.config.drainTimeoutSeconds * 1000
@@ -834,8 +839,14 @@ export class Orchestrator {
           return
         }
         this.upgradingPhase = 'drain'
-        const result = await this.drain(handle, login, deadline, dispatched)
+        const result = await this.drain(handle, login, deadline, dispatched, fallback)
         this.upgradingPhase = 'upgrade'
+        if (result.recovered) {
+          await this.releaseDrain(handle, login, 'the workspace recovered on the target release')
+          this.updating.delete(handle)
+          this.stuckWarned.delete(handle)
+          return
+        }
         drainAttempted = drainAttempted || result.attempted
         confirmedBusy = confirmedBusy || result.confirmedBusy
         // A round that observed drain state supersedes the admission an earlier round saw; a round
@@ -946,8 +957,8 @@ export class Orchestrator {
    * idle answer alone never recreates the workspace. Admission is the drain as last observed; an
    * answer showing it off un-admits, and a round with no usable answer leaves it alone.
    */
-  private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }): Promise<{
-    idle: boolean; nativePending: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; observed: boolean; sawDown: boolean;
+  private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }, fallback: ImageRelease | null): Promise<{
+    idle: boolean; nativePending: boolean; recovered: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; observed: boolean; sawDown: boolean;
     lastCounts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null
   }> {
     const { config, log, now } = this.deps
@@ -959,7 +970,16 @@ export class Orchestrator {
     let sawDown = false
     let sawDraining = false
     const lastCounts: { counts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null } = { counts: null }
-    const done = (idle: boolean, nativePending = false) => ({ idle, nativePending, attempted: dispatched.value, confirmedBusy, admitted, observed, sawDown, lastCounts: lastCounts.counts })
+    const done = (idle: boolean, nativePending = false, recovered = false) => ({ idle, nativePending, recovered, attempted: dispatched.value, confirmedBusy, admitted, observed, sawDown, lastCounts: lastCounts.counts })
+    const recovered = async (health: ServiceHealth): Promise<boolean> => {
+      if (!fallback || !health.ok || health.release !== fallback.release) return false
+      // Settings or the container may have changed while the drain waited outside the lock.
+      return this.withLock(handle, async () => {
+        const details = await this.deps.docker.inspectContainer(workspaceNames(handle).container)
+        return details?.State.Running === true && this.changedSetting(details) === null
+          && imageRelease(await this.deps.docker.imageLabels(details.Image))?.base === fallback.base
+      })
+    }
     // Original cleanup may be permanently held after controller loss. It must not subject Chat
     // to a full drain deadline on every upgrade pass; existing maintenance can retry without it.
     const pendingCleanup = (health: ServiceHealth): boolean => !health.idle && health.unsettledNativeCalls !== 0 && health.runningCallerCalls === 0
@@ -1017,6 +1037,7 @@ export class Orchestrator {
     }
     try {
       const health = await postDrain()
+      if (await recovered(health)) return done(false, false, true)
       if (!health.ok || !health.draining) {
         unconfirmed(health)
       } else {
@@ -1037,6 +1058,7 @@ export class Orchestrator {
         if (renew) {
           const health = await postDrain()
           requestedAt = now()
+          if (await recovered(health)) return done(false, false, true)
           // A renewal that finally shows the drain confirms the admission the first POST missed.
           if (!health.ok || !health.draining) unconfirmed(health)
           else {
@@ -1051,6 +1073,7 @@ export class Orchestrator {
           }
         } else {
           const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+          if (await recovered(health)) return done(false, false, true)
           note(health)
           if (health.ok && health.draining && pendingCleanup(health)) return done(false, true)
           // Idle behind an applied drain finishes; idle without one waits for a renewal to admit.

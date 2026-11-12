@@ -422,10 +422,8 @@ Production shutdown retains one `process.shutdown` Error when cleanup rejects or
 reaches its ten-second deadline, including pending runtime/HTTP phases and known
 rejection causes. It commits through the same independent diagnostic store before
 exit 1, including after runtime teardown has stopped Logging. The supervisor
-omits its duplicate generic exit only when that launch's unique diagnostic ID
-has a retained shutdown failure; missing or unreadable evidence preserves the
-generic Error. A healthy successor does not clear the prior shutdown failure.
-Clean update exits (75) remain quiet. Cleanup ordering and exit codes are unchanged.
+can also record a generic exit event for the same shutdown. Logging retains
+those events after a healthy successor starts. Clean update exits (75) stay quiet.
 
 Container discovery includes stopped containers and removes checkpoints only for absent container IDs; retained events survive that cleanup. Operator ingress deduplicates exact record replays, while separate records sharing a request ID retain distinct occurrence IDs. Bootstrap line capture keeps folded credential-header state across child output chunks before reporting or persistence.
 

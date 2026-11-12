@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import subprocess
 import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, TypeVar
+
+if TYPE_CHECKING:
+    import httpx
 
 
 class GitHubApiError(RuntimeError):
@@ -78,7 +84,7 @@ def split_http_response(stdout: str) -> tuple[dict[str, str], str]:
     return headers, body
 
 
-def raise_rate_limit(headers: dict[str, str], diagnostic: str) -> None:
+def raise_rate_limit(headers: Mapping[str, str], diagnostic: str) -> None:
     if headers.get("x-ratelimit-remaining") != "0":
         return
     # A successful request may spend the final point, and an unrelated error
@@ -391,49 +397,176 @@ query($owner: String!, $name: String!, $number: Int!) {{
 """
 
 
+_GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+_GITHUB_GRAPHQL_HOST = "api.github.com"
+
+
+def _github_proxy(environment: dict[str, str]) -> str | None:
+    # Match gh's Go proxy selection for this fixed HTTPS host.
+    proxy = environment.get("HTTPS_PROXY") or environment.get("https_proxy")
+    if not proxy:
+        return None
+    exclusions = environment.get("NO_PROXY") or environment.get("no_proxy", "")
+    for entry in exclusions.lower().split(","):
+        entry = entry.strip()
+        if entry == "*":
+            return None
+        host, _, port = entry.partition(":")
+        if port and port != "443":
+            continue
+        if host.startswith("*."):
+            host = host[1:]
+        domain_suffix = host if host.startswith(".") else "." + host
+        if host == _GITHUB_GRAPHQL_HOST or _GITHUB_GRAPHQL_HOST.endswith(domain_suffix):
+            return None
+    return proxy if "://" in proxy else f"http://{proxy}"
+
+
+def _uses_cli_transport(environment: dict[str, str]) -> bool:
+    if environment.get("GH_HOST") != "github.com" or environment.get("GH_DEBUG"):
+        return True
+    # Keep gh's own endpoint and socket configuration on its CLI path. These
+    # settings are inspected once per run, before any GraphQL requests.
+    for key in ("http_unix_socket", "api_host"):
+        config = subprocess.run(
+            ["gh", "config", "get", key, "--host", "github.com"],
+            capture_output=True, text=True, env=environment,
+        )
+        if config.returncode == 0:
+            if config.stdout.strip():
+                return True
+        elif config.returncode != 1 or f'could not find key "{key}"' not in config.stderr:
+            raise GitHubApiError(f"could not read gh transport configuration: {config.stderr.strip()}")
+    return False
+
+
+def _json_ended_early(error: json.JSONDecodeError) -> bool:
+    tail = error.doc[error.pos:]
+    if not tail or error.msg == "Unterminated string starting at":
+        return True
+    if error.msg == "Expecting value":
+        return tail in {"-", "n", "nu", "nul", "t", "tr", "tru", "f", "fa", "fal", "fals"}
+    if error.msg == "Invalid \\uXXXX escape":
+        return bool(re.fullmatch(r"u[0-9a-fA-F]{0,3}", tail))
+    return (error.msg in {"Expecting ',' delimiter", "Extra data"}
+            and error.pos > 0 and error.doc[error.pos - 1].isdigit()
+            and bool(re.fullmatch(r"\.|[eE][+-]?", tail)))
+
+
+@contextmanager
+def datastore_github_client() -> Iterator[GitHubClient]:
+    environment = os.environ.copy()
+    token = environment.get("GH_TOKEN", "").strip()
+    proxy = _github_proxy(environment)
+    if not token or (proxy and not proxy.startswith(("http://", "https://"))) or _uses_cli_transport(environment):
+        yield GitHubClient()
+        return
+    try:
+        import httpx
+    except ImportError:  # Test harnesses run the datastore on a bare system python.
+        yield GitHubClient()
+        return
+
+    with httpx.Client(proxy=proxy, trust_env=False, verify=ssl.create_default_context(),
+                      timeout=httpx.Timeout(None, connect=30.0)) as http:
+        yield GitHubClient(http=http, token=token)
+
+
 class GitHubClient:
-    def __init__(self, attempts: int = 5, retry_sleep_seconds: int = 1) -> None:
+    def __init__(
+        self, attempts: int = 5, retry_sleep_seconds: int = 1, *,
+        http: httpx.Client | None = None, token: str | None = None,
+    ) -> None:
         if attempts <= 0:
             raise ValueError("attempts must be positive")
         self.attempts = attempts
         self.retry_sleep_seconds = retry_sleep_seconds
+        self._http = http
+        self._token = token
         self._rate_limit_error: GitHubRateLimitError | None = None
 
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-        args = ["gh", "api", "graphql", "--include", "-f", f"query={query}"]
-        for key, value in (variables or {}).items():
-            if value is None:
-                continue
-            # Raw fields preserve numeric names and literals such as "null" as strings.
-            args.extend(["-f" if isinstance(value, str) else "-F", f"{key}={value}"])
-
         last_error = ""
         environment = os.environ.copy()
         # Several accounts can be signed in to gh; the datastore reads GitHub
         # only as the account whose token it is given, never gh's active one.
-        if not environment.get("GH_TOKEN", "").strip():
+        token = self._token if self._token is not None else environment.get("GH_TOKEN", "").strip()
+        if not token:
             raise GitHubApiError("GH_TOKEN is not set: github-datastore reads GitHub only as the account whose token it is given")
+        fields = {key: value for key, value in (variables or {}).items() if value is not None}
         for attempt in range(1, self.attempts + 1):
             if self._rate_limit_error is not None and time.time() < self._rate_limit_error.reset_at:
                 raise self._rate_limit_error
-            proc = subprocess.run(args, capture_output=True, text=True, env=environment)
-            headers, body = split_http_response(proc.stdout)
-            if proc.returncode == 0:
-                payload = json.loads(body)
-                if payload.get("errors"):
-                    diagnostic = f"GraphQL errors: {json.dumps(payload['errors'])}"
-                    self._raise_rate_limit(headers, diagnostic)
-                    raise GitHubApiError(diagnostic)
-                return payload["data"]
-            last_error = "\n".join(part.strip() for part in (proc.stderr, body) if part.strip())
+            if self._http is None:
+                headers, body, failure, retryable = self._cli_request(query, fields, environment)
+            else:
+                headers, body, failure, retryable = self._http_request(self._http, query, fields, token)
+            if failure is None:
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError as error:
+                    if self._http is None or not _json_ended_early(error):
+                        raise
+                    failure = f"unexpected end of JSON input: {error}"
+                    retryable = True
+                else:
+                    if payload.get("errors"):
+                        diagnostic = f"GraphQL errors: {json.dumps(payload['errors'])}"
+                        self._raise_rate_limit(headers, diagnostic)
+                        raise GitHubApiError(diagnostic)
+                    return payload["data"]
+            last_error = failure
             self._raise_rate_limit(headers, f"GraphQL request failed: {last_error}")
-            if not self._retryable(last_error) or attempt == self.attempts:
+            if not retryable or attempt == self.attempts:
                 raise GitHubApiError(f"GraphQL request failed: {last_error}")
             time.sleep(self.retry_sleep_seconds)
 
         raise GitHubApiError(f"GraphQL request failed: {last_error}")
 
-    def _raise_rate_limit(self, headers: dict[str, str], diagnostic: str) -> None:
+    def _cli_request(
+        self, query: str, fields: dict[str, Any], environment: dict[str, str],
+    ) -> tuple[Mapping[str, str], str, str | None, bool]:
+        args = ["gh", "api", "graphql", "--include", "-f", f"query={query}"]
+        for key, value in fields.items():
+            # Raw fields preserve numeric names and literals such as "null" as strings.
+            args.extend(["-f" if isinstance(value, str) else "-F", f"{key}={value}"])
+        proc = subprocess.run(args, capture_output=True, text=True, env=environment)
+        headers, body = split_http_response(proc.stdout)
+        if proc.returncode == 0:
+            return headers, body, None, False
+        failure = "\n".join(part.strip() for part in (proc.stderr, body) if part.strip())
+        return headers, body, failure, self._retryable(failure)
+
+    @staticmethod
+    def _http_request(
+        http: httpx.Client, query: str, fields: dict[str, Any], token: str,
+    ) -> tuple[Mapping[str, str], str, str | None, bool]:
+        import httpx
+
+        # An explicit request avoids carrying cookies from one GraphQL read to
+        # the next. The token is sent only to the configured GitHub endpoint.
+        request = httpx.Request(
+            "POST", _GITHUB_GRAPHQL_URL, json={"query": query, "variables": fields},
+            headers={"Authorization": f"token {token}", "Accept": "application/json",
+                     "Accept-Encoding": "gzip", "User-Agent": "github-datastore"},
+        )
+        try:
+            response = http.send(request, follow_redirects=False)
+        except httpx.RequestError as error:
+            detail = str(error).replace(token, "[redacted]")
+            retryable = isinstance(error, (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException))
+            return {}, "", detail, retryable and "CERTIFICATE_VERIFY_FAILED" not in detail
+        if response.is_success:
+            try:
+                return response.headers, response.content.decode("utf-8"), None, False
+            except UnicodeDecodeError as error:
+                if error.reason != "unexpected end of data":
+                    raise
+                return response.headers, "", f"unexpected end of JSON input: {error}", True
+        detail = f"HTTP {response.status_code} {response.reason_phrase}\n{response.text}".strip()
+        return response.headers, "", detail, response.status_code in (429, 500, 502, 503, 504)
+
+    def _raise_rate_limit(self, headers: Mapping[str, str], diagnostic: str) -> None:
         try:
             raise_rate_limit(headers, diagnostic)
         except GitHubRateLimitError as error:
@@ -458,6 +591,7 @@ class GitHubClient:
             "timed out",
             "unexpected EOF",
             "unexpected end of JSON input",
+            "Something went wrong while executing your query",
             "can't assign requested address",
             "cannot assign requested address",
             "read tcp ",

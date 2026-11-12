@@ -1423,7 +1423,9 @@ class TestOtherProviderVerdicts(TestCase):
 class TestVerifiedResultsOrExplicitFailures(TestCase):
     """#236: every attempt ends with a validated receipt or a typed failure."""
 
-    def _codex_run(self, *, returncode=0, stderr="", stdout_events=(), verdict=None):
+    CODEX_WARNING = "WARNING: proceeding, even though we could not update PATH: Permission denied (os error 13)"
+
+    def _codex_run(self, *, returncode=0, stderr="", stdout_events=(), stdout=None, verdict=None):
         def process(args, **kwargs):
             if args[0] == "github-interface":
                 action = {"--request-changes": "requested_changes", "--reviewed-clean": "reviewed_clean",
@@ -1432,12 +1434,95 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
                     {"action": action, "review_id": 91, "head_sha": "a" * 40}), stderr="")
             Path(args[args.index("--output-last-message") + 1]).write_text(
                 json.dumps(verdict or {"assessment": ASSESSMENT, "action": "reviewed_clean", "comments": []}))
-            return SimpleNamespace(returncode=returncode, stdout="\n".join(
+            return SimpleNamespace(returncode=returncode, stdout=stdout if stdout is not None else "\n".join(
                 json.dumps(event) for event in stdout_events), stderr=stderr)
         with patch.object(structured_review.subprocess, "run", side_effect=process) as run, \
                 patch.object(ReviewWatch, "run", side_effect=run):
-            return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
-                                         "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60), run
+            try:
+                return structured_review.run("/repo", "system", "packet", CATALOG.resolve("gpt-6-astra-ultra"),
+                                             "pr_review", "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60), run
+            finally:
+                if returncode:
+                    # Even a valid verdict file cannot authorize submission.
+                    self.assertEqual(run.call_count, 1)
+
+    def test_codex_startup_warning_does_not_reject_a_successful_review(self):
+        result, run = self._codex_run(stderr=self.CODEX_WARNING, stdout_events=[{"type": "turn.completed"}])
+        self.assertIn('"review_id": 91', result)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args.args[0][1], "--reviewed-clean")
+
+    def test_codex_nonzero_exit_prefers_terminal_cause_despite_malformed_events(self):
+        message = "connection reset via https://user:private-password@proxy.example?token=private-value; " + "detail " * 100
+        for event in ({"type": "turn.failed", "error": {"message": message}},
+                      {"type": "error", "message": message},
+                      {"type": "error", "error": message},
+                      {"type": "turn.failed", "error": {"message": 17}, "message": message}):
+            with self.subTest(event=event):
+                stdout = ('not JSON\n[]\n{"type":"error","message":"earlier failure"}\n'
+                          + json.dumps(event) + '\n{"type":"turn.failed","error":')
+                with self.assertRaises(atoms.AgentPreflightError) as failure:
+                    self._codex_run(returncode=101, stdout=stdout,
+                                    stderr=self.CODEX_WARNING + "\nError: less specific stderr failure")
+                self.assertEqual(failure.exception.code, "review_provider_exit")
+                diagnostic = failure.exception.diagnostic
+                self.assertEqual(diagnostic["exit_code"], 101)
+                self.assertIsNone(diagnostic["signal"])
+                self.assertEqual(diagnostic["submission"], "none")
+                cause = atoms.bounded_cause(message)
+                self.assertEqual(diagnostic["stderr"], cause[:500])
+                self.assertEqual(str(failure.exception), f"codex review failed: {cause}")
+                for field in (str(failure.exception), diagnostic["stderr"]):
+                    self.assertIn("connection reset", field)
+                    self.assertIn("[redacted]", field)
+                    self.assertNotIn("private-password", field)
+                    self.assertNotIn("private-value", field)
+                    self.assertNotIn("WARNING", field)
+                    self.assertLessEqual(len(field), 600)
+
+    def test_codex_nonzero_exit_uses_stderr_failure_after_warning(self):
+        message = "Error: transport failed via https://user:private-password@proxy.example; " + "detail " * 100
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._codex_run(returncode=101, stderr=self.CODEX_WARNING + "\n" + message)
+        self.assertEqual(failure.exception.code, "review_provider_exit")
+        self.assertEqual(failure.exception.diagnostic["exit_code"], 101)
+        self.assertEqual(failure.exception.diagnostic["stderr"], atoms.bounded_cause(message)[:500])
+        self.assertIn("[redacted]", str(failure.exception))
+        self.assertNotIn("private-password", str(failure.exception))
+        self.assertNotIn("WARNING", str(failure.exception))
+
+    def test_codex_unprefixed_block_still_types_as_blocked(self):
+        message = "Grok Build usage balance exhausted"
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._codex_run(returncode=101, stderr=self.CODEX_WARNING + "\n" + message)
+        self.assertEqual(failure.exception.code, "review_provider_blocked")
+        self.assertIn(message, str(failure.exception))
+
+    def test_codex_warning_without_usable_cause_retains_exit_or_signal(self):
+        for returncode in (101, -9):
+            for stdout in ("", 'not JSON\n[]\n{"type":"turn.failed",',
+                           '\n'.join(json.dumps(event) for event in (
+                               {"type": "turn.failed", "error": {"message": 17}, "message": " "},
+                               {"type": "error", "error": []},
+                               {"type": "item.completed", "message": "not a terminal failure"}))):
+                with self.subTest(returncode=returncode, stdout=stdout):
+                    with self.assertRaises(atoms.AgentPreflightError) as failure:
+                        self._codex_run(returncode=returncode, stderr=self.CODEX_WARNING, stdout=stdout)
+                    self.assertEqual(failure.exception.code, "review_provider_exit")
+                    diagnostic = failure.exception.diagnostic
+                    self.assertEqual(diagnostic["exit_code"], 101 if returncode > 0 else None)
+                    self.assertEqual(diagnostic["signal"], 9 if returncode < 0 else None)
+                    self.assertEqual(diagnostic["outcome"], "signal" if returncode < 0 else "exit")
+                    self.assertEqual(diagnostic["submission"], "none")
+                    status = "signal 9" if returncode < 0 else "exit 101"
+                    self.assertEqual(diagnostic["stderr"], f"cause unavailable (codex {status})")
+                    self.assertIn(diagnostic["stderr"], str(failure.exception))
+
+    def test_codex_success_still_rejects_malformed_events(self):
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._codex_run(stderr=self.CODEX_WARNING, stdout='{"type":"turn.completed"}\n{"type":')
+        self.assertEqual(failure.exception.code, "review_contract_violation")
+        self.assertEqual(failure.exception.diagnostic["submission"], "none")
 
     def test_codex_exit_101_is_typed_bounded_and_submits_nothing(self):
         stream = [{"type": "thread.started", "thread_id": "01234567-89ab-4cde-8123-456789abcdef"}] * 5
