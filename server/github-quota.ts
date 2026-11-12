@@ -246,6 +246,9 @@ export async function readGithubQuota(options: { lastObserved?: boolean } = {}):
     return { ...account, ...snapshot, checkedAt: new Date(snapshot.checkedAt).toISOString() }
   }))
   if (JSON.stringify(configured) !== JSON.stringify(configuredAccounts())) throw new Error('GitHub accounts changed while reading quota; retry.')
+  // A read of last observations only reads: it may hold an older snapshot than
+  // the monitor's latest, so risk windows and alerts stay the monitor's.
+  if (options.lastObserved) return { accounts }
   const now = Date.now()
   const observed = observeQuotaConditions(accounts, now)
   syncQuotaAlerts(accounts, now, observed)

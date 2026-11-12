@@ -133,6 +133,29 @@ describe('identity-scoped reads', () => {
     await vi.waitFor(async () => expect((await quota.readGithubQuota({ lastObserved: true })).accounts[0].checkedAt).not.toBe(first.accounts[0].checkedAt))
   })
 
+  it('never writes an older observation back over the monitor’s, even racing it', async () => {
+    database.setMeta('me', 'a-user')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'token-a' : JSON.stringify(payload(100)) }))
+    await quota.readGithubQuota()
+    database.setMeta('agentAccount', 'b-agent')
+    vi.setSystemTime(T0 + quota.QUOTA_INTERVAL_MS + 1)
+    let releaseB!: () => void
+    const gateB = new Promise<void>((resolve) => { releaseB = resolve })
+    mocks.runFile.mockImplementation(async (_command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
+      if (args[0] === 'auth') return { stdout: args.at(-1) === 'b-agent' ? 'token-b' : 'token-a' }
+      if (options.env.GH_TOKEN === 'token-b') { await gateB; return { stdout: JSON.stringify(payload(100)) } }
+      // a-user's budget is now spent.
+      return { stdout: JSON.stringify(payload(5000)) }
+    })
+    // The monitor reads both fresh; the browser takes a-user's older snapshot and joins b-agent's read.
+    const monitor = quota.readGithubQuota()
+    const browser = quota.readGithubQuota({ lastObserved: true })
+    releaseB()
+    await monitor
+    expect((await browser).accounts.find((account) => account.login === 'a-user')!.buckets.find((bucket) => bucket.resource === 'core')!.remaining).toBe(4900)
+    expect(alerts.openAlerts().map((alert) => alert.kind)).toContain('github_quota_exhausted')
+  })
+
   it('reads an account never observed now, even for the browser', async () => {
     database.setMeta('me', 'Octocat')
     mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload()) }))
