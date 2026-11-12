@@ -49,14 +49,11 @@ its retained incident. Source time is displayed in Settings' timezone; missing
 source time is explicitly labeled as ingestion time. Today, Yesterday and This
 week use civil boundaries in that timezone. Custom intervals require UTC offsets.
 
-Settings → Navigation can drag Logging into the top bar, arrange its shortcut,
-or hide it on either surface. Hiding shortcuts preserves diagnostic deep links.
-
-Logging also contains the existing behavior-chain evidence panel: cutover and
-legacy ownership, capacity, active/held work, sequence-checked Hold/Resume and
+The behavior chain's evidence is in Observe → Tasks: cutover and legacy
+ownership, capacity, active/held work, sequence-checked Hold/Resume and
 paginated journal history. Notifications' Journal evidence action opens its
-recorded journal cursor here, including after reload. These are reads of the
-canonical chain journal, separate from the severity-filtered diagnostic table;
+recorded journal cursor there, including after reload. These are reads of the
+canonical chain journal, separate from Logging's diagnostics and their Work impact;
 they create no new Logging events or severity mapping. General keeps only chain
 preferences and guarded cutover controls.
 
