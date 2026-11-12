@@ -8,6 +8,7 @@ import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeader
 import { assertCallerRelease } from './caller-release'
 import { refuseInspectorActivation, registerProductionShutdownSignals } from './production-signals'
 import { abandonProductionCpuCapture, installProductionCpuCapture } from './production-cpu-profile'
+import { installStallObserver } from './stall-observer'
 // In-process launchers (scripts/start-production.mjs, scripts/self-update/launch.mjs)
 // import these from the bundle, so they are re-exported here.
 export { refuseInspectorActivation, registerProductionShutdownSignals }
@@ -27,6 +28,8 @@ const isProductionEntrypoint = process.argv[1]
   ? resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
   : false
 if (isProductionEntrypoint) refuseInspectorActivation()
+// Before the runtime's modules open their databases: /api/health/stalls reads it.
+if (isProductionEntrypoint) installStallObserver()
 if (isProductionEntrypoint && process.env.POISE_MODE === 'service') installProductionCpuCapture()
 
 // Security validation must run before dotenv reads the file and before modules

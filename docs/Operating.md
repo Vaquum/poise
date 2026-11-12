@@ -15,6 +15,20 @@ For an external Caddy proxy, install the optional
 [bounded diagnostic reader](../deploy/ingress/README.md) on its operator-owned
 Docker host to connect the external ingress source with expiring health.
 
+## Main-thread stalls
+
+`GET /api/health/stalls` reports, from memory and with no I/O, where the
+server's main thread has stalled since it started (`server/stall-observer.ts`):
+- garbage-collection pauses;
+- SQLite calls of 50 ms or more, with SQL literals masked and the three frames
+  that made the call, including each transaction's `BEGIN` and `COMMIT`;
+- how long a trivial file read waited for the file-I/O threads, probed every
+  2 s;
+- the event loop's delay and the process's memory.
+
+Nothing triggers, writes or exports anything; it is always on, and its cost is
+two clock reads per SQLite call.
+
 ## Bounded CPU capture
 
 The direct service-mode production server accepts at most one operator-requested

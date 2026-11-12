@@ -58,6 +58,7 @@ import { retryFailedPrReviews, setBehaviorCheckSlots } from './behaviors'
 import { setWorkerChatReader } from './worker-capacity'
 import { bindings as workBindings } from './chat/control-store'
 import { enforceApiRequest, httpStatus, readJson, setApiHeaders, type RequestAuthority } from './http'
+import { stallSnapshot } from './stall-observer'
 import { ChatRuntime } from './chat/runtime'
 import { ChatControl, CHAT_CONTROL_PATH } from './chat/control'
 import { ChatSocketServer, handleChatApi, speaksForPerson } from './chat/transport'
@@ -401,6 +402,10 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // while draining: it performs no I/O, so no dependency can slow it.
         if (url === '/api/health/live' && req.method === 'GET') {
           return json(res, 200, livenessSnapshot())
+        }
+        // Where the main thread stalls (server/stall-observer.ts): in-memory, no I/O.
+        if (url === '/api/health/stalls' && req.method === 'GET') {
+          return json(res, 200, stallSnapshot())
         }
         if (path === CHAT_CONTROL_PATH) {
           if (!chatControl) return json(res, 503, { error: 'native chat control is not started' })
