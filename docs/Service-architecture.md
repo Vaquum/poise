@@ -405,12 +405,9 @@ its own instead of refusing with dirty_unowned.
   75, it starts the release named in `~/.poise/releases/next` and makes it
   current. A release that exits on its own within a minute of starting is
   marked failed and never run again; the image's own release takes over.
-  Each application launch receives a unique `POISE_SHUTDOWN_DIAGNOSTIC_ID`.
-  Production shutdown synchronously retains deadline/rejection evidence under
-  that ID in the existing private Logging store before exit 1, even if Logging
-  has already stopped. The supervisor suppresses its duplicate exit Error only
-  after reading that same launch's retained shutdown failure; queued releases
-  and healthy successors do not establish clean shutdown. Clean exit 75 stays quiet.
+  Production shutdown synchronously retains deadline and rejection evidence in
+  the private Logging store before exit 1, even after Logging stops. The
+  supervisor records its own abnormal exit event. Clean exit 75 stays quiet.
   On Linux the same supervisor owns the private native-cleanup controller.
   Its uid-only Unix socket and random generation are passed to Poise and
   Caller as `POISE_NATIVE_CONTROL`; neither the address nor per-Call tokens
