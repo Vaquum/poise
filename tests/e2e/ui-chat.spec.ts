@@ -2706,7 +2706,8 @@ test('history: streaming keeps selection stable, while switching or reloading re
   await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/active/)
   await expect(historyPanel(page)).toBeHidden(); await input(page).press('ArrowUp')
   await expect(historyRows(page)).toHaveCount(1); await expect(historyRows(page)).toHaveText('Other session message')
-  await input(page).press('Escape'); await page.reload(); await input(page).press('ArrowUp')
+  await input(page).press('Escape'); await page.reload()
+  await expect(page.locator('.chat-session-item[data-id="s2"]')).toHaveClass(/active/); await input(page).press('ArrowUp')
   await expect(historyRows(page)).toHaveText('Other session message')
 })
 
