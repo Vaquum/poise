@@ -7,7 +7,10 @@ import { basename, delimiter, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { CALLER_COMMANDS, callerBinRoot } from '../scripts/caller.mjs'
-import { restoreError, startChild, type ChildOutcome, type ChildRequest, type ChildTermination, type ProcessWorkerReply, type ProcessWorkerRequest, type RunningChild, type SerializedError } from './process-child'
+import {
+  CALL_ABORTED, CALL_IDLE, CALL_PID, CALL_STARTING, CALL_STATE, restoreError, startChild,
+  type ChildOutcome, type ChildRequest, type ChildTermination, type ProcessWorkerReply, type ProcessWorkerRequest, type RunningChild, type SerializedError,
+} from './process-child'
 
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000
 export const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -541,9 +544,14 @@ function terminationError(termination: ChildTermination, command: string, timeou
 interface WorkerCall {
   resolve: (outcome: ChildOutcome) => void
   killSignal: NodeJS.Signals
-  pid: number | null
+  slot: Int32Array
   aborted: boolean
 }
+
+// The longest an abort waits for a spawn() already under way in the worker:
+// the wait this thread used to spend inside spawn() itself, bounded so that a
+// wedged worker cannot hold this thread.
+const STARTING_WAIT_MS = 2_000
 
 interface ProcessWorker {
   worker: Worker
@@ -561,16 +569,26 @@ function killGroup(pid: number, signal: NodeJS.Signals): void {
   try { process.kill(-pid, signal) } catch { /* the group has already gone */ }
 }
 
+// The child's pid for an abort, read at once: a call the worker has not
+// started is claimed so it never starts, and a spawn() under way is waited for.
+function startedPid(slot: Int32Array): number {
+  const was = Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_ABORTED)
+  if (was === CALL_IDLE) return 0
+  if (was === CALL_STARTING) Atomics.wait(slot, CALL_STATE, CALL_STARTING, STARTING_WAIT_MS)
+  return Atomics.load(slot, CALL_PID)
+}
+
 function runChild(request: ChildRequest): RunningChild {
   void processWorkerReady()
   const state = processWorker
   if (!state?.ready) return startChild(request)
   const id = nextWorkerCall++
-  const call: WorkerCall = { resolve: () => {}, killSignal: request.killSignal, pid: null, aborted: false }
+  const slot = new Int32Array(new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT))
+  const call: WorkerCall = { resolve: () => {}, killSignal: request.killSignal, slot, aborted: false }
   const outcome = new Promise<ChildOutcome>((resolve) => { call.resolve = resolve })
   state.calls.set(id, call)
   try {
-    state.worker.postMessage({ type: 'run', id, request } satisfies ProcessWorkerRequest)
+    state.worker.postMessage({ type: 'run', id, request, slot } satisfies ProcessWorkerRequest)
   } catch {
     // Nothing started: a request the worker cannot take starts here instead.
     state.calls.delete(id)
@@ -583,9 +601,10 @@ function runChild(request: ChildRequest): RunningChild {
     abort: () => {
       if (call.aborted) return
       call.aborted = true
-      // Stop the group now, as an in-thread abort does: a shutdown may exit
-      // before the worker reads the message.
-      if (call.pid) killGroup(call.pid, call.killSignal)
+      // Stop the group now, as an in-thread abort does: a teardown may exit
+      // before the worker reads the message below.
+      const pid = startedPid(slot)
+      if (pid) killGroup(pid, call.killSignal)
       state.worker.postMessage({ type: 'abort', id } satisfies ProcessWorkerRequest)
     },
   }
@@ -645,11 +664,6 @@ async function startProcessWorker(): Promise<boolean> {
       }
       const call = state.calls.get(message.id)
       if (!call) return
-      if (message.type === 'spawned') {
-        call.pid = message.pid
-        if (call.aborted) killGroup(message.pid, call.killSignal)
-        return
-      }
       state.calls.delete(message.id)
       call.resolve(restoreOutcome(message.outcome))
     })
@@ -663,7 +677,8 @@ async function startProcessWorker(): Promise<boolean> {
       resolve(false)
       console.error('[process] the process worker stopped; CLI calls start on the main thread:', reason)
       for (const call of state.calls.values()) {
-        if (call.pid) killGroup(call.pid, call.killSignal)
+        const pid = Atomics.load(call.slot, CALL_PID)
+        if (pid) killGroup(pid, call.killSignal)
         call.resolve({ code: null, signal: null, stdout: '', stderr: '', termination: { kind: 'interrupted' } })
       }
       state.calls.clear()

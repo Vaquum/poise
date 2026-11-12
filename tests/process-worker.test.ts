@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { execFileSync } from 'node:child_process'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 // Counts the children started on this thread. The process worker loads its own
 // node:child_process, so what it starts never reaches this count.
@@ -114,6 +115,44 @@ describe('the process worker', () => {
       expect(mainThread.spawns).toBe(1)
     } finally {
       await running.catch(() => undefined)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('stops the child of an abort at once, even when this thread exits before the worker reads the abort', async () => {
+    // A teardown can abort and exit in one turn of the main thread, as an
+    // in-thread abort always could: the abort itself must stop the child.
+    const root = await mkdtemp(join(tmpdir(), 'poise-process-worker-'))
+    const pidFile = join(root, 'child.pid')
+    try {
+      const { build } = await import('esbuild')
+      const bundle = async (entry: string, outfile: string) => {
+        await build({ entryPoints: [entry], outfile, bundle: true, platform: 'node', format: 'esm', packages: 'external', logLevel: 'silent' })
+      }
+      await bundle(fileURLToPath(new URL('../server/process-worker.ts', import.meta.url)), join(root, 'process-worker.js'))
+      await writeFile(join(root, 'scenario.ts'), [
+        "import { existsSync, readFileSync } from 'node:fs'",
+        `import { processWorkerReady, runFile } from ${JSON.stringify(fileURLToPath(new URL('../server/process.ts', import.meta.url)))}`,
+        'const pidFile = process.argv[2]',
+        'if (!await processWorkerReady()) process.exit(2)',
+        'const controller = new AbortController()',
+        "runFile(process.execPath, ['-e', \"require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1_000)\", pidFile],",
+        '  { signal: controller.signal, timeoutMs: 60_000 }).catch(() => undefined)',
+        // No turn of this thread until the child runs, so no message from the worker can arrive first.
+        'const deadline = Date.now() + 10_000',
+        "while (!(existsSync(pidFile) && readFileSync(pidFile, 'utf8'))) if (Date.now() > deadline) process.exit(3)",
+        'controller.abort()',
+        "process.kill(process.pid, 'SIGKILL')",
+      ].join('\n'))
+      await bundle(join(root, 'scenario.ts'), join(root, 'scenario.mjs'))
+
+      const scenario = spawnSync(process.execPath, [join(root, 'scenario.mjs'), pidFile], { encoding: 'utf8', timeout: 30_000 })
+      expect({ status: scenario.status, signal: scenario.signal, stderr: scenario.stderr }).toMatchObject({ signal: 'SIGKILL' })
+      const pid = await waitFor(() => readPid(pidFile))
+      await waitFor(() => processStopped(pid) ? true : null)
+    } finally {
+      const pid = await readPid(pidFile)
+      if (pid) try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
       await rm(root, { recursive: true, force: true })
     }
   })

@@ -36,6 +36,8 @@ export interface ChildOutcome<E = Error> {
 export interface RunningChild {
   outcome: Promise<ChildOutcome>
   abort: () => void
+  /** Set once spawn() has returned with a child. */
+  pid?: number
 }
 
 export interface SerializedError {
@@ -45,13 +47,22 @@ export interface SerializedError {
   props: Record<string, unknown>
 }
 
+// Each call's slot, shared by the main thread and the process worker: an abort
+// reads the child's pid at once, as an in-thread abort reads child.pid, with no
+// message that a teardown could exit before.
+export const CALL_STATE = 0
+export const CALL_PID = 1
+export const CALL_IDLE = 0
+export const CALL_STARTING = 1
+export const CALL_STARTED = 2
+export const CALL_ABORTED = 3
+
 export type ProcessWorkerRequest =
-  | { type: 'run', id: number, request: ChildRequest }
+  | { type: 'run', id: number, request: ChildRequest, slot: Int32Array }
   | { type: 'abort', id: number }
 
 export type ProcessWorkerReply =
   | { type: 'ready' }
-  | { type: 'spawned', id: number, pid: number }
   | { type: 'done', id: number, outcome: ChildOutcome<SerializedError> }
 
 // The fields Node's process errors carry; anything else may not cross a worker message.
@@ -113,8 +124,9 @@ export async function terminateProcessTree(child: ChildProcess, signal: NodeJS.S
 // spawn keeps argv separate from the shell. POSIX children lead an isolated
 // process group so timeout, abort, and output-limit termination includes their
 // complete descendant tree.
-export function startChild(request: ChildRequest, spawned?: (pid: number) => void): RunningChild {
+export function startChild(request: ChildRequest): RunningChild {
   let abort = () => {}
+  let pid: number | undefined
   const outcome = new Promise<ChildOutcome>((resolve) => {
     let child: ChildProcess
     try {
@@ -131,7 +143,7 @@ export function startChild(request: ChildRequest, spawned?: (pid: number) => voi
       resolve({ code: null, signal: null, stdout: '', stderr: '', termination: { kind: 'error', error: error as Error } })
       return
     }
-    if (child.pid) spawned?.(child.pid)
+    pid = child.pid
     const stdoutChunks: Buffer[] = []
     const stderrChunks: Buffer[] = []
     let stdoutBytes = 0
@@ -195,5 +207,5 @@ export function startChild(request: ChildRequest, spawned?: (pid: number) => voi
 
     const timeoutHandle = setTimeout(() => requestTermination({ kind: 'timeout' }), request.timeoutMs)
   })
-  return { outcome, abort: () => abort() }
+  return { outcome, abort: () => abort(), pid }
 }

@@ -1,5 +1,8 @@
 import { parentPort } from 'node:worker_threads'
-import { serializeError, startChild, type ChildOutcome, type ProcessWorkerReply, type ProcessWorkerRequest, type SerializedError } from './process-child'
+import {
+  CALL_IDLE, CALL_PID, CALL_STARTED, CALL_STARTING, CALL_STATE, serializeError, startChild,
+  type ChildOutcome, type ProcessWorkerReply, type ProcessWorkerRequest, type SerializedError,
+} from './process-child'
 
 // runFile's children, started off the main thread. On Linux, spawning forks the
 // server and waits for the child to exec; under CPU contention that wait held
@@ -22,8 +25,16 @@ port.on('message', (message: ProcessWorkerRequest) => {
     aborts.get(message.id)?.()
     return
   }
-  const { id, request } = message
-  const child = startChild(request, (pid) => reply({ type: 'spawned', id, pid }))
+  const { id, request, slot } = message
+  // An abort the main thread took before this point means the child never starts.
+  if (Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_STARTING) !== CALL_IDLE) {
+    reply({ type: 'done', id, outcome: { code: null, signal: null, stdout: '', stderr: '', termination: { kind: 'abort' } } })
+    return
+  }
+  const child = startChild(request)
+  Atomics.store(slot, CALL_PID, child.pid ?? 0)
+  Atomics.store(slot, CALL_STATE, CALL_STARTED)
+  Atomics.notify(slot, CALL_STATE)
   aborts.set(id, child.abort)
   void child.outcome.then((outcome) => {
     aborts.delete(id)
