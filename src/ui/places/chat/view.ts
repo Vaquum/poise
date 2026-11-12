@@ -760,7 +760,7 @@ function creatorHtml(s: SessionRecord): string {
 function sidebarHtml(): string {
   const visible = order.filter(isVisible)
   if (!visible.length) {
-    return '<div class="chat-empty chat-sidebar-empty">No sessions yet.</div>'
+    return `<div class="chat-empty chat-sidebar-empty">${orderRestored ? 'No sessions yet.' : 'Reading chats…'}</div>`
   }
   const records = order.map((id) => sessions.get(id)!.record)
   return visible.map((id) => {
@@ -3152,8 +3152,7 @@ export async function openManagerChat(): Promise<boolean> {
   return true
 }
 
-/** Opens the Switchboard pane, as its header toggle does. */
+/** Opens the Switchboard pane at its width, as its header toggle does but without the slide. */
 export function openSwitchboardPane(): void {
-  const toggle = viewEl?.querySelector<HTMLButtonElement>('.chat-switchboard-toggle')
-  if (toggle && toggle.getAttribute('aria-expanded') !== 'true') toggle.click()
+  switchboard?.show()
 }

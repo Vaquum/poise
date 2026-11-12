@@ -90,6 +90,8 @@ export interface SwitchboardPane {
   readonly overlaid: boolean
   mount(): void
   hide(): void
+  /** Opens at its width at once, without the slide. */
+  show(): void
   refresh(): Promise<void>
 }
 
@@ -553,6 +555,7 @@ export function createSwitchboardPane(view: HTMLElement, toggle: HTMLButtonEleme
       void refresh()
     },
     hide() { if (open) setOpen(false) },
+    show() { if (open) return; setOpen(true, false); deps.onOpen(); void refresh() },
     refresh,
   }
 }
