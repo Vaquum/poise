@@ -12,6 +12,7 @@
 
 import type { EvidenceAttachment } from '../../gateway/src/diagnostics/evidence-contract'
 import { GITHUB_AUTOMATION_SIGN_IN_TITLE } from '../accounts/types'
+import { REVIEW_BUDGET_STOPPED } from '../behavior-diagnostics'
 import { getBehaviorIncident, listBehaviorIncidents } from '../db'
 import { readInvolvedPullRequests, readOwnPullRequests, type InvolvedPullRequest, type OwnPullRequest } from '../gh'
 import { HttpError } from '../http'
@@ -97,7 +98,8 @@ export function noticesState(now = Date.now()): NoticesState {
       kind: alert.kind,
       title: alert.kind === 'sign_in_needed' && alert.dedupeKey === 'sign-in:gh:agent'
         ? GITHUB_AUTOMATION_SIGN_IN_TITLE : alert.title,
-      body: target && 'swarm' in target ? 'Open it in Poise to see what happened.' : alert.body,
+      body: incident?.error === REVIEW_BUDGET_STOPPED ? incident.error
+        : target && 'swarm' in target ? 'Open it in Poise to see what happened.' : alert.body,
       since: alert.createdAt,
       due: new Date(due).toISOString(),
       silenceable: SILENCEABLE.has(alert.kind),

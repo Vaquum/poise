@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { REVIEW_BUDGET_STOPPED } from '../server/behavior-diagnostics'
 import type { OwnPullRequest } from '../server/gh'
 
 // The notices the page shows at its top (server/alerts/notices.ts): which
@@ -215,17 +216,33 @@ describe('the notices', () => {
 
 describe('an alert target', () => {
   it('opens the current failed call for an existing behavior alert', () => {
-    store.raiseAlert(held, at(0))
+    store.raiseAlert({ ...held, body: REVIEW_BUDGET_STOPPED }, at(0))
     const insert = database.db.prepare(`
       INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, call_id, error, created_at)
       VALUES(?, ?, ?, ?, ?, ?, ?, ?)
     `)
-    insert.run('first', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-1', 'Review failed', new Date(at(0)).toISOString())
+    insert.run('first', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-1', REVIEW_BUDGET_STOPPED, new Date(at(0)).toISOString())
     // Another behavior on the same PR must never become this notice's target.
     insert.run('unrelated', 'approve-prs', 'acme/api#9', 'acme/api', 9, 'approval-call', 'Approval failed', new Date(at(1)).toISOString())
-    expect(shown(at(2))[0]).toMatchObject({ target: { swarm: 'failed-call-1' }, body: 'Open it in Poise to see what happened.' })
-    insert.run('second', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-2', 'Review failed again', new Date(at(3)).toISOString())
-    expect(shown(at(4))[0].target).toEqual({ swarm: 'failed-call-2' })
+    expect(shown(at(2))[0]).toMatchObject({ target: { swarm: 'failed-call-1' }, body: REVIEW_BUDGET_STOPPED })
+    insert.run('second', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'failed-call-2', 'review_budget_exhausted: Review timed out', new Date(at(3)).toISOString())
+    expect(shown(at(4))[0]).toMatchObject({ target: { swarm: 'failed-call-2' }, body: 'Open it in Poise to see what happened.' })
+  })
+
+  it('explains a stopped review without changing its alert or dismissal', () => {
+    const alert = store.raiseAlert(held, at(0))!
+    database.db.prepare(`
+      INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, call_id, error, created_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('stopped', 'review-new-prs', 'acme/api#9', 'acme/api', 9, 'stopped-call', REVIEW_BUDGET_STOPPED, new Date(at(1)).toISOString())
+    expect(shown(at(2))).toEqual([{
+      id: alert.id, kind: held.kind, title: held.title, body: REVIEW_BUDGET_STOPPED,
+      since: alert.createdAt, due: alert.createdAt, silenceable: false,
+      target: { swarm: 'stopped-call' }, subject: { behavior: 'review-new-prs', target: 'acme/api#9' },
+    }])
+    notices.dismissNotice(alert.id, at(3))
+    expect(shown(at(200))).toEqual([])
+    expect(store.latestAlertSeq()).toBe(alert.seq)
   })
 
   it('keeps a pre-launch failure on its diagnostic when no Swarm call exists', () => {
