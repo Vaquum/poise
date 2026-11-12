@@ -25,7 +25,8 @@
 .obv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); padding: var(--sp-3) var(--sp-5); }
 .obv-bar .seg[hidden] { display: none; }
 .obv-count { font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--c-text-muted); }
-.obv-note { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1) var(--sp-2); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-muted); min-width: 0; }
+.obv-note { display: inline-flex; flex-wrap: nowrap; align-items: center; gap: var(--sp-1) var(--sp-2); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-muted); min-width: 0; white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
+.obv-note::-webkit-scrollbar { display: none; }
 .obv-note .is-warn { color: var(--c-attention-on); }
 .obv-gap { flex: 1; }
 .obv-warn { display: flex; overflow-wrap: anywhere; align-items: center; gap: var(--sp-2); margin: 0 var(--sp-5) var(--sp-2); padding: var(--sp-2) var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-attention-edge); background: var(--c-attention-wash); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-soft); }

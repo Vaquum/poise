@@ -90,6 +90,14 @@ export function settingsLoaded(): boolean {
   return loaded
 }
 
+/** Settings for a place that is opening: the page's first read is awaited;
+ *  after it, the last answer stands while a fresh one is read behind it. */
+export function placeSettings(): Promise<AppSettings> {
+  if (!loaded) return loadSettings()
+  void loadSettings()
+  return Promise.resolve(current)
+}
+
 export function settingsReady(): boolean {
   return !!(getOrganizations().some((org) => org.status === 'ready') && current.me)
 }

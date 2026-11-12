@@ -10,7 +10,7 @@ import { routeBack } from '../shell'
 import { takeOpenChat } from '../open-chat'
 import type { MountPlace } from '../router'
 import { foldListWhenNarrow, initChatView, openChatForSubject, openChatSession, stopChatRefresh } from './chat/view'
-import { loadSettings } from '../../config'
+import { placeSettings } from '../../config'
 import { installIconTooltips } from '../../icon-tooltips'
 
 let viewEl: HTMLElement | null = null
@@ -46,7 +46,7 @@ export async function mountChatView(root: HTMLElement, signal: AbortSignal, plac
   view.hidden = false
   view.dataset.place = place
   // Times are on Poise's clock, in Settings' time zone, as classic reads them.
-  await loadSettings().catch(() => undefined)
+  await placeSettings().catch(() => undefined)
   const started = initChatView()
   // The shell is drawn by now: the route back sits first in the chat's own
   // header, never over its controls, and a narrow window starts with the list folded.

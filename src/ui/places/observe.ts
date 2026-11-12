@@ -6,7 +6,7 @@
 // unless the address names one.
 import './observe.css'
 import './observe/registry'
-import { loadSettings, startRefreshTicker } from '../../config'
+import { placeSettings, startRefreshTicker } from '../../config'
 import { registerReloadGuard } from '../../self-update-watch'
 import { $, $$, esc, store } from '../dom'
 import { hydrateIcons } from '../icons'
@@ -53,7 +53,7 @@ export const mount: MountPlace = async (ctx: PlaceContext) => {
   routeBack($('[data-back]', root), address)
   startRefreshTicker()
   // Organizations and the time zone come with the settings, and every part reads by them.
-  await loadSettings()
+  await placeSettings()
   if (signal.aborted) return
 
   // ---------- The Scope: Board's choice, or wider for this visit when a link needs it ----------

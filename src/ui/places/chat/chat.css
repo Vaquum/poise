@@ -17,3 +17,6 @@
 /* Floating over a narrow chat, the right-hand panes start under the chat's header, so its controls stay in reach. */
 #view-chat .chat-layout { --chat-head-h: 0; }
 @media (max-width: 1000px) { #view-chat .chat-switchboard-pane, #view-chat .chat-memories-pane { top: var(--chat-head-h); } }
+
+/* A turn off screen is not laid out: a long transcript arrives and returns without one long task. */
+#view-chat .chat-turn { content-visibility: auto; contain-intrinsic-size: auto calc(var(--sp-unit) * 40); }

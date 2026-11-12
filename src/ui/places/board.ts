@@ -13,7 +13,7 @@ import { paintTerms } from '../reference'
 import { closeMenus, lifeTo, motion, routeBack, toast, type Stage } from '../shell'
 import { placeHref } from '../address'
 import type { MountPlace } from '../router'
-import { getOrganizations, loadSettings, startRefreshTicker } from '../../config'
+import { getOrganizations, placeSettings, startRefreshTicker } from '../../config'
 import { CURRENT_FILTER_KEY, timeRangeWindow, type TimeRange } from '../../time-range'
 import { ORGANIZATION_STORAGE_KEY, setSelectedOrganization } from '../../organizations'
 import { noticeFeed } from '../../notices'
@@ -1084,7 +1084,7 @@ export const mount: MountPlace = (ctx) => {
   render(false)
   startRefreshTicker()
   void (async () => {
-    await loadSettings().catch(() => undefined)
+    await placeSettings().catch(() => undefined)
     if (signal.aborted) return
     const scope = getOrganizations().some((o) => o.login === F.org && o.status === 'ready') ? F.org : ''
     if (scope !== F.org) choose({ org: scope })
