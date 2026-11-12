@@ -674,7 +674,7 @@ class TestProcessesAndErrors(TestCase):
                 other.terminate()
                 other.wait(timeout=10)
 
-    def test_stale_cleanup_removes_only_inactive_owned_run_directories(self):
+    def test_stale_cleanup_retains_unregistered_run_directories_and_reports_why(self):
         with tempfile.TemporaryDirectory() as work, patch.object(issue_review, "WORK_ROOT", Path(work)):
             stale = Path(work) / ("a" * 32)
             fresh = Path(work) / ("b" * 32)
@@ -685,12 +685,13 @@ class TestProcessesAndErrors(TestCase):
                 (directory / "artifact").write_text("keep unless owned and abandoned")
             link = Path(work) / ("c" * 32)
             link.symlink_to(outside, target_is_directory=True)
-            old = time.time() - issue_review.STALE_RUN_SECONDS - 60
+            old = time.time() - 8 * 24 * 3600
             for directory in [stale, unknown, outside]:
                 os.utime(directory, (old, old))
-            with patch.object(issue_review, "_cwd_pids", return_value=[]):
+            with self.assertLogs(issue_review.logger, level="WARNING") as captured:
                 issue_review.sweep()
-            self.assertFalse(stale.exists())
+                self.assertEqual((stale / "artifact").read_text(), "keep unless owned and abandoned")
+            self.assertIn("ownership and process termination are unverified", "\n".join(captured.output))
             self.assertTrue(fresh.exists())
             self.assertTrue(unknown.exists())
             self.assertTrue(link.is_symlink())
@@ -700,7 +701,7 @@ class TestProcessesAndErrors(TestCase):
         with tempfile.TemporaryDirectory() as work, patch.object(issue_review, "WORK_ROOT", Path(work)):
             active = Path(work) / ("d" * 32)
             active.mkdir()
-            old = time.time() - issue_review.STALE_RUN_SECONDS - 60
+            old = time.time() - 8 * 24 * 3600
             os.utime(active, (old, old))
             process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=active)
             try:
@@ -737,7 +738,7 @@ class TestProcessesAndErrors(TestCase):
         with tempfile.TemporaryDirectory() as work:
             self.assertIs(issue_review.cleanup(Path(work) / "absent"), True)
 
-    def test_sweep_covers_the_atomic_work_sibling_root(self):
+    def test_sweep_retains_the_legacy_atomic_work_sibling_root(self):
         with tempfile.TemporaryDirectory() as base:
             reviews, atomic = Path(base) / "issue-review", Path(base) / "atomic-work"
             reviews.mkdir()
@@ -746,32 +747,64 @@ class TestProcessesAndErrors(TestCase):
             for directory in (stale_review, stale_atomic, fresh_atomic):
                 directory.mkdir()
                 (directory / "artifact").write_text("keep unless owned and abandoned")
-            old = time.time() - issue_review.STALE_RUN_SECONDS - 60
+            old = time.time() - 8 * 24 * 3600
             os.utime(stale_review, (old, old))
             os.utime(stale_atomic, (old, old))
             with patch.object(issue_review, "WORK_ROOT", reviews):
                 self.assertEqual(issue_review.sweep_roots(), [reviews, atomic])
-                with patch.object(issue_review, "_cwd_pids", return_value=[]):
+                with self.assertLogs(issue_review.logger, level="WARNING") as captured:
                     issue_review.sweep()
-            self.assertFalse(stale_review.exists())
-            self.assertFalse(stale_atomic.exists())
+                    self.assertTrue(stale_review.exists())
+                    self.assertTrue(stale_atomic.exists())
+            self.assertIn(str(reviews), "\n".join(captured.output))
+            self.assertIn(str(atomic), "\n".join(captured.output))
             self.assertTrue(fresh_atomic.exists())
 
-    def test_a_sweep_that_cannot_remove_retries_on_the_next_sweep(self):
+    def test_repeated_sweeps_cannot_authorize_legacy_deletion(self):
         with tempfile.TemporaryDirectory() as work, patch.object(issue_review, "WORK_ROOT", Path(work)):
             stale = Path(work) / ("e" * 32)
             stale.mkdir()
             (stale / "artifact").write_text("x")
-            old = time.time() - issue_review.STALE_RUN_SECONDS - 60
+            old = time.time() - 8 * 24 * 3600
             os.utime(stale, (old, old))
-            with patch.object(issue_review, "_cwd_pids", return_value=[]), \
-                    patch.object(issue_review.shutil, "rmtree", side_effect=OSError("busy")), \
-                    self.assertLogs(issue_review.logger, level="WARNING"):
+            with self.assertLogs(issue_review.logger, level="WARNING"):
                 issue_review.sweep()
-            self.assertTrue(stale.exists())
-            with patch.object(issue_review, "_cwd_pids", return_value=[]):
+                self.assertEqual((stale / "artifact").read_text(), "x")
                 issue_review.sweep()
-            self.assertFalse(stale.exists())
+                self.assertEqual((stale / "artifact").read_text(), "x")
+
+    def test_sweep_retains_foreign_files_after_ancestor_replacement(self):
+        with tempfile.TemporaryDirectory() as base:
+            parent = Path(base) / "legacy"
+            reviews = parent / "issue-review"
+            name = "a" * 32
+            original = reviews / name
+            foreign = Path(base) / "foreign"
+            replacement = foreign / "issue-review" / name
+            original.mkdir(parents=True)
+            (original / "publication.json").write_text("original receipt")
+            replacement.mkdir(parents=True)
+            sentinel = replacement / "auth.json"
+            sentinel.write_text("foreign authentication")
+            sentinel.chmod(0o600)
+            old = time.time() - 8 * 24 * 3600
+            for directory in (original, replacement):
+                os.utime(directory, (old, old))
+            identity = sentinel.stat()
+            retained = Path(base) / "retained-legacy"
+            parent.rename(retained)
+            parent.symlink_to(foreign, target_is_directory=True)
+
+            with patch.object(issue_review, "WORK_ROOT", reviews), \
+                    self.assertLogs(issue_review.logger, level="WARNING") as captured:
+                issue_review.sweep()
+                self.assertEqual(sentinel.read_text(), "foreign authentication")
+
+            self.assertEqual(sentinel.stat().st_ino, identity.st_ino)
+            self.assertEqual(sentinel.stat().st_mode, identity.st_mode)
+            self.assertEqual((retained / "issue-review" / name / "publication.json").read_text(), "original receipt")
+            self.assertTrue(parent.is_symlink())
+            self.assertIn("ownership and process termination are unverified", "\n".join(captured.output))
 
     def test_read_only_artifacts_are_removed_without_changing_symlink_targets(self):
         with tempfile.TemporaryDirectory() as work:

@@ -35,8 +35,8 @@ class Repository:
     def __init__(self, root: Path, info: dict):
         self.root, self.info = root, info
 
-    def inspect(self, requests: list[dict]) -> dict:
-        limit = review_budget.timeout(30, reserve=review_budget.FINAL_CHECK_SECONDS)
+    def inspect(self, requests: list[dict], *, timeout_s: float = 30) -> dict:
+        limit = review_budget.timeout(timeout_s, reserve=review_budget.FINAL_CHECK_SECONDS)
         try:
             done = subprocess.run(
                 [os.getenv("GITHUB_INTERFACE_CLI", "github-interface"), "--review-context",

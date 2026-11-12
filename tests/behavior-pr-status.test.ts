@@ -250,6 +250,130 @@ describe('readPrStatus', () => {
     })
   }
 
+  function seedReview(db: typeof import('../server/db'), options: {
+    behavior?: 'review-new-prs' | 'approve-prs', target?: string, head?: string,
+    callId?: string, failureAt?: string,
+  } = {}) {
+    const { behavior = 'approve-prs', head = NEXT, callId = 'c'.repeat(32), failureAt } = options
+    const target = options.target ?? `${pr.repo}#${pr.number}@head=${head}`
+    const claimId = db.claimSeenOwned(behavior, target)
+    if (!claimId) throw new Error('could not arrange review claim')
+    if (!db.markBehaviorLaunchIntentOwned({
+      key: behavior, target, claimId, launchBehavior: behavior === 'approve-prs' ? 'pr_approve' : 'pr_review',
+      repo: pr.repo, pr: pr.number, requestedAt: failureAt ?? '2026-11-12T15:14:41Z',
+      expectedHead: head, actor: 'review-bot', source: `poise:${behavior}`, correlationId: claimId,
+    }) || !db.linkBehaviorLaunchCallOwned(behavior, target, claimId, callId)) {
+      throw new Error('could not arrange review launch')
+    }
+    if (failureAt) {
+      const launch = db.listBehaviorLaunchClaims(behavior).find((row) => row.claimId === claimId)
+      if (!launch) throw new Error('could not find review launch')
+      const error = 'review failed: HTTP 503 Service Unavailable'
+      const id = db.recordBehaviorDeadLetter(launch, error)
+      db.db.prepare('UPDATE behavior_dead_letters SET created_at = ? WHERE id = ?').run(failureAt, id)
+      db.setBehaviorLaunchErrorOwned(behavior, target, claimId, error)
+      db.completeSeenOwned(behavior, target, claimId)
+    }
+    return { behavior, target, claimId }
+  }
+
+  it('shows the current review alongside both retained past-revision failures', async () => {
+    const { db, runtime, status } = await setup()
+    seedReview(db, { behavior: 'review-new-prs', target: `${pr.repo}#${pr.number}`,
+      head: HEAD, callId: 'a'.repeat(32), failureAt: '2026-11-12T14:40:00Z' })
+    const old = seedReview(db, { target: `${pr.repo}#${pr.number}@req=2026-11-12T14:40:00Z/r=1/head=${HEAD}:secondary`,
+      head: HEAD, callId: 'b'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+    // The full-SHA target remains evidence even after its launch row is gone.
+    db.releaseSeen(old.behavior, old.target)
+    seedReview(db)
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker).toMatchObject({
+      id: 'review_running', line: `review running: approve-prs on ${NEXT.slice(0, 8)}`,
+      details: [
+        `past review: approve-prs upstream_unavailable on ${HEAD} since 2026-11-12T15:03:00Z`,
+        `past review: review-new-prs upstream_unavailable on ${HEAD} since 2026-11-12T14:40:00Z`,
+      ],
+    })
+    expect(reply.rows[0].ledger).toBe(`/api/behavior-ledger?repository=${pr.repo}&number=${pr.number}`)
+  })
+
+  it('keeps a current-head hold ahead of the live review in a mixed revision history', async () => {
+    const { db, runtime, status } = await setup()
+    seedReview(db, { head: HEAD, callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+    seedReview(db, { target: `${pr.repo}#${pr.number}@req=2026-11-12T14:40:00Z/r=1/head=${NEXT}`,
+      head: NEXT, callId: 'b'.repeat(32), failureAt: '2026-11-12T14:40:00Z' })
+    seedReview(db)
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker).toMatchObject({
+      id: 'held', line: 'held: approve-prs upstream_unavailable since 14:40Z',
+      details: [`past review: approve-prs upstream_unavailable on ${HEAD} since 2026-11-12T15:03:00Z`],
+    })
+  })
+
+  it.each(['missing', 'short target head', 'conflicting', 'reused target'] as const)(
+    'keeps a hold with %s revision identity', async (identity) => {
+      const { db, runtime, status } = await setup()
+      const target = `${pr.repo}#${pr.number}${identity === 'conflicting' ? `@head=${HEAD}`
+        : identity === 'short target head' ? `@head=${HEAD.slice(0, 8)}` : ''}`
+      const old = seedReview(db, { target, head: identity === 'conflicting' ? NEXT : HEAD,
+        callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+      if (identity !== 'conflicting') db.releaseSeen(old.behavior, old.target)
+      seedReview(db, identity === 'reused target' ? { target } : {})
+      seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+      const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+    },
+  )
+
+  it.each(['missing', 'stale', 'failed', 'paused', 'disabled', 'headless'] as const)(
+    'keeps old holds when the merge cache is %s despite a live current-head claim', async (evidence) => {
+      const { db, runtime, status } = await setup()
+      seedReview(db, { head: HEAD, callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+      seedReview(db)
+      if (evidence !== 'missing') seedCache(runtime, evidence === 'stale' ? '2026-11-12T14:00:00Z' : '2026-11-12T15:31:00Z',
+        { head: evidence === 'headless' ? null : NEXT, error: evidence === 'failed' ? 'GitHub unavailable' : null })
+      if (evidence === 'paused') db.setMeta('behavior_merge_prs_paused_until', new Date(Date.now() + 3_600_000).toISOString())
+      if (evidence === 'disabled') db.setMeta('behavior_merge_prs_enabled', '0')
+
+      const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+      expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+    },
+  )
+
+  it.each([null, HEAD])('keeps old holds without a live claim matching the current head (%s)', async (head) => {
+    const { db, runtime, status } = await setup()
+    seedReview(db, { head: HEAD, callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+    if (head) seedReview(db, { target: `${pr.repo}#${pr.number}@other`, head })
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+  })
+
+  it.each(['invalid_result', 'unreadable'] as const)('preserves PR-wide %s quarantine across head changes', async (quarantine) => {
+    const { db, runtime, status } = await setup()
+    seedReview(db, { head: HEAD, callId: 'a'.repeat(32), failureAt: '2026-11-12T15:03:00Z' })
+    const held = seedReview(db, { behavior: 'review-new-prs', head: HEAD, callId: 'b'.repeat(32) })
+    expect(db.quarantineBehaviorLaunchOwned(held.behavior, held.target, held.claimId, quarantine, 'invalid review result', false)).toBe(true)
+    db.completeSeenOwned(held.behavior, held.target, held.claimId)
+    seedReview(db)
+    seedCache(runtime, '2026-11-12T15:31:00Z', { head: NEXT })
+
+    const reply = await status.readPrStatus(50, Date.parse('2026-11-12T15:31:00Z'))
+
+    expect(reply.rows[0].blocker).toMatchObject({ id: 'held', details: [] })
+  })
+
   it('projects one approved green row with rounds from the cap counter', async () => {
     const { db, runtime, status } = await setup()
     runtime.setReviewCap(5)
@@ -396,6 +520,28 @@ describe('readPrStatus', () => {
     expect(reply.rows).toEqual([])
     expect(reply.datastore.orgs).toHaveLength(1)
     expect(reply.datastore.orgs[0]).toMatchObject({ status: 'unavailable', error: 'datastore offline' })
+  })
+
+  it('reads every organization at once, not one after another', async () => {
+    const { db, status } = await setup()
+    for (const login of ['acme', 'beta']) db.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES (?, ?, 1, 'ready', 'ready', 'poise-user')`).run(login, `/datastores/${login}.sqlite`)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let reads = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command !== 'github-datastore' || !args.includes('view')) throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
+      reads++
+      await gate
+      return { stdout: '[]', stderr: '' }
+    })
+    const reply = status.readPrStatus(50, Date.now())
+    try {
+      await vi.waitFor(() => expect(reads).toBe(3), { timeout: 1_000 })
+    } finally {
+      release()
+    }
+    expect((await reply).datastore.orgs.map((org) => [org.org, org.status])).toEqual([['Vaquum', 'ready'], ['acme', 'ready'], ['beta', 'ready']])
   })
 
   it('bounds rows with flagged oldest first', async () => {

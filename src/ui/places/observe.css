@@ -14,7 +14,8 @@
 .obv-tabs [role="tab"][aria-selected="true"]::after { content: ""; position: absolute; left: var(--sp-3); right: var(--sp-3); bottom: calc(var(--line-hair) * -1); height: var(--line-focus); border-radius: var(--r-pill); background: var(--c-text-soft); }
 .obv-tabs .n { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--fs-micro); font-weight: var(--fw-regular); color: var(--c-text-muted); }
 .obv-tabs .n:empty { display: none; }
-.obv-gloss { flex: 1; min-width: 0; }
+/* One line: a tab's number arriving never wraps it and moves the page. */
+.obv-gloss { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .obv-scope { display: inline-flex; align-items: center; gap: var(--sp-2); }
 .obv-scope[hidden] { display: none; }
 .obv-scope .t-micro { font-size: var(--fs-tiny); }
@@ -25,7 +26,8 @@
 .obv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); padding: var(--sp-3) var(--sp-5); }
 .obv-bar .seg[hidden] { display: none; }
 .obv-count { font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--c-text-muted); }
-.obv-note { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1) var(--sp-2); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-muted); min-width: 0; }
+.obv-note { display: inline-flex; flex-wrap: nowrap; align-items: center; gap: var(--sp-1) var(--sp-2); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-muted); min-width: 0; white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
+.obv-note::-webkit-scrollbar { display: none; }
 .obv-note .is-warn { color: var(--c-attention-on); }
 .obv-gap { flex: 1; }
 .obv-warn { display: flex; overflow-wrap: anywhere; align-items: center; gap: var(--sp-2); margin: 0 var(--sp-5) var(--sp-2); padding: var(--sp-2) var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-attention-edge); background: var(--c-attention-wash); font-size: var(--fs-micro); line-height: var(--lh-ui); color: var(--c-text-soft); }

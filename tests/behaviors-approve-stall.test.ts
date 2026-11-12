@@ -270,7 +270,7 @@ describe('approve-prs under load', () => {
     expect(resumed.sort()).toEqual(['#27', '#28'])
   })
 
-  it('records a launch failure instead of dropping it when the sweep deadline already expired', async () => {
+  it.each(['changed', 'unavailable', 'malformed'] as const)('records a %s head read after the sweep deadline', async (headRead) => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
     const { database: db, behaviors: runtime } = await startApproving([pr, secondPr])
@@ -279,11 +279,13 @@ describe('approve-prs under load', () => {
     mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
       if (command === 'github-interface' && args[0] === '--head-sha' && String(args[1]) === '#18') {
         fire.resolve()
-        // The head lookup answers after the sweep deadline with a new head: a
-        // genuine launch failure, not an abort.
+        // The launch lookup settles after the sweep deadline; its outcome
+        // must still be recorded under the lifecycle signal.
         await new Promise<void>((resolve) => setTimeout(resolve, 57_000))
+        if (headRead === 'unavailable') throw new Error('head lookup unavailable')
         return {
-          stdout: JSON.stringify({ action: 'head_sha', repository: secondPr.repo, pull_number: 18, head_sha: NEXT_HEAD_SHA }),
+          stdout: JSON.stringify({ action: 'head_sha', repository: secondPr.repo, pull_number: 18,
+            head_sha: headRead === 'changed' ? NEXT_HEAD_SHA : 'not-a-sha' }),
           stderr: '',
         }
       }
@@ -298,10 +300,21 @@ describe('approve-prs under load', () => {
     // #17's pipeline never stalls behind #18's slow launch.
     expect(mocks.spawnDetached).toHaveBeenCalledOnce()
     expect(mocks.spawnDetached.mock.calls[0]?.[1]).toContain('#17')
-    const stored = JSON.parse(db.getMeta(`behavior_approve_prs_failure:${secondPr.repo}#18:check`)!)
-    expect(stored.error).toMatch(/head changed/)
-    expect(stored.consecutiveFailures).toBe(1)
-    expect(stored.nextRetryAtMs - stored.lastFailureAtMs).toBe(60_000)
+    const failure = db.getMeta(`behavior_approve_prs_failure:${secondPr.repo}#18:check`)
+    if (headRead === 'changed') {
+      expect(failure).toBeNull()
+      const admission = mocks.captureAdmission.mock.calls.find(([input]) => input.number === 18)![0]
+      expect(mocks.captureOutcome).toHaveBeenCalledWith({
+        nativeId: admission.nativeId, state: 'superseded', activity: 'settled', stateSource: 'native',
+        outcome: 'superseded', completedAt: expect.any(String),
+      })
+    } else {
+      const stored = JSON.parse(failure!)
+      expect(stored.error).toContain(headRead === 'unavailable' ? 'head lookup unavailable' : '--head-sha returned malformed state')
+      expect(stored.consecutiveFailures).toBe(1)
+      expect(stored.nextRetryAtMs - stored.lastFailureAtMs).toBe(60_000)
+      expect(mocks.captureOutcome).not.toHaveBeenCalledWith(expect.objectContaining({ outcome: 'superseded' }))
+    }
   })
 
   it('retries a quota-exhausted check at the reset instead of the hour-long backoff', async () => {

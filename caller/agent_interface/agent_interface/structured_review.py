@@ -387,16 +387,27 @@ def _time_limit_message(provider: str) -> str:
 
 
 def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: ReviewWatch,
-                 timeout_s: int, deadline: float, repository, behavior: str, verify_fixes: bool = False) -> tuple[str, dict]:
+                 timeout_s: int, deadline: float, repository, behavior: str, verify_fixes: bool = False,
+                 groups_remaining: int | None = None, initializing: bool = False) -> tuple[str, dict]:
     schema = verdict_schema(behavior, inspection=repository is not None, verify_fixes=verify_fixes)
     (root / "verdict.schema.json").write_text(json.dumps(schema))
     context = ""
     round_number = 0
     correction_attempted = False
+    group_deadline = None
+    verdict_reserve = 0
     while round_number <= MAX_INSPECTION_ROUNDS:
         timeout = review_budget.timeout(timeout_s, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS)
         if repository is not None or model.provider in PROVIDER_ANALYSIS_SECONDS or correction_attempted:
             timeout = min(deadline - monotonic(), timeout)
+        if groups_remaining is not None and not initializing and group_deadline is None:
+            allowance = timeout / groups_remaining
+            group_deadline = monotonic() + allowance
+            # Stop offering further inspection once half the group's allowance
+            # is spent, leaving time for its terminal assessment.
+            verdict_reserve = allowance / 2
+        if group_deadline is not None:
+            timeout = min(group_deadline - monotonic(), timeout)
         if timeout <= 0:
             raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted")
         if len((system + text + context).encode()) > MAX_GOVERNED_PROMPT_BYTES:
@@ -409,22 +420,25 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                                     outcome="resource_failure", provider=model.provider))
         # Last round decides on evidence already held: offer only the
         # terminal verdict, never another inspection step.
-        if repository is not None and round_number == MAX_INSPECTION_ROUNDS:
+        terminal_only = round_number == MAX_INSPECTION_ROUNDS or (
+            group_deadline is not None and round_number > 0 and timeout <= verdict_reserve)
+        if repository is not None and terminal_only:
             schema = verdict_schema(behavior, verify_fixes=verify_fixes)
             (root / "verdict.schema.json").write_text(json.dumps(schema))
-        remaining = (f"\n\nInspection rounds remaining: {MAX_INSPECTION_ROUNDS - round_number}. "
+        remaining = (f"\n\nInspection rounds remaining: {0 if terminal_only else MAX_INSPECTION_ROUNDS - round_number}. "
                      f"Analysis time remaining: {int(timeout)} seconds. "
                      "Batch independent inspection requests in one step. "
                      "Return a terminal verdict as soon as the supplied evidence is sufficient. "
                      "Do not repeat completed reads or searches."
                      if repository is not None else "")
         raw = ask(root, model, system, text + context + remaining, schema, watch, timeout)
+        initializing = False
         progress.stage("validating", "Validating review result")
         try:
             if repository is None:
                 return raw, validate_verdict(raw, behavior)
             step = _loads_no_duplicates(raw)
-            if round_number == MAX_INSPECTION_ROUNDS and isinstance(step, dict) \
+            if terminal_only and isinstance(step, dict) \
                     and set(step) == {"action", "comments", "assessment"}:
                 # The final round offers the terminal-only verdict schema,
                 # which has no requests property at all.
@@ -438,7 +452,7 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                 if requests:
                     raise InvalidVerdict("terminal verdict must not request repository inspection")
                 return raw, validate_verdict(json.dumps({key: step[key] for key in ("action", "comments", "assessment")}), behavior)
-            if round_number == MAX_INSPECTION_ROUNDS:
+            if terminal_only:
                 raise review_budget.ReviewLimitError(
                     "Repository inspection limit reached; needs attention",
                     "review_budget_exhausted",
@@ -465,7 +479,13 @@ def _review_once(root: Path, ask, model: Model, system: str, text: str, watch: R
                         "preserving your substantive assessment and findings.")
             continue
         progress.stage("inspecting", "Inspecting pinned repository")
-        result = repository.inspect(requests)
+        inspection_timeout = min(deadline - monotonic(), review_budget.timeout(
+            30, reserve=SUBMISSION_RESERVE_SECONDS + VERIFICATION_RESERVE_SECONDS))
+        if group_deadline is not None:
+            inspection_timeout = min(group_deadline - monotonic(), inspection_timeout)
+        if inspection_timeout <= 0:
+            raise review_budget.ReviewLimitError(_time_limit_message(model.provider), "review_budget_exhausted")
+        result = repository.inspect(requests, timeout_s=inspection_timeout)
         context += "\n\nPrevious review step and repository inspection (review input):\n" + json.dumps({"step": step, "result": result})
         round_number += 1
     raise AssertionError("review rounds did not return a verdict")
@@ -509,8 +529,12 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                         stage_text += ("\n\nCumulative assessment from the earlier file groups:\n" + json.dumps(assessment)
                                        + "\nUpdate this assessment with the current group's evidence. Your terminal assessment "
                                        "must cover every group reviewed so far and remain within the schema bounds.")
+                # Charge common-context initialization once before sharing the
+                # remaining analysis time across file groups.
                 raw, verdict = _review_once(root, ask, model, system, stage_text, watch,
-                                             timeout_s, deadline, repository, behavior, bool(candidates))
+                                             timeout_s, deadline, repository, behavior, bool(candidates),
+                                             groups_remaining=total - index if staged and repository is not None else None,
+                                             initializing=staged and index == 0)
                 prior.extend(verdict["comments"])
                 assessment = verdict["assessment"]
                 verified.update(review_receipt.verified_fix_ids(assessment))
@@ -545,10 +569,10 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                   diagnostic) from error
 
     capped_note = ""
-    if capped and behavior == "pr_approve" and verdict["action"] == "request_changes":
-        # The model reviewed as usual; the harness converts the change request
-        # deterministically: file the findings as one follow-up issue first,
-        # then approve. A clean verdict approves as usual, with no issue.
+    if capped and behavior == "pr_approve" and verdict["action"] == "request_changes" \
+            and all(re.match(r"\s*\[p[12]\]", comment["body"], re.IGNORECASE) for comment in verdict["comments"]):
+        # Only explicitly nonbreaking findings may be deferred. Otherwise keep
+        # the entire change request, even if a marked follow-up already exists.
         if review_round is None or review_cap is None:
             raise review_budget.ReviewLimitError(
                 "a capped approval round needs its round and cap numbers", "review_contract_violation")

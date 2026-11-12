@@ -405,6 +405,12 @@ its own instead of refusing with dirty_unowned.
   75, it starts the release named in `~/.poise/releases/next` and makes it
   current. A release that exits on its own within a minute of starting is
   marked failed and never run again; the image's own release takes over.
+  Each application launch receives a unique `POISE_SHUTDOWN_DIAGNOSTIC_ID`.
+  Production shutdown synchronously retains deadline/rejection evidence under
+  that ID in the existing private Logging store before exit 1, even if Logging
+  has already stopped. The supervisor suppresses its duplicate exit Error only
+  after reading that same launch's retained shutdown failure; queued releases
+  and healthy successors do not establish clean shutdown. Clean exit 75 stays quiet.
   On Linux the same supervisor owns the private native-cleanup controller.
   Its uid-only Unix socket and random generation are passed to Poise and
   Caller as `POISE_NATIVE_CONTROL`; neither the address nor per-Call tokens
@@ -470,6 +476,10 @@ its own instead of refusing with dirty_unowned.
   cancellation never bypasses the quiet gate for server work, background
   work or admitted launches. The gateway asks again on later passes until health reports the
   release, which the request makes idempotent.
+- **Shutdown.** Active HTTP responses finish before their keep-alive sockets
+  retire. Clean shutdown waits for runtime cleanup and HTTP closure, closes
+  SQLite, then exits 75. The existing ten-second deadline still exits 1;
+  errors name pending shutdown phases and retain known cleanup failure causes.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
   unreachable past the switch grace gets a new container, drained first.
@@ -556,6 +566,10 @@ computer.
   this root), removed with the run ([Issue review](Issue-review.md)).
 - Caller itself runs from the image: its CLIs from `CALLER_BIN_ROOT`,
   `agent-interface` in `AGENT_INTERFACE_ROOT`.
+
+Legacy review parents are retained under the
+[storage retention policy](Operating.md#storage-maintenance); only original
+native resource receipts can authorize maintenance reclamation of owned Calls.
 
 Poise delegates GitHub-mirror cache eviction to Caller's local, account-free
 `github-interface --prune-mirrors` behavior. Caller retains each
@@ -1128,7 +1142,9 @@ The supporting reads behind those names:
 - `GET /api/chat/requests`: every open chat request with a revision, kept
   current by the `chatRequests.updated` frame.
 - `GET /api/notices/handled?since=<ISO>`: the append-only handling log, kept
-  30 days from each entry's time.
+  30 days from each entry's time. It answers from the stored log at once and
+  starts the notices check without waiting for it, so what that check
+  resolves is in the next read.
 - `GET /api/editor/reviews`: every publication with its `checkedAt`, `stale`,
   `problems` and `retryAt`, including ones with no open thread; a cold or
   failed one stays listed, never looking as if it had no feedback. The

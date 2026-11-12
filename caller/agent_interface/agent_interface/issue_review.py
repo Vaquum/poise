@@ -42,7 +42,6 @@ TIMEOUT_SECONDS = 3600
 POST_RESERVE_SECONDS = 120
 MAX_PACKET_BYTES = 1_500_000
 MAX_COMMENT_CHARS = 60_000
-STALE_RUN_SECONDS = 2 * TIMEOUT_SECONDS
 LEFTOVER_GRACE_SECONDS = 3
 WORK_ROOT = Path(os.getenv("AGENT_INTERFACE_WORK_DIR") or Path.home() / ".cache" / "agent-interface" / "issue-review")
 REF_RE = re.compile(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#(\d+)")
@@ -812,26 +811,19 @@ def cleanup(path: Path) -> bool:
 
 
 def sweep_roots() -> list[Path]:
-    """Disposable run roots a killed run could not clean up: issue reviews
-    and their atomic-work siblings."""
+    """Legacy issue-review and atomic-work parents without cleanup authority."""
     return [WORK_ROOT, WORK_ROOT.parent / "atomic-work"]
 
 
 def sweep() -> None:
-    """Remove stale run directories a killed run could not clean up.
-
-    Only a verified removal counts: a directory that survives stays in place
-    for the next sweep instead of reading as reclaimed."""
+    """Report retained legacy roots; native recovery uses original receipts."""
     for root in sweep_roots():
-        if not root.is_dir():
+        try:
+            root.lstat()
+        except FileNotFoundError:
             continue
-        for path in root.iterdir():
-            if path.is_symlink() or not re.fullmatch(r"[0-9a-f]{32}", path.name):
-                continue
-            try:
-                if path.is_dir() and time() - path.stat().st_mtime > STALE_RUN_SECONDS:
-                    active = _cwd_pids(path, require_complete=True)
-                    if active is not None and not active:
-                        cleanup(path)
-            except OSError as error:
-                logger.warning("Could not inspect issue-review workspace %s: %s", path, error)
+        except OSError as error:
+            logger.warning("Could not inspect legacy review workspaces %s: %s", root, error)
+        else:
+            logger.warning("Retaining legacy review workspaces %s: original ownership and process termination are unverified; "
+                           "native resources require their original cleanup receipts", root)

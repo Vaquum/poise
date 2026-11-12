@@ -25,11 +25,11 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     p = _p(payload.get("p"))
 
     pull = await get_pull(client, owner, repo, pull_number)
-    actual_head = str((pull.get("head") or {}).get("sha") or "").lower()
+    actual_head = expected_head({"expected_head": (pull.get("head") or {}).get("sha")})
+    base = expected_head({"expected_head": (pull.get("base") or {}).get("sha")})
+    target = {"action": "read", "repository": f"{owner}/{repo}", "pull_number": pull_number}
     if actual_head != required_head:
-        raise RuntimeError(
-            f"pull-request head changed: expected {required_head}, got {actual_head or 'missing'}"
-        )
+        return {**target, "outcome": "superseded", "head_sha": actual_head}
     rest_comments = await list_inline_comments(client, owner, repo, pull_number)
     public_comments = await issue_comments(client, owner, repo, pull_number)
     threads = await list_review_threads(client, owner, repo, pull_number)
@@ -42,9 +42,7 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
                   if author and reviewer and reviewer != author and thread["author"].lower() == reviewer
                   and thread.get("repair_answer", {}).get("author", "").lower() == author][:100]
     context = {
-        "action": "read",
-        "repository": f"{owner}/{repo}",
-        "pull_number": pull_number,
+        **target,
         "head_sha": required_head,
         "p": f"p{p}",
         "instructions": _instructions(p),
@@ -59,8 +57,10 @@ async def run(client: GitHubClient, payload: dict[str, Any]) -> dict[str, Any]:
     }
     packet_diff = await review_diff(client, owner, repo, pull, context, since=since)
     latest = await get_pull(client, owner, repo, pull_number)
-    if latest["head"]["sha"] != required_head or latest["base"]["sha"] != pull["base"]["sha"]:
-        raise RuntimeError("pull-request head or base changed while building review packet")
+    latest_head = expected_head({"expected_head": (latest.get("head") or {}).get("sha")})
+    latest_base = expected_head({"expected_head": (latest.get("base") or {}).get("sha")})
+    if latest_head != required_head or latest_base != base:
+        return {**target, "outcome": "superseded", "head_sha": latest_head}
     return {**context, **packet_diff}
 
 

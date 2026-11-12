@@ -66,8 +66,12 @@ publication. An unverified settlement retains ownership and reports remaining
 PIDs, process names and states.
 The [service contract](../../docs/Service-architecture.md#workspace-behavior-observation)
 defines support, teardown and uncertainty. Same-supervisor claimed disk recovery
-uses the maintenance path below; forced-container lifecycle proof and complete
-resource acceptance remain pending under #806.
+uses the maintenance path below. Losing its original witnesses through forced
+supervisor/container replacement retains the disk and reservation, without an
+eventual-reclamation guarantee. Complete resource acceptance remains pending
+under #806. Legacy review parents stay retained with a warning through Caller's
+sweep; age, names and empty path scans grant no cleanup authority
+([retention policy](../../docs/Operating.md#storage-maintenance)).
 
 Cleanup recovery uses the existing maintenance/runtime triggers and the same
 original Call. Its private `resource_cleanup` column records a bounded cleanup
@@ -370,6 +374,14 @@ observed head, preserving the launch provenance. Poise then reconsiders the PR
 through its existing scheduler. Normal completion still uses the existing
 terminal head checks and authoritative review outcomes.
 
+Before provider invocation, verified head or base drift at either PR packet guard
+also settles as `superseded`. The packet CLI returns the original repository and
+PR with the validated observed head; Caller checks that target before caching or
+launching a provider. Base-only drift may retain the expected head. The audit
+response and launch provenance remain durable, and normal reconciliation admits
+the current revision. Missing or malformed revisions and packet-read failures
+remain errors.
+
 ### Several reviewers on one head
 
 Every submission answers with GitHub's `review_id`, and a run records it as
@@ -416,7 +428,11 @@ is one response, and Claude Code restarts a response cut at the limit without th
 Other behaviors retain their existing model assignments and limits.
 
 Local pinned-repository inspection has a separate 30-second deadline, capped by
-the remaining review budget. A timeout records `review_inspection_timeout` and
+the remaining review budget. Structured analysis also caps each inspection by
+the remaining analysis allowance and current file group's deadline, keeping the
+60-second submission and 60-second verification reserves even after a provider
+returns near the analysis cutoff.
+A timeout records `review_inspection_timeout` and
 retains the inspection phase, deadline and pinned target in the existing process
 diagnostic, without command arguments or inspection content in the error.
 Poise excludes this diagnostic from provider backoff, including older calls
@@ -462,19 +478,24 @@ after an atomic file save, so clients can fetch new text when storage recovers.
 ### Capped review rounds
 
 `--pr-approve ... --review-cap-reached --review-round N --review-cap N` runs
-the capped round: the run must not request changes again. It files that
-round's findings as one follow-up issue via `github-interface
---create-pr-linked-issue` and approves; a round with no findings approves
-without filing. The issue body starts with a marker for its pull request and
+the capped round. On and after the cap, any verified `p0` (breaks a common path)
+keeps the whole atomic change request blocking, including mixed p0/p1/p2
+findings. Missing or unrecognized severity also stays blocking. Only when all
+finding bodies explicitly start with `[p1]` or `[p2]` (case-insensitive) does it
+file one follow-up issue via `github-interface --create-pr-linked-issue` and
+approve; a round with no findings approves without filing. New findings carry
+a severity prefix; reaffirmed threads keep their original bodies.
+The issue body starts with a marker for its pull request and
 head (`<!-- poise:review-cap #N@sha -->`), then one finding per section, each
 pinned to the reviewed head — or to its base for removed-side findings.
 A rejected filing approves nothing and raises a contract violation;
 an uncertain filing (timeout, transient GitHub error, exit 0 without a
 receipt) raises a submission error for Poise to reconcile, and the retry
-reuses the marked issue instead of filing again. Structured providers review
-as usual and the harness converts a change-request verdict deterministically;
-Claude receives the capped tool contract (file the issue, then approve) and
-must submit nothing when filing fails.
+reuses the marked issue instead of filing again. An existing marked issue
+never bypasses the breaking-finding check. Structured providers review as usual
+and the harness converts only explicitly nonbreaking change requests;
+Claude receives the same severity policy and can request changes or file the
+issue then approve. It must submit nothing when filing fails.
 
 ### Staged and follow-up reviews
 
@@ -492,8 +513,14 @@ review duration and usage. Codex keeps one native conversation across file
 groups and inspection rounds, retaining earlier analysis and inspected source.
 Structured reviews reserve 60 seconds for submission and another 60 seconds
 for the authoritative outcome lookup. Submission keeps that verification
-reserve even when it is slow. Every stage's findings combine into the single
-verdict the harness submits; a packet that fits in one group needs no staging.
+reserve even when it is slow. After the first common-context turn, staged
+inspection shares the remaining analysis allowance across the remaining file
+groups. Each group stops offering further inspection once half its allowance
+is spent and requests a terminal assessment on the evidence already held.
+Provider execution and inspection stay within the group's deadline; a timeout
+still fails without submitting an incomplete review. Every stage's findings
+combine into the single verdict the harness submits; a packet that fits in one
+group needs no staging.
 A follow-up (`--pr-approve`) round reviews the diff since
 the reviewer's last submitted review instead of the whole PR again: new
 findings on current lines stay on current-head lines, while a defect caused

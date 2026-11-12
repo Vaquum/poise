@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, utimes, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -512,22 +512,62 @@ describe('snapshot expiry', () => {
     await expect(lstat(join(snapshots, 'recent'))).resolves.toBeDefined()
   })
 
-  it('expires only old hex issue-review runs', async () => {
+  it.each([false, true])('retains unregistered old hex issue-review runs (dryRun=%s)', async (dryRun) => {
+    vi.stubEnv('POISE_MODE', 'service')
+    vi.stubEnv('HOME', home)
     const work = join(home, 'agent-work')
     const stale = join(work, 'a'.repeat(32))
     const fresh = join(work, 'b'.repeat(32))
     await mkdir(stale, { recursive: true })
     await mkdir(fresh, { recursive: true })
     await mkdir(join(work, 'notes'), { recursive: true })
+    await writeFile(join(stale, 'publication.json'), 'original receipt\n')
     await age(stale, 8 * DAY)
     await age(join(work, 'notes'), 8 * DAY)
     const report = await maintenance.runStorageMaintenance({
-      now: Date.now(), chatRoot, stateRoot, home, trim: async () => null, claims: () => [],
+      now: Date.now(), dryRun, chatRoot, stateRoot, home, trim: async () => null, claims: () => [],
     })
-    expect(report.removed.map((item) => item.path)).toContain(stale)
-    await expect(lstat(stale)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(join(stale, 'publication.json'), 'utf8')).resolves.toBe('original receipt\n')
+    expect(report.removed).toEqual([])
+    expect(report.reclaimedBytes).toBe(0)
+    expect(report.held).toContainEqual({ path: work, reason: expect.stringContaining('ownership and process termination are unverified') })
     await expect(lstat(fresh)).resolves.toBeDefined()
     await expect(lstat(join(work, 'notes'))).resolves.toBeDefined()
+  })
+
+  it('retains foreign legacy files after an ancestor is replaced, including under disk pressure', async () => {
+    vi.stubEnv('POISE_MODE', 'service')
+    vi.stubEnv('HOME', home)
+    const parent = join(home, 'legacy')
+    const work = join(parent, 'agent-work')
+    const name = 'a'.repeat(32)
+    const original = join(work, name)
+    const foreign = join(root, 'foreign')
+    const sentinel = join(foreign, 'agent-work', name, 'auth.json')
+    await mkdir(original, { recursive: true })
+    await writeFile(join(original, 'publication.json'), 'original receipt\n')
+    await mkdir(join(foreign, 'agent-work', name), { recursive: true })
+    await writeFile(sentinel, 'foreign authentication\n')
+    await chmod(sentinel, 0o600)
+    await age(original, 8 * DAY)
+    await age(join(foreign, 'agent-work', name), 8 * DAY)
+    const identity = await lstat(sentinel)
+    await rename(parent, join(home, 'retained-legacy'))
+    await symlink(foreign, parent, 'dir')
+    vi.stubEnv('AGENT_INTERFACE_WORK_DIR', work)
+
+    const report = await maintenance.runStorageMaintenance({
+      pressureRun: true, chatRoot, stateRoot, home, trim: async () => null, claims: () => [],
+    })
+
+    await expect(readFile(sentinel, 'utf8')).resolves.toBe('foreign authentication\n')
+    expect((await lstat(sentinel)).ino).toBe(identity.ino)
+    expect((await lstat(sentinel)).mode).toBe(identity.mode)
+    await expect(readFile(join(home, 'retained-legacy', 'agent-work', name, 'publication.json'), 'utf8')).resolves.toBe('original receipt\n')
+    expect((await lstat(parent)).isSymbolicLink()).toBe(true)
+    expect(report.removed).toEqual([])
+    expect(report.reclaimedBytes).toBe(0)
+    expect(report.held).toContainEqual({ path: work, reason: expect.stringContaining('ownership and process termination are unverified') })
   })
 })
 

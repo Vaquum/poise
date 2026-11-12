@@ -111,7 +111,7 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
             self.assertGreater(len(packet['diff'].encode()), 1_500_000)
             self.assertLess(len(json.dumps(packet, indent=2).encode()), 2_950_000)
 
-    async def test_packet_rejects_head_or_base_change_after_read(self):
+    async def test_packet_supersedes_head_or_base_change_after_read(self):
         head = 'a' * 40
         base = 'b' * 40
         for changed in ('head', 'base'):
@@ -123,8 +123,9 @@ class TestReviewDiff(IsolatedAsyncioTestCase):
                     patch.object(pr_review, 'list_review_threads', AsyncMock(return_value=[])), \
                     patch.object(pr_review, 'list_reviews', AsyncMock(return_value=[])), \
                     patch.object(pr_review, 'linked_issues', AsyncMock(return_value=[])):
-                with self.assertRaisesRegex(RuntimeError, 'head or base changed'):
-                    await pr_review.run(AsyncMock(), {'repository': 'o/r', 'pr': 1, 'expected_head': head})
+                result = await pr_review.run(AsyncMock(), {'repository': 'o/r', 'pr': 1, 'expected_head': head})
+                self.assertEqual(result, {'action': 'read', 'repository': 'o/r', 'pull_number': 1,
+                                          'outcome': 'superseded', 'head_sha': latest['head']['sha']})
 
 
 class TestPacketPolicy(TestCase):

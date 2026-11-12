@@ -3039,7 +3039,9 @@ function settleClaimAfterExit(
         const snapshot = parseAgentLogList(rows)
         const call = snapshot.entries[0]
         if (rows.length === 1 && snapshot.quarantined.length === 0
-          && call.status === 'failed'
+          && (call.status === 'failed'
+            || (call.status === 'superseded' && call.outcome === 'superseded' && call.action === null
+              && call.review_id == null && !call.error && call.error_code == null))
           && call.behavior === upstreamBehavior(behavior) && call.behavior === claim.launchBehavior
           && call.repo === claim.launchRepo && call.pr_id === String(claim.launchPr)
           && call.actor?.toLowerCase() === claim.launchActor.toLowerCase()
@@ -3050,6 +3052,11 @@ function settleClaimAfterExit(
           && Date.parse(agentCallStartedAt(call)) >= Date.parse(claim.launchRequestedAt)
           && Date.parse(call.completed_at ?? '') >= Date.parse(agentCallStartedAt(call))) {
           const row = objectValue(rows[0], 'worker exit Caller evidence') as Record<string, unknown>
+          if (call.status === 'superseded') {
+            if (row.evidence_unavailable == null && row.diagnostic == null) return
+            console.error(message)
+            return
+          }
           const timeout = behavior === 'review-new-prs' && call.error_code === 'review_budget_exhausted'
           const preflight503 = !call.error_code && /^(?:error: )?GitHub 503\b/.test(call.error)
             && call.action === 'not_started' && call.outcome === 'preflight_failed'
@@ -4572,9 +4579,19 @@ async function fireApprove(
   // in that window still posted on the pull request it was meant to stop.
   if (!isEnabled('approve-prs') || behaviorAborted()) return false
   if (currentHead !== expectedHead) {
-    throw new Error(
-      `approval head changed before launch: expected ${expectedHead}, got ${currentHead}`,
-    )
+    const settledAt = new Date().toISOString()
+    const organization = currentOrganization()?.login ?? null
+    // This rejected request has not reached markLaunchIntent's ledger admission.
+    captureBehaviorAdmission({
+      admissionKey: JSON.stringify(slot === 'primary'
+        ? [organization, 'approve-prs', claimTarget]
+        : [organization, 'approve-prs', claimTarget, slot]),
+      nativeId: claimId, behavior: 'approve-prs', source: 'poise:approve-prs', owner: organization,
+      actor, repository: pr.repo, number: pr.number, head: expectedHead, slot, plannedSlots: [slot], startedAt: settledAt,
+    })
+    captureBehaviorOutcome({ nativeId: claimId, state: 'superseded', activity: 'settled', stateSource: 'native',
+      outcome: 'superseded', completedAt: settledAt })
+    return false
   }
   // Shed load before provisioning a checkout: a launch past the shared
   // budget defers without backoff and retries when a slot frees.

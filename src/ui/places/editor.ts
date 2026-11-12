@@ -13,7 +13,7 @@ import { takeEditorDoc } from '../intents'
 import type { MountPlace } from '../router'
 import { initEditorView, stopEditorRefresh } from '../../views/editor-view'
 import { chatSidePane } from '../../views/chat-side-pane'
-import { loadSettings } from '../../config'
+import { placeSettings } from '../../config'
 import { installIconTooltips } from '../../icon-tooltips'
 
 let viewEl: HTMLElement | null = null
@@ -32,7 +32,7 @@ export const mount: MountPlace = async ({ root, address, query }) => {
   }
   $('main', root).append(viewEl)
   viewEl.hidden = false
-  await loadSettings().catch(() => undefined)
+  await placeSettings().catch(() => undefined)
   await initEditorView()
   // The route back sits first in the Editor's own header, never over its controls.
   viewEl.querySelector(':scope > .view-header')?.prepend(back)

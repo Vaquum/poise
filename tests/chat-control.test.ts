@@ -1872,28 +1872,42 @@ describe('native Poise control through HTTP, SQLite and the real Chat runtime', 
   })
 
   it('returns to an unblocked recipient while a later recipient keeps receiving new messages', async () => {
-    const pair = [await manager(), await manager()].sort((a, b) => a.id < b.id ? -1 : 1)
-    const [blocked, fast] = pair
-    await runtime.enqueue(blocked.id, randomUUID(), { text: 'Deferred task', attachments: [], mentions: [] })
-    // Only a running or armed queue holds ordinary delivery (#590): start the item.
-    runtime.prompt(blocked.id, { text: 'First task', attachments: [], mentions: [] })
-    await until(() => prompts.has(blocked.id))
-    finishes.get(blocked.id)!({ stopReason: 'end_turn' })
-    await until(() => (prompts.get(blocked.id) ?? []).length === 2)
-    store.message(runtime.instance, blocked.id, 'fixture', 'Older blocked context')
-    store.message(runtime.instance, fast.id, 'fixture', 'Fast context 0')
-    await control.tick()
-    await until(() => prompts.has(fast.id))
-    finishes.get(blocked.id)!({ stopReason: 'end_turn' })
-    await until(() => runtime.get(blocked.id)?.status === 'idle')
-    finishes.get(fast.id)!({ stopReason: 'end_turn' })
-    await until(() => runtime.get(fast.id)?.status === 'idle')
-    store.message(runtime.instance, fast.id, 'fixture', 'Fast context 1')
-    await control.tick()
-    expect(store.inbox(runtime.instance, blocked.id)[0].state, JSON.stringify({
-      blockedStatus: runtime.get(blocked.id)?.status, blockedQueue: runtime.get(blocked.id)?.queue,
-      fastStatus: runtime.get(fast.id)?.status, eligible: store.pending(runtime.instance).map(item => ({ recipient: item.recipient, seq: item.seq })),
-    })).toBe('admitted')
+    await control.stop()
+    // Keep delivery on explicit rounds: a live tick can consume transient idle.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    control = new Control(runtime, { ci, now: () => clock, targetStatus, reviews, ownsBehind, mergeWake, connectionDir: join(root, 'connections') })
+    control.attach(server); control.start()
+    try {
+      const pair = [await manager(), await manager()].sort((a, b) => a.id < b.id ? -1 : 1)
+      const [blocked, fast] = pair
+      await runtime.enqueue(blocked.id, randomUUID(), { text: 'Deferred task', attachments: [], mentions: [] })
+      // Only a running or armed queue holds ordinary delivery (#590): start the item.
+      runtime.prompt(blocked.id, { text: 'First task', attachments: [], mentions: [] })
+      await until(() => prompts.has(blocked.id))
+      finishes.get(blocked.id)!({ stopReason: 'end_turn' })
+      await until(() => (prompts.get(blocked.id) ?? []).length === 2)
+      store.message(runtime.instance, blocked.id, 'fixture', 'Older blocked context')
+      store.message(runtime.instance, fast.id, 'fixture', 'Fast context 0')
+      await control.tick()
+      await until(() => prompts.has(fast.id))
+      finishes.get(blocked.id)!({ stopReason: 'end_turn' })
+      await until(() => runtime.get(blocked.id)?.status === 'idle')
+      finishes.get(fast.id)!({ stopReason: 'end_turn' })
+      await until(() => runtime.get(fast.id)?.status === 'idle')
+      expect(store.inbox(runtime.instance, blocked.id)[0].state).toBe('pending')
+      expect(prompts.get(blocked.id)).toHaveLength(2)
+      store.message(runtime.instance, fast.id, 'fixture', 'Fast context 1')
+      await control.tick()
+      expect(store.inbox(runtime.instance, blocked.id)[0].state, JSON.stringify({
+        blockedStatus: runtime.get(blocked.id)?.status, blockedQueue: runtime.get(blocked.id)?.queue,
+        fastStatus: runtime.get(fast.id)?.status, eligible: store.pending(runtime.instance).map(item => ({ recipient: item.recipient, seq: item.seq })),
+      })).toBe('admitted')
+      await until(() => prompts.get(blocked.id)?.length === 3)
+      expect(prompts.get(blocked.id)![2].text).toMatch(/\nOlder blocked context$/)
+    } finally {
+      await control.stop()
+      vi.useRealTimers()
+    }
   })
 
   it('rejects missing/forged credentials, browser origins, foreign sessions and malformed targets', async () => {

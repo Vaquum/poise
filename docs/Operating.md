@@ -1315,6 +1315,14 @@ before constructing the canonical lease. Ownership/Git initialization and
 the post-wait existence check run under that same held lease. Foreign
 markers are refused; an unsettled initializer worker keeps its lease.
 
+Legacy issue-review and atomic-work directories stay retained regardless of
+age, hex names or an empty path-based process scan. Neither maintenance nor
+Caller's sweep traverses those trees for deletion or permission repair.
+Maintenance lists the legacy review parent as held; Caller warns for each
+existing legacy parent that original ownership and process termination are
+unverified. Owned native resources continue through the existing original
+receipt, process-witness and pinned-directory cleanup path.
+
 Settings → General reads a cached storage summary: one scan answers
 concurrent requests, and its observation answers Settings opens for 60
 seconds. Each read walks at most 100,000 entries or 5 seconds across every

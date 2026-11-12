@@ -90,7 +90,11 @@ Notifications off; it adds no alert record or execution authority.
 
 A failed behavior's notice and its diagnostic are one entry. The notice says
 what can be done; the diagnostic says what happened and how it is classified,
-which also decides its group. In classic, each Behaviors row shows that
+which also decides its group. When the current incident records the legacy stop
+after two review timeouts, the notice explains that automatic retries stopped
+and asks you to change the head or model, or retry explicitly. It keeps the link
+to that incident's Call; an unknown stop keeps the generic wording.
+In classic, each Behaviors row shows that
 behavior's counts: Poise faults, needs you and automatic; a count opens the rail
 on that behavior with its first entry in that group expanded.
 
@@ -154,6 +158,10 @@ conversation is unresolved.
 Classic's Current and notifications share a simultaneous check of the same pull request
 when both use the same agent GitHub account. Its answer is cached for 60 seconds
 from the start of the check; a different agent account gets its own check.
+Showing the checks (Overview, and classic's Current) answers with a check up to
+five minutes past those 60 seconds and reads it again behind the answer, five
+at a time; with none that recent, it waits. This check always waits for a
+fresh one.
 
 - A pull request that becomes ready is noticed at once, and Poise Link shows
   it once.

@@ -5,7 +5,7 @@
 import './overview.css'
 import './overview/registry'
 import { getBehaviorDiagnostics, isBehaviorStateLoaded, refreshState } from '../../behaviors'
-import { loadSettings } from '../../config'
+import { placeSettings } from '../../config'
 import { noticeFeed } from '../../notices'
 import type { ChainAttentionRow } from '../../notification-items'
 import { placeHref } from '../address'
@@ -101,7 +101,7 @@ function layoutHTML(): string {
 
 export const mount: MountPlace = async (ctx) => {
   // Days begin at midnight in Settings' time zone, and the organizations are Settings': read them first.
-  await loadSettings()
+  await placeSettings()
   if (ctx.signal.aborted) return
   const { root, address } = ctx
   root.innerHTML = layoutHTML()

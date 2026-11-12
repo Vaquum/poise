@@ -243,3 +243,78 @@ describe('why a pull request is held', () => {
     expect(heldOf(result.body, 54).head).toBeNull()
   })
 })
+
+describe('reading the checks again', () => {
+  // The next green_pr read: open pull requests listed at once, every GitHub
+  // check held until `release`, and then answering green.
+  function gatedRead(numbers: number[]) {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    mocks.runFile.mockImplementation(async (command: string) => {
+      if (command !== 'github-interface') return { stdout: JSON.stringify(numbers.map((number) => record(number))), stderr: '' }
+      await gate
+      return { stdout: JSON.stringify(evidence({ status: 'green' })), stderr: '' }
+    })
+    return { read: handleGhBody({ operation: 'green_pr', org: 'alpha' }), release }
+  }
+  const statuses = (body: unknown) => (body as any).records.map((entry: any) => entry.status)
+
+  it('answers with checks past their minute and reads them again behind the answer, five at a time', async () => {
+    const numbers = [61, 62, 63, 64, 65, 66, 67]
+    expect(statuses((await greenPr(Object.fromEntries(numbers.map((number) => [`#${number}`, evidence({ status: 'yellow' })])), numbers)).body))
+      .toEqual(Array(7).fill('yellow'))
+    expect(mergeableCalls()).toHaveLength(7)
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2 * 60_000)
+    try {
+      const { read, release } = gatedRead(numbers)
+      try {
+        const answer = await Promise.race([read, new Promise<never>((_resolve, reject) => {
+          setTimeout(() => reject(new Error('the read waited for GitHub')), 2_000)
+        })])
+        expect(statuses(answer.body)).toEqual(Array(7).fill('yellow'))
+        await vi.waitFor(() => expect(mergeableCalls()).toHaveLength(7 + 5))
+      } finally {
+        release()
+      }
+      await vi.waitFor(() => expect(mergeableCalls()).toHaveLength(7 + 7))
+      await vi.waitFor(async () => expect(statuses((await handleGhBody({ operation: 'green_pr', org: 'alpha' })).body)).toEqual(Array(7).fill('green')))
+      expect(mergeableCalls()).toHaveLength(7 + 7)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('reads again what a later read finds past its minute while a refresh still runs', async () => {
+    await greenPr({ '#81': evidence({ status: 'yellow' }) }, [81])
+    await greenPr({ '#82': evidence({ status: 'yellow' }) }, [82])
+    expect(mergeableCalls()).toHaveLength(2)
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2 * 60_000)
+    try {
+      const first = gatedRead([81])
+      await first.read
+      await vi.waitFor(() => expect(mergeableCalls()).toHaveLength(3))
+      // A read of other pull requests while #81's refresh is still out.
+      const second = gatedRead([82])
+      await second.read
+      first.release()
+      second.release()
+      await vi.waitFor(() => expect(mergeableCalls().map(([, args]) => args[1])).toEqual(['#81', '#82', '#81', '#82']))
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('waits for GitHub when the last check is more than five minutes past its minute', async () => {
+    await greenPr({ '#71': evidence({ status: 'yellow' }) }, [71])
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 7 * 60_000)
+    try {
+      const { read, release } = gatedRead([71])
+      const waited = await Promise.race([read.then(() => false), new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 200))])
+      release()
+      expect(waited).toBe(true)
+      expect(statuses((await read).body)).toEqual(['green'])
+    } finally {
+      clock.mockRestore()
+    }
+  })
+})

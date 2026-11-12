@@ -30,6 +30,8 @@ import type { ObservePart, PartContext } from './part'
 
 const PAGE_SIZE = 200
 const HISTORY_PAGE_LIMIT = 200
+/** The last first page read, kept across visits with its scope and search. */
+let lastFirst: { scope: string, search: string, data: LogFeed } | null = null
 const STOP_ARM_MS = 4000
 const COLUMNS = 11
 const RECORDS_KEY = 'swarm-records'
@@ -396,6 +398,7 @@ export function createBehaviors(ctx: PartContext): ObservePart {
   const byTime = (list: LogEntry[]): LogEntry[] => list.map((e) => [startedAtMs(e), e] as const).sort((a, b) => b[0] - a[0]).map(([, e]) => e)
 
   function applyFirstPage(data: LogFeed, current: () => boolean): void {
+    lastFirst = { scope: org(), search: searchQuery, data }
     if (!current()) return
     entries = data.logs || []
     historyIds = new Set(entries.map((e) => e.id))
@@ -949,6 +952,8 @@ export function createBehaviors(ctx: PartContext): ObservePart {
   const call = ctx.query.get('call')
   const target = /^([\w.-]+\/[\w.-]+)#(\d+)$/.exec(ctx.query.get('pr') ?? '')
   let opened = false
+  // A return paints the last first page at once; the first poll then refreshes it in place.
+  if (lastFirst && lastFirst.scope === org() && lastFirst.search === searchQuery) applyFirstPage(lastFirst.data, () => true)
 
   return {
     show() {
