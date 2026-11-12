@@ -114,6 +114,9 @@ page's optional `attention` projection is independent of the ordinary chain-list
 cursor/filter; later list pages retain the existing pagination contract. Failed
 refreshes label retained attention entries stale. These are read-only summaries
 on the existing refresh clock, with no new observation or execution authority.
+Unchanged attention reads reuse the history-derived progress clock after
+validating the chain's current journal revision. A new event invalidates only
+that chain's cached clock; restart reconstructs it from the original history.
 
 In v2, Review New Issues shows that saved seed scope instead of the inactive
 legacy repository filter. Its setting opens the existing General seed controls,
