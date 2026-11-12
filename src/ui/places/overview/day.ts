@@ -60,8 +60,14 @@ export function countPair(label: string, report: AnalyticsReport, baseline: Anal
 }
 
 interface Shown { snapshot: AnalyticsSnapshot, progress: number | undefined, snapshotTime: string | undefined }
-/** Today's last numbers, kept across visits: a return paints them at once, then reads again. */
-let lastDay: { key: string, shown: Shown, day: Read<true>, history: Read<AnalyticsHistory>, daily: Read<AnalyticsHistory> } | null = null
+/** Today's last numbers, kept across visits and page loads: a return or a
+ *  reload paints them at once, with the time they were read, then reads again.
+ *  Another day's or organization's numbers never stand for these. */
+type LastDay = { key: string, shown: Shown, day: Read<true>, history: Read<AnalyticsHistory>, daily: Read<AnalyticsHistory> }
+const LAST_DAY_KEY = 'poise-overview-day'
+let lastDay: LastDay | null = (() => {
+  try { return JSON.parse(localStorage.getItem(LAST_DAY_KEY) ?? 'null') as LastDay | null } catch { return null }
+})()
 
 export function mountDay(ctx: PartContext, main: HTMLElement): void {
   const { signal } = ctx
@@ -214,7 +220,10 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
 
   const dayKey = () => `${getSelectedOrganization()}|${analyticsDay(0, anchor).since}`
   const paint = () => {
-    if (offset === 0 && shown) lastDay = { key: dayKey(), shown, day, history, daily }
+    if (offset === 0 && shown && (lastDay?.shown !== shown || lastDay.day !== day || lastDay.history !== history || lastDay.daily !== daily)) {
+      lastDay = { key: dayKey(), shown, day, history, daily }
+      try { localStorage.setItem(LAST_DAY_KEY, JSON.stringify(lastDay)) } catch { /* the next page reads them anew */ }
+    }
     paintDay(); paintTiles(); paintSmall()
   }
   // Typical by now moves with the clock; nothing redraws under the pointer or focus.
@@ -345,7 +354,7 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
   }, { signal })
 
   // ---------- Live ----------
-  // A return paints today's last numbers at once, so nothing below moves; the read refreshes them in place.
+  // A return or a reload paints today's last numbers at once, so nothing below moves; the read refreshes them in place.
   if (lastDay?.key === dayKey()) ({ shown, day, history, daily } = lastDay)
   paint()
   void readDay(!!shown)

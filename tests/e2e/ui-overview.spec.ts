@@ -364,3 +364,15 @@ test('In motion says what was never read, rather than zero or clear', async ({ p
   await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
   await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
 })
+
+test('a reload paints the day’s last numbers at once, with when they were read, while it reads again', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  await expect(page.getByText('Reading the day’s numbers…')).toHaveCount(0)
+  // The day's reads are held; the reload paints the last numbers anyway.
+  await page.route(/\/api\/analytics(\?|\/history)/, async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(page.locator('[data-tile]').first()).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('[data-dayline]')).toContainText('until')
+  await expect(page.getByText('Reading the day’s numbers…')).toHaveCount(0)
+})
