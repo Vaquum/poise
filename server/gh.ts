@@ -19,6 +19,7 @@ import { mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ReviewSummary } from '../src/analytics-work-review'
+import { readDatastoreView } from './datastore-reader'
 import { getMeta } from './db'
 import { HttpError } from './http'
 import { getOrganizations, readyOrganizations, organizationArgs, type Organization } from './organizations'
@@ -243,19 +244,58 @@ function parseRequestedReviewers(value: unknown): string[] | null {
   }
 }
 
+// Overview, Board and every open tab ask for the same views at once: an
+// identical read in flight is joined, and nothing is kept once it settles.
+const datastoreReads = new Map<string, Promise<DatastoreRecord[]>>()
+
 export async function runCli(org: Organization, args: string[]): Promise<DatastoreRecord[]> {
+  const key = JSON.stringify([org.login, org.datastorePath, args])
+  let read = datastoreReads.get(key)
+  if (!read) {
+    const started = readDatastore(org, args)
+    datastoreReads.set(key, started)
+    const settle = () => { if (datastoreReads.get(key) === started) datastoreReads.delete(key) }
+    started.then(settle, settle)
+    read = started
+  }
+  return (await read).slice()
+}
+
+// Reader failures already reported, so a persistent one is logged once.
+const readerFailures = new Set<string>()
+
+async function readDatastore(org: Organization, args: string[]): Promise<DatastoreRecord[]> {
+  // The `pr`, `issue` and `user` views are read in-process; anything else,
+  // and any reader failure, is the CLI's to answer, as before.
+  const inProcess = org.datastorePath ? readDatastoreView(org.datastorePath, args) : null
+  let records: unknown
+  if (inProcess) {
+    try {
+      records = await inProcess
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!readerFailures.has(message)) {
+        readerFailures.add(message)
+        console.error(`[datastore-reader] ${org.login}: the in-process read failed, so github-datastore answers it: ${message}`)
+      }
+      records = await readDatastoreCli(org, args)
+    }
+  } else records = await readDatastoreCli(org, args)
+  if (!Array.isArray(records)) throw new Error('datastore returned a non-array')
+  if (records.some((row) => !row || typeof row.repo !== 'string' || !repoBelongsTo(row.repo, org.login))) {
+    throw new Error(`datastore contains records outside ${org.login}`)
+  }
+  return records
+}
+
+async function readDatastoreCli(org: Organization, args: string[]): Promise<unknown> {
   const { stdout } = await runFile(CLI, organizationArgs(org, args), {
     timeoutMs: 30_000,
     maxOutputBytes: 32 * 1024 * 1024,
   })
   const trimmed = stdout.trim()
   if (!trimmed) throw new Error('datastore returned empty output')
-  const records = JSON.parse(trimmed)
-  if (!Array.isArray(records)) throw new Error('datastore returned a non-array')
-  if (records.some((row) => !row || typeof row.repo !== 'string' || !repoBelongsTo(row.repo, org.login))) {
-    throw new Error(`datastore contains records outside ${org.login}`)
-  }
-  return records
+  return JSON.parse(trimmed)
 }
 
 function toLegacy(r: DatastoreRecord, kind: 'pr' | 'issue', me: string): GhRecord {
