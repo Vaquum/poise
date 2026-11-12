@@ -448,7 +448,11 @@ def datastore_github_client() -> Iterator[GitHubClient]:
     if not token or (proxy and not proxy.startswith(("http://", "https://"))) or _uses_cli_transport(environment):
         yield GitHubClient()
         return
-    import httpx
+    try:
+        import httpx
+    except ImportError:  # Test harnesses run the datastore on a bare system python.
+        yield GitHubClient()
+        return
 
     with httpx.Client(proxy=proxy, trust_env=False, verify=ssl.create_default_context(),
                       timeout=httpx.Timeout(None, connect=30.0)) as http:

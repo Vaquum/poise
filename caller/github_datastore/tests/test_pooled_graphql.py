@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -86,6 +87,18 @@ class PooledGraphQLTest(unittest.TestCase):
                 datastore_github_client() as client:
             self.assertEqual(client.graphql(QUERY), DATA)
         self.assertEqual([request.args[0][1] for request in gh.call_args_list], ["config", "api"])
+
+    def test_missing_httpx_imports_and_keeps_the_cli_route(self) -> None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = (f"import sys; sys.modules['httpx'] = None; sys.path.insert(0, {root!r}); "
+                  "import github_datastore.github_api as api; print(hasattr(api, 'GitHubClient'))")
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        self.assertEqual(proc.stdout.strip(), "True", proc.stderr)
+        with patch.dict(os.environ, ENV, clear=True), \
+                patch.dict(sys.modules, {"httpx": None}), \
+                patch("github_datastore.github_api.subprocess.run", return_value=NO_CONFIG), \
+                datastore_github_client() as client:
+            self.assertIsNone(client._http)
 
     def test_disconnect_and_503_retry_the_same_token_and_request(self) -> None:
         requests = []
