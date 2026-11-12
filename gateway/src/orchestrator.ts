@@ -242,7 +242,7 @@ export class Orchestrator {
   private readonly refused = new Map<string, string>()
   /** The release a stuck-switch warning was logged for, so it warns once per release, not per pass. */
   private readonly stuckWarned = new Map<string, string>()
-  private readonly deferredCleanup = new Map<string, string>()
+  private readonly reportedCleanup = new Map<string, string>()
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.drainPollMs = deps.drainPollMs ?? DRAIN_POLL_MS
@@ -485,7 +485,6 @@ export class Orchestrator {
             if (updated === 'unreachable') fallback = target
           }
           if (details.State.Running && await this.cleanupStillHeld(handle, login)) continue
-          this.deferredCleanup.delete(handle)
           await this.upgrade(handle, login, imageId, reason, target, fallback)
         } catch (error) {
           log.error('workspace.upgrade.failed', { handle, error: errorMessage(error) })
@@ -498,18 +497,30 @@ export class Orchestrator {
   }
 
   private async cleanupStillHeld(handle: string, login: string): Promise<boolean> {
-    const callId = this.deferredCleanup.get(handle)
-    if (!callId) return false
     try {
       const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
-      if (!health.ok || health.nativeCleanupHold?.callId !== callId) return false
+      if (!health.ok) return false
+      if (!health.nativeCleanupHold) {
+        this.reportedCleanup.delete(handle)
+        return false
+      }
+      this.notePendingCleanup(handle, health)
       if (health.draining) await this.releaseDrain(handle, login, 'original native cleanup remains held')
       return true
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
-      this.deps.log.warn('workspace.upgrade.native-check.failed', { handle, callId, error: errorMessage(error) })
+      // A missing or unusable probe leaves the existing drain and replacement checks in charge.
       return false
     }
+  }
+
+  private notePendingCleanup(handle: string, { nativeCleanupHold, unsettledNativeCalls }: ServiceHealth): void {
+    if (nativeCleanupHold) {
+      if (this.reportedCleanup.get(handle) === nativeCleanupHold.callId) return
+      this.reportedCleanup.set(handle, nativeCleanupHold.callId)
+    }
+    this.deps.log.warn('workspace.upgrade.native-pending', { handle, unsettledNativeCalls: unsettledNativeCalls ?? null,
+      ...(nativeCleanupHold && { callId: nativeCleanupHold.callId, cleanupReason: nativeCleanupHold.reason }) })
   }
 
   /**
@@ -886,11 +897,8 @@ export class Orchestrator {
         if (!result.idle) sawDown = sawDown || result.sawDown
         lastCounts = result.lastCounts ?? lastCounts
         if (result.nativePending) {
-          const { nativeCleanupHold, unsettledNativeCalls } = result.nativePending
-          if (nativeCleanupHold) this.deferredCleanup.set(handle, nativeCleanupHold.callId)
-          this.deps.log.warn('workspace.upgrade.native-pending', { handle, unsettledNativeCalls: unsettledNativeCalls ?? null,
-            ...(nativeCleanupHold && { callId: nativeCleanupHold.callId, cleanupReason: nativeCleanupHold.reason }) })
-          await abortUnknown(nativeCleanupHold
+          this.notePendingCleanup(handle, result.nativePending)
+          await abortUnknown(result.nativePending.nativeCleanupHold
             ? 'original native cleanup remains held; deferred to the next upgrade pass'
             : 'native cleanup remains pending or unknown without a live Caller; deferred to the next upgrade pass')
           return

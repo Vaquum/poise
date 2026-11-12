@@ -656,8 +656,8 @@ assertion may only resume, and anything else is refused with 403):
   - Optional `nativeCleanupHold` identifies one terminal Call with a recorded
     cleanup failure from that same snapshot. It exposes `callId` and a bounded,
     redacted `reason`, which is `null` while a retry owns the claim and has yet
-    to record its result. After deferring replacement for a reported hold,
-    the gateway checks that Call on later passes before admitting a drain.
+    to record its result. Before requesting a replacement drain, the gateway
+    defers on a hold in fresh health, including on its first pass after restart.
   - `backgroundWork` counts everything else a restart would cut: the Chat
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),
