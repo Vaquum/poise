@@ -50,7 +50,7 @@ for index in range(24):
     author = AUTHORS[index % 3]
     state = "closed" if index % 5 == 0 else "open"
     # Two items share an updated_at, so the repo and number tiebreaks decide.
-    updated = stamp(1 + index % 9, 12 if index in (4, 7) else index % 24)
+    updated = stamp(5 if index in (4, 7) else 1 + index % 9, 12 if index in (4, 7) else index % 24)
     created = stamp(1 + index % 5, 3)
     assignees = [user(me)] if index % 4 == 0 else [user("helper")] if index % 4 == 1 else []
     body = f"Work item {number}" + (f" for @{me}" if index % 6 == 1 else "")
