@@ -277,6 +277,26 @@ it('answers one turn finish from its index instead of scanning the transcript', 
 })
 
 
+it('finds where a transcript\'s last turns begin from the turn-finish index', async () => {
+  const storage = await import('../server/chat/storage')
+  const { db } = await import('../server/db')
+  const id = await session()
+  const finished: number[] = []
+  for (let i = 0; i < 4; i++) {
+    const turnId = randomUUID()
+    storage.appendEvent(id, { type: 'turn.started', turnId, prompt: { text: `turn ${i}`, attachments: [], mentions: [] } })
+    finished.push(storage.finalizeTurn(id, { type: 'turn.finished', turnId, stopReason: 'end_turn' }).seq)
+  }
+  // The last two turns begin after the second turn's finish; with no more turns than asked, from the start.
+  expect(storage.lastTurnsStart(id, 2)).toBe(finished[1])
+  expect(storage.lastTurnsStart(id, 1)).toBe(finished[2])
+  expect(storage.lastTurnsStart(id, 4)).toBe(0)
+  expect(storage.listEvents(id, storage.lastTurnsStart(id, 2)).events.map((env) => env.event.type)).toEqual(['turn.started', 'turn.finished', 'turn.started', 'turn.finished'])
+  const plan = db.prepare<[string, number], { detail: string }>(`EXPLAIN QUERY PLAN SELECT seq FROM chat_events INDEXED BY idx_chat_events_turn_finished
+    WHERE session_id = ? AND json_extract(event, '$.type') = 'turn.finished' ORDER BY seq DESC LIMIT 1 OFFSET ?`).all(id, 2).map((row) => row.detail)
+  expect(plan.join('\n')).toContain('USING INDEX idx_chat_events_turn_finished')
+})
+
 it('uses the actual recent turns for a handoff after a transcript exceeds one history page', async () => {
   const storage = await import('../server/chat/storage')
   const id = await session()

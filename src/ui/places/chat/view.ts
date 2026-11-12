@@ -91,6 +91,10 @@ interface SessionEntry {
   pending: boolean
   draft: ComposerDraft | null
   error: string | null
+  /** Opened on its last turns: the seq they begin after, until the earlier ones are read. */
+  earlier: number
+  /** Events that arrive while the whole history is read again; they follow it. */
+  held: ChatEnvelope[] | null
 }
 
 let viewEl: HTMLElement
@@ -412,6 +416,7 @@ function renderShell(): void {
     onRevert: (diffId) => { void revertDiff(diffId) },
     onLoadDiff: (diffId) => { void loadCompleteDiff(diffId) },
     onSelectSession: (id) => { void selectSession(id) },
+    onEarlier: () => { const e = activeId ? sessions.get(activeId) : undefined; if (e) void readEarlier(e) },
     onOpenInEditor: () => {
       const id = activeId
       const subject = id ? sessions.get(id)?.record.subject : undefined
@@ -426,7 +431,8 @@ function renderShell(): void {
     jevAvailable: () => jev?.configured === true,
     history: () => {
       const e = entry()
-      return { entries: e ? recentMessages(e.model, e.record.context) : [], loading: !!e?.loading, error: e?.error }
+      // A handoff's context turn is the first one only when the first one was read.
+      return { entries: e ? recentMessages(e.model, e.earlier ? undefined : e.record.context) : [], loading: !!e?.loading, error: e?.error }
     },
     onSend: (draft) => {
       if (parseChatCommandChain(commandDraftText(draft)).create || parseChatCommandChain(commandDraftText(draft)).context === 'reset') void sendPrompt(draft)
@@ -634,7 +640,7 @@ function sortOrder(): void {
 function upsertRecord(record: SessionRecord, opts: { pending?: boolean, sort?: boolean } = {}): SessionEntry {
   let e = sessions.get(record.id)
   if (!e) {
-    e = { record, model: createModel(), loaded: false, loading: false, pending: !!opts.pending, draft: null, error: null }
+    e = { record, model: createModel(), loaded: false, loading: false, pending: !!opts.pending, draft: null, error: null, earlier: 0, held: null }
     sessions.set(record.id, e)
     order.push(record.id)
   } else {
@@ -1256,14 +1262,25 @@ async function selectSession(id: string, restoring = false): Promise<void> {
 
 /** Events applied between yields while a transcript loads. */
 const HISTORY_SLICE = 300
+/** Turns a first open reads, as many as the composer recalls; "Show earlier turns" reads the rest. */
+const OPEN_TURNS = 10
 
-async function loadHistory(e: SessionEntry): Promise<void> {
+/** Read a transcript: on a first open its last turns, or with `whole` all of it.
+ *  Returns the last seq applied. */
+async function loadHistory(e: SessionEntry, whole = false): Promise<number> {
   e.loading = true
   queueRender()
+  let after = whole ? 0 : chatClient.subscribedAfter(e.record.id) ?? 0
   try {
-    let after = chatClient.subscribedAfter(e.record.id) ?? 0
+    let turns = after === 0 && !whole ? OPEN_TURNS : undefined
     for (let guard = 0; guard < 100; guard++) {
-      const page = await chatClient.fetchSession(e.record.id, after)
+      const page = await chatClient.fetchSession(e.record.id, after, turns)
+      if (turns && page.from) {
+        after = page.from
+        e.earlier = page.from
+        e.model.blocks.unshift({ kind: 'earlier', key: 'earlier', rev: 0 })
+      }
+      turns = undefined
       e.record = reconcileSession(e.record, page.session)
       applyResetRecord(e, e.record)
       for (const [i, env] of page.events.entries()) {
@@ -1273,7 +1290,7 @@ async function loadHistory(e: SessionEntry): Promise<void> {
       }
       if (!page.truncated || !page.events.length) break
     }
-    chatClient.subscribe(e.record.id, after)
+    if (!whole) chatClient.subscribe(e.record.id, after)
     e.loaded = true
     e.error = null
   } catch (err) {
@@ -1283,13 +1300,36 @@ async function loadHistory(e: SessionEntry): Promise<void> {
     e.loading = false
     sortOrder()
     queueRender()
-    if (activeId === e.record.id) scrollToBottom(true)
+    if (activeId === e.record.id && !whole) scrollToBottom(true)
   }
+  return after
+}
+
+/** "Show earlier turns": read the whole transcript again into a new model.
+ *  Live events wait and follow it, each once; a failed read keeps what was shown. */
+async function readEarlier(e: SessionEntry): Promise<void> {
+  if (e.loading || !e.earlier || e.held) return
+  const previous = { model: e.model, earlier: e.earlier }
+  const anchor = previous.model.blocks.find((block) => block.kind === 'turn')?.key
+  e.held = []
+  e.model = createModel()
+  e.earlier = 0
+  transcript.clear()
+  const last = await loadHistory(e, true)
+  const failed = !!e.error
+  if (failed) { e.model = previous.model; e.earlier = previous.earlier; transcript.clear() }
+  const held = e.held ?? []
+  e.held = null
+  for (const env of held) if (failed || env.seq > last) onEvent(env)
+  queueRender()
+  // Keep the turn that was first in view where the reader left it.
+  if (anchor && !failed) requestAnimationFrame(() => requestAnimationFrame(() => transcriptEl.querySelector<HTMLElement>(`[data-key="${CSS.escape(anchor)}"]`)?.scrollIntoView({ block: 'start' })))
 }
 
 function onEvent(env: ChatEnvelope): void {
   const e = sessions.get(env.sessionId)
   if (!e) return
+  if (e.held) { e.held.push(env); return }
   const ev = env.event
   if (ev.type === 'session.reset') {
     upsertRecord({ ...ev.session, lastSeq: env.seq }, { pending: false })

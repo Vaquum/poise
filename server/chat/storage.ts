@@ -340,6 +340,15 @@ export function listEvents(sessionId: string, afterSeq: number, limit: number = 
   }
 }
 
+/** The seq after which a transcript's last `turns` turns begin, read from the
+ *  turn-finish index; 0 when it has no more finished turns than that. */
+export function lastTurnsStart(sessionId: string, turns: number): number {
+  const row = db.prepare(`SELECT seq FROM chat_events INDEXED BY idx_chat_events_turn_finished
+    WHERE session_id = ? AND json_extract(event, '$.type') = 'turn.finished'
+    ORDER BY seq DESC LIMIT 1 OFFSET ?`).get(sessionId, turns) as { seq: number } | undefined
+  return row?.seq ?? 0
+}
+
 export function lastEvent(sessionId: string): ChatEnvelope | null {
   const row = db.prepare('SELECT seq, at, event FROM chat_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1').get(sessionId) as { seq: number, at: string, event: string } | undefined
   return row ? { seq: row.seq, sessionId, at: row.at, event: JSON.parse(row.event) as ChatEvent } : null
