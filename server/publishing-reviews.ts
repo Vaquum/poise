@@ -322,12 +322,17 @@ function checkedMs(value: Cached): number {
   return Number.isFinite(at) ? at : Number.NEGATIVE_INFINITY
 }
 
+const LEDGER_READS_AT_ONCE = 16
+
 async function listCandidates(me: string): Promise<Candidate[]> {
   const out: Candidate[] = []
-  // Every document's ledger at once: one after another, each read waited its
-  // own turn of a busy server's loop.
+  // Sixteen ledgers at a time: one after another, each read waited its own
+  // turn of a busy server's loop; all at once could run out of descriptors.
   const docs = await listDocs()
-  const ledgers = await Promise.all(docs.map((doc) => readPublishLedger(doc.slug)))
+  const ledgers: Awaited<ReturnType<typeof readPublishLedger>>[] = []
+  for (let start = 0; start < docs.length; start += LEDGER_READS_AT_ONCE) {
+    ledgers.push(...await Promise.all(docs.slice(start, start + LEDGER_READS_AT_ONCE).map((doc) => readPublishLedger(doc.slug))))
+  }
   for (const [index, doc] of docs.entries()) {
     for (const record of ledgers[index]!.records) out.push({ slug: doc.slug, record, value: cached(keyFor(me, record)) })
   }
