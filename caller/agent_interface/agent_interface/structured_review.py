@@ -734,7 +734,26 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
         done = watch.run(command, input=part, cwd=str(root), timeout=remaining, env=env, provider="codex")
         if done.returncode:
             code, sig = (None, -done.returncode) if done.returncode < 0 else (done.returncode, None)
-            provider_failure(done.stderr.strip() or f"codex exited {done.returncode}",
+            cause = ""
+            # A failed process may leave truncated events. Keep its exit/signal
+            # classification; successful output still uses strict parsing below.
+            for line in reversed(done.stdout.splitlines()):
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict) or event.get("type") not in ("error", "turn.failed"):
+                    continue
+                error = event.get("error")
+                messages = (error.get("message") if isinstance(error, dict) else error, event.get("message"))
+                cause = next((message.strip() for message in messages if isinstance(message, str) and message.strip()), "")
+                if cause:
+                    break
+            if not cause:
+                cause = next((line.strip() for line in reversed(done.stderr.splitlines())
+                              if re.match(r"(?:error\b|fatal\b|thread .+ panicked at\b)", line.strip(), re.IGNORECASE)), "")
+            status = f"signal {sig}" if sig is not None else f"exit {code}"
+            provider_failure(cause or f"cause unavailable (codex {status})",
                              provider="codex", exit_code=code, signal=sig)
         # Startup item errors can be notices about disabled tools. Failed
         # turns and actual native tool executions still reject the verdict.
