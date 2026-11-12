@@ -397,6 +397,28 @@ query($owner: String!, $name: String!, $number: Int!) {{
 
 
 _GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+_GITHUB_GRAPHQL_HOST = "api.github.com"
+
+
+def _github_proxy(environment: dict[str, str]) -> str | None:
+    # Match gh's Go proxy selection for this fixed HTTPS host.
+    proxy = environment.get("HTTPS_PROXY") or environment.get("https_proxy")
+    if not proxy:
+        return None
+    exclusions = environment.get("NO_PROXY") or environment.get("no_proxy", "")
+    for entry in exclusions.lower().split(","):
+        entry = entry.strip()
+        if entry == "*":
+            return None
+        host, _, port = entry.partition(":")
+        if port and port != "443":
+            continue
+        if host.startswith("*."):
+            host = host[1:]
+        domain_suffix = host if host.startswith(".") else "." + host
+        if host == _GITHUB_GRAPHQL_HOST or _GITHUB_GRAPHQL_HOST.endswith(domain_suffix):
+            return None
+    return proxy if "://" in proxy else f"http://{proxy}"
 
 
 def _uses_cli_transport(environment: dict[str, str]) -> bool:
@@ -421,10 +443,12 @@ def _uses_cli_transport(environment: dict[str, str]) -> bool:
 def datastore_github_client() -> Iterator[GitHubClient]:
     environment = os.environ.copy()
     token = environment.get("GH_TOKEN", "").strip()
-    if not token or _uses_cli_transport(environment):
+    proxy = _github_proxy(environment)
+    if not token or (proxy and not proxy.startswith(("http://", "https://"))) or _uses_cli_transport(environment):
         yield GitHubClient()
         return
-    with httpx.Client(verify=ssl.create_default_context(), timeout=httpx.Timeout(None, connect=30.0)) as http:
+    with httpx.Client(proxy=proxy, trust_env=False, verify=ssl.create_default_context(),
+                      timeout=httpx.Timeout(None, connect=30.0)) as http:
         yield GitHubClient(http=http, token=token)
 
 

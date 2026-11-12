@@ -8,7 +8,13 @@ from unittest.mock import call, patch
 
 import httpx
 
-from github_datastore.github_api import GitHubApiError, GitHubClient, GitHubRateLimitError, datastore_github_client
+from github_datastore.github_api import (
+    GitHubApiError,
+    GitHubClient,
+    GitHubRateLimitError,
+    _github_proxy,
+    datastore_github_client,
+)
 
 
 ENV = {"GH_HOST": "github.com", "GH_TOKEN": "fixture-token", "NO_PROXY": "*"}
@@ -18,6 +24,16 @@ NO_CONFIG = subprocess.CompletedProcess(["gh"], 0, stdout="", stderr="")
 
 
 class PooledGraphQLTest(unittest.TestCase):
+    def test_proxy_selection_matches_gh_for_the_github_endpoint(self) -> None:
+        self.assertIsNone(_github_proxy({"ALL_PROXY": "http://alternate:3128", "HTTP_PROXY": "http://other:3128"}))
+        environment = {"HTTPS_PROXY": "fixture:3128", "https_proxy": "http://alternate:3128"}
+        for bypass in ("*", ".github.com", "*.github.com", "GITHUB.COM", "api.github.com:443"):
+            with self.subTest(bypass=bypass):
+                self.assertIsNone(_github_proxy({**environment, "NO_PROXY": bypass}))
+        for entry in ("other.com", ".api.github.com", "api.github.com:444", "bapi.github.com"):
+            with self.subTest(entry=entry):
+                self.assertEqual(_github_proxy({**environment, "NO_PROXY": entry}), "http://fixture:3128")
+
     def test_configured_datastore_reuses_a_socket_and_preserves_request_values(self) -> None:
         seen = []
 

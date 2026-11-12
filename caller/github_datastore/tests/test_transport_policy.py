@@ -11,7 +11,7 @@ class TransportPolicyTest(unittest.TestCase):
         ).read_text()
         endpoint = 'https://api.github.com/graphql'
         self.assertEqual(source.count(f'"{endpoint}"'), 1)
-        source = source.replace(f'"{endpoint}"', "")
+        source = source.replace(f'"{endpoint}"', "").replace('"api.github.com"', "")
         forbidden = [
             "api.github.com",
             '"/repos/',

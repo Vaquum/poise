@@ -89,7 +89,7 @@ is unset). GitHub reads require `GH_TOKEN`. Poise obtains that token with
 `gh auth token --user LOGIN` for the selected account and sets
 `GH_HOST=github.com`. With that host, initialization and each sync reuse
 HTTPS connections to GitHub GraphQL within the run. Other host selection,
-custom gh endpoint or socket configuration, and gh debugging use the
+custom gh endpoint or socket configuration, non-HTTP proxies, and gh debugging use the
 `gh api graphql` transport.
 
 ## Trust Rule
