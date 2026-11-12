@@ -333,7 +333,7 @@ function refuseUpgrade(req: IncomingMessage, socket: Duplex, service: ServiceCon
 
 let runtimeStopPromise: Promise<void> | null = null
 let databaseClosed = false
-const serverShutdowns = new WeakMap<Server, Promise<void>>()
+const serverShutdowns = new WeakMap<Server, { promise: Promise<void>; pending: Set<string>; failures: Error[] }>()
 
 function stopRuntimeOnce(): Promise<void> {
   runtimeStopPromise ??= Promise.resolve().then(() => stopPoiseRuntime())
@@ -363,20 +363,27 @@ async function closeHttpServer(server: Server): Promise<void> {
 
 export function shutdownProductionServer(server: Server): Promise<void> {
   const existing = serverShutdowns.get(server)
-  if (existing) return existing
+  if (existing) return existing.promise
   abandonProductionCpuCapture()
 
+  const pending = new Set(['runtime stop', 'HTTP close'])
+  const failures: Error[] = []
   const shutdown = (async () => {
-    const results = await Promise.allSettled([stopRuntimeOnce(), closeHttpServer(server)])
+    const operations = [['runtime stop', stopRuntimeOnce()], ['HTTP close', closeHttpServer(server)]] as const
+    await Promise.allSettled(operations.map(async ([phase, operation]) => {
+      try { await operation }
+      catch (error) {
+        const failure = new Error(`${phase} failed`, { cause: error })
+        failures.push(failure)
+        throw failure
+      } finally { pending.delete(phase) }
+    }))
     // Runtime tasks can touch SQLite during their own teardown. Close the DB
     // only after both shutdown operations have settled.
     closeDatabaseOnce()
-    const failures = results
-      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
-      .map((result) => result.reason)
-    if (failures.length > 0) throw new AggregateError(failures, 'production shutdown failed')
+    if (failures.length > 0) throw new AggregateError(failures, 'production shutdown failed', { cause: failures[0] })
   })()
-  serverShutdowns.set(server, shutdown)
+  serverShutdowns.set(server, { promise: shutdown, pending, failures })
   return shutdown
 }
 
@@ -393,7 +400,11 @@ export function createProductionShutdown(
     const deadline = setTimeout(() => {
       if (finished) return
       finished = true
-      try { closeDatabaseOnce() }
+      try {
+        const state = serverShutdowns.get(server)!
+        console.error(`[poise] shutdown timed out after ${PRODUCTION_SHUTDOWN_TIMEOUT_MS}ms; pending: ${[...state.pending].join(', ')}`, ...state.failures)
+        closeDatabaseOnce()
+      }
       finally { exit(1) }
     }, PRODUCTION_SHUTDOWN_TIMEOUT_MS)
     deadline.unref()
@@ -434,6 +445,11 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   })
 
   const server = createServer((req, res) => {
+    res.once('finish', () => {
+      // close() reaps only sockets already idle when it starts. Retire ones
+      // whose in-flight responses finish during shutdown as well.
+      if (!server.listening) server.closeIdleConnections()
+    })
     void Promise.resolve(api(req, res, () => {
       if (res.writableEnded) return
       if ((req.url || '').startsWith('/api/confab')) {
