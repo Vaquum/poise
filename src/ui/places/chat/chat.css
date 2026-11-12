@@ -17,3 +17,11 @@
 /* Floating over a narrow chat, the right-hand panes start under the chat's header, so its controls stay in reach. */
 #view-chat .chat-layout { --chat-head-h: 0; }
 @media (max-width: 1000px) { #view-chat .chat-switchboard-pane, #view-chat .chat-memories-pane { top: var(--chat-head-h); } }
+
+
+/* Chat's own values hold whichever place's copy of a classic rule loads after Chat's stylesheet
+   (once the page preloads the places, every place's stylesheet is present). */
+#view-chat .chat-view-controls { gap: var(--sp-2); }
+#view-chat .chat-notice { margin-top: var(--sp-2); }
+#view-chat .jev-notice { margin-top: calc(var(--sp-unit) * 3); }
+#view-chat .chat-v-composer { padding: 0; border-top: none; }

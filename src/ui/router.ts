@@ -38,6 +38,9 @@ const FADE_ONLY = new Set<Place>(['chat', 'manager', 'editor'])
 const entered = new Set<Place>()
 
 let root: HTMLElement
+/** The other places' code is fetched once, when the page first goes idle. */
+let preloaded = false
+const whenIdle = (fn: () => void): void => { if ('requestIdleCallback' in window) requestIdleCallback(() => fn()); else setTimeout(fn, 200) }
 let current: { place: Place, controller: AbortController, leave?: () => void } | null = null
 let sequence = 0
 
@@ -68,11 +71,15 @@ async function mountAddress(): Promise<void> {
   root.replaceChildren()
   root.dataset.place = address.place
   scrollTo(0, 0)
-  const leave = await module.mount(ctx)
+  // The place enters as soon as its structure is drawn, never waiting for its reads.
+  const mounting = module.mount(ctx)
+  if (!entered.has(address.place)) { entered.add(address.place); paintTerms(root); reveal(root, FADE_ONLY.has(address.place) ? { distance: 0 } : {}) }
+  const leave = await mounting
   if (current?.controller !== controller) { if (typeof leave === 'function') leave(); return }
   if (typeof leave === 'function') current.leave = leave
   paintTerms(root)
-  if (!entered.has(address.place)) { entered.add(address.place); reveal(root, FADE_ONLY.has(address.place) ? { distance: 0 } : {}) }
+  // A first open of another place then never waits for its code; it loads once this place has had its turn.
+  if (!preloaded) { preloaded = true; setTimeout(() => whenIdle(() => { for (const load of Object.values(PLACES)) void load().catch(() => undefined) }), 1500) }
 }
 
 /** Moves to `href`, a link within this page, as a new history entry. */

@@ -13,7 +13,7 @@ import { paintTerms } from '../reference'
 import { closeMenus, lifeHTML, lifeTo, motion, routeBack, toast, type Stage } from '../shell'
 import { placeHref } from '../address'
 import type { MountPlace } from '../router'
-import { getOrganizations, loadSettings, startRefreshTicker } from '../../config'
+import { getOrganizations, placeSettings, startRefreshTicker } from '../../config'
 import { CURRENT_FILTER_KEY, timeRangeWindow, type TimeRange } from '../../time-range'
 import { ORGANIZATION_STORAGE_KEY, setSelectedOrganization } from '../../organizations'
 import { noticeFeed } from '../../notices'
@@ -60,6 +60,8 @@ type FilterKey = keyof Filters
 /** Classic's Current keeps `status` as all|open in the same key; Board reads and writes it that way.
  *  Board's view, what its time means and Who are its own (`poise-board`). */
 const BOARD_KEY = 'poise-board'
+/** Board's last read, kept across visits: a return paints it at once, then reads again. */
+let lastRead: { key: string, cards: Card[], items: Item[], statuses: Awaited<ReturnType<typeof readPrStatus>> | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean } | null = null
 function readFilters(): Filters {
   const saved = store.get<Record<string, unknown>>(CURRENT_FILTER_KEY, {})
   const own = { ...saved, ...store.get<Record<string, unknown>>(BOARD_KEY, {}) }
@@ -100,6 +102,8 @@ export const mount: MountPlace = (ctx) => {
 
   // ---------- Filters: yours, or a link's for this visit only ----------
   const F = readFilters()
+  /** What Board's last read was for: the same organization, status and time read the same items. */
+  const readKey = (): string => `${F.org}|${F.status}|${F.time}`
   const linked: Partial<Filters> = {}
   const linkTo = <K extends FilterKey>(k: K, v: Filters[K]) => { if (!(k in linked)) (linked as Record<string, unknown>)[k] = F[k]; F[k] = v }
   for (const k of ['layout', 'by', 'who', 'time', 'status'] as const) {
@@ -436,9 +440,25 @@ export const mount: MountPlace = (ctx) => {
   async function load(first = false): Promise<void> {
     const mine = ++generation
     const w = timeWindow()
+    const cardsReading = first ? settle('cards', 'your cards', readCards(F.org)) : Promise.resolve(undefined)
+    const liveReading = settle('live', 'GitHub issues and pull requests', readLive({ open: F.status === 'open', since: w.since, until: w.until }, F.org))
+    // A first read draws the cards and the items once they answer, unless the rest lands within
+    // 100 ms and draws them whole, in one draw; their states fill in as the rest lands.
+    if (first) {
+      void Promise.all([cardsReading, liveReading]).then(([cardsRead, live]) => window.setTimeout(() => {
+        if (mine !== generation || signal.aborted || readOnce) return
+        if (cardsRead) cards = cardsRead
+        if (live) {
+          truncated = live.truncated
+          items = live.records.map((record) => toItem({ record, status: statusesRead?.get(itemKey(record.repo, record.number)), chain: null, run: null, labelled: assigned.has(itemKey(record.repo, record.number)), closing: null }))
+          liveRead = true
+        }
+        render(false)
+      }, 100))
+    }
     const [cardsRead, live, statuses, intakeRead, running, chainsRead, chatsRead] = await Promise.all([
-      first ? settle('cards', 'your cards', readCards(F.org)) : Promise.resolve(undefined),
-      settle('live', 'GitHub issues and pull requests', readLive({ open: F.status === 'open', since: w.since, until: w.until }, F.org)),
+      cardsReading,
+      liveReading,
       settle('status', 'pull requests’ blockers', readPrStatus()),
       settle('intake', 'which issues are assigned to Poise', readIntake(F.org)),
       settle('running', 'the runs going now', readRunning(F.org)),
@@ -492,6 +512,7 @@ export const mount: MountPlace = (ctx) => {
       }
     }
     readOnce = true
+    if (live) lastRead = { key: readKey(), cards, items, statuses: statusesRead, intake, capacity, chats, truncated }
     paintPartial()
     if (first || !busy()) render(!first)
     else summary()
@@ -1083,11 +1104,17 @@ export const mount: MountPlace = (ctx) => {
   })
 
   // ---------- Start ----------
+  // A return paints Board's last read at once; the read below refreshes it.
+  if (lastRead?.key === readKey()) {
+    ({ cards, items, intake, capacity, chats, truncated } = lastRead)
+    statusesRead = lastRead.statuses
+    readOnce = liveRead = true
+  }
   paintHead()
   render(false)
   startRefreshTicker()
   void (async () => {
-    await loadSettings().catch(() => undefined)
+    await placeSettings().catch(() => undefined)
     if (signal.aborted) return
     const scope = getOrganizations().some((o) => o.login === F.org && o.status === 'ready') ? F.org : ''
     if (scope !== F.org) choose({ org: scope })

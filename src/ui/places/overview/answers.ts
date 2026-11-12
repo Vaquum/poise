@@ -780,7 +780,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   }, { signal })
 
   // ---------- Live ----------
-  const unsubscribe = noticeFeed.subscribe((state) => { feed = state; paint() })
+  // Leaving clears Overview's notices one by one; a place that has left does not repaint for each.
+  const unsubscribe = noticeFeed.subscribe((state) => { feed = state; if (!signal.aborted) paint() })
   chatClient.start()
   const offRequests = chatClient.on('chatRequests', (revision) => {
     requests.frame = Math.max(requests.frame, revision)
