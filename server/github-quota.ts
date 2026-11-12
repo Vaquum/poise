@@ -88,11 +88,17 @@ function configuredAccounts(): Array<Pick<GithubQuotaAccount, 'login' | 'roles'>
   return [...accounts.values()]
 }
 
-async function readAccount(login: string): Promise<Snapshot> {
+async function readAccount(login: string, lastObserved = false): Promise<Snapshot> {
   const key = login.toLowerCase()
   const cached = cache.get(key)
   if (cached && Date.now() < cached.expiresAt
     && cached.snapshot.buckets.every((bucket) => Date.parse(bucket.resetAt) > Date.now() || bucket.limit === 0)) return cached.snapshot
+  // A reader that takes the last observation gets it at once, with when it
+  // was made, and the account is read again behind it.
+  if (lastObserved && cached) {
+    void readAccount(login)
+    return cached.snapshot
+  }
   const active = pending.get(key)
   if (active) return active
   const startedAt = Date.now()
@@ -230,10 +236,13 @@ export function syncQuotaAlerts(accounts: GithubQuotaAccount[], now = Date.now()
   }
 }
 
-export async function readGithubQuota(): Promise<GithubQuotaReport> {
+/** `lastObserved`: answer from each account's last observation at once,
+ *  reading it again behind the answer, as the browser's read does; an
+ *  account never observed is read now. The monitor always reads fresh. */
+export async function readGithubQuota(options: { lastObserved?: boolean } = {}): Promise<GithubQuotaReport> {
   const configured = configuredAccounts()
   const accounts = await Promise.all(configured.map(async (account): Promise<GithubQuotaAccount> => {
-    const snapshot = await readAccount(account.login)
+    const snapshot = await readAccount(account.login, options.lastObserved)
     return { ...account, ...snapshot, checkedAt: new Date(snapshot.checkedAt).toISOString() }
   }))
   if (JSON.stringify(configured) !== JSON.stringify(configuredAccounts())) throw new Error('GitHub accounts changed while reading quota; retry.')

@@ -113,6 +113,34 @@ describe('identity-scoped reads', () => {
     expect(mocks.runFile).toHaveBeenCalledTimes(4)
   })
 
+  it('answers the browser from the last observation at once and reads it again behind the answer', async () => {
+    database.setMeta('me', 'Octocat')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload(100)) }))
+    const first = await quota.readGithubQuota()
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    vi.setSystemTime(T0 + quota.QUOTA_INTERVAL_MS + 1)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
+      await gate
+      return { stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload(200)) }
+    })
+    // GitHub is held: the answer still comes, from the last observation, with when it was made.
+    const stale = await quota.readGithubQuota({ lastObserved: true })
+    expect(stale.accounts[0].checkedAt).toBe(first.accounts[0].checkedAt)
+    expect(mocks.runFile).toHaveBeenCalledTimes(3)
+    release()
+    await vi.waitFor(async () => expect((await quota.readGithubQuota({ lastObserved: true })).accounts[0].checkedAt).not.toBe(first.accounts[0].checkedAt))
+  })
+
+  it('reads an account never observed now, even for the browser', async () => {
+    database.setMeta('me', 'Octocat')
+    mocks.runFile.mockImplementation(async (_command: string, args: string[]) => ({ stdout: args[0] === 'auth' ? 'test-token' : JSON.stringify(payload()) }))
+    const report = await quota.readGithubQuota({ lastObserved: true })
+    expect(report.accounts[0].error).toBe(null)
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+  })
+
   it('expires the cache from request start so CLI latency does not skip the next tick', async () => {
     database.setMeta('me', 'Octocat')
     mocks.runFile.mockImplementation(async (_command: string, args: string[]) => {
