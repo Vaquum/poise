@@ -483,6 +483,10 @@ its own instead of refusing with dirty_unowned.
 - **Unreachable.** A workspace that does not answer a probe keeps its
   container; the gateway probes again on later passes, and only a workspace
   unreachable past the switch grace gets a new container, drained first.
+  During that fallback drain, each successful drain or health reply can prove
+  the target release is already running. If the base and required container
+  settings still match, the gateway explicitly resumes the workspace and ends
+  replacement, even while Caller work continues.
 - **Waiting.** A switch fires at a quiet moment, so a busy workspace keeps its
   container while the gateway asks again; each pass logs `workspace.update.waiting`
   with what it waits on. An idle workspace still on the old release past the switch
