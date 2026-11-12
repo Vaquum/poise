@@ -113,22 +113,45 @@ test('Who shows Poise’s own work or everything else, and each open issue its c
   await expect(card(page, 'Owned by Poise')).toHaveCount(0)
 })
 
-test('Assign to Poise asks Sure?, adds the label, and shows Poise at once', async ({ page }) => {
-  const world: World = { records: RECORDS }
-  await board(page, world)
-  const issue = card(page, 'Opened today')
-  await issue.getByRole('button', { name: 'Assign to Poise' }).click()
-  await expect(issue.getByRole('button', { name: 'Sure?' })).toBeVisible()
-  expect(world.assigned).toEqual([])
-  await issue.getByRole('button', { name: 'Sure?' }).click()
-  await expect(issue.getByRole('link', { name: 'Poise', exact: true })).toBeVisible()
-  await expect(issue.getByRole('button', { name: /Assign to Poise|Sure\?/ })).toHaveCount(0)
-  expect(world.assigned).toEqual(['acme/site#42'])
-})
+for (const layout of ['Lanes', 'List'] as const) {
+  test(`${layout}: Assign is the first action icon, restores after expiry, and adds the label after Sure?`, async ({ page }) => {
+    const world: World = { records: RECORDS }
+    await board(page, world)
+    await view(page, layout).click()
+    const issue = card(page, 'Opened today')
+    if (layout === 'Lanes') await issue.hover()
+    else await issue.focus()
+    const assign = issue.getByRole('button', { name: 'Assign to Poise', exact: true })
+    await expect(issue.locator('[data-act="assign"]')).toHaveCount(1)
+    await expect(issue.locator('.card-state [data-act="assign"]')).toHaveCount(0)
+    await expect(issue.locator('.card-acts > :first-child')).toHaveAttribute('aria-label', 'Assign to Poise')
+    await expect(issue.locator('.card-acts > :nth-child(2)')).toHaveAttribute('aria-label', 'Copy')
+    await expect(assign).toHaveClass('ib')
+    await expect(assign).toHaveText('')
+    await expect(assign.locator('svg use')).toHaveAttribute('href', '#i-handoff')
+    const original = await assign.innerHTML()
+    await page.clock.install()
+    await assign.click()
+    await expect(issue.getByRole('button', { name: 'Sure?' })).toBeVisible()
+    expect(world.assigned).toEqual([])
+    await page.clock.fastForward(4000)
+    await expect(assign).not.toHaveClass(/is-armed/)
+    expect(await assign.innerHTML()).toBe(original)
+    await expect(assign).toHaveText('')
+    await assign.click()
+    await expect(issue.getByRole('button', { name: 'Sure?' })).toBeVisible()
+    expect(world.assigned).toEqual([])
+    await issue.getByRole('button', { name: 'Sure?' }).click()
+    await expect(issue.getByRole('link', { name: 'Poise', exact: true })).toBeVisible()
+    await expect(issue.getByRole('button', { name: /Assign to Poise|Sure\?/ })).toHaveCount(0)
+    expect(world.assigned).toEqual(['acme/site#42'])
+  })
+}
 
 test('a refused assignment keeps its reason on the row, and the chain being off is said', async ({ page }) => {
   await board(page, { records: RECORDS, assign: 'refused', chainEnabled: false })
   const issue = card(page, 'Opened today')
+  await issue.hover()
   await expect(issue.getByRole('button', { name: 'Assign to Poise' })).toHaveAttribute('title', /chain is off/)
   await issue.getByRole('button', { name: 'Assign to Poise' }).click()
   await issue.getByRole('button', { name: 'Sure?' }).click()
@@ -175,6 +198,10 @@ test('choosing a live item opens it beside the board, and a card’s chat opens 
   await expect(beside.getByRole('link', { name: 'Its row in GitHub' })).toHaveAttribute('href', /view=observe&part=github&item=acme%2Fsite%2344/)
   await beside.getByRole('button', { name: 'Close' }).click()
   await expect(beside).toBeHidden()
+
+  await card(page, 'Opened today').locator('.card-meta').click()
+  await expect(beside.getByRole('button', { name: 'Assign to Poise' })).toHaveText('Assign to Poise')
+  await beside.getByRole('button', { name: 'Close' }).click()
 
   await card(page, 'Opened today').hover()
   await card(page, 'Opened today').getByRole('button', { name: 'Chat about this, beside the board' }).click()
@@ -239,6 +266,7 @@ test('a GitHub read that never succeeded reads as not read, never as zero', asyn
 test('a held repaint leaves an armed Assign armed', async ({ page }) => {
   const world: World = { records: RECORDS.map((r) => ({ ...r })) }
   await board(page, world)
+  await card(page, 'Opened today').hover()
   await card(page, 'Opened today').getByRole('button', { name: 'Assign to Poise' }).click()
   await expect(card(page, 'Opened today').getByRole('button', { name: 'Sure?' })).toBeVisible()
   await card(page, 'A pull request').focus()
