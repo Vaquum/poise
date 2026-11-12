@@ -255,7 +255,11 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('server did not bind')
   const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  // The API shares identical list reads for ten seconds; a rejected POST clears
+  // that cache so this test reads fresh data and leaves none for the next.
+  const clearSharedLists = () => fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
   try {
+    await clearSharedLists()
     const active = await (await fetch(`${base}?state=active&after=closed/`)).json()
     expect(active.chains.map((chain: { id: string }) => chain.id).sort()).toEqual(retained.map(chain => chain.id).sort())
     const attention = (await (await fetch(`${base}?state=active`)).json()).attention.map((chain: { id: string }) => chain.id)
@@ -279,6 +283,7 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
     expect(journal.forPull('closed/repo', 1260)).toBeNull()
     expect(journal.history(held.id)).toEqual(before.at(-1))
     expect((await (await fetch(`${base}?state=active`)).json()).attention.map((chain: { id: string }) => chain.id)).toEqual(attention)
+    await clearSharedLists()
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })
 
