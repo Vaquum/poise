@@ -65,9 +65,11 @@ const BOARD_KEY = 'poise-board'
  *  or filter's read never stands for it. */
 type Statuses = Awaited<ReturnType<typeof readPrStatus>>
 type Runs = Awaited<ReturnType<typeof readRunning>>
-interface LastRead { key: string, me: string, cards: Card[], items: Item[], statuses: Statuses | undefined, runs: Runs | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean }
+interface LastRead { key: string, me: string, orgs: string, cards: Card[], items: Item[], statuses: Statuses | undefined, runs: Runs | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean }
 type Kept = Omit<LastRead, 'statuses' | 'runs' | 'chats' | 'intake'> & { statuses?: Array<[string, Statuses extends Map<string, infer V> ? V : never]>, runs?: Array<[string, Runs extends Map<string, infer V> ? V : never]>, chats: Array<[string, ChatOn]>, intake: (Omit<Intake, 'labelled'> & { labelled: string[] }) | null }
 const LAST_READ_KEY = 'poise-board-last'
+/** The organizations ready now: All orgs never stands for another set of them. */
+const readyOrgs = (): string => getOrganizations().filter((o) => o.status === 'ready').map((o) => o.login.toLowerCase()).sort().join(',')
 let lastRead: LastRead | null = (() => {
   try {
     const kept = JSON.parse(localStorage.getItem(LAST_READ_KEY) ?? 'null') as Kept | null
@@ -534,9 +536,9 @@ export const mount: MountPlace = (ctx) => {
       }
     }
     readOnce = true
-    // Kept only for the GitHub user this Board opened with.
-    if (live && me !== null && (getSettings().me ?? '') === me) {
-      lastRead = { key: readKey(), me, cards, items, statuses: statusesRead, runs: runsRead, intake, capacity, chats, truncated }
+    // Kept only for a known GitHub user, the one this Board opened with.
+    if (live && me && (getSettings().me ?? '') === me) {
+      lastRead = { key: readKey(), me, orgs: readyOrgs(), cards, items, statuses: statusesRead, runs: runsRead, intake, capacity, chats, truncated }
       keepRead(lastRead)
     }
     paintPartial()
@@ -1142,7 +1144,7 @@ export const mount: MountPlace = (ctx) => {
     // user, organization and filters; the read below refreshes it.
     me = getSettings().me ?? ''
     const kept = lastRead
-    if (kept && !readOnce && kept.me === me && kept.key === readKey()) {
+    if (kept && !readOnce && me && kept.me === me && kept.orgs === readyOrgs() && kept.key === readKey()) {
       ({ cards, items, intake, capacity, chats, truncated } = kept)
       statusesRead = kept.statuses
       runsRead = kept.runs
