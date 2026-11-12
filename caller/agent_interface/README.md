@@ -94,6 +94,8 @@ names that reclaimed ancestor; it carries no invented child device/inode.
 Allocated roots, preparation siblings and unknown older ownership require
 their own proof. Original and recovery cleanup use the same private claim;
 PID loss, a new epoch or a deadline never grants takeover by itself.
+The claim transaction rechecks whether the Call still needs cleanup and is due.
+Recovery reads the current settlement only after claiming the Call.
 The supervisor pins Caller's original data directory, database and response
 directory. Caller metadata reads/writes and service drain counts use those
 handles after an ancestor rename; a replacement directory never becomes the
