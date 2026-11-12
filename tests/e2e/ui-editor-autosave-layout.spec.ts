@@ -183,5 +183,12 @@ for (const width of [375, 768, 1000]) {
     await page.setViewportSize({ width, height: 800 })
     await openEditor(page, 'Draft', 'ok')
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(0)
+    // With a route back, a wrapped header grows to hold its rows: nothing in it lies over the document.
+    await page.goto('/?view=editor&doc=draft&back=overview')
+    await expect(page.locator('#editor-doc')).toContainText('word')
+    expect(await page.evaluate(() => {
+      const header = document.querySelector<HTMLElement>('#view-editor > .view-header')!
+      return Math.max(...[...header.querySelectorAll<HTMLElement>('*')].map((el) => el.getBoundingClientRect().bottom)) - header.getBoundingClientRect().bottom
+    })).toBeLessThanOrEqual(1)
   })
 }

@@ -5,3 +5,5 @@
 /* The document chat opens beside the document, under the Editor's toolbar, not over it. */
 #view-editor > .view-header { box-sizing: border-box; height: calc(var(--sp-unit) * 12); }
 body:has(#view-editor:not([hidden])) #chat-side-pane { top: calc(var(--size-topbar) + var(--sp-unit) * 12); height: calc(100vh - var(--size-topbar) - var(--sp-unit) * 12 - var(--foot-h)); }
+/* Where headers wrap (820 px), the Editor's grows to fit its rows. */
+@media (max-width: 820px) { #view-editor > .view-header { height: auto; } }
