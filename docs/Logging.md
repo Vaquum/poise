@@ -544,8 +544,7 @@ workflow incident, alert dedupe key and material-cause hash retain their separat
 lifecycle roles. Source, workspace, target and material cause must match; a newer
 record about the same PR cannot substitute for missing evidence.
 
-Opening evidence preserves dismissal/silence state; in classic it also closes a
-floating rail and leaves a docked rail open. Arrival cards keep their primary controls. Known links
+Opening evidence preserves dismissal/silence state. Arrival cards keep their primary controls. Known links
 keep the ordinary 410 expiry, indistinguishable unknown/foreign 404 and honest
 503 unavailable behavior described above. Recovery, Notifications off and
 container replacement do not delete retained source evidence.

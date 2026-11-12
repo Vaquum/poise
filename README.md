@@ -26,10 +26,8 @@ and `deploy/restore.sh` back it up and restore it.
 
 The interface is one page with a fixed top bar: Overview, Board, Chat, Editor,
 Observe and Settings. Elements explain themselves on hover, keyboard focus or
-`?`; Chat, the Manager place, the Editor and Settings' sections built on classic's
-views keep classic's tooltips for now. See [Interface](docs/Interface.md); the
-previous interface stays at
-`/classic.html` until it is removed.
+`?`; Chat, the Manager place, the Editor and reused Settings components keep
+their existing tooltips. See [Interface](docs/Interface.md).
 
 - **Overview** — *Answer here* lists what needs you, with the answer on each entry: a failed behavior, a sign-in, a chat waiting for you, a Switchboard decision, a review thread, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. *In motion* shows the work in seven states; beside it, the day's numbers against their pace and year, Behaviors' runs and the GitHub API quota. The bell on every place opens it. See [Notifications](docs/Notifications.md) and [Analytics](docs/Analytics.md).
 - **Board** — idea, concept and plan cards beside live issues and pull requests, a chained issue and its pull request as one task, and a List of the same work with its phase, owner and *Assign to Poise*.

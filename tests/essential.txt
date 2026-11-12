@@ -66,7 +66,6 @@ tests/worker-capacity-chain.test.ts
 tests/worker-capacity.test.ts
 
 # Data loss: storage, deletion, ledgers, locks, imports and drafts.
-tests/archive-view-logic.test.ts
 tests/behavior-chain-closed-target.test.ts
 tests/behavior-chain-native.test.ts
 tests/behavior-ledger-recovery.test.ts
@@ -125,4 +124,3 @@ tests/behaviors-preparation.test.ts
 tests/behaviors-repo-skips-api.test.ts
 tests/notification-evidence.test.ts
 tests/organizations-api.test.ts
-tests/view-cleanup-wired.test.ts

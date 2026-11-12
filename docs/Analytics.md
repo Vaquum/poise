@@ -1,28 +1,10 @@
 # Analytics
 
-In the new interface, Analytics is Overview's tiles: the day's eight numbers
+Analytics is Overview's tiles: the day's eight numbers
 with their pace and year, under each year the 30 days before it in five bins,
 then the five per merged pull request, work type and review. Drag a tile to
 reorder them; the order is kept in this browser. Each tile reads the same
 metrics this page defines.
-
-Classic, at `/classic.html` until it is removed (#556), keeps **Analytics** as
-a view of its own, as the rest of this page describes. Its shortcut is in the
-burger menu; choosing it closes the menu and returns focus to the burger.
-Settings → Navigation can place it in the top bar too. The shortcut on either
-surface marks Analytics as the current page. A reload stays on Analytics, and
-choosing another view leaves it.
-
-Analytics starts with a compact **System health · Live** strip, followed by
-the existing board of cards. **Pull requests merged**, its selected-day display
-and the board's histogram settings are unchanged. The default board order
-is eight productivity cards (two rows of four in a wide window), Work type,
-Review rounds and Change-request share, five per-PR cards, then live GitHub API
-account cards. Productivity and API cards share the taller height; Work & review
-and per-PR cards share the shorter height. Each family expands together when
-text or typography needs more space. Narrow windows reduce columns. During a
-resize, the board stays within the window while the cards move to their new
-positions.
 
 ## System health
 
@@ -72,128 +54,27 @@ existing chain journal evidence.
 
 Five cards share one row where space permits and wrap on narrower screens.
 
-Drag a card's top bar to move it anywhere on the board. The held card follows
-the pointer directly; other cards make room with the shared Tactile spring.
-The outlined slot shows the destination. Release to place; Escape, pointer
-cancellation, leaving Analytics or resizing cancels the move. Dragging near the
-viewport edge scrolls the page. Keyboard users focus a header, press Space or
-Enter, move with arrow keys (Home/End reach the ends), then press Space or Enter
-to place. Escape restores the previous order. Focus and document order follow
-the placed cards. Reduced motion places cards immediately.
-
-The browser remembers the order across day and organization changes, refreshes,
-navigation and reloads. New cards append to the saved order; unavailable account
-identities retain their saved position. A live read that completes during a move
-is applied after the move, retaining the held card and its controls.
-
-Every metric retains its value, comparison and weekly history. Productivity and
-per-PR cards retain their histograms. Work & review and GitHub API distributions
-are omitted; API cards retain their 24-hour usage chart. Borders, colors, spacing,
-tooltips and motion follow the shared design system.
-
-## Card layout
-
-The board is one named Analytics panels region. Each card has a semantic name;
-per-PR names retain “per merged pull request”, and quota headers retain “Live”.
-Quota cards describe their independence from the day and organization filter.
-There are sixteen metric cards and one card per reported account, holding that
-account's REST and GraphQL budgets together. A shared user/automation login is
-one account; an unavailable account keeps its identity and an unknown value.
-
-Cards pack in document order over twenty width units, with a 12px gap and no
-dense backfill. Mixed rows advance by their tallest card; shorter cards retain
-their own height. The minimum heights are 22rem and 17rem. At every content,
-font or width change each family grows to its largest member's measured content
-height, with the taller family retaining at least 5rem clearance above the shorter
-family. Work type uses two columns when each has at least 14rem of space,
-reducing to one below a 640px board width or when larger type needs it;
-all twelve types remain visible and focusable. There is no
-internal card scrolling or content clipping.
-
-| Board width | Productivity / review | Work type / API account | Per-PR |
-| --- | --- | --- | --- |
-| Below 450px | 20 units | 20 units | 20 units |
-| 450–879px | 10 units | 20 units | 10 units |
-| 880px or wider | 5 units | 10 units | 4 units |
-
-The whole header is a Pointer Events handle, with a grip, a 40px minimum target
-(44px for coarse pointers), `touch-action: none`, pointer capture and a 5px
-movement threshold. Only the primary pointer and primary button initiate a move.
-Plots and the page keep their ordinary interactions outside the header. Insertion
-uses stable boundaries between the other cards, with a 24px switching margin to
-avoid oscillation. Distinct orders remain reachable when a wide card wraps into
-the same destination box. Drop outside the board places at the nearest valid slot. Edge
-scrolling is bounded by the board; the held card cannot extend the page.
-Escape, pointer cancellation/capture loss, window blur, hidden tab, departure,
-font changes and viewport resize restore the committed order and release capture.
-Only a successful drop saves. Reordering announces pickup, position and placement
-or cancellation through one status region; ordinary data reads do not announce
-the entire board. Chart arrow keys remain scoped to the plot; reorder keys are
-scoped to the header. Guided scrolling keeps a keyboard-held or dropped header
-visible below the fixed application bar. Tab or focus leaving a keyboard-held
-header cancels the move; ordinary chart/value focus never leaves it held.
-Focus stays on the semantic control after placement or Escape cancellation.
-
-`poise-analytics-card-order` stores a JSON array of unique card IDs in localStorage.
-This first format is browser/origin-local, shared by logins using that browser,
-and contains layout metadata only. Metric IDs are `metric:<group>:<label>`;
-account IDs are `quota:<lowercase login>`. Renamed metrics and new accounts append
-as new identities; duplicate/obsolete IDs are ignored, and currently missing IDs
-remain remembered when saving another move. No existing format needs migration.
-Malformed data and denied/exhausted storage show an accessible visible error;
-Analytics remains usable in memory. A successful later move writes a valid array.
-
-Foreground reads replace metric bodies with keyed empty slots while retaining
-their measured family heights, including quota cards interleaved among them.
-The loader overlays the board without shifting it. Errors remove
-those placeholders. Background reads retain the semantic card/control nodes;
-the latest combined metric/quota patch waits during a move and applies on drop
-or cancellation, including after a failed preference save. The order survives
-history arrivals, account/day/settings changes, navigation and reload; returning
-to Analytics still resets its day to Today. Existing endpoints, polling and
-chart reads remain unchanged. `src/analytics-layout.ts` is the new controller
-for geometry, DOM reconciliation, persistence and gesture handling. It reuses
-the existing `data-id` reconciliation keys and shared 180/20/1 spring, without
-changing `dom-patch.ts`, `motion.ts` or the gateway motion model.
-Active history readouts raise their card above neighbors and replay their cursor
-after every combined patch, including quota polls and patches deferred by a move.
-Returning to Analytics reserves known account slots but clears previous usage,
-reset, risk and checked-time readings until the fresh quota response arrives.
-
 ## The day
 
 The control bar holds the day: previous day, the date, next day. Analytics
-opens on Today whenever it is chosen from the menu or the page loads; saving
+opens on Today whenever Overview is entered; saving
 settings while it shows keeps the chosen day. The arrows move one calendar
 day backward or forward; Next day is disabled on Today. Yesterday is named,
 and older days show a date including the year. Days start at midnight in the
 timezone from Settings → General, including daylight-saving transitions.
-Analytics does not change Current's filters. The selected calendar date stays
+Analytics does not change Board's filters. The selected calendar date stays
 fixed across midnight; labels and forward navigation refresh when the local
 day changes.
 
-The browser prepares today's day and baseline while another view is visible,
-at startup and on the shared refresh tick. Opening Analytics uses that prepared
-snapshot immediately when its date, organization, identities and timezone match
-and it is within the configured refresh interval. Its original read time is
-retained for pace calculations. An in-flight preparation is shared with opening
-the view; the click does not start duplicate reads. History and quota are not
-prefetched. Settings/account changes cannot reuse another scope's snapshot.
+Overview keeps today's last numbers across visits and refreshes them in place
+on return. With no retained result, it shows that the day's numbers are being
+read. Day and baseline reads share an in-flight request for the same scope;
+year history and quota load independently. A failed refresh keeps the last
+known totals and shows the failure beside them and in Answer here. Initial
+failures leave values unknown, never replaced with zero counts.
 
-Without a matching fresh preparation, previous values are removed immediately
-and the standard three-dot loading indicator appears. The server reads the local datastore views directly,
-without starting a CLI process for each scope.
-On entry the board remains in its loading state until both the selected-day
-snapshot and the initial live-quota read settle, then exposes all available
-cards together. Quota cannot appear as a completed view while the main metrics
-are still pending, and prepared metrics wait for that initial quota read too.
-Read failures appear in Notifications; failed content is absent, never replaced
-with zero counts, and the board leaves its loading state.
-Overlapping quota refreshes share the pending read. Leaving aborts it, and a
-five-second UI quota deadline settles failures instead of starving the initial board.
-This bounds the initial gate even when the server's shared quota refresh takes
-longer; a later scheduled read can show its result.
-Subsequent quota and metric refreshes retain independent schedules.
+The server reads the local datastore views directly, without starting a CLI
+process for each scope.
 Each datastore read runs in a one-shot worker thread using the captured account
 configuration and involvement scopes. SQLite work therefore completes without
 repeatedly yielding into the server's command-launch and background-work queue.
@@ -257,7 +138,7 @@ is involved in, plus what the agent account opened. Without a GitHub account
 in Settings it counts everything in the datastore. The organization filter in the
 control bar, shown with two or more organizations, narrows it to one. Its
 shared default label is “All orgs”; every selected label is vertically centered. It is
-the same choice Current, Swarm and Archive use, and Analytics reads again when
+the same choice Board and Observe use, and Analytics reads again when
 it changes.
 
 Productivity:
@@ -473,13 +354,13 @@ GitHub requests and refresh schedules are unchanged.
 A missing metric shows —; its measurement tooltip explains its meaning and
 any partial size coverage. No merges produce zero changed lines and unknown
 per-PR metrics. An unconfigured agent is explained with its missing value.
-No status paragraphs or account errors are rendered inside Analytics.
+Each failed read shows where it belongs, alongside any retained values.
 
 Account, day, baseline, history and quota read failures go to the shared
-notification rail. Repeated account failures across Analytics reads
+Answer here. Repeated account failures across Analytics reads
 appear once. They remain accessible after navigating away, can be dismissed,
 and clear once all reporting reads recover. A recurrence after recovery is a
-new notification. These browser read failures are local to the tab and remain accessible in the rail when Notifications are off
+new notification. These browser read failures are local to the tab and remain accessible in Answer here when Notifications are off
 (the switch suppresses their popups); recording, dismissing and clearing them makes
 no API request. A generic fetch failure does not establish a server fault or
 connection-reset cause. Existing server sync alerts continue independently.

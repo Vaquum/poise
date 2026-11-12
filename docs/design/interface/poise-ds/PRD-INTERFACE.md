@@ -1,3 +1,5 @@
+> **Historical design.** The flip has shipped and classic has been removed (#1175). Its page, rollback address and specs described below no longer exist. [Interface](../../../Interface.md) describes the current application.
+
 > **Copy of autonomio/poise#556 as it stands on 11 November 2026.** The issue is the authority. [CHANGES-2026-11-11.md](CHANGES-2026-11-11.md), [CHANGES-2026-11-04.md](CHANGES-2026-11-04.md), [CHANGES-2026-11-03.md](CHANGES-2026-11-03.md) and [CHANGES-2026-10-28.md](CHANGES-2026-10-28.md) say what changed in the mocks.
 
 ### Objective

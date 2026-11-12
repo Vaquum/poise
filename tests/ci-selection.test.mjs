@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
@@ -9,8 +9,8 @@ import { promisify } from 'node:util'
 import { parse } from 'yaml'
 import { browserShards, callerAffected, drawsFullRun, failedTests, failureReport, reusableRun, selectTests, selectUnitTests, verify } from '../.github/workflows/ci.mjs'
 
-const core = ['independent-startup', 'service-mode', 'smoke', 'ui-frame'].map(name => `tests/e2e/${name}.spec.ts`)
-const browsers = [...core, 'tests/e2e/swarm-loading.spec.ts', 'tests/e2e/swarm-pagination.spec.ts', 'tests/e2e/analytics.spec.ts', 'tests/e2e/settings-save.spec.ts', 'tests/e2e/chat.spec.ts', 'tests/e2e/notices.spec.ts']
+const core = ['service-mode', 'ui-frame'].map(name => `tests/e2e/${name}.spec.ts`)
+const browsers = [...core, ...['ui-overview', 'ui-settings', 'ui-chat', 'ui-editor-chat', 'ui-article-reviews'].map(name => `tests/e2e/${name}.spec.ts`)]
 const select = (paths, event = 'pull_request') => selectTests(event, paths, browsers)
 const ciScript = resolve('.github/workflows/ci.mjs')
 const notDrawn = '1'.repeat(40)
@@ -25,12 +25,12 @@ describe('what runs every time', () => {
   })
 
   it.each(['pull_request', 'merge_group'])('runs the affected browser area and core journeys on %s', (event) => {
-    expect(select(['src/views/swarm-view.ts', 'tests/swarm-view-logic.test.ts'], event)).toEqual({
+    expect(select(['src/views/editor-view.ts', 'tests/editor-history.test.ts'], event)).toEqual({
       mode: 'essential',
-      browserFiles: [...core, 'tests/e2e/swarm-loading.spec.ts', 'tests/e2e/swarm-pagination.spec.ts'].sort(),
+      browserFiles: [...core, 'tests/e2e/ui-editor-chat.spec.ts', 'tests/e2e/ui-article-reviews.spec.ts'].sort(),
     })
     expect(select(['src/analytics-history.ts', 'src/settings-save.ts'], event).browserFiles)
-      .toEqual(expect.arrayContaining(['tests/e2e/analytics.spec.ts', 'tests/e2e/settings-save.spec.ts']))
+      .toEqual(expect.arrayContaining(['tests/e2e/ui-overview.spec.ts', 'tests/e2e/ui-settings.spec.ts']))
   })
 
   it("runs a place's own specs when the new interface's place changes, and only the core journeys for its frame", () => {
@@ -57,10 +57,10 @@ describe('what runs every time', () => {
   })
 
   it('includes edited browser regressions alongside the core journeys', () => {
-    expect(select(['tests/e2e/notices.spec.ts']).browserFiles).toEqual([...core, 'tests/e2e/notices.spec.ts'].sort())
+    expect(select(['tests/e2e/ui-overview.spec.ts']).browserFiles).toEqual([...core, 'tests/e2e/ui-overview.spec.ts'].sort())
   })
 
-  it.each(['server/process.ts', 'server/gone.ts', 'scripts/build-server.mjs', 'src/style.css', 'src/http.ts', 'src/main.ts', 'tests/fixtures/accounts.ts', 'caller/agent_interface/agent_interface/__init__.py', 'gateway/src/main.ts', 'new-root-config.json'])
+  it.each(['server/process.ts', 'server/gone.ts', 'scripts/build-server.mjs', 'src/ui/tokens.css', 'src/http.ts', 'src/ui/main.ts', 'tests/fixtures/accounts.ts', 'caller/agent_interface/agent_interface/__init__.py', 'gateway/src/main.ts', 'new-root-config.json'])
   ('runs only the core journeys for code outside a browser area: %s', (path) => {
     for (const event of ['pull_request', 'merge_group']) expect(select([path], event)).toEqual({ mode: 'essential', browserFiles: core })
   })
@@ -79,12 +79,31 @@ describe('what runs every time', () => {
   })
 
   it('fails rather than silently dropping missing smoke or feature coverage', () => {
-    expect(() => selectTests('pull_request', ['src/views/swarm-view.ts'], browsers.filter(file => !file.includes('swarm')))).toThrow('No browser coverage')
+    expect(() => selectTests('pull_request', ['src/views/editor-view.ts'], browsers.filter(file => !/editor|article-reviews/.test(file)))).toThrow('No browser coverage')
     expect(() => selectTests('pull_request', ['tests/analytics.test.ts'], [])).toThrow('Missing core')
   })
 
+  it.each([
+    ['src/chat-client.ts', 'ui-chat'],
+    ['src/views/connected-accounts.ts', 'ui-settings'],
+    ['src/settings-save.ts', 'ui-settings'],
+    ['src/analytics-history.ts', 'ui-overview'],
+    ['src/views/editor-view.ts', 'ui-editor-chat'],
+    ['src/views/snippets-view.ts', 'ui-settings'],
+    ['src/notification-items.ts', 'ui-overview'],
+    ['src/views/notification-rail.ts', 'ui-overview'],
+    ['src/motion.ts', 'ui-frame'],
+  ])('selects surviving browser coverage for shared code: %s', (path, suite) => {
+    const files = readdirSync('tests/e2e').filter(file => file.endsWith('.spec.ts')).map(file => `tests/e2e/${file}`)
+    for (const event of ['pull_request', 'merge_group']) {
+      expect(selectTests(event, [path], files)).toEqual({
+        mode: 'essential', browserFiles: expect.arrayContaining([...core, `tests/e2e/${suite}.spec.ts`]),
+      })
+    }
+  })
+
   it('does not run Caller on frontend-only PRs, but retains shared and unknown coverage', () => {
-    expect(callerAffected(['src/views/swarm-view.ts', 'tests/e2e/swarm-loading.spec.ts', 'docs/Testing.md'])).toBe(false)
+    expect(callerAffected(['src/views/chat-composer.ts', 'tests/e2e/ui-chat.spec.ts', 'docs/Testing.md'])).toBe(false)
     for (const path of ['caller/agent_interface/agent_interface/__init__.py', 'server/process.ts', 'package-lock.json', 'tests/chat/checkout-lock.test.ts', '.github/workflows/ci.mjs', 'new-config']) {
       expect(callerAffected([path]), path).toBe(true)
     }
