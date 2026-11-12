@@ -437,3 +437,46 @@ test('a read that lands after Overview was left keeps nothing', async ({ page })
   await page.waitForTimeout(500)
   expect(await page.evaluate(() => localStorage.getItem('poise-overview-motion'))).not.toContain('Late chat')
 })
+
+test('a reload paints the day’s last numbers at once, with when they were read, while it reads again', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  await expect(page.getByText('Reading the day’s numbers…')).toHaveCount(0)
+  // The day's reads are held; the reload paints the last numbers anyway.
+  await page.route(/\/api\/analytics(\?|\/history)/, async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(page.locator('[data-tile]').first()).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('[data-dayline]')).toContainText('until')
+  await expect(page.getByText('Reading the day’s numbers…')).toHaveCount(0)
+})
+
+test('a reload never paints another GitHub user’s day', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  // Settings now name another GitHub user, and the day's reads are held.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, { org: '', organizations: [{ login: 'acme', managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }], me: 'other', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } }))
+  await page.route(/\/api\/analytics(\?|\/history)/, async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(page.getByText('Reading the day’s numbers…')).toBeVisible()
+  await expect(page.locator('[data-tile]')).toHaveCount(0)
+})
+
+test('a reload reads the 30 days again when they failed, though the year was read', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  // A first read whose 30 days fail while the year is read.
+  let fail = true
+  await page.route('**/api/analytics/history**', (route) => fail && (new URL(route.request().url()).searchParams.get('bounds') ?? '').split(',').length <= 31
+    ? json(route, { error: 'history store unavailable' }, 503) : route.fallback())
+  await page.evaluate(() => localStorage.removeItem('poise-overview-day'))
+  await page.reload()
+  const failed = page.locator('p.onote.is-warn', { hasText: 'The 30 days' })
+  await page.locator('[data-tile]').first().click()
+  await expect(failed).toBeVisible()
+  // The service recovers; the next reload paints the remembered day and reads the 30 days again.
+  fail = false
+  await page.reload()
+  await page.locator('[data-tile]').first().click()
+  await expect(page.getByText(/of 30 days known/)).toBeVisible()
+  await expect(failed).toHaveCount(0)
+})

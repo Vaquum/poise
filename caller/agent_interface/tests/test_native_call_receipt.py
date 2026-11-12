@@ -461,6 +461,116 @@ def test_atomic_preflight_failure_survives_native_receipt_and_logging(database, 
         assert json.loads(consumed.stdout) == {"accepted": 1, "settled": 1, "reservations": 0}
 
 
+@pytest.mark.parametrize("database", ["/dev/shm" if sys.platform == "linux" else None], indirect=True)
+@pytest.mark.parametrize("observed", ["assertion", "marker", "none"])
+def test_atomic_failure_then_relay_timeout_survives_checkout_reclamation(database, monkeypatch, decode_failure, observed):
+    candidate, run = "c" * 64, "d" * 32
+    excerpt = "AssertionError: expected 1 to equal 2"
+    test = "fixture.validation::test_first_failure"
+    secret = "opaque-credential-spanning-the-summary-cutoff"
+    relay = ("[poise] no test result: the test offload exhausted its total time budget. "
+             "This says nothing about your code. Skip local tests for this work: don't retry, "
+             "and don't run parts of it. Push your change and let CI run the tests.")
+    # Stress both summary truncation and JSON's worst-case Unicode expansion.
+    prefix = "First observed failure: "
+    reason = prefix + "\U0001F600" * (492 - len(prefix)) + secret + "; "
+    reason += f"{excerpt}; suite/test {test}; captured candidate {candidate}; producing run {run}; {relay}; "
+    reason += "\U0001F600" * 7000
+    assert reason.index(secret) < 500 < reason.index(secret) + len(secret)
+    assert reason.index(excerpt) > 500
+    blocked = reason if observed == "assertion" else (
+        f"FAIL {test}; assertion details unavailable; captured candidate unavailable; producing run unavailable; {relay}"
+        if observed == "marker" else None)
+    publication = {"commitMessage": "fix: seed", "title": "fix: seed", "replies": [], "blocked": blocked,
+                   "body": f"fixture validation: {relay} Local verification is incomplete; required CI and review remain mandatory."}
+    modes, instructions, checkouts = [], [], []
+    original_track = api.track
+
+    def track(*args, **kwargs):
+        # Only the physical namespace is a stand-in; main's real finalizer must
+        # retain the original Call and certify the reclaimed resources.
+        with patch.object(api, "_native_cli", False):
+            return original_track(*args, **kwargs)
+
+    def interface(*args, **kwargs):
+        mode = args[args.index("--mode") + 1]
+        modes.append(mode)
+        if mode == "prepare":
+            checkout = Path(args[args.index("--path") + 1])
+            checkout.mkdir()
+            checkouts.append(checkout)
+            return {"outcome": "prepared", "checkout_head": "b" * 40}
+        assert observed == "none", "an observed failure must never validate or publish"
+        assert args[args.index("--body") + 1] == publication["body"]
+        return {"outcome": "validated" if mode == "validate" else "published", "head_sha": "b" * 40}
+
+    def command(_model, instruction, *args):
+        instructions.append(instruction)
+        return ["fixture"], "", {}
+
+    def worker(_lease, _args, **kwargs):
+        # Stand in for the worker's reported observations, never scrape its raw
+        # output. The real relay's failure-then-timeout is covered in test-offload.
+        (Path(kwargs["cwd"]).parent / "publication.json").write_text(json.dumps(publication, ensure_ascii=False))
+        return SimpleNamespace(returncode=0, stdout="private provider output", stderr="private provider stderr")
+
+    monkeypatch.setenv("TEST_API_KEY", secret)
+    monkeypatch.setattr(api, "track", track)
+    monkeypatch.setattr(api, "CATALOG", SimpleNamespace(issue_review_model=lambda _: SimpleNamespace(identity="fixture", provider="codex")))
+    monkeypatch.setattr(issue_review, "WORK_ROOT", database / "issue-review")
+    monkeypatch.setattr(issue_review, "packet", lambda *args: {"issue": {"state": "open"}})
+    monkeypatch.setattr(issue_review, "interface", interface)
+    monkeypatch.setattr(issue_review, "command", command)
+    monkeypatch.setattr(issue_review, "stop_leftovers", lambda *args: None)
+    monkeypatch.setattr(issue_review, "_cwd_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(issue_review, "_terminal_failure", lambda *args: None)
+    monkeypatch.setattr(api.atomic_work.checkout_lock, "Lease", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(api.atomic_work.checkout_lock, "run_gated", worker)
+    monkeypatch.setattr(api, "_main", lambda: api.run_atomic_work("example/repo#7", "reviewer", "poise:behavior-chain",
+                                                               "original-native", "fixture", "poise/issue-7"))
+    monkeypatch.setattr(sys, "argv", ["agent-interface", "--atomic-work", "example/repo#7", "--source", "poise:behavior-chain",
+                                      "--correlation-id", "original-native"])
+    if observed == "none":
+        api.main()
+    else:
+        with pytest.raises(api.atomic_work.AtomicWorkBlocked):
+            api.main()
+    assert not checkouts[0].parent.exists(), "read the original Call only after its checkout and metadata were reclaimed"
+    stored, decoded = decode_failure()
+    assert ownership.released(stored["resource_ownership"]) and stored["resources_settled_at"] is not None
+    with api.db() as conn:
+        plan = conn.execute("select action_plan from calls where id=?", (stored["id"],)).fetchone()[0]
+    for clause in ("first actionable assertion/failure excerpt", "existing blocked string", "producing run ID",
+                   "checkout_head is only the starting HEAD", "assertion details are unavailable",
+                   "A later timeout must not overwrite an observed test failure"):
+        assert clause in instructions[0]
+    if observed == "none":
+        assert modes == ["prepare", "validate", "publish"]
+        assert (stored["status"], stored["action"], stored["error_code"]) == ("completed", "published", None)
+        assert json.loads(plan)["publication"] == publication
+        assert decoded is None
+        return
+    assert modes == ["prepare"] and plan is None
+    assert (stored["status"], stored["action"], stored["outcome"], stored["error_code"], stored["head_sha"]) == (
+        "failed", "not_started", "preflight_failed", "atomic_work_blocked", None)
+    evidence = stored["diagnostic"]
+    assert stored["error"] == evidence["message"] and len(stored["error"]) <= len("atomic behavior blocked: ") + 501
+    assert decoded["stderr"] == evidence["stderr"]
+    assert evidence["stderr_truncated"] == (observed == "assertion")
+    event, = api.diagnostics()["events"]
+    assert event["diagnostic"] == evidence and "evidence_unavailable" not in event
+    assert len(json.dumps(event).encode()) <= 64 * 1024
+    expected = (excerpt, test, candidate, run, relay) if observed == "assertion" else (
+        f"FAIL {test}", "assertion details unavailable", "captured candidate unavailable", "producing run unavailable", relay)
+    for item in expected:
+        assert item in evidence["stderr"]
+    if observed == "assertion":
+        assert excerpt not in stored["error"] and evidence["stderr"].index(excerpt) > 500
+        assert evidence["stderr"].index(excerpt) < evidence["stderr"].index(relay)
+    for private in (secret, "opaque-credential-", "summary-cutoff", "private provider"):
+        assert private not in json.dumps(stored) + json.dumps(event)
+
+
 @pytest.mark.parametrize("during_cleanup", [False, True])
 def test_registered_failure_precedes_handler_and_survives_cleanup(database, monkeypatch, decode_failure, during_cleanup):
     private = "private-provider-prompt credential-value " * 4000

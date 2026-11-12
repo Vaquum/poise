@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { afterAll, afterEach, expect, it } from 'vitest'
+import { afterAll, afterEach, expect, it, vi } from 'vitest'
 import { BehaviorChainJournal, chainBasis, type BehaviorChain, type ChainEvent } from '../server/behavior-chain-store'
 import { behaviorChainAttention, CHAIN_ATTENTION_DELAY_MS } from '../server/behavior-chain-summary'
 import type { ChainObservation } from '../server/behavior-chain-decision'
@@ -55,6 +55,34 @@ it('preserves age over unchanged polls, failed retries, history pages and a new 
   expect(result.map(entry => [entry.id, entry.progressAt, entry.ageMs])).toEqual(first.map(entry => [entry.id, entry.progressAt, entry.ageMs]))
   expect(db.prepare('SELECT * FROM behavior_chain_events').all()).toEqual(before)
   expect(restarted.read(chain.id)!.held).toBe(first[0].blocker)
+})
+
+it('reuses verified progress on unchanged polls and replays only a changed chain without hiding projection corruption', () => {
+  const journal = new BehaviorChainJournal(db)
+  const first = delayedChainFixture(journal, now).attention
+  const history = vi.spyOn(journal, 'history')
+  expect(behaviorChainAttention(journal, now)).toEqual(first)
+  expect(history).not.toHaveBeenCalled()
+
+  let chain = journal.read(first[0].id)!
+  const invocationIds = chain.invocations.map(invocation => [invocation.id, invocation.callId])
+  const observation = structuredClone(chain.observation) as ChainObservation
+  observation.checkedAt = now + 1000
+  observation.pull!.head = observation.publication.head_sha = 'b'.repeat(40)
+  chain = append(journal, chain, { type: 'chain.observed', observation }, now + 1000)
+  const updated = behaviorChainAttention(journal, now + 1000)
+  expect(new Set(history.mock.calls.map(([id]) => id))).toEqual(new Set([chain.id]))
+  expect(updated.find(entry => entry.id === chain.id)).toMatchObject({ progressAt: now + 1000, ageMs: 0 })
+  expect(journal.read(chain.id)!.invocations.map(invocation => [invocation.id, invocation.callId])).toEqual(invocationIds)
+  history.mockClear()
+  expect(behaviorChainAttention(journal, now + 2000).find(entry => entry.id === chain.id))
+    .toMatchObject({ progressAt: now + 1000, ageMs: 1000 })
+  expect(history).not.toHaveBeenCalled()
+
+  journal.rebuild()
+  expect(behaviorChainAttention(new BehaviorChainJournal(db), now + 1000)).toEqual(updated)
+  db.prepare("UPDATE behavior_chain_current SET state = '{}' WHERE chain_id = ?").run(chain.id)
+  expect(() => behaviorChainAttention(journal, now + 2000)).toThrow('authoritative event journal')
 })
 
 it('selects an oldest unpublished admission beyond page one and applies the exact 24-hour cutoff', () => {

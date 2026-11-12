@@ -2922,7 +2922,7 @@ function reconcileClosedTargetIncidents(): Promise<void> {
       }
     })
   }).catch((error: unknown) => {
-    if (!signal.aborted) console.error('[behaviors] closed-target reconciliation failed:', error)
+    if (!signal.aborted && !staleDatastoreFailure(error)) console.error('[behaviors] closed-target reconciliation failed:', error)
   }).finally(() => {
     clock.close()
     release()

@@ -322,11 +322,19 @@ function checkedMs(value: Cached): number {
   return Number.isFinite(at) ? at : Number.NEGATIVE_INFINITY
 }
 
+const LEDGER_READS_AT_ONCE = 16
+
 async function listCandidates(me: string): Promise<Candidate[]> {
   const out: Candidate[] = []
-  for (const doc of await listDocs()) {
-    const { records } = await readPublishLedger(doc.slug)
-    for (const record of records) out.push({ slug: doc.slug, record, value: cached(keyFor(me, record)) })
+  // Sixteen ledgers at a time: one after another, each read waited its own
+  // turn of a busy server's loop; all at once could run out of descriptors.
+  const docs = await listDocs()
+  const ledgers: Awaited<ReturnType<typeof readPublishLedger>>[] = []
+  for (let start = 0; start < docs.length; start += LEDGER_READS_AT_ONCE) {
+    ledgers.push(...await Promise.all(docs.slice(start, start + LEDGER_READS_AT_ONCE).map((doc) => readPublishLedger(doc.slug))))
+  }
+  for (const [index, doc] of docs.entries()) {
+    for (const record of ledgers[index]!.records) out.push({ slug: doc.slug, record, value: cached(keyFor(me, record)) })
   }
   // The publication checked longest ago goes first, each publication
   // separately, so documents published to several sites progress per site.
