@@ -3,11 +3,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import subprocess
 import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, TypeVar
+
+import httpx
 
 
 class GitHubApiError(RuntimeError):
@@ -78,7 +83,7 @@ def split_http_response(stdout: str) -> tuple[dict[str, str], str]:
     return headers, body
 
 
-def raise_rate_limit(headers: dict[str, str], diagnostic: str) -> None:
+def raise_rate_limit(headers: Mapping[str, str], diagnostic: str) -> None:
     if headers.get("x-ratelimit-remaining") != "0":
         return
     # A successful request may spend the final point, and an unrelated error
@@ -391,49 +396,119 @@ query($owner: String!, $name: String!, $number: Int!) {{
 """
 
 
+_GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
+
+
+def _uses_cli_transport(environment: dict[str, str]) -> bool:
+    if environment.get("GH_HOST") != "github.com" or environment.get("GH_DEBUG"):
+        return True
+    # Keep gh's own endpoint and socket configuration on its CLI path. These
+    # settings are inspected once per run, before any GraphQL requests.
+    for key in ("http_unix_socket", "api_host"):
+        config = subprocess.run(
+            ["gh", "config", "get", key, "--host", "github.com"],
+            capture_output=True, text=True, env=environment,
+        )
+        if config.returncode == 0:
+            if config.stdout.strip():
+                return True
+        elif config.returncode != 1 or f'could not find key "{key}"' not in config.stderr:
+            raise GitHubApiError(f"could not read gh transport configuration: {config.stderr.strip()}")
+    return False
+
+
+@contextmanager
+def datastore_github_client() -> Iterator[GitHubClient]:
+    environment = os.environ.copy()
+    token = environment.get("GH_TOKEN", "").strip()
+    if not token or _uses_cli_transport(environment):
+        yield GitHubClient()
+        return
+    with httpx.Client(verify=ssl.create_default_context(), timeout=httpx.Timeout(None, connect=30.0)) as http:
+        yield GitHubClient(http=http, token=token)
+
+
 class GitHubClient:
-    def __init__(self, attempts: int = 5, retry_sleep_seconds: int = 1) -> None:
+    def __init__(
+        self, attempts: int = 5, retry_sleep_seconds: int = 1, *,
+        http: httpx.Client | None = None, token: str | None = None,
+    ) -> None:
         if attempts <= 0:
             raise ValueError("attempts must be positive")
         self.attempts = attempts
         self.retry_sleep_seconds = retry_sleep_seconds
+        self._http = http
+        self._token = token
         self._rate_limit_error: GitHubRateLimitError | None = None
 
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
-        args = ["gh", "api", "graphql", "--include", "-f", f"query={query}"]
-        for key, value in (variables or {}).items():
-            if value is None:
-                continue
-            # Raw fields preserve numeric names and literals such as "null" as strings.
-            args.extend(["-f" if isinstance(value, str) else "-F", f"{key}={value}"])
-
         last_error = ""
         environment = os.environ.copy()
         # Several accounts can be signed in to gh; the datastore reads GitHub
         # only as the account whose token it is given, never gh's active one.
-        if not environment.get("GH_TOKEN", "").strip():
+        token = self._token if self._token is not None else environment.get("GH_TOKEN", "").strip()
+        if not token:
             raise GitHubApiError("GH_TOKEN is not set: github-datastore reads GitHub only as the account whose token it is given")
+        fields = {key: value for key, value in (variables or {}).items() if value is not None}
         for attempt in range(1, self.attempts + 1):
             if self._rate_limit_error is not None and time.time() < self._rate_limit_error.reset_at:
                 raise self._rate_limit_error
-            proc = subprocess.run(args, capture_output=True, text=True, env=environment)
-            headers, body = split_http_response(proc.stdout)
-            if proc.returncode == 0:
+            if self._http is None:
+                headers, body, failure, retryable = self._cli_request(query, fields, environment)
+            else:
+                headers, body, failure, retryable = self._http_request(self._http, query, fields, token)
+            if failure is None:
                 payload = json.loads(body)
                 if payload.get("errors"):
                     diagnostic = f"GraphQL errors: {json.dumps(payload['errors'])}"
                     self._raise_rate_limit(headers, diagnostic)
                     raise GitHubApiError(diagnostic)
                 return payload["data"]
-            last_error = "\n".join(part.strip() for part in (proc.stderr, body) if part.strip())
+            last_error = failure
             self._raise_rate_limit(headers, f"GraphQL request failed: {last_error}")
-            if not self._retryable(last_error) or attempt == self.attempts:
+            if not retryable or attempt == self.attempts:
                 raise GitHubApiError(f"GraphQL request failed: {last_error}")
             time.sleep(self.retry_sleep_seconds)
 
         raise GitHubApiError(f"GraphQL request failed: {last_error}")
 
-    def _raise_rate_limit(self, headers: dict[str, str], diagnostic: str) -> None:
+    def _cli_request(
+        self, query: str, fields: dict[str, Any], environment: dict[str, str],
+    ) -> tuple[Mapping[str, str], str, str | None, bool]:
+        args = ["gh", "api", "graphql", "--include", "-f", f"query={query}"]
+        for key, value in fields.items():
+            # Raw fields preserve numeric names and literals such as "null" as strings.
+            args.extend(["-f" if isinstance(value, str) else "-F", f"{key}={value}"])
+        proc = subprocess.run(args, capture_output=True, text=True, env=environment)
+        headers, body = split_http_response(proc.stdout)
+        if proc.returncode == 0:
+            return headers, body, None, False
+        failure = "\n".join(part.strip() for part in (proc.stderr, body) if part.strip())
+        return headers, body, failure, self._retryable(failure)
+
+    @staticmethod
+    def _http_request(
+        http: httpx.Client, query: str, fields: dict[str, Any], token: str,
+    ) -> tuple[Mapping[str, str], str, str | None, bool]:
+        # An explicit request avoids carrying cookies from one GraphQL read to
+        # the next. The token is sent only to the configured GitHub endpoint.
+        request = httpx.Request(
+            "POST", _GITHUB_GRAPHQL_URL, json={"query": query, "variables": fields},
+            headers={"Authorization": f"token {token}", "Accept": "application/json",
+                     "Accept-Encoding": "gzip", "User-Agent": "github-datastore"},
+        )
+        try:
+            response = http.send(request, follow_redirects=False)
+        except httpx.RequestError as error:
+            detail = str(error).replace(token, "[redacted]")
+            retryable = isinstance(error, (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException))
+            return {}, "", detail, retryable and "CERTIFICATE_VERIFY_FAILED" not in detail
+        if response.is_success:
+            return response.headers, response.content.decode("utf-8"), None, False
+        detail = f"HTTP {response.status_code} {response.reason_phrase}\n{response.text}".strip()
+        return response.headers, "", detail, response.status_code in (429, 500, 502, 503, 504)
+
+    def _raise_rate_limit(self, headers: Mapping[str, str], diagnostic: str) -> None:
         try:
             raise_rate_limit(headers, diagnostic)
         except GitHubRateLimitError as error:

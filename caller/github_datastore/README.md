@@ -85,9 +85,12 @@ rows; the sync owns freshness.
 Every command takes `--db PATH`; without it the database is
 `$XDG_DATA_HOME/github-datastore/github_datastore.sqlite`
 (`~/.local/share/github-datastore/github_datastore.sqlite` when `XDG_DATA_HOME`
-is unset). GitHub is read through `gh` only as the account whose token
-`GH_TOKEN` holds (for example `GH_TOKEN=$(gh auth token --user LOGIN)`), never
-gh's active account; without it, the commands that read GitHub fail.
+is unset). GitHub reads require `GH_TOKEN`. Poise obtains that token with
+`gh auth token --user LOGIN` for the selected account and sets
+`GH_HOST=github.com`. With that host, initialization and each sync reuse
+HTTPS connections to GitHub GraphQL within the run. Other host selection,
+custom gh endpoint or socket configuration, and gh debugging use the
+`gh api graphql` transport.
 
 ## Trust Rule
 

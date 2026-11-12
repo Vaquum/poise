@@ -9,6 +9,9 @@ class TransportPolicyTest(unittest.TestCase):
             / "github_datastore"
             / "github_api.py"
         ).read_text()
+        endpoint = 'https://api.github.com/graphql'
+        self.assertEqual(source.count(f'"{endpoint}"'), 1)
+        source = source.replace(f'"{endpoint}"', "")
         forbidden = [
             "api.github.com",
             '"/repos/',
