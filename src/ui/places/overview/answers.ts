@@ -17,9 +17,9 @@ import { placeHref } from '../../address'
 import { $, $$, esc } from '../../dom'
 import { paintTerms } from '../../reference'
 import { term } from '../../registry'
-import { lifeHTML, type Stage } from '../../shell'
+import { lifeHTML, toast, type Stage } from '../../shell'
 import {
-  decisionEntries, foldWaiting, itemEntries, ordered, requestEntries, requestsFrom, threadEntries,
+  decisionEntries, foldWaiting, itemEntries, openDecision, ordered, requestEntries, requestsFrom, threadEntries,
   type DecisionItem, type Entry, type Publication, type RequestsRead, type Role, type ThreadReview,
 } from './entries'
 import { answersChanged, GROUPS, LEVELS, readLevel, saveLevel, setAnswerGroups, shownAt, tally } from './level'
@@ -81,7 +81,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   /** Settled here, kept off the open list while its source still lists it. */
   const done = new Map<string, HandledRow>()
   const settledHere: HandledRow[] = []
-  const holds = new Map<string, { kind: 'dismiss' | 'silence', notice: Notice, timer: number }>()
+  const holds = new Map<string, { kind: 'dismiss' | 'silence', notice?: Notice, decision?: number, timer: number }>()
   const opened = new Set<string>()
   const replying = new Set<string>()
   const fresh = new Set<string>()
@@ -113,6 +113,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   // ---------- Why a request can no longer be answered here ----------
   function unavailable(entry: Entry): string {
     if (entry.source === 'request' && chatClient.connectionState() !== 'open') return 'The connection to Poise dropped. Answers wait until it is back; nothing is sent meanwhile.'
+    if (entry.decision && board.data?.find((item) => item.id === entry.decision!.id)?.source.exists === false) return 'The chat that asked no longer exists, so it can no longer be answered.'
     return ''
   }
   function goneWords(entry: Entry): string {
@@ -303,7 +304,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     if (focused && !focused.isConnected) $(`[data-notice="${CSS.escape(focused.closest<HTMLElement>('[data-notice]')?.dataset.notice ?? '')}"]`, list)?.focus({ preventScroll: true })
     paintTerms(list)
     const levelBox = $('[data-levelbox]', root)
-    if (levelBox && levelBox.dataset.level !== String(level)) { levelBox.innerHTML = levelHTML(); levelBox.dataset.level = String(level) }
+    if (levelBox && levelBox.dataset.shown !== String(level)) { levelBox.innerHTML = levelHTML(); levelBox.dataset.shown = String(level) }
     const count = $('[data-ncount]', root)
     const t = tally(openEntries().map((entry) => entry.group), level)
     if (count) { count.textContent = String(t.count); if (t.tone) count.dataset.tone = t.tone; else delete count.dataset.tone }
@@ -461,9 +462,9 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
 
   // ---------- Dismiss and Silence: held for eight seconds, with Undo ----------
   function holdSend(entry: Entry, kind: 'dismiss' | 'silence'): void {
-    if (!entry.notice || holds.has(entry.id)) return
+    if (!(entry.notice || entry.decision) || holds.has(entry.id)) return
     const timer = window.setTimeout(() => sendHeld(entry.id), HOLD_MS)
-    holds.set(entry.id, { kind, notice: entry.notice, timer })
+    holds.set(entry.id, { kind, notice: entry.notice, decision: entry.decision?.id, timer })
     settle(entry, kind === 'dismiss' ? 'Dismissed' : 'Silenced', kind === 'dismiss' ? 'Put away' : 'No more reminders while it stays open', { undo: true })
   }
   function undo(id: string): void {
@@ -484,12 +485,17 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     holds.delete(id)
     const p = progress.get(id)
     if (p) progress.set(id, { ...p, undo: false })
-    const action = hold.kind === 'dismiss' ? noticeFeed.dismiss(hold.notice.id) : noticeFeed.silence(hold.notice.id)
+    const { notice, decision } = hold
+    const action = decision !== undefined
+      ? chatClient.dismissSwitchboardItem(decision).then((state) => { const next = parseBoard(state); if (next) acceptBoard(next) }, () => undefined)
+      : hold.kind === 'dismiss' ? noticeFeed.dismiss(notice!.id) : noticeFeed.silence(notice!.id)
     if (leaving) return
     paint()
     void action.then(() => {
-      // Put away when the next read omits it; a notice still there could not be.
-      const still = noticeFeed.current.notices.some((notice) => notice.id === hold.notice.id && (hold.kind === 'silence' || notice.due === hold.notice.due))
+      // Put away when the next read omits it; one still there could not be.
+      const still = decision !== undefined
+        ? (board.data ?? []).some((item) => item.id === decision && openDecision(item))
+        : noticeFeed.current.notices.some((value) => value.id === notice!.id && (hold.kind === 'silence' || value.due === notice!.due))
       if (!still || signal.aborted) return
       done.delete(id)
       progress.set(id, { stage: 'Failed', label: hold.kind === 'dismiss' ? 'Dismiss' : 'Silence', words: 'It could not be put away; it is still open.', at: Date.now() })
@@ -501,7 +507,8 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
     for (const [id, hold] of holds) {
       window.clearTimeout(hold.timer)
       holds.delete(id)
-      void fetch(`/api/notices/${encodeURIComponent(hold.notice.id)}/${hold.kind}`, { method: 'POST', keepalive: true, headers: { Accept: 'application/json' } }).catch(() => undefined)
+      const path = hold.decision !== undefined ? `/api/chat/switchboard/items/${hold.decision}/dismiss` : `/api/notices/${encodeURIComponent(hold.notice!.id)}/${hold.kind}`
+      void fetch(path, { method: 'POST', keepalive: true, headers: { Accept: 'application/json' } }).catch(() => undefined)
     }
   }, { signal })
 
@@ -708,13 +715,18 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
   }
   function setLevel(next: number): void {
     if (!(next >= 0 && next < LEVELS.length) || next === level) return
+    const added = GROUPS.slice(level + 1, next + 1).map(([group]) => group)
     level = next
     saveLevel(level)
-    // Choosing what to see is a deliberate change: the list redraws at the new level.
+    // Choosing what to see is a deliberate change: the list redraws at the new
+    // level, and what the level adds comes into view, or says there is none.
     if (holding) holding = null
     paint()
     if (inside) holding = shown.map((entry) => entry.id)
     $(`[data-level="${level}"]`, root)?.focus()
+    if (!added.length) return
+    const first = added.map((group) => $(`[data-key="g:${group}"]`, list)).find(Boolean)
+    if (first) first.scrollIntoView({ block: 'nearest' }); else toast('Nothing more is open at this level.')
   }
   root.addEventListener('submit', (e) => {
     const form = (e.target as Element).closest<HTMLFormElement>('[data-form]')

@@ -225,6 +225,24 @@ test('the level decides what shows and what the bell counts, and is remembered',
   await expect(page.locator('[data-bell]')).toHaveText('1')
 })
 
+test('a level brings what it adds into view, or says there is none, and arrow keys keep moving it', async ({ page }) => {
+  const ready = Array.from({ length: 30 }, (_, i) => ({ id: `pr${i}`, kind: 'pr_ready', title: `acme/site#${i} is ready to merge`, body: 'Checks pass.', since: ago(20 + i), due: ago(5), silenceable: true, target: { pullRequest: `https://github.com/acme/site/pull/${i}` } }))
+  const notices = [...ready, { id: 'turn', kind: 'chat_turn_finished', title: 'Codex finished', body: 'Done after 6 minutes.', since: ago(9), due: ago(9), silenceable: false, target: { chat: 's2' } }]
+  await open(page, { notices, requests: [], decisions: [], revision: 1 })
+  const level = (name: string) => answers(page).getByRole('radio', { name })
+
+  await level('Only you').click()
+  await level('+ Faults').click()
+  await expect(page.locator('.toast')).toHaveText('Nothing more is open at this level.')
+  await level('+ Done').click()
+  await expect(entry(page, 'notice:turn')).toBeInViewport()
+
+  await page.keyboard.press('ArrowLeft')
+  await page.keyboard.press('ArrowLeft')
+  await expect(level('Only you')).toHaveAttribute('aria-checked', 'true')
+  await expect(level('Only you')).toBeFocused()
+})
+
 test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {
   const notices = [{ id: 'disk', kind: 'storage_low', title: 'Workspace disk is 95% full', body: '4.6 GB free.', since: ago(30), due: ago(30), silenceable: false, target: { settings: 'general' } }]
   const sent: string[] = []
@@ -235,6 +253,28 @@ test('Dismiss waits eight seconds in the tab, with Undo', async ({ page }) => {
   await entry(page, 'notice:disk').getByRole('button', { name: 'Undo' }).click()
   await expect(entry(page, 'notice:disk').getByRole('button', { name: 'Dismiss' })).toBeVisible()
   expect(sent).toEqual([])
+})
+
+test('a decision whose chat is gone says so, and Dismiss puts it away', async ({ page }) => {
+  const decision = (id: number, exists: boolean) => ({ id, kind: 'decision', text: `Decision ${id}`, detail: null, createdAt: ago(4), source: { sessionId: `s${id}`, title: `Chat ${id}`, agent: 'claude', model: 'opus', exists }, sourceSeq: 2, options: [{ id: 'a', label: 'Open the fix', detail: null, recommended: true }], explanation: { state: 'none' } })
+  const workspace: Workspace = { notices: [], requests: [], revision: 1, decisions: [decision(7, true), decision(8, false)] }
+  const sent: string[] = []
+  await page.route('**/api/chat/switchboard/items/*/dismiss', (route) => {
+    sent.push(new URL(route.request().url()).pathname)
+    workspace.decisions = workspace.decisions.filter((item) => (item as { id: number }).id !== 8)
+    return json(route, { revision: 2, status: 'live', items: workspace.decisions })
+  })
+  await open(page, workspace)
+  await expect(entry(page, 'decision:7').getByRole('button', { name: 'Dismiss' })).toHaveCount(0)
+  await expect(entry(page, 'decision:8')).toContainText('The chat that asked no longer exists, so it can no longer be answered.')
+  await expect(entry(page, 'decision:8').getByRole('button', { name: /Open the fix/ })).toHaveAttribute('aria-disabled', 'true')
+
+  await entry(page, 'decision:8').getByRole('button', { name: 'Dismiss' }).click()
+  await expect(entry(page, 'decision:8')).toContainText('Dismissed')
+  await expect.poll(() => sent, { timeout: 12_000 }).toEqual(['/api/chat/switchboard/items/8/dismiss'])
+  await page.mouse.move(1000, 600)
+  await expect(entry(page, 'decision:8')).toHaveCount(0)
+  await expect(entry(page, 'decision:7')).toBeVisible()
 })
 
 for (const width of [375, 768, 1000]) {
