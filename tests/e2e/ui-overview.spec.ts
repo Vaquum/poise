@@ -480,3 +480,39 @@ test('a reload reads the 30 days again when they failed, though the year was rea
   await expect(page.getByText(/of 30 days known/)).toBeVisible()
   await expect(failed).toHaveCount(0)
 })
+
+/** Settings as the fixture serves them, with another GitHub user or other organizations. */
+const settingsAs = (as: { me?: string, logins?: string[] }) => ({ org: '', organizations: (as.logins ?? ['acme']).map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null })),
+  me: as.me ?? 'me', agentAccount: 'bot', timezone: 'UTC', manager: { rhythm: 5, stability: 'Balanced', autonomy: 'Balanced', scope: null, paused: false, version: 1 } })
+const holdReads = async (page: Page) => {
+  await page.route(/\/api\/analytics(\?|\/history)/, async () => { await new Promise(() => {}) })
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+}
+
+test('the day and In motion keep nothing for an unknown GitHub user', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  // Settings name no GitHub user: what this load reads is kept for nobody.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, settingsAs({ me: '' })))
+  await page.reload()
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  await expect(page.locator('[data-counts="items"] b').first()).not.toHaveText('—')
+  await holdReads(page)
+  await page.reload()
+  await expect(page.getByText('Reading the day’s numbers…')).toBeVisible()
+  await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
+})
+
+test('All orgs’ last reads never stand for another set of organizations', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-tile]').first()).toBeVisible()
+  await expect(page.locator('[data-counts="items"] b').first()).not.toHaveText('—')
+  // beta is added elsewhere; the day's and GitHub's reads are held.
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, settingsAs({ logins: ['acme', 'beta'] })))
+  await holdReads(page)
+  await page.reload()
+  await expect(page.getByText('Reading the day’s numbers…')).toBeVisible()
+  await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
+  // The workspace's chats still stand.
+  await expect(page.locator('[data-counts="people"] b').first()).not.toHaveText('—')
+})

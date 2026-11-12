@@ -218,9 +218,11 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
     if (when) when.textContent = new Intl.DateTimeFormat('en-GB', { timeZone: effectiveTimezone(), weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())
   }
 
-  const dayKey = () => `${getSettings().me ?? ''}|${getSelectedOrganization()}|${analyticsDay(0, anchor).since}`
+  // Only a known GitHub user keeps the day, and All orgs only for the same organizations.
+  const readyOrgs = () => getOrganizations().filter((org) => org.status === 'ready').map((org) => org.login.toLowerCase()).sort().join(',')
+  const dayKey = () => `${getSettings().me ?? ''}|${getSelectedOrganization()}|${readyOrgs()}|${analyticsDay(0, anchor).since}`
   const paint = () => {
-    if (offset === 0 && shown && (lastDay?.shown !== shown || lastDay.day !== day || lastDay.history !== history || lastDay.daily !== daily)) {
+    if (offset === 0 && shown && getSettings().me && (lastDay?.shown !== shown || lastDay.day !== day || lastDay.history !== history || lastDay.daily !== daily)) {
       lastDay = { key: dayKey(), shown, day, history, daily }
       try { localStorage.setItem(LAST_DAY_KEY, JSON.stringify(lastDay)) } catch { /* the next page reads them anew */ }
     }
@@ -355,7 +357,7 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
 
   // ---------- Live ----------
   // A return or a reload paints today's last numbers at once, so nothing below moves; the read refreshes them in place.
-  if (lastDay?.key === dayKey()) ({ shown, day, history, daily } = lastDay)
+  if (getSettings().me && lastDay?.key === dayKey()) ({ shown, day, history, daily } = lastDay)
   paint()
   void readDay(!!shown)
   ctx.every(getRefreshRateMs(), () => { if (document.visibilityState === 'visible') void readDay(true) })
