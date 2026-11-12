@@ -210,11 +210,14 @@ export function closeRef(): void {
   layerObserver = null
   layer.remove()
   layer = null
+  // A live update may have replaced the element: focus then returns to its successor.
+  const successor = layerFor
   layerFor = null
   for (const n of inerted) n.inert = false
   inerted = []
   savedScroll.forEach(([s, t]) => { if (s) s.scrollTop = t })
-  if (lastFocus?.isConnected) lastFocus.focus({ preventScroll: true })
+  const back = lastFocus?.isConnected ? lastFocus : successor
+  back?.focus({ preventScroll: true })
   document.dispatchEvent(new CustomEvent('poise:ref', { detail: { open: false } }))
 }
 

@@ -351,3 +351,12 @@ test('Settings → Manager explains Rhythm on a direct load, without Overview', 
   await page.locator('[data-ref="mgr.rhythm"]').first().hover()
   await expect(page.getByRole('tooltip')).toContainText('How many workers the Manager keeps on tasks at once')
 })
+
+test('Settings → Behaviors fits the columns it keeps', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await settings(page, {}, '/?view=settings&settings=behaviors')
+  const table = page.locator('#behaviors-table')
+  await expect(table).toBeVisible()
+  const [width, room] = await table.evaluate((t) => [t.getBoundingClientRect().width, (t.closest('main') as HTMLElement).clientWidth])
+  expect(width).toBeLessThanOrEqual(room)
+})

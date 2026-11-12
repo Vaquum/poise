@@ -40,7 +40,8 @@ another day and the year for another year.
 
 Server notices are unresolved alerts, the same alerts
 [Poise Link](Poise-Link.md) shows on the desktop. In the new interface a failed
-read shows on the element it belongs to, where it happened. In classic, Swarm,
+read shows on the element it belongs to, and as a tab-local Poise fault in
+Answer here, which the bell counts. In classic, Swarm,
 Current, Archive, Behaviors, Snippets, Editor and Analytics report browser
 read failures in the rail as tab-local Poise faults. Failed writes and conflicts also
 appear here, classified as faults or actions needing the person. Changed failures

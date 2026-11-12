@@ -41,6 +41,11 @@ describe('Board puts every live item in the seven states', () => {
     expect(item({ record: record({ kind: 'issue' }), labelled: true }).who).toMatchObject({ kind: 'poise' })
     expect(item({ record: record({ kind: 'issue' }) })).toMatchObject({ state: 'idle', who: null })
   })
+
+  it('gives an item no state word while the runs have never been read, rather than Idle', () => {
+    expect(item({ record: record({ kind: 'issue' }), run: undefined })).toMatchObject({ state: null, detail: '' })
+    expect(item({ record: record({ kind: 'issue' }), run: null })).toMatchObject({ state: 'idle' })
+  })
 })
 
 describe('Board says how long, and marks what has stood still', () => {
