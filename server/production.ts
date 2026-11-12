@@ -1,4 +1,4 @@
-import { createReadStream, type Stats } from 'node:fs'
+import { createReadStream, writeSync, type Stats } from 'node:fs'
 import { realpath, stat } from 'node:fs/promises'
 import { STATUS_CODES, createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
@@ -39,6 +39,7 @@ readServiceConfig()
 if (isProductionEntrypoint && process.env.POISE_MODE === 'service') installProductionCpuCapture()
 const { startLogging } = await import('./logging')
 startLogging({ captureFatal: true })
+const { recordRuntimeDiagnostic } = await import('./runtime-diagnostic')
 const { attachChatSockets, createPoiseMiddleware, stopDailyModelRefresh, stopPoiseRuntime } = await import('./cache-plugin')
 const { closeDatabase } = await import('./db')
 
@@ -333,7 +334,11 @@ function refuseUpgrade(req: IncomingMessage, socket: Duplex, service: ServiceCon
 
 let runtimeStopPromise: Promise<void> | null = null
 let databaseClosed = false
-const serverShutdowns = new WeakMap<Server, { promise: Promise<void>; pending: Set<string>; failures: Error[] }>()
+const serverShutdowns = new WeakMap<Server, {
+  promise: Promise<void>
+  pending: Set<string>
+  failures: Array<{ phase: string; error: unknown }>
+}>()
 
 function stopRuntimeOnce(): Promise<void> {
   runtimeStopPromise ??= Promise.resolve().then(() => stopPoiseRuntime())
@@ -366,22 +371,20 @@ export function shutdownProductionServer(server: Server): Promise<void> {
   if (existing) return existing.promise
   abandonProductionCpuCapture()
 
-  const pending = new Set(['runtime stop', 'HTTP close'])
-  const failures: Error[] = []
+  const pending = new Set(['runtime_stop', 'http_close'])
+  const failures: Array<{ phase: string; error: unknown }> = []
+  const track = async (phase: string, operation: Promise<void>) => {
+    try { await operation }
+    catch (error) { failures.push({ phase, error }); throw error }
+    finally { pending.delete(phase) }
+  }
   const shutdown = (async () => {
-    const operations = [['runtime stop', stopRuntimeOnce()], ['HTTP close', closeHttpServer(server)]] as const
-    await Promise.allSettled(operations.map(async ([phase, operation]) => {
-      try { await operation }
-      catch (error) {
-        const failure = new Error(`${phase} failed`, { cause: error })
-        failures.push(failure)
-        throw failure
-      } finally { pending.delete(phase) }
-    }))
+    await Promise.allSettled([track('runtime_stop', stopRuntimeOnce()), track('http_close', closeHttpServer(server))])
     // Runtime tasks can touch SQLite during their own teardown. Close the DB
     // only after both shutdown operations have settled.
-    closeDatabaseOnce()
-    if (failures.length > 0) throw new AggregateError(failures, 'production shutdown failed', { cause: failures[0] })
+    try { closeDatabaseOnce() }
+    catch (error) { failures.push({ phase: 'database_close', error }); throw error }
+    if (failures.length > 0) throw new AggregateError(failures.map(({ error }) => error), 'production shutdown failed')
   })()
   serverShutdowns.set(server, { promise: shutdown, pending, failures })
   return shutdown
@@ -397,15 +400,43 @@ export function createProductionShutdown(
   return (exitCode = 0) => {
     if (started) return
     started = true
+    const recordFailure = (timedOut: boolean) => {
+      const state = serverShutdowns.get(server)!
+      const cause: string[] = []
+      let truncated = false
+      for (const { phase, error } of state.failures) {
+        const errors = [error]
+        const seen = new Set<unknown>()
+        while (errors.length && cause.length < 8) {
+          const value = errors.shift()
+          if (seen.has(value)) continue
+          seen.add(value)
+          cause.push(`${phase}: ${value instanceof Error ? value.message : String(value)}`)
+          if (value instanceof Error && value.cause !== undefined) errors.push(value.cause)
+          if (value instanceof AggregateError) errors.push(...value.errors)
+        }
+        truncated ||= errors.length > 0
+      }
+      // Runtime teardown can already have stopped Logging. Commit synchronously
+      // through its independent store before the immediate process exit.
+      recordRuntimeDiagnostic({ id: process.env.POISE_SHUTDOWN_DIAGNOSTIC_ID, source: 'poise', component: 'production',
+        operation: 'process.shutdown', level: 'error', phase: timedOut ? 'shutdown_deadline' : 'shutdown_rejected',
+        message: timedOut ? `Production shutdown reached its ${PRODUCTION_SHUTDOWN_TIMEOUT_MS} ms deadline; pending: ${[...state.pending].join(', ')}`
+          : `Production shutdown rejected during ${state.failures.map(({ phase }) => phase).join(', ')}`,
+        cause, truncated, exitCode: 1, timeoutMs: PRODUCTION_SHUTDOWN_TIMEOUT_MS,
+        context: { requestedExitCode: exitCode, pendingPhases: [...state.pending] } },
+      { write: (event) => { writeSync(2, JSON.stringify({ poiseDiagnostic: event }) + '\n') } })
+    }
     const deadline = setTimeout(() => {
       if (finished) return
       finished = true
       try {
         const state = serverShutdowns.get(server)!
-        console.error(`[poise] shutdown timed out after ${PRODUCTION_SHUTDOWN_TIMEOUT_MS}ms; pending: ${[...state.pending].join(', ')}`, ...state.failures)
+        console.error(`[poise] shutdown timed out after ${PRODUCTION_SHUTDOWN_TIMEOUT_MS}ms; pending: ${[...state.pending].join(', ')}`, ...state.failures.map(({ error }) => error))
         closeDatabaseOnce()
       }
-      finally { exit(1) }
+      catch (error) { serverShutdowns.get(server)!.failures.push({ phase: 'database_close', error }) }
+      finally { recordFailure(true); exit(1) }
     }, PRODUCTION_SHUTDOWN_TIMEOUT_MS)
     deadline.unref()
 
@@ -414,11 +445,11 @@ export function createProductionShutdown(
       finished = true
       clearTimeout(deadline)
       exit(exitCode)
-    }, (error: unknown) => {
+    }, () => {
       if (finished) return
       finished = true
       clearTimeout(deadline)
-      console.error('[poise] shutdown failed:', error)
+      recordFailure(false)
       exit(1)
     })
   }
@@ -483,6 +514,7 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   server.requestTimeout = 30_000
   server.keepAliveTimeout = 5_000
   server.once('close', () => {
+    if (serverShutdowns.has(server)) return
     void stopRuntimeOnce().catch((error: unknown) => {
       console.error('[poise] runtime shutdown failed:', error)
     })

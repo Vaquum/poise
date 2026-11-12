@@ -90,7 +90,11 @@ Notifications off; it adds no alert record or execution authority.
 
 A failed behavior's notice and its diagnostic are one entry. The notice says
 what can be done; the diagnostic says what happened and how it is classified,
-which also decides its group. In classic, each Behaviors row shows that
+which also decides its group. When the current incident records the legacy stop
+after two review timeouts, the notice explains that automatic retries stopped
+and asks you to change the head or model, or retry explicitly. It keeps the link
+to that incident's Call; an unknown stop keeps the generic wording.
+In classic, each Behaviors row shows that
 behavior's counts: Poise faults, needs you and automatic; a count opens the rail
 on that behavior with its first entry in that group expanded.
 

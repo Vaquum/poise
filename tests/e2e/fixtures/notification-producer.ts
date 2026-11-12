@@ -9,7 +9,7 @@ import { db, getMeta, setMeta, recordBehaviorDeadLetter, retireBehaviorDeadLette
 import { normalize } from '../../../gateway/src/diagnostics/contract'
 import { callerDiagnostic } from '../../../gateway/src/diagnostics/sources'
 import { withNoticeDiagnosticIdentity } from '../../../server/logging-context'
-import { behaviorErrorMessage } from '../../../server/behavior-diagnostics'
+import { behaviorErrorMessage, REVIEW_BUDGET_STOPPED } from '../../../server/behavior-diagnostics'
 import { runFile } from '../../../server/process'
 
 const mode = process.argv[2]
@@ -47,9 +47,10 @@ try {
   } else {
     if (!existsSync(backup)) writeFileSync(backup, readFileSync(cli))
     const calls: Array<Record<string, unknown>> = existsSync(fixture) ? JSON.parse(readFileSync(fixture, 'utf8')) : []
-    const callId = (mode === 'held-one' ? '1' : mode === 'held-two' ? '2' : '3').repeat(32)
+    const callId = (mode === 'held-one' ? '1' : mode === 'held-two' ? '2' : mode === 'held-stopped' ? '4' : '3').repeat(32)
     const correlationId = callId
-    const error = mode === 'held-change' ? 'error: changed retained cause' : 'error: precise retained cause'
+    const error = mode === 'held-stopped' ? REVIEW_BUDGET_STOPPED
+      : mode === 'held-change' ? 'error: changed retained cause' : 'error: precise retained cause'
     const now = new Date().toISOString()
     const call = { id: callId, repo, pr_id: '901', actor: 'review-bot', behavior: 'pr_review', source: 'poise:review-new-prs', correlation_id: correlationId,
       started_at: now, completed_at: now, status: 'failed', outcome: 'preflight_failed', action: 'not_started', error, expected_head: 'a'.repeat(40), model: 'fixture',

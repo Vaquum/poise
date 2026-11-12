@@ -64,7 +64,7 @@ export function createGithub(ctx: PartContext): ObservePart {
       <div class="seg" role="group" aria-label="Status" data-ar-status data-ref="gh.status"><button type="button" data-v="all">Any</button><button type="button" data-v="open">Open</button></div>
       <div class="seg" role="group" aria-label="Updated" data-ar-time data-ref="gh.time"><button type="button" data-v="all">Any time</button><button type="button" data-v="today">Today</button><button type="button" data-v="yesterday">Yesterday</button><button type="button" data-v="week">This week</button></div>
       <input class="search" type="search" placeholder="Filter…" aria-label="Filter the history" autocomplete="off" spellcheck="false" data-ar-search data-ref="gh.search">
-      <span class="obv-count" data-ar-count data-ref="gh.count"></span>
+      <span class="obv-count" data-ar-count data-ref="gh.count">Reading…</span>
     </div>
     <p class="obv-warn" data-ar-error data-ref="gh.error" role="status" hidden></p>
     <p class="obv-warn" data-ar-focus role="status" hidden></p>
@@ -293,7 +293,8 @@ export function createGithub(ctx: PartContext): ObservePart {
     const done = selected.every((s) => s.done)
     const loaded = selected.some((s) => s.loaded)
     $('[data-ar-empty]', root).hidden = items.length > 0 || !loaded || fetching
-    $('[data-ar-count]', root).textContent = partial ? (items.length ? `${items.length}` : '') : total > 0 ? `${Math.min(items.length, total)} of ${total.toLocaleString('en-US')}` : ''
+    // While reading, the count says so: its first number then takes the place the words held, and the bar never re-wraps.
+    $('[data-ar-count]', root).textContent = partial ? (items.length ? `${items.length}` : 'Reading…') : total > 0 ? `${Math.min(items.length, total)} of ${total.toLocaleString('en-US')}` : ''
     $('[data-ar-more]', root).innerHTML = fetching ? '<span class="spin"></span> Reading the history…'
       : !done ? `${partial ? '' : `${(total - items.length).toLocaleString('en-US')} older · `}they load as you scroll`
         : items.length ? 'The whole history is here.' : ''

@@ -128,6 +128,15 @@ churn during integration never masquerades as the blocker. A vanished queue
 entry reads as a removal without inventing its cause. Flags are display
 only and never raise alerts or influence execution.
 
+For legacy PRs, a live review on the verified current head can move past-revision
+review failures into `blocker.details`, retaining their head, cause and time.
+Attribution uses full-SHA targets or launch evidence matching the incident's
+behavior, target and Call ID; a newer launch on the same target supplies no
+identity for an older incident. Current-head, conflicting or unattributable holds
+and PR-wide quarantine keep precedence. Without usable merge-candidate head
+evidence and a matching live claim, retained incidents remain held. The row's
+ledger link keeps the original evidence accessible; execution gates are unchanged.
+
 Collection is read-only: one cached datastore listing per minute at most,
 pure launch-ledger and dead-letter reads, and the merge-candidate reading
 the existing merge-prs tick already fetched (rollup state, review decision,

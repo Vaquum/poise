@@ -631,7 +631,7 @@ function sortOrder(): void {
     (id) => sessions.get(id)!.pending || sessions.get(id)!.record.role === 'manager')
 }
 
-function upsertRecord(record: SessionRecord, opts: { pending?: boolean } = {}): SessionEntry {
+function upsertRecord(record: SessionRecord, opts: { pending?: boolean, sort?: boolean } = {}): SessionEntry {
   let e = sessions.get(record.id)
   if (!e) {
     e = { record, model: createModel(), loaded: false, loading: false, pending: !!opts.pending, draft: null, error: null }
@@ -642,12 +642,14 @@ function upsertRecord(record: SessionRecord, opts: { pending?: boolean } = {}): 
     if (opts.pending !== undefined) e.pending = opts.pending
   }
   applyResetRecord(e, e.record)
-  sortOrder()
+  if (opts.sort !== false) sortOrder()
   return e
 }
 
 let sessionLoad: Promise<void> | null = null
 let sessionReloadRequested = false
+/** The list read in flight, or the last one. */
+let sessionRead: Promise<void> = Promise.resolve()
 
 function loadSessions(): Promise<void> {
   sessionReloadRequested = true
@@ -655,7 +657,8 @@ function loadSessions(): Promise<void> {
   sessionLoad = (async () => {
     do {
       sessionReloadRequested = false
-      await readSessions()
+      sessionRead = readSessions()
+      await sessionRead
     } while (sessionReloadRequested)
   })().finally(() => { sessionLoad = null })
   return sessionLoad
@@ -666,7 +669,8 @@ async function readSessions(): Promise<void> {
   try {
     const { sessions: list } = await chatClient.listSessions()
     const seen = new Set<string>()
-    for (const s of list) { upsertRecord(s); seen.add(s.id) }
+    // One sort once the whole list is in, not one per chat.
+    for (const s of list) { upsertRecord(s, { sort: false }); seen.add(s.id) }
     // Sessions gone from the server (deleted elsewhere) leave the list, but a
     // pending one the server has not answered for yet stays, as does one
     // hidden by its own in-flight delete until that DELETE answers.
@@ -756,7 +760,7 @@ function creatorHtml(s: SessionRecord): string {
 function sidebarHtml(): string {
   const visible = order.filter(isVisible)
   if (!visible.length) {
-    return '<div class="chat-empty chat-sidebar-empty">No sessions yet.</div>'
+    return `<div class="chat-empty chat-sidebar-empty">${orderRestored ? 'No sessions yet.' : 'Reading chats…'}</div>`
   }
   const records = order.map((id) => sessions.get(id)!.record)
   return visible.map((id) => {
@@ -1250,6 +1254,9 @@ async function selectSession(id: string, restoring = false): Promise<void> {
   if (activeId === id && !viewEl.hidden && !memories.el.contains(document.activeElement)) composer.focus()
 }
 
+/** Events applied between yields while a transcript loads. */
+const HISTORY_SLICE = 300
+
 async function loadHistory(e: SessionEntry): Promise<void> {
   e.loading = true
   queueRender()
@@ -1259,8 +1266,10 @@ async function loadHistory(e: SessionEntry): Promise<void> {
       const page = await chatClient.fetchSession(e.record.id, after)
       e.record = reconcileSession(e.record, page.session)
       applyResetRecord(e, e.record)
-      for (const env of page.events) {
+      for (const [i, env] of page.events.entries()) {
         if (env.seq > after) { applyEvent(e.model, env); after = env.seq }
+        // A long transcript is applied a slice at a time, so the page stays responsive.
+        if (i % HISTORY_SLICE === HISTORY_SLICE - 1) await new Promise((done) => setTimeout(done, 0))
       }
       if (!page.truncated || !page.events.length) break
     }
@@ -3098,7 +3107,9 @@ export async function initChatView(): Promise<void> {
   chatClient.start()
   void loadAgents()
   void loadSwitches().catch(() => undefined)
-  await loadSessions()
+  // The first list read is enough to open a chat; a re-read the connection asks for updates the list in place.
+  void loadSessions()
+  await sessionRead
   if (viewEl.hidden) return
   const restoreActive = restoredSnapshot?.activeSessionId ?? null
   applyRestoredSnapshot()
@@ -3141,8 +3152,7 @@ export async function openManagerChat(): Promise<boolean> {
   return true
 }
 
-/** Opens the Switchboard pane, as its header toggle does. */
+/** Opens the Switchboard pane at its width, as its header toggle does but without the slide. */
 export function openSwitchboardPane(): void {
-  const toggle = viewEl?.querySelector<HTMLButtonElement>('.chat-switchboard-toggle')
-  if (toggle && toggle.getAttribute('aria-expanded') !== 'true') toggle.click()
+  switchboard?.show()
 }

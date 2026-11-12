@@ -72,7 +72,7 @@ class TestReviewBudget(TestCase):
         self.assertEqual(budget.timeout(3600), 3600)
 
     def test_packet_reused_only_inside_same_review(self):
-        with patch.object(atoms.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='immutable packet')) as run:
+        with patch.object(atoms.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='{}')) as run:
             with budget.ReviewBudget():
                 self.assertEqual(atoms.packet('/tmp', '#1', 'bit-mis', HEAD), atoms.packet('/tmp', '#1', 'bit-mis', HEAD))
                 self.assertEqual(run.call_count, 1)
@@ -822,7 +822,7 @@ class TestRecovery(TestCase):
         self.assertEqual(self.mod.run.call_count, 2)
         self.assertEqual(row['outcome'], 'superseded')
         response = stored_response(row['id'])
-        self.assertIn('head changed to', response)
+        self.assertIn('head or base changed', response)
         self.assertIn('prior: review submission was a no-op', response)
 
     def test_repeat_only_refusal_keeps_prior_disposition_when_head_moves(self):

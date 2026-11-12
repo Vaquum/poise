@@ -223,6 +223,20 @@ def packet(
                 else None)
         diagnostic = diagnostic_from_stderr(done.stderr, "packet_acquisition")
         raise AgentPreflightError(diagnostic_message(diagnostic) if diagnostic else error, code, diagnostic)
+    try:
+        reply = json.loads(done.stdout)
+        if not isinstance(reply, dict):
+            raise ValueError("PR packet is not an object")
+        if reply.get("outcome") == "superseded":
+            if (reply.get("action") != "read" or reply.get("repository") != repo_name(pr, pwd)
+                    or type(reply.get("pull_number")) is not int
+                    or reply["pull_number"] != int(pr_number(pr))):
+                raise ValueError("superseded packet differs from the review target")
+            observed_head = expected_head(reply.get("head_sha"))
+            from .review_watch import ReviewSuperseded
+            raise ReviewSuperseded(observed_head)
+    except ValueError as error:
+        raise AgentPreflightError(f"cannot read PR packet: {error}") from error
     if cache is not None:
         cache[key] = done.stdout
     return done.stdout

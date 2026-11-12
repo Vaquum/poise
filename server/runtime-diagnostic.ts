@@ -172,7 +172,24 @@ export function recordRuntimeDiagnostic(input: DiagnosticInput, options: Capture
   } catch { forward(2, 'poise-runtime: diagnostic reporting unavailable.\n'); return null }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/** Only durable evidence from this supervisor launch can replace its generic exit fault. */
+export function hasRetainedShutdownFailure(id: string, options: CaptureOptions = {}): boolean {
+  const workspace = options.workspace ?? process.env.POISE_WORKSPACE_HANDLE ?? 'local'
+  const event = normalize({ id, source: 'poise', operation: 'process.shutdown', level: 'error', message: '', workspace, visibility: 'workspace' })!
+  const path = options.path ?? join(process.env.POISE_DB ? dirname(process.env.POISE_DB) : join(homedir(), '.poise'), 'logging.db')
+  let store: DiagnosticStore | null = null
+  try {
+    store = new DiagnosticStore(path, diagnosticConfig(process.env).policy, Date.now, true)
+    const result = store.lookup({ workspace, operator: false }, event.id)
+    return result.status === 'found' && result.event.operation === 'process.shutdown'
+      && result.event.severity === 'error' && result.event.exitCode === 1
+      && ['shutdown_deadline', 'shutdown_rejected'].includes(result.event.phase ?? '')
+  } catch { forward(2, 'poise-runtime: shutdown diagnostic evidence unavailable.\n'); return false }
+  finally { store?.close() }
+}
+
+// This module is also bundled into the production server for shutdown reporting.
+if (process.argv[1] && /(?:^|[/\\])runtime-diagnostic\.(?:js|ts)$/.test(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [command, ...args] = process.argv.slice(2)
   if (!command) { forward(2, 'runtime-diagnostic requires an installer command\n'); process.exitCode = 126 }
   else process.exitCode = await captureRuntimeCommand(command, args)

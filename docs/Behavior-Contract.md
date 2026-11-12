@@ -113,6 +113,12 @@ Each behavior follows one transaction shape:
    an expected action/outcome pair on the expected head.
 6. Dead-letter uncertain terminal work. Never retry an ambiguous side effect.
 
+Verified PR packet head or base drift settles through Caller's existing
+`superseded` outcome before provider invocation or publication. A matching,
+durable, no-publication supersession also suppresses a generic review worker
+exit Error; missing, unreadable or mismatched evidence and independent process
+failures remain visible. Normal reconciliation reconsiders the current revision.
+
 Managed accounts interleave ordinary refreshes with resumable daily
 reconciliation chunks (20-second work budget, plus in-flight GraphQL work).
 Partial maintenance is not a completed daily reconciliation and does not
@@ -151,6 +157,11 @@ The firing ledger distinguishes `review_target_closed` from a head-change
 supersession: closure ends unstarted panel slots, while any running or uncertain
 started sibling retains its actual activity. A later admission cannot inherit
 an earlier closure. A clean review becomes approval-eligible on the next scheduler scan.
+Before a legacy approval worker starts, a verified head change records the rejected
+request as superseded with settled activity and releases ownership without check
+backoff. The next tick evaluates the new head; the rejected request keeps its
+expected head. Unavailable or malformed head reads still fail visibly, and Caller
+retains its head-pinned publication guard.
 After a dismissal and a head change, a completed change-request review by the
 configured reviewer can admit a fresh head-pinned approval evaluation through
 the same activity and ownership guards. Dismissal never counts as approval.
@@ -202,28 +213,32 @@ and a superseded run that nevertheless carries a review id is quarantined
 for a person instead of being silently released. The count is read from the
 durable launch ledger at preparation time, so it survives restarts. From the capped round on
 (round ≥ cap, never = cap alone, so a push after a capped approval cannot
-reopen the loop), the run files that round's findings as one follow-up issue
-in the pull request's repository and approves instead of requesting changes
-again. A capped round with no findings is a plain approval with no issue.
+reopen the loop), the run retains the ordinary atomic change request with all
+blocking findings if any verified `p0` remains (`p0` breaks a common path).
+Missing or unrecognized severity also stays blocking. Only when every finding
+body explicitly starts with `[p1]` or `[p2]` (case-insensitive) does the run file
+the findings as one follow-up issue in the pull request's repository and approve.
+New findings carry a severity prefix; reaffirmed threads keep their original
+bodies. A capped round with no findings is a plain approval with no issue.
 The issue carries a marker for its pull request and head
 (`<!-- poise:review-cap #N@sha -->`), one section per finding with its
-severity where the provider reports one, path, line and side, a permalink
+severity, path, line and side, a permalink
 pinned to the reviewed head (to its base for removed-side findings), and a
 link back to the pull request; a retry or replay
 reuses the marked issue and never files a second one for the same head.
 An explicit approval replay runs under the same effective cap: at or past
-the capped round it files (or reuses) the follow-up issue and approves
-instead of requesting changes again.
+the capped round it applies the same breaking-finding check before filing
+(or reusing) a follow-up issue and approving. An existing marked issue never
+bypasses that check.
 The capped approval reconciles as the ordinary head-pinned approved outcome.
 When the issue cannot be created, nothing is approved and the run fails loudly
 with a contract violation; an uncertain filing is reconciled from live
-evidence before anything retries. The cap is literal: the capped round defers
-every severity and approves, so with Merge Pull Requests on, a pull request
-can merge with deferred findings and the follow-up issue is their only
-remaining record. Structured providers convert a change request into the
-issue-plus-approval deterministically in the harness; Claude runs the capped
-tool contract (file the issue, then approve — request-changes is not offered)
-and submits nothing when filing fails. A human's change request still blocks
+evidence before anything retries. With Merge Pull Requests on, a pull request
+can merge with deferred p1/p2 findings and the follow-up issue is their only
+remaining record. Structured providers convert only explicitly nonbreaking
+change requests into issue-plus-approval in the harness; Claude receives the
+same severity policy and can request changes or file the issue then approve.
+Claude submits nothing when filing fails. A human's change request still blocks
 as before, and the row's Skip list and pause/disable guards apply to capped
 runs like any other launch.
 `resolve-unblocking` uses the upstream strong
