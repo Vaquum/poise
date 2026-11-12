@@ -32,6 +32,8 @@ interface Workspace {
   answerDecision?: { delay: Promise<void>, status: number, body: unknown }
   /** The chats read fails from the start. */
   chatsFail?: boolean
+  /** The runs read fails from the start. */
+  runsFail?: boolean
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -78,7 +80,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
     if (path === '/api/github-quota') return json(route, { accounts: [] })
     if (path === '/api/behavior-metrics') return json(route, { behaviors: {}, error: null })
     if (path === '/api/behavior-estimates') return json(route, { estimates: [] })
-    if (path === '/api/agent-logs') return json(route, { logs: [] })
+    if (path === '/api/agent-logs') return workspace.runsFail ? json(route, { error: 'agent-interface did not answer' }, 503) : json(route, { logs: [] })
     if (path === '/api/gh') return json(route, { records: [], held: [], errors: [] })
     if (path === '/api/claude-auth') return json(route, { status: 'authenticated', reason: null, checkedAt: null, verifiedAt: null, authMethod: null, subscriptionType: null, loginInProgress: false })
     return route.fallback()
@@ -279,7 +281,7 @@ test('a decision whose chat is gone says so, and Dismiss puts it away', async ({
   await expect(entry(page, 'decision:7')).toBeVisible()
 })
 
-for (const width of [375, 768, 1000]) {
+for (const width of [375, 768, 1000, 1280]) {
   test(`nothing overflows the page at ${width} pixels`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 })
     await open(page, { notices: [], decisions: [], revision: 1, requests: [permission('p1', 's1', 'Run gh pr create with a long title that wraps across the narrow column')] })
@@ -289,11 +291,13 @@ for (const width of [375, 768, 1000]) {
     const sizes = await page.evaluate(() => {
       const d = document.documentElement
       const ova = document.querySelector<HTMLElement>('.ova')!
-      return { page: [d.scrollWidth, d.clientWidth, d.scrollHeight, d.clientHeight], ova: [ova.scrollWidth, ova.clientWidth] }
+      const main = document.querySelector<HTMLElement>('.ova-main')!
+      return { page: [d.scrollWidth, d.clientWidth, d.scrollHeight, d.clientHeight], ova: [ova.scrollWidth, ova.clientWidth], main: [main.scrollWidth, main.clientWidth] }
     })
     expect(sizes.page[0]).toBeLessThanOrEqual(sizes.page[1])
     expect(sizes.page[2]).toBeLessThanOrEqual(sizes.page[3])
     expect(sizes.ova[0]).toBeLessThanOrEqual(sizes.ova[1])
+    expect(sizes.main[0]).toBeLessThanOrEqual(sizes.main[1])
   })
 }
 
@@ -305,7 +309,7 @@ test('System health reads its five cards live, and a failed read keeps them, wit
     rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
     blocked: { count: 3, oldestProgressAt: now - 26 * 3_600_000, largestStage: 'Repair: 2', items: [] },
     recovery: { automatic: [{}, {}], intervention: [{}], unknown: 0 },
-    lastError: { error: { at: now - 15 * 60_000, work: 'autonomio/poise#496', journal: '', summary: '' }, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now },
+    lastError: { error: { at: now - 15 * 60_000, work: 'autonomio/poise#496', journal: '', summary: '', callId: 'call-1', incident: EVIDENCE.incidentId, invocation: 'inv-1' }, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now },
     coverage: [
       { name: 'Chain journal', scope: 'All configured accounts', status: 'verified v2', lastReadAt: null, intervals: null },
       { name: 'Caller receipts', scope: 'Instance-wide', status: 'ok', lastReadAt: null, intervals: [{ since: now - 100, until: now - 4, state: 'covered' }, { since: now - 4, until: now, state: 'unknown' }] },
@@ -318,6 +322,7 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   await expect(card('ov.h.blocked')).toContainText('oldest 1d 2h without verified progress · Repair: 2')
   await expect(card('ov.h.recovery')).toContainText('1 needed outside help')
   await expect(card('ov.h.lasterror')).toContainText('at ')
+  await expect(card('ov.h.lasterror')).toHaveAttribute('href', `?view=observe&part=logging&incident=${EVIDENCE.incidentId}&back=overview`)
   await expect(card('ov.h.coverage').getByRole('img')).toHaveAttribute('aria-label', '96% covered, 4% unknown')
   await expect(page.getByText('Planned · #1101')).toHaveCount(0)
 
@@ -333,7 +338,9 @@ test('System health reads its five cards live, and a failed read keeps them, wit
 })
 
 test('In motion says what was never read, rather than zero or clear', async ({ page }) => {
-  await open(page, { notices: [], requests: [], decisions: [], revision: 1, chatsFail: true })
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1, chatsFail: true, runsFail: true })
   await expect(page.locator('[data-counts="people"] b').first()).toHaveText('—')
+  // A run never read is not Idle: the items' counts wait for the runs going now.
+  await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
   await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
 })
