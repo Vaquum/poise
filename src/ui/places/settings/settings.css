@@ -219,3 +219,4 @@
 
 /* Runs, minutes and success live in Overview (#556): Settings → Behaviors keeps the switches. */
 #view-behaviors #behaviors-filters, #view-behaviors .col-last, #view-behaviors .behavior-last-cell, #view-behaviors .behavior-metric { display: none; }
+#view-behaviors #behaviors-table { min-width: 0; }
