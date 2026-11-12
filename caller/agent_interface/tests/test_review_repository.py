@@ -391,7 +391,9 @@ class TestStructuredInspection(TestCase):
                     patch.object(repo, "inspect", return_value=result) as inspect, \
                     patch.object(sr.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps({"action": "requested_changes", "review_id": 91, "head_sha": HEAD}), stderr="")) as submit:
                 sr.run("/repo", "system", "packet", model, "pr_review", PR, "bot", HEAD, 60, repository=repo)
-                inspect.assert_called_once_with([REQUEST])
+                inspect.assert_called_once()
+                self.assertEqual(inspect.call_args.args, ([REQUEST],))
+                self.assertLessEqual(inspect.call_args.kwargs['timeout_s'], 30)
                 submit.assert_called_once()
                 self.assertEqual(submit.call_args.args[0][-4:], ["--expected-head", HEAD, "--token-user", "bot"])
                 self.assertEqual(json.loads(submit.call_args.args[0][4]), [FINDING])

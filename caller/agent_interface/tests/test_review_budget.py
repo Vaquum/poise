@@ -101,6 +101,40 @@ class TestReviewBudget(TestCase):
             self.assertGreaterEqual(snapshot['budget']['used_seconds'], 0)
             self.assertLessEqual(snapshot['budget']['used_seconds'], 100)
 
+    def test_inspection_at_analysis_cutoff_preserves_both_publication_reserves(self):
+        from agent_interface import review_repository
+
+        for returned_at in (1292, 1293):
+            with self.subTest(returned_at=returned_at):
+                clock = SimpleNamespace(now=0.0)
+                repository = review_repository.Repository(Path('/tmp/review'), {'head_sha': HEAD})
+                request = {'operation': 'read', 'path': 'consumer.py', 'query': '', 'start_line': 1}
+
+                def ask(*args):
+                    clock.now = returned_at
+                    return json.dumps({'action': 'inspect', 'comments': [], 'requests': [request],
+                                       'assessment': json.loads(APPROVAL)['assessment']})
+
+                def inspect(argv, *, timeout, **kwargs):
+                    self.assertEqual(argv[1], '--review-context')
+                    self.assertEqual(timeout, 1)
+                    clock.now += timeout
+                    return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps(
+                        {'action': 'review_context', 'head_sha': HEAD, 'results': []}))
+
+                with patch.object(budget, 'monotonic', lambda: clock.now), \
+                        patch.object(structured_review, 'monotonic', lambda: clock.now), \
+                        patch.object(structured_review, 'ReviewWatch', return_value=nullcontext()), \
+                        patch.dict(structured_review.ASK, {'codex': ask}), \
+                        patch.object(subprocess, 'run', side_effect=inspect) as command, \
+                        budget.ReviewBudget(), self.assertRaises(budget.ReviewLimitError) as failure:
+                    structured_review.run('/tmp', 'system', 'packet', CATALOG.resolve('gpt-6-astra-ultra'),
+                                          'pr_review', 'https://github.com/o/r/pull/1', 'bit-mis', HEAD,
+                                          1413, repository=repository)
+                self.assertEqual(failure.exception.code, 'review_budget_exhausted')
+                self.assertEqual(command.call_count, 1 if returned_at == 1292 else 0)
+                self.assertEqual(clock.now, 1293)
+
 class TestPreparationDeadlines(TestCase):
     def test_packet_git_deadline_does_not_claim_the_total_budget_expired(self):
         diagnostic = {"version": 1, "source": "caller", "severity": "error", "operation": "fetch",
@@ -508,7 +542,7 @@ class TestRecovery(TestCase):
         self.assertEqual(self.mod.run.call_count, 1)
         self.assertEqual(row['error_code'], 'review_budget_exhausted')
 
-    def _staged_review(self, files, *, publication='normal', stalled=False):
+    def _staged_review(self, files, *, publication='normal', stalled=False, inspection_loop=False):
         from hashlib import sha256
 
         from agent_interface import pr_review, review_stages
@@ -569,7 +603,7 @@ class TestRecovery(TestCase):
             elif flag == '--review-context':
                 requests = json.loads(argv[argv.index('--requests-json') + 1])
                 spend('listing' if requests[0]['operation'] == 'list' else 'inspection',
-                      10 if requests[0]['operation'] == 'list' else 1, timeout)
+                      10 if requests[0]['operation'] == 'list' else 0.4 if inspection_loop else 1, timeout)
                 observed.inspected.update(r['path'] for r in requests if r['path'] in paths)
                 observed.guidance_reads += sum(r['path'] == 'AGENTS.md' for r in requests)
                 value = {'action': 'review_context', 'head_sha': HEAD,
@@ -596,7 +630,7 @@ class TestRecovery(TestCase):
                 history = observed.threads[thread_id]
             else:
                 thread_id = str(uuid4())
-                history = SimpleNamespace(common=False, inspected=set(), pending=None, stage=None)
+                history = SimpleNamespace(common=False, inspected=set(), pending=None, stage=None, optional={})
                 observed.threads[thread_id] = history
             if history.pending is not None:
                 kind, group, requests = history.pending
@@ -615,6 +649,10 @@ class TestRecovery(TestCase):
             self.assertEqual(stage['head_sha'], HEAD)
             self.assertEqual(stage['pull'], packet['pull'])
             self.assertEqual(stage['repository'], 'o/r')
+            if inspection_loop and 'PR packet:\n' in input:
+                for earlier in range(1, group):
+                    self.assertIn(f'Blocking defect in file group {earlier}.', input)
+                    self.assertIn(f'Pinned evidence for group {earlier}', input)
             observed.groups[group] = observed.groups.get(group, 0) + 1
             requests = []
             if not history.common:
@@ -627,11 +665,34 @@ class TestRecovery(TestCase):
                     requests = [{'operation': 'read', 'path': f['filename'], 'query': '', 'start_line': 1}
                                 for f in stage['files']]
                     history.pending = ('group', group, requests)
+            schema = json.loads(Path(argv[argv.index('--output-schema') + 1]).read_text())
+            if inspection_loop:
+                # #1161 Call 5fed3a4a entered group 5 at 1,284.8 s, with
+                # ~10 s left. Its final inspections took ~0.4 s, compared
+                # with 20/33 s provider turns. These bounded fixture costs
+                # reproduce that starvation; they are not a production trace.
+                seconds = 195 if not history.common else 61.75
+                if 'requests' not in schema['properties']:
+                    self.assertTrue(history.common)
+                    self.assertIn(group, history.inspected)
+                    requests = []
+                elif not requests and history.optional.get(group, 0) < 2:
+                    history.optional[group] = history.optional.get(group, 0) + 1
+                    requests = [{'operation': 'search', 'path': '.', 'start_line': 1,
+                                 'query': f'optional-consumer-{group}-{history.optional[group]}'}]
+                    history.pending = ('optional', group, requests)
             spend('provider', float('inf') if stalled else seconds, timeout)
             finding = {'path': stage['files'][0]['filename'], 'line': 1, 'side': 'RIGHT',
                        'body': f'[p1] Blocking defect in file group {group}.'}
             reply = {'action': 'inspect' if requests else 'request_changes', 'comments': [finding],
                      'assessment': json.loads(APPROVAL)['assessment'], 'requests': requests}
+            if inspection_loop:
+                reply['assessment']['reviewed_context'] = '; '.join(
+                    f'Pinned evidence for group {earlier}' for earlier in sorted(history.inspected))
+                if not history.inspected:
+                    reply['assessment']['reviewed_context'] = 'Reading pinned guidance before the file groups.'
+                if 'requests' not in schema['properties']:
+                    del reply['requests']
             Path(argv[argv.index('--output-last-message') + 1]).write_text(json.dumps(reply))
             return SimpleNamespace(returncode=0, stderr='', stdout=json.dumps(
                 {'type': 'thread.started', 'thread_id': thread_id}))
@@ -686,6 +747,30 @@ class TestRecovery(TestCase):
         self.assertEqual(run.inspected, set(run.paths))
         self.assertEqual(run.elapsed, 1397)
         self.assertLess(run.elapsed, 1413)
+
+    def test_slow_inspection_loop_finishes_every_group_and_verifies_one_verdict(self):
+        row, run = self._staged_review(36, inspection_loop=True)
+        self.assertEqual((row['status'], row['outcome'], row['review_id']),
+                         ('completed', 'changes_requested', run.review_id), (row['error'], run.timeline))
+        self.assertEqual(run.total, 5)
+        self.assertEqual(set(run.groups), set(range(1, 6)))
+        self.assertEqual(run.inspected, set(run.paths))
+        self.assertEqual(run.lookups, [0, 1])
+        self.assertEqual(len(run.submissions), 1)
+        self.assertEqual(len(run.threads), 1)
+        argv = run.submissions[0]
+        findings = json.loads(argv[argv.index('--comments-json') + 1])
+        self.assertEqual([finding['body'] for finding in findings],
+                         [f'[p1] Blocking defect in file group {group}.' for group in range(1, 6)])
+        assessment = json.loads(argv[argv.index('--assessment-json') + 1])
+        self.assertEqual(assessment['reviewed_context'], '; '.join(
+            f'Pinned evidence for group {group}' for group in range(1, 6)))
+        self.assertEqual(row['expected_head'], HEAD)
+        self.assertEqual(row['head_sha'], HEAD)
+        self.assertIsNone(row['recovery_model'])
+        self.assertLessEqual(run.elapsed, 1413)
+        self.assertAlmostEqual(run.elapsed, 1382.8)
+        self.assertAlmostEqual(row['progress']['budget']['used_seconds'], run.elapsed)
 
     def test_staged_exhaustion_and_uncertain_publication_do_not_retry(self):
         for kwargs, code in (({'stalled': True}, 'review_budget_exhausted'),

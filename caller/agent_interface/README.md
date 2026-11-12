@@ -424,7 +424,11 @@ is one response, and Claude Code restarts a response cut at the limit without th
 Other behaviors retain their existing model assignments and limits.
 
 Local pinned-repository inspection has a separate 30-second deadline, capped by
-the remaining review budget. A timeout records `review_inspection_timeout` and
+the remaining review budget. Structured analysis also caps each inspection by
+the remaining analysis allowance and current file group's deadline, keeping the
+60-second submission and 60-second verification reserves even after a provider
+returns near the analysis cutoff.
+A timeout records `review_inspection_timeout` and
 retains the inspection phase, deadline and pinned target in the existing process
 diagnostic, without command arguments or inspection content in the error.
 Poise excludes this diagnostic from provider backoff, including older calls
@@ -505,8 +509,14 @@ review duration and usage. Codex keeps one native conversation across file
 groups and inspection rounds, retaining earlier analysis and inspected source.
 Structured reviews reserve 60 seconds for submission and another 60 seconds
 for the authoritative outcome lookup. Submission keeps that verification
-reserve even when it is slow. Every stage's findings combine into the single
-verdict the harness submits; a packet that fits in one group needs no staging.
+reserve even when it is slow. After the first common-context turn, staged
+inspection shares the remaining analysis allowance across the remaining file
+groups. Each group stops offering further inspection once half its allowance
+is spent and requests a terminal assessment on the evidence already held.
+Provider execution and inspection stay within the group's deadline; a timeout
+still fails without submitting an incomplete review. Every stage's findings
+combine into the single verdict the harness submits; a packet that fits in one
+group needs no staging.
 A follow-up (`--pr-approve`) round reviews the diff since
 the reviewer's last submitted review instead of the whole PR again: new
 findings on current lines stay on current-head lines, while a defect caused

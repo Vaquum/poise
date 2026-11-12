@@ -579,7 +579,9 @@ class TestStagedReview(TestCase):
             structured_review.run("/repo", "system", text, CATALOG.resolve("gpt-6-astra-ultra"), "pr_review",
                                   "https://github.com/o/r/pull/12", "bit-mis", "a" * 40, 60,
                                   repository=repo, packet=packet)
-        inspect.assert_called_once_with([request])
+        inspect.assert_called_once()
+        self.assertEqual(inspect.call_args.args, ([request],))
+        self.assertLessEqual(inspect.call_args.kwargs['timeout_s'], 30)
         submit.assert_called_once()
         self.assertEqual(len(calls), 3)
         self.assertIn("file group 2 of 2", calls[2])
@@ -590,7 +592,7 @@ GROK_HANDOFF = "grok review reached its analysis time limit; handing off so the 
 NEVER_RETURNS = float("inf")
 INSPECT = {"assessment": ASSESSMENT, "action": "inspect", "comments": [],
            "requests": [{"operation": "read", "path": "src/old.py", "query": "", "start_line": 1}]}
-INSPECTED = SimpleNamespace(inspect=lambda requests: {"action": "review_context", "results": []})
+INSPECTED = SimpleNamespace(inspect=lambda requests, **kwargs: {"action": "review_context", "results": []})
 
 
 class TestGrokAnalysisCeiling(TestCase):
