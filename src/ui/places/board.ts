@@ -10,7 +10,7 @@ import { $, $$, esc, store } from '../dom'
 import { hydrateIcons, icon } from '../icons'
 import { term } from '../registry'
 import { paintTerms } from '../reference'
-import { closeMenus, lifeTo, motion, routeBack, toast, type Stage } from '../shell'
+import { closeMenus, lifeHTML, lifeTo, motion, routeBack, toast, type Stage } from '../shell'
 import { placeHref } from '../address'
 import type { MountPlace } from '../router'
 import { getOrganizations, placeSettings, startRefreshTicker } from '../../config'
@@ -61,7 +61,7 @@ type FilterKey = keyof Filters
  *  Board's view, what its time means and Who are its own (`poise-board`). */
 const BOARD_KEY = 'poise-board'
 /** Board's last read, kept across visits: a return paints it at once, then reads again. */
-let lastRead: { key: string, cards: Card[], items: Item[], statuses: Awaited<ReturnType<typeof readPrStatus>> | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean } | null = null
+let lastRead: { key: string, cards: Card[], items: Item[], statuses: Awaited<ReturnType<typeof readPrStatus>> | undefined, runs: Awaited<ReturnType<typeof readRunning>> | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean } | null = null
 function readFilters(): Filters {
   const saved = store.get<Record<string, unknown>>(CURRENT_FILTER_KEY, {})
   const own = { ...saved, ...store.get<Record<string, unknown>>(BOARD_KEY, {}) }
@@ -117,6 +117,8 @@ export const mount: MountPlace = (ctx) => {
     setSelectedOrganization(org)
   }
   const choose = (patch: Partial<Filters>) => {
+    // Another organization's runs never stand for this one's.
+    if (patch.org !== undefined && patch.org !== F.org) runsRead = undefined
     for (const [k, v] of Object.entries(patch)) { (F as unknown as Record<string, unknown>)[k] = v; delete (linked as Record<string, unknown>)[k] }
     saveFilters()
   }
@@ -294,7 +296,7 @@ export const mount: MountPlace = (ctx) => {
       const n = w.labels.length
       const pop = w.labelsOpen ? labelsHTML(w) : ''
       const blocked = !!w.conflict || w.busy
-      return `<div class="writer" data-writer="issue">${w.edit ? `<span class="t-micro" data-ref="composer.editing">Edit ${esc(w.repo)}#${w.edit.number}</span>` : ''}<input data-w="issue-title" placeholder="Issue title" aria-label="Issue title" data-ref="composer.title" value="${esc(w.title)}"${w.busy ? ' readonly' : ''}><textarea data-w="issue-body" rows="3" placeholder="What should happen, in plain words (optional)" aria-label="Issue body" data-ref="composer.body"${w.busy ? ' readonly' : ''}>${esc(w.body)}</textarea><div class="row"><select data-w="issue-repo" aria-label="Repository" data-ref="composer.repo"${w.edit || w.busy ? ' disabled' : ''}>${repoOptions(w.repo, false)}</select>${w.edit ? '' : `<button class="ib${n ? ' is-on' : ''}" data-act="labels" aria-label="Labels${n ? `, ${n} chosen` : ''}" aria-expanded="${w.labelsOpen}"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.labels">${icon('tag', 'sm')}${n ? `<span class="n">${n}</span>` : ''}</button>`}<span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="issue"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-open-issue"${blocked ? ' aria-disabled="true"' : ''} data-ref="${w.edit ? 'composer.save-issue' : 'composer.open'}">${w.edit ? 'Save issue' : 'Open issue'}</button></div>${pop}${w.conflict ? `<p class="w-err" role="alert">${esc(w.conflict)} <button class="lnk" data-act="w-theirs">Load the latest</button></p>` : ''}${w.err ? `<p class="w-err" role="alert">${esc(w.err)}</p>` : ''}${w.cleared ? `<p class="t-gloss">Cleared ${w.cleared} label${w.cleared > 1 ? 's' : ''} chosen for the previous repository.</p>` : ''}</div>`
+      return `<div class="writer" data-writer="issue">${w.edit ? `<span class="t-micro" data-ref="composer.editing">Edit ${esc(w.repo)}#${w.edit.number}</span>` : ''}<input data-w="issue-title" placeholder="Issue title" aria-label="Issue title" data-ref="composer.title" value="${esc(w.title)}"${w.busy ? ' readonly' : ''}><textarea data-w="issue-body" rows="3" placeholder="What should happen, in plain words (optional)" aria-label="Issue body" data-ref="composer.body"${w.busy ? ' readonly' : ''}>${esc(w.body)}</textarea><div class="row"><select data-w="issue-repo" aria-label="Repository" data-ref="composer.repo"${w.edit || w.busy ? ' disabled' : ''}>${repoOptions(w.repo, false)}</select>${w.edit ? '' : `<button class="ib${n ? ' is-on' : ''}" data-act="labels" aria-label="Labels${n ? `, ${n} chosen` : ''}" aria-expanded="${w.labelsOpen}"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.labels">${icon('tag', 'sm')}${n ? `<span class="n">${n}</span>` : ''}</button>`}<span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="issue"${w.busy ? ' aria-disabled="true"' : ''} data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-open-issue"${blocked ? ' aria-disabled="true"' : ''} data-ref="${w.edit ? 'composer.save-issue' : 'composer.open'}">${w.edit ? 'Save issue' : 'Open issue'}</button></div>${pop}${w.busy ? `<div class="life" data-ref="life" data-life="Executing" role="status">${lifeHTML('Executing', w.edit ? 'saving on GitHub' : 'opening on GitHub', true)}</div>` : ''}${w.conflict ? `<p class="w-err" role="alert">${esc(w.conflict)} <button class="lnk" data-act="w-theirs">Load the latest</button></p>` : ''}${w.err ? `<p class="w-err" role="alert">${esc(w.err)}</p>` : ''}${w.cleared ? `<p class="t-gloss">Cleared ${w.cleared} label${w.cleared > 1 ? 's' : ''} chosen for the previous repository.</p>` : ''}</div>`
     }
     if (lane.kind === 'mine' && W.has(`add.${lane.key}`)) {
       return `<div class="writer" data-writer="add.${lane.key}"><textarea data-w="add-text" rows="3" placeholder="Write a card…" aria-label="Card text" data-ref="composer.text"></textarea><div class="row"><select data-w="add-repo" aria-label="Link a repository" data-ref="composer.repo">${repoOptions(null)}</select><span class="spacer"></span><button class="btn btn-line" data-act="w-cancel" data-w-key="add.${lane.key}" data-ref="composer.cancel">Cancel</button><button class="btn btn-primary" data-act="w-add" data-lane="${lane.key}" data-ref="composer.add">Add</button></div></div>`
@@ -426,6 +428,7 @@ export const mount: MountPlace = (ctx) => {
   let generation = 0
   /** The last status read: a failed read keeps it rather than guessing. */
   let statusesRead: Awaited<ReturnType<typeof readPrStatus>> | undefined
+  let runsRead: Awaited<ReturnType<typeof readRunning>> | undefined
   async function settle<T>(key: string, what: string, read: Promise<T>): Promise<T | undefined> {
     try {
       const value = await read
@@ -449,7 +452,7 @@ export const mount: MountPlace = (ctx) => {
         if (cardsRead) cards = cardsRead
         if (live) {
           truncated = live.truncated
-          items = live.records.map((record) => toItem({ record, status: statusesRead?.get(itemKey(record.repo, record.number)), chain: null, run: null, labelled: assigned.has(itemKey(record.repo, record.number)), closing: null }))
+          items = live.records.map((record) => toItem({ record, status: statusesRead?.get(itemKey(record.repo, record.number)), chain: null, run: runsRead ? runsRead.get(itemKey(record.repo, record.number)) ?? null : undefined, labelled: assigned.has(itemKey(record.repo, record.number)), closing: null }))
           liveRead = true
         }
         render(false)
@@ -473,14 +476,16 @@ export const mount: MountPlace = (ctx) => {
     if (chainsRead) capacity = chainsRead.capacity
     if (chatsRead) chats = chatsRead
     if (statuses) statusesRead = statuses
+    if (running) runsRead = running
     if (live) {
       truncated = live.truncated
       const sig = (it: Item) => `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`
       const before = new Map(items.map((it) => [it.id, sig(it)]))
+      const runs = running ?? runsRead
       items = live.records.map((record) => {
         const key = itemKey(record.repo, record.number)
         return toItem({
-          record, status: statuses ? statuses.get(key) ?? null : statusesRead?.get(key), chain: chainsRead?.byItem.get(key) ?? null, run: running?.get(key) ?? null,
+          record, status: statuses ? statuses.get(key) ?? null : statusesRead?.get(key), chain: chainsRead?.byItem.get(key) ?? null, run: runs ? runs.get(key) ?? null : undefined,
           labelled: !!intake?.labelled.has(key) || assigned.has(key), closing: intake ? intake.prs[key] ?? [] : null,
         })
       })
@@ -509,7 +514,7 @@ export const mount: MountPlace = (ctx) => {
       }
     }
     readOnce = true
-    if (live) lastRead = { key: readKey(), cards, items, statuses: statusesRead, intake, capacity, chats, truncated }
+    if (live) lastRead = { key: readKey(), cards, items, statuses: statusesRead, runs: runsRead, intake, capacity, chats, truncated }
     paintPartial()
     if (first || !busy()) render(!first)
     else summary()
@@ -1105,6 +1110,7 @@ export const mount: MountPlace = (ctx) => {
   if (lastRead?.key === readKey()) {
     ({ cards, items, intake, capacity, chats, truncated } = lastRead)
     statusesRead = lastRead.statuses
+    runsRead = lastRead.runs
     readOnce = liveRead = true
   }
   paintHead()

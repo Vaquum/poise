@@ -215,6 +215,9 @@ test('opening an issue keeps its writer open and guarded until GitHub answers', 
   await page.getByLabel('Issue title').fill('A new issue')
   await page.getByRole('button', { name: 'Open issue' }).click()
   await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
+  // It says where it is, where it was asked, and its unavailable buttons look it.
+  await expect(page.locator('[data-writer="issue"] [data-ref="life"]')).toContainText('Executing · opening on GitHub')
+  await expect(page.getByRole('button', { name: 'Open issue' })).toHaveCSS('opacity', '0.45')
   // Neither a new writer, Cancel nor more typing takes the one whose answer is on its way.
   await page.getByRole('button', { name: 'Add issue' }).click()
   await expect(page.locator('[data-writer="issue"]').getByRole('button', { name: 'Cancel' })).toHaveAttribute('aria-disabled', 'true')
@@ -243,4 +246,67 @@ test('a held repaint leaves an armed Assign armed', async ({ page }) => {
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
   await expect(page.locator('[data-ref="cur.held"]')).toHaveText('1 update held')
   await expect(card(page, 'Opened today').getByRole('button', { name: 'Sure?' })).toBeVisible()
+})
+
+test('a failed read of the runs going now keeps the last runs, never a guessed state', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [{ status: 'running', repo: 'acme/site', pr_id: 44, behavior: 'review-prs', started_at: iso(10), started_at_precise: iso(10) }] } }))
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(card(page, 'A pull request').locator('.card-state')).toContainText('Review running')
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ status: 502, json: { error: 'agent-interface did not answer' } }))
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(page.locator('[data-ref="cur.partial"]')).toContainText('the runs going now')
+  await expect(card(page, 'A pull request').locator('.card-state')).toContainText('Review running')
+})
+
+test('Board scrolls inside itself, so its header and In motion stay in view', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await board(page, { records: [...RECORDS, ...Array.from({ length: 40 }, (_, i) => record('issue', 100 + i, `Issue ${100 + i}`))] })
+  await expect(card(page, 'Issue 139')).toHaveCount(1)
+  // Measured once the place has arrived: its entrance moves it by the travel distance.
+  await page.waitForFunction(() => !document.querySelector('[data-place-root][data-motion-running], [data-place-root][data-flow-enter]'))
+  const sizes = await page.evaluate(() => {
+    const d = document.documentElement
+    const lane = document.querySelector<HTMLElement>('.lane[data-lane="issue"] .lane-body')!
+    return { page: [d.scrollHeight, d.clientHeight], lane: [lane.scrollHeight, lane.clientHeight] }
+  })
+  expect(sizes.page[0]).toBeLessThanOrEqual(sizes.page[1])
+  expect(sizes.lane[0]).toBeGreaterThan(sizes.lane[1])
+})
+
+test('at 375 pixels Board’s header and lanes keep the narrow gutter', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 })
+  await board(page, { records: RECORDS })
+  const pads = await page.evaluate(() => {
+    const probe = document.createElement('div')
+    probe.style.paddingLeft = 'var(--sp-3)'
+    document.body.append(probe)
+    const gutter = getComputedStyle(probe).paddingLeft
+    probe.remove()
+    return { gutter, head: getComputedStyle(document.querySelector('.cur-head')!).paddingLeft, lanes: getComputedStyle(document.querySelector('.lanes')!).paddingLeft }
+  })
+  expect(pads.head).toBe(pads.gutter)
+  expect(pads.lanes).toBe(pads.gutter)
+})
+
+test('another organization’s runs never stand for the one chosen', async ({ page }) => {
+  const organizations = ['acme', 'beta'].map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }))
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const response = await route.fetch()
+    return route.fulfill({ response, json: { ...(await response.json()), organizations } })
+  })
+  const beta = record('issue', 50, 'Beta’s own issue', { repo: 'beta/api', url: 'https://github.com/beta/api/issues/50' })
+  await board(page, { records: [...RECORDS, beta] })
+  const pick = async (org: string) => {
+    await page.locator('[data-menu="board-org-menu"]').click()
+    await page.locator(`#board-org-menu [data-org="${org}"]`).click()
+  }
+  // acme's runs are read; then All orgs is chosen and its runs cannot be read.
+  await pick('acme')
+  await expect(card(page, 'Old issue changed today')).toHaveAttribute('data-state', 'idle')
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ status: 502, json: { error: 'agent-interface did not answer' } }))
+  await pick('')
+  await expect(page.locator('[data-ref="cur.partial"]')).toContainText('the runs going now')
+  await expect(card(page, 'Beta’s own issue')).toHaveAttribute('data-state', '')
 })

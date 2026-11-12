@@ -152,7 +152,6 @@ svg.flip-x { transform: rotate(180deg); }
 .omgr .sentence { font-size: var(--fs-row); line-height: var(--lh-body); color: var(--c-text); }
 .omgr-r { display: flex; flex-direction: column; align-items: stretch; gap: var(--sp-3); }
 .omgr .rhythm { margin-top: 0; min-width: 0; }
-.omgr .slots { flex-wrap: nowrap; }
 .omgr .slot { width: var(--cap-w); }
 .omgr .lnk { font-size: var(--fs-micro); align-self: flex-start; }
 .sbtn { display: inline-flex; align-items: center; gap: var(--sp-2); align-self: flex-start; font-size: var(--fs-micro); font-weight: var(--fw-strong); color: var(--c-text-soft); }

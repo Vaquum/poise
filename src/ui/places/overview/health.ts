@@ -4,6 +4,7 @@
 import type { AnalyticsHealth, HealthSource } from '../../../analytics-health-types'
 import { formatCount, formatDuration, formatRate } from '../../../analytics-format'
 import { organizationUrl } from '../../../organizations'
+import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
 import { clockAt, json, readLine, reason, reportRead, unread, whileVisible, type PartContext, type Read } from './util'
 
@@ -33,6 +34,8 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
   }
 
   function paint(): void {
+    // The last error's card opens that diagnostic in Logging, or Logging while there is none.
+    $('[data-ref="ov.h.lasterror"]', box).setAttribute('href', placeHref('observe', { part: 'logging', incident: health.data?.lastError.error?.incident, back: 'overview' }))
     const line = readLine('System health', health)
     $('[data-healthfail]', box).innerHTML = line ? `<p class="onote is-warn ova-fail" role="status" data-ref="ov.read">${esc(line)}</p>` : ''
     const data = health.data

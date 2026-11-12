@@ -32,7 +32,7 @@ old or new bounds intersect the viewport receive layout/entry motion. Clipped
 departures use the captured geometry without reading styles after each removal.
 Spatial offsets are non-inherited CSS properties: an actor moves its subtree
 without recalculating every descendant's styles on each animation frame.
-Swarm pages bounded history for search, grouping and counts, mounting at most
+Observe → Behaviors pages bounded history for search, grouping and counts, mounting at most
 200 run rows per Previous/Next page, including expanded identical runs. Detail
 rows belong only to mounted runs. Each history read costs its own page plus an
 exact total that counts without loading; running statuses refresh from their

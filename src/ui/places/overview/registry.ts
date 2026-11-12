@@ -95,7 +95,7 @@ export const OVERVIEW: Registry = {
   'ov.h.errors': { name: 'Errors per completed work item', kind: 'Display', what: 'For work completed in the last 24 hours, its distinct work errors over its whole life, per item, with both counts.', does: 'Opens Logging.' },
   'ov.h.blocked': { name: 'Work blocked', kind: 'Display', what: 'Work held, not confirmed or overdue now, with the oldest time since verified progress and the stages it sits at.', does: 'Opens Observe → Tasks.' },
   'ov.h.recovery': { name: 'Recovered by itself', kind: 'Display', what: 'Work that recovered by itself after a failed run in the last 24 hours, with how many needed outside help.', does: 'Opens Observe → Tasks.' },
-  'ov.h.lasterror': { name: 'Since the last work error', kind: 'Display', what: 'How long since the latest verified work error, and when.', does: 'Opens Logging.' },
+  'ov.h.lasterror': { name: 'Since the last work error', kind: 'Display', what: 'How long since the latest verified work error, and when.', does: 'Opens that diagnostic in Logging.' },
   'ov.h.coverage': { name: 'Evidence coverage', kind: 'Display', what: 'One row for each source these cards read: covered time, gaps, and unknown time.', does: 'Opens Logging.' },
   'ov.advance': { name: 'No verified advance', kind: 'Display', what: 'How long since the chain last verified progress on this work. Held work shows at once; other work after a day.', now: (el) => text(el) },
   'ov.impact': { name: 'Work impact', kind: 'Display', what: 'What this entry’s failure did to managed work, as the chain verifies it: its impact, target and stage, last verified progress and the next retry.', now: (el) => text(el) },

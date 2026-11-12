@@ -69,8 +69,8 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
     return out
   }
 
-  /** A group not yet read: chats, or items with pull requests whose statuses have not been read. */
-  const unreadGroup = (group: 'people' | 'items'): boolean => group === 'people' ? !sessions.data : !items.data || (!pulls.data && items.data.some((record) => record.kind === 'pr'))
+  /** A group not yet read: chats, or items before the runs going now, or their pull requests' statuses, have been read. */
+  const unreadGroup = (group: 'people' | 'items'): boolean => group === 'people' ? !sessions.data : !items.data || !running.data || (!pulls.data && items.data.some((record) => record.kind === 'pr'))
 
   function countsHTML(list: Work[], group: 'people' | 'items'): string {
     const counts = countStates(list.filter((entry) => entry.group === group))

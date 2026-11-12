@@ -217,3 +217,29 @@ test('a move takes the tooltip with it, and a place enters only the first time i
   await expect(page.locator('.lanes')).toBeVisible()
   expect(await page.locator('[data-place-root]').getAttribute('data-flow-enter')).toBeNull()
 })
+
+test('closing the reference returns focus to its element, or to the one a live update put in its place', async ({ page }) => {
+  await open(page)
+  const board = nav(page).getByRole('link', { name: 'Board' })
+  await board.focus()
+  await board.hover()
+  await expect(page.getByRole('tooltip')).toBeVisible()
+  await page.keyboard.press('?')
+  await expect(page.getByRole('dialog', { name: 'Board' })).toBeVisible()
+  await page.evaluate(() => {
+    const old = [...document.querySelectorAll<HTMLElement>('a')].find((a) => a.textContent?.trim() === 'Board' && a.closest('nav'))!
+    const fresh = old.cloneNode(true) as HTMLElement
+    fresh.dataset.fresh = '1'
+    old.replaceWith(fresh)
+  })
+  await page.keyboard.press('Escape')
+  await expect(page.locator('[data-fresh="1"]')).toBeFocused()
+})
+
+test('a long toast wraps inside a narrow window', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 })
+  await open(page, '/?view=manager')
+  const toast = page.locator('.toast')
+  await expect(toast).toContainText('There is no Manager yet')
+  await expect.poll(async () => { const b = await toast.boundingBox(); return !!b && b.x >= 0 && b.x + b.width <= 375 }).toBe(true)
+})
