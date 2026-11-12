@@ -565,6 +565,28 @@ test('a long document chat opens on its last ten turns, and Show earlier turns r
   await expect(paneTranscript(page).getByText('Message live.')).toHaveCount(1)
 })
 
+test('a failed read of the earlier turns opens the last ones again, with a way to try again', async ({ page }) => {
+  const { state } = await editor(page)
+  state.sessions.unshift(session({ id: 's-doc', subject: SUBJECT, status: 'idle' }))
+  state.history['s-doc'] = Array.from({ length: 14 }, (_, i) => [
+    env('s-doc', i * 2 + 1, { type: 'turn.started', turnId: `doc-${i}`, prompt: { text: `Message ${i + 1}.`, attachments: [], mentions: [] } }),
+    env('s-doc', i * 2 + 2, { type: 'turn.finished', turnId: `doc-${i}`, stopReason: 'end_turn' }),
+  ]).flat()
+  await openDocChat(page)
+  await expect(paneTranscript(page)).toContainText('Message 14.')
+  // The whole history's read fails once; the last turns' read still answers.
+  let fail = true
+  await page.route('**/api/chat/sessions/s-doc?after=0', (route) => fail ? route.fulfill({ status: 500, json: { error: 'history store unavailable' } }) : route.fallback())
+  await paneTranscript(page).getByRole('button', { name: 'Show earlier turns' }).click()
+  await expect(pane(page)).toContainText('Earlier turns could not be read')
+  await expect(paneTranscript(page)).toContainText('Message 14.')
+  await expect(paneTranscript(page).getByRole('button', { name: 'Show earlier turns' })).toBeVisible()
+  fail = false
+  await pane(page).getByRole('button', { name: 'Try again' }).click()
+  await expect(paneTranscript(page)).toContainText('Message 1.')
+  await expect(pane(page)).not.toContainText('Earlier turns could not be read')
+})
+
 test("shows a document's earlier conversation and continues it", async ({ page }) => {
   const { state, sock } = await editor(page)
   const seeded = session({ id: 's-doc', subject: SUBJECT, importedFrom: 'editor-draft-1760000000000', status: 'idle' })

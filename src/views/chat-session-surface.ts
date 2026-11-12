@@ -199,7 +199,7 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
     onSuggestedReply: (text) => {
       container.dispatchEvent(new CustomEvent('chat:use-suggested-reply', { bubbles: true, detail: { subject, text } }))
     },
-    onEarlier: () => { if (record && !adopting) void adopt(record, true) },
+    onEarlier: () => { if (record && !adopting) void readEarlier(record) },
   })
   transcriptEl.addEventListener('chat:rerender', render)
 
@@ -445,10 +445,14 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
   }
 
   let seenSeq = 0
+  /** While "Show earlier turns" reads the history again, what this pane already
+   *  showed still counts as seen: closing it then raises no false New reply. */
+  let shownBefore = 0
   let adopting: ChatEnvelope[] | null = null
   let subscribed: string | null = null
   /** Adopt a session: a first open reads its last turns; `whole` reads all of it. */
   async function adopt(session: SessionRecord, whole = false): Promise<void> {
+    shownBefore = whole && record?.id === session.id ? Math.max(seenSeq, shownBefore) : 0
     if (subscribed) { chatClient.unsubscribe(subscribed); subscribed = null }
     const pending: ChatEnvelope[] = []
     adopting = pending
@@ -489,6 +493,19 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
       showEditRetry()
     } finally {
       if (adopting === pending) adopting = null
+    }
+  }
+
+  /** "Show earlier turns". A failed read opens the last turns again, live, and
+   *  says so with a way to try again. */
+  async function readEarlier(session: SessionRecord): Promise<void> {
+    try {
+      await adopt(session, true)
+    } catch (err) {
+      if (destroyed) return
+      const reason = (err as Error).message
+      try { await adopt(session) } catch { /* the notice below says what failed */ }
+      if (!destroyed) setNotice(`Earlier turns could not be read — ${reason}`, [{ label: 'Try again', run: () => { setNotice(null); void readEarlier(session) } }])
     }
   }
 
@@ -748,7 +765,7 @@ export function mountSessionSurface(container: HTMLElement, options: SurfaceOpti
 
   return {
     session: () => record?.id ?? null,
-    lastSeq: () => seenSeq,
+    lastSeq: () => Math.max(seenSeq, shownBefore),
     pendingRequests: () => {
       const pending = new Set(record?.pendingRequests)
       for (const [id, item] of model.permissions) {

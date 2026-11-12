@@ -583,6 +583,33 @@ test('does not mark a pane reply already shown but marks a later background repl
   await expect(marker(page, 'New reply')).toBeVisible()
 })
 
+test('closing a passage thread while its earlier turns are read raises no New reply', async ({ page }) => {
+  const { state, sock } = await editor(page, [annotation({ id: 'ann-1' })])
+  const passage = session({ id: 's-passage', subject: { surface: 'editor-passage', key: 'draft:ann-1', label: '' }, status: 'idle' })
+  state.sessions.unshift(passage)
+  state.history[passage.id] = Array.from({ length: 14 }, (_, i) => [
+    env(passage.id, i * 2 + 1, { type: 'turn.started', turnId: `p-${i}`, prompt: { text: `Message ${i + 1}.`, attachments: [], mentions: [] } }),
+    env(passage.id, i * 2 + 2, { type: 'turn.finished', turnId: `p-${i}`, stopReason: 'end_turn' }),
+  ]).flat()
+  await openThreadForMark(page, 'ann-1')
+  await expect(threadTranscript(page)).toContainText('Message 14.')
+  // The whole history's read is held while the thread closes.
+  let release!: () => void
+  let started!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const requested = new Promise<void>((resolve) => { started = resolve })
+  await page.route(`**/api/chat/sessions/${passage.id}?after=0`, async (route) => { started(); await held; await route.fallback() })
+  try {
+    await threadTranscript(page).getByRole('button', { name: 'Show earlier turns' }).click()
+    await requested
+    await thread(page).getByRole('button', { name: 'Close', exact: true }).click()
+    // The marker follows from what the thread showed, never from 0: from 0 the
+    // service replays every finished turn as a new reply.
+    await expect.poll(() => (sock.framesOf('subscribe').filter((frame) => (frame.command as { sessionId: string }).sessionId === passage.id).at(-1)?.command as { afterSeq: number } | undefined)?.afterSeq).toBe(28)
+    await expect(marker(page, 'New reply')).toHaveCount(0)
+  } finally { release() }
+})
+
 test('keeps a buffered pane reply marked new when closed before history is shown', async ({ page }) => {
   await page.addInitScript(() => {
     const parse = JSON.parse
