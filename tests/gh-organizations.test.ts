@@ -309,8 +309,13 @@ describe('concurrent pull request status reads', () => {
       handleGhBody({ operation: 'green_pr', org: 'alpha' }),
       readOwnPullRequests(),
     ])
-    expect(retried.body).toEqual({ records: [{ repo: 'alpha/same', number, status: 'green' }], held: [heldStatic(number, [])], errors: [] })
+    // green_pr answers with the expired failure at once and retries behind
+    // it; the notices' read waits for that same retry.
+    expect(retried.body).toEqual({ records: [], held: [heldUnknown(number)], errors: [] })
     expect(retriedNotices.pullRequests[0].status).toBe('green')
+    expect(statusCalls()).toHaveLength(2)
+    expect((await handleGhBody({ operation: 'green_pr', org: 'alpha' })).body)
+      .toEqual({ records: [{ repo: 'alpha/same', number, status: 'green' }], held: [heldStatic(number, [])], errors: [] })
     expect(statusCalls()).toHaveLength(2)
   })
 })

@@ -134,6 +134,10 @@ const GH_INTERFACE_CWD_ROOT = join(tmpdir(), 'poise-gh-interface')
 // checks within the tick.
 const GREEN_TTL_MS = 60_000
 const GREEN_CONCURRENCY = 5
+// green_pr answers with a check this far past its minute and reads it again
+// behind the answer: Overview reads every 60 s, so it found every check just
+// expired and waited for GitHub on each open pull request, every time.
+const GREEN_STALE_MS = 5 * 60_000
 // Current's colour for a pull request: green when it is ready to merge, yellow when
 // its merge button is green but a check fails or runs, or a conversation is open.
 type PrColour = 'green' | 'yellow'
@@ -148,6 +152,11 @@ export interface HeldEntry { repo: string, number: number, head: string | null, 
 interface PrCheck { status: PrStatus, held: HeldInfo, head: string | null }
 const greenCache = new Map<string, { check: PrCheck, expiry: number }>()
 const greenReads = new Map<string, Promise<PrCheck>>()
+let greenRefresh: Promise<void> | null = null
+/** Expired checks the running refresh has still to read, by key: a later read adds its own. */
+const greenStale = new Map<string, [agent: string, owner: string, repo: string, number: number]>()
+const greenKey = (agent: string, owner: string, repo: string, number: number): string =>
+  `${agent.toLowerCase()}:${owner}/${repo}#${number}`
 
 // Subset of fields the datastore returns. Pr-only and issue-only fields
 // are optional; the user-footprint view adds `item_type` and `reasons`.
@@ -506,7 +515,7 @@ function unknownHeld(): HeldInfo {
 // or git remote is available. We just point cwd at a tmp directory whose
 // last two parts are `<owner>/<repo>` and the CLI picks it up.
 async function checkPrStatus(owner: string, repo: string, number: number, agent: string): Promise<PrCheck> {
-  const key = `${agent.toLowerCase()}:${owner}/${repo}#${number}`
+  const key = greenKey(agent, owner, repo, number)
   const now = Date.now()
   const cached = greenCache.get(key)
   if (cached && cached.expiry > now) return cached.check
@@ -629,6 +638,8 @@ async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promi
   const agent = requireAgentAccount()
   const read = await fetchKind('pr', { ...body, record_state: 'open', count_only: true }, me, orgs)
   const openPrs = read.records
+  const now = Date.now()
+  const expired: Array<[owner: string, repo: string, number: number]> = []
 
   const results: { repo: string, number: number, status: PrColour }[] = []
   const held: HeldEntry[] = []
@@ -637,6 +648,11 @@ async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promi
     const checks = await Promise.all(chunk.map(async (pr) => {
       if (!pr.repo.includes('/')) return null
       const [owner, repoName] = pr.repo.split('/', 2)
+      const cached = greenCache.get(greenKey(agent, owner, repoName, pr.number))
+      if (cached && cached.expiry <= now && now - cached.expiry < GREEN_STALE_MS) {
+        expired.push([owner, repoName, pr.number])
+        return { pr, check: cached.check }
+      }
       return { pr, check: await checkPrStatus(owner, repoName, pr.number, agent) }
     }))
     for (const entry of checks) {
@@ -645,7 +661,26 @@ async function fetchGreenPrs(me: string, body: any, orgs: Organization[]): Promi
       held.push({ repo: entry.pr.repo, number: entry.pr.number, head: entry.check.head, held: entry.check.held })
     }
   }
+  if (expired.length) refreshGreenPrs(expired, agent)
   return { records: results, held, errors: read.errors }
+}
+
+// The expired checks green_pr answered with, read again five at a time.
+// One refresh runs at a time and also reads what later reads add, from any
+// organization. A check never rejects: a failed read is cached as unknown.
+function refreshGreenPrs(prs: Array<[owner: string, repo: string, number: number]>, agent: string): void {
+  for (const [owner, repo, number] of prs) greenStale.set(greenKey(agent, owner, repo, number), [agent, owner, repo, number])
+  greenRefresh ??= (async () => {
+    try {
+      while (greenStale.size) {
+        const batch = [...greenStale].slice(0, GREEN_CONCURRENCY)
+        for (const [key] of batch) greenStale.delete(key)
+        await Promise.all(batch.map(([, [reader, owner, repo, number]]) => checkPrStatus(owner, repo, number, reader)))
+      }
+    } finally {
+      greenRefresh = null
+    }
+  })()
 }
 
 /** The datastore queries that select what Current shows: what `me` is
