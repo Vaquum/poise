@@ -58,12 +58,14 @@ describe('organization data aggregation', () => {
     const joined = handleGhBody({ ...body })
     const other = handleGhBody({ ...body, org: 'alpha' })
     release()
-    expect(await joined).toEqual(await first)
-    await other
-    // Two organizations for the shared read, one for the other selection.
-    expect(mocks.runFile).toHaveBeenCalledTimes(3)
-    await handleGhBody({ ...body })
-    expect(mocks.runFile).toHaveBeenCalledTimes(5)
+    // The identical read is the same answer; another selection is its own.
+    expect(await joined).toBe(await first)
+    expect(await other).not.toBe(await first)
+    // Identical datastore reads in flight are shared below the list (runCli), so
+    // the other selection's one view joins the first read's.
+    expect(mocks.runFile).toHaveBeenCalledTimes(2)
+    expect(await handleGhBody({ ...body })).not.toBe(await first)
+    expect(mocks.runFile).toHaveBeenCalledTimes(4)
   })
 
   it('never joins a read started before the accounts or an organization changed', async () => {
@@ -78,10 +80,15 @@ describe('organization data aggregation', () => {
     mocks.orgs[1]!.status = 'initializing'
     const afterOrganization = handleGhBody({ ...body })
     release()
-    await Promise.all([before, afterAccount, afterOrganization])
-    // Each started its own read: two organizations; then both again for the author
-    // and the automation account; then only the ready one, for both accounts.
-    expect(mocks.runFile).toHaveBeenCalledTimes(2 + 4 + 2)
+    const [read, accountRead, organizationRead] = await Promise.all([before, afterAccount, afterOrganization])
+    // Each is its own list read, never the answer of one started before the change.
+    expect(accountRead).not.toBe(read)
+    expect(organizationRead).not.toBe(accountRead)
+    expect((read.body as { records: Array<{ repo: string }> }).records.some((r) => r.repo.startsWith('beta/'))).toBe(true)
+    expect((organizationRead.body as { records: Array<{ repo: string }> }).records.every((r) => r.repo.startsWith('alpha/'))).toBe(true)
+    // Identical datastore reads in flight are shared below the list (runCli):
+    // two organizations; then only the automation account's two are new.
+    expect(mocks.runFile).toHaveBeenCalledTimes(2 + 2)
   })
 
   it('keeps same repository names and issue numbers distinct, and paginates the combined order', async () => {

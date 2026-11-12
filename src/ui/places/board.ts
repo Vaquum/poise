@@ -13,7 +13,7 @@ import { paintTerms } from '../reference'
 import { closeMenus, lifeHTML, lifeTo, motion, routeBack, toast, type Stage } from '../shell'
 import { placeHref } from '../address'
 import type { MountPlace } from '../router'
-import { getOrganizations, placeSettings, startRefreshTicker } from '../../config'
+import { getOrganizations, getSettings, placeSettings, startRefreshTicker } from '../../config'
 import { CURRENT_FILTER_KEY, timeRangeWindow, type TimeRange } from '../../time-range'
 import { ORGANIZATION_STORAGE_KEY, setSelectedOrganization } from '../../organizations'
 import { noticeFeed } from '../../notices'
@@ -60,8 +60,28 @@ type FilterKey = keyof Filters
 /** Classic's Current keeps `status` as all|open in the same key; Board reads and writes it that way.
  *  Board's view, what its time means and Who are its own (`poise-board`). */
 const BOARD_KEY = 'poise-board'
-/** Board's last read, kept across visits: a return paints it at once, then reads again. */
-let lastRead: { key: string, cards: Card[], items: Item[], statuses: Awaited<ReturnType<typeof readPrStatus>> | undefined, runs: Awaited<ReturnType<typeof readRunning>> | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean } | null = null
+/** Board's last read, kept across visits and page loads: a return or a reload
+ *  paints it at once, then reads again. Another GitHub user's, organization's
+ *  or filter's read never stands for it. */
+type Statuses = Awaited<ReturnType<typeof readPrStatus>>
+type Runs = Awaited<ReturnType<typeof readRunning>>
+interface LastRead { key: string, me: string, orgs: string, cards: Card[], items: Item[], statuses: Statuses | undefined, runs: Runs | undefined, intake: Intake | null, capacity: ChainCapacity | null, chats: Map<string, ChatOn>, truncated: boolean }
+type Kept = Omit<LastRead, 'statuses' | 'runs' | 'chats' | 'intake'> & { statuses?: Array<[string, Statuses extends Map<string, infer V> ? V : never]>, runs?: Array<[string, Runs extends Map<string, infer V> ? V : never]>, chats: Array<[string, ChatOn]>, intake: (Omit<Intake, 'labelled'> & { labelled: string[] }) | null }
+const LAST_READ_KEY = 'poise-board-last'
+/** The organizations ready now: All orgs never stands for another set of them. */
+const readyOrgs = (): string => getOrganizations().filter((o) => o.status === 'ready').map((o) => o.login.toLowerCase()).sort().join(',')
+let lastRead: LastRead | null = (() => {
+  try {
+    const kept = JSON.parse(localStorage.getItem(LAST_READ_KEY) ?? 'null') as Kept | null
+    return kept ? { ...kept, statuses: kept.statuses && new Map(kept.statuses), runs: kept.runs && new Map(kept.runs), chats: new Map(kept.chats), intake: kept.intake && { ...kept.intake, labelled: new Set(kept.intake.labelled) } } : null
+  } catch {
+    return null
+  }
+})()
+function keepRead(read: LastRead): void {
+  const kept: Kept = { ...read, statuses: read.statuses && [...read.statuses], runs: read.runs && [...read.runs], chats: [...read.chats], intake: read.intake && { ...read.intake, labelled: [...read.intake.labelled] } }
+  try { localStorage.setItem(LAST_READ_KEY, JSON.stringify(kept)) } catch { /* the next page reads it anew */ }
+}
 function readFilters(): Filters {
   const saved = store.get<Record<string, unknown>>(CURRENT_FILTER_KEY, {})
   const own = { ...saved, ...store.get<Record<string, unknown>>(BOARD_KEY, {}) }
@@ -104,6 +124,8 @@ export const mount: MountPlace = (ctx) => {
   const F = readFilters()
   /** What Board's last read was for: the same organization, status and time read the same items. */
   const readKey = (): string => `${F.org}|${F.status}|${F.time}`
+  /** The GitHub user this Board read for, once the settings are in. */
+  let me: string | null = null
   const linked: Partial<Filters> = {}
   const linkTo = <K extends FilterKey>(k: K, v: Filters[K]) => { if (!(k in linked)) (linked as Record<string, unknown>)[k] = F[k]; F[k] = v }
   for (const k of ['layout', 'by', 'who', 'time', 'status'] as const) {
@@ -514,7 +536,11 @@ export const mount: MountPlace = (ctx) => {
       }
     }
     readOnce = true
-    if (live) lastRead = { key: readKey(), cards, items, statuses: statusesRead, runs: runsRead, intake, capacity, chats, truncated }
+    // Kept only for a known GitHub user, the one this Board opened with.
+    if (live && me && (getSettings().me ?? '') === me) {
+      lastRead = { key: readKey(), me, orgs: readyOrgs(), cards, items, statuses: statusesRead, runs: runsRead, intake, capacity, chats, truncated }
+      keepRead(lastRead)
+    }
     paintPartial()
     if (first || !busy()) render(!first)
     else summary()
@@ -1106,13 +1132,6 @@ export const mount: MountPlace = (ctx) => {
   })
 
   // ---------- Start ----------
-  // A return paints Board's last read at once; the read below refreshes it.
-  if (lastRead?.key === readKey()) {
-    ({ cards, items, intake, capacity, chats, truncated } = lastRead)
-    statusesRead = lastRead.statuses
-    runsRead = lastRead.runs
-    readOnce = liveRead = true
-  }
   paintHead()
   render(false)
   startRefreshTicker()
@@ -1121,8 +1140,33 @@ export const mount: MountPlace = (ctx) => {
     if (signal.aborted) return
     const held = () => getOrganizations().some((o) => o.login === F.org && o.status === 'ready')
     if (F.org && !held()) choose({ org: '' })
-    // Opened on remembered settings: when the fresh ones no longer hold the organization, it is no longer read.
-    window.addEventListener('poise:settings-read', () => { if (F.org && !held()) { choose({ org: '' }); void load(true) } }, { signal })
+    // A return or a reload paints Board's last read at once, for the same GitHub
+    // user, organization and filters; the read below refreshes it.
+    me = getSettings().me ?? ''
+    const kept = lastRead
+    let restored: LastRead | null = null
+    if (kept && !readOnce && me && kept.me === me && kept.orgs === readyOrgs() && kept.key === readKey()) {
+      ({ cards, items, intake, capacity, chats, truncated } = kept)
+      statusesRead = kept.statuses
+      runsRead = kept.runs
+      readOnce = liveRead = true
+      restored = kept
+      render(false)
+    }
+    // Opened on remembered settings: when the fresh ones no longer hold the
+    // organization, it is no longer read; when they name another GitHub user or
+    // other organizations, a read restored for the remembered ones is dropped.
+    window.addEventListener('poise:settings-read', () => {
+      if (F.org && !held()) { choose({ org: '' }); void load(true); return }
+      if (restored && (restored.me !== (getSettings().me ?? '') || restored.orgs !== readyOrgs())) {
+        restored = null
+        cards = []; items = []; intake = null; capacity = null; chats = new Map(); truncated = false
+        statusesRead = undefined; runsRead = undefined
+        readOnce = liveRead = false
+        render(false)
+        void load(true)
+      }
+    }, { signal })
     void readRepos(F.org).then((r) => { repos = r.repos; if (r.warning) failures.set('repos', r.warning); else failures.delete('repos') }).catch((error) => { failures.set('repos', `Could not load your repositories: ${(error as Error).message}.`) })
     await load(true)
     const item = address.item

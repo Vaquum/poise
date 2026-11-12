@@ -8,6 +8,7 @@ import { HttpError, enforceDocumentRequest, httpStatus, readBuffer, setApiHeader
 import { assertCallerRelease } from './caller-release'
 import { refuseInspectorActivation, registerProductionShutdownSignals } from './production-signals'
 import { abandonProductionCpuCapture, installProductionCpuCapture } from './production-cpu-profile'
+import { installStallObserver } from './stall-observer'
 // In-process launchers (scripts/start-production.mjs, scripts/self-update/launch.mjs)
 // import these from the bundle, so they are re-exported here.
 export { refuseInspectorActivation, registerProductionShutdownSignals }
@@ -523,6 +524,8 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
 }
 
 export async function startProductionServer(options: ProductionServerOptions = {}): Promise<Server> {
+  // Every launcher starts the server here; /api/health/stalls reads what it observes.
+  installStallObserver()
   await assertSecureDotenv()
   const host = options.host || process.env.POISE_HOST || DEFAULT_HOST
   const service = options.service === undefined ? readServiceConfig() : options.service

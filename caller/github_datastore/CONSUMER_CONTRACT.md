@@ -29,6 +29,15 @@ CSV:
 github-datastore view pr --status open --limit 50 --format csv
 ```
 
+Poise reads the `pr`, `issue` and `user` views without the CLI for its GitHub
+lists: its server opens the datastore read-only and runs `views._select`'s
+query on the `prs`, `issues` and `user_items` SQL views
+(`server/datastore-views.ts`). Those views, and `_select`'s filters, order,
+label-evidence check and datetime normalization, are therefore part of this
+contract. A change to them changes Poise's reader in the same pull request;
+`tests/datastore-views.test.ts` compares both answers on a datastore this
+package builds.
+
 ## Python
 
 ```python

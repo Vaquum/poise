@@ -43,3 +43,8 @@ await build({
   entryPoints: ['server/process-worker.ts'], bundle: true, platform: 'node',
   format: 'esm', packages: 'external', outfile: 'dist/process-worker.js', logLevel: 'info',
 })
+
+await build({
+  entryPoints: ['server/datastore-reader-worker.ts'], bundle: true, platform: 'node',
+  format: 'esm', packages: 'external', outfile: 'dist/datastore-reader-worker.js', logLevel: 'info',
+})
