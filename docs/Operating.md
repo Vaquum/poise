@@ -791,6 +791,16 @@ is refused. A box holds no sign-in, so a test that needs a secret or an ignored
 file fails there. What the suite changes stays on the box and goes with it, so
 update snapshots with the runner on your own machine if you need them back.
 
+With GNU tar, the runner and relay can reuse verified chunks of the ignored
+dependency directories selected for the outer checkout. The runner hashes their
+captured tar bytes, including file contents, paths and metadata. Source, Git
+data and separately selected interpreters travel with each run. The relay
+retains compressed dependency chunks in private temporary files scoped to the
+workspace. It keeps at most 128 chunks and 512 MiB across workspaces, expires
+idle entries after 30 minutes, and starts empty after a restart. Each fresh box
+receives the whole tar in its original order. A miss sends bytes from the
+runner's captured input, including during recovery.
+
 **How it dies.** A box is created for one suite and ended when it ends: a sandbox
 is terminated, a job cancelled. That happens in each of these cases, and none
 depends on the others:

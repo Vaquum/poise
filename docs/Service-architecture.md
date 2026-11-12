@@ -305,6 +305,15 @@ children with the hooks while `relay` exists
 ([Agents' test suites](Operating.md#agents-test-suites)). The settings travel this
 way because only a new container would take an environment variable.
 
+The relay's run admission advertises `dependencyCache: true`. The authenticated
+workspace can send `POST /runs/:id/dependency?sha256=…` between checkout parts
+to insert one cached gzip member in order. An empty request looks up the
+workspace's chunk and returns 404 on a miss. A request with a body submits the
+member, which the relay verifies against the SHA-256 of its uncompressed tar
+bytes before forwarding and retaining it. Earlier runners and relays still
+exchange the whole checkout through the existing tree upload. Jobs and
+sandboxes receive the same single tar stream from either route.
+
 A workspace container created with another `POISE_DRAIN_TIMEOUT` than the
 gateway's, or with none, is recreated as one on an outdated image is: drained
 first if it runs ([Deployment](#deployment)).

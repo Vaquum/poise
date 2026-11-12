@@ -5,13 +5,15 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
+import { createInterface } from 'node:readline'
 import { pipeline } from 'node:stream/promises'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import { createGzip } from 'node:zlib'
+import { promisify } from 'node:util'
+import { createGzip, gzip } from 'node:zlib'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const LEASE_MS = 10_000
@@ -21,6 +23,9 @@ const GATEWAY_RESTART = 'the gateway restarted'
 // A suite that reached for Docker on a job, which has none: it starts again on a sandbox, which has.
 const USES_DOCKER = 'this suite uses Docker'
 const CHUNK_BYTES = 8 * 1024 * 1024
+// Leave room in one upload for gzip's framing and worst-case expansion.
+const DEPENDENCY_BYTES = CHUNK_BYTES - 64 * 1024
+const zip = promisify(gzip)
 // The first bytes go at once: a proxy gives up on a download that stays silent for long.
 const FIRST_CHUNK_BYTES = 64 * 1024
 const FRAME = { heartbeat: 0, stdout: 1, stderr: 2, exit: 3, fail: 4, ready: 5 }
@@ -64,13 +69,13 @@ function checkoutFiles(top) {
   for (const name of gitPaths(top, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')) {
     const path = join(top, name).replace(/\/$/, '')
     // git names a submodule or an embedded repository as one path, and tar would take all of it.
-    if (existsSync(join(path, '.git'))) paths.push(...checkoutFiles(path))
+    if (existsSync(join(path, '.git'))) paths.push(...checkoutFiles(path).paths)
     else paths.push(path)
   }
-  for (const name of gitPaths(top, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory')) {
-    if (DEPENDENCIES.has(basename(name))) paths.push(join(top, name).replace(/\/$/, ''))
-  }
-  paths.push(join(top, '.git'))
+  const dependencies = gitPaths(top, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory')
+    .filter((name) => DEPENDENCIES.has(basename(name))).map((name) => join(top, name).replace(/\/$/, ''))
+  const gitEntry = join(top, '.git')
+  paths.push(...dependencies, gitEntry)
   // A linked worktree's .git is a file naming this folder, which may be anywhere.
   const gitDir = resolve(top, git(top, 'rev-parse', '--git-common-dir')?.toString().trim() ?? '.git')
   const config = join(gitDir, 'config')
@@ -78,7 +83,7 @@ function checkoutFiles(top) {
     throw new Error(`${config} holds a credential, which must not reach a test box`)
   }
   if (relative(top, gitDir).startsWith('..')) paths.push(gitDir)
-  return paths
+  return { paths, dependencies, gitEntry }
 }
 
 /**
@@ -116,12 +121,13 @@ function wayTo(path) {
  * link on the way to them, when no test box has them. Throws when that would carry something that must
  * stay here.
  */
-export function filesToSend(cwd, also = [], env = process.env, home = homedir()) {
+function selectedFiles(cwd, also, env, home) {
   const paths = []
   const holdsSecrets = (path) => [home, env.TMPDIR].filter(Boolean).some((place) => !relative(path, place).startsWith('..'))
   const top = git(cwd, 'rev-parse', '--show-toplevel')?.toString().trim()
-  if (top) {
-    paths.push(...checkoutFiles(top))
+  const checkout = top ? checkoutFiles(top) : null
+  if (checkout) {
+    paths.push(...checkout.paths)
   } else {
     if (holdsSecrets(cwd)) throw new Error(`run the suite from a checkout: ${cwd} holds what must not reach a test box`)
     paths.push(cwd)
@@ -135,9 +141,29 @@ export function filesToSend(cwd, also = [], env = process.env, home = homedir())
     if (holdsSecrets(steps.at(-1))) throw new Error(`${path} holds what must not reach a test box`)
     paths.push(...steps.filter((step) => !/^\/usr(\/|$)/.test(step)))
   }
-  return [...new Set(paths)].filter((path) => {
+  const present = [...new Set(paths)].filter((path) => {
     try { return Boolean(lstatSync(path)) } catch { return false }
   })
+  return { ...checkout, paths: present }
+}
+
+export function filesToSend(cwd, also = [], env = process.env, home = homedir()) {
+  return selectedFiles(cwd, also, env, home).paths
+}
+
+// Only cache the contiguous ignored dependency entries immediately before this checkout's .git.
+// GNU tar reports the start of each entry, including any long-name records. Offsets let us keep
+// one tar stream, with its original ordering and even hard links between dependencies and source.
+function dependencyBoundaries({ paths, dependencies, gitEntry }) {
+  if (!dependencies?.length || process.env.TAR_OPTIONS) return null
+  const end = paths.indexOf(gitEntry)
+  const start = end - dependencies.length
+  if (start < 0 || !dependencies.every((path, index) => path === paths[start + index])) return null
+  const names = [paths[start], gitEntry].map((path) => path.slice(1))
+  // Only recognize names whose representation in the escaped listing is unambiguous.
+  if (!names.every((name) => /^[\w./-]+$/.test(name))) return null
+  if (!spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout?.startsWith('tar (GNU tar)')) return null
+  return names
 }
 
 /** Reads a stream of [type, 4-byte length, payload] frames, whatever pieces they arrive in. */
@@ -204,9 +230,9 @@ async function main(args) {
   for (const [signal, number] of [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1]]) {
     process.once(signal, () => stop(128 + number))
   }
-  let paths
+  let selection
   try {
-    paths = filesToSend(cwd, also)
+    selection = selectedFiles(cwd, also, process.env, homedir())
   } catch (error) {
     // The agent can do something about this one.
     say(error.message)
@@ -215,53 +241,94 @@ async function main(args) {
   }
 
   const directory = mkdtempSync(join(tmpdir(), 'poise-test-input-'))
-  const archive = join(directory, 'tree.tgz')
+  const boundaries = dependencyBoundaries(selection)
+  const archive = join(directory, boundaries ? 'tree.tar' : 'tree.tgz')
+  let dependencyRange
   process.once('exit', () => rmSync(directory, { recursive: true, force: true }))
   const capture = async () => {
-    const tar = spawn('tar', ['-C', '/', '--null', '-T', '-', '-cf', '-'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    const indexPath = join(directory, 'tar.index')
+    const index = boundaries ? ['--block-number', '-v', '--quoting-style=escape', `--index-file=${indexPath}`] : []
+    const tar = spawn('tar', [...index, '-C', '/', '--null', '-T', '-', '-cf', '-'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: boundaries ? { ...process.env, LC_ALL: 'C' } : process.env,
+    })
     const closed = new Promise((done, reject) => { tar.on('close', done); tar.on('error', reject) })
     let errors = ''
     tar.stderr.on('data', (chunk) => { errors = (errors + chunk).slice(-2000) })
-    tar.stdin.end(paths.map((path) => path.replace(/^\//, '')).join('\0'))
-    const gzip = createGzip({ level: 1 })
+    tar.stdin.end(selection.paths.map((path) => path.replace(/^\//, '')).join('\0'))
+    const streams = boundaries ? [tar.stdout] : [tar.stdout, createGzip({ level: 1 })]
     const hash = createHash('sha256').update(spec)
-    gzip.on('data', (chunk) => hash.update(chunk))
+    streams.at(-1).on('data', (chunk) => hash.update(chunk))
     try {
-      const [, code] = await Promise.all([pipeline(tar.stdout, gzip, createWriteStream(archive), { signal: lifetime.signal }), closed])
+      const [, code] = await Promise.all([pipeline(...streams, createWriteStream(archive), { signal: lifetime.signal }), closed])
       // tar's exit 1 says a file changed as it was read. Both attempts still use these exact bytes.
       if (code !== 0 && code !== 1) throw new Error(`tar exited with ${code}: ${errors}`)
+      if (boundaries) {
+        const offsets = new Map()
+        for await (const line of createInterface({ input: createReadStream(indexPath, { signal: lifetime.signal }) })) {
+          const match = /^block (\d+): (.+?)\/?$/.exec(line)
+          if (!match || !boundaries.includes(match[2])) continue
+          offsets.set(match[2], offsets.has(match[2]) ? NaN : Number(match[1]) * 512)
+        }
+        const [start, end] = boundaries.map((name) => offsets.get(name))
+        if (start >= 0 && end > start && end < statSync(archive).size) dependencyRange = { start, end }
+      }
       return hash.digest('hex')
     } finally {
       if (tar.exitCode === null) tar.kill()
     }
   }
 
-  const sendTree = async (id, signal) => {
+  const sendTree = async (id, signal, dependencyCache) => {
     let parts = []
     let size = 0
     let total = 0
     let limit = FIRST_CHUNK_BYTES
     const started = Date.now()
-    for await (const chunk of createReadStream(archive, { highWaterMark: FIRST_CHUNK_BYTES, signal })) {
-      parts.push(chunk)
-      size += chunk.length
-      total += chunk.length
-      if (size >= limit) {
-        await call('POST', `/runs/${id}/tree`, Buffer.concat(parts), signal)
-        parts = []
-        size = 0
-        limit = CHUNK_BYTES
+    const flush = async (end = false) => {
+      if (size || end) await call('POST', `/runs/${id}/tree${end ? '?end=1' : ''}`, Buffer.concat(parts), signal)
+      parts = []
+      size = 0
+      limit = CHUNK_BYTES
+    }
+    const send = async (chunks) => {
+      for await (const chunk of chunks) {
+        parts.push(chunk)
+        size += chunk.length
+        total += chunk.length
+        if (size >= limit) await flush()
       }
     }
-    await call('POST', `/runs/${id}/tree?end=1`, Buffer.concat(parts), signal)
+    const read = (range) => createReadStream(archive, { highWaterMark: FIRST_CHUNK_BYTES, signal, ...range })
+    const sendRaw = (range) => pipeline(read(range), createGzip({ level: 1 }), send, { signal })
+    if (dependencyRange && dependencyCache) {
+      const { start, end } = dependencyRange
+      if (start > 0) await sendRaw({ end: start - 1 })
+      await flush()
+      for await (const chunk of read({ start, end: end - 1, highWaterMark: DEPENDENCY_BYTES })) {
+        const digest = createHash('sha256').update(chunk).digest('hex')
+        const path = `/runs/${id}/dependency?sha256=${digest}`
+        try {
+          await call('POST', path, undefined, signal)
+        } catch (error) {
+          if (error.status !== 404) throw error
+          const compressed = await zip(chunk, { level: 1 })
+          await call('POST', path, compressed, signal)
+          total += compressed.length
+        }
+      }
+      await sendRaw({ start: end })
+    } else if (boundaries) await sendRaw()
+    else await send(read())
+    await flush(true)
     say(`checkout sent, ${Math.round(total / 1024 / 1024)} MB in ${Math.round((Date.now() - started) / 1000)} s. The box is unpacking it, then runs the suite.`)
   }
 
   const createRun = async (signal = lifetime.signal) => {
     const created = await call('POST', '/runs', docker ? JSON.stringify({ ...request, docker }) : spec, signal)
-    const { id } = await created.json()
+    const { id, dependencyCache } = await created.json()
     if (!/^[0-9a-f]{32}$/.test(id)) throw new Error('the test relay did not name the new run')
-    return id
+    return { id, dependencyCache: dependencyCache === true }
   }
   const recover = async () => {
     const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(RECOVERY_MS)])
@@ -309,9 +376,9 @@ async function main(args) {
     const suite = command.slice(0, 5).map((word) => basename(word)).join(' ').slice(0, 200)
     say(`candidate ${candidate}, suite ${suite}, cwd ${cwd}`)
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      current = attempt === 0 ? await createRun() : await recover()
+      const { id, dependencyCache } = attempt === 0 ? await createRun() : await recover()
+      current = id
       lifetime.signal.throwIfAborted()
-      const id = current
       if (attempt === 1) say(`relay recovered; rerunning candidate ${candidate} as run ${id}`)
       const controller = new AbortController()
       const signal = AbortSignal.any([lifetime.signal, controller.signal])
@@ -327,7 +394,7 @@ async function main(args) {
         else if (type === FRAME.fail) failure = { code: payload[0], message: payload.subarray(1).toString() }
         else if (type === FRAME.ready && !upload) {
           say('the box is up. Sending the captured checkout.')
-          upload = sendTree(id, signal).catch((error) => {
+          upload = sendTree(id, signal, dependencyCache).catch((error) => {
             uploadError = error
             // A 410 means the run is over: the restart frame (if any) is still on the
             // output stream, so keep reading it instead of cancelling it.
