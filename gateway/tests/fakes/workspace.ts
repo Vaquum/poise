@@ -45,6 +45,7 @@ export interface WorkspaceStub {
   answerDelayMs: number
   requests: SeenRequest[]
   serviceRequests: SeenRequest[]
+  onServiceRequest?: (request: SeenRequest) => void
   /** The releases POST /api/service/switch was asked for. */
   switches: string[]
   /** Releases the workspace refuses because they failed to start there. */
@@ -128,6 +129,7 @@ export async function startWorkspaceStub(): Promise<WorkspaceStub> {
       const seen = { method: req.method ?? '', url, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') }
       if (url.startsWith('/api/service/')) {
         stub.serviceRequests.push(seen)
+        stub.onServiceRequest?.(seen)
         // A drain takes effect when received, even when its answer is slow past the gateway timeout —
         // unless the stub refuses admission, in which case the answer reports no drain.
         if (url === '/api/service/drain' && req.method === 'POST' && stub.drainApplies) stub.health.draining = true
