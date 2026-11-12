@@ -85,8 +85,8 @@ export interface ItemInput {
   /** Undefined when the status could not be read. */
   status: PrStatus | null | undefined
   chain: ChainRow | null
-  /** A run going on it now: its behavior's name, and when it started. */
-  run: { name: string, since: number | null } | null
+  /** A run going on it now: its behavior's name, and when it started. Undefined while the runs have never been read. */
+  run: { name: string, since: number | null } | null | undefined
   labelled: boolean
   closing: { number: number, url: string }[] | null
 }
@@ -116,6 +116,8 @@ export function toItem(input: ItemInput): Item {
     return { ...base, state: blockerState(status.blocker.id), detail: status.blocker.line, since: ms(status.blocker.since), sinceRestart: status.blocker.sinceRestart, who: poise }
   }
   if (record.kind === 'pr' && status === undefined) return { ...base, state: null, detail: '', since: null, sinceRestart: false, who: poise }
+  // Idle only for want of a run, while the runs have never been read: no state word either.
+  if (run === undefined) return { ...base, state: null, detail: '', since: null, sinceRestart: false, who: poise }
   return { ...base, state: 'idle', detail: '', since: null, sinceRestart: false, who: poise }
 }
 

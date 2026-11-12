@@ -459,10 +459,11 @@ export const mount: MountPlace = (ctx) => {
       truncated = live.truncated
       const sig = (it: Item) => `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`
       const before = new Map(items.map((it) => [it.id, sig(it)]))
+      const runs = running ?? runsRead
       items = live.records.map((record) => {
         const key = itemKey(record.repo, record.number)
         return toItem({
-          record, status: statuses ? statuses.get(key) ?? null : statusesRead?.get(key), chain: chainsRead?.byItem.get(key) ?? null, run: (running ?? runsRead)?.get(key) ?? null,
+          record, status: statuses ? statuses.get(key) ?? null : statusesRead?.get(key), chain: chainsRead?.byItem.get(key) ?? null, run: runs ? runs.get(key) ?? null : undefined,
           labelled: !!intake?.labelled.has(key) || assigned.has(key), closing: intake ? intake.prs[key] ?? [] : null,
         })
       })
