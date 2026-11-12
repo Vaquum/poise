@@ -1023,6 +1023,21 @@ cat "$GH_FIXTURES/$file"
         self.assertNotIn('run rerun', calls)
         self.assertNotIn('workflow run', calls)
 
+    def test_sync_retries_a_failed_settings_reapply_after_earlier_success(self):
+        self.green()
+        self.fixture('upstream.json', {'sha': self.TIP})
+        self.deploy_run(301, apply='success')
+        self.deploy_run(302, apply='failure', conclusion='failure')
+        self.fixture('deploy-runs.json', {'workflow_runs': [
+            self.workflow_run(301, event='workflow_run', created_at=self.verified_at),
+            self.workflow_run(302, event='workflow_dispatch', created_at=self.verified_at, conclusion='failure'),
+        ]})
+        result, outputs = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs['retry'], '302')
+        with open(self.calls) as file:
+            self.assertIn(f'run rerun 302 --repo {self.REPO}', file.read())
+
     def test_sync_does_not_confuse_an_early_refusal_or_an_old_deploy_with_a_final_attempt(self):
         self.green()
         self.deploy_run(conclusion='failure', created_at=self.created_at)

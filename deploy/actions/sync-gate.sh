@@ -132,7 +132,7 @@ while IFS= read -r run; do
   conclusion=$(jq -r '.conclusion' <<<"$run")
   applied=$(jq -r --arg step "Deploy $tip" '
     [.jobs[].steps[]? | select(.name == $step and .conclusion == "success")] | length' <<<"$jobs")
-  if (( applied > 0 )); then
+  if (( applied > 0 )) && [ -z "$failed_run" ]; then
     finish 'host applied' true "Deploy applied $tip ($url). Workspace verification and health release establish what is serving."
     exit 0
   fi
