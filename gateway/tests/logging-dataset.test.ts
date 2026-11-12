@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { availableParallelism, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import { normalize, type LogEvent } from '../src/diagnostics/contract.js'
@@ -9,6 +9,8 @@ import { DiagnosticStore, DEFAULT_LOG_POLICY, type LogFilter } from '../src/diag
 import { LOGGING_RESPONSE_BYTES, type LoggingRead } from '../src/diagnostics/query-types.js'
 
 it('queries 100,000 retained records with independent filter/count/export and snapshot parity', async () => {
+  const started = performance.now()
+  const timings = { normalization: 0, ingestion: 0, sorting: 0, filteredExport: 0, workerStartupAndRead: 0, boundedExport: 0 }
   const dir = mkdtempSync(join(tmpdir(), 'logging-100k-'))
   const now = Date.now()
   const path = join(dir, 'logging.db')
@@ -17,10 +19,16 @@ it('queries 100,000 retained records with independent filter/count/export and sn
   const events: LogEvent[] = []
   const access = { workspace: 'alice', operator: false }
   const request: LoggingRead = { path, now, policy, access, operation: 'list', filter: {} }
-  const sort = (values: LogEvent[]) => [...values].sort((a, b) => (b.eventTime ?? b.ingestedAt).localeCompare(a.eventTime ?? a.ingestedAt) || b.id.localeCompare(a.id))
+  const sort = (values: LogEvent[]) => {
+    const at = performance.now()
+    const result = [...values].sort((a, b) => (b.eventTime ?? b.ingestedAt).localeCompare(a.eventTime ?? a.ingestedAt) || b.id.localeCompare(a.id))
+    timings.sorting += performance.now() - at
+    return result
+  }
   const read = (filter: LogFilter) => JSON.parse(executeLoggingRead({ ...request, filter }).body) as ReturnType<DiagnosticStore['query']>
   try {
     for (let start = 0; start < 100_000; start += 100) {
+      const at = performance.now()
       const batch = Array.from({ length: 100 }, (_, offset) => {
         const i = start + offset
         return normalize({ id: 'dataset-' + i, time: i % 11 ? new Date(now - (i % 1000) * 1000).toISOString() : null,
@@ -29,17 +37,31 @@ it('queries 100,000 retained records with independent filter/count/export and sn
           account: 'account-' + i % 2, repository: 'acme/repo', callId: (i % 1000 + 1).toString(16).padStart(32, '0'),
           correlationId: 'c'.repeat(32), target: 'target-' + i % 10, message: 'failure literal_% ' + i % 10 + '\nAuthorization: Bearer never-search-secret' }, now, ['never-search-secret'])!
       })
-      events.push(...batch); db.append(batch)
+      timings.normalization += performance.now() - at
+      events.push(...batch)
     }
+    // Adjacent index keys avoid random fixture writes; rotation keeps ingestion and query order independent.
+    const ordered = sort(events)
+    let firstIngested: string[] = []
+    const appendAt = performance.now()
+    for (let start = 0; start < ordered.length; start += 100) {
+      const offset = (start + 50_000) % ordered.length
+      const batch = ordered.slice(offset, offset + 100)
+      if (start === 0) firstIngested = batch.slice(0, 50).map((event) => event.id)
+      db.append(batch)
+    }
+    timings.ingestion = performance.now() - appendAt
     const foreign = normalize({ id: 'bob-private', source: 'caller', workspace: 'bob', level: 'critical', operation: 'dataset', message: 'bob-private-cause' }, now)!
     db.append([foreign])
     const measured = (filter: LogFilter) => { const at = performance.now(); const result = read(filter); return { result, ms: performance.now() - at } }
     const first = measured({})
     expect(first.result.total).toBe(100_000)
     expect(first.result.events.map((event) => event.id)).toEqual(sort(events).slice(0, 50).map((event) => event.id))
+    expect(first.result.events.map((event) => event.id)).not.toEqual(firstIngested)
     const search = measured({ search: 'literal_% 7' })
     expect(search.result.total).toBe(10_000)
-    console.info('Logging 100k fixture performance (ms)', { first: first.ms, search: search.ms })
+    console.info('Logging 100k fixture performance (ms)', { normalization: timings.normalization, ingestion: timings.ingestion, first: first.ms, search: search.ms,
+      parallelism: availableParallelism(), memoryBytes: process.constrainedMemory(), poolId: process.env.VITEST_POOL_ID })
     expect(first.ms).toBeLessThan(500); expect(search.ms).toBeLessThan(500)
     const cases: Array<[LogFilter, (event: LogEvent) => boolean]> = [
       [{ severities: [] }, () => false],
@@ -57,17 +79,22 @@ it('queries 100,000 retained records with independent filter/count/export and sn
     }
     const filter = { callId: events[7].callId! }
     const expected = sort(events.filter((event) => event.callId === filter.callId))
+    const exportAt = performance.now()
     const exported = executeLoggingRead({ ...request, operation: 'export', filter })
+    timings.filteredExport = performance.now() - exportAt
     const lines = exported.body.trim().split('\n').map((line) => JSON.parse(line))
     expect(lines[0]).toMatchObject({ total: 100, exported: 100, truncated: false, resumeCursor: null })
     expect(lines.slice(1).map((line) => line.event.id)).toEqual(expected.map((event) => event.id))
     expect(exported.body).not.toContain('never-search-secret'); expect(exported.body).not.toContain('bob-private-cause')
     const pool = new LoggingQueryPool(); let timedOut = false
+    const poolAt = performance.now()
     try {
       const lease = await pool.read({ ...request, filter: { callId: events[7].callId! } }, 'alice', new AbortController().signal, () => { timedOut = true })
       expect(JSON.parse(lease.reply.body).total).toBe(100); expect(timedOut).toBe(false); lease.release()
-    } finally { await pool.close() }
+    } finally { timings.workerStartupAndRead = performance.now() - poolAt; await pool.close() }
+    const boundedAt = performance.now()
     const bounded = executeLoggingRead({ ...request, operation: 'export' })
+    timings.boundedExport = performance.now() - boundedAt
     const header = JSON.parse(bounded.body.split('\n')[0])
     expect(header).toMatchObject({ exported: 1000, truncated: true, resumeCursor: expect.any(String) })
     expect(Buffer.byteLength(bounded.body)).toBeLessThanOrEqual(LOGGING_RESPONSE_BYTES)
@@ -83,6 +110,9 @@ it('queries 100,000 retained records with independent filter/count/export and sn
     expect(related.events[0].occurrences).toBe(events.filter((event) => event.incidentId === events[7].incidentId).length)
     expect(() => read({ source: 'caller', cursor: before.nextCursor! })).toThrow('cursor')
   } finally { db.close(); rmSync(dir, { recursive: true, force: true }) }
+  const total = performance.now() - started
+  console.info('Logging 100k phases (ms)', { ...timings, total })
+  expect(total).toBeLessThan(120_000)
 }, 120_000)
 
 it('exports an honest byte-bounded prefix and resumes exactly at the first omitted event', () => {
