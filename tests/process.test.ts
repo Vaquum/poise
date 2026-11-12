@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { spawn as spawnProcess } from 'node:child_process'
 import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -9,6 +9,7 @@ import {
   MAX_PROCESS_ARG_BYTES,
   assertProcessArgSize,
   claudeSubscriptionEnvironment,
+  processWorkerReady,
   runFile,
   runningCallerLaunches,
   scrubbedChildEnvironment,
@@ -86,6 +87,12 @@ async function runWithInput(
     child.stdin.end(input)
   })
 }
+
+// Every runFile below runs in the process worker, as production's do;
+// process-worker.test.ts covers the main-thread fallback.
+beforeAll(async () => {
+  expect(await processWorkerReady()).toBe(true)
+})
 
 describe('bounded process helpers', () => {
   it('passes arguments without shell interpretation', async () => {
