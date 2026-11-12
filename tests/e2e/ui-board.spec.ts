@@ -120,10 +120,9 @@ for (const layout of ['Lanes', 'List'] as const) {
     await view(page, layout).click()
     const issue = card(page, 'Opened today')
     const assign = issue.getByRole('button', { name: 'Assign to Poise', exact: true })
-    // Resting on the card raises its tooltip over the action row, where it pins
-    // itself open; moving straight to the icon keeps the click clear.
-    if (layout === 'Lanes') { await issue.hover(); await assign.hover() }
-    else await issue.focus()
+    // Focus reveals the action row without resting on the card, which would
+    // raise its tooltip over the row and pin itself open over the icon.
+    await issue.focus()
     await expect(issue.locator('[data-act="assign"]')).toHaveCount(1)
     await expect(issue.locator('.card-state [data-act="assign"]')).toHaveCount(0)
     await expect(issue.locator('.card-acts > :first-child')).toHaveAttribute('aria-label', 'Assign to Poise')
@@ -157,22 +156,19 @@ test('arming a second Assign disarms the first, and a rearmed Assign restores it
   const second = card(page, 'Old issue changed today')
   const firstAssign = first.getByRole('button', { name: 'Assign to Poise' })
   const secondAssign = second.getByRole('button', { name: 'Assign to Poise' })
-  await first.hover()
-  await firstAssign.hover()
+  await firstAssign.focus()
   await page.clock.install()
   await firstAssign.click()
   await expect(first.getByRole('button', { name: 'Sure?' })).toBeVisible()
-  await second.hover()
-  await secondAssign.hover()
+  await secondAssign.focus()
   await secondAssign.click()
   await expect(second.getByRole('button', { name: 'Sure?' })).toBeVisible()
   await expect(first.getByRole('button', { name: 'Assign to Poise' })).toBeVisible()
   await expect(first.getByRole('button', { name: 'Sure?' })).toHaveCount(0)
   await page.clock.fastForward(4000)
   await expect(second.getByRole('button', { name: 'Assign to Poise' })).toBeVisible()
-  await first.hover()
   const assign = first.getByRole('button', { name: 'Assign to Poise', exact: true })
-  await assign.hover()
+  await assign.focus()
   const original = await assign.innerHTML()
   await assign.click()
   await expect(first.getByRole('button', { name: 'Sure?' })).toBeVisible()
@@ -189,8 +185,7 @@ test('arming a second Assign disarms the first, and a rearmed Assign restores it
 test('a refused assignment keeps its reason on the row, and the chain being off is said', async ({ page }) => {
   await board(page, { records: RECORDS, assign: 'refused', chainEnabled: false })
   const issue = card(page, 'Opened today')
-  await issue.hover()
-  await issue.getByRole('button', { name: 'Assign to Poise' }).hover()
+  await issue.getByRole('button', { name: 'Assign to Poise' }).focus()
   await expect(issue.getByRole('button', { name: 'Assign to Poise' })).toHaveAttribute('title', /chain is off/)
   await issue.getByRole('button', { name: 'Assign to Poise' }).click()
   await issue.getByRole('button', { name: 'Sure?' }).click()
@@ -243,7 +238,6 @@ test('choosing a live item opens it beside the board, and a card’s chat opens 
   await beside.getByRole('button', { name: 'Close' }).click()
 
   await card(page, 'Opened today').hover()
-  await card(page, 'Opened today').getByRole('button', { name: 'Chat about this, beside the board' }).hover()
   await card(page, 'Opened today').getByRole('button', { name: 'Chat about this, beside the board' }).click()
   await expect(page.locator('#chat-side-pane .chat-title')).toContainText('acme/site#42')
 })
@@ -306,8 +300,7 @@ test('a GitHub read that never succeeded reads as not read, never as zero', asyn
 test('a held repaint leaves an armed Assign armed', async ({ page }) => {
   const world: World = { records: RECORDS.map((r) => ({ ...r })) }
   await board(page, world)
-  await card(page, 'Opened today').hover()
-  await card(page, 'Opened today').getByRole('button', { name: 'Assign to Poise' }).hover()
+  await card(page, 'Opened today').getByRole('button', { name: 'Assign to Poise' }).focus()
   await card(page, 'Opened today').getByRole('button', { name: 'Assign to Poise' }).click()
   await expect(card(page, 'Opened today').getByRole('button', { name: 'Sure?' })).toBeVisible()
   await card(page, 'A pull request').focus()
