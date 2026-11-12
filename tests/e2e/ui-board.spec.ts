@@ -215,7 +215,11 @@ test('opening an issue keeps its writer open and guarded until GitHub answers', 
   await page.getByLabel('Issue title').fill('A new issue')
   await page.getByRole('button', { name: 'Open issue' }).click()
   await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
+  // Neither a new writer nor Cancel takes the one whose answer is on its way.
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.locator('[data-writer="issue"]').getByRole('button', { name: 'Cancel' }).click()
   await expect(page.getByLabel('Issue title')).toHaveValue('A new issue')
+  await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
   answer()
   await expect(page.locator('[data-writer="issue"]')).toHaveCount(0)
   await expect(card(page, 'A new issue')).toBeVisible()

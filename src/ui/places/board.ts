@@ -499,6 +499,8 @@ export const mount: MountPlace = (ctx) => {
   // ---------- Writing: one writer at a time; a draft you leave is kept ----------
   const stash = () => $$('[data-writer]', lanesEl).forEach((w: HTMLElement) => { drafts.set(w.dataset.writer ?? '', Object.fromEntries($$('[data-w]', w).map((f: HTMLInputElement) => [f.dataset.w, f.value]))) })
   function openWriter(key: string, data: unknown = {}): void {
+    // An issue on its way to GitHub keeps its writer, so the answer lands where it was asked.
+    if (issueW()?.busy) return
     stash()
     W.clear()
     W.set(key, data)
@@ -513,6 +515,7 @@ export const mount: MountPlace = (ctx) => {
     w.scrollIntoView({ block: 'nearest' })
   }
   function closeWriter(key: string, focusTo?: () => void): void {
+    if (issueW()?.busy) return
     drafts.delete(key)
     W.delete(key)
     render(false)
