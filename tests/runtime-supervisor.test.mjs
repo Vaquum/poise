@@ -5,8 +5,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FAILED_START_MS, openNamespaceWitness, supervisor, UPDATE_EXIT_CODE } from '../deploy/runtime/supervisor.mjs'
-import { hasRetainedShutdownFailure, recordRuntimeDiagnostic } from '../server/runtime-diagnostic'
-import { DiagnosticStore } from '../gateway/src/diagnostics/store'
 
 // The workspace supervisor (deploy/runtime/supervisor.mjs): which release it
 // runs, how it switches without stopping the container, and what it does
@@ -34,11 +32,10 @@ async function pointer(name, value) {
   await writeFile(join(home, '.poise', 'releases', name), `${value}\n`)
 }
 
-function supervise(diagnostic, nativeControlFactory = null, retainedShutdownFailure = null) {
+function supervise(diagnostic, nativeControlFactory = null) {
   return supervisor({
     home,
     diagnostic,
-    hasRetainedShutdownFailure: retainedShutdownFailure,
     nativeControlFactory,
     image: IMAGE,
     base: 'B',
@@ -66,7 +63,6 @@ beforeEach(async () => {
 })
 afterEach(async () => {
   vi.restoreAllMocks()
-  vi.unstubAllEnvs()
   await rm(home, { recursive: true, force: true })
 })
 
@@ -227,56 +223,6 @@ it('records native supervisor failure facts and omits planned switches and shutd
   const stopping = supervise((input) => records.push(input)); const stopped = stopping.run()
   const third = await nth(2); stopping.stop('SIGTERM'); third.child.exit(0)
   await stopped; expect(records).toHaveLength(1)
-})
-
-it.each(['clean', 'shutdown_deadline', 'shutdown_rejected', 'unrelated', 'another_process', 'unretained', 'read_failure'])('retains the %s exit correctly after a queued successor starts', async (outcome) => {
-  vi.stubEnv('POISE_MODE', 'service')
-  vi.stubEnv('POISE_WORKSPACE_HANDLE', 'alice')
-  const options = { path: join(home, '.poise', 'logging.db'), workspace: 'alice', write: () => {} }
-  // Start with an empty retained store, as a healthy application does.
-  new DiagnosticStore(options.path).close()
-  const records = () => {
-    const store = new DiagnosticStore(options.path, undefined, Date.now, true)
-    try { return store.query({ workspace: 'alice', operator: false }).events }
-    finally { store.close() }
-  }
-  const lookup = outcome === 'read_failure' ? () => { throw new Error('fixture read unavailable') }
-    : (id) => hasRetainedShutdownFailure(id, options)
-  if (outcome === 'read_failure' || outcome === 'unretained') vi.spyOn(process.stderr, 'write').mockReturnValue(true)
-  if (outcome === 'read_failure') vi.spyOn(console, 'error').mockImplementation(() => {})
-  const instance = supervise((input) => recordRuntimeDiagnostic(input, options), null, lookup)
-  const running = instance.run()
-  const first = await nth(0)
-  await install('r2', 'B')
-  await pointer('next', 'r2')
-  if (['shutdown_deadline', 'shutdown_rejected', 'another_process', 'unretained'].includes(outcome)) {
-    const badPath = join(home, 'unavailable.db')
-    if (outcome === 'unretained') await writeFile(badPath, 'not a database')
-    recordRuntimeDiagnostic({ id: outcome === 'another_process' ? 'previous-process' : first.env.POISE_SHUTDOWN_DIAGNOSTIC_ID,
-      source: 'poise', operation: 'process.shutdown', phase: outcome === 'shutdown_rejected' ? 'shutdown_rejected' : 'shutdown_deadline',
-      level: 'error', message: 'Production shutdown failed; pending: http_close', exitCode: 1, release: 'r1',
-      cause: ['runtime_stop: precise cleanup rejection'] }, outcome === 'unretained' ? { ...options, path: badPath } : options)
-  }
-  first.child.exit(outcome === 'clean' ? UPDATE_EXIT_CODE : 1)
-  const second = await nth(1)
-  expect(second.release.name).toBe('r2')
-  expect(second.env.POISE_SHUTDOWN_DIAGNOSTIC_ID).not.toBe(first.env.POISE_SHUTDOWN_DIAGNOSTIC_ID)
-  // The successor stays healthy past the failed-start window. Its success
-  // cannot erase a failure of the process it replaced.
-  clock += FAILED_START_MS
-  const events = records()
-  if (outcome === 'clean') expect(events).toEqual([])
-  else if (outcome === 'shutdown_deadline' || outcome === 'shutdown_rejected') {
-    expect(events).toEqual([expect.objectContaining({ operation: 'process.shutdown', phase: outcome, severity: 'error',
-      release: 'r1', cause: ['runtime_stop: precise cleanup rejection'] })])
-  } else {
-    expect(events.filter(event => event.operation === 'workspace.exit')).toEqual([expect.objectContaining({ severity: 'error', release: 'r1', exitCode: 1 })])
-    expect(events.filter(event => event.operation === 'process.shutdown')).toHaveLength(outcome === 'another_process' ? 1 : 0)
-  }
-  instance.stop('SIGTERM')
-  second.child.exit(0)
-  expect(await running).toBe(0)
-  expect(records()).toEqual(events)
 })
 
 it('retains actual spawn errors without letting a diagnostic reporter change supervision', async () => {

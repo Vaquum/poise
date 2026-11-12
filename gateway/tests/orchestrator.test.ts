@@ -882,10 +882,10 @@ describe('image upgrades', () => {
 describe('updates in place', () => {
   let h: Harness
   const BASE = 'base-1'
-  const start = async (options: { oldBase?: string | null; running?: boolean; release?: string | null; repairRepositories?: string } = {}) => {
+  const start = async (options: { oldBase?: string | null; running?: boolean; release?: string | null; repairRepositories?: string; drainRenewMs?: number } = {}) => {
     const { oldBase = BASE, running = true, release = 'old-release' } = options
     // A workspace that does not answer cannot prove native cleanup clear at this timeout.
-    h = await startHarness({ env: { POISE_DRAIN_TIMEOUT: '1', POISE_REPAIR_EXHAUSTION_REPOSITORIES: options.repairRepositories } })
+    h = await startHarness({ drainRenewMs: options.drainRenewMs, env: { POISE_DRAIN_TIMEOUT: '1', POISE_REPAIR_EXHAUSTION_REPOSITORIES: options.repairRepositories } })
     await h.openWorkspace('Alice')
     h.store.noteWorkspace('alice', 'Alice')
     h.docker.imageLabels.set(CURRENT_IMAGE_ID, { 'poise.release': 'new-release', 'poise.base': BASE })
@@ -958,7 +958,7 @@ describe('updates in place', () => {
   })
 
   it('recreates the container when the new image has another base, its release made current first', async () => {
-    await start({ oldBase: 'base-0' })
+    await start({ oldBase: 'base-0', release: 'new-release' })
     const before = containerId()
     await h.orchestrator.upgradePass()
     expect(h.workspace.switches).toEqual([])
@@ -1159,7 +1159,7 @@ describe('updates in place', () => {
   })
 
   it('recreates a workspace of the same base whose container settings changed', async () => {
-    await start()
+    await start({ release: 'new-release' })
     const before = containerId()
     h.docker.containers.get('poise-ws-alice')!.spec = { ...h.docker.containers.get('poise-ws-alice')!.spec, Env: ['POISE_DRAIN_TIMEOUT=60'] }
     await h.orchestrator.upgradePass()
@@ -1290,6 +1290,80 @@ describe('updates in place', () => {
     expect(events(h.logs, 'workspace.upgrade.native-pending')).toHaveLength(1)
     expect(h.logs.find((entry) => entry.event === 'workspace.update.unreachable')).toMatchObject({ handle: 'alice' })
   })
+
+  it.each(['initial idle reply', 'initial busy reply', 'health poll', 'drain renewal'])(
+    'releases an unreachable fallback on recovery in the %s without stopping its container', async reply => {
+      await start({ drainRenewMs: reply === 'drain renewal' ? 1 : undefined })
+      const before = containerId()
+      await h.orchestrator.upgradePass()
+      h.workspace.healthStatus = 503
+      await h.orchestrator.upgradePass()
+      h.advance(11 * 60_000)
+      // The failed probe's answer is captured before recovery; the first drain can answer healthy.
+      h.workspace.answerDelayMs = 100
+      const requestsBefore = h.workspace.serviceRequests.length
+      const began = Date.now()
+      const upgrade = h.orchestrator.upgradePass()
+      await waitFor(() => h.workspace.serviceRequests.length > requestsBefore, 'the failed in-place probe')
+      h.workspace.answerDelayMs = 0
+      h.workspace.healthStatus = 200
+      h.workspace.health.runningCallerCalls = reply === 'initial idle reply' ? 0 : 1
+      h.workspace.health.switching = null
+      if (reply.startsWith('initial')) h.workspace.health.release = 'new-release'
+      else {
+        await waitFor(() => events(h.logs, 'workspace.drain.requested').length > 0, 'an admitted busy drain')
+        expect(h.workspace.health.draining).toBe(true)
+        expect(h.workspace.health.runningCallerCalls).toBe(1)
+        h.workspace.health.release = 'new-release'
+      }
+      await upgrade
+
+      expect(Date.now() - began).toBeLessThan(h.config.drainTimeoutSeconds * 1000)
+      expect(h.workspace.health).toMatchObject({ draining: false, runningCallerCalls: reply === 'initial idle reply' ? 0 : 1 })
+      const requests = h.workspace.serviceRequests.slice(requestsBefore)
+      expect(requests.at(-1)).toMatchObject({ method: 'POST', url: '/api/service/resume' })
+      const drainRequests = requests.filter(request => request.url === '/api/service/drain')
+      if (reply === 'drain renewal') expect(drainRequests.length).toBeGreaterThanOrEqual(2)
+      else expect(drainRequests).toHaveLength(1)
+      if (reply === 'health poll') expect(requests.slice(2, -1)).toContainEqual(expect.objectContaining({ method: 'GET', url: '/api/service/health' }))
+      expect(containerId()).toBe(before)
+      expect(h.docker.containers.get('poise-ws-alice')?.running).toBe(true)
+      expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+      expect(dockerCalls(h)).not.toContain('DELETE /containers/poise-ws-alice')
+      expect(releaseTasks().map(task => (task.spec as { Cmd: string[] }).Cmd)).toEqual([[]])
+      expect(h.orchestrator.updatingTo('alice')).toBeNull()
+      expect(events(h.logs, 'workspace.drain.timeout')).toHaveLength(0)
+      expect(h.logs.find(entry => entry.event === 'workspace.drain.released'))
+        .toMatchObject({ handle: 'alice', reason: 'the workspace recovered on the target release' })
+    },
+  )
+
+  it.each(['unhealthy', 'pending release', 'missing release', 'changed setting', 'changed base'])(
+    'keeps the fallback safeguards when recovery is unproven: %s', async cause => {
+      await start({ drainRenewMs: 1 })
+      const before = containerId()
+      h.workspace.reachable = false
+      await h.orchestrator.upgradePass()
+      h.advance(11 * 60_000)
+      const upgrade = h.orchestrator.upgradePass()
+      await waitFor(() => events(h.logs, 'workspace.drain.request.failed').length > 0, 'the failed fallback drain')
+      h.workspace.reachable = true
+      h.workspace.health.release = cause === 'pending release' ? 'old-release' : cause === 'missing release' ? null : 'new-release'
+      h.workspace.health.switching = 'new-release'
+      h.workspace.health.runningCallerCalls = 1
+      h.workspace.health.ok = cause !== 'unhealthy'
+      if (cause === 'changed setting') containerEnv(h, 'alice').push('POISE_BEHAVIOR_MEMORY_BUDGET_BYTES=6442450944')
+      if (cause === 'changed base') h.docker.imageLabels.set(OLD_IMAGE_ID, { 'poise.release': 'old-release', 'poise.base': 'base-0' })
+      await upgrade
+
+      expect(events(h.logs, 'workspace.drain.timeout')).toHaveLength(1)
+      expect(events(h.logs, 'workspace.upgrade.aborted')).toHaveLength(1)
+      expect(h.logs.some(entry => entry.event === 'workspace.drain.released' && entry.reason === 'the workspace recovered on the target release')).toBe(false)
+      expect(containerId()).toBe(before)
+      expect(dockerCalls(h)).not.toContain('POST /containers/poise-ws-alice/stop')
+      expect(dockerCalls(h)).not.toContain('DELETE /containers/poise-ws-alice')
+    },
+  )
 
   it('rides out one missed probe long after the switch was asked for, and asks again on the next pass', async () => {
     await start()
