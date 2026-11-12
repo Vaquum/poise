@@ -256,6 +256,7 @@ source_sha() {
   head=$(git -C "$root" rev-parse --verify HEAD) || die "$root is not a git checkout of Poise."
   changes=$(git -C "$root" status --porcelain --untracked-files=normal) || die "git status failed in $root."
   if [ -n "$changes" ]; then
+    [ "${POISE_DEPLOY_APPLY_ONLY:-}" != true ] || die "the Actions deployment needs a clean checkout at $head."
     warn "$root has changes that are not committed, so the workspace image is a development build and reports version null. The changes:
 $(head -n 10 <<<"$changes")"
     return
@@ -432,7 +433,25 @@ wait_for_gateway() {
 # commit before it reports what is still pending instead of success.
 verify_timeout_seconds=600
 verify_poll_seconds=10
+verify_pending_ok=false
 workspace_proof_file=$deploy/.env.workspace-proof
+
+lock_deployment() {
+  exec 8>"$workspace_proof_file.lock" || die "cannot open the deployment lock."
+  flock --exclusive "$@" 8
+}
+
+finish_deployment() {
+  if [ -n "${rollout_file:-}" ]; then
+    touch "$rollout_file.applied" || die "cannot retain the applied rollout checkpoint."
+  fi
+  if [ "${POISE_DEPLOY_APPLY_ONLY:-}" = true ]; then
+    return
+  fi
+  verify_workspaces "$@"
+  ensure_caller_guard
+  prune_docker_storage "$2"
+}
 
 # Keep an unfinished deploy's obligations across process failure and retry.
 # The checkout survives operator deploys; backups intentionally contain only
@@ -528,6 +547,7 @@ start_rollout() {
       rollout_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     fi
     rollout_expected=$expected
+    rm -f "$rollout_file.applied" || die "cannot clear the previous applied rollout checkpoint."
     write_rollout pending 'Image built; awaiting workspace verification.'
     temporary=$(mktemp "$workspace_proof_file.rollouts/current.XXXXXX") || die "cannot create the current rollout pointer."
     if ! printf '%s\n' "${rollout_file##*/}" >"$temporary" || ! mv "$temporary" "$workspace_proof_file.rollouts/current"; then
@@ -730,7 +750,8 @@ verify_workspaces() {
         if [ "$running" = true ]; then
           if health=$(docker exec "$name" curl -fsS --max-time 10 http://127.0.0.1:5555/api/service/health 2>/dev/null); then
             active=$(health_field "$health" release)
-            if [ "$active" = "$sha" ]; then
+            if [ "$active" = "$sha" ] && [ "$(health_field "$health" version)" = "$sha" ] \
+              && [ -z "$(health_field "$health" switching)" ]; then
               serving="$serving$handle "
               continue
             fi
@@ -797,6 +818,7 @@ verify_workspaces() {
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
       if [ -n "${rollout_file:-}" ]; then show_rollout; fi
+      if [ "$verify_pending_ok" = true ]; then return 0; fi
       die "the deploy of $sha is still pending after ${verify_timeout_seconds}s: these workspaces do not serve it yet:
 $(printf '%b' "$pending")"
     fi

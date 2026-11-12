@@ -34,6 +34,7 @@ class AtomicWorkBlocked(ValueError):
 
     def __init__(self, reason: object):
         message = "AtomicWorkBlocked"
+        stderr = ""
         if isinstance(reason, str) and reason.strip():
             # Mask complete environment credentials around pattern redaction:
             # values patterns would only fragment (a ghp_ token or a Bearer
@@ -125,10 +126,14 @@ class AtomicWorkBlocked(ValueError):
                                   lambda match: match[0] if re.fullmatch(marker, match[0]) else "[redacted]", safe)
             # Mask complete credentials before whitespace normalization or the
             # cutoff, including a secret spanning either boundary.
-            message = "atomic behavior blocked: " + atoms.bounded_cause(safe)
+            # Leave room for JSON-escaped Unicode and the short summary in the
+            # diagnostic stream's 64 KiB event, without losing the first failure.
+            stderr = atoms.bounded_cause(safe, limit=4096)
+            message = "atomic behavior blocked: " + atoms.bounded_cause(stderr)
         super().__init__(message)
         self.diagnostic = diagnostic_envelope(operation="provider.atomic_work", phase="validating", outcome="blocked",
-                                              message=message, submission="none")
+                                              message=message, submission="none", stderr=stderr,
+                                              stderr_truncated=len(stderr) > 4096)
 
 
 def _verify_ci_dependency(value: dict, repo: str, pull: int, head: str, actor: str, queue: dict) -> dict:
@@ -273,6 +278,12 @@ def run(model: Model, repo: str, number: int, branch: str, actor: str, work: Pat
         "so Caller can validate and publish normally. Never report the incomplete check as passed. "
         "Required CI and review remain mandatory. Genuine suite failures, provider execution-budget exhaustion "
         "and other blockers remain blockers; do not relabel them as relay no-results. "
+        "Before cleanup, put the worker-reported first actionable assertion/failure excerpt, suite/test identifier, "
+        "captured candidate digest and producing run ID in the existing blocked string, ahead of any later relay timeout explanation. "
+        "Use the relay's captured candidate digest, which includes uncommitted edits; checkout_head is only the starting HEAD. "
+        "Retain the run ID of the attempt that produced the failure. If only a failed-test marker was observed, "
+        "say assertion details are unavailable; say when candidate or run identity is unavailable too. "
+        "A later timeout must not overwrite an observed test failure or permit the relay-only handoff. "
         "Never fabricate reviews, approvals, CI, completion, or tests. "
         "Do not start other agents or chats, schedule work, create orchestration scripts, modify Poise settings, "
         "commit, push, open a PR, submit reviews, resolve threads or merge. Caller performs publication after this invocation ends. "

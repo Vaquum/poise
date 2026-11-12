@@ -13,7 +13,16 @@ function reply(res: ServerResponse, status: number, value: unknown): void {
   res.statusCode = status; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value))
 }
 
+// A list read computes a page of chain summaries and every active chain's
+// attention synchronously on the server's thread, and Overview, Board and
+// Observe poll it from every open tab. Identical reads within a few seconds
+// share that work; a change made through this API clears it at once.
+const LIST_REUSE_MS = 10_000
+let listReuse = new Map<string, { at: number, chains: unknown[], next: string | null }>()
+let attentionReuse: { at: number, value: unknown } | null = null
+
 export async function handleBehaviorChains(req: IncomingMessage, res: ServerResponse, url: string): Promise<void> {
+  let clearAfter = false
   try {
     const params = new URL(url, 'http://localhost').searchParams
     const journal = behaviorChainJournal()
@@ -56,12 +65,26 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
           cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })
       }
       const after = params.get('after') || ''
-      const chains = journal.page(after, 100, params.get('state') === 'active' ? false : params.get('state') === 'merged' ? true : null)
-      return reply(res, 200, { chains: chains.map(summary), next: chains.length === 100 ? chains.at(-1)!.id : null,
-        ...(!after ? { attention: behaviorChainAttention(journal) } : {}),
+      const now = Date.now()
+      const merged = params.get('state') === 'active' ? false : params.get('state') === 'merged' ? true : null
+      // Only what the page depends on keys it, and nothing outlives its window.
+      const key = `${after}|${merged}`
+      for (const [old, kept] of listReuse) if (now - kept.at >= LIST_REUSE_MS) listReuse.delete(old)
+      let page = listReuse.get(key)
+      if (!page) {
+        const chains = journal.page(after, 100, merged)
+        page = { at: now, chains: chains.map(summary), next: chains.length === 100 ? chains.at(-1)!.id : null }
+        listReuse.set(key, page)
+      }
+      if (!after && (!attentionReuse || now - attentionReuse.at >= LIST_REUSE_MS)) attentionReuse = { at: now, value: behaviorChainAttention(journal) }
+      return reply(res, 200, { chains: page.chains, next: page.next,
+        ...(!after ? { attention: attentionReuse!.value } : {}),
         cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })
     }
     if (req.method !== 'POST') throw new HttpError(405, 'behavior chains support GET and POST')
+    // Cleared once the change is made (finally, below): a read that arrives while
+    // this one awaits its body or a check must not keep what came before it.
+    clearAfter = true
     const body = await readJson<unknown>(req)
     if (body && typeof body === 'object' && 'operation' in body && ['switch-to-v2', 'cancel-cutover'].includes(String(body.operation))) {
       if (!('sequence' in body) || !Number.isSafeInteger(body.sequence)) throw new HttpError(400, 'current cutover sequence is required')
@@ -84,5 +107,7 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
     return reply(res, 200, { chain: summary(next) })
   } catch (error) {
     return reply(res, httpStatus(error, 409), { error: error instanceof Error ? error.message : String(error) })
+  } finally {
+    if (clearAfter) { listReuse = new Map(); attentionReuse = null }
   }
 }

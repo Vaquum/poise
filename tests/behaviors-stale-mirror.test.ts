@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
 import { behaviorDiagnosticGroups } from '../src/behavior-diagnostics'
 import { notificationItems } from '../src/notification-items'
-import { arrangeCli, fixture, loadModules, mocks, restartModules } from './behaviors-runtime-fixture'
+import { arrangeCli, fixture, loadModules, mocks, pr, restartModules } from './behaviors-runtime-fixture'
 import type { NativeChainHooks } from '../server/behavior-chain-native'
 
 let logging: typeof import('../server/logging') | null = null
@@ -104,6 +104,53 @@ it('reports concurrent refusals and changing ages once per mirror through the re
   expect(behaviorDiagnosticGroups({ ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null })).toHaveLength(2)
   expect(notificationItems([], { ...behaviors.getBehaviorsRuntimeHealth(), agentLogsError: null }, Date.now()).map((item) => item.id)).toEqual(items.map((item) => item.id))
   expect(mocks.runFile.mock.calls.some(([command, args]) => command === 'github-datastore' && args.includes('view'))).toBe(false)
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+})
+
+it('shares the stale episode with closed-target reconciliation while retaining independent faults', async () => {
+  const { database, behaviors, path } = await start()
+  // A retained target makes reconciliation reach the freshness gate.
+  database.db.prepare(`INSERT INTO behavior_dead_letters(id, behavior, target, repo, pr, error, created_at)
+    VALUES ('retained-target', 'review-new-prs', ?, ?, ?, 'retained launch failure', ?)`)
+    .run(`${pr.repo}#${pr.number}`, pr.repo, pr.number, new Date().toISOString())
+  await behaviors.runEnabledBehaviorsOnce()
+  const [first] = episodes(database)
+  for (const age of [150, 210, 270]) {
+    saveProbe(path, health(path, age, first.latest.lastSuccessAt))
+    await behaviors.runEnabledBehaviorsOnce()
+    expect(episodes(database)).toEqual([expect.objectContaining({ id: first.id, startedAt: first.startedAt,
+      first: first.first, latest: expect.objectContaining({ ageSeconds: age }), recoveredAt: null })])
+    expect(events()).toEqual([expect.objectContaining({ severity: 'warning', operation: 'github-datastore.stale',
+      phase: 'opened', correlationId: first.id, occurrences: 1 })])
+    expect(mocks.runFile.mock.calls.some(([command, args]) => command === 'github-datastore' && args.includes('view'))).toBe(false)
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+  }
+  expect(episodes(database)[0].behaviors.sort()).toEqual(['approve-prs', 'resolve-unblocking', 'review-new-prs'])
+
+  const recoveredProbe = health(path, 1)
+  saveProbe(path, recoveredProbe)
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(episodes(database)[0]).toMatchObject({ id: first.id, recoveredAt: expect.any(String) })
+  expect(events().filter((event) => event.phase === 'recovered')).toEqual([
+    expect.objectContaining({ correlationId: first.id }),
+  ])
+  expect(mocks.runFile.mock.calls.some(([command, args]) => command === 'github-datastore' && args.includes('--number'))).toBe(true)
+
+  mocks.runFile.mockClear()
+  saveProbe(path, health(path, 180, JSON.parse(recoveredProbe.stdout).last_success_at))
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(episodes(database)[0]).toMatchObject({ recoveredAt: null, latest: { ageSeconds: 180 } })
+  expect(episodes(database)[0].id).not.toBe(first.id)
+  expect(events().filter((event) => event.phase === 'opened')).toHaveLength(2)
+  expect(events().filter((event) => event.severity === 'error')).toEqual([])
+  expect(mocks.runFile.mock.calls.some(([command, args]) => command === 'github-datastore' && args.includes('view'))).toBe(false)
+  expect(mocks.spawnDetached).not.toHaveBeenCalled()
+
+  saveProbe(path, { code: 1, stdout: '{invalid', stderr: 'independent health fault' })
+  await behaviors.runEnabledBehaviorsOnce()
+  expect(events()).toEqual(expect.arrayContaining([expect.objectContaining({ severity: 'error', operation: 'application.behaviors',
+    context: expect.objectContaining({ componentMessage: '[behaviors] closed-target reconciliation failed:' }) })]))
+  expect(episodes(database)[0].recoveredAt).toBeNull()
   expect(mocks.spawnDetached).not.toHaveBeenCalled()
 })
 

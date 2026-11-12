@@ -220,23 +220,31 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
     target: `${chain.repository}#${publication?.pull_number ?? chain.issue}`,
     progressAt: progress.at, retryAt,
     nextAction: contradicted ? 'Reconcile contradictory original resource-release evidence'
-      : chain.held ? `Resolve the hold and explicitly resume: ${chain.held}`
-        : chain.reviewPending ? 'Reconcile original pre-merge review evidence'
+      : chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
+        : chain.held ? `Resolve the hold and explicitly resume: ${chain.held}`
           : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
             : active ? 'Await the original invocation outcome' : chain.mergeSha ? null
               : retryAt !== null ? 'Automatic retry eligible after backoff, subject to existing admission gates' : waiting,
     journal: `/api/behavior-chains?${new URLSearchParams({ id: chain.id, after: String(Math.max(0, progress.sequence - 1)) })}` }
 }
 
+const attentionProgress = new WeakMap<BehaviorChainJournal, Map<string, { revision: number, progress: ReturnType<typeof chainProgress> }>>()
+
 /** Read-only attention across every active page, including unpublished issues
  * and merged chains whose original review obligation remains open. */
 export function behaviorChainAttention(journal: BehaviorChainJournal, now = Date.now()) {
+  let cache = attentionProgress.get(journal)
+  if (!cache) { cache = new Map(); attentionProgress.set(journal, cache) }
   const entries = []
   let after = ''
   for (;;) {
     const chains = journal.active(after)
     for (const chain of chains) {
-      const progress = chainProgress(journal, chain.id)
+      // active() validates the projection against immutable history before
+      // its revision can reuse a clock; only new events require replay.
+      const cached = cache.get(chain.id)
+      const progress = cached?.revision === chain.sequence ? cached.progress : chainProgress(journal, chain.id)
+      cache.set(chain.id, { revision: chain.sequence, progress })
       const active = chain.invocations.find(invocation => invocation.state !== 'settled')
       const ageMs = Math.max(0, now - progress.at)
       if (!chain.held && !chain.reviewPending && active?.state !== 'uncertain' && ageMs < CHAIN_ATTENTION_DELAY_MS) continue

@@ -155,12 +155,18 @@ export async function fetchRunningAgentLogSnapshot(
 
 async function laneAgentLogSnapshot(
   lane: AgentLogLane,
-  options: { signal?: AbortSignal, fresh?: boolean },
+  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean },
   read: (signal: AbortSignal) => Promise<AgentLogSnapshot>,
 ): Promise<AgentLogSnapshot> {
   // A caller that is already gone never joins work it cannot use.
   options.signal?.throwIfAborted()
   if (!options.fresh && lane.cached && Date.now() < lane.cached.expiresAt) return lane.cached.snapshot
+  // A reader that takes the last snapshot gets it at once, past its time, and
+  // the lane reads again behind it.
+  if (options.lastObserved && !options.fresh && lane.cached) {
+    if (!lane.running) startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
+    return lane.cached.snapshot
+  }
   const target = lane.running
     ? (!options.fresh ? lane.running : (lane.queued ?? createLaneAgentLogRead(lane)))
     : startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
@@ -448,7 +454,7 @@ export interface AgentLogSelection {
 
 export async function fetchSelectedAgentLogSnapshot(
   selection: AgentLogSelection,
-  options: { signal?: AbortSignal, fresh?: boolean } = {},
+  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean } = {},
 ): Promise<AgentLogSnapshot> {
   return selectedAgentLogSnapshot(['--logs', '--select', JSON.stringify(selection)], options)
 }
@@ -533,7 +539,7 @@ export async function fetchAgentLogWatermark(): Promise<string> {
 }
 
 async function selectedAgentLogSnapshot(
-  args: readonly string[], options: { signal?: AbortSignal, fresh?: boolean },
+  args: readonly string[], options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean },
 ): Promise<AgentLogSnapshot> {
   const key = JSON.stringify(args)
   let lane = selectedAgentLogLanes.get(key)

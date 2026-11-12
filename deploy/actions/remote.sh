@@ -7,6 +7,7 @@
 #   path     the checkout on the server
 #   token    the run's GitHub token, which expires with the run
 #   settings deploy/.env's new content
+#   apply_only whether the workflow runs workspace verification separately
 #
 # It clones the repository on the first run, brings the checkout to sha,
 # writes deploy/.env and applies it: deploy/install.sh the first time,
@@ -64,6 +65,8 @@ git branch --quiet --set-upstream-to=origin/main main
 mv deploy/.env.next deploy/.env
 say "deploy/.env sets $(sed -n 's/^\([A-Z0-9_]*\)=.*/\1/p' deploy/.env | paste -sd ' ' -)."
 
+# Actions verifies the retained rollout separately from the host apply.
+export POISE_DEPLOY_APPLY_ONLY="${apply_only:-false}"
 if docker container inspect poise-gateway >/dev/null 2>&1; then
   deploy/upgrade.sh --no-pull
 else

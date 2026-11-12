@@ -114,6 +114,9 @@ page's optional `attention` projection is independent of the ordinary chain-list
 cursor/filter; later list pages retain the existing pagination contract. Failed
 refreshes label retained attention entries stale. These are read-only summaries
 on the existing refresh clock, with no new observation or execution authority.
+Unchanged attention reads reuse the history-derived progress clock after
+validating the chain's current journal revision. A new event invalidates only
+that chain's cached clock; restart reconstructs it from the original history.
 
 In v2, Review New Issues shows that saved seed scope instead of the inactive
 legacy repository filter. Its setting opens the existing General seed controls,
@@ -257,9 +260,17 @@ An implementation or repair that explicitly reports a blocker records
 `atomic_work_blocked` and holds its chain with that reason. Caller masks
 credential patterns and known environment credentials before normalizing and
 limiting the explicit string reason to 500 characters plus a truncation ellipsis.
-The exception and retained diagnostic use the same safe message; empty or
-unsupported reasons retain `AtomicWorkBlocked`. Ordinary exception text and raw
-provider output remain excluded from native failure evidence. The reason grants
+The exception and retained diagnostic use the same safe message. Before deriving
+that summary, Caller retains up to 4096 redacted reason characters plus an ellipsis
+in the existing diagnostic `stderr`, with `stderr_truncated` when clipped, within
+the 64 KiB diagnostic event limit. Workers put the first observed actionable
+assertion/failure excerpt, suite/test and available relay captured-candidate digest
+and producing-run ID first in `blocked`, before a later timeout explanation. Missing
+assertion details or identities are explicitly unavailable. This worker-reported
+evidence survives checkout reclamation; a later relay timeout cannot excuse an
+observed test failure. Empty or unsupported reasons retain `AtomicWorkBlocked`.
+Ordinary exception text and raw provider output remain excluded from native failure
+evidence. The reason grants
 no retry or resource-release authority. Cleanup still
 requires its original positive proof and does not restart blocked work. The
 hold survives journal rebuild and server replacement; the person can resume
@@ -804,6 +815,41 @@ reload. Confirmed threads are skipped on continuation; an unacknowledged attempt
 refuses continuation and remains uncertain even if a later read finds it closed.
 A failed checkpoint stops further mutations. Partial progress cannot replace the
 completed batch response, final readiness/thread checks or resource-release proof.
+
+### Queue admission trace — 12 November 2026 (#1254)
+
+GitHub's complete enablement/queue/merge timelines were read alongside the
+workspace's retained Caller and chain receipts. All times below are UTC.
+
+| PR | Auto-merge enabled | Queue admission | Merge |
+| --- | --- | --- | --- |
+| [#1245](https://github.com/autonomio/poise/pull/1245) | 18:50:53 | 18:53:35 | 19:00:15, [`afd8c832`](https://github.com/autonomio/poise/commit/afd8c832301b19cdea063c14a8a6bfd8555b7d91) |
+| [#1246](https://github.com/autonomio/poise/pull/1246) | 18:51:35 | 18:54:32 | 19:09:20, [`e9610e22`](https://github.com/autonomio/poise/commit/e9610e22b8b867d616fcb8685bbf589eebc9441d) |
+| [#1247](https://github.com/autonomio/poise/pull/1247) | 18:53:51 | 19:02:27 | 19:21:36, [`27b8fde1`](https://github.com/autonomio/poise/commit/27b8fde1b78797a58a86e3553f02fddb4da1a04a) |
+| [#1252](https://github.com/autonomio/poise/pull/1252) | 19:05:12 | 19:08:45 | 19:21:52, [`7be811a1`](https://github.com/autonomio/poise/commit/7be811a1e5fec6178dbd21e01b2ceefbdec0263a) |
+
+The enablement actor is `bit-mis`; the originating client remains **unknown**.
+The three held chains retain implementation Calls
+`f9fdfde023424f6a8648d6c2638a72d4` (#1237),
+`dde7cebda2bb467d9adb0a5338c5b924` (#1218) and
+`53393c235a284a37b9f326e2db43bf63` (#1240), plus issue reviews, but no
+`review-pr` or `merge-pr` invocation. The manual-action receipt table is empty,
+and no Chat events were recorded during 18:45–19:10. These absences do not
+attribute the enablement request to an operator, Chat or autonomous behavior.
+Their final-head GitHub approvals contain neither native invocation nor review
+response markers. Each verified merge remains recorded with `reviewPending: true`.
+
+#1252's original review Call `57b2824699ec475ea462912d458544c2` posted
+[review 5880497729](https://github.com/autonomio/poise/pull/1252#pullrequestreview-5880497729)
+at 19:11:17, after admission and before merge. It proves reconciliation of the
+original review, not enforcement at admission. The chain decision requires all
+configured review slots; Caller's `merge_if_ready` validates the retained
+response before its direct enqueue. Neither enables auto-merge. No autonomous
+enablement bypass is established by this trace. Work reads already preserve
+the merge and pending obligation; [Logging's Work impact](Logging.md#observe--logging)
+directs reconciliation of that original evidence even while held, rather than
+recommending Resume on a merged chain. A GitHub approval alone cannot discharge
+the obligation or authorize a new post-merge review.
 
 ## Seed observation batch
 

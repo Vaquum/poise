@@ -1,4 +1,5 @@
 import { DiagnosticCursorError } from '../../gateway/src/diagnostics/store'
+import { environmentSecrets, redact } from '../../gateway/src/diagnostics/contract'
 import { diagnosticPage } from '../logging'
 // The service endpoints the container health check and the gateway call
 // (docs/Service-architecture.md, "Service endpoints"). A drain is the drain a
@@ -21,7 +22,7 @@ import { HttpError, readJson, type RequestAuthority } from '../http'
 import { markReleaseSwitch, pauseReleaseBackground, releaseBackgroundBusy, resumeReleaseBackground } from '../release-background'
 import { eventLoopDelayStats, type EventLoopDelayStats } from '../event-loop-delay'
 import { DEFAULT_CHAT_SETTINGS } from '../settings'
-import { runningCallerCalls } from './caller-calls'
+import { runningCallerCalls, type NativeCleanupHold } from './caller-calls'
 import { canRestartForUpdate, requestUpdateRestart } from './restart'
 
 export interface ServiceHealth {
@@ -33,6 +34,7 @@ export interface ServiceHealth {
   runningCallerCalls: number
   /** Native Calls awaiting durable resource release or cleanup retirement; null when unreadable. */
   unsettledNativeCalls: number | null
+  nativeCleanupHold?: NativeCleanupHold
   backgroundWork: number
   /** True only when nothing a restart would cut is running. */
   idle: boolean
@@ -163,6 +165,7 @@ export class ServiceControl {
   health(): ServiceHealth {
     const activeChatTurns = listOpenTurns(this.runtime.instance).length
     const calls = runningCallerCalls()
+    const cleanupHold = calls.cleanupHold
     const backgroundWork = this.runtime.busy() + releaseBackgroundBusy() + this.launches + calls.pendingResources
     const pending = this.pendingSwitchRecord()
     const release = this.release.name
@@ -176,6 +179,8 @@ export class ServiceControl {
       activeChatTurns,
       runningCallerCalls: calls.count,
       unsettledNativeCalls: calls.known ? calls.pendingResources : null,
+      ...(cleanupHold && { nativeCleanupHold: { callId: cleanupHold.callId,
+        reason: cleanupHold.reason === null ? null : redact(cleanupHold.reason, environmentSecrets()).slice(0, 2000) } }),
       backgroundWork,
       // Never idle while Caller's records cannot be read: calls an earlier server started may still run.
       idle: calls.known && activeChatTurns + calls.count + backgroundWork === 0,
