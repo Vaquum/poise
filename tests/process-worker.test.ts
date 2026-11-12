@@ -78,6 +78,23 @@ describe('the process worker', () => {
     expect(shape(inWorker)).toMatchObject({ code: 'ENOENT', syscall: 'spawn /nonexistent/poise-cli', path: '/nonexistent/poise-cli', stdout: '', stderr: '' })
   })
 
+  it('rejects a child spawn cannot start, in the worker as on the main thread', async () => {
+    const { processWorkerReady, runFile, stopProcessWorker } = await import('../server/process')
+    expect(await processWorkerReady()).toBe(true)
+    const invalid = { cwd: 123 as unknown as string }
+
+    const inWorker = await runFile(process.execPath, ['-e', ''], invalid).catch((error: unknown) => error)
+    expect(mainThread.spawns).toBe(0)
+    await stopProcessWorker()
+    const onMainThread = await runFile(process.execPath, ['-e', ''], invalid).catch((error: unknown) => error)
+    expect(mainThread.spawns).toBe(1)
+
+    for (const error of [inWorker, onMainThread]) {
+      expect(error).toBeInstanceOf(Error)
+      expect(error).toMatchObject({ code: 'ERR_INVALID_ARG_TYPE', stdout: '', stderr: '' })
+    }
+  })
+
   it('stops the children of a worker that stops, reports them interrupted, and starts later calls on the main thread', async () => {
     const { processWorkerReady, runFile, stopProcessWorker } = await import('../server/process')
     expect(await processWorkerReady()).toBe(true)

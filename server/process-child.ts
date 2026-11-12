@@ -116,13 +116,21 @@ export async function terminateProcessTree(child: ChildProcess, signal: NodeJS.S
 export function startChild(request: ChildRequest, spawned?: (pid: number) => void): RunningChild {
   let abort = () => {}
   const outcome = new Promise<ChildOutcome>((resolve) => {
-    const child = spawn(request.file, request.args, {
-      cwd: request.cwd,
-      env: request.env,
-      detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    })
+    let child: ChildProcess
+    try {
+      child = spawn(request.file, request.args, {
+        cwd: request.cwd,
+        env: request.env,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+    } catch (error) {
+      // A child spawn cannot start rejects through the outcome, as runFile's
+      // always has, instead of leaving the outcome unsettled.
+      resolve({ code: null, signal: null, stdout: '', stderr: '', termination: { kind: 'error', error: error as Error } })
+      return
+    }
     if (child.pid) spawned?.(child.pid)
     const stdoutChunks: Buffer[] = []
     const stderrChunks: Buffer[] = []
