@@ -11,11 +11,11 @@ from unittest import TestCase
 from unittest.mock import AsyncMock, patch
 
 import agent_interface
-from agent_interface import atoms, pr_review, review_repository as rr, structured_review as sr
+from agent_interface import atoms, pr_review, review_budget, review_repository as rr, structured_review as sr
 from agent_interface.model_catalog import CATALOG
 from agent_interface.review_watch import ReviewWatch
 from github_interface import cli, interface
-from github_interface.behaviors import checkout_review
+from github_interface.behaviors import checkout_review, pr_review as packet_review
 
 ASSESSMENT = {'verdict': 'The changed validation paths have no remaining blocking defects.', 'reviewed_context': 'Inspected the supplied immutable diff and its affected callers.', 'limitations': 'Provider fixture; no application test execution.'}
 HEAD, BASE = "a" * 40, "b" * 40
@@ -27,6 +27,85 @@ PACKET = json.dumps({"repository": "o/r", "head_sha": HEAD, "merge_base_sha": BA
 
 
 class TestRepositoryLifecycle(TestCase):
+    def test_packet_drift_crosses_cli_and_settles_without_provider_or_publication(self):
+        saved = json.loads((Path(__file__).resolve().parents[3]
+                            / "tests/fixtures/review-checkout-superseded.json").read_text())
+        for phase, changed in (("before", "head"), ("during", "head"),
+                               ("during", "base"), ("during", "failure")):
+            pull = {"head": {"sha": HEAD}, "base": {"sha": BASE}}
+            latest = {**pull, changed: {"sha": saved["head_sha"]}}
+            client = AsyncMock()
+            commands = []
+
+            def command(args, **kwargs):
+                self.assertEqual(args[1], "--pr-review")
+                stdout, stderr = io.StringIO(), io.StringIO()
+                code = 0
+                with patch.object(sys, "argv", args), redirect_stdout(stdout), redirect_stderr(stderr):
+                    try:
+                        cli.main()
+                    except SystemExit as stopped:
+                        code = stopped.code
+                commands.append(code)
+                return SimpleNamespace(returncode=code, stdout=stdout.getvalue(), stderr=stderr.getvalue())
+
+            with self.subTest(phase=phase, changed=changed), tempfile.TemporaryDirectory() as work, \
+                    patch.object(agent_interface, "DB", Path(work) / "calls.sqlite3"), \
+                    patch.object(agent_interface, "RESPONSES", Path(work) / "responses"), \
+                    patch.object(agent_interface, "review_facts", return_value={}) as facts, \
+                    patch.object(atoms, "run_agent") as provider, patch.object(rr, "prepare") as checkout, \
+                    patch("github_interface.context._git_remote", return_value=("o", "r")), \
+                    patch.object(interface, "GitHubClient", return_value=client), \
+                    patch.object(packet_review, "get_pull", AsyncMock(side_effect=[latest] if phase == "before" else [pull, latest])), \
+                    patch.object(packet_review, "list_inline_comments", AsyncMock(return_value=[])), \
+                    patch.object(packet_review, "issue_comments", AsyncMock(return_value=[])), \
+                    patch.object(packet_review, "list_review_threads", AsyncMock(return_value=[])), \
+                    patch.object(packet_review, "list_reviews", AsyncMock(return_value=[])), \
+                    patch.object(packet_review, "linked_issues", AsyncMock(return_value=[])), \
+                    patch.object(packet_review, "review_diff", AsyncMock(return_value={},
+                        side_effect=RuntimeError("packet diff read failed") if changed == "failure" else None)), \
+                    patch.object(atoms.subprocess, "run", side_effect=command), redirect_stdout(io.StringIO()) as output:
+                agent_interface.init_db()
+                if changed == "failure":
+                    with self.assertRaises(SystemExit) as failed:
+                        agent_interface.run_pr_review(PR, "bot", HEAD, "poise:review-new-prs", "correlation", model="opus-5-high")
+                    self.assertEqual(failed.exception.code, 1)
+                else:
+                    agent_interface.run_pr_review(PR, "bot", HEAD, "poise:review-new-prs", "correlation", model="opus-5-high")
+                row = agent_interface.logs()[0]
+                self.assertEqual(commands, [int(changed == "failure")])
+                self.assertEqual(facts.call_count, 1)
+                provider.assert_not_called()
+                checkout.assert_not_called()
+                client.post.assert_not_called()
+                self.assertEqual((row["repo"], row["pr_id"], row["actor"], row["source"], row["correlation_id"], row["expected_head"]),
+                                 ("o/r", "12", "bot", "poise:review-new-prs", "correlation", HEAD))
+                if changed == "failure":
+                    self.assertEqual((row["status"], row["outcome"], row["action"]), ("failed", "preflight_failed", "not_started"))
+                    self.assertIn("packet diff read failed", row["error"])
+                else:
+                    self.assertEqual({key: row[key] for key in saved}, {**saved, "head_sha": latest["head"]["sha"]})
+                    self.assertEqual(json.loads(output.getvalue())["outcome"], "superseded")
+                    with agent_interface.db() as conn:
+                        response_path = conn.execute("select response_path from calls where id=?", (row["id"],)).fetchone()[0]
+                    self.assertIn("head or base changed", Path(response_path).read_text())
+
+    def test_superseded_packet_requires_its_target_and_valid_head_and_is_never_cached(self):
+        from agent_interface.review_watch import ReviewSuperseded
+
+        receipt = {"action": "read", "repository": "o/r", "pull_number": 12,
+                   "outcome": "superseded", "head_sha": HEAD}
+        for invalid in ({}, {"action": "wrong"}, {"repository": "other/repo"}, {"pull_number": 13},
+                        {"pull_number": "12"}, {"pull_number": True}, {"head_sha": None}, {"head_sha": "z" * 40}):
+            done = SimpleNamespace(returncode=0, stdout=json.dumps({**receipt, **invalid}), stderr="")
+            with self.subTest(invalid=invalid), review_budget.ReviewBudget(), \
+                    patch.object(atoms.subprocess, "run", return_value=done) as command:
+                for _ in range(2):
+                    with self.assertRaises(atoms.AgentPreflightError if invalid else ReviewSuperseded):
+                        atoms.packet("/repo", PR, "bot", HEAD)
+                    self.assertEqual(review_budget.packet_cache(), {})
+                self.assertEqual(command.call_count, 2)
+
     def test_checkout_drift_saves_superseded_without_invoking_a_provider(self):
         saved = json.loads((Path(__file__).resolve().parents[3]
                             / "tests/fixtures/review-checkout-superseded.json").read_text())

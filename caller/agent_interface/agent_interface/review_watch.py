@@ -56,7 +56,7 @@ _GITHUB_STATUS = re.compile(rb"github\s+\d{3}")
 class ReviewSuperseded(RuntimeError):
     def __init__(self, head_sha: str):
         self.head_sha = atoms.expected_head(head_sha)
-        super().__init__(f"Review stopped early: PR head changed to {self.head_sha}")
+        super().__init__(f"Review stopped early: PR head or base changed; observed head {self.head_sha}")
 
 
 def _provider_diagnostic(line: bytes, *, stderr: bool) -> bytes:
