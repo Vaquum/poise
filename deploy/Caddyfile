@@ -23,6 +23,18 @@
 }
 
 {$POISE_DOMAIN} {
+	# Page assets and reads go compressed, about a tenth of the bytes; event streams go as they are.
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/plain*
+			header Content-Type text/javascript*
+			header Content-Type application/javascript*
+			header Content-Type application/json*
+			header Content-Type image/svg+xml*
+		}
+	}
 	reverse_proxy {
 		# The gateway's container is replaced stop-first: its Docker DNS name briefly resolves to
 		# nothing, then to the new container. Resolve it per attempt and retry dials, so a
@@ -40,6 +52,18 @@
 *.{$POISE_DOMAIN} {
 	tls {
 		on_demand
+	}
+	# Page assets and reads go compressed, about a tenth of the bytes; event streams go as they are.
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/plain*
+			header Content-Type text/javascript*
+			header Content-Type application/javascript*
+			header Content-Type application/json*
+			header Content-Type image/svg+xml*
+		}
 	}
 	reverse_proxy {
 		dynamic a {

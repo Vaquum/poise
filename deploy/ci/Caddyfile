@@ -2,6 +2,18 @@
 # POISE_INSECURE_HTTP=1 (deploy/ci/e2e.sh). The run checks deploy/Caddyfile
 # itself separately, over TLS from Caddy's own certificate authority.
 http://{$POISE_DOMAIN}, http://*.{$POISE_DOMAIN} {
+	# Page assets and reads go compressed, about a tenth of the bytes; event streams go as they are.
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/plain*
+			header Content-Type text/javascript*
+			header Content-Type application/javascript*
+			header Content-Type application/json*
+			header Content-Type image/svg+xml*
+		}
+	}
 	reverse_proxy {
 		# The same replacement bridging as deploy/Caddyfile: the gateway's
 		# container is replaced stop-first, so its Docker DNS name briefly

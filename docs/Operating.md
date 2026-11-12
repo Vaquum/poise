@@ -899,7 +899,7 @@ deploy/upgrade.sh
 
 It pulls the newest commit of the branch the checkout follows (fast-forward
 only), rebuilds the workspace image, lets Compose recreate Caddy or the
-gateway if they changed, and lists the workspaces that run an older image.
+gateway if they changed, restarts or reloads Caddy when its Caddyfile changed, and lists the workspaces that run an older image.
 A fork that deploys itself does this once CI passes on what a push to its
 main brought ([Run your own Poise from a fork](#run-your-own-poise-from-a-fork)).
 
