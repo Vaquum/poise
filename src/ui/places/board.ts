@@ -117,6 +117,8 @@ export const mount: MountPlace = (ctx) => {
     setSelectedOrganization(org)
   }
   const choose = (patch: Partial<Filters>) => {
+    // Another organization's runs never stand for this one's.
+    if (patch.org !== undefined && patch.org !== F.org) runsRead = undefined
     for (const [k, v] of Object.entries(patch)) { (F as unknown as Record<string, unknown>)[k] = v; delete (linked as Record<string, unknown>)[k] }
     saveFilters()
   }

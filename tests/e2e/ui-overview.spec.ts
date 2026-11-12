@@ -338,9 +338,13 @@ test('System health reads its five cards live, and a failed read keeps them, wit
 })
 
 test('In motion says what was never read, rather than zero or clear', async ({ page }) => {
+  let ghReads = 0
+  page.on('requestfinished', (request) => { if (new URL(request.url()).pathname === '/api/gh') ghReads++ })
   await open(page, { notices: [], requests: [], decisions: [], revision: 1, chatsFail: true, runsFail: true })
   await expect(page.locator('[data-counts="people"] b').first()).toHaveText('—')
-  // A run never read is not Idle: the items' counts wait for the runs going now.
+  // A run never read is not Idle: once GitHub's items are read, their counts still wait for the runs going now.
+  await page.waitForLoadState('networkidle')
+  expect(ghReads).toBeGreaterThan(0)
   await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
   await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
 })

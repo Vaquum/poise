@@ -288,3 +288,25 @@ test('at 375 pixels Board’s header and lanes keep the narrow gutter', async ({
   expect(pads.head).toBe(pads.gutter)
   expect(pads.lanes).toBe(pads.gutter)
 })
+
+test('another organization’s runs never stand for the one chosen', async ({ page }) => {
+  const organizations = ['acme', 'beta'].map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }))
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const response = await route.fetch()
+    return route.fulfill({ response, json: { ...(await response.json()), organizations } })
+  })
+  const beta = record('issue', 50, 'Beta’s own issue', { repo: 'beta/api', url: 'https://github.com/beta/api/issues/50' })
+  await board(page, { records: [...RECORDS, beta] })
+  const pick = async (org: string) => {
+    await page.locator('[data-menu="board-org-menu"]').click()
+    await page.locator(`#board-org-menu [data-org="${org}"]`).click()
+  }
+  // acme's runs are read; then All orgs is chosen and its runs cannot be read.
+  await pick('acme')
+  await expect(card(page, 'Old issue changed today')).toHaveAttribute('data-state', 'idle')
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ status: 502, json: { error: 'agent-interface did not answer' } }))
+  await pick('')
+  await expect(page.locator('[data-ref="cur.partial"]')).toContainText('the runs going now')
+  await expect(card(page, 'Beta’s own issue')).toHaveAttribute('data-state', '')
+})
