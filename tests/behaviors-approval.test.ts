@@ -11,6 +11,57 @@ function modelOf(call: unknown[]): string {
 
 describe('approval eligibility and review activity', () => {
 
+  it('supersedes a pre-launch head change without backoff and evaluates the new head next tick', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-12T15:15:37.000Z'))
+    arrangeCli(true)
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      const result = await original(command, args, options)
+      if (command === 'github-interface' && args[0] === '--head-sha') {
+        return { ...result, stdout: JSON.stringify({ ...JSON.parse(result.stdout), head_sha: NEXT_HEAD_SHA }) }
+      }
+      return result
+    })
+    mocks.spawnDetached.mockResolvedValue(undefined)
+    const { database: db, behaviors: runtime } = await loadModules()
+    runtime.startBehaviorsRuntime()
+    db.setMeta('me', 'poise-user')
+    db.setMeta('behavior_approve_prs_enabled', '1')
+    const target = `${pr.repo}#17@req=2026-07-10T10:00:00Z/r=1/head=${HEAD_SHA}`
+
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    expect(mocks.captureAdmission).toHaveBeenCalledExactlyOnceWith({
+      admissionKey: JSON.stringify(['Vaquum', 'approve-prs', target]),
+      nativeId: expect.any(String), behavior: 'approve-prs', source: 'poise:approve-prs', owner: 'Vaquum',
+      actor: 'review-bot', repository: pr.repo, number: 17, head: HEAD_SHA, slot: 'primary', plannedSlots: ['primary'],
+      startedAt: new Date().toISOString(),
+    })
+    expect(mocks.captureOutcome).toHaveBeenCalledExactlyOnceWith({
+      nativeId: mocks.captureAdmission.mock.calls[0][0].nativeId,
+      state: 'superseded', activity: 'settled', stateSource: 'native', outcome: 'superseded',
+      completedAt: new Date().toISOString(),
+    })
+    expect(mocks.captureAdmission.mock.invocationCallOrder[0]).toBeLessThan(mocks.captureOutcome.mock.invocationCallOrder[0])
+    expect(db.listSeenTargets('approve-prs')).toEqual([])
+    expect(db.hasSeen('pr-operation', `${pr.repo}#17`)).toBe(false)
+    expect(db.getMeta(`behavior_approve_prs_failure:${pr.repo}#17:check`)).toBeNull()
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+
+    arrangeCli(true, false, { headSha: NEXT_HEAD_SHA })
+    await runtime.runEnabledBehaviorsOnce()
+
+    expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    const args = mocks.spawnDetached.mock.calls[0][1] as string[]
+    expect(args.slice(0, 2)).toEqual(['--pr-approve', '#17'])
+    expect(args[args.indexOf('--expected-head') + 1]).toBe(NEXT_HEAD_SHA)
+    expect(db.hasSeen('approve-prs', target)).toBe(false)
+    expect(db.hasSeen('approve-prs', target.replace(HEAD_SHA, NEXT_HEAD_SHA))).toBe(true)
+    expect(runtime.getBehaviorsRuntimeHealth().failures).toEqual([])
+  })
+
   it('starts a current-head follow-up for a public author reply without a newer commit', async () => {
     arrangeCli(true, false, { headSha: NEXT_HEAD_SHA }, {
       commits_after_request: 0,
