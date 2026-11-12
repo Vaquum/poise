@@ -364,3 +364,29 @@ test('In motion says what was never read, rather than zero or clear', async ({ p
   await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
   await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
 })
+
+test('a reload paints In motion’s last reads at once, while it reads them again', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const people = page.locator('[data-counts="people"] b').first()
+  const items = page.locator('[data-counts="items"] b').first()
+  await expect(people).not.toHaveText('—')
+  await expect(items).not.toHaveText('—')
+  // GitHub's reads and the chats are held; the reload paints the last ones anyway.
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.route('**/api/chat/sessions', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(people).not.toHaveText('—', { timeout: 2_000 })
+  await expect(items).not.toHaveText('—', { timeout: 2_000 })
+})
+
+test('In motion never paints another organization’s last issues and pull requests', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const items = page.locator('[data-counts="items"] b').first()
+  await expect(items).not.toHaveText('—')
+  // Another organization is chosen, and GitHub's reads are held.
+  await page.evaluate(() => localStorage.setItem('poise-organization', 'acme'))
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(page.locator('[data-counts="people"] b').first()).not.toHaveText('—')
+  await expect(items).toHaveText('—')
+})
