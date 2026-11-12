@@ -202,6 +202,7 @@ function layout(el: HTMLElement): void {
 }
 
 export function closeRef(): void {
+  hideTip()
   if (!layer) return
   removeEventListener('resize', relayout)
   layerObserver?.disconnect()

@@ -30,6 +30,8 @@ interface Workspace {
   decisions: unknown[]
   /** How the Switchboard answers an answer: delay, then status and body. */
   answerDecision?: { delay: Promise<void>, status: number, body: unknown }
+  /** The chats read fails from the start. */
+  chatsFail?: boolean
 }
 
 interface Socket { ws: WebSocketRoute | null, frames: { id: string, command: Record<string, unknown> }[] }
@@ -63,7 +65,7 @@ async function open(page: Page, workspace: Workspace, address = '/?view=overview
       await workspace.answerDecision.delay
       return json(route, workspace.answerDecision.body, workspace.answerDecision.status)
     }
-    if (path === '/api/chat/sessions') return json(route, { instance: 'poise-dev:test', sessions: [] })
+    if (path === '/api/chat/sessions') return workspace.chatsFail ? json(route, { error: 'the chat service did not answer' }, 503) : json(route, { instance: 'poise-dev:test', sessions: [] })
     if (path === '/api/editor/reviews') return json(route, { publications: [], sweep: { publications: 0, longestDelayMinutes: 15 } })
     if (path === '/api/behavior-chains') return json(route, { chains: [], attention: [] })
     if (path === '/api/behaviors') return json(route, { diagnostics: { status: 'ok', agentLogsError: null, datastore: { status: 'healthy', checkedAt: ago(1), ageSeconds: 1, lastSuccessAt: ago(1), error: null }, identity: { status: 'valid', actor: 'bot', error: null }, failures: [], deadLetters: [], holds: [] } })
@@ -323,4 +325,10 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:organization-filter-changed')))
   await expect(page.locator('[data-healthfail]')).toContainText('System health could not be read: evidence store unavailable. Last read at')
   await expect(card('ov.h.errors')).toContainText('0.5 per item')
+})
+
+test('In motion says what was never read, rather than zero or clear', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1, chatsFail: true })
+  await expect(page.locator('[data-counts="people"] b').first()).toHaveText('—')
+  await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
 })

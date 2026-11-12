@@ -19,6 +19,7 @@ interface World {
   labelled?: string[]
   prs?: { [key: string]: { number: number, url: string }[] }
   intakeFails?: boolean
+  liveFails?: boolean
   assign?: 'ok' | 'refused'
   chainEnabled?: boolean
   assigned?: string[]
@@ -46,6 +47,7 @@ async function board(page: Page, world: World, address = '/?view=board'): Promis
   await page.route('**/api/gh', async (route) => {
     const body = JSON.parse(route.request().postData() || '{}') as { operation: string, updated_since?: string, repository_full_name?: string, issue_number?: number }
     if (body.operation === 'list') {
+      if (world.liveFails) return route.fulfill({ status: 502, json: { error: 'GitHub answered 502' } })
       const since = body.updated_since ? Date.parse(body.updated_since) : -Infinity
       return route.fulfill({ json: { records: world.records.filter((r) => Date.parse(r.updated_at) >= since) } })
     }
@@ -217,4 +219,11 @@ test('opening an issue keeps its writer open and guarded until GitHub answers', 
   answer()
   await expect(page.locator('[data-writer="issue"]')).toHaveCount(0)
   await expect(card(page, 'A new issue')).toBeVisible()
+})
+
+test('a GitHub read that never succeeded reads as not read, never as zero', async ({ page }) => {
+  await board(page, { records: RECORDS, liveFails: true })
+  await expect(page.locator('.lane[data-lane="issue"] .empty')).toHaveText('Not read yet.')
+  await expect(page.locator('.lane[data-lane="issue"] [data-ref="lane.count"]')).toHaveText('—')
+  await expect(page.locator('[data-ref="cur.count"] .n').first()).toHaveText('—')
 })

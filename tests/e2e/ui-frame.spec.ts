@@ -200,3 +200,18 @@ test('Claude’s subscription sits at the foot and the page makes room; updating
   await expect(page.locator('.up-backdrop')).toContainText('Updating to the latest version')
   await expect(page.locator('.frame')).toHaveAttribute('inert', '')
 })
+
+test('a move takes the tooltip with it, and a place enters only the first time it opens', async ({ page }) => {
+  await open(page, '/?view=board&back=overview')
+  const back = page.getByRole('link', { name: 'Back to Overview' })
+  await back.hover()
+  await expect(page.getByRole('tooltip')).toBeVisible()
+  await back.click()
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
+  await expect(page.getByRole('tooltip')).toHaveCount(0)
+
+  await page.waitForFunction(() => !document.querySelector('[data-place-root][data-flow-enter]'))
+  await nav(page).getByRole('link', { name: 'Board' }).click()
+  await expect(page.locator('.lanes')).toBeVisible()
+  expect(await page.locator('[data-place-root]').getAttribute('data-flow-enter')).toBeNull()
+})

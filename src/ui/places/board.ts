@@ -130,6 +130,8 @@ export const mount: MountPlace = (ctx) => {
   let chats = new Map<string, ChatOn>()
   let truncated = false
   let readOnce = false
+  /** GitHub's issues and pull requests have been read at least once: until then nothing reads as zero. */
+  let liveRead = false
   const failures = new Map<string, string>()
   /** Issues opened here, shown at once until GitHub's copy arrives. */
   const pending = new Map<string, Item>()
@@ -329,11 +331,11 @@ export const mount: MountPlace = (ctx) => {
     const count = open.length + done.length
     const add = lane.key === 'issue' ? `<button class="lane-add" data-act="add-issue" data-ref="lane.add-issue">${icon('plus', 'sm')}Add issue</button>`
       : lane.kind === 'mine' ? `<button class="lane-add" data-act="add" data-lane="${lane.key}" data-ref="lane.add">${icon('plus', 'sm')}Add</button>` : ''
-    const empty = count ? '' : !readOnce && live ? '<div class="empty">Reading GitHub…</div>' : `<div class="empty" data-ref="cur.empty">${filtersOn() || F.org ? `Nothing here under your filters.${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}` : live ? 'Nothing here.' : 'No cards yet. Add one, or drag one here.'}</div>`
+    const empty = count ? '' : live && !liveRead ? `<div class="empty">${failures.has('live') ? 'Not read yet.' : 'Reading GitHub…'}</div>` : `<div class="empty" data-ref="cur.empty">${filtersOn() || F.org ? `Nothing here under your filters.${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}` : live ? 'Nothing here.' : 'No cards yet. Add one, or drag one here.'}</div>`
     const fold = done.length ? `<div class="done-fold${folds[lane.key] ? ' open' : ''}"><button class="done-h" data-act="fold" data-lane="${lane.key}" aria-expanded="${!!folds[lane.key]}" data-ref="cur.done">${icon('chev', 'sm')}<span class="t-micro">${term('state.done')}</span><span class="n">${done.length}</span><span class="t-gloss">merged and closed</span></button><div class="lane-list done-list">${done.map(liveHTML).join('')}</div></div>` : ''
     const trunc = live && truncated ? '<p class="trunc" data-ref="cur.trunc">Older items are not loaded: Board shows the 200 most recently updated issues and pull requests, combined.</p>' : ''
     return `<section class="lane" data-lane="${lane.key}" data-kind="${lane.kind}" aria-label="${lane.label}">`
-      + `<header class="lane-h"><span class="station"></span><span class="name"><span class="t-micro" data-ref="lane.${lane.key}">${lane.label}</span><span class="count" data-ref="lane.count">${count}${live && truncated ? '+' : ''}</span></span>${add}</header>`
+      + `<header class="lane-h"><span class="station"></span><span class="name"><span class="t-micro" data-ref="lane.${lane.key}">${lane.label}</span><span class="count" data-ref="lane.count">${live && !liveRead ? '—' : count}${live && truncated ? '+' : ''}</span></span>${add}</header>`
       + `<p class="lane-gloss">${lane.gloss}</p>`
       + `<div class="lane-body" data-body="${lane.key}">${lane.key === 'issue' ? '<div class="drop-hint" data-ref="lane.drop">Drop to open this card as an issue</div>' : ''}${writerHTML(lane)}<div class="lane-list" data-list="${lane.key}">${body}</div>${empty}${fold}${trunc}</div></section>`
   }
@@ -341,7 +343,7 @@ export const mount: MountPlace = (ctx) => {
   function summary(): void {
     const counts = Object.fromEntries(STATES.map((s) => [s, 0])) as Record<StateKey, number>
     for (const it of shown()) if (it.state) counts[it.state]++
-    sumEl.innerHTML = `<span class="t-micro" data-ref="cur.summary">In motion</span>${STATES.map((s) => `<button class="st" data-state="${s}" data-n="${counts[s]}" aria-pressed="${only === s}" data-act="state" data-ref="cur.count"><span data-term="state.${s}">${term(`state.${s}`)}</span><span class="n">${counts[s]}</span></button>`).join('')}${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}`
+    sumEl.innerHTML = `<span class="t-micro" data-ref="cur.summary">In motion</span>${STATES.map((s) => `<button class="st" data-state="${s}" data-n="${counts[s]}" aria-pressed="${only === s}" data-act="state" data-ref="cur.count"><span data-term="state.${s}">${term(`state.${s}`)}</span><span class="n">${liveRead ? counts[s] : '—'}</span></button>`).join('')}${filtersOn() ? '<button class="clear" data-act="clear" data-ref="cur.clear">Clear filters</button>' : ''}`
     sumEl.classList.toggle('is-filtered', !!only)
   }
 
@@ -466,6 +468,7 @@ export const mount: MountPlace = (ctx) => {
       const changed = items.filter((it) => before.has(it.id) && before.get(it.id) !== sig(it)).length
         + items.filter((it) => !before.has(it.id)).length * (readOnce ? 1 : 0)
       readOnce = true
+      liveRead = true
       paintPartial()
       if (busy() && changed && !first) {
         // Their state words change at once, in place; their new places wait (cur.held).
