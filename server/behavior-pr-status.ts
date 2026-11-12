@@ -374,7 +374,10 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
   const freshness = new Map(datastoreFreshnessEntries(now).map((entry) => [entry.org?.toLowerCase() ?? 'legacy', entry]))
   const coverage: PrStatusCoverage[] = []
   const inventory: Array<{ pr: DatastorePr, org: string | null }> = []
-  for (const scope of scopes) {
+  // Every organization at once: each read is its own datastore process,
+  // and one after another their times added up.
+  const reads = await Promise.all(scopes.map((scope) => scope.ready ? readScopeRows(scope.login) : null))
+  for (const [index, scope] of scopes.entries()) {
     const observed = freshness.get(scope.login?.toLowerCase() ?? 'legacy')
     if (!scope.ready) {
       coverage.push({ org: scope.login, status: 'initializing', checkedAt: observed?.checkedAt ?? null,
@@ -382,7 +385,7 @@ export async function readPrStatus(limit: number, now = Date.now()): Promise<PrS
         error: 'datastore is initializing' })
       continue
     }
-    const { rows, error } = await readScopeRows(scope.login)
+    const { rows, error } = reads[index]!
     if (!rows) {
       coverage.push({ org: scope.login, status: 'unavailable', checkedAt: observed?.checkedAt ?? null,
         ageSeconds: observed?.ageSeconds ?? null, lastSuccessAt: observed?.lastSuccessAt ?? null, error })

@@ -398,6 +398,28 @@ describe('readPrStatus', () => {
     expect(reply.datastore.orgs[0]).toMatchObject({ status: 'unavailable', error: 'datastore offline' })
   })
 
+  it('reads every organization at once, not one after another', async () => {
+    const { db, status } = await setup()
+    for (const login of ['acme', 'beta']) db.db.prepare(`INSERT INTO organizations(login, datastore_path, managed, status, stage, indexed_user)
+      VALUES (?, ?, 1, 'ready', 'ready', 'poise-user')`).run(login, `/datastores/${login}.sqlite`)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let reads = 0
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command !== 'github-datastore' || !args.includes('view')) throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
+      reads++
+      await gate
+      return { stdout: '[]', stderr: '' }
+    })
+    const reply = status.readPrStatus(50, Date.now())
+    try {
+      await vi.waitFor(() => expect(reads).toBe(3), { timeout: 1_000 })
+    } finally {
+      release()
+    }
+    expect((await reply).datastore.orgs.map((org) => [org.org, org.status])).toEqual([['Vaquum', 'ready'], ['acme', 'ready'], ['beta', 'ready']])
+  })
+
   it('bounds rows with flagged oldest first', async () => {
     const { status } = await setup()
     const base = Date.parse('2026-10-29T10:00:00Z')
