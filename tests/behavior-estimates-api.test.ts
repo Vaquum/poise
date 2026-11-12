@@ -144,6 +144,53 @@ describe('behavior estimates API', () => {
     expect(remaining).toBeLessThanOrEqual(2 * 60_000)
   })
 
+  it('answers estimates and metrics from the last history at once while the history is read again behind', async () => {
+    const now = Date.now()
+    running = [row({ id: 'e'.repeat(32), status: 'running', started_at: new Date(now).toISOString(), completed_at: null, outcome: null, action: null })]
+    expect((await fetch(`${base}/api/behavior-estimates`)).status).toBe(200)
+    // Past the history's five seconds its next read is held; both answers still come at once.
+    const answer = mocks.runFile.getMockImplementation()!
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args.length === 1 && args[0] === '--logs') await held
+      return answer(command, args, options)
+    })
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6_000)
+    const within = <T>(promise: Promise<T>) => Promise.race([promise, new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000))])
+    try {
+      const estimates = await within(fetch(`${base}/api/behavior-estimates`))
+      expect(estimates?.status).toBe(200)
+      const metrics = await within(fetch(`${base}/api/behavior-metrics`))
+      expect(metrics?.status).toBe(200)
+      expect(mocks.runFile.mock.calls.filter(([, args]) => (args as string[]).length === 1 && (args as string[])[0] === '--logs')).toHaveLength(2)
+    } finally {
+      clock.mockRestore()
+      release()
+    }
+  })
+
+  it('reports a failed history refresh at the next read instead of answering from the last history on and on', async () => {
+    const now = Date.now()
+    running = [row({ id: 'e'.repeat(32), status: 'running', started_at: new Date(now).toISOString(), completed_at: null, outcome: null, action: null })]
+    expect((await fetch(`${base}/api/behavior-estimates`)).status).toBe(200)
+    // Past the history's five seconds, every whole-history read fails.
+    const answer = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args.length === 1 && args[0] === '--logs') throw new Error('log unavailable')
+      return answer(command, args, options)
+    })
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6_000)
+    try {
+      // The first reader is answered from the last history; the read behind it fails, and the next readers say so.
+      expect((await fetch(`${base}/api/behavior-estimates`)).status).toBe(200)
+      await vi.waitFor(async () => expect((await fetch(`${base}/api/behavior-estimates`)).status).toBe(502))
+      expect((await (await fetch(`${base}/api/behavior-metrics`)).json() as { error: string | null }).error).toMatch(/log unavailable/)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   it('reports no estimate below five samples and answers 502 when the log cannot be read', async () => {
     history = []
     running = [row({ id: 'e'.repeat(32), status: 'running', started_at: new Date().toISOString(), completed_at: null, outcome: null, action: null })]

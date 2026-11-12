@@ -2605,6 +2605,27 @@ function historyFixture(id = 's1', messages = Array.from({ length: 12 }, (_, i) 
   ])
 }
 
+test('a long chat opens on its last ten turns, and Show earlier turns reads the rest once', async ({ page }) => {
+  const state = makeState([session()], { s1: historyFixture('s1', Array.from({ length: 14 }, (_, i) => `Message ${i + 1}.`)) })
+  await installRoutes(page, state)
+  const sock = await installSocket(page, state); await page.goto('/?view=chat'); await sock.subscribed('s1')
+  const transcript = page.locator('.chat-transcript')
+  await expect(transcript).toContainText('Message 14.')
+  await expect(transcript).toContainText('Message 5.')
+  await expect(transcript).not.toContainText('Message 4.')
+  expect(state.reads).toEqual([{ id: 's1', after: 0, turns: 10 }])
+  await page.getByRole('button', { name: 'Show earlier turns' }).click()
+  await expect(transcript).toContainText('Message 1.')
+  await expect(transcript).toContainText('Message 14.')
+  await expect(page.getByRole('button', { name: 'Show earlier turns' })).toHaveCount(0)
+  expect(state.reads).toEqual([{ id: 's1', after: 0, turns: 10 }, { id: 's1', after: 0, turns: 0 }])
+  // The live subscription goes on as before: a new turn lands once.
+  sock.seq = 28
+  sock.push('s1', { type: 'turn.started', turnId: 's1-live', prompt: { text: 'Message live.', attachments: [], mentions: [] } })
+  await expect(transcript.getByText('Message live.')).toHaveCount(1)
+  expect(sock.framesOf('subscribe')).toHaveLength(1)
+})
+
 test('history: Up opens the last ten messages, arrows navigate rows, and Enter recalls without sending', async ({ page }) => {
   const state = makeState([session()], { s1: historyFixture() }); await installRoutes(page, state)
   const sock = await installSocket(page, state); await page.goto('/?view=chat'); await sock.subscribed('s1')
