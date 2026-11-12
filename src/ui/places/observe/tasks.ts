@@ -32,6 +32,9 @@ export function railHTML(chain: ChainRow): string {
 
 const identity = (repository: string, issue: number, pull: number | null): string => `${repository}#${issue}${pull ? ` → #${pull}` : ''}`
 
+/** Tasks' last read with its choice of list, kept across visits: a return paints it at once, then reads again. */
+let lastRead: { which: string, chains: ChainRow[], next: string | null, meta: ChainsPage | null, attention: AttentionRow[], activeCount: number | null, activeMore: boolean, readAt: number } | null = null
+
 export function createTasks(ctx: PartContext): ObservePart {
   const { root, query, back } = ctx
   root.innerHTML = `<div class="obv-bar">
@@ -133,6 +136,7 @@ export function createTasks(ctx: PartContext): ObservePart {
       readAt = Date.now()
       failure = ''
       stale = false
+      lastRead = { which, chains, next, meta, attention, activeCount, activeMore, readAt }
       await readMissing(mine)
     } catch (error) {
       if (aborted(error) || mine !== generation) return
@@ -466,6 +470,7 @@ export function createTasks(ctx: PartContext): ObservePart {
   addEventListener('poise:refresh-tick', () => { if (ctx.visible()) void read(false, true) }, { signal: ctx.signal })
   ctx.scope.onChange(() => paintList())
 
+  if (lastRead?.which === which) ({ chains, next, meta, attention, activeCount, activeMore, readAt } = lastRead)
   paint()
   if (open) void readJournal('open')
   return {
