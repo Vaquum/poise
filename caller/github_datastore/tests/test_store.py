@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from github_datastore.db import (
     init_db,
     prune_items_for_repo,
     set_state,
+    upsert_expanded_item,
     upsert_repo,
 )
 from github_datastore.github_api import PullReconciliation
@@ -111,6 +113,41 @@ class BatchReader:
 
 
 class StoreTest(unittest.TestCase):
+    def test_missing_issue_labels_index_upgrades_and_tracks_repairs(self) -> None:
+        query = (
+            "SELECT DISTINCT repo_id FROM items WHERE item_type='issue' "
+            "AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array'"
+        )
+        with tempfile.TemporaryDirectory() as tmp, closing(connect(Path(tmp) / "db.sqlite")) as conn:
+            init_db(conn)
+            conn.execute("DROP INDEX IF EXISTS idx_items_missing_issue_labels")
+
+            def snapshot(repo_id: int, label_evidence: dict[str, object]) -> None:
+                expanded = base_expanded("", [])
+                expanded["repo"].update(id=repo_id, node_id=f"R_{repo_id}", name=str(repo_id), full_name=f"Vaquum/{repo_id}")
+                expanded["issue"].update(id=repo_id, node_id=f"I_{repo_id}")
+                del expanded["issue"]["labels"]
+                expanded["issue"].update(label_evidence)
+                with conn:
+                    upsert_repo(conn, expanded["repo"])
+                    upsert_expanded_item(conn, expanded)
+
+            for repo_id, labels in enumerate(({}, {"labels": None}, {"labels": "legacy"}, {"labels": []}), 1):
+                snapshot(repo_id, labels)
+            before = {row["repo_id"] for row in conn.execute(query)}
+            self.assertEqual(before, {1, 2, 3})
+
+            init_db(conn)
+            plan = [row["detail"] for row in conn.execute(f"EXPLAIN QUERY PLAN {query}")]
+            self.assertTrue(any("idx_items_missing_issue_labels" in detail for detail in plan), plan)
+            self.assertEqual({row["repo_id"] for row in conn.execute(query)}, before)
+
+            snapshot(5, {})
+            self.assertEqual({row["repo_id"] for row in conn.execute(query)}, {1, 2, 3, 5})
+            for repo_id in (1, 2, 3, 5):
+                snapshot(repo_id, {"labels": []})
+            self.assertEqual(conn.execute(query).fetchall(), [])
+
     def test_regular_sync_backfills_label_evidence_without_editing_old_seed_issues(self) -> None:
         stub = {'id': 100, 'number': 1, 'item_kind': 'issue', 'updated_at': '2026-01-02T00:00:00Z'}
 
@@ -137,6 +174,7 @@ class StoreTest(unittest.TestCase):
             db_path = Path(tmp) / 'db.sqlite'
             initialize_sync_state(db_path, '2026-08-29T12:00:00Z')
             conn = connect(db_path)
+            conn.execute("DROP INDEX IF EXISTS idx_items_missing_issue_labels")
             legacy = base_expanded('', [])
             del legacy['issue']['labels']
             store_expanded(conn, legacy); conn.close()

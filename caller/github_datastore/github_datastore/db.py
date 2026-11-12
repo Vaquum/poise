@@ -184,6 +184,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS item_fts USING fts5(
 );
 CREATE INDEX IF NOT EXISTS idx_items_repo_updated ON items(repo_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_items_repo_number ON items(repo_id, number);
+-- Match the missing-label checks in sync and label-filtered issue reads.
+CREATE INDEX IF NOT EXISTS idx_items_missing_issue_labels ON items(repo_id)
+WHERE item_type='issue' AND coalesce(json_type(expanded_json,'$.issue.labels'),'missing') != 'array';
 CREATE INDEX IF NOT EXISTS idx_associations_username ON associations(username);
 CREATE INDEX IF NOT EXISTS idx_associations_item ON associations(item_id);
 CREATE INDEX IF NOT EXISTS idx_events_item ON events(item_id);
