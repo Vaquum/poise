@@ -20,7 +20,9 @@ is eight productivity cards (two rows of four in a wide window), Work type,
 Review rounds and Change-request share, five per-PR cards, then live GitHub API
 account cards. Productivity and API cards share the taller height; Work & review
 and per-PR cards share the shorter height. Each family expands together when
-text or typography needs more space. Narrow windows reduce columns.
+text or typography needs more space. Narrow windows reduce columns. During a
+resize, the board stays within the window while the cards move to their new
+positions.
 
 ## System health
 
