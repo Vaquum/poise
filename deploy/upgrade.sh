@@ -78,6 +78,16 @@ start_rollout "$sha" "$image" "$expected_workspaces"
 plan=$(plan_workspaces "$image")
 say "Recreating what changed."
 compose up --detach --build
+# Caddy reads its Caddyfile through a one-file mount, which keeps the file the container
+# started with: a changed Caddyfile applies only once Caddy restarts.
+caddy=$(compose ps --quiet caddy 2>/dev/null || true)
+if [ -n "$caddy" ]; then
+  mounted=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/etc/caddy/Caddyfile"}}{{.Source}}{{end}}{{end}}' "$caddy")
+  if [ -n "$mounted" ] && ! docker exec "$caddy" cat /etc/caddy/Caddyfile | cmp -s - "$mounted"; then
+    say "Restarting Caddy onto its changed Caddyfile."
+    compose restart caddy
+  fi
+fi
 wait_for_gateway
 check_gateway_networks
 verify_workspaces "$sha" "$image" "$expected_workspaces"
