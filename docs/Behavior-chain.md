@@ -14,6 +14,13 @@ A closed seed without a bound PR also discovers exactly one merged GitHub closin
 reference on the expected base repository and default branch, confirming its merge
 SHA through the normal PR read. Missing, ambiguous or contradictory evidence keeps
 the closure hold; discovery grants no publication ownership or new invocation.
+When the bound PR is confirmed closed without merge, the same verifier retains
+the different closing PR as separate observation evidence. Its linked reference
+does not keep an otherwise settled closed chain active. The original binding,
+invocation receipts and merge/review fields remain unchanged; GitHub's test-merge
+SHA on the unmerged binding is not evidence of a merge. Other linked PRs,
+uncertain publication, unsettled native resources and recorded review obligations
+still keep the chain active.
 
 After a confirmed merge, review reconciliation uses the last canonical
 pre-merge observation recorded before both the actual merge time and the first

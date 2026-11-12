@@ -1388,6 +1388,11 @@ For a closed seed without an owned PR, Caller's seed read can identify a sole
 merged closing PR on the expected base repository and default branch. The normal
 PR read confirms its merge SHA before reconciliation records the external outcome;
 missing original review evidence remains pending and publication ownership is unchanged.
+For a bound PR confirmed closed without merge, the same verifier retains a
+different merged closing PR separately in `externalMerge`. Only that verified
+closing reference is discounted from the active-list exclusion; the original
+binding and receipts remain unchanged, and its test-merge SHA cannot establish
+a merge. Remaining publication, native resource and review obligations stay active.
 Recovered full-suite repairs can instead end with verified supersession. The
 same journal retains failure/recovery runs, covering merges, the duplicate head
 and its native close receipt; summaries expose that evidence separately from

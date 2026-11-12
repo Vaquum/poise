@@ -183,6 +183,10 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
     publication: { pull_number: null, state: null, merged: false, merge_sha: null } }
   const closedPull = { ...closed, publication: { pull_number: 17, state: 'closed', merged: false, merge_sha: null },
     pull: { number: 17, state: 'closed', merged: false, mergeSha: null } }
+  const closing = 'https://github.com/closed/repo/pull/1260'
+  const externallyClosed = { ...closedPull, existingPulls: [closing],
+    publication: { ...closedPull.publication, merge_sha: '307c8a031acceae31843add8e66d97ce93ef5e13' },
+    externalMerge: { pull_number: 1260, merge_sha: 'd'.repeat(40) } }
   const seed = (issue: number, observation: Record<string, unknown> | null = closed) => {
     let chain = journal.append(`closed/repo#${issue}`, `closed-seed-${issue}`, 0, { type: 'chain.admitted', repository: 'closed/repo', issue,
       branch: `poise/issue-${issue}`, author: 'author', reviewer: 'reviewer' })
@@ -199,9 +203,12 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
     seed(12, { ...closedPull, publication: { ...closedPull.publication, state: 'open' } }),
     seed(13, { ...closedPull, pull: { ...closedPull.pull, number: 18 } }),
     seed(14, { ...closedPull, publication: { ...closedPull.publication, merged: true, merge_sha: 'd'.repeat(40) },
-      pull: { ...closedPull.pull, merged: true, mergeSha: 'd'.repeat(40) } })]
+      pull: { ...closedPull.pull, merged: true, mergeSha: 'd'.repeat(40) } }),
+    seed(15, { ...externallyClosed, externalMerge: undefined }),
+    seed(16, { ...externallyClosed, existingPulls: [closing, 'https://github.com/closed/repo/pull/1261'] }),
+    seed(17, { ...externallyClosed, externalMerge: { pull_number: 1260 } })]
   for (const [index, state] of ['admitted', 'started', 'uncertain', 'settled'].entries()) {
-    let chain = seed(20 + index)
+    let chain = seed(20 + index, externallyClosed)
     // Resume only to admit the original invocation; closure never settles it.
     chain = record(chain, { type: 'chain.resumed' })
     chain = record(chain, { type: 'invocation.admitted', invocation: { id: chain.id, behavior: 'resolve-threads', basis: 'seed',
@@ -213,10 +220,35 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
       callId: 'c'.repeat(32), outcome: 'target_closed', evidence: { status: 'deferred', action: 'not_started' } })
     retained.push(chain)
   }
-  let pending = seed(30)
+  let publication = seed(24, externallyClosed)
+  publication = record(publication, { type: 'chain.resumed' })
+  publication = record(publication, { type: 'invocation.admitted', invocation: { id: publication.id, behavior: 'publish-issue', basis: 'seed',
+    actor: publication.author, model: null, slot: null, admittedAt: Date.now(),
+    request: { command: 'github-interface', argv: ['--fixture'], cwd: '/fixture' } } })
+  publication = record(publication, { type: 'invocation.settled', invocationId: publication.id, callId: 'b'.repeat(32),
+    outcome: 'published', evidence: { publicationResume: { correlation: 'original-publication' } } })
+  retained.push(publication)
+  let pending = seed(30, externallyClosed)
   pending = record(pending, { type: 'chain.merged', mergeSha: 'd'.repeat(40), evidence: {
     repository: pending.repository, pull_number: 17, merged: true, merge_sha: 'd'.repeat(40), review_complete: false } })
   retained.push(pending)
+  let held = journal.append('closed/repo#1251', 'competing-seed', 0, { type: 'chain.admitted', repository: 'closed/repo', issue: 1251,
+    branch: 'poise/issue-1251', author: 'author', reviewer: 'reviewer' })
+  for (const [index, behavior] of (['review-issue', 'implement-issue'] as const).entries()) {
+    held = record(held, { type: 'invocation.admitted', invocation: { id: `competing-${index}`, behavior, basis: 'original',
+      actor: index ? held.author : held.reviewer, model: 'fixture', slot: 'primary', admittedAt: Date.now(),
+      request: { command: 'agent-interface', argv: ['--fixture'], cwd: '/fixture', nativeResources: 2 } } })
+    held = record(held, { type: 'invocation.settled', invocationId: `competing-${index}`, callId: String(index + 1).repeat(32),
+      outcome: 'completed', evidence: { status: 'completed', resources_settled_at: new Date().toISOString(),
+        resource_ownership: { version: 1, roots: [], errors: [] } } })
+  }
+  const heldClosed = { ...externallyClosed, publication: { ...externallyClosed.publication, pull_number: 1259 },
+    pull: { ...externallyClosed.pull, number: 1259 } }
+  held = record(held, { type: 'chain.observed', observation: { ...heldClosed, issue: { open: true }, externalMerge: undefined } })
+  held = record(held, { type: 'chain.held', reason: `seed issue already belongs to existing work: ${closing}` })
+  expect(journal.page('closed/', 100, false)).toContainEqual(held)
+  held = record(held, { type: 'chain.observed', observation: heldClosed })
+  quiescent.push(held)
   const before = quiescent.map(chain => journal.history(chain.id))
   const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -226,6 +258,8 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
   try {
     const active = await (await fetch(`${base}?state=active&after=closed/`)).json()
     expect(active.chains.map((chain: { id: string }) => chain.id).sort()).toEqual(retained.map(chain => chain.id).sort())
+    const attention = (await (await fetch(`${base}?state=active`)).json()).attention.map((chain: { id: string }) => chain.id)
+    for (const chain of quiescent) expect(attention).not.toContain(chain.id)
     const all = await (await fetch(`${base}?after=closed/`)).json()
     const merged = await (await fetch(`${base}?state=merged&after=closed/`)).json()
     for (const [index, chain] of quiescent.entries()) {
@@ -233,7 +267,7 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
       expect(merged.chains.map((row: { id: string }) => row.id)).not.toContain(chain.id)
       const detail = await (await fetch(`${base}?id=${encodeURIComponent(chain.id)}`)).json()
       expect(detail.chain).toEqual(behaviorChainSummary(chain, { at: journal.reconciliationAt(chain) }))
-      expect(detail.events.map((event: { type: string }) => event.type)).toEqual(['chain.admitted', 'chain.observed', 'chain.held'])
+      expect(detail.events.map((event: { type: string }) => event.type)).toEqual(before[index].map(row => JSON.parse(row.payload).type))
       expect(journal.read(chain.id)).toEqual(chain)
       expect(journal.history(chain.id)).toEqual(before[index])
     }
@@ -241,6 +275,10 @@ it('excludes closed seeds only after PR, execution, resource and review obligati
     const rebuilt = await (await fetch(`${base}?state=active&after=closed/`)).json()
     expect(rebuilt).toEqual(active)
     expect(journal.forPull('closed/repo', 16)).toEqual(quiescent[1])
+    expect(journal.forPull('closed/repo', 1259)).toEqual(held)
+    expect(journal.forPull('closed/repo', 1260)).toBeNull()
+    expect(journal.history(held.id)).toEqual(before.at(-1))
+    expect((await (await fetch(`${base}?state=active`)).json()).attention.map((chain: { id: string }) => chain.id)).toEqual(attention)
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
 })
 
