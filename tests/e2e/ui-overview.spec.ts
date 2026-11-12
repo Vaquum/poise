@@ -364,3 +364,21 @@ test('In motion says what was never read, rather than zero or clear', async ({ p
   await expect(page.locator('[data-counts="items"] b').first()).toHaveText('—')
   await expect(page.locator('[data-worklist]')).toHaveText('Not read yet.')
 })
+
+test('a reload opens Overview on the settings this browser remembers, without waiting for the server’s', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+  // The server's settings answer is held; the reload opens the place anyway.
+  let answer: () => void = () => {}
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    await new Promise<void>((resolve) => { answer = resolve })
+    return route.fallback()
+  })
+  await page.reload()
+  await expect(page.getByRole('complementary', { name: 'Answer here' })).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('.ova-main')).toBeVisible({ timeout: 2_000 })
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+  answer()
+  await expect(page.locator('[data-mgrbox]')).not.toContainText('Settings could not be read')
+})

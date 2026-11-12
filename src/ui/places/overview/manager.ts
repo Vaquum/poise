@@ -3,7 +3,7 @@
 // controls and Settings → Manager. Each change sends only its own field, with
 // the value this tab read, and shows what the service saved.
 import type { SessionRecord } from '../../../../server/chat/protocol'
-import { getSettings, setLocalSettings, settingsLoadOk, type AppSettings } from '../../../config'
+import { getSettings, setLocalSettings, settingsLoaded, settingsLoadOk, type AppSettings } from '../../../config'
 import { placeHref } from '../../address'
 import { $, esc } from '../../dom'
 import { hydrateIcons } from '../../icons'
@@ -105,8 +105,11 @@ export function mountManager(ctx: PartContext, box: HTMLElement, sessions: () =>
     if (button.dataset.act === 'mgr-paused') void save('paused', !m.paused)
   }, { signal: ctx.signal })
 
-  // The place read Settings before it mounted; a failed read shows here, never guessed controls.
-  error = !settingsLoadOk() ? 'Settings could not be read' : managerOf(getSettings()) ? '' : 'the service answered without them'
+  // A failed read of Settings shows here, never guessed controls. A place opened
+  // on the settings this browser remembers repaints when the fresh read lands.
+  const judge = () => { error = !settingsLoadOk() && !settingsLoaded() && managerOf(getSettings()) ? '' : !settingsLoadOk() ? 'Settings could not be read' : managerOf(getSettings()) ? '' : 'the service answered without them' }
+  judge()
   paint()
+  window.addEventListener('poise:settings-read', () => { if (!saving && !$('[data-act]:focus', box)) { judge(); paint() } }, { signal: ctx.signal })
   return { sessionsChanged: () => { if (!saving && !$('[data-act]:focus', box)) paint() } }
 }
