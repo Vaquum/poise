@@ -345,3 +345,9 @@ test('behind the gateway, a workspace still to be set up opens setup at GitHub, 
   await expect(page.getByRole('dialog')).toBeVisible()
   await expect(page.locator('#ob-title')).toHaveText('Connect your GitHub account')
 })
+
+test('Settings → Manager explains Rhythm on a direct load, without Overview', async ({ page }) => {
+  await settings(page, {}, '/?view=settings&settings=manager')
+  await page.locator('[data-ref="mgr.rhythm"]').first().hover()
+  await expect(page.getByRole('tooltip')).toContainText('How many workers the Manager keeps on tasks at once')
+})

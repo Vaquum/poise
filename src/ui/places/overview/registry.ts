@@ -104,23 +104,6 @@ export const OVERVIEW: Registry = {
 
   /* ---------- The Manager, on the same settings as its controls ---------- */
   mgr: { name: 'The Manager', kind: 'Agent', what: 'The agent that plans work across workers, starts them within your Rhythm, and brings decisions to you according to Autonomy.', does: 'Its chat is where you instruct it. Its controls live in its place and in Settings → Manager, on the same settings as this card.' },
-  'mgr.effective': { name: 'In effect', kind: 'Display', what: 'Your Manager controls read together, with what they govern.', now: (el) => text(el.querySelector('.sentence') ?? el), scope: 'Work the Manager runs in this workspace.', source: 'The same settings, live.' },
-  'mgr.rhythm': {
-    name: 'Rhythm', kind: 'Manager control', what: 'How many workers the Manager keeps on tasks at once: 1 to 10 slots.',
-    does: 'Each worker holds a slot from the moment it takes a task until its chat is closed. A free slot gets the Manager’s next ticket, as a new worker, on its next turn.',
-    now: (el) => { const r = el.closest<HTMLElement>('.omgr')?.querySelector<HTMLElement>('[data-rhythm]'); if (!r) return ''; const { limit, used } = r.dataset; return used === undefined ? `${limit} slots.` : `${limit} slots; ${used} held by workers.` },
-    values: [['1', 'One task at a time: slow and easy to follow.'], ['5', 'Default.'], ['10', 'The most parallel work Poise allows; more to watch.']],
-    scope: 'Workers the Manager runs in this workspace.',
-    when: 'From the Manager’s next turn, which carries it. Lowering it below current use lets each worker finish its task, and starts nothing new until use is below the limit.',
-    unchanged: 'Running at once, chats you run yourself, Stability ↔ Expansion and Autonomy.',
-    source: 'The same setting as Settings → Manager → Rhythm.',
-  },
-  'mgr.paused': {
-    name: 'Pause new work', kind: 'Manager control', what: 'Tells the Manager that new work waits until you resume. It still wakes, watches and answers; it gives out no new ticket.',
-    now: (el) => ((el.closest('[aria-pressed]') ?? el).getAttribute('aria-pressed') === 'true' ? 'Paused: new work waits until you resume.' : 'Not paused.'),
-    when: 'From the Manager’s next turn.', unchanged: 'Workers already on tasks, which finish them; wake-ups; Hold, which is separate.',
-    source: 'The paused flag in the Manager controls, the same setting as Settings → Manager.',
-  },
   'mgr.why': { name: 'Why this came to you', kind: 'Display', what: 'The reason this decision was brought to you.', now: (el) => text(el) },
 }
 
