@@ -41,6 +41,7 @@ export interface ServiceHealth {
   runningCallerCalls: number
   /** Missing on older workspaces; null when their native resource records are unreadable. */
   unsettledNativeCalls?: number | null
+  nativeCleanupHold?: { callId: string; reason: string | null }
   backgroundWork: number
   /** True only when activeChatTurns, runningCallerCalls and backgroundWork are all 0. */
   idle: boolean
@@ -154,11 +155,23 @@ function parseHealth(text: string, what: string): ServiceHealth {
   if (nativeCalls !== undefined && nativeCalls !== 0 && value.idle) {
     throw new WorkspaceAnswerError(`the workspace answered ${what} idle with unsettled or unknown native resources`)
   }
+  let nativeCleanupHold: ServiceHealth['nativeCleanupHold']
+  const hold = value.nativeCleanupHold
+  if (hold !== undefined) {
+    if (typeof nativeCalls !== 'number' || nativeCalls === 0
+        || !hold || typeof hold !== 'object'
+        || !('callId' in hold) || typeof hold.callId !== 'string' || !/^[a-f0-9]{32}$/.test(hold.callId)
+        || !('reason' in hold) || (hold.reason !== null && (typeof hold.reason !== 'string' || hold.reason.length > 2000))) {
+      throw new WorkspaceAnswerError(`the workspace answered ${what} with an invalid native cleanup hold`)
+    }
+    nativeCleanupHold = { callId: hold.callId, reason: hold.reason }
+  }
   return {
     ok: value.ok,
     activeChatTurns: value.activeChatTurns,
     runningCallerCalls: value.runningCallerCalls,
     ...(nativeCalls === undefined ? {} : { unsettledNativeCalls: nativeCalls }),
+    ...(nativeCleanupHold && { nativeCleanupHold }),
     backgroundWork: value.backgroundWork,
     idle: value.idle,
     draining: value.draining,
@@ -229,6 +242,7 @@ export class Orchestrator {
   private readonly refused = new Map<string, string>()
   /** The release a stuck-switch warning was logged for, so it warns once per release, not per pass. */
   private readonly stuckWarned = new Map<string, string>()
+  private readonly deferredCleanup = new Map<string, string>()
 
   constructor(private readonly deps: OrchestratorDeps) {
     this.drainPollMs = deps.drainPollMs ?? DRAIN_POLL_MS
@@ -470,6 +484,8 @@ export class Orchestrator {
             if (updated === true) continue
             if (updated === 'unreachable') fallback = target
           }
+          if (details.State.Running && await this.cleanupStillHeld(handle, login)) continue
+          this.deferredCleanup.delete(handle)
           await this.upgrade(handle, login, imageId, reason, target, fallback)
         } catch (error) {
           log.error('workspace.upgrade.failed', { handle, error: errorMessage(error) })
@@ -478,6 +494,19 @@ export class Orchestrator {
       }
     } finally {
       this.upgrading = false
+    }
+  }
+
+  private async cleanupStillHeld(handle: string, login: string): Promise<boolean> {
+    const callId = this.deferredCleanup.get(handle)
+    if (!callId) return false
+    try {
+      const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
+      return health.ok && health.nativeCleanupHold?.callId === callId
+    } catch (error) {
+      if (error instanceof WorkspaceNetworkError) throw error
+      this.deps.log.warn('workspace.upgrade.native-check.failed', { handle, callId, error: errorMessage(error) })
+      return false
     }
   }
 
@@ -855,8 +884,13 @@ export class Orchestrator {
         if (!result.idle) sawDown = sawDown || result.sawDown
         lastCounts = result.lastCounts ?? lastCounts
         if (result.nativePending) {
-          this.deps.log.warn('workspace.upgrade.native-pending', { handle })
-          await abortUnknown('native cleanup remains pending or unknown without a live Caller; deferred to the next upgrade pass')
+          const { nativeCleanupHold, unsettledNativeCalls } = result.nativePending
+          if (nativeCleanupHold) this.deferredCleanup.set(handle, nativeCleanupHold.callId)
+          this.deps.log.warn('workspace.upgrade.native-pending', { handle, unsettledNativeCalls: unsettledNativeCalls ?? null,
+            ...(nativeCleanupHold && { callId: nativeCleanupHold.callId, cleanupReason: nativeCleanupHold.reason }) })
+          await abortUnknown(nativeCleanupHold
+            ? 'original native cleanup remains held; deferred to the next upgrade pass'
+            : 'native cleanup remains pending or unknown without a live Caller; deferred to the next upgrade pass')
           return
         }
         if (result.idle) {
@@ -958,7 +992,7 @@ export class Orchestrator {
    * answer showing it off un-admits, and a round with no usable answer leaves it alone.
    */
   private async drain(handle: string, login: string, deadline: number, dispatched: { value: boolean }, fallback: ImageRelease | null): Promise<{
-    idle: boolean; nativePending: boolean; recovered: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; observed: boolean; sawDown: boolean;
+    idle: boolean; nativePending: ServiceHealth | null; recovered: boolean; attempted: boolean; confirmedBusy: boolean; admitted: boolean; observed: boolean; sawDown: boolean;
     lastCounts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null
   }> {
     const { config, log, now } = this.deps
@@ -970,7 +1004,7 @@ export class Orchestrator {
     let sawDown = false
     let sawDraining = false
     const lastCounts: { counts: { activeChatTurns: number; runningCallerCalls: number; backgroundWork: number } | null } = { counts: null }
-    const done = (idle: boolean, nativePending = false, recovered = false) => ({ idle, nativePending, recovered, attempted: dispatched.value, confirmedBusy, admitted, observed, sawDown, lastCounts: lastCounts.counts })
+    const done = (idle: boolean, nativePending: ServiceHealth | null = null, recovered = false) => ({ idle, nativePending, recovered, attempted: dispatched.value, confirmedBusy, admitted, observed, sawDown, lastCounts: lastCounts.counts })
     const recovered = async (health: ServiceHealth): Promise<boolean> => {
       if (!fallback || !health.ok || health.release !== fallback.release) return false
       // Settings or the container may have changed while the drain waited outside the lock.
@@ -982,7 +1016,8 @@ export class Orchestrator {
     }
     // Original cleanup may be permanently held after controller loss. It must not subject Chat
     // to a full drain deadline on every upgrade pass; existing maintenance can retry without it.
-    const pendingCleanup = (health: ServiceHealth): boolean => !health.idle && health.unsettledNativeCalls !== 0 && health.runningCallerCalls === 0
+    const pendingCleanup = (health: ServiceHealth): boolean => !health.idle
+      && (health.nativeCleanupHold !== undefined || (health.unsettledNativeCalls !== 0 && health.runningCallerCalls === 0))
     const waiting = (health: ServiceHealth): void => {
       log.info('workspace.drain.waiting', {
         handle,
@@ -1037,14 +1072,14 @@ export class Orchestrator {
     }
     try {
       const health = await postDrain()
-      if (await recovered(health)) return done(false, false, true)
+      if (await recovered(health)) return done(false, null, true)
       if (!health.ok || !health.draining) {
         unconfirmed(health)
       } else {
         this.lifecycle('workspace.drain.requested', handle, counts(health))
         note(health)
         if (health.idle) return done(true)
-        if (pendingCleanup(health)) return done(false, true)
+        if (pendingCleanup(health)) return done(false, health)
       }
     } catch (error) {
       if (error instanceof WorkspaceNetworkError) throw error
@@ -1058,13 +1093,13 @@ export class Orchestrator {
         if (renew) {
           const health = await postDrain()
           requestedAt = now()
-          if (await recovered(health)) return done(false, false, true)
+          if (await recovered(health)) return done(false, null, true)
           // A renewal that finally shows the drain confirms the admission the first POST missed.
           if (!health.ok || !health.draining) unconfirmed(health)
           else {
             if (!admitted) this.lifecycle('workspace.drain.requested', handle, counts(health))
             note(health)
-            if (pendingCleanup(health)) return done(false, true)
+            if (pendingCleanup(health)) return done(false, health)
             if (health.idle) {
               this.lifecycle('workspace.drain.idle', handle)
               return done(true)
@@ -1073,9 +1108,9 @@ export class Orchestrator {
           }
         } else {
           const health = await this.serviceCall(handle, login, 'GET', '/api/service/health')
-          if (await recovered(health)) return done(false, false, true)
+          if (await recovered(health)) return done(false, null, true)
           note(health)
-          if (health.ok && health.draining && pendingCleanup(health)) return done(false, true)
+          if (health.ok && health.draining && pendingCleanup(health)) return done(false, health)
           // Idle behind an applied drain finishes; idle without one waits for a renewal to admit.
           // A lifted drain re-applies on renewal, so waiting costs one renew cycle, never safety.
           if (health.ok && health.idle && health.draining) {

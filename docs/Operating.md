@@ -981,9 +981,10 @@ the original cleanup witnesses alive. Older workspaces can still upgrade when
 cooperatively idle. Abrupt container loss without original cleanup proof keeps
 the disk and reservation held; a restart cannot prove reclamation.
 Pending or unknown native cleanup without a live Caller releases the drain
-immediately, without activation or waiting out its deadline. Later upgrade passes
-retry the same check while ordinary maintenance retries cleanup; a permanent
-resource hold cannot continuously drain Chat.
+immediately. A recorded terminal cleanup failure also releases the drain if
+other Caller work is active. The gateway logs the blocking Call and its
+available reason, and later passes read health before admitting another drain
+for that Call. Ordinary maintenance continues to retry cleanup between passes.
 After starting the replacement the gateway
 waits for its health before declaring the upgrade finished, within the two-minute
 idle-to-ready bound; past it the miss is recorded (`workspace.upgrade.ready.missed`),

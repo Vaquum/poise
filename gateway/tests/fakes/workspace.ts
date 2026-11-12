@@ -14,6 +14,7 @@ export interface StubHealth {
   activeChatTurns: number
   runningCallerCalls: number
   unsettledNativeCalls?: number | null
+  nativeCleanupHold?: { callId: string; reason: string | null }
   backgroundWork: number
   draining: boolean
   /** The release its supervisor runs; null for a workspace started without one. */

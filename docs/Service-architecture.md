@@ -653,6 +653,11 @@ assertion may only resume, and anything else is refused with 403):
   - `unsettledNativeCalls` exposes the same bounded Caller read's count of
     native Calls awaiting durable resource release or cleanup-claim retirement.
     It is `null` when that read is unknown, never an assumed zero.
+  - Optional `nativeCleanupHold` identifies one terminal Call with a recorded
+    cleanup failure from that same snapshot. It exposes `callId` and a bounded,
+    redacted `reason`, which is `null` while a retry owns the claim and has yet
+    to record its result. After deferring replacement for a reported hold,
+    the gateway checks that Call on later passes before admitting a drain.
   - `backgroundWork` counts everything else a restart would cut: the Chat
     runtime's startups, operations and agent processes, process-owned
     background work (behavior ticks, provider CLI updates, the model check),

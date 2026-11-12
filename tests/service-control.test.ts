@@ -118,15 +118,20 @@ describe('service health', () => {
     const database = new Database(join(records, 'calls.sqlite3'))
     database.exec('create table calls (id text, status text, pid integer, runner text, source text, resources_settled_at real, resource_cleanup text)')
     const insert = database.prepare('insert into calls values (?,?,?,?,?,?,?)')
-    insert.run('interrupted', 'failed', null, null, 'poise:behavior-chain', null, '{"token":"private"}')
+    const heldId = 'a'.repeat(32)
+    const claim = { token: 'private-cleanup-token', failures: 2, last_error: 'Original handle missing: Bearer sample-credential' }
+    insert.run(heldId, 'failed', null, null, 'poise:behavior-chain', null, JSON.stringify(claim))
     insert.run('fenced', 'superseded', null, null, 'poise:behavior-chain', 1, null)
     insert.run('chat', 'failed', null, 'external', 'poise:chat', null, null)
     vi.stubEnv('AGENT_INTERFACE_DATA_DIR', records)
     vi.stubEnv('POISE_MODE', 'service')
     try {
-      expect(service.health()).toMatchObject({ runningCallerCalls: 0, unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
+      const hold = { callId: heldId, reason: 'Original handle missing: [redacted credential]' }
+      expect(service.health()).toMatchObject({ runningCallerCalls: 0, unsettledNativeCalls: 1, nativeCleanupHold: hold, backgroundWork: 1, idle: false })
+      expect(JSON.stringify(service.health())).not.toContain(claim.token)
       expect(service.drain()).toMatchObject({ draining: true, unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
-      const original = database.prepare("select * from calls where id='interrupted'").get()
+      const readHeld = database.prepare('select * from calls where id=?')
+      const original = readHeld.get(heldId)
       for (const repositories of ['acme/repo', '']) {
         const body = JSON.stringify({ repairExhaustionRepositories: repositories })
         const req = Object.assign(Readable.from([body]), { method: 'POST', headers: { 'content-type': 'application/json' } }) as unknown as IncomingMessage
@@ -134,12 +139,13 @@ describe('service health', () => {
         await control.handleServiceApi(req, res as unknown as ServerResponse, '/api/service/config', { kind: 'gateway', scope: 'admin' }, service)
         expect(res.statusCode).toBe(200)
         expect(service.health()).toMatchObject({ repairExhaustionRepositories: repositories, draining: true, unsettledNativeCalls: 1, idle: false })
-        expect(database.prepare("select * from calls where id='interrupted'").get()).toEqual(original)
+        expect(readHeld.get(heldId)).toEqual(original)
       }
-      database.exec("update calls set resources_settled_at=1 where id='interrupted'")
-      expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, backgroundWork: 1, idle: false })
-      database.exec("update calls set resource_cleanup=null where id='interrupted'")
+      database.prepare('update calls set resources_settled_at=1 where id=?').run(heldId)
+      expect(service.health()).toMatchObject({ unsettledNativeCalls: 1, nativeCleanupHold: hold, backgroundWork: 1, idle: false })
+      database.prepare('update calls set resource_cleanup=null where id=?').run(heldId)
       expect(service.health()).toMatchObject({ unsettledNativeCalls: 0, backgroundWork: 0, idle: true, draining: true })
+      expect(service.health().nativeCleanupHold).toBeUndefined()
     } finally {
       service.resume()
       vi.stubEnv('AGENT_INTERFACE_DATA_DIR', '')

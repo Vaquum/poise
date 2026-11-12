@@ -598,6 +598,31 @@ describe('image upgrades', () => {
     expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/resume')).toHaveLength(3)
   }, 5000)
 
+  it('keeps work available after a native cleanup hold and replaces after it clears', async () => {
+    await start()
+    const before = h.docker.containers.get('poise-ws-alice')?.id
+    const hold = { callId: 'a'.repeat(32), reason: 'Original native resource handle is unavailable' }
+    Object.assign(h.workspace.health, { unsettledNativeCalls: 1, backgroundWork: 1, nativeCleanupHold: hold })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.health.draining).toBe(false)
+    expect(h.logs.filter(entry => entry.event === 'workspace.upgrade.native-pending')).toEqual([
+      expect.objectContaining({ callId: hold.callId, cleanupReason: hold.reason, unsettledNativeCalls: 1 }),
+    ])
+
+    // A new Caller launch does not change the original failed cleanup.
+    Object.assign(h.workspace.health, { unsettledNativeCalls: 2, backgroundWork: 2, runningCallerCalls: 1 })
+    await h.orchestrator.upgradePass()
+    expect(h.workspace.health.draining).toBe(false)
+    expect(h.docker.containers.get('poise-ws-alice')?.id).toBe(before)
+    expect(h.workspace.serviceRequests.filter(request => request.url === '/api/service/drain')).toHaveLength(1)
+
+    delete h.workspace.health.nativeCleanupHold
+    Object.assign(h.workspace.health, { unsettledNativeCalls: 0, backgroundWork: 0, runningCallerCalls: 0 })
+    await h.orchestrator.upgradePass()
+    expect(h.docker.containers.get('poise-ws-alice')?.id).not.toBe(before)
+    expect(h.docker.containers.get('poise-ws-alice')).toMatchObject({ imageId: CURRENT_IMAGE_ID, running: true })
+  })
+
   it('notices a drain lifted while it waits instead of silently draining again', async () => {
     await start({ drainRenewMs: 200 })
     h.workspace.health.runningCallerCalls = 1
