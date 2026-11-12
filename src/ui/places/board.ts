@@ -500,7 +500,7 @@ export const mount: MountPlace = (ctx) => {
         for (const it of items) {
           const card = before.has(it.id) && before.get(it.id) !== sig(it) ? $(`.card[data-id="${CSS.escape(it.id)}"]`, lanesEl) as HTMLElement | null : null
           const focused = document.activeElement
-          if (!card || armedAssign === it.id || (focused !== card && card.contains(focused))) continue
+          if (!card || armedAssign?.id === it.id || (focused !== card && card.contains(focused))) continue
           const fresh = document.createElement('div')
           fresh.innerHTML = liveHTML(it)
           const next = fresh.firstElementChild as HTMLElement
@@ -757,15 +757,22 @@ export const mount: MountPlace = (ctx) => {
       toast(`The review did not start: ${(error as Error).message}`, 'failed')
     }
   }
-  let armedAssign: string | null = null
+  let armedAssign: { id: string, button: HTMLElement, original: string } | null = null
   async function assign(b: HTMLElement, it: Item): Promise<void> {
-    if (armedAssign !== it.id) {
-      armedAssign = it.id
+    if (armedAssign?.id !== it.id) {
+      const prev = armedAssign
+      if (prev && prev.button.isConnected) {
+        prev.button.innerHTML = prev.original
+        prev.button.setAttribute('aria-label', 'Assign to Poise')
+        prev.button.classList.remove('is-armed')
+      }
       const original = b.innerHTML
+      const armed = { id: it.id, button: b, original }
+      armedAssign = armed
       b.textContent = 'Sure?'
       b.setAttribute('aria-label', 'Sure?')
       b.classList.add('is-armed')
-      ctx.after(4000, () => { if (armedAssign === it.id) { armedAssign = null; if (b.isConnected) { b.innerHTML = original; b.setAttribute('aria-label', 'Assign to Poise'); b.classList.remove('is-armed') } } })
+      ctx.after(4000, () => { if (armedAssign === armed) { armedAssign = null; if (b.isConnected) { b.innerHTML = original; b.setAttribute('aria-label', 'Assign to Poise'); b.classList.remove('is-armed') } } })
       return
     }
     armedAssign = null
