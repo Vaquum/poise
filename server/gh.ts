@@ -778,7 +778,9 @@ export async function handleGhBody(body: any): Promise<{ status: number, body: u
   const op = body?.operation
   const me = getMeta('me') || ''
   if (op !== 'list') return handleGhOperation(body, op, me)
-  const key = JSON.stringify([me, body])
+  // Everything the read depends on keys it: an account or an organization that
+  // changes while one runs starts a new read, never joins the old one.
+  const key = JSON.stringify([me, getMeta('agentAccount') || '', getOrganizations().map((org) => [org.login, org.status, org.datastorePath, org.error]), body])
   const running = listReads.get(key)
   if (running) return running
   const result = handleGhOperation(body, op, me)
