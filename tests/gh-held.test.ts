@@ -284,6 +284,26 @@ describe('reading the checks again', () => {
     }
   })
 
+  it('reads again what a later read finds past its minute while a refresh still runs', async () => {
+    await greenPr({ '#81': evidence({ status: 'yellow' }) }, [81])
+    await greenPr({ '#82': evidence({ status: 'yellow' }) }, [82])
+    expect(mergeableCalls()).toHaveLength(2)
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 2 * 60_000)
+    try {
+      const first = gatedRead([81])
+      await first.read
+      await vi.waitFor(() => expect(mergeableCalls()).toHaveLength(3))
+      // A read of other pull requests while #81's refresh is still out.
+      const second = gatedRead([82])
+      await second.read
+      first.release()
+      second.release()
+      await vi.waitFor(() => expect(mergeableCalls().map(([, args]) => args[1])).toEqual(['#81', '#82', '#81', '#82']))
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   it('waits for GitHub when the last check is more than five minutes past its minute', async () => {
     await greenPr({ '#71': evidence({ status: 'yellow' }) }, [71])
     const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 7 * 60_000)
