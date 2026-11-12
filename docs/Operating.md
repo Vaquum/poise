@@ -350,6 +350,20 @@ poise.example.com {
 }
 ```
 
+Apply the retry window to every handler that reaches the gateway, including
+separate Poise Link and authenticated routes. Leave `lb_retry_match` unset:
+Caddy can retry any method after a failed dial, but its default only retries
+GET after a connected request fails. A dispatched mutation with an unknown
+outcome must not be replayed. Genuine upstream HTTP 502 responses and connection
+failures that exhaust the 30-second window remain visible.
+
+Validate and reload the operator-owned Caddy, then inspect its private admin
+API (`GET /config/`) to confirm every gateway handler has the retry window.
+`deploy/upgrade.sh` reloads only the bundled Caddy. For replacement proof,
+record the old and new gateway container IDs, start public requests while the
+gateway listener is absent, and wait for their completed results through the
+successor. Include a POST handled exactly once; readiness alone is insufficient.
+
 Point the DNS records at the proxy. The OAuth App and everything after it
 are the same as above.
 
