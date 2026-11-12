@@ -104,6 +104,7 @@ tests/release-background.test.ts
 tests/release-line.test.ts
 tests/release-worker-safety.test.mjs
 tests/running-release.test.ts
+tests/runtime-supervisor.test.mjs
 tests/self-update-client.test.ts
 tests/self-update-controller.test.mjs
 tests/self-update-daemon.test.mjs

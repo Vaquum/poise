@@ -278,6 +278,7 @@ export function supervisor({
   }),
   now = Date.now,
   diagnostic = null,
+  hasRetainedShutdownFailure = null,
   log = (line) => console.log(`poise-runtime: ${line}`),
 } = {}) {
   const releases = join(home, '.poise', 'releases')
@@ -347,10 +348,11 @@ export function supervisor({
 
   const runOnce = (release) => new Promise((resolve) => {
     const began = now()
+    const shutdownId = randomBytes(16).toString('hex')
     const spawnFailure = (error) => record({ level: 'error', operation: 'workspace.spawn', phase: 'application_spawn', release: release.name,
       message: error.message, stack: error.stack, errno: error.errno ?? error.code ?? null,
       context: { executable: process.execPath, cwd: release.poise, elapsedMs: now() - began, processErrorCode: error.code ?? null } })
-    try { child = start(release, childEnv(release)) }
+    try { child = start(release, { ...childEnv(release), POISE_SHUTDOWN_DIAGNOSTIC_ID: shutdownId }) }
     catch (error) { spawnFailure(error); throw error }
     child.once('error', (error) => {
       spawnFailure(error)
@@ -359,7 +361,12 @@ export function supervisor({
       resolve(1)
     })
     child.once('exit', (code, signal) => {
-      if (!stopping && code !== UPDATE_EXIT_CODE && (code !== 0 || signal)) record({ level: 'error', operation: 'workspace.exit', phase: 'application_exit',
+      let shutdownFailureRetained = false
+      if (code === 1 && !signal) {
+        try { shutdownFailureRetained = hasRetainedShutdownFailure?.(shutdownId) === true }
+        catch (error) { console.error(`poise-runtime: shutdown diagnostic evidence unavailable: ${error instanceof Error ? error.name : 'read failure'}`) }
+      }
+      if (!stopping && code !== UPDATE_EXIT_CODE && (code !== 0 || signal) && !shutdownFailureRetained) record({ level: 'error', operation: 'workspace.exit', phase: 'application_exit',
         release: release.name, message: `Workspace application exited (code ${code}, signal ${signal})`, exitCode: code, signal,
         context: { executable: process.execPath, cwd: release.poise, elapsedMs: now() - began, stderrEvidence: 'Application diagnostics use the inherited stream and separate durable store' } })
       child = null
@@ -402,9 +409,10 @@ export function supervisor({
 
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
   let diagnostic = null
-  try { ({ recordRuntimeDiagnostic: diagnostic } = await import('/opt/poise/dist/runtime-diagnostic.js')) }
+  let hasRetainedShutdownFailure = null
+  try { ({ recordRuntimeDiagnostic: diagnostic, hasRetainedShutdownFailure } = await import('/opt/poise/dist/runtime-diagnostic.js')) }
   catch { process.stderr.write('poise-runtime: diagnostic helper unavailable.\n') }
-  const instance = supervisor({ diagnostic })
+  const instance = supervisor({ diagnostic, hasRetainedShutdownFailure })
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => instance.stop(signal))
   process.exitCode = await instance.run()
 }
