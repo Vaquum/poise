@@ -1,8 +1,6 @@
 /* Current — the board as one line: Idea → Concept → Plan → Issue → PR. Tokens only. */
 
-.cur-page { height: 100vh; overflow: hidden; }
-.cur-page .frame { height: calc(100vh - var(--foot-h)); min-height: 0; }
-.cur { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; }
+.cur { display: grid; grid-template-rows: auto minmax(0, 1fr); height: calc(100vh - var(--size-topbar) - var(--foot-h)); min-height: 0; }
 
 /* ---------- Header: scope, what shows, order, and what is in motion ---------- */
 .cur-head { display: flex; flex-direction: column; gap: var(--sp-3); padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: var(--line-hair) solid var(--c-line); }
@@ -24,7 +22,8 @@
 .cur-sum .clear:hover { color: var(--c-text); }
 
 /* ---------- Lanes sit on one route line; each scrolls on its own ---------- */
-.lanes { display: grid; grid-template-columns: repeat(5, minmax(var(--w-lane-min), 1fr)); gap: var(--sp-4); padding: var(--sp-5) var(--sp-5) 0; min-height: 0; overflow-x: auto; }
+.lanes { display: grid; grid-template-columns: repeat(5, minmax(var(--w-lane-min), 1fr)); grid-template-rows: minmax(0, 1fr); gap: var(--sp-4); padding: var(--sp-5) var(--sp-5) 0; min-height: 0; overflow-x: auto; }
+.lane { display: flex; flex-direction: column; min-height: 0; }
 /* A hairline joins the stations: present, never loud */
 .lane-h { position: relative; z-index: var(--z-raise); display: flex; align-items: center; gap: var(--sp-2); height: var(--size-control-sm); }
 .lane:not(:last-child) .lane-h::after { content: ""; position: absolute; z-index: -1; left: calc(var(--cap-w) * 0.5); right: calc((var(--sp-4) + var(--cap-w) * 0.5) * -1); top: 50%; height: var(--line-hair); background: var(--c-line); }
