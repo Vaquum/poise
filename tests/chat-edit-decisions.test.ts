@@ -188,7 +188,11 @@ describe('edit decisions', () => {
     expect(finishes).toHaveLength(3)
     const last = await read('after=0&turns=1')
     expect(last.from).toBe(finishes[1])
-    expect(last.events.map(({ seq }) => seq)).toEqual(all.events.filter(({ seq }) => seq > finishes[1]).map(({ seq }) => seq))
+    // The last turn's events, from right after the turn before it and with no gap.
+    // A turn's trailing events may still land between the two reads, so the
+    // first read is not the measure of where they end.
+    expect(last.events.map(({ seq }) => seq)).toEqual(last.events.map((_, index) => finishes[1]! + 1 + index))
+    expect(last.events.at(-1)!.seq).toBeGreaterThanOrEqual(finishes[2]!)
     expect(last.events.filter(({ event }) => event.type === 'turn.started')).toHaveLength(1)
     // A later page reads after its cursor, whatever else it asks.
     expect((await read(`after=${finishes[0]}&turns=1`)).from).toBe(finishes[0])
