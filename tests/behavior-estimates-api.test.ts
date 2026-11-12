@@ -170,6 +170,27 @@ describe('behavior estimates API', () => {
     }
   })
 
+  it('reports a failed history refresh at the next read instead of answering from the last history on and on', async () => {
+    const now = Date.now()
+    running = [row({ id: 'e'.repeat(32), status: 'running', started_at: new Date(now).toISOString(), completed_at: null, outcome: null, action: null })]
+    expect((await fetch(`${base}/api/behavior-estimates`)).status).toBe(200)
+    // Past the history's five seconds, every whole-history read fails.
+    const answer = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args.length === 1 && args[0] === '--logs') throw new Error('log unavailable')
+      return answer(command, args, options)
+    })
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6_000)
+    try {
+      // The first reader is answered from the last history; the read behind it fails, and the next readers say so.
+      expect((await fetch(`${base}/api/behavior-estimates`)).status).toBe(200)
+      await vi.waitFor(async () => expect((await fetch(`${base}/api/behavior-estimates`)).status).toBe(502))
+      expect((await (await fetch(`${base}/api/behavior-metrics`)).json() as { error: string | null }).error).toMatch(/log unavailable/)
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   it('reports no estimate below five samples and answers 502 when the log cannot be read', async () => {
     history = []
     running = [row({ id: 'e'.repeat(32), status: 'running', started_at: new Date().toISOString(), completed_at: null, outcome: null, action: null })]
