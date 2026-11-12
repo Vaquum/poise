@@ -1,4 +1,5 @@
 import { db } from './db'
+import { cachedStatement } from './statements'
 import { BehaviorChainJournal, chainIdentity } from './behavior-chain-store'
 
 let journal: BehaviorChainJournal | undefined
@@ -14,19 +15,19 @@ export function behaviorChainJournal(): BehaviorChainJournal {
 export interface ChainPullIdentity { headRef: string | null, headRepo: string | null }
 
 export function behaviorChainForPull(repository: string, number: number, identity?: ChainPullIdentity) {
-  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()) return null
+  if (!cachedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()) return null
   return behaviorChainJournal().forPull(repository, number, identity)
 }
 
 export function behaviorChainOwnsRepository(repository: string): boolean {
-  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()) return false
+  if (!cachedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()) return false
   const row = db.prepare(`SELECT chain_id FROM behavior_chain_current WHERE merged = 0
     AND lower(json_extract(state, '$.repository')) = lower(?) LIMIT 1`).get(repository) as { chain_id: string } | undefined
   return !!row && !!behaviorChainJournal().read(row.chain_id)
 }
 
 export function behaviorChainOwner(repository: string, number: number, kind: 'issues' | 'pull', identity?: ChainPullIdentity): string | null {
-  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()) return null
+  if (!cachedStatement(db, "SELECT 1 FROM sqlite_master WHERE name = 'behavior_chain_current'").get()) return null
   const source = behaviorChainJournal()
   if (kind === 'issues') {
     const chain = source.read(chainIdentity(repository, number))

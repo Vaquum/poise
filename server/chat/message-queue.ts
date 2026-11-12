@@ -4,6 +4,7 @@
 // not arm anything: only a completed turn advances the queue, except
 // recovery re-arming follow-ups a restart stranded.
 import { db } from '../db'
+import { cachedStatement } from '../statements'
 import type { MessageQueue, QueuedMessage } from './protocol'
 
 db.exec(`
@@ -50,8 +51,8 @@ function publicRow(row: Row): QueuedMessage {
   return { ...JSON.parse(row.record), state: row.state, ...(row.turn_id ? { turnId: row.turn_id } : {}), ...(row.error ? { error: row.error } : {}) }
 }
 export function readQueue(sessionId: string): MessageQueue {
-  const head = db.prepare('SELECT revision, ready, executor_session_id FROM chat_message_queue_state WHERE session_id = ?').get(sessionId) as { revision: number, ready: number, executor_session_id: string | null } | undefined
-  const rows = db.prepare("SELECT * FROM chat_message_queue WHERE session_id = ? AND state IN ('waiting', 'running', 'failed') ORDER BY rowid").all(sessionId) as Row[]
+  const head = cachedStatement(db, 'SELECT revision, ready, executor_session_id FROM chat_message_queue_state WHERE session_id = ?').get(sessionId) as { revision: number, ready: number, executor_session_id: string | null } | undefined
+  const rows = cachedStatement(db, "SELECT * FROM chat_message_queue WHERE session_id = ? AND state IN ('waiting', 'running', 'failed') ORDER BY rowid").all(sessionId) as Row[]
   return { revision: head?.revision ?? 0, ready: head?.ready === 1, items: rows.map(publicRow), ...(head?.executor_session_id ? { executorSessionId: head.executor_session_id } : {}) }
 }
 export const enqueueMessage = db.transaction((sessionId: string, item: QueuedMessage): MessageQueue => {
