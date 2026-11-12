@@ -20,15 +20,14 @@
   #view-chat:not(.chat-sidebar-collapsed) .chat-sidebar { box-shadow: var(--shadow-dialog); }
   #view-chat .chat-sidebar-resize { display: none; }
   .place .jev-title { flex-basis: 100%; order: -1; }
-  .chat-head { padding-inline: var(--sp-3); }
 
   /* Board: lanes scroll inside themselves, and a card's chat takes the place */
   .cur { position: relative; }
-  .cur-head { padding-inline: var(--sp-3); }
+  .place .cur-head { padding-inline: var(--sp-3); }
   .place .cur-filters .push { margin-left: 0; }
   .cur-head .fgrp, .cur-sumrow, .cur-sum { flex-wrap: wrap; min-width: 0; max-width: 100%; }
   .cur-partial { overflow-wrap: anywhere; }
-  .lanes { padding-inline: var(--sp-3); scroll-snap-type: x proximity; }
+  .place .lanes { padding-inline: var(--sp-3); scroll-snap-type: x proximity; }
   .lane { scroll-snap-align: start; }
   .place .bside { position: absolute; top: 0; right: 0; bottom: 0; left: 0; z-index: var(--z-panel); border-left: 0; }
 
@@ -41,7 +40,7 @@
   .ova-three, .ova-counts { grid-template-columns: minmax(0, 1fr); }
 
   /* Observe: the tables scroll inside themselves */
-  .obv-head { padding-inline: var(--sp-3); }
+  .place .obv-head { padding-inline: var(--sp-3); }
   .obv-gloss { display: none; }
   .obv-tabs { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
   .obv-tabs > * { flex: none; }
@@ -55,6 +54,5 @@
   .place .srow { grid-template-columns: minmax(0, 1fr); }
 
   /* Setup */
-  .ob-scrim { padding: var(--sp-2); }
   .ob-head, .ob-body { padding-inline: var(--sp-4); }
 }
