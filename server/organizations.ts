@@ -373,6 +373,7 @@ async function caller(path: string, args: readonly string[], me: string, env: No
   try {
     const { stdout } = await runFile('github-datastore', ['--db', path, ...args], {
       env, signal, timeoutMs: CLI_TIMEOUT_MS, maxOutputBytes: 4 * 1024 * 1024,
+      reportFailure: false,
     })
     return stdout
   } catch (error) {

@@ -770,21 +770,60 @@ describe('managed organization synchronization', () => {
     }
   })
 
-  it('exposes sync failures without dropping the org and recovers on the next sync', async () => {
-    organizations!.addOrganization('acme')
-    await ready('acme')
-    let failing = true
-    mocks.runFile.mockImplementation(async (command, args, options) => {
-      if (failing && command === 'github-datastore' && args[2] === 'sync') throw new Error('network unavailable')
-      return cli(command, args, options)
-    })
-    organizations!.retryOrganization('acme')
-    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.stage).toBe('sync-error'))
-    expect(organizations!.readyOrganizations()).toHaveLength(1)
-    failing = false
-    organizations!.retryOrganization('acme')
-    await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.error).toBeNull())
-    await ready('acme')
+  it('reports exhausted reconciliation once with its process cause and recovers after a validated sync', async () => {
+    const processes = await vi.importActual<typeof import('../server/process')>('../server/process')
+    const background = await import('../server/release-background')
+    const failures = vi.fn()
+    const stderr = 'GraphQL request failed: unexpected end of JSON input\n'
+    writeFileSync(join(tempRoot, 'github-datastore'), `#!${process.execPath}\nprocess.stderr.write(${JSON.stringify(stderr)});process.exitCode = 1`, { mode: 0o700 })
+    vi.stubEnv('CALLER_BIN_ROOT', tempRoot)
+    processes.setProcessFailureObserver(failures)
+    try {
+      organizations!.addOrganization('acme')
+      await ready('acme')
+      await vi.waitFor(() => expect(background.releaseBackgroundBusy()).toBe(0))
+      mocks.runFile.mockClear()
+      mocks.diagnosticFailure.mockClear()
+      const lastSync = Date.now() - 112_600
+      database!.db.prepare('UPDATE organizations SET last_sync_at = ?, last_reconcile_at = 0').run(lastSync)
+      let failing = true
+      mocks.runFile.mockImplementation(async (command, args, options) => {
+        if (failing && command === 'github-datastore' && args.includes('--reconcile')) return processes.runFile(command, args, options)
+        return cli(command, args, options)
+      })
+      organizations!.startOrganizationsRuntime()
+      await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.stage).toBe('sync-error'))
+      expect(mocks.diagnosticFailure).toHaveBeenCalledExactlyOnceWith('datastore.sync',
+        expect.objectContaining({ code: 1, stderr }), expect.objectContaining({
+          account: 'acme', phase: 'reconciling', lastSuccessfulSyncAt: new Date(lastSync).toISOString(),
+          ageMs: expect.any(Number), freshnessLimitMs: 120_000, retryCount: 1, nextRetryAt: expect.any(Number),
+        }), expect.any(Object))
+      expect(mocks.diagnosticFailure.mock.calls[0]![2].ageMs).toBeGreaterThanOrEqual(112_600)
+      expect(failures).not.toHaveBeenCalled()
+      expect(organizations!.getOrganizations()[0]!.error).toContain(stderr.trim())
+      expect(database!.db.prepare('SELECT last_sync_at, last_reconcile_at FROM organizations').get())
+        .toEqual({ last_sync_at: lastSync, last_reconcile_at: 0 })
+      expect(operations('health')).toHaveLength(0)
+      expect(organizations!.readyOrganizations()).toHaveLength(1)
+      failing = false
+      organizations!.retryOrganization('acme')
+      await vi.waitFor(() => expect(organizations!.getOrganizations()[0]!.error).toBeNull())
+      expect(organizations!.getOrganizations()[0]!.stage).toBe('ready')
+      expect(database!.db.prepare('SELECT sync_failures, next_sync_at FROM organizations').get())
+        .toEqual({ sync_failures: 0, next_sync_at: 0 })
+      const recovered = database!.db.prepare('SELECT last_sync_at, last_reconcile_at FROM organizations').get() as { last_sync_at: number, last_reconcile_at: number }
+      expect(recovered.last_sync_at).toBeGreaterThan(lastSync)
+      expect(recovered.last_reconcile_at).toBeGreaterThan(0)
+      expect(operations('health')).toHaveLength(1)
+      expect(operations('health')[0]![1].slice(2)).toEqual(['health', '--max-age-seconds', '120'])
+      await expect(processes.runFile('github-datastore', ['sync', '--reconcile'])).rejects.toMatchObject({ code: 1, stderr })
+      expect(failures).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ code: 1, stderr }),
+        expect.objectContaining({ command: 'github-datastore' }))
+      expect(mocks.diagnosticFailure).toHaveBeenCalledTimes(1)
+    } finally {
+      processes.setProcessFailureObserver(null)
+      vi.unstubAllEnvs()
+    }
   })
 
   it('alerts once syncs have been failing for 15 minutes, until one succeeds', async () => {
