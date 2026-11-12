@@ -151,6 +151,11 @@ The firing ledger distinguishes `review_target_closed` from a head-change
 supersession: closure ends unstarted panel slots, while any running or uncertain
 started sibling retains its actual activity. A later admission cannot inherit
 an earlier closure. A clean review becomes approval-eligible on the next scheduler scan.
+Before a legacy approval worker starts, a verified head change records the rejected
+request as superseded with settled activity and releases ownership without check
+backoff. The next tick evaluates the new head; the rejected request keeps its
+expected head. Unavailable or malformed head reads still fail visibly, and Caller
+retains its head-pinned publication guard.
 After a dismissal and a head change, a completed change-request review by the
 configured reviewer can admit a fresh head-pinned approval evaluation through
 the same activity and ownership guards. Dismissal never counts as approval.

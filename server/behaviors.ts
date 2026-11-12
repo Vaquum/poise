@@ -4544,9 +4544,19 @@ async function fireApprove(
   // in that window still posted on the pull request it was meant to stop.
   if (!isEnabled('approve-prs') || behaviorAborted()) return false
   if (currentHead !== expectedHead) {
-    throw new Error(
-      `approval head changed before launch: expected ${expectedHead}, got ${currentHead}`,
-    )
+    const settledAt = new Date().toISOString()
+    const organization = currentOrganization()?.login ?? null
+    // This rejected request has not reached markLaunchIntent's ledger admission.
+    captureBehaviorAdmission({
+      admissionKey: JSON.stringify(slot === 'primary'
+        ? [organization, 'approve-prs', claimTarget]
+        : [organization, 'approve-prs', claimTarget, slot]),
+      nativeId: claimId, behavior: 'approve-prs', source: 'poise:approve-prs', owner: organization,
+      actor, repository: pr.repo, number: pr.number, head: expectedHead, slot, plannedSlots: [slot], startedAt: settledAt,
+    })
+    captureBehaviorOutcome({ nativeId: claimId, state: 'superseded', activity: 'settled', stateSource: 'native',
+      outcome: 'superseded', completedAt: settledAt })
+    return false
   }
   // Shed load before provisioning a checkout: a launch past the shared
   // budget defers without backoff and retries when a slot frees.
