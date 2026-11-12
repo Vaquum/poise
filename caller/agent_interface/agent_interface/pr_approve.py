@@ -29,6 +29,7 @@ RULES = (
     "Confirm every defect against the cited diff line before commenting.",
     "Do not block on unverified assumptions about dependency internals; require evidence in the supplied packet.",
     "State the defect and impact in one sentence; do not write the fix.",
+    "Prefix each new finding body with [p0], [p1], or [p2]; preserve original bodies when reaffirming existing threads.",
     "Put one inline comment per {levels} finding into the single atomic review; for non-{levels}, do nothing.",
     "Avoid duplicate findings. If the supplied head reintroduces a resolved defect, report the new regression and its current evidence.",
     "Reaffirm an unresolved outdated finding only after confirming it still blocks the supplied head, using its original body and path.",
@@ -46,9 +47,12 @@ repo_name = atoms.repo_name
 
 def capped_policy(review_round: int, review_cap: int) -> str:
     return (
-        f"This is review round {review_round} of a {review_cap}-round cap: the final round. "
-        "Review the supplied immutable PR packet as usual. Do NOT request changes: file "
-        "every blocking finding as ONE follow-up issue, then approve exactly once."
+        f"This is review round {review_round} of a {review_cap}-round cap. "
+        "Review the supplied immutable PR packet as usual. On and after the capped round, "
+        "if any verified p0 (breaks a common path) remains, request changes exactly once "
+        "with ALL blocking inline findings, including p1/p2 findings. Missing or unrecognized "
+        "severity also stays blocking. Only when every finding body explicitly starts with "
+        "[p1] or [p2] (case-insensitive), file the findings as ONE follow-up issue, then approve exactly once."
         " Pass --assessment-json with a JSON object: verdict (your substantive assessment, "
         "20-4000 characters), reviewed_context (what you inspected, 20-4000 characters), "
         "and limitations (including unverified tests, 4-4000 characters)."
@@ -77,11 +81,16 @@ def capped_rules(
         "Confirm every defect against the cited diff line before commenting.",
         "Do not block on unverified assumptions about dependency internals; require evidence in the supplied packet.",
         "State the defect and impact in one sentence; do not write the fix.",
-        "Put one inline comment per {levels} finding into the follow-up issue; for non-{levels}, do nothing.",
+        "Prefix each new finding body with [p0], [p1], or [p2]; preserve original bodies when reaffirming existing threads.",
+        "Put one inline comment per {levels} finding into the single change request or follow-up issue; for non-{levels}, do nothing.",
         "Never publish duplicate findings or re-litigate resolved findings.",
-        f"First check the packet's linked_issues for an issue whose body contains "
+        "Reaffirm an unresolved current or outdated finding only after confirming it still blocks the supplied head, using its original body and thread coordinates.",
+        "github-interface deduplicates existing findings and can submit a summary-only change request reaffirming the unresolved blocker.",
+        "Check for p0, missing or unrecognized severity BEFORE checking linked issues. If any remains, "
+        "submit the ordinary atomic change request with ALL blocking findings; do not defer any or approve, even if a marked follow-up issue exists.",
+        f"Only when all findings explicitly start with [p1] or [p2] (case-insensitive), check the packet's linked_issues for an issue whose body contains "
         f"`{followup.marker(number, head)}`. If one exists, reuse it: file nothing.",
-        "If blocking findings remain and no such issue exists, file ONE follow-up issue with "
+        "If only explicitly nonbreaking findings remain and no such issue exists, file ONE follow-up issue with "
         f"exactly this command shape: `{issue_command}`. The body starts with the marker line "
         f"`{followup.marker(number, head)}`, then one section per finding with its severity, "
         "path, line, side, a permalink pinned to the supplied head for new-side findings or "
@@ -90,7 +99,7 @@ def capped_rules(
         "sentence. The issue links back to the pull request itself.",
         "File the issue BEFORE approving. If no blocking finding remains, approve without filing an issue.",
         "If filing the issue fails, submit NOTHING and report the error: never approve a round whose findings were lost.",
-        "Finish with exactly one atomic approval. Never request changes on a capped round.",
+        "Finish with exactly one atomic review: a change request when any finding must stay blocking, otherwise an approval.",
     )
 
 
@@ -98,10 +107,9 @@ def allowed(pr: str, actor: str, expected_head: str, capped: bool = False) -> li
     ref = shlex.quote(atoms.pr_ref(pr))
     fixed = atoms.fixed_mutation_args(actor, expected_head)
     if capped:
-        # A capped round cannot request changes: its findings become one
-        # follow-up issue, filed before the approval.
         token = f"--token-user {atoms.actor(actor)}"
         return [
+            f"Bash(github-interface --request-changes {ref} --comments-json * --assessment-json * {fixed})",
             f"Bash(github-interface --create-pr-linked-issue {ref} --title * --body * {token})",
             f"Bash(github-interface --approve-pr {ref} --assessment-json * {fixed})",
         ]
@@ -149,7 +157,7 @@ def run(
         rules = capped_rules(repo_name(pr, pwd), pr, expected_head, review_round or 0, review_cap or 0, actor)
     else:
         # Structured providers review as usual; the harness files the
-        # follow-up issue and converts a change request into an approval.
+        # follow-up issue and approves only explicitly nonbreaking findings.
         policy = POLICY if spec.provider == "claude" else atoms.STRUCTURED_POLICY
         rules = RULES
     text = atoms.prompt(

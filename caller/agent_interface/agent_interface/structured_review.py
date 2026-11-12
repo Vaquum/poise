@@ -545,10 +545,10 @@ def run(pwd: str, system: str, text: str, model: Model, behavior: str,
                                   diagnostic) from error
 
     capped_note = ""
-    if capped and behavior == "pr_approve" and verdict["action"] == "request_changes":
-        # The model reviewed as usual; the harness converts the change request
-        # deterministically: file the findings as one follow-up issue first,
-        # then approve. A clean verdict approves as usual, with no issue.
+    if capped and behavior == "pr_approve" and verdict["action"] == "request_changes" \
+            and all(re.match(r"\s*\[p[12]\]", comment["body"], re.IGNORECASE) for comment in verdict["comments"]):
+        # Only explicitly nonbreaking findings may be deferred. Otherwise keep
+        # the entire change request, even if a marked follow-up already exists.
         if review_round is None or review_cap is None:
             raise review_budget.ReviewLimitError(
                 "a capped approval round needs its round and cap numbers", "review_contract_violation")
