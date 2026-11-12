@@ -44,8 +44,41 @@ it('shares a list read’s chains and attention between identical reads for a fe
     expect(response.status).toBe(400)
     await (await fetch(`${base}?state=active`)).json()
     expect(pages.mock.calls.length).toBeGreaterThan(settled)
+    // Any state value reads as one of the three it can mean, and windows that ended are dropped.
+    const before = pages.mock.calls.length
+    for (const state of ['x', 'y', 'z']) await (await fetch(`${base}?state=${state}`)).json()
+    expect(pages.mock.calls.length).toBe(before + 1)
   } finally {
     clock.mockRestore()
+    pages.mockRestore()
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
+})
+
+it('clears what was shared after a change is made, so a read made meanwhile never outlasts it', async () => {
+  const journal = behaviorChainJournal()
+  const pages = vi.spyOn(journal, 'page')
+  const server = createServer((req, res) => { void handleBehaviorChains(req, res, req.url || '/') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('server did not bind')
+  const base = `http://127.0.0.1:${address.port}/api/behavior-chains`
+  try {
+    // A change whose body arrives slowly; a list read lands while it waits.
+    const http = await import('node:http')
+    const slow = new Promise<number>((resolve, reject) => {
+      const request = http.request(base, { method: 'POST', headers: { 'Content-Type': 'application/json' } }, (response) => { response.resume(); resolve(response.statusCode ?? 0) })
+      request.on('error', reject)
+      request.write('{"operation":"hold"')
+      setTimeout(() => request.end('}'), 300)
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    await (await fetch(`${base}?state=active`)).json()
+    expect(await slow).toBe(400)
+    const counted = pages.mock.calls.length
+    await (await fetch(`${base}?state=active`)).json()
+    expect(pages.mock.calls.length).toBeGreaterThan(counted)
+  } finally {
     pages.mockRestore()
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   }
