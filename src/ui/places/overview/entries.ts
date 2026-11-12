@@ -230,7 +230,8 @@ export function decisionEntries(items: readonly DecisionItem[], role: Role): Ent
       options: options.map((o) => ({ key: o.id, label: o.recommended ? `${o.label} (recommended)` : o.label, primary: o.recommended, detail: o.detail })),
       freeText: { label: options.length ? 'Something else…' : 'Answer…', placeholder: `Your answer to ${item.source.title}`, send: 'Send answer' },
       open: item.source.exists ? chatOpening(item.source.sessionId, role(item.source.sessionId)) : undefined,
-      dismissable: false, silenceable: false, behaviors: [], decision: { id: item.id },
+      // Answering settles a decision; one whose chat is gone can only be put away.
+      dismissable: !item.source.exists, silenceable: false, behaviors: [], decision: { id: item.id },
     }
   })
 }
