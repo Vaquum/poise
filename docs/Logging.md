@@ -200,6 +200,9 @@ opening prompts or response/reasoning artifacts. Process capture excludes argv,
 stdout and environments; credential commands also exclude stderr. Sync phases,
 input admission limits, model-discovery outcomes, lock acquisition failures and
 temporary-filesystem pressure retain measurements known at the source.
+Managed datastore failures are reported once by `datastore.sync` or
+`datastore.activate`, retaining the process exit code and stderr alongside retry
+and freshness context. Standalone datastore process failures are still reported.
 
 Untyped GitHub 5xx and transport failures from `github-interface`,
 `github-datastore` and Caller completions retain Warning evidence. A bare exit

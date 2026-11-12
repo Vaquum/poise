@@ -47,6 +47,7 @@ class GitHubTransportRetryTest(unittest.TestCase):
     def test_transient_transport_failures_retry_the_same_request(self) -> None:
         errors = [
             "Post https://github.example/graphql: unexpected EOF",
+            "unexpected end of JSON input",
             "read tcp 172.20.10.6:54013->140.82.121.6:443: read: can't assign requested address",
             "read tcp 172.20.10.6:54031->140.82.121.6:443: cannot assign requested address",
             "write tcp 172.20.10.6:54041->140.82.121.6:443: write: broken pipe",
@@ -86,14 +87,15 @@ class GitHubTransportRetryTest(unittest.TestCase):
                     self.assertEqual(request.kwargs["env"], environment)
 
     def test_exhausted_retries_raise_the_original_transport_diagnostic(self) -> None:
-        error = "Post https://github.example/graphql: unexpected EOF"
-        with patch("github_datastore.github_api.subprocess.run", return_value=failed(error)) as run:
-            with patch("github_datastore.github_api.time.sleep") as sleep:
-                with self.assertRaises(GitHubApiError) as raised:
-                    GitHubClient().graphql(QUERY, VARIABLES)
-        self.assertEqual(str(raised.exception), f"GraphQL request failed: {error}")
-        self.assertEqual(run.call_count, 5)
-        self.assertEqual(sleep.call_args_list, [call(1)] * 4)
+        for error in ["Post https://github.example/graphql: unexpected EOF", "unexpected end of JSON input"]:
+            with self.subTest(error=error):
+                with patch("github_datastore.github_api.subprocess.run", return_value=failed(error)) as run:
+                    with patch("github_datastore.github_api.time.sleep") as sleep:
+                        with self.assertRaises(GitHubApiError) as raised:
+                            GitHubClient().graphql(QUERY, VARIABLES)
+                self.assertEqual(str(raised.exception), f"GraphQL request failed: {error}")
+                self.assertEqual(run.call_count, 5)
+                self.assertEqual(sleep.call_args_list, [call(1)] * 4)
 
     def test_auth_access_and_validation_errors_fail_without_retries(self) -> None:
         errors = [
