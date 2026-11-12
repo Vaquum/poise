@@ -26,7 +26,8 @@ case "$mode" in
     verify_pending_ok=true
     ;;
   --wait-for)
-    [ $# -eq 2 ] && [[ $2 =~ ^[0-9a-f]{40}$ ]] || die "usage: $0 --wait-for SHA"
+    [ $# -eq 2 ] || die "usage: $0 --wait-for SHA"
+    [[ $2 =~ ^[0-9a-f]{40}$ ]] || die "invalid rollout SHA: $2"
     lock_deployment --timeout 600
     id=$(cat "$store/current") || die "cannot read the current rollout."
     ;;
