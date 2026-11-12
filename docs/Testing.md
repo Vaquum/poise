@@ -164,6 +164,10 @@ The test keeps its no-overlap and exactly-one-approval assertions.
 ## Agents' suites
 
 On a deployment with a test relay, a suite an agent starts in a workspace runs on a disposable test box, not beside Poise ([Agents' test suites](Operating.md#agents-test-suites)). `tests/test-offload.test.ts` runs the real hooks, runner, relay and box script against a stand-in for Render's API.
+With GNU tar it exercises dependency reuse on jobs and sandboxes, including
+hard links, metadata, source edits and dependency edits at the same HEAD and
+mtime. It checks workspace isolation and replays the original dependency
+bytes after a cache hit followed by a relay restart.
 It replaces the relay mid-suite and verifies one recovery with identical captured
 input despite unchanged-HEAD edits, genuine failures (including exit 125),
 cancellation, repeated restarts and an unrecovered relay. Recovery and the full

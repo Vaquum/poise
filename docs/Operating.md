@@ -363,6 +363,11 @@ API (`GET /config/`) to confirm every gateway handler has the retry window.
 record the old and new gateway container IDs, start public requests while the
 gateway listener is absent, and wait for their completed results through the
 successor. Include a POST handled exactly once; readiness alone is insufficient.
+The deployment test runs on an isolated Docker Engine with
+`"userland-proxy": false`, so the published port refuses dials until the gateway
+listens. Docker's userspace proxy can accept a connection during startup and
+then reset it before the gateway listens. Caddy treats that reset as a
+connected failure and returns 502 for a POST whose delivery it cannot verify.
 
 Point the DNS records at the proxy. The OAuth App and everything after it
 are the same as above.
@@ -804,6 +809,16 @@ git or GitHub, and the hooks. A checkout whose `.git/config` holds a credential
 is refused. A box holds no sign-in, so a test that needs a secret or an ignored
 file fails there. What the suite changes stays on the box and goes with it, so
 update snapshots with the runner on your own machine if you need them back.
+
+With GNU tar, the runner and relay can reuse verified chunks of the ignored
+dependency directories selected for the outer checkout. The runner hashes their
+captured tar bytes, including file contents, paths and metadata. Source, Git
+data and separately selected interpreters travel with each run. The relay
+retains compressed dependency chunks in private temporary files scoped to the
+workspace. It keeps at most 128 chunks and 512 MiB across workspaces, expires
+idle entries after 30 minutes, and starts empty after a restart. Each fresh box
+receives the whole tar in its original order. A miss sends bytes from the
+runner's captured input, including during recovery.
 
 **How it dies.** A box is created for one suite and ended when it ends: a sandbox
 is terminated, a job cancelled. That happens in each of these cases, and none

@@ -2,7 +2,10 @@ import { createHash, createPublicKey, sign, randomBytes, timingSafeEqual, verify
 import { readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Writable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { createGunzip } from 'node:zlib'
 import type { Logger } from './log.js'
+import { TestDependencyCache } from './test-dependency-cache.js'
 
 /**
  * Where agents' test suites leave a workspace (docs/Operating.md, "Agents' test suites"). This starts a disposable
@@ -68,6 +71,7 @@ interface Run {
   /** The last of a job's numbered output posts that was taken: one retried after a lost answer is not taken twice. */
   received: number
   parts: number
+  uploading: boolean
 }
 
 interface Connect { uri: string; method: string; token: string }
@@ -96,6 +100,7 @@ const SNAPSHOT_RENEW_MS = 7 * 24 * 3_600_000
 const MAX_SPEC_BYTES = 1024 * 1024
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 const MAX_TREE_PART_BYTES = 64 * 1024 * 1024
+const MAX_DEPENDENCY_PART_BYTES = 8 * 1024 * 1024
 const UPLOAD_ATTEMPTS = 3
 const RUN_ID = /^[0-9a-f]{32}$/
 // A job's start command names the relay it reports to, and its run.
@@ -157,6 +162,27 @@ async function readLimited(req: IncomingMessage, limit: number): Promise<Buffer>
   return Buffer.concat(chunks)
 }
 
+async function verifyDependency(body: Buffer, digest: string): Promise<void> {
+  const hash = createHash('sha256')
+  const gzip = createGunzip()
+  let size = 0
+  try {
+    await pipeline([body], gzip, async (chunks: AsyncIterable<Buffer>) => {
+      for await (const chunk of chunks) {
+        size += chunk.length
+        if (size > MAX_DEPENDENCY_PART_BYTES) throw new Error('dependency part expands past its limit')
+        hash.update(chunk)
+      }
+    })
+  } catch {
+    throw new RelayError(422, 'invalid dependency part archive')
+  }
+  // zlib can otherwise ignore trailing padding that would mask subsequent gzip members.
+  if (gzip.bytesWritten !== body.length || hash.digest('hex') !== digest) {
+    throw new RelayError(422, 'dependency part digest does not match')
+  }
+}
+
 /** Resolves once the reader took the chunk, or is gone. */
 function write(to: Writable, chunk: Buffer): Promise<void> {
   return new Promise((resolve) => {
@@ -199,6 +225,7 @@ export class TestRelay {
   private readonly instanceScript: Buffer
   /** The checkouts whose suites reached for Docker, by workspace: theirs go to a sandbox at once. */
   private readonly dockerRepos = new Set<string>()
+  private readonly dependencies: TestDependencyCache
   private timer: NodeJS.Timeout | null = null
   private lastRenderSweep = 0
   private base: Promise<{ group: string; snapshot: string }> | null = null
@@ -213,6 +240,9 @@ export class TestRelay {
     this.boxScript = readFileSync(new URL('./test-box.cjs', import.meta.url))
     this.setupScript = readFileSync(new URL('./test-box-setup.sh', import.meta.url))
     this.instanceScript = readFileSync(new URL('./test-instance.cjs', import.meta.url))
+    this.dependencies = new TestDependencyCache((error) => {
+      deps.log.warn('test_relay.dependency_cache.failed', { error: errorMessage(error) })
+    })
   }
 
   /** Starts the sweep, which also ends what an earlier gateway left running, and gets the first box's base ready. */
@@ -235,6 +265,7 @@ export class TestRelay {
   stop(): void {
     if (this.timer) clearInterval(this.timer)
     for (const run of this.runs.values()) this.kill(run, 'the gateway restarted')
+    this.dependencies.stop()
   }
 
   private async render<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -401,6 +432,7 @@ export class TestRelay {
       else run.output?.write(frame(FRAME.heartbeat))
     }
     if (!withRender) return
+    this.dependencies.sweep(now)
     const alive = new Set<string>()
     if (this.group) {
       const listed = (await this.render<{ sandbox: { id: string; createdAt: string } }[]>('GET', `/sandboxes?${this.owner}&sandboxGroupId=${this.group}&status=running&status=creating&limit=100`)).map((item) => item.sandbox)
@@ -492,7 +524,7 @@ export class TestRelay {
     // A job costs less, and moves its suite to a sandbox once it reaches for Docker; a checkout known to do so goes there at once.
     const job = this.deps.config.baseService !== null && spec.docker !== true && !this.dockerRepos.has(`${handle} ${spec.repo}`)
     const run: Run = {
-      id: randomBytes(16).toString('hex'), handle, spec, token: randomBytes(32).toString('hex'), created: now, lease: now, boxId: null, job, boxCreated: 0, ready: false, output: null, tree: null, received: 0, parts: 0,
+      id: randomBytes(16).toString('hex'), handle, spec, token: randomBytes(32).toString('hex'), created: now, lease: now, boxId: null, job, boxCreated: 0, ready: false, output: null, tree: null, received: 0, parts: 0, uploading: false,
     }
     this.runs.set(run.id, run)
     return run
@@ -547,7 +579,7 @@ export class TestRelay {
 
     if (req.method === 'POST' && !id) {
       const run = await this.createRun(handle, await readLimited(req, MAX_SPEC_BYTES))
-      res.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify({ id: run.id }))
+      res.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify({ id: run.id, dependencyCache: true }))
       return
     }
 
@@ -566,15 +598,15 @@ export class TestRelay {
     } else if (req.method === 'POST' && part === 'lease') {
       run.lease = this.deps.now()
       res.writeHead(204).end()
-    } else if (req.method === 'POST' && part === 'tree' && run.job) {
-      const tree = run.tree
-      if (!tree) throw new RelayError(409, 'the test box is not ready')
-      for await (const chunk of req) await write(tree, chunk as Buffer)
-      if (url.searchParams.get('end') === '1') tree.end()
-      res.writeHead(204).end()
-    } else if (req.method === 'POST' && part === 'tree') {
-      await this.receiveTree(req, url, run)
-      res.writeHead(204).end()
+    } else if (req.method === 'POST' && (part === 'tree' || part === 'dependency')) {
+      if (run.uploading) throw new RelayError(409, 'a checkout part is already arriving')
+      run.uploading = true
+      try {
+        const received = part === 'dependency' ? await this.receiveDependency(req, url, run) : await this.receiveTree(req, url, run)
+        res.writeHead(received === false ? 404 : 204).end()
+      } finally {
+        run.uploading = false
+      }
     } else if (req.method === 'DELETE' && !part) {
       this.kill(run, 'the suite was stopped', 143)
       res.writeHead(204).end()
@@ -618,27 +650,65 @@ export class TestRelay {
     }
   }
 
-  /** One upload per part: Render's upload token does not outlive a slow connection, and a blip costs one part. */
+  private async receiveDependency(req: IncomingMessage, url: URL, run: Run): Promise<boolean> {
+    if (!run.ready) throw new RelayError(409, 'the test box is not ready')
+    const digest = url.searchParams.get('sha256') ?? ''
+    if (!/^[a-f0-9]{64}$/.test(digest)) throw new RelayError(400, 'invalid dependency part digest')
+    const body = await readLimited(req, MAX_DEPENDENCY_PART_BYTES)
+    const now = this.deps.now()
+    const cacheError = (error: unknown): void => {
+      this.deps.log.warn('test_relay.dependency_cache.failed', { handle: run.handle, error: errorMessage(error) })
+    }
+    let part: Buffer | null
+    if (body.length) {
+      await verifyDependency(body, digest)
+      if (!this.runs.has(run.id)) throw new RelayError(410, 'this run is over')
+      await this.dependencies.put(run.handle, digest, body, now).catch(cacheError)
+      part = body
+    } else {
+      part = await this.dependencies.get(run.handle, digest, now).catch((error: unknown) => {
+        cacheError(error)
+        return null
+      })
+    }
+    if (!this.runs.has(run.id)) throw new RelayError(410, 'this run is over')
+    if (!part) return false
+    if (run.tree) await write(run.tree, part)
+    else await this.uploadTreePart(run, part)
+    return true
+  }
+
   private async receiveTree(req: IncomingMessage, url: URL, run: Run): Promise<void> {
+    if (run.job) {
+      const tree = run.tree
+      if (!tree) throw new RelayError(409, 'the test box is not ready')
+      for await (const chunk of req) await write(tree, chunk as Buffer)
+      if (url.searchParams.get('end') === '1') tree.end()
+      return
+    }
     if (!run.ready || !run.boxId) throw new RelayError(409, 'the test box is not ready')
     const part = await readLimited(req, MAX_TREE_PART_BYTES)
-    if (part.length) {
-      const path = `${TREE_PATH}/${String(run.parts).padStart(6, '0')}`
-      run.parts += 1
-      for (let attempt = 1; ; attempt += 1) {
-        try {
-          await this.uploadTo(run.boxId, path, new Blob([new Uint8Array(part)]))
-          break
-        } catch (error) {
-          if (attempt >= UPLOAD_ATTEMPTS) {
-            this.kill(run, `sending the checkout to the box failed: ${errorMessage(error)}`)
-            return
-          }
-          await new Promise((done) => { setTimeout(done, (this.deps.pollMs ?? POLL_MS) * attempt) })
+    if (part.length) await this.uploadTreePart(run, part)
+    if (url.searchParams.get('end') === '1' && this.runs.has(run.id)) void this.execute(run)
+  }
+
+  /** One upload per part: Render's upload token does not outlive a slow connection, and a blip costs one part. */
+  private async uploadTreePart(run: Run, part: Buffer): Promise<void> {
+    if (!run.ready || !run.boxId) throw new RelayError(409, 'the test box is not ready')
+    const path = `${TREE_PATH}/${String(run.parts).padStart(6, '0')}`
+    run.parts += 1
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await this.uploadTo(run.boxId, path, new Blob([new Uint8Array(part)]))
+        return
+      } catch (error) {
+        if (attempt >= UPLOAD_ATTEMPTS) {
+          this.kill(run, `sending the checkout to the box failed: ${errorMessage(error)}`)
+          return
         }
+        await new Promise((done) => { setTimeout(done, (this.deps.pollMs ?? POLL_MS) * attempt) })
       }
     }
-    if (url.searchParams.get('end') === '1' && this.runs.has(run.id)) void this.execute(run)
   }
 
   private async execute(run: Run): Promise<void> {

@@ -2,12 +2,13 @@
 // Agents' test suites run on disposable test boxes: these run the real hooks, runner, relay and box
 // script, with only Render itself replaced. docs/Operating.md, "Agents' test suites".
 import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { generateKeyPairSync } from 'node:crypto'
+import { createHash, generateKeyPairSync } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { gzipSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { BOX_COMMAND, SETUP_COMMAND, TEST_RELAY_PATH, TestRelay, workspaceKey, type TestRelayDeps } from '../gateway/src/test-relay'
@@ -19,6 +20,7 @@ import { scrubbedChildEnvironment } from '../server/process'
 const SOURCE = resolve('scripts/test-offload')
 const { privateKey } = generateKeyPairSync('ed25519')
 const KEY = workspaceKey(privateKey, 'alice')
+const GNU_TAR = spawnSync('tar', ['--version'], { encoding: 'utf8' }).stdout?.startsWith('tar (GNU tar)')
 
 const temporary: string[] = []
 function temp(prefix = 'test-offload-'): string {
@@ -467,6 +469,7 @@ describe('a suite on a test box', () => {
   let relayUrl: string
   let hooks: string
   let unpacked: string
+  let uploads: { path: string; bytes: number }[]
 
   async function listen(server: Server, port = 0): Promise<number> {
     await new Promise<void>((done) => { server.listen(port, '127.0.0.1', done) })
@@ -474,6 +477,15 @@ describe('a suite on a test box', () => {
   }
 
   const json = (res: ServerResponse, status: number, body: unknown) => res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+
+  function serveRelay(req: IncomingMessage, res: ServerResponse): void {
+    const url = new URL(req.url ?? '/', 'http://relay')
+    const part = url.pathname.split('/').at(-1)
+    if (req.method === 'POST' && (part === 'tree' || part === 'dependency')) {
+      uploads.push({ path: part, bytes: Number(req.headers['content-length'] ?? 0) })
+    }
+    void relay.handle(req, res, url)
+  }
 
   // What a box's command does here: the real box script over what was uploaded, or a stand-in for the setup.
   function runOnBox(box: Box, command: string, res: ServerResponse): void {
@@ -611,7 +623,7 @@ describe('a suite on a test box', () => {
       pollMs: 10,
       ...deps,
     })
-    relayServer = createServer((req, res) => { void relay.handle(req, res, new URL(req.url ?? '/', 'http://relay')) })
+    relayServer = createServer(serveRelay)
     relayOrigin = `http://127.0.0.1:${await listen(relayServer)}`
     relayUrl = `${relayOrigin}${TEST_RELAY_PATH}`
     relay.start()
@@ -633,6 +645,7 @@ describe('a suite on a test box', () => {
     listLagMs = 0
     warnings = []
     events = []
+    uploads = []
     runners = []
     runBoxes = true
     runJobs = true
@@ -711,6 +724,9 @@ describe('a suite on a test box', () => {
   it('moves a suite that reaches for the Docker socket to a sandbox, and sends that checkout\'s next suite there at once', async () => {
     await startAll({ baseService: 'crn-test' })
     const repo = committed()
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n')
+    mkdirSync(join(repo, 'node_modules'))
+    writeFileSync(join(repo, 'node_modules', 'fixture'), 'dependency')
     // On a job, DOCKER_HOST names the job's stand-in; a sandbox's Docker needs none.
     const script = `const host = process.env.DOCKER_HOST
       if (!host) { console.log('with Docker'); process.exit(0) }
@@ -723,6 +739,10 @@ describe('a suite on a test box', () => {
     expect(jobs.size).toBe(1)
     expect(suiteBoxes()).toHaveLength(1)
     expect(warnings.filter((warning) => warning.event === 'test_relay.run.failed')).toEqual([])
+    if (GNU_TAR) {
+      const dependencyPosts = uploads.filter(({ path }) => path === 'dependency')
+      expect(dependencyPosts.map(({ bytes }) => bytes > 0)).toEqual([false, true, false])
+    }
     const second = await suite(repo, [process.execPath, '-e', script], { DOCKER_HOST: '' }).done
     expect(second).toMatchObject({ code: 0, stdout: 'with Docker\n' })
     expect(second.stderr).not.toContain('reached for Docker')
@@ -823,6 +843,117 @@ describe('a suite on a test box', () => {
     expect(readFileSync(join(unpacked, repo, 'tracked.txt'), 'utf8')).toBe('checked out\n')
     expect(existsSync(join(unpacked, repo, '.git', 'HEAD'))).toBe(true)
     expect(existsSync(join(unpacked, repo, '.env'))).toBe(false)
+  })
+
+  it.skipIf(!GNU_TAR).each([null, 'crn-test'])('reuses verified dependency bytes with base service %s', async (baseService) => {
+    await startAll({ baseService })
+    const repo = committed()
+    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD']).toString()
+    writeFileSync(join(repo, '.gitignore'), '.env\nnode_modules/\n')
+    const deps = join(repo, 'node_modules')
+    mkdirSync(deps)
+    const file = join(deps, 'package.js')
+    const when = new Date('2025-01-01T00:00:00Z')
+    writeFileSync(file, 'first', { mode: 0o755 })
+    utimesSync(file, when, when)
+    linkSync(join(repo, 'tracked.txt'), join(deps, 'hard'))
+    symlinkSync('package.js', join(deps, 'sym'))
+    const script = `const fs = require('fs')
+      const file = name => require('path').join(process.argv[1], name)
+      const info = fs.statSync(file('node_modules/package.js'))
+      console.log(JSON.stringify({
+        text: fs.readFileSync(file('node_modules/sym'), 'utf8'),
+        symlink: fs.readlinkSync(file('node_modules/sym')),
+        hardlink: fs.statSync(file('node_modules/hard')).ino === fs.statSync(file('tracked.txt')).ino,
+        mode: info.mode & 511, mtime: info.mtimeMs, ignored: fs.existsSync(file('.env'))
+      }))
+      process.exit(7)`
+    const run = async (env: Record<string, string> = {}) => {
+      uploads.length = 0
+      unpacked = temp()
+      return await suite(repo, [process.execPath, '-e', script, join(unpacked, repo)], env).done
+    }
+    const baseline = await run({ TAR_OPTIONS: '--format=gnu' })
+    expect(baseline.code).toBe(7)
+    const original = JSON.parse(baseline.stdout) as Record<string, unknown>
+    expect(original).toEqual({ text: 'first', symlink: 'package.js', hardlink: true, mode: 0o755, mtime: when.getTime(), ignored: false })
+    expect(uploads.filter(({ path }) => path === 'dependency')).toHaveLength(0)
+
+    const cold = await run()
+    expect({ code: cold.code, stdout: cold.stdout }).toEqual({ code: baseline.code, stdout: baseline.stdout })
+    expect(uploads.some(({ path, bytes }) => path === 'dependency' && bytes > 0)).toBe(true)
+    // Change where the dependency bytes begin in the full tar without touching those bytes.
+    writeFileSync(join(repo, 'new-source.txt'), 'x'.repeat(4096))
+    const warm = await run()
+    expect({ code: warm.code, stdout: warm.stdout }).toEqual({ code: baseline.code, stdout: baseline.stdout })
+    expect(uploads.filter(({ path }) => path === 'dependency')).toEqual([{ path: 'dependency', bytes: 0 }])
+
+    writeFileSync(file, 'later')
+    utimesSync(file, when, when)
+    expect(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD']).toString()).toBe(head)
+    const changed = await run()
+    expect(changed.code).toBe(7)
+    expect(JSON.parse(changed.stdout)).toEqual({ ...original, text: 'later' })
+    expect(uploads.some(({ path, bytes }) => path === 'dependency' && bytes > 0)).toBe(true)
+  })
+
+  it.skipIf(!GNU_TAR)('replays dependency bytes captured on a hit after the relay restarts', async () => {
+    await startAll()
+    const repo = committed()
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n')
+    mkdirSync(join(repo, 'node_modules'))
+    const dependency = join(repo, 'node_modules', 'fixture')
+    writeFileSync(dependency, 'original')
+    const script = "console.log(require('fs').readFileSync(process.argv[1], 'utf8')); setTimeout(() => {}, 300)"
+    const command = [process.execPath, '-e', script, join(unpacked, repo, 'node_modules', 'fixture')]
+    expect((await suite(repo, command).done).code).toBe(0)
+    uploads.length = 0
+    const run = suite(repo, command)
+    await new Promise((done) => { run.child.stdout?.once('data', done) })
+    expect(uploads.filter(({ path }) => path === 'dependency')).toEqual([{ path: 'dependency', bytes: 0 }])
+    writeFileSync(dependency, 'replaced')
+    relay.stop()
+    await startAll2()
+    const { code, stdout, stderr } = await run.done
+    expect(code).toBe(0)
+    expect(stdout).toBe('original\noriginal\n')
+    expect(stderr).toContain('relay recovered; rerunning candidate')
+    expect(uploads.some(({ path, bytes }) => path === 'dependency' && bytes > 0)).toBe(true)
+  })
+
+  it('rejects a false dependency digest and only reuses bytes within the authenticated workspace', async () => {
+    await startAll()
+    const start = async (key: string) => {
+      const headers = { authorization: `Bearer ${key}` }
+      const created = await fetch(`${relayUrl}/runs`, {
+        method: 'POST', headers, body: JSON.stringify({ argv: ['true'], cwd: '/', env: {} }),
+      })
+      const { id } = await created.json() as { id: string }
+      const output = await fetch(`${relayUrl}/runs/${id}/output`, { headers })
+      await until(() => relay.runs.get(id)?.ready === true, 'box ready')
+      return { id, output, headers }
+    }
+    const alice = await start(KEY)
+    const bob = await start(workspaceKey(privateKey, 'bob'))
+    try {
+      const raw = Buffer.from('dependency')
+      const compressed = gzipSync(raw)
+      const digest = createHash('sha256').update(raw).digest('hex')
+      const post = (run: typeof alice, body?: Buffer, digestOverride = digest) =>
+        fetch(`${relayUrl}/runs/${run.id}/dependency?sha256=${digestOverride}`, {
+          method: 'POST', headers: run.headers, body: body ? new Uint8Array(body) : undefined,
+        })
+      expect((await post(alice, compressed, '0'.repeat(64))).status).toBe(422)
+      expect((await post(alice, Buffer.concat([compressed, Buffer.alloc(512)]))).status).toBe(422)
+      expect((await post(alice)).status).toBe(404)
+      expect((await post(alice, compressed)).status).toBe(204)
+      expect((await post(bob)).status).toBe(404)
+      expect((await post(alice)).status).toBe(204)
+      expect(readdirSync(join(runBox().dir, 'tmp/poise-tree'))).toEqual(['000000', '000001'])
+    } finally {
+      await alice.output.body?.cancel()
+      await bob.output.body?.cancel()
+    }
   })
 
   it('leaves the agent’s temporary folder behind, which can be too long for a Unix socket', async () => {
@@ -1438,7 +1569,7 @@ ${stderr}`
       pollMs: 10,
       ...deps,
     })
-    relayServer = createServer((req, res) => { void relay.handle(req, res, new URL(req.url ?? '/', 'http://relay')) })
+    relayServer = createServer(serveRelay)
     relayUrl = `http://127.0.0.1:${await listen(relayServer, port)}${TEST_RELAY_PATH}`
     relay.start()
     writeFileSync(join(hooks, 'relay'), `${relayUrl}\n${KEY}\n`)

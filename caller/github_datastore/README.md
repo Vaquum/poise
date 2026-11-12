@@ -132,6 +132,9 @@ Invalid identities and cursors still reject the sync. If a complete
 incremental enumeration omits a cached PR, sync enumerates that repository
 again. It removes only PRs absent from both complete reads. An incomplete
 confirmation or a newly missing PR fails the sync without advancing freshness.
+Normal initialization and sync add a partial index for stored issues missing
+a label array. Those issues still trigger a full repository refresh when
+GitHub's update timestamps match. An empty label array is complete evidence.
 Read-only GraphQL transport retries include `unexpected end of JSON input` and
 `Something went wrong while executing your query`, with at most five attempts
 using the same request and token. Exhaustion retains
