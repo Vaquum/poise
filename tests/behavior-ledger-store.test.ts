@@ -170,6 +170,17 @@ describe('behavior firing ledger store', () => {
     expect(records(db)[0]).toMatchObject({ state: 'running', activity: 'running', stateSource: 'native' })
   })
 
+  it.each(['closed', 'already_closed'] as const)('retains a direct age-close %s outcome without a model or expected head', outcome => {
+    const db = store()
+    db.capture(admission('close-1', { admissionKey: 'close-1', behavior: 'close-old-prs',
+      source: 'poise:close-old-prs', head: null, slot: undefined, plannedSlots: [] }))
+    expect(db.pending()).toEqual([])
+    db.capture({ type: 'result', nativeId: 'close-1', state: 'completed', activity: 'settled', outcome, completedAt: stamp() })
+    expect(records(db)).toHaveLength(2)
+    expect(records(db).every(record => record.behavior === 'close-old-prs' && record.head === null
+      && record.state === 'completed' && record.outcome === outcome && record.plannedSlots.length === 0)).toBe(true)
+  })
+
   it('never downgrades a settled terminal firing with a delayed unknown observation', () => {
     const db = store()
     db.capture(admission('direct-1', { admissionKey: 'direct-1', behavior: 'merge-prs', source: 'poise:merge-prs', plannedSlots: [], slot: undefined }))

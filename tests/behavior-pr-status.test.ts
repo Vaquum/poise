@@ -407,7 +407,7 @@ describe('readPrStatus', () => {
       { ...pr, draft: 1 },
       { ...pr, number: 18, url: 'https://github.com/Vaquum/poise-test/pull/18', draft: 0 },
     ]
-    for (const behavior of ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci'] as const) {
+    for (const behavior of ['review-new-prs', 'approve-prs', 'resolve-unblocking', 'merge-prs', 'rerun-grey-ci', 'close-old-prs'] as const) {
       runtime.setRepositorySkips(behavior, ['Vaquum/poise-test'])
     }
     const reply = await status.readPrStatus(50, Date.now())

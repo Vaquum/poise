@@ -292,6 +292,7 @@ export const SETTINGS: Registry = {
       ['review-new-prs', 'Review New Pull Requests', 'Reviews each new pull request of yours with the PR review models, and posts the review as the automation account.'],
       ['approve-prs', 'Approve Pull Requests', 'Approves your pull request when you have addressed the automation account’s change request, or when a clean one asks for its approval.'],
       ['resolve-unblocking', 'Resolve Unblocking Conversations', 'When a pull request of yours is approved and green, resolves the conversations that only block the merge.'],
+      ['close-old-prs', 'Close Old Pull Requests', 'Closes your open pull requests once they reach the configured number of elapsed days. Existing old pull requests qualify on the first run.'],
       ['rerun-grey-ci', 'Rerun Grey CI', 'Reruns checks on your pull requests that finished without a result.'],
       ['merge-prs', 'Merge Pull Requests', 'Merges your pull requests once they are approved and every check passes.'],
       ['review-new-issues', 'Review New Issues', 'Reviews each new issue in the repositories you choose, from authors you trust.']

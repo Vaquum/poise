@@ -6,7 +6,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from .interface import issue_work
+from .interface import close_old_pr_if_ready, issue_work
 from .behaviors.merge_if_ready import MergeAdmissionError
 
 from .interface import chain_seed, checkout_review, review_context, approve_pr, assign_issue, checkout_pr_head, checkout_repo, comment_issue, commit_work, create_issue, create_pr_linked_issue, current_pr, edit_issue_comment, head_sha, issue_comments, list_failing_ci, list_test_files, local_checkout_path, grey_ci_candidates, rerun_grey_ci_if_ready, merge_candidates, merge_if_ready, merge_pr, pull_action_state, update_branch_if_behind, mergeable, post_pr_comment, prune_mirrors, pr_readiness, pr_review, read_failing_ci_log, read_file, read_issue, request_change, request_changes, requested_changes_addressed, requested_review_ready, reviewed_clean, review_activity_since, resolve_conversation, resolve_nonblocking_conversations_if_ready, resolve_pr_conversations, sub_issues, view_repos, write_file
@@ -41,6 +41,7 @@ behaviors:
   --post-pr-comment PR --body BODY
   --mergeable PR
   --grey-ci-candidates --requests-json JSON --token-user USER
+  --close-old-pr-if-ready PR --cutoff-ms TIMESTAMP --author USER --token-user USER [--repository OWNER/REPO]
   --rerun-grey-ci-if-ready PR --run-id ID --run-attempt N --expected-head SHA --author USER --token-user USER
   --merge-candidates --requests-json JSON --token-user USER
   --merge-if-ready PR --expected-head SHA --author USER --token-user USER
@@ -78,7 +79,7 @@ def main() -> None:
     if argv in (["-h"], ["--help"]):
         print(TOP_HELP)
         return
-    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--issue-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--merge-pr", "--pull-action-state", "--update-branch-if-behind", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context", "--prune-mirrors", "--chain-seed"}:
+    if not argv or argv[0] not in {"--pr-review", "--approve-pr", "--head-sha", "--list-failing-ci", "--read-failing-ci-log", "--checkout-pr-head", "--commit-work", "--issue-work", "--list-test-files", "--read-file", "--write-file", "--request-change", "--request-changes", "--reviewed-clean", "--requested-changes-addressed", "--requested-review-ready", "--review-activity-since", "--resolve-conversation", "--resolve-pr-conversations", "--resolve-nonblocking-conversations-if-ready", "--create-issue", "--create-pr-linked-issue", "--post-pr-comment", "--mergeable", "--merge-if-ready", "--merge-pr", "--pull-action-state", "--update-branch-if-behind", "--merge-candidates", "--grey-ci-candidates", "--rerun-grey-ci-if-ready", "--close-old-pr-if-ready", "--current-pr", "--pr-readiness", "--local-checkout-path", "--view-repos", "--read-issue", "--assign-issue", "--comment-issue", "--edit-issue-comment", "--issue-comments", "--sub-issues", "--checkout-repo", "--checkout-review", "--review-context", "--prune-mirrors", "--chain-seed"}:
         print("error: first argument must be a behavior switch\n", file=sys.stderr)
         print(TOP_HELP, file=sys.stderr)
         raise SystemExit(2)
@@ -152,6 +153,7 @@ def main() -> None:
         "--merge-candidates": merge_candidates,
         "--grey-ci-candidates": grey_ci_candidates,
         "--rerun-grey-ci-if-ready": rerun_grey_ci_if_ready,
+        "--close-old-pr-if-ready": close_old_pr_if_ready,
         "--current-pr": current_pr,
         "--pr-readiness": pr_readiness,
         "--local-checkout-path": local_checkout_path,
@@ -288,6 +290,13 @@ def _arguments(behavior: str) -> argparse.ArgumentParser:
     if behavior in {"--merge-candidates", "--grey-ci-candidates"}:
         parser = argparse.ArgumentParser(prog=f"github-interface {behavior}")
         parser.add_argument("--requests-json", required=True)
+        return parser
+
+    if behavior == "--close-old-pr-if-ready":
+        parser = argparse.ArgumentParser(prog="github-interface --close-old-pr-if-ready PR")
+        parser.add_argument("--cutoff-ms", type=float, required=True)
+        parser.add_argument("--author", required=True)
+        _add_repository(parser)
         return parser
 
     if behavior == "--rerun-grey-ci-if-ready":

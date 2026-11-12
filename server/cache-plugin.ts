@@ -49,7 +49,7 @@ import { listSessions } from './chat/storage'
 import { handleGoogleApi } from './google/api'
 import { validateGoogleEnvironment } from './google/accounts'
 import { getBehaviorDiagnosticIncidents } from './behaviors'
-import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, setReviewCap as setBehaviorReviewCap, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getReviewCap, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isValidReviewCap, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, setPaused as setBehaviorPaused, getPausedUntil as getBehaviorPausedUntil, getPausedBy as getBehaviorPausedBy, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
+import { setEnabled as setBehaviorEnabled, setSetting as setBehaviorSetting, setScratchpad as setBehaviorScratchpad, setReviewers as setBehaviorReviewers, setReviewCap as setBehaviorReviewCap, getEnabledMap, getSettingMap, getScratchpadMap, getReviewers, getReviewCap, getBehaviorsRuntimeHealth, isValidSetting, isValidReviewers, isValidReviewCap, isPanelBehavior, getIssueRepositories, setIssueRepositories, isValidRepository, getIssueAuthors, setIssueAuthors, isValidAuthorList, isSkippableBehavior, isValidRepositoryList, getRepositorySkips, setRepositorySkips, MAX_SKIPPED_REPOSITORIES, admitReplay, ReplayRefusedError, startBehaviorsRuntime, stopBehaviorsRuntime, getResolveUnblockingLastFired, getMergePrsLastFired, getGreyCiLastFired, getGreyCiLastSucceeded, getCloseOldPrsLastFired, getCloseOldPrsDays, setCloseOldPrsDays, isValidCloseOldPrsDays, setPaused as setBehaviorPaused, getPausedUntil as getBehaviorPausedUntil, getPausedBy as getBehaviorPausedBy, BEHAVIOR_KEYS, type BehaviorKey } from './behaviors'
 import { startReviewCheckoutPruning, stopReviewCheckoutPruning } from './review-checkout'
 import { maintenanceRunning, runStorageMaintenanceOnce, startStorageMaintenanceRuntime, stopStorageMaintenanceRuntime, storageStatus } from './storage-maintenance'
 import { ContentLaunchPendingError, contentLaunchIdForCall, getContentJobResponse, getContentLaunchResponse, launchAndEnqueueContentJob, startContentFinalizer, stopContentFinalizer } from './content-jobs'
@@ -1026,6 +1026,12 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               scratchpad: null,
               lastTriggered: getResolveUnblockingLastFired(),
             },
+            'close-old-prs': {
+              ...pauseState('close-old-prs'),
+              owner, enabled: enabled['close-old-prs'], setting: null, reviewers: null,
+              days: getCloseOldPrsDays(), skipRepos: getRepositorySkips('close-old-prs'), scratchpad: null,
+              lastTriggered: getCloseOldPrsLastFired(),
+            },
             'rerun-grey-ci': {
               ...pauseState('rerun-grey-ci'),
               owner, enabled: enabled['rerun-grey-ci'], setting: null, reviewers: null,
@@ -1111,6 +1117,13 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
                 return json(res, 400, { error: 'reviewers must be 1, 2 or 3' })
               }
             }
+            if ('days' in body && (key !== 'close-old-prs' || !isValidCloseOldPrsDays(body.days))) {
+              return json(res, 400, { error: 'only close-old-prs takes days, a positive whole number' })
+            }
+            if (key === 'close-old-prs' && body.enabled === true
+              && !isValidCloseOldPrsDays('days' in body ? body.days : getCloseOldPrsDays())) {
+              return json(res, 400, { error: 'Close Old Pull Requests requires a positive whole number of days before enabling' })
+            }
             if ('reviewCap' in body) {
               if (key !== 'approve-prs') {
                 return json(res, 400, { error: 'only approve-prs takes a review cap' })
@@ -1181,6 +1194,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
             }
             // Persist passive configuration first; enabling last guarantees
             // the first tick observes the submitted setting and memory.
+            if ('days' in body) setCloseOldPrsDays(body.days)
             if ('setting' in body) setBehaviorSetting(key, body.setting)
             if ('reviewers' in body && isPanelBehavior(key)) setBehaviorReviewers(body.reviewers, key)
             if ('reviewCap' in body && key === 'approve-prs') setBehaviorReviewCap(body.reviewCap)
@@ -1204,6 +1218,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
               setting: getSettingMap()[key],
               reviewers: isPanelBehavior(key) ? getReviewers(key) : null,
               ...(key === 'approve-prs' ? { reviewCap: getReviewCap() } : {}),
+              ...(key === 'close-old-prs' ? { days: getCloseOldPrsDays() } : {}),
               ...(key === 'review-new-issues' ? {
                 repos: getIssueRepositories().map((entry) => entry.repo),
                 authors: getIssueAuthors(),

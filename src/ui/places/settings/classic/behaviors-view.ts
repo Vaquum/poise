@@ -15,7 +15,7 @@ import { layout, watchPanel } from '../../../../motion'
 // runtime — the view is just a UI for state, not the place where
 // agent automations actually run.
 
-import { BEHAVIORS, isEnabled, setEnabled, getSetting, getReviewCap, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getLastSucceeded, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../../../../behaviors'
+import { BEHAVIORS, isEnabled, setEnabled, getSetting, getDays, isValidDays, getReviewCap, getReviewers, setReviewers, isReviewerCount, getScratchpad, setScratchpad, getRepos, getAuthors, getSkipRepos, setSettingFields, getLastTriggered, getLastSucceeded, getBehaviorDiagnostics, refreshState, BehaviorConflictError, type BehaviorKey, type BehaviorSetting, type ReviewerCount, type SettingFields, isBehaviorStateLoaded, getBehaviorOwner } from '../../../../behaviors'
 import { organizationErrors } from '../../../../organizations'
 import { notificationCountsFor, onNotificationItems, openNotifications } from '../../../../views/notification-rail'
 import type { ItemGroup } from '../../../../notification-items'
@@ -36,7 +36,7 @@ let metricsGeneration = 0
 
 function metricCells(key: BehaviorKey): string {
   const metrics = metricsReport?.behaviors[key]
-  const direct = key === 'resolve-unblocking' || key === 'merge-prs' || key === 'rerun-grey-ci'
+  const direct = key === 'resolve-unblocking' || key === 'merge-prs' || key === 'rerun-grey-ci' || key === 'close-old-prs'
   const note = metricsError || (!metrics ? metricsReport?.error || 'Reading run history…' : direct
     ? 'Direct action attempts recorded since run tracking was introduced; earlier history is unavailable.'
     : 'Automatic runs started in the selected period. Live runs contribute elapsed time; success rate excludes unfinished runs.')
@@ -224,7 +224,7 @@ function lastTriggeredUnavailable(): boolean {
 
 function lastTriggeredCell(key: BehaviorKey): string {
   const last = getLastTriggered(key)
-  if (!last && (stateUnknown() || key !== 'merge-prs' && key !== 'rerun-grey-ci' && lastTriggeredUnavailable())) {
+  if (!last && (stateUnknown() || key !== 'merge-prs' && key !== 'rerun-grey-ci' && key !== 'close-old-prs' && lastTriggeredUnavailable())) {
     return '<span class="last-dash" title="The latest history could not be read, so this is unknown — not necessarily never.">?</span>'
   }
   if (key === 'rerun-grey-ci') {
@@ -235,7 +235,7 @@ function lastTriggeredCell(key: BehaviorKey): string {
     return `<a class="behavior-last-link" data-merged-pr href="${escapeHtml(last.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(last.target)} · ${escapeHtml(last.at)}">${escapeHtml(relTime(last.at))}</a>${checked}`
   }
   if (!last) return '<span class="last-dash">—</span>'
-  if (key === 'merge-prs') {
+  if (key === 'merge-prs' || key === 'close-old-prs') {
     const match = last.target.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/)
     if (!match) return '<span class="last-dash">?</span>'
     const href = `https://github.com/${match[1]}/pull/${match[2]}`
@@ -306,7 +306,7 @@ let orgReposLoading: Promise<void> | null = null
 let triggersPanelEl: HTMLElement | null = null
 let triggersKey: BehaviorKey | null = null
 let triggersDraft = new Set<string>()
-let triggersLoaded = { repos: [] as string[], authors: [] as string[], skipRepos: [] as string[], setting: 'p2' as BehaviorSetting, reviewCap: null as number | null }
+let triggersLoaded = { repos: [] as string[], authors: [] as string[], skipRepos: [] as string[], setting: 'p2' as BehaviorSetting, reviewCap: null as number | null, days: null as number | null }
 let triggersSaving: Promise<boolean> | null = null
 
 function shortRepo(repo: string): string {
@@ -349,7 +349,9 @@ function triggersPresentation(key: BehaviorKey) {
     const capLabel = cap ? `Cap ${cap}` : ''
     // The ceiling and the cap never share a row; whichever leads, the
     // skipped count must stay readable next to it.
-    const lead = ceiling || capLabel
+    const days = getDays(key)
+    const daysLabel = key === 'close-old-prs' ? days === null ? 'Set days' : `${days} days` : ''
+    const lead = ceiling || capLabel || daysLabel
     return {
       none: false,
       unknown,
@@ -546,6 +548,10 @@ function buildTriggersPanel(): HTMLElement {
       <label class="bt-label" for="bt-ceiling">Priority</label>
       <select id="bt-ceiling" class="behavior-setting bt-ceiling-select">${ceilings}</select>
     </div>
+    <div class="bt-section bt-days" hidden>
+      <label class="bt-label" for="bt-days">Close after days</label>
+      <input id="bt-days" class="st-input bt-days-input" type="number" min="1" step="1" required title="Elapsed 24-hour days since opening. Existing old pull requests qualify on the first run." />
+    </div>
     <div class="bt-section bt-review-cap" hidden>
       <label class="bt-label" for="bt-review-cap">Review cap (legacy only)</label>
       <select id="bt-review-cap" class="behavior-setting bt-review-cap-select" title="From this round on, Approve files the round's findings as one follow-up issue and approves instead of requesting changes. Off disables the cap.">${caps}</select>
@@ -637,15 +643,17 @@ function openTriggersPanel(key: BehaviorKey) {
   triggersPanelEl.dataset.mode = mode
   triggersPanelEl.setAttribute('aria-label', meta.hasSkips ? `Setting for ${meta.label}` : 'Repositories and authors that trigger Review New Issues')
   triggersPanelEl.querySelector<HTMLElement>('.bt-ceiling')!.hidden = !(meta.hasSkips && meta.hasSetting)
+  triggersPanelEl.querySelector<HTMLElement>('.bt-days')!.hidden = key !== 'close-old-prs'
   triggersPanelEl.querySelector<HTMLElement>('.bt-review-cap')!.hidden = !(meta.hasSkips && meta.hasReviewCap)
   triggersPanelEl.querySelector<HTMLElement>('.bt-authors-section')!.hidden = meta.hasSkips
   triggersPanelEl.querySelector('.bt-repos-label')!.textContent = meta.hasSkips ? 'Skip repositories' : 'Repositories'
   triggersPanelEl.querySelector('.bt-repos')!.setAttribute('aria-label', meta.hasSkips ? 'Repositories to skip' : 'Repositories')
   triggersKey = key
-  triggersLoaded = { repos: getRepos(key), authors: getAuthors(key), skipRepos: getSkipRepos(key), setting: getSetting(key), reviewCap: getReviewCap(key) }
+  triggersLoaded = { repos: getRepos(key), authors: getAuthors(key), skipRepos: getSkipRepos(key), setting: getSetting(key), reviewCap: getReviewCap(key), days: getDays(key) }
   triggersDraft = new Set(meta.hasSkips ? triggersLoaded.skipRepos : triggersLoaded.repos)
   triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value = triggersLoaded.setting
   triggersPanelEl.querySelector<HTMLSelectElement>('.bt-review-cap-select')!.value = triggersLoaded.reviewCap === null ? '' : String(triggersLoaded.reviewCap)
+  triggersPanelEl.querySelector<HTMLInputElement>('.bt-days-input')!.value = triggersLoaded.days === null ? '' : String(triggersLoaded.days)
   triggersPanelEl.querySelector<HTMLInputElement>('.bt-filter')!.value = ''
   triggersPanelEl.querySelector<HTMLInputElement>('.bt-authors')!.value = triggersLoaded.authors.join(', ')
   setTriggersStatus('')
@@ -663,7 +671,7 @@ function openTriggersPanel(key: BehaviorKey) {
     document.addEventListener('mousedown', onTriggersOutside)
     document.addEventListener('keydown', onTriggersKeydown)
     // The first control: the ceiling or cap where there is one, otherwise the filter.
-    const first = triggersPanelEl?.querySelector<HTMLElement>('.bt-ceiling:not([hidden]) select, .bt-review-cap:not([hidden]) select')
+    const first = triggersPanelEl?.querySelector<HTMLElement>('.bt-ceiling:not([hidden]) select, .bt-review-cap:not([hidden]) select, .bt-days:not([hidden]) input')
       ?? triggersPanelEl?.querySelector<HTMLInputElement>('.bt-filter')
     first?.focus()
   }, 0)
@@ -688,6 +696,13 @@ function closeTriggersPanel(force = false): Promise<boolean> {
   const saveStatus = (text: string, cls: 'info' | 'error' = 'info') =>
     setTriggersStatus([rejectedAuthors, text].filter(Boolean).join(' '), rejectedAuthors ? 'error' : cls)
   if (meta.hasSkips) {
+    if (key === 'close-old-prs') {
+      const days = Number(triggersPanelEl.querySelector<HTMLInputElement>('.bt-days-input')!.value)
+      if (!isValidDays(days)) {
+        setTriggersStatus('Days must be a positive whole number.', 'error')
+        if (!force) return Promise.resolve(false)
+      } else if (days !== triggersLoaded.days) changes.days = days
+    }
     if (!same(draft, [...triggersLoaded.skipRepos].sort())) changes.skipRepos = draft
     const setting = triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value as BehaviorSetting
     if (meta.hasSetting && setting !== triggersLoaded.setting) changes.setting = setting

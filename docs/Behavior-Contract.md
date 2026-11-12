@@ -20,8 +20,8 @@ admissions pin their account pair and reviewer. The roles must still match at
 launch, even when the reviewer username stays the same. Resolution pins
 the pair before invoking Caller. Completed work
 and uncertain publications retain their original actor and dedupe identities.
-Existing baseline markers remain: previously unclaimed agent PRs become eligible
-on a normal scan; first enable snapshots both authors. No age cutoff is added.
+Review New PRs' existing baseline markers remain: previously unclaimed agent PRs
+become eligible on a normal scan; first enable snapshots both authors.
 
 When reviewing as the main user, only recorded Poise review receipts authorize
 follow-up approval or resolution. Any manual/unclaimed review by that account
@@ -418,6 +418,30 @@ window. Every completed scan stamps Last succeeded, so a stale stamp with no
 visible failure is a silent stop, not a quiet queue.
 The behavior needs no model and adds zero GitHub traffic when disabled.
 
+`close-old-prs` (Close Old Pull Requests) is off by default and needs a positive
+whole number of days before enabling. The global `behavior_close_old_prs_days`
+metadata setting is independent of the priority ceiling; the behavior API reads
+and writes it as `days`. A tick with missing or invalid days closes nothing and
+reports one operation failure. It uses the shared fresh open-PR listing and full
+PR eligibility policy, including repository holds and chain ownership exclusions.
+There is no backlog baseline: existing old PRs qualify on the first enabled tick.
+Age is elapsed time since `created_at`: `now - Date.parse(created_at) >= days *
+86_400_000`. Missing, invalid or future creation times leave the PR open with a
+visible failure; `updated_at` never substitutes for creation time.
+
+Each candidate takes the shared PR operation lock and rechecks enablement, pause,
+scope, account pair and current days before dispatch. Caller
+`--close-old-pr-if-ready` rechecks live open state, non-draft status, author and
+creation time against the supplied cutoff immediately before closing. It validates
+an unmerged closed receipt; a lost write response gets one read, never a repeated
+write. Already closed or merged returns `already_closed`; other live refusals
+return `not_ready`. Only `closed` updates `behavior_close_old_prs_last_fired` and
+Last triggered. Direct runs and the firing ledger retain outcomes; errors and
+unconfirmed receipts stay visible as failures and dead letters, with normal retry
+backoff. A repository read 404 uses the existing access hold; a 403 stays per target.
+No intent or seen state is needed: retries live-check closure and never re-close
+an already closed PR. Disabled ticks add no GitHub traffic.
+
 New behaviors must add the required atomic fact or mutation upstream first.
 They must not add GitHub authentication, GraphQL, REST, or repository-source
 access to Poise.
@@ -477,14 +501,14 @@ an exact proof that this particular run never submitted.
 
 ## Where the pull-request behaviors act
 
-`review-new-prs`, `approve-prs`, `resolve-unblocking`, `merge-prs` and `rerun-grey-ci` each have a Skip
+`review-new-prs`, `approve-prs`, `resolve-unblocking`, `merge-prs`, `rerun-grey-ci` and `close-old-prs` each have a Skip
 repositories list (`behavior_<behavior>_skip_repos`): `owner/repo` names, one
 list per behavior shared by every ready account. Before a scan claims, reads or
 launches anything, it keeps only the pull requests that pass one check: open,
 not a draft, authored by either configured GitHub account, and outside the behavior's
 skipped repositories. A skipped pull request is never claimed, dead-lettered or
 counted toward a retry. The list is read again immediately before a launch or a
-resolution or merge or CI rerun, so a repository skipped while a scan is under way is left alone too.
+resolution, merge, CI rerun or age close, so a repository skipped while a scan is under way is left alone too.
 
 `review-new-prs` takes its anti-flood baseline (`behavior_seen`,
 `__snapshot_v3__` and the pull requests recorded with it) over every open pull
@@ -493,7 +517,7 @@ already open when the behavior began, wherever it is. Saving a skip list never
 retakes the baseline or clears the ledger. Unskipping a repository therefore
 makes its open pull requests eligible on the next tick exactly as new ones are:
 those opened since the baseline are reviewed, and the backlog it recorded is
-not. `approve-prs`, `resolve-unblocking`, `merge-prs` and `rerun-grey-ci` have no baseline; an unskipped
+not. `approve-prs`, `resolve-unblocking`, `merge-prs`, `rerun-grey-ci` and `close-old-prs` have no baseline; an unskipped
 repository's pull requests are evaluated on the next tick like any other.
 
 ## Dead-letter reconciliation
@@ -584,10 +608,10 @@ Historical Caller v1 diagnostics may omit outcome, stderr or truncation facts;
 these read as null, retaining submission uncertainty and the failed lifecycle.
 Present malformed fields and unsupported versions remain quarantined. Diagnostic
 reading grants no new execution or replay authority.
-Resolution, merge, and grey-CI metrics count direct mutation attempts recorded
+Resolution, merge, grey-CI and age-close metrics count direct mutation attempts recorded
 in the local run ledger since tracking was introduced; earlier history is
 unavailable. Eligibility checks and resolution polls that change no conversations
-are excluded. Safe no-write merge/rerun receipts count as successful executions;
+are excluded. Safe no-write merge/rerun/close receipts count as successful executions;
 errors count as failures. A direct run whose owner died without finishing
 closes as interrupted with its completion unknown: it stays out of the
 success rate and its duration stays unknown. Durations use explicit units, such
@@ -610,7 +634,7 @@ accounting. [Logging](Logging.md#notification-evidence) defines the read boundar
 
 The [Behavior ledger](Behavior-ledger.md) exposes compact per-firing metadata,
 child attempts, native evidence references and a resumable change feed. It
-observes the existing six Behaviors through nonblocking hooks and existing
+observes the existing Behaviors through nonblocking hooks and existing
 Caller snapshots. Its separate worker/store cannot change behavior decisions,
 claims, retries, metrics or launch arguments. Missing or stale evidence stays
 explicitly unknown; capture loss is visible in independent health metadata.

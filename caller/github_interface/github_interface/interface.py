@@ -220,3 +220,7 @@ async def grey_ci_candidates(payload: dict[str, Any]) -> Any:
 
 async def rerun_grey_ci_if_ready(payload: dict[str, Any]) -> Any:
     return await run_behavior("rerun_grey_ci_if_ready", payload)
+
+
+async def close_old_pr_if_ready(payload: dict[str, object]) -> object:
+    return await run_behavior("close_old_pr_if_ready", payload)

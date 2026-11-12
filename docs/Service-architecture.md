@@ -982,7 +982,8 @@ reviews under the main account cannot become automation evidence: only recorded
 Poise receipts authorize automated follow-up approval and conversation resolution.
 See [PR accounts](Behavior-Contract.md#pr-accounts) for admission and recovery rules.
 
-**Repository opt-out.** Review new PRs, Approve PRs and Resolve unblocking
+**Repository opt-out.** Review new PRs, Approve PRs, Resolve unblocking,
+Merge PRs, Rerun Grey CI and Close Old Pull Requests
 each have a "Skip repositories" list:
 - The list is chosen from all repositories of the person's ready accounts.
 - The picker groups repositories by account and offers "Select all" for each

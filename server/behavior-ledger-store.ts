@@ -21,9 +21,9 @@ const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]{1,1
 const SHA = /^[a-f0-9]{40}$/
 const SLOTS: readonly LedgerSlot[] = ['primary', 'secondary', 'tertiary']
 const PRECEDENCE: readonly LedgerState[] = ['running', 'held', 'unknown', 'pending', 'failed', 'superseded', 'completed']
-const OUTCOMES = new Set(['clean', 'changes_requested', 'approved', 'commented', 'preflight_failed', 'resolved', 'waiting', 'no_op', 'merged', 'already_merged', 'updated', 'not_ready', 'superseded', 'rerun_requested', 'read_failed', 'spawn_failed', 'adopted', 'enqueued', 'review_target_closed'])
+const OUTCOMES = new Set(['clean', 'changes_requested', 'approved', 'commented', 'preflight_failed', 'resolved', 'waiting', 'no_op', 'merged', 'already_merged', 'updated', 'not_ready', 'superseded', 'closed', 'already_closed', 'rerun_requested', 'read_failed', 'spawn_failed', 'adopted', 'enqueued', 'review_target_closed'])
 const TERMINAL = new Set<LedgerState>(['completed', 'failed', 'superseded'])
-const DIRECT = new Set(['resolve-unblocking', 'merge-prs', 'rerun-grey-ci'])
+const DIRECT = new Set(['resolve-unblocking', 'merge-prs', 'rerun-grey-ci', 'close-old-prs'])
 const cliBehavior = { 'review-new-prs': 'pr_review', 'approve-prs': 'pr_approve', 'review-new-issues': 'issue_review' } as const
 const hash = () => createHash('sha256').update(randomUUID()).digest('hex')
 const iso = (value: string | null | undefined): boolean => value == null || (typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value)))
@@ -718,7 +718,7 @@ export class BehaviorLedgerStore {
 
 function directNoWrite(record: LedgerRecord): boolean {
   return DIRECT.has(record.behavior) && record.state === 'completed'
-    && ['waiting', 'no_op', 'not_ready', 'already_merged'].includes(record.outcome ?? '')
+    && ['waiting', 'no_op', 'not_ready', 'already_merged', 'already_closed'].includes(record.outcome ?? '')
 }
 function completedPair(record: LedgerRecord, row: LedgerCaller): boolean {
   if (!row.completedAt || !iso(row.completedAt) || Date.parse(row.completedAt) < Date.parse(row.startedAt!)) return false
