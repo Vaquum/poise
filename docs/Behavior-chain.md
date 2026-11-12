@@ -257,9 +257,17 @@ An implementation or repair that explicitly reports a blocker records
 `atomic_work_blocked` and holds its chain with that reason. Caller masks
 credential patterns and known environment credentials before normalizing and
 limiting the explicit string reason to 500 characters plus a truncation ellipsis.
-The exception and retained diagnostic use the same safe message; empty or
-unsupported reasons retain `AtomicWorkBlocked`. Ordinary exception text and raw
-provider output remain excluded from native failure evidence. The reason grants
+The exception and retained diagnostic use the same safe message. Before deriving
+that summary, Caller retains up to 4096 redacted reason characters plus an ellipsis
+in the existing diagnostic `stderr`, with `stderr_truncated` when clipped, within
+the 64 KiB diagnostic event limit. Workers put the first observed actionable
+assertion/failure excerpt, suite/test and available relay captured-candidate digest
+and producing-run ID first in `blocked`, before a later timeout explanation. Missing
+assertion details or identities are explicitly unavailable. This worker-reported
+evidence survives checkout reclamation; a later relay timeout cannot excuse an
+observed test failure. Empty or unsupported reasons retain `AtomicWorkBlocked`.
+Ordinary exception text and raw provider output remain excluded from native failure
+evidence. The reason grants
 no retry or resource-release authority. Cleanup still
 requires its original positive proof and does not restart blocked work. The
 hold survives journal rebuild and server replacement; the person can resume
