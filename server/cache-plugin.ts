@@ -677,16 +677,18 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           }
         }
         // The handling log: the newest handled notices, behavior firings
-        // and Caller-reported runs. The checks settle first, so a handled
-        // row never stays active; failures keep prior state, as they do
-        // for the active notices, and the stored rows still answer.
+        // and Caller-reported runs, from the stored rows at once. The read
+        // starts a check, or joins the one running, without waiting for it:
+        // a check asks GitHub about every open pull request, and the read
+        // would wait as long. What it resolves is logged for the next read;
+        // a failed check keeps prior state, as it does for active notices.
         // `?since=<ISO>` keeps rows handled at or after that time.
         if (path === '/api/notices/handled' && req.method === 'GET') {
           const since = new URLSearchParams(url.split('?')[1] || '').get('since')
           if (since !== null && !Number.isFinite(Date.parse(since))) {
             return json(res, 400, { error: 'since must be an ISO time' })
           }
-          await checkNotices()
+          void checkNotices()
           return json(res, 200, { handled: listHandling(HANDLED_READ_LIMIT, Date.now(), since ?? undefined) })
         }
 

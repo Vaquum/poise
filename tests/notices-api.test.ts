@@ -275,6 +275,10 @@ describe('the handling log', () => {
   async function handled(): Promise<{ status: number, body: { handled: Array<Record<string, unknown>> } }> {
     return await call('GET', '/api/notices/handled') as { status: number, body: { handled: Array<Record<string, unknown>> } }
   }
+  // The check a read started, or a new one when none runs.
+  async function check(): Promise<void> {
+    await (await import('../server/alerts/notices')).checkNotices()
+  }
 
   it('records a dismissal while the notice stays active, then its clearing', async () => {
     const raised = store!.raiseAlert(waiting)!
@@ -320,9 +324,12 @@ describe('the handling log', () => {
     const raised = store!.raiseAlert(ready)!
     const silenced = await call('POST', `/api/notices/${encodeURIComponent(raised.id)}/silence`)
     expect(silenced.status).toBe(200)
+    expect((await handled()).body.handled.map((row) => row.outcome)).toEqual(['silenced'])
+    // The read started a check without waiting for it: with no GitHub
+    // account set, nothing is followed, so the check resolves the silenced
+    // alert, and the next read has it.
+    await check()
     const state = await handled()
-    // The read's own check resolved the silence's alert first: with no
-    // GitHub account set, nothing is followed, so nothing stays active.
     expect(state.body.handled.map((row) => row.outcome).sort()).toEqual(['resolved', 'silenced'])
     expect(state.body.handled.find((row) => row.outcome === 'silenced')).toMatchObject({ actor: 'api' })
   })
@@ -390,8 +397,10 @@ describe('the handling log', () => {
     store!.raiseAlert(ready)!
     const dismissed = await call('POST', `/api/notices/${encodeURIComponent((await call('GET', '/api/notices')).body.notices[0].id)}/dismiss`, undefined, true)
     expect(dismissed.status).toBe(200)
-    // No GitHub account is set: the read's check has nothing to read, and
-    // the stored dismissal still answers.
+    // No GitHub account is set: the read's check has nothing to read and
+    // resolves the alert, and the stored dismissal still answers.
+    await handled()
+    await check()
     let state = await handled()
     expect(state.status).toBe(200)
     expect(state.body.handled.map((row) => row.outcome).sort()).toEqual(['dismissed', 'resolved'])
@@ -404,6 +413,37 @@ describe('the handling log', () => {
     state = await handled()
     expect(state.status).toBe(200)
     expect(state.body.handled.map((row) => row.outcome).sort()).toEqual(['dismissed', 'resolved'])
+    await check()
+    expect((await handled()).body.handled.map((row) => row.outcome).sort()).toEqual(['dismissed', 'resolved'])
+  })
+
+  it('answers from the stored rows while its check is still reading GitHub', async () => {
+    const raised = store!.raiseAlert(waiting)!
+    expect((await call('POST', `/api/notices/${encodeURIComponent(raised.id)}/dismiss`, undefined, true)).status).toBe(200)
+    database!.setMeta('me', 'octocat')
+    database!.setMeta('agentAccount', 'octo-agent')
+    database!.setMeta('org', 'Legacy')
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    mocks.runFile.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'github-datastore') {
+        await gate
+        return { stdout: '[]', stderr: '' }
+      }
+      throw new Error(`Unexpected test command: ${command} ${args.join(' ')}`)
+    })
+    try {
+      const state = await Promise.race([handled(), new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('the read waited for its check')), 2_000)
+      })])
+      expect(state.status).toBe(200)
+      expect(state.body.handled.map((row) => row.outcome)).toEqual(['dismissed'])
+      // The read started the check, which is still reading GitHub.
+      await vi.waitFor(() => expect(mocks.runFile.mock.calls.some(([command]) => command === 'github-datastore')).toBe(true))
+    } finally {
+      release()
+    }
+    await check()
   })
 
   it('filters by since and refuses a malformed one', async () => {
@@ -441,6 +481,7 @@ describe('the handling log', () => {
     expect((await call('POST', '/api/settings', { notifications: { enabled: false } })).status).toBe(200)
     release()
     expect((await reading).status).toBe(200)
+    await check()
     // The pass noticed nothing: the alert stays open and unhandled.
     expect(store!.openAlerts().map((alert) => alert.dedupeKey)).toContain('pr-ready:acme/api#1')
     expect((await handled()).body.handled).toEqual([])

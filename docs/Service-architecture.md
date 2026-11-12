@@ -1128,7 +1128,9 @@ The supporting reads behind those names:
 - `GET /api/chat/requests`: every open chat request with a revision, kept
   current by the `chatRequests.updated` frame.
 - `GET /api/notices/handled?since=<ISO>`: the append-only handling log, kept
-  30 days from each entry's time.
+  30 days from each entry's time. It answers from the stored log at once and
+  starts the notices check without waiting for it, so what that check
+  resolves is in the next read.
 - `GET /api/editor/reviews`: every publication with its `checkedAt`, `stale`,
   `problems` and `retryAt`, including ones with no open thread; a cold or
   failed one stays listed, never looking as if it had no feedback. The
