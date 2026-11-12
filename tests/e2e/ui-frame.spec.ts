@@ -22,7 +22,7 @@ const query = (page: Page) => new URL(page.url()).searchParams
 
 test('the frame opens Overview, and each move between places is a history entry under the same top bar', async ({ page }) => {
   await open(page)
-  await expect(page).toHaveTitle('Poise')
+  await expect(page).toHaveTitle('Poise — Overview')
   await expect(nav(page).getByRole('link', { name: 'Overview' })).toHaveAttribute('aria-current', 'page')
   expect(query(page).get('view')).toBe('overview')
   await page.locator('.topbar').evaluate((bar) => { (window as unknown as { bar: Element }).bar = bar })
@@ -157,10 +157,16 @@ test('the bell counts what needs you and opens Answer here with a route back', a
   const at = new Date().toISOString()
   const notice = (id: string) => ({ id, kind: 'pr_ready', title: `acme/site#${id} is ready to merge`, body: 'Checks passed.', since: at, due: at, silenceable: true, target: null })
   await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [] } }))
+  // Answer here's other sources, which the bell reads on every place: one open review thread.
+  await page.route('**/api/behaviors', (route) => route.fulfill({ json: {} }))
+  await page.route('**/api/behavior-chains**', (route) => route.fulfill({ json: { chains: [], attention: [] } }))
+  await page.route('**/api/chat/requests', (route) => route.fulfill({ json: { revision: 1, complete: true, requests: [] } }))
+  await page.route('**/api/chat/switchboard', (route) => route.fulfill({ json: { revision: 1, items: [] } }))
+  await page.route('**/api/editor/reviews', (route) => route.fulfill({ json: { publications: [{ slug: 'notes', openThreads: 1 }] } }))
   await open(page, '/?view=board', { notices: [notice('1'), notice('2')] })
   const bell = page.getByRole('button', { name: /^Notifications/ })
-  await expect(bell.locator('[data-bell]')).toHaveText('2')
-  await expect(bell).toHaveAccessibleName('Notifications, 2 open. Opens Answer here in Overview.')
+  await expect(bell.locator('[data-bell]')).toHaveText('3')
+  await expect(bell).toHaveAccessibleName('Notifications, 3 open. Opens Answer here in Overview.')
   await bell.click()
   await expect(nav(page).getByRole('link', { name: 'Overview' })).toHaveAttribute('aria-current', 'page')
   expect(Object.fromEntries(query(page))).toEqual({ view: 'overview', back: 'board' })

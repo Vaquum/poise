@@ -7,7 +7,10 @@ import { icon, hydrateIcons } from './icons'
 import { noticeFeed, READ_INTERVAL_MS } from '../notices'
 import { PLACE_NAMES, placeHref, type Address, type Place } from './address'
 import { styleSettingsHref } from './style-panel'
-import { bellTally, onBellChange } from './places/overview/level'
+import { awayGroups, watchAway } from './places/overview/away'
+import { bellTally, onBellChange, onOverview } from './places/overview/level'
+import { fetchGatewayAccount } from '../gateway-client'
+import { workspaceMode } from '../workspace-mode'
 
 // ---------- Motion read from tokens ----------
 let probe: HTMLElement | null = null
@@ -100,7 +103,7 @@ function menuHTML(): string {
     <button class="menu-row" role="menuitem" data-style-open data-ref="set.style"><i data-i="palette" class="sm"></i>Style panel</button>
     <a class="menu-row" role="menuitem" data-menu-manager data-ref="set.manager"><i data-i="sliders" class="sm"></i>Manager’s controls<span class="t-gloss">Rhythm · Stability · Autonomy</span></a>
     <div class="sep"></div>
-    ${SECTION_LINKS.map(([section, label]) => `<a class="menu-row" role="menuitem" data-menu-section="${section}" data-ref="set.go"><span class="t">${label}</span></a>`).join('')}
+    ${SECTION_LINKS.map(([section, label]) => `<a class="menu-row" role="menuitem" data-menu-section="${section}" data-ref="set.go"${section === 'admin' ? ' hidden' : ''}><span class="t">${label}</span></a>`).join('')}
   </div>`
 }
 
@@ -119,6 +122,18 @@ export function mountFrame(host: HTMLElement): HTMLElement {
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && openFor) { const a = openFor; closeMenus(); a.focus() } })
   watchConnection($('[data-ref="conn"]', host))
   watchBell($('[data-ref="bell"]', host))
+  // Admin is listed for the gateway's admins only, as Settings shows it; a
+  // lookup that fails is asked again each time the menu opens.
+  let adminKnown = false
+  const checkAdmin = (): void => {
+    if (adminKnown) return
+    void workspaceMode().then((mode) => mode.service ? fetchGatewayAccount() : null).then((account) => {
+      adminKnown = true
+      if (account?.isAdmin) $('[data-menu-section="admin"]', host).hidden = false
+    }).catch(() => {})
+  }
+  checkAdmin()
+  $('[data-menu-open]', host).addEventListener('click', checkAdmin)
   return $('[data-place-root]', host)
 }
 
@@ -136,7 +151,7 @@ export function showPlace(address: Address): void {
   settings?.classList.toggle('on', here === 'settings')
   if (here === 'settings') settings?.setAttribute('aria-current', 'page'); else settings?.removeAttribute('aria-current')
   const back = here === 'settings' ? address.back : here
-  $('[data-menu-manager]')?.setAttribute('href', placeHref('manager', { pane: 'controls', back: here === 'manager' ? address.back : back }))
+  $('[data-menu-manager]')?.setAttribute('href', placeHref('settings', { settings: 'manager', back }))
   $$('[data-menu-section]').forEach((a: HTMLElement) => {
     a.setAttribute('href', placeHref('settings', { settings: a.dataset.menuSection, back }))
     if (here === 'settings' && address.section === a.dataset.menuSection) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current')
@@ -180,14 +195,15 @@ function watchBell(btn: HTMLElement | null): void {
   const badge = btn?.querySelector<HTMLElement>('[data-bell]')
   if (!btn || !badge) return
   const paint = () => {
-    const { count, tone } = bellTally(noticeFeed.current.notices)
+    const { count, tone } = bellTally(awayGroups)
     badge.textContent = String(count)
     badge.hidden = !count
     if (tone) badge.dataset.tone = tone; else delete badge.dataset.tone
     btn.setAttribute('aria-label', `Notifications, ${count} open. Opens Answer here in Overview.`)
   }
+  const readAway = watchAway(() => !onOverview(), paint)
   noticeFeed.subscribe(paint)
-  onBellChange(paint)
+  onBellChange(() => { readAway(); paint() })
   paint()
   btn.addEventListener('click', () => {
     const href = `${placeHref('overview', { back: bellBack === 'overview' ? null : bellBack })}#answer`

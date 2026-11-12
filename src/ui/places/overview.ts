@@ -70,11 +70,6 @@ function layoutHTML(): string {
         <div class="ova-detail" data-detail hidden></div>
       </section>
 
-      <section class="ova-sec" aria-labelledby="h-out">
-        <h3 class="ova-sh" id="h-out"><span class="t-micro" data-ref="ov.outcomes">Pull request outcomes</span><span class="t-gloss">merged, needed outside help, and recovered on their own</span><span class="chip is-outline" data-ref="ov.planned">Planned · #819</span></h3>
-        <div class="ocard ova-out"><p class="onote">Not measured yet. Poise draws these three lines once #819 measures them; until then there is nothing to show, rather than a guess.</p></div>
-      </section>
-
       <section class="ova-sec" aria-labelledby="h-pr">
         <h3 class="ova-sh" id="h-pr"><span class="t-micro">Per merged pull request</span><span class="t-gloss">medians against the 7 days before</span></h3>
         <div class="ova-small" data-perpr></div>

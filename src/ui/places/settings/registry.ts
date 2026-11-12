@@ -221,6 +221,7 @@ export const SETTINGS: Registry = {
     'set.preset.save': { name: 'Save', kind: 'Action', what: 'Saves every place’s current choices under this name.' },
     'set.fixed': { name: 'Fixed models', kind: 'Display', what: 'Places whose model the Caller catalog sets.', now: nowOf, source: 'The Caller catalog.' },
     'set.fixed.row': { name: 'Fixed model', kind: 'Display', what: 'A place and the model Caller sets for it.', now: itemNow },
+    'set.manager-place': { name: 'The Manager', kind: 'Place', what: 'The Manager’s chat beside the Switchboard.', does: 'Opens the Manager place. Its controls are in Settings → Manager.' },
     'set.catalog': { name: 'Model catalog', kind: 'Display', what: 'Where every model choice comes from, and when it was last checked.', when: 'Checked daily at 07:00 in your time zone.', source: 'Caller and the provider CLIs.', values: [['Not checked yet', 'The daily check runs at 07:00.'], ['No connected providers to check', 'Connect one in Settings → Accounts.'], ['Model check incomplete', 'Existing model choices remain available.'], ['Model check timed out', 'Latest versions could not be confirmed; your selections are kept. Check now tries again.'], ['Model catalog unavailable', 'Your model selections are kept.']] },
     'set.catalog.check': { name: 'Check now', kind: 'Action', what: 'Updates the provider CLIs, then checks which models exist.', shows: 'Running with the time elapsed, then Done with what changed.', unchanged: 'Your choices, and chats meanwhile.', unavailable: why('A check is running.') },
 

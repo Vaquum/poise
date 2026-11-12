@@ -210,7 +210,7 @@ export const MODELS: SectionDef = {
   load: async () => { if (!data) await read() },
   rows: (ctx) => {
     if (!data) {
-      return [{ key: 'catalog-failed', group: 'The three models', label: 'Models', type: 'custom', plain: true, gloss: 'The three models every place runs.',
+      return [{ key: 'catalog-failed', ref: 'set.catalog', group: 'The three models', label: 'Models', type: 'custom', plain: true, gloss: 'The three models every place runs.',
         control: () => `<p class="is-err" role="alert">${esc(failure || 'The model catalog is not read yet.')}</p><button type="button" class="btn-ghost" data-act="retry">Retry</button>`,
         act: () => { void read().then(() => ctx.rerender()) } }]
     }

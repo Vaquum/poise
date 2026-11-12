@@ -133,7 +133,7 @@ async function checkWakeControls(page: Page, clock: typeof WAKE_CLOCK_CASES[numb
   // The select stays enabled while the Manager runs.
   state.sessions[0] = { ...manager, status: 'running', lastSeq: 1 }
   sock.push('m1', { type: 'session.updated', session: state.sessions[0] })
-  await expect(page.locator('.chat-h-status')).toHaveText('running')
+  await expect(page.locator('.chat-h-status')).toHaveText('Running')
   await expect(wake).toBeEnabled()
 
   // Every status line renders from its fixture state.

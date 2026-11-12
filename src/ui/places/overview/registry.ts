@@ -91,8 +91,6 @@ export const OVERVIEW: Registry = {
   },
 
   /* ---------- Planned ---------- */
-  'ov.outcomes': { name: 'Pull request outcomes', kind: 'Display', what: 'Three lines on one scale: pull requests merged, workflows that needed outside help, and errors that recovered on their own.', unchanged: 'A stretch with missing coverage, which is a gap, never a zero.', source: 'Poise’s measurement of outcomes (#817), once it exists.' },
-  'ov.planned': { name: 'Planned', kind: 'Display', what: 'This card is decided in autonomio/poise#819 and not built yet. It shows where it goes and draws nothing until Poise measures it.' },
   'ov.health': { name: 'System health', kind: 'Display', what: 'Five live cards over the last 24 hours of v2 chain work: errors per completed item, work blocked, recovered by itself, time since the last work error, and evidence coverage. Each opens the evidence behind its value.', source: 'PRD autonomio/poise#1101, being built: the chain journal, Caller receipts, GitHub and Logging’s coverage.' },
   'ov.planned-health': { name: 'Planned', kind: 'Display', what: 'This strip is decided in autonomio/poise#1101 and being built. Until Poise serves it, the cards show where they go and what they will open, with no value.' },
   'ov.h.errors': { name: 'Errors per completed work item', kind: 'Display', what: 'For work completed in the last 24 hours, its distinct work errors over its whole life, per item, with both counts.', does: 'Opens Logging.' },

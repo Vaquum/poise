@@ -77,5 +77,5 @@ const cleared = new Set<string>()
 /** A part's read state in words: nothing while it is fine. */
 export function readLine(name: string, read: Read<unknown>): string {
   if (!read.error) return ''
-  return `${name} could not be read: ${read.error}. ${read.at ? `Last read at ${clockAt(read.at)}.` : 'Not read yet.'}`
+  return `${name} could not be read: ${read.error.replace(/\.$/, '')}. ${read.at ? `Last read at ${clockAt(read.at)}.` : 'Not read yet.'}`
 }

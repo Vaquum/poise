@@ -48,7 +48,8 @@ export interface Item {
   title: string
   url: string
   record: GhRecord
-  state: StateKey
+  /** Null when its status could not be read: no state word, never a guessed one. */
+  state: StateKey | null
   detail: string
   /** When the current state began, in ms, when known. */
   since: number | null
@@ -67,20 +68,22 @@ export interface Item {
 export const itemKey = (repo: string, number: number): string => `${repo}#${number}`.toLowerCase()
 
 /** A pull request's one current blocker in the seven states (CURRENT.md, "How the brief lands"). */
-export function blockerState(id: BlockerId): StateKey {
+export function blockerState(id: BlockerId): StateKey | null {
   switch (id) {
     case 'review_running': return 'running'
-    case 'ci_pending': case 'in_queue': case 'behind': return 'waiting'
+    case 'ci_pending': case 'in_queue': return 'waiting'
     case 'ci_failing': return 'failed'
-    case 'conflicting': case 'blocked': return 'blocked'
+    case 'conflicting': case 'behind': case 'blocked': return 'blocked'
     case 'held': case 'awaiting_review': case 'awaiting_author': case 'unresolved_threads': case 'approved_not_enqueued': return 'needs-you'
-    case 'not_eligible': case 'unknown': return 'idle'
+    case 'not_eligible': return 'idle'
+    case 'unknown': return null
   }
 }
 
 export interface ItemInput {
   record: GhRecord
-  status: PrStatus | null
+  /** Undefined when the status could not be read. */
+  status: PrStatus | null | undefined
   chain: ChainRow | null
   /** A run going on it now, with its behavior's name. */
   run: string | null
@@ -102,7 +105,7 @@ export function toItem(input: ItemInput): Item {
   } as const
   const poise: Who | null = chain || labelled ? { tag: 'Poise', kind: 'poise', href: '' } : null
   if (record.state !== 'open') {
-    return { ...base, state: 'done', detail: record.state === 'merged' ? 'merged' : 'closed', since: ms(record.merged_at) ?? base.updatedAt, sinceRestart: false, who: poise }
+    return { ...base, state: record.kind === 'pr' && record.state === 'closed' ? 'idle' : 'done', detail: record.state === 'merged' ? 'merged' : 'closed', since: ms(record.merged_at) ?? base.updatedAt, sinceRestart: false, who: poise }
   }
   if (chain) {
     const { state, reason } = taskState(chain)
@@ -112,8 +115,12 @@ export function toItem(input: ItemInput): Item {
   if (record.kind === 'pr' && status) {
     return { ...base, state: blockerState(status.blocker.id), detail: status.blocker.line, since: ms(status.blocker.since), sinceRestart: status.blocker.sinceRestart, who: poise }
   }
+  if (record.kind === 'pr' && status === undefined) return { ...base, state: null, detail: '', since: null, sinceRestart: false, who: poise }
   return { ...base, state: 'idle', detail: '', since: null, sinceRestart: false, who: poise }
 }
+
+/** Merged or closed: folded at the end of its lane, with nothing left to do. */
+export const isSettled = (item: Item): boolean => item.record.state !== 'open'
 
 /** The phase on the rail: a chain's from its journal, other work's from its blocker (CURRENT.md, "Board as a list"). */
 export function phaseOf(item: Item): { index: number | null, word: string } {
@@ -121,7 +128,7 @@ export function phaseOf(item: Item): { index: number | null, word: string } {
     const p = chainPhase(item.chain)
     return { index: p.index, word: p.word }
   }
-  if (item.state === 'done') return item.lane === 'pr' && item.record.state === 'merged' ? { index: PHASES.length, word: 'Merged' } : { index: null, word: 'Closed' }
+  if (isSettled(item)) return item.lane === 'pr' && item.record.state === 'merged' ? { index: PHASES.length, word: 'Merged' } : { index: null, word: 'Closed' }
   const at = (index: number) => ({ index, word: PHASES[index] })
   if (item.lane === 'issue') return at(item.who && item.who.kind !== 'poise' ? 2 : 0)
   const id = item.detail
@@ -134,7 +141,7 @@ export function phaseOf(item: Item): { index: number | null, word: string } {
 /** How long, in Board's words (CURRENT.md): running says for how long; anything
  *  else how long it has waited, marked once it is the same for 15 minutes. */
 export function dwell(item: Item, now: number): { text: string, stuck: boolean } {
-  if (item.state === 'done') return { text: '', stuck: false }
+  if (isSettled(item) || !item.state) return { text: '', stuck: false }
   const from = item.since ?? item.updatedAt
   const minutes = Math.max(0, (now - from) / 60_000)
   if (minutes < 1) return { text: item.state === 'running' ? 'just started' : 'just now', stuck: false }
@@ -154,11 +161,12 @@ export function ago(minutes: number): string {
 }
 
 /** A pull request opened in the last six hours, still open: a blue New chip. */
-export const isNew = (item: Item, now: number): boolean => item.lane === 'pr' && item.state !== 'done' && now - item.openedAt < 6 * 3_600_000
+export const isNew = (item: Item, now: number): boolean => item.lane === 'pr' && !isSettled(item) && now - item.openedAt < 6 * 3_600_000
 
 export type Order = 'attention' | 'recent' | 'repo'
 export const recent = (a: Item, b: Item): number => b.updatedAt - a.updatedAt
-export const attention = (a: Item, b: Item): number => RANK[a.state] - RANK[b.state] || recent(a, b)
+const rank = (item: Item): number => item.state ? RANK[item.state] : STATES.length
+export const attention = (a: Item, b: Item): number => rank(a) - rank(b) || recent(a, b)
 export function sortItems(items: Item[], order: Order): Item[] {
   const by = order === 'recent' ? recent : attention
   const sorted = [...items].sort(by)
@@ -167,5 +175,5 @@ export function sortItems(items: Item[], order: Order): Item[] {
 
 /** Can this item be assigned to Poise: an open issue nobody has, the intake read, and not every issue entering already. */
 export function canAssign(item: Item, intakeRead: boolean, everyIssueEnters: boolean): boolean {
-  return intakeRead && !everyIssueEnters && item.lane === 'issue' && item.state !== 'done' && !item.who && !item.chain && !item.labelled
+  return intakeRead && !everyIssueEnters && item.lane === 'issue' && !isSettled(item) && !item.who && !item.chain && !item.labelled
 }

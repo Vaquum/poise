@@ -18,9 +18,8 @@ export function itemOf(url: string): string | null {
   return match ? `${match[1]}/${match[2]}#${match[3]}` : null
 }
 
-/** A chat opens in Chat; a worker and the Manager open in the Manager place. */
+/** A chat or a worker opens in Chat; the Manager opens in the Manager place. */
 export function chatOpening(chat: string, role?: 'manager' | 'worker' | null): Opening {
-  if (role === 'worker') return { href: placeHref('manager', { peek: chat, back: 'overview' }), label: 'Open the worker in the Manager' }
   if (role === 'manager') return { href: placeHref('manager', { back: 'overview' }), label: 'Open the Manager' }
   return { href: placeHref('chat', { chat, back: 'overview' }), label: 'Open the chat' }
 }

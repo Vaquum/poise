@@ -80,7 +80,7 @@ test('executes an idle five-item queue after the first task through real ACP, SQ
     expect((await (await page.request.get(`${origin}/__test__/timings`)).json()).spawnCount).toBe(1)
     // The same real browser/runtime/stdio journey now chains a chosen model
     // into the Poise reply-review instruction rather than a native diff review.
-    await expect(page.locator('.chat-h-status')).toHaveText('idle')
+    await expect(page.locator('.chat-h-status')).toHaveText('Idle')
     await input.fill('/model')
     await page.locator('.chat-command-models [data-identity="grok-4.6-high"]').click()
     await input.fill('/review'); await input.press('Space'); await input.press('Enter')
@@ -101,14 +101,14 @@ test('executes an idle five-item queue after the first task through real ACP, SQ
     await expect(page.locator('.chat-msg-user').last()).toContainText('/model grok-4.6-high /review')
     // Exercise an attachment-bearing steer through the actual runtime/stdio,
     // then replay its file badge from SQLite after a browser reload.
-    await expect(page.locator('.chat-h-status')).toHaveText('idle')
+    await expect(page.locator('.chat-h-status')).toHaveText('Idle')
     await input.fill('QC steering task'); await input.press('Enter')
-    await expect(page.locator('.chat-h-status')).toHaveText('running')
+    await expect(page.locator('.chat-h-status')).toHaveText('Running')
     await page.locator('.chat-file-input').setInputFiles({ name: 'steering-notes.txt', mimeType: 'text/plain', buffer: Buffer.from('Additional context: äö.') })
     await expect(page.locator('.chat-attachment-chip')).toContainText('steering-notes.txt')
     await input.fill('Use these notes too'); await input.press('Enter')
     await expect(page.locator('.chat-msg-steer')).toContainText('steering-notes.txt')
-    await expect(page.locator('.chat-h-status')).toHaveText('idle')
+    await expect(page.locator('.chat-h-status')).toHaveText('Idle')
     const steered = await (await page.request.get(`${origin}/__test__/timings`)).json()
     expect(steered.nativeSteers).toHaveLength(1)
     expect(steered.nativeSteers[0]).toContain('Additional context: äö.')
@@ -122,7 +122,7 @@ test('executes an idle five-item queue after the first task through real ACP, SQ
       await page.evaluate(value => { document.documentElement.dataset.theme = value }, theme)
       await page.screenshot({ path: info.outputPath(`qc-steering-${theme}.png`), animations: 'disabled' })
     }
-    await expect(page.locator('.chat-h-status')).toHaveText('idle')
+    await expect(page.locator('.chat-h-status')).toHaveText('Idle')
     // /create is a local library edit: no native prompt, checkout action or turn.
     await input.fill('/create /release-notes\nUse concrete outcomes, evidence and limitations.'); await input.press('Enter')
     await expect(page.locator('.chat-notice')).toContainText('Saved /release-notes')
@@ -134,7 +134,7 @@ test('executes an idle five-item queue after the first task through real ACP, SQ
     const nativeBefore = steered.session.nativeSessionId
     await input.fill('/compact'); await input.press('Space'); await input.press('Enter')
     await expect(page.locator('.chat-note')).toContainText('native compaction command')
-    await expect(page.locator('.chat-h-status')).toHaveText('idle')
+    await expect(page.locator('.chat-h-status')).toHaveText('Idle')
     await expect(page.locator('.chat-msg-steer')).toContainText('steering-notes.txt')
     const compacted = await (await page.request.get(`${origin}/__test__/timings`)).json()
     expect(compacted.session.nativeSessionId).toBe(nativeBefore)
@@ -159,14 +159,14 @@ test('executes an idle five-item queue after the first task through real ACP, SQ
     expect(fresh.nativeInputs.at(-1)[0].text).toBe('A wholly fresh task')
     expect(fresh.nativeInputs.at(-1).at(-1).text).toBe('\n\n[Memories]\nRemember this on every queued task: äö.')
     // The library survives reset/reload. Queue expansion uses the last saved body.
-    await expect(page.locator('.chat-h-status')).toHaveText('idle')
+    await expect(page.locator('.chat-h-status')).toHaveText('Idle')
     await input.fill('/queue /release-notes Describe the result'); await input.press('Enter')
     await expect(page.locator('.chat-message-queue')).toContainText('/release-notes Describe the result')
     await input.fill('/create /release-notes\nUpdated reusable instructions: concrete outcomes only.'); await input.press('Enter')
     await expect(page.locator('.chat-notice')).toContainText('Updated /release-notes')
     await input.fill('Initial task for the saved-switch queue'); await input.press('Enter')
     await expect(page.locator('.chat-msg-agent').last()).toContainText('DONE: Describe the result')
-    await expect(page.locator('.chat-h-status')).toHaveText('idle')
+    await expect(page.locator('.chat-h-status')).toHaveText('Idle')
     const reused = await (await page.request.get(`${origin}/__test__/timings`)).json()
     expect(reused.nativeInputs).toHaveLength(12)
     expect(reused.nativeInputs.at(-1)[0].text).toBe('Describe the result\n\n[Saved switch: /release-notes]\nUpdated reusable instructions: concrete outcomes only.\n[End saved switch: /release-notes]')

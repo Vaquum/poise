@@ -38,6 +38,17 @@ describe('the new interface has one vocabulary', () => {
     expect([...keys].filter((key) => !registered()[key])).toEqual([])
   })
 
+  // A row is a key, perhaps a ref, then its group, on one line or several; its reference is the ref or set.<key>.
+  it('explains every Settings row, keyed by its ref or by set.<its key>', () => {
+    const keys = new Set<string>()
+    for (const file of walk(join('src', 'ui', 'places', 'settings')).filter((f) => f.endsWith('.ts'))) {
+      for (const [, key, ref] of readFileSync(file, 'utf8').matchAll(/\{\s*key: '([\w.-]+)',(?:\s*ref: '([\w.-]+)',)?\s*group:/g)) keys.add(ref || `set.${key}`)
+    }
+    expect(keys.size).toBeGreaterThan(20)
+    expect(keys).toContain('set.models.slots')
+    expect([...keys].filter((key) => !registered()[key])).toEqual([])
+  })
+
   it('puts the registry’s words on screen', () => {
     expect(term('state.needs-you')).toBe('Needs you')
     expect(term('no.such.key')).toBe('no.such.key')

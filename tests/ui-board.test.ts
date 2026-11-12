@@ -14,10 +14,10 @@ const item = (patch: Partial<Parameters<typeof toItem>[0]> = {}): Item => toItem
 
 describe('Board puts every live item in the seven states', () => {
   it('maps each of main’s pull request blockers to one state', () => {
-    const expected: Record<BlockerId, string> = {
-      review_running: 'running', ci_pending: 'waiting', in_queue: 'waiting', behind: 'waiting', ci_failing: 'failed',
+    const expected: Record<BlockerId, string | null> = {
+      review_running: 'running', ci_pending: 'waiting', in_queue: 'waiting', behind: 'blocked', ci_failing: 'failed',
       conflicting: 'blocked', blocked: 'blocked', held: 'needs-you', awaiting_review: 'needs-you', awaiting_author: 'needs-you',
-      unresolved_threads: 'needs-you', approved_not_enqueued: 'needs-you', not_eligible: 'idle', unknown: 'idle',
+      unresolved_threads: 'needs-you', approved_not_enqueued: 'needs-you', not_eligible: 'idle', unknown: null,
     }
     for (const [id, state] of Object.entries(expected)) expect(blockerState(id as BlockerId)).toBe(state)
   })
@@ -28,9 +28,12 @@ describe('Board puts every live item in the seven states', () => {
     expect(it.since).toBe(Date.parse(iso(20)))
   })
 
-  it('says merged and closed work is Done, and a run going on it Running', () => {
+  it('says merged work and closed issues are Done, a closed pull request Idle, and a run going on it Running', () => {
     expect(item({ record: record({ state: 'merged', merged_at: iso(5) }) })).toMatchObject({ state: 'done', detail: 'merged' })
     expect(item({ record: record({ kind: 'issue', state: 'closed' }) })).toMatchObject({ state: 'done', detail: 'closed' })
+    expect(item({ record: record({ state: 'closed' }) })).toMatchObject({ state: 'idle', detail: 'closed' })
+    // A pull request whose status could not be read has no state word.
+    expect(item({ status: undefined })).toMatchObject({ state: null, detail: '' })
     expect(item({ run: 'Review', status: status('awaiting_review') })).toMatchObject({ state: 'running', who: { kind: 'run', tag: 'Review' } })
   })
 

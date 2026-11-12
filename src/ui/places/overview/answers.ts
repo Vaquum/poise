@@ -104,7 +104,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       ...reviewed,
     ]))
   }
-  const editorHref = (slugName: string) => placeHref('editor', { doc: slugName, tab: 'reviews', back: 'overview' })
+  const editorHref = (slugName: string) => placeHref('editor', { doc: slugName, back: 'overview' })
 
   /** Open at the level: not settled here, not waiting to be sent away. */
   const isOpen = (entry: Entry) => !done.has(entry.id) && !progress.get(entry.id)?.settled
@@ -531,7 +531,7 @@ export function mountAnswers(ctx: PartContext, root: HTMLElement, options: { rol
       sessionStorage.setItem(QUESTION_DRAFTS, JSON.stringify(saved))
     } catch { /* nothing to clear */ }
   }
-  const draftTyped = () => current.some((entry) => entry.request?.kind === 'question' && questionDraft(entry).size > 0
+  const draftTyped = () => [...replyDrafts.values()].some((value) => !!value.trim()) || current.some((entry) => entry.request?.kind === 'question' && questionDraft(entry).size > 0
     && [...questionDraft(entry).values()].some((input) => input.type === 'text' ? !!input.value.trim() : input.checked))
 
   // An answer on its way, or a Dismiss or Silence still waiting in the tab, is

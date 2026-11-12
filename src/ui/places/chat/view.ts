@@ -58,7 +58,9 @@ import { createFilePreview } from '../../../views/chat-file-preview'
 import { ICON_FORK, ICON_HANDOFF, ICON_ACTIVITY, ICON_TOOLS, ICON_AUTO_MERGE, ICON_MEMORIES, ICON_SAFE_MODE, ICON_REASONING, ICON_PIN } from '../../../views/chat-icons'
 import { WAKE_OPTIONS, wakeStatusText, type ManagerWakeView, type WakeMinutes } from '../../../chat-manager-settings-types'
 import { deriveSessionTitle } from '../../../chat-title'
-import { applyWorklogOrder, compareWorklog, sessionDot } from '../../../chat-worklog'
+import { applyWorklogOrder, compareWorklog } from '../../../chat-worklog'
+import { term } from '../../registry'
+import { chatState } from '../overview/states'
 import { shortElapsed } from '../../../chat-turn-time'
 import { createDeployCard, type DeployCard, type LocalPendingChange } from '../../../views/chat-deploy-card'
 import { recognisePoiseRequest } from '../../../poise-request-intent'
@@ -273,18 +275,10 @@ function stallSummary(stall: StallState): string {
   return `Stalled — the last turn left ${parts.join(', ')}.`
 }
 
-function statusText(s: SessionRecord): string {
-  switch (s.status) {
-    case 'starting': return s.cliChecking ? 'checking CLI…' : 'starting…'
-    case 'idle': return s.stall ? 'stalled' : 'idle'
-    case 'queued': return queuedStatusText(s.queuedBehind)
-    case 'running': return 'running'
-    case 'waiting': return 'waiting for you'
-    case 'stopping': return 'stopping…'
-    case 'interrupted': return 'interrupted'
-    case 'closed': return 'closed'
-    case 'error': return 'error'
-  }
+/** A chat's state in the registry's words, as Overview and Board say them (#556's vocabulary). */
+function stateWords(s: SessionRecord): string {
+  const placed = chatState(s)
+  return `${term(`state.${placed.state}`)}${placed.note ? ` · ${placed.note}` : ''}`
 }
 
 function isRunning(status: SessionStatus): boolean {
@@ -765,15 +759,14 @@ function sidebarHtml(): string {
     return '<div class="chat-empty chat-sidebar-empty">No sessions yet.</div>'
   }
   const records = order.map((id) => sessions.get(id)!.record)
-  const now = Date.now()
-  const zone = effectiveTimezone()
   return visible.map((id) => {
     const e = sessions.get(id)!
     const s = e.record
     const armed = armedDelete?.id === id && armedDelete.until > Date.now()
     const bulkArmed = armed && armedDelete!.bulk && armedDelete!.bulk.length > 1 ? armedDelete!.bulk : null
     const confirm = armed ? (bulkArmed ? deleteBulkConfirmCopy(bulkArmed.length) : deleteConfirmCopy(s, records)) : null
-    const dot = sessionDot(s, now, zone)
+    const placed = chatState(s)
+    const said = stateWords(s)
     const pinned = pins.has(id) && s.role !== 'manager'
     const selected = selectedIds.has(id)
     return `<div class="chat-session-item${id === activeId ? ' active' : ''}${e.pending ? ' pending' : ''}${pinned ? ' pinned' : ''}${selected ? ' selected' : ''}" role="listitem" data-id="${escapeHtml(id)}" tabindex="0" draggable="${s.role !== 'manager'}">`
@@ -784,8 +777,8 @@ function sidebarHtml(): string {
       + (s.role === 'manager' ? `<span class="chat-pill chat-pill-manager">Manager</span>` : '')
       + (s.role === 'worker' ? `<span class="chat-pill chat-pill-worker">Worker</span>` : '')
       + `<span class="chat-pill">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)} · ${escapeHtml(s.model)}</span>`
-      + `<span class="chat-session-dot" data-state="${dot.state}" title="${escapeHtml(dot.label)}" aria-hidden="true"></span>`
-      + `<span class="chat-session-state" title="${escapeHtml(dot.label)}">${escapeHtml(dot.label)}</span>`
+      + `<span class="sc" data-state="${placed.state}" aria-hidden="true"></span>`
+      + `<span class="chat-session-state" title="${escapeHtml(said)}">${escapeHtml(said)}</span>`
       + `<span class="chat-session-date">${escapeHtml(dateLabel(s.createdAt))}</span>`
       + `</div>`
       + (pinned ? `<button type="button" class="chat-session-pin" title="Unpin — return to automatic order" aria-label="Unpin chat">${ICON_PIN}</button>` : '')
@@ -1213,10 +1206,18 @@ async function deleteSessions(ids: string[]): Promise<void> {
 
 // ── Selecting and loading a session ────────────────────────────────────────
 
+// On a narrow window the list floats over the chat (ui/narrow.css): Chat opens with it
+// folded, and opening a chat folds it away again.
+export function foldListWhenNarrow(): void {
+  if (viewEl?.isConnected && matchMedia('(max-width: 760px)').matches && !viewEl.classList.contains('chat-sidebar-collapsed')) viewEl.querySelector<HTMLButtonElement>('.chat-sidebar-toggle')?.click()
+}
+if (typeof window !== 'undefined') matchMedia('(max-width: 760px)').addEventListener('change', (e) => { if (e.matches) foldListWhenNarrow() })
+
 async function selectSession(id: string, restoring = false): Promise<void> {
   if (!restoring) jev?.leave(); mainEl?.classList.remove('jev-mode')
   const e = sessions.get(id)
   if (!e || deleting.has(id)) return
+  foldListWhenNarrow()
   if (!activeId) freshDraft = composer.getDraft()
   if (activeId && activeId !== id) {
     const prev = sessions.get(activeId)
@@ -2528,7 +2529,7 @@ function headerHtml(): string {
   // answered, but its model, settings and messages are not the person's to change.
   if (!listed(s.id)) {
     return `<div class="chat-h-row"><span class="chat-pill chat-h-agent">${escapeHtml(AGENT_LABELS[s.agent] || s.agent)}</span><span class="chat-h-model">${escapeHtml(s.model)}</span>`
-      + `<span class="chat-h-status" data-status="${s.status}">${escapeHtml(statusText(s))}</span> ${sinceHtml(e, s)}<span class="chat-controls-spacer"></span>`
+      + `<span class="chat-h-status" data-status="${s.status}">${escapeHtml(stateWords(s))}</span> ${sinceHtml(e, s)}<span class="chat-controls-spacer"></span>`
       + `${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" title="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}</div>`
       + '<div class="st-help st-help-info chat-observer-note">Poise runs this chat for the Switchboard pane. It takes no messages; answer here only what it asks you.</div>'
   }
@@ -2554,7 +2555,7 @@ function headerHtml(): string {
       </span>
       <span class="chat-h-repo" title="${escapeHtml(s.checkout || '')}">${s.workspaceKind === 'poise-local' ? '<span>Poise · local</span>' : s.workspaceKind === 'poise-change' ? `<span>Poise · change</span> · <code>${escapeHtml(s.branch?.name || '')}</code>` : `<code>${escapeHtml(s.repo || 'local')}</code> · <code>${escapeHtml(s.branch?.name || '')}</code>`}${ws.text ? ` <span class="chat-h-ws ${ws.cls}">${escapeHtml(ws.text)}</span>` : ''}</span>
       ${modeSel}
-      <span class="chat-h-status" data-status="${s.status}">${escapeHtml(statusText(s))}</span>
+      <span class="chat-h-status" data-status="${s.status}">${escapeHtml(stateWords(s))}</span>
       ${sinceHtml(e, s)}
       <span class="chat-controls-spacer"></span>
       ${isRunning(s.status) ? `<button type="button" class="chat-h-btn chat-h-stop" title="Stop the turn (⌘.)">${ICON_STOP} Stop</button>` : ''}

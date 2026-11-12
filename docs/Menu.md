@@ -2,8 +2,8 @@
 
 The top bar is fixed: Overview, Board, Chat, Editor, Observe and Settings, in
 that order ([Interface](Interface.md)). Settings opens a menu under it: *Style
-panel*, *Manager's controls* (Rhythm, Stability and Autonomy, in the Manager
-place), then the ten sections of Settings: General, Accounts, Models,
+panel*, *Manager's controls* (Rhythm, Stability and Autonomy, in Settings →
+Manager), then the ten sections of Settings: General, Accounts, Models,
 Extensions, Publishing, Behaviors, Snippets, Admin, Style and Manager. Each
 opens Settings at that section's address, `?view=settings&settings=<section>`,
 with a route back to the place you came from. Admin opens only where it is
@@ -23,8 +23,10 @@ mode and a workspace terminal. Publishing lists the websites the Editor
 publishes to (see [Publishing](Publishing.md)). Style holds the type, scale,
 shape, motion and meaning colours the Style panel holds, and the writing ones.
 
-Explanations appear after half a second over any element, and on keyboard
-focus; `?` opens the full reference ([Interface](Interface.md#the-reference)).
+Explanations appear after half a second over any element that has one, and on
+keyboard focus; `?` opens the full reference ([Interface](Interface.md#the-reference)).
+Chat, the Manager place, the Editor and Settings' sections built on classic's
+views keep classic's own tooltips for now.
 Errors, account state and pairing instructions remain visible. Existing account,
 pairing and admin links open their destination directly.
 

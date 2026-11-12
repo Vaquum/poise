@@ -60,7 +60,7 @@ test('lists sessions, opens one on a delayed click, and renames on double-click'
   await items.nth(1).click()
   await expect(items.nth(1)).not.toHaveClass(/active/)
   await expect(items.nth(1)).toHaveClass(/active/)
-  await expect(page.locator('.chat-h-status')).toHaveText('idle')
+  await expect(page.locator('.chat-h-status')).toHaveText('Idle')
   await expect(page.locator('.chat-h-repo')).toContainText('acme/app')
   await expect(page.locator('.chat-h-repo')).toContainText('clean')
 })
@@ -90,7 +90,7 @@ test('shows the pending entry the instant the first prompt is sent, and lifts th
   sock.ack(prompt)
   sock.push('fresh', { type: 'turn.started', turnId: 't1', prompt: { text: 'Refactor the auth module', attachments: [], mentions: [] } })
   sock.push('fresh', { type: 'status.changed', status: 'running' })
-  await expect(page.locator('.chat-h-status')).toHaveText('running')
+  await expect(page.locator('.chat-h-status')).toHaveText('Running')
   await expect(page.locator('.chat-msg-user')).toHaveCount(1)
 })
 
@@ -165,7 +165,7 @@ test('Enter sends, Shift+Enter breaks the line, Enter steers while running, and 
   await expect(page.locator('.chat-msg-steer')).toContainText('also check the tests')
   await ta.press('ControlOrMeta+.')
   await expect.poll(() => sock.framesOf('cancel').length).toBe(1)
-  await expect(page.locator('.chat-h-status')).toHaveText('stopping…')
+  await expect(page.locator('.chat-h-status')).toHaveText('Running · Stopping…')
   sock.push('s1', { type: 'turn.finished', turnId: 't1', stopReason: 'cancelled', durationMs: 4200 })
   sock.push('s1', { type: 'status.changed', status: 'idle' })
   await expect(page.locator('.chat-turn-footer')).toContainText('Stopped')
@@ -388,7 +388,7 @@ test('answers a permission with the keyboard and a question with its options', a
   const card = page.locator('.chat-permission')
   await expect(card).toHaveClass(/pending/)
   await expect(card.locator('.chat-card-btn')).toHaveText(['1Allow once', '2Allow for this session', '3Reject'])
-  await expect(page.locator('.chat-h-status')).toHaveText('waiting for you')
+  await expect(page.locator('.chat-h-status')).toHaveText(/^Needs you · /)
   // While the composer is focused the digits are typing, not answers.
   await input(page).focus()
   await page.keyboard.press('1')
@@ -442,13 +442,13 @@ test('discovers native workers live and after reconnect without losing the manag
   const busyWorker = state.sessions.find(s => s.id === 'worker-0')!
   busyWorker.status = 'running'
   sock.ws!.send(JSON.stringify({ kind: 'session.updated', session: busyWorker }))
-  await expect(page.locator('.chat-session-item[data-id="worker-0"] .chat-session-dot[data-state="working"]')).toBeVisible()
+  await expect(page.locator('.chat-session-item[data-id="worker-0"] .sc[data-state="running"]')).toBeVisible()
   const staleResponse = page.waitForResponse(response => response.url().endsWith('/api/chat/sessions'))
   releaseList!()
   await (await staleResponse).finished()
   await page.evaluate(() => new Promise<void>(done => requestAnimationFrame(() => requestAnimationFrame(() => done()))))
   await expect(page.locator('.chat-session-item')).toHaveCount(4)
-  await expect(page.locator('.chat-session-item[data-id="worker-0"] .chat-session-dot[data-state="working"]')).toBeVisible()
+  await expect(page.locator('.chat-session-item[data-id="worker-0"] .sc[data-state="running"]')).toBeVisible()
   const reconnected = sock.ws
   sock.ws!.close()
   const missed = session({ id: 'missed-worker', title: 'Created while disconnected' })
@@ -678,7 +678,7 @@ test('renders an unanswered permission from history after a reload, and an inter
   await expect.poll(() => sock.framesOf('subscribe').map((f) => f.command)).toContainEqual({ type: 'subscribe', sessionId: 's1', afterSeq: 2 })
   await page.locator('.chat-session-item[data-id="s2"]').click()
   await expect(page.locator('.chat-turn-footer')).toHaveText('Interrupted')
-  await expect(page.locator('.chat-h-status')).toHaveText('interrupted')
+  await expect(page.locator('.chat-h-status')).toHaveText('Needs you · Interrupted: Resume continues')
   await expect(page.locator('.chat-h-status')).toHaveCSS('color', 'rgb(168, 121, 43)')
   await expect(input(page)).toBeEnabled() // /reset can recover without the old native log.
   await expect(page.locator('.chat-send')).toBeDisabled()
@@ -688,7 +688,7 @@ test('renders an unanswered permission from history after a reload, and an inter
   await expect(input(page)).toHaveAttribute('placeholder', /resume/i)
   await page.locator('.chat-resume-btn').click()
   await expect.poll(() => state.calls.filter((c) => c.path.endsWith('/resume')).length).toBe(1)
-  await expect(page.locator('.chat-h-status')).toHaveText('idle')
+  await expect(page.locator('.chat-h-status')).toHaveText('Idle')
   await expect(input(page)).toBeEnabled()
 })
 
@@ -1083,9 +1083,9 @@ test('creates a session from the dialog with a pending entry before the server a
   expect(created).not.toHaveProperty('branch')
   expect(state.calls.filter(c => c.path === '/api/chat/repo')).toHaveLength(0)
   await expect.poll(() => sock.framesOf('subscribe').map((f) => f.command)).toContainEqual({ type: 'subscribe', sessionId: 'new-1', afterSeq: 0 })
-  await expect(page.locator('.chat-h-status')).toHaveText('starting…')
+  await expect(page.locator('.chat-h-status')).toHaveText('Running · Starting')
   sock.push('new-1', { type: 'session.updated', session: { ...state.sessions[0], status: 'idle' } })
-  await expect(page.locator('.chat-h-status')).toHaveText('idle')
+  await expect(page.locator('.chat-h-status')).toHaveText('Idle')
   await expect(input(page)).toBeEnabled()
   await expect(input(page)).toHaveValue(pendingDraft)
   await input(page).press('Enter')
@@ -3369,7 +3369,7 @@ test('saved switches: creation and replacement during a turn never steer, queue 
   await expect(page.locator('.chat-notice')).toContainText('Updated /velocin-voice')
   expect(sock.framesOf('switch.create')[0].command).toMatchObject({ revision: 1, content: 'Revised voice.' })
   for (const kind of ['prompt', 'steer', 'cancel', 'queue.add']) expect(sock.framesOf(kind)).toEqual([])
-  await expect(page.locator('.chat-h-status')).toHaveText('running')
+  await expect(page.locator('.chat-h-status')).toHaveText('Running')
   await input(page).fill('/velocin-voice Check the wording'); await input(page).press('Enter')
   await expect.poll(() => sock.framesOf('steer').length).toBe(1)
   expect(sock.framesOf('steer')[0].command).toMatchObject({ text: '/velocin-voice Check the wording' })
@@ -3630,6 +3630,29 @@ test('CLI refresh: the model menu follows a moving console without another resiz
   await expect(picker).toHaveAttribute('data-side', 'above')
   await page.keyboard.press('Escape'); await expect(picker).toBeHidden()
 })
+
+// ---------- Narrow windows (#556: no page overflow at 375, 768 and 1000; the composer stays in reach) ----------
+
+for (const width of [375, 768, 1000]) {
+  test(`nothing overflows Chat or the Manager place at ${width} pixels, and the composer stays in reach`, async ({ page }) => {
+    const state = makeState([session({ id: 's1', title: 'First' })], { s1: [] })
+    await installRoutes(page, state)
+    await installSocket(page, state)
+    await page.setViewportSize({ width, height: 800 })
+    const overflow = () => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    await page.goto('/?view=chat&chat=s1')
+    await expect(page.locator('#view-chat .chat-layout')).toBeVisible()
+    expect(await overflow()).toBeLessThanOrEqual(0)
+    // Nothing lies over the composer: what is under the middle of its input is the input itself.
+    await settled(page)
+    const input = page.locator('.chat-input:visible')
+    const box = (await input.boundingBox())!
+    expect(await input.evaluate((el, [x, y]) => document.elementFromPoint(x, y) === el, [box.x + box.width / 2, box.y + box.height / 2])).toBe(true)
+    await page.goto('/?view=manager')
+    await expect(page.locator('#view-chat .chat-layout')).toBeVisible()
+    expect(await overflow()).toBeLessThanOrEqual(0)
+  })
+}
 
 // ---------- Entry points of the new interface (#556 PR 3) ----------
 

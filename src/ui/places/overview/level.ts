@@ -1,6 +1,6 @@
 // How much of Answer here to show (#556, Overview's level). The place and the
 // bell in the top bar both read it, so the bell's number is always what the
-// level shows: on Overview its own entries, elsewhere the notices themselves.
+// level shows: on Overview its own entries, elsewhere the same sources (away.ts).
 import { store } from '../../dom'
 import type { NoticeKind } from '../../../notices'
 
@@ -86,8 +86,10 @@ export function saveLevel(level: number): void {
 }
 
 // While Overview is mounted it hands over its open entries' groups, chat
-// requests, decisions and threads included; elsewhere the bell counts notices.
+// requests, decisions and threads included; elsewhere away.ts reads them.
 let answerGroups: (() => readonly Group[]) | null = null
+
+export const onOverview = (): boolean => answerGroups !== null
 
 export function setAnswerGroups(source: (() => readonly Group[]) | null): void {
   answerGroups = source
@@ -99,6 +101,6 @@ export function answersChanged(): void {
   if (answerGroups) changed()
 }
 
-export function bellTally(notices: readonly { kind: NoticeKind }[]): Tally {
-  return tally(answerGroups ? answerGroups() : notices.map((notice) => noticeGroup(notice.kind)), readLevel())
+export function bellTally(away: () => readonly Group[]): Tally {
+  return tally(answerGroups ? answerGroups() : away(), readLevel())
 }

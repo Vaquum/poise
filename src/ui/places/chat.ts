@@ -9,7 +9,7 @@ import { $ } from '../dom'
 import { routeBack } from '../shell'
 import { takeOpenChat } from '../open-chat'
 import type { MountPlace } from '../router'
-import { initChatView, openChatForSubject, openChatSession, stopChatRefresh } from './chat/view'
+import { foldListWhenNarrow, initChatView, openChatForSubject, openChatSession, stopChatRefresh } from './chat/view'
 import { loadSettings } from '../../config'
 import { installIconTooltips } from '../../icon-tooltips'
 
@@ -39,6 +39,8 @@ async function openRequested(chat: string | null): Promise<void> {
  *  as classic does: a frame after Chat starts, while its sessions load. */
 export async function mountChatView(root: HTMLElement, signal: AbortSignal, place: 'chat' | 'manager', chat: string | null = null): Promise<() => void> {
   const main: HTMLElement = $('main', root)
+  // This mount's own route back, taken before any wait: a newer place may own the root by then.
+  const back: HTMLElement = $('[data-back]', root)
   const view = chatView()
   main.append(view)
   view.hidden = false
@@ -46,10 +48,15 @@ export async function mountChatView(root: HTMLElement, signal: AbortSignal, plac
   // Times are on Poise's clock, in Settings' time zone, as classic reads them.
   await loadSettings().catch(() => undefined)
   const started = initChatView()
+  // The shell is drawn by now: the route back sits first in the chat's own
+  // header, never over its controls, and a narrow window starts with the list folded.
+  view.querySelector(':scope > .view-header')?.prepend(back)
+  foldListWhenNarrow()
   await new Promise((done) => requestAnimationFrame(done))
   await Promise.all([started, openRequested(chat)])
   document.addEventListener('poise:open-chat-pending', () => { void openRequested(null) }, { signal })
   return () => {
+    back.remove()
     stopChatRefresh()
     view.hidden = true
     if (!keep) {

@@ -25,8 +25,10 @@ and `deploy/restore.sh` back it up and restore it.
 ## Capabilities
 
 The interface is one page with a fixed top bar: Overview, Board, Chat, Editor,
-Observe and Settings. Every element explains itself on hover, keyboard focus or
-`?`. See [Interface](docs/Interface.md); the previous interface stays at
+Observe and Settings. Elements explain themselves on hover, keyboard focus or
+`?`; Chat, the Manager place, the Editor and Settings' sections built on classic's
+views keep classic's tooltips for now. See [Interface](docs/Interface.md); the
+previous interface stays at
 `/classic.html` until it is removed.
 
 - **Overview** — *Answer here* lists what needs you, with the answer on each entry: a failed behavior, a sign-in, a chat waiting for you, a Switchboard decision, a review thread, and your pull requests once they are ready to merge, again every 15 minutes until merged or silenced. *In motion* shows the work in seven states; beside it, the day's numbers against their pace and year, Behaviors' runs and the GitHub API quota. The bell on every place opens it. See [Notifications](docs/Notifications.md) and [Analytics](docs/Analytics.md).
@@ -42,7 +44,7 @@ Observe and Settings. Every element explains itself on hover, keyboard focus or
 Settings reads only the selected section's expensive data. Accounts shows each
 CLI result independently, with pending checks and failures named alongside it.
 External font stylesheets load after first paint; system fonts keep the app
-usable while typography is unavailable or still loading.
+usable while the interface's fonts are unavailable or still loading.
 Editor, Snippets and Chat start independently of GitHub settings. Editor opens the
 remembered document while discovering the library; its open selector updates as
 soon as discovery finishes and distinguishes loading, failure and an empty library.
@@ -131,7 +133,7 @@ npm run dev
 ```
 
 Open <http://localhost:5555>. Configure your GitHub account, your agent
-account, timezone, refresh interval, and theme in Settings. Add GitHub
+account, timezone and refresh interval in Settings. Add GitHub
 organizations and personal accounts there, using the organization name or
 personal username (for example, `octocat`). Settings refuses a time zone the
 Poise server does not know. The browser shows times in the saved zone, or in
@@ -144,11 +146,11 @@ browser's own zone until you choose another.
 Settings → General → GitHub holds two accounts, and no GitHub account is fixed
 anywhere in Poise or Caller:
 
-- **Your GitHub account** scopes Current and Archive's issue/PR history to
-  what you are involved in. Archive's Actions filter reads workflows across ready
+- **Your GitHub account** scopes Board's and Observe → GitHub's issue/PR history to
+  what you are involved in. Observe → GitHub's Actions filter reads workflows across ready
   accounts independently of that involvement. Repository lists, account
-  indexing, issues opened from Current or the Editor and issues assigned to Poise
-  from Current also use your account.
+  indexing, issues opened from Board or the Editor and issues assigned to Poise
+  from Board also use your account.
 - **GitHub automation account** is the GitHub user your reviews and comments are posted
   as: PR reviews and approvals, conversation resolution, issue reviews, and
   the checkouts and reads they need. It is optional to save, but every
@@ -205,13 +207,13 @@ it exits; Open a shell starts your login shell. Poise never reads the CLIs'
 credentials. At most two terminals run at once, and one closes after 15 idle
 minutes. See [Connected accounts](docs/Connected-accounts.md).
 
-Current, Archive, and Swarm combine GitHub accounts and offer an account
-filter. Repository identities retain their owner; Archive and Swarm show
+Board, Observe → GitHub and Observe → Behaviors combine GitHub accounts and offer an account
+filter. Repository identities retain their owner; Observe → GitHub and Behaviors show
 separate Org and Repo columns. Repository-free manual cards,
 Editor, Snippets, and local chats remain personal. If one account's reads
-fail, available results remain visible with an explicit error. Current paints personal cards and GitHub lanes as
+fail, available results remain visible with an explicit error. Board paints personal cards and GitHub lanes as
 each read arrives; repository discovery and agent activity do not delay them.
-Current keeps an issue draft open while its write is pending and closes it
+Board keeps an issue draft open while its write is pending and closes it
 after confirmation. A failed write retains the draft for an explicit retry.
 A later refresh failure does not reopen the draft or report the confirmed
 write as failed.
@@ -231,12 +233,12 @@ chain is off, though the chain does not take such an issue until that changes.
 With the chain's intake set to all open issues, there is no label to show or add.
 An account whose intake or pull request references cannot be fully read shows
 none of this and reports the error.
-Archive paints its page before the full-history total is available, showing
+Observe → GitHub paints its page before the full-history total is available, showing
 an available-row count until that read finishes.
 
 Behaviors uses one shared set of enabled flags, review settings, repository
 selections, skipped repositories, trusted authors, and memory across all ready
-GitHub accounts. Account filters in Current, Archive, and Swarm do not change
+GitHub accounts. Account filters in Board and Observe do not change
 automation scope. The repository pickers list the repositories of all ready
 accounts by their full `owner/repo` names. Newly activated accounts use the
 same behavior settings.
@@ -267,7 +269,7 @@ Activation never initializes over the existing account's database.
 
 Models have one name everywhere: the identity `<family>-<version>-<effort>`
 from Caller's catalog (`opus-5-max`, `gpt-6-astra-ultra`, …), the same string
-the Swarm log records. Settings → Models lists every place Poise launches a
+Observe → Behaviors records. Settings → Models lists every place Poise launches a
 model — Chat, Editor chat, PR review, PR approval, Issue review — with a default and a
 fallback each, plus the places Caller decides on its own (`/content`,
 `/consensus`, fix failing CI, simplify issue, the sign-in check). Every place
@@ -282,7 +284,7 @@ The PR review place also names a secondary and a tertiary reviewer (seeded
 from different families than the default). The Reviewers column of the
 Behaviors view decides how many of the three review each new pull request —
 primary only by default, primary + secondary, or all three — and they run at
-the same time, each as its own Swarm row with its own model and Stop button.
+the same time, each as its own row in Observe → Behaviors with its own model and Stop button.
 Every review posts as your agent account, so the pull request ends up with
 the union of their findings; a bug two reviewers find in the same minutes can
 appear twice, since github-interface deduplicates only against threads already
@@ -290,7 +292,7 @@ posted. Each run reports the review it submitted (Caller records the GitHub
 review id as its receipt), so a reviewer that dies is relaunched exactly like a
 single review is: once every review posted since its launch is accounted for by
 a sibling. Approvals stay with the default model. A wider panel applies to
-pull requests opened after the change; the manual Review button in Swarm keeps
+pull requests opened after the change; the manual Review button in Observe → Behaviors keeps
 launching the default alone.
 
 The catalog holds the latest model of each family with its top two efforts
@@ -320,7 +322,7 @@ evidence holds unresolved launches until a trustworthy matching run record resto
 normal reconciliation, retry, and timeout handling.
 Issue holds preserve their original child coverage; confirmed terminal holds do not
 consume worker slots. Uncertain live workers still count toward the concurrency limit.
-Swarm identifies unreadable targets and their errors alongside valid live runs, and
+Observe → Behaviors identifies unreadable targets and their errors alongside valid live runs, and
 persistent incidents keep holds visible after the source logs disappear.
 
 ## Behaviors
@@ -346,7 +348,7 @@ as its own agent account.
 
 **Merge Pull Requests** is off by default. Turn it on to merge your eligible
 pull requests automatically on the server's one-minute tick, including ones
-already open. It follows Current's green status: the merge button is available,
+already open. It follows Board's green status: the merge button is available,
 checks have passed (or none exist), and no live conversation remains unresolved.
 Yellow or unknown pull requests wait. Caller rereads readiness and pins the head
 SHA when merging; GitHub still enforces repository protections. It prefers squash
@@ -393,10 +395,10 @@ including across restarts or disable/enable. If a write receipt is uncertain,
 the marker and a visible diagnostic hold it rather than risk duplicate reruns.
 A manual rerun or new head remains available through GitHub.
 
-Replay in Swarm runs only what the scheduler itself would run. A pull request
+Replay in Observe → Behaviors runs only what the scheduler itself would run. A pull request
 must be open, not a draft, yours, and outside that behavior's skipped
 repositories; an issue must be open, by a trusted author, in a repository
-opted in to Review New Issues. Anything else is refused, and Swarm shows why
+opted in to Review New Issues. Anything else is refused, and Observe → Behaviors shows why
 under the row. See [Behavior integration contract](docs/Behavior-Contract.md).
 
 ## Review New Issues
@@ -410,7 +412,7 @@ so it can read the whole repository and run the tests; Caller posts its
 comments as your agent account. Nothing is reviewed until a repository is
 ticked in the row's Setting dropdown, and only issues by the trusted authors
 listed there count — your account and the agent account until you save a
-list. Swarm shows every reviewer like a PR review. See
+list. Observe → Behaviors shows every reviewer like a PR review. See
 [Review New Issues](docs/Issue-review.md).
 
 ## Production
@@ -588,7 +590,7 @@ is reported and nothing runs until it is corrected. A drain skips the run.
 | `CONFAB_URL` | Optional Confab service | `http://localhost:8000` |
 | `CONFAB_API_KEY` | Optional Confab bearer credential | unset |
 
-The browser keeps view, filter, typography, refresh, and theme preferences in
+The browser keeps view, filter, Style and refresh preferences in
 `localStorage`. SQLite uses WAL mode and stores local settings, manual cards,
 and automation deduplication state. Editor documents remain plain Markdown.
 
@@ -638,7 +640,7 @@ See [SECURITY.md](SECURITY.md) for the supported trust boundary.
 
 ## Stopping a run
 
-Every Swarm row that is still running has a Stop button. The first click arms
+Every row in Observe → Behaviors that is still running has a Stop button. The first click arms
 it ("Sure?"), the second click asks Caller to stop the run: `agent-interface
 --stop` signals the call's process group and closes the row as failed with
 `error_code: stopped`. A stopped review or approval is held for that head like
@@ -646,26 +648,26 @@ a bounded failure — it is not relaunched by the next tick; a new head or a
 replay is a fresh decision. A stop is not counted against the Claude sign-in.
 Needs a Caller release with `--stop`; older releases answer "Update Caller".
 
-## Review activity in Swarm
+## Review activity in Observe → Behaviors
 
-Swarm first shows the 50 newest readable calls, then loads the complete history.
+Behaviors first shows the 50 newest readable calls, then loads the complete history.
 Large histories prepare their rows in batches so the recent calls and navigation
 stay usable while the remaining rows are prepared.
 The count and loading message identify the partial history; a failed full read
 keeps those calls visible and reports the missing history. Account scoping and
 quarantine checks apply before the preview limit, so unreadable/conflicting rows
-are never made actionable by the preview. Returning to Swarm paints received
+are never made actionable by the preview. Returning to Behaviors paints received
 history immediately while a fresh read runs. The optional `limit=1` through
 `limit=100` on `GET /api/agent-logs` returns a newest-first preview and its
 `total` readable-run count. Unbounded reads retain the full-history response.
 The optional `status=running` returns only running rows (plus quarantined rows
-whose status is unreadable or running); Current's running-job accent uses it
+whose status is unreadable or running); Board's running-job accent uses it
 instead of the full history.
 
 With a current Caller release, review/approval rows show the last
 observed stage. Expand a row for timestamped activity, worker heartbeat age, last
 provider event age, and the current stage deadline. Active runs refresh every 15
-seconds while Swarm is visible. Missing heartbeats, provider silence, incomplete
+seconds while Behaviors is visible. Missing heartbeats, provider silence, incomplete
 events, and runs without instrumentation are labeled explicitly. These labels
 report observations; they do not change review outcomes or trigger retries.
 Each minute records whether new reasoning activity arrived. Expand **Provider
@@ -678,7 +680,7 @@ updates existing rows and text in place, preserving expansion and scroll positio
 The full Chat view owns persistent sessions for Claude Code, Codex, Grok Build
 and Muse. New sessions use Git-ignored storage inside Poise, with no repository
 or branch picker. It includes inline permissions and
-questions, steering, Stop, durable transcripts, and Current/Swarm/Editor
+questions, steering, Stop, durable transcripts, and Board, Observe and Editor
 handoffs. It requires the companion Caller turn-recording and checkout-lock
 changes; the existing pane stays available for `/content`, `/consensus` and
 Editor annotations in v1.
@@ -835,11 +837,11 @@ so a different successful rerun cannot clear an unresolved hold. A `read_failed`
 receipt proves no write occurred: its intent is released and the visible read
 failure retries with backoff. Errors after the write begins remain held.
 
-Archive's Actions filter reads workflow runs independently of PR involvement, including
+Observe → GitHub's Actions filter reads workflow runs independently of PR involvement, including
 push and deployment runs after merge. Failed selects GitHub's `failure` conclusion;
 Any includes all conclusions and active runs. It reads at most the latest 100 runs
 per repository for the selected outcome. Snapshot limits remain diagnostic API
-metadata and do not produce notices in Archive; read failures remain visible.
+metadata and do not produce notices in Observe → GitHub; read failures remain visible.
 Search and date filters apply within that snapshot. Older runs remain
 available in GitHub. Workflow reads start only while Actions is selected, share a
 five-minute cache across pages, counts, search, date and account filters, and make
@@ -850,7 +852,7 @@ unavailable or partial reads retry after one minute, reusing healthy repositorie
 Expired reads send authenticated ETags: unchanged `304` responses reuse the
 verified snapshot and do not consume GitHub's primary REST rate limit.
 
-Archive's Actions, Issues and PR controls are independent toggles; PR selects only
+Observe → GitHub's Actions, Issues and PR controls are independent toggles; PR selects only
 pull requests. Actions has its own Failed/Any outcome control, while Any/Open
 applies to issues and pull requests. Selected sources render independently and
 merge by update time. Query results remain in memory across toggles; full-history
