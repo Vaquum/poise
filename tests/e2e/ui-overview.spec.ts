@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
+import type { AnalyticsHealth } from '../../src/analytics-health-types'
 
 // Overview in the new interface (#556, PRD Support → Tests): Answer here with
 // a request answered elsewhere while held or focused, several requests at
@@ -299,10 +300,11 @@ for (const width of [375, 768, 1000]) {
 
 test('System health reads its five cards live, and a failed read keeps them, with when', async ({ page }) => {
   let fail = false
+  let rate: AnalyticsHealth['rate'] = { completed: 6, errors: 3, perItem: 0.5, items: [] }
   const now = Date.now()
   await page.route('**/api/analytics/system-health*', (route) => fail ? json(route, { error: 'evidence store unavailable' }, 503) : json(route, {
     readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
-    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    rate,
     blocked: { count: 3, oldestProgressAt: now - 26 * 3_600_000, largestStage: 'Repair: 2', items: [] },
     recovery: { automatic: [{}, {}], intervention: [{}], unknown: 0 },
     lastError: { error: { at: now - 15 * 60_000, work: 'autonomio/poise#496', journal: '', summary: '' }, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now },
@@ -314,7 +316,7 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
   const card = (ref: string) => page.locator(`[data-ref="ov.health"] [data-ref="${ref}"]`)
   await expect(card('ov.h.errors')).toContainText('0.5 per item')
-  await expect(card('ov.h.errors')).toContainText('3 errors across 6 items completed')
+  await expect(card('ov.h.errors').locator(':scope > .t-gloss')).toHaveText('3 errors across 6 items completed')
   await expect(card('ov.h.blocked')).toContainText('oldest 1d 2h without verified progress · Repair: 2')
   await expect(card('ov.h.recovery')).toContainText('1 needed outside help')
   await expect(card('ov.h.lasterror')).toContainText('at ')
@@ -330,6 +332,20 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:organization-filter-changed')))
   await expect(card('ov.h.errors')).toContainText('—')
   await expect(page.locator('[data-healthfail]')).toContainText('Not read yet.')
+
+  fail = false
+  for (const [completed, errors, perItem, value, note] of [
+    [0, 0, null, 'Unavailable', '0 errors across 0 items completed · rate requires a nonempty, complete lifetime cohort'],
+    [2, 2, null, 'Unavailable', '2 errors across 2 items completed · rate requires a nonempty, complete lifetime cohort'],
+    [2, 0, 0, '0 per item', '0 errors across 2 items completed'],
+  ] as const) {
+    rate = { completed, errors, perItem, items: [] }
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+    await expect(card('ov.h.errors').locator('.osmall-v')).toHaveText(value)
+    await expect(card('ov.h.errors').locator(':scope > .t-gloss')).toHaveText(note)
+    await expect(card('ov.h.errors').locator(':scope > .t-gloss')).toBeVisible()
+    await expect(card('ov.h.errors')).toHaveAttribute('href', '?view=observe&part=logging&back=overview')
+  }
 })
 
 test('In motion says what was never read, rather than zero or clear', async ({ page }) => {

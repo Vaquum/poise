@@ -43,7 +43,7 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
       return
     }
     const { rate, blocked, recovery, lastError: { error, lastObserved, coveredSince, coveredUntil } } = data
-    card('ov.h.errors', rate.perItem === null ? 'Unavailable' : `${esc(formatRate(rate.perItem))}<span class="t-gloss"> per item</span>`, `${formatCount(rate.errors)} errors across ${formatCount(rate.completed)} items completed`)
+    card('ov.h.errors', rate.perItem === null ? 'Unavailable' : `${esc(formatRate(rate.perItem))}<span class="t-gloss"> per item</span>`, `${formatCount(rate.errors)} errors across ${formatCount(rate.completed)} items completed${rate.perItem === null ? ' · rate requires a nonempty, complete lifetime cohort' : ''}`)
     card('ov.h.blocked', esc(formatCount(blocked.count)), blocked.oldestProgressAt === null ? 'none without verified progress' : `oldest ${formatDuration(data.readAt - blocked.oldestProgressAt)} without verified progress${blocked.largestStage ? ` · ${blocked.largestStage}` : ''}`)
     card('ov.h.recovery', esc(formatCount(recovery.automatic.length)), `${formatCount(recovery.intervention.length)} needed outside help`)
     card('ov.h.lasterror', error ? esc(formatDuration(data.readAt - error.at)) : coveredSince !== null && coveredUntil !== null ? 'None' : 'Unavailable',
