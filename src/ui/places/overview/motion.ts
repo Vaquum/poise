@@ -55,8 +55,11 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
   let chains: Read<ChainLike[]> = unread()
   let pick: { group: 'people' | 'items', state: State } | { phase: Phase } = { group: 'people', state: 'running' }
   const sessionListeners = new Set<() => void>()
-  // The organization the issues, pull requests and runs held here were read for.
+  // The GitHub user this mount reads for, and the organization of the issues,
+  // pull requests and runs it holds; a read overtaken by a later one is dropped.
+  const me = getSettings().me ?? ''
   let itemsOrg = getSelectedOrganization()
+  let itemsRead = 0
   const last = rememberedMotion()
   if (last) {
     if (last.sessions.data) Object.assign(sessions, { data: new Map(last.sessions.data.map((session) => [session.id, session])), at: last.sessions.at })
@@ -64,8 +67,10 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
     if (last.org === itemsOrg) ({ items, pulls, running } = last)
   }
   function remember(): void {
+    // A place left, or a GitHub user changed since it opened, keeps nothing.
+    if (signal.aborted || (getSettings().me ?? '') !== me) return
     const kept = <T>(read: Read<T>): Read<T> => ({ data: read.data, error: '', at: read.at })
-    const last: LastMotion = { me: getSettings().me ?? '', org: itemsOrg, sessions: kept({ data: sessions.data ? [...sessions.data.values()] : null, error: '', at: sessions.at }),
+    const last: LastMotion = { me, org: itemsOrg, sessions: kept({ data: sessions.data ? [...sessions.data.values()] : null, error: '', at: sessions.at }),
       items: kept(items), pulls: kept(pulls), running: kept(running), chains: kept(chains) }
     try { localStorage.setItem(LAST_MOTION_KEY, JSON.stringify(last)) } catch { /* the next page reads them anew */ }
   }
@@ -170,15 +175,18 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
     // Another organization's last reads never stand for this one's.
     const org = getSelectedOrganization()
     if (org !== itemsOrg) { [items, pulls, running] = [unread(), unread(), unread()]; itemsOrg = org }
+    const mine = ++itemsRead
     const gh = (body: Record<string, unknown>) => json<Record<string, unknown>>('/api/gh', { method: 'POST', body: JSON.stringify({ ...body, ...organizationPayload() }) })
     const settle = async <T>(target: Read<T>, read: () => Promise<T>): Promise<Read<T>> => {
       try { return { data: await read(), error: '', at: Date.now() } } catch (error) { return { ...target, error: reason(error) } }
     }
-    ;[items, pulls, running] = await Promise.all([
+    const read = await Promise.all([
       settle(items, async () => ((await gh({ operation: 'list', record_type: 'all', record_state: 'open', limit: 200, offset: 0 })).records ?? []) as GhRecord[]),
       settle(pulls, async () => await gh({ operation: 'green_pr' }) as GreenRead),
       settle(running, async () => ((await json<{ logs?: RunningLog[] }>(organizationUrl('/api/agent-logs?status=running'))).logs ?? []).filter((log) => log.status === 'running')),
     ])
+    if (mine !== itemsRead || signal.aborted) return
+    ;[items, pulls, running] = read
     reportRead(ctx, 'overview-items', 'Issues and pull requests could not be read', items)
     reportRead(ctx, 'overview-pulls', 'Pull requests’ status checks could not be read', pulls)
     reportRead(ctx, 'overview-running', 'Running runs could not be read', running)

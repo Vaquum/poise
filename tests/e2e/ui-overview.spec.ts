@@ -390,3 +390,50 @@ test('In motion never paints another organization’s last issues and pull reque
   await expect(page.locator('[data-counts="people"] b').first()).not.toHaveText('—')
   await expect(items).toHaveText('—')
 })
+
+test('In motion keeps an organization’s last reads only from its own latest read', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  // Two organizations; all organizations' read is held, beta's answers at once with its one issue.
+  const organizations = ['acme', 'beta'].map((login) => ({ login, managed: false, status: 'ready', stage: 'ready', error: null, activatedAt: null }))
+  await page.route('**/api/settings', (route) => route.request().method() !== 'GET' ? route.fallback() : json(route, { org: '', organizations, me: 'me', agentAccount: 'bot', timezone: 'UTC' }))
+  const issue = (repo: string, number: number) => ({ kind: 'issue', repo, number, title: `Issue ${number}`, state: 'open' })
+  let release = () => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/gh', async (route) => {
+    const body = route.request().postDataJSON() as { operation: string, org?: string }
+    if (body.operation !== 'list') return json(route, { records: [], held: [], errors: [] })
+    if (!body.org) { await held; return json(route, { records: [issue('acme/site', 1), issue('acme/site', 2), issue('beta/api', 3)], errors: [] }) }
+    return json(route, { records: [issue('beta/api', 3)], errors: [] })
+  })
+  await page.reload()
+  await expect(page.locator('select[data-org]')).toBeVisible()
+  // beta is chosen while all organizations' read is still out, and In motion reads again.
+  await page.locator('select[data-org]').selectOption('beta')
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  const items = page.locator('[data-counts="items"] b')
+  const total = async () => (await items.allTextContents()).reduce((sum, text) => sum + (Number(text) || 0), 0)
+  await expect.poll(total).toBe(1)
+  // The overtaken read lands late; beta keeps its own.
+  release()
+  await page.waitForTimeout(500)
+  expect(await total()).toBe(1)
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect.poll(total).toBe(1)
+})
+
+test('a read that lands after Overview was left keeps nothing', async ({ page }) => {
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  await expect(page.locator('[data-counts="people"] b').first()).not.toHaveText('—')
+  let release = () => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  await page.route('**/api/chat/sessions', async (route) => {
+    await held
+    return json(route, { instance: 'poise-dev:test', sessions: [{ id: 'late', title: 'Late chat', role: null, status: 'idle', agent: 'claude', createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString(), lastSeq: 0, pendingRequests: [] }] })
+  })
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  await page.getByRole('navigation', { name: 'Poise' }).getByRole('link', { name: 'Board' }).click()
+  release()
+  await page.waitForTimeout(500)
+  expect(await page.evaluate(() => localStorage.getItem('poise-overview-motion'))).not.toContain('Late chat')
+})
