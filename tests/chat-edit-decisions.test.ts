@@ -181,6 +181,8 @@ describe('edit decisions', () => {
   it('opens a transcript on its last turns when asked, saying where they begin', async () => {
     const { session } = await runtime.createForSubject({ agent: 'grok', model: 'grok-4.6-xhigh', subject: docSubject() })
     for (let i = 0; i < 3; i++) await runReplyTurn(session.id, REPLY)
+    // The runtime publishes idle after recording the terminal turn event.
+    await until(() => storage.getSession(session.id)?.status === 'idle', 'the final idle status')
     const read = async (query: string) => await (await fetch(`${origin}/api/chat/sessions/${session.id}?${query}`)).json() as { events: ChatEnvelope[], from: number }
     const all = await read('after=0')
     expect(all.from).toBe(0)
