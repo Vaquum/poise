@@ -430,7 +430,11 @@ export function createProductionShutdown(
     const deadline = setTimeout(() => {
       if (finished) return
       finished = true
-      try { closeDatabaseOnce() }
+      try {
+        const state = serverShutdowns.get(server)!
+        console.error(`[poise] shutdown timed out after ${PRODUCTION_SHUTDOWN_TIMEOUT_MS}ms; pending: ${[...state.pending].join(', ')}`, ...state.failures.map(({ error }) => error))
+        closeDatabaseOnce()
+      }
       catch (error) { serverShutdowns.get(server)!.failures.push({ phase: 'database_close', error }) }
       finally { recordFailure(true); exit(1) }
     }, PRODUCTION_SHUTDOWN_TIMEOUT_MS)
@@ -472,6 +476,11 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
   })
 
   const server = createServer((req, res) => {
+    res.once('finish', () => {
+      // close() reaps only sockets already idle when it starts. Retire ones
+      // whose in-flight responses finish during shutdown as well.
+      if (!server.listening) server.closeIdleConnections()
+    })
     void Promise.resolve(api(req, res, () => {
       if (res.writableEnded) return
       if ((req.url || '').startsWith('/api/confab')) {

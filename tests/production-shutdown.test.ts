@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { Agent, request, type IncomingMessage, type ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -12,8 +13,8 @@ const mocks = vi.hoisted(() => ({
   stopPoiseRuntime: vi.fn<() => Promise<void>>(),
   closeDatabase: vi.fn<() => void>(),
   createPoiseMiddleware: vi.fn(() => (
-    _req: unknown,
-    _res: unknown,
+    _req: IncomingMessage,
+    _res: ServerResponse,
     next: () => void,
   ) => next()),
   // The Chat WebSocket attaches to the production server's upgrade event;
@@ -110,6 +111,62 @@ describe('production shutdown', () => {
     expect(failures()).toEqual([])
   })
 
+  it('finishes an in-flight response and retires its keep-alive socket before SQLite closes and exit 75', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    for (const [key, value] of Object.entries(serviceEnvironment(gatewayKeys()))) vi.stubEnv(key, value)
+    mocks.stopPoiseRuntime.mockResolvedValue(undefined)
+    let response!: ServerResponse
+    let accepted!: () => void
+    const incoming = new Promise<void>((resolve) => { accepted = resolve })
+    mocks.createPoiseMiddleware.mockImplementationOnce(() => (_req, res) => {
+      response = res
+      accepted()
+    })
+    const production = await import('../server/production')
+    const server = production.createProductionServer()
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('test server did not bind')
+    const agent = new Agent({ keepAlive: true })
+    const closed = vi.fn()
+    server.once('close', closed)
+    const exit = vi.fn<(code: number) => void>()
+    const body = new Promise<string>((resolve, reject) => {
+      const req = request({ host: '127.0.0.1', port: address.port, path: '/api/held', agent }, (res) => {
+        let text = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk: string) => { text += chunk })
+        res.once('end', () => resolve(text))
+        res.once('error', reject)
+      })
+      req.once('error', reject)
+      req.end()
+    })
+    try {
+      await incoming
+      production.createProductionShutdown(server, exit)(75)
+      // The response is still active halfway through the shutdown budget.
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(mocks.stopPoiseRuntime).toHaveBeenCalledTimes(1)
+      expect(response.destroyed).toBe(false)
+      expect(closed).not.toHaveBeenCalled()
+      expect(mocks.closeDatabase).not.toHaveBeenCalled()
+      expect(exit).not.toHaveBeenCalled()
+
+      response.end('completed in flight')
+      expect(await body).toBe('completed in flight')
+      await vi.waitFor(() => expect(exit).toHaveBeenCalledExactlyOnceWith(75))
+      expect(closed).toHaveBeenCalledTimes(1)
+      expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
+      expect(closed.mock.invocationCallOrder[0]).toBeLessThan(mocks.closeDatabase.mock.invocationCallOrder[0])
+      expect(mocks.closeDatabase.mock.invocationCallOrder[0]).toBeLessThan(exit.mock.invocationCallOrder[0])
+    } finally {
+      response?.end()
+      agent.destroy()
+      await production.shutdownProductionServer(server)
+    }
+  })
+
   it('forces shutdown once after the ten-second deadline', async () => {
     vi.useFakeTimers()
     let releaseRuntime!: () => void
@@ -117,6 +174,7 @@ describe('production shutdown', () => {
       releaseRuntime = resolve
     }))
     const production = await import('../server/production')
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     const server = production.createProductionServer()
     const exits: number[] = []
     const shutdown = production.createProductionShutdown(server, (code) => { exits.push(code) })
@@ -133,6 +191,7 @@ describe('production shutdown', () => {
     await vi.advanceTimersByTimeAsync(1)
     expect(mocks.closeDatabase).toHaveBeenCalledTimes(1)
     expect(exits).toEqual([1])
+    expect(errors).toHaveBeenCalledExactlyOnceWith('[poise] shutdown timed out after 10000ms; pending: runtime_stop')
 
     expect(failures()).toEqual([expect.objectContaining({ severity: 'error', operation: 'process.shutdown',
       phase: 'shutdown_deadline', exitCode: 1, timeoutMs: 10_000, context: { requestedExitCode: 0, pendingPhases: ['runtime_stop'] } })])
