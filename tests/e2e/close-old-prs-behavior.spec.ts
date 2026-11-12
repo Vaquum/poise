@@ -1,18 +1,29 @@
-import { expect, test } from './fixtures/classic'
+import { expect, test } from '@playwright/test'
+import { BEHAVIORS } from '../../src/behaviors'
 
 test('old PR closing requires whole days, persists its setting and skips, and links its last close', async ({ page }) => {
   let enabled = false
   let days: number | null = null
   let skipRepos: string[] = []
   const writes: Array<Record<string, unknown>> = []
-  await page.addInitScript(() => { localStorage.clear(); localStorage.setItem('poise-view', 'main') })
+  await page.addInitScript(() => { localStorage.clear(); sessionStorage.clear() })
   await page.route(/https:\/\/(?:rsms\.me|fonts\.googleapis\.com|fonts\.gstatic\.com|github\.com)\//, (route) => route.abort())
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
     const body = route.request().method() === 'POST' ? route.request().postDataJSON() as Record<string, unknown> : {}
-    if (url.pathname === '/api/settings') return route.fulfill({ json: { org: 'acme', me: 'octocat', timezone: 'UTC', models: {} } })
+    if (url.pathname === '/api/settings') return route.fulfill({ json: {
+      org: 'acme', me: 'octocat', agentAccount: 'bit-bot', timezone: 'UTC', models: {},
+      chat: {}, notifications: { enabled: true }, manager: { version: 3 },
+      behaviorChain: { enabled: false, seedMode: 'label', label: 'poise' },
+      organizations: [{ login: 'acme', managed: true, status: 'ready', stage: 'ready', error: null }],
+    } })
+    if (url.pathname === '/api/workspace') return route.fulfill({ json: { mode: 'local' } })
+    if (url.pathname === '/api/onboarding') return route.fulfill({ json: { available: false } })
+    if (url.pathname === '/api/notices') return route.fulfill({ json: { enabled: true, notices: [] } })
     if (url.pathname === '/api/repos') return route.fulfill({ json: { repos: ['acme/app', 'acme/skip'] } })
     if (url.pathname === '/api/organizations') return route.fulfill({ json: { organizations: [{ login: 'acme', status: 'ready', stage: 'ready', managed: false }] } })
+    if (url.pathname === '/api/behavior-metrics') return route.fulfill({ json: { behaviors: Object.fromEntries(BEHAVIORS.map(({ key }) => [key, null])), error: null } })
+    if (url.pathname === '/api/behavior-chains') return route.fulfill({ json: { chains: [] } })
     if (url.pathname === '/api/behaviors/close-old-prs') {
       writes.push(body)
       if (typeof body.days === 'number') days = body.days
@@ -34,14 +45,14 @@ test('old PR closing requires whole days, persists its setting and skips, and li
           identity: { status: 'valid', actor: 'review-bot', error: null } },
       } })
     }
-    if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', loginInProgress: false } })
+    if (url.pathname === '/api/claude-auth') return route.fulfill({ json: { status: 'authenticated', reason: null, checkedAt: null, verifiedAt: null, authMethod: null, subscriptionType: null, loginInProgress: false } })
     if (url.pathname === '/api/gh') return route.fulfill({ json: body.count_only ? { count: 0 } : { records: [] } })
     return route.fulfill({ json: {} })
   })
   const row = page.locator('tr[data-behavior="close-old-prs"]')
   const toggle = row.locator('input[type="checkbox"]')
-  await page.goto('/')
-  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  await page.goto('/?view=settings&settings=behaviors')
+  await expect(page.locator('[data-settings]')).toBeVisible()
   await expect(row).toContainText('Close Old Pull Requests')
   await expect(toggle).toBeEnabled()
   await expect(toggle).not.toBeChecked()
@@ -64,7 +75,7 @@ test('old PR closing requires whole days, persists its setting and skips, and li
   await expect(toggle).toBeChecked()
   await expect.poll(() => enabled).toBe(true)
   await page.reload()
-  await page.getByRole('button', { name: 'Behaviors', exact: true }).click()
+  await expect(page.locator('[data-settings]')).toBeVisible()
   await expect(toggle).toBeChecked()
   await expect(row.locator('.behavior-triggers-btn')).toHaveText('30 days, skip 1')
   await row.locator('.toggle').click()
