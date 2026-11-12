@@ -106,6 +106,8 @@ interface AgentLogLane {
   running: AgentLogRead | null
   queued: AgentLogRead | null
   cached: { snapshot: AgentLogSnapshot, expiresAt: number } | null
+  /** The latest read failed: the last snapshot no longer answers a reader at once. */
+  failed?: boolean
 }
 
 const AGENT_LOG_SNAPSHOT_TTL_MS = 5_000
@@ -141,8 +143,10 @@ function agentLogAbortError(signal: AbortSignal): Error {
   return Object.assign(error, { code: 'ABORT_ERR' })
 }
 
+/** The whole history. `lastObserved` answers at once from the last snapshot
+ *  and reads it again behind the answer; never-read history is read now. */
 export async function fetchAgentLogSnapshot(
-  options: { signal?: AbortSignal, fresh?: boolean } = {},
+  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean } = {},
 ): Promise<AgentLogSnapshot> {
   return laneAgentLogSnapshot(historyAgentLogLane, options, readHistoryAgentLogSnapshot)
 }
@@ -163,7 +167,8 @@ async function laneAgentLogSnapshot(
   if (!options.fresh && lane.cached && Date.now() < lane.cached.expiresAt) return lane.cached.snapshot
   // A reader that takes the last snapshot gets it at once, past its time, and
   // the lane reads again behind it.
-  if (options.lastObserved && !options.fresh && lane.cached) {
+  // A refresh that failed is reported by the next read, never hidden behind the last snapshot.
+  if (options.lastObserved && !options.fresh && lane.cached && !lane.failed) {
     if (!lane.running) startLaneAgentLogRead(lane, createLaneAgentLogRead(lane), read)
     return lane.cached.snapshot
   }
@@ -214,9 +219,13 @@ function startLaneAgentLogRead(
   readSnapshot(read.controller.signal).then(
     (snapshot) => {
       lane.cached = { snapshot, expiresAt: Date.now() + AGENT_LOG_SNAPSHOT_TTL_MS }
+      lane.failed = false
       settleLaneAgentLogRead(lane, read, { snapshot }, readSnapshot)
     },
-    (error) => settleLaneAgentLogRead(lane, read, { error }, readSnapshot),
+    (error) => {
+      if (!read.controller.signal.aborted) lane.failed = true
+      settleLaneAgentLogRead(lane, read, { error }, readSnapshot)
+    },
   )
   return read
 }
