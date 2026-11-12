@@ -506,6 +506,16 @@ def prune_items_for_repo(conn: sqlite3.Connection, repo_id: int, visible_item_id
         conn.execute("DELETE FROM items WHERE repo_id = ?", (repo_id,))
 
 
+def prune_missing_pulls(conn: sqlite3.Connection, repo_id: int, missing_ids: set[int]) -> None:
+    params = [(repo_id, item_id) for item_id in sorted(missing_ids)]
+    predicate = "repo_id = ? AND item_id = ? AND item_type = 'pr'"
+    conn.executemany(
+        f"DELETE FROM item_fts WHERE item_id IN (SELECT item_id FROM items WHERE {predicate})",
+        params,
+    )
+    conn.executemany(f"DELETE FROM items WHERE {predicate}", params)
+
+
 def require(value: Any, label: str) -> Any:
     if value is None or value == "":
         raise ValueError(f"missing required value: {label}")
