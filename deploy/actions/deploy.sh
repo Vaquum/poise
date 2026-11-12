@@ -11,6 +11,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 settings=$("$here/env.sh")
 {
-  printf 'repo=%q sha=%q path=%q token=%q settings=%q\n' "$REPO" "$SHA" "$DEPLOY_PATH" "$TOKEN" "$settings"
+  printf 'repo=%q sha=%q path=%q token=%q settings=%q apply_only=%q\n' \
+    "$REPO" "$SHA" "$DEPLOY_PATH" "$TOKEN" "$settings" "${APPLY_ONLY:-false}"
   cat "$here/remote.sh"
 } | ssh poise-server bash -s

@@ -502,7 +502,7 @@ class RolloutTest(LibTest):
         with open(self.state + '.proof.rollouts/' + rollout) as file:
             return file.read().splitlines()
 
-    def resume(self, rollout):
+    def resume(self, *args):
         # A fresh process executes the real verification-only entrypoint.
         directory = os.path.join(self.work.name, 'resume')
         os.makedirs(directory, exist_ok=True)
@@ -512,7 +512,7 @@ class RolloutTest(LibTest):
                        'require_linux() { :; }\n')
         target = os.path.join(directory, 'verify.sh')
         shutil.copyfile(os.path.join(ROOT, 'deploy/verify.sh'), target)
-        return self.lib(f'bash {shlex.quote(target)} {shlex.quote(rollout)}')
+        return self.lib(f'bash {shlex.quote(target)} {shlex.join(args)}')
 
     def change_state(self, **changes):
         with open(self.state) as file:
@@ -550,6 +550,36 @@ class RolloutTest(LibTest):
         self.assertTrue(all(call.startswith(('version ', 'compose version', 'ps ', 'inspect ', 'exec '))
                             for call in reads), reads)
         self.assertFalse(any('/switch' in call for call in reads))
+
+    def test_scheduled_recovery_checks_only_applied_rollouts(self):
+        alice = f'alice {IMAGE_ID} true /poise-ws-alice'
+        result = self.start({'containers': [alice], 'health': {'poise-ws-alice': [health(OLD)]}})
+        self.assertEqual(result.returncode, 1)
+        rollout = self.current()
+        checkpoint = self.state + '.proof.rollouts/' + rollout + '.applied'
+        self.change_state(health={'poise-ws-alice': [health(NEW)]})
+        self.assertEqual(self.resume('--current').returncode, 0)
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        with open(checkpoint, 'w'):
+            pass
+        self.change_state(health={'poise-ws-alice': [health(OLD)]})
+        result = self.resume('--current')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'Rollout {rollout}: pending', result.stdout)
+        self.assertEqual(self.record(rollout)[4], 'pending')
+        self.change_state(health={'poise-ws-alice': [health(NEW)]})
+        result = self.resume('--current')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f'Rollout {rollout}: complete', result.stdout)
+        self.assertEqual(self.record(rollout)[4], 'complete')
+        self.assertNotIn('build', ' '.join(self.calls()))
+
+    def test_action_verifier_refuses_a_different_rollout_target(self):
+        alice = f'alice {IMAGE_ID} true /poise-ws-alice'
+        self.start({'containers': [alice], 'health': {'poise-ws-alice': [health(OLD)]}})
+        result = self.resume('--wait-for', OLD)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f'the current rollout targets {NEW}, expected {OLD}', result.stderr)
 
     def test_missing_expected_workspace_remains_pending_after_process_exit(self):
         alice = f'alice {IMAGE_ID} true /poise-ws-alice'

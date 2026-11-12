@@ -104,15 +104,17 @@ def workspace_proof(deploy, candidate, remembered=frozenset()):
     """
     notes, errors, expected, serving = [], [], set(remembered), []
     store = deploy / '.env.workspace-proof.rollouts'
-    pointer = target = image = None
+    pointer = target = image = rollout_state = None
     try:
         pointer = (store / 'current').read_text().strip()
         if not re.fullmatch(r'[0-9a-f]{40}\.[a-zA-Z0-9]{6}', pointer):
             raise ValueError('invalid current rollout ID')
         receipt = (store / pointer).read_text()
-        target, image, _, handles, _, _ = receipt.splitlines()[:6]
+        target, image, _, handles, rollout_state, _ = receipt.splitlines()[:6]
         if not SHA.fullmatch(target) or not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
             raise ValueError('invalid rollout target/image')
+        if rollout_state not in ('pending', 'complete', 'failed', 'superseded'):
+            raise ValueError('invalid rollout state')
         expected.update(handles.split())
     except (OSError, ValueError) as error:
         errors.append(f'retained rollout unavailable ({error}); expected inventory unverified')
@@ -158,7 +160,9 @@ def workspace_proof(deploy, candidate, remembered=frozenset()):
             serving.append(f'{handle}: {release}')
             notes.append(f'{handle}: active {release}; desired {health.get("desiredRelease")}; '
                          f'switching {health.get("switching")}; pending since {health.get("pendingSince")}; '
-                         f'waiting on {health.get("switchWaitingOn")}')
+                         f'waiting on {health.get("switchWaitingOn")}; drain {health.get("draining")}; '
+                         f'running Caller {health.get("runningCallerCalls")}; '
+                         f'unsettled native Calls {health.get("unsettledNativeCalls")}')
             if release == candidate and not health.get('switching'):
                 proven.add(handle)
             if release != candidate:
@@ -175,6 +179,7 @@ def workspace_proof(deploy, candidate, remembered=frozenset()):
         errors.append('no running workspace establishes a serving release')
     return dict(current=bool(expected) and expected <= proven and target == candidate and not errors,
                 serving=serving, notes=notes, errors=errors, rollout=pointer, switching=switching and target == candidate, lag=lag,
+                rollout_state=rollout_state if pointer else None, rollout_target=target if pointer else None,
                 expected=sorted(expected))
 
 
@@ -205,8 +210,11 @@ def stage(evidence, proof):
         run = runs[0]
         verified_at = max(verified_at, run['updated_at'])
         if run['status'] != 'completed' or run['conclusion'] != 'success':
-            reason = f'{name}: {run["status"]} {run.get("conclusion") or ""} ({run["html_url"]})'
+            reason = f'{name}: {run["status"]} {run.get("conclusion") or ""} (attempt {run["run_attempt"]}, {run["html_url"]})'
             return workflow(name, reason, 'Wait for running verification, or inspect and repair the failed run; retain the normal gate.')
+    if proof.get('rollout_target') == evidence['candidate'] and proof.get('rollout_state') == 'failed':
+        return 'workspace switch: intended release failed to start', \
+            'Inspect the failure in the retained rollout and apply a verified fix.', False
     if proof.get('switching'):
         return 'workspace switch: intended release pending', \
             'Inspect the current health blockers and retained rollout on the deployment host; allow the normal switch/drain to finish.', False
@@ -219,9 +227,9 @@ def stage(evidence, proof):
         steps = run.get('steps', [])
         attempted = [step for step in steps if step.get('name') == f'Deploy {evidence["candidate"]}'
                      and step.get('conclusion') not in (None, 'skipped')]
-        if run['conclusion'] == 'success' and any(step['conclusion'] == 'success' for step in attempted):
+        if any(step['conclusion'] == 'success' for step in attempted):
             return 'workspace switch: intended release not verified serving', \
-                'Inspect the workspace health and retained rollout on the deployment host; allow the normal switch/drain to finish. ' \
+                'The host applied the release. Sync rechecks the retained proof while the gateway handles activation. ' \
                 f'[Deploy evidence]({run["html_url"]}).', False
         admitted = any(step.get('name') == 'Refuse any tip whose required CI did not pass on it'
                        and (step.get('started_at') or '') >= verified_at for step in steps)
@@ -292,7 +300,7 @@ def render(evidence, proof, state, status, reason, action):
         lines.append(f'- {label}: [{sha}](https://github.com/{repository}/commit/{sha})' if sha else f'- {label}: unavailable')
     lines.append('- Serving now (fresh health): ' + ('; '.join(proof['serving']) or 'unavailable'))
     if proof['rollout']:
-        lines.append(f'- Retained rollout: `deploy/.env.workspace-proof.rollouts/{proof["rollout"]}` (historical outcome is not serving proof).')
+        lines.append(f'- Retained rollout: `deploy/.env.workspace-proof.rollouts/{proof["rollout"]}` ({proof["rollout_state"]}).')
     lines += [f'- {note}' for note in proof['notes']]
     for name, workflow in evidence['workflows'].items():
         for run in workflow['runs'][:1]:
