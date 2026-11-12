@@ -310,3 +310,29 @@ test('another organization’s runs never stand for the one chosen', async ({ pa
   await expect(page.locator('[data-ref="cur.partial"]')).toContainText('the runs going now')
   await expect(card(page, 'Beta’s own issue')).toHaveAttribute('data-state', '')
 })
+
+test('a reload paints Board’s last read at once, while it reads again', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // GitHub's reads are held; the reload paints the last read anyway.
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(card(page, 'Opened today')).toBeVisible({ timeout: 2_000 })
+  await expect(card(page, 'A pull request')).toBeVisible()
+})
+
+test('Board never paints another GitHub user’s last read', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  await expect(card(page, 'Opened today')).toBeVisible()
+  // Settings now name another GitHub user, and GitHub's reads are held.
+  await page.route('**/api/settings', async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const response = await route.fetch()
+    return route.fulfill({ response, json: { ...(await response.json()), me: 'someone-else' } })
+  })
+  await page.route('**/api/gh', async () => { await new Promise(() => {}) })
+  await page.reload()
+  await expect(page.locator('.lanes .lane')).toHaveCount(5)
+  await page.waitForTimeout(500)
+  await expect(card(page, 'Opened today')).toHaveCount(0)
+})
