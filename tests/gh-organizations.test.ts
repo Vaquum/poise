@@ -48,6 +48,24 @@ beforeEach(() => {
 })
 
 describe('organization data aggregation', () => {
+  it('lets an identical list read join one already running, and reads afresh once it settles', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const answer = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (...args: Parameters<typeof answer>) => { await gate; return answer(...args) })
+    const body = { operation: 'list', record_type: 'pull_request' }
+    const first = handleGhBody({ ...body })
+    const joined = handleGhBody({ ...body })
+    const other = handleGhBody({ ...body, org: 'alpha' })
+    release()
+    expect(await joined).toEqual(await first)
+    await other
+    // Two organizations for the shared read, one for the other selection.
+    expect(mocks.runFile).toHaveBeenCalledTimes(3)
+    await handleGhBody({ ...body })
+    expect(mocks.runFile).toHaveBeenCalledTimes(5)
+  })
+
   it('keeps same repository names and issue numbers distinct, and paginates the combined order', async () => {
     const result = await handleGhBody({ operation: 'list', record_type: 'pull_request', offset: 1, limit: 2 })
     expect((result.body as any).records.map((r: any) => `${r.repo}#${r.number}`)).toEqual(['alpha/same#1', 'beta/same#2'])
