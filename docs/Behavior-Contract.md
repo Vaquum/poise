@@ -320,7 +320,10 @@ deadline; a checkout failure there releases the claim and records a
 Scheduled ticks start each ready account a few seconds apart so their CLI
 bursts don't collide, and the service health and behavior diagnostics expose
 the current minute window of event-loop delay, where fan-out stalls show up
-first.
+first. Every such CLI process starts from a worker thread: on Linux, starting a
+process blocks the starting thread until the child runs, and under CPU
+contention that wait held the event loop. Should the worker fail, processes
+start on the main thread again.
 
 `merge-prs` is disabled unless `behavior_merge_prs_enabled` is explicitly `1`.
 It uses Caller directly without a model launch: after fresh datastore eligibility,

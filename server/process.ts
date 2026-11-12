@@ -1,11 +1,16 @@
 import { environmentSecrets } from '../gateway/src/diagnostics/redaction.mjs'
 import { spawn } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { basename, delimiter, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { Worker } from 'node:worker_threads'
 import { CALLER_COMMANDS, callerBinRoot } from '../scripts/caller.mjs'
+import {
+  CALL_PID, abortWorkerCall, claimSignal, createCallSlot, killGroup, restoreError, startChild,
+  type ChildOutcome, type ChildRequest, type ChildTermination, type ProcessWorkerReply, type ProcessWorkerRequest, type RunningChild, type SerializedError,
+} from './process-child'
 
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000
 export const DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -415,44 +420,6 @@ export function isAbortError(error: unknown): boolean {
     && ((error as { name?: unknown }).name === 'AbortError' || (error as { code?: unknown }).code === 'ABORT_ERR')
 }
 
-async function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): Promise<void> {
-  const pid = child.pid
-  if (!pid) return
-
-  if (process.platform !== 'win32') {
-    // runFile children are process-group leaders. Negative pid targets the
-    // complete group, including grandchildren that inherited it.
-    try { process.kill(-pid, signal) }
-    catch {
-      // The group may have exited between the deadline and this call. A direct
-      // kill is a safe fallback if group creation or lookup failed.
-      try { child.kill(signal) } catch { /* already gone */ }
-    }
-    return
-  }
-
-  // Windows has no process-group signal equivalent. taskkill /T walks the
-  // descendant tree; /F is the only dependable hard-deadline behavior.
-  await new Promise<void>((resolve) => {
-    let done = false
-    const finish = () => {
-      if (done) return
-      done = true
-      clearTimeout(fallback)
-      resolve()
-    }
-    const killer = spawn('taskkill.exe', ['/pid', String(pid), '/T', '/F'], {
-      env: childEnvironment('taskkill.exe'),
-      stdio: 'ignore',
-      windowsHide: true,
-    })
-    const fallback = setTimeout(finish, 2_000)
-    killer.once('error', finish)
-    killer.once('close', finish)
-  })
-  try { child.kill(signal) } catch { /* taskkill already reaped it */ }
-}
-
 export interface ProcessFailureEvidence {
   command: string
   executable: string
@@ -466,9 +433,12 @@ export interface ProcessFailureEvidence {
 let processFailureObserver: ((error: Error, evidence: ProcessFailureEvidence) => void) | null = null
 export function setProcessFailureObserver(observer: typeof processFailureObserver): void { processFailureObserver = observer }
 
-// Run a short-lived CLI with production-safe bounds. spawn keeps argv separate
-// from the shell. POSIX children lead an isolated process group so timeout,
-// abort, and output-limit termination includes their complete descendant tree.
+// Run a short-lived CLI with production-safe bounds (process-child.ts starts,
+// reads and stops it). The child starts in the process worker once that is
+// ready: on Linux, libuv forks and then blocks the calling thread until the
+// child execs, and under CPU contention that wait held the event loop for
+// hundreds of milliseconds per burst of calls. Until the worker is ready, after
+// it has failed, and on Windows, children start on this thread as before.
 export function runFile(
   command: string,
   args: readonly string[],
@@ -505,66 +475,24 @@ export function runFile(
         process.stderr.write(JSON.stringify({ level: 'error', event: 'logging.process_observer.failed', message: failure instanceof Error ? failure.message : 'observer failure' }) + '\n')
       }
     }
-    const child = spawn(resolveCommand(command), [...args], {
+    const child = runChild({
+      file: resolveCommand(command),
+      args: [...args],
       cwd: options.cwd,
       env: childEnvironment(command, options.env, args),
-      detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
+      maxBuffer,
+      timeoutMs: timeout,
+      killSignal,
+      ...(process.platform === 'win32' ? { killEnv: childEnvironment('taskkill.exe') } : {}),
     })
-    const stdoutChunks: Buffer[] = []
-    const stderrChunks: Buffer[] = []
-    let stdoutBytes = 0
-    let stderrBytes = 0
-    let terminalError: Error | undefined
-    let termination: Promise<void> | undefined
-    let finishing = false
 
-    const requestTermination = (error: Error) => {
-      if (terminalError || finishing) return
-      terminalError = error
-      termination = terminateProcessTree(child, killSignal)
-    }
-
-    const collect = (stream: 'stdout' | 'stderr', value: Buffer | string) => {
-      if (terminalError || finishing) return
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
-      const chunks = stream === 'stdout' ? stdoutChunks : stderrChunks
-      const used = stream === 'stdout' ? stdoutBytes : stderrBytes
-      const remaining = maxBuffer - used
-      if (chunk.byteLength > remaining) {
-        if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
-        if (stream === 'stdout') stdoutBytes = maxBuffer
-        else stderrBytes = maxBuffer
-        requestTermination(Object.assign(
-          new Error(`${stream} maxBuffer length exceeded`),
-          {
-            code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
-            killed: true,
-            signal: killSignal,
-          },
-        ))
-        return
-      }
-      chunks.push(chunk)
-      if (stream === 'stdout') stdoutBytes += chunk.byteLength
-      else stderrBytes += chunk.byteLength
-    }
-
-    const cleanup = () => {
-      clearTimeout(timeoutHandle)
+    const onAbort = () => child.abort()
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    if (options.signal?.aborted) onAbort()
+    void child.outcome.then(({ code, signal, stdout, stderr, termination }) => {
       options.signal?.removeEventListener('abort', onAbort)
-    }
-
-    const finish = async (code: number | null, signal: NodeJS.Signals | null) => {
-      if (finishing) return
-      finishing = true
-      cleanup()
-      await termination
-      const stdout = Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8')
-      const stderr = Buffer.concat(stderrChunks, stderrBytes).toString('utf8')
-      if (terminalError) {
-        Object.assign(terminalError, { stdout, stderr })
+      if (termination) {
+        const terminalError = Object.assign(terminationError(termination, command, timeout, killSignal, options.signal), { stdout, stderr })
         observe(terminalError)
         reject(terminalError)
         return
@@ -590,32 +518,181 @@ export function runFile(
         return
       }
       resolve({ stdout, stderr })
-    }
+    })
+  })
+}
 
-    const onAbort = () => requestTermination(abortError(options.signal!, killSignal))
-    child.stdout?.on('data', (chunk) => collect('stdout', chunk))
-    child.stderr?.on('data', (chunk) => collect('stderr', chunk))
-    child.stdout?.on('error', requestTermination)
-    child.stderr?.on('error', requestTermination)
-    child.once('error', (error) => {
-      if (child.pid) {
-        requestTermination(error)
+function terminationError(termination: ChildTermination, command: string, timeout: number, killSignal: NodeJS.Signals, signal?: AbortSignal): Error {
+  switch (termination.kind) {
+    case 'timeout':
+      return Object.assign(new Error(`Command timed out after ${timeout}ms: ${command}`), { code: null, killed: true, signal: killSignal })
+    case 'maxBuffer':
+      return Object.assign(new Error(`${termination.stream} maxBuffer length exceeded`), {
+        code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        killed: true,
+        signal: killSignal,
+      })
+    case 'abort':
+      return abortError(signal!, killSignal)
+    case 'error':
+      return termination.error
+    case 'interrupted':
+      return Object.assign(new Error(`Command interrupted, the process worker stopped: ${command}`), { code: null, killed: true, signal: killSignal })
+  }
+}
+
+interface WorkerCall {
+  resolve: (outcome: ChildOutcome) => void
+  killSignal: NodeJS.Signals
+  slot: Int32Array
+  aborted: boolean
+  /** This abort signalled the group before anything else could. */
+  abortSignalled: boolean
+}
+
+interface ProcessWorker {
+  worker: Worker
+  ready: boolean
+  calls: Map<number, WorkerCall>
+}
+
+let processWorker: ProcessWorker | null = null
+let processWorkerStart: Promise<boolean> | null = null
+let nextWorkerCall = 1
+
+function runChild(request: ChildRequest): RunningChild {
+  void processWorkerReady()
+  const state = processWorker
+  if (!state?.ready) return startChild(request)
+  const id = nextWorkerCall++
+  const slot = createCallSlot()
+  const call: WorkerCall = { resolve: () => {}, killSignal: request.killSignal, slot, aborted: false, abortSignalled: false }
+  const outcome = new Promise<ChildOutcome>((resolve) => { call.resolve = resolve })
+  state.calls.set(id, call)
+  try {
+    state.worker.postMessage({ type: 'run', id, request, slot } satisfies ProcessWorkerRequest)
+  } catch {
+    // Nothing started: a request the worker cannot take starts here instead.
+    state.calls.delete(id)
+    return startChild(request)
+  }
+  return {
+    // An abort taken here before the outcome arrived wins over an exit the
+    // worker saw first, as an abort before the child's close always has; and
+    // one that signalled the group first wins over the worker's later reason.
+    outcome: outcome.then((result) => call.aborted && (call.abortSignalled || !result.termination)
+      ? { ...result, termination: { kind: 'abort' } } : result),
+    abort: () => {
+      if (call.aborted) return
+      call.aborted = true
+      // Stop the group now, as an in-thread abort does: a teardown may exit
+      // before the worker reads the message below. The wait for a spawn()
+      // under way is bounded by the call's own timeout.
+      call.abortSignalled = abortWorkerCall(slot, call.killSignal, request.timeoutMs)
+      state.worker.postMessage({ type: 'abort', id } satisfies ProcessWorkerRequest)
+    },
+  }
+}
+
+function restoreOutcome(outcome: ChildOutcome<SerializedError>): ChildOutcome {
+  const { termination, ...rest } = outcome
+  if (!termination) return rest
+  return { ...rest, termination: termination.kind === 'error' ? { kind: 'error', error: restoreError(termination.error) } : termination }
+}
+
+/** Starts the process worker once: true while it is ready to take runFile's
+ *  children, false when it could not start or has stopped. */
+export function processWorkerReady(): Promise<boolean> {
+  if (process.platform === 'win32') return Promise.resolve(false)
+  return processWorkerStart ??= startProcessWorker()
+}
+
+/** Stops the process worker as a fault would: the children it runs are stopped
+ *  as interrupted, and later calls start on this thread. The fallback tests use it. */
+export async function stopProcessWorker(): Promise<void> {
+  await processWorker?.worker.terminate()
+}
+
+async function startProcessWorker(): Promise<boolean> {
+  let asset: { url: URL, dir: string | null }
+  try {
+    asset = await processWorkerAsset()
+  } catch (error) {
+    console.error('[process] the process worker is unavailable; CLI calls start on the main thread:', error)
+    processWorkerStart = Promise.resolve(false)
+    return false
+  }
+  const removeAsset = () => {
+    if (asset.dir) void rm(asset.dir, { recursive: true, force: true }).catch((error: unknown) => console.error('[process] could not remove the process worker build:', error))
+  }
+  return await new Promise<boolean>((resolve) => {
+    let worker: Worker
+    try {
+      worker = new Worker(asset.url)
+    } catch (error) {
+      console.error('[process] the process worker did not start; CLI calls start on the main thread:', error)
+      removeAsset()
+      processWorkerStart = Promise.resolve(false)
+      resolve(false)
+      return
+    }
+    worker.unref()
+    const state: ProcessWorker = { worker, ready: false, calls: new Map() }
+    processWorker = state
+    worker.on('message', (message: ProcessWorkerReply) => {
+      if (message.type === 'ready') {
+        state.ready = true
+        removeAsset()
+        resolve(true)
         return
       }
-      terminalError = error
-      void finish(null, null)
+      const call = state.calls.get(message.id)
+      if (!call) return
+      state.calls.delete(message.id)
+      call.resolve(restoreOutcome(message.outcome))
     })
-    child.once('close', (code, signal) => { void finish(code, signal) })
-
-    options.signal?.addEventListener('abort', onAbort, { once: true })
-    if (options.signal?.aborted) onAbort()
-    const timeoutHandle = setTimeout(() => {
-      requestTermination(Object.assign(
-        new Error(`Command timed out after ${timeout}ms: ${command}`),
-        { code: null, killed: true, signal: killSignal },
-      ))
-    }, timeout)
+    // A worker fault never stops CLI calls: later ones start on this thread,
+    // and the ones it was running are stopped and reported as interrupted.
+    const retire = (reason: unknown) => {
+      if (processWorker !== state) return
+      processWorker = null
+      processWorkerStart = Promise.resolve(false)
+      if (!state.ready) removeAsset()
+      resolve(false)
+      console.error('[process] the process worker stopped; CLI calls start on the main thread:', reason)
+      for (const call of state.calls.values()) {
+        const pid = Atomics.load(call.slot, CALL_PID)
+        if (pid && claimSignal(call.slot)) killGroup(pid, call.killSignal)
+        call.resolve({ code: null, signal: null, stdout: '', stderr: '', termination: { kind: 'interrupted' } })
+      }
+      state.calls.clear()
+    }
+    worker.once('error', retire)
+    worker.once('exit', (code) => retire(new Error(`exited with code ${code}`)))
   })
+}
+
+// The production bundle ships dist/process-worker.js beside dist/server.js.
+// From the source tree (development, tests) the worker is bundled once, as
+// agent.ts does for its parse worker.
+async function processWorkerAsset(): Promise<{ url: URL, dir: string | null }> {
+  const built = new URL('./process-worker.js', import.meta.url)
+  if (existsSync(built)) return { url: built, dir: null }
+  const source = new URL('./process-worker.ts', import.meta.url)
+  if (process.env.NODE_ENV === 'production' || !existsSync(source)) {
+    throw new Error('The process worker asset is missing')
+  }
+  const dir = await mkdtemp(join(tmpdir(), 'poise-process-worker-'))
+  try {
+    const output = join(dir, 'worker.mjs')
+    const { build } = await import('esbuild')
+    await build({ entryPoints: [fileURLToPath(source)], outfile: output, bundle: true,
+      platform: 'node', format: 'esm', packages: 'external', logLevel: 'silent' })
+    return { url: pathToFileURL(output), dir }
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true })
+    throw error
+  }
 }
 
 export interface DetachedSpawnOptions {

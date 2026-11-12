@@ -1,0 +1,262 @@
+import { spawn, type ChildProcess } from 'node:child_process'
+
+// One runFile child: started, read and stopped exactly as runFile always has.
+// server/process.ts runs it in the process worker (process-worker.ts), so the
+// request and the outcome hold only values a worker message can carry.
+
+export interface ChildRequest {
+  file: string
+  args: string[]
+  cwd?: string
+  env: NodeJS.ProcessEnv
+  maxBuffer: number
+  timeoutMs: number
+  killSignal: NodeJS.Signals
+  /** Windows only: taskkill's scrubbed environment. */
+  killEnv?: NodeJS.ProcessEnv
+}
+
+/** Why the child was stopped rather than left to exit; the first reason wins. */
+export type ChildTermination<E = Error> =
+  | { kind: 'timeout' }
+  | { kind: 'maxBuffer', stream: 'stdout' | 'stderr' }
+  | { kind: 'abort' }
+  | { kind: 'error', error: E }
+  /** The process worker stopped while the child ran. */
+  | { kind: 'interrupted' }
+
+export interface ChildOutcome<E = Error> {
+  code: number | null
+  signal: NodeJS.Signals | null
+  stdout: string
+  stderr: string
+  termination?: ChildTermination<E>
+}
+
+export interface RunningChild {
+  outcome: Promise<ChildOutcome>
+  abort: () => void
+  /** Set once spawn() has returned with a child. */
+  pid?: number
+}
+
+export interface SerializedError {
+  name: string
+  message: string
+  stack?: string
+  props: Record<string, unknown>
+}
+
+// Each call's slot, shared by the main thread and the process worker: an abort
+// reads the child's pid at once, as an in-thread abort reads child.pid, with no
+// message that a teardown could exit before.
+export const CALL_STATE = 0
+export const CALL_PID = 1
+/** Set by an abort; the worker reads it as soon as spawn() returns. */
+export const CALL_ABORT = 2
+/** Taken by whichever side signals the child's group: one signal per call,
+ *  as in-thread, so a child that escalates on a second one can clean up. */
+export const CALL_SIGNAL = 3
+export const CALL_IDLE = 0
+export const CALL_STARTING = 1
+export const CALL_STARTED = 2
+export const CALL_ABORTED = 3
+
+export function createCallSlot(): Int32Array {
+  return new Int32Array(new SharedArrayBuffer(4 * Int32Array.BYTES_PER_ELEMENT))
+}
+
+export function claimSignal(slot: Int32Array): boolean {
+  return Atomics.compareExchange(slot, CALL_SIGNAL, 0, 1) === 0
+}
+
+// Only the group: a direct kill after the child was reaped could reach a
+// process that reused its pid. The worker still runs the full termination.
+export function killGroup(pid: number, signal: NodeJS.Signals): void {
+  try { process.kill(-pid, signal) } catch { /* the group has already gone */ }
+}
+
+/** The main thread's side of an abort. A call the worker has not started is
+ *  claimed, so it never starts. A spawn() under way is waited for, as this
+ *  thread once waited inside spawn() itself; `waitMs` only guards against a
+ *  wedged worker, and if it passes, the worker stops the child as soon as
+ *  spawn() returns. The child's group is then signalled here, at once, unless
+ *  the worker has signalled it already. True when this abort sent the signal. */
+export function abortWorkerCall(slot: Int32Array, killSignal: NodeJS.Signals, waitMs: number): boolean {
+  Atomics.store(slot, CALL_ABORT, 1)
+  const was = Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_ABORTED)
+  if (was === CALL_IDLE) return false
+  if (was === CALL_STARTING) Atomics.wait(slot, CALL_STATE, CALL_STARTING, waitMs)
+  const pid = Atomics.load(slot, CALL_PID)
+  if (!pid || !claimSignal(slot)) return false
+  killGroup(pid, killSignal)
+  return true
+}
+
+/** The worker's side: null when an abort claimed the call first; otherwise
+ *  starts the child, publishes its pid, and stops it at once if an abort came
+ *  while spawn() ran. */
+export function startWorkerCall(request: ChildRequest, slot: Int32Array): RunningChild | null {
+  if (Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_STARTING) !== CALL_IDLE) return null
+  const child = startChild(request, () => claimSignal(slot))
+  Atomics.store(slot, CALL_PID, child.pid ?? 0)
+  Atomics.store(slot, CALL_STATE, CALL_STARTED)
+  Atomics.notify(slot, CALL_STATE)
+  if (Atomics.load(slot, CALL_ABORT)) child.abort()
+  return child
+}
+
+export type ProcessWorkerRequest =
+  | { type: 'run', id: number, request: ChildRequest, slot: Int32Array }
+  | { type: 'abort', id: number }
+
+export type ProcessWorkerReply =
+  | { type: 'ready' }
+  | { type: 'done', id: number, outcome: ChildOutcome<SerializedError> }
+
+// The fields Node's process errors carry; anything else may not cross a worker message.
+const ERROR_PROPS = ['code', 'errno', 'syscall', 'path', 'spawnargs', 'killed', 'signal'] as const
+
+export function serializeError(error: Error): SerializedError {
+  const props: Record<string, unknown> = {}
+  for (const key of ERROR_PROPS) {
+    if (key in error) props[key] = (error as unknown as Record<string, unknown>)[key]
+  }
+  return { name: error.name, message: error.message, stack: error.stack, props }
+}
+
+export function restoreError(serialized: SerializedError): Error {
+  const error = Object.assign(new Error(serialized.message), serialized.props)
+  if (serialized.name !== 'Error') error.name = serialized.name
+  if (serialized.stack !== undefined) error.stack = serialized.stack
+  return error
+}
+
+export async function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals, killEnv?: NodeJS.ProcessEnv): Promise<void> {
+  const pid = child.pid
+  if (!pid) return
+
+  if (process.platform !== 'win32') {
+    // runFile children are process-group leaders. Negative pid targets the
+    // complete group, including grandchildren that inherited it.
+    try { process.kill(-pid, signal) }
+    catch {
+      // The group may have exited between the deadline and this call. A direct
+      // kill is a safe fallback if group creation or lookup failed.
+      try { child.kill(signal) } catch { /* already gone */ }
+    }
+    return
+  }
+
+  // Windows has no process-group signal equivalent. taskkill /T walks the
+  // descendant tree; /F is the only dependable hard-deadline behavior.
+  await new Promise<void>((resolve) => {
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      clearTimeout(fallback)
+      resolve()
+    }
+    const killer = spawn('taskkill.exe', ['/pid', String(pid), '/T', '/F'], {
+      env: killEnv,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    const fallback = setTimeout(finish, 2_000)
+    killer.once('error', finish)
+    killer.once('close', finish)
+  })
+  try { child.kill(signal) } catch { /* taskkill already reaped it */ }
+}
+
+// spawn keeps argv separate from the shell. POSIX children lead an isolated
+// process group so timeout, abort, and output-limit termination includes their
+// complete descendant tree.
+export function startChild(request: ChildRequest, claim: () => boolean = () => true): RunningChild {
+  let abort = () => {}
+  let pid: number | undefined
+  const outcome = new Promise<ChildOutcome>((resolve) => {
+    let child: ChildProcess
+    try {
+      child = spawn(request.file, request.args, {
+        cwd: request.cwd,
+        env: request.env,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+    } catch (error) {
+      // A child spawn cannot start rejects through the outcome, as runFile's
+      // always has, instead of leaving the outcome unsettled.
+      resolve({ code: null, signal: null, stdout: '', stderr: '', termination: { kind: 'error', error: error as Error } })
+      return
+    }
+    pid = child.pid
+    const stdoutChunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let termination: ChildTermination | undefined
+    let terminating: Promise<void> | undefined
+    let finishing = false
+
+    // `claim` is false when an abort on the main thread has signalled the
+    // group already: the reason is still recorded, without a second signal.
+    const requestTermination = (reason: ChildTermination) => {
+      if (termination || finishing) return
+      termination = reason
+      if (claim()) terminating = terminateProcessTree(child, request.killSignal, request.killEnv)
+    }
+
+    const collect = (stream: 'stdout' | 'stderr', value: Buffer | string) => {
+      if (termination || finishing) return
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
+      const chunks = stream === 'stdout' ? stdoutChunks : stderrChunks
+      const used = stream === 'stdout' ? stdoutBytes : stderrBytes
+      const remaining = request.maxBuffer - used
+      if (chunk.byteLength > remaining) {
+        if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
+        if (stream === 'stdout') stdoutBytes = request.maxBuffer
+        else stderrBytes = request.maxBuffer
+        requestTermination({ kind: 'maxBuffer', stream })
+        return
+      }
+      chunks.push(chunk)
+      if (stream === 'stdout') stdoutBytes += chunk.byteLength
+      else stderrBytes += chunk.byteLength
+    }
+
+    const finish = async (code: number | null, signal: NodeJS.Signals | null) => {
+      if (finishing) return
+      finishing = true
+      clearTimeout(timeoutHandle)
+      await terminating
+      resolve({
+        code,
+        signal,
+        stdout: Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8'),
+        stderr: Buffer.concat(stderrChunks, stderrBytes).toString('utf8'),
+        ...(termination ? { termination } : {}),
+      })
+    }
+
+    abort = () => requestTermination({ kind: 'abort' })
+    child.stdout?.on('data', (chunk) => collect('stdout', chunk))
+    child.stderr?.on('data', (chunk) => collect('stderr', chunk))
+    child.stdout?.on('error', (error) => requestTermination({ kind: 'error', error }))
+    child.stderr?.on('error', (error) => requestTermination({ kind: 'error', error }))
+    child.once('error', (error) => {
+      if (child.pid) {
+        requestTermination({ kind: 'error', error })
+        return
+      }
+      termination = { kind: 'error', error }
+      void finish(null, null)
+    })
+    child.once('close', (code, signal) => { void finish(code, signal) })
+
+    const timeoutHandle = setTimeout(() => requestTermination({ kind: 'timeout' }), request.timeoutMs)
+  })
+  return { outcome, abort: () => abort(), pid }
+}
