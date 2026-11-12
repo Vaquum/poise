@@ -118,6 +118,9 @@ for (const layout of ['Lanes', 'List'] as const) {
     const world: World = { records: RECORDS }
     await board(page, world)
     await view(page, layout).click()
+    // Fake the clock before focusing: focus schedules the reference tooltip,
+    // and a real timer would show it over the action row mid-test.
+    await page.clock.install()
     const issue = card(page, 'Opened today')
     const assign = issue.getByRole('button', { name: 'Assign to Poise', exact: true })
     // Focus reveals the action row without resting on the card, which would
@@ -131,11 +134,12 @@ for (const layout of ['Lanes', 'List'] as const) {
     await expect(assign).toHaveText('')
     await expect(assign.locator('svg use')).toHaveAttribute('href', '#i-handoff')
     const original = await assign.innerHTML()
-    await page.clock.install()
     await assign.click()
     await expect(issue.getByRole('button', { name: 'Sure?' })).toBeVisible()
     expect(world.assigned).toEqual([])
     await page.clock.fastForward(4000)
+    // fastForward also fires the tooltip timer; hide it so it cannot cover the icon.
+    await page.keyboard.press('Escape')
     await expect(assign).not.toHaveClass(/is-armed/)
     expect(await assign.innerHTML()).toBe(original)
     await expect(assign).toHaveText('')
@@ -152,12 +156,14 @@ for (const layout of ['Lanes', 'List'] as const) {
 test('arming a second Assign disarms the first, and a rearmed Assign restores its icon', async ({ page }) => {
   const world: World = { records: RECORDS }
   await board(page, world)
+  // Fake the clock before focusing: focus schedules the reference tooltip,
+  // and a real timer would show it over the action row mid-test.
+  await page.clock.install()
   const first = card(page, 'Opened today')
   const second = card(page, 'Old issue changed today')
   const firstAssign = first.getByRole('button', { name: 'Assign to Poise' })
   const secondAssign = second.getByRole('button', { name: 'Assign to Poise' })
   await firstAssign.focus()
-  await page.clock.install()
   await firstAssign.click()
   await expect(first.getByRole('button', { name: 'Sure?' })).toBeVisible()
   await secondAssign.focus()
@@ -166,6 +172,8 @@ test('arming a second Assign disarms the first, and a rearmed Assign restores it
   await expect(first.getByRole('button', { name: 'Assign to Poise' })).toBeVisible()
   await expect(first.getByRole('button', { name: 'Sure?' })).toHaveCount(0)
   await page.clock.fastForward(4000)
+  // fastForward also fires the tooltip timer; hide it so it cannot cover the icon.
+  await page.keyboard.press('Escape')
   await expect(second.getByRole('button', { name: 'Assign to Poise' })).toBeVisible()
   const assign = first.getByRole('button', { name: 'Assign to Poise', exact: true })
   await assign.focus()
@@ -173,6 +181,7 @@ test('arming a second Assign disarms the first, and a rearmed Assign restores it
   await assign.click()
   await expect(first.getByRole('button', { name: 'Sure?' })).toBeVisible()
   await page.clock.fastForward(4000)
+  await page.keyboard.press('Escape')
   expect(await assign.innerHTML()).toBe(original)
   await expect(assign).toHaveText('')
   await expect(assign.locator('svg use')).toHaveAttribute('href', '#i-handoff')
@@ -237,7 +246,7 @@ test('choosing a live item opens it beside the board, and a card’s chat opens 
   await expect(beside.getByRole('button', { name: 'Assign to Poise' })).toHaveText('Assign to Poise')
   await beside.getByRole('button', { name: 'Close' }).click()
 
-  await card(page, 'Opened today').hover()
+  await card(page, 'Opened today').getByRole('button', { name: 'Chat about this, beside the board' }).focus()
   await card(page, 'Opened today').getByRole('button', { name: 'Chat about this, beside the board' }).click()
   await expect(page.locator('#chat-side-pane .chat-title')).toContainText('acme/site#42')
 })
