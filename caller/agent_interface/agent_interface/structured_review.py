@@ -750,8 +750,11 @@ def ask_codex(root: Path, model: Model, system: str, text: str, schema: dict, wa
                 if cause:
                     break
             if not cause:
+                # A blocked account still types as blocked when codex says so
+                # without an error prefix, as its full stderr once did.
                 cause = next((line.strip() for line in reversed(done.stderr.splitlines())
-                              if re.match(r"(?:error\b|fatal\b|thread .+ panicked at\b)", line.strip(), re.IGNORECASE)), "")
+                              if re.match(r"(?:error\b|fatal\b|thread .+ panicked at\b)", line.strip(), re.IGNORECASE)
+                              or provider_blocked(line)), "")
             status = f"signal {sig}" if sig is not None else f"exit {code}"
             provider_failure(cause or f"cause unavailable (codex {status})",
                              provider="codex", exit_code=code, signal=sig)

@@ -1491,6 +1491,13 @@ class TestVerifiedResultsOrExplicitFailures(TestCase):
         self.assertNotIn("private-password", str(failure.exception))
         self.assertNotIn("WARNING", str(failure.exception))
 
+    def test_codex_unprefixed_block_still_types_as_blocked(self):
+        message = "Grok Build usage balance exhausted"
+        with self.assertRaises(atoms.AgentPreflightError) as failure:
+            self._codex_run(returncode=101, stderr=self.CODEX_WARNING + "\n" + message)
+        self.assertEqual(failure.exception.code, "review_provider_blocked")
+        self.assertIn(message, str(failure.exception))
+
     def test_codex_warning_without_usable_cause_retains_exit_or_signal(self):
         for returncode in (101, -9):
             for stdout in ("", 'not JSON\n[]\n{"type":"turn.failed",',
