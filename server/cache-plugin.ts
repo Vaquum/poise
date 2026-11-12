@@ -878,7 +878,8 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
         // See server/behavior-estimates.ts.
         if (path === '/api/behavior-estimates' && req.method === 'GET') {
           try {
-            const [running, history] = await Promise.all([fetchRunningAgentLogSnapshot(), fetchAgentLogSnapshot()])
+            // The whole history only shapes the estimates: its last snapshot answers at once.
+            const [running, history] = await Promise.all([fetchRunningAgentLogSnapshot(), fetchAgentLogSnapshot({ lastObserved: true })])
             return json(res, 200, { estimates: readBehaviorEstimates(history.entries, running.entries) })
           } catch (err: any) {
             return json(res, 502, { error: 'agent-interface --logs failed: ' + (err.message || String(err)) })
@@ -915,7 +916,7 @@ export function createPoiseMiddleware(opts: CachePluginOptions = {}): Connect.Ne
           const query = new URLSearchParams(url.split('?')[1] || '')
           const window = parseWindow(query.get('since'), query.get('until'))
           try {
-            const snapshot = await fetchAgentLogSnapshot()
+            const snapshot = await fetchAgentLogSnapshot({ lastObserved: true })
             return json(res, 200, readBehaviorMetrics(snapshot.entries, window, null, snapshot.quarantined))
           } catch (error) {
             return json(res, 200, readBehaviorMetrics([], window, error instanceof Error ? error.message : String(error)))

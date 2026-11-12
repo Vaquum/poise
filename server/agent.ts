@@ -141,8 +141,10 @@ function agentLogAbortError(signal: AbortSignal): Error {
   return Object.assign(error, { code: 'ABORT_ERR' })
 }
 
+/** The whole history. `lastObserved` answers at once from the last snapshot
+ *  and reads it again behind the answer; never-read history is read now. */
 export async function fetchAgentLogSnapshot(
-  options: { signal?: AbortSignal, fresh?: boolean } = {},
+  options: { signal?: AbortSignal, fresh?: boolean, lastObserved?: boolean } = {},
 ): Promise<AgentLogSnapshot> {
   return laneAgentLogSnapshot(historyAgentLogLane, options, readHistoryAgentLogSnapshot)
 }
