@@ -543,6 +543,12 @@ describe('production server', () => {
     await expect(production.startProductionServer({ staticDir, port })).rejects.toThrow(/POISE_PORT/)
   })
 
+  it('observes main-thread stalls however the server is launched', async () => {
+    const { stallSnapshot } = await import('../server/stall-observer')
+    await expect(production.startProductionServer({ staticDir, port: -1 })).rejects.toThrow(/POISE_PORT/)
+    expect(stallSnapshot().installedAt).not.toBeNull()
+  })
+
   it('fails closed when the Caller is not set up', async () => {
     vi.stubEnv('CALLER_BIN_ROOT', join(root, 'no-caller'))
     try {

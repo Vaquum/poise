@@ -28,8 +28,6 @@ const isProductionEntrypoint = process.argv[1]
   ? resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
   : false
 if (isProductionEntrypoint) refuseInspectorActivation()
-// Before the runtime's modules open their databases: /api/health/stalls reads it.
-if (isProductionEntrypoint) installStallObserver()
 if (isProductionEntrypoint && process.env.POISE_MODE === 'service') installProductionCpuCapture()
 
 // Security validation must run before dotenv reads the file and before modules
@@ -526,6 +524,8 @@ export function createProductionServer(options: ProductionServerOptions = {}): S
 }
 
 export async function startProductionServer(options: ProductionServerOptions = {}): Promise<Server> {
+  // Every launcher starts the server here; /api/health/stalls reads what it observes.
+  installStallObserver()
   await assertSecureDotenv()
   const host = options.host || process.env.POISE_HOST || DEFAULT_HOST
   const service = options.service === undefined ? readServiceConfig() : options.service

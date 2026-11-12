@@ -6,9 +6,9 @@
 // nothing triggers, writes or exports a profile. Only calls of SLOW_MS or
 // more are kept, with SQL literals masked.
 import Database from 'better-sqlite3'
-import { stat } from 'node:fs/promises'
 import { PerformanceObserver, constants, performance } from 'node:perf_hooks'
 import { getHeapStatistics } from 'node:v8'
+import { Worker } from 'node:worker_threads'
 import { eventLoopDelayStats } from './event-loop-delay'
 
 const SLOW_MS = 50
@@ -32,9 +32,35 @@ const GC_KINDS: Record<number, string> = {
   [constants.NODE_PERFORMANCE_GC_WEAKCB]: 'weak callbacks',
 }
 
-/** SQL text with its literals masked: what ran, never the values it carried. */
+/** SQL text with its literals masked and comments dropped: what ran, never the
+ *  values it carried. Quoted identifiers stay; an unterminated literal masks the rest. */
 export function maskSql(sql: string): string {
-  return sql.replace(/'(?:[^']|'')*'/g, '?').replace(/\b\d+(?:\.\d+)?\b/g, '?').replace(/\s+/g, ' ').trim().slice(0, 160)
+  let out = ''
+  for (let i = 0; i < sql.length;) {
+    const c = sql[i]
+    if (c === "'") {
+      for (i++; i < sql.length; i++) if (sql[i] === "'") { if (sql[i + 1] === "'") i++; else { i++; break } }
+      out += '?'
+    } else if (c === '-' && sql[i + 1] === '-') {
+      const end = sql.indexOf('\n', i)
+      i = end < 0 ? sql.length : end
+      out += ' '
+    } else if (c === '/' && sql[i + 1] === '*') {
+      const end = sql.indexOf('*/', i + 2)
+      i = end < 0 ? sql.length : end + 2
+      out += ' '
+    } else if (c === '"' || c === '`' || c === '[') {
+      const close = c === '[' ? ']' : c
+      const end = sql.indexOf(close, i + 1)
+      const stop = end < 0 ? sql.length : end + 1
+      out += sql.slice(i, stop)
+      i = stop
+    } else {
+      out += c
+      i++
+    }
+  }
+  return out.replace(/\b\d+(?:\.\d+)?\b/g, '?').replace(/\s+/g, ' ').trim().slice(0, 160)
 }
 
 /** The first frames below the timed call, outside SQLite's binding: who made it. */
@@ -48,9 +74,9 @@ function callSite(below: (...args: never[]) => unknown): string {
     .join(' < ')
 }
 
-export function recordStall(kind: Kind, what: string, ms: number, site = ''): void {
+export function recordStall(kind: Kind, what: string, ms: number, site = '', atMs = Date.now()): void {
   if (ms < SLOW_MS) return
-  const at = new Date().toISOString()
+  const at = new Date(atMs).toISOString()
   recent.push({ at, kind, what, ms: Math.round(ms), site })
   if (recent.length > RECENT) recent.shift()
   const key = `${kind}\u0000${what}\u0000${site}`
@@ -101,17 +127,31 @@ export function installStallObserver(): void {
       recordStall('gc', GC_KINDS[(entry as unknown as { detail?: { kind?: number } }).detail?.kind ?? -1] ?? 'gc', entry.duration)
     }
   }).observe({ entryTypes: ['gc'] })
-  const timer = setInterval(() => {
-    const started = performance.now()
-    void stat('/').catch(() => undefined).finally(() => {
-      const ms = performance.now() - started
+  // The probe runs in its own small thread, so a blocked main thread never
+  // delays its callback and counts as a file-I/O wait. File I/O shares the
+  // process's libuv threads, so the probe waits as the server's reads do.
+  try {
+    const worker = new Worker(PROBE, { eval: true, workerData: { everyMs: PROBE_MS } })
+    worker.unref()
+    worker.on('message', ({ ms, at }: { ms: number, at: number }) => {
       probe.lastMs = Math.round(ms)
-      if (ms >= probe.maxMs) probe = { lastMs: probe.lastMs, maxMs: Math.round(ms), maxAt: new Date().toISOString() }
-      recordStall('threadpool', 'a trivial file read waited', ms)
+      if (ms >= probe.maxMs) probe = { lastMs: probe.lastMs, maxMs: Math.round(ms), maxAt: new Date(at).toISOString() }
+      recordStall('threadpool', 'a trivial file read waited', ms, '', at)
     })
-  }, PROBE_MS)
-  timer.unref()
+    worker.on('error', () => { /* a diagnostic never takes the server down */ })
+  } catch { /* nor does one that cannot start */ }
 }
+
+const PROBE = `
+const { parentPort, workerData } = require('node:worker_threads')
+const { stat } = require('node:fs/promises')
+const { performance } = require('node:perf_hooks')
+setInterval(async () => {
+  const started = performance.now()
+  try { await stat('/') } catch {}
+  parentPort.postMessage({ ms: performance.now() - started, at: Date.now() })
+}, workerData.everyMs)
+`
 
 const mb = (bytes: number) => Math.round(bytes / 1_048_576)
 
