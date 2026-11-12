@@ -101,6 +101,8 @@ interface ServerState {
   createDelay?: () => Promise<void>
   /** Earlier conversations by subject key for GET /api/chat/legacy. */
   legacy?: Record<string, { turns: Array<{ prompt: string, reply: string, at: string, status: string }>, omitted: number } | null>
+  /** Each GET of a session's events, with what it asked for. */
+  reads?: Array<{ id: string, after: number, turns: number }>
   /** Answer for POST /api/chat-content; recorded in state.calls. */
   content?: (topic: string, chatSession: string) => { status: number, json: unknown }
   /** Author-content jobs by call_id or launch_id for the status route. */
@@ -290,8 +292,14 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
         await route.fulfill({ json: { ok: true, workspaceRemoved: false } })
         return
       }
+      // As the service answers: a first open with `turns` reads after the turn that ended before its last ones.
       const after = Number(url.searchParams.get('after') || 0)
-      await route.fulfill({ json: { session: s, events: (state.history[id] || []).filter((e) => e.seq > after) } })
+      const turns = Number(url.searchParams.get('turns') || 0)
+      const events = state.history[id] || []
+      const finished = events.filter((e) => e.event.type === 'turn.finished').map((e) => e.seq)
+      const from = after > 0 ? after : turns > 0 ? finished[finished.length - 1 - turns] ?? 0 : 0
+      state.reads = [...(state.reads ?? []), { id, after, turns }]
+      await route.fulfill({ json: { session: s, events: events.filter((e) => e.seq > from), truncated: false, from } })
       return
     }
     await route.fulfill({ json: {} })

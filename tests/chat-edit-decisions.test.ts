@@ -178,6 +178,22 @@ describe('edit decisions', () => {
     expect(replayed[0]?.event).toMatchObject({ type: 'edit.decided', turnId, messageId, index: 0, decision: 'applied' })
   }, 180_000)
 
+  it('opens a transcript on its last turns when asked, saying where they begin', async () => {
+    const { session } = await runtime.createForSubject({ agent: 'grok', model: 'grok-4.6-xhigh', subject: docSubject() })
+    for (let i = 0; i < 3; i++) await runReplyTurn(session.id, REPLY)
+    const read = async (query: string) => await (await fetch(`${origin}/api/chat/sessions/${session.id}?${query}`)).json() as { events: ChatEnvelope[], from: number }
+    const all = await read('after=0')
+    expect(all.from).toBe(0)
+    const finishes = all.events.filter(({ event }) => event.type === 'turn.finished').map(({ seq }) => seq)
+    expect(finishes).toHaveLength(3)
+    const last = await read('after=0&turns=1')
+    expect(last.from).toBe(finishes[1])
+    expect(last.events.map(({ seq }) => seq)).toEqual(all.events.filter(({ seq }) => seq > finishes[1]).map(({ seq }) => seq))
+    expect(last.events.filter(({ event }) => event.type === 'turn.started')).toHaveLength(1)
+    // A later page reads after its cursor, whatever else it asks.
+    expect((await read(`after=${finishes[0]}&turns=1`)).from).toBe(finishes[0])
+  }, 180_000)
+
   it('refuses a decision for an unfinished turn or an edit card the parser does not produce', async () => {
     const { session } = await runtime.createForSubject({ agent: 'grok', model: 'grok-4.6-xhigh', subject: docSubject() })
     const socket = await connect()

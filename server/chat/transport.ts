@@ -639,8 +639,12 @@ export async function handleChatApi(req: IncomingMessage, res: ServerResponse, u
         const session = runtime.get(id)
         if (!session) throw new ChatError(404, 'unknown session', 'unknown_session')
         const after = Number(query.get('after') || 0)
-        const { events, truncated } = runtime.events(id, Number.isSafeInteger(after) && after >= 0 ? after : 0)
-        return json(res, 200, { session, events: events.map(clientEnvelope), truncated }), true
+        // A first open asks for its last turns; `from` says where they begin, and earlier ones are read on request.
+        const turns = Number(query.get('turns') || 0)
+        const from = Number.isSafeInteger(after) && after > 0 ? after
+          : Number.isSafeInteger(turns) && turns > 0 ? runtime.turnsStart(id, Math.min(turns, 200)) : 0
+        const { events, truncated } = runtime.events(id, from)
+        return json(res, 200, { session, events: events.map(clientEnvelope), truncated, from }), true
       }
       if (!action && req.method === 'PATCH') {
         const body = await readJson<any>(req)
