@@ -78,8 +78,8 @@ async function mountAddress(): Promise<void> {
   if (current?.controller !== controller) { if (typeof leave === 'function') leave(); return }
   if (typeof leave === 'function') current.leave = leave
   paintTerms(root)
-  // A first open of another place then never waits for its code.
-  if (!preloaded) { preloaded = true; whenIdle(() => { for (const load of Object.values(PLACES)) void load().catch(() => undefined) }) }
+  // A first open of another place then never waits for its code; it loads once this place has had its turn.
+  if (!preloaded) { preloaded = true; setTimeout(() => whenIdle(() => { for (const load of Object.values(PLACES)) void load().catch(() => undefined) }), 1500) }
 }
 
 /** Moves to `href`, a link within this page, as a new history entry. */

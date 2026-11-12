@@ -441,9 +441,10 @@ export const mount: MountPlace = (ctx) => {
     const w = timeWindow()
     const cardsReading = first ? settle('cards', 'your cards', readCards(F.org)) : Promise.resolve(undefined)
     const liveReading = settle('live', 'GitHub issues and pull requests', readLive({ open: F.status === 'open', since: w.since, until: w.until }, F.org))
-    // A first read draws the cards and the items as soon as they answer; their states fill in as the rest lands.
+    // A first read draws the cards and the items as soon as they answer, unless the rest lands within
+    // a frame and draws them whole; their states fill in as the rest lands.
     if (first) {
-      void Promise.all([cardsReading, liveReading]).then(([cardsRead, live]) => {
+      void Promise.all([cardsReading, liveReading]).then(([cardsRead, live]) => requestAnimationFrame(() => {
         if (mine !== generation || signal.aborted || readOnce) return
         if (cardsRead) cards = cardsRead
         if (live) {
@@ -452,7 +453,7 @@ export const mount: MountPlace = (ctx) => {
           liveRead = true
         }
         render(false)
-      })
+      }))
     }
     const [cardsRead, live, statuses, intakeRead, running, chainsRead, chatsRead] = await Promise.all([
       cardsReading,
