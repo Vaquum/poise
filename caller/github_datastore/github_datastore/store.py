@@ -6,6 +6,7 @@ import math
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -32,10 +33,10 @@ from .db import (
 from .extract import extract_associations
 from .github_api import (
     ITEM_GRAPH_BATCH_SIZE,
-    GitHubClient,
     GitHubOrgReader,
     GitHubRateLimitError,
     PullReconciliation,
+    datastore_github_client,
     parse_graphql_datetime,
 )
 
@@ -61,10 +62,9 @@ def init_org(
     if workers <= 0:
         raise ValueError("workers must be positive")
     validate_repo_filter(include_repos, exclude_repos)
-    conn = connect(db_path)
-    reader = GitHubOrgReader(GitHubClient())
-    run_started = utc_now()
-    try:
+    with closing(connect(db_path)) as conn, datastore_github_client() as client:
+        reader = GitHubOrgReader(client)
+        run_started = utc_now()
         init_db(conn)
         prior = (
             initialization_to_resume(conn, org, include_repos, exclude_repos)
@@ -139,8 +139,6 @@ def init_org(
             set_state(conn, "org", INITIALIZATION_KEY, json.dumps(state, sort_keys=True))
             set_state(conn, "org", "last_full_build_at", utc_now())
             set_state(conn, "org", "last_sync_at", catchup_started)
-    finally:
-        conn.close()
 
 
 def initialization_filter(
@@ -370,10 +368,9 @@ def sync_once(
         raise ValueError("reconcile-max-seconds requires reconcile and a positive finite duration")
     deadline = time.monotonic() + reconcile_max_seconds if reconcile_max_seconds is not None else None
     validate_repo_filter(include_repos, exclude_repos)
-    conn = connect(db_path)
-    reader = GitHubOrgReader(GitHubClient())
-    run_started = utc_now()
-    try:
+    with closing(connect(db_path)) as conn, datastore_github_client() as client:
+        reader = GitHubOrgReader(client)
+        run_started = utc_now()
         init_db(conn)
         org = get_state(conn, "org", "login")
         if not org:
@@ -528,8 +525,6 @@ def sync_once(
                 set_state(conn, "org", "last_sync_at", run_started)
             assert_no_duplicate_items(conn)
         return True
-    finally:
-        conn.close()
 
 
 def stored_pr_updated_at_by_id(conn: sqlite3.Connection, repo_id: int) -> dict[int, str]:
