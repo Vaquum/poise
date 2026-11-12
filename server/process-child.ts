@@ -54,13 +54,20 @@ export const CALL_STATE = 0
 export const CALL_PID = 1
 /** Set by an abort; the worker reads it as soon as spawn() returns. */
 export const CALL_ABORT = 2
+/** Taken by whichever side signals the child's group: one signal per call,
+ *  as in-thread, so a child that escalates on a second one can clean up. */
+export const CALL_SIGNAL = 3
 export const CALL_IDLE = 0
 export const CALL_STARTING = 1
 export const CALL_STARTED = 2
 export const CALL_ABORTED = 3
 
 export function createCallSlot(): Int32Array {
-  return new Int32Array(new SharedArrayBuffer(3 * Int32Array.BYTES_PER_ELEMENT))
+  return new Int32Array(new SharedArrayBuffer(4 * Int32Array.BYTES_PER_ELEMENT))
+}
+
+export function claimSignal(slot: Int32Array): boolean {
+  return Atomics.compareExchange(slot, CALL_SIGNAL, 0, 1) === 0
 }
 
 // Only the group: a direct kill after the child was reaped could reach a
@@ -73,14 +80,17 @@ export function killGroup(pid: number, signal: NodeJS.Signals): void {
  *  claimed, so it never starts. A spawn() under way is waited for, as this
  *  thread once waited inside spawn() itself; `waitMs` only guards against a
  *  wedged worker, and if it passes, the worker stops the child as soon as
- *  spawn() returns. The child's group is then stopped here, at once. */
-export function abortWorkerCall(slot: Int32Array, killSignal: NodeJS.Signals, waitMs: number): void {
+ *  spawn() returns. The child's group is then signalled here, at once, unless
+ *  the worker has signalled it already. True when this abort sent the signal. */
+export function abortWorkerCall(slot: Int32Array, killSignal: NodeJS.Signals, waitMs: number): boolean {
   Atomics.store(slot, CALL_ABORT, 1)
   const was = Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_ABORTED)
-  if (was === CALL_IDLE) return
+  if (was === CALL_IDLE) return false
   if (was === CALL_STARTING) Atomics.wait(slot, CALL_STATE, CALL_STARTING, waitMs)
   const pid = Atomics.load(slot, CALL_PID)
-  if (pid) killGroup(pid, killSignal)
+  if (!pid || !claimSignal(slot)) return false
+  killGroup(pid, killSignal)
+  return true
 }
 
 /** The worker's side: null when an abort claimed the call first; otherwise
@@ -88,7 +98,7 @@ export function abortWorkerCall(slot: Int32Array, killSignal: NodeJS.Signals, wa
  *  while spawn() ran. */
 export function startWorkerCall(request: ChildRequest, slot: Int32Array): RunningChild | null {
   if (Atomics.compareExchange(slot, CALL_STATE, CALL_IDLE, CALL_STARTING) !== CALL_IDLE) return null
-  const child = startChild(request)
+  const child = startChild(request, () => claimSignal(slot))
   Atomics.store(slot, CALL_PID, child.pid ?? 0)
   Atomics.store(slot, CALL_STATE, CALL_STARTED)
   Atomics.notify(slot, CALL_STATE)
@@ -163,7 +173,7 @@ export async function terminateProcessTree(child: ChildProcess, signal: NodeJS.S
 // spawn keeps argv separate from the shell. POSIX children lead an isolated
 // process group so timeout, abort, and output-limit termination includes their
 // complete descendant tree.
-export function startChild(request: ChildRequest): RunningChild {
+export function startChild(request: ChildRequest, claim: () => boolean = () => true): RunningChild {
   let abort = () => {}
   let pid: number | undefined
   const outcome = new Promise<ChildOutcome>((resolve) => {
@@ -191,10 +201,12 @@ export function startChild(request: ChildRequest): RunningChild {
     let terminating: Promise<void> | undefined
     let finishing = false
 
+    // `claim` is false when an abort on the main thread has signalled the
+    // group already: the reason is still recorded, without a second signal.
     const requestTermination = (reason: ChildTermination) => {
       if (termination || finishing) return
       termination = reason
-      terminating = terminateProcessTree(child, request.killSignal, request.killEnv)
+      if (claim()) terminating = terminateProcessTree(child, request.killSignal, request.killEnv)
     }
 
     const collect = (stream: 'stdout' | 'stderr', value: Buffer | string) => {

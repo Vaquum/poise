@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 import { CALLER_COMMANDS, callerBinRoot } from '../scripts/caller.mjs'
 import {
-  CALL_PID, abortWorkerCall, createCallSlot, killGroup, restoreError, startChild,
+  CALL_PID, abortWorkerCall, claimSignal, createCallSlot, killGroup, restoreError, startChild,
   type ChildOutcome, type ChildRequest, type ChildTermination, type ProcessWorkerReply, type ProcessWorkerRequest, type RunningChild, type SerializedError,
 } from './process-child'
 
@@ -546,6 +546,8 @@ interface WorkerCall {
   killSignal: NodeJS.Signals
   slot: Int32Array
   aborted: boolean
+  /** This abort signalled the group before anything else could. */
+  abortSignalled: boolean
 }
 
 interface ProcessWorker {
@@ -564,7 +566,7 @@ function runChild(request: ChildRequest): RunningChild {
   if (!state?.ready) return startChild(request)
   const id = nextWorkerCall++
   const slot = createCallSlot()
-  const call: WorkerCall = { resolve: () => {}, killSignal: request.killSignal, slot, aborted: false }
+  const call: WorkerCall = { resolve: () => {}, killSignal: request.killSignal, slot, aborted: false, abortSignalled: false }
   const outcome = new Promise<ChildOutcome>((resolve) => { call.resolve = resolve })
   state.calls.set(id, call)
   try {
@@ -576,15 +578,17 @@ function runChild(request: ChildRequest): RunningChild {
   }
   return {
     // An abort taken here before the outcome arrived wins over an exit the
-    // worker saw first, as an abort before the child's close always has.
-    outcome: outcome.then((result) => call.aborted && !result.termination ? { ...result, termination: { kind: 'abort' } } : result),
+    // worker saw first, as an abort before the child's close always has; and
+    // one that signalled the group first wins over the worker's later reason.
+    outcome: outcome.then((result) => call.aborted && (call.abortSignalled || !result.termination)
+      ? { ...result, termination: { kind: 'abort' } } : result),
     abort: () => {
       if (call.aborted) return
       call.aborted = true
       // Stop the group now, as an in-thread abort does: a teardown may exit
       // before the worker reads the message below. The wait for a spawn()
       // under way is bounded by the call's own timeout.
-      abortWorkerCall(slot, call.killSignal, request.timeoutMs)
+      call.abortSignalled = abortWorkerCall(slot, call.killSignal, request.timeoutMs)
       state.worker.postMessage({ type: 'abort', id } satisfies ProcessWorkerRequest)
     },
   }
@@ -658,7 +662,7 @@ async function startProcessWorker(): Promise<boolean> {
       console.error('[process] the process worker stopped; CLI calls start on the main thread:', reason)
       for (const call of state.calls.values()) {
         const pid = Atomics.load(call.slot, CALL_PID)
-        if (pid) killGroup(pid, call.killSignal)
+        if (pid && claimSignal(call.slot)) killGroup(pid, call.killSignal)
         call.resolve({ code: null, signal: null, stdout: '', stderr: '', termination: { kind: 'interrupted' } })
       }
       state.calls.clear()

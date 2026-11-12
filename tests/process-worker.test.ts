@@ -157,6 +157,31 @@ describe('the process worker', () => {
     }
   })
 
+  it('signals an aborted child once, so one that traps the signal can finish its cleanup', async () => {
+    const { processWorkerReady, runFile } = await import('../server/process')
+    expect(await processWorkerReady()).toBe(true)
+    const root = await mkdtemp(join(tmpdir(), 'poise-process-worker-'))
+    const signals = join(root, 'signals')
+    const ready = join(root, 'ready')
+    const controller = new AbortController()
+    const running = runFile(process.execPath, ['-e', [
+      "const { appendFileSync, writeFileSync } = require('node:fs')",
+      "process.on('SIGTERM', () => { appendFileSync(process.argv[1], 'x'); setTimeout(() => process.exit(0), 300) })",
+      "writeFileSync(process.argv[2], 'ready')",
+      'setInterval(() => {}, 1_000)',
+    ].join(';'), signals, ready], { killSignal: 'SIGTERM', signal: controller.signal, timeoutMs: 30_000 })
+    try {
+      await waitFor(async () => (await readFile(ready, 'utf8').catch(() => '')) === 'ready' ? true : null)
+      controller.abort()
+      await expect(running).rejects.toMatchObject({ code: 'ABORT_ERR', signal: 'SIGTERM' })
+      expect(await readFile(signals, 'utf8')).toBe('x')
+    } finally {
+      controller.abort()
+      await running.catch(() => undefined)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('starts children on the main thread when the worker cannot start', async () => {
     vi.doMock('node:worker_threads', async (original) => ({
       ...(await original<typeof import('node:worker_threads')>()),
@@ -197,6 +222,32 @@ describe('the call slot', () => {
     expect(waited).toBeGreaterThanOrEqual(90)
     expect(waited).toBeLessThan(2_000)
     expect(Atomics.load(slot, CALL_ABORT)).toBe(1)
+  })
+
+  it('leaves the one signal to the worker when the wait of an abort expires', async () => {
+    const { CALL_STARTING, CALL_STATE, abortWorkerCall, createCallSlot, startWorkerCall } = await import('../server/process-child')
+    const groupSignals = vi.spyOn(process, 'kill')
+    const slot = createCallSlot()
+    Atomics.store(slot, CALL_STATE, CALL_STARTING)
+    expect(abortWorkerCall(slot, 'SIGTERM', 50)).toBe(false)
+    // The worker's spawn() returns after the wait expired.
+    Atomics.store(slot, CALL_STATE, 0)
+    const child = startWorkerCall({ file: process.execPath, ...sleeper, killSignal: 'SIGTERM' }, slot)!
+    child.abort()
+    expect((await child.outcome).termination).toEqual({ kind: 'abort' })
+    expect(groupSignals.mock.calls.filter(([pid]) => Number(pid) < 0)).toEqual([[-child.pid!, 'SIGTERM']])
+  })
+
+  it('signals a started child once when the abort and the worker both stop it', async () => {
+    const { abortWorkerCall, createCallSlot, startWorkerCall } = await import('../server/process-child')
+    const groupSignals = vi.spyOn(process, 'kill')
+    const slot = createCallSlot()
+    const child = startWorkerCall({ file: process.execPath, ...sleeper, killSignal: 'SIGTERM' }, slot)!
+    expect(abortWorkerCall(slot, 'SIGTERM', 30_000)).toBe(true)
+    // The abort message reaches the worker afterwards.
+    child.abort()
+    expect((await child.outcome).termination).toEqual({ kind: 'abort' })
+    expect(groupSignals.mock.calls.filter(([pid]) => Number(pid) < 0)).toEqual([[-child.pid!, 'SIGTERM']])
   })
 
   it('stops the child the moment spawn() returns when an abort came while it ran', async () => {
