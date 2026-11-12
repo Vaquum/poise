@@ -2419,11 +2419,11 @@ test('QC: unfinished answers survive switching away and back to a session', asyn
 })
 
 test('QC: a dismissed delayed file suggestion never reopens itself', async ({ page }) => {
-  const state = makeState([session()]); await installRoutes(page, state); await installSocket(page, state)
+  const state = makeState([session()]); await installRoutes(page, state); const sock = await installSocket(page, state)
   let release!: () => void; let requested = false
   const hold = new Promise<void>(resolve => { release = resolve })
   await page.route('**/api/chat/files?**', async route => { requested = true; await hold; await route.fulfill({ json: { files: ['src/main.ts'] } }) })
-  await page.goto('/?view=chat'); await input(page).fill('@src')
+  await page.goto('/?view=chat'); await sock.subscribed('s1'); await input(page).fill('@src')
   await expect.poll(() => requested).toBe(true)
   await input(page).press('Escape'); release()
   await page.waitForTimeout(250)
