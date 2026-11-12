@@ -693,15 +693,25 @@ function closeTriggersPanel(force = false): Promise<boolean> {
   const same = (a: string[], b: string[]) => a.length === b.length && a.every((value, index) => value === b[index])
   const changes: SettingFields = {}
   let rejectedAuthors = ''
+  let rejectedDays = ''
   const saveStatus = (text: string, cls: 'info' | 'error' = 'info') =>
-    setTriggersStatus([rejectedAuthors, text].filter(Boolean).join(' '), rejectedAuthors ? 'error' : cls)
+    setTriggersStatus([rejectedAuthors, rejectedDays, text].filter(Boolean).join(' '), rejectedAuthors || rejectedDays ? 'error' : cls)
   if (meta.hasSkips) {
     if (key === 'close-old-prs') {
-      const days = Number(triggersPanelEl.querySelector<HTMLInputElement>('.bt-days-input')!.value)
-      if (!isValidDays(days)) {
-        setTriggersStatus('Days must be a positive whole number.', 'error')
-        if (!force) return Promise.resolve(false)
-      } else if (days !== triggersLoaded.days) changes.days = days
+      // Untouched days are absence of input, not invalid input: an empty box
+      // with no stored days must neither block other edits nor report itself.
+      const raw = triggersPanelEl.querySelector<HTMLInputElement>('.bt-days-input')!.value.trim()
+      const loaded = triggersLoaded.days === null ? '' : String(triggersLoaded.days)
+      if (raw !== loaded) {
+        const days = Number(raw)
+        if (!isValidDays(days)) {
+          if (!force) {
+            setTriggersStatus('Days must be a positive whole number.', 'error')
+            return Promise.resolve(false)
+          }
+          rejectedDays = 'The close-after days were not saved — days must be a positive whole number.'
+        } else if (days !== triggersLoaded.days) changes.days = days
+      }
     }
     if (!same(draft, [...triggersLoaded.skipRepos].sort())) changes.skipRepos = draft
     const setting = triggersPanelEl.querySelector<HTMLSelectElement>('.bt-ceiling-select')!.value as BehaviorSetting
