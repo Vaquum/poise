@@ -57,7 +57,7 @@ interface ServerState {
   /** `null` plays an older server: `{}` for every unknown route. */
   status: SelfUpdateStatus | null
   revert: (body: { changeId: string, expectedReleaseId: string }) => { status: number, json: unknown }
-  /** `/api/health` body; `{}` (no build identity) unless a test sets it. */
+  /** `/api/health/live` body; `{}` (no build identity) unless a test sets it. */
   health: unknown
   /** `/api/workspace` body; local unless a test sets it. */
   workspace: unknown
@@ -82,7 +82,7 @@ async function installRoutes(page: Page, state: ServerState): Promise<void> {
     const method = req.method()
     const body = method === 'POST' || method === 'PATCH' ? (req.postDataJSON?.() ?? null) : null
     state.calls.push({ method, path, query: Object.fromEntries(url.searchParams), body })
-    if (path === '/api/health') { await route.fulfill({ json: state.health }); return }
+    if (path === '/api/health/live') { await route.fulfill({ json: state.health }); return }
     if (path === '/api/workspace') { await route.fulfill({ json: state.workspace }); return }
     if (/^\/api\/editor\/doc\/[^/]+\/reviews(?:\/sync)?$/.test(path)) { await route.fulfill({ json: { reviews: [], checkedAt: null, active: false, stale: false, problems: [] } }); return }
     if (state.editor && path.startsWith('/api/editor/')) { await state.editor(path, method, route); return }
@@ -596,7 +596,7 @@ test.describe('on a release build', () => {
     await sock.subscribed('s1')
     expect(await page.evaluate(() => sessionStorage.getItem('poise-self-update-reloaded-release'))).toBeNull()
     // The bundle really is this SHA, and the server really reports another.
-    await expect.poll(() => state.calls.filter((c) => c.path === '/api/health').length).toBeGreaterThan(0)
+    await expect.poll(() => state.calls.filter((c) => c.path === '/api/health/live').length).toBeGreaterThan(0)
     const banner = page.locator('.self-update-banner')
     await expect(banner).toBeVisible()
     await expect(banner).toContainText(`A new Poise build is live (${SHA_B.slice(0, 7)})`)
