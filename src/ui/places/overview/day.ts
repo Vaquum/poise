@@ -6,7 +6,7 @@ import { analyticsDay, analyticsDailyBounds, analyticsDayProgress, analyticsHist
 import { analyticsGroups, type AnalyticsGroup, type AnalyticsReport, type AnalyticsTile } from '../../../analytics-format'
 import { historySeries, periodLabel, type AnalyticsHistory, type HistorySeries } from '../../../analytics-history'
 import { readAnalyticsSnapshot, type AnalyticsSnapshot } from '../../../analytics-snapshot'
-import { effectiveTimezone, getOrganizations, getRefreshRateMs } from '../../../config'
+import { effectiveTimezone, getOrganizations, getRefreshRateMs, getSettings } from '../../../config'
 import { noticeFeed, type ReadFailure } from '../../../notices'
 import { getSelectedOrganization, organizationUrl, setSelectedOrganization } from '../../../organizations'
 import { $, $$, esc, store } from '../../dom'
@@ -62,7 +62,7 @@ export function countPair(label: string, report: AnalyticsReport, baseline: Anal
 interface Shown { snapshot: AnalyticsSnapshot, progress: number | undefined, snapshotTime: string | undefined }
 /** Today's last numbers, kept across visits and page loads: a return or a
  *  reload paints them at once, with the time they were read, then reads again.
- *  Another day's or organization's numbers never stand for these. */
+ *  Another day's, organization's or GitHub user's numbers never stand for these. */
 type LastDay = { key: string, shown: Shown, day: Read<true>, history: Read<AnalyticsHistory>, daily: Read<AnalyticsHistory> }
 const LAST_DAY_KEY = 'poise-overview-day'
 let lastDay: LastDay | null = (() => {
@@ -218,7 +218,7 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
     if (when) when.textContent = new Intl.DateTimeFormat('en-GB', { timeZone: effectiveTimezone(), weekday: 'long', day: 'numeric', month: 'long' }).format(new Date())
   }
 
-  const dayKey = () => `${getSelectedOrganization()}|${analyticsDay(0, anchor).since}`
+  const dayKey = () => `${getSettings().me ?? ''}|${getSelectedOrganization()}|${analyticsDay(0, anchor).since}`
   const paint = () => {
     if (offset === 0 && shown && (lastDay?.shown !== shown || lastDay.day !== day || lastDay.history !== history || lastDay.daily !== daily)) {
       lastDay = { key: dayKey(), shown, day, history, daily }
@@ -257,7 +257,7 @@ export function mountDay(ctx: PartContext, main: HTMLElement): void {
       }
       day = { data: true, error: '', at: Date.now() }
       noticeFeed.reportReadErrors('overview-day', [...accountFailures(snapshot.report.errors), ...accountFailures(snapshot.baseline.errors)])
-      if (!background || !history.data) void readHistory(mine)
+      if (!background || !history.data || !daily.data) void readHistory(mine)
     } catch (error) {
       if (mine !== generation || signal.aborted) return
       // A failed refresh keeps the last totals; the failure shows on the tiles.
