@@ -380,6 +380,7 @@ async function main(args) {
       current = id
       lifetime.signal.throwIfAborted()
       if (attempt === 1) say(`relay recovered; rerunning candidate ${candidate} as run ${id}`)
+      else say(`candidate ${candidate}, suite ${suite}, run ${id}`)
       const controller = new AbortController()
       const signal = AbortSignal.any([lifetime.signal, controller.signal])
       const lease = setInterval(() => { call('POST', `/runs/${id}/lease`, undefined, signal).catch(() => {}) }, LEASE_MS)

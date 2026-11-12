@@ -544,8 +544,9 @@ export class ChatClient {
     return result.diff
   }
 
-  fetchSession(id: string, after: number): Promise<{ session: SessionRecord, events: ChatEnvelope[], truncated?: boolean }> {
-    return jsonFetch(`/api/chat/sessions/${encodeURIComponent(id)}?after=${after}`)
+  /** A page of a session's events after `after`; with `turns` and no `after`, its last turns, which begin after `from`. */
+  fetchSession(id: string, after: number, turns?: number): Promise<{ session: SessionRecord, events: ChatEnvelope[], truncated?: boolean, from?: number }> {
+    return jsonFetch(`/api/chat/sessions/${encodeURIComponent(id)}?after=${after}${turns ? `&turns=${turns}` : ''}`)
   }
 
   async setAutoMerge(sessionId: string, enabled: boolean): Promise<AutoMergeAck> {

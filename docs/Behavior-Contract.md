@@ -452,6 +452,8 @@ Behaviors groups those refusals under the same episode while keeping each
 behavior's refusal. Changing sync ages, later ticks and server restarts do not
 open another episode. Evidence is ordered by successful sync timestamp, then
 age within that sync; late stale or healthy results cannot replace newer evidence.
+Closed-target reconciliation uses the same episode for verified stale refusals,
+without adding Error rows on later probes or reading targets before freshness returns.
 Healthy probes keep advancing the retained evidence after recovery. Only a
 validated successful healthy probe records recovery and rearms the mirror.
 Caller's normal stale stderr with validated stale JSON is an expected probe

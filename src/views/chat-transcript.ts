@@ -119,6 +119,8 @@ export type Block =
   | { kind: 'imported', key: string, rev: number, legacyId: string, turns: LegacyConversation['turns'], omitted: number }
   | { kind: 'content', key: string, rev: number, topic: string, launchId: string, callId?: string }
   | { kind: 'consensus', key: string, rev: number, id: string, topic: string, synthesis?: string, truncated?: boolean, error?: string, finished: boolean }
+  /** A transcript opened on its last turns: the earlier ones are read on request. */
+  | { kind: 'earlier', key: string, rev: number }
 
 export interface TranscriptModel {
   /** Buffered history cannot cross a reset barrier. */
@@ -562,6 +564,8 @@ export interface TranscriptHandlers {
   onEditLeave?(): void
   onOpenInEditor?(): void
   onSuggestedReply?(text: string): void
+  /** Read the turns before the ones a first open read. */
+  onEarlier?(): void
 }
 
 export interface RenderContext {
@@ -1234,6 +1238,8 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
           pollContent(b, model)
         } else if (b.kind === 'consensus') {
           el.innerHTML = consensusCardHtml(b)
+        } else if (b.kind === 'earlier') {
+          el.innerHTML = '<div class="chat-note"><button type="button" class="lnk" data-chat-earlier>Show earlier turns</button></div>'
         } else {
           el.innerHTML = `<div class="chat-note">${escapeHtml(b.text)}</div>`
         }
@@ -1288,6 +1294,7 @@ export function createTranscriptView(container: HTMLElement, handlers: Transcrip
 
   container.addEventListener('click', (e) => {
     const target = e.target as HTMLElement
+    if (target.closest('[data-chat-earlier]') && handlers.onEarlier) { handlers.onEarlier(); return }
     const article = target.closest<HTMLButtonElement>('.chat-content-open')
     if (article?.dataset.slug) {
       window.dispatchEvent(new CustomEvent('poise:open-editor-doc', { detail: { slug: article.dataset.slug } }))

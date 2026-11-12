@@ -808,9 +808,29 @@ async function fetchKind(itemType: 'pr' | 'issue', body: any, me: string, orgs: 
   return { records: out, errors }
 }
 
+// A list read runs a datastore process for every organization, kind and
+// scope, and Overview, Board and every open tab ask for the same lists. An
+// identical list read that arrives while one is running joins it; once it
+// settles, the next one reads afresh.
+const listReads = new Map<string, Promise<{ status: number, body: unknown }>>()
+
 export async function handleGhBody(body: any): Promise<{ status: number, body: unknown }> {
   const op = body?.operation
   const me = getMeta('me') || ''
+  if (op !== 'list') return handleGhOperation(body, op, me)
+  // Everything the read depends on keys it: an account or an organization that
+  // changes while one runs starts a new read, never joins the old one.
+  const key = JSON.stringify([me, getMeta('agentAccount') || '', getOrganizations().map((org) => [org.login, org.status, org.datastorePath, org.error]), body])
+  const running = listReads.get(key)
+  if (running) return running
+  const result = handleGhOperation(body, op, me)
+  listReads.set(key, result)
+  const settle = () => { if (listReads.get(key) === result) listReads.delete(key) }
+  result.then(settle, settle)
+  return result
+}
+
+async function handleGhOperation(body: any, op: unknown, me: string): Promise<{ status: number, body: unknown }> {
 
   if (op === 'actions') return listActionRuns(body)
 
