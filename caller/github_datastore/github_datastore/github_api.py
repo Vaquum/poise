@@ -10,9 +10,10 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
-import httpx
+if TYPE_CHECKING:
+    import httpx
 
 
 class GitHubApiError(RuntimeError):
@@ -447,6 +448,8 @@ def datastore_github_client() -> Iterator[GitHubClient]:
     if not token or (proxy and not proxy.startswith(("http://", "https://"))) or _uses_cli_transport(environment):
         yield GitHubClient()
         return
+    import httpx
+
     with httpx.Client(proxy=proxy, trust_env=False, verify=ssl.create_default_context(),
                       timeout=httpx.Timeout(None, connect=30.0)) as http:
         yield GitHubClient(http=http, token=token)
@@ -514,6 +517,8 @@ class GitHubClient:
     def _http_request(
         http: httpx.Client, query: str, fields: dict[str, Any], token: str,
     ) -> tuple[Mapping[str, str], str, str | None, bool]:
+        import httpx
+
         # An explicit request avoids carrying cookies from one GraphQL read to
         # the next. The token is sent only to the configured GitHub endpoint.
         request = httpx.Request(
