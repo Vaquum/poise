@@ -100,7 +100,7 @@ svg.i.solid { fill: currentColor; stroke: none; }
 .btn-ghost { height: var(--size-control-sm); padding: 0 var(--sp-3); border-radius: var(--r-card); border: var(--line-hair) solid var(--c-edge); background: var(--c-surface); color: var(--c-text-soft); font-size: var(--fs-micro); font-weight: var(--fw-strong); display: inline-flex; align-items: center; gap: var(--sp-2); }
 .btn-ghost:hover { border-color: var(--c-edge-strong); color: var(--c-text); }
 .btn-ghost[disabled], .btn-ghost[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; }
-.btn-ghost.is-armed { border-color: var(--c-failed-edge); background: var(--c-failed-tint); color: var(--c-failed-on); }
+.btn-ghost.is-armed, .btn-line.is-armed { border-color: var(--c-failed-edge); background: var(--c-failed-tint); color: var(--c-failed-on); }
 .ib { width: var(--size-control-sm); height: var(--size-control-sm); border-radius: var(--r-card); display: inline-grid; place-items: center; color: var(--c-text-muted); flex: none; transition: background var(--dur-feedback) var(--ease-out), color var(--dur-feedback) var(--ease-out); }
 .ib:hover { background: var(--c-surface); color: var(--c-text); }
 .ib[disabled], .ib[aria-disabled="true"] { opacity: 0.4; cursor: not-allowed; }

@@ -82,6 +82,23 @@ test('the Settings menu opens each section with a route back, and the Style pane
   expect(await density()).toBe('0.8')
 })
 
+test('the Style panel’s Reset to Poise asks “Sure?” first, and Undo puts your style back', async ({ page }) => {
+  await open(page)
+  await nav(page).getByRole('button', { name: 'Settings' }).click()
+  await page.getByRole('menu', { name: 'Settings' }).getByRole('menuitem', { name: 'Style panel' }).click()
+  const panel = page.getByRole('complementary', { name: 'Style' })
+  const density = () => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--ctl-density').trim())
+  const poise = await density()
+  await panel.getByRole('button', { name: /Compact/ }).click()
+  await panel.getByRole('button', { name: 'Reset to Poise' }).click()
+  expect(await density()).toBe('0.8')
+  await panel.getByRole('button', { name: 'Sure?' }).click()
+  expect(await density()).toBe(poise)
+  await panel.getByRole('button', { name: 'Undo' }).click()
+  expect(await density()).toBe('0.8')
+  await expect(panel.getByRole('button', { name: 'Reset to Poise' })).toBeVisible()
+})
+
 test('the reference names what the pointer rests on, and explains it in full on ?', async ({ page }) => {
   await open(page)
   const board = nav(page).getByRole('link', { name: 'Board' })

@@ -160,12 +160,27 @@ function build(settingsHref: string): HTMLElement {
     if (t.dataset.preset) setMany(PRESETS[t.dataset.preset].values)
     if (t.dataset.arch) setArchetype(t.dataset.arch)
     if (t.hasAttribute('data-motion')) set('--ctl-motion', styleToken('--ctl-motion') === '0' ? '1' : '0')
-    if (t.hasAttribute('data-style-reset')) { for (const k of Object.keys(saved)) root.style.removeProperty(k); saved = {}; write(saved); sync() }
+    if (t.hasAttribute('data-style-reset')) resetToPoise(t)
     if (t.hasAttribute('data-style-copy')) void copyCss(t)
     if (t.hasAttribute('data-style-close')) toggleStylePanel(false)
     if (t.hasAttribute('data-style-settings')) toggleStylePanel(false)
   })
   return panel
+}
+
+/** Reset to Poise, as Settings → Style's Reset everything: “Sure?” first, then Undo for eight seconds. */
+let beforeReset: Saved | null = null
+let resetTimer = 0
+function resetToPoise(button: HTMLElement): void {
+  window.clearTimeout(resetTimer)
+  const idle = (): void => { beforeReset = null; button.classList.remove('is-armed'); button.textContent = 'Reset to Poise' }
+  if (beforeReset) { restore(beforeReset); idle(); return }
+  if (!button.classList.contains('is-armed')) { button.classList.add('is-armed'); button.textContent = 'Sure?'; resetTimer = window.setTimeout(idle, 3000); return }
+  beforeReset = savedStyle()
+  restore({})
+  button.classList.remove('is-armed')
+  button.textContent = 'Undo'
+  resetTimer = window.setTimeout(idle, 8000)
 }
 
 /** Copies the choices as CSS, and says on the button whether the browser took them. */
