@@ -203,12 +203,14 @@ test('Claude’s subscription sits at the foot and the page makes room; updating
 
 test('a move takes the tooltip with it, and a place enters only the first time it opens', async ({ page }) => {
   await open(page, '/?view=board&back=overview')
+  // What the pointer rests on in the next place may show its own tooltip; the back link's never follows.
+  const backTip = () => page.evaluate(() => [...document.querySelectorAll('[role="tooltip"]')].some((tip) => tip.textContent?.includes('Returns to where you were')))
   const back = page.getByRole('link', { name: 'Back to Overview' })
   await back.hover()
-  await expect(page.getByRole('tooltip')).toBeVisible()
+  await expect(page.getByRole('tooltip')).toContainText('Returns to where you were')
   await back.click()
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible()
-  await expect(page.getByRole('tooltip')).toHaveCount(0)
+  expect(await backTip()).toBe(false)
 
   await page.waitForFunction(() => !document.querySelector('[data-place-root][data-flow-enter]'))
   await nav(page).getByRole('link', { name: 'Board' }).click()

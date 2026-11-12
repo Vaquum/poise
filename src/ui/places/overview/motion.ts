@@ -69,10 +69,13 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
     return out
   }
 
+  /** A group not yet read: chats, or items with pull requests whose statuses have not been read. */
+  const unreadGroup = (group: 'people' | 'items'): boolean => group === 'people' ? !sessions.data : !items.data || (!pulls.data && items.data.some((record) => record.kind === 'pr'))
+
   function countsHTML(list: Work[], group: 'people' | 'items'): string {
     const counts = countStates(list.filter((entry) => entry.group === group))
     // Never read is not zero: its counts say so until a read arrives.
-    const unread = !(group === 'people' ? sessions.data : items.data)
+    const unread = unreadGroup(group)
     return `<div class="ocounts" role="group" data-ref="ov.counts">${STATES.map((state) => {
       const on = 'state' in pick && pick.group === group && pick.state === state
       return `<button class="oc${on ? ' is-on' : ''}" data-state-pick="${state}" data-group="${group}" aria-pressed="${on}"${counts[state] && !unread ? '' : ' aria-disabled="true"'} data-ref="ov.count"><span class="sc" data-state="${state}"></span><b>${unread ? '—' : counts[state]}</b><span>${esc(term(`state.${state}`))}</span></button>`
@@ -100,7 +103,7 @@ export function mountMotion(ctx: PartContext, card: HTMLElement): Motion {
     const listed = 'phase' in chosen
       ? list.filter((entry) => entry.group === 'tasks' && entry.phase === chosen.phase)
       : list.filter((entry) => entry.group !== 'tasks' && entry.state === chosen.state)
-    const unread = 'phase' in chosen ? !chains.data : !(chosen.group === 'people' ? sessions.data : items.data)
+    const unread = 'phase' in chosen ? !chains.data : unreadGroup(chosen.group)
     const empty = unread ? 'Not read yet.' : 'phase' in chosen ? 'No task at this phase right now.' : `Nothing ${term(`state.${chosen.state}`)} right now.`
     $('[data-worklist]', card).innerHTML = listed.length
       ? listed.map((entry) => `<li><span class="sc" data-state="${entry.state}" data-ref="state"></span><a href="${esc(entry.href)}">${esc(entry.title)}</a>${entry.note ? `<span class="onote">${esc(entry.note)}</span>` : ''}</li>`).join('')

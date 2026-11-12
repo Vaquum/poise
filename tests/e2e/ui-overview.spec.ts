@@ -322,9 +322,14 @@ test('System health reads its five cards live, and a failed read keeps them, wit
   await expect(page.getByText('Planned · #1101')).toHaveCount(0)
 
   fail = true
-  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:organization-filter-changed')))
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
   await expect(page.locator('[data-healthfail]')).toContainText('System health could not be read: evidence store unavailable. Last read at')
   await expect(card('ov.h.errors')).toContainText('0.5 per item')
+
+  // Another organization's figures never stand for the one chosen.
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:organization-filter-changed')))
+  await expect(card('ov.h.errors')).toContainText('—')
+  await expect(page.locator('[data-healthfail]')).toContainText('Not read yet.')
 })
 
 test('In motion says what was never read, rather than zero or clear', async ({ page }) => {

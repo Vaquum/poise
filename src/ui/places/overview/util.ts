@@ -69,6 +69,7 @@ export const unread = <T>(): Read<T> => ({ data: null, error: '', at: 0 })
 /** A failed read also shows as a local notice, as classic's reads report
  *  theirs; it clears when the part reads again, or when the place leaves. */
 export function reportRead(ctx: PartContext, source: string, title: string, read: Read<unknown>): void {
+  if (ctx.signal.aborted) return
   noticeFeed.reportReadErrors(source, read.error ? [{ key: source, title, body: read.at ? `${read.error} Last read at ${clockAt(read.at)}.` : read.error }] : [])
   if (!cleared.has(source)) { cleared.add(source); ctx.signal.addEventListener('abort', () => { cleared.delete(source); noticeFeed.reportReadErrors(source, []) }) }
 }

@@ -192,7 +192,7 @@ for (const width of [375, 768, 1000]) {
   })
 }
 
-test('while the pointer is on the board, a changed item repaints in place and its move waits', async ({ page }) => {
+test('while the pointer is on the board, a changed item repaints in place, and the update is held', async ({ page }) => {
   await board(page, { records: RECORDS })
   await card(page, 'A pull request').hover()
   await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [{ status: 'running', repo: 'acme/site', pr_id: 44, behavior: 'review-prs', started_at: iso(10), started_at_precise: iso(10) }] } }))
@@ -215,9 +215,10 @@ test('opening an issue keeps its writer open and guarded until GitHub answers', 
   await page.getByLabel('Issue title').fill('A new issue')
   await page.getByRole('button', { name: 'Open issue' }).click()
   await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
-  // Neither a new writer nor Cancel takes the one whose answer is on its way.
+  // Neither a new writer, Cancel nor more typing takes the one whose answer is on its way.
   await page.getByRole('button', { name: 'Add issue' }).click()
-  await page.locator('[data-writer="issue"]').getByRole('button', { name: 'Cancel' }).click()
+  await expect(page.locator('[data-writer="issue"]').getByRole('button', { name: 'Cancel' })).toHaveAttribute('aria-disabled', 'true')
+  await expect(page.getByLabel('Issue title')).not.toBeEditable()
   await expect(page.getByLabel('Issue title')).toHaveValue('A new issue')
   await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
   answer()
@@ -230,4 +231,16 @@ test('a GitHub read that never succeeded reads as not read, never as zero', asyn
   await expect(page.locator('.lane[data-lane="issue"] .empty')).toHaveText('Not read yet.')
   await expect(page.locator('.lane[data-lane="issue"] [data-ref="lane.count"]')).toHaveText('—')
   await expect(page.locator('[data-ref="cur.count"] .n').first()).toHaveText('—')
+})
+
+test('a held repaint leaves an armed Assign armed', async ({ page }) => {
+  const world: World = { records: RECORDS.map((r) => ({ ...r })) }
+  await board(page, world)
+  await card(page, 'Opened today').getByRole('button', { name: 'Assign to Poise' }).click()
+  await expect(card(page, 'Opened today').getByRole('button', { name: 'Sure?' })).toBeVisible()
+  await card(page, 'A pull request').focus()
+  world.records = world.records.map((r) => (r.number === 42 ? { ...r, title: 'Opened today, retitled' } : r))
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(page.locator('[data-ref="cur.held"]')).toHaveText('1 update held')
+  await expect(card(page, 'Opened today').getByRole('button', { name: 'Sure?' })).toBeVisible()
 })

@@ -4,6 +4,6 @@
 #view-editor > .view-header { position: static; inset: auto; z-index: auto; height: auto; padding: var(--sp-2) var(--sp-4); border-bottom: var(--line-hair) solid var(--c-line); background: var(--c-canvas); }
 /* The document chat opens beside the document, under the Editor's toolbar, not over it. */
 #view-editor > .view-header { box-sizing: border-box; height: calc(var(--sp-unit) * 12); }
-body:has(#view-editor:not([hidden])) #chat-side-pane { top: calc(var(--size-topbar) + var(--sp-unit) * 12); height: calc(100vh - var(--size-topbar) - var(--sp-unit) * 12 - var(--foot-h)); }
+body:has(#view-editor:not([hidden])) #chat-side-pane { top: calc(var(--size-topbar) + var(--editor-head-h)); height: calc(100vh - var(--size-topbar) - var(--editor-head-h) - var(--foot-h)); }
 /* Where headers wrap (820 px), the Editor's grows to fit its rows. */
 @media (max-width: 820px) { #view-editor > .view-header { height: auto; } }

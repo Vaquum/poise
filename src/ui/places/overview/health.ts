@@ -36,7 +36,12 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
     const line = readLine('System health', health)
     $('[data-healthfail]', box).innerHTML = line ? `<p class="onote is-warn ova-fail" role="status" data-ref="ov.read">${esc(line)}</p>` : ''
     const data = health.data
-    if (!data) return
+    if (!data) {
+      for (const ref of ['ov.h.errors', 'ov.h.blocked', 'ov.h.recovery', 'ov.h.lasterror']) card(ref, '—', 'Not read yet')
+      $('[data-ref="ov.h.coverage"] .hcov', box).innerHTML = ''
+      $('[data-ref="ov.h.coverage"] > .t-gloss', box).textContent = 'Not read yet'
+      return
+    }
     const { rate, blocked, recovery, lastError: { error, lastObserved, coveredSince, coveredUntil } } = data
     card('ov.h.errors', rate.perItem === null ? 'Unavailable' : `${esc(formatRate(rate.perItem))}<span class="t-gloss"> per item</span>`, `${formatCount(rate.errors)} errors across ${formatCount(rate.completed)} items completed`)
     card('ov.h.blocked', esc(formatCount(blocked.count)), blocked.oldestProgressAt === null ? 'none without verified progress' : `oldest ${formatDuration(data.readAt - blocked.oldestProgressAt)} without verified progress${blocked.largestStage ? ` · ${blocked.largestStage}` : ''}`)
@@ -64,5 +69,6 @@ export function mountHealth(ctx: PartContext, box: HTMLElement): void {
   }
 
   whileVisible(ctx, 60_000, () => { void read() })
-  window.addEventListener('poise:organization-filter-changed', () => { void read() }, { signal: ctx.signal })
+  // Another organization's figures never stand for this one's.
+  window.addEventListener('poise:organization-filter-changed', () => { health = unread(); paint(); void read() }, { signal: ctx.signal })
 }
