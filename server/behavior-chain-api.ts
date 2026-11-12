@@ -13,6 +13,14 @@ function reply(res: ServerResponse, status: number, value: unknown): void {
   res.statusCode = status; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value))
 }
 
+// A list read computes a page of chain summaries and every active chain's
+// attention synchronously on the server's thread, and Overview, Board and
+// Observe poll it from every open tab. Identical reads within a few seconds
+// share that work; a change made through this API clears it at once.
+const LIST_REUSE_MS = 10_000
+let listReuse = new Map<string, { at: number, chains: unknown[], next: string | null }>()
+let attentionReuse: { at: number, value: unknown } | null = null
+
 export async function handleBehaviorChains(req: IncomingMessage, res: ServerResponse, url: string): Promise<void> {
   try {
     const params = new URL(url, 'http://localhost').searchParams
@@ -56,12 +64,22 @@ export async function handleBehaviorChains(req: IncomingMessage, res: ServerResp
           cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })
       }
       const after = params.get('after') || ''
-      const chains = journal.page(after, 100, params.get('state') === 'active' ? false : params.get('state') === 'merged' ? true : null)
-      return reply(res, 200, { chains: chains.map(summary), next: chains.length === 100 ? chains.at(-1)!.id : null,
-        ...(!after ? { attention: behaviorChainAttention(journal) } : {}),
+      const now = Date.now()
+      const key = `${after}|${params.get('state') ?? ''}`
+      let page = listReuse.get(key)
+      if (!page || now - page.at >= LIST_REUSE_MS) {
+        const chains = journal.page(after, 100, params.get('state') === 'active' ? false : params.get('state') === 'merged' ? true : null)
+        page = { at: now, chains: chains.map(summary), next: chains.length === 100 ? chains.at(-1)!.id : null }
+        listReuse.set(key, page)
+      }
+      if (!after && (!attentionReuse || now - attentionReuse.at >= LIST_REUSE_MS)) attentionReuse = { at: now, value: behaviorChainAttention(journal) }
+      return reply(res, 200, { chains: page.chains, next: page.next,
+        ...(!after ? { attention: attentionReuse!.value } : {}),
         cutover: cutover(), settings: getBehaviorChainSettings(), runtime: getBehaviorChainRuntimeHealth(), capacity: getBehaviorChainCapacity() })
     }
     if (req.method !== 'POST') throw new HttpError(405, 'behavior chains support GET and POST')
+    listReuse = new Map()
+    attentionReuse = null
     const body = await readJson<unknown>(req)
     if (body && typeof body === 'object' && 'operation' in body && ['switch-to-v2', 'cancel-cutover'].includes(String(body.operation))) {
       if (!('sequence' in body) || !Number.isSafeInteger(body.sequence)) throw new HttpError(400, 'current cutover sequence is required')
