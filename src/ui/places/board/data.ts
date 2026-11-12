@@ -3,6 +3,7 @@
 // chats on each item. Every failure carries the service's reason.
 import { organizationErrors } from '../../../organizations'
 import { readChainsPage, type ChainRow, type ChainCapacity } from '../observe/chains'
+import { startedAtMs } from '../observe/runs'
 import { itemKey, type GhRecord, type MineLane, type PrStatus } from './model'
 
 /** A card of yours, as /api/current keeps it. */
@@ -88,12 +89,14 @@ export async function readIntake(org: string): Promise<{ intake: Intake, warning
   return { intake: { label: data.label || null, labelled: new Set((data.labelled ?? []).map((k) => k.toLowerCase())), prs: data.prs ?? {} }, warning: organizationErrors(data) }
 }
 
-/** The runs going now, by item: the behavior's name. */
-export async function readRunning(org: string): Promise<Map<string, string>> {
-  const data = await json<{ logs?: Array<{ status?: string, repo?: string, pr_id?: number, behavior?: string, label?: string }> }>(scoped('/api/agent-logs?status=running', org))
-  const running = new Map<string, string>()
+/** The runs going now, by item: the behavior's name, and when it started. */
+export async function readRunning(org: string): Promise<Map<string, { name: string, since: number | null }>> {
+  const data = await json<{ logs?: Array<{ status?: string, repo?: string, pr_id?: number, behavior?: string, label?: string, started_at?: string, started_at_precise?: string | null }> }>(scoped('/api/agent-logs?status=running', org))
+  const running = new Map<string, { name: string, since: number | null }>()
   for (const log of data.logs ?? []) {
-    if (log.status === 'running' && log.repo && log.pr_id) running.set(itemKey(log.repo, log.pr_id), runName(log.behavior || log.label || 'Run'))
+    if (log.status !== 'running' || !log.repo || !log.pr_id) continue
+    const since = startedAtMs({ started_at: log.started_at ?? '', started_at_precise: log.started_at_precise ?? null })
+    running.set(itemKey(log.repo, log.pr_id), { name: runName(log.behavior || log.label || 'Run'), since: Number.isFinite(since) ? since : null })
   }
   return running
 }

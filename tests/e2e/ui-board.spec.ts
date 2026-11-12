@@ -189,3 +189,32 @@ for (const width of [375, 768, 1000]) {
     }
   })
 }
+
+test('while the pointer is on the board, a changed item repaints in place and its move waits', async ({ page }) => {
+  await board(page, { records: RECORDS })
+  await card(page, 'A pull request').hover()
+  await page.route('**/api/agent-logs**', (route) => route.fulfill({ json: { logs: [{ status: 'running', repo: 'acme/site', pr_id: 44, behavior: 'review-prs', started_at: iso(10), started_at_precise: iso(10) }] } }))
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:refresh-tick')))
+  await expect(card(page, 'A pull request').locator('.card-state')).toContainText('Review running')
+  await expect(card(page, 'A pull request')).toHaveClass(/is-changed/)
+  await expect(page.locator('[data-ref="cur.held"]')).toHaveText('1 update held')
+})
+
+test('opening an issue keeps its writer open and guarded until GitHub answers', async ({ page }) => {
+  let answer: () => void = () => {}
+  await board(page, { records: RECORDS })
+  await page.route('**/api/gh', async (route) => {
+    const body = JSON.parse(route.request().postData() || '{}') as { operation: string }
+    if (body.operation !== 'open_issue') return route.fallback()
+    await new Promise<void>((resolve) => { answer = resolve })
+    return route.fulfill({ json: { record: record('issue', 45, 'A new issue', { created_at: iso(0), updated_at: iso(0) }), labels_dropped: [] } })
+  })
+  await page.getByRole('button', { name: 'Add issue' }).click()
+  await page.getByLabel('Issue title').fill('A new issue')
+  await page.getByRole('button', { name: 'Open issue' }).click()
+  await expect(page.getByRole('button', { name: 'Open issue' })).toHaveAttribute('aria-disabled', 'true')
+  await expect(page.getByLabel('Issue title')).toHaveValue('A new issue')
+  answer()
+  await expect(page.locator('[data-writer="issue"]')).toHaveCount(0)
+  await expect(card(page, 'A new issue')).toBeVisible()
+})

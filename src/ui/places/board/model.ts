@@ -85,8 +85,8 @@ export interface ItemInput {
   /** Undefined when the status could not be read. */
   status: PrStatus | null | undefined
   chain: ChainRow | null
-  /** A run going on it now, with its behavior's name. */
-  run: string | null
+  /** A run going on it now: its behavior's name, and when it started. */
+  run: { name: string, since: number | null } | null
   labelled: boolean
   closing: { number: number, url: string }[] | null
 }
@@ -109,9 +109,9 @@ export function toItem(input: ItemInput): Item {
   }
   if (chain) {
     const { state, reason } = taskState(chain)
-    return { ...base, state, detail: reason, since: null, sinceRestart: false, who: poise }
+    return { ...base, state, detail: reason, since: chain.invocations[chain.invocations.length - 1]?.admittedAt ?? null, sinceRestart: false, who: poise }
   }
-  if (run) return { ...base, state: 'running', detail: `${run} running`, since: null, sinceRestart: false, who: { tag: run, kind: 'run', href: '' } }
+  if (run) return { ...base, state: 'running', detail: `${run.name} running`, since: run.since, sinceRestart: false, who: { tag: run.name, kind: 'run', href: '' } }
   if (record.kind === 'pr' && status) {
     return { ...base, state: blockerState(status.blocker.id), detail: status.blocker.line, since: ms(status.blocker.since), sinceRestart: status.blocker.sinceRestart, who: poise }
   }

@@ -453,7 +453,8 @@ export const mount: MountPlace = (ctx) => {
     if (statuses) statusesRead = statuses
     if (live) {
       truncated = live.truncated
-      const before = new Map(items.map((it) => [it.id, `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`]))
+      const sig = (it: Item) => `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`
+      const before = new Map(items.map((it) => [it.id, sig(it)]))
       items = live.records.map((record) => {
         const key = itemKey(record.repo, record.number)
         return toItem({
@@ -462,11 +463,27 @@ export const mount: MountPlace = (ctx) => {
         })
       })
       for (const id of [...pending.keys()]) if (items.some((it) => it.id === id) || now() - (pending.get(id)?.openedAt ?? 0) > 3_600_000) pending.delete(id)
-      const changed = items.filter((it) => before.has(it.id) && before.get(it.id) !== `${it.state}|${it.detail}|${it.title}|${it.record.updated_at}`).length
+      const changed = items.filter((it) => before.has(it.id) && before.get(it.id) !== sig(it)).length
         + items.filter((it) => !before.has(it.id)).length * (readOnce ? 1 : 0)
       readOnce = true
       paintPartial()
-      if (busy() && changed && !first) { held += changed; showHeld(); summary(); return }
+      if (busy() && changed && !first) {
+        // Their state words change at once, in place; their new places wait (cur.held).
+        for (const it of items) {
+          const card = before.has(it.id) && before.get(it.id) !== sig(it) ? $(`.card[data-id="${CSS.escape(it.id)}"]`, lanesEl) as HTMLElement | null : null
+          const focused = document.activeElement
+          if (!card || (focused !== card && card.contains(focused))) continue
+          const fresh = document.createElement('div')
+          fresh.innerHTML = liveHTML(it)
+          const next = fresh.firstElementChild as HTMLElement
+          card.innerHTML = next.innerHTML
+          card.dataset.state = next.dataset.state ?? ''
+          card.setAttribute('aria-label', next.getAttribute('aria-label') ?? '')
+          card.classList.add('is-changed')
+          hydrateIcons(card)
+        }
+        held += changed; showHeld(); summary(); return
+      }
     }
     readOnce = true
     paintPartial()
@@ -582,15 +599,10 @@ export const mount: MountPlace = (ctx) => {
     }
     const source = w.source
     const repo = w.repo, title = w.title, body = w.body, chosen = w.labels
-    W.delete('issue')
-    drafts.delete('issue')
-    const temp = `${repo}#new-${Date.now()}`
-    LIFE.set(temp, ['Accepted', clock(), true])
-    render(false)
     try {
-      life(temp, 'Executing', 'opening on GitHub')
       const { record, dropped } = await openIssue({ repo, title, body, labels: chosen })
-      LIFE.delete(temp)
+      W.delete('issue')
+      drafts.delete('issue')
       if (record) {
         const it = toItem({ record, status: null, chain: null, run: null, labelled: !!intake?.label && chosen.includes(intake.label), closing: intake ? [] : null })
         pending.set(it.id, { ...it, openedAt: now() })
@@ -606,8 +618,8 @@ export const mount: MountPlace = (ctx) => {
       toast(`${source !== null ? `Opened ${where} from your card; the card is removed.` : `Opened ${where}${chosen.length ? `, labelled ${chosen.filter((l) => !dropped.includes(l)).join(', ') || 'nothing'}` : ''}.`}${dropped.length ? ` GitHub did not apply ${dropped.join(', ')}: the account may lack permission.` : ''}${hidden ? ' Your filters hide it; clear them to see it.' : ''}${intake?.label && chosen.includes(intake.label) ? ` With ${intake.label}, it enters the chain.` : ''}`, 'done')
       if (record) $(`.card[data-id="${CSS.escape(`${record.repo}#${record.number}`)}"]`, lanesEl)?.focus({ preventScroll: true })
     } catch (error) {
-      LIFE.delete(temp)
-      W.set('issue', newIssueWriter({ repo, title, body, labels: chosen, source, err: `The issue was not opened: ${(error as Error).message}` }))
+      w.busy = false
+      w.err = `The issue was not opened: ${(error as Error).message}`
       render(false)
     }
   }
