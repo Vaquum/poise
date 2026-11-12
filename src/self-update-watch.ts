@@ -1,6 +1,6 @@
 import { patchContent } from './dom-patch'
 // The tab-wide watch that moves a browser onto a newly promoted Poise build.
-// It polls `/api/health` for the served build's SHA, compares it with the SHA
+// It polls `/api/health/live` for the served build's SHA, compares it with the SHA
 // this bundle was compiled from, and — only when the app reports nothing in
 // flight and nothing unsaved — writes the Chat drafts to tab-local storage and
 // reloads. Anything less certain shows a banner with an explicit Refresh.
@@ -131,7 +131,9 @@ export function installSelfUpdateWatch(opts: { browserSha?: string | null, fetch
 
   const fetchHealth = opts.fetchHealth || (async (): Promise<HealthObservation | null> => {
     try {
-      const res = await fetch('/api/health', { cache: 'no-store' })
+      // Liveness carries the served build and does no I/O; the full health
+      // read checks Caller and the behaviors, which a build check never needs.
+      const res = await fetch('/api/health/live', { cache: 'no-store' })
       let body: unknown = null
       try { body = await res.json() } catch { body = null }
       return { ok: res.ok, build: parseBuildIdentity(body) }
