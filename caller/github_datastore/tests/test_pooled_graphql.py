@@ -120,6 +120,41 @@ class PooledGraphQLTest(unittest.TestCase):
         self.assertEqual(requests[0][1], "token fixture-token")
         self.assertEqual(sleep.call_args_list, [call(1), call(1)])
 
+    def test_incomplete_json_retries_then_recovers_or_reports_the_cutoff(self) -> None:
+        for body in [b'{"data":', b'{"data":nul', b'{"data":"part', b'{"data":"\xc3']:
+            with self.subTest(body=body), patch.dict(os.environ, ENV, clear=True):
+                for succeeds in (True, False):
+                    calls = []
+
+                    def reply(request):
+                        calls.append(request.content)
+                        if succeeds and len(calls) == 2:
+                            return httpx.Response(200, json={"data": DATA})
+                        return httpx.Response(200, content=body)
+
+                    with httpx.Client(transport=httpx.MockTransport(reply)) as http, \
+                            patch("github_datastore.github_api.time.sleep") as sleep:
+                        client = GitHubClient(http=http)
+                        if succeeds:
+                            self.assertEqual(client.graphql(QUERY), DATA)
+                        else:
+                            with self.assertRaisesRegex(GitHubApiError, "unexpected end of JSON input:"):
+                                client.graphql(QUERY)
+                    count = 2 if succeeds else 5
+                    self.assertEqual(calls, [calls[0]] * count)
+                    self.assertEqual(sleep.call_args_list, [call(1)] * (count - 1))
+
+    def test_invalid_json_fails_without_retry(self) -> None:
+        def reply(_request):
+            return httpx.Response(200, content=b'{"data": invalid}')
+
+        with patch.dict(os.environ, ENV, clear=True), \
+                httpx.Client(transport=httpx.MockTransport(reply)) as http, \
+                patch("github_datastore.github_api.time.sleep") as sleep:
+            with self.assertRaises(json.JSONDecodeError):
+                GitHubClient(http=http).graphql(QUERY)
+        sleep.assert_not_called()
+
     def test_rate_limit_stops_requests_and_denials_do_not_retry(self) -> None:
         for status, payload, error in [
             (403, {"message": "API rate limit exceeded for user"}, GitHubRateLimitError),

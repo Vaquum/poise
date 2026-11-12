@@ -440,6 +440,19 @@ def _uses_cli_transport(environment: dict[str, str]) -> bool:
     return False
 
 
+def _json_ended_early(error: json.JSONDecodeError) -> bool:
+    tail = error.doc[error.pos:]
+    if not tail or error.msg == "Unterminated string starting at":
+        return True
+    if error.msg == "Expecting value":
+        return tail in {"-", "n", "nu", "nul", "t", "tr", "tru", "f", "fa", "fal", "fals"}
+    if error.msg == "Invalid \\uXXXX escape":
+        return bool(re.fullmatch(r"u[0-9a-fA-F]{0,3}", tail))
+    return (error.msg in {"Expecting ',' delimiter", "Extra data"}
+            and error.pos > 0 and error.doc[error.pos - 1].isdigit()
+            and bool(re.fullmatch(r"\.|[eE][+-]?", tail)))
+
+
 @contextmanager
 def datastore_github_client() -> Iterator[GitHubClient]:
     environment = os.environ.copy()
@@ -489,12 +502,19 @@ class GitHubClient:
             else:
                 headers, body, failure, retryable = self._http_request(self._http, query, fields, token)
             if failure is None:
-                payload = json.loads(body)
-                if payload.get("errors"):
-                    diagnostic = f"GraphQL errors: {json.dumps(payload['errors'])}"
-                    self._raise_rate_limit(headers, diagnostic)
-                    raise GitHubApiError(diagnostic)
-                return payload["data"]
+                try:
+                    payload = json.loads(body)
+                except json.JSONDecodeError as error:
+                    if self._http is None or not _json_ended_early(error):
+                        raise
+                    failure = f"unexpected end of JSON input: {error}"
+                    retryable = True
+                else:
+                    if payload.get("errors"):
+                        diagnostic = f"GraphQL errors: {json.dumps(payload['errors'])}"
+                        self._raise_rate_limit(headers, diagnostic)
+                        raise GitHubApiError(diagnostic)
+                    return payload["data"]
             last_error = failure
             self._raise_rate_limit(headers, f"GraphQL request failed: {last_error}")
             if not retryable or attempt == self.attempts:
@@ -537,7 +557,12 @@ class GitHubClient:
             retryable = isinstance(error, (httpx.NetworkError, httpx.RemoteProtocolError, httpx.TimeoutException))
             return {}, "", detail, retryable and "CERTIFICATE_VERIFY_FAILED" not in detail
         if response.is_success:
-            return response.headers, response.content.decode("utf-8"), None, False
+            try:
+                return response.headers, response.content.decode("utf-8"), None, False
+            except UnicodeDecodeError as error:
+                if error.reason != "unexpected end of data":
+                    raise
+                return response.headers, "", f"unexpected end of JSON input: {error}", True
         detail = f"HTTP {response.status_code} {response.reason_phrase}\n{response.text}".strip()
         return response.headers, "", detail, response.status_code in (429, 500, 502, 503, 504)
 
