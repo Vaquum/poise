@@ -2350,10 +2350,28 @@ test('shows five live health cards with evidence, stale retained reads, historic
   await page.locator('#analytics-filters').getByLabel('Organization filter').selectOption('acme')
   await expect(strip.getByRole('status')).toContainText('acme · Read')
   await expect(strip).toContainText('Instance-wide coverage history')
-  for (const width of [736, 360]) {
-    await page.setViewportSize({ width, height: 1000 })
-    expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+  // Keep the desktop card positions until both narrow viewports are checked.
+  const restoreFrames = await page.evaluateHandle(() => {
+    const requestFrame = window.requestAnimationFrame
+    window.requestAnimationFrame = () => 0
+    return () => {
+      window.requestAnimationFrame = requestFrame
+      window.dispatchEvent(new Event('resize'))
+    }
+  })
+  try {
+    for (const width of [736, 360]) {
+      await page.setViewportSize({ width, height: 1000 })
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+    }
+  } finally {
+    await restoreFrames.evaluate(restore => restore())
+    await restoreFrames.dispose()
   }
+  await expect.poll(() => page.locator('.analytics-board').evaluate(board => {
+    const right = board.getBoundingClientRect().right
+    return [...board.children].every(card => card.getBoundingClientRect().right <= right + 1)
+  })).toBe(true)
   const reads = healthReads
   await page.getByRole('button', { name: 'Previous day', exact: true }).click()
   await expect(value(page, 'Pull requests merged')).toHaveText('0')

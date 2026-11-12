@@ -995,7 +995,10 @@ tr:hover .review-btn { opacity: 1; }
 
 /* Analytics: shared card rhythm, with larger productivity and compact per-PR plots. */
 #view-analytics main {
-  margin-inline: calc(50% - var(--page-w, calc(100vw - var(--scrollbar-w, 0px))) / 2 + 24px);
+  /* Keep the card gutter inside the clip so pre-resize positions cannot widen the page. */
+  margin-inline: calc(50% - var(--page-w, calc(100vw - var(--scrollbar-w, 0px))) / 2 + 12px);
+  padding-inline: 12px;
+  overflow-x: clip;
   container: analytics / inline-size;
 }
 .analytics-date { display: flex; align-items: center; justify-content: center; min-width: 7.5em; padding: var(--sp-1) var(--sp-3); border: var(--b-base); border-right: none; background: var(--surface); color: var(--text); font-size: .75rem; font-weight: 600; white-space: nowrap; }
