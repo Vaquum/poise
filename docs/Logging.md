@@ -85,6 +85,9 @@ unreadable associations show unknown. A failed workspace read leaves retained
 Logging evidence usable, including in service mode. Source severity and Count
 (retained event/occurrence count) keep their separate meanings. This annotation
 neither starts work nor changes execution or holds.
+For a verified merge with a pending native review obligation, the next action is
+to reconcile original pre-merge review evidence, including when a durable hold
+is retained. Resume cannot start a new review after merge.
 
 Filters and the selected view survive reload. A mounted refresh preserves focus,
 scroll position and ID-keyed expansion. Only the visible first page checks for

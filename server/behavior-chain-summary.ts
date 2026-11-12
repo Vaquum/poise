@@ -220,8 +220,8 @@ export function behaviorChainWorkImpact(journal: BehaviorChainJournal, callId: s
     target: `${chain.repository}#${publication?.pull_number ?? chain.issue}`,
     progressAt: progress.at, retryAt,
     nextAction: contradicted ? 'Reconcile contradictory original resource-release evidence'
-      : chain.held ? `Resolve the hold and explicitly resume: ${chain.held}`
-        : chain.reviewPending ? 'Reconcile original pre-merge review evidence'
+      : chain.reviewPending ? 'Reconcile original pre-merge review evidence; no new invocation can start after merge'
+        : chain.held ? `Resolve the hold and explicitly resume: ${chain.held}`
           : active?.state === 'uncertain' ? 'Reconcile the original invocation receipt before retrying'
             : active ? 'Await the original invocation outcome' : chain.mergeSha ? null
               : retryAt !== null ? 'Automatic retry eligible after backoff, subject to existing admission gates' : waiting,
