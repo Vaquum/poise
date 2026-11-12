@@ -367,6 +367,87 @@ describe('approve-prs under load', () => {
     } finally { await logging.stopLogging() }
   })
 
+  it('keeps a timed-out activity read pending on the retained cycle failure', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))
+    const { database: db, behaviors: runtime } = await startApproving([pr, secondPr])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      const result = await original(command, args, options)
+      if (command !== 'github-interface' || args[0] !== '--review-activity-since' || !args.includes('--requests-json')) return result
+      const packet = JSON.parse(result.stdout)
+      return { ...result, stdout: JSON.stringify({ ...packet,
+        records: (packet.records as Array<Record<string, unknown>>).map((record) =>
+          record.pull_number === 17
+            ? { repository: record.repository, pull_number: 17, error: 'Command timed out after 30000ms: github-interface' }
+            : record),
+      }) }
+    })
+    const launched = deferred<void>(), released = deferred<void>()
+    mocks.spawnDetached.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[1] !== '#18') return
+      launched.resolve()
+      await released.promise
+    })
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      const run = runtime.runEnabledBehaviorsOnce()
+      await launched.promise
+      await vi.advanceTimersByTimeAsync(runtime.BEHAVIOR_OPERATION_TIMEOUT_MS)
+      released.resolve()
+      await run
+      logging.loggingRuntime()!.flush()
+      const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
+      expect(JSON.parse(db.getMeta(`behavior_approve_prs_failure:${pr.repo}#17:check`)!).error).toContain('timed out')
+      expect(events.filter((event) => event.operation === 'application.behaviors'
+        && event.message === 'The operation was aborted due to timeout')).toEqual([expect.objectContaining({
+        severity: 'error', behavior: 'approve-prs', phase: 'launch',
+        context: expect.objectContaining({
+          progress: { eligiblePrs: 2, checksPending: 1, changeChecksRead: 2, activityChecksRead: 1, launched: 1, publication: 'unverified' } }),
+      })])
+      expect(mocks.spawnDetached).toHaveBeenCalledOnce()
+    } finally {
+      released.resolve()
+      await logging.stopLogging()
+    }
+  })
+
+  it('keeps a launch-preparation failure on its PR claim instead of the cycle', async () => {
+    const { database: db, behaviors: runtime } = await startApproving([pr])
+    const original = mocks.runFile.getMockImplementation()!
+    mocks.runFile.mockImplementation(async (command: string, args: string[], options: unknown) => {
+      if (command === 'agent-interface' && args[0] === '--diagnostics') return {
+        stdout: JSON.stringify({ version: 1, streamId: 'a'.repeat(32), events: [], cursor: 0, hasMore: false, backfillPending: false }), stderr: '',
+      }
+      return original(command, args, options)
+    })
+    const { prepareModelClis } = await import('../server/provider-clis')
+    vi.mocked(prepareModelClis).mockRejectedValueOnce(new Error('provider preparation failed'))
+    const logging = await import('../server/logging')
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true)
+    logging.startLogging()
+    try {
+      await runtime.runEnabledBehaviorsOnce()
+      logging.loggingRuntime()!.flush()
+      const { events } = logging.loggingRuntime()!.query((store) => store.query({ workspace: logging.loggingWorkspace(), operator: false }))
+      const stored = JSON.parse(db.getMeta(`behavior_approve_prs_failure:${pr.repo}#17:check`)!)
+      expect(stored.error).toContain('provider preparation failed')
+      const diagnostic = events.find((event) => event.operation === 'application.behaviors' && event.message.includes('provider preparation failed'))
+      expect(diagnostic).toMatchObject({
+        behavior: 'approve-prs', target: `${pr.repo}#17`, correlationId: stored.correlationId,
+      })
+      const { behaviorEvidence } = await import('../server/notification-evidence')
+      const joined = await behaviorEvidence({ failures: [{ behavior: 'approve-prs', target: `${pr.repo}#17:check`, error: stored.error, correlationId: stored.correlationId }], deadLetters: [] })
+      expect((joined.failures[0] as { evidenceStatus?: string })?.evidenceStatus).toBe('retained')
+      expect(mocks.spawnDetached).not.toHaveBeenCalled()
+    } finally { await logging.stopLogging() }
+  })
+
   it('still fires prepared approvals when a slow check pushes the sweep past its deadline, and resumes the rest next pass', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
     vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'))

@@ -12,7 +12,7 @@ export interface NoticeDiagnosticIdentity {
 const context = new AsyncLocalStorage<NoticeDiagnosticIdentity>()
 const failures = new WeakMap<object, NoticeDiagnosticIdentity>()
 export function diagnosticIdentity(error?: unknown): NoticeDiagnosticIdentity | undefined {
-  return context.getStore() ?? (error !== null && typeof error === 'object' ? failures.get(error) : undefined)
+  return (error !== null && typeof error === 'object' ? failures.get(error) : undefined) ?? context.getStore()
 }
 export async function withNoticeDiagnosticIdentity<T>(identity: NoticeDiagnosticIdentity, work: () => Promise<T>): Promise<T> {
   return context.run(identity, async () => {

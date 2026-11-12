@@ -4962,6 +4962,7 @@ async function tickApprovePrs(): Promise<void> {
       // so a sweep cut short by its deadline still fires the approvals it
       // managed to prepare, and the next sweep prepares the rest.
       const launches: ApproveLaunch[] = []
+      progress.checksPending += checks.length
       for (let sub = 0; sub < checks.length; sub += PR_READ_BATCH_SIZE) {
         if (!isEnabled('approve-prs') || behaviorAborted()) return
         const activityBatch = checks.slice(sub, sub + PR_READ_BATCH_SIZE)
@@ -4969,7 +4970,9 @@ async function tickApprovePrs(): Promise<void> {
         try {
           if (context) context.phase = 'review-activity'
           activityRecords = await readReviewActivityBatch(activityBatch, reviewer)
-          progress.activityChecksRead += activityRecords.filter((record) => record.error === null).length
+          const activityRead = activityRecords.filter((record) => record.error === null).length
+          progress.activityChecksRead += activityRead
+          progress.checksPending -= activityRead
         } catch (err) {
           if (behaviorAborted()) return
           console.error('[behaviors] approve-prs batch activity check failed:', err)
