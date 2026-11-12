@@ -48,8 +48,8 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement): BehaviorsTab
 
   function chips(key: BehaviorKey): string {
     const mine = entries.filter((entry) => entry.behaviors.includes(key))
-    const counts = [['needs-you', 'needs you'], ['fault', 'fault'], ['auto', 'automatic']].map(([group, word]) => [mine.filter((entry) => entry.group === group).length, word] as const)
-    return counts.filter(([n]) => n).map(([n, word]) => `<a class="chip is-outline" href="#answer" data-act="to-answers">${n} ${word}</a>`).join('')
+    const counts = [['needs-you', 'needs you'], ['fault', 'fault'], ['auto', 'automatic']].map(([group, word]) => [mine.filter((entry) => entry.group === group), word] as const)
+    return counts.filter(([of]) => of.length).map(([of, word]) => `<a class="chip is-outline" href="#answer" data-act="to-answers" data-entry="${esc(of[0].id)}">${of.length} ${word}</a>`).join('')
   }
 
   function row(key: BehaviorKey, label: string): string {
@@ -120,7 +120,8 @@ export function mountBehaviors(ctx: PartContext, box: HTMLElement): BehaviorsTab
     const target = e.target as Element
     const pick = target.closest<HTMLElement>('[data-range]')
     if (pick) { range = pick.dataset.range as TimeRange; metrics = { ...metrics, data: null }; paint(); void readMetrics(); return }
-    if (target.closest('[data-act="to-answers"]')) { e.preventDefault(); (document.querySelector('[data-answers] [data-notice]') as HTMLElement | null)?.focus(); return }
+    const chip = target.closest<HTMLElement>('[data-act="to-answers"]')
+    if (chip) { e.preventDefault(); (document.querySelector(`[data-answers] [data-notice="${CSS.escape(chip.dataset.entry ?? '')}"]`) as HTMLElement | null ?? document.querySelector('[data-answers] [data-ref="ov.answer"]') as HTMLElement | null)?.focus(); return }
     const toggle = target.closest<HTMLElement>('[data-act="beh-toggle"]')
     if (!toggle || toggle.matches('[aria-disabled="true"]')) return
     const key = toggle.closest<HTMLElement>('[data-beh]')!.dataset.beh as BehaviorKey

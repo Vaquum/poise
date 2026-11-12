@@ -239,10 +239,16 @@ svg.flip-x { transform: rotate(180deg); }
 .owork a:hover { text-decoration: underline; text-decoration-color: var(--c-edge-strong); }
 .owork .onote { margin-left: auto; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* System health (#1101, planned): five cards in one row, each a link to its evidence */
+/* System health (#1101): five cards in one row, each a link to its evidence */
 .ohealths { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: var(--sp-3); }
 .ohealth { text-decoration: none; }
-.ohealth .osmall-v { color: var(--c-text-muted); }
+.ohealth .osmall-v .t-gloss { font-size: var(--fs-micro); }
+.hcov { margin: var(--sp-1) 0; padding: 0; list-style: none; display: grid; gap: var(--sp-1); font-size: var(--fs-micro); color: var(--c-text-soft); }
+.hcov li { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: var(--sp-2); }
+.hbar { width: 100%; height: var(--sp-1); }
+.hb-covered { fill: var(--c-text-faint); }
+.hb-gap { fill: var(--c-attention-on); }
+.hb-unknown { fill: none; stroke: var(--c-edge); stroke-width: var(--line-hair); vector-effect: non-scaling-stroke; }
 
 @media (max-width: 1000px) {
   .ova-counts { grid-template-columns: minmax(0, 1fr); }

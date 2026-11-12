@@ -2,6 +2,7 @@
 // onto Running, Needs you, Waiting, Blocked, Idle, Done and Failed, with the
 // outcome word kept beside the state where the state alone would lose it.
 // Pure, so the mapping is tested without a page.
+import { queuedStatusText } from '../../../chat-text'
 
 export type State = 'running' | 'needs-you' | 'waiting' | 'blocked' | 'idle' | 'done' | 'failed'
 
@@ -34,7 +35,7 @@ export function chatState(chat: ChatLike): Placed {
       const asks = chat.pendingRequests?.length ?? 0
       return { state: 'needs-you', note: asks > 1 ? `${asks} requests wait for you` : 'a request waits for you' }
     }
-    case 'queued': return { state: 'waiting', note: chat.queuedBehind || 'queued' }
+    case 'queued': return { state: 'waiting', note: queuedStatusText(chat.queuedBehind) }
     case 'interrupted': return { state: 'needs-you', note: 'Interrupted: Resume continues' }
     case 'closed': return { state: 'idle', note: 'Closed' }
     case 'error': return { state: 'failed', note: 'its last turn failed' }

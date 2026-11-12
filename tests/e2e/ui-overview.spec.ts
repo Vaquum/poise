@@ -294,3 +294,33 @@ for (const width of [375, 768, 1000]) {
     expect(sizes.ova[0]).toBeLessThanOrEqual(sizes.ova[1])
   })
 }
+
+test('System health reads its five cards live, and a failed read keeps them, with when', async ({ page }) => {
+  let fail = false
+  const now = Date.now()
+  await page.route('**/api/analytics/system-health*', (route) => fail ? json(route, { error: 'evidence store unavailable' }, 503) : json(route, {
+    readAt: now, window: { since: now - 86_400_000, until: now }, scope: '', limits: [],
+    rate: { completed: 6, errors: 3, perItem: 0.5, items: [] },
+    blocked: { count: 3, oldestProgressAt: now - 26 * 3_600_000, largestStage: 'Repair: 2', items: [] },
+    recovery: { automatic: [{}, {}], intervention: [{}], unknown: 0 },
+    lastError: { error: { at: now - 15 * 60_000, work: 'autonomio/poise#496', journal: '', summary: '' }, lastObserved: false, coveredSince: now - 86_400_000, coveredUntil: now },
+    coverage: [
+      { name: 'Chain journal', scope: 'All configured accounts', status: 'verified v2', lastReadAt: null, intervals: null },
+      { name: 'Caller receipts', scope: 'Instance-wide', status: 'ok', lastReadAt: null, intervals: [{ since: now - 100, until: now - 4, state: 'covered' }, { since: now - 4, until: now, state: 'unknown' }] },
+    ],
+  }))
+  await open(page, { notices: [], requests: [], decisions: [], revision: 1 })
+  const card = (ref: string) => page.locator(`[data-ref="ov.health"] [data-ref="${ref}"]`)
+  await expect(card('ov.h.errors')).toContainText('0.5 per item')
+  await expect(card('ov.h.errors')).toContainText('3 errors across 6 items completed')
+  await expect(card('ov.h.blocked')).toContainText('oldest 1d 2h without verified progress · Repair: 2')
+  await expect(card('ov.h.recovery')).toContainText('1 needed outside help')
+  await expect(card('ov.h.lasterror')).toContainText('at ')
+  await expect(card('ov.h.coverage').getByRole('img')).toHaveAttribute('aria-label', '96% covered, 4% unknown')
+  await expect(page.getByText('Planned · #1101')).toHaveCount(0)
+
+  fail = true
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent('poise:organization-filter-changed')))
+  await expect(page.locator('[data-healthfail]')).toContainText('System health could not be read: evidence store unavailable. Last read at')
+  await expect(card('ov.h.errors')).toContainText('0.5 per item')
+})

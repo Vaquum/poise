@@ -16,14 +16,15 @@ import { routeBack } from '../shell'
 import { mountAnswers } from './overview/answers'
 import { mountBehaviors } from './overview/behaviors'
 import { mountDay } from './overview/day'
+import { mountHealth } from './overview/health'
 import { mountManager } from './overview/manager'
 import { mountMotion } from './overview/motion'
 import { mountQuota } from './overview/quota'
 import type { ChainLike } from './overview/states'
 import { json, reason, whileVisible } from './overview/util'
 
-const health = (ref: string, href: string, label: string) =>
-  `<a class="osmall ohealth" href="${href}" data-ref="${ref}"><span class="otile-l">${label}</span><span class="osmall-v">—</span><span class="t-gloss">Not served yet</span></a>`
+const health = (ref: string, href: string, label: string, value = '<span class="osmall-v">—</span>') =>
+  `<a class="osmall ohealth" href="${href}" data-ref="${ref}"><span class="otile-l">${label}</span>${value}<span class="t-gloss">Not read yet</span></a>`
 
 function layoutHTML(): string {
   return `<main class="ova">
@@ -52,14 +53,15 @@ function layoutHTML(): string {
         </div>
       </section>
 
-      <section class="ova-sec" aria-labelledby="h-health">
-        <h3 class="ova-sh" id="h-health"><span class="t-micro">System health</span><span class="t-gloss">live · the last 24 hours of v2 chain work · each card opens its evidence</span><span class="chip is-outline" data-ref="ov.planned-health">Planned · #1101</span></h3>
+      <section class="ova-sec" aria-labelledby="h-health" data-health>
+        <h3 class="ova-sh" id="h-health"><span class="t-micro">System health</span><span class="t-gloss">live · the last 24 hours of v2 chain work · each card opens its evidence</span></h3>
+        <div data-healthfail></div>
         <div class="ohealths" data-ref="ov.health">
           ${health('ov.h.errors', placeHref('observe', { part: 'logging', back: 'overview' }), 'Errors per completed work item')}
           ${health('ov.h.blocked', placeHref('observe', { part: 'tasks', which: 'attention', back: 'overview' }), 'Work blocked')}
           ${health('ov.h.recovery', placeHref('observe', { part: 'tasks', back: 'overview' }), 'Recovered by itself')}
           ${health('ov.h.lasterror', placeHref('observe', { part: 'logging', back: 'overview' }), 'Since the last work error')}
-          ${health('ov.h.coverage', placeHref('observe', { part: 'logging', data: '1', back: 'overview' }), 'Evidence coverage')}
+          ${health('ov.h.coverage', placeHref('observe', { part: 'logging', data: '1', back: 'overview' }), 'Evidence coverage', '<ul class="hcov"></ul>')}
         </div>
       </section>
 
@@ -117,6 +119,7 @@ export const mount: MountPlace = async (ctx) => {
   })
   motion.onSessions(() => { manager.sessionsChanged(); answers.diagnosticsChanged() })
   mountDay(ctx, main)
+  mountHealth(ctx, $('[data-health]', root))
   mountQuota(ctx, $('[data-quota]', root))
 
   // The chain's journal feeds Answer here (work that needs attention) and In motion (tasks).
